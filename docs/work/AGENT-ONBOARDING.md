@@ -43,12 +43,20 @@ export PATH=/opt/homebrew/bin:/Users/uno/.cargo/bin:/usr/local/bin:$PATH
 cargo build --all-targets 2>&1 | tail -20'
 ```
 
-## Current state (as of 2026-05-13)
+## Current state (as of 2026-05-13, post-R3 merge)
 
-- **Main tip:** includes Round 1 + Round 2 merged
-- **Active branch:** `feat/phase-3-round-3` — 2 commits, awaiting codex review
-- **Test count:** 123 passing (45 core + 71 daemon lib + 3 overlay pipe + 4 pipeline integration + 1 ignored hardware)
-- **All checks green:** fmt, clippy, build release, cargo test, dashboard npm build, git diff --check
+- **Main tip:** includes Round 1 + Round 2 + Round 3 merged
+- **Next branch:** `feat/phase-3-round-4` (or later) — prep Round 4 scope:
+  overlay restart loop + system audio capture (ScreenCaptureKit on macOS,
+  WASAPI loopback on Windows)
+- **Test count on main after R3:** 130 passing (45 core + 78 daemon lib +
+  3 overlay pipe + 4 pipeline integration + 1 ignored hardware)
+- **R3 delivered:** Deepgram Nova-3 live streaming provider with
+  `connect()` + WS reader/writer + exponential-backoff reconnect supervisor
+  + mock-WS integration tests (7 live-connection tests); native overlay
+  IPC via `NativeOverlayHandle`; overlay stub binary + integration tests
+- **All checks green on merge:** fmt, clippy (D warnings), build release,
+  cargo test, dashboard npm build, git diff --check
 
 ## Workflow loop (kiro ↔ codex ↔ user)
 
@@ -126,15 +134,25 @@ In `crates/cue-core/src/`:
 - `stt.rs`: `SttProvider` async trait, `TranscriptEvent {Partial, Final, SpeakerLabel}`, `ConnectionState`, `SttError`, `WordTiming`, `SttConfig`
 - `overlay_ipc.rs`: `OverlayMessage` (SessionSwitched/ListeningStateChanged/TranscriptPartial/TranscriptFinal/Ping), `OverlayIpcCommand {Pong, RequestSync}`, `encode_ndjson`, `decode_ndjson`
 
-## Pending — Round 4 scope (deferred from Round 3)
+## Round 4 scope
 
-1. **Deepgram live `connect()`** — bind `connect_async` to the `from_channels` seam; all other pieces (URL, auth, parser, backoff, error map) are tested and ready
-2. **Overlay restart-on-crash loop** — helpers ready (`restart_delay`, `Restarting { attempt }`); watcher currently single-shot
-3. **System audio capture** — ScreenCaptureKit (macOS), WASAPI loopback (Windows)
-4. **Real Swift/C overlay code updates** — consume `OverlayMessage::SessionSwitched`
+Codex accepted Round 3 with nits (2026-05-13). Round 4 scope:
 
-Do **NOT** start Round 4 until codex has reviewed Round 3 and user has
-acknowledged the verdict.
+1. **Overlay restart-on-crash loop** — helpers ready (`restart_delay`,
+   `OverlayProcessState::Restarting { attempt }`); watcher currently
+   single-shot. Wire the relaunch path with backoff + cap at
+   `MAX_RESTART_ATTEMPTS`. Add integration test that kills the stub
+   mid-session and asserts automatic recovery.
+2. **System audio capture** — ScreenCaptureKit on macOS, WASAPI loopback
+   on Windows. Must produce `AudioChunk { source: AudioSource::System, .. }`
+   via the same `AudioChunk` producer channel as mic capture, so the
+   VAD/STT pipeline stays source-agnostic.
+
+Deferred to later rounds (not Round 4):
+- STT fallback chain (primary Deepgram → secondary cloud → local whisper).
+  Design captured in `docs/work/PLAN-STT-FALLBACK-CHAIN.md`.
+- Real Swift/C overlay code updates — unblocked after Round 4 ships
+  system audio + overlay restart, but sequencing depends on stealth work.
 
 ## First actions for a new agent
 

@@ -37,30 +37,29 @@ Round 3 of Phase 3. Builds the first streaming STT provider (Deepgram Nova-3) an
 
 Plus this doc + the IMPL doc as their own commit.
 
-## Verification — ALL GREEN
+## Verification — ALL GREEN (post-fix)
 
 ```
 cargo fmt --all --check                              ✅ pass
 cargo clippy --all-targets -- -D warnings            ✅ pass
-cargo build --all-targets --release                  ✅ 55.59s
-cargo test --all-targets                             ✅ 123 pass
-                                                        45 core + 71 daemon lib + 3 overlay pipe
+cargo build --all-targets --release                  ✅
+cargo test --all-targets                             ✅ 130 pass
+                                                        45 core + 78 daemon lib + 3 overlay pipe
                                                         + 4 pipeline integration + 1 ignored (hw)
 cd crates/cue-dashboard/ui && npm run build          ✅ 297 KB JS
 git diff --check main..HEAD                          ✅ clean
-TOML validation (.codex/agents/*.toml)               ✅ all 7 valid
 ```
 
 Test count:
 
-| Tier | Round 2 | Round 3 | Δ |
-|---|---|---|---|
-| cue-core lib | 45 | 45 | — |
-| cue-daemon lib | 48 | 71 | +23 (20 deepgram + 3 overlay unit) |
-| Integration: pipeline | 4 | 4 | — |
-| Integration: overlay pipe | 0 | 3 | +3 |
-| Ignored (hardware) | 1 | 1 | — |
-| **Total running** | **97** | **123** | **+26** |
+| Tier | Round 2 | Round 3 (initial) | Round 3 (final, post-fix) | Δ vs R2 |
+|---|---|---|---|---|
+| cue-core lib | 45 | 45 | 45 | — |
+| cue-daemon lib | 48 | 71 | 78 | +30 (20 deepgram unit + 7 deepgram live + 3 overlay unit) |
+| Integration: pipeline | 4 | 4 | 4 | — |
+| Integration: overlay pipe | 0 | 3 | 3 | +3 |
+| Ignored (hardware) | 1 | 1 | 1 | — |
+| **Total running** | **97** | **123** | **130** | **+33** |
 
 ## Architecture diagram — Round 3 additions
 
@@ -73,10 +72,11 @@ Audio/Mic ──▶ Framer──▶ TwoStageVad──▶ SttProvider            
                                            │                      │
                                       DeepgramProvider            │
                                   ┌────────┴──────────────┐       │
-                                  │   from_channels seam  │       │
+                                  │   connect() (live)    │       │
+                                  │   supervisor + backoff│       │
+                                  │   WS reader / writer  │       │
                                   │   parse_frame         │       │
-                                  │   build_url, auth     │       │
-                                  │   reconnect_delay     │       │
+                                  │   build_url, auth hdr │       │
                                   └───────────────────────┘       │
                                                                   │
 Active session change ────────▶ NativeOverlayHandle               │
