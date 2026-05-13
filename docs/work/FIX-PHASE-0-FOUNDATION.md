@@ -20,7 +20,7 @@ Codex reviewed commit range `8034be1..fa19623` and returned 🔴 REQUEST CHANGES
 ## Fix Summary
 
 - **Blocker 1**: Ran `cargo fmt --all` across workspace.
-- **Blocker 2**: Quoted the hashFiles glob: `hashFiles(**/Cargo.lock)`.
+- **Blocker 2**: Quoted the hashFiles glob: `hashFiles('**/Cargo.lock')`.
 - **Blocker 3**: Converted all 7 `.codex/agents/*.toml` from invalid `- "..."` syntax to `key = [...]` arrays.
 - **Blocker 4**: Added `[lints.rust] unexpected_cfgs = { level = "allow", check-cfg = [...] }` to `cue-dashboard/Cargo.toml`.
 - **Blocker 5**: Added conditional `apt-get install` step for Tauri Linux deps in CI (ubuntu-latest only).
