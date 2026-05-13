@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useNavigate } from "react-router-dom";
 import { useSessionEvents } from "../hooks/useSessionEvents";
+import { useActiveSession } from "../hooks/useActiveSession";
 
 interface Session {
   id: string;
@@ -11,10 +13,17 @@ interface Session {
   token_count: number;
 }
 
+type Filter = "all" | "active" | "paused" | "archived";
+
 export function Chats() {
+  const navigate = useNavigate();
+  const { activeId } = useActiveSession();
+
   const [sessions, setSessions] = useState<Session[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<Filter>("all");
 
   const fetchSessions = useCallback(async () => {
     try {
@@ -30,16 +39,29 @@ export function Chats() {
 
   async function handleCreate() {
     try {
-      await invoke("create_session", { title: null });
+      const s = await invoke<Session>("create_session", { title: null });
+      await fetchSessions();
+      navigate(`/session/${s.id}`);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function handleArchive(id: string, event: React.MouseEvent) {
+    event.stopPropagation();
+    try {
+      await invoke("archive_session", { id });
       await fetchSessions();
     } catch (e) {
       setError(String(e));
     }
   }
 
-  async function handleArchive(id: string) {
+  async function handleDelete(id: string, title: string, event: React.MouseEvent) {
+    event.stopPropagation();
+    if (!confirm(`Delete session "${title}"? This cannot be undone.`)) return;
     try {
-      await invoke("archive_session", { id });
+      await invoke("delete_session", { id });
       await fetchSessions();
     } catch (e) {
       setError(String(e));
@@ -50,27 +72,27 @@ export function Chats() {
     fetchSessions();
   }, [fetchSessions]);
 
-  // D1.8: refresh session list when the daemon emits `session:created`.
-  // Today create_session is called directly from this window, but Phase 2+
-  // will emit events from the daemon side when sessions arrive through other
-  // paths (e.g. CLI, hotkey, background jobs), and this hook will pick them up
-  // without any change here.
+  // D1.8: refresh on session:created event (from daemon or other windows).
   const handleSessionCreated = useCallback(() => {
     void fetchSessions();
   }, [fetchSessions]);
   useSessionEvents(handleSessionCreated);
 
-  if (loading) {
-    return <p className="text-zinc-500">Loading sessions...</p>;
-  }
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return sessions.filter((s) => {
+      if (filter !== "all" && s.status !== filter) return false;
+      if (q && !s.title.toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }, [sessions, filter, query]);
 
-  if (error) {
-    return <p className="text-red-400">Error: {error}</p>;
-  }
+  if (loading) return <p className="text-zinc-500">Loading sessions...</p>;
+  if (error) return <p className="text-red-400">Error: {error}</p>;
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-4">
         <h2 className="text-xl font-semibold">Sessions</h2>
         <button
           onClick={handleCreate}
@@ -79,44 +101,92 @@ export function Chats() {
           New Session
         </button>
       </div>
-      {sessions.length === 0 ? (
-        <p className="text-zinc-500">No sessions yet. Create one to get started.</p>
+
+      <div className="flex items-center gap-3">
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search by title..."
+          className="flex-1 rounded-md border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-sm placeholder-zinc-600 focus:border-zinc-600 focus:outline-none"
+        />
+        <div className="flex items-center gap-1 rounded-md border border-zinc-800 bg-zinc-900 p-0.5 text-xs">
+          {(["all", "active", "paused", "archived"] as Filter[]).map((f) => (
+            <button
+              key={f}
+              onClick={() => setFilter(f)}
+              className={`rounded px-2 py-1 capitalize ${
+                filter === f ? "bg-zinc-800 text-zinc-200" : "text-zinc-500 hover:text-zinc-300"
+              }`}
+            >
+              {f}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {filtered.length === 0 ? (
+        <p className="text-zinc-500">
+          {sessions.length === 0
+            ? "No sessions yet. Create one to get started."
+            : "No sessions match the current filter."}
+        </p>
       ) : (
         <ul className="space-y-2">
-          {sessions.map((s) => (
-            <li
-              key={s.id}
-              className="flex items-center justify-between rounded-md border border-zinc-800 bg-zinc-900 px-4 py-3"
-            >
-              <div>
-                <p className="font-medium">{s.title}</p>
-                <p className="text-xs text-zinc-500">
-                  {new Date(s.created_at).toLocaleString()} · {s.token_count} tokens
-                </p>
-              </div>
-              <div className="flex items-center gap-2">
-                <span
-                  className={`rounded-full px-2 py-0.5 text-xs ${
-                    s.status === "active"
-                      ? "bg-green-900/50 text-green-400"
-                      : s.status === "archived"
-                        ? "bg-zinc-700 text-zinc-400"
-                        : "bg-yellow-900/50 text-yellow-400"
-                  }`}
-                >
-                  {s.status}
-                </span>
-                {s.status !== "archived" && (
-                  <button
-                    onClick={() => handleArchive(s.id)}
-                    className="rounded px-2 py-1 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+          {filtered.map((s) => {
+            const isActive = s.id === activeId;
+            return (
+              <li
+                key={s.id}
+                onClick={() => navigate(`/session/${s.id}`)}
+                className={`flex items-center justify-between rounded-md border px-4 py-3 transition-colors cursor-pointer ${
+                  isActive
+                    ? "border-blue-700 bg-blue-950/30"
+                    : "border-zinc-800 bg-zinc-900 hover:bg-zinc-850 hover:border-zinc-700"
+                }`}
+              >
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <p className="truncate font-medium">{s.title}</p>
+                    {isActive && (
+                      <span className="shrink-0 rounded-full bg-blue-900/40 px-2 py-0.5 text-xs text-blue-300">
+                        active
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-xs text-zinc-500">
+                    {new Date(s.created_at).toLocaleString()} · {s.token_count} tokens
+                  </p>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  <span
+                    className={`rounded-full px-2 py-0.5 text-xs ${
+                      s.status === "active"
+                        ? "bg-green-900/50 text-green-400"
+                        : s.status === "archived"
+                          ? "bg-zinc-700 text-zinc-400"
+                          : "bg-yellow-900/50 text-yellow-400"
+                    }`}
                   >
-                    Archive
+                    {s.status}
+                  </span>
+                  {s.status !== "archived" && (
+                    <button
+                      onClick={(e) => handleArchive(s.id, e)}
+                      className="rounded px-2 py-1 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+                    >
+                      Archive
+                    </button>
+                  )}
+                  <button
+                    onClick={(e) => handleDelete(s.id, s.title, e)}
+                    className="rounded px-2 py-1 text-xs text-red-400 hover:bg-red-950 hover:text-red-300"
+                  >
+                    Delete
                   </button>
-                )}
-              </div>
-            </li>
-          ))}
+                </div>
+              </li>
+            );
+          })}
         </ul>
       )}
     </div>

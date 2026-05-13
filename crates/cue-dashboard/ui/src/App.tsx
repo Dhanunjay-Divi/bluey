@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route } from "react-router-dom";
 import { DashboardLayout } from "./components/DashboardLayout";
 import { Chats } from "./pages/Chats";
+import { SessionDetail } from "./pages/SessionDetail";
 import { Placeholder } from "./pages/Placeholder";
 
 function App() {
@@ -10,6 +11,7 @@ function App() {
         <Route element={<DashboardLayout />}>
           <Route index element={<Placeholder name="Home" />} />
           <Route path="chats" element={<Chats />} />
+          <Route path="session/:id" element={<SessionDetail />} />
           <Route path="prompts" element={<Placeholder name="Prompts" />} />
           <Route path="shortcuts" element={<Placeholder name="Shortcuts" />} />
           <Route path="settings" element={<Placeholder name="Settings" />} />
