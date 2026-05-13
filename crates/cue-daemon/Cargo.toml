@@ -34,9 +34,15 @@ uuid.workspace = true
 rusqlite.workspace = true
 
 futures-util.workspace = true
+tokio-tungstenite.workspace = true
+url.workspace = true
 [lints.clippy]
 needless_return = "allow"
 filter_next = "allow"
 needless_question_mark = "allow"
 option_as_ref_deref = "allow"
 single_char_add_str = "allow"
+
+[[bin]]
+name = "overlay-stub"
+path = "src/bin/overlay_stub.rs"
