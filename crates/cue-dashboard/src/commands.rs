@@ -84,12 +84,27 @@ pub fn delete_session(
     if *active == Some(uuid) {
         *active = None;
         drop(active);
-        // Persist cleared selection — best-effort
-        let db_guard = db.0.lock().map_err(|e| e.to_string())?;
-        if let Err(e) = db_guard.save_active_session(None) {
-            tracing::warn!(error = %e, "failed to clear persisted active session id");
+        // Persist cleared selection — best-effort.
+        //
+        // At this point the DELETE already committed and the in-memory active
+        // selection already cleared. A lock poison or SQLite write failure here
+        // must NOT turn that into a user-facing error: the delete succeeded.
+        // The persisted active_session_id (if any) will be validated on next
+        // daemon startup via load_active_session, which returns None for stale
+        // ids. Log + continue.
+        match db.0.lock() {
+            Ok(db_guard) => {
+                if let Err(e) = db_guard.save_active_session(None) {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to clear persisted active session id; will self-heal on next daemon startup"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "db lock poisoned while clearing persisted active session id");
+            }
         }
-        drop(db_guard);
         if let Err(e) = app.emit("session:switched", SessionSwitchedPayload { id: None }) {
             tracing::warn!(error = %e, "failed to emit session:switched event");
         }
