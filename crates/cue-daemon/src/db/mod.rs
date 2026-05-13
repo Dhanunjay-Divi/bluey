@@ -184,10 +184,20 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
     let id_str: String = row.get(0)?;
     let status_str: String = row.get(2)?;
     let skill_str: Option<String> = row.get(9)?;
+    let id = Uuid::parse_str(&id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let status = SessionStatus::from_str(&status_str).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            format!("invalid session status: {status_str}").into(),
+        )
+    })?;
     Ok(Session {
-        id: Uuid::parse_str(&id_str).unwrap_or_default(),
+        id,
         title: row.get(1)?,
-        status: SessionStatus::from_str(&status_str).unwrap_or(SessionStatus::Active),
+        status,
         created_at: row.get(3)?,
         updated_at: row.get(4)?,
         last_active_at: row.get(5)?,
@@ -203,13 +213,26 @@ fn row_to_turn(row: &rusqlite::Row) -> rusqlite::Result<Turn> {
     let id_str: String = row.get(0)?;
     let session_id_str: String = row.get(1)?;
     let lane_str: String = row.get(5)?;
+    let id = Uuid::parse_str(&id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let session_id = Uuid::parse_str(&session_id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let lane = Lane::from_str(&lane_str).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            5,
+            rusqlite::types::Type::Text,
+            format!("invalid lane: {lane_str}").into(),
+        )
+    })?;
     Ok(Turn {
-        id: Uuid::parse_str(&id_str).unwrap_or_default(),
-        session_id: Uuid::parse_str(&session_id_str).unwrap_or_default(),
+        id,
+        session_id,
         turn_index: row.get(2)?,
         user_message: row.get(3)?,
         model_response: row.get(4)?,
-        lane: Lane::from_str(&lane_str).unwrap_or(Lane::Snap),
+        lane,
         provider: row.get(6)?,
         model: row.get(7)?,
         created_at: row.get(8)?,
