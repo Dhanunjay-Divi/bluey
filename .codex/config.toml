@@ -1,0 +1,33 @@
+# Codex CLI configuration for Cue (Bluey)
+
+[project]
+name = "cue"
+description = "Cross-platform AI meeting copilot (Tauri 2 + Rust + React 19)"
+
+[context]
+# Files always loaded into agent context
+always_include = [
+  "CLAUDE.md",
+  "Cargo.toml",
+  "CHANGELOG.md",
+]
+
+[context.on_demand]
+# Loaded when relevant to the task
+patterns = [
+  "docs/reviews/CUE-BLUEY-V3-*.md",
+  "docs/work/IMPL-*.md",
+]
+
+[defaults]
+model = "claude-sonnet-4-20250514"
+max_tokens = 8192
+
+[safety]
+# Prevent destructive operations
+blocked_commands = [
+  "rm -rf /",
+  "git push",
+  "git push --force",
+  "git reset --hard",
+]
