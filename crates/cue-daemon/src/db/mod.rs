@@ -30,10 +30,15 @@ impl Database {
     }
 
     fn run_migrations(&self) -> Result<()> {
-        const MIGRATION: &str = include_str!("../../../../infra/migrations/002_sessions.sql");
+        const MIGRATION_002: &str = include_str!("../../../../infra/migrations/002_sessions.sql");
+        const MIGRATION_003: &str =
+            include_str!("../../../../infra/migrations/003_turns_unique_index.sql");
         self.conn
-            .execute_batch(MIGRATION)
+            .execute_batch(MIGRATION_002)
             .context("failed to run session migration")?;
+        self.conn
+            .execute_batch(MIGRATION_003)
+            .context("failed to run turns unique index migration")?;
         Ok(())
     }
 
@@ -109,6 +114,18 @@ impl Database {
     }
 
     pub fn append_turn(&self, session_id: Uuid, turn: NewTurn) -> Result<Turn> {
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let result = self.append_turn_inner(session_id, &turn);
+        match &result {
+            Ok(_) => self.conn.execute_batch("COMMIT")?,
+            Err(_) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+            }
+        }
+        result
+    }
+
+    fn append_turn_inner(&self, session_id: Uuid, turn: &NewTurn) -> Result<Turn> {
         let id = Uuid::new_v4();
         let turn_index: u32 = self.conn.query_row(
             "SELECT COALESCE(MAX(turn_index) + 1, 0) FROM turns WHERE session_id = ?1",
@@ -149,11 +166,11 @@ impl Database {
             id,
             session_id,
             turn_index,
-            user_message: turn.user_message,
-            model_response: turn.model_response,
+            user_message: turn.user_message.clone(),
+            model_response: turn.model_response.clone(),
             lane: turn.lane,
-            provider: turn.provider,
-            model: turn.model,
+            provider: turn.provider.clone(),
+            model: turn.model.clone(),
             created_at: turn.created_at,
             duration_ms: turn.duration_ms,
             input_tokens: turn.input_tokens,
