@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { useSessionEvents } from "../hooks/useSessionEvents";
 
 interface Session {
   id: string;
@@ -15,9 +16,8 @@ export function Chats() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  async function fetchSessions() {
+  const fetchSessions = useCallback(async () => {
     try {
-      setLoading(true);
       setError(null);
       const result = await invoke<Session[]>("list_sessions");
       setSessions(result);
@@ -26,7 +26,7 @@ export function Chats() {
     } finally {
       setLoading(false);
     }
-  }
+  }, []);
 
   async function handleCreate() {
     try {
@@ -48,7 +48,17 @@ export function Chats() {
 
   useEffect(() => {
     fetchSessions();
-  }, []);
+  }, [fetchSessions]);
+
+  // D1.8: refresh session list when the daemon emits `session:created`.
+  // Today create_session is called directly from this window, but Phase 2+
+  // will emit events from the daemon side when sessions arrive through other
+  // paths (e.g. CLI, hotkey, background jobs), and this hook will pick them up
+  // without any change here.
+  const handleSessionCreated = useCallback(() => {
+    void fetchSessions();
+  }, [fetchSessions]);
+  useSessionEvents(handleSessionCreated);
 
   if (loading) {
     return <p className="text-zinc-500">Loading sessions...</p>;
