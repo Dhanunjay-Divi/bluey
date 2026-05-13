@@ -52,7 +52,8 @@ async fn pipeline_silence_is_dropped_before_stt() {
 #[tokio::test]
 async fn pipeline_loud_audio_passes_to_stt_and_delivers_scripted_transcript() {
     let (mut provider, ctrl) = MockStt::new(SttConfig::default());
-    let mut vad = TwoStageVad::new(&VadConfig::default(), SampleRate::new(16_000).unwrap()).unwrap();
+    let mut vad =
+        TwoStageVad::new(&VadConfig::default(), SampleRate::new(16_000).unwrap()).unwrap();
 
     // Feed 5 loud chunks — should all pass RMS stage.
     // WebRTC VAD may classify synthetic constant-amplitude frames as non-speech
