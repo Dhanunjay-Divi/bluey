@@ -40,8 +40,15 @@ pub fn run() {
                 .join("sessions.db");
             let db = Database::open(db_path.to_str().unwrap_or("bluey.db"))
                 .expect("failed to open database");
+            // Best-effort recover the previously-active session id. If the row
+            // points at a session that was deleted while the daemon was off,
+            // load_active_session() returns None and we start with no selection.
+            let restored = db.load_active_session().unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "failed to restore active session id");
+                None
+            });
             app.manage(DbState(Mutex::new(db)));
-            app.manage(ActiveSessionState(Mutex::new(None)));
+            app.manage(ActiveSessionState(Mutex::new(restored)));
 
             // Register global shortcut
             register_global_shortcut(app)?;

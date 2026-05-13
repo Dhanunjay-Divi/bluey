@@ -33,12 +33,16 @@ impl Database {
         const MIGRATION_002: &str = include_str!("../../../../infra/migrations/002_sessions.sql");
         const MIGRATION_003: &str =
             include_str!("../../../../infra/migrations/003_turns_unique_index.sql");
+        const MIGRATION_004: &str = include_str!("../../../../infra/migrations/004_app_state.sql");
         self.conn
             .execute_batch(MIGRATION_002)
             .context("failed to run session migration")?;
         self.conn
             .execute_batch(MIGRATION_003)
             .context("failed to run turns unique index migration")?;
+        self.conn
+            .execute_batch(MIGRATION_004)
+            .context("failed to run app_state migration")?;
         Ok(())
     }
 
@@ -205,6 +209,64 @@ impl Database {
         let rows = stmt.query_map(params![session_id.to_string(), limit], row_to_turn)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    // ===== Key-value app-state (Phase 3 follow-up) =====
+
+    /// Read a single value from the `app_state` key-value table.
+    ///
+    /// Returns `None` if the key has never been written OR was explicitly
+    /// cleared via `set_app_state(key, None)`. Empty string is a valid value
+    /// and is returned as `Some(String::new())` — callers that want to treat
+    /// empty as unset must do so explicitly.
+    pub fn get_app_state(&self, key: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM app_state WHERE key = ?1")?;
+        let mut rows = stmt.query(params![key])?;
+        match rows.next()? {
+            Some(row) => Ok(row.get::<_, Option<String>>(0)?),
+            None => Ok(None),
+        }
+    }
+
+    /// Upsert a key into the `app_state` table.
+    ///
+    /// Passing `value = None` clears the stored value but keeps the row, so a
+    /// subsequent `get_app_state(key)` returns `Ok(None)`.
+    pub fn set_app_state(&self, key: &str, value: Option<&str>) -> Result<()> {
+        let now = now_ms();
+        self.conn.execute(
+                "INSERT INTO app_state (key, value, updated_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+                params![key, value, now],
+            )?;
+        Ok(())
+    }
+
+    /// Convenience: load the persisted active session id, if any, and verify
+    /// it still points at a real session. Invalid / stale ids return `None`
+    /// so the caller can fall back to "no selection" cleanly.
+    pub fn load_active_session(&self) -> Result<Option<Uuid>> {
+        let raw = match self.get_app_state("active_session_id")? {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        let Ok(id) = Uuid::parse_str(&raw) else {
+            return Ok(None);
+        };
+        if self.get_session(id)?.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(id))
+    }
+
+    /// Persist the active session id. Pass `None` to clear.
+    pub fn save_active_session(&self, id: Option<Uuid>) -> Result<()> {
+        match id {
+            Some(u) => self.set_app_state("active_session_id", Some(&u.to_string())),
+            None => self.set_app_state("active_session_id", None),
+        }
     }
 }
 
@@ -503,6 +565,46 @@ mod tests {
 
     // D0.2 V2 nit regression: duplicate (session_id, turn_index) must fail
     // due to the unique index added in migration 003.
+    // Phase 3 follow-up: app_state persistence round-trips for active session id
+    #[test]
+    fn test_app_state_round_trip() {
+        let db = test_db();
+        assert_eq!(db.get_app_state("missing").unwrap(), None);
+        db.set_app_state("foo", Some("bar")).unwrap();
+        assert_eq!(db.get_app_state("foo").unwrap(), Some("bar".into()));
+        db.set_app_state("foo", Some("baz")).unwrap();
+        assert_eq!(db.get_app_state("foo").unwrap(), Some("baz".into()));
+        db.set_app_state("foo", None).unwrap();
+        assert_eq!(db.get_app_state("foo").unwrap(), None);
+    }
+
+    #[test]
+    fn test_active_session_persistence_valid() {
+        let db = test_db();
+        let s = db.create_session(Some("Persist me".into())).unwrap();
+        db.save_active_session(Some(s.id)).unwrap();
+
+        let loaded = db.load_active_session().unwrap();
+        assert_eq!(loaded, Some(s.id));
+    }
+
+    #[test]
+    fn test_active_session_persistence_recovers_from_stale_id() {
+        let db = test_db();
+        let s = db.create_session(None).unwrap();
+        db.save_active_session(Some(s.id)).unwrap();
+        // Delete the session while it is still the persisted active selection
+        db.delete_session(s.id).unwrap();
+
+        // Must not resurrect the stale id — return None, caller starts blank
+        let loaded = db.load_active_session().unwrap();
+        assert_eq!(loaded, None);
+
+        // And we can clear explicitly
+        db.save_active_session(None).unwrap();
+        assert_eq!(db.load_active_session().unwrap(), None);
+    }
+
     #[test]
     fn test_duplicate_turn_index_rejected_by_unique_constraint() {
         let db = test_db();

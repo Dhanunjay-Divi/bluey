@@ -83,6 +83,13 @@ pub fn delete_session(
     let mut active = active.0.lock().map_err(|e| e.to_string())?;
     if *active == Some(uuid) {
         *active = None;
+        drop(active);
+        // Persist cleared selection — best-effort
+        let db_guard = db.0.lock().map_err(|e| e.to_string())?;
+        if let Err(e) = db_guard.save_active_session(None) {
+            tracing::warn!(error = %e, "failed to clear persisted active session id");
+        }
+        drop(db_guard);
         if let Err(e) = app.emit("session:switched", SessionSwitchedPayload { id: None }) {
             tracing::warn!(error = %e, "failed to emit session:switched event");
         }
@@ -136,6 +143,16 @@ pub fn set_active_session(
     drop(active); // release lock before emitting
 
     if changed {
+        // Persist the new active selection so a daemon restart can restore it.
+        // Best-effort: a DB write failure here should not fail the command —
+        // the user selection is still correct in-memory and will be persisted
+        // on the next switch.
+        let db = db.0.lock().map_err(|e| e.to_string())?;
+        if let Err(e) = db.save_active_session(new_id) {
+            tracing::warn!(error = %e, "failed to persist active session id");
+        }
+        drop(db);
+
         let payload = SessionSwitchedPayload {
             id: new_id.map(|u| u.to_string()),
         };
