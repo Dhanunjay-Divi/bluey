@@ -6,6 +6,8 @@ use std::sync::Mutex;
 
 use cue_daemon::db::Database;
 use tauri::Manager;
+
+use crate::commands::ActiveSessionState;
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
 /// Shared database state accessible from Tauri commands.
@@ -25,6 +27,10 @@ pub fn run() {
             commands::get_session,
             commands::archive_session,
             commands::delete_session,
+            commands::update_session_title,
+            commands::get_active_session,
+            commands::set_active_session,
+            commands::list_turns,
         ])
         .setup(|app| {
             // Open database
@@ -35,6 +41,7 @@ pub fn run() {
             let db = Database::open(db_path.to_str().unwrap_or("bluey.db"))
                 .expect("failed to open database");
             app.manage(DbState(Mutex::new(db)));
+            app.manage(ActiveSessionState(Mutex::new(None)));
 
             // Register global shortcut
             register_global_shortcut(app)?;

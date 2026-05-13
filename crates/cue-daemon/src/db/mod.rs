@@ -101,6 +101,22 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_session_title(&self, id: Uuid, title: &str) -> Result<()> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(anyhow::anyhow!("session title cannot be empty"));
+        }
+        let now = now_ms();
+        let changed = self.conn.execute(
+            "UPDATE sessions SET title = ?1, updated_at = ?2 WHERE id = ?3",
+            params![title, now, id.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(anyhow::anyhow!("session {id} not found"));
+        }
+        Ok(())
+    }
+
     pub fn archive_session(&self, id: Uuid) -> Result<()> {
         self.update_session_status(id, SessionStatus::Archived)
     }
