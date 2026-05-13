@@ -11,7 +11,9 @@ const NS_WINDOW_STYLE_MASK_NON_ACTIVATING_PANEL: i32 = 1 << 7;
 pub fn setup_nspanel(app: &App) -> Result<(), Box<dyn std::error::Error>> {
     app.handle().plugin(tauri_nspanel::init())?;
 
-    let window = app.get_webview_window("main").expect("main window not found");
+    let window = app
+        .get_webview_window("main")
+        .expect("main window not found");
     let panel = window.to_panel()?;
 
     panel.set_level(NS_FLOAT_WINDOW_LEVEL);

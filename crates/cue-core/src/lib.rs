@@ -1,4 +1,3 @@
-pub mod session;
 pub mod ai;
 pub mod app_paths;
 pub mod audio;
@@ -10,6 +9,7 @@ pub mod intelligence;
 pub mod ipc;
 pub mod meeting;
 pub mod overlay;
+pub mod session;
 pub mod state;
 
 pub use ai::{

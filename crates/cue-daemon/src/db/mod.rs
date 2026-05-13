@@ -63,11 +63,7 @@ impl Database {
         }
     }
 
-    pub fn list_sessions(
-        &self,
-        status: Option<SessionStatus>,
-        limit: u32,
-    ) -> Result<Vec<Session>> {
+    pub fn list_sessions(&self, status: Option<SessionStatus>, limit: u32) -> Result<Vec<Session>> {
         let (sql, p): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = match status {
             Some(s) => (
                 "SELECT id, title, status, created_at, updated_at, last_active_at, \
@@ -110,8 +106,10 @@ impl Database {
     }
 
     pub fn delete_session(&self, id: Uuid) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM sessions WHERE id = ?1", params![id.to_string()])?;
+        self.conn.execute(
+            "DELETE FROM sessions WHERE id = ?1",
+            params![id.to_string()],
+        )?;
         Ok(())
     }
 
@@ -256,7 +254,8 @@ mod tests {
         let db = test_db();
         let s1 = db.create_session(Some("Active 1".into())).unwrap();
         let s2 = db.create_session(Some("Active 2".into())).unwrap();
-        db.update_session_status(s2.id, SessionStatus::Paused).unwrap();
+        db.update_session_status(s2.id, SessionStatus::Paused)
+            .unwrap();
 
         let active = db.list_sessions(Some(SessionStatus::Active), 10).unwrap();
         assert_eq!(active.len(), 1);
