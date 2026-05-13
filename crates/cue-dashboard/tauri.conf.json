@@ -1,0 +1,38 @@
+{
+  "productName": "bluey",
+  "version": "0.1.0",
+  "identifier": "com.bluey.dashboard",
+  "build": {
+    "frontendDist": "ui/dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "cd ui && npm run dev",
+    "beforeBuildCommand": "cd ui && npm run build"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "bluey",
+        "width": 1200,
+        "height": 800,
+        "center": true,
+        "decorations": true,
+        "contentProtected": true,
+        "hiddenTitle": false
+      }
+    ],
+    "macOSPrivateApi": true
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

@@ -1,0 +1,30 @@
+[package]
+name = "cue-dashboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bluey dashboard window (Tauri 2)"
+
+[[bin]]
+name = "cue-dashboard"
+path = "src/main.rs"
+
+[lib]
+name = "cue_dashboard"
+path = "src/lib.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api"] }
+tauri-plugin-shell = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2" }
