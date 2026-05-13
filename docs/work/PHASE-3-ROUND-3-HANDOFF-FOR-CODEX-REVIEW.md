@@ -109,14 +109,17 @@ Active session change ────────▶ NativeOverlayHandle           
 
 ## Deferred to Round 4 (explicit)
 
-1. **`DeepgramProvider::connect()` live path** — the WS open + rx/tx tasks. All pieces exist (URL builder, auth, parser, backoff, state machine); only the `connect_async` + task-binding remain. Connecting in tests requires a mock WS server, which is a separate concern.
-2. **Overlay restart-on-crash loop** — `restart_delay` helper + `OverlayProcessState::Restarting { attempt }` variant are defined; watcher task currently observes exit but doesn't relaunch. Waiting until real Swift/C overlay exists to tune semantics.
+1. **Overlay restart-on-crash loop** — `restart_delay` helper + `OverlayProcessState::Restarting { attempt }` variant are defined; watcher task currently observes exit but doesn't relaunch. Waiting until real Swift/C overlay exists to tune semantics.
+2. **STT fallback chain** (Deepgram primary → secondary cloud provider → local whisper.cpp) — design captured in `docs/work/PLAN-STT-FALLBACK-CHAIN.md` per user direction 2026-05-13. Requires a router layer around `SttProvider`; deferred to a later round.
 3. **System audio capture** (ScreenCaptureKit macOS, WASAPI loopback Windows) — Round 4
 4. **Real Swift/C overlay code updates** — Round 4 (or later; depends on stealth work sequencing)
 
+**NOT deferred (shipped in Round 3 after FIX commit):**
+- `DeepgramProvider::connect()` live path — full `connect_async` + auth header + split reader/writer tasks + supervisor with exponential-backoff reconnect loop + error classification
+
 ## Known quirks
 
-1. **`DeepgramProvider::source` field marked `#[allow(dead_code)]`** — intentional. Tests use `from_channels` seam which doesn't stamp it on emitted events. The future `connect()` path uses it when mapping parsed frames to events.
+1. **`DeepgramProvider::source` field marked `#[allow(dead_code)]`** — intentional. The live `connect()` path threads `source` into its supervisor task which stamps it on emitted events; the field on the handle itself is retained so future extensions (e.g. per-request re-tagging) can access it without reshaping constructors.
 2. **Overlay watcher is single-shot**, documented above. `restart_delay` and `Restarting { attempt }` are defined but unused this round.
 3. **Stub binary builds as part of `cargo test`** — Cargo automatically builds bins that integration tests reference via `CARGO_BIN_EXE_<name>`. Runs transparently in CI.
 
@@ -182,6 +185,6 @@ Active session change ────────▶ NativeOverlayHandle           
 
 Codex: review the commits + new modules + integration test + IMPL doc. Write `docs/work/REVIEW-PHASE-3-ROUND-3.md` with verdict.
 
-- 🟢 ACCEPT → merge to main, start Round 4 (Deepgram live connect() + overlay restart loop + system audio capture OR Swift/C overlay code updates — whichever we sequence first)
+- 🟢 ACCEPT → merge to main, start Round 4 (overlay restart loop + system audio capture + Swift/C overlay code updates, whichever we sequence first)
 - 🟡 ACCEPT WITH NITS → fold into Round 4
-- 🔴 REQUEST CHANGES → I write `FIX-PHASE-3-ROUND-3.md` using `TEMPLATE-FIX.md`
+- 🔴 REQUEST CHANGES → I update `docs/work/FIX-PHASE-3-ROUND-3.md` (already present from the first fix cycle) and re-hand

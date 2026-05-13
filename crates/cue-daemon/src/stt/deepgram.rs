@@ -1135,4 +1135,68 @@ mod tests {
             .expect_err("expected quota error");
         assert!(matches!(err, SttError::Quota(_)), "got {err:?}");
     }
+
+    /// Mock server that fails the FIRST connection with an abnormal WS
+    /// close code (classified as retryable `SttError::Network`) and then
+    /// serves a happy-path transcript on the SECOND connection. Exercises
+    /// the supervisor's reconnect loop end-to-end.
+    async fn start_retry_server() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+            // First connection: accept handshake, then close with an
+            // abnormal close code to force a retry.
+            if let Ok((stream, _)) = listener.accept().await {
+                if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                    let cf = CloseFrame {
+                        code: CloseCode::Error,
+                        reason: "simulated server error".into(),
+                    };
+                    let _ = ws.send(Message::Close(Some(cf))).await;
+                }
+            }
+            // Second connection: deliver a final transcript, then clean close.
+            if let Ok((stream, _)) = listener.accept().await {
+                if let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await {
+                    let _ = ws
+                        .send(Message::text(
+                            r#"{"type":"Results","is_final":true,"channel":{"alternatives":[{"transcript":"after reconnect","confidence":0.9,"words":[]}]}}"#,
+                        ))
+                        .await;
+                    let _ = ws.close(None).await;
+                }
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn connect_reconnects_on_retryable_server_close() {
+        let addr = start_retry_server().await;
+        let cfg = DeepgramConfig {
+            api_key: "dg_test".into(),
+            base_url: Some(format!("ws://{addr}")),
+            ..Default::default()
+        };
+        let mut provider =
+            DeepgramProvider::connect(cfg, SttConfig::default(), AudioSource::Microphone)
+                .await
+                .unwrap();
+
+        // First connection fails with a retryable close; supervisor
+        // backs off `reconnect_delay(0) == 250 ms` and retries. The
+        // transcript we assert on is only sent on the SECOND connection,
+        // so receiving it proves the retry path ran.
+        let event = tokio::time::timeout(Duration::from_secs(5), provider.next_event())
+            .await
+            .expect("no transcript within timeout — reconnect path did not recover")
+            .expect("stream closed before any event")
+            .expect("stream error — reconnect did not succeed");
+
+        let TranscriptEvent::Final { text, .. } = event else {
+            panic!("expected Final after reconnect, got {event:?}");
+        };
+        assert_eq!(text, "after reconnect");
+    }
 }
