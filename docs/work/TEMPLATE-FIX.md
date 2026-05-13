@@ -20,7 +20,7 @@
 
 ## Edge Cases Handled
 
-- 
+-
 
 ## How to Test
 

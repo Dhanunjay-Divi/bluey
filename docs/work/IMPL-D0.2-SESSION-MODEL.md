@@ -1,7 +1,7 @@
 # IMPL-D0.2: Session UUID Model + SQLite Schema
 
-**Status:** Complete  
-**Branch:** `feat/phase-0-d0.2-session-model`  
+**Status:** Complete
+**Branch:** `feat/phase-0-d0.2-session-model`
 **Date:** 2026-05-12
 
 ## Schema Summary

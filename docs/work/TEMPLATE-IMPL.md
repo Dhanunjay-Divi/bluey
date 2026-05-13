@@ -2,9 +2,9 @@
 
 ## Scope
 
-**Does:** 
+**Does:**
 
-**Does NOT:** 
+**Does NOT:**
 
 ## Files Created / Modified
 
@@ -29,7 +29,7 @@ cargo clippy       # ✅ no warnings
 
 ## Known Follow-ups
 
-- 
+-
 
 ## Review Checklist (for reviewer)
 

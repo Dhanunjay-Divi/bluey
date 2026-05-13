@@ -1,8 +1,8 @@
 ## Summary
 
-- 
-- 
-- 
+-
+-
+-
 
 ## Task IDs
 
@@ -55,5 +55,5 @@
 
 ## CHANGELOG Updated?
 
-- [ ] Yes — link to diff: 
+- [ ] Yes — link to diff:
 - [ ] N/A (no user-facing changes)
