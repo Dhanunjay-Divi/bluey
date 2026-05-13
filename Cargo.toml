@@ -3,6 +3,7 @@ members = [
     "crates/cue-cli",
     "crates/cue-core",
     "crates/cue-daemon",
+    "crates/cue-dashboard",
 ]
 resolver = "2"
 
