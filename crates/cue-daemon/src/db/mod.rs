@@ -403,4 +403,154 @@ mod tests {
         let turns = db.list_turns(session.id, None).unwrap();
         assert!(turns.is_empty());
     }
+
+    // ===== Phase 2 regression tests =====
+    // Cover deferred D0.2 V2 nits + new Phase 2 behavior.
+
+    #[test]
+    fn test_update_session_title_works() {
+        let db = test_db();
+        let s = db.create_session(Some("Old title".into())).unwrap();
+
+        db.update_session_title(s.id, "New title").unwrap();
+
+        let fetched = db.get_session(s.id).unwrap().unwrap();
+        assert_eq!(fetched.title, "New title");
+        assert!(
+            fetched.updated_at >= s.updated_at,
+            "updated_at must be refreshed on title change"
+        );
+    }
+
+    #[test]
+    fn test_update_session_title_rejects_empty() {
+        let db = test_db();
+        let s = db.create_session(Some("Keep".into())).unwrap();
+
+        assert!(db.update_session_title(s.id, "").is_err());
+        assert!(db.update_session_title(s.id, "   ").is_err());
+
+        // Title unchanged
+        let fetched = db.get_session(s.id).unwrap().unwrap();
+        assert_eq!(fetched.title, "Keep");
+    }
+
+    #[test]
+    fn test_update_session_title_missing_id_errors() {
+        let db = test_db();
+        let random_id = uuid::Uuid::new_v4();
+
+        let err = db
+            .update_session_title(random_id, "Anything")
+            .expect_err("must error for missing id");
+        assert!(format!("{err}").contains("not found"));
+    }
+
+    // D0.2 V2 nit regression: unarchiving a session must clear archived_at.
+    #[test]
+    fn test_unarchive_clears_archived_at() {
+        let db = test_db();
+        let s = db.create_session(Some("S".into())).unwrap();
+
+        db.update_session_status(s.id, SessionStatus::Archived)
+            .unwrap();
+        let archived: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT archived_at FROM sessions WHERE id = ?1",
+                params![s.id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(archived.is_some(), "archived_at must be set after archive");
+
+        // Move back to active
+        db.update_session_status(s.id, SessionStatus::Active)
+            .unwrap();
+        let after: Option<i64> = db
+            .conn
+            .query_row(
+                "SELECT archived_at FROM sessions WHERE id = ?1",
+                params![s.id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(after.is_none(), "archived_at must be cleared on unarchive");
+    }
+
+    // D0.2 V2 nit regression: invalid UUID strings in DB rows surface as errors,
+    // NOT silently mapped to nil UUID via unwrap_or_default.
+    #[test]
+    fn test_invalid_uuid_in_db_row_surfaces_error() {
+        let db = test_db();
+        // Force-insert a row with a malformed id
+        db.conn
+            .execute(
+                "INSERT INTO sessions (id, title, status, created_at, updated_at, token_count) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params!["not-a-uuid", "broken", "active", 1i64, 1i64, 0i64],
+            )
+            .unwrap();
+
+        // list_sessions should fail, not return a session with nil UUID
+        let result = db.list_sessions(None, 10);
+        assert!(
+            result.is_err(),
+            "list_sessions must surface invalid-UUID errors, got: {:?}",
+            result
+        );
+    }
+
+    // D0.2 V2 nit regression: duplicate (session_id, turn_index) must fail
+    // due to the unique index added in migration 003.
+    #[test]
+    fn test_duplicate_turn_index_rejected_by_unique_constraint() {
+        let db = test_db();
+        let s = db.create_session(None).unwrap();
+
+        // Insert first turn via the normal path to establish turn_index=0
+        db.append_turn(
+            s.id,
+            NewTurn {
+                user_message: "m0".into(),
+                model_response: "r0".into(),
+                lane: Lane::Snap,
+                provider: "cerebras".into(),
+                model: "deepseek-v3".into(),
+                created_at: 1000,
+                duration_ms: None,
+                input_tokens: None,
+                output_tokens: None,
+                cost_cents: None,
+            },
+        )
+        .unwrap();
+
+        // Now try to force-insert a duplicate turn_index=0 for the same session
+        let dup_id = uuid::Uuid::new_v4().to_string();
+        let result = db.conn.execute(
+            "INSERT INTO turns (id, session_id, turn_index, user_message, model_response, \
+             lane, provider, model, created_at) \
+             VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                dup_id,
+                s.id.to_string(),
+                "dup",
+                "dup",
+                "snap",
+                "cerebras",
+                "deepseek-v3",
+                2000i64,
+            ],
+        );
+        assert!(
+            result.is_err(),
+            "unique index on (session_id, turn_index) must reject duplicate"
+        );
+        let msg = format!("{:?}", result.err().unwrap());
+        assert!(
+            msg.contains("UNIQUE") || msg.contains("unique") || msg.contains("constraint"),
+            "error should mention unique constraint violation, got: {msg}"
+        );
+    }
 }
