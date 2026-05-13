@@ -1,4 +1,4 @@
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { HashRouter, Routes, Route } from "react-router-dom";
 import { DashboardLayout } from "./components/DashboardLayout";
 import { Chats } from "./pages/Chats";
 import { SessionDetail } from "./pages/SessionDetail";
@@ -6,7 +6,7 @@ import { Placeholder } from "./pages/Placeholder";
 
 function App() {
   return (
-    <BrowserRouter>
+    <HashRouter>
       <Routes>
         <Route element={<DashboardLayout />}>
           <Route index element={<Placeholder name="Home" />} />
@@ -21,7 +21,7 @@ function App() {
           <Route path="dev" element={<Placeholder name="Dev Tools" />} />
         </Route>
       </Routes>
-    </BrowserRouter>
+    </HashRouter>
   );
 }
 

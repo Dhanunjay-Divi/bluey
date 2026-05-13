@@ -1,17 +1,32 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Command } from "cmdk";
+import { invoke } from "@tauri-apps/api/core";
 
-const commands = [
-  { label: "New session", action: "/chats" },
-  { label: "Go to chats", action: "/chats" },
-  { label: "Go to settings", action: "/settings" },
-  { label: "Go to prompts", action: "/prompts" },
-  { label: "Go to home", action: "/" },
+interface Session {
+  id: string;
+  title: string;
+}
+
+/**
+ * Palette command with a typed action so we can tell "plain navigation" from
+ * "do a thing then navigate" at dispatch time.
+ */
+type PaletteCommand =
+  | { label: string; kind: "navigate"; to: string }
+  | { label: string; kind: "new-session" };
+
+const commands: PaletteCommand[] = [
+  { label: "New session", kind: "new-session" },
+  { label: "Go to chats", kind: "navigate", to: "/chats" },
+  { label: "Go to settings", kind: "navigate", to: "/settings" },
+  { label: "Go to prompts", kind: "navigate", to: "/prompts" },
+  { label: "Go to home", kind: "navigate", to: "/" },
 ];
 
 export function CommandPalette() {
   const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
   const navigate = useNavigate();
 
   useEffect(() => {
@@ -25,6 +40,26 @@ export function CommandPalette() {
     return () => document.removeEventListener("keydown", onKeyDown);
   }, []);
 
+  async function run(cmd: PaletteCommand) {
+    if (busy) return;
+    if (cmd.kind === "navigate") {
+      navigate(cmd.to);
+      setOpen(false);
+      return;
+    }
+    // new-session: actually create the session, then navigate to it.
+    setBusy(true);
+    try {
+      const s = await invoke<Session>("create_session", { title: null });
+      navigate(`/session/${s.id}`);
+      setOpen(false);
+    } catch (e) {
+      console.error("create_session via palette failed", e);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   if (!open) return null;
 
   return (
@@ -36,8 +71,9 @@ export function CommandPalette() {
         }}
       >
         <Command.Input
-          placeholder="Type a command..."
+          placeholder={busy ? "Creating session..." : "Type a command..."}
           className="w-full border-b border-zinc-700 bg-transparent px-4 py-3 text-sm text-zinc-100 outline-none placeholder:text-zinc-500"
+          disabled={busy}
         />
         <Command.List className="max-h-[300px] overflow-auto p-2">
           <Command.Empty className="px-4 py-2 text-sm text-zinc-500">
@@ -47,10 +83,7 @@ export function CommandPalette() {
             <Command.Item
               key={cmd.label}
               value={cmd.label}
-              onSelect={() => {
-                navigate(cmd.action);
-                setOpen(false);
-              }}
+              onSelect={() => run(cmd)}
               className="cursor-pointer rounded-md px-3 py-2 text-sm text-zinc-300 aria-selected:bg-blue-600/20 aria-selected:text-blue-400"
             >
               {cmd.label}
