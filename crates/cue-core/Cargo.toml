@@ -5,6 +5,8 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
 anyhow.workspace = true
 dirs.workspace = true
 serde.workspace = true

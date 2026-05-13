@@ -12,6 +12,11 @@ pub mod overlay;
 pub mod session;
 pub mod state;
 
+pub mod overlay_ipc;
+pub mod pcm;
+pub mod stt;
+pub mod vad;
+
 pub use ai::{
     AiCapabilities, AiCapability, AiModelId, AiProviderId, AiProviderKind, AiRuntimeStatus,
     AnswerContext, AnswerContextKind, AnswerRequest, AnswerResponse, AnswerStreamEvent, CostBudget,
