@@ -9,6 +9,8 @@
     "shell:allow-open",
     "opener:default",
     "dialog:default",
-    "fs:default"
+    "fs:default",
+    "global-shortcut:allow-register",
+    "global-shortcut:allow-unregister"
   ]
 }
