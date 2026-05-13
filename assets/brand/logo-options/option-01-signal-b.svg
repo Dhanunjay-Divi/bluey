@@ -1,0 +1,16 @@
+<svg viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Bluey signal B logo">
+  <defs>
+    <linearGradient id="bg1" x1="8" y1="5" x2="88" y2="91" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6EF7FF"/>
+      <stop offset=".52" stop-color="#2F9BFF"/>
+      <stop offset="1" stop-color="#5865FF"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="80" height="80" rx="24" fill="#06111F"/>
+  <rect x="8" y="8" width="80" height="80" rx="24" fill="url(#bg1)"/>
+  <path d="M33 25v45" stroke="#F7FDFF" stroke-width="11" stroke-linecap="round"/>
+  <path d="M36 47c0-9 7-16 16-16s16 7 16 16-7 16-16 16H36V47Z" fill="#F7FDFF"/>
+  <circle cx="52" cy="47" r="7" fill="#2F9BFF"/>
+  <path d="M66 32c5 3 8 8 8 15s-3 12-8 15M73 24c8 5 13 13 13 23s-5 18-13 23" fill="none" stroke="#EAFDFF" stroke-width="5" stroke-linecap="round" opacity=".76"/>
+  <circle cx="74" cy="68" r="4" fill="#8BFF9D"/>
+</svg>

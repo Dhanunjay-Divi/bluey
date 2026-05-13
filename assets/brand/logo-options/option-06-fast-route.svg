@@ -1,0 +1,16 @@
+<svg viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Bluey fast route logo">
+  <defs>
+    <linearGradient id="bg6" x1="10" y1="8" x2="86" y2="88" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#65F6FF"/>
+      <stop offset=".45" stop-color="#319CFF"/>
+      <stop offset="1" stop-color="#754FFF"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="80" height="80" rx="24" fill="#06111F"/>
+  <rect x="8" y="8" width="80" height="80" rx="24" fill="url(#bg6)"/>
+  <path d="M33 24v48" stroke="#F8FEFF" stroke-width="10" stroke-linecap="round"/>
+  <path d="M36 33h15c10 0 17 6 17 15s-7 15-17 15H36V33Z" fill="#F8FEFF"/>
+  <path d="M57 21L38 52h15l-7 23 24-35H55l2-19Z" fill="#06111F" opacity=".88"/>
+  <path d="M59 22L42 49h14l-6 19 19-29H55l4-17Z" fill="#8BFF9D"/>
+  <circle cx="75" cy="68" r="4" fill="#F8FEFF"/>
+</svg>

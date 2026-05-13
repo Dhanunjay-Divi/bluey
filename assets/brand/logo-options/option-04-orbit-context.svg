@@ -1,0 +1,17 @@
+<svg viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Bluey orbit context logo">
+  <defs>
+    <linearGradient id="bg4" x1="8" y1="8" x2="88" y2="88" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#76F1FF"/>
+      <stop offset=".48" stop-color="#2E9EFF"/>
+      <stop offset="1" stop-color="#10243A"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="80" height="80" rx="26" fill="url(#bg4)"/>
+  <ellipse cx="48" cy="48" rx="30" ry="16" fill="none" stroke="#E9FCFF" stroke-width="4" opacity=".82" transform="rotate(-24 48 48)"/>
+  <ellipse cx="48" cy="48" rx="30" ry="16" fill="none" stroke="#06111F" stroke-width="3" opacity=".26" transform="rotate(24 48 48)"/>
+  <path d="M37 25v46" stroke="#F8FEFF" stroke-width="10" stroke-linecap="round"/>
+  <path d="M40 34h12c9 0 15 6 15 14s-6 14-15 14H40V34Z" fill="#F8FEFF"/>
+  <circle cx="54" cy="48" r="6" fill="#2E9EFF"/>
+  <circle cx="25" cy="57" r="5" fill="#8BFF9D"/>
+  <circle cx="73" cy="34" r="5" fill="#F8FEFF"/>
+</svg>

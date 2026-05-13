@@ -1,0 +1,22 @@
+<svg viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Bluey logo">
+  <defs>
+    <linearGradient id="bluey-bg" x1="9" y1="10" x2="85" y2="88" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#091827"/>
+      <stop offset=".55" stop-color="#0D314C"/>
+      <stop offset="1" stop-color="#124D6B"/>
+    </linearGradient>
+    <linearGradient id="bluey-accent" x1="24" y1="26" x2="74" y2="70" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7AF8FF"/>
+      <stop offset="1" stop-color="#5F7CFF"/>
+    </linearGradient>
+    <filter id="bluey-glow" x="-30%" y="-30%" width="160%" height="160%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="0" stdDeviation="3" flood-color="#7AF8FF" flood-opacity=".68"/>
+      <feDropShadow dx="0" dy="10" stdDeviation="10" flood-color="#020A14" flood-opacity=".42"/>
+    </filter>
+  </defs>
+  <rect x="8" y="8" width="80" height="80" rx="24" fill="url(#bluey-bg)"/>
+  <rect x="22" y="25" width="52" height="42" rx="12" fill="#06111F" stroke="#64E9FF" stroke-width="4" filter="url(#bluey-glow)"/>
+  <path d="M32 39l9 9-9 9" fill="none" stroke="#F5FDFF" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M47 58h17" stroke="url(#bluey-accent)" stroke-width="6" stroke-linecap="round"/>
+  <path d="M69 22l2 7 7 2-7 2-2 7-2-7-7-2 7-2 2-7Z" fill="#8BFF9D"/>
+</svg>

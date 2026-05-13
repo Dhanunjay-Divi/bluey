@@ -1,0 +1,108 @@
+version: 1
+defaults:
+  payload_version: 1
+  retry:
+    max_attempts: 5
+    backoff: exponential
+    initial_delay_seconds: 10
+    max_delay_seconds: 900
+  dead_letter_suffix: ".dead"
+  required_fields:
+    - job_id
+    - workspace_id
+    - trace_id
+    - created_at
+    - attempt
+    - payload_version
+queues:
+  stt.realtime:
+    owner: realtime-audio
+    purpose: Convert live audio chunks into partial and final transcript events.
+    latency_budget_ms: 1500
+    idempotency_key: audio_chunk_id
+    payload:
+      audio_chunk_id: string
+      meeting_id: string
+      source: system_or_microphone
+      object_key: string
+      content_type: string
+      sample_rate_hz: integer
+  vision.ocr:
+    owner: vision-worker
+    purpose: Extract OCR text and visual summaries from screenshots and documents.
+    latency_budget_ms: 15000
+    idempotency_key: artifact_id
+    payload:
+      artifact_id: string
+      meeting_id: string
+      object_key: string
+      content_type: string
+  transcript.chunk:
+    owner: memory-worker
+    purpose: Chunk transcript, recap, action item, decision, and instruction events for retrieval.
+    latency_budget_ms: 5000
+    idempotency_key: source_event_id
+    payload:
+      meeting_id: string
+      source_event_id: string
+      event_type: string
+  embedding.write:
+    owner: memory-worker
+    purpose: Embed chunks and write vector rows.
+    latency_budget_ms: 10000
+    idempotency_key: chunk_id
+    payload:
+      chunk_id: string
+      model: string
+  meeting.extract:
+    owner: intelligence-worker
+    purpose: Extract recap, actions, decisions, questions, and answer instructions.
+    latency_budget_ms: 30000
+    idempotency_key: meeting_id_plus_window
+    payload:
+      meeting_id: string
+      window_start: datetime
+      window_end: datetime
+  rag.compact:
+    owner: memory-worker
+    purpose: Compact older meeting memory into summary chunks while preserving citations.
+    latency_budget_ms: 60000
+    idempotency_key: meeting_id_plus_policy_version
+    payload:
+      meeting_id: string
+      policy_version: integer
+  retention.sweep:
+    owner: compliance-worker
+    purpose: Expire metadata, object storage, vectors, and caches according to retention policy.
+    latency_budget_ms: 120000
+    idempotency_key: workspace_id_plus_cutoff
+    payload:
+      cutoff_at: datetime
+      dry_run: boolean
+  export.build:
+    owner: compliance-worker
+    purpose: Build encrypted user, meeting, or workspace export bundles.
+    latency_budget_ms: 300000
+    idempotency_key: export_request_id
+    payload:
+      export_request_id: string
+      scope: user_workspace_or_meeting
+  delete.cascade:
+    owner: compliance-worker
+    purpose: Cascade deletion across Postgres tombstones, object storage, vector rows, and caches.
+    latency_budget_ms: 300000
+    idempotency_key: deletion_request_id
+    payload:
+      deletion_request_id: string
+      scope: user_workspace_or_meeting
+  billing.meter:
+    owner: billing-worker
+    purpose: Convert provider usage, audio minutes, storage, and RAG operations into billable meter events.
+    latency_budget_ms: 30000
+    idempotency_key: usage_event_id
+    payload:
+      usage_event_id: string
+      subject_type: answer_stt_embedding_storage
+      quantity: number
+      unit: string
+

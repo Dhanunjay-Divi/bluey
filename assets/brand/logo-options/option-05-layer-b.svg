@@ -1,0 +1,20 @@
+<svg viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Bluey layer B logo">
+  <defs>
+    <linearGradient id="bg5" x1="8" y1="12" x2="88" y2="84" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#05101E"/>
+      <stop offset=".55" stop-color="#0A2842"/>
+      <stop offset="1" stop-color="#112F58"/>
+    </linearGradient>
+    <linearGradient id="pane5" x1="24" y1="24" x2="72" y2="74" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7AF8FF" stop-opacity=".95"/>
+      <stop offset="1" stop-color="#448BFF" stop-opacity=".68"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="80" height="80" rx="24" fill="url(#bg5)"/>
+  <rect x="22" y="25" width="43" height="38" rx="12" fill="url(#pane5)" opacity=".58"/>
+  <rect x="31" y="33" width="43" height="38" rx="12" fill="url(#pane5)" stroke="#BFF9FF" stroke-width="3"/>
+  <path d="M41 25v45" stroke="#F8FEFF" stroke-width="9" stroke-linecap="round"/>
+  <path d="M44 40h12c7 0 12 5 12 11s-5 11-12 11H44V40Z" fill="#F8FEFF"/>
+  <circle cx="57" cy="51" r="5" fill="#2F9BFF"/>
+  <circle cx="69" cy="27" r="4" fill="#8BFF9D"/>
+</svg>

@@ -1,0 +1,368 @@
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::clock;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Speaker {
+    System,
+    User,
+    Other,
+    Unknown,
+}
+
+impl Default for Speaker {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+impl std::fmt::Display for Speaker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::System => write!(f, "system"),
+            Self::User => write!(f, "user"),
+            Self::Other => write!(f, "other"),
+            Self::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptSegment {
+    pub id: Uuid,
+    pub speaker: Speaker,
+    pub text: String,
+    pub created_at: String,
+    pub is_final: bool,
+}
+
+impl TranscriptSegment {
+    pub fn new(speaker: Speaker, text: impl Into<String>, is_final: bool) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            speaker,
+            text: text.into(),
+            created_at: clock::now_epoch_ms_string(),
+            is_final,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActionItem {
+    pub id: Uuid,
+    pub text: String,
+    pub owner: Option<String>,
+    pub source_segment_id: Option<Uuid>,
+    pub created_at: String,
+    pub done: bool,
+}
+
+impl ActionItem {
+    pub fn new(
+        text: impl Into<String>,
+        owner: Option<String>,
+        source_segment_id: Option<Uuid>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            text: text.into(),
+            owner,
+            source_segment_id,
+            created_at: clock::now_epoch_ms_string(),
+            done: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Decision {
+    pub id: Uuid,
+    pub text: String,
+    pub source_segment_id: Option<Uuid>,
+    pub created_at: String,
+}
+
+impl Decision {
+    pub fn new(text: impl Into<String>, source_segment_id: Option<Uuid>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            text: text.into(),
+            source_segment_id,
+            created_at: clock::now_epoch_ms_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextKind {
+    Image,
+    Diagram,
+    Code,
+    Document,
+    Text,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextProcessingStatus {
+    Pending,
+    Ready,
+    Unsupported,
+    Failed,
+}
+
+impl Default for ContextProcessingStatus {
+    fn default() -> Self {
+        Self::Pending
+    }
+}
+
+impl std::fmt::Display for ContextProcessingStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::Ready => write!(f, "ready"),
+            Self::Unsupported => write!(f, "unsupported"),
+            Self::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+impl std::fmt::Display for ContextKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Image => write!(f, "image"),
+            Self::Diagram => write!(f, "diagram"),
+            Self::Code => write!(f, "code"),
+            Self::Document => write!(f, "document"),
+            Self::Text => write!(f, "text"),
+            Self::Other => write!(f, "other"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextArtifact {
+    pub id: Uuid,
+    pub kind: ContextKind,
+    pub path: String,
+    pub title: String,
+    pub note: Option<String>,
+    pub size_bytes: Option<u64>,
+    #[serde(default)]
+    pub text_preview: Option<String>,
+    #[serde(default)]
+    pub processing_status: ContextProcessingStatus,
+    #[serde(default)]
+    pub processing_error: Option<String>,
+    pub created_at: String,
+}
+
+impl ContextArtifact {
+    pub fn new(
+        kind: ContextKind,
+        path: impl Into<String>,
+        title: impl Into<String>,
+        note: Option<String>,
+        size_bytes: Option<u64>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            kind,
+            path: path.into(),
+            title: title.into(),
+            note,
+            size_bytes,
+            text_preview: None,
+            processing_status: ContextProcessingStatus::Pending,
+            processing_error: None,
+            created_at: clock::now_epoch_ms_string(),
+        }
+    }
+
+    pub fn with_text_preview(mut self, preview: impl Into<String>) -> Self {
+        let preview = preview.into();
+        if preview.trim().is_empty() {
+            return self;
+        }
+
+        self.text_preview = Some(preview);
+        self.processing_status = ContextProcessingStatus::Ready;
+        self.processing_error = None;
+        self
+    }
+
+    pub fn with_processing_status(mut self, status: ContextProcessingStatus) -> Self {
+        self.processing_status = status;
+        self
+    }
+
+    pub fn with_processing_error(mut self, error: impl Into<String>) -> Self {
+        self.processing_status = ContextProcessingStatus::Failed;
+        self.processing_error = Some(error.into());
+        self
+    }
+
+    pub fn with_unsupported_error(mut self, error: impl Into<String>) -> Self {
+        self.processing_status = ContextProcessingStatus::Unsupported;
+        self.processing_error = Some(error.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationTurn {
+    pub id: Uuid,
+    pub question: String,
+    pub answer: String,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    pub created_at: String,
+}
+
+impl ConversationTurn {
+    pub fn new(
+        question: impl Into<String>,
+        answer: impl Into<String>,
+        source: Option<String>,
+        provider: Option<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            question: question.into(),
+            answer: answer.into(),
+            source,
+            provider,
+            created_at: clock::now_epoch_ms_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingRecord {
+    pub id: Uuid,
+    pub title: String,
+    pub started_at: String,
+    pub ended_at: Option<String>,
+    pub transcript: Vec<TranscriptSegment>,
+    pub action_items: Vec<ActionItem>,
+    pub decisions: Vec<Decision>,
+    #[serde(default)]
+    pub context: Vec<ContextArtifact>,
+    #[serde(default)]
+    pub conversation: Vec<ConversationTurn>,
+    #[serde(default)]
+    pub answer_instructions: Option<String>,
+    pub summary: Option<String>,
+}
+
+impl MeetingRecord {
+    pub fn new(title: Option<String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            title: title
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "Ad hoc meeting".to_string()),
+            started_at: clock::now_epoch_ms_string(),
+            ended_at: None,
+            transcript: Vec::new(),
+            action_items: Vec::new(),
+            decisions: Vec::new(),
+            context: Vec::new(),
+            conversation: Vec::new(),
+            answer_instructions: None,
+            summary: None,
+        }
+    }
+
+    pub fn last_transcript_text(&self, count: usize) -> String {
+        let start = self.transcript.len().saturating_sub(count);
+        self.transcript[start..]
+            .iter()
+            .map(|segment| format!("{}: {}", segment.speaker, segment.text))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub fn push_conversation_turn(&mut self, turn: ConversationTurn) {
+        self.conversation.push(turn);
+        let excess = self.conversation.len().saturating_sub(80);
+        if excess > 0 {
+            self.conversation.drain(0..excess);
+        }
+    }
+
+    pub fn last_conversation_text(&self, count: usize) -> String {
+        let start = self.conversation.len().saturating_sub(count);
+        self.conversation[start..]
+            .iter()
+            .map(|turn| {
+                let mut text = format!("you: {}\nbluey: {}", turn.question, turn.answer);
+                if let Some(provider) = turn
+                    .provider
+                    .as_ref()
+                    .filter(|provider| !provider.trim().is_empty())
+                {
+                    text.push_str(&format!("\nprovider: {provider}"));
+                }
+                text
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingRecap {
+    pub meeting_id: Uuid,
+    pub title: String,
+    pub summary: String,
+    pub transcript_segments: usize,
+    pub context: Vec<ContextArtifact>,
+    pub answer_instructions: Option<String>,
+    pub action_items: Vec<ActionItem>,
+    pub decisions: Vec<Decision>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryHit {
+    pub meeting_id: Uuid,
+    pub meeting_title: String,
+    pub source: String,
+    pub snippet: String,
+    pub score: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recent_conversation_text_keeps_follow_up_context() {
+        let mut meeting = MeetingRecord::new(Some("Follow-up".to_string()));
+        meeting.push_conversation_turn(ConversationTurn::new(
+            "What is the plan?",
+            "Use the current session context.",
+            Some("overlay ask".to_string()),
+            Some("Bluey managed".to_string()),
+        ));
+        meeting.push_conversation_turn(ConversationTurn::new(
+            "Can you expand step two?",
+            "Step two is to wire the provider route.",
+            Some("overlay ask".to_string()),
+            Some("Bluey managed".to_string()),
+        ));
+
+        let text = meeting.last_conversation_text(2);
+        assert!(text.contains("you: What is the plan?"));
+        assert!(text.contains("bluey: Step two is to wire the provider route."));
+        assert!(text.contains("provider: Bluey managed"));
+    }
+}

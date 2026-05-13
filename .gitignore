@@ -1,0 +1,13 @@
+/target/
+**/.build/
+.DS_Store
+
+# Local reference/source snapshots used for research, not product source.
+_refs/
+*.zip
+
+# Build and release output.
+dist/
+
+# Local visual QA screenshots.
+tmp-*.png

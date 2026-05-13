@@ -1,0 +1,626 @@
+openapi: 3.1.0
+info:
+  title: Bluey Cloud API
+  version: 0.1.0
+  description: Production API skeleton for Bluey auth, sync, settings, RAG, and managed answers.
+servers:
+  - url: https://api.cue.example
+security:
+  - bearerAuth: []
+paths:
+  /auth/device-code:
+    post:
+      security: []
+      summary: Start desktop login.
+      operationId: createDeviceCode
+      responses:
+        "200":
+          description: Device login instructions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeviceCodeResponse"
+  /auth/token:
+    post:
+      security: []
+      summary: Exchange a device code for tokens.
+      operationId: exchangeDeviceCode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TokenExchangeRequest"
+      responses:
+        "200":
+          description: Token pair.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthTokens"
+        "428":
+          description: Login is still pending.
+  /auth/refresh:
+    post:
+      security: []
+      summary: Rotate refresh token and issue a new access token.
+      operationId: refreshToken
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token, device_id]
+              properties:
+                refresh_token:
+                  type: string
+                device_id:
+                  type: string
+      responses:
+        "200":
+          description: Rotated token pair.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthTokens"
+  /auth/logout:
+    post:
+      summary: Revoke the current device session.
+      operationId: logout
+      responses:
+        "204":
+          description: Session revoked.
+  /devices/register:
+    post:
+      summary: Register or update desktop device capabilities.
+      operationId: registerDevice
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeviceRegistration"
+      responses:
+        "200":
+          description: Registered device.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Device"
+  /settings:
+    get:
+      summary: Read workspace settings profile.
+      operationId: getSettings
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      responses:
+        "200":
+          description: Settings profile.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SettingsProfile"
+    put:
+      summary: Update workspace settings profile.
+      operationId: updateSettings
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SettingsPatch"
+      responses:
+        "200":
+          description: Updated settings profile.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SettingsProfile"
+        "409":
+          description: Profile version conflict.
+  /meetings:
+    post:
+      summary: Create or update a meeting shell.
+      operationId: upsertMeeting
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MeetingUpsert"
+      responses:
+        "200":
+          description: Meeting accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Meeting"
+  /meetings/{meeting_id}/events:
+    post:
+      summary: Append one or more meeting events.
+      operationId: appendMeetingEvents
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - name: meeting_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [workspace_id, events]
+              properties:
+                workspace_id:
+                  type: string
+                events:
+                  type: array
+                  items:
+                    $ref: "#/components/schemas/MeetingEvent"
+      responses:
+        "202":
+          description: Events accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventAck"
+  /artifacts/upload-url:
+    post:
+      summary: Create a short-lived direct upload URL.
+      operationId: createArtifactUploadUrl
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ArtifactUploadRequest"
+      responses:
+        "200":
+          description: Upload URL.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ArtifactUploadUrl"
+  /sync:
+    post:
+      summary: Batch desktop sync operation.
+      operationId: syncDesktopState
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SyncRequest"
+      responses:
+        "200":
+          description: Sync acknowledgements.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SyncResponse"
+  /answers/stream:
+    post:
+      summary: Start a managed answer stream.
+      description: Returns text/event-stream in production; schema shows event envelopes.
+      operationId: streamAnswer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AnswerRequest"
+      responses:
+        "200":
+          description: Stream of answer events.
+          content:
+            text/event-stream:
+              schema:
+                $ref: "#/components/schemas/AnswerStreamEvent"
+  /rag/query:
+    post:
+      summary: Query tenant-scoped memory.
+      operationId: queryRag
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RagQuery"
+      responses:
+        "200":
+          description: RAG results.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RagResponse"
+  /billing/portal:
+    get:
+      summary: Create billing portal URL.
+      operationId: getBillingPortal
+      parameters:
+        - $ref: "#/components/parameters/WorkspaceId"
+      responses:
+        "200":
+          description: Portal link.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [url]
+                properties:
+                  url:
+                    type: string
+                    format: uri
+  /export-requests:
+    post:
+      summary: Request user or workspace data export.
+      operationId: createExportRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DataRequest"
+      responses:
+        "202":
+          description: Export queued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RequestStatus"
+  /deletion-requests:
+    post:
+      summary: Request deletion across metadata, objects, and vectors.
+      operationId: createDeletionRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DataRequest"
+      responses:
+        "202":
+          description: Deletion queued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RequestStatus"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    WorkspaceId:
+      name: workspace_id
+      in: query
+      required: true
+      schema:
+        type: string
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+  schemas:
+    DeviceCodeResponse:
+      type: object
+      required: [device_code, user_code, verification_uri, expires_in_seconds, interval_seconds]
+      properties:
+        device_code:
+          type: string
+        user_code:
+          type: string
+        verification_uri:
+          type: string
+          format: uri
+        expires_in_seconds:
+          type: integer
+        interval_seconds:
+          type: integer
+    TokenExchangeRequest:
+      type: object
+      required: [device_code, device_id]
+      properties:
+        device_code:
+          type: string
+        device_id:
+          type: string
+    AuthTokens:
+      type: object
+      required: [access_token, refresh_token, expires_in_seconds, workspace_id]
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        expires_in_seconds:
+          type: integer
+        workspace_id:
+          type: string
+    DeviceRegistration:
+      type: object
+      required: [workspace_id, device_id, platform, app_version, capabilities]
+      properties:
+        workspace_id:
+          type: string
+        device_id:
+          type: string
+        platform:
+          type: string
+          enum: [macos, windows]
+        app_version:
+          type: string
+        capabilities:
+          type: object
+          additionalProperties:
+            type: string
+    Device:
+      type: object
+      required: [device_id, workspace_id, status]
+      properties:
+        device_id:
+          type: string
+        workspace_id:
+          type: string
+        status:
+          type: string
+          enum: [active, revoked]
+    SettingsProfile:
+      type: object
+      required: [workspace_id, profile_version, capture, privacy, answering, shortcuts]
+      properties:
+        workspace_id:
+          type: string
+        profile_version:
+          type: integer
+        capture:
+          type: object
+          additionalProperties: true
+        privacy:
+          type: object
+          additionalProperties: true
+        answering:
+          type: object
+          additionalProperties: true
+        shortcuts:
+          type: object
+          additionalProperties:
+            type: string
+    SettingsPatch:
+      type: object
+      required: [workspace_id, profile_version, patch]
+      properties:
+        workspace_id:
+          type: string
+        profile_version:
+          type: integer
+        patch:
+          type: object
+          additionalProperties: true
+    MeetingUpsert:
+      type: object
+      required: [workspace_id, source_meeting_id, title, started_at]
+      properties:
+        workspace_id:
+          type: string
+        source_meeting_id:
+          type: string
+        title:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+    Meeting:
+      type: object
+      required: [meeting_id, workspace_id, title, started_at]
+      properties:
+        meeting_id:
+          type: string
+        workspace_id:
+          type: string
+        title:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+    MeetingEvent:
+      type: object
+      required: [source_event_id, event_type, occurred_at, payload]
+      properties:
+        source_event_id:
+          type: string
+        event_type:
+          type: string
+          enum: [transcript, answer, action_item, decision, question, artifact_attached, instruction_changed, capture_state]
+        occurred_at:
+          type: string
+          format: date-time
+        payload:
+          type: object
+          additionalProperties: true
+    EventAck:
+      type: object
+      required: [accepted, rejected]
+      properties:
+        accepted:
+          type: array
+          items:
+            type: string
+        rejected:
+          type: array
+          items:
+            type: object
+            required: [source_event_id, reason, retryable]
+            properties:
+              source_event_id:
+                type: string
+              reason:
+                type: string
+              retryable:
+                type: boolean
+    ArtifactUploadRequest:
+      type: object
+      required: [workspace_id, meeting_id, artifact_id, content_type, byte_size, sha256]
+      properties:
+        workspace_id:
+          type: string
+        meeting_id:
+          type: string
+        artifact_id:
+          type: string
+        content_type:
+          type: string
+        byte_size:
+          type: integer
+        sha256:
+          type: string
+    ArtifactUploadUrl:
+      type: object
+      required: [artifact_id, upload_url, expires_at, headers]
+      properties:
+        artifact_id:
+          type: string
+        upload_url:
+          type: string
+          format: uri
+        expires_at:
+          type: string
+          format: date-time
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+    SyncRequest:
+      type: object
+      required: [workspace_id, device_id, cursor, meetings, events]
+      properties:
+        workspace_id:
+          type: string
+        device_id:
+          type: string
+        cursor:
+          type: string
+          nullable: true
+        meetings:
+          type: array
+          items:
+            $ref: "#/components/schemas/MeetingUpsert"
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/MeetingEvent"
+    SyncResponse:
+      type: object
+      required: [cursor, event_ack]
+      properties:
+        cursor:
+          type: string
+        event_ack:
+          $ref: "#/components/schemas/EventAck"
+    AnswerRequest:
+      type: object
+      required: [workspace_id, meeting_id, question, mode]
+      properties:
+        workspace_id:
+          type: string
+        meeting_id:
+          type: string
+        question:
+          type: string
+        mode:
+          type: string
+          enum: [general, meeting, code, system_design, writing]
+        route:
+          type: string
+          enum: [managed_auto, realtime, reasoning, fast]
+        include_rag:
+          type: boolean
+          default: true
+    AnswerStreamEvent:
+      type: object
+      required: [type, answer_run_id]
+      properties:
+        type:
+          type: string
+          enum: [started, delta, citation, final, error]
+        answer_run_id:
+          type: string
+        text:
+          type: string
+        citations:
+          type: array
+          items:
+            $ref: "#/components/schemas/RagCitation"
+    RagQuery:
+      type: object
+      required: [workspace_id, query]
+      properties:
+        workspace_id:
+          type: string
+        meeting_id:
+          type: string
+        query:
+          type: string
+        top_k:
+          type: integer
+          default: 8
+    RagResponse:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/RagCitation"
+    RagCitation:
+      type: object
+      required: [chunk_id, source_type, source_id, title, snippet, score]
+      properties:
+        chunk_id:
+          type: string
+        source_type:
+          type: string
+        source_id:
+          type: string
+        title:
+          type: string
+        snippet:
+          type: string
+        score:
+          type: number
+    DataRequest:
+      type: object
+      required: [workspace_id, scope]
+      properties:
+        workspace_id:
+          type: string
+        scope:
+          type: string
+          enum: [user, workspace, meeting]
+        meeting_id:
+          type: string
+    RequestStatus:
+      type: object
+      required: [request_id, status]
+      properties:
+        request_id:
+          type: string
+        status:
+          type: string
+          enum: [queued, running, complete, failed]
+

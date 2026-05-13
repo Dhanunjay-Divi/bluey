@@ -1,0 +1,904 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bluey | stay present, stay unseen</title>
+  <meta name="description" content="Bluey is a lightweight native AI overlay for macOS and Windows. Start with bluey on, attach context, capture audio with consent, and keep answers close without breaking focus.">
+  <meta name="theme-color" content="#020405">
+  <link rel="icon" type="image/svg+xml" href="assets/bluey-logo.svg">
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      background: #020405;
+      color: #edf8ff;
+      font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      overflow-x: hidden;
+      background: #020405;
+      color: #edf8ff;
+    }
+
+    .hero {
+      position: relative;
+      min-height: 100svh;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      overflow: hidden;
+    }
+
+    .scene {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+      background: #020405;
+    }
+
+    .shade {
+      position: absolute;
+      inset: 0;
+      background:
+        radial-gradient(circle at 82% 38%, rgba(117, 239, 247, .08), transparent 30%),
+        radial-gradient(circle at 86% 74%, rgba(57, 157, 255, .07), transparent 28%),
+        linear-gradient(90deg, rgba(2, 4, 5, .96), rgba(2, 4, 5, .70) 40%, rgba(2, 4, 5, .32));
+      pointer-events: none;
+    }
+
+    .nav {
+      position: relative;
+      z-index: 2;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 22px clamp(20px, 5vw, 68px);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      color: #f4fbff;
+      text-decoration: none;
+      font-size: 17px;
+      font-weight: 750;
+      letter-spacing: 0;
+    }
+
+    .brand img {
+      width: 36px;
+      height: 36px;
+      display: block;
+    }
+
+    .navlinks {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+    }
+
+    .navlinks a {
+      color: #9bb6c8;
+      text-decoration: none;
+      font-size: 14px;
+    }
+
+    .navlinks .download {
+      height: 38px;
+      display: inline-flex;
+      align-items: center;
+      padding: 0 16px;
+      border: 1px solid rgba(118, 226, 255, .28);
+      border-radius: 12px;
+      color: #e9fbff;
+      background: rgba(255, 255, 255, .045);
+      box-shadow: 0 12px 34px rgba(40, 155, 255, .10);
+    }
+
+    .theme-toggle {
+      height: 38px;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: 1px solid rgba(118, 226, 255, .28);
+      border-radius: 999px;
+      color: #e9fbff;
+      background: linear-gradient(180deg, rgba(117, 239, 247, .10), rgba(255, 255, 255, .045));
+      padding: 0 13px;
+      font: 750 13px Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      cursor: pointer;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .06);
+    }
+
+    .theme-toggle:focus-visible,
+    .top-theme-toggle:focus-visible {
+      outline: 2px solid rgba(117, 239, 247, .82);
+      outline-offset: 3px;
+    }
+
+    .theme-toggle svg {
+      width: 15px;
+      height: 15px;
+      stroke: currentColor;
+      stroke-width: 2.1;
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .content {
+      position: relative;
+      z-index: 2;
+      display: grid;
+      grid-template-columns: minmax(280px, 430px) minmax(660px, 1fr);
+      align-items: center;
+      gap: clamp(18px, 3vw, 52px);
+      padding: 8px clamp(18px, 3.4vw, 54px) 46px;
+    }
+
+    .copy h1 {
+      margin: 0 0 10px;
+      font-size: clamp(72px, 11vw, 132px);
+      line-height: .82;
+      letter-spacing: 0;
+      font-weight: 820;
+    }
+
+    .tagline {
+      margin: 0 0 18px;
+      color: #75eff7;
+      font-size: clamp(28px, 4.4vw, 58px);
+      line-height: 1;
+      font-weight: 820;
+      letter-spacing: 0;
+    }
+
+    .launch {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 42px;
+      padding: 5px 12px 5px 6px;
+      margin-bottom: 18px;
+      border-radius: 999px;
+      border: 1px solid rgba(117, 239, 247, .18);
+      background: rgba(5, 15, 26, .62);
+      box-shadow: 0 18px 44px rgba(0, 0, 0, .22), inset 0 1px 0 rgba(255, 255, 255, .05);
+    }
+
+    .launch-mark {
+      position: relative;
+      width: 32px;
+      height: 32px;
+      flex: 0 0 auto;
+      display: grid;
+      place-items: center;
+      border-radius: 10px;
+      background: rgba(117, 239, 247, .08);
+      box-shadow: 0 0 0 1px rgba(117, 239, 247, .14), 0 0 18px rgba(117, 239, 247, .18);
+    }
+
+    .launch-mark:after {
+      content: "";
+      position: absolute;
+      inset: -4px;
+      border-radius: 13px;
+      border: 1px solid rgba(117, 239, 247, .30);
+      animation: logoPulse 1.6s ease-out infinite;
+    }
+
+    .launch-mark img {
+      width: 32px;
+      height: 32px;
+      border-radius: 10px;
+      display: block;
+    }
+
+    @keyframes logoPulse {
+      0% {
+        opacity: .65;
+        transform: scale(.88);
+      }
+
+      75%,
+      100% {
+        opacity: 0;
+        transform: scale(1.35);
+      }
+    }
+
+    .launch code {
+      color: #ebfbff;
+      font: 750 13px ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      background: rgba(117, 239, 247, .09);
+      border: 1px solid rgba(117, 239, 247, .14);
+      border-radius: 999px;
+      padding: 5px 9px;
+      white-space: nowrap;
+    }
+
+    .launch-copy {
+      color: #9bb6c8;
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .tag {
+      max-width: 520px;
+      margin: 0 0 28px;
+      color: #b0c6d4;
+      font-size: clamp(17px, 2vw, 21px);
+      line-height: 1.52;
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+
+    .btn {
+      height: 48px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 14px;
+      padding: 0 20px;
+      font-weight: 760;
+      text-decoration: none;
+      border: 1px solid rgba(255, 255, 255, .12);
+    }
+
+    .primary {
+      color: #03111d;
+      background: linear-gradient(135deg, #7ff8ff, #3a9dff 58%, #7781ff);
+      box-shadow: 0 20px 54px rgba(50, 164, 255, .28);
+    }
+
+    .secondary {
+      color: #eaf9ff;
+      background: rgba(255, 255, 255, .055);
+      border-color: rgba(134, 220, 255, .23);
+    }
+
+    .caption {
+      color: #7895a8;
+      font-size: 13px;
+    }
+
+    .product {
+      position: relative;
+      width: min(940px, 100%);
+      min-height: 610px;
+      justify-self: end;
+    }
+
+    .topbar,
+    .bottombar,
+    .panel {
+      position: absolute;
+      backdrop-filter: blur(18px);
+      -webkit-backdrop-filter: blur(18px);
+      background: rgba(3, 7, 12, .88);
+      border: 1px solid rgba(126, 236, 255, .18);
+      box-shadow: 0 28px 86px rgba(0, 0, 0, .54), inset 0 1px 0 rgba(255, 255, 255, .05);
+    }
+
+    .topbar {
+      top: 24px;
+      left: 50%;
+      width: min(840px, 90%);
+      height: 62px;
+      transform: translateX(-50%);
+      border-radius: 31px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 14px;
+    }
+
+    .top-logo {
+      width: 36px;
+      height: 36px;
+      flex: 0 0 auto;
+      display: block;
+      filter: drop-shadow(0 0 18px rgba(117, 239, 247, .30));
+    }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      flex: 0 0 auto;
+      border-radius: 99px;
+      background: #8bff9d;
+      box-shadow: 0 0 18px #8bff9d;
+    }
+
+    .icon {
+      width: 36px;
+      height: 36px;
+      flex: 0 0 auto;
+      border-radius: 50%;
+      background: rgba(255, 255, 255, .075);
+      border: 1px solid rgba(255, 255, 255, .13);
+      display: grid;
+      place-items: center;
+      color: #dff8ff;
+    }
+
+    button.icon {
+      appearance: none;
+      -webkit-appearance: none;
+      cursor: pointer;
+      font: inherit;
+      padding: 0;
+    }
+
+    .top-theme-toggle {
+      height: 36px;
+      min-width: 78px;
+      flex: 0 0 auto;
+      border-radius: 999px;
+      border: 1px solid rgba(117, 239, 247, .28);
+      background: linear-gradient(180deg, rgba(117, 239, 247, .12), rgba(255, 255, 255, .055));
+      color: #e9fbff;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      font: 800 13px Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      cursor: pointer;
+      box-shadow: 0 12px 28px rgba(27, 166, 255, .12), inset 0 1px 0 rgba(255, 255, 255, .06);
+    }
+
+    .top-theme-toggle svg {
+      width: 15px;
+      height: 15px;
+      stroke: currentColor;
+      stroke-width: 2.15;
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .icon svg,
+    .chip svg {
+      width: 16px;
+      height: 16px;
+      display: block;
+      stroke: currentColor;
+      stroke-width: 2.2;
+      fill: none;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .select {
+      height: 34px;
+      border-radius: 18px;
+      background: rgba(2, 8, 14, .74);
+      border: 1px solid rgba(255, 255, 255, .09);
+      color: #d7eef8;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0 16px;
+      font-size: 14px;
+      font-weight: 650;
+      line-height: 1;
+      white-space: nowrap;
+    }
+
+    .select.model {
+      min-width: 118px;
+      margin-left: auto;
+    }
+
+    .select.mode {
+      min-width: 128px;
+    }
+
+    .panel {
+      left: 0;
+      right: 0;
+      top: 100px;
+      height: 360px;
+      border-radius: 34px;
+      padding: 28px;
+    }
+
+    .card {
+      border-radius: 24px;
+      background: rgba(3, 9, 16, .82);
+      border: 1px solid rgba(118, 226, 255, .15);
+      padding: 20px 22px;
+      margin-bottom: 16px;
+    }
+
+    .eyebrow {
+      font-size: 12px;
+      font-weight: 850;
+      color: #75eff7;
+      letter-spacing: .08em;
+    }
+
+    .card h2 {
+      font-size: clamp(18px, 2vw, 25px);
+      line-height: 1.18;
+      margin: 10px 0 18px;
+      letter-spacing: 0;
+      max-width: 620px;
+      color: #edf8ff;
+    }
+
+    .line {
+      height: 10px;
+      border-radius: 20px;
+      background: linear-gradient(90deg, rgba(220, 245, 255, .84), rgba(117, 239, 247, .20));
+      margin: 9px 0;
+    }
+
+    .line.short {
+      width: 62%;
+    }
+
+    .bottombar {
+      left: 50%;
+      top: 486px;
+      width: min(680px, 70%);
+      min-height: 118px;
+      transform: translateX(-50%);
+      border-radius: 30px;
+      padding: 13px;
+    }
+
+    .ask {
+      height: 44px;
+      border-radius: 22px;
+      border: 1px solid rgba(255, 255, 255, .10);
+      background: rgba(2, 8, 14, .78);
+      display: flex;
+      align-items: center;
+      color: #8da8bb;
+      padding: 0 16px;
+      font-size: 15px;
+      font-weight: 600;
+    }
+
+    .chips {
+      display: grid;
+      grid-template-columns: .9fr .9fr 1.22fr;
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    .chip {
+      height: 34px;
+      min-width: 0;
+      border-radius: 18px;
+      background: rgba(255, 255, 255, .065);
+      border: 1px solid rgba(255, 255, 255, .10);
+      color: #d8f4ff;
+      font-size: 13px;
+      font-weight: 800;
+      line-height: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      text-align: center;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .chip.primary-action {
+      border-color: rgba(117, 239, 247, .20);
+      background: linear-gradient(180deg, rgba(117, 239, 247, .10), rgba(255, 255, 255, .055));
+    }
+
+    .grip {
+      position: absolute;
+      right: 18px;
+      bottom: 18px;
+      width: 40px;
+      height: 40px;
+      border-radius: 18px;
+      border: 1px solid rgba(117, 239, 247, .32);
+      background: rgba(117, 239, 247, .08);
+    }
+
+    .grip:before {
+      content: "";
+      position: absolute;
+      right: 9px;
+      bottom: 9px;
+      width: 18px;
+      height: 18px;
+      background: repeating-linear-gradient(135deg, transparent 0 5px, rgba(204, 251, 255, .72) 5px 7px, transparent 7px 10px);
+    }
+
+    .section {
+      background: #020405;
+      padding: 56px clamp(20px, 5vw, 68px) 72px;
+      border-top: 1px solid rgba(255, 255, 255, .06);
+    }
+
+    body.dark-ui-backdrop {
+      background: #020405;
+      color: #edf8ff;
+    }
+
+    body.dark-ui-backdrop .scene {
+      background: #020405;
+    }
+
+    body.dark-ui-backdrop .shade {
+      background:
+        radial-gradient(circle at 82% 38%, rgba(117, 239, 247, .08), transparent 30%),
+        radial-gradient(circle at 86% 74%, rgba(57, 157, 255, .07), transparent 28%),
+        linear-gradient(90deg, rgba(2, 4, 5, .96), rgba(2, 4, 5, .70) 40%, rgba(2, 4, 5, .32));
+    }
+
+    body.dark-ui-backdrop .brand,
+    body.dark-ui-backdrop .copy h1,
+    body.dark-ui-backdrop .secondary,
+    body.dark-ui-backdrop .launch code,
+    body.dark-ui-backdrop .navlinks .download,
+    body.dark-ui-backdrop .theme-toggle {
+      color: #e9fbff;
+    }
+
+    body.dark-ui-backdrop .tag,
+    body.dark-ui-backdrop .caption,
+    body.dark-ui-backdrop .navlinks a,
+    body.dark-ui-backdrop .launch-copy,
+    body.dark-ui-backdrop .tile p {
+      color: #9bb6c8;
+    }
+
+    body.dark-ui-backdrop .launch,
+    body.dark-ui-backdrop .navlinks .download,
+    body.dark-ui-backdrop .theme-toggle,
+    body.dark-ui-backdrop .tile {
+      background: rgba(5, 15, 26, .62);
+      border-color: rgba(117, 239, 247, .18);
+      box-shadow: 0 18px 44px rgba(0, 0, 0, .22), inset 0 1px 0 rgba(255, 255, 255, .05);
+    }
+
+    body.dark-ui-backdrop .section {
+      background: #020405;
+      border-top-color: rgba(255, 255, 255, .06);
+    }
+
+    .product.light-overlay .card h2,
+    .product.light-overlay .chip,
+    .product.light-overlay .select,
+    .product.light-overlay .top-theme-toggle {
+      color: #07121b;
+    }
+
+    .product.light-overlay .ask {
+      color: #406173;
+    }
+
+    .product.light-overlay .topbar,
+    .product.light-overlay .bottombar,
+    .product.light-overlay .panel,
+    .product.light-overlay .card {
+      background: rgba(248, 252, 255, .84);
+      border-color: rgba(32, 162, 206, .30);
+      box-shadow: 0 26px 70px rgba(16, 72, 110, .16), inset 0 1px 0 rgba(255, 255, 255, .90);
+    }
+
+    .product.light-overlay .icon,
+    .product.light-overlay .top-theme-toggle,
+    .product.light-overlay .select,
+    .product.light-overlay .ask,
+    .product.light-overlay .chip {
+      background: rgba(255, 255, 255, .74);
+      border-color: rgba(32, 162, 206, .22);
+    }
+
+    .product.light-overlay .icon {
+      color: #20556b;
+    }
+
+    .product.light-overlay .line {
+      background: linear-gradient(90deg, rgba(190, 231, 244, .88), rgba(41, 168, 215, .18));
+    }
+
+    .grid {
+      max-width: 1120px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .tile {
+      border: 1px solid rgba(126, 236, 255, .13);
+      background: rgba(255, 255, 255, .035);
+      border-radius: 16px;
+      padding: 20px;
+    }
+
+    .tile h3 {
+      margin: 0 0 8px;
+      font-size: 16px;
+      letter-spacing: 0;
+    }
+
+    .tile p {
+      margin: 0;
+      color: #9eb7c7;
+      line-height: 1.58;
+      font-size: 14px;
+    }
+
+    @media (max-width: 980px) {
+      .content {
+        grid-template-columns: 1fr;
+        padding-inline: clamp(20px, 5vw, 68px);
+      }
+
+      .product {
+        min-height: 660px;
+        justify-self: stretch;
+        width: 100%;
+      }
+
+      .copy h1 {
+        font-size: 78px;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+
+      .navlinks a:not(.download) {
+        display: none;
+      }
+    }
+
+    @media (max-width: 620px) {
+      .topbar {
+        width: 100%;
+        top: 22px;
+      }
+
+      .panel {
+        top: 102px;
+        height: 360px;
+        padding: 18px;
+      }
+
+      .bottombar {
+        width: 100%;
+        top: 486px;
+      }
+
+      .select {
+        display: none;
+      }
+
+      .top-theme-toggle {
+        min-width: 44px;
+      }
+
+      .top-theme-toggle span {
+        display: none;
+      }
+
+      .copy h1 {
+        font-size: 64px;
+      }
+
+      .launch-copy {
+        display: none;
+      }
+
+      .chip {
+        font-size: 12px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="hero">
+    <canvas class="scene" id="scene" aria-hidden="true"></canvas>
+    <div class="shade"></div>
+    <nav class="nav">
+      <a class="brand" href="/">
+        <img src="assets/bluey-logo.svg" alt="">
+        Bluey
+      </a>
+      <div class="navlinks">
+        <a href="#platforms">Platforms</a>
+        <a href="#security">Security</a>
+        <button class="theme-toggle" id="themeToggle" type="button" aria-label="Switch Bluey UI theme">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v2"/><path d="M12 19v2"/><path d="m4.22 4.22 1.42 1.42"/><path d="m18.36 18.36 1.42 1.42"/><path d="M3 12h2"/><path d="M19 12h2"/><path d="m4.22 19.78 1.42-1.42"/><path d="m18.36 5.64 1.42-1.42"/><circle cx="12" cy="12" r="4"/></svg>
+          <span id="themeToggleText">White UI</span>
+        </button>
+        <a class="download" href="#download">Download</a>
+      </div>
+    </nav>
+    <section class="content">
+      <div class="copy">
+        <div class="launch">
+          <span class="launch-mark"><img src="assets/bluey-logo.svg" alt=""></span>
+          <code>bluey on</code>
+          <span class="launch-copy">private command layer ready</span>
+        </div>
+        <h1>Bluey</h1>
+        <p class="tagline">stay present, stay unseen</p>
+        <p class="tag">A lightweight native AI overlay for live work. One command opens a private, movable command layer for audio, page context, attached files, and fast answers.</p>
+        <div class="actions">
+          <a class="btn primary" href="#download">Get Bluey</a>
+          <a class="btn secondary" href="#demo">See the overlay</a>
+        </div>
+        <p class="caption">macOS and Windows native helpers. No Electron-first shell. No loopback-driver setup for the primary audio path.</p>
+      </div>
+      <div class="product" id="demo" aria-label="Bluey overlay mockup">
+        <div class="topbar">
+          <img class="top-logo" src="assets/bluey-logo.svg" alt="">
+          <div class="dot"></div>
+          <div class="icon" aria-label="Audio">
+            <svg viewBox="0 0 24 24"><path d="M4 13a8 8 0 0 1 16 0"/><path d="M4 13v5a2 2 0 0 0 2 2h2v-8H6a2 2 0 0 0-2 2Z"/><path d="M20 13v5a2 2 0 0 1-2 2h-2v-8h2a2 2 0 0 1 2 2Z"/></svg>
+          </div>
+          <div class="icon" aria-label="Microphone">
+            <svg viewBox="0 0 24 24"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/></svg>
+          </div>
+          <div class="select model">Bluey Auto</div>
+          <div class="select mode">System Design</div>
+          <button class="top-theme-toggle" id="mockThemeToggle" type="button" aria-label="Switch overlay background">
+            <svg id="mockThemeIcon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v2"/><path d="M12 19v2"/><path d="m4.22 4.22 1.42 1.42"/><path d="m18.36 18.36 1.42 1.42"/><path d="M3 12h2"/><path d="M19 12h2"/><path d="m4.22 19.78 1.42-1.42"/><path d="m18.36 5.64 1.42-1.42"/><circle cx="12" cy="12" r="4"/></svg>
+            <span id="mockThemeLabel">White</span>
+          </button>
+          <div class="icon" aria-label="Attach">
+            <svg viewBox="0 0 24 24"><path d="m21 11-8.5 8.5a5 5 0 0 1-7-7L14 4a3.5 3.5 0 0 1 5 5l-8.5 8.5a2 2 0 1 1-3-3L15 7"/></svg>
+          </div>
+          <div class="icon" aria-label="Move">
+            <svg viewBox="0 0 24 24"><path d="M12 3v18"/><path d="M8 7l4-4 4 4"/><path d="M8 17l4 4 4-4"/><path d="M3 12h18"/><path d="M7 8l-4 4 4 4"/><path d="M17 8l4 4-4 4"/></svg>
+          </div>
+        </div>
+        <div class="panel">
+          <div class="card">
+            <div class="eyebrow">ANSWER</div>
+            <h2>Use the current session, page, audio, and files.</h2>
+            <div class="line"></div>
+            <div class="line"></div>
+            <div class="line short"></div>
+          </div>
+          <div class="card">
+            <div class="eyebrow">TRANSCRIPT</div>
+            <h2>System and microphone stay source-labeled.</h2>
+            <div class="line"></div>
+            <div class="line short"></div>
+          </div>
+          <div class="grip" title="Resizable overlay"></div>
+        </div>
+        <div class="bottombar">
+          <div class="ask">Ask me anything...</div>
+          <div class="chips">
+            <div class="chip">
+              <svg viewBox="0 0 24 24"><path d="m13 2-8 12h7l-1 8 8-12h-7l1-8Z"/></svg>
+              Answer
+            </div>
+            <div class="chip">
+              <svg viewBox="0 0 24 24"><path d="M4 5h16"/><path d="M4 12h11"/><path d="M4 19h8"/><path d="m17 15 2 2 4-5"/></svg>
+              Recap
+            </div>
+            <div class="chip primary-action">
+              <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/><path d="M18 4l1 3 3 1-3 1-1 3-1-3-3-1 3-1 1-3Z"/></svg>
+              Analyse Screen
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+  <section class="section">
+    <div class="grid">
+      <article class="tile" id="platforms"><h3>Native desktop</h3><p>macOS uses ScreenCaptureKit and CoreAudio. Windows uses WASAPI. The app stays fast, light, and built for the OS.</p></article>
+      <article class="tile" id="security"><h3>User-controlled context</h3><p>Attach files, capture page text, and start audio from visible controls. Bluey keeps source labels and session boundaries clear.</p></article>
+      <article class="tile"><h3>Commercial-ready path</h3><p>The desktop can run locally today, with cloud auth, sync, RAG, billing, and team controls documented as the hosted product path.</p></article>
+    </div>
+  </section>
+  <script>
+    const canvas = document.getElementById('scene');
+    const ctx = canvas.getContext('2d');
+    const themeToggle = document.getElementById('themeToggle');
+    const themeToggleText = document.getElementById('themeToggleText');
+    const mockThemeToggle = document.getElementById('mockThemeToggle');
+    const mockThemeLabel = document.getElementById('mockThemeLabel');
+    const mockThemeIcon = document.getElementById('mockThemeIcon');
+    const productMock = document.getElementById('demo');
+    let w = 0;
+    let h = 0;
+    let t = 0;
+    let lightOverlay = false;
+
+    const sunIcon = '<path d="M12 3v2"/><path d="M12 19v2"/><path d="m4.22 4.22 1.42 1.42"/><path d="m18.36 18.36 1.42 1.42"/><path d="M3 12h2"/><path d="M19 12h2"/><path d="m4.22 19.78 1.42-1.42"/><path d="m18.36 5.64 1.42-1.42"/><circle cx="12" cy="12" r="4"/>';
+    const moonIcon = '<path d="M20 14.5A7.5 7.5 0 0 1 9.5 4 8 8 0 1 0 20 14.5Z"/>';
+
+    function setTheme(nextLight) {
+      lightOverlay = nextLight;
+      productMock.classList.toggle('light-overlay', lightOverlay);
+      document.body.classList.toggle('dark-ui-backdrop', !lightOverlay);
+      themeToggleText.textContent = lightOverlay ? 'Black UI' : 'White UI';
+      mockThemeLabel.textContent = lightOverlay ? 'Black' : 'White';
+      mockThemeIcon.innerHTML = lightOverlay ? moonIcon : sunIcon;
+      themeToggle.setAttribute('aria-pressed', String(lightOverlay));
+      mockThemeToggle.setAttribute('aria-pressed', String(lightOverlay));
+    }
+
+    themeToggle.addEventListener('click', () => setTheme(!lightOverlay));
+    mockThemeToggle.addEventListener('click', () => setTheme(!lightOverlay));
+    setTheme(false);
+
+    function resize() {
+      w = canvas.width = innerWidth * devicePixelRatio;
+      h = canvas.height = innerHeight * devicePixelRatio;
+      canvas.style.width = innerWidth + 'px';
+      canvas.style.height = innerHeight + 'px';
+    }
+
+    addEventListener('resize', resize, { passive: true });
+    resize();
+
+    function draw() {
+      t += 0.006;
+      ctx.clearRect(0, 0, w, h);
+      const g = ctx.createLinearGradient(0, 0, w, h);
+      if (lightOverlay) {
+        g.addColorStop(0, '#020405');
+        g.addColorStop(.58, '#061522');
+        g.addColorStop(1, '#020405');
+      } else {
+        g.addColorStop(0, '#010304');
+        g.addColorStop(.58, '#061522');
+        g.addColorStop(1, '#020405');
+      }
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, w, h);
+      ctx.globalAlpha = .34;
+      for (let i = 0; i < 46; i++) {
+        const y = h * (.16 + i / 58);
+        ctx.beginPath();
+        for (let x = 0; x <= w; x += 18) {
+          const yy = y + Math.sin(x * .006 + i * .33 + t * 9) * 18 * devicePixelRatio + Math.cos(x * .002 + t * 5) * 10 * devicePixelRatio;
+          if (x === 0) ctx.moveTo(x, yy);
+          else ctx.lineTo(x, yy);
+        }
+        ctx.strokeStyle = i % 5 === 0 ? (lightOverlay ? '#75eff7' : '#1fa7d9') : (lightOverlay ? '#246a99' : '#9ad7ef');
+        ctx.lineWidth = i % 5 === 0 ? 1.2 * devicePixelRatio : .6 * devicePixelRatio;
+        ctx.stroke();
+      }
+      ctx.globalAlpha = .16;
+      for (let i = 0; i < 80; i++) {
+        const x = (Math.sin(i * 91.7 + t * .7) * .5 + .5) * w;
+        const y = (Math.cos(i * 37.2 + t * .9) * .5 + .5) * h;
+        ctx.fillStyle = i % 3 === 0 ? (lightOverlay ? '#75eff7' : '#1fa7d9') : (lightOverlay ? '#5f75ff' : '#78aaff');
+        ctx.beginPath();
+        ctx.arc(x, y, (1 + i % 3) * devicePixelRatio, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+      requestAnimationFrame(draw);
+    }
+
+    draw();
+  </script>
+</body>
+</html>

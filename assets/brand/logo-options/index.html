@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Bluey Logo Options</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: #eff9ff;
+      background:
+        linear-gradient(120deg, rgba(8, 34, 58, .92), rgba(4, 13, 25, .98)),
+        #06111f;
+      font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 42px 28px 56px;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: end;
+      gap: 24px;
+      margin-bottom: 28px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 42px;
+      line-height: 1;
+      letter-spacing: 0;
+    }
+    p {
+      margin: 10px 0 0;
+      max-width: 620px;
+      color: #9fb9ca;
+      line-height: 1.5;
+      font-size: 15px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 18px;
+    }
+    .card {
+      border: 1px solid rgba(126, 236, 255, .16);
+      background: rgba(7, 18, 31, .72);
+      border-radius: 18px;
+      padding: 22px;
+      box-shadow: 0 24px 70px rgba(0, 0, 0, .28);
+    }
+    .logo-row {
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      min-height: 128px;
+    }
+    .logo {
+      width: 96px;
+      height: 96px;
+      flex: 0 0 auto;
+    }
+    .word {
+      min-width: 0;
+    }
+    .name {
+      font-size: 18px;
+      font-weight: 800;
+      margin-bottom: 6px;
+    }
+    .caption {
+      color: #90aabd;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 28px;
+      margin-top: 16px;
+      padding: 0 10px;
+      border-radius: 999px;
+      color: #bff8ff;
+      background: rgba(117, 239, 247, .08);
+      border: 1px solid rgba(117, 239, 247, .16);
+      font-size: 12px;
+      font-weight: 700;
+    }
+    @media (max-width: 900px) {
+      .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 620px) {
+      .grid { grid-template-columns: 1fr; }
+      header { align-items: start; flex-direction: column; }
+      h1 { font-size: 34px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Bluey logo options</h1>
+        <p>Six directions for the app icon and command-bar mark. All are vector SVGs and avoid the old eye motif.</p>
+      </div>
+    </header>
+    <section class="grid">
+      <article class="card">
+        <div class="logo-row">
+          <img class="logo" src="option-01-signal-b.svg" alt="Signal B">
+          <div class="word">
+            <div class="name">01 Signal B</div>
+            <div class="caption">Cleanest continuation of the current mark: Bluey as a quiet signal layer.</div>
+            <div class="pill">Best for product polish</div>
+          </div>
+        </div>
+      </article>
+      <article class="card">
+        <div class="logo-row">
+          <img class="logo" src="option-02-wave-b.svg" alt="Wave B">
+          <div class="word">
+            <div class="name">02 Wave B</div>
+            <div class="caption">More audio-forward, good if system and mic transcript is the core story.</div>
+            <div class="pill">Audio-first</div>
+          </div>
+        </div>
+      </article>
+      <article class="card">
+        <div class="logo-row">
+          <img class="logo" src="option-03-command-spark.svg" alt="Command Spark">
+          <div class="word">
+            <div class="name">03 Command Spark</div>
+            <div class="caption">Feels terminal-native and fast, with a clear assistant/action cue.</div>
+            <div class="pill">Terminal-first</div>
+          </div>
+        </div>
+      </article>
+      <article class="card">
+        <div class="logo-row">
+          <img class="logo" src="option-04-orbit-context.svg" alt="Orbit Context">
+          <div class="word">
+            <div class="name">04 Orbit Context</div>
+            <div class="caption">Communicates session memory, RAG, page context, and connected sources.</div>
+            <div class="pill">Context/RAG</div>
+          </div>
+        </div>
+      </article>
+      <article class="card">
+        <div class="logo-row">
+          <img class="logo" src="option-05-layer-b.svg" alt="Layer B">
+          <div class="word">
+            <div class="name">05 Layer B</div>
+            <div class="caption">A glass overlay identity: app layer, files, pages, and transcript stacked together.</div>
+            <div class="pill">Overlay-native</div>
+          </div>
+        </div>
+      </article>
+      <article class="card">
+        <div class="logo-row">
+          <img class="logo" src="option-06-fast-route.svg" alt="Fast Route">
+          <div class="word">
+            <div class="name">06 Fast Route</div>
+            <div class="caption">More aggressive speed/performance mark for low-latency answers.</div>
+            <div class="pill">Fastest feel</div>
+          </div>
+        </div>
+      </article>
+    </section>
+  </main>
+</body>
+</html>
