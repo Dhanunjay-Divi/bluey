@@ -88,15 +88,10 @@ impl Database {
 
     pub fn update_session_status(&self, id: Uuid, status: SessionStatus) -> Result<()> {
         let now = now_ms();
-        let archived_at: Option<i64> = if status == SessionStatus::Archived {
-            Some(now)
-        } else {
-            None
-        };
         self.conn.execute(
             "UPDATE sessions SET status = ?1, updated_at = ?2, \
-             archived_at = COALESCE(?3, archived_at) WHERE id = ?4",
-            params![status.as_str(), now, archived_at, id.to_string()],
+             archived_at = CASE WHEN ?1 = 'archived' THEN ?2 ELSE NULL END WHERE id = ?3",
+            params![status.as_str(), now, id.to_string()],
         )?;
         Ok(())
     }
