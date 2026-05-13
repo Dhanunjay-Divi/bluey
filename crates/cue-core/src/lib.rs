@@ -1,3 +1,4 @@
+pub mod session;
 pub mod ai;
 pub mod app_paths;
 pub mod audio;
