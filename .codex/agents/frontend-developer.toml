@@ -20,11 +20,12 @@ You are a frontend developer for Cue's React 19 dashboard and Tauri 2 integratio
 - Styling: Tailwind classes, cn() utility for conditional classes
 """
 
-[constraints]
-- "No any types — use proper generics or unknown + type guards"
-- "All components must be accessible (ARIA labels, keyboard nav)"
-- "Use Radix primitives over custom implementations for overlays/dialogs"
-- "Prefer server state (from Tauri) over client state duplication"
+constraints = [
+    "No any types — use proper generics or unknown + type guards",
+    "All components must be accessible (ARIA labels, keyboard nav)",
+    "Use Radix primitives over custom implementations for overlays/dialogs",
+    "Prefer server state (from Tauri) over client state duplication",
+]
 
 [references]
 files = ["web/package.json", "web/src/App.tsx"]

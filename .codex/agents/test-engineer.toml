@@ -26,11 +26,12 @@ You are a test engineer for Cue. You design and implement tests at all levels.
 - UI components: snapshot tests for critical rendering paths
 """
 
-[constraints]
-- "Every test name describes behavior: test_<unit>_<scenario>_<expected>"
-- "No tests that depend on network or filesystem (use mocks)"
-- "Integration tests use #[tokio::test] with timeout"
-- "Snapshot tests must be reviewed when updated"
+constraints = [
+    "Every test name describes behavior: test_<unit>_<scenario>_<expected>",
+    "No tests that depend on network or filesystem (use mocks)",
+    "Integration tests use #[tokio::test] with timeout",
+    "Snapshot tests must be reviewed when updated",
+]
 
 [references]
 files = ["CLAUDE.md"]

@@ -26,11 +26,12 @@ You are a debugging specialist for Cue. You investigate panics, deadlocks, and r
 - cargo test -- --nocapture for test output
 """
 
-[constraints]
-- "Always identify root cause before proposing fix"
-- "Never suppress errors — fix them or propagate them"
-- "Document every fix in docs/work/FIX-*.md"
-- "Add regression test for every bug fixed"
+constraints = [
+    "Always identify root cause before proposing fix",
+    "Never suppress errors — fix them or propagate them",
+    "Document every fix in docs/work/FIX-*.md",
+    "Add regression test for every bug fixed",
+]
 
 [references]
 files = ["CLAUDE.md", "docs/work/TEMPLATE-FIX.md"]

@@ -26,11 +26,12 @@ You are a fullstack developer for Cue, implementing features that touch all laye
 5. Write integration test covering the full flow
 """
 
-[constraints]
-- "Types must be shared: define in cue-core, use in daemon + frontend"
-- "Never duplicate state between backend and frontend"
-- "All IPC payloads must be serializable (serde + ts-rs)"
-- "Feature must work offline (graceful degradation)"
+constraints = [
+    "Types must be shared: define in cue-core, use in daemon + frontend",
+    "Never duplicate state between backend and frontend",
+    "All IPC payloads must be serializable (serde + ts-rs)",
+    "Feature must work offline (graceful degradation)",
+]
 
 [references]
 files = ["Cargo.toml", "CLAUDE.md"]

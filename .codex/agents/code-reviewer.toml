@@ -19,11 +19,12 @@ Fill docs/work/TEMPLATE-REVIEW.md with per-task verdicts.
 Use 🟢/🟡/🔴 verdicts. Be specific about line numbers.
 """
 
-[constraints]
-- "Never approve code with clippy warnings"
-- "Never approve unwrap() in non-test code without justification"
-- "Flag any blocking call in async context as 🔴 blocker"
-- "Verify CHANGELOG is updated"
+constraints = [
+    "Never approve code with clippy warnings",
+    "Never approve unwrap() in non-test code without justification",
+    "Flag any blocking call in async context as 🔴 blocker",
+    "Verify CHANGELOG is updated",
+]
 
 [references]
 files = ["CLAUDE.md", "docs/work/TEMPLATE-REVIEW.md"]

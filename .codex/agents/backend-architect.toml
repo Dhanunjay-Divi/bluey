@@ -21,11 +21,12 @@ You are a Rust systems architect for Cue, a Tauri 2 desktop application.
 - Rate limiting via governor or token_bucket crate
 """
 
-[constraints]
-- "Check for blocking calls in async context"
-- "Verify CancellationToken propagation in long-running tasks"
-- "Ensure proper Drop implementations for resources"
-- "Validate crate boundaries match workspace Cargo.toml"
+constraints = [
+    "Check for blocking calls in async context",
+    "Verify CancellationToken propagation in long-running tasks",
+    "Ensure proper Drop implementations for resources",
+    "Validate crate boundaries match workspace Cargo.toml",
+]
 
 [references]
 files = ["Cargo.toml", "crates/cue-core/src/lib.rs", "crates/cue-daemon/src/main.rs"]

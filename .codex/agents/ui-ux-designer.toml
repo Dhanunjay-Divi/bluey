@@ -21,11 +21,12 @@ You are a UI/UX designer for Cue, focusing on the meeting copilot experience.
 - Responsive: dashboard works from 320px to 4K
 """
 
-[constraints]
-- "All interactive elements must have ARIA labels"
-- "Color must not be the only indicator (use icons + text)"
-- "Overlay must respect system reduced-motion preferences"
-- "Streaming content must have stable scroll position"
+constraints = [
+    "All interactive elements must have ARIA labels",
+    "Color must not be the only indicator (use icons + text)",
+    "Overlay must respect system reduced-motion preferences",
+    "Streaming content must have stable scroll position",
+]
 
 [references]
 files = ["web/src/App.tsx"]
