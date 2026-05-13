@@ -10,3 +10,8 @@ dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+
+[lints.clippy]
+derivable_impls = "allow"
+large_enum_variant = "allow"
+should_implement_trait = "allow"

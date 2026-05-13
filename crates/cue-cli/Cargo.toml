@@ -19,3 +19,6 @@ cue-core = { path = "../cue-core" }
 libc.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+
+[lints.clippy]
+ptr_arg = "allow"
