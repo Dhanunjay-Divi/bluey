@@ -13,9 +13,13 @@
 //! ### Process lifecycle
 //!
 //! - `spawn(path, args)` launches the binary, connects stdin/stdout, and
-//!   starts a writer + reader task.
-//! - If the child exits while the handle is still alive, the watcher task
-//!   attempts to relaunch with exponential backoff up to [`MAX_RESTART_ATTEMPTS`].
+//!   starts writer + reader + watcher tasks.
+//! - The watcher observes the child exit and updates
+//!   [`OverlayProcessState`] accordingly. **It does NOT relaunch the
+//!   child in this round.** A restart loop is scaffolded via
+//!   [`restart_delay`] and [`OverlayProcessState::Restarting`] but the
+//!   actual relaunch plumbing lands in a follow-up once we have a real
+//!   Swift/C overlay to drive restart semantics against.
 //! - `shutdown()` (also runs on Drop) signals both tasks to exit and waits
 //!   for the child to die. It does NOT send a kill signal first — it closes
 //!   stdin, which the stub / real overlay uses to notice it should exit.
@@ -147,8 +151,12 @@ impl NativeOverlayHandle {
         })
     }
 
-    /// Enqueue a message for the overlay. Non-blocking. Returns `Err` only
-    /// if the handle has been shut down (channel closed).
+    /// Enqueue a message for the overlay. Non-blocking. Returns `Err`
+    /// when the writer task's receiver has been dropped (e.g. the task
+    /// has already exited due to a broken pipe or explicit shutdown).
+    /// Note: `shutdown(self)` consumes the handle, so a caller cannot
+    /// observe this error via a post-shutdown `send` on the same handle
+    /// - it only surfaces when the writer dies mid-flight.
     pub fn send(&self, msg: OverlayMessage) -> Result<(), OverlayMessage> {
         self.send_tx.send(msg).map_err(|e| e.0)
     }

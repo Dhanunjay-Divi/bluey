@@ -69,6 +69,11 @@ pub enum OverlayIpcCommand {
     /// Overlay requests the daemon resend its current state (useful when
     /// the overlay launches after the daemon was already running).
     RequestSync,
+    /// Debug echo. Payload is the JSON form of a recently-received
+    /// `OverlayMessage` as observed by the overlay. Overlays can opt in
+    /// for observability / integration tests; the daemon logs these at
+    /// info level but otherwise ignores them.
+    Echo { payload: String },
 }
 
 /// Serialize an `OverlayMessage` to a single-line NDJSON string (newline

@@ -1,8 +1,12 @@
 //! Stub overlay process used in integration tests ONLY.
 //!
-//! Reads NDJSON [`OverlayMessage`]s from stdin (one per line) and responds
-//! on stdout with [`OverlayIpcCommand::Pong`] for each message it sees.
-//! Also supports a special `OverlayMessage::Ping` → responds with `Pong`.
+//! Reads NDJSON [`OverlayMessage`]s from stdin (one per line). For each
+//! decoded message it writes TWO NDJSON [`OverlayIpcCommand`]s to stdout:
+//!
+//! 1. `OverlayIpcCommand::Pong` — a plain ack.
+//! 2. `OverlayIpcCommand::Echo { payload }` — carries the JSON form of the
+//!    decoded message. Tests use this to assert the full payload arrived
+//!    intact (not just that the enum variant was decodable).
 //!
 //! Exits cleanly on stdin EOF, so the daemon's `shutdown()` (which closes
 //! the child's stdin) causes the stub to terminate.
@@ -11,7 +15,7 @@
 //! ships with the real app. It has NO other purpose and MUST NOT be used
 //! as a runtime overlay — shipping it would break real overlay behavior.
 
-use cue_core::overlay_ipc::{decode_ndjson, OverlayIpcCommand, OverlayMessage};
+use cue_core::overlay_ipc::{decode_ndjson, OverlayIpcCommand};
 use std::io::{BufRead, BufReader, Write};
 
 fn main() {
@@ -31,10 +35,16 @@ fn main() {
                     continue;
                 }
                 match decode_ndjson(trimmed) {
-                    Ok(OverlayMessage::Ping) | Ok(_) => {
-                        // Acknowledge every message with Pong — tests assert this.
-                        let cmd = OverlayIpcCommand::Pong;
-                        if write_ipc_command(&mut out, &cmd).is_err() {
+                    Ok(msg) => {
+                        // 1. Ack
+                        if write_ipc_command(&mut out, &OverlayIpcCommand::Pong).is_err() {
+                            break;
+                        }
+                        // 2. Echo the decoded message back as JSON so tests
+                        //    can verify exact payload fidelity.
+                        let payload = serde_json::to_string(&msg).unwrap_or_default();
+                        let echo = OverlayIpcCommand::Echo { payload };
+                        if write_ipc_command(&mut out, &echo).is_err() {
                             break;
                         }
                     }

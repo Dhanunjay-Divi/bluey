@@ -6,7 +6,10 @@
 //!   1. Spawning the child process
 //!   2. Sending `OverlayMessage::SessionSwitched` over stdin as NDJSON
 //!   3. Receiving `OverlayIpcCommand::Pong` back over stdout
-//!   4. Clean shutdown
+//!   4. Receiving `OverlayIpcCommand::Echo { payload }` carrying the exact
+//!      JSON-serialized message — proves payload fidelity, not just
+//!      decodability of the variant
+//!   5. Clean shutdown
 //!
 //! The stub binary's path is injected via `CARGO_BIN_EXE_overlay-stub`
 //! (Cargo automatically sets this env var for any integration test in a
@@ -22,34 +25,64 @@ fn stub_path() -> String {
     env!("CARGO_BIN_EXE_overlay-stub").to_string()
 }
 
+async fn collect_commands(
+    handle: &mut NativeOverlayHandle,
+    count: usize,
+    per_cmd_timeout: Duration,
+) -> Vec<OverlayIpcCommand> {
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let cmd = tokio::time::timeout(per_cmd_timeout, handle.next_command())
+            .await
+            .expect("stub response timeout")
+            .expect("stub channel closed unexpectedly");
+        out.push(cmd);
+    }
+    out
+}
+
 #[tokio::test]
 async fn session_switched_round_trips_through_overlay_pipe() {
     let opts = OverlaySpawnOptions::new(stub_path());
     let mut handle = NativeOverlayHandle::spawn(opts).await.expect("spawn stub");
 
-    // Just after spawn, running.
     assert_eq!(handle.state(), OverlayProcessState::Running);
 
-    // Send three SessionSwitched events — expect three Pongs.
-    for (id, title) in [
-        (Some("abc-001".to_string()), Some("first".to_string())),
-        (None, None),
-        (Some("xyz-777".to_string()), Some("third".to_string())),
-    ] {
-        handle
-            .send(OverlayMessage::SessionSwitched {
-                session_id: id,
-                title,
-            })
-            .expect("send to stub");
+    // Send three SessionSwitched events with distinct payloads.
+    let messages = vec![
+        OverlayMessage::SessionSwitched {
+            session_id: Some("abc-001".into()),
+            title: Some("first".into()),
+        },
+        OverlayMessage::SessionSwitched {
+            session_id: None,
+            title: None,
+        },
+        OverlayMessage::SessionSwitched {
+            session_id: Some("xyz-777".into()),
+            title: Some("third".into()),
+        },
+    ];
+
+    for msg in &messages {
+        handle.send(msg.clone()).expect("send to stub");
     }
 
-    for _ in 0..3 {
-        let cmd = tokio::time::timeout(Duration::from_secs(3), handle.next_command())
-            .await
-            .expect("stub response timeout")
-            .expect("stub channel closed unexpectedly");
-        assert_eq!(cmd, OverlayIpcCommand::Pong);
+    // Each message yields two commands: Pong then Echo{payload}.
+    let commands = collect_commands(&mut handle, messages.len() * 2, Duration::from_secs(3)).await;
+
+    // Verify the interleaved (Pong, Echo) pattern AND that each Echo
+    // payload round-trips to the exact OverlayMessage we sent.
+    for (i, expected) in messages.iter().enumerate() {
+        let pong = &commands[i * 2];
+        let echo = &commands[i * 2 + 1];
+        assert_eq!(pong, &OverlayIpcCommand::Pong, "message {i}: missing Pong");
+        let OverlayIpcCommand::Echo { payload } = echo else {
+            panic!("message {i}: expected Echo, got {echo:?}");
+        };
+        let decoded: OverlayMessage = serde_json::from_str(payload)
+            .unwrap_or_else(|e| panic!("message {i}: bad Echo payload {e}: {payload}"));
+        assert_eq!(&decoded, expected, "message {i}: payload was not preserved");
     }
 
     handle.shutdown().await;
@@ -60,18 +93,19 @@ async fn transcript_partial_round_trips_through_overlay_pipe() {
     let opts = OverlaySpawnOptions::new(stub_path());
     let mut handle = NativeOverlayHandle::spawn(opts).await.unwrap();
 
-    handle
-        .send(OverlayMessage::TranscriptPartial {
-            source: "microphone".into(),
-            text: "hello wor".into(),
-        })
-        .unwrap();
+    let sent = OverlayMessage::TranscriptPartial {
+        source: "microphone".into(),
+        text: "hello wor".into(),
+    };
+    handle.send(sent.clone()).unwrap();
 
-    let cmd = tokio::time::timeout(Duration::from_secs(3), handle.next_command())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(cmd, OverlayIpcCommand::Pong);
+    let commands = collect_commands(&mut handle, 2, Duration::from_secs(3)).await;
+    assert_eq!(commands[0], OverlayIpcCommand::Pong);
+    let OverlayIpcCommand::Echo { payload } = &commands[1] else {
+        panic!("expected Echo, got {:?}", commands[1]);
+    };
+    let decoded: OverlayMessage = serde_json::from_str(payload).unwrap();
+    assert_eq!(decoded, sent);
 
     handle.shutdown().await;
 }
