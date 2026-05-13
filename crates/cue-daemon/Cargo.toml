@@ -13,6 +13,13 @@ name = "bluey-daemon"
 path = "src/bin/bluey-daemon.rs"
 
 [dependencies]
+thiserror.workspace = true
+parking_lot.workspace = true
+async-trait.workspace = true
+bytemuck.workspace = true
+webrtc-vad.workspace = true
+ringbuf.workspace = true
+cpal.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
@@ -26,6 +33,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 rusqlite.workspace = true
 
+futures-util.workspace = true
 [lints.clippy]
 needless_return = "allow"
 filter_next = "allow"
