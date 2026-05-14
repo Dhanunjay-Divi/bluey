@@ -50,3 +50,7 @@ path = "src/bin/overlay_stub.rs"
 [[bin]]
 name = "overlay-stub-oneshot"
 path = "src/bin/overlay_stub_oneshot.rs"
+
+[[bin]]
+name = "system-audio-stub"
+path = "src/bin/system_audio_stub.rs"

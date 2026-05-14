@@ -15,7 +15,7 @@
 #include <windows.h>
 #include <io.h>
 
-#define BLUEY_TARGET_SAMPLE_RATE 48000.0
+#define BLUEY_TARGET_SAMPLE_RATE 16000.0
 
 static const GUID BLUEY_SUBTYPE_PCM = {
     0x00000001,
@@ -45,6 +45,7 @@ typedef enum CaptureSource {
 typedef struct Args {
     CaptureSource source;
     DWORD duration_ms;
+    int continuous;
 } Args;
 
 typedef struct Resampler {
@@ -56,6 +57,7 @@ static Args parse_args(int argc, char **argv) {
     Args args;
     args.source = CAPTURE_SOURCE_SYSTEM;
     args.duration_ms = 3000;
+    args.continuous = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--source") == 0 && i + 1 < argc) {
@@ -75,6 +77,8 @@ static Args parse_args(int argc, char **argv) {
                 value = 30000;
             }
             args.duration_ms = (DWORD)value;
+        } else if (strcmp(argv[i], "--continuous") == 0) {
+            args.continuous = 1;
         }
     }
 
@@ -156,15 +160,16 @@ static float read_channel_sample(const BYTE *sample, const WAVEFORMATEX *format,
     }
 }
 
-static void write_resampled(Resampler *resampler, float sample) {
+static void write_resampled_i16(Resampler *resampler, float sample) {
     resampler->carry += resampler->ratio;
     while (resampler->carry >= 1.0) {
-        fwrite(&sample, sizeof(float), 1, stdout);
+        int16_t out = (int16_t)(sample * 32767.0f);
+        fwrite(&out, sizeof(int16_t), 1, stdout);
         resampler->carry -= 1.0;
     }
 }
 
-static void write_frames_as_48k_mono(
+static void write_frames_as_16k_mono_i16(
     Resampler *resampler,
     const BYTE *data,
     UINT32 frame_count,
@@ -182,7 +187,7 @@ static void write_frames_as_48k_mono(
                 mono += read_channel_sample(frame_data, format, channel) / (float)channel_count;
             }
         }
-        write_resampled(resampler, mono);
+        write_resampled_i16(resampler, mono);
     }
 }
 
@@ -270,7 +275,7 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    ULONGLONG end_tick = GetTickCount64() + args.duration_ms;
+    ULONGLONG end_tick = args.continuous ? ULLONG_MAX : (GetTickCount64() + args.duration_ms);
     while (GetTickCount64() < end_tick) {
         UINT32 packet_frames = 0;
         hr = IAudioCaptureClient_GetNextPacketSize(capture_client, &packet_frames);
@@ -294,7 +299,8 @@ int main(int argc, char **argv) {
                 goto stop;
             }
 
-            write_frames_as_48k_mono(&resampler, data, frame_count, flags, mix_format);
+            write_frames_as_16k_mono_i16(&resampler, data, frame_count, flags, mix_format);
+            fflush(stdout);
             IAudioCaptureClient_ReleaseBuffer(capture_client, frame_count);
 
             hr = IAudioCaptureClient_GetNextPacketSize(capture_client, &packet_frames);

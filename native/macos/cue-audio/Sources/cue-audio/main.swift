@@ -11,6 +11,7 @@ private enum CaptureSource: String {
 private struct Args {
     var source: CaptureSource = .system
     var durationMs: Int = 3_000
+    var continuous: Bool = false
 }
 
 private func parseArgs() -> Args {
@@ -26,6 +27,8 @@ private func parseArgs() -> Args {
             if let value = iterator.next(), let duration = Int(value) {
                 parsed.durationMs = min(max(duration, 250), 30_000)
             }
+        case "--continuous":
+            parsed.continuous = true
         default:
             break
         }
@@ -33,25 +36,38 @@ private func parseArgs() -> Args {
     return parsed
 }
 
-private final class RawFloatWriter {
+/// Writes 16 kHz mono i16 LE PCM to stdout from 48 kHz mono float input.
+private final class PCM16Writer {
     private let handle = FileHandle.standardOutput
     private let lock = NSLock()
+    private let ratio: Double = 16_000.0 / 48_000.0
+    private var carry: Double = 0.0
 
-    func writeMonoFloat32(_ pointer: UnsafePointer<Float>, frameCount: Int) {
+    func write48kFloat(_ pointer: UnsafePointer<Float>, frameCount: Int) {
         guard frameCount > 0 else { return }
         lock.lock()
-        handle.write(Data(bytes: pointer, count: frameCount * MemoryLayout<Float>.size))
+        var output = Data()
+        output.reserveCapacity(frameCount * 2 / 3)
+        for i in 0..<frameCount {
+            carry += ratio
+            while carry >= 1.0 {
+                let clamped = max(-1.0, min(1.0, pointer[i]))
+                var sample = Int16(clamped * 32767.0)
+                withUnsafeBytes(of: &sample) { output.append(contentsOf: $0) }
+                carry -= 1.0
+            }
+        }
+        handle.write(output)
         lock.unlock()
     }
 
-    func writeInterleavedOrPlanarFloat32(_ bufferList: UnsafeMutableAudioBufferListPointer, frameCount: Int) {
+    func writePlanar48kFloat(_ bufferList: UnsafeMutableAudioBufferListPointer, frameCount: Int) {
         guard frameCount > 0 else { return }
         if bufferList.count == 1,
            let data = bufferList[0].mData?.assumingMemoryBound(to: Float.self) {
-            writeMonoFloat32(data, frameCount: frameCount)
+            write48kFloat(data, frameCount: frameCount)
             return
         }
-
         var mono = [Float](repeating: 0, count: frameCount)
         for audioBuffer in bufferList {
             guard let data = audioBuffer.mData?.assumingMemoryBound(to: Float.self) else { continue }
@@ -61,7 +77,7 @@ private final class RawFloatWriter {
         }
         mono.withUnsafeBufferPointer { pointer in
             if let base = pointer.baseAddress {
-                writeMonoFloat32(base, frameCount: frameCount)
+                write48kFloat(base, frameCount: frameCount)
             }
         }
     }
@@ -70,11 +86,13 @@ private final class RawFloatWriter {
 @available(macOS 13.0, *)
 private final class SystemAudioCapture: NSObject, SCStreamOutput {
     private let duration: TimeInterval
-    private let writer = RawFloatWriter()
+    private let continuous: Bool
+    private let writer = PCM16Writer()
     private var stream: SCStream?
 
-    init(durationMs: Int) {
+    init(durationMs: Int, continuous: Bool) {
         self.duration = TimeInterval(durationMs) / 1_000.0
+        self.continuous = continuous
         super.init()
     }
 
@@ -99,8 +117,16 @@ private final class SystemAudioCapture: NSObject, SCStreamOutput {
         self.stream = stream
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: DispatchQueue(label: "sh.bluey.audio.system", qos: .userInitiated))
         try await stream.startCapture()
-        try await Task.sleep(nanoseconds: UInt64(duration * 1_000_000_000))
-        try await stream.stopCapture()
+
+        if continuous {
+            // Run until killed
+            while true {
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        } else {
+            try await Task.sleep(nanoseconds: UInt64(duration * 1_000_000_000))
+            try await stream.stopCapture()
+        }
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -118,7 +144,7 @@ private final class SystemAudioCapture: NSObject, SCStreamOutput {
             blockBufferOut: &blockBuffer
         )
         guard status == noErr else { return }
-        writer.writeInterleavedOrPlanarFloat32(
+        writer.writePlanar48kFloat(
             UnsafeMutableAudioBufferListPointer(&audioBufferList),
             frameCount: sampleBuffer.numSamples
         )
@@ -128,13 +154,13 @@ private final class SystemAudioCapture: NSObject, SCStreamOutput {
 
 private final class MicrophoneCapture {
     private let duration: TimeInterval
-    private let writer = RawFloatWriter()
+    private let continuous: Bool
+    private let writer = PCM16Writer()
     private let engine = AVAudioEngine()
-    private var converter: AVAudioConverter?
-    private var targetFormat: AVAudioFormat?
 
-    init(durationMs: Int) {
+    init(durationMs: Int, continuous: Bool) {
         self.duration = TimeInterval(durationMs) / 1_000.0
+        self.continuous = continuous
     }
 
     func run() throws {
@@ -144,43 +170,35 @@ private final class MicrophoneCapture {
             throw NSError(domain: "BlueyAudio", code: 2, userInfo: [NSLocalizedDescriptionKey: "no microphone input format available"])
         }
         guard let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 1, interleaved: false) else {
-            throw NSError(domain: "BlueyAudio", code: 3, userInfo: [NSLocalizedDescriptionKey: "failed to create microphone target format"])
+            throw NSError(domain: "BlueyAudio", code: 3, userInfo: [NSLocalizedDescriptionKey: "failed to create target format"])
         }
-        self.targetFormat = targetFormat
-        converter = AVAudioConverter(from: inputFormat, to: targetFormat)
+        let converter = AVAudioConverter(from: inputFormat, to: targetFormat)
 
         input.installTap(onBus: 0, bufferSize: 1_024, format: inputFormat) { [weak self] buffer, _ in
-            self?.handle(buffer: buffer)
+            guard let self else { return }
+            let ratio = targetFormat.sampleRate / buffer.format.sampleRate
+            let capacity = AVAudioFrameCount(max(1, Int(Double(buffer.frameLength) * ratio) + 8))
+            guard let converted = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return }
+            var consumed = false
+            converter?.convert(to: converted, error: nil) { _, status in
+                if consumed { status.pointee = .noDataNow; return nil }
+                consumed = true
+                status.pointee = .haveData
+                return buffer
+            }
+            guard converted.frameLength > 0, let channel = converted.floatChannelData?[0] else { return }
+            self.writer.write48kFloat(channel, frameCount: Int(converted.frameLength))
         }
         try engine.start()
-        Thread.sleep(forTimeInterval: duration)
-        engine.stop()
-        input.removeTap(onBus: 0)
-    }
 
-    private func handle(buffer: AVAudioPCMBuffer) {
-        guard let targetFormat else { return }
-        guard let converter else { return }
-        let ratio = targetFormat.sampleRate / buffer.format.sampleRate
-        let capacity = AVAudioFrameCount(max(1, Int(Double(buffer.frameLength) * ratio) + 8))
-        guard let converted = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return }
-
-        var consumed = false
-        var conversionError: NSError?
-        converter.convert(to: converted, error: &conversionError) { _, status in
-            if consumed {
-                status.pointee = .noDataNow
-                return nil
-            }
-            consumed = true
-            status.pointee = .haveData
-            return buffer
+        if continuous {
+            // Run until killed
+            dispatchMain()
+        } else {
+            Thread.sleep(forTimeInterval: duration)
+            engine.stop()
+            input.removeTap(onBus: 0)
         }
-
-        guard conversionError == nil,
-              converted.frameLength > 0,
-              let channel = converted.floatChannelData?[0] else { return }
-        writer.writeMonoFloat32(channel, frameCount: Int(converted.frameLength))
     }
 }
 
@@ -193,10 +211,10 @@ private func run() async -> Int32 {
                 fputs("system audio capture requires macOS 13+\n", stderr)
                 return 2
             }
-            let capture = SystemAudioCapture(durationMs: args.durationMs)
+            let capture = SystemAudioCapture(durationMs: args.durationMs, continuous: args.continuous)
             try await capture.run()
         case .microphone:
-            let capture = MicrophoneCapture(durationMs: args.durationMs)
+            let capture = MicrophoneCapture(durationMs: args.durationMs, continuous: args.continuous)
             try capture.run()
         }
         return 0

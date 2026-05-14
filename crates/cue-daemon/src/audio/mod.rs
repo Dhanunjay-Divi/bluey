@@ -5,3 +5,6 @@ pub mod vad;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod capture;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod system_capture;

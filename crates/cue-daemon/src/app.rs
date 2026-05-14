@@ -452,6 +452,29 @@ pub async fn run() -> Result<()> {
     }
     spawn_overlay_event_handler(daemon.clone(), overlay_events_rx);
 
+    // System audio continuous capture (opt-in via env var).
+    if std::env::var("BLUEY_SYSTEM_AUDIO_CONTINUOUS")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        let (sys_tx, mut sys_rx) = mpsc::unbounded_channel();
+        match crate::audio::system_capture::SystemAudioCapture::start(sys_tx) {
+            Ok(_handle) => {
+                info!("system audio continuous capture started");
+                let daemon_sys = daemon.clone();
+                tokio::spawn(async move {
+                    while let Some(chunk) = sys_rx.recv().await {
+                        let text = format!("[system audio chunk: {}ms]", chunk.duration_ms());
+                        debug!("{text}");
+                        let _ = &daemon_sys;
+                    }
+                });
+            }
+            Err(e) => {
+                debug!("system audio continuous capture not available: {e}");
+            }
+        }
+    }
     write_state(&daemon).await?;
 
     let listener = TcpListener::bind(&args.addr)
