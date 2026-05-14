@@ -6,8 +6,25 @@
 #define _UNICODE
 #endif
 
+#ifndef WINVER
+#define WINVER 0x0601
+#endif
+
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+
+#define COBJMACROS
 #include <windows.h>
 #include <windowsx.h>
+
+#ifdef DrawText
+#undef DrawText
+#endif
+
+#include <initguid.h>
+#include <d2d1.h>
+#include <dwrite.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -52,6 +69,16 @@ static bool g_collapsed_dragging = false;
 static bool g_collapsed_drag_moved = false;
 static POINT g_collapsed_drag_start = {0, 0};
 static RECT g_collapsed_drag_rect = {0, 0, 0, 0};
+static bool g_d2d_available = false;
+static ID2D1Factory *g_d2d_factory = NULL;
+static IDWriteFactory *g_dwrite_factory = NULL;
+static ID2D1HwndRenderTarget *g_d2d_target = NULL;
+static ID2D1SolidColorBrush *g_d2d_brush = NULL;
+static IDWriteTextFormat *g_fmt_pill = NULL;
+static IDWriteTextFormat *g_fmt_brand = NULL;
+static IDWriteTextFormat *g_fmt_label = NULL;
+static IDWriteTextFormat *g_fmt_title = NULL;
+static IDWriteTextFormat *g_fmt_body = NULL;
 
 #define ID_ASK_EDIT 1001
 #define ID_SEND_BUTTON 1002
@@ -628,9 +655,333 @@ static void current_card_label(wchar_t *dest, size_t dest_len) {
     }
 }
 
+static void release_d2d_target(void) {
+    if (g_d2d_brush) {
+        ID2D1SolidColorBrush_Release(g_d2d_brush);
+        g_d2d_brush = NULL;
+    }
+    if (g_d2d_target) {
+        ID2D1HwndRenderTarget_Release(g_d2d_target);
+        g_d2d_target = NULL;
+    }
+}
+
+static void release_d2d_resources(void) {
+    release_d2d_target();
+    if (g_fmt_pill) {
+        IDWriteTextFormat_Release(g_fmt_pill);
+        g_fmt_pill = NULL;
+    }
+    if (g_fmt_brand) {
+        IDWriteTextFormat_Release(g_fmt_brand);
+        g_fmt_brand = NULL;
+    }
+    if (g_fmt_label) {
+        IDWriteTextFormat_Release(g_fmt_label);
+        g_fmt_label = NULL;
+    }
+    if (g_fmt_title) {
+        IDWriteTextFormat_Release(g_fmt_title);
+        g_fmt_title = NULL;
+    }
+    if (g_fmt_body) {
+        IDWriteTextFormat_Release(g_fmt_body);
+        g_fmt_body = NULL;
+    }
+    if (g_dwrite_factory) {
+        IDWriteFactory_Release(g_dwrite_factory);
+        g_dwrite_factory = NULL;
+    }
+    if (g_d2d_factory) {
+        ID2D1Factory_Release(g_d2d_factory);
+        g_d2d_factory = NULL;
+    }
+    g_d2d_available = false;
+}
+
+static D2D1_COLOR_F d2d_color_rgb(int red, int green, int blue, float alpha) {
+    D2D1_COLOR_F color;
+    color.r = (FLOAT)red / 255.0f;
+    color.g = (FLOAT)green / 255.0f;
+    color.b = (FLOAT)blue / 255.0f;
+    color.a = alpha;
+    return color;
+}
+
+static D2D1_RECT_F d2d_rectf(float left, float top, float right, float bottom) {
+    D2D1_RECT_F rect;
+    rect.left = left;
+    rect.top = top;
+    rect.right = right;
+    rect.bottom = bottom;
+    return rect;
+}
+
+static D2D1_POINT_2F d2d_point(float x, float y) {
+    D2D1_POINT_2F point;
+    point.x = x;
+    point.y = y;
+    return point;
+}
+
+static void d2d_set_brush_color(int red, int green, int blue, float alpha) {
+    D2D1_COLOR_F color = d2d_color_rgb(red, green, blue, alpha);
+    ID2D1SolidColorBrush_SetColor(g_d2d_brush, &color);
+}
+
+static void d2d_fill_round(float left, float top, float right, float bottom, float radius, int red, int green, int blue, float alpha) {
+    D2D1_ROUNDED_RECT rounded;
+    rounded.rect = d2d_rectf(left, top, right, bottom);
+    rounded.radiusX = radius;
+    rounded.radiusY = radius;
+    d2d_set_brush_color(red, green, blue, alpha);
+    ID2D1HwndRenderTarget_FillRoundedRectangle(g_d2d_target, &rounded, (ID2D1Brush *)g_d2d_brush);
+}
+
+static void d2d_stroke_round(float left, float top, float right, float bottom, float radius, int red, int green, int blue, float alpha, float width) {
+    D2D1_ROUNDED_RECT rounded;
+    rounded.rect = d2d_rectf(left, top, right, bottom);
+    rounded.radiusX = radius;
+    rounded.radiusY = radius;
+    d2d_set_brush_color(red, green, blue, alpha);
+    ID2D1HwndRenderTarget_DrawRoundedRectangle(g_d2d_target, &rounded, (ID2D1Brush *)g_d2d_brush, width, NULL);
+}
+
+static void d2d_text(const wchar_t *text, IDWriteTextFormat *format, D2D1_RECT_F rect, int red, int green, int blue, float alpha) {
+    d2d_set_brush_color(red, green, blue, alpha);
+    ID2D1HwndRenderTarget_DrawText(
+        g_d2d_target,
+        text,
+        (UINT32)wcslen(text),
+        format,
+        &rect,
+        (ID2D1Brush *)g_d2d_brush,
+        D2D1_DRAW_TEXT_OPTIONS_NONE,
+        DWRITE_MEASURING_MODE_NATURAL
+    );
+}
+
+static HRESULT create_text_format(float size, DWRITE_FONT_WEIGHT weight, DWRITE_TEXT_ALIGNMENT alignment, DWRITE_PARAGRAPH_ALIGNMENT paragraph, IDWriteTextFormat **out) {
+    HRESULT hr = IDWriteFactory_CreateTextFormat(
+        g_dwrite_factory,
+        L"Segoe UI",
+        NULL,
+        weight,
+        DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL,
+        size,
+        L"en-us",
+        out
+    );
+    if (FAILED(hr)) return hr;
+    IDWriteTextFormat_SetTextAlignment(*out, alignment);
+    IDWriteTextFormat_SetParagraphAlignment(*out, paragraph);
+    IDWriteTextFormat_SetWordWrapping(*out, DWRITE_WORD_WRAPPING_WRAP);
+    return S_OK;
+}
+
+static bool init_d2d_resources(void) {
+    if (g_d2d_available) return true;
+
+    D2D1_FACTORY_OPTIONS options;
+    ZeroMemory(&options, sizeof(options));
+    HRESULT hr = D2D1CreateFactory(
+        D2D1_FACTORY_TYPE_SINGLE_THREADED,
+        &IID_ID2D1Factory,
+        &options,
+        (void **)&g_d2d_factory
+    );
+    if (FAILED(hr)) {
+        release_d2d_resources();
+        return false;
+    }
+
+    hr = DWriteCreateFactory(
+        DWRITE_FACTORY_TYPE_SHARED,
+        &IID_IDWriteFactory,
+        (IUnknown **)&g_dwrite_factory
+    );
+    if (FAILED(hr)) {
+        release_d2d_resources();
+        return false;
+    }
+
+    if (FAILED(create_text_format(13.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, &g_fmt_pill)) ||
+        FAILED(create_text_format(20.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, &g_fmt_brand)) ||
+        FAILED(create_text_format(13.0f, DWRITE_FONT_WEIGHT_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, &g_fmt_label)) ||
+        FAILED(create_text_format(21.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, &g_fmt_title)) ||
+        FAILED(create_text_format(16.0f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, &g_fmt_body))) {
+        release_d2d_resources();
+        return false;
+    }
+
+    g_d2d_available = true;
+    return true;
+}
+
+static bool ensure_d2d_target(HWND hwnd) {
+    if (!init_d2d_resources()) return false;
+    if (g_d2d_target) return true;
+
+    RECT rect;
+    GetClientRect(hwnd, &rect);
+    D2D1_RENDER_TARGET_PROPERTIES properties;
+    ZeroMemory(&properties, sizeof(properties));
+    properties.type = D2D1_RENDER_TARGET_TYPE_DEFAULT;
+    properties.pixelFormat.format = DXGI_FORMAT_UNKNOWN;
+    properties.pixelFormat.alphaMode = D2D1_ALPHA_MODE_UNKNOWN;
+    properties.dpiX = 0.0f;
+    properties.dpiY = 0.0f;
+    properties.usage = D2D1_RENDER_TARGET_USAGE_NONE;
+    properties.minLevel = D2D1_FEATURE_LEVEL_DEFAULT;
+
+    D2D1_HWND_RENDER_TARGET_PROPERTIES hwnd_properties;
+    ZeroMemory(&hwnd_properties, sizeof(hwnd_properties));
+    hwnd_properties.hwnd = hwnd;
+    hwnd_properties.pixelSize.width = (UINT32)(rect.right - rect.left);
+    hwnd_properties.pixelSize.height = (UINT32)(rect.bottom - rect.top);
+    hwnd_properties.presentOptions = D2D1_PRESENT_OPTIONS_NONE;
+
+    HRESULT hr = ID2D1Factory_CreateHwndRenderTarget(
+        g_d2d_factory,
+        &properties,
+        &hwnd_properties,
+        &g_d2d_target
+    );
+    if (FAILED(hr)) {
+        release_d2d_target();
+        return false;
+    }
+
+    D2D1_COLOR_F brush_color = d2d_color_rgb(255, 255, 255, 1.0f);
+    hr = ID2D1HwndRenderTarget_CreateSolidColorBrush(
+        g_d2d_target,
+        &brush_color,
+        NULL,
+        &g_d2d_brush
+    );
+    if (FAILED(hr)) {
+        release_d2d_target();
+        return false;
+    }
+
+    return true;
+}
+
+static void resize_d2d_target(HWND hwnd) {
+    if (!g_d2d_target) return;
+    RECT rect;
+    GetClientRect(hwnd, &rect);
+    D2D1_SIZE_U size;
+    size.width = (UINT32)(rect.right - rect.left);
+    size.height = (UINT32)(rect.bottom - rect.top);
+    if (FAILED(ID2D1HwndRenderTarget_Resize(g_d2d_target, &size))) {
+        release_d2d_target();
+    }
+}
+
+static void draw_bluey_logo_d2d(float x, float y, float size) {
+    d2d_fill_round(x, y, x + size, y + size, size * 0.22f, 12, 52, 78, 1.0f);
+    d2d_stroke_round(x + 0.5f, y + 0.5f, x + size - 0.5f, y + size - 0.5f, size * 0.22f, 120, 236, 246, 1.0f, 1.2f);
+    d2d_fill_round(x + size * 0.20f, y + size * 0.33f, x + size * 0.80f, y + size * 0.76f, size * 0.14f, 6, 17, 31, 1.0f);
+    d2d_stroke_round(x + size * 0.20f, y + size * 0.33f, x + size * 0.80f, y + size * 0.76f, size * 0.14f, 100, 233, 255, 1.0f, 1.6f);
+
+    d2d_set_brush_color(245, 252, 255, 1.0f);
+    ID2D1HwndRenderTarget_DrawLine(g_d2d_target, d2d_point(x + size * 0.34f, y + size * 0.45f), d2d_point(x + size * 0.44f, y + size * 0.50f), (ID2D1Brush *)g_d2d_brush, 2.0f, NULL);
+    ID2D1HwndRenderTarget_DrawLine(g_d2d_target, d2d_point(x + size * 0.44f, y + size * 0.50f), d2d_point(x + size * 0.34f, y + size * 0.58f), (ID2D1Brush *)g_d2d_brush, 2.0f, NULL);
+    d2d_set_brush_color(122, 248, 255, 1.0f);
+    ID2D1HwndRenderTarget_DrawLine(g_d2d_target, d2d_point(x + size * 0.50f, y + size * 0.61f), d2d_point(x + size * 0.66f, y + size * 0.61f), (ID2D1Brush *)g_d2d_brush, 2.0f, NULL);
+
+    d2d_set_brush_color(139, 255, 157, 1.0f);
+    ID2D1HwndRenderTarget_DrawLine(g_d2d_target, d2d_point(x + size * 0.72f, y + size * 0.20f), d2d_point(x + size * 0.72f, y + size * 0.52f), (ID2D1Brush *)g_d2d_brush, 1.6f, NULL);
+    ID2D1HwndRenderTarget_DrawLine(g_d2d_target, d2d_point(x + size * 0.56f, y + size * 0.36f), d2d_point(x + size * 0.88f, y + size * 0.36f), (ID2D1Brush *)g_d2d_brush, 1.6f, NULL);
+}
+
+static void draw_resize_affordance_d2d(RECT rect) {
+    d2d_stroke_round((float)rect.left + 1.0f, (float)rect.top + 1.0f, (float)rect.right - 1.0f, (float)rect.bottom - 1.0f, 18.0f, 38, 98, 138, 0.8f, 1.0f);
+    d2d_set_brush_color(120, 236, 246, 1.0f);
+    float right = (float)rect.right - 11.0f;
+    float bottom = (float)rect.bottom - 10.0f;
+    for (int i = 0; i < 3; i++) {
+        float offset = 7.0f + ((float)i * 6.0f);
+        ID2D1HwndRenderTarget_DrawLine(g_d2d_target, d2d_point(right - offset, bottom), d2d_point(right, bottom - offset), (ID2D1Brush *)g_d2d_brush, 2.0f, NULL);
+    }
+}
+
+static bool paint_with_d2d(HWND hwnd) {
+    if (!ensure_d2d_target(hwnd)) return false;
+
+    RECT rect;
+    GetClientRect(hwnd, &rect);
+    ID2D1HwndRenderTarget_BeginDraw(g_d2d_target);
+    D2D1_COLOR_F bg_color = g_light_theme ? d2d_color_rgb(246, 250, 252, 1.0f) : d2d_color_rgb(2, 4, 6, 1.0f);
+    ID2D1HwndRenderTarget_Clear(g_d2d_target, &bg_color);
+
+    if (g_collapsed) {
+        draw_bluey_logo_d2d(10.0f, 8.0f, 25.0f);
+        d2d_set_brush_color(62, 220, 128, 1.0f);
+        D2D1_ELLIPSE dot;
+        dot.point = d2d_point((float)rect.right - 17.0f, 14.0f);
+        dot.radiusX = 5.0f;
+        dot.radiusY = 5.0f;
+        ID2D1HwndRenderTarget_FillEllipse(g_d2d_target, &dot, (ID2D1Brush *)g_d2d_brush);
+        d2d_text(L"Bluey", g_fmt_pill, d2d_rectf(40.0f, 0.0f, (float)rect.right - 16.0f, (float)rect.bottom), g_light_theme ? 8 : 235, g_light_theme ? 22 : 245, g_light_theme ? 32 : 255, 1.0f);
+    } else {
+        int header_w = clamp_int((rect.right * 84) / 100, 520, 780);
+        if (header_w > rect.right - 28) header_w = rect.right - 28;
+        int header_left = (rect.right - header_w) / 2;
+        int composer_w = clamp_int((rect.right * 72) / 100, 560, 760);
+        int composer_left = (rect.right - composer_w) / 2;
+
+        d2d_fill_round((float)header_left, 8.0f, (float)(header_left + header_w), 54.0f, 22.0f, g_light_theme ? 248 : 5, g_light_theme ? 252 : 11, g_light_theme ? 255 : 18, 1.0f);
+        d2d_stroke_round((float)header_left + 0.5f, 8.5f, (float)(header_left + header_w) - 0.5f, 53.5f, 22.0f, g_light_theme ? 82 : 36, g_light_theme ? 172 : 102, g_light_theme ? 205 : 124, 0.9f, 1.2f);
+
+        d2d_fill_round((float)composer_left, (float)rect.bottom - 110.0f, (float)(composer_left + composer_w), (float)rect.bottom - 8.0f, 22.0f, g_light_theme ? 248 : 5, g_light_theme ? 252 : 11, g_light_theme ? 255 : 18, 1.0f);
+        d2d_stroke_round((float)composer_left + 0.5f, (float)rect.bottom - 109.5f, (float)(composer_left + composer_w) - 0.5f, (float)rect.bottom - 8.5f, 22.0f, g_light_theme ? 82 : 38, g_light_theme ? 172 : 98, g_light_theme ? 205 : 138, 0.9f, 1.2f);
+
+        draw_resize_affordance_d2d(rect);
+        draw_bluey_logo_d2d((float)header_left + 14.0f, 14.0f, 28.0f);
+
+        d2d_set_brush_color(g_recording ? 62 : 40, g_recording ? 220 : 92, g_recording ? 128 : 62, 1.0f);
+        D2D1_ELLIPSE record_dot;
+        record_dot.point = d2d_point((float)header_left + 114.5f, 29.5f);
+        record_dot.radiusX = 4.5f;
+        record_dot.radiusY = 4.5f;
+        ID2D1HwndRenderTarget_FillEllipse(g_d2d_target, &record_dot, (ID2D1Brush *)g_d2d_brush);
+
+        d2d_text(L"Bluey", g_fmt_brand, d2d_rectf((float)header_left + 50.0f, 10.0f, (float)header_left + 118.0f, 46.0f), g_light_theme ? 8 : 230, g_light_theme ? 22 : 240, g_light_theme ? 32 : 245, 1.0f);
+
+        wchar_t card_label[32];
+        current_card_label(card_label, 32);
+        if (wcscmp(card_label, L"MIC") == 0) {
+            d2d_text(card_label, g_fmt_label, d2d_rectf(18.0f, 60.0f, (float)rect.right - 18.0f, 82.0f), 118, 242, 153, 1.0f);
+        } else {
+            d2d_text(card_label, g_fmt_label, d2d_rectf(18.0f, 60.0f, (float)rect.right - 18.0f, 82.0f), 112, 238, 248, 1.0f);
+        }
+
+        bool show_title = wcscmp(g_kind, L"transcript") != 0
+            && wcscmp(g_kind, L"question") != 0
+            && wcscmp(g_kind, L"answer") != 0
+            && wcslen(g_title) > 0;
+        int body_top = show_title ? 108 : 86;
+        if (show_title) {
+            d2d_text(g_title, g_fmt_title, d2d_rectf(18.0f, 82.0f, (float)rect.right - 18.0f, 108.0f), g_light_theme ? 8 : 230, g_light_theme ? 22 : 240, g_light_theme ? 32 : 245, 1.0f);
+        }
+        d2d_text(g_body, g_fmt_body, d2d_rectf(18.0f, (float)body_top, (float)rect.right - 18.0f, (float)rect.bottom - 124.0f), g_light_theme ? 22 : 230, g_light_theme ? 43 : 240, g_light_theme ? 56 : 245, 1.0f);
+    }
+
+    HRESULT hr = ID2D1HwndRenderTarget_EndDraw(g_d2d_target, NULL, NULL);
+    if (hr == D2DERR_RECREATE_TARGET) {
+        release_d2d_target();
+        return false;
+    }
+    return SUCCEEDED(hr);
+}
+
 static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     switch (msg) {
     case WM_SIZE:
+        resize_d2d_target(hwnd);
         layout_controls();
         return 0;
     case WM_DRAWITEM: {
@@ -820,6 +1171,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         return HTTRANSPARENT;
     }
     case WM_PAINT: {
+        if (paint_with_d2d(hwnd)) {
+            ValidateRect(hwnd, NULL);
+            return 0;
+        }
+
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
         RECT rect;
@@ -945,6 +1301,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             DeleteObject(g_edit_brush);
             g_edit_brush = NULL;
         }
+        release_d2d_resources();
         PostQuitMessage(0);
         return 0;
     }

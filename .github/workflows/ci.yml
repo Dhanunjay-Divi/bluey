@@ -13,7 +13,7 @@ jobs:
   check:
     strategy:
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        os: [macos-latest, ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -40,6 +40,10 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Configure MSVC
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -63,3 +67,10 @@ jobs:
 
       - name: Test
         run: cargo test --all-targets
+
+      - name: Build Windows native helpers
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          native\windows\cue-overlay\build.ps1
+          native\windows\cue-audio\build.ps1
