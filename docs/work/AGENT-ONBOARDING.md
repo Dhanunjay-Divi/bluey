@@ -10,8 +10,7 @@ to connect to uno and pick up the bluey/cue project work.
 **bluey/cue** — A Rust+Tauri desktop app that listens to mic/system audio,
 runs VAD, streams STT, and shows transcripts with live overlay.
 
-- Planning doc (on uno): `/Users/uno/Downloads/cue/docs/work/CUE-PORT-PLAN.md`
-- Current phase: **Phase 3 (Listening upgrade)** — streaming STT + overlay IPC
+- Current phase: **Phase 3 (Listening upgrade)** — streaming STT + overlay IPC + system audio
 
 ## Remote machine (uno)
 
@@ -43,20 +42,28 @@ export PATH=/opt/homebrew/bin:/Users/uno/.cargo/bin:/usr/local/bin:$PATH
 cargo build --all-targets 2>&1 | tail -20'
 ```
 
-## Current state (as of 2026-05-13, post-R3 merge)
+## Current state (as of 2026-05-14, post-R4 implementation)
 
-- **Main tip:** includes Round 1 + Round 2 + Round 3 merged
-- **Next branch:** `feat/phase-3-round-4` (or later) — prep Round 4 scope:
-  overlay restart loop + system audio capture (ScreenCaptureKit on macOS,
-  WASAPI loopback on Windows)
-- **Test count on main after R3:** 130 passing (45 core + 78 daemon lib +
-  3 overlay pipe + 4 pipeline integration + 1 ignored hardware)
-- **R3 delivered:** Deepgram Nova-3 live streaming provider with
-  `connect()` + WS reader/writer + exponential-backoff reconnect supervisor
-  + mock-WS integration tests (7 live-connection tests); native overlay
-  IPC via `NativeOverlayHandle`; overlay stub binary + integration tests
-- **All checks green on merge:** fmt, clippy (D warnings), build release,
-  cargo test, dashboard npm build, git diff --check
+- **Branch:** `feat/phase-3-round-4` — 4 commits ahead of main (pending codex review):
+  ```
+  6fc8682 feat(daemon): system audio capture via native helpers (macOS ScreenCaptureKit + Windows WASAPI) [P3.R4 stage 2]
+  329f324 fix(windows): make native helper builds pass MSVC
+  6f21864 feat(windows): render overlay with Direct2D and add Windows CI
+  19ff43a fix(daemon): restructure overlay supervisor to own send_rx, fixes restart-loop race [P3.R4 stage 1]
+  ```
+- **Test count:** 136 passing (45 core + 81 daemon lib + 3 overlay pipe +
+  1 overlay restart + 2 system audio + 4 pipeline integration + 1 ignored hardware)
+- **R4 delivered:**
+  - Overlay supervisor restructured: `send_rx` owned by supervisor, `run_one_child` with
+    carryover semantics, restart-on-crash with exponential backoff (max 5 attempts)
+  - System audio capture via native helpers: macOS ScreenCaptureKit (Swift, macOS 13+),
+    Windows WASAPI loopback (C, MSVC-compatible)
+  - Rust `SystemAudioCapture` launcher: spawns helper, reads 16 kHz mono i16 LE stdout,
+    frames into 20 ms `AudioChunk`s, restart-on-crash
+  - Windows overlay with Direct2D rendering + Windows CI
+  - Opt-in via `BLUEY_SYSTEM_AUDIO_CONTINUOUS=1` env var
+- **All checks green:** fmt, clippy (-D warnings), build, cargo test (136),
+  dashboard npm build, swift build, git diff --check
 
 ## Workflow loop (kiro ↔ codex ↔ user)
 
@@ -95,7 +102,7 @@ docs/work/TEMPLATE-FIX.md
    ```
 5. **Never log secrets** — API keys use `mask_api_key` helper pattern
 6. **Commit messages** follow Conventional Commits, e.g.:
-   `feat(daemon): Deepgram Nova-3 STT + native overlay IPC [P3.R3]`
+   `feat(daemon): system audio capture via native helpers [P3.R4]`
 
 ## Key files + locations on uno
 
@@ -106,23 +113,38 @@ docs/work/TEMPLATE-FIX.md
 │   ├── cue-core/                         # types: pcm, vad, stt, overlay_ipc
 │   ├── cue-daemon/
 │   │   ├── src/
-│   │   │   ├── audio/                    # capture, framer
+│   │   │   ├── audio/
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── system_capture.rs     # Round 4 — native helper launcher
 │   │   │   ├── stt/
-│   │   │   │   ├── mock.rs               # MockStt (test pattern template)
+│   │   │   │   ├── mock.rs
 │   │   │   │   └── deepgram.rs           # Round 3 — Nova-3 provider
-│   │   │   ├── overlay.rs                # Round 3 — NativeOverlayHandle
-│   │   │   └── bin/overlay_stub.rs       # Round 3 — test stub binary
+│   │   │   ├── overlay.rs                # Round 3+4 — supervisor with restart loop
+│   │   │   ├── bin/
+│   │   │   │   ├── overlay_stub.rs       # Round 3 — test stub (echo Pong)
+│   │   │   │   ├── overlay_stub_oneshot.rs # Round 4 — crash-after-one-msg stub
+│   │   │   │   └── system_audio_stub.rs  # Round 4 — 440Hz sine stub
+│   │   │   └── app.rs                    # BLUEY_SYSTEM_AUDIO_CONTINUOUS wiring
 │   │   └── tests/
 │   │       ├── pipeline_integration.rs
-│   │       └── overlay_pipe_integration.rs
+│   │       ├── overlay_pipe_integration.rs
+│   │       ├── overlay_restart_integration.rs  # Round 4
+│   │       └── system_audio_integration.rs     # Round 4
 │   └── cue-dashboard/                    # Tauri + React UI
+├── native/
+│   ├── macos/cue-audio/                  # Swift: ScreenCaptureKit + AVAudioEngine
+│   │   ├── Package.swift
+│   │   └── Sources/cue-audio/main.swift
+│   └── windows/
+│       ├── cue-audio/main.c              # C: WASAPI loopback
+│       └── cue-overlay/main.c            # C: Direct2D overlay
 └── docs/work/
-    ├── CUE-PORT-PLAN.md                  # master plan
     ├── TEMPLATE-REVIEW.md
     ├── TEMPLATE-FIX.md
-    ├── IMPL-PHASE-3-ROUND-{1,2,3}.md
-    ├── PHASE-3-ROUND-{1,2,3}-HANDOFF-FOR-CODEX-REVIEW.md
-    └── REVIEW-PHASE-3-ROUND-{1,2}.md     # codex's verdicts
+    ├── IMPL-PHASE-3-ROUND-{1,2,3,4}.md
+    ├── PHASE-3-ROUND-{1,2,3,4}-HANDOFF-FOR-CODEX-REVIEW.md
+    ├── REVIEW-PHASE-3-ROUND-{1,2,3}.md   # codex's verdicts
+    └── PLAN-STT-FALLBACK-CHAIN.md
 ```
 
 ## Type foundations (from Round 1 — use these, don't re-create)
@@ -134,25 +156,16 @@ In `crates/cue-core/src/`:
 - `stt.rs`: `SttProvider` async trait, `TranscriptEvent {Partial, Final, SpeakerLabel}`, `ConnectionState`, `SttError`, `WordTiming`, `SttConfig`
 - `overlay_ipc.rs`: `OverlayMessage` (SessionSwitched/ListeningStateChanged/TranscriptPartial/TranscriptFinal/Ping), `OverlayIpcCommand {Pong, RequestSync}`, `encode_ndjson`, `decode_ndjson`
 
-## Round 4 scope
+## Round 5+ scope (after R4 merges)
 
-Codex accepted Round 3 with nits (2026-05-13). Round 4 scope:
-
-1. **Overlay restart-on-crash loop** — helpers ready (`restart_delay`,
-   `OverlayProcessState::Restarting { attempt }`); watcher currently
-   single-shot. Wire the relaunch path with backoff + cap at
-   `MAX_RESTART_ATTEMPTS`. Add integration test that kills the stub
-   mid-session and asserts automatic recovery.
-2. **System audio capture** — ScreenCaptureKit on macOS, WASAPI loopback
-   on Windows. Must produce `AudioChunk { source: AudioSource::System, .. }`
-   via the same `AudioChunk` producer channel as mic capture, so the
-   VAD/STT pipeline stays source-agnostic.
-
-Deferred to later rounds (not Round 4):
-- STT fallback chain (primary Deepgram → secondary cloud → local whisper).
-  Design captured in `docs/work/PLAN-STT-FALLBACK-CHAIN.md`.
-- Real Swift/C overlay code updates — unblocked after Round 4 ships
-  system audio + overlay restart, but sequencing depends on stealth work.
+1. **STT routing for system audio** — `AudioChunk { source: System }` chunks
+   currently reach the daemon channel but are not forwarded to STT. Needs a
+   source-aware multiplexer or a second `SttProvider` instance.
+2. **STT fallback chain** — design in `docs/work/PLAN-STT-FALLBACK-CHAIN.md`.
+   Deepgram primary → secondary cloud provider → local whisper.cpp.
+3. **Full overlay wiring with native helpers** — production spawn of the
+   Swift/C overlay binaries via `NativeOverlayHandle` (currently tests use stubs).
+4. **System audio device selection UX** — currently uses OS default endpoint.
 
 ## First actions for a new agent
 
@@ -164,10 +177,9 @@ Deferred to later rounds (not Round 4):
    git -P branch --show-current'
    ```
 2. Read these docs on uno in order:
-   - `docs/work/CUE-PORT-PLAN.md` (master plan)
-   - The most recent `IMPL-PHASE-*-ROUND-*.md` (latest round's context)
-   - The most recent `PHASE-*-ROUND-*-HANDOFF-FOR-CODEX-REVIEW.md`
-   - Any `REVIEW-PHASE-*-ROUND-*.md` codex has synced back
+   - `docs/work/IMPL-PHASE-3-ROUND-4.md` (latest round's context)
+   - `docs/work/PHASE-3-ROUND-4-HANDOFF-FOR-CODEX-REVIEW.md`
+   - Any `REVIEW-PHASE-3-ROUND-4.md` codex has synced back
 3. Ask the user what the current task is — don't guess. Possible states:
    - Waiting on codex review → nothing to do, just read and be ready
    - Codex gave 🔴 → need to write FIX doc and address feedback
@@ -181,6 +193,7 @@ Deferred to later rounds (not Round 4):
 - **SSH hangs**: verify key permissions (`chmod 600 ~/.ssh/id_ed25519`)
 - **Build takes forever**: release builds are ~55 s; incremental dev builds are <10 s
 - **Cargo complains about workspace dep**: check root `Cargo.toml` `[workspace.dependencies]` first
+- **Swift build fails**: ensure Xcode CLT installed; `swift build` from `native/macos/cue-audio/`
 
 ## Contact points
 
