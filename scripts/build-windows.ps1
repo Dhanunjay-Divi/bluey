@@ -3,6 +3,11 @@ $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $Root
 
+$CargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+if (Test-Path $CargoBin) {
+  $env:Path = "$CargoBin;$env:Path"
+}
+
 cargo build --release
 powershell -ExecutionPolicy Bypass -File native\windows\cue-overlay\build.ps1 | Out-Null
 powershell -ExecutionPolicy Bypass -File native\windows\cue-audio\build.ps1 | Out-Null

@@ -14,7 +14,9 @@
 #define _WIN32_WINNT 0x0601
 #endif
 
+#ifndef __cplusplus
 #define COBJMACROS
+#endif
 #include <windows.h>
 #include <windowsx.h>
 
@@ -79,6 +81,48 @@ static IDWriteTextFormat *g_fmt_brand = NULL;
 static IDWriteTextFormat *g_fmt_label = NULL;
 static IDWriteTextFormat *g_fmt_title = NULL;
 static IDWriteTextFormat *g_fmt_body = NULL;
+
+#ifdef __cplusplus
+#define BLUEY_COM_RELEASE(ptr) (ptr)->Release()
+#define BLUEY_SET_COLOR(brush, color) (brush)->SetColor((color))
+#define BLUEY_FILL_ROUNDED_RECTANGLE(target, rect, brush) (target)->FillRoundedRectangle((rect), (brush))
+#define BLUEY_DRAW_ROUNDED_RECTANGLE(target, rect, brush, width, style) (target)->DrawRoundedRectangle((rect), (brush), (width), (style))
+#define BLUEY_DRAW_TEXT(target, text, len, format, rect, brush, options, measuring_mode) (target)->DrawText((text), (len), (format), (rect), (brush), (options), (measuring_mode))
+#define BLUEY_CREATE_TEXT_FORMAT(factory, family, collection, weight, style, stretch, size, locale, out) (factory)->CreateTextFormat((family), (collection), (weight), (style), (stretch), (size), (locale), (out))
+#define BLUEY_SET_TEXT_ALIGNMENT(format, alignment) (format)->SetTextAlignment((alignment))
+#define BLUEY_SET_PARAGRAPH_ALIGNMENT(format, alignment) (format)->SetParagraphAlignment((alignment))
+#define BLUEY_SET_WORD_WRAPPING(format, wrapping) (format)->SetWordWrapping((wrapping))
+#define BLUEY_CREATE_HWND_RENDER_TARGET(factory, props, hwnd_props, out) (factory)->CreateHwndRenderTarget((props), (hwnd_props), (out))
+#define BLUEY_CREATE_SOLID_COLOR_BRUSH(target, color, props, out) (target)->CreateSolidColorBrush((color), (props), (out))
+#define BLUEY_D2D_CREATE_FACTORY(options, out) D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory), (options), (void **)(out))
+#define BLUEY_DWRITE_CREATE_FACTORY(out) DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown **)(out))
+#define BLUEY_TARGET_RESIZE(target, size) (target)->Resize((size))
+#define BLUEY_BEGIN_DRAW(target) (target)->BeginDraw()
+#define BLUEY_CLEAR(target, color) (target)->Clear((color))
+#define BLUEY_DRAW_LINE(target, p0, p1, brush, width, style) (target)->DrawLine((p0), (p1), (brush), (width), (style))
+#define BLUEY_FILL_ELLIPSE(target, ellipse, brush) (target)->FillEllipse((ellipse), (brush))
+#define BLUEY_END_DRAW(target, tag1, tag2) (target)->EndDraw((tag1), (tag2))
+#else
+#define BLUEY_COM_RELEASE(ptr) IUnknown_Release((IUnknown *)(ptr))
+#define BLUEY_SET_COLOR(brush, color) ID2D1SolidColorBrush_SetColor((brush), (color))
+#define BLUEY_FILL_ROUNDED_RECTANGLE(target, rect, brush) ID2D1HwndRenderTarget_FillRoundedRectangle((target), (rect), (ID2D1Brush *)(brush))
+#define BLUEY_DRAW_ROUNDED_RECTANGLE(target, rect, brush, width, style) ID2D1HwndRenderTarget_DrawRoundedRectangle((target), (rect), (ID2D1Brush *)(brush), (width), (style))
+#define BLUEY_DRAW_TEXT(target, text, len, format, rect, brush, options, measuring_mode) ID2D1HwndRenderTarget_DrawText((target), (text), (len), (format), (rect), (ID2D1Brush *)(brush), (options), (measuring_mode))
+#define BLUEY_CREATE_TEXT_FORMAT(factory, family, collection, weight, style, stretch, size, locale, out) IDWriteFactory_CreateTextFormat((factory), (family), (collection), (weight), (style), (stretch), (size), (locale), (out))
+#define BLUEY_SET_TEXT_ALIGNMENT(format, alignment) IDWriteTextFormat_SetTextAlignment((format), (alignment))
+#define BLUEY_SET_PARAGRAPH_ALIGNMENT(format, alignment) IDWriteTextFormat_SetParagraphAlignment((format), (alignment))
+#define BLUEY_SET_WORD_WRAPPING(format, wrapping) IDWriteTextFormat_SetWordWrapping((format), (wrapping))
+#define BLUEY_CREATE_HWND_RENDER_TARGET(factory, props, hwnd_props, out) ID2D1Factory_CreateHwndRenderTarget((factory), (props), (hwnd_props), (out))
+#define BLUEY_CREATE_SOLID_COLOR_BRUSH(target, color, props, out) ID2D1HwndRenderTarget_CreateSolidColorBrush((target), (color), (props), (out))
+#define BLUEY_D2D_CREATE_FACTORY(options, out) D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, &IID_ID2D1Factory, (options), (void **)(out))
+#define BLUEY_DWRITE_CREATE_FACTORY(out) DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, &IID_IDWriteFactory, (IUnknown **)(out))
+#define BLUEY_TARGET_RESIZE(target, size) ID2D1HwndRenderTarget_Resize((target), (size))
+#define BLUEY_BEGIN_DRAW(target) ID2D1HwndRenderTarget_BeginDraw((target))
+#define BLUEY_CLEAR(target, color) ID2D1HwndRenderTarget_Clear((target), (color))
+#define BLUEY_DRAW_LINE(target, p0, p1, brush, width, style) ID2D1HwndRenderTarget_DrawLine((target), (p0), (p1), (ID2D1Brush *)(brush), (width), (style))
+#define BLUEY_FILL_ELLIPSE(target, ellipse, brush) ID2D1HwndRenderTarget_FillEllipse((target), (ellipse), (ID2D1Brush *)(brush))
+#define BLUEY_END_DRAW(target, tag1, tag2) ID2D1HwndRenderTarget_EndDraw((target), (tag1), (tag2))
+#endif
 
 #define ID_ASK_EDIT 1001
 #define ID_SEND_BUTTON 1002
@@ -657,11 +701,11 @@ static void current_card_label(wchar_t *dest, size_t dest_len) {
 
 static void release_d2d_target(void) {
     if (g_d2d_brush) {
-        ID2D1SolidColorBrush_Release(g_d2d_brush);
+        BLUEY_COM_RELEASE(g_d2d_brush);
         g_d2d_brush = NULL;
     }
     if (g_d2d_target) {
-        ID2D1HwndRenderTarget_Release(g_d2d_target);
+        BLUEY_COM_RELEASE(g_d2d_target);
         g_d2d_target = NULL;
     }
 }
@@ -669,31 +713,31 @@ static void release_d2d_target(void) {
 static void release_d2d_resources(void) {
     release_d2d_target();
     if (g_fmt_pill) {
-        IDWriteTextFormat_Release(g_fmt_pill);
+        BLUEY_COM_RELEASE(g_fmt_pill);
         g_fmt_pill = NULL;
     }
     if (g_fmt_brand) {
-        IDWriteTextFormat_Release(g_fmt_brand);
+        BLUEY_COM_RELEASE(g_fmt_brand);
         g_fmt_brand = NULL;
     }
     if (g_fmt_label) {
-        IDWriteTextFormat_Release(g_fmt_label);
+        BLUEY_COM_RELEASE(g_fmt_label);
         g_fmt_label = NULL;
     }
     if (g_fmt_title) {
-        IDWriteTextFormat_Release(g_fmt_title);
+        BLUEY_COM_RELEASE(g_fmt_title);
         g_fmt_title = NULL;
     }
     if (g_fmt_body) {
-        IDWriteTextFormat_Release(g_fmt_body);
+        BLUEY_COM_RELEASE(g_fmt_body);
         g_fmt_body = NULL;
     }
     if (g_dwrite_factory) {
-        IDWriteFactory_Release(g_dwrite_factory);
+        BLUEY_COM_RELEASE(g_dwrite_factory);
         g_dwrite_factory = NULL;
     }
     if (g_d2d_factory) {
-        ID2D1Factory_Release(g_d2d_factory);
+        BLUEY_COM_RELEASE(g_d2d_factory);
         g_d2d_factory = NULL;
     }
     g_d2d_available = false;
@@ -726,7 +770,7 @@ static D2D1_POINT_2F d2d_point(float x, float y) {
 
 static void d2d_set_brush_color(int red, int green, int blue, float alpha) {
     D2D1_COLOR_F color = d2d_color_rgb(red, green, blue, alpha);
-    ID2D1SolidColorBrush_SetColor(g_d2d_brush, &color);
+    BLUEY_SET_COLOR(g_d2d_brush, &color);
 }
 
 static void d2d_fill_round(float left, float top, float right, float bottom, float radius, int red, int green, int blue, float alpha) {
@@ -735,7 +779,7 @@ static void d2d_fill_round(float left, float top, float right, float bottom, flo
     rounded.radiusX = radius;
     rounded.radiusY = radius;
     d2d_set_brush_color(red, green, blue, alpha);
-    ID2D1HwndRenderTarget_FillRoundedRectangle(g_d2d_target, &rounded, (ID2D1Brush *)g_d2d_brush);
+    BLUEY_FILL_ROUNDED_RECTANGLE(g_d2d_target, &rounded, g_d2d_brush);
 }
 
 static void d2d_stroke_round(float left, float top, float right, float bottom, float radius, int red, int green, int blue, float alpha, float width) {
@@ -744,25 +788,25 @@ static void d2d_stroke_round(float left, float top, float right, float bottom, f
     rounded.radiusX = radius;
     rounded.radiusY = radius;
     d2d_set_brush_color(red, green, blue, alpha);
-    ID2D1HwndRenderTarget_DrawRoundedRectangle(g_d2d_target, &rounded, (ID2D1Brush *)g_d2d_brush, width, NULL);
+    BLUEY_DRAW_ROUNDED_RECTANGLE(g_d2d_target, &rounded, g_d2d_brush, width, NULL);
 }
 
 static void d2d_text(const wchar_t *text, IDWriteTextFormat *format, D2D1_RECT_F rect, int red, int green, int blue, float alpha) {
     d2d_set_brush_color(red, green, blue, alpha);
-    ID2D1HwndRenderTarget_DrawText(
+    BLUEY_DRAW_TEXT(
         g_d2d_target,
         text,
         (UINT32)wcslen(text),
         format,
         &rect,
-        (ID2D1Brush *)g_d2d_brush,
+        g_d2d_brush,
         D2D1_DRAW_TEXT_OPTIONS_NONE,
         DWRITE_MEASURING_MODE_NATURAL
     );
 }
 
 static HRESULT create_text_format(float size, DWRITE_FONT_WEIGHT weight, DWRITE_TEXT_ALIGNMENT alignment, DWRITE_PARAGRAPH_ALIGNMENT paragraph, IDWriteTextFormat **out) {
-    HRESULT hr = IDWriteFactory_CreateTextFormat(
+    HRESULT hr = BLUEY_CREATE_TEXT_FORMAT(
         g_dwrite_factory,
         L"Segoe UI",
         NULL,
@@ -774,9 +818,9 @@ static HRESULT create_text_format(float size, DWRITE_FONT_WEIGHT weight, DWRITE_
         out
     );
     if (FAILED(hr)) return hr;
-    IDWriteTextFormat_SetTextAlignment(*out, alignment);
-    IDWriteTextFormat_SetParagraphAlignment(*out, paragraph);
-    IDWriteTextFormat_SetWordWrapping(*out, DWRITE_WORD_WRAPPING_WRAP);
+    BLUEY_SET_TEXT_ALIGNMENT(*out, alignment);
+    BLUEY_SET_PARAGRAPH_ALIGNMENT(*out, paragraph);
+    BLUEY_SET_WORD_WRAPPING(*out, DWRITE_WORD_WRAPPING_WRAP);
     return S_OK;
 }
 
@@ -785,22 +829,13 @@ static bool init_d2d_resources(void) {
 
     D2D1_FACTORY_OPTIONS options;
     ZeroMemory(&options, sizeof(options));
-    HRESULT hr = D2D1CreateFactory(
-        D2D1_FACTORY_TYPE_SINGLE_THREADED,
-        &IID_ID2D1Factory,
-        &options,
-        (void **)&g_d2d_factory
-    );
+    HRESULT hr = BLUEY_D2D_CREATE_FACTORY(&options, &g_d2d_factory);
     if (FAILED(hr)) {
         release_d2d_resources();
         return false;
     }
 
-    hr = DWriteCreateFactory(
-        DWRITE_FACTORY_TYPE_SHARED,
-        &IID_IDWriteFactory,
-        (IUnknown **)&g_dwrite_factory
-    );
+    hr = BLUEY_DWRITE_CREATE_FACTORY(&g_dwrite_factory);
     if (FAILED(hr)) {
         release_d2d_resources();
         return false;
@@ -842,7 +877,7 @@ static bool ensure_d2d_target(HWND hwnd) {
     hwnd_properties.pixelSize.height = (UINT32)(rect.bottom - rect.top);
     hwnd_properties.presentOptions = D2D1_PRESENT_OPTIONS_NONE;
 
-    HRESULT hr = ID2D1Factory_CreateHwndRenderTarget(
+    HRESULT hr = BLUEY_CREATE_HWND_RENDER_TARGET(
         g_d2d_factory,
         &properties,
         &hwnd_properties,
@@ -854,7 +889,7 @@ static bool ensure_d2d_target(HWND hwnd) {
     }
 
     D2D1_COLOR_F brush_color = d2d_color_rgb(255, 255, 255, 1.0f);
-    hr = ID2D1HwndRenderTarget_CreateSolidColorBrush(
+    hr = BLUEY_CREATE_SOLID_COLOR_BRUSH(
         g_d2d_target,
         &brush_color,
         NULL,
@@ -875,7 +910,7 @@ static void resize_d2d_target(HWND hwnd) {
     D2D1_SIZE_U size;
     size.width = (UINT32)(rect.right - rect.left);
     size.height = (UINT32)(rect.bottom - rect.top);
-    if (FAILED(ID2D1HwndRenderTarget_Resize(g_d2d_target, &size))) {
+    if (FAILED(BLUEY_TARGET_RESIZE(g_d2d_target, &size))) {
         release_d2d_target();
     }
 }
@@ -887,14 +922,14 @@ static void draw_bluey_logo_d2d(float x, float y, float size) {
     d2d_stroke_round(x + size * 0.20f, y + size * 0.33f, x + size * 0.80f, y + size * 0.76f, size * 0.14f, 100, 233, 255, 1.0f, 1.6f);
 
     d2d_set_brush_color(245, 252, 255, 1.0f);
-    ID2D1HwndRenderTarget_DrawLine(g_d2d_target, d2d_point(x + size * 0.34f, y + size * 0.45f), d2d_point(x + size * 0.44f, y + size * 0.50f), (ID2D1Brush *)g_d2d_brush, 2.0f, NULL);
-    ID2D1HwndRenderTarget_DrawLine(g_d2d_target, d2d_point(x + size * 0.44f, y + size * 0.50f), d2d_point(x + size * 0.34f, y + size * 0.58f), (ID2D1Brush *)g_d2d_brush, 2.0f, NULL);
+    BLUEY_DRAW_LINE(g_d2d_target, d2d_point(x + size * 0.34f, y + size * 0.45f), d2d_point(x + size * 0.44f, y + size * 0.50f), g_d2d_brush, 2.0f, NULL);
+    BLUEY_DRAW_LINE(g_d2d_target, d2d_point(x + size * 0.44f, y + size * 0.50f), d2d_point(x + size * 0.34f, y + size * 0.58f), g_d2d_brush, 2.0f, NULL);
     d2d_set_brush_color(122, 248, 255, 1.0f);
-    ID2D1HwndRenderTarget_DrawLine(g_d2d_target, d2d_point(x + size * 0.50f, y + size * 0.61f), d2d_point(x + size * 0.66f, y + size * 0.61f), (ID2D1Brush *)g_d2d_brush, 2.0f, NULL);
+    BLUEY_DRAW_LINE(g_d2d_target, d2d_point(x + size * 0.50f, y + size * 0.61f), d2d_point(x + size * 0.66f, y + size * 0.61f), g_d2d_brush, 2.0f, NULL);
 
     d2d_set_brush_color(139, 255, 157, 1.0f);
-    ID2D1HwndRenderTarget_DrawLine(g_d2d_target, d2d_point(x + size * 0.72f, y + size * 0.20f), d2d_point(x + size * 0.72f, y + size * 0.52f), (ID2D1Brush *)g_d2d_brush, 1.6f, NULL);
-    ID2D1HwndRenderTarget_DrawLine(g_d2d_target, d2d_point(x + size * 0.56f, y + size * 0.36f), d2d_point(x + size * 0.88f, y + size * 0.36f), (ID2D1Brush *)g_d2d_brush, 1.6f, NULL);
+    BLUEY_DRAW_LINE(g_d2d_target, d2d_point(x + size * 0.72f, y + size * 0.20f), d2d_point(x + size * 0.72f, y + size * 0.52f), g_d2d_brush, 1.6f, NULL);
+    BLUEY_DRAW_LINE(g_d2d_target, d2d_point(x + size * 0.56f, y + size * 0.36f), d2d_point(x + size * 0.88f, y + size * 0.36f), g_d2d_brush, 1.6f, NULL);
 }
 
 static void draw_resize_affordance_d2d(RECT rect) {
@@ -904,7 +939,7 @@ static void draw_resize_affordance_d2d(RECT rect) {
     float bottom = (float)rect.bottom - 10.0f;
     for (int i = 0; i < 3; i++) {
         float offset = 7.0f + ((float)i * 6.0f);
-        ID2D1HwndRenderTarget_DrawLine(g_d2d_target, d2d_point(right - offset, bottom), d2d_point(right, bottom - offset), (ID2D1Brush *)g_d2d_brush, 2.0f, NULL);
+        BLUEY_DRAW_LINE(g_d2d_target, d2d_point(right - offset, bottom), d2d_point(right, bottom - offset), g_d2d_brush, 2.0f, NULL);
     }
 }
 
@@ -913,9 +948,9 @@ static bool paint_with_d2d(HWND hwnd) {
 
     RECT rect;
     GetClientRect(hwnd, &rect);
-    ID2D1HwndRenderTarget_BeginDraw(g_d2d_target);
+    BLUEY_BEGIN_DRAW(g_d2d_target);
     D2D1_COLOR_F bg_color = g_light_theme ? d2d_color_rgb(246, 250, 252, 1.0f) : d2d_color_rgb(2, 4, 6, 1.0f);
-    ID2D1HwndRenderTarget_Clear(g_d2d_target, &bg_color);
+    BLUEY_CLEAR(g_d2d_target, &bg_color);
 
     if (g_collapsed) {
         draw_bluey_logo_d2d(10.0f, 8.0f, 25.0f);
@@ -924,7 +959,7 @@ static bool paint_with_d2d(HWND hwnd) {
         dot.point = d2d_point((float)rect.right - 17.0f, 14.0f);
         dot.radiusX = 5.0f;
         dot.radiusY = 5.0f;
-        ID2D1HwndRenderTarget_FillEllipse(g_d2d_target, &dot, (ID2D1Brush *)g_d2d_brush);
+        BLUEY_FILL_ELLIPSE(g_d2d_target, &dot, g_d2d_brush);
         d2d_text(L"Bluey", g_fmt_pill, d2d_rectf(40.0f, 0.0f, (float)rect.right - 16.0f, (float)rect.bottom), g_light_theme ? 8 : 235, g_light_theme ? 22 : 245, g_light_theme ? 32 : 255, 1.0f);
     } else {
         int header_w = clamp_int((rect.right * 84) / 100, 520, 780);
@@ -947,7 +982,7 @@ static bool paint_with_d2d(HWND hwnd) {
         record_dot.point = d2d_point((float)header_left + 114.5f, 29.5f);
         record_dot.radiusX = 4.5f;
         record_dot.radiusY = 4.5f;
-        ID2D1HwndRenderTarget_FillEllipse(g_d2d_target, &record_dot, (ID2D1Brush *)g_d2d_brush);
+        BLUEY_FILL_ELLIPSE(g_d2d_target, &record_dot, g_d2d_brush);
 
         d2d_text(L"Bluey", g_fmt_brand, d2d_rectf((float)header_left + 50.0f, 10.0f, (float)header_left + 118.0f, 46.0f), g_light_theme ? 8 : 230, g_light_theme ? 22 : 240, g_light_theme ? 32 : 245, 1.0f);
 
@@ -970,7 +1005,7 @@ static bool paint_with_d2d(HWND hwnd) {
         d2d_text(g_body, g_fmt_body, d2d_rectf(18.0f, (float)body_top, (float)rect.right - 18.0f, (float)rect.bottom - 124.0f), g_light_theme ? 22 : 230, g_light_theme ? 43 : 240, g_light_theme ? 56 : 245, 1.0f);
     }
 
-    HRESULT hr = ID2D1HwndRenderTarget_EndDraw(g_d2d_target, NULL, NULL);
+    HRESULT hr = BLUEY_END_DRAW(g_d2d_target, NULL, NULL);
     if (hr == D2DERR_RECREATE_TARGET) {
         release_d2d_target();
         return false;
