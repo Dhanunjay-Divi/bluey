@@ -2,7 +2,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
+swift build -c release
 mkdir -p .build
-swiftc -O -framework AppKit main.swift -o .build/bluey-overlay-macos
-cp .build/bluey-overlay-macos .build/cue-overlay-macos
+cp "$(swift build -c release --show-bin-path)/cue-overlay" .build/bluey-overlay-macos
 echo ".build/bluey-overlay-macos"
