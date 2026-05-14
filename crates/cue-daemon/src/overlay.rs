@@ -1,34 +1,4 @@
 //! Daemon ↔ native-overlay process IPC.
-//!
-//! The native overlay (Swift on macOS, C on Windows in later phases) is a
-//! child process. The daemon drives it over stdin (NDJSON
-//! [`OverlayMessage`]s) and listens to stdout (NDJSON
-//! [`OverlayIpcCommand`]s).
-//!
-//! This module isolates all of that plumbing behind one type,
-//! [`NativeOverlayHandle`]. The rest of the daemon just calls `send(...)`
-//! and `try_recv()`; restart, reader/writer tasks, and backoff all live
-//! inside here.
-//!
-//! ### Process lifecycle
-//!
-//! - `spawn(path, args)` launches the binary, connects stdin/stdout, and
-//!   starts writer + reader + watcher tasks.
-//! - The watcher observes the child exit and updates
-//!   [`OverlayProcessState`] accordingly. **It does NOT relaunch the
-//!   child in this round.** A restart loop is scaffolded via
-//!   [`restart_delay`] and [`OverlayProcessState::Restarting`] but the
-//!   actual relaunch plumbing lands in a follow-up once we have a real
-//!   Swift/C overlay to drive restart semantics against.
-//! - `shutdown()` (also runs on Drop) signals both tasks to exit and waits
-//!   for the child to die. It does NOT send a kill signal first — it closes
-//!   stdin, which the stub / real overlay uses to notice it should exit.
-//!
-//! ### Testing
-//!
-//! The integration test spawns `overlay-stub` (a tiny Rust binary in
-//! `src/bin/overlay_stub.rs`) and drives a real `NativeOverlayHandle`
-//! against it. See `tests/overlay_pipe_integration.rs`.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -42,30 +12,18 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
-/// Upper bound on consecutive child-process restart attempts before we give
-/// up and mark the handle as failed. Backoff doubles from 250 ms, capped at
-/// 5 s, giving ~15 s of total budget before failure.
 pub const MAX_RESTART_ATTEMPTS: u32 = 5;
 
-/// Coarse-grained state of the overlay-process side of the pipe. Queried
-/// via [`NativeOverlayHandle::state`] for telemetry and UI banners.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlayProcessState {
-    /// Process not started or already shut down.
     Idle,
-    /// Starting up (between `spawn_child` and first successful I/O).
     Starting,
-    /// Running — writer and reader tasks are active.
     Running,
-    /// Process died, waiting to restart with backoff.
     Restarting { attempt: u32 },
-    /// Gave up after [`MAX_RESTART_ATTEMPTS`].
     Failed,
-    /// `shutdown` was called — will not restart.
     ShuttingDown,
 }
 
-/// Options used to spawn the overlay child.
 #[derive(Debug, Clone)]
 pub struct OverlaySpawnOptions {
     pub executable: PathBuf,
@@ -86,12 +44,8 @@ impl OverlaySpawnOptions {
     }
 }
 
-/// Shared state accessed by the handle, the writer task, the reader task,
-/// and the watcher/restart task.
 struct Shared {
     state: Mutex<OverlayProcessState>,
-    /// Flag consulted by tasks on every loop iteration — set to true when
-    /// `shutdown` is called so tasks can exit without a channel drop.
     shutdown_requested: std::sync::atomic::AtomicBool,
 }
 
@@ -113,11 +67,6 @@ impl Shared {
     }
 }
 
-/// Handle to a running (or restarting) overlay child process.
-///
-/// Construction is async (spawn requires a runtime context); once built,
-/// both sending and receiving are non-blocking. Dropping the handle runs
-/// `shutdown` implicitly.
 pub struct NativeOverlayHandle {
     send_tx: UnboundedSender<OverlayMessage>,
     recv_rx: UnboundedReceiver<OverlayIpcCommand>,
@@ -126,23 +75,16 @@ pub struct NativeOverlayHandle {
 }
 
 impl NativeOverlayHandle {
-    /// Spawn the overlay child process and start the IPC tasks.
-    ///
-    /// Returns an error if the executable path is invalid / not executable.
-    /// I/O problems AFTER a successful spawn are handled by the restart
-    /// watcher — they do not return here.
     pub async fn spawn(opts: OverlaySpawnOptions) -> std::io::Result<Self> {
         let shared = Arc::new(Shared::new());
         let (send_tx, send_rx) = unbounded_channel::<OverlayMessage>();
         let (recv_tx, recv_rx) = unbounded_channel::<OverlayIpcCommand>();
 
         shared.set_state(OverlayProcessState::Starting);
-
         let child = spawn_child(&opts).await?;
         shared.set_state(OverlayProcessState::Running);
 
         let tasks = wire_child(child, opts, shared.clone(), send_rx, recv_tx);
-
         Ok(Self {
             send_tx,
             recv_rx,
@@ -151,45 +93,29 @@ impl NativeOverlayHandle {
         })
     }
 
-    /// Enqueue a message for the overlay. Non-blocking. Returns `Err`
-    /// when the writer task's receiver has been dropped (e.g. the task
-    /// has already exited due to a broken pipe or explicit shutdown).
-    /// Note: `shutdown(self)` consumes the handle, so a caller cannot
-    /// observe this error via a post-shutdown `send` on the same handle
-    /// - it only surfaces when the writer dies mid-flight.
     pub fn send(&self, msg: OverlayMessage) -> Result<(), OverlayMessage> {
         self.send_tx.send(msg).map_err(|e| e.0)
     }
 
-    /// Await the next `OverlayIpcCommand` from the overlay, if any.
-    /// Returns `None` when the pipe is permanently closed.
     pub async fn next_command(&mut self) -> Option<OverlayIpcCommand> {
         self.recv_rx.recv().await
     }
 
-    /// Non-blocking peek. Returns `None` if no command is pending.
     pub fn try_next_command(&mut self) -> Option<OverlayIpcCommand> {
         self.recv_rx.try_recv().ok()
     }
 
-    /// Current process state. Useful for UI indicators.
     pub fn state(&self) -> OverlayProcessState {
         *self.shared.state.lock()
     }
 
-    /// Request shutdown. Tasks will exit promptly; the watcher will not
-    /// restart the child. Safe to call multiple times.
     pub async fn shutdown(mut self) {
         self.shared
             .shutdown_requested
             .store(true, std::sync::atomic::Ordering::Release);
         self.shared.set_state(OverlayProcessState::ShuttingDown);
-        // Drop the sender so the writer task sees channel close and exits.
-        // Safety:  is replaced with a dead channel; the handle
-        // is being consumed anyway.
         let (dead_tx, _dead_rx) = unbounded_channel();
         let _ = std::mem::replace(&mut self.send_tx, dead_tx);
-        // Take the tasks vec out so we own it independently of .
         let tasks = std::mem::take(&mut self._tasks);
         for handle in tasks {
             let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
@@ -215,114 +141,265 @@ async fn spawn_child(opts: &OverlaySpawnOptions) -> std::io::Result<Child> {
         .spawn()
 }
 
-/// Start the writer + reader + watcher tasks for a spawned child. Returns
-/// the list of `JoinHandle`s so the caller can join on shutdown.
 fn wire_child(
-    mut child: Child,
+    initial_child: Child,
     opts: OverlaySpawnOptions,
+    shared: Arc<Shared>,
+    send_rx: UnboundedReceiver<OverlayMessage>,
+    recv_tx: UnboundedSender<OverlayIpcCommand>,
+) -> Vec<JoinHandle<()>> {
+    vec![tokio::spawn(run_supervisor(
+        initial_child,
+        opts,
+        shared,
+        send_rx,
+        recv_tx,
+    ))]
+}
+
+/// One iteration of the supervisor: drives a child to completion.
+///
+/// The supervisor owns `send_rx` and writes directly to the child's stdin.
+/// A `shutdown_notify` is used to signal the supervisor when the reader
+/// detects EOF (child exited). The supervisor selects on `child.wait()`,
+/// `send_rx.recv()`, and the EOF notify. When the child exits, any message
+/// that was written to stdin but not confirmed read by the child is carried
+/// over to the next generation.
+async fn run_one_child(
+    mut child: Child,
     shared: Arc<Shared>,
     mut send_rx: UnboundedReceiver<OverlayMessage>,
     recv_tx: UnboundedSender<OverlayIpcCommand>,
-) -> Vec<JoinHandle<()>> {
-    let mut tasks = Vec::with_capacity(3);
-
-    let stdin = child.stdin.take().expect("stdin piped");
+    carryover_in: Option<OverlayMessage>,
+) -> (
+    UnboundedReceiver<OverlayMessage>,
+    Option<OverlayMessage>,
+    bool,
+) {
+    tracing::debug!("run_one_child: starting new generation");
+    let mut stdin = child.stdin.take().expect("stdin piped");
     let stdout = child.stdout.take().expect("stdout piped");
 
-    // Writer: drain send_rx → child stdin.
-    let shared_w = shared.clone();
-    tasks.push(tokio::spawn(async move {
-        let mut stdin = stdin;
-        while let Some(msg) = send_rx.recv().await {
-            if shared_w.is_shutdown_requested() {
-                break;
-            }
-            let line = match encode_ndjson(&msg) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to encode overlay message");
-                    continue;
-                }
-            };
-            if let Err(e) = stdin.write_all(line.as_bytes()).await {
-                tracing::warn!(error = %e, "overlay stdin write failed");
-                break;
-            }
-            if let Err(e) = stdin.flush().await {
-                tracing::warn!(error = %e, "overlay stdin flush failed");
-                break;
-            }
-        }
-    }));
+    // Track messages written since last child output (pong/response).
+    // When child exits, the last unacknowledged message is carryover.
+    let msgs_written = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let msgs_acked = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
-    // Reader: stream child stdout lines → recv_tx.
-    let shared_r = shared.clone();
+    // Reader task.
     let recv_tx_reader = recv_tx.clone();
-    tasks.push(tokio::spawn(async move {
+    let shared_r = shared.clone();
+    let msgs_acked_r = msgs_acked.clone();
+    let reader = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         loop {
             if shared_r.is_shutdown_requested() {
                 break;
             }
             match lines.next_line().await {
-                Ok(Some(line)) => match decode_ndjson(&line) {
-                    Ok(OverlayMessage::Ping) => {
-                        // Overlay responding with a ping instead of a proper command
-                        // is allowed during handshake — treat as a Pong-equivalent.
-                        let _ = recv_tx_reader.send(OverlayIpcCommand::Pong);
-                    }
-                    Ok(_) => {
-                        // Overlay stdout is expected to carry COMMANDS not MESSAGES.
-                        // Anything else is a protocol mismatch — log and move on.
-                        tracing::warn!(line = %line, "overlay sent message on reverse pipe");
-                    }
-                    Err(_) => {
-                        // Try decoding as a command (proper reverse-direction type).
-                        match serde_json::from_str::<OverlayIpcCommand>(&line) {
+                Ok(Some(line)) => {
+                    tracing::debug!(line = %line, "reader: got line");
+                    // Child produced output — it has read all messages up to now.
+                    msgs_acked_r.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    match decode_ndjson(&line) {
+                        Ok(OverlayMessage::Ping) => {
+                            let _ = recv_tx_reader.send(OverlayIpcCommand::Pong);
+                        }
+                        Ok(_) => {
+                            tracing::warn!(line = %line, "overlay sent message on reverse pipe");
+                        }
+                        Err(_) => match serde_json::from_str::<OverlayIpcCommand>(&line) {
                             Ok(cmd) => {
                                 let _ = recv_tx_reader.send(cmd);
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, line = %line, "bad overlay stdout line");
                             }
-                        }
+                        },
                     }
-                },
-                Ok(None) => break, // EOF — child closed stdout
+                }
+                Ok(None) => {
+                    tracing::debug!("reader: EOF");
+                    break;
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, "overlay stdout read error");
                     break;
                 }
             }
         }
-    }));
+    });
 
-    // Watcher: wait on the child; restart with backoff if it dies unexpectedly.
-    let shared_wait = shared.clone();
-    tasks.push(tokio::spawn(async move {
-        // Phase 3 scope: restart loop left as a single-shot for the first
-        // child. A future phase will extend this to relaunch the child with
-        // backoff on unexpected exit. For now, just observe the exit and
-        // update state — integration tests exercise the single-shot path.
-        let status = child.wait().await;
-        if shared_wait.is_shutdown_requested() {
-            shared_wait.set_state(OverlayProcessState::ShuttingDown);
-        } else {
-            match status {
-                Ok(s) if s.success() => shared_wait.set_state(OverlayProcessState::Idle),
-                Ok(_) | Err(_) => shared_wait.set_state(OverlayProcessState::Failed),
+    // Helper to write one message to stdin.
+    async fn write_msg(stdin: &mut tokio::process::ChildStdin, msg: &OverlayMessage) -> bool {
+        let line = match encode_ndjson(msg) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to encode overlay message");
+                return true; // encoding error — drop msg
+            }
+        };
+        stdin.write_all(line.as_bytes()).await.is_ok() && stdin.flush().await.is_ok()
+    }
+
+    // Write carryover first.
+    if let Some(ref msg) = carryover_in {
+        tracing::debug!("supervisor: writing carryover msg");
+        if !write_msg(&mut stdin, msg).await {
+            drop(stdin);
+            let _ = reader.await;
+            let status = child.wait().await;
+            let clean = matches!(&status, Ok(s) if s.success());
+            return (send_rx, carryover_in, clean);
+        }
+        msgs_written.fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    // Main select loop.
+    let mut wait_fut = Box::pin(child.wait());
+    let mut last_msg: Option<OverlayMessage> = carryover_in;
+    let mut write_failed = false;
+    let mut rx_closed = false;
+
+    let status = loop {
+        if shared.is_shutdown_requested() || rx_closed {
+            break (&mut wait_fut).await;
+        }
+        tokio::select! {
+            biased;
+            s = &mut wait_fut => break s,
+            msg = send_rx.recv() => {
+                match msg {
+                    Some(m) => {
+                        if !write_msg(&mut stdin, &m).await {
+                            last_msg = Some(m);
+                            write_failed = true;
+                            break (&mut wait_fut).await;
+                        }
+                        msgs_written.fetch_add(1, std::sync::atomic::Ordering::Release);
+                        last_msg = Some(m);
+                    }
+                    None => { rx_closed = true; }
+                }
             }
         }
-        // `opts` retained so a future restart implementation has the
-        // original spawn args without needing another allocation.
-        let _ = opts;
-    }));
+    };
 
-    tasks
+    let clean_exit = matches!(&status, Ok(s) if s.success());
+
+    // Drop stdin so reader sees EOF.
+    drop(stdin);
+    let _ = reader.await;
+
+    // Determine carryover: if we wrote more messages than the child acked,
+    // the last written message was likely not read.
+    let written = msgs_written.load(std::sync::atomic::Ordering::Acquire);
+    let acked = msgs_acked.load(std::sync::atomic::Ordering::Acquire);
+    let carryover_out = if !clean_exit && (written > acked || write_failed) {
+        last_msg
+    } else {
+        None
+    };
+
+    tracing::debug!(
+        carryover = carryover_out.is_some(),
+        clean = clean_exit,
+        written = written,
+        acked = acked,
+        "run_one_child: finished"
+    );
+    (send_rx, carryover_out, clean_exit)
 }
 
-/// Exponential backoff helper for child-process restarts. Same shape as the
-/// Deepgram one but with a lower cap (5 s) because the overlay is local.
+async fn run_supervisor(
+    initial_child: Child,
+    opts: OverlaySpawnOptions,
+    shared: Arc<Shared>,
+    mut send_rx: UnboundedReceiver<OverlayMessage>,
+    recv_tx: UnboundedSender<OverlayIpcCommand>,
+) {
+    let mut current_child = initial_child;
+    let mut consecutive_failures: u32 = 0;
+    let mut carryover: Option<OverlayMessage> = None;
+
+    loop {
+        let (rx_back, carryover_out, clean_exit) = run_one_child(
+            current_child,
+            shared.clone(),
+            send_rx,
+            recv_tx.clone(),
+            carryover.take(),
+        )
+        .await;
+        send_rx = rx_back;
+        carryover = carryover_out;
+
+        if shared.is_shutdown_requested() {
+            shared.set_state(OverlayProcessState::ShuttingDown);
+            return;
+        }
+
+        if clean_exit {
+            shared.set_state(OverlayProcessState::Idle);
+            return;
+        }
+
+        consecutive_failures += 1;
+        if consecutive_failures > MAX_RESTART_ATTEMPTS {
+            tracing::error!(
+                attempts = consecutive_failures,
+                "overlay child failed too many times; giving up"
+            );
+            shared.set_state(OverlayProcessState::Failed);
+            return;
+        }
+
+        let delay = restart_delay(consecutive_failures - 1);
+        shared.set_state(OverlayProcessState::Restarting {
+            attempt: consecutive_failures,
+        });
+        tracing::warn!(
+            attempt = consecutive_failures,
+            delay_ms = delay.as_millis() as u64,
+            executable = %opts.executable.display(),
+            "overlay child exited unexpectedly; respawning"
+        );
+        tokio::time::sleep(delay).await;
+
+        match spawn_child(&opts).await {
+            Ok(c) => {
+                current_child = c;
+                shared.set_state(OverlayProcessState::Running);
+                consecutive_failures = 0;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    attempt = consecutive_failures,
+                    "overlay respawn failed; will retry"
+                );
+                if consecutive_failures > MAX_RESTART_ATTEMPTS {
+                    shared.set_state(OverlayProcessState::Failed);
+                    return;
+                }
+                let next_delay = restart_delay(consecutive_failures);
+                tokio::time::sleep(next_delay).await;
+                match spawn_child(&opts).await {
+                    Ok(c) => {
+                        current_child = c;
+                        shared.set_state(OverlayProcessState::Running);
+                        consecutive_failures = 0;
+                    }
+                    Err(e2) => {
+                        tracing::error!(error = %e2, "overlay respawn failed twice; giving up");
+                        shared.set_state(OverlayProcessState::Failed);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn restart_delay(attempt: u32) -> Duration {
     let base_ms: u64 = 250;
     let capped = attempt.min(6);
@@ -352,7 +429,6 @@ mod tests {
         assert_eq!(restart_delay(0).as_millis(), 250);
         assert_eq!(restart_delay(1).as_millis(), 500);
         assert_eq!(restart_delay(4).as_millis(), 4_000);
-        // capped at 5000
         assert_eq!(restart_delay(10).as_millis(), 5_000);
     }
 

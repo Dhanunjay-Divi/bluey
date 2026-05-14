@@ -46,3 +46,7 @@ single_char_add_str = "allow"
 [[bin]]
 name = "overlay-stub"
 path = "src/bin/overlay_stub.rs"
+
+[[bin]]
+name = "overlay-stub-oneshot"
+path = "src/bin/overlay_stub_oneshot.rs"
