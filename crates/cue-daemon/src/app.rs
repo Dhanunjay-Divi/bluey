@@ -457,17 +457,41 @@ pub async fn run() -> Result<()> {
         .map(|v| v == "1")
         .unwrap_or(false)
     {
+        let stt_enabled = crate::audio::system_capture::is_system_audio_stt_enabled();
         let (sys_tx, mut sys_rx) = mpsc::unbounded_channel();
         match crate::audio::system_capture::SystemAudioCapture::start(sys_tx) {
             Ok(_handle) => {
-                info!("system audio continuous capture started");
+                info!(
+                    system_stt = stt_enabled,
+                    "system audio continuous capture started"
+                );
                 let daemon_sys = daemon.clone();
                 tokio::spawn(async move {
+                    let mut stt: Option<Box<dyn cue_core::stt::SttProvider>> = if stt_enabled {
+                        match build_system_audio_stt_provider().await {
+                            Ok(provider) => Some(provider),
+                            Err(e) => {
+                                warn!("system audio STT provider failed to start: {e:#}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
                     while let Some(chunk) = sys_rx.recv().await {
-                        let text = format!("[system audio chunk: {}ms]", chunk.duration_ms());
-                        debug!("{text}");
-                        let _ = &daemon_sys;
+                        debug!("[system audio chunk: {}ms]", chunk.duration_ms());
+                        if let Some(ref provider) = stt {
+                            if let Err(e) = provider.send_audio(&chunk).await {
+                                warn!("system audio STT send failed: {e}");
+                            }
+                        }
                     }
+
+                    if let Some(ref mut provider) = stt {
+                        let _ = provider.close().await;
+                    }
+                    let _ = &daemon_sys;
                 });
             }
             Err(e) => {
@@ -1252,6 +1276,52 @@ async fn start_audio_capture(
     }
 
     Ok(status)
+}
+
+/// Build an STT provider for the system audio continuous capture path.
+async fn build_system_audio_stt_provider() -> anyhow::Result<Box<dyn cue_core::stt::SttProvider>> {
+    use cue_core::pcm::AudioSource;
+    use cue_core::stt::SttConfig;
+
+    let stt_cfg = SttConfig {
+        source: AudioSource::System,
+        ..Default::default()
+    };
+
+    if crate::stt::router::is_router_enabled() {
+        let mut providers: Vec<Box<dyn cue_core::stt::SttProvider>> = Vec::new();
+
+        if let Some(api_key) = env_first(&["BLUEY_STT_API_KEY", "DEEPGRAM_API_KEY"]) {
+            let dg_cfg = crate::stt::deepgram::DeepgramConfig {
+                api_key,
+                ..Default::default()
+            };
+            let provider = crate::stt::deepgram::DeepgramProvider::connect(
+                dg_cfg,
+                stt_cfg.clone(),
+                AudioSource::System,
+            )
+            .await?;
+            providers.push(Box::new(provider));
+        }
+
+        providers.push(Box::new(crate::stt::echo::EchoProvider::new(
+            AudioSource::System,
+        )));
+
+        Ok(Box::new(crate::stt::router::SttRouter::new(providers)))
+    } else {
+        let api_key = env_first(&["BLUEY_STT_API_KEY", "DEEPGRAM_API_KEY"])
+            .ok_or_else(|| anyhow::anyhow!("no STT API key configured for system audio"))?;
+        let dg_cfg = crate::stt::deepgram::DeepgramConfig {
+            api_key,
+            ..Default::default()
+        };
+        let provider =
+            crate::stt::deepgram::DeepgramProvider::connect(dg_cfg, stt_cfg, AudioSource::System)
+                .await?;
+        Ok(Box::new(provider))
+    }
 }
 
 async fn build_real_audio_runtime_config(
