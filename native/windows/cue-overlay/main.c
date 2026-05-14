@@ -81,6 +81,11 @@ static IDWriteTextFormat *g_fmt_brand = NULL;
 static IDWriteTextFormat *g_fmt_label = NULL;
 static IDWriteTextFormat *g_fmt_title = NULL;
 static IDWriteTextFormat *g_fmt_body = NULL;
+static IDWriteTextFormat *g_fmt_partial = NULL;
+static wchar_t g_transcript_partial[1024] = L"";
+static wchar_t g_transcript_final[1024] = L"";
+static wchar_t g_session_banner[256] = L"";
+static ULONGLONG g_session_banner_tick = 0;
 
 #ifdef __cplusplus
 #define BLUEY_COM_RELEASE(ptr) (ptr)->Release()
@@ -669,6 +674,20 @@ static DWORD WINAPI stdin_thread(LPVOID unused) {
         } else if (strstr(line, "\"type\":\"shutdown\"")) {
             PostMessage(g_hwnd, WM_CLOSE, 0, 0);
             break;
+        } else if (strstr(line, "\"type\":\"transcript_partial\"")) {
+            naive_extract_json_string(line, "text", g_transcript_partial, 1024);
+            InvalidateRect(g_hwnd, NULL, TRUE);
+        } else if (strstr(line, "\"type\":\"transcript_final\"")) {
+            naive_extract_json_string(line, "text", g_transcript_final, 1024);
+            g_transcript_partial[0] = L'\0';
+            InvalidateRect(g_hwnd, NULL, TRUE);
+        } else if (strstr(line, "\"type\":\"session_switched\"")) {
+            naive_extract_json_string(line, "title", g_session_banner, 256);
+            if (wcslen(g_session_banner) == 0) wcscpy_s(g_session_banner, 256, L"New session");
+            g_session_banner_tick = GetTickCount64();
+            g_transcript_partial[0] = L'\0';
+            g_transcript_final[0] = L'\0';
+            InvalidateRect(g_hwnd, NULL, TRUE);
         } else if (strstr(line, "\"type\":\"ping\"")) {
             printf("{\"type\":\"pong\"}\n");
             fflush(stdout);
@@ -731,6 +750,10 @@ static void release_d2d_resources(void) {
     if (g_fmt_body) {
         BLUEY_COM_RELEASE(g_fmt_body);
         g_fmt_body = NULL;
+    }
+    if (g_fmt_partial) {
+        BLUEY_COM_RELEASE(g_fmt_partial);
+        g_fmt_partial = NULL;
     }
     if (g_dwrite_factory) {
         BLUEY_COM_RELEASE(g_dwrite_factory);
@@ -845,7 +868,8 @@ static bool init_d2d_resources(void) {
         FAILED(create_text_format(20.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, &g_fmt_brand)) ||
         FAILED(create_text_format(13.0f, DWRITE_FONT_WEIGHT_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, &g_fmt_label)) ||
         FAILED(create_text_format(21.0f, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, &g_fmt_title)) ||
-        FAILED(create_text_format(16.0f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, &g_fmt_body))) {
+        FAILED(create_text_format(16.0f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, &g_fmt_body)) ||
+        FAILED(create_text_format(13.0f, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_PARAGRAPH_ALIGNMENT_NEAR, &g_fmt_partial))) {
         release_d2d_resources();
         return false;
     }
@@ -1003,6 +1027,31 @@ static bool paint_with_d2d(HWND hwnd) {
             d2d_text(g_title, g_fmt_title, d2d_rectf(18.0f, 82.0f, (float)rect.right - 18.0f, 108.0f), g_light_theme ? 8 : 230, g_light_theme ? 22 : 240, g_light_theme ? 32 : 245, 1.0f);
         }
         d2d_text(g_body, g_fmt_body, d2d_rectf(18.0f, (float)body_top, (float)rect.right - 18.0f, (float)rect.bottom - 124.0f), g_light_theme ? 22 : 230, g_light_theme ? 43 : 240, g_light_theme ? 56 : 245, 1.0f);
+
+        /* Transcript overlay: bottom-right floating banner (~400x80) */
+        {
+            float tx_right = (float)rect.right - 12.0f;
+            float tx_bottom = (float)rect.bottom - 126.0f;
+            float tx_left = tx_right - 400.0f;
+            if (tx_left < 12.0f) tx_left = 12.0f;
+            float tx_top = tx_bottom - 80.0f;
+
+            /* Session banner (3 seconds) */
+            if (g_session_banner[0] && (GetTickCount64() - g_session_banner_tick) < 3000) {
+                d2d_fill_round(tx_left, tx_top, tx_right, tx_bottom, 8.0f, 10, 30, 50, 0.85f);
+                d2d_text(g_session_banner, g_fmt_label, d2d_rectf(tx_left + 10.0f, tx_top + 4.0f, tx_right - 10.0f, tx_bottom - 4.0f), 100, 230, 255, 1.0f);
+            } else if (g_transcript_final[0] || g_transcript_partial[0]) {
+                d2d_fill_round(tx_left, tx_top, tx_right, tx_bottom, 8.0f, 5, 10, 18, 0.82f);
+                /* Final text (normal, white) */
+                if (g_transcript_final[0]) {
+                    d2d_text(g_transcript_final, g_fmt_body, d2d_rectf(tx_left + 10.0f, tx_top + 4.0f, tx_right - 10.0f, tx_top + 44.0f), 235, 245, 255, 1.0f);
+                }
+                /* Partial text (dim, italic via g_fmt_partial) */
+                if (g_transcript_partial[0]) {
+                    d2d_text(g_transcript_partial, g_fmt_partial, d2d_rectf(tx_left + 10.0f, tx_top + 44.0f, tx_right - 10.0f, tx_bottom - 4.0f), 180, 200, 220, 0.7f);
+                }
+            }
+        }
     }
 
     HRESULT hr = BLUEY_END_DRAW(g_d2d_target, NULL, NULL);
