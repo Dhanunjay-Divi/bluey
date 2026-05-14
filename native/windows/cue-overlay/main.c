@@ -141,6 +141,11 @@ static ULONGLONG g_session_banner_tick = 0;
 #define ID_RECAP_BUTTON 1011
 #define ID_THEME_BUTTON 1012
 
+/* Stealth: hide overlay from screen recording, screenshots, and screen-share.
+ * WDA_EXCLUDEFROMCAPTURE (Windows 10 2004+ / build 19041) makes the window
+ * invisible to all capture APIs (OBS, Teams screen-share, Win+Shift+S, etc.).
+ * Fallback: WDA_MONITOR renders the window as black in captures on older builds
+ * (still hidden from casual observation but not fully invisible). */
 static void apply_capture_exclusion(HWND hwnd) {
     if (!SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)) {
         SetWindowDisplayAffinity(hwnd, WDA_MONITOR);
@@ -1405,6 +1410,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     RegisterClassW(&wc);
 
+    /* Stealth: WS_EX_TOOLWINDOW removes the window from Alt+Tab and the
+     * taskbar, making it invisible in the task switcher. Combined with
+     * WDA_EXCLUDEFROMCAPTURE this ensures the overlay leaves no trace in
+     * screen recordings or window lists. */
     DWORD ex_style = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW;
     g_hwnd = CreateWindowExW(
         ex_style,

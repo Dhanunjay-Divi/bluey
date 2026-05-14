@@ -139,8 +139,11 @@ private final class TranscriptView: NSView {
 
 private let app = NSApplication.shared
 
-// Hide from Dock — the overlay is an accessory process with no Dock icon,
-// no main menu, and no Cmd+Tab entry. This reduces visual footprint.
+// MARK: - Stealth
+
+// Hide from Dock and Cmd+Tab — .accessory activation policy means no Dock
+// icon, no main menu bar, and no entry in the application switcher. The
+// overlay is invisible in the macOS UI chrome.
 app.setActivationPolicy(.accessory)
 
 private let window: NSWindow = {
@@ -164,8 +167,9 @@ private let window: NSWindow = {
     w.collectionBehavior = [.canJoinAllSpaces, .stationary]
 
     // Stealth: hide from screen recording, screenshots, and screen-share.
-    // .none means the window's content is not included in any captured
-    // image/stream (macOS 10.0+, effective for screen capture APIs).
+    // NSWindowSharingType.none excludes this window from all capture APIs
+    // (ScreenCaptureKit, CGWindowListCreateImage, OBS, Zoom/Teams share).
+    // The window is fully invisible in any recorded or shared output.
     w.sharingType = .none
 
     w.contentView = TranscriptView(frame: NSRect(origin: .zero, size: size))
