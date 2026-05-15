@@ -100,7 +100,11 @@ impl Database {
             .map_err(Into::into)
     }
 
-    pub fn export_session_markdown(&self, session_id: &str, opts: &ExportOptions) -> Result<String> {
+    pub fn export_session_markdown(
+        &self,
+        session_id: &str,
+        opts: &ExportOptions,
+    ) -> Result<String> {
         let session = self
             .get_session(uuid::Uuid::parse_str(session_id)?)
             .context("session lookup")?
@@ -131,7 +135,10 @@ impl Database {
                 if speaker_label.is_empty() {
                     out.push_str(&format!("{}{}\n\n", ts_prefix, t.text));
                 } else {
-                    out.push_str(&format!("{}**{}** ({}): {}\n\n", ts_prefix, speaker_label, t.source, t.text));
+                    out.push_str(&format!(
+                        "{}**{}** ({}): {}\n\n",
+                        ts_prefix, speaker_label, t.source, t.text
+                    ));
                 }
             }
         }
@@ -150,7 +157,9 @@ impl Database {
         out.push_str(&format!("{}\n", session.title));
         out.push_str(&format!("Date: {}\n\n", format_ts(session.created_at)));
         for t in &transcripts {
-            if !t.is_final { continue; }
+            if !t.is_final {
+                continue;
+            }
             let name = speaker_name(t.speaker_id, &speakers);
             if name.is_empty() {
                 out.push_str(&format!("[{}] {}\n", t.source, t.text));

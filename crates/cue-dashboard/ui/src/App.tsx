@@ -3,6 +3,7 @@ import { DashboardLayout } from "./components/DashboardLayout";
 import { Chats } from "./pages/Chats";
 import { SessionDetail } from "./pages/SessionDetail";
 import { Placeholder } from "./pages/Placeholder";
+import { Search } from "./routes/Search";
 
 function App() {
   return (
@@ -18,6 +19,7 @@ function App() {
           <Route path="responses" element={<Placeholder name="Responses" />} />
           <Route path="screenshot" element={<Placeholder name="Screenshot" />} />
           <Route path="audio" element={<Placeholder name="Audio" />} />
+          <Route path="search" element={<Search />} />
           <Route path="dev" element={<Placeholder name="Dev Tools" />} />
         </Route>
       </Routes>

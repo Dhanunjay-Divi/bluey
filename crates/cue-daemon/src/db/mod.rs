@@ -38,7 +38,8 @@ impl Database {
             include_str!("../../../../infra/migrations/003_turns_unique_index.sql");
         const MIGRATION_004: &str = include_str!("../../../../infra/migrations/004_app_state.sql");
         const MIGRATION_005: &str = include_str!("../../../../infra/migrations/005_settings.sql");
-        const MIGRATION_006: &str = include_str!("../../../../infra/migrations/006_transcript_fts.sql");
+        const MIGRATION_006: &str =
+            include_str!("../../../../infra/migrations/006_transcript_fts.sql");
         const MIGRATION_007: &str = include_str!("../../../../infra/migrations/007_speakers.sql");
         self.conn
             .execute_batch(MIGRATION_002)
@@ -297,7 +298,9 @@ impl Database {
     }
 
     pub fn load_setting(&self, key: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare("SELECT value FROM app_settings WHERE key = ?1")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM app_settings WHERE key = ?1")?;
         let mut rows = stmt.query(params![key])?;
         match rows.next()? {
             Some(row) => Ok(Some(row.get(0)?)),
@@ -719,9 +722,26 @@ mod fts_tests {
         let db = test_db();
         let session = db.create_session(Some("FTS Test".into())).unwrap();
         let sid = session.id.to_string();
-        db.insert_transcript(&sid, "hello world from the microphone", "mic", Some(0), true, 1000).unwrap();
-        db.insert_transcript(&sid, "system audio playing music", "system", None, true, 2000).unwrap();
-        db.insert_transcript(&sid, "hello again from speaker", "mic", Some(1), true, 3000).unwrap();
+        db.insert_transcript(
+            &sid,
+            "hello world from the microphone",
+            "mic",
+            Some(0),
+            true,
+            1000,
+        )
+        .unwrap();
+        db.insert_transcript(
+            &sid,
+            "system audio playing music",
+            "system",
+            None,
+            true,
+            2000,
+        )
+        .unwrap();
+        db.insert_transcript(&sid, "hello again from speaker", "mic", Some(1), true, 3000)
+            .unwrap();
         let hits = db.search_transcripts("hello", 10).unwrap();
         assert_eq!(hits.len(), 2);
         assert!(hits[0].snippet.contains("hello"));
@@ -736,8 +756,17 @@ mod fts_tests {
         let db = test_db();
         let session = db.create_session(Some("Rank Test".into())).unwrap();
         let sid = session.id.to_string();
-        db.insert_transcript(&sid, "the quick brown fox", "mic", None, true, 1000).unwrap();
-        db.insert_transcript(&sid, "fox fox fox repeated many times fox", "mic", None, true, 2000).unwrap();
+        db.insert_transcript(&sid, "the quick brown fox", "mic", None, true, 1000)
+            .unwrap();
+        db.insert_transcript(
+            &sid,
+            "fox fox fox repeated many times fox",
+            "mic",
+            None,
+            true,
+            2000,
+        )
+        .unwrap();
         let hits = db.search_transcripts("fox", 10).unwrap();
         assert_eq!(hits.len(), 2);
     }
@@ -747,7 +776,8 @@ mod fts_tests {
         let db = test_db();
         let session = db.create_session(Some("Speaker Test".into())).unwrap();
         let sid = session.id.to_string();
-        db.set_speaker_name(&sid, 0, "Alice", Some("#ff0000")).unwrap();
+        db.set_speaker_name(&sid, 0, "Alice", Some("#ff0000"))
+            .unwrap();
         db.set_speaker_name(&sid, 1, "Bob", None).unwrap();
         let speakers = db.list_speakers(&sid).unwrap();
         assert_eq!(speakers.len(), 2);
@@ -773,7 +803,8 @@ mod fts_tests {
         let db = test_db();
         let session = db.create_session(None).unwrap();
         let sid = session.id.to_string();
-        db.set_speaker_name(&sid, 0, "Alice", Some("#00ff00")).unwrap();
+        db.set_speaker_name(&sid, 0, "Alice", Some("#00ff00"))
+            .unwrap();
         db.set_speaker_name(&sid, 0, "Alicia", None).unwrap();
         let speakers = db.list_speakers(&sid).unwrap();
         assert_eq!(speakers[0].name, "Alicia");
@@ -785,9 +816,12 @@ mod fts_tests {
         let db = test_db();
         let session = db.create_session(Some("Export Test".into())).unwrap();
         let sid = session.id.to_string();
-        db.insert_transcript(&sid, "Hello everyone", "mic", Some(0), true, 1000).unwrap();
+        db.insert_transcript(&sid, "Hello everyone", "mic", Some(0), true, 1000)
+            .unwrap();
         db.set_speaker_name(&sid, 0, "Alice", None).unwrap();
-        let md = db.export_session_markdown(&sid, &super::search::ExportOptions::default()).unwrap();
+        let md = db
+            .export_session_markdown(&sid, &super::search::ExportOptions::default())
+            .unwrap();
         assert!(md.contains("# Export Test"));
         assert!(md.contains("Alice"));
         assert!(md.contains("Hello everyone"));
@@ -798,7 +832,8 @@ mod fts_tests {
         let db = test_db();
         let session = db.create_session(Some("Text Export".into())).unwrap();
         let sid = session.id.to_string();
-        db.insert_transcript(&sid, "Test line", "mic", None, true, 1000).unwrap();
+        db.insert_transcript(&sid, "Test line", "mic", None, true, 1000)
+            .unwrap();
         let txt = db.export_session_text(&sid).unwrap();
         assert!(txt.contains("Text Export"));
         assert!(txt.contains("Test line"));
@@ -809,7 +844,8 @@ mod fts_tests {
         let db = test_db();
         let session = db.create_session(Some("JSON Export".into())).unwrap();
         let sid = session.id.to_string();
-        db.insert_transcript(&sid, "JSON test", "mic", Some(0), true, 1000).unwrap();
+        db.insert_transcript(&sid, "JSON test", "mic", Some(0), true, 1000)
+            .unwrap();
         db.set_speaker_name(&sid, 0, "Charlie", None).unwrap();
         let json = db.export_session_json(&sid).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
