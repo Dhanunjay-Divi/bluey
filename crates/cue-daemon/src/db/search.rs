@@ -81,10 +81,9 @@ impl Database {
     }
 
     pub fn delete_transcript(&self, id: &str) -> Result<bool> {
-        let changed = self.conn.execute(
-            "DELETE FROM transcripts WHERE id = ?1",
-            params![id],
-        )?;
+        let changed = self
+            .conn
+            .execute("DELETE FROM transcripts WHERE id = ?1", params![id])?;
         Ok(changed > 0)
     }
 
