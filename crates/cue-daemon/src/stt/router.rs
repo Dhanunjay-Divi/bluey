@@ -98,6 +98,13 @@ pub fn is_router_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Returns true if the OpenAI Realtime fallback is enabled via environment variable.
+pub fn is_openai_fallback_enabled() -> bool {
+    std::env::var("BLUEY_STT_FALLBACK_OPENAI")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,11 +195,4 @@ mod tests {
         // Still at index 1 (no more to fail over to)
         assert_eq!(router.active_index(), 1);
     }
-}
-
-/// Returns true if the OpenAI Realtime fallback is enabled via environment variable.
-pub fn is_openai_fallback_enabled() -> bool {
-    std::env::var("BLUEY_STT_FALLBACK_OPENAI")
-        .map(|v| v == "1")
-        .unwrap_or(false)
 }
