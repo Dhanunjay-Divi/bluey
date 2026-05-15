@@ -8,6 +8,7 @@ import { SessionDetail } from "./pages/SessionDetail";
 import { Placeholder } from "./pages/Placeholder";
 import { Search } from "./routes/Search";
 import { UpdateToast } from "./components/UpdateToast";
+import { PermissionBanner } from "./components/PermissionBanner";
 import { Onboarding } from "./pages/Onboarding";
 
 /** Listens for tray "navigate_to" events and routes accordingly. */
@@ -73,6 +74,8 @@ function App() {
   }
 
   return (
+    <>
+    <PermissionBanner />
     <HashRouter>
       <NavigateListener />
       <HotkeyListener />
@@ -93,6 +96,7 @@ function App() {
       </Routes>
       <UpdateToast />
     </HashRouter>
+    </>
   );
 }
 

@@ -56,6 +56,9 @@ pub fn run() {
             commands::daemon_toggle_overlay,
             // R5: Update check
             commands::check_for_updates,
+            // R6: Permission UX
+            commands::open_privacy_settings,
+            commands::emit_permission_denied,
         ])
         .setup(|app| {
             // Open database

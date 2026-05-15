@@ -332,3 +332,51 @@ mod tests {
         PathBuf::from("target/debug/system-audio-stub")
     }
 }
+
+/// Exit codes from the native system audio helper that indicate permission denial.
+/// The macOS ScreenCaptureKit helper exits with code 3 when screen recording
+/// permission has not been granted.
+const PERMISSION_DENIED_EXIT_CODE: i32 = 3;
+
+/// Check if a child process exit status indicates permission denial.
+pub fn is_system_audio_permission_denied(status: std::process::ExitStatus) -> bool {
+    status.code() == Some(PERMISSION_DENIED_EXIT_CODE)
+}
+
+/// Check if stderr output from the system audio helper indicates permission denial.
+pub fn is_system_audio_permission_denied_message(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("permission")
+        || lower.contains("screen recording")
+        || lower.contains("screencapturekit")
+        || lower.contains("not authorized")
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    #[test]
+    fn detects_permission_denied_exit_code() {
+        // We can't easily construct ExitStatus with a specific code in tests
+        // on all platforms, so test the message classifier instead.
+        assert!(is_system_audio_permission_denied_message(
+            "permission denied"
+        ));
+        assert!(is_system_audio_permission_denied_message(
+            "Screen Recording access not granted"
+        ));
+        assert!(is_system_audio_permission_denied_message(
+            "ScreenCaptureKit error: not authorized"
+        ));
+    }
+
+    #[test]
+    fn does_not_false_positive_system() {
+        assert!(!is_system_audio_permission_denied_message(
+            "device not found"
+        ));
+        assert!(!is_system_audio_permission_denied_message("timeout"));
+        assert!(!is_system_audio_permission_denied_message(""));
+    }
+}

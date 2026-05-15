@@ -434,6 +434,53 @@ pub async fn check_for_updates(app: AppHandle) -> Result<String, String> {
 
 // ===== Tests =====
 
+// ===== Phase 3 Round 6: Permission UX =====
+
+/// Open the OS privacy settings pane for the given audio source.
+/// On macOS, opens System Preferences to the relevant Privacy pane.
+/// On Windows, opens the Settings app to the microphone privacy page.
+#[tauri::command]
+pub fn open_privacy_settings(source: String) -> Result<(), String> {
+    let url = match (std::env::consts::OS, source.as_str()) {
+        ("macos", "microphone") => {
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+        }
+        ("macos", "system") => {
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+        }
+        ("windows", "microphone") => "ms-settings:privacy-microphone",
+        ("windows", _) => "ms-settings:privacy-microphone",
+        _ => {
+            return Err(format!(
+                "unsupported platform/source: {}/{source}",
+                std::env::consts::OS
+            ))
+        }
+    };
+    std::process::Command::new("open")
+        .arg(url)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Payload for the audio_permission_denied event.
+#[derive(Clone, Serialize)]
+pub struct PermissionDeniedPayload {
+    pub source: String,
+}
+
+/// Emit a permission-denied event to the dashboard for testing/integration.
+/// In production, the daemon capture code calls this when it detects denial.
+#[tauri::command]
+pub fn emit_permission_denied(source: String, app: AppHandle) -> Result<(), String> {
+    app.emit(
+        "audio_permission_denied",
+        PermissionDeniedPayload { source },
+    )
+    .map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

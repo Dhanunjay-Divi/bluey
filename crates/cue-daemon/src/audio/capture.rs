@@ -312,3 +312,41 @@ mod tests {
         assert_eq!(val, Some("My USB Mic".to_string()));
     }
 }
+
+/// Check if a CPAL  indicates a macOS microphone permission denial.
+pub fn is_permission_denied_error(error: &cpal::BuildStreamError) -> bool {
+    is_permission_denied_message(&error.to_string())
+}
+
+/// String-based classifier for permission denial messages from CPAL/CoreAudio.
+pub fn is_permission_denied_message(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    lower.contains("permission")
+        || lower.contains("not authorized")
+        || lower.contains("kaudiosed")
+        || lower.contains("mediaservicesd")
+        || lower.contains("input device is not available")
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::*;
+
+    #[test]
+    fn detects_permission_keywords() {
+        assert!(is_permission_denied_message("permission denied by user"));
+        assert!(is_permission_denied_message(
+            "Not authorized to access microphone"
+        ));
+        assert!(is_permission_denied_message(
+            "The input device is not available"
+        ));
+    }
+
+    #[test]
+    fn does_not_false_positive() {
+        assert!(!is_permission_denied_message("device disconnected"));
+        assert!(!is_permission_denied_message("sample rate mismatch"));
+        assert!(!is_permission_denied_message(""));
+    }
+}

@@ -1055,6 +1055,9 @@ pub enum AudioEvent {
     SttSegment {
         segment: SttSegmentMetadata,
     },
+    PermissionDenied {
+        source: AudioSourceKind,
+    },
     Error {
         source: Option<AudioSourceKind>,
         message: String,
