@@ -452,24 +452,52 @@ fn load_mic_device_from_settings(db: &State<DbState>) -> Option<String> {
 /// On Windows, opens the Settings app to the microphone privacy page.
 #[tauri::command]
 pub fn open_privacy_settings(source: String) -> Result<(), String> {
-    let url = match (std::env::consts::OS, source.as_str()) {
-        ("macos", "microphone") => {
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
-        }
-        ("macos", "system") => {
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
-        }
-        ("windows", "microphone") => "ms-settings:privacy-microphone",
-        ("windows", _) => "ms-settings:privacy-microphone",
-        _ => {
-            return Err(format!(
-                "unsupported platform/source: {}/{source}",
-                std::env::consts::OS
-            ))
-        }
-    };
-    std::process::Command::new("open")
-        .arg(url)
+    open_privacy_settings_inner(&source)
+}
+
+/// Returns the (program, args) tuple for opening privacy settings on the current platform.
+/// Exposed for testing without actually spawning a process.
+pub fn privacy_settings_command(source: &str) -> Result<(&'static str, Vec<String>), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let section = match source {
+            "microphone" => "Privacy_Microphone",
+            _ => "Privacy_ScreenCapture",
+        };
+        Ok((
+            "open",
+            vec![format!(
+                "x-apple.systempreferences:com.apple.preference.security?{section}"
+            )],
+        ))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let section = match source {
+            "microphone" => "privacy-microphone",
+            _ => "privacy-microphone",
+        };
+        Ok((
+            "cmd",
+            vec![
+                "/C".to_string(),
+                "start".to_string(),
+                format!("ms-settings:{section}"),
+            ],
+        ))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = source;
+        Err("open_privacy_settings: not supported on this platform".into())
+    }
+}
+
+/// Platform-specific privacy settings launcher.
+fn open_privacy_settings_inner(source: &str) -> Result<(), String> {
+    let (program, args) = privacy_settings_command(source)?;
+    std::process::Command::new(program)
+        .args(&args)
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -490,6 +518,25 @@ pub fn emit_permission_denied(source: String, app: AppHandle) -> Result<(), Stri
         PermissionDeniedPayload { source },
     )
     .map_err(|e| e.to_string())
+}
+
+/// Poll daemon audio status; if permission_denied_source is set, emit the
+/// Tauri event so the dashboard banner appears from real capture failures.
+#[tauri::command]
+pub async fn poll_audio_permission(app: AppHandle) -> Result<(), String> {
+    let resp = daemon_ipc(DaemonRequest::AudioStatus).await?;
+    if let DaemonResponse::AudioStatus { status } = resp {
+        if let Some(source) = status.capture.permission_denied_source {
+            app.emit(
+                "audio_permission_denied",
+                PermissionDeniedPayload {
+                    source: source.default_label().to_string(),
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -516,5 +563,50 @@ mod tests {
     fn test_get_app_version_not_empty() {
         let version = get_app_version();
         assert!(!version.is_empty());
+    }
+
+    #[test]
+    fn test_privacy_settings_command_microphone() {
+        let result = privacy_settings_command("microphone");
+        assert!(result.is_ok());
+        let (program, args) = result.unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(program, "open");
+            assert_eq!(args.len(), 1);
+            assert!(args[0].contains("Privacy_Microphone"));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(program, "cmd");
+            assert!(args.contains(&"ms-settings:privacy-microphone".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_privacy_settings_command_system() {
+        let result = privacy_settings_command("system");
+        assert!(result.is_ok());
+        let (program, args) = result.unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(program, "open");
+            assert_eq!(args.len(), 1);
+            assert!(args[0].contains("Privacy_ScreenCapture"));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(program, "cmd");
+            assert!(args.contains(&"ms-settings:privacy-microphone".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_permission_denied_payload_serializes() {
+        let payload = PermissionDeniedPayload {
+            source: "microphone".to_string(),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains("microphone"));
     }
 }

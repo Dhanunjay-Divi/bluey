@@ -1969,19 +1969,28 @@ async fn real_audio_loop(
                 Ok(None) => {}
                 Err(error) => {
                     let message = compact_snippet(&format!("{error:#}"), 260);
+                    let is_permission = crate::audio::capture::is_permission_denied_message(&message)
+                        || crate::audio::system_capture::is_system_audio_permission_denied_message(&message);
                     {
                         let mut audio = daemon.audio.lock().await;
                         if audio.session_id.as_deref() != Some(session_id.as_str()) {
                             return;
                         }
                         audio.record_drop(source.source, message.clone());
+                        if is_permission {
+                            audio.capture.permission_denied_source = Some(source.source);
+                        }
                     }
                     if !warned_stt_error {
                         warned_stt_error = true;
                         push_system_card(
                             &daemon,
                             CardKind::Warning,
-                            "Audio transcription needs attention",
+                            if is_permission {
+                                "Audio permission denied"
+                            } else {
+                                "Audio transcription needs attention"
+                            },
                             message,
                         )
                         .await;

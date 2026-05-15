@@ -827,6 +827,8 @@ impl AudioSourceStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AudioCaptureStatus {
     pub state: AudioCaptureState,
+    /// Set when a capture error is classified as permission denial.
+    pub permission_denied_source: Option<AudioSourceKind>,
     pub started_at: Option<String>,
     pub updated_at: String,
     pub system: AudioSourceStatus,
@@ -838,6 +840,7 @@ impl AudioCaptureStatus {
     pub fn idle() -> Self {
         Self {
             state: AudioCaptureState::Idle,
+            permission_denied_source: None,
             started_at: None,
             updated_at: clock::now_epoch_ms_string(),
             system: AudioSourceStatus::disabled(AudioSourceKind::System),
@@ -849,6 +852,7 @@ impl AudioCaptureStatus {
     pub fn from_plan(plan: &AudioCapturePlan) -> Self {
         Self {
             state: AudioCaptureState::Planning,
+            permission_denied_source: None,
             started_at: None,
             updated_at: clock::now_epoch_ms_string(),
             system: AudioSourceStatus::from_plan(&plan.system),
@@ -1277,5 +1281,22 @@ mod tests {
         assert!(segment.text.contains("[dev audio:microphone]"));
         assert_eq!(segment.source_sequence_start, Some(3));
         assert_eq!(segment.source_sequence_end, Some(3));
+    }
+
+    #[test]
+    fn capture_status_permission_denied_source_defaults_to_none() {
+        let status = AudioCaptureStatus::idle();
+        assert_eq!(status.permission_denied_source, None);
+    }
+
+    #[test]
+    fn capture_status_permission_denied_source_can_be_set() {
+        let mut status = AudioCaptureStatus::idle();
+        status.permission_denied_source = Some(AudioSourceKind::Microphone);
+        assert_eq!(status.permission_denied_source, Some(AudioSourceKind::Microphone));
+
+        // Verify it serializes correctly
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["permission_denied_source"], "microphone");
     }
 }

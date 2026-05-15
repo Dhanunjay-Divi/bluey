@@ -59,6 +59,7 @@ pub fn run() {
             // R6: Permission UX
             commands::open_privacy_settings,
             commands::emit_permission_denied,
+            commands::poll_audio_permission,
         ])
         .setup(|app| {
             // Open database
