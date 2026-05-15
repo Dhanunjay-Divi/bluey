@@ -4,6 +4,7 @@ import { Chats } from "./pages/Chats";
 import { SessionDetail } from "./pages/SessionDetail";
 import { Placeholder } from "./pages/Placeholder";
 import { Search } from "./routes/Search";
+import { UpdateToast } from "./components/UpdateToast";
 
 function App() {
   return (
@@ -23,6 +24,7 @@ function App() {
           <Route path="dev" element={<Placeholder name="Dev Tools" />} />
         </Route>
       </Routes>
+      <UpdateToast />
     </HashRouter>
   );
 }

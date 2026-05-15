@@ -45,6 +45,8 @@ pub fn create_session(
         let db = db.0.lock().map_err(|e| e.to_string())?;
         db.create_session(title).map_err(|e| e.to_string())?
     };
+    // Broadcast so any other window / page listening via
+    // `useSessionEvents` picks up the new session without a refetch.
     if let Err(e) = app.emit("session:created", &session) {
         tracing::warn!(error = %e, "failed to emit session:created event");
     }
@@ -77,10 +79,12 @@ pub fn delete_session(
         let db = db.0.lock().map_err(|e| e.to_string())?;
         db.delete_session(uuid).map_err(|e| e.to_string())?;
     }
+    // If the deleted session was active, clear the selection and notify.
     let mut active = active.0.lock().map_err(|e| e.to_string())?;
     if *active == Some(uuid) {
         *active = None;
         drop(active);
+        // Persist cleared selection — best-effort.
         match db.0.lock() {
             Ok(db_guard) => {
                 if let Err(e) = db_guard.save_active_session(None) {
@@ -109,12 +113,18 @@ pub fn update_session_title(id: String, title: String, db: State<DbState>) -> Re
         .map_err(|e| e.to_string())
 }
 
+/// Return the currently-active session id, or `None` if no session is selected.
 #[tauri::command]
 pub fn get_active_session(active: State<ActiveSessionState>) -> Result<Option<String>, String> {
     let active = active.0.lock().map_err(|e| e.to_string())?;
     Ok(active.map(|u| u.to_string()))
 }
 
+/// Set the active session. Pass `None` to clear the selection.
+///
+/// Validates that the target session exists before switching (avoids pointing
+/// at an id that was just deleted in another window). Emits `session:switched`
+/// whenever the selection changes.
 #[tauri::command]
 pub fn set_active_session(
     id: Option<String>,
@@ -125,6 +135,7 @@ pub fn set_active_session(
     let new_id = match id {
         Some(raw) => {
             let uuid = Uuid::parse_str(&raw).map_err(|e| e.to_string())?;
+            // Confirm the session still exists.
             let db = db.0.lock().map_err(|e| e.to_string())?;
             if db.get_session(uuid).map_err(|e| e.to_string())?.is_none() {
                 return Err(format!("session {uuid} not found"));
@@ -137,7 +148,7 @@ pub fn set_active_session(
     let mut active = active.0.lock().map_err(|e| e.to_string())?;
     let changed = *active != new_id;
     *active = new_id;
-    drop(active);
+    drop(active); // release lock before emitting
 
     if changed {
         let db = db.0.lock().map_err(|e| e.to_string())?;
@@ -156,6 +167,7 @@ pub fn set_active_session(
     Ok(())
 }
 
+/// List turns for a session (read-only). Used by the session detail page.
 #[tauri::command]
 pub fn list_turns(
     session_id: String,
@@ -316,6 +328,27 @@ pub fn daemon_set_push_to_talk(app: AppHandle) -> Result<(), String> {
 pub fn daemon_toggle_overlay(app: AppHandle) -> Result<(), String> {
     app.emit("hotkey_toggle_overlay", ())
         .map_err(|e| e.to_string())
+}
+
+/// Trigger an update check from the UI. Emits `update_available` or `update_not_available`.
+#[tauri::command]
+pub async fn check_for_updates(app: AppHandle) -> Result<String, String> {
+    let updater = tauri_plugin_updater::UpdaterExt::updater(&app).map_err(|e| e.to_string())?;
+    match updater.check().await {
+        Ok(Some(update)) => {
+            let version = update.version.clone();
+            let _ = app.emit("update_available", &version);
+            Ok(version)
+        }
+        Ok(None) => {
+            let _ = app.emit("update_not_available", ());
+            Ok("up-to-date".to_string())
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "update check failed");
+            Err(format!("update check failed: {e}"))
+        }
+    }
 }
 
 // ===== Tests =====

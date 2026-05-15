@@ -24,6 +24,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        // Auto-update plugin. Endpoint + pubkey configured in tauri.conf.json.
+        // PLACEHOLDER: replace pubkey and endpoint URL before production release.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             commands::get_app_version,
             commands::list_sessions,
@@ -51,6 +54,8 @@ pub fn run() {
             commands::daemon_toggle_listening,
             commands::daemon_set_push_to_talk,
             commands::daemon_toggle_overlay,
+            // R5: Update check
+            commands::check_for_updates,
         ])
         .setup(|app| {
             // Open database
@@ -73,13 +78,37 @@ pub fn run() {
             // Setup system tray
             setup_tray(app)?;
 
+            // Auto-update: silent background check after 30s delay
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(30));
+                tauri::async_runtime::block_on(async {
+                    match tauri_plugin_updater::UpdaterExt::updater(&handle) {
+                        Ok(updater) => match updater.check().await {
+                            Ok(Some(update)) => {
+                                tracing::info!(version = %update.version, "update available");
+                                let _ = handle.emit("update_available", update.version.clone());
+                            }
+                            Ok(None) => {
+                                tracing::debug!("no update available");
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "update check failed (network?)");
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to create updater");
+                        }
+                    }
+                });
+            });
+
             #[cfg(target_os = "macos")]
             macos::setup_nspanel(app)?;
 
             Ok(())
         })
-        // Intercept window close: hide to tray instead of quitting.
-        // Quit only via tray menu "Quit" item.
+        // Intercept window close: hide to tray instead of quitting
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
@@ -172,6 +201,8 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let show_dashboard = MenuItemBuilder::with_id("show_dashboard", "Show Dashboard").build(app)?;
     let toggle_overlay = MenuItemBuilder::with_id("toggle_overlay", "Toggle Overlay").build(app)?;
     let settings = MenuItemBuilder::with_id("settings", "Settings…").build(app)?;
+    let check_updates =
+        MenuItemBuilder::with_id("check_updates", "Check for Updates…").build(app)?;
     let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
 
     let menu = MenuBuilder::new(app)
@@ -180,6 +211,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .item(&toggle_overlay)
         .item(&PredefinedMenuItem::separator(app)?)
         .item(&settings)
+        .item(&check_updates)
         .item(&PredefinedMenuItem::separator(app)?)
         .item(&quit)
         .build()?;
@@ -206,6 +238,28 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                     let _ = window.set_focus();
                     let _ = app.emit("navigate_to", "/settings");
                 }
+            }
+            "check_updates" => {
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    match tauri_plugin_updater::UpdaterExt::updater(&handle) {
+                        Ok(updater) => match updater.check().await {
+                            Ok(Some(update)) => {
+                                let _ = handle.emit("update_available", update.version.clone());
+                            }
+                            Ok(None) => {
+                                let _ = handle.emit("update_not_available", ());
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "manual update check failed");
+                                let _ = handle.emit("update_check_failed", e.to_string());
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to create updater");
+                        }
+                    }
+                });
             }
             "quit" => {
                 app.exit(0);

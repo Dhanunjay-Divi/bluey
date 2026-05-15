@@ -34,5 +34,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://example.com/cue/updates/{{target}}/{{current_version}}"
+      ],
+      "pubkey": "REPLACE_BEFORE_RELEASE"
+    }
   }
 }
