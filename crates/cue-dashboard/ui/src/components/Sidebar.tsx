@@ -9,6 +9,7 @@ import {
   Camera,
   Mic,
   Code,
+  Radio,
   Search,
 } from "lucide-react";
 
@@ -21,6 +22,7 @@ const links = [
   { to: "/responses", icon: MessageCircle, label: "Responses" },
   { to: "/screenshot", icon: Camera, label: "Screenshot" },
   { to: "/audio", icon: Mic, label: "Audio" },
+  { to: "/live", icon: Radio, label: "Live" },
   { to: "/search", icon: Search, label: "Search" },
   { to: "/dev", icon: Code, label: "Dev Tools" },
 ];

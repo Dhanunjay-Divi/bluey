@@ -56,6 +56,8 @@ pub fn run() {
             commands::daemon_toggle_overlay,
             // R5: Update check
             commands::check_for_updates,
+            // R7: Live Transcript
+            commands::get_live_transcripts,
             // R6: Permission UX
             commands::open_privacy_settings,
             commands::emit_permission_denied,
@@ -75,6 +77,58 @@ pub fn run() {
             });
             app.manage(DbState(Mutex::new(db)));
             app.manage(ActiveSessionState(Mutex::new(restored)));
+
+            // R7: Live transcript poller — reads daemon meeting file and emits
+            // Tauri events for new segments.
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    let mut last_count: usize = 0;
+                    let mut last_session_id = String::new();
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        let Ok(paths) = cue_core::app_paths::AppPaths::discover() else {
+                            continue;
+                        };
+                        let Ok(store) = cue_daemon::storage::MeetingStore::new(&paths) else {
+                            continue;
+                        };
+                        let Ok(Some(meeting)) = store.load_active() else {
+                            if last_count > 0 {
+                                last_count = 0;
+                                last_session_id.clear();
+                            }
+                            continue;
+                        };
+                        let sid = meeting.id.to_string();
+                        if sid != last_session_id {
+                            last_count = 0;
+                            last_session_id = sid.clone();
+                        }
+                        let total = meeting.transcript.len();
+                        if total <= last_count {
+                            continue;
+                        }
+                        for seg in meeting.transcript.iter().skip(last_count) {
+                            let source = match seg.speaker {
+                                cue_core::Speaker::System => "system",
+                                cue_core::Speaker::User => "microphone",
+                                _ => "unknown",
+                            };
+                            let payload = commands::LiveTranscriptPayload {
+                                session_id: sid.clone(),
+                                source: source.to_string(),
+                                text: seg.text.clone(),
+                                is_final: seg.is_final,
+                                speaker: None,
+                                ts_ms: seg.created_at.parse::<u64>().unwrap_or(0),
+                            };
+                            let _ = handle.emit("live_transcript", &payload);
+                        }
+                        last_count = total;
+                    }
+                });
+            }
 
             // Register global shortcuts
             register_global_shortcut(app)?;

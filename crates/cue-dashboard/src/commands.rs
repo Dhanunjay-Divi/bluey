@@ -610,3 +610,50 @@ mod tests {
         assert!(json.contains("microphone"));
     }
 }
+
+// ===== Phase 3 Round 7: Live Transcript =====
+
+/// Payload matching the  Tauri event shape.
+#[derive(Clone, Serialize)]
+pub struct LiveTranscriptPayload {
+    pub session_id: String,
+    pub source: String,
+    pub text: String,
+    pub is_final: bool,
+    pub speaker: Option<u8>,
+    pub ts_ms: u64,
+}
+
+/// Return recent transcript segments from the daemon's active meeting file.
+/// The UI calls this on mount for catch-up, and the background poller uses
+/// it to detect new segments and emit  Tauri events.
+#[tauri::command]
+pub fn get_live_transcripts(since_index: usize) -> Result<Vec<LiveTranscriptPayload>, String> {
+    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+    let store = cue_daemon::storage::MeetingStore::new(&paths).map_err(|e| e.to_string())?;
+    let Some(meeting) = store.load_active().map_err(|e| e.to_string())? else {
+        return Ok(Vec::new());
+    };
+    let session_id = meeting.id.to_string();
+    let segments: Vec<LiveTranscriptPayload> = meeting
+        .transcript
+        .iter()
+        .skip(since_index)
+        .map(|seg| {
+            let source = match seg.speaker {
+                cue_core::Speaker::System => "system",
+                cue_core::Speaker::User => "microphone",
+                _ => "unknown",
+            };
+            LiveTranscriptPayload {
+                session_id: session_id.clone(),
+                source: source.to_string(),
+                text: seg.text.clone(),
+                is_final: seg.is_final,
+                speaker: None,
+                ts_ms: seg.created_at.parse::<u64>().unwrap_or(0),
+            }
+        })
+        .collect();
+    Ok(segments)
+}
