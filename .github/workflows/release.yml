@@ -1,0 +1,184 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: bluey-darwin-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: bluey-darwin-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: bluey-windows-x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: bluey-linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf build-essential libssl-dev libayatana-appindicator3-dev libxdo-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Configure MSVC
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ matrix.target }}-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.target }}-release-
+
+      - name: Build daemon and CLI
+        run: cargo build --release --target ${{ matrix.target }} -p cue-daemon -p cue-cli
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked || true
+
+      - name: Build dashboard
+        run: cargo tauri build --target ${{ matrix.target }}
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Build macOS native helpers
+        if: matrix.os == 'macos-latest'
+        run: |
+          for helper in native/macos/*/build.sh; do
+            [ -f "$helper" ] && bash "$helper" || true
+          done
+
+      - name: Package (Unix)
+        if: matrix.os != 'windows-latest'
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/cue-daemon staging/bluey-daemon || true
+          cp target/${{ matrix.target }}/release/cue-cli staging/bluey || true
+          # Copy Tauri bundle app if exists
+          find target/${{ matrix.target }}/release/bundle -name "*.app" -exec cp -R {} staging/ \; 2>/dev/null || true
+          find target/${{ matrix.target }}/release/bundle -name "*.AppImage" -exec cp {} staging/ \; 2>/dev/null || true
+          # Copy native helpers
+          find native -name "*.dylib" -o -name "cue-*" -type f -perm +111 | while read f; do cp "$f" staging/ 2>/dev/null || true; done
+          tar -czf ${{ matrix.artifact }}.tar.gz -C staging .
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force staging
+          Copy-Item target/${{ matrix.target }}/release/cue-daemon.exe staging/bluey-daemon.exe -ErrorAction SilentlyContinue
+          Copy-Item target/${{ matrix.target }}/release/cue-cli.exe staging/bluey.exe -ErrorAction SilentlyContinue
+          Get-ChildItem -Recurse target/${{ matrix.target }}/release/bundle -Filter "*.msi" | Copy-Item -Destination staging/ -ErrorAction SilentlyContinue
+          Get-ChildItem -Recurse target/${{ matrix.target }}/release/bundle -Filter "*.exe" | Copy-Item -Destination staging/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path staging/* -DestinationPath ${{ matrix.artifact }}.zip
+
+      - name: Compute SHA256
+        id: sha
+        shell: bash
+        run: |
+          if [ -f "${{ matrix.artifact }}.tar.gz" ]; then
+            echo "sha256=$(shasum -a 256 ${{ matrix.artifact }}.tar.gz | cut -d  -f1)" >> "$GITHUB_OUTPUT"
+            echo "file=${{ matrix.artifact }}.tar.gz" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha256=$(shasum -a 256 ${{ matrix.artifact }}.zip | cut -d  -f1)" >> "$GITHUB_OUTPUT"
+            echo "file=${{ matrix.artifact }}.zip" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ steps.sha.outputs.file }}
+
+    outputs:
+      sha256: ${{ steps.sha.outputs.sha256 }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Compute all SHA256 sums
+        run: |
+          cd artifacts
+          for f in *; do shasum -a 256 "$f"; done | tee ../SHA256SUMS.txt
+
+      - name: Generate Tauri updater manifest (latest.json)
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cat > latest.json << EOF
+          {
+            "version": "$VERSION",
+            "notes": "Release $VERSION",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "darwin-aarch64": {
+                "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/bluey-darwin-arm64.tar.gz",
+                "signature": ""
+              },
+              "darwin-x86_64": {
+                "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/bluey-darwin-x86_64.tar.gz",
+                "signature": ""
+              },
+              "windows-x86_64": {
+                "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/bluey-windows-x86_64.zip",
+                "signature": ""
+              },
+              "linux-x86_64": {
+                "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/bluey-linux-x86_64.tar.gz",
+                "signature": ""
+              }
+            }
+          }
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/*
+            SHA256SUMS.txt
+            latest.json
