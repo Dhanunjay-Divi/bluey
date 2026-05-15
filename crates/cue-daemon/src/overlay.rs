@@ -114,11 +114,13 @@ impl NativeOverlayHandle {
             .shutdown_requested
             .store(true, std::sync::atomic::Ordering::Release);
         self.shared.set_state(OverlayProcessState::ShuttingDown);
+        // Drop send_tx so the supervisor's send_rx.recv() returns None,
+        // which triggers stdin close → child sees EOF → exits cleanly.
         let (dead_tx, _dead_rx) = unbounded_channel();
         let _ = std::mem::replace(&mut self.send_tx, dead_tx);
         let tasks = std::mem::take(&mut self._tasks);
         for handle in tasks {
-            let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
         }
     }
 }
@@ -158,13 +160,6 @@ fn wire_child(
 }
 
 /// One iteration of the supervisor: drives a child to completion.
-///
-/// The supervisor owns `send_rx` and writes directly to the child's stdin.
-/// A `shutdown_notify` is used to signal the supervisor when the reader
-/// detects EOF (child exited). The supervisor selects on `child.wait()`,
-/// `send_rx.recv()`, and the EOF notify. When the child exits, any message
-/// that was written to stdin but not confirmed read by the child is carried
-/// over to the next generation.
 async fn run_one_child(
     mut child: Child,
     shared: Arc<Shared>,
@@ -180,8 +175,6 @@ async fn run_one_child(
     let mut stdin = child.stdin.take().expect("stdin piped");
     let stdout = child.stdout.take().expect("stdout piped");
 
-    // Track messages written since last child output (pong/response).
-    // When child exits, the last unacknowledged message is carryover.
     let msgs_written = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let msgs_acked = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
@@ -198,7 +191,6 @@ async fn run_one_child(
             match lines.next_line().await {
                 Ok(Some(line)) => {
                     tracing::debug!(line = %line, "reader: got line");
-                    // Child produced output — it has read all messages up to now.
                     msgs_acked_r.fetch_add(1, std::sync::atomic::Ordering::Release);
                     match decode_ndjson(&line) {
                         Ok(OverlayMessage::Ping) => {
@@ -258,10 +250,11 @@ async fn run_one_child(
     let mut wait_fut = Box::pin(child.wait());
     let mut last_msg: Option<OverlayMessage> = carryover_in;
     let mut write_failed = false;
-    let mut rx_closed = false;
 
     let status = loop {
-        if shared.is_shutdown_requested() || rx_closed {
+        if shared.is_shutdown_requested() {
+            // Drop stdin so child sees EOF and exits cleanly.
+            drop(stdin);
             break (&mut wait_fut).await;
         }
         tokio::select! {
@@ -278,7 +271,11 @@ async fn run_one_child(
                         msgs_written.fetch_add(1, std::sync::atomic::Ordering::Release);
                         last_msg = Some(m);
                     }
-                    None => { rx_closed = true; }
+                    None => {
+                        // Channel closed (shutdown). Close stdin so child exits.
+                        drop(stdin);
+                        break (&mut wait_fut).await;
+                    }
                 }
             }
         }
@@ -286,8 +283,7 @@ async fn run_one_child(
 
     let clean_exit = matches!(&status, Ok(s) if s.success());
 
-    // Drop stdin so reader sees EOF.
-    drop(stdin);
+    // Ensure reader task completes.
     let _ = reader.await;
 
     // Determine carryover: if we wrote more messages than the child acked,
@@ -350,6 +346,16 @@ async fn run_supervisor(
                 "overlay child failed too many times; giving up"
             );
             shared.set_state(OverlayProcessState::Failed);
+            // Drain pending messages so senders see backpressure immediately.
+            let mut drained: u64 = 0;
+            while send_rx.try_recv().is_ok() {
+                drained += 1;
+            }
+            if drained > 0 {
+                tracing::warn!(drained, "drained pending messages after cap exhaustion");
+            }
+            // Drop recv_tx so downstream readers see channel close.
+            drop(recv_tx);
             return;
         }
 
@@ -369,7 +375,6 @@ async fn run_supervisor(
             Ok(c) => {
                 current_child = c;
                 shared.set_state(OverlayProcessState::Running);
-                consecutive_failures = 0;
             }
             Err(e) => {
                 tracing::warn!(
@@ -387,7 +392,6 @@ async fn run_supervisor(
                     Ok(c) => {
                         current_child = c;
                         shared.set_state(OverlayProcessState::Running);
-                        consecutive_failures = 0;
                     }
                     Err(e2) => {
                         tracing::error!(error = %e2, "overlay respawn failed twice; giving up");
