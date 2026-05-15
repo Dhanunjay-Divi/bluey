@@ -1,7 +1,7 @@
 use cue_core::session::Session;
 use serde::Serialize;
 use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
 use crate::DbState;
@@ -187,4 +187,132 @@ pub fn list_turns(
     let uuid = Uuid::parse_str(&session_id).map_err(|e| e.to_string())?;
     let db = db.0.lock().map_err(|e| e.to_string())?;
     db.list_turns(uuid, None).map_err(|e| e.to_string())
+}
+
+// ===== Settings + Secrets commands (Phase 3 Round 5) =====
+
+#[tauri::command]
+pub fn save_stt_api_key(provider: String, key: String) -> Result<(), String> {
+    cue_daemon::secrets::store_api_key(&provider, &key).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn load_stt_api_key(provider: String) -> Result<Option<String>, String> {
+    let raw = cue_daemon::secrets::load_api_key(&provider).map_err(|e| e.to_string())?;
+    Ok(raw.map(|s| {
+        if s.len() <= 4 {
+            "****".to_string()
+        } else {
+            format!("****{}", &s[s.len() - 4..])
+        }
+    }))
+}
+
+#[tauri::command]
+pub fn list_audio_devices() -> Result<Vec<String>, String> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+    let host = cpal::default_host();
+    let mut names = Vec::new();
+    if let Ok(devices) = host.input_devices() {
+        for d in devices {
+            if let Ok(name) = d.name() {
+                names.push(name);
+            }
+        }
+    }
+    Ok(names)
+}
+
+#[tauri::command]
+pub fn save_settings(
+    settings: std::collections::HashMap<String, String>,
+    db: State<DbState>,
+) -> Result<(), String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    for (k, v) in &settings {
+        db.save_setting(k, v).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn load_settings(
+    db: State<DbState>,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    db.load_all_settings().map_err(|e| e.to_string())
+}
+
+// ===== Phase 3 Round 5: Search, Export, Speakers =====
+
+#[tauri::command]
+pub fn search_transcripts(
+    query: String,
+    limit: Option<usize>,
+    db: State<DbState>,
+) -> Result<Vec<cue_daemon::db::search::TranscriptHit>, String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    db.search_transcripts(&query, limit.unwrap_or(50))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn export_session_to_clipboard(
+    id: String,
+    format: String,
+    app: AppHandle,
+) -> Result<String, String> {
+    let db_state: State<DbState> = app.state();
+    let db = db_state.0.lock().map_err(|e| e.to_string())?;
+    let content = match format.as_str() {
+        "markdown" => db
+            .export_session_markdown(&id, &cue_daemon::export::ExportOptions::default())
+            .map_err(|e| e.to_string())?,
+        "text" => db.export_session_text(&id).map_err(|e| e.to_string())?,
+        "json" => db.export_session_json(&id).map_err(|e| e.to_string())?,
+        _ => return Err(format!("unsupported format: {format}")),
+    };
+    Ok(content)
+}
+
+#[tauri::command]
+pub fn export_session_to_file(
+    id: String,
+    format: String,
+    path: String,
+    app: AppHandle,
+) -> Result<(), String> {
+    let db_state: State<DbState> = app.state();
+    let db = db_state.0.lock().map_err(|e| e.to_string())?;
+    let content = match format.as_str() {
+        "markdown" => db
+            .export_session_markdown(&id, &cue_daemon::export::ExportOptions::default())
+            .map_err(|e| e.to_string())?,
+        "text" => db.export_session_text(&id).map_err(|e| e.to_string())?,
+        "json" => db.export_session_json(&id).map_err(|e| e.to_string())?,
+        _ => return Err(format!("unsupported format: {format}")),
+    };
+    std::fs::write(&path, content).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_speaker_name(
+    session_id: String,
+    speaker_id: i32,
+    name: String,
+    color: Option<String>,
+    db: State<DbState>,
+) -> Result<(), String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    db.set_speaker_name(&session_id, speaker_id, &name, color.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn list_speakers(
+    session_id: String,
+    db: State<DbState>,
+) -> Result<Vec<cue_daemon::db::speakers::SpeakerMapping>, String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    db.list_speakers(&session_id).map_err(|e| e.to_string())
 }

@@ -31,6 +31,16 @@ pub fn run() {
             commands::get_active_session,
             commands::set_active_session,
             commands::list_turns,
+            commands::save_stt_api_key,
+            commands::load_stt_api_key,
+            commands::list_audio_devices,
+            commands::save_settings,
+            commands::load_settings,
+            commands::search_transcripts,
+            commands::export_session_to_clipboard,
+            commands::export_session_to_file,
+            commands::set_speaker_name,
+            commands::list_speakers,
         ])
         .setup(|app| {
             // Open database

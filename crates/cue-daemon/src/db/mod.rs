@@ -34,6 +34,7 @@ impl Database {
         const MIGRATION_003: &str =
             include_str!("../../../../infra/migrations/003_turns_unique_index.sql");
         const MIGRATION_004: &str = include_str!("../../../../infra/migrations/004_app_state.sql");
+        const MIGRATION_005: &str = include_str!("../../../../infra/migrations/005_settings.sql");
         self.conn
             .execute_batch(MIGRATION_002)
             .context("failed to run session migration")?;
@@ -43,6 +44,9 @@ impl Database {
         self.conn
             .execute_batch(MIGRATION_004)
             .context("failed to run app_state migration")?;
+        self.conn
+            .execute_batch(MIGRATION_005)
+            .context("failed to run settings migration")?;
         Ok(())
     }
 
@@ -338,6 +342,43 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
+}
+
+// ===== Settings (Phase 3 Round 5) =====
+impl Database {
+    pub fn save_setting(&self, key: &str, value: &str) -> Result<()> {
+        let now = now_ms();
+        self.conn.execute(
+            "INSERT INTO app_settings (key, value, updated_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![key, value, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_setting(&self, key: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT value FROM app_settings WHERE key = ?1")?;
+        let mut rows = stmt.query(params![key])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn load_all_settings(&self) -> Result<std::collections::HashMap<String, String>> {
+        let mut stmt = self.conn.prepare("SELECT key, value FROM app_settings")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (k, v) = row?;
+            map.insert(k, v);
+        }
+        Ok(map)
+    }
 }
 
 #[cfg(test)]
@@ -654,5 +695,32 @@ mod tests {
             msg.contains("UNIQUE") || msg.contains("unique") || msg.contains("constraint"),
             "error should mention unique constraint violation, got: {msg}"
         );
+    }
+
+    #[test]
+    fn test_save_and_load_setting() {
+        let db = test_db();
+        assert_eq!(db.load_setting("stt_provider").unwrap(), None);
+        db.save_setting("stt_provider", "deepgram").unwrap();
+        assert_eq!(
+            db.load_setting("stt_provider").unwrap(),
+            Some("deepgram".into())
+        );
+        db.save_setting("stt_provider", "echo").unwrap();
+        assert_eq!(
+            db.load_setting("stt_provider").unwrap(),
+            Some("echo".into())
+        );
+    }
+
+    #[test]
+    fn test_load_all_settings() {
+        let db = test_db();
+        db.save_setting("a", "1").unwrap();
+        db.save_setting("b", "2").unwrap();
+        let all = db.load_all_settings().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.get("a").unwrap(), "1");
+        assert_eq!(all.get("b").unwrap(), "2");
     }
 }
