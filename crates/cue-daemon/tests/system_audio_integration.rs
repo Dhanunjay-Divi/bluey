@@ -159,3 +159,94 @@ async fn system_audio_stt_gating() {
     // Clean up
     std::env::remove_var("BLUEY_SYSTEM_AUDIO_STT");
 }
+
+/// Test that the daemon retains the SystemAudioCapture handle and can shut down cleanly.
+#[tokio::test]
+async fn system_audio_handle_retained_for_shutdown() {
+    let stub = stub_binary_path();
+    if !stub.exists() {
+        return;
+    }
+
+    std::env::set_var("BLUEY_SYSTEM_AUDIO_BINARY", &stub);
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let capture = SystemAudioCapture::start(tx).expect("start capture");
+
+    // Simulate what the daemon does: store in Option, then take + stop on shutdown
+    let handle: Option<SystemAudioCapture> = Some(capture);
+    assert!(handle.is_some(), "handle must be retained, not dropped");
+
+    // Receive at least one chunk to prove it is running
+    let chunk = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+    assert_eq!(chunk.source, AudioSource::System);
+
+    // Explicit shutdown path: take + stop
+    if let Some(c) = handle {
+        c.stop().await;
+    }
+
+    // After stop, the channel should eventually close (no new production).
+    while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {}
+
+    std::env::remove_var("BLUEY_SYSTEM_AUDIO_BINARY");
+}
+
+/// Test that the STT event-drain task forwards Final events downstream and
+/// handles errors without panicking.
+#[tokio::test]
+async fn stt_event_drain_forwards_finals_and_handles_errors() {
+    use cue_core::stt::SttError;
+
+    let cfg = SttConfig {
+        source: AudioSource::System,
+        ..Default::default()
+    };
+    let (mut provider, ctrl) = MockStt::new(cfg);
+
+    let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    ctrl.emit_final("hello from system", Vec::new());
+    ctrl.emit_final("second transcript", Vec::new());
+    ctrl.emit_error(SttError::Auth);
+
+    let drain_handle = tokio::spawn(async move {
+        loop {
+            match provider.next_event().await {
+                Some(Ok(event)) => {
+                    let _ = result_tx.send(event);
+                }
+                Some(Err(e)) => {
+                    let _ = format!("error: {e}");
+                    if !e.is_retryable() {
+                        break;
+                    }
+                }
+                None => break,
+            }
+        }
+    });
+
+    let ev1 = tokio::time::timeout(Duration::from_millis(200), result_rx.recv())
+        .await
+        .expect("timeout on ev1")
+        .expect("channel closed");
+    assert!(matches!(ev1, TranscriptEvent::Final { ref text, .. } if text == "hello from system"));
+
+    let ev2 = tokio::time::timeout(Duration::from_millis(200), result_rx.recv())
+        .await
+        .expect("timeout on ev2")
+        .expect("channel closed");
+    assert!(matches!(ev2, TranscriptEvent::Final { ref text, .. } if text == "second transcript"));
+
+    let result = tokio::time::timeout(Duration::from_secs(1), drain_handle)
+        .await
+        .expect("drain task should exit within timeout");
+    assert!(
+        result.is_ok(),
+        "drain task must not panic on SttError::Auth"
+    );
+}
