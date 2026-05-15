@@ -42,32 +42,36 @@ export PATH=/opt/homebrew/bin:/Users/uno/.cargo/bin:/usr/local/bin:$PATH
 cargo build --all-targets 2>&1 | tail -20'
 ```
 
-## Current state (as of 2026-05-15, post-R6 fix wave)
+## Current state (as of 2026-05-15, post-R6 merge + R7 implementation)
 
-- **Branch:** `feat/phase-3-round-6` — 11 commits ahead of R5:
+- **main tip:** `6126b28` — R3-R6 merged, 201 tests passing
+- **Branch:** `feat/phase-3-round-7` — 10 commits ahead of main:
   ```
-  7a9285f chore(p3r6-fix): cargo fmt across cherry-picked fixes
-  b8ed87e fix(daemon): OpenAI Realtime STT uses transcription session protocol [P3.R6 fix]
-  3f08371 fix(dashboard): wire permission denial from real capture errors + platform-specific Settings launchers [P3.R6 fix]
-  5dbd982 fix(daemon): plumb mic device selection through AudioStart IPC to capture [P3.R6 fix]
-  fb3beed fix(daemon): system-audio STT must use single provider for send + drain [P3.R5 fix2]
-  1574eb2 docs(work): comprehensive handoff to codex (R5/R6 review + all pending implementation)
-  18f14bc chore(p3r6): fix clippy items-after-test-module + result_large_err in openai
-  9a7879b feat(daemon): OpenAI Realtime STT provider with auth + reconnect [P3.R6]
-  5ef2098 feat(dashboard): permission denial UX for mic + system audio [P3.R6]
-  1e55972 feat(daemon): respect mic device selection from app settings [P3.R6]
-  dd0f4de feat(daemon): wire hotkey/tray events to start-stop / PTT / overlay toggle [P3.R6]
+  97aa759 chore(p3r7): fix items-after-test-module in stt/router.rs
+  2457314 feat(dashboard): point Tauri updater at GitHub releases endpoint [P3.R7]
+  0e84903 feat(infra): Homebrew tap formula + Scoop manifest [P3.R7]
+  5181a65 feat(infra): GitHub Actions release pipeline + Makefile targets [P3.R7]
+  b2c3991 feat(daemon): wire LocalWhisper as third tier in SttRouter [P3.R7]
+  d4d0800 feat(daemon): LocalWhisperProvider with NDJSON IPC + tests [P3.R7]
+  fd8ab9a feat(whisper): macOS + Windows native helper binaries (stub) [P3.R7]
+  73c0fb0 feat(dashboard): live transcript route + auto-scroll list [P3.R7]
+  40b9340 feat(daemon): emit live_transcript event for each transcript segment [P3.R7]
   ```
-- **Test count:** 201 passing, 2 ignored (+37 vs R5 post-fix)
-- **R6 deliverables shipped (end-to-end):**
-  - Hotkey/tray events wired to daemon IPC (toggle listening, PTT, overlay toggle)
-  - Mic device selection plumbed through `AudioStart` IPC to capture config
-  - Permission denial UX: real capture errors classified → status field → dashboard poll → banner + platform-specific Settings launcher
-  - OpenAI Realtime STT provider with transcription session protocol (correct event names, model, session.update)
-  - System-audio STT fixed: single provider for send + drain via `tokio::select!`
-- **All checks green:** fmt, clippy (-D warnings), build, cargo test (201),
-  dashboard npm build, swift build (cue-overlay), git diff --check
-- **Status:** Awaiting codex re-review (PHASE-3-ROUND-6-HANDOFF-FOR-CODEX-REVIEW.md submitted)
+- **Test count:** 213 passing, 2 ignored (+12 vs main)
+- **Status:** Awaiting codex review (PHASE-3-ROUND-7-HANDOFF-FOR-CODEX-REVIEW.md submitted)
+
+### R7 deliverables shipped:
+- **Live transcript UX:** daemon broadcast channel → file-polling bridge → Tauri event → LiveTranscript route with rolling 200-segment buffer + auto-scroll
+- **Local Whisper fallback (stub):** macOS Swift + Windows C helper stubs (NDJSON IPC); `LocalWhisperProvider` Rust impl; SttRouter 3-tier chain (Deepgram → OpenAI → LocalWhisper) gated by `BLUEY_STT_LOCAL_WHISPER=1`
+- **Distribution scaffolding:** GitHub Actions release pipeline (matrix build), Makefile targets, Homebrew formula, Scoop manifest, Tauri updater endpoint, INSTALL.md, bump-formulae.sh
+
+### All checks green:
+- `cargo fmt --all --check` ✅
+- `cargo clippy --all-targets -- -D warnings` ✅
+- `cargo build --all-targets` ✅
+- `cargo test --all-targets` ✅ 213 pass
+- `cd crates/cue-dashboard/ui && npm run build` ✅
+- `git -P diff --check main..HEAD` ✅
 
 ## Workflow loop (kiro ↔ codex ↔ user)
 
@@ -88,11 +92,12 @@ Templates on uno:
 ```
 docs/work/TEMPLATE-REVIEW.md
 docs/work/TEMPLATE-FIX.md
+docs/work/TEMPLATE-IMPL.md
 ```
 
 ## Standing rules
 
-1. **Never spawn subagents** — user has standing rule against agent spawning
+1. **Never spawn subagents** — user has standing rule against agent spawning (unless explicitly allowed per-task)
 2. **Never `git push`** — all work stays local on uno
 3. **No force push, no history rewrite** — once committed, commits are immutable
 4. **Always build + test before committing** — full verification pipeline:
@@ -108,105 +113,83 @@ docs/work/TEMPLATE-FIX.md
 6. **Commit messages** follow Conventional Commits, e.g.:
    `feat(daemon): system audio capture via native helpers [P3.R4]`
 
-## Parallel subagent strategy (learned from R5 → improved in R6)
+## Parallel subagent strategy (established in R6, continued in R7)
 
-**R5 problem:** 4 parallel subagents sharing a single working tree caused cherry-pick conflicts, duplicate implementations, and required a reconciliation commit.
-
-**R6 solution:** 4 parallel subagents each used an isolated git worktree. Commits were cherry-picked onto the main branch after completion. A single `cargo fmt` commit normalized formatting. **Zero conflicts, zero reconciliation needed.** Recommend continuing this pattern for future parallel work.
+Each parallel subagent uses an isolated git worktree. Commits are cherry-picked onto the main feature branch after completion. A single lint/fmt commit normalizes formatting. **Zero conflicts, zero reconciliation needed.** Continue this pattern for future parallel work.
 
 ## Key files + locations on uno
 
 ```
 /Users/uno/Downloads/cue/
 ├── Cargo.toml                            # workspace root
+├── Makefile                              # R7 — build/package targets
+├── INSTALL.md                            # R7 — user-facing install instructions
+├── .github/workflows/release.yml         # R7 — release pipeline
 ├── crates/
 │   ├── cue-core/                         # types: pcm, vad, stt, overlay_ipc, session, audio
 │   ├── cue-daemon/
 │   │   ├── src/
 │   │   │   ├── audio/
-│   │   │   │   ├── mod.rs
-│   │   │   │   ├── capture.rs            # R6 — load_mic_device_setting helper
-│   │   │   │   └── system_capture.rs     # R4 — native helper launcher
 │   │   │   ├── stt/
-│   │   │   │   ├── mock.rs
 │   │   │   │   ├── deepgram.rs           # R3 — Nova-3 provider
-│   │   │   │   ├── openai.rs             # R6 — OpenAI Realtime transcription session
-│   │   │   │   ├── router.rs             # R5 — SttRouter failover chain
-│   │   │   │   └── echo.rs              # R5 — EchoProvider stub
-│   │   │   ├── db/
-│   │   │   │   ├── mod.rs               # R5 — settings KV + migrations
-│   │   │   │   ├── search.rs            # R5 — FTS5 search + export
-│   │   │   │   └── speakers.rs          # R5 — speaker name mapping
-│   │   │   ├── secrets/
-│   │   │   │   └── mod.rs               # R5 — keyring API key store
-│   │   │   ├── export/
-│   │   │   │   └── mod.rs               # R5 — ExportOptions re-export
-│   │   │   ├── overlay.rs                # R3+4 — supervisor with restart loop
-│   │   │   ├── app.rs                    # R6 — single-task select! for sys STT; mic device plumbing; permission classifier
+│   │   │   │   ├── openai.rs             # R6 — OpenAI Realtime transcription
+│   │   │   │   ├── router.rs             # R5+R7 — SttRouter 3-tier failover
+│   │   │   │   ├── whisper/              # R7 — LocalWhisperProvider + parser
+│   │   │   │   ├── echo.rs              # R5 — EchoProvider stub
+│   │   │   │   └── mock.rs
+│   │   │   ├── app.rs                    # R6+R7 — live transcript broadcast
 │   │   │   └── bin/
-│   │   │       ├── overlay_stub.rs
-│   │   │       ├── overlay_stub_oneshot.rs
-│   │   │       └── system_audio_stub.rs
+│   │   │       └── whisper_stub.rs       # R7 — test stub binary
 │   │   └── tests/
-│   │       ├── pipeline_integration.rs
-│   │       ├── overlay_pipe_integration.rs
-│   │       ├── overlay_restart_integration.rs
-│   │       ├── system_audio_integration.rs  # R6 — single_provider_send_and_drain test
-│   │       └── mic_device_selection.rs      # R6 — 5 IPC/config/DB tests
+│   │       ├── live_transcript_emit.rs   # R7 — 3 tests
+│   │       └── whisper_integration.rs    # R7 — 9 tests
 │   └── cue-dashboard/                    # Tauri + React UI
 │       ├── src/
-│       │   ├── lib.rs                    # R5+R6 — tray, hotkeys, updater, window intercept, poll_audio_permission
-│       │   └── commands.rs               # R6 — mic device from DB, permission poll, platform launchers
+│       │   ├── lib.rs                    # R7 — background poller for live transcript
+│       │   └── commands.rs               # R7 — get_live_transcripts command
 │       └── ui/src/
-│           ├── pages/Onboarding.tsx       # R5 — first-run flow
-│           ├── routes/Search.tsx          # R5 — FTS5 search UI
-│           ├── components/UpdateToast.tsx  # R5 — update notification
-│           └── components/PermissionBanner.tsx  # R6 — permission denial banner
+│           ├── routes/LiveTranscript.tsx  # R7 — live transcript route
+│           └── components/LiveTranscriptList.tsx  # R7 — auto-scroll list
 ├── native/
 │   ├── macos/
 │   │   ├── cue-audio/                    # Swift: ScreenCaptureKit + AVAudioEngine
-│   │   └── cue-overlay/                  # R5 — Swift: NSWindow overlay with stealth
+│   │   ├── cue-overlay/                  # Swift: NSWindow overlay
+│   │   └── cue-whisper/                  # R7 — Swift whisper helper stub
 │   └── windows/
 │       ├── cue-audio/main.c              # C: WASAPI loopback
-│       └── cue-overlay/main.c            # R4+R5: Direct2D overlay + transcript rendering
-├── infra/migrations/
-│   ├── 005_settings.sql                  # R5 — app_settings KV table
-│   ├── 006_transcript_fts.sql            # R5 — transcripts + FTS5 + triggers
-│   ├── 007_speakers.sql                  # R5 — speakers table
-│   └── 008_fts_cascade_fix.sql           # R5 fix — FTS delete consistency
+│       ├── cue-overlay/main.c            # C: Direct2D overlay
+│       └── cue-whisper/main.c            # R7 — C whisper helper stub
+├── infra/
+│   ├── homebrew/bluey.rb                 # R7 — Homebrew formula
+│   ├── scoop/bluey.json                  # R7 — Scoop manifest
+│   ├── scripts/
+│   │   ├── bump-formulae.sh             # R7 — post-release SHA256 updater
+│   │   └── download-whisper-model.sh    # R7 — model downloader
+│   └── migrations/
 └── docs/work/
-    ├── TEMPLATE-REVIEW.md
-    ├── TEMPLATE-FIX.md
-    ├── TEMPLATE-IMPL.md
-    ├── IMPL-PHASE-3-ROUND-{1,2,3,4,5,6}.md
-    ├── PHASE-3-ROUND-{1,2,3,4,5,6}-HANDOFF-FOR-CODEX-REVIEW.md
-    ├── REVIEW-PHASE-3-ROUND-{1,2,3,5,6}.md   # codex's verdicts
-    ├── HANDOFF-FROM-CODEX-TO-KIRO.md          # codex's R5/R6 handoff
-    ├── AGENT-ONBOARDING.md
-    └── PLAN-STT-FALLBACK-CHAIN.md
+    ├── IMPL-PHASE-3-ROUND-{1..7}.md
+    ├── PHASE-3-ROUND-{1..7}-HANDOFF-FOR-CODEX-REVIEW.md
+    ├── REVIEW-PHASE-3-ROUND-{1,2,3,5,6}.md
+    ├── HANDOFF-TO-CODEX-FROM-KIRO.md     # R7 review + pending work
+    ├── HANDOFF-FROM-CODEX-TO-KIRO.md     # (stale — codex will overwrite)
+    ├── AGENT-ONBOARDING.md               # this file
+    ├── PLAN-STT-FALLBACK-CHAIN.md
+    └── PLAN-DISTRIBUTION.md
 ```
 
-## Type foundations (from Round 1 — use these, don't re-create)
+## Pending work (after R7 review passes)
 
-In `crates/cue-core/src/`:
+### Next rounds (priority order)
 
-- `pcm.rs`: `AudioSource {Microphone, System}`, `SampleRate`, `AudioChunk { source, sample_rate, samples, captured_at_ms }`
-- `vad.rs`: `FrameAction {Send, SendSilence, Drop}`, `VadAggressiveness`, `VadConfig`
-- `stt.rs`: `SttProvider` async trait, `TranscriptEvent {Partial, Final, SpeakerLabel}`, `ConnectionState`, `SttError`, `WordTiming`, `SttConfig`
-- `overlay_ipc.rs`: `OverlayMessage` (SessionSwitched/ListeningStateChanged/TranscriptPartial/TranscriptFinal/Ping), `OverlayIpcCommand {Pong, RequestSync}`, `encode_ndjson`, `decode_ndjson`
-- `audio.rs`: `AudioCaptureStatus { permission_denied_source: Option<String>, ... }`, `AudioCaptureConfig`
-- `ipc.rs`: `DaemonRequest::AudioStart { enable_system, enable_microphone, mic_device_id }`
-
-## Pending work (after R6 re-review passes)
-
-1. **Wire OpenAI into SttRouter** — behind `BLUEY_STT_FALLBACK_OPENAI=1` with failover tests.
-2. **Live transcript UX** — overlay + dashboard real-time display of system-audio transcripts.
-3. **Distribution scaffolding** — GitHub Releases, auto-update endpoint, app signing.
-4. **AI features** — meeting summary, action items, cues.
-5. **Local whisper.cpp provider** — tier 3 offline fallback.
-6. **Advanced search filters** — date range, source filter, speaker filter.
-7. **Full settings page UI** — replace Placeholder with real component.
-8. **Hotkey daemon IPC via Rust** — move from React listener to Rust-side for reliability.
+1. **Real whisper.cpp integration** — replace stub helpers with actual whisper.cpp inference; bundle `tiny.en` model (~75MB)
+2. **LocalWhisperProvider crash restart loop** — supervisor pattern for helper process
+3. **AI features (the "cue" differentiator)** — LLM-powered meeting summary, action items, live suggestions, custom cues. NOT YET STARTED.
+4. **Structured logging + crash reporting** — `tracing-appender` file rotation + panic dump files
+5. **Long-session stress tests** — `#[ignore]` test running 5-minute synthetic pipeline
+6. **Bookmarks / highlights** — SQLite migration + keyboard shortcut + transcript markers
+7. **Session metadata** — title, tags, participants, notes
+8. **Mic device hot-swap mid-session** — detect disappearance, pause, emit UI event
+9. **Auto-update endpoint signing keys** — `tauri signer generate` + GitHub Secrets setup
 
 ## First actions for a new agent
 
@@ -218,9 +201,9 @@ In `crates/cue-core/src/`:
    git -P branch --show-current'
    ```
 2. Read these docs on uno in order:
-   - `docs/work/IMPL-PHASE-3-ROUND-6.md` (latest round's context)
-   - `docs/work/PHASE-3-ROUND-6-HANDOFF-FOR-CODEX-REVIEW.md`
-   - Any `REVIEW-PHASE-3-ROUND-6-RECHECK.md` codex has synced back
+   - `docs/work/IMPL-PHASE-3-ROUND-7.md` (latest round's context)
+   - `docs/work/PHASE-3-ROUND-7-HANDOFF-FOR-CODEX-REVIEW.md`
+   - `docs/work/HANDOFF-TO-CODEX-FROM-KIRO.md` (full task assignment)
 3. Ask the user what the current task is — don't guess. Possible states:
    - Waiting on codex review → nothing to do, just read and be ready
    - Codex gave 🔴 → need to write FIX doc and address feedback
