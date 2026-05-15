@@ -1,8 +1,10 @@
-//! OpenAI Realtime STT provider.
+//! OpenAI Realtime STT provider — transcription session protocol.
 //!
-//! Connects via WebSocket with Bearer auth and OpenAI-Beta header.
-//! Audio is sent as base64-encoded PCM16 24kHz mono via JSON text frames.
-//! Transcripts arrive as delta (partial) and done (final) events.
+//! Connects via WebSocket to the OpenAI Realtime API with `?intent=transcription`.
+//! After handshake, sends `session.update` to configure transcription mode.
+//! Audio is sent as base64-encoded PCM16 24kHz mono via `input_audio_buffer.append`.
+//! Transcripts arrive as `conversation.item.input_audio_transcription.delta` (partial)
+//! and `conversation.item.input_audio_transcription.completed` (final).
 
 use std::sync::Arc;
 
@@ -24,7 +26,7 @@ use super::deepgram::{map_ws_error, mask_api_key, reconnect_delay, MAX_RECONNECT
 #[derive(Debug, Clone)]
 pub struct OpenAiRealtimeConfig {
     pub api_key: String,
-    /// Model to use. Defaults to "gpt-4o-realtime-preview".
+    /// Transcription model. Defaults to "gpt-4o-mini-transcribe".
     pub model: String,
     /// Override base URL for tests.
     pub base_url: Option<String>,
@@ -34,7 +36,7 @@ impl Default for OpenAiRealtimeConfig {
     fn default() -> Self {
         Self {
             api_key: String::new(),
-            model: "gpt-4o-realtime-preview".into(),
+            model: "gpt-4o-mini-transcribe".into(),
             base_url: None,
         }
     }
@@ -85,7 +87,7 @@ struct OaiError {
     message: Option<String>,
 }
 
-/// Parse an OpenAI Realtime event JSON into transcript events.
+/// Parse an OpenAI Realtime transcription event JSON into transcript events.
 pub fn parse_event(payload: &str, source: AudioSource) -> Result<Vec<TranscriptEvent>, SttError> {
     let ev: OaiEvent = serde_json::from_str(payload)
         .map_err(|e| SttError::Protocol(format!("invalid OpenAI JSON: {e}")))?;
@@ -106,7 +108,7 @@ pub fn parse_event(payload: &str, source: AudioSource) -> Result<Vec<TranscriptE
     }
 
     match ty {
-        "response.audio_transcript.delta" => {
+        "conversation.item.input_audio_transcription.delta" => {
             if let Some(text) = ev.delta {
                 if !text.is_empty() {
                     return Ok(vec![TranscriptEvent::Partial {
@@ -118,7 +120,7 @@ pub fn parse_event(payload: &str, source: AudioSource) -> Result<Vec<TranscriptE
             }
             Ok(Vec::new())
         }
-        "response.audio_transcript.done" => {
+        "conversation.item.input_audio_transcription.completed" => {
             if let Some(text) = ev.transcript {
                 if !text.is_empty() {
                     return Ok(vec![TranscriptEvent::Final {
@@ -143,6 +145,13 @@ pub fn map_handshake_status(status: u16) -> SttError {
         s if (500..600).contains(&s) => SttError::Network(format!("server error {s}")),
         other => SttError::Protocol(format!("unexpected handshake status {other}")),
     }
+}
+
+/// Build the session.update JSON payload for transcription mode.
+pub fn build_session_update(model: &str) -> String {
+    format!(
+        r#"{{"type":"session.update","session":{{"input_audio_transcription":{{"model":"{model}"}}}}}}"#
+    )
 }
 
 // ========== Provider ==========
@@ -336,7 +345,10 @@ async fn run_connection(
     events_tx: &UnboundedSender<Result<TranscriptEvent, SttError>>,
 ) -> Result<(), SttError> {
     let base = cfg.base_url.as_deref().unwrap_or("wss://api.openai.com");
-    let url_str = format!("{base}/v1/realtime?model={}", cfg.model);
+    let url_str = format!(
+        "{base}/v1/realtime?model={}&intent=transcription",
+        cfg.model
+    );
     let url: url::Url =
         url::Url::parse(&url_str).map_err(|e| SttError::Protocol(format!("bad url: {e}")))?;
 
@@ -359,9 +371,16 @@ async fn run_connection(
         .await
         .map_err(map_ws_error)?;
 
-    *state.connection.lock() = ConnectionState::Connected;
-
     let (mut write, mut read) = ws_stream.split();
+
+    // Send session.update to configure transcription mode (proceed optimistically).
+    let session_update = build_session_update(&cfg.model);
+    write
+        .send(Message::text(session_update))
+        .await
+        .map_err(map_ws_error)?;
+
+    *state.connection.lock() = ConnectionState::Connected;
 
     loop {
         if state.closed.load(std::sync::atomic::Ordering::Acquire) {
@@ -451,23 +470,27 @@ mod tests {
 
     #[test]
     fn parse_event_delta_yields_partial() {
-        let payload = r#"{"type":"response.audio_transcript.delta","delta":"hello "}"#;
+        let payload =
+            r#"{"type":"conversation.item.input_audio_transcription.delta","delta":"hello "}"#;
         let events = parse_event(payload, AudioSource::Microphone).unwrap();
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], TranscriptEvent::Partial { text, .. } if text == "hello "));
     }
 
     #[test]
-    fn parse_event_done_yields_final() {
-        let payload = r#"{"type":"response.audio_transcript.done","transcript":"hello world"}"#;
+    fn parse_event_completed_yields_final() {
+        let payload = r#"{"type":"conversation.item.input_audio_transcription.completed","transcript":"hello world"}"#;
         let events = parse_event(payload, AudioSource::Microphone).unwrap();
         assert_eq!(events.len(), 1);
-        assert!(matches!(&events[0], TranscriptEvent::Final { text, .. } if text == "hello world"));
+        assert!(
+            matches!(&events[0], TranscriptEvent::Final { text, .. } if text == "hello world")
+        );
     }
 
     #[test]
     fn parse_event_error_auth() {
-        let payload = r#"{"type":"error","error":{"code":"invalid_api_key","message":"bad key"}}"#;
+        let payload =
+            r#"{"type":"error","error":{"code":"invalid_api_key","message":"bad key"}}"#;
         let err = parse_event(payload, AudioSource::Microphone).unwrap_err();
         assert!(matches!(err, SttError::Auth));
     }
@@ -494,6 +517,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_event_old_event_names_ignored() {
+        // Old event names must NOT produce transcript events
+        let payload = r#"{"type":"response.audio_transcript.delta","delta":"old"}"#;
+        let events = parse_event(payload, AudioSource::Microphone).unwrap();
+        assert!(events.is_empty());
+
+        let payload = r#"{"type":"response.audio_transcript.done","transcript":"old"}"#;
+        let events = parse_event(payload, AudioSource::Microphone).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
     fn resample_16k_to_24k_ratio() {
         let input = vec![0i16; 320]; // 20ms @ 16kHz
         let output = resample_16k_to_24k(&input);
@@ -505,6 +540,23 @@ mod tests {
         let input = vec![1000i16; 100];
         let output = resample_16k_to_24k(&input);
         assert!(output.iter().all(|&s| (s - 1000).unsigned_abs() <= 1));
+    }
+
+    #[test]
+    fn default_model_is_transcription_model() {
+        let cfg = OpenAiRealtimeConfig::default();
+        assert_eq!(cfg.model, "gpt-4o-mini-transcribe");
+    }
+
+    #[test]
+    fn build_session_update_contains_model() {
+        let json = build_session_update("gpt-4o-mini-transcribe");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "session.update");
+        assert_eq!(
+            v["session"]["input_audio_transcription"]["model"],
+            "gpt-4o-mini-transcribe"
+        );
     }
 
     // ========== Mock WebSocket tests ==========
@@ -544,12 +596,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_sends_session_update_first() {
+        let (tx, _rx) = stdmpsc::channel();
+        let (frame_tx, frame_rx) = stdmpsc::channel();
+        let addr = start_mock_server(tx, move |mut ws| async move {
+            // Read the first frame from the client — should be session.update
+            if let Some(Ok(msg)) = ws.next().await {
+                let text = msg.into_text().unwrap_or_default();
+                let _ = frame_tx.send(text);
+            }
+            let _ = ws.close(None).await;
+        })
+        .await;
+
+        let cfg = OpenAiRealtimeConfig {
+            api_key: "sk-test-key".into(),
+            base_url: Some(format!("ws://{addr}")),
+            model: "gpt-4o-mini-transcribe".into(),
+        };
+        let mut provider =
+            OpenAiRealtimeProvider::connect(cfg, SttConfig::default(), AudioSource::Microphone)
+                .await
+                .unwrap();
+
+        // Wait for connection to close
+        let _ = tokio::time::timeout(Duration::from_secs(3), provider.next_event()).await;
+
+        let first_frame =
+            tokio::task::spawn_blocking(move || frame_rx.recv_timeout(Duration::from_secs(2)))
+                .await
+                .unwrap()
+                .unwrap();
+
+        let v: serde_json::Value = serde_json::from_str(&first_frame).unwrap();
+        assert_eq!(v["type"], "session.update");
+        assert_eq!(
+            v["session"]["input_audio_transcription"]["model"],
+            "gpt-4o-mini-transcribe"
+        );
+    }
+
+    #[tokio::test]
     async fn connect_sends_bearer_auth_header() {
         let (tx, rx) = stdmpsc::channel();
         let addr = start_mock_server(tx, |mut ws| async move {
+            // Consume session.update then send a transcript
+            let _ = ws.next().await;
             let _ = ws
                 .send(Message::text(
-                    r#"{"type":"response.audio_transcript.done","transcript":"hi"}"#,
+                    r#"{"type":"conversation.item.input_audio_transcription.completed","transcript":"hi"}"#,
                 ))
                 .await;
             let _ = ws.close(None).await;
@@ -580,17 +675,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_delivers_delta_then_done() {
+    async fn connect_delivers_delta_then_completed() {
         let (tx, _rx) = stdmpsc::channel();
         let addr = start_mock_server(tx, |mut ws| async move {
+            // Consume session.update
+            let _ = ws.next().await;
             let _ = ws
                 .send(Message::text(
-                    r#"{"type":"response.audio_transcript.delta","delta":"hel"}"#,
+                    r#"{"type":"conversation.item.input_audio_transcription.delta","delta":"hel"}"#,
                 ))
                 .await;
             let _ = ws
                 .send(Message::text(
-                    r#"{"type":"response.audio_transcript.done","transcript":"hello"}"#,
+                    r#"{"type":"conversation.item.input_audio_transcription.completed","transcript":"hello"}"#,
                 ))
                 .await;
             let _ = ws.close(None).await;
@@ -627,6 +724,9 @@ mod tests {
         let (tx, _rx) = stdmpsc::channel();
         let (sig_tx, sig_rx) = stdmpsc::channel();
         let addr = start_mock_server(tx, move |mut ws| async move {
+            // First frame is session.update — skip it
+            let _ = ws.next().await;
+            // Second frame should be audio
             if let Some(Ok(msg)) = ws.next().await {
                 let is_text = msg.is_text();
                 let data = msg.into_text().unwrap_or_default();
@@ -678,5 +778,67 @@ mod tests {
                 .await
                 .unwrap_err();
         assert!(matches!(err, SttError::Auth));
+    }
+
+    #[tokio::test]
+    async fn error_event_auth_mapping() {
+        let (tx, _rx) = stdmpsc::channel();
+        let addr = start_mock_server(tx, |mut ws| async move {
+            let _ = ws.next().await; // session.update
+            let _ = ws
+                .send(Message::text(
+                    r#"{"type":"error","error":{"code":"invalid_api_key","message":"bad"}}"#,
+                ))
+                .await;
+            let _ = ws.close(None).await;
+        })
+        .await;
+
+        let cfg = OpenAiRealtimeConfig {
+            api_key: "sk-test".into(),
+            base_url: Some(format!("ws://{addr}")),
+            ..Default::default()
+        };
+        let mut provider =
+            OpenAiRealtimeProvider::connect(cfg, SttConfig::default(), AudioSource::Microphone)
+                .await
+                .unwrap();
+
+        let ev = tokio::time::timeout(Duration::from_secs(5), provider.next_event())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(ev, Err(SttError::Auth)));
+    }
+
+    #[tokio::test]
+    async fn error_event_quota_mapping() {
+        let (tx, _rx) = stdmpsc::channel();
+        let addr = start_mock_server(tx, |mut ws| async move {
+            let _ = ws.next().await; // session.update
+            let _ = ws
+                .send(Message::text(
+                    r#"{"type":"error","error":{"code":"rate_limit_exceeded","message":"slow"}}"#,
+                ))
+                .await;
+            let _ = ws.close(None).await;
+        })
+        .await;
+
+        let cfg = OpenAiRealtimeConfig {
+            api_key: "sk-test".into(),
+            base_url: Some(format!("ws://{addr}")),
+            ..Default::default()
+        };
+        let mut provider =
+            OpenAiRealtimeProvider::connect(cfg, SttConfig::default(), AudioSource::Microphone)
+                .await
+                .unwrap();
+
+        let ev = tokio::time::timeout(Duration::from_secs(5), provider.next_event())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(ev, Err(SttError::Quota(_))));
     }
 }
