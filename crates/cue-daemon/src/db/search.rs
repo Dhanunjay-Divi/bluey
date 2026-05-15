@@ -63,7 +63,7 @@ impl Database {
 
     pub fn search_transcripts(&self, query: &str, limit: usize) -> Result<Vec<TranscriptHit>> {
         let mut stmt = self.conn.prepare(
-            "SELECT session_id, text, snippet(transcript_fts, 1, '\u{00AB}', '\u{00BB}', '\u{2026}', 8), source, ts, rank \
+            "SELECT session_id, text, snippet(transcript_fts, 2, '\u{00AB}', '\u{00BB}', '\u{2026}', 8), source, ts, rank \
              FROM transcript_fts WHERE text MATCH ?1 ORDER BY rank LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![query, limit as i64], |row| {
@@ -78,6 +78,14 @@ impl Database {
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    pub fn delete_transcript(&self, id: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "DELETE FROM transcripts WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(changed > 0)
     }
 
     pub fn list_transcripts(&self, session_id: &str) -> Result<Vec<TranscriptRow>> {

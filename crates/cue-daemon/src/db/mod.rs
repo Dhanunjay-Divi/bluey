@@ -41,6 +41,8 @@ impl Database {
         const MIGRATION_006: &str =
             include_str!("../../../../infra/migrations/006_transcript_fts.sql");
         const MIGRATION_007: &str = include_str!("../../../../infra/migrations/007_speakers.sql");
+        const MIGRATION_008: &str =
+            include_str!("../../../../infra/migrations/008_fts_cascade_fix.sql");
         self.conn
             .execute_batch(MIGRATION_002)
             .context("failed to run session migration")?;
@@ -59,6 +61,9 @@ impl Database {
         self.conn
             .execute_batch(MIGRATION_007)
             .context("failed to run speakers migration")?;
+        self.conn
+            .execute_batch(MIGRATION_008)
+            .context("failed to run fts cascade fix migration")?;
         Ok(())
     }
 
@@ -861,5 +866,57 @@ mod fts_tests {
         assert_eq!(db.load_setting("key1").unwrap(), Some("val1".into()));
         let all = db.load_all_settings().unwrap();
         assert_eq!(all.get("key1").unwrap(), "val1");
+    }
+
+    #[test]
+    fn fts_delete_removes_index_row() {
+        let db = test_db();
+        let session = db.create_session(Some("Del Test".into())).unwrap();
+        let sid = session.id.to_string();
+        let tid = db
+            .insert_transcript(&sid, "unique deletable phrase", "mic", None, true, 1000)
+            .unwrap();
+        let hits = db.search_transcripts("deletable", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        db.delete_transcript(&tid).unwrap();
+        let hits = db.search_transcripts("deletable", 10).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn fts_cascade_delete_clears_session_index() {
+        let db = test_db();
+        let session = db.create_session(Some("Cascade Test".into())).unwrap();
+        let sid = session.id.to_string();
+        db.insert_transcript(&sid, "cascade alpha content", "mic", None, true, 1000)
+            .unwrap();
+        db.insert_transcript(&sid, "cascade beta content", "mic", None, true, 2000)
+            .unwrap();
+        db.insert_transcript(&sid, "cascade gamma content", "mic", None, true, 3000)
+            .unwrap();
+        assert_eq!(db.search_transcripts("cascade", 10).unwrap().len(), 3);
+        db.delete_session(session.id).unwrap();
+        assert!(db.search_transcripts("cascade", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fts_index_is_consistent_after_mixed_ops() {
+        let db = test_db();
+        let session = db.create_session(Some("Mixed Ops".into())).unwrap();
+        let sid = session.id.to_string();
+        let t1 = db
+            .insert_transcript(&sid, "mixop first entry", "mic", None, true, 1000)
+            .unwrap();
+        db.insert_transcript(&sid, "mixop second entry", "mic", None, true, 2000)
+            .unwrap();
+        assert_eq!(db.search_transcripts("mixop", 10).unwrap().len(), 2);
+        db.delete_transcript(&t1).unwrap();
+        assert_eq!(db.search_transcripts("mixop", 10).unwrap().len(), 1);
+        db.insert_transcript(&sid, "mixop third entry", "mic", None, true, 3000)
+            .unwrap();
+        let hits = db.search_transcripts("mixop", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|h| h.text.contains("second")));
+        assert!(hits.iter().any(|h| h.text.contains("third")));
     }
 }
