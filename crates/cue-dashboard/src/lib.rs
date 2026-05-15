@@ -31,6 +31,18 @@ pub fn run() {
             commands::get_active_session,
             commands::set_active_session,
             commands::list_turns,
+            // R5: STT settings + secure key store
+            commands::save_stt_api_key,
+            commands::load_stt_api_key,
+            commands::list_audio_devices,
+            commands::save_settings,
+            commands::load_settings,
+            // R5: Search, Export, Speakers
+            commands::search_transcripts,
+            commands::export_session_to_clipboard,
+            commands::export_session_to_file,
+            commands::set_speaker_name,
+            commands::list_speakers,
         ])
         .setup(|app| {
             // Open database

@@ -6,7 +6,7 @@ use std::time::Duration;
 use cue_core::pcm::{AudioSource, SampleRate};
 use cue_core::stt::{SttConfig, SttProvider, TranscriptEvent};
 use cue_daemon::audio::system_capture::SystemAudioCapture;
-use cue_daemon::stt::mock::{MockStt, MockSttControl};
+use cue_daemon::stt::mock::MockStt;
 
 fn stub_binary_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_BIN_EXE_system-audio-stub"));

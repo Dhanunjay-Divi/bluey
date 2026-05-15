@@ -251,6 +251,13 @@ pub fn restart_delay(attempt: u32) -> Duration {
     Duration::from_millis(ms.min(5_000))
 }
 
+/// Check if system audio STT is enabled via env var.
+pub fn is_system_audio_stt_enabled() -> bool {
+    std::env::var("BLUEY_SYSTEM_AUDIO_STT")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,11 +331,4 @@ mod tests {
         }
         PathBuf::from("target/debug/system-audio-stub")
     }
-}
-
-/// Check if system audio STT is enabled via env var.
-pub fn is_system_audio_stt_enabled() -> bool {
-    std::env::var("BLUEY_SYSTEM_AUDIO_STT")
-        .map(|v| v == "1")
-        .unwrap_or(false)
 }
