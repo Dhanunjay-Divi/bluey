@@ -5,7 +5,11 @@ mod macos;
 use std::sync::Mutex;
 
 use cue_daemon::db::Database;
-use tauri::{Emitter, Manager};
+use tauri::{
+    menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem},
+    tray::TrayIconBuilder,
+    Emitter, Manager,
+};
 
 use crate::commands::ActiveSessionState;
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
@@ -66,10 +70,21 @@ pub fn run() {
             // Register global shortcuts
             register_global_shortcut(app)?;
 
+            // Setup system tray
+            setup_tray(app)?;
+
             #[cfg(target_os = "macos")]
             macos::setup_nspanel(app)?;
 
             Ok(())
+        })
+        // Intercept window close: hide to tray instead of quitting.
+        // Quit only via tray menu "Quit" item.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -147,6 +162,57 @@ fn register_global_shortcut(app: &tauri::App) -> Result<(), Box<dyn std::error::
             }
         },
     )?;
+
+    Ok(())
+}
+
+fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let toggle_listening =
+        MenuItemBuilder::with_id("toggle_listening", "Toggle Listening").build(app)?;
+    let show_dashboard = MenuItemBuilder::with_id("show_dashboard", "Show Dashboard").build(app)?;
+    let toggle_overlay = MenuItemBuilder::with_id("toggle_overlay", "Toggle Overlay").build(app)?;
+    let settings = MenuItemBuilder::with_id("settings", "Settings…").build(app)?;
+    let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+
+    let menu = MenuBuilder::new(app)
+        .item(&toggle_listening)
+        .item(&show_dashboard)
+        .item(&toggle_overlay)
+        .item(&PredefinedMenuItem::separator(app)?)
+        .item(&settings)
+        .item(&PredefinedMenuItem::separator(app)?)
+        .item(&quit)
+        .build()?;
+
+    TrayIconBuilder::new()
+        .icon(app.default_window_icon().cloned().unwrap())
+        .menu(&menu)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "toggle_listening" => {
+                let _ = app.emit("hotkey_toggle_listening", ());
+            }
+            "show_dashboard" => {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+            "toggle_overlay" => {
+                let _ = app.emit("hotkey_toggle_overlay", ());
+            }
+            "settings" => {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                    let _ = app.emit("navigate_to", "/settings");
+                }
+            }
+            "quit" => {
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .build(app)?;
 
     Ok(())
 }

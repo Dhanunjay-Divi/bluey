@@ -17,7 +17,7 @@ path = "src/lib.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["macos-private-api"] }
+tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
 tauri-plugin-shell = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
@@ -36,4 +36,4 @@ uuid = { workspace = true }
 tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2" }
 
 [lints.rust]
-unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("cargo-clippy"))']}
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("cargo-clippy"))']  }
