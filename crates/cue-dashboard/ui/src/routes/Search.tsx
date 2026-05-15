@@ -12,6 +12,38 @@ interface TranscriptHit {
   rank: number;
 }
 
+/** Parse a snippet with «highlighted» markers into safe React elements. */
+function renderSnippet(snippet: string) {
+  const parts: { text: string; highlight: boolean }[] = [];
+  let remaining = snippet;
+  while (remaining.length > 0) {
+    const start = remaining.indexOf("\u00AB");
+    if (start === -1) {
+      parts.push({ text: remaining, highlight: false });
+      break;
+    }
+    if (start > 0) {
+      parts.push({ text: remaining.slice(0, start), highlight: false });
+    }
+    const end = remaining.indexOf("\u00BB", start);
+    if (end === -1) {
+      parts.push({ text: remaining.slice(start), highlight: false });
+      break;
+    }
+    parts.push({ text: remaining.slice(start + 1, end), highlight: true });
+    remaining = remaining.slice(end + 1);
+  }
+  return parts.map((p, i) =>
+    p.highlight ? (
+      <mark key={i} className="bg-yellow-600/40 text-yellow-200 rounded px-0.5">
+        {p.text}
+      </mark>
+    ) : (
+      <span key={i}>{p.text}</span>
+    )
+  );
+}
+
 export function Search() {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<TranscriptHit[]>([]);
@@ -62,7 +94,7 @@ export function Search() {
                 </span>
                 <span>{new Date(hit.ts).toLocaleTimeString()}</span>
               </div>
-              <p className="text-zinc-300" dangerouslySetInnerHTML={{ __html: hit.snippet.replace(/\u00AB/g, '<mark class="bg-yellow-600/40 text-yellow-200 rounded px-0.5">').replace(/\u00BB/g, '</mark>') }} />
+              <p className="text-zinc-300">{renderSnippet(hit.snippet)}</p>
             </li>
           ))}
         </ul>

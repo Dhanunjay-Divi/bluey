@@ -1,14 +1,53 @@
-import { HashRouter, Routes, Route } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { HashRouter, Routes, Route, useNavigate } from "react-router-dom";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { DashboardLayout } from "./components/DashboardLayout";
 import { Chats } from "./pages/Chats";
 import { SessionDetail } from "./pages/SessionDetail";
 import { Placeholder } from "./pages/Placeholder";
 import { Search } from "./routes/Search";
 import { UpdateToast } from "./components/UpdateToast";
+import { Onboarding } from "./pages/Onboarding";
+
+/** Listens for tray "navigate_to" events and routes accordingly. */
+function NavigateListener() {
+  const navigate = useNavigate();
+  useEffect(() => {
+    const unlisten = listen<string>("navigate_to", (event) => {
+      navigate(event.payload);
+    });
+    return () => { unlisten.then((fn) => fn()); };
+  }, [navigate]);
+  return null;
+}
 
 function App() {
+  const [ready, setReady] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(false);
+
+  useEffect(() => {
+    invoke<Record<string, string>>("load_settings")
+      .then((settings) => {
+        if (!settings?.onboarding_complete || settings.onboarding_complete !== "true") {
+          setShowOnboarding(true);
+        }
+      })
+      .catch(() => {
+        setShowOnboarding(true);
+      })
+      .finally(() => setReady(true));
+  }, []);
+
+  if (!ready) return null;
+
+  if (showOnboarding) {
+    return <Onboarding onComplete={() => setShowOnboarding(false)} />;
+  }
+
   return (
     <HashRouter>
+      <NavigateListener />
       <Routes>
         <Route element={<DashboardLayout />}>
           <Route index element={<Placeholder name="Home" />} />
