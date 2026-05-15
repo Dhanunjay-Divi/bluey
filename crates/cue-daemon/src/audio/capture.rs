@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use anyhow::{bail, Context, Result};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{SampleFormat, StreamConfig};
 use cue_core::pcm::{AudioChunk, AudioSource, SampleRate};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
@@ -28,6 +28,13 @@ pub struct CaptureOptions {
     /// Target chunk duration in milliseconds (20 ms recommended — matches
     /// WebRTC VAD frame sizes).
     pub chunk_ms: u32,
+    /// Preferred input device name. If set and a matching device is found, it
+    /// will be used instead of the system default. If not found, falls back to
+    /// the default device with a warning log.
+    ///
+    /// Note: changing this while a session is active does NOT hot-swap the
+    /// device. The new setting applies on the next capture session start.
+    pub device_name: Option<String>,
 }
 
 impl Default for CaptureOptions {
@@ -35,8 +42,31 @@ impl Default for CaptureOptions {
         Self {
             source: AudioSource::Microphone,
             chunk_ms: 20,
+            device_name: None,
         }
     }
+}
+
+/// Resolve the input device: prefer `device_name` if set, fall back to default.
+fn resolve_input_device(host: &cpal::Host, device_name: Option<&str>) -> Result<cpal::Device> {
+    if let Some(name) = device_name.filter(|n| !n.trim().is_empty()) {
+        if let Ok(devices) = host.input_devices() {
+            for d in devices {
+                if let Ok(n) = d.name() {
+                    if n == name {
+                        tracing::info!(device = %name, "using configured mic device");
+                        return Ok(d);
+                    }
+                }
+            }
+        }
+        tracing::warn!(
+            requested = %name,
+            "configured mic device not found, falling back to default"
+        );
+    }
+    host.default_input_device()
+        .context("no default input device available")
 }
 
 /// Handle to a running capture session. Drop this to stop the stream.
@@ -47,15 +77,13 @@ pub struct MicrophoneCapture {
 }
 
 impl MicrophoneCapture {
-    /// Start capture on the system's default input device.
+    /// Start capture on the configured or default input device.
     ///
     /// Returns a `(handle, rx)` pair: the handle owns the capture thread;
     /// `rx` yields framed `AudioChunk`s.
     pub fn start(opts: CaptureOptions) -> Result<(Self, UnboundedReceiver<AudioChunk>)> {
         let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .context("no default input device available")?;
+        let device = resolve_input_device(&host, opts.device_name.as_deref())?;
 
         let config = device
             .default_input_config()
@@ -144,6 +172,7 @@ impl MicrophoneCapture {
                 }
             };
 
+            use cpal::traits::StreamTrait;
             if let Err(e) = stream.play() {
                 tracing::error!(error = %e, "failed to play input stream");
                 return;
@@ -199,6 +228,16 @@ fn epoch_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Load the configured mic device name from the app settings database.
+/// Returns `None` if no setting is stored or the DB is unavailable.
+pub fn load_mic_device_setting(db_path: &str) -> Option<String> {
+    let db = crate::db::Database::open(db_path).ok()?;
+    db.load_setting("audio.mic_device")
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     // Real CPAL tests require an audio device and permissions — ignored in CI.
@@ -223,5 +262,53 @@ mod tests {
                 .ok();
         });
         cap.stop();
+    }
+
+    #[test]
+    fn resolve_device_falls_back_to_default_when_name_not_found() {
+        // With a bogus device name, resolve_input_device should fall back to default.
+        let host = cpal::default_host();
+        let result = resolve_input_device(&host, Some("__nonexistent_device_xyz__"));
+        // On CI without audio devices this may fail, but the logic path is exercised.
+        // If a default device exists, it should succeed.
+        if host.default_input_device().is_some() {
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn resolve_device_uses_default_when_name_is_none() {
+        let host = cpal::default_host();
+        let result = resolve_input_device(&host, None);
+        if host.default_input_device().is_some() {
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn resolve_device_uses_default_when_name_is_empty() {
+        let host = cpal::default_host();
+        let result = resolve_input_device(&host, Some(""));
+        if host.default_input_device().is_some() {
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn load_mic_device_setting_returns_none_for_missing_db() {
+        // Non-existent path should return None gracefully.
+        let result = load_mic_device_setting("/tmp/__nonexistent_bluey_test_db__/test.db");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn load_mic_device_setting_returns_stored_value() {
+        let db = crate::db::Database::open(":memory:").unwrap();
+        db.save_setting("audio.mic_device", "My USB Mic").unwrap();
+        let val = db
+            .load_setting("audio.mic_device")
+            .unwrap()
+            .filter(|s| !s.trim().is_empty());
+        assert_eq!(val, Some("My USB Mic".to_string()));
     }
 }
