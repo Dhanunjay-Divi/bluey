@@ -63,3 +63,7 @@ path = "src/bin/overlay_stub_long.rs"
 [[bin]]
 name = "overlay-stub-crash"
 path = "src/bin/overlay_stub_crash.rs"
+
+[[bin]]
+name = "whisper-stub"
+path = "src/bin/whisper_stub.rs"
