@@ -49,28 +49,28 @@
 | Field | Value |
 |-------|-------|
 | Files | `crates/cue-core/src/audio.rs`, `crates/cue-daemon/src/app.rs`, `crates/cue-dashboard/src/commands.rs`, `crates/cue-dashboard/src/lib.rs`, `crates/cue-dashboard/ui/src/App.tsx`, `crates/cue-dashboard/ui/src/components/PermissionBanner.tsx` |
-| Verdict | 🔴 blocker |
+| Verdict | 🟢 accept |
 
 **Findings:**
 - ✅ The daemon now calls the microphone/system permission classifiers from the real audio error path and records `permission_denied_source` on `AudioCaptureStatus` (`crates/cue-daemon/src/app.rs:1972`, `crates/cue-daemon/src/app.rs:1985`).
 - ✅ The cross-process status field is present and serializable (`crates/cue-core/src/audio.rs:828`).
 - ✅ `open_privacy_settings` no longer hardcodes macOS `open`; command construction is platform-specific (`crates/cue-dashboard/src/commands.rs:460`).
-- 🔴 The dashboard still does not surface real permission denials automatically. `poll_audio_permission` checks daemon status and emits `audio_permission_denied` (`crates/cue-dashboard/src/commands.rs:526`), but there are no frontend call sites for `poll_audio_permission` in `App.tsx` or `PermissionBanner.tsx` (`crates/cue-dashboard/ui/src/App.tsx:76`, `crates/cue-dashboard/ui/src/components/PermissionBanner.tsx:25`). As shipped, the banner still appears only when some caller explicitly invokes the test/manual command path, so the original user-facing UX gap remains.
-- Required fix: add a mounted frontend poller or daemon/dashboard event bridge that invokes `poll_audio_permission` after audio start and periodically while audio is active. Add a UI-side test or component-level test that proves a status permission denial becomes a visible `PermissionBanner` without manually calling `emit_permission_denied`.
+- ✅ The final UI bridge is now mounted. `PermissionPoller` invokes `poll_audio_permission` once on mount and every 5 seconds, which activates the daemon-status → Tauri event → `PermissionBanner` path without requiring manual `emit_permission_denied` calls (`crates/cue-dashboard/ui/src/App.tsx:58`, `crates/cue-dashboard/ui/src/App.tsx:107`).
+- 🟡 Follow-up: the poller runs whenever the dashboard app is mounted, not only while audio is active. That is acceptable for alpha because the command is cheap and failure-tolerant, but Round 7 can reduce idle polling by checking audio state or starting the poll after audio start.
 
 ### P3.R6.4 Recheck — OpenAI Realtime STT Provider
 
 | Field | Value |
 |-------|-------|
 | Files | `crates/cue-daemon/src/stt/openai.rs`, `crates/cue-daemon/src/stt/router.rs` |
-| Verdict | 🔴 blocker |
+| Verdict | 🟢 accept |
 
 **Findings:**
 - ✅ The old `response.audio_transcript.*` parser issue is fixed. The parser now maps `conversation.item.input_audio_transcription.delta` to partials and `.completed` to finals (`crates/cue-daemon/src/stt/openai.rs:111`, `crates/cue-daemon/src/stt/openai.rs:123`).
 - ✅ The connect URL includes `intent=transcription`, auth stays Bearer-based, and the old response-audio transcript events are ignored instead of being misclassified.
-- 🔴 The session configuration frame still does not match the current official OpenAI transcription-session API. The current OpenAI API reference documents the client event as `transcription_session.update` with transcription settings under the transcription session fields; this code sends `{"type":"session.update","session":{"input_audio_transcription":...}}` (`crates/cue-daemon/src/stt/openai.rs:150`, `crates/cue-daemon/src/stt/openai.rs:377`). A mock server accepting this project-local shape does not prove live API compatibility.
+- ✅ The session configuration frame now uses the current official event type: `transcription_session.update` (`crates/cue-daemon/src/stt/openai.rs:151`, `crates/cue-daemon/src/stt/openai.rs:160`). Mock WebSocket tests assert that exact frame type before accepting audio/transcript traffic (`crates/cue-daemon/src/stt/openai.rs:558`, `crates/cue-daemon/src/stt/openai.rs:605`).
 - 🟡 Model default note: `gpt-4o-mini-transcribe` is at least a transcription model, so this is no longer the old conversation-model blocker. However, the current realtime transcription guide recommends `gpt-realtime-whisper` for lowest-latency streaming sessions. If Bluey keeps `gpt-4o-mini-transcribe` as the default, document the latency/cost tradeoff and add a model override setting in the router-wiring round.
-- Required fix: align the client configuration event with the current OpenAI transcription-session reference, or pin/document a specific supported beta protocol with a live smoke test. Add a mock-WS assertion for the exact official frame type/shape.
+- 🟡 Follow-up: comments in the OpenAI test server still say "session.update" in a few places even though the assertions are correct. That is doc-comment polish only.
 
 ### P3.R6.5 — R6 Work Docs
 
@@ -87,8 +87,8 @@
 
 - R5.F3 is fixed; the severe dual-provider system-audio STT bug is gone.
 - R6.2 mic-device plumbing is fixed.
-- R6.3 is improved in the backend and Tauri command layer, but not complete as user-facing UX because no mounted UI code invokes the poll command.
-- R6.4 is directionally better, but still needs one more protocol correction/verification against OpenAI's current transcription-session API before it can be called a live OpenAI provider.
+- R6.3 is now end-to-end enough for alpha: real capture failures set daemon status, dashboard polling emits the Tauri event, and the banner listens for it.
+- R6.4 now matches the current OpenAI transcription-session event shape at the client-event level. Live API smoke testing can happen when keys/router wiring land.
 
 ## Build & Test Verification
 
@@ -103,10 +103,11 @@ git diff --check                           # ✅
 
 ## Overall Verdict
 
-🔴 **REQUEST CHANGES** — R5.F3 and mic-device selection are fixed, but Round 6 still has two merge blockers: permission denial is not automatically surfaced by the UI, and OpenAI Realtime's session configuration frame needs to match the current official transcription-session protocol or be proven with a live-compatible contract.
+🟢 **ACCEPT** — Ready to merge R5+R6 to main and start Round 7.
 
 ## Follow-ups for Next Batch
 
-- Add a lightweight mounted permission poller in the dashboard, or move the permission-denial event bridge fully into Rust/Tauri so it does not depend on manual command invocation.
-- Update OpenAI Realtime STT to the current `transcription_session.update` event shape, or provide a documented protocol pin plus a real API smoke test.
-- Keep Rust-side hotkey IPC dispatch and OpenAI router factory wiring for Round 7 after these blockers are closed.
+- Reduce idle permission polling or move the permission-denial bridge fully into Rust/Tauri when hardening the dashboard background lifecycle.
+- Keep the OpenAI default model decision (`gpt-4o-mini-transcribe` vs `gpt-realtime-whisper`) for the router-wiring round, where it can be tested with real keys and latency/cost metrics.
+- Wire OpenAI into `SttRouter` behind `BLUEY_STT_FALLBACK_OPENAI=1` and add a live-compatible smoke test once credentials are available.
+- Move hotkey daemon IPC dispatch from React listeners into Rust-side handlers for better behavior during webview reloads.
