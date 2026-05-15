@@ -42,45 +42,32 @@ export PATH=/opt/homebrew/bin:/Users/uno/.cargo/bin:/usr/local/bin:$PATH
 cargo build --all-targets 2>&1 | tail -20'
 ```
 
-## Current state (as of 2026-05-14, post-R5 implementation)
+## Current state (as of 2026-05-15, post-R6 fix wave)
 
-- **Branch:** `feat/phase-3-round-5` — 16 commits ahead of R4 (pending codex review):
+- **Branch:** `feat/phase-3-round-6` — 11 commits ahead of R5:
   ```
-  8ad44fe feat(dashboard): auto-update support via tauri-plugin-updater [P3.R5]
-  863b44b feat(dashboard): system tray with listening + dashboard + overlay controls [P3.R5]
-  4f1501d feat(dashboard): global hotkeys for listening/PTT/overlay-toggle [P3.R5]
-  617ed16 fix(p3r5): reconcile parallel-subagent cherry-picks (deps + secrets module + commands wiring) [P3.R5]
-  deb48fa feat(dashboard): first-run onboarding flow [P3.R5]
-  e52767f feat(daemon): SttRouter with failover + EchoProvider stub [P3.R5]
-  12991de feat(daemon): route system audio through parallel STT [P3.R5]
-  1759ceb feat(overlay): stealth flags (hide-from-screenshare, hide-from-dock/alt-tab) [P3.R5]
-  4143ce8 feat(overlay): render transcript content in macOS + Windows overlays [P3.R5]
-  c4dc846 feat(overlay): macOS native overlay binary with NSWindow + protocol ABI [P3.R5]
-  bb4c5f8 feat(dashboard): speaker name mapping with persistence [P3.R5]
-  3b118c0 feat(dashboard): export sessions to markdown/text/json + clipboard/file [P3.R5]
-  361c38e feat(daemon): FTS5 transcript search with backfill [P3.R5]
-  3e3dada feat(dashboard): settings panel with STT provider + audio device + language [P3.R5]
-  f832d3a feat(daemon): FTS5 transcript search with backfill [P3.R5]
-  cbcdc08 feat(daemon): secure API key storage via OS keychain [P3.R5]
+  7a9285f chore(p3r6-fix): cargo fmt across cherry-picked fixes
+  b8ed87e fix(daemon): OpenAI Realtime STT uses transcription session protocol [P3.R6 fix]
+  3f08371 fix(dashboard): wire permission denial from real capture errors + platform-specific Settings launchers [P3.R6 fix]
+  5dbd982 fix(daemon): plumb mic device selection through AudioStart IPC to capture [P3.R6 fix]
+  fb3beed fix(daemon): system-audio STT must use single provider for send + drain [P3.R5 fix2]
+  1574eb2 docs(work): comprehensive handoff to codex (R5/R6 review + all pending implementation)
+  18f14bc chore(p3r6): fix clippy items-after-test-module + result_large_err in openai
+  9a7879b feat(daemon): OpenAI Realtime STT provider with auth + reconnect [P3.R6]
+  5ef2098 feat(dashboard): permission denial UX for mic + system audio [P3.R6]
+  1e55972 feat(daemon): respect mic device selection from app settings [P3.R6]
+  dd0f4de feat(daemon): wire hotkey/tray events to start-stop / PTT / overlay toggle [P3.R6]
   ```
-- **Test count:** 157 passing (+21 vs R4)
-- **R5 delivered:**
-  - macOS native overlay (Swift/AppKit) with transcript rendering + stealth (`sharingType = .none`)
-  - Windows overlay transcript rendering + `WDA_EXCLUDEFROMCAPTURE` stealth
-  - `SttRouter` with failover chain + `EchoProvider` stub as secondary
-  - System audio → parallel STT routing (events produced, not yet consumed downstream)
-  - Secure API key storage via OS keychain (`keyring` crate)
-  - Settings panel Tauri commands (save/load settings, list audio devices)
-  - First-run onboarding flow (API key → mic test → system audio opt-in)
-  - FTS5 full-text search on transcripts with `snippet()` highlighting
-  - Session export to markdown/text/JSON (clipboard + file)
-  - Speaker name mapping with per-session persistence
-  - Global hotkeys (toggle listening, PTT toggle, toggle overlay, toggle dashboard)
-  - System tray with menu controls
-  - Auto-update infrastructure (`tauri-plugin-updater`, placeholder endpoint)
-  - Window-close intercept (hide to tray, not quit)
-- **All checks green:** fmt, clippy (-D warnings), build, cargo test (157),
+- **Test count:** 201 passing, 2 ignored (+37 vs R5 post-fix)
+- **R6 deliverables shipped (end-to-end):**
+  - Hotkey/tray events wired to daemon IPC (toggle listening, PTT, overlay toggle)
+  - Mic device selection plumbed through `AudioStart` IPC to capture config
+  - Permission denial UX: real capture errors classified → status field → dashboard poll → banner + platform-specific Settings launcher
+  - OpenAI Realtime STT provider with transcription session protocol (correct event names, model, session.update)
+  - System-audio STT fixed: single provider for send + drain via `tokio::select!`
+- **All checks green:** fmt, clippy (-D warnings), build, cargo test (201),
   dashboard npm build, swift build (cue-overlay), git diff --check
+- **Status:** Awaiting codex re-review (PHASE-3-ROUND-6-HANDOFF-FOR-CODEX-REVIEW.md submitted)
 
 ## Workflow loop (kiro ↔ codex ↔ user)
 
@@ -121,14 +108,11 @@ docs/work/TEMPLATE-FIX.md
 6. **Commit messages** follow Conventional Commits, e.g.:
    `feat(daemon): system audio capture via native helpers [P3.R4]`
 
-## Parallel subagent risks (learned from R5)
+## Parallel subagent strategy (learned from R5 → improved in R6)
 
-Round 5 used 4 parallel subagents sharing a single working tree on uno. This caused:
-- Cherry-pick conflicts when subagents committed to the same files
-- Duplicate implementations (two subagents both wrote FTS5 search)
-- A reconciliation commit was needed to resolve conflicts
+**R5 problem:** 4 parallel subagents sharing a single working tree caused cherry-pick conflicts, duplicate implementations, and required a reconciliation commit.
 
-**For future rounds:** if parallel subagents are used again, assign non-overlapping file sets to each subagent, or use sequential execution. The reconciliation overhead was significant.
+**R6 solution:** 4 parallel subagents each used an isolated git worktree. Commits were cherry-picked onto the main branch after completion. A single `cargo fmt` commit normalized formatting. **Zero conflicts, zero reconciliation needed.** Recommend continuing this pattern for future parallel work.
 
 ## Key files + locations on uno
 
@@ -136,15 +120,17 @@ Round 5 used 4 parallel subagents sharing a single working tree on uno. This cau
 /Users/uno/Downloads/cue/
 ├── Cargo.toml                            # workspace root
 ├── crates/
-│   ├── cue-core/                         # types: pcm, vad, stt, overlay_ipc, session
+│   ├── cue-core/                         # types: pcm, vad, stt, overlay_ipc, session, audio
 │   ├── cue-daemon/
 │   │   ├── src/
 │   │   │   ├── audio/
 │   │   │   │   ├── mod.rs
-│   │   │   │   └── system_capture.rs     # R4 — native helper launcher + R5 STT routing
+│   │   │   │   ├── capture.rs            # R6 — load_mic_device_setting helper
+│   │   │   │   └── system_capture.rs     # R4 — native helper launcher
 │   │   │   ├── stt/
 │   │   │   │   ├── mock.rs
 │   │   │   │   ├── deepgram.rs           # R3 — Nova-3 provider
+│   │   │   │   ├── openai.rs             # R6 — OpenAI Realtime transcription session
 │   │   │   │   ├── router.rs             # R5 — SttRouter failover chain
 │   │   │   │   └── echo.rs              # R5 — EchoProvider stub
 │   │   │   ├── db/
@@ -156,7 +142,7 @@ Round 5 used 4 parallel subagents sharing a single working tree on uno. This cau
 │   │   │   ├── export/
 │   │   │   │   └── mod.rs               # R5 — ExportOptions re-export
 │   │   │   ├── overlay.rs                # R3+4 — supervisor with restart loop
-│   │   │   ├── app.rs                    # Wiring: system audio, STT router
+│   │   │   ├── app.rs                    # R6 — single-task select! for sys STT; mic device plumbing; permission classifier
 │   │   │   └── bin/
 │   │   │       ├── overlay_stub.rs
 │   │   │       ├── overlay_stub_oneshot.rs
@@ -165,34 +151,38 @@ Round 5 used 4 parallel subagents sharing a single working tree on uno. This cau
 │   │       ├── pipeline_integration.rs
 │   │       ├── overlay_pipe_integration.rs
 │   │       ├── overlay_restart_integration.rs
-│   │       └── system_audio_integration.rs
+│   │       ├── system_audio_integration.rs  # R6 — single_provider_send_and_drain test
+│   │       └── mic_device_selection.rs      # R6 — 5 IPC/config/DB tests
 │   └── cue-dashboard/                    # Tauri + React UI
 │       ├── src/
-│       │   ├── lib.rs                    # R5 — tray, hotkeys, updater, window intercept
-│       │   └── commands.rs               # R5 — 15+ new Tauri commands
+│       │   ├── lib.rs                    # R5+R6 — tray, hotkeys, updater, window intercept, poll_audio_permission
+│       │   └── commands.rs               # R6 — mic device from DB, permission poll, platform launchers
 │       └── ui/src/
 │           ├── pages/Onboarding.tsx       # R5 — first-run flow
 │           ├── routes/Search.tsx          # R5 — FTS5 search UI
-│           └── components/UpdateToast.tsx  # R5 — update notification
+│           ├── components/UpdateToast.tsx  # R5 — update notification
+│           └── components/PermissionBanner.tsx  # R6 — permission denial banner
 ├── native/
 │   ├── macos/
 │   │   ├── cue-audio/                    # Swift: ScreenCaptureKit + AVAudioEngine
 │   │   └── cue-overlay/                  # R5 — Swift: NSWindow overlay with stealth
-│   │       ├── Package.swift
-│   │       └── Sources/cue-overlay/main.swift
 │   └── windows/
 │       ├── cue-audio/main.c              # C: WASAPI loopback
 │       └── cue-overlay/main.c            # R4+R5: Direct2D overlay + transcript rendering
 ├── infra/migrations/
 │   ├── 005_settings.sql                  # R5 — app_settings KV table
 │   ├── 006_transcript_fts.sql            # R5 — transcripts + FTS5 + triggers
-│   └── 007_speakers.sql                  # R5 — speakers table
+│   ├── 007_speakers.sql                  # R5 — speakers table
+│   └── 008_fts_cascade_fix.sql           # R5 fix — FTS delete consistency
 └── docs/work/
     ├── TEMPLATE-REVIEW.md
     ├── TEMPLATE-FIX.md
-    ├── IMPL-PHASE-3-ROUND-{1,2,3,4,5}.md
-    ├── PHASE-3-ROUND-{1,2,3,4,5}-HANDOFF-FOR-CODEX-REVIEW.md
-    ├── REVIEW-PHASE-3-ROUND-{1,2,3}.md   # codex's verdicts
+    ├── TEMPLATE-IMPL.md
+    ├── IMPL-PHASE-3-ROUND-{1,2,3,4,5,6}.md
+    ├── PHASE-3-ROUND-{1,2,3,4,5,6}-HANDOFF-FOR-CODEX-REVIEW.md
+    ├── REVIEW-PHASE-3-ROUND-{1,2,3,5,6}.md   # codex's verdicts
+    ├── HANDOFF-FROM-CODEX-TO-KIRO.md          # codex's R5/R6 handoff
+    ├── AGENT-ONBOARDING.md
     └── PLAN-STT-FALLBACK-CHAIN.md
 ```
 
@@ -204,17 +194,19 @@ In `crates/cue-core/src/`:
 - `vad.rs`: `FrameAction {Send, SendSilence, Drop}`, `VadAggressiveness`, `VadConfig`
 - `stt.rs`: `SttProvider` async trait, `TranscriptEvent {Partial, Final, SpeakerLabel}`, `ConnectionState`, `SttError`, `WordTiming`, `SttConfig`
 - `overlay_ipc.rs`: `OverlayMessage` (SessionSwitched/ListeningStateChanged/TranscriptPartial/TranscriptFinal/Ping), `OverlayIpcCommand {Pong, RequestSync}`, `encode_ndjson`, `decode_ndjson`
+- `audio.rs`: `AudioCaptureStatus { permission_denied_source: Option<String>, ... }`, `AudioCaptureConfig`
+- `ipc.rs`: `DaemonRequest::AudioStart { enable_system, enable_microphone, mic_device_id }`
 
-## Post-R5 next-round candidates
+## Pending work (after R6 re-review passes)
 
-1. **Real secondary STT provider** — replace `EchoProvider` with OpenAI Realtime / AssemblyAI / Groq Whisper (tier 2 in fallback chain plan).
-2. **System audio STT event consumption** — wire parallel STT events into session manager + overlay.
-3. **Real auto-update endpoint** — GitHub Releases or custom server; replace placeholder pubkey.
-4. **AI features** — meeting summary, action items, cues (the "cue" in the app name).
-5. **Advanced search filters** — date range, source filter, speaker filter.
-6. **Full settings page UI** — replace Placeholder with real component.
-7. **Local whisper.cpp provider** — tier 3 offline fallback.
-8. **App signing** — Apple Developer + Authenticode for non-terminal distribution.
+1. **Wire OpenAI into SttRouter** — behind `BLUEY_STT_FALLBACK_OPENAI=1` with failover tests.
+2. **Live transcript UX** — overlay + dashboard real-time display of system-audio transcripts.
+3. **Distribution scaffolding** — GitHub Releases, auto-update endpoint, app signing.
+4. **AI features** — meeting summary, action items, cues.
+5. **Local whisper.cpp provider** — tier 3 offline fallback.
+6. **Advanced search filters** — date range, source filter, speaker filter.
+7. **Full settings page UI** — replace Placeholder with real component.
+8. **Hotkey daemon IPC via Rust** — move from React listener to Rust-side for reliability.
 
 ## First actions for a new agent
 
@@ -226,9 +218,9 @@ In `crates/cue-core/src/`:
    git -P branch --show-current'
    ```
 2. Read these docs on uno in order:
-   - `docs/work/IMPL-PHASE-3-ROUND-5.md` (latest round's context)
-   - `docs/work/PHASE-3-ROUND-5-HANDOFF-FOR-CODEX-REVIEW.md`
-   - Any `REVIEW-PHASE-3-ROUND-5.md` codex has synced back
+   - `docs/work/IMPL-PHASE-3-ROUND-6.md` (latest round's context)
+   - `docs/work/PHASE-3-ROUND-6-HANDOFF-FOR-CODEX-REVIEW.md`
+   - Any `REVIEW-PHASE-3-ROUND-6-RECHECK.md` codex has synced back
 3. Ask the user what the current task is — don't guess. Possible states:
    - Waiting on codex review → nothing to do, just read and be ready
    - Codex gave 🔴 → need to write FIX doc and address feedback
