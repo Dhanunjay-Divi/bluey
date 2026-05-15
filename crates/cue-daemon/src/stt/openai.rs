@@ -482,15 +482,12 @@ mod tests {
         let payload = r#"{"type":"conversation.item.input_audio_transcription.completed","transcript":"hello world"}"#;
         let events = parse_event(payload, AudioSource::Microphone).unwrap();
         assert_eq!(events.len(), 1);
-        assert!(
-            matches!(&events[0], TranscriptEvent::Final { text, .. } if text == "hello world")
-        );
+        assert!(matches!(&events[0], TranscriptEvent::Final { text, .. } if text == "hello world"));
     }
 
     #[test]
     fn parse_event_error_auth() {
-        let payload =
-            r#"{"type":"error","error":{"code":"invalid_api_key","message":"bad key"}}"#;
+        let payload = r#"{"type":"error","error":{"code":"invalid_api_key","message":"bad key"}}"#;
         let err = parse_event(payload, AudioSource::Microphone).unwrap_err();
         assert!(matches!(err, SttError::Auth));
     }

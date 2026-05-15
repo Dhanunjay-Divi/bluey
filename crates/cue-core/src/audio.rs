@@ -1293,7 +1293,10 @@ mod tests {
     fn capture_status_permission_denied_source_can_be_set() {
         let mut status = AudioCaptureStatus::idle();
         status.permission_denied_source = Some(AudioSourceKind::Microphone);
-        assert_eq!(status.permission_denied_source, Some(AudioSourceKind::Microphone));
+        assert_eq!(
+            status.permission_denied_source,
+            Some(AudioSourceKind::Microphone)
+        );
 
         // Verify it serializes correctly
         let json = serde_json::to_value(&status).unwrap();
