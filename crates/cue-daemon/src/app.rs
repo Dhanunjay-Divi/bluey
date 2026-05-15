@@ -367,6 +367,7 @@ struct Daemon {
     cloud: Mutex<CloudSyncStatus>,
     answer_generation: AtomicU64,
     active_answer_card: Mutex<Option<(u64, uuid::Uuid)>>,
+    system_audio: Mutex<Option<crate::audio::system_capture::SystemAudioCapture>>,
 }
 
 struct OverlayProcess {
@@ -436,6 +437,7 @@ pub async fn run() -> Result<()> {
         cloud: Mutex::new(cloud_status),
         answer_generation: AtomicU64::new(0),
         active_answer_card: Mutex::new(None),
+        system_audio: Mutex::new(None),
     });
 
     if !args.no_overlay {
@@ -460,11 +462,12 @@ pub async fn run() -> Result<()> {
         let stt_enabled = crate::audio::system_capture::is_system_audio_stt_enabled();
         let (sys_tx, mut sys_rx) = mpsc::unbounded_channel();
         match crate::audio::system_capture::SystemAudioCapture::start(sys_tx) {
-            Ok(_handle) => {
+            Ok(handle) => {
                 info!(
                     system_stt = stt_enabled,
                     "system audio continuous capture started"
                 );
+                *daemon.system_audio.lock().await = Some(handle);
                 let daemon_sys = daemon.clone();
                 tokio::spawn(async move {
                     let mut stt: Option<Box<dyn cue_core::stt::SttProvider>> = if stt_enabled {
@@ -493,6 +496,15 @@ pub async fn run() -> Result<()> {
                     }
                     let _ = &daemon_sys;
                 });
+
+                // Spawn STT event-drain task: polls next_event() and forwards
+                // transcripts to the same downstream consumer that mic uses.
+                if stt_enabled {
+                    let daemon_drain = daemon.clone();
+                    tokio::spawn(async move {
+                        drain_system_audio_stt_events(daemon_drain).await;
+                    });
+                }
             }
             Err(e) => {
                 debug!("system audio continuous capture not available: {e}");
@@ -4640,7 +4652,65 @@ async fn write_state(daemon: &Arc<Daemon>) -> Result<()> {
     Ok(())
 }
 
+/// Drain task: builds a system-audio STT provider, polls `next_event()` in a
+/// loop, and forwards each transcript to the daemon's downstream consumer
+/// (same path as mic STT). Logs errors at warn; exits cleanly on `None`.
+async fn drain_system_audio_stt_events(daemon: Arc<Daemon>) {
+    let mut provider = match build_system_audio_stt_provider().await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("system audio STT drain: provider init failed: {e:#}");
+            return;
+        }
+    };
+
+    loop {
+        match provider.next_event().await {
+            Some(Ok(event)) => {
+                if let Some(segment) = transcript_event_to_stt_segment(&event) {
+                    if let Err(e) = add_audio_transcript_segment(&daemon, &segment).await {
+                        warn!("system audio STT drain: forward failed: {e:#}");
+                    }
+                }
+            }
+            Some(Err(e)) => {
+                warn!("system audio STT drain: provider error: {e}");
+                if !e.is_retryable() {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+
+    let _ = provider.close().await;
+}
+
+/// Convert a `TranscriptEvent` into an `SttSegmentMetadata` for the downstream consumer.
+fn transcript_event_to_stt_segment(
+    event: &cue_core::stt::TranscriptEvent,
+) -> Option<cue_core::audio::SttSegmentMetadata> {
+    use cue_core::pcm::AudioSource;
+    use cue_core::stt::TranscriptEvent;
+    match event {
+        TranscriptEvent::Final { text, source, .. } => {
+            let kind = match source {
+                AudioSource::System => AudioSourceKind::System,
+                AudioSource::Microphone => AudioSourceKind::Microphone,
+            };
+            let segment = cue_core::audio::SttSegmentMetadata::new(text.clone(), 0, 0, true)
+                .with_source(kind)
+                .with_speaker_label(kind.default_label());
+            Some(segment)
+        }
+        TranscriptEvent::Partial { .. } | TranscriptEvent::SpeakerLabel { .. } => None,
+    }
+}
+
 async fn shutdown_daemon(daemon: &Arc<Daemon>) {
+    if let Some(capture) = daemon.system_audio.lock().await.take() {
+        capture.stop().await;
+    }
     let _ = stop_audio_capture(daemon).await;
     if let Some(meeting) = daemon.meeting.lock().await.as_ref() {
         let _ = daemon.store.save_active(meeting);
