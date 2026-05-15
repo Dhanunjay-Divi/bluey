@@ -22,6 +22,33 @@ function NavigateListener() {
   return null;
 }
 
+/** Subscribe to hotkey/tray events and forward them to daemon via Tauri commands. */
+function HotkeyListener() {
+  useEffect(() => {
+    const unlisteners = [
+      listen("hotkey_toggle_listening", () => {
+        invoke("daemon_toggle_listening").catch((e) =>
+          console.warn("daemon_toggle_listening failed:", e)
+        );
+      }),
+      listen("hotkey_push_to_talk", () => {
+        invoke("daemon_set_push_to_talk").catch((e) =>
+          console.warn("daemon_set_push_to_talk failed:", e)
+        );
+      }),
+      listen("hotkey_toggle_overlay", () => {
+        invoke("daemon_toggle_overlay").catch((e) =>
+          console.warn("daemon_toggle_overlay failed:", e)
+        );
+      }),
+    ];
+    return () => {
+      unlisteners.forEach((p) => p.then((fn) => fn()));
+    };
+  }, []);
+  return null;
+}
+
 function App() {
   const [ready, setReady] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
@@ -48,6 +75,7 @@ function App() {
   return (
     <HashRouter>
       <NavigateListener />
+      <HotkeyListener />
       <Routes>
         <Route element={<DashboardLayout />}>
           <Route index element={<Placeholder name="Home" />} />

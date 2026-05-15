@@ -1082,6 +1082,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-shell",
  "tauri-plugin-updater",
+ "tokio",
  "tracing",
  "uuid",
 ]

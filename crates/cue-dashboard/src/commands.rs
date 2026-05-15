@@ -1,3 +1,4 @@
+use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
 use cue_core::session::Session;
 use serde::Serialize;
 use std::sync::Mutex;
@@ -22,6 +23,38 @@ pub struct ActiveSessionState(pub Mutex<Option<Uuid>>);
 pub struct SessionSwitchedPayload {
     /// Session id now active, or `None` if active selection was cleared.
     pub id: Option<String>,
+}
+
+// ===== Daemon IPC helper =====
+
+/// Send a request to the running daemon over TCP and return the response.
+async fn daemon_ipc(request: DaemonRequest) -> Result<DaemonResponse, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpStream;
+
+    let stream = TcpStream::connect(DEFAULT_DAEMON_ADDR)
+        .await
+        .map_err(|e| format!("failed to connect to daemon: {e}"))?;
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+
+    let line = serde_json::to_string(&request).map_err(|e| e.to_string())?;
+    writer
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    writer.write_all(b"\n").await.map_err(|e| e.to_string())?;
+    writer.flush().await.map_err(|e| e.to_string())?;
+
+    let mut response = String::new();
+    let read = reader
+        .read_line(&mut response)
+        .await
+        .map_err(|e| e.to_string())?;
+    if read == 0 {
+        return Err("daemon closed connection without a response".to_string());
+    }
+    serde_json::from_str(response.trim_end()).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -306,28 +339,76 @@ pub fn list_speakers(
     db.list_speakers(&session_id).map_err(|e| e.to_string())
 }
 
-// ===== Phase 3 Round 5: Hotkey event commands =====
+// ===== Phase 3 Round 6: Hotkey → daemon action commands =====
 
-/// Emit toggle-listening event. The UI subscribes to this to start/stop a session.
+/// Toggle listening: if a meeting/audio session is active, end it; otherwise start one.
+/// Sends the appropriate IPC request to the running daemon.
 #[tauri::command]
-pub fn daemon_toggle_listening(app: AppHandle) -> Result<(), String> {
-    app.emit("hotkey_toggle_listening", ())
-        .map_err(|e| e.to_string())
+pub async fn daemon_toggle_listening() -> Result<String, String> {
+    // Query daemon status to decide start vs stop.
+    let status = daemon_ipc(DaemonRequest::Status).await?;
+    let is_active = match &status {
+        DaemonResponse::Status { state } => {
+            matches!(state.meeting, cue_core::MeetingState::InMeeting { .. })
+        }
+        _ => false,
+    };
+    let resp = if is_active {
+        daemon_ipc(DaemonRequest::MeetingEnd).await?
+    } else {
+        daemon_ipc(DaemonRequest::MeetingStart { title: None }).await?
+    };
+    match resp {
+        DaemonResponse::Text { text } => Ok(text),
+        DaemonResponse::Recap { recap } => Ok(format!("Session ended: {}", recap.summary)),
+        DaemonResponse::Ok => Ok("ok".to_string()),
+        DaemonResponse::Error { message } => Err(message),
+        _ => Ok("ok".to_string()),
+    }
 }
 
-/// Emit push-to-talk event. Since global-shortcut doesn't distinguish press/release,
-/// this acts as a toggle. The UI manages the on/off state.
+/// Push-to-talk toggle. Since global shortcuts don't distinguish press/release,
+/// this toggles audio capture on/off. When PTT is "enabled" conceptually, audio
+/// only streams while toggled on. Each press cycles the state.
 #[tauri::command]
-pub fn daemon_set_push_to_talk(app: AppHandle) -> Result<(), String> {
-    app.emit("hotkey_push_to_talk", ())
-        .map_err(|e| e.to_string())
+pub async fn daemon_set_push_to_talk() -> Result<String, String> {
+    // Toggle audio: if audio is active, stop it; otherwise start mic-only.
+    let status = daemon_ipc(DaemonRequest::AudioStatus).await?;
+    let is_active = match &status {
+        DaemonResponse::AudioStatus { status } => {
+            status.session_id.is_some()
+                && !matches!(
+                    status.capture.state,
+                    cue_core::AudioCaptureState::Stopped | cue_core::AudioCaptureState::Failed
+                )
+        }
+        _ => false,
+    };
+    let resp = if is_active {
+        daemon_ipc(DaemonRequest::AudioStop).await?
+    } else {
+        daemon_ipc(DaemonRequest::AudioStart {
+            enable_system: false,
+            enable_microphone: true,
+        })
+        .await?
+    };
+    match resp {
+        DaemonResponse::AudioStatus { status } => Ok(format!("audio: {:?}", status.capture.state)),
+        DaemonResponse::Error { message } => Err(message),
+        _ => Ok("ok".to_string()),
+    }
 }
 
-/// Emit toggle-overlay event. The UI or native layer handles overlay visibility.
+/// Toggle overlay visibility via daemon IPC.
 #[tauri::command]
-pub fn daemon_toggle_overlay(app: AppHandle) -> Result<(), String> {
-    app.emit("hotkey_toggle_overlay", ())
-        .map_err(|e| e.to_string())
+pub async fn daemon_toggle_overlay() -> Result<String, String> {
+    let resp = daemon_ipc(DaemonRequest::OverlayToggle).await?;
+    match resp {
+        DaemonResponse::Ok => Ok("ok".to_string()),
+        DaemonResponse::Error { message } => Err(message),
+        _ => Ok("ok".to_string()),
+    }
 }
 
 /// Trigger an update check from the UI. Emits `update_available` or `update_not_available`.
