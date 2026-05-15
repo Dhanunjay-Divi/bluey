@@ -482,11 +482,48 @@ pub async fn run() -> Result<()> {
                         None
                     };
 
-                    while let Some(chunk) = sys_rx.recv().await {
-                        debug!("[system audio chunk: {}ms]", chunk.duration_ms());
-                        if let Some(ref provider) = stt {
-                            if let Err(e) = provider.send_audio(&chunk).await {
-                                warn!("system audio STT send failed: {e}");
+                    // Single-task select! loop: send audio AND drain events
+                    // from the SAME provider instance.
+                    loop {
+                        if let Some(ref mut provider) = stt {
+                            tokio::select! {
+                                chunk_opt = sys_rx.recv() => {
+                                    match chunk_opt {
+                                        Some(chunk) => {
+                                            debug!("[system audio chunk: {}ms]", chunk.duration_ms());
+                                            if let Err(e) = provider.send_audio(&chunk).await {
+                                                warn!("system audio STT send failed: {e}");
+                                            }
+                                        }
+                                        None => break,
+                                    }
+                                }
+                                event_opt = provider.next_event() => {
+                                    match event_opt {
+                                        Some(Ok(event)) => {
+                                            if let Some(segment) = transcript_event_to_stt_segment(&event) {
+                                                if let Err(e) = add_audio_transcript_segment(&daemon_sys, &segment).await {
+                                                    warn!("system audio STT drain: forward failed: {e:#}");
+                                                }
+                                            }
+                                        }
+                                        Some(Err(e)) => {
+                                            warn!("system audio STT drain: provider error: {e}");
+                                            if !e.is_retryable() {
+                                                break;
+                                            }
+                                        }
+                                        None => break,
+                                    }
+                                }
+                            }
+                        } else {
+                            // No STT provider — just drain audio chunks.
+                            match sys_rx.recv().await {
+                                Some(chunk) => {
+                                    debug!("[system audio chunk: {}ms]", chunk.duration_ms());
+                                }
+                                None => break,
                             }
                         }
                     }
@@ -494,17 +531,7 @@ pub async fn run() -> Result<()> {
                     if let Some(ref mut provider) = stt {
                         let _ = provider.close().await;
                     }
-                    let _ = &daemon_sys;
                 });
-
-                // Spawn STT event-drain task: polls next_event() and forwards
-                // transcripts to the same downstream consumer that mic uses.
-                if stt_enabled {
-                    let daemon_drain = daemon.clone();
-                    tokio::spawn(async move {
-                        drain_system_audio_stt_events(daemon_drain).await;
-                    });
-                }
             }
             Err(e) => {
                 debug!("system audio continuous capture not available: {e}");
@@ -4650,40 +4677,6 @@ async fn write_state(daemon: &Arc<Daemon>) -> Result<()> {
         .await
         .with_context(|| format!("failed to write {}", daemon.paths.state_file.display()))?;
     Ok(())
-}
-
-/// Drain task: builds a system-audio STT provider, polls `next_event()` in a
-/// loop, and forwards each transcript to the daemon's downstream consumer
-/// (same path as mic STT). Logs errors at warn; exits cleanly on `None`.
-async fn drain_system_audio_stt_events(daemon: Arc<Daemon>) {
-    let mut provider = match build_system_audio_stt_provider().await {
-        Ok(p) => p,
-        Err(e) => {
-            warn!("system audio STT drain: provider init failed: {e:#}");
-            return;
-        }
-    };
-
-    loop {
-        match provider.next_event().await {
-            Some(Ok(event)) => {
-                if let Some(segment) = transcript_event_to_stt_segment(&event) {
-                    if let Err(e) = add_audio_transcript_segment(&daemon, &segment).await {
-                        warn!("system audio STT drain: forward failed: {e:#}");
-                    }
-                }
-            }
-            Some(Err(e)) => {
-                warn!("system audio STT drain: provider error: {e}");
-                if !e.is_retryable() {
-                    break;
-                }
-            }
-            None => break,
-        }
-    }
-
-    let _ = provider.close().await;
 }
 
 /// Convert a `TranscriptEvent` into an `SttSegmentMetadata` for the downstream consumer.

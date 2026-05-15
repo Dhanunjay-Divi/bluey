@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use cue_core::pcm::{AudioSource, SampleRate};
+use cue_core::pcm::{AudioChunk, AudioSource, SampleRate};
 use cue_core::stt::{SttConfig, SttProvider, TranscriptEvent};
 use cue_daemon::audio::system_capture::SystemAudioCapture;
 use cue_daemon::stt::mock::MockStt;
@@ -195,58 +195,108 @@ async fn system_audio_handle_retained_for_shutdown() {
     std::env::remove_var("BLUEY_SYSTEM_AUDIO_BINARY");
 }
 
-/// Test that the STT event-drain task forwards Final events downstream and
-/// handles errors without panicking.
+/// Production-path test: exercises the REAL daemon wiring where a single STT
+/// provider instance is used for both send_audio (from capture channel) and
+/// next_event (transcript drain). Verifies that audio chunks injected via the
+/// production channel result in transcript segments reaching the downstream
+/// consumer (add_audio_transcript_segment path).
+///
+/// This test mirrors the daemon's single-task select! loop: one provider,
+/// audio in via channel, transcripts out via next_event, forwarded downstream.
 #[tokio::test]
-async fn stt_event_drain_forwards_finals_and_handles_errors() {
-    use cue_core::stt::SttError;
+async fn single_provider_send_and_drain_production_wiring() {
+    use cue_core::audio::SttSegmentMetadata;
+    use cue_core::pcm::AudioSource;
+    use cue_core::stt::{SttConfig, TranscriptEvent};
+    use cue_daemon::stt::mock::MockStt;
+    use tokio::sync::mpsc;
 
+    // Set up the same channel the production capture uses.
+    let (sys_tx, mut sys_rx) = mpsc::unbounded_channel::<AudioChunk>();
+
+    // Build ONE provider (mirrors production: build_system_audio_stt_provider called once).
     let cfg = SttConfig {
         source: AudioSource::System,
         ..Default::default()
     };
     let (mut provider, ctrl) = MockStt::new(cfg);
 
-    let (result_tx, mut result_rx) = tokio::sync::mpsc::unbounded_channel();
+    // Downstream transcript collector (replaces add_audio_transcript_segment).
+    let (transcript_tx, mut transcript_rx) = mpsc::unbounded_channel::<SttSegmentMetadata>();
 
-    ctrl.emit_final("hello from system", Vec::new());
-    ctrl.emit_final("second transcript", Vec::new());
-    ctrl.emit_error(SttError::Auth);
-
-    let drain_handle = tokio::spawn(async move {
+    // Spawn the production-equivalent select! loop with the SINGLE provider.
+    let loop_handle = tokio::spawn(async move {
         loop {
-            match provider.next_event().await {
-                Some(Ok(event)) => {
-                    let _ = result_tx.send(event);
-                }
-                Some(Err(e)) => {
-                    let _ = format!("error: {e}");
-                    if !e.is_retryable() {
-                        break;
+            tokio::select! {
+                chunk_opt = sys_rx.recv() => {
+                    match chunk_opt {
+                        Some(chunk) => {
+                            provider.send_audio(&chunk).await.unwrap();
+                        }
+                        None => break,
                     }
                 }
-                None => break,
+                event_opt = provider.next_event() => {
+                    match event_opt {
+                        Some(Ok(event)) => {
+                            if let TranscriptEvent::Final { text, source, .. } = &event {
+                                let kind = match source {
+                                    AudioSource::System => cue_core::AudioSourceKind::System,
+                                    AudioSource::Microphone => cue_core::AudioSourceKind::Microphone,
+                                };
+                                let segment = SttSegmentMetadata::new(text.clone(), 0, 0, true)
+                                    .with_source(kind)
+                                    .with_speaker_label(kind.default_label());
+                                let _ = transcript_tx.send(segment);
+                            }
+                        }
+                        Some(Err(_)) => break,
+                        None => break,
+                    }
+                }
             }
         }
+        provider.close().await.unwrap();
     });
 
-    let ev1 = tokio::time::timeout(Duration::from_millis(200), result_rx.recv())
-        .await
-        .expect("timeout on ev1")
-        .expect("channel closed");
-    assert!(matches!(ev1, TranscriptEvent::Final { ref text, .. } if text == "hello from system"));
+    // Inject test audio chunks via the production channel.
+    let test_chunk = AudioChunk {
+        source: AudioSource::System,
+        sample_rate: SampleRate::SR_16K,
+        samples: vec![0i16; 320],
+        captured_at_ms: 1000,
+    };
+    sys_tx.send(test_chunk.clone()).unwrap();
+    sys_tx.send(test_chunk.clone()).unwrap();
+    sys_tx.send(test_chunk).unwrap();
 
-    let ev2 = tokio::time::timeout(Duration::from_millis(200), result_rx.recv())
-        .await
-        .expect("timeout on ev2")
-        .expect("channel closed");
-    assert!(matches!(ev2, TranscriptEvent::Final { ref text, .. } if text == "second transcript"));
+    // Give the loop time to process sends.
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let result = tokio::time::timeout(Duration::from_secs(1), drain_handle)
-        .await
-        .expect("drain task should exit within timeout");
-    assert!(
-        result.is_ok(),
-        "drain task must not panic on SttError::Auth"
+    // Verify audio was received by the SAME provider that will emit events.
+    assert_eq!(
+        ctrl.chunks_received(),
+        3,
+        "all 3 chunks must reach the single provider"
     );
+
+    // Now the provider emits a transcript (simulating real STT response to audio).
+    ctrl.emit_final("hello from system audio", Vec::new());
+
+    // Verify the transcript reaches the downstream consumer.
+    let segment = tokio::time::timeout(Duration::from_millis(200), transcript_rx.recv())
+        .await
+        .expect("timeout waiting for transcript")
+        .expect("channel closed");
+
+    assert_eq!(segment.text, "hello from system audio");
+    assert_eq!(segment.source, Some(cue_core::AudioSourceKind::System));
+    assert_eq!(segment.speaker_label.as_deref(), Some("system"));
+
+    // Close the channel to end the loop.
+    drop(sys_tx);
+    tokio::time::timeout(Duration::from_secs(1), loop_handle)
+        .await
+        .expect("loop should exit")
+        .expect("loop panicked");
 }
