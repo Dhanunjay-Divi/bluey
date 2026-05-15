@@ -1,6 +1,7 @@
--- Phase 3 Round 5: app_settings table for structured settings (JSON blobs).
+-- Phase 3 Round 5: App settings key-value store.
+
 CREATE TABLE IF NOT EXISTS app_settings (
     key         TEXT PRIMARY KEY,
     value       TEXT NOT NULL,
-    updated_at  INTEGER NOT NULL
+    updated_at  INTEGER NOT NULL DEFAULT 0
 );

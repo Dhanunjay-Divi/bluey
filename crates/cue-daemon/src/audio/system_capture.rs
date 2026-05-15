@@ -325,3 +325,10 @@ mod tests {
         PathBuf::from("target/debug/system-audio-stub")
     }
 }
+
+/// Check if system audio STT is enabled via env var.
+pub fn is_system_audio_stt_enabled() -> bool {
+    std::env::var("BLUEY_SYSTEM_AUDIO_STT")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}

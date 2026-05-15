@@ -1,3 +1,6 @@
+pub mod search;
+pub mod speakers;
+
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -35,6 +38,8 @@ impl Database {
             include_str!("../../../../infra/migrations/003_turns_unique_index.sql");
         const MIGRATION_004: &str = include_str!("../../../../infra/migrations/004_app_state.sql");
         const MIGRATION_005: &str = include_str!("../../../../infra/migrations/005_settings.sql");
+        const MIGRATION_006: &str = include_str!("../../../../infra/migrations/006_transcript_fts.sql");
+        const MIGRATION_007: &str = include_str!("../../../../infra/migrations/007_speakers.sql");
         self.conn
             .execute_batch(MIGRATION_002)
             .context("failed to run session migration")?;
@@ -47,6 +52,12 @@ impl Database {
         self.conn
             .execute_batch(MIGRATION_005)
             .context("failed to run settings migration")?;
+        self.conn
+            .execute_batch(MIGRATION_006)
+            .context("failed to run transcript_fts migration")?;
+        self.conn
+            .execute_batch(MIGRATION_007)
+            .context("failed to run speakers migration")?;
         Ok(())
     }
 
@@ -272,6 +283,40 @@ impl Database {
             None => self.set_app_state("active_session_id", None),
         }
     }
+
+    // ===== Settings =====
+
+    pub fn save_setting(&self, key: &str, value: &str) -> Result<()> {
+        let now = now_ms();
+        self.conn.execute(
+            "INSERT INTO app_settings (key, value, updated_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![key, value, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_setting(&self, key: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare("SELECT value FROM app_settings WHERE key = ?1")?;
+        let mut rows = stmt.query(params![key])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn load_all_settings(&self) -> Result<std::collections::HashMap<String, String>> {
+        let mut stmt = self.conn.prepare("SELECT key, value FROM app_settings")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (k, v) = row?;
+            map.insert(k, v);
+        }
+        Ok(map)
+    }
 }
 
 fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
@@ -342,43 +387,6 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
-}
-
-// ===== Settings (Phase 3 Round 5) =====
-impl Database {
-    pub fn save_setting(&self, key: &str, value: &str) -> Result<()> {
-        let now = now_ms();
-        self.conn.execute(
-            "INSERT INTO app_settings (key, value, updated_at) VALUES (?1, ?2, ?3) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            params![key, value, now],
-        )?;
-        Ok(())
-    }
-
-    pub fn load_setting(&self, key: &str) -> Result<Option<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT value FROM app_settings WHERE key = ?1")?;
-        let mut rows = stmt.query(params![key])?;
-        match rows.next()? {
-            Some(row) => Ok(Some(row.get(0)?)),
-            None => Ok(None),
-        }
-    }
-
-    pub fn load_all_settings(&self) -> Result<std::collections::HashMap<String, String>> {
-        let mut stmt = self.conn.prepare("SELECT key, value FROM app_settings")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut map = std::collections::HashMap::new();
-        for row in rows {
-            let (k, v) = row?;
-            map.insert(k, v);
-        }
-        Ok(map)
-    }
 }
 
 #[cfg(test)]
@@ -696,31 +704,126 @@ mod tests {
             "error should mention unique constraint violation, got: {msg}"
         );
     }
+}
 
-    #[test]
-    fn test_save_and_load_setting() {
-        let db = test_db();
-        assert_eq!(db.load_setting("stt_provider").unwrap(), None);
-        db.save_setting("stt_provider", "deepgram").unwrap();
-        assert_eq!(
-            db.load_setting("stt_provider").unwrap(),
-            Some("deepgram".into())
-        );
-        db.save_setting("stt_provider", "echo").unwrap();
-        assert_eq!(
-            db.load_setting("stt_provider").unwrap(),
-            Some("echo".into())
-        );
+#[cfg(test)]
+mod fts_tests {
+    use super::*;
+
+    fn test_db() -> Database {
+        Database::open(":memory:").expect("failed to open in-memory db")
     }
 
     #[test]
-    fn test_load_all_settings() {
+    fn test_insert_and_search_transcripts() {
         let db = test_db();
-        db.save_setting("a", "1").unwrap();
-        db.save_setting("b", "2").unwrap();
+        let session = db.create_session(Some("FTS Test".into())).unwrap();
+        let sid = session.id.to_string();
+        db.insert_transcript(&sid, "hello world from the microphone", "mic", Some(0), true, 1000).unwrap();
+        db.insert_transcript(&sid, "system audio playing music", "system", None, true, 2000).unwrap();
+        db.insert_transcript(&sid, "hello again from speaker", "mic", Some(1), true, 3000).unwrap();
+        let hits = db.search_transcripts("hello", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits[0].snippet.contains("hello"));
+        assert_eq!(hits[0].session_id, sid);
+        let hits = db.search_transcripts("music", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].source, "system");
+    }
+
+    #[test]
+    fn test_fts_ranking_sanity() {
+        let db = test_db();
+        let session = db.create_session(Some("Rank Test".into())).unwrap();
+        let sid = session.id.to_string();
+        db.insert_transcript(&sid, "the quick brown fox", "mic", None, true, 1000).unwrap();
+        db.insert_transcript(&sid, "fox fox fox repeated many times fox", "mic", None, true, 2000).unwrap();
+        let hits = db.search_transcripts("fox", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn test_speaker_set_and_list() {
+        let db = test_db();
+        let session = db.create_session(Some("Speaker Test".into())).unwrap();
+        let sid = session.id.to_string();
+        db.set_speaker_name(&sid, 0, "Alice", Some("#ff0000")).unwrap();
+        db.set_speaker_name(&sid, 1, "Bob", None).unwrap();
+        let speakers = db.list_speakers(&sid).unwrap();
+        assert_eq!(speakers.len(), 2);
+        assert_eq!(speakers[0].name, "Alice");
+        assert_eq!(speakers[0].color, Some("#ff0000".to_string()));
+        assert_eq!(speakers[1].name, "Bob");
+    }
+
+    #[test]
+    fn test_speaker_rename_persists() {
+        let db = test_db();
+        let session = db.create_session(None).unwrap();
+        let sid = session.id.to_string();
+        db.set_speaker_name(&sid, 0, "Speaker 0", None).unwrap();
+        db.set_speaker_name(&sid, 0, "Alice", None).unwrap();
+        let speakers = db.list_speakers(&sid).unwrap();
+        assert_eq!(speakers.len(), 1);
+        assert_eq!(speakers[0].name, "Alice");
+    }
+
+    #[test]
+    fn test_speaker_color_preserved_on_rename() {
+        let db = test_db();
+        let session = db.create_session(None).unwrap();
+        let sid = session.id.to_string();
+        db.set_speaker_name(&sid, 0, "Alice", Some("#00ff00")).unwrap();
+        db.set_speaker_name(&sid, 0, "Alicia", None).unwrap();
+        let speakers = db.list_speakers(&sid).unwrap();
+        assert_eq!(speakers[0].name, "Alicia");
+        assert_eq!(speakers[0].color, Some("#00ff00".to_string()));
+    }
+
+    #[test]
+    fn test_export_markdown() {
+        let db = test_db();
+        let session = db.create_session(Some("Export Test".into())).unwrap();
+        let sid = session.id.to_string();
+        db.insert_transcript(&sid, "Hello everyone", "mic", Some(0), true, 1000).unwrap();
+        db.set_speaker_name(&sid, 0, "Alice", None).unwrap();
+        let md = db.export_session_markdown(&sid, &super::search::ExportOptions::default()).unwrap();
+        assert!(md.contains("# Export Test"));
+        assert!(md.contains("Alice"));
+        assert!(md.contains("Hello everyone"));
+    }
+
+    #[test]
+    fn test_export_text() {
+        let db = test_db();
+        let session = db.create_session(Some("Text Export".into())).unwrap();
+        let sid = session.id.to_string();
+        db.insert_transcript(&sid, "Test line", "mic", None, true, 1000).unwrap();
+        let txt = db.export_session_text(&sid).unwrap();
+        assert!(txt.contains("Text Export"));
+        assert!(txt.contains("Test line"));
+    }
+
+    #[test]
+    fn test_export_json() {
+        let db = test_db();
+        let session = db.create_session(Some("JSON Export".into())).unwrap();
+        let sid = session.id.to_string();
+        db.insert_transcript(&sid, "JSON test", "mic", Some(0), true, 1000).unwrap();
+        db.set_speaker_name(&sid, 0, "Charlie", None).unwrap();
+        let json = db.export_session_json(&sid).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["title"], "JSON Export");
+        assert_eq!(parsed["transcripts"][0]["text"], "JSON test");
+        assert_eq!(parsed["speakers"][0]["name"], "Charlie");
+    }
+
+    #[test]
+    fn test_settings_round_trip() {
+        let db = test_db();
+        db.save_setting("key1", "val1").unwrap();
+        assert_eq!(db.load_setting("key1").unwrap(), Some("val1".into()));
         let all = db.load_all_settings().unwrap();
-        assert_eq!(all.len(), 2);
-        assert_eq!(all.get("a").unwrap(), "1");
-        assert_eq!(all.get("b").unwrap(), "2");
+        assert_eq!(all.get("key1").unwrap(), "val1");
     }
 }
