@@ -38,7 +38,7 @@
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://example.com/cue/updates/{{target}}/{{current_version}}"
+        "https://github.com/<org>/bluey/releases/latest/download/latest.json"
       ],
       "pubkey": "REPLACE_BEFORE_RELEASE"
     }
