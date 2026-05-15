@@ -12,24 +12,21 @@ CREATE TABLE IF NOT EXISTS transcripts (
 
 CREATE INDEX IF NOT EXISTS idx_transcripts_session ON transcripts(session_id, created_at);
 
+-- FTS5 virtual table (standalone, not content-synced for simplicity).
 CREATE VIRTUAL TABLE IF NOT EXISTS transcript_fts USING fts5(
     session_id UNINDEXED,
     text,
     source UNINDEXED,
-    ts UNINDEXED,
-    content='transcripts',
-    content_rowid='rowid'
+    ts UNINDEXED
 );
 
+-- Auto-index new transcripts into FTS5.
 CREATE TRIGGER IF NOT EXISTS trg_transcripts_ai AFTER INSERT ON transcripts BEGIN
-    INSERT INTO transcript_fts(rowid, session_id, text, source, ts)
-    VALUES (new.rowid, new.session_id, new.text, new.source, new.created_at);
+    INSERT INTO transcript_fts(session_id, text, source, ts)
+    VALUES (new.session_id, new.text, new.source, new.created_at);
 END;
 
+-- Auto-remove from FTS on delete.
 CREATE TRIGGER IF NOT EXISTS trg_transcripts_ad AFTER DELETE ON transcripts BEGIN
-    INSERT INTO transcript_fts(transcript_fts, rowid, session_id, text, source, ts)
-    VALUES ('delete', old.rowid, old.session_id, old.text, old.source, old.created_at);
+    DELETE FROM transcript_fts WHERE rowid = old.rowid;
 END;
-
-INSERT OR IGNORE INTO transcript_fts(rowid, session_id, text, source, ts)
-    SELECT rowid, session_id, text, source, created_at FROM transcripts;

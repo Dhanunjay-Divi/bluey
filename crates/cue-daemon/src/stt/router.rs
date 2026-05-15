@@ -1,4 +1,5 @@
 //! STT router - selects among multiple providers with fallback.
+use async_trait::async_trait;
 use cue_core::pcm::AudioChunk;
 use cue_core::stt::{ConnectionState, SttError, SttProvider, TranscriptEvent};
 
@@ -19,6 +20,7 @@ impl SttRouter {
     }
 }
 
+#[async_trait]
 impl SttProvider for SttRouter {
     fn name(&self) -> &'static str {
         "router"

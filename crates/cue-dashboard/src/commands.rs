@@ -189,60 +189,6 @@ pub fn list_turns(
     db.list_turns(uuid, None).map_err(|e| e.to_string())
 }
 
-// ===== Settings + Secrets commands (Phase 3 Round 5) =====
-
-#[tauri::command]
-pub fn save_stt_api_key(provider: String, key: String) -> Result<(), String> {
-    cue_daemon::secrets::store_api_key(&provider, &key).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub fn load_stt_api_key(provider: String) -> Result<Option<String>, String> {
-    let raw = cue_daemon::secrets::load_api_key(&provider).map_err(|e| e.to_string())?;
-    Ok(raw.map(|s| {
-        if s.len() <= 4 {
-            "****".to_string()
-        } else {
-            format!("****{}", &s[s.len() - 4..])
-        }
-    }))
-}
-
-#[tauri::command]
-pub fn list_audio_devices() -> Result<Vec<String>, String> {
-    use cpal::traits::{DeviceTrait, HostTrait};
-    let host = cpal::default_host();
-    let mut names = Vec::new();
-    if let Ok(devices) = host.input_devices() {
-        for d in devices {
-            if let Ok(name) = d.name() {
-                names.push(name);
-            }
-        }
-    }
-    Ok(names)
-}
-
-#[tauri::command]
-pub fn save_settings(
-    settings: std::collections::HashMap<String, String>,
-    db: State<DbState>,
-) -> Result<(), String> {
-    let db = db.0.lock().map_err(|e| e.to_string())?;
-    for (k, v) in &settings {
-        db.save_setting(k, v).map_err(|e| e.to_string())?;
-    }
-    Ok(())
-}
-
-#[tauri::command]
-pub fn load_settings(
-    db: State<DbState>,
-) -> Result<std::collections::HashMap<String, String>, String> {
-    let db = db.0.lock().map_err(|e| e.to_string())?;
-    db.load_all_settings().map_err(|e| e.to_string())
-}
-
 // ===== Phase 3 Round 5: Search, Export, Speakers =====
 
 #[tauri::command]

@@ -1,4 +1,5 @@
 //! Echo STT provider stub - no-op provider for fallback.
+use async_trait::async_trait;
 use cue_core::pcm::{AudioChunk, AudioSource};
 use cue_core::stt::{ConnectionState, SttError, SttProvider, TranscriptEvent};
 
@@ -12,6 +13,7 @@ impl EchoProvider {
     }
 }
 
+#[async_trait]
 impl SttProvider for EchoProvider {
     fn name(&self) -> &'static str {
         "echo"

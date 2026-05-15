@@ -25,7 +25,6 @@ tauri-plugin-fs = "2"
 tauri-plugin-global-shortcut = "2"
 cue-core = { path = "../cue-core" }
 cue-daemon = { path = "../cue-daemon" }
-cpal.workspace = true
 dirs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
