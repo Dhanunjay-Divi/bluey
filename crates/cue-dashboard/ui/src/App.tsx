@@ -50,6 +50,31 @@ function HotkeyListener() {
   return null;
 }
 
+/** Periodically polls the daemon for audio permission status.
+ * The daemon emits an `audio_permission_denied` event when the most recent
+ * capture failure was a permission error; PermissionBanner listens for it.
+ * Without this poller, the banner would never auto-fire from real failures.
+ */
+function PermissionPoller() {
+  useEffect(() => {
+    let cancelled = false;
+    const poll = () => {
+      if (cancelled) return;
+      invoke("poll_audio_permission").catch((e) =>
+        console.warn("poll_audio_permission failed:", e)
+      );
+    };
+    poll();
+    const id = setInterval(poll, 5000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
+  return null;
+}
+
+
 function App() {
   const [ready, setReady] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
@@ -79,6 +104,7 @@ function App() {
     <HashRouter>
       <NavigateListener />
       <HotkeyListener />
+      <PermissionPoller />
       <Routes>
         <Route element={<DashboardLayout />}>
           <Route index element={<Placeholder name="Home" />} />

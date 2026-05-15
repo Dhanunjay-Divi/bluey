@@ -1,7 +1,8 @@
 //! OpenAI Realtime STT provider — transcription session protocol.
 //!
 //! Connects via WebSocket to the OpenAI Realtime API with `?intent=transcription`.
-//! After handshake, sends `session.update` to configure transcription mode.
+//! After handshake, sends `transcription_session.update` to configure transcription mode.
+//! See https://platform.openai.com/docs/api-reference/realtime-client-events/transcription_session
 //! Audio is sent as base64-encoded PCM16 24kHz mono via `input_audio_buffer.append`.
 //! Transcripts arrive as `conversation.item.input_audio_transcription.delta` (partial)
 //! and `conversation.item.input_audio_transcription.completed` (final).
@@ -147,10 +148,18 @@ pub fn map_handshake_status(status: u16) -> SttError {
     }
 }
 
-/// Build the session.update JSON payload for transcription mode.
+/// Build the `transcription_session.update` client event payload to configure
+/// transcription mode against the OpenAI Realtime transcription session API.
+/// Reference: https://platform.openai.com/docs/api-reference/realtime-client-events/transcription_session
+///
+/// Wire shape:
+/// ```json
+/// {"type":"transcription_session.update",
+///  "session":{"input_audio_transcription":{"model":"<model>"}}}
+/// ```
 pub fn build_session_update(model: &str) -> String {
     format!(
-        r#"{{"type":"session.update","session":{{"input_audio_transcription":{{"model":"{model}"}}}}}}"#
+        r#"{{"type":"transcription_session.update","session":{{"input_audio_transcription":{{"model":"{model}"}}}}}}"#
     )
 }
 
@@ -373,7 +382,8 @@ async fn run_connection(
 
     let (mut write, mut read) = ws_stream.split();
 
-    // Send session.update to configure transcription mode (proceed optimistically).
+    // Send transcription_session.update to configure transcription mode (proceed optimistically).
+    // See https://platform.openai.com/docs/api-reference/realtime-client-events/transcription_session
     let session_update = build_session_update(&cfg.model);
     write
         .send(Message::text(session_update))
@@ -549,7 +559,7 @@ mod tests {
     fn build_session_update_contains_model() {
         let json = build_session_update("gpt-4o-mini-transcribe");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["type"], "session.update");
+        assert_eq!(v["type"], "transcription_session.update");
         assert_eq!(
             v["session"]["input_audio_transcription"]["model"],
             "gpt-4o-mini-transcribe"
@@ -626,7 +636,7 @@ mod tests {
                 .unwrap();
 
         let v: serde_json::Value = serde_json::from_str(&first_frame).unwrap();
-        assert_eq!(v["type"], "session.update");
+        assert_eq!(v["type"], "transcription_session.update");
         assert_eq!(
             v["session"]["input_audio_transcription"]["model"],
             "gpt-4o-mini-transcribe"
