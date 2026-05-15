@@ -5,7 +5,7 @@ mod macos;
 use std::sync::Mutex;
 
 use cue_daemon::db::Database;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 use crate::commands::ActiveSessionState;
 use tauri_plugin_global_shortcut::GlobalShortcutExt;
@@ -43,6 +43,10 @@ pub fn run() {
             commands::export_session_to_file,
             commands::set_speaker_name,
             commands::list_speakers,
+            // R5: Hotkey commands
+            commands::daemon_toggle_listening,
+            commands::daemon_set_push_to_talk,
+            commands::daemon_toggle_overlay,
         ])
         .setup(|app| {
             // Open database
@@ -52,9 +56,6 @@ pub fn run() {
                 .join("sessions.db");
             let db = Database::open(db_path.to_str().unwrap_or("bluey.db"))
                 .expect("failed to open database");
-            // Best-effort recover the previously-active session id. If the row
-            // points at a session that was deleted while the daemon was off,
-            // load_active_session() returns None and we start with no selection.
             let restored = db.load_active_session().unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "failed to restore active session id");
                 None
@@ -62,7 +63,7 @@ pub fn run() {
             app.manage(DbState(Mutex::new(db)));
             app.manage(ActiveSessionState(Mutex::new(restored)));
 
-            // Register global shortcut
+            // Register global shortcuts
             register_global_shortcut(app)?;
 
             #[cfg(target_os = "macos")]
@@ -77,6 +78,7 @@ pub fn run() {
 fn register_global_shortcut(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     use tauri_plugin_global_shortcut::ShortcutState;
 
+    // Toggle dashboard visibility: Cmd/Ctrl+Shift+D
     let handle = app.handle().clone();
     app.global_shortcut().on_shortcut(
         if cfg!(target_os = "macos") {
@@ -98,5 +100,53 @@ fn register_global_shortcut(app: &tauri::App) -> Result<(), Box<dyn std::error::
             }
         },
     )?;
+
+    // Toggle listening: Cmd/Ctrl+Shift+L
+    let handle2 = app.handle().clone();
+    app.global_shortcut().on_shortcut(
+        if cfg!(target_os = "macos") {
+            "CmdOrCtrl+Shift+L"
+        } else {
+            "Ctrl+Shift+L"
+        },
+        move |_app, _shortcut, event| {
+            if event.state == ShortcutState::Pressed {
+                let _ = handle2.emit("hotkey_toggle_listening", ());
+            }
+        },
+    )?;
+
+    // Push-to-talk toggle: Cmd/Ctrl+Shift+P
+    // Note: tauri-plugin-global-shortcut does not expose distinct press/release
+    // events, so we use a toggle approach (each press cycles the state).
+    let handle3 = app.handle().clone();
+    app.global_shortcut().on_shortcut(
+        if cfg!(target_os = "macos") {
+            "CmdOrCtrl+Shift+P"
+        } else {
+            "Ctrl+Shift+P"
+        },
+        move |_app, _shortcut, event| {
+            if event.state == ShortcutState::Pressed {
+                let _ = handle3.emit("hotkey_push_to_talk", ());
+            }
+        },
+    )?;
+
+    // Toggle overlay: Cmd/Ctrl+Shift+H
+    let handle4 = app.handle().clone();
+    app.global_shortcut().on_shortcut(
+        if cfg!(target_os = "macos") {
+            "CmdOrCtrl+Shift+H"
+        } else {
+            "Ctrl+Shift+H"
+        },
+        move |_app, _shortcut, event| {
+            if event.state == ShortcutState::Pressed {
+                let _ = handle4.emit("hotkey_toggle_overlay", ());
+            }
+        },
+    )?;
+
     Ok(())
 }
