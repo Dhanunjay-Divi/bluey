@@ -105,6 +105,13 @@ pub fn is_openai_fallback_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Returns true if local whisper fallback is enabled via environment variable.
+pub fn is_local_whisper_enabled() -> bool {
+    std::env::var("BLUEY_STT_LOCAL_WHISPER")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,11 +202,4 @@ mod tests {
         // Still at index 1 (no more to fail over to)
         assert_eq!(router.active_index(), 1);
     }
-}
-
-/// Returns true if local whisper fallback is enabled via environment variable.
-pub fn is_local_whisper_enabled() -> bool {
-    std::env::var("BLUEY_STT_LOCAL_WHISPER")
-        .map(|v| v == "1")
-        .unwrap_or(false)
 }
