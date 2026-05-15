@@ -32,7 +32,7 @@ use cue_core::{
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command as TokioCommand;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
@@ -352,6 +352,18 @@ struct Args {
     overlay_bin: Option<PathBuf>,
 }
 
+/// Payload emitted on the live transcript broadcast channel whenever a new
+/// transcript segment is added to the active meeting.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LiveTranscriptEvent {
+    pub session_id: String,
+    pub source: String,
+    pub text: String,
+    pub is_final: bool,
+    pub speaker: Option<u8>,
+    pub ts_ms: u64,
+}
+
 struct Daemon {
     paths: AppPaths,
     store: MeetingStore,
@@ -368,6 +380,7 @@ struct Daemon {
     answer_generation: AtomicU64,
     active_answer_card: Mutex<Option<(u64, uuid::Uuid)>>,
     system_audio: Mutex<Option<crate::audio::system_capture::SystemAudioCapture>>,
+    live_transcript_tx: broadcast::Sender<LiveTranscriptEvent>,
 }
 
 struct OverlayProcess {
@@ -438,6 +451,7 @@ pub async fn run() -> Result<()> {
         answer_generation: AtomicU64::new(0),
         active_answer_card: Mutex::new(None),
         system_audio: Mutex::new(None),
+        live_transcript_tx: broadcast::channel(64).0,
     });
 
     if !args.no_overlay {
@@ -2422,6 +2436,27 @@ async fn add_audio_transcript_segment(
         .unwrap_or_else(|| "audio STT".to_string());
     let card = CueCard::new(CardKind::Transcript, title, text).with_source(source);
     let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
+
+    // Broadcast live transcript event for dashboard consumption.
+    let source_label = match segment.source {
+        Some(AudioSourceKind::System) => "system",
+        Some(AudioSourceKind::Microphone) => "microphone",
+        None => "unknown",
+    };
+    let ts_ms = meeting_snapshot
+        .transcript
+        .last()
+        .and_then(|s| s.created_at.parse::<u64>().ok())
+        .unwrap_or(0);
+    let _ = daemon.live_transcript_tx.send(LiveTranscriptEvent {
+        session_id: meeting_snapshot.id.to_string(),
+        source: source_label.to_string(),
+        text: text.to_string(),
+        is_final: segment.is_final,
+        speaker: None,
+        ts_ms,
+    });
+
     Ok(())
 }
 
