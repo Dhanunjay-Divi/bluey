@@ -189,3 +189,10 @@ mod tests {
         assert_eq!(router.active_index(), 1);
     }
 }
+
+/// Returns true if the OpenAI Realtime fallback is enabled via environment variable.
+pub fn is_openai_fallback_enabled() -> bool {
+    std::env::var("BLUEY_STT_FALLBACK_OPENAI")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}

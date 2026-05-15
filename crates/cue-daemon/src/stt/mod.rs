@@ -3,4 +3,5 @@
 pub mod deepgram;
 pub mod echo;
 pub mod mock;
+pub mod openai;
 pub mod router;
