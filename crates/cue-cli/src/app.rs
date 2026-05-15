@@ -586,6 +586,7 @@ pub async fn cli_main() -> Result<()> {
                 AudioCommands::Start(args) => DaemonRequest::AudioStart {
                     enable_system: !args.no_system,
                     enable_microphone: !args.no_microphone,
+                    mic_device_id: None,
                 },
                 AudioCommands::Stop => DaemonRequest::AudioStop,
             };

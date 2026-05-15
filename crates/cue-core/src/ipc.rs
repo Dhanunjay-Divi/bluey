@@ -70,6 +70,8 @@ pub enum DaemonRequest {
     AudioStart {
         enable_system: bool,
         enable_microphone: bool,
+        #[serde(default)]
+        mic_device_id: Option<String>,
     },
     AudioStop,
     AiStatus,

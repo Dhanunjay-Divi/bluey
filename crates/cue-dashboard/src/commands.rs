@@ -371,7 +371,7 @@ pub async fn daemon_toggle_listening() -> Result<String, String> {
 /// this toggles audio capture on/off. When PTT is "enabled" conceptually, audio
 /// only streams while toggled on. Each press cycles the state.
 #[tauri::command]
-pub async fn daemon_set_push_to_talk() -> Result<String, String> {
+pub async fn daemon_set_push_to_talk(db: State<'_, DbState>) -> Result<String, String> {
     // Toggle audio: if audio is active, stop it; otherwise start mic-only.
     let status = daemon_ipc(DaemonRequest::AudioStatus).await?;
     let is_active = match &status {
@@ -387,9 +387,11 @@ pub async fn daemon_set_push_to_talk() -> Result<String, String> {
     let resp = if is_active {
         daemon_ipc(DaemonRequest::AudioStop).await?
     } else {
+        let mic_device_id = load_mic_device_from_settings(&db);
         daemon_ipc(DaemonRequest::AudioStart {
             enable_system: false,
             enable_microphone: true,
+            mic_device_id,
         })
         .await?
     };
@@ -430,6 +432,15 @@ pub async fn check_for_updates(app: AppHandle) -> Result<String, String> {
             Err(format!("update check failed: {e}"))
         }
     }
+}
+
+/// Read the `audio.mic_device` setting from the dashboard DB.
+fn load_mic_device_from_settings(db: &State<DbState>) -> Option<String> {
+    let db = db.0.lock().ok()?;
+    db.load_setting("audio.mic_device")
+        .ok()
+        .flatten()
+        .filter(|s| !s.trim().is_empty())
 }
 
 // ===== Tests =====

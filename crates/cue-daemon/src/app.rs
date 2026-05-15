@@ -903,6 +903,7 @@ async fn handle_request_inner(
         DaemonRequest::AudioStart {
             enable_system,
             enable_microphone,
+            mic_device_id,
         } => {
             if !enable_system && !enable_microphone {
                 return Ok(DaemonResponse::Text {
@@ -910,11 +911,12 @@ async fn handle_request_inner(
                 });
             }
 
-            let status = start_audio_capture(
-                daemon,
-                AudioCaptureConfig::from_enabled_sources(enable_system, enable_microphone),
-            )
-            .await?;
+            let mut config =
+                AudioCaptureConfig::from_enabled_sources(enable_system, enable_microphone);
+            if let Some(device_id) = mic_device_id {
+                config.microphone.device_id = Some(device_id);
+            }
+            let status = start_audio_capture(daemon, config).await?;
             Ok(DaemonResponse::AudioStatus { status })
         }
         DaemonRequest::AudioStop => {
