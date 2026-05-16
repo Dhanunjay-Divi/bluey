@@ -163,7 +163,6 @@ pub fn apply_disguise(req: &DisguiseRequest) -> Result<(), StealthError> {
     Ok(())
 }
 
-
 // ─── Anti-debug public API ───────────────────────────────────────────────────
 
 /// Install anti-debug protections for the current platform.

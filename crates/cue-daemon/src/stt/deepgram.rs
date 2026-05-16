@@ -103,10 +103,7 @@ impl Default for DeepgramConfig {
 /// deterministically without spinning up an actual WS server.
 pub fn build_url(deepgram: &DeepgramConfig, stt: &SttConfig) -> Result<url::Url, SttError> {
     let default_url = obfstr::obfstr!("wss://api.deepgram.com").to_string();
-    let base = deepgram
-        .base_url
-        .as_deref()
-        .unwrap_or(&default_url);
+    let base = deepgram.base_url.as_deref().unwrap_or(&default_url);
     let mut u = url::Url::parse(&format!("{base}/v1/listen"))
         .map_err(|e| SttError::Protocol(format!("invalid base url: {e}")))?;
     {

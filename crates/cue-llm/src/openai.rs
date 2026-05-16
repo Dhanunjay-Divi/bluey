@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{LlmChunk, LlmChunkStream, LlmError, LlmProvider, LlmRequest, LlmResponse};
 
-fn default_base_url() -> String { obfstr::obfstr!("https://api.openai.com").to_string() }
+fn default_base_url() -> String {
+    obfstr::obfstr!("https://api.openai.com").to_string()
+}
 const DEFAULT_MODEL: &str = "gpt-4o-mini";
 
 pub struct OpenAiProvider {
@@ -136,7 +138,10 @@ impl LlmProvider for OpenAiProvider {
         let resp = self
             .client
             .post(format!("{}/v1/chat/completions", self.base_url))
-            .header(obfstr::obfstr!("Authorization"), format!("Bearer {}", self.api_key))
+            .header(
+                obfstr::obfstr!("Authorization"),
+                format!("Bearer {}", self.api_key),
+            )
             .json(&body)
             .send()
             .await

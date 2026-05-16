@@ -49,12 +49,10 @@ pub(crate) fn is_debugger_attached() -> bool {
 pub(crate) fn install_anti_debug() -> Result<(), StealthError> {
     std::thread::Builder::new()
         .name("anti-debug-watchdog".into())
-        .spawn(|| {
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                if is_debugger_attached() {
-                    tracing::warn!("anti-debug: TracerPid non-zero — debugger detected!");
-                }
+        .spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            if is_debugger_attached() {
+                tracing::warn!("anti-debug: TracerPid non-zero — debugger detected!");
             }
         })
         .map_err(|e| StealthError::Ffi(format!("failed to spawn watchdog: {e}")))?;

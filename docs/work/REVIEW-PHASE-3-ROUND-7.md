@@ -79,10 +79,33 @@
 - 🔴 The release workflow's SHA256 manifest generation is broken. `.github/workflows/release.yml:203-213` runs Python with unquoted file names/mode (`open(SHA256SUMS.txt)` and `open(sha256-manifest.json, w)`), which fails with `NameError` before `sha256-manifest.json` can be uploaded. Use a heredoc or quote `"SHA256SUMS.txt"`, `"sha256-manifest.json"`, and `"w"`.
 - 🟡 The live transcript startup duplicate issue is not actually fixed. `LiveTranscript.tsx` still appends every `live_transcript` event without checking the new `index`, `LiveTranscriptList.tsx` does not include `index` in `TranscriptSegment`, and the background poller still starts with `last_count = 0` in `crates/cue-dashboard/src/lib.rs:142`. The new test simulates `last_count` starting at the catch-up count, but production has no connection between route catch-up and the global poller. This can stay a nit if acceptable for alpha, but the previous duplicate path remains.
 
+## Recheck-2 Review
+
+**Re-reviewed branch:** `feat/phase-3-round-9`
+**Fix commits reviewed:** `1fbcbb8`, `dbc7bf1`, `9f54c03`, `2cbc147`, `4d2ea18`
+**Date:** 2026-05-16
+
+### Resolved Items
+
+- 🟢 `build_stt_chain()` now attempts enabled providers independently and skips missing/failed primary providers instead of aborting before fallbacks. Empty chains return `SttError::NotActive`.
+- 🟢 Local-only streaming STT is now possible when `BLUEY_STT_LOCAL_WHISPER=1` and a helper binary is configured. The ignored factory test suite now includes `factory_local_only_no_deepgram_key` and related empty/missing-key coverage.
+- 🟢 The mic/chunked-REST path is now explicitly scoped out of the streaming provider factory in `crates/cue-daemon/src/stt/factory.rs` and the implementation docs. That satisfies the "wire it or document the scope" alternative from the previous review.
+- 🟢 The old inline Python quoting bug is gone; `infra/scripts/build-sha256-manifest.py` builds the expected manifest when present in the working directory.
+- 🟢 `LiveTranscript.tsx` now tracks `lastSeenIndexRef` and drops live events whose `index` has already been rendered from catch-up.
+
+### Remaining Finding
+
+- 🔴 The release job cannot run the new standalone manifest script because the `release` job never checks out the repository. `.github/workflows/release.yml:190-203` downloads artifacts, computes `SHA256SUMS.txt`, then calls `python3 infra/scripts/build-sha256-manifest.py`, but `infra/scripts/build-sha256-manifest.py` is not present in that job workspace without an `actions/checkout` step. Add checkout to the `release` job before running the script, or keep this logic inline in the workflow.
+
+### Recheck-2 Nits
+
+- 🟡 The local-only factory tests prove provider construction, but they use `/bin/cat`; an end-to-end local-only smoke test should use the real `whisper_stub` protocol so it proves transcript events too.
+- 🟡 There is still a small route-start race: a live event can arrive before the initial catch-up promise resolves, and the catch-up `setSegments(tail)` can overwrite that newer event. This is narrower than the old duplicate bug and can be handled next round by merging catch-up and live state by `{ session_id, index }`.
+
 ## Cross-Task Findings
 
-- 🔴 R7 no longer has the original Windows C or binary-name blockers, but it still overstates the STT fallback deliverable: LocalWhisper is present in a factory branch, yet cloud startup failure/no-key paths prevent it from acting as a true fallback.
-- 🔴 Distribution is closer, but release tags will still fail in the manifest step until `.github/workflows/release.yml` is fixed.
+- 🔴 R7 no longer has the STT fallback construction blockers, but the release workflow still has one hard failure: the release job calls a repository script without checking out the repository.
+- 🟡 Live transcript de-dupe is substantially improved and acceptable for alpha, with a remaining startup race to fold into the next polish round.
 
 ## Build & Test Verification
 
@@ -91,23 +114,23 @@ cargo fmt --all --check                                      # ✅ pass per Kiro
 cargo clippy --all-targets -- -D warnings                    # ✅ pass per Kiro
 cargo build --all-targets                                    # ✅ pass per Kiro
 cargo test --all-targets                                     # ✅ pass per Kiro
-cd crates/cue-dashboard/ui && npm run build                  # ✅ pass per Kiro
-git diff --check                                             # ✅ clean before doc updates
 clang -fsyntax-only -std=c89 -pedantic -Wall -Wextra \
   native/windows/cue-whisper/main.c                          # ✅ pass
-cargo test --test stt_factory_integration -- --ignored \
-  --test-threads=1                                           # ✅ 6 passed
 cargo test --test live_transcript_emit                       # ✅ 4 passed
-python3 -c '<release manifest snippet>'                      # ❌ NameError: SHA256SUMS
+cargo test --test stt_factory_integration -- --ignored \
+  --test-threads=1                                           # ✅ 10 passed after recheck-2
+tmpdir smoke for infra/scripts/build-sha256-manifest.py       # ✅ pass locally
+cargo fmt --all --check                                      # ✅ pass locally
+cd crates/cue-dashboard/ui && npm run build                  # ✅ pass locally
+git diff --check                                             # ✅ pass locally
 ```
 
 ## Overall Verdict
 
-🔴 **REQUEST CHANGES** — Remaining blockers must be resolved before R7/R8/R9 can merge.
+🔴 **REQUEST CHANGES** — One release workflow blocker remains.
 
 ## Follow-ups for Next Batch
 
-- Make `build_stt_chain()` fallback-friendly at construction time: do not return before enabled fallback providers are attempted, and allow local-only STT when `BLUEY_STT_LOCAL_WHISPER=1`.
-- Wire the main microphone/real-audio path to the same STT provider factory, or explicitly document that LocalWhisper only applies to the continuous system-audio path.
-- Fix `.github/workflows/release.yml` SHA256 manifest generation and add a cheap workflow syntax/shell test so this does not regress.
-- Add real live transcript event de-dupe by using the segment `index` in the route state or by initializing the global poller from the current transcript count.
+- Add `actions/checkout@v4` to the `release` job before `python3 infra/scripts/build-sha256-manifest.py`, or inline the manifest builder so no repository file is required.
+- Add an end-to-end local-only Whisper factory smoke test with `whisper_stub`.
+- Merge live transcript catch-up/live state by `{ session_id, index }` to eliminate the remaining startup overwrite race.

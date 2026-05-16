@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{LlmChunk, LlmChunkStream, LlmError, LlmProvider, LlmRequest, LlmResponse};
 
-fn default_base_url() -> String { obfstr::obfstr!("https://api.anthropic.com").to_string() }
+fn default_base_url() -> String {
+    obfstr::obfstr!("https://api.anthropic.com").to_string()
+}
 const DEFAULT_MODEL: &str = "claude-3-5-sonnet-20241022";
 
 pub struct AnthropicProvider {

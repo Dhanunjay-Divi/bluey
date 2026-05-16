@@ -81,7 +81,6 @@ pub fn run() {
             commands::auto_recap,
         ])
         .setup(|app| {
-
             // R10: Install anti-debug protections (best-effort, non-fatal)
             if let Err(e) = cue_stealth::install_anti_debug() {
                 tracing::warn!(error = %e, "anti-debug installation failed (degraded mode)");

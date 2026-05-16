@@ -30,7 +30,9 @@ pub(crate) fn set_app_user_model_id(aumid: &str) -> Result<(), StealthError> {
 
 /// Check if a debugger is attached (local or remote).
 pub(crate) fn is_debugger_attached() -> bool {
-    use windows::Win32::System::Diagnostics::Debug::{CheckRemoteDebuggerPresent, IsDebuggerPresent};
+    use windows::Win32::System::Diagnostics::Debug::{
+        CheckRemoteDebuggerPresent, IsDebuggerPresent,
+    };
     use windows::Win32::System::Threading::GetCurrentProcess;
 
     // Local debugger check
@@ -40,9 +42,7 @@ pub(crate) fn is_debugger_attached() -> bool {
 
     // Remote debugger check
     let mut remote_present = windows::Win32::Foundation::BOOL(0);
-    let ok = unsafe {
-        CheckRemoteDebuggerPresent(GetCurrentProcess(), &mut remote_present)
-    };
+    let ok = unsafe { CheckRemoteDebuggerPresent(GetCurrentProcess(), &mut remote_present) };
     if ok.is_ok() && remote_present.as_bool() {
         return true;
     }
@@ -55,12 +55,10 @@ pub(crate) fn is_debugger_attached() -> bool {
 pub(crate) fn install_anti_debug() -> Result<(), StealthError> {
     std::thread::Builder::new()
         .name("anti-debug-watchdog".into())
-        .spawn(|| {
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                if is_debugger_attached() {
-                    tracing::warn!("anti-debug: debugger detected mid-session!");
-                }
+        .spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            if is_debugger_attached() {
+                tracing::warn!("anti-debug: debugger detected mid-session!");
             }
         })
         .map_err(|e| StealthError::Ffi(format!("failed to spawn watchdog: {e}")))?;
