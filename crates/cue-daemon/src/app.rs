@@ -32,7 +32,7 @@ use cue_core::{
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command as TokioCommand;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::time::{sleep, Duration};
 use tracing::{debug, error, info, warn};
 
@@ -195,7 +195,7 @@ fn is_near_duplicate_transcript(
     })
 }
 
-fn normalize_transcript_text(text: &str) -> String {
+pub fn normalize_transcript_text(text: &str) -> String {
     text.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -208,6 +208,32 @@ fn transcript_age_ms(created_at: &str, now_ms: u64) -> u64 {
         .ok()
         .map(|created_ms| now_ms.saturating_sub(created_ms))
         .unwrap_or(u64::MAX)
+}
+
+/// Partial→Final dedup: when a final transcript arrives, remove the most recent
+/// partial from the same speaker if the final text starts with (or equals) the
+/// partial text (case-insensitive, whitespace-normalized).
+/// Returns true if a partial was removed.
+pub fn dedup_partial_on_final(
+    meeting: &mut MeetingRecord,
+    speaker: Speaker,
+    final_text: &str,
+) -> bool {
+    let norm_final = normalize_transcript_text(final_text);
+    // Search backwards for the most recent non-final segment from same speaker
+    if let Some(idx) = meeting
+        .transcript
+        .iter()
+        .rposition(|seg| !seg.is_final && seg.speaker == speaker)
+    {
+        let norm_partial = normalize_transcript_text(&meeting.transcript[idx].text);
+        // Final supersedes partial if final starts with partial text
+        if norm_final.starts_with(&norm_partial) || norm_partial.starts_with(&norm_final) {
+            meeting.transcript.remove(idx);
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -352,6 +378,18 @@ struct Args {
     overlay_bin: Option<PathBuf>,
 }
 
+/// Payload emitted on the live transcript broadcast channel whenever a new
+/// transcript segment is added to the active meeting.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LiveTranscriptEvent {
+    pub session_id: String,
+    pub source: String,
+    pub text: String,
+    pub is_final: bool,
+    pub speaker: Option<u8>,
+    pub ts_ms: u64,
+}
+
 struct Daemon {
     paths: AppPaths,
     store: MeetingStore,
@@ -368,6 +406,18 @@ struct Daemon {
     answer_generation: AtomicU64,
     active_answer_card: Mutex<Option<(u64, uuid::Uuid)>>,
     system_audio: Mutex<Option<crate::audio::system_capture::SystemAudioCapture>>,
+    live_transcript_tx: broadcast::Sender<LiveTranscriptEvent>,
+    rag: Option<Arc<crate::db::rag::RagPipeline>>,
+    /// Per-session token issued at boot. Native overlay must echo this in
+    /// every event; mismatched / missing token -> event dropped.
+    overlay_session_token: String,
+    /// State-machine of the overlay UI (Idle / AttachOpen / InstructionsOpen).
+    /// Events are validated against this state before being forwarded; e.g.
+    /// AttachFilesRequested only accepted while AttachOpen,
+    /// InstructionsUpdated only accepted while InstructionsOpen.
+    /// AttachRequested and InstructionsRequested are entry-point events
+    /// allowed from any state (they drive the transition INTO the open states).
+    overlay_ui_state: parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>,
 }
 
 struct OverlayProcess {
@@ -415,6 +465,7 @@ pub async fn run() -> Result<()> {
     let cloud_status = cloud_status_from_env(&paths);
     let (overlay_events_tx, overlay_events_rx) = mpsc::unbounded_channel();
     let overlay_bin = args.overlay_bin.clone();
+    let rag_pipeline = init_rag_pipeline(&paths);
 
     let daemon = Arc::new(Daemon {
         paths,
@@ -438,10 +489,21 @@ pub async fn run() -> Result<()> {
         answer_generation: AtomicU64::new(0),
         active_answer_card: Mutex::new(None),
         system_audio: Mutex::new(None),
+        live_transcript_tx: broadcast::channel(64).0,
+        rag: rag_pipeline,
+        overlay_session_token: crate::overlay::generate_session_token(),
+        overlay_ui_state: parking_lot::Mutex::new(cue_core::overlay_ipc::OverlayUiState::Idle),
     });
 
     if !args.no_overlay {
-        match spawn_overlay(overlay_bin.as_deref(), overlay_events_tx.clone()) {
+        match spawn_overlay(
+            overlay_bin.as_deref(),
+            overlay_events_tx.clone(),
+            daemon.overlay_session_token.clone(),
+            Arc::new(parking_lot::Mutex::new(
+                cue_core::overlay_ipc::OverlayUiState::Idle,
+            )),
+        ) {
             Ok(overlay) => {
                 info!("native overlay started");
                 *daemon.overlay.lock().await = Some(overlay);
@@ -715,6 +777,8 @@ async fn handle_request_inner(
             .with_source(path.display().to_string());
             let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
             write_state(daemon).await?;
+            // R10: Auto-recap via LLM (best-effort, fire-and-forget).
+            spawn_auto_recap(daemon, &meeting);
             Ok(DaemonResponse::Recap { recap })
         }
         DaemonRequest::TranscriptAdd {
@@ -1019,6 +1083,8 @@ async fn ensure_overlay_ready(
         let process = spawn_overlay(
             daemon.overlay_bin.as_deref(),
             daemon.overlay_events_tx.clone(),
+            daemon.overlay_session_token.clone(),
+            Arc::new(parking_lot::Mutex::new(*daemon.overlay_ui_state.lock())),
         )
         .context("failed to start native overlay")?;
         *overlay = Some(process);
@@ -1329,40 +1395,25 @@ async fn build_system_audio_stt_provider() -> anyhow::Result<Box<dyn cue_core::s
         ..Default::default()
     };
 
-    if crate::stt::router::is_router_enabled() {
-        let mut providers: Vec<Box<dyn cue_core::stt::SttProvider>> = Vec::new();
+    crate::stt::factory::build_stt_chain(&stt_cfg, AudioSource::System)
+        .await
+        .map_err(|e| anyhow::anyhow!("STT factory: {e}"))
+}
 
-        if let Some(api_key) = env_first(&["BLUEY_STT_API_KEY", "DEEPGRAM_API_KEY"]) {
-            let dg_cfg = crate::stt::deepgram::DeepgramConfig {
-                api_key,
-                ..Default::default()
-            };
-            let provider = crate::stt::deepgram::DeepgramProvider::connect(
-                dg_cfg,
-                stt_cfg.clone(),
-                AudioSource::System,
-            )
-            .await?;
-            providers.push(Box::new(provider));
-        }
+/// Build an STT provider for the microphone path via the factory chain.
+/// Called when the streaming factory is preferred (e.g. LocalWhisper enabled).
+pub async fn build_mic_stt_provider() -> anyhow::Result<Box<dyn cue_core::stt::SttProvider>> {
+    use cue_core::pcm::AudioSource;
+    use cue_core::stt::SttConfig;
 
-        providers.push(Box::new(crate::stt::echo::EchoProvider::new(
-            AudioSource::System,
-        )));
+    let stt_cfg = SttConfig {
+        source: AudioSource::Microphone,
+        ..Default::default()
+    };
 
-        Ok(Box::new(crate::stt::router::SttRouter::new(providers)))
-    } else {
-        let api_key = env_first(&["BLUEY_STT_API_KEY", "DEEPGRAM_API_KEY"])
-            .ok_or_else(|| anyhow::anyhow!("no STT API key configured for system audio"))?;
-        let dg_cfg = crate::stt::deepgram::DeepgramConfig {
-            api_key,
-            ..Default::default()
-        };
-        let provider =
-            crate::stt::deepgram::DeepgramProvider::connect(dg_cfg, stt_cfg, AudioSource::System)
-                .await?;
-        Ok(Box::new(provider))
-    }
+    crate::stt::factory::build_stt_chain(&stt_cfg, AudioSource::Microphone)
+        .await
+        .map_err(|e| anyhow::anyhow!("STT factory (mic): {e}"))
 }
 
 async fn build_real_audio_runtime_config(
@@ -2398,6 +2449,10 @@ async fn add_audio_transcript_segment(
         if is_near_duplicate_transcript(meeting, speaker, text, segment.is_final) {
             return Ok(());
         }
+        // Dedup: if this is a final, remove superseded partial from same speaker
+        if segment.is_final {
+            dedup_partial_on_final(meeting, speaker, text);
+        }
         let transcript_segment = TranscriptSegment::new(speaker, text, segment.is_final);
         meeting.transcript.push(transcript_segment.clone());
         let analysis = analyze_segment(&transcript_segment, meeting);
@@ -2422,6 +2477,38 @@ async fn add_audio_transcript_segment(
         .unwrap_or_else(|| "audio STT".to_string());
     let card = CueCard::new(CardKind::Transcript, title, text).with_source(source);
     let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
+
+    // Broadcast live transcript event for dashboard consumption.
+    let source_label = match segment.source {
+        Some(AudioSourceKind::System) => "system",
+        Some(AudioSourceKind::Microphone) => "microphone",
+        None => "unknown",
+    };
+    let ts_ms = meeting_snapshot
+        .transcript
+        .last()
+        .and_then(|s| s.created_at.parse::<u64>().ok())
+        .unwrap_or(0);
+    let _ = daemon.live_transcript_tx.send(LiveTranscriptEvent {
+        session_id: meeting_snapshot.id.to_string(),
+        source: source_label.to_string(),
+        text: text.to_string(),
+        is_final: segment.is_final,
+        speaker: None,
+        ts_ms,
+    });
+
+    // Live RAG indexing on Final transcripts (fire-and-forget).
+    if segment.is_final {
+        if let Some(rag) = daemon.rag.as_ref() {
+            let rag = Arc::clone(rag);
+            let sid = meeting_snapshot.id.to_string();
+            let t = text.to_string();
+            tokio::spawn(async move {
+                rag.index_transcript(&sid, &t).await;
+            });
+        }
+    }
     Ok(())
 }
 
@@ -4731,37 +4818,99 @@ async fn shutdown_daemon(daemon: &Arc<Daemon>) {
     let _ = tokio::fs::remove_file(&daemon.paths.state_file).await;
 }
 
+/// Production overlay path with R11 hardening:
+/// - Env-override gating (BLUEY_DEV_OVERLAY required for overrides in release builds)
+/// - Binary path canonicalization + install-dir containment check
+/// - Per-session token passed via env var; events without matching token dropped
+/// - Per-event field length limits; oversized events dropped + logged
+/// - UI state-machine: AttachFilesRequested allowed only when AttachOpen, etc.
 fn spawn_overlay(
     explicit: Option<&Path>,
     events: mpsc::UnboundedSender<OverlayEvent>,
+    expected_token: String,
+    ui_state: Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
 ) -> Result<OverlayProcess> {
-    let overlay_bin = if let Some(path) = explicit {
+    // Step 1: resolve path. In production builds, env overrides require
+    // BLUEY_DEV_OVERLAY=1 (handled by overlay::resolve_overlay_path).
+    let resolved = if let Some(path) = explicit {
         path.to_path_buf()
-    } else if let Ok(path) = env::var("BLUEY_OVERLAY_BIN").or_else(|_| env::var("CUE_OVERLAY_BIN"))
-    {
-        PathBuf::from(path)
     } else {
-        discover_overlay_bin()?
+        let default = discover_overlay_bin()?;
+        crate::overlay::resolve_overlay_path(&default)
     };
 
-    let mut child = Command::new(&overlay_bin)
+    // Step 2: verify the binary path is canonical + inside the install dir.
+    // The install dir is the parent of the daemon's own current_exe (Tauri+helpers
+    // ship side-by-side). For dev builds we allow any path under the cwd.
+    let install_dir = if cfg!(debug_assertions) || crate::overlay::is_dev_overlay_enabled() {
+        env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    } else {
+        env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("/"))
+    };
+    if let Err(e) = crate::overlay::verify_overlay_binary(&resolved, &install_dir) {
+        warn!(
+            error = %e,
+            binary = %resolved.display(),
+            install_dir = %install_dir.display(),
+            "overlay binary verification failed; refusing to spawn"
+        );
+        return Err(anyhow!("overlay binary verification failed: {e}"));
+    }
+
+    // Step 3: spawn with the per-session token in env var.
+    let mut child = Command::new(&resolved)
+        .env("BLUEY_OVERLAY_SESSION_TOKEN", &expected_token)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .with_context(|| format!("failed to spawn overlay {}", overlay_bin.display()))?;
+        .with_context(|| format!("failed to spawn overlay {}", resolved.display()))?;
 
     let stdin = child.stdin.take().context("overlay stdin is not piped")?;
 
+    // Step 4: line reader with token + length + state validation before forwarding.
     if let Some(stdout) = child.stdout.take() {
+        let token_for_reader = expected_token;
+        let ui_state_for_reader = ui_state.clone();
         std::thread::spawn(move || {
             let reader = std::io::BufReader::new(stdout);
             for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
-                if let Ok(event) = serde_json::from_str::<OverlayEvent>(&line) {
-                    info!("overlay event: {:?}", event);
-                    let _ = events.send(event);
-                } else {
-                    info!("overlay: {line}");
+                match validate_and_decode_overlay_line(
+                    &line,
+                    &token_for_reader,
+                    &ui_state_for_reader,
+                ) {
+                    Ok(event) => {
+                        info!("overlay event: {:?}", event);
+                        let _ = events.send(event);
+                    }
+                    Err(OverlayLineReject::NotJson) => {
+                        // Plain log line from overlay (non-event output).
+                        info!("overlay: {line}");
+                    }
+                    Err(OverlayLineReject::TokenMismatch) => {
+                        warn!("overlay event rejected: token mismatch");
+                    }
+                    Err(OverlayLineReject::FieldTooLong { field, len, max }) => {
+                        warn!(
+                            field = %field,
+                            len, max,
+                            "overlay event rejected: field exceeds max length"
+                        );
+                    }
+                    Err(OverlayLineReject::StateNotAllowed { kind, state }) => {
+                        warn!(
+                            kind = %kind,
+                            state = ?state,
+                            "overlay event rejected: not allowed in current UI state"
+                        );
+                    }
+                    Err(OverlayLineReject::ParseError(e)) => {
+                        warn!(error = %e, "overlay event parse error; line dropped");
+                    }
                 }
             }
             let _ = events.send(OverlayEvent::Exited);
@@ -4769,6 +4918,162 @@ fn spawn_overlay(
     }
 
     Ok(OverlayProcess { child, stdin })
+}
+
+/// Reasons a line from the overlay child can be rejected before being forwarded.
+#[derive(Debug)]
+pub enum OverlayLineReject {
+    NotJson,
+    TokenMismatch,
+    FieldTooLong {
+        field: &'static str,
+        len: usize,
+        max: usize,
+    },
+    StateNotAllowed {
+        kind: String,
+        state: cue_core::overlay_ipc::OverlayUiState,
+    },
+    ParseError(String),
+}
+
+impl std::fmt::Display for OverlayLineReject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+/// Per-field length caps for the production overlay path.
+/// Mirrors `cue_core::overlay_ipc` limits.
+const OVERLAY_MAX_QUESTION: usize = 4 * 1024;
+const OVERLAY_MAX_INSTRUCTIONS: usize = 16 * 1024;
+const OVERLAY_MAX_PATH: usize = 1024;
+const OVERLAY_MAX_PATHS: usize = 16;
+const OVERLAY_MAX_TEXT: usize = 64 * 1024;
+const OVERLAY_MAX_LINE: usize = 128 * 1024;
+
+pub fn validate_and_decode_overlay_line(
+    line: &str,
+    expected_token: &str,
+    ui_state: &parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>,
+) -> Result<OverlayEvent, OverlayLineReject> {
+    if line.len() > OVERLAY_MAX_LINE {
+        return Err(OverlayLineReject::FieldTooLong {
+            field: "<line>",
+            len: line.len(),
+            max: OVERLAY_MAX_LINE,
+        });
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(line).map_err(|_| OverlayLineReject::NotJson)?;
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => return Err(OverlayLineReject::NotJson),
+    };
+
+    // Token validation. If the daemon has a non-empty token, the event MUST
+    // include a matching `token` field. Empty expected token means legacy mode.
+    if !expected_token.is_empty() {
+        let supplied = obj.get("token").and_then(|v| v.as_str()).unwrap_or("");
+        if supplied != expected_token {
+            return Err(OverlayLineReject::TokenMismatch);
+        }
+    }
+
+    // Field length limits BEFORE state-machine check (cheaper to reject).
+    if let Some(s) = obj.get("question").and_then(|v| v.as_str()) {
+        if s.len() > OVERLAY_MAX_QUESTION {
+            return Err(OverlayLineReject::FieldTooLong {
+                field: "question",
+                len: s.len(),
+                max: OVERLAY_MAX_QUESTION,
+            });
+        }
+    }
+    if let Some(s) = obj.get("text").and_then(|v| v.as_str()) {
+        if s.len() > OVERLAY_MAX_TEXT {
+            return Err(OverlayLineReject::FieldTooLong {
+                field: "text",
+                len: s.len(),
+                max: OVERLAY_MAX_TEXT,
+            });
+        }
+    }
+    if let Some(s) = obj.get("instructions").and_then(|v| v.as_str()) {
+        if s.len() > OVERLAY_MAX_INSTRUCTIONS {
+            return Err(OverlayLineReject::FieldTooLong {
+                field: "instructions",
+                len: s.len(),
+                max: OVERLAY_MAX_INSTRUCTIONS,
+            });
+        }
+    }
+    if let Some(arr) = obj.get("paths").and_then(|v| v.as_array()) {
+        if arr.len() > OVERLAY_MAX_PATHS {
+            return Err(OverlayLineReject::FieldTooLong {
+                field: "paths",
+                len: arr.len(),
+                max: OVERLAY_MAX_PATHS,
+            });
+        }
+        for p in arr {
+            if let Some(s) = p.as_str() {
+                if s.len() > OVERLAY_MAX_PATH {
+                    return Err(OverlayLineReject::FieldTooLong {
+                        field: "paths[entry]",
+                        len: s.len(),
+                        max: OVERLAY_MAX_PATH,
+                    });
+                }
+            }
+        }
+    }
+    if let Some(s) = obj.get("error").and_then(|v| v.as_str()) {
+        if s.len() > OVERLAY_MAX_QUESTION {
+            return Err(OverlayLineReject::FieldTooLong {
+                field: "error",
+                len: s.len(),
+                max: OVERLAY_MAX_QUESTION,
+            });
+        }
+    }
+
+    // Deserialize into typed event after stripping token (serde will ignore
+    // unknown fields by default for #[serde(tag = "type", ...)] enums).
+    let event: OverlayEvent =
+        serde_json::from_value(value).map_err(|e| OverlayLineReject::ParseError(e.to_string()))?;
+
+    // State-machine validation: certain events are only allowed in certain UI states.
+    let kind_str: String = format!("{event:?}")
+        .split_whitespace()
+        .next()
+        .unwrap_or("Unknown")
+        .to_string();
+    let current_state = *ui_state.lock();
+    use cue_core::overlay_ipc::OverlayUiState as S;
+    let allowed = match &event {
+        // AttachRequested / InstructionsRequested are user-initiated *entry*
+        // events: clicking "open attach" or "open instructions" from any state.
+        // They drive the transition Idle -> AttachOpen / InstructionsOpen.
+        // They MUST be accepted from Idle (otherwise the panels can never open).
+        OverlayEvent::AttachRequested | OverlayEvent::InstructionsRequested => true,
+        // AttachFilesRequested is the inner submit from the attach picker;
+        // it makes sense only while the attach panel is open.
+        OverlayEvent::AttachFilesRequested { .. } => current_state == S::AttachOpen,
+        // InstructionsUpdated is the inner submit from the instructions form;
+        // only valid while the instructions panel is open.
+        OverlayEvent::InstructionsUpdated { .. } => current_state == S::InstructionsOpen,
+        // All other events allowed in any state.
+        _ => true,
+    };
+    if !allowed {
+        return Err(OverlayLineReject::StateNotAllowed {
+            kind: kind_str,
+            state: current_state,
+        });
+    }
+
+    Ok(event)
 }
 
 fn discover_overlay_bin() -> Result<PathBuf> {
@@ -5443,6 +5748,90 @@ async fn update_state_from_meeting(
         }
     }
     write_state(daemon).await
+}
+
+/// Initialize the RAG pipeline if an OpenAI API key is available.
+/// Returns None (with a log) if no key is configured — RAG is optional.
+fn init_rag_pipeline(paths: &AppPaths) -> Option<Arc<crate::db::rag::RagPipeline>> {
+    let api_key = match crate::secrets::load_api_key("openai") {
+        Ok(Some(key)) => key,
+        _ => {
+            info!("RAG pipeline disabled: no OpenAI API key configured");
+            return None;
+        }
+    };
+    let embedder = Arc::new(cue_rag::embedder::OpenAiEmbedder::new(api_key));
+    let store_path = paths.data_dir.join("rag_vectors.db");
+    match crate::db::rag::RagPipeline::new(store_path, embedder) {
+        Ok(pipeline) => {
+            info!("RAG pipeline initialized");
+            Some(Arc::new(pipeline))
+        }
+        Err(e) => {
+            warn!("RAG pipeline init failed: {e:#}");
+            None
+        }
+    }
+}
+
+/// Spawn a best-effort auto-recap via LLM after a session ends.
+/// If no LLM provider is configured, logs a warning and returns.
+fn spawn_auto_recap(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
+    let transcript: String = meeting
+        .transcript
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if transcript.trim().is_empty() {
+        return;
+    }
+    let session_id = meeting.id.to_string();
+    let db_dir = daemon.paths.data_dir.clone();
+    tokio::spawn(async move {
+        let llm = match build_recap_llm_from_env() {
+            Some(p) => p,
+            None => {
+                warn!("auto-recap skipped: no LLM provider configured");
+                return;
+            }
+        };
+        let result = crate::llm::RecapLlm
+            .run(&transcript, &session_id, llm.as_ref())
+            .await;
+        match result {
+            Ok(resp) => {
+                let db_path = db_dir.join("sessions.db");
+                if let Ok(db) = crate::db::Database::open(db_path.to_str().unwrap_or("sessions.db"))
+                {
+                    if let Err(e) = db.insert_cue_response(
+                        &resp.id,
+                        &resp.source_session_id,
+                        &resp.kind,
+                        &resp.text,
+                        resp.source_text.as_deref(),
+                        resp.ts_ms as i64,
+                    ) {
+                        warn!(error = %e, "auto-recap: failed to persist");
+                    } else {
+                        info!(session = %session_id, "auto-recap persisted");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "auto-recap LLM call failed");
+            }
+        }
+    });
+}
+
+/// Build an LLM provider from env for auto-recap (best-effort).
+fn build_recap_llm_from_env() -> Option<Box<dyn cue_llm::LlmProvider>> {
+    let key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .or_else(|| crate::secrets::load_api_key("llm_openai").ok().flatten())?;
+    Some(Box::new(cue_llm::openai::OpenAiProvider::new(key)))
 }
 
 #[cfg(test)]

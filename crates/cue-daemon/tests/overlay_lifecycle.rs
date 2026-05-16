@@ -4,7 +4,9 @@
 use std::time::Duration;
 
 use cue_core::overlay_ipc::{OverlayIpcCommand, OverlayMessage};
-use cue_daemon::overlay::{NativeOverlayHandle, OverlayProcessState, OverlaySpawnOptions};
+use cue_daemon::overlay::{
+    generate_session_token, NativeOverlayHandle, OverlayProcessState, OverlaySpawnOptions,
+};
 
 fn crash_stub_path() -> String {
     env!("CARGO_BIN_EXE_overlay-stub-crash").to_string()
@@ -15,16 +17,13 @@ fn long_stub_path() -> String {
 }
 
 /// After MAX_RESTART_ATTEMPTS consecutive failures the supervisor must
-/// reach Failed state and stay there (no further restarts, no zombie tasks).
+/// reach Failed state and stay there.
 #[tokio::test]
 async fn overlay_supervisor_caps_at_max_restart_attempts() {
     let _ = tracing_subscriber::fmt::try_init();
-    // Use a stub that exits immediately with non-zero — every spawn is a
-    // consecutive failure since the child never processes anything.
     let opts = OverlaySpawnOptions::new(crash_stub_path());
     let handle = NativeOverlayHandle::spawn(opts).await.expect("spawn");
 
-    // Wait for state to reach Failed (supervisor exhausts restart attempts).
     let reached_failed = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if handle.state() == OverlayProcessState::Failed {
@@ -38,11 +37,9 @@ async fn overlay_supervisor_caps_at_max_restart_attempts() {
 
     assert!(reached_failed, "supervisor did not reach Failed state");
 
-    // Assert state stays Failed for 1 second (no further restarts).
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(handle.state(), OverlayProcessState::Failed);
 
-    // send_tx should now fail (supervisor exited, recv_tx dropped).
     let send_result = handle.send(OverlayMessage::Ping);
     assert!(
         send_result.is_err(),
@@ -50,17 +47,16 @@ async fn overlay_supervisor_caps_at_max_restart_attempts() {
     );
 }
 
-/// A long-running child that exits cleanly on stdin EOF should be shut down
-/// gracefully by shutdown(). The child exits with code 0.
+/// Long-running child with token: exits cleanly on stdin EOF.
 #[tokio::test]
 async fn overlay_long_running_child_shuts_down_cleanly() {
     let _ = tracing_subscriber::fmt::try_init();
-    let opts = OverlaySpawnOptions::new(long_stub_path());
+    let token = generate_session_token();
+    let opts = OverlaySpawnOptions::new(long_stub_path()).with_session_token(token);
     let mut handle = NativeOverlayHandle::spawn(opts).await.expect("spawn");
 
     assert_eq!(handle.state(), OverlayProcessState::Running);
 
-    // Send 10 messages and collect 10 Pong + 10 Echo responses.
     for i in 0..10 {
         handle
             .send(OverlayMessage::SessionSwitched {
@@ -87,7 +83,6 @@ async fn overlay_long_running_child_shuts_down_cleanly() {
     assert_eq!(pongs, 10);
     assert_eq!(echoes, 10);
 
-    // Shutdown should complete within 3 seconds.
     let shutdown_result = tokio::time::timeout(Duration::from_secs(3), handle.shutdown()).await;
     assert!(
         shutdown_result.is_ok(),

@@ -1,89 +1,66 @@
-# Codex → Kiro: R5+R6 Review + Implementation Handoff
+# Codex → Kiro: Final v0.1 Alpha Chain Review
 
-## 1. R5 + R6 Verdicts
+## 1. Overall Verdict
 
-- `docs/work/REVIEW-PHASE-3-ROUND-5.md`: 🔴 **REQUEST CHANGES**
-- `docs/work/REVIEW-PHASE-3-ROUND-6.md`: 🔴 **REQUEST CHANGES**
+🟢 **ACCEPT** — R7-fix-3 → R8 → R9 → R10 → R11 are merge-ready on `feat/phase-3-round-11` tip `b199058`.
 
-I did the review pass first, as requested, and did not start P0 implementation because both reviewed rounds still have merge-blocking issues. The important one is R5: continuous system-audio STT still sends audio into one provider instance and drains events from a second provider instance, so the original "system audio transcripts never reach the session" blocker is not actually fixed.
+## 2. Per-Round Verdicts
 
-## 2. What I Implemented
+- R7-fix-3: 🟢 **ACCEPT** — release job checkout/script blocker is resolved.
+- R8: 🟢 **ACCEPT** — key masking and explicit secret-write rejection nits are cleared.
+- R9: 🟢 **ACCEPT** — AI/RAG/small-wins round is acceptable with documented follow-ups.
+- R10: 🟢 **ACCEPT** — original R10 blockers are resolved by the R11 fix wave.
+- R11: 🟢 **ACCEPT** — production overlay hardening and streaming fixes are now wired and tested.
 
-No product-code implementation was started. I created the review artifacts and this handoff doc only.
+## 3. Review Docs Written / Updated
 
-| Item | Files changed | Notes |
-|------|---------------|-------|
-| R5 post-fix re-review | `docs/work/REVIEW-PHASE-3-ROUND-5.md` | Re-reviewed all six claimed blocker fixes. Five pass; system-audio STT drain remains a blocker. |
-| R6 first review | `docs/work/REVIEW-PHASE-3-ROUND-6.md` | Reviewed hotkeys/tray, mic selection, permission UX, and OpenAI Realtime STT. Found multiple end-to-end blockers. |
-| Codex-to-Kiro handoff | `docs/work/HANDOFF-FROM-CODEX-TO-KIRO.md` | Captures verdicts, skipped work, and next required fix sequence. |
+- Updated `docs/work/REVIEW-PHASE-3-ROUND-7.md` with final accept.
+- Updated `docs/work/REVIEW-PHASE-3-ROUND-8.md` with final accept.
+- Added `docs/work/REVIEW-PHASE-3-ROUND-9.md`.
+- Added `docs/work/REVIEW-PHASE-3-ROUND-10.md`.
+- Updated `docs/work/REVIEW-PHASE-3-ROUND-11.md` with Recheck 2 accept.
+- Overwrote this handoff with the final chain verdict.
 
-## 3. What I Skipped and Why
+## 4. Residual Round 12 Nits
 
-- P0 Item 1, R6 IMPL + HANDOFF docs: skipped because Round 6 needs a fix round first; writing implementation docs now would canonize behavior that is not actually working.
-- P0 Item 2, Live transcript UX: skipped because the underlying R5/R6 live transcript sources are still blocked.
-- P0 Item 3, Local Whisper fallback: skipped because the existing cloud-provider and router plumbing needs correction first.
-- P0 Item 4, Distribution scaffolding: skipped to keep the branch focused on fixing runtime correctness before packaging.
-- P1/P2 items: skipped because P0 correctness is not ready.
+- `Responses.tsx` should append non-empty text before deleting an in-flight card on `finished: true`.
+- `overlay_ui_state` is mostly future-facing; wire real transitions if modal overlay IPC expands, or simplify it.
+- `generate_session_token()` should either use 32 random bytes or adjust its comment away from "random 32-byte token"; two UUID v4 values are strong enough for alpha but not literally 256 random bits.
+- RAG still uses in-memory cosine search; move to sqlite-vec/ANN before large-scale data.
+- Windows real whisper.cpp remains deferred.
 
-## 4. Pipeline Status
+## 5. What I Implemented
 
-I ran the verification pipeline after adding the review/handoff docs. The branch has no Codex product-code changes, only docs.
+No product code changes.
+
+Documentation changes only: review docs and this handoff.
+
+## 6. What I Skipped and Why
+
+- Product naming/white-label/runtime wording: intentionally not revisited per user direction.
+- Full manual execution of GitHub Actions release packaging on hosted runners. The workflow blocker was reviewed statically and the relevant local pipeline is green.
+- Ignored hardware/keychain tests remain ignored by design.
+
+## 7. Pipeline Status
+
+Checks run locally on `feat/phase-3-round-11`:
 
 ```bash
-cargo fmt --all --check                    # ✅
-cargo clippy --all-targets -- -D warnings  # ✅
-cargo build --all-targets                  # ✅
-cargo test --all-targets                   # ✅ 185 passed, 2 ignored
-cd crates/cue-dashboard/ui && npm run build # ✅
-git diff --check                           # ✅
+cargo fmt --all --check                              # ✅
+cargo clippy --all-targets -- -D warnings            # ✅
+cargo build --all-targets --release                  # ✅
+cargo test --all-targets                             # ✅ 354 passed, 14 ignored
+cd crates/cue-dashboard/ui && npm run build          # ✅
+swift build -c release --package-path native/macos/cue-overlay   # ✅
+swift build -c release --package-path native/macos/cue-whisper   # ✅
+cargo test -p cue-daemon --test cue_streaming_integration
+                                                       # ✅ 5 passed
+cargo test -p cue-daemon --test overlay_production_path
+                                                       # ✅ 20 passed
+cargo test -p cue-dashboard r8_nit_tests --lib        # ✅ 3 passed
+git diff --check                                      # ✅
 ```
 
-I did not run `swift build` because Codex did not touch native overlay code in this pass.
+## 8. Next Action for Kiro
 
-## 5. New Test Count
-
-No tests were added by Codex in this pass.
-
-Current reported state from Kiro's handoff:
-
-| Branch | Reported running tests |
-|--------|------------------------|
-| `feat/phase-3-round-5` | 164 |
-| `feat/phase-3-round-6` | 185 |
-
-## 6. Branches Ready for Kiro Review
-
-No new implementation branch is ready for Kiro review. The current branch `feat/phase-3-round-6` now contains review docs and needs a Kiro fix round before merge.
-
-Paste-ready next instruction for Kiro:
-
-```text
-Fix R5/R6 blockers called out by Codex.
-
-Read:
-- docs/work/REVIEW-PHASE-3-ROUND-5.md
-- docs/work/REVIEW-PHASE-3-ROUND-6.md
-
-Required fixes:
-1. R5: continuous system-audio STT must use one provider instance for both send_audio and next_event. Add a production-wiring test that proves captured system audio reaches add_audio_transcript_segment/session transcript.
-2. R6: mic device selection must be consumed by daemon capture, not just saved/tested.
-3. R6: permission denial UX must be emitted from real capture failures to the dashboard, and open_privacy_settings must use platform-specific launch commands.
-4. R6: OpenAI Realtime STT must send transcription-session setup, parse conversation.item.input_audio_transcription.delta/completed, use a transcription model default, and test those real event names.
-5. R6: write IMPL-PHASE-3-ROUND-6.md and PHASE-3-ROUND-6-HANDOFF-FOR-CODEX-REVIEW.md after fixes.
-
-Then rerun:
-cargo fmt --all --check
-cargo clippy --all-targets -- -D warnings
-cargo build --all-targets
-cargo test --all-targets
-cd crates/cue-dashboard/ui && npm run build
-git -P diff --check feat/phase-3-round-5..HEAD
-
-Hand back to Codex for re-review with fix doc(s) and updated test count.
-```
-
-## 7. Pending Followups
-
-- After the R5/R6 fix round passes, resume P0 in the original order: R6 docs, live transcript UX, local Whisper fallback, distribution scaffolding.
-- For OpenAI Realtime, use the official realtime transcription guide as the compatibility source for event names and session setup: https://platform.openai.com/docs/guides/realtime-transcription
-- Consider moving hotkey/tray daemon IPC out of React listeners and into Rust-side handlers so background control survives webview reloads.
+Merge the stacked branch to main and start the v0.1 alpha rollout. Fold residual nits into Round 12 rather than blocking the merge.

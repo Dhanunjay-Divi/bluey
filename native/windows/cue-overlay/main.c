@@ -32,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include "json_type_extract.h"
 
 #ifndef WDA_EXCLUDEFROMCAPTURE
 #define WDA_EXCLUDEFROMCAPTURE 0x00000011
@@ -152,8 +153,34 @@ static void apply_capture_exclusion(HWND hwnd) {
     }
 }
 
+
+// Per-session token from the daemon (BLUEY_OVERLAY_SESSION_TOKEN env var).
+// Embedded in every emitted JSON event. Daemon validates + drops events
+// whose token does not match its own per-session value.
+static char g_session_token[129] = {0}; // 128-char max + NUL
+
+static void load_session_token(void) {
+    DWORD n = GetEnvironmentVariableA(
+        "BLUEY_OVERLAY_SESSION_TOKEN",
+        g_session_token,
+        (DWORD)sizeof(g_session_token));
+    if (n == 0 || n >= sizeof(g_session_token)) {
+        g_session_token[0] = '\0';
+    }
+}
+
+// Print `,"token":"..."` if a token is set, else nothing.
+// Caller must have already opened the JSON object and emitted >= 1 field.
+static void emit_token_field(void) {
+    if (g_session_token[0] != '\0') {
+        printf(",\"token\":\"%s\"", g_session_token);
+    }
+}
+
 static void emit_ready(void) {
-    printf("{\"type\":\"ready\",\"platform\":\"windows\",\"capture_excluded\":true}\n");
+    printf("{\"type\":\"ready\",\"platform\":\"windows\",\"capture_excluded\":true");
+    emit_token_field();
+    printf("}\n");
     fflush(stdout);
 }
 
@@ -176,7 +203,9 @@ static void json_print_escaped(const char *text) {
 }
 
 static void emit_simple_event(const char *type) {
-    printf("{\"type\":\"%s\"}\n", type);
+    printf("{\"type\":\"%s\"", type);
+    emit_token_field();
+    printf("}\n");
     fflush(stdout);
 }
 
@@ -187,7 +216,11 @@ static void emit_ask_event(const wchar_t *question) {
 
     fputs("{\"type\":\"ask_requested\",\"question\":\"", stdout);
     json_print_escaped(utf8);
-    fputs("\",\"provider\":\"auto\",\"model\":\"\",\"mode\":\"General\"}\n", stdout);
+    // Close `question`, emit fixed fields, append `,"token":"..."` if set,
+    // then close the JSON object.
+    fputs("\",\"provider\":\"auto\",\"model\":\"\",\"mode\":\"General\"", stdout);
+    emit_token_field();
+    fputs("}\n", stdout);
     fflush(stdout);
 }
 
@@ -621,85 +654,121 @@ static void send_current_question(void) {
     SetFocus(g_ask_edit);
 }
 
+static void safe_extract_json_to_wide(const char *line, size_t line_len, const char *key, wchar_t *dest, size_t dest_wchars) {
+    char buf[4096];
+    if (json_extract_string(line, line_len, key, buf, sizeof(buf))) {
+        set_utf8_text(dest, dest_wchars, buf);
+    }
+}
+
+static bool safe_extract_json_number(const char *line, size_t line_len, const char *key, double *dest) {
+    char buf[64];
+    if (json_extract_string(line, line_len, key, buf, sizeof(buf))) {
+        char *end = NULL;
+        double value = strtod(buf, &end);
+        if (end != buf) {
+            *dest = value;
+            return true;
+        }
+    }
+    /* Fallback: try the naive number extractor for non-string numbers */
+    return naive_extract_json_number(line, key, dest);
+}
+
 static DWORD WINAPI stdin_thread(LPVOID unused) {
     (void)unused;
     char line[8192];
     while (fgets(line, sizeof(line), stdin)) {
-        if (strstr(line, "\"type\":\"show\"")) {
+        size_t line_len = strlen(line);
+
+        /* Item 6: reject overlong lines */
+        if (json_line_too_long(line_len)) {
+            continue;
+        }
+
+        /* Item 5: safely extract the top-level "type" field */
+        char msg_type[128];
+        if (!json_extract_type(line, line_len, msg_type, sizeof(msg_type))) {
+            continue; /* no valid type field - drop */
+        }
+
+        if (strcmp(msg_type, "show") == 0) {
             show_full_overlay(true);
-        } else if (strstr(line, "\"type\":\"hide\"")) {
+        } else if (strcmp(msg_type, "hide") == 0) {
             collapse_to_pill(g_hwnd, true);
-        } else if (strstr(line, "\"type\":\"toggle\"")) {
+        } else if (strcmp(msg_type, "toggle") == 0) {
             if (g_visible) collapse_to_pill(g_hwnd, true);
             else show_full_overlay(true);
-        } else if (strstr(line, "\"type\":\"clear\"")) {
+        } else if (strcmp(msg_type, "clear") == 0) {
             wcscpy_s(g_title, 256, L"Bluey");
             wcscpy_s(g_body, 2048, L"");
             wcscpy_s(g_kind, 64, L"system");
             wcscpy_s(g_source, 256, L"");
             wcscpy_s(g_card_id, 80, L"");
             InvalidateRect(g_hwnd, NULL, TRUE);
-        } else if (strstr(line, "\"type\":\"boot\"")) {
+        } else if (strcmp(msg_type, "boot") == 0) {
             wcscpy_s(g_title, 256, L"Bluey online");
             wcscpy_s(g_body, 2048, L"> overlay link established\n> session memory loaded\n> context controls armed\n> ready");
             wcscpy_s(g_kind, 64, L"system");
             wcscpy_s(g_source, 256, L"");
             wcscpy_s(g_card_id, 80, L"");
-            naive_extract_json_string(line, "title", g_title, 256);
+            safe_extract_json_to_wide(line, line_len, "title", g_title, 256);
             show_full_overlay(false);
             InvalidateRect(g_hwnd, NULL, TRUE);
-        } else if (strstr(line, "\"type\":\"set_position\"")) {
-            if (strstr(line, "top_left")) position_window("top_left");
-            else if (strstr(line, "bottom_left")) position_window("bottom_left");
-            else if (strstr(line, "bottom_right")) position_window("bottom_right");
-            else if (strstr(line, "center")) position_window("center");
-            else position_window("top_right");
-        } else if (strstr(line, "\"type\":\"set_opacity\"")) {
+        } else if (strcmp(msg_type, "set_position") == 0) {
+            char pos[32];
+            if (json_extract_string(line, line_len, "position", pos, sizeof(pos))) {
+                position_window(pos);
+            } else {
+                position_window("top_right");
+            }
+        } else if (strcmp(msg_type, "set_opacity") == 0) {
             double opacity = g_opacity;
-            if (naive_extract_json_number(line, "opacity", &opacity)) {
+            if (safe_extract_json_number(line, line_len, "opacity", &opacity)) {
                 set_window_opacity(opacity);
             }
-        } else if (strstr(line, "\"type\":\"push_card\"")) {
-            naive_extract_json_string(line, "title", g_title, 256);
-            naive_extract_json_string(line, "body", g_body, 2048);
-            naive_extract_json_string(line, "kind", g_kind, 64);
-            naive_extract_json_string(line, "source", g_source, 256);
-            naive_extract_json_string(line, "id", g_card_id, 80);
+        } else if (strcmp(msg_type, "push_card") == 0) {
+            safe_extract_json_to_wide(line, line_len, "title", g_title, 256);
+            safe_extract_json_to_wide(line, line_len, "body", g_body, 2048);
+            safe_extract_json_to_wide(line, line_len, "kind", g_kind, 64);
+            safe_extract_json_to_wide(line, line_len, "source", g_source, 256);
+            safe_extract_json_to_wide(line, line_len, "id", g_card_id, 80);
             if (g_visible && !g_collapsed) {
                 show_full_overlay(false);
             }
             InvalidateRect(g_hwnd, NULL, TRUE);
-        } else if (strstr(line, "\"type\":\"update_card\"")) {
+        } else if (strcmp(msg_type, "update_card") == 0) {
             wchar_t id[80] = L"";
-            naive_extract_json_string(line, "id", id, 80);
+            safe_extract_json_to_wide(line, line_len, "id", id, 80);
             if (wcslen(g_card_id) == 0 || wcscmp(id, g_card_id) == 0) {
-                naive_extract_json_string(line, "body", g_body, 2048);
+                safe_extract_json_to_wide(line, line_len, "body", g_body, 2048);
                 InvalidateRect(g_hwnd, NULL, TRUE);
             }
-        } else if (strstr(line, "\"type\":\"shutdown\"")) {
+        } else if (strcmp(msg_type, "shutdown") == 0) {
             PostMessage(g_hwnd, WM_CLOSE, 0, 0);
             break;
-        } else if (strstr(line, "\"type\":\"transcript_partial\"")) {
-            naive_extract_json_string(line, "text", g_transcript_partial, 1024);
+        } else if (strcmp(msg_type, "transcript_partial") == 0) {
+            safe_extract_json_to_wide(line, line_len, "text", g_transcript_partial, 1024);
             InvalidateRect(g_hwnd, NULL, TRUE);
-        } else if (strstr(line, "\"type\":\"transcript_final\"")) {
-            naive_extract_json_string(line, "text", g_transcript_final, 1024);
+        } else if (strcmp(msg_type, "transcript_final") == 0) {
+            safe_extract_json_to_wide(line, line_len, "text", g_transcript_final, 1024);
             g_transcript_partial[0] = L'\0';
             InvalidateRect(g_hwnd, NULL, TRUE);
-        } else if (strstr(line, "\"type\":\"session_switched\"")) {
-            naive_extract_json_string(line, "title", g_session_banner, 256);
+        } else if (strcmp(msg_type, "session_switched") == 0) {
+            safe_extract_json_to_wide(line, line_len, "title", g_session_banner, 256);
             if (wcslen(g_session_banner) == 0) wcscpy_s(g_session_banner, 256, L"New session");
             g_session_banner_tick = GetTickCount64();
             g_transcript_partial[0] = L'\0';
             g_transcript_final[0] = L'\0';
             InvalidateRect(g_hwnd, NULL, TRUE);
-        } else if (strstr(line, "\"type\":\"ping\"")) {
-            printf("{\"type\":\"pong\"}\n");
+        } else if (strcmp(msg_type, "ping") == 0) {
+            emit_simple_event("pong");
             fflush(stdout);
         }
     }
     return 0;
 }
+
 
 static void current_card_label(wchar_t *dest, size_t dest_len) {
     if (wcscmp(g_kind, L"question") == 0) {
@@ -1434,6 +1503,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     set_window_opacity(g_opacity);
     apply_capture_exclusion(g_hwnd);
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+    load_session_token();
     emit_ready();
     CreateThread(NULL, 0, stdin_thread, NULL, 0, NULL);
 

@@ -2,6 +2,8 @@
 
 pub mod deepgram;
 pub mod echo;
+pub mod factory;
 pub mod mock;
 pub mod openai;
 pub mod router;
+pub mod whisper;

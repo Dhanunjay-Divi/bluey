@@ -56,12 +56,35 @@ pub fn run() {
             commands::daemon_toggle_overlay,
             // R5: Update check
             commands::check_for_updates,
+            // R7: Live Transcript
+            commands::get_live_transcripts,
             // R6: Permission UX
             commands::open_privacy_settings,
             commands::emit_permission_denied,
             commands::poll_audio_permission,
+            // R8: Process Masquerading
+            commands::set_disguise,
+            commands::get_disguise,
+            // R9: LLM / Cue
+            commands::save_llm_api_key,
+            commands::list_llm_providers,
+            commands::list_responses,
+            commands::set_llm_chain,
+            // R9: Mouse passthrough + Keybinds
+            commands::set_mouse_passthrough,
+            commands::get_mouse_passthrough,
+            commands::list_keybinds,
+            commands::set_keybind,
+            commands::reset_keybinds,
+            // R10: Cue AI hotkey
+            commands::request_cue,
+            commands::auto_recap,
         ])
         .setup(|app| {
+            // R10: Install anti-debug protections (best-effort, non-fatal)
+            if let Err(e) = cue_stealth::install_anti_debug() {
+                tracing::warn!(error = %e, "anti-debug installation failed (degraded mode)");
+            }
             // Open database
             let db_path = dirs::data_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
@@ -75,6 +98,101 @@ pub fn run() {
             });
             app.manage(DbState(Mutex::new(db)));
             app.manage(ActiveSessionState(Mutex::new(restored)));
+
+            // R8: Apply process disguise on startup
+            {
+                let db_state: tauri::State<DbState> = app.state();
+                let mode_str = db_state
+                    .0
+                    .lock()
+                    .ok()
+                    .and_then(|db| db.load_setting("disguise_mode").ok().flatten())
+                    .unwrap_or_else(|| "none".to_string());
+                let mode = cue_stealth::DisguiseMode::from_str_loose(&mode_str);
+                let req = cue_stealth::build_request(mode, None);
+                if let Err(e) = cue_stealth::apply_disguise(&req) {
+                    tracing::warn!(error = %e, "failed to apply startup disguise");
+                }
+                // Re-assertion timers: OS sometimes drifts the process title.
+                // Read the CURRENT persisted mode at each tick so rapid user
+                // changes are respected (no stale overrides).
+                let app_name = req.app_name.clone();
+                let db_path = db_path.to_str().unwrap_or("bluey.db").to_owned();
+                std::thread::spawn(move || {
+                    for delay_ms in [200, 1000, 5000] {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        let current_mode = cue_daemon::db::Database::open(&db_path)
+                            .ok()
+                            .and_then(|db| db.load_setting("disguise_mode").ok().flatten())
+                            .unwrap_or_else(|| "none".to_string());
+                        let re_req = cue_stealth::build_request(
+                            cue_stealth::DisguiseMode::from_str_loose(&current_mode),
+                            None,
+                        );
+                        let _ = cue_stealth::apply_disguise(&re_req);
+                    }
+                });
+                // Set window title if disguise is active
+                if mode != cue_stealth::DisguiseMode::None {
+                    let title = app_name.trim().to_owned();
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.set_title(&title);
+                    }
+                }
+            }
+
+            // R7: Live transcript poller — reads daemon meeting file and emits
+            // Tauri events for new segments.
+            {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    let mut last_count: usize = 0;
+                    let mut last_session_id = String::new();
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        let Ok(paths) = cue_core::app_paths::AppPaths::discover() else {
+                            continue;
+                        };
+                        let Ok(store) = cue_daemon::storage::MeetingStore::new(&paths) else {
+                            continue;
+                        };
+                        let Ok(Some(meeting)) = store.load_active() else {
+                            if last_count > 0 {
+                                last_count = 0;
+                                last_session_id.clear();
+                            }
+                            continue;
+                        };
+                        let sid = meeting.id.to_string();
+                        if sid != last_session_id {
+                            last_count = 0;
+                            last_session_id = sid.clone();
+                        }
+                        let total = meeting.transcript.len();
+                        if total <= last_count {
+                            continue;
+                        }
+                        for (i, seg) in meeting.transcript.iter().enumerate().skip(last_count) {
+                            let source = match seg.speaker {
+                                cue_core::Speaker::System => "system",
+                                cue_core::Speaker::User => "microphone",
+                                _ => "unknown",
+                            };
+                            let payload = commands::LiveTranscriptPayload {
+                                index: i,
+                                session_id: sid.clone(),
+                                source: source.to_string(),
+                                text: seg.text.clone(),
+                                is_final: seg.is_final,
+                                speaker: None,
+                                ts_ms: seg.created_at.parse::<u64>().unwrap_or(0),
+                            };
+                            let _ = handle.emit("live_transcript", &payload);
+                        }
+                        last_count = total;
+                    }
+                });
+            }
 
             // Register global shortcuts
             register_global_shortcut(app)?;
@@ -177,6 +295,21 @@ fn register_global_shortcut(app: &tauri::App) -> Result<(), Box<dyn std::error::
         move |_app, _shortcut, event| {
             if event.state == ShortcutState::Pressed {
                 let _ = handle3.emit("hotkey_push_to_talk", ());
+            }
+        },
+    )?;
+
+    // Request cue (AI answer): Cmd/Ctrl+Shift+A
+    let handle_a = app.handle().clone();
+    app.global_shortcut().on_shortcut(
+        if cfg!(target_os = "macos") {
+            "CmdOrCtrl+Shift+A"
+        } else {
+            "Ctrl+Shift+A"
+        },
+        move |_app, _shortcut, event| {
+            if event.state == ShortcutState::Pressed {
+                let _ = handle_a.emit("hotkey_request_cue", ());
             }
         },
     )?;

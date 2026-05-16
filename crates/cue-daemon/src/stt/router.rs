@@ -32,6 +32,11 @@ impl SttRouter {
     }
 
     /// Index of the currently active provider.
+    /// Returns the names of all providers in the chain, in order.
+    pub fn provider_names(&self) -> Vec<&'static str> {
+        self.providers.iter().map(|p| p.name()).collect()
+    }
+
     pub fn active_index(&self) -> usize {
         self.active
     }
@@ -101,6 +106,13 @@ pub fn is_router_enabled() -> bool {
 /// Returns true if the OpenAI Realtime fallback is enabled via environment variable.
 pub fn is_openai_fallback_enabled() -> bool {
     std::env::var("BLUEY_STT_FALLBACK_OPENAI")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// Returns true if local whisper fallback is enabled via environment variable.
+pub fn is_local_whisper_enabled() -> bool {
+    std::env::var("BLUEY_STT_LOCAL_WHISPER")
         .map(|v| v == "1")
         .unwrap_or(false)
 }

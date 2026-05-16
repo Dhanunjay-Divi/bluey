@@ -8,9 +8,10 @@ to connect to uno and pick up the bluey/cue project work.
 ## Project
 
 **bluey/cue** — A Rust+Tauri desktop app that listens to mic/system audio,
-runs VAD, streams STT, and shows transcripts with live overlay.
+runs VAD, streams STT, shows transcripts with live overlay, and provides
+real-time AI assistance during meetings (the "cue" feature).
 
-- Current phase: **Phase 3 (Listening upgrade)** — streaming STT + overlay IPC + system audio + user-facing alpha features
+- Current phase: **Phase 3 (Listening upgrade)** — streaming STT + overlay IPC + system audio + AI features + v0.1 alpha
 
 ## Remote machine (uno)
 
@@ -42,32 +43,30 @@ export PATH=/opt/homebrew/bin:/Users/uno/.cargo/bin:/usr/local/bin:$PATH
 cargo build --all-targets 2>&1 | tail -20'
 ```
 
-## Current state (as of 2026-05-15, post-R6 fix wave)
+## Current state (as of 2026-05-16, post-R11 implementation)
 
-- **Branch:** `feat/phase-3-round-6` — 11 commits ahead of R5:
-  ```
-  7a9285f chore(p3r6-fix): cargo fmt across cherry-picked fixes
-  b8ed87e fix(daemon): OpenAI Realtime STT uses transcription session protocol [P3.R6 fix]
-  3f08371 fix(dashboard): wire permission denial from real capture errors + platform-specific Settings launchers [P3.R6 fix]
-  5dbd982 fix(daemon): plumb mic device selection through AudioStart IPC to capture [P3.R6 fix]
-  fb3beed fix(daemon): system-audio STT must use single provider for send + drain [P3.R5 fix2]
-  1574eb2 docs(work): comprehensive handoff to codex (R5/R6 review + all pending implementation)
-  18f14bc chore(p3r6): fix clippy items-after-test-module + result_large_err in openai
-  9a7879b feat(daemon): OpenAI Realtime STT provider with auth + reconnect [P3.R6]
-  5ef2098 feat(dashboard): permission denial UX for mic + system audio [P3.R6]
-  1e55972 feat(daemon): respect mic device selection from app settings [P3.R6]
-  dd0f4de feat(daemon): wire hotkey/tray events to start-stop / PTT / overlay toggle [P3.R6]
-  ```
-- **Test count:** 201 passing, 2 ignored (+37 vs R5 post-fix)
-- **R6 deliverables shipped (end-to-end):**
-  - Hotkey/tray events wired to daemon IPC (toggle listening, PTT, overlay toggle)
-  - Mic device selection plumbed through `AudioStart` IPC to capture config
-  - Permission denial UX: real capture errors classified → status field → dashboard poll → banner + platform-specific Settings launcher
-  - OpenAI Realtime STT provider with transcription session protocol (correct event names, model, session.update)
-  - System-audio STT fixed: single provider for send + drain via `tokio::select!`
-- **All checks green:** fmt, clippy (-D warnings), build, cargo test (201),
-  dashboard npm build, swift build (cue-overlay), git diff --check
-- **Status:** Awaiting codex re-review (PHASE-3-ROUND-6-HANDOFF-FOR-CODEX-REVIEW.md submitted)
+- **main tip:** `6126b28` — R3-R6 merged, 201 tests passing
+- **Branch `feat/phase-3-round-7`:** 10 commits ahead of main, 213 tests — awaiting codex final verdict (R7-fix-3 recheck: `a5991b2`)
+- **Branch `feat/phase-3-round-8`:** 7 commits ahead of R7, 224 tests — 🟡 accepted with nits
+- **Branch `feat/phase-3-round-9`:** 16 commits ahead of R8, 284 tests — awaiting codex review
+- **Branch `feat/phase-3-round-10`:** 12 commits ahead of R9, 299 tests — awaiting codex review
+- **Branch `feat/phase-3-round-11`:** 11 commits ahead of R10, **331 tests** — current, awaiting codex review
+
+### R11 deliverables shipped:
+- **R10 codex fixes (4):** End-to-end UI streaming via `run_streaming(callback)` + `cue_response_chunk` events; obfstr on streaming auth header names; SwiftWhisper exact 1.2.0 pin; alignment-safe PCM16 decode with `loadUnaligned`.
+- **Overlay injection hardening (7):** Production overlay-bin override gate (`BLUEY_DEV_OVERLAY=1` required); IPC session token handshake (64-hex-char via env var); native overlay token implementation (macOS Swift + Windows C); safe JSON type extractor replacing `strstr`; event state machine with UI-state allowlist (`OverlayUiState`); field length limits (question 4KB, instructions 16KB, etc.); 8 prompt-injection security tests.
+- **Reconciliation:** Parallel subagent C+D merge with 2 clippy allows for readability.
+
+### v0.1 alpha status:
+Feature-complete + hardened. All core product functionality implemented across R7-R11. Shipping pending codex review chain acceptance (R7→R11).
+
+### All checks green (R11 tip):
+- `cargo fmt --all --check` ✅
+- `cargo clippy --all-targets -- -D warnings` ✅
+- `cargo build --all-targets` ✅
+- `cargo test --all-targets` ✅ 331 pass, 10 ignored
+- `cd crates/cue-dashboard/ui && npm run build` ✅
+- `git -P diff --check feat/phase-3-round-10..HEAD` ✅
 
 ## Workflow loop (kiro ↔ codex ↔ user)
 
@@ -88,11 +87,12 @@ Templates on uno:
 ```
 docs/work/TEMPLATE-REVIEW.md
 docs/work/TEMPLATE-FIX.md
+docs/work/TEMPLATE-IMPL.md
 ```
 
 ## Standing rules
 
-1. **Never spawn subagents** — user has standing rule against agent spawning
+1. **Never spawn subagents** — user has standing rule against agent spawning (unless explicitly allowed per-task)
 2. **Never `git push`** — all work stays local on uno
 3. **No force push, no history rewrite** — once committed, commits are immutable
 4. **Always build + test before committing** — full verification pipeline:
@@ -108,105 +108,116 @@ docs/work/TEMPLATE-FIX.md
 6. **Commit messages** follow Conventional Commits, e.g.:
    `feat(daemon): system audio capture via native helpers [P3.R4]`
 
-## Parallel subagent strategy (learned from R5 → improved in R6)
+## Parallel subagent strategy (established in R6, continued in R7-R11)
 
-**R5 problem:** 4 parallel subagents sharing a single working tree caused cherry-pick conflicts, duplicate implementations, and required a reconciliation commit.
-
-**R6 solution:** 4 parallel subagents each used an isolated git worktree. Commits were cherry-picked onto the main branch after completion. A single `cargo fmt` commit normalized formatting. **Zero conflicts, zero reconciliation needed.** Recommend continuing this pattern for future parallel work.
+Each parallel subagent uses an isolated git worktree. Commits are cherry-picked onto the main feature branch after completion. A single lint/fmt commit normalizes formatting. Reconciliation commits resolve Cargo.toml/mod.rs conflicts from parallel work. **Continue this pattern for future parallel work.**
 
 ## Key files + locations on uno
 
 ```
 /Users/uno/Downloads/cue/
 ├── Cargo.toml                            # workspace root
+├── Makefile                              # R7 — build/package targets
+├── INSTALL.md                            # R7 — user-facing install instructions
+├── .github/workflows/release.yml         # R7 — release pipeline
 ├── crates/
 │   ├── cue-core/                         # types: pcm, vad, stt, overlay_ipc, session, audio
+│   │   └── src/overlay_ipc.rs            # R11 — token validation, state machine, length limits
+│   ├── cue-llm/                          # R9+R10+R11 — LLM provider abstraction + streaming
+│   │   └── src/{lib,router,anthropic,openai,ollama}.rs
+│   ├── cue-rag/                          # R9 — RAG: chunker + vector store + embedder
+│   │   └── src/{lib,chunker,store,embedder}.rs
+│   ├── cue-stealth/                      # R8+R10 — process masquerading + anti-debug
+│   │   └── src/{lib,macos,linux,windows}.rs
 │   ├── cue-daemon/
 │   │   ├── src/
 │   │   │   ├── audio/
-│   │   │   │   ├── mod.rs
-│   │   │   │   ├── capture.rs            # R6 — load_mic_device_setting helper
-│   │   │   │   └── system_capture.rs     # R4 — native helper launcher
 │   │   │   ├── stt/
-│   │   │   │   ├── mock.rs
-│   │   │   │   ├── deepgram.rs           # R3 — Nova-3 provider
-│   │   │   │   ├── openai.rs             # R6 — OpenAI Realtime transcription session
-│   │   │   │   ├── router.rs             # R5 — SttRouter failover chain
-│   │   │   │   └── echo.rs              # R5 — EchoProvider stub
+│   │   │   │   ├── deepgram.rs           # R3+R10 — Nova-3 provider + obfstr
+│   │   │   │   ├── openai.rs             # R6+R10 — OpenAI Realtime + obfstr
+│   │   │   │   ├── router.rs             # R5+R7 — SttRouter 3-tier failover
+│   │   │   │   ├── factory.rs            # R9(R7fix) — build_stt_chain()
+│   │   │   │   ├── whisper/              # R7 — LocalWhisperProvider + parser
+│   │   │   │   ├── echo.rs              # R5 — EchoProvider stub
+│   │   │   │   └── mock.rs
+│   │   │   ├── llm/                      # R9+R10+R11 — specialized LLMs + streaming
+│   │   │   │   ├── mod.rs               # CueResponse type + ends_with_question
+│   │   │   │   ├── answer.rs            # AnswerLlm (run_streaming)
+│   │   │   │   ├── recap.rs             # RecapLlm (run_streaming)
+│   │   │   │   └── suggest.rs           # WhatToAnswerLlm (run_streaming)
+│   │   │   ├── util/
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── rate_limiter.rs      # R9 — token bucket
 │   │   │   ├── db/
-│   │   │   │   ├── mod.rs               # R5 — settings KV + migrations
-│   │   │   │   ├── search.rs            # R5 — FTS5 search + export
-│   │   │   │   └── speakers.rs          # R5 — speaker name mapping
-│   │   │   ├── secrets/
-│   │   │   │   └── mod.rs               # R5 — keyring API key store
-│   │   │   ├── export/
-│   │   │   │   └── mod.rs               # R5 — ExportOptions re-export
-│   │   │   ├── overlay.rs                # R3+4 — supervisor with restart loop
-│   │   │   ├── app.rs                    # R6 — single-task select! for sys STT; mic device plumbing; permission classifier
+│   │   │   │   └── mod.rs               # migrations 009-011
+│   │   │   ├── app.rs                    # R6-R11 — live transcript + RAG + auto-recap + hotkey + overlay token
 │   │   │   └── bin/
-│   │   │       ├── overlay_stub.rs
-│   │   │       ├── overlay_stub_oneshot.rs
-│   │   │       └── system_audio_stub.rs
+│   │   │       └── whisper_stub.rs       # R7 — test stub binary
 │   │   └── tests/
-│   │       ├── pipeline_integration.rs
-│   │       ├── overlay_pipe_integration.rs
-│   │       ├── overlay_restart_integration.rs
-│   │       ├── system_audio_integration.rs  # R6 — single_provider_send_and_drain test
-│   │       └── mic_device_selection.rs      # R6 — 5 IPC/config/DB tests
+│   │       ├── live_transcript_emit.rs   # R7 — 3 tests
+│   │       ├── live_transcript_dedup.rs  # R9(R7fix) — 4 tests
+│   │       ├── whisper_integration.rs    # R7 — 9 tests
+│   │       ├── stt_factory_integration.rs # R9(R7fix) — 4 tests
+│   │       ├── whisper_stub_e2e.rs       # R10 — 2 tests (ignored)
+│   │       ├── auto_recap_integration.rs # R10 — 2 tests
+│   │       └── streaming_chunk_emit.rs   # R11 — 5 tests
 │   └── cue-dashboard/                    # Tauri + React UI
 │       ├── src/
-│       │   ├── lib.rs                    # R5+R6 — tray, hotkeys, updater, window intercept, poll_audio_permission
-│       │   └── commands.rs               # R6 — mic device from DB, permission poll, platform launchers
-│       └── ui/src/
-│           ├── pages/Onboarding.tsx       # R5 — first-run flow
-│           ├── routes/Search.tsx          # R5 — FTS5 search UI
-│           ├── components/UpdateToast.tsx  # R5 — update notification
-│           └── components/PermissionBanner.tsx  # R6 — permission denial banner
+│       │   ├── lib.rs                    # R7-R10 — poller + disguise + hotkey + anti-debug
+│       │   └── commands.rs               # R7-R11 — all Tauri commands (streaming chunks)
+│       ├── ui/src/
+│       │   ├── pages/Settings.tsx        # R8+R9 — settings with disguise + AI config
+│       │   ├── pages/Responses.tsx       # R9 — AI responses page
+│       │   ├── routes/Responses.tsx      # R9+R10 — streaming chunk subscription
+│       │   ├── routes/LiveTranscript.tsx  # R7+R10 — Map-based dedup
+│       │   ├── App.tsx                   # R10 — HotkeyListener
+│       │   └── components/LiveTranscriptList.tsx  # R7 — auto-scroll list
+│       └── icons/disguise/               # R8 — placeholder PNGs + README
 ├── native/
 │   ├── macos/
 │   │   ├── cue-audio/                    # Swift: ScreenCaptureKit + AVAudioEngine
-│   │   └── cue-overlay/                  # R5 — Swift: NSWindow overlay with stealth
+│   │   ├── cue-overlay/                  # Swift: NSWindow overlay + R11 token handshake
+│   │   └── cue-whisper/                  # R7+R10+R11 — real whisper.cpp (exact 1.2.0 pin)
 │   └── windows/
 │       ├── cue-audio/main.c              # C: WASAPI loopback
-│       └── cue-overlay/main.c            # R4+R5: Direct2D overlay + transcript rendering
-├── infra/migrations/
-│   ├── 005_settings.sql                  # R5 — app_settings KV table
-│   ├── 006_transcript_fts.sql            # R5 — transcripts + FTS5 + triggers
-│   ├── 007_speakers.sql                  # R5 — speakers table
-│   └── 008_fts_cascade_fix.sql           # R5 fix — FTS delete consistency
+│       ├── cue-overlay/main.c            # C: Direct2D overlay + R11 token + safe JSON
+│       ├── cue-overlay/json_type_extract.h  # R11 — safe type field extractor
+│       └── cue-whisper/main.c            # R7+R10 — stub with model env check
+├── infra/
+│   ├── homebrew/bluey.rb                 # R7+R9fix — Homebrew formula
+│   ├── scoop/bluey.json                  # R7+R9fix — Scoop manifest
+│   └── scripts/
 └── docs/work/
-    ├── TEMPLATE-REVIEW.md
-    ├── TEMPLATE-FIX.md
-    ├── TEMPLATE-IMPL.md
-    ├── IMPL-PHASE-3-ROUND-{1,2,3,4,5,6}.md
-    ├── PHASE-3-ROUND-{1,2,3,4,5,6}-HANDOFF-FOR-CODEX-REVIEW.md
-    ├── REVIEW-PHASE-3-ROUND-{1,2,3,5,6}.md   # codex's verdicts
-    ├── HANDOFF-FROM-CODEX-TO-KIRO.md          # codex's R5/R6 handoff
-    ├── AGENT-ONBOARDING.md
-    └── PLAN-STT-FALLBACK-CHAIN.md
+    ├── IMPL-PHASE-3-ROUND-{1..11}.md
+    ├── FIX-PHASE-3-ROUND-{7,10}.md
+    ├── PHASE-3-ROUND-{1..11}-HANDOFF-FOR-CODEX-REVIEW.md
+    ├── REVIEW-PHASE-3-ROUND-{1,2,3,5,6,7,8}.md
+    ├── HANDOFF-TO-CODEX-FROM-KIRO.md
+    ├── AGENT-ONBOARDING.md               # this file
+    ├── PLAN-STT-FALLBACK-CHAIN.md
+    └── PLAN-DISTRIBUTION.md
 ```
 
-## Type foundations (from Round 1 — use these, don't re-create)
+## Pending work (after R7-R11 review chain passes → v0.1 alpha ships)
 
-In `crates/cue-core/src/`:
+### Next rounds (user-prioritized order)
 
-- `pcm.rs`: `AudioSource {Microphone, System}`, `SampleRate`, `AudioChunk { source, sample_rate, samples, captured_at_ms }`
-- `vad.rs`: `FrameAction {Send, SendSilence, Drop}`, `VadAggressiveness`, `VadConfig`
-- `stt.rs`: `SttProvider` async trait, `TranscriptEvent {Partial, Final, SpeakerLabel}`, `ConnectionState`, `SttError`, `WordTiming`, `SttConfig`
-- `overlay_ipc.rs`: `OverlayMessage` (SessionSwitched/ListeningStateChanged/TranscriptPartial/TranscriptFinal/Ping), `OverlayIpcCommand {Pong, RequestSync}`, `encode_ndjson`, `decode_ndjson`
-- `audio.rs`: `AudioCaptureStatus { permission_denied_source: Option<String>, ... }`, `AudioCaptureConfig`
-- `ipc.rs`: `DaemonRequest::AudioStart { enable_system, enable_microphone, mic_device_id }`
+1. **R12: Hardening deep** — Tauri signing keypair, mlock for API keys, SQLCipher migration, SHA-256 overlay binary verification (enable scaffolded check), Windows real anti-debug with process termination, token rotation on session boundaries.
+2. **R13: sqlite-vec + native overlay passthrough** — replace in-memory cosine with native ANN; macOS Swift `window.ignoresMouseEvents` + Windows C `WS_EX_TRANSPARENT`; multi-provider embedding (Ollama/local ONNX).
+3. **R14: Observability** — structured logging (`tracing-appender` file rotation), crash reporting (panic dump files), long-session stress tests, mic hot-swap mid-session.
+4. **R15: Distribution publishing** — homebrew tap repo, scoop bucket repo, first tagged release, GitHub release automation end-to-end.
+5. **R16: Polish** — production icons, README overhaul, privacy policy, onboarding videos, telemetry opt-in.
 
-## Pending work (after R6 re-review passes)
+### Remaining feature backlog (post-v0.1)
 
-1. **Wire OpenAI into SttRouter** — behind `BLUEY_STT_FALLBACK_OPENAI=1` with failover tests.
-2. **Live transcript UX** — overlay + dashboard real-time display of system-audio transcripts.
-3. **Distribution scaffolding** — GitHub Releases, auto-update endpoint, app signing.
-4. **AI features** — meeting summary, action items, cues.
-5. **Local whisper.cpp provider** — tier 3 offline fallback.
-6. **Advanced search filters** — date range, source filter, speaker filter.
-7. **Full settings page UI** — replace Placeholder with real component.
-8. **Hotkey daemon IPC via Rust** — move from React listener to Rust-side for reliability.
+- More specialized LLMs (the other 17 from natively-cluely reference)
+- Function-calling / tool use in LLM requests
+- Screenshot + cropper window for context injection
+- Calendar / meeting-platform integration
+- Bookmarks / highlights
+- Session metadata (title, tags, participants)
+- Multi-language whisper support
+- CoreML acceleration for whisper.cpp
 
 ## First actions for a new agent
 
@@ -218,9 +229,9 @@ In `crates/cue-core/src/`:
    git -P branch --show-current'
    ```
 2. Read these docs on uno in order:
-   - `docs/work/IMPL-PHASE-3-ROUND-6.md` (latest round's context)
-   - `docs/work/PHASE-3-ROUND-6-HANDOFF-FOR-CODEX-REVIEW.md`
-   - Any `REVIEW-PHASE-3-ROUND-6-RECHECK.md` codex has synced back
+   - `docs/work/IMPL-PHASE-3-ROUND-11.md` (latest round's context)
+   - `docs/work/PHASE-3-ROUND-11-HANDOFF-FOR-CODEX-REVIEW.md`
+   - `docs/work/AGENT-ONBOARDING.md` (this file)
 3. Ask the user what the current task is — don't guess. Possible states:
    - Waiting on codex review → nothing to do, just read and be ready
    - Codex gave 🔴 → need to write FIX doc and address feedback
@@ -234,8 +245,9 @@ In `crates/cue-core/src/`:
 - **SSH hangs**: verify key permissions (`chmod 600 ~/.ssh/id_ed25519`)
 - **Build takes forever**: release builds are ~55 s; incremental dev builds are <10 s
 - **Cargo complains about workspace dep**: check root `Cargo.toml` `[workspace.dependencies]` first
-- **Swift build fails**: ensure Xcode CLT installed; `swift build` from `native/macos/cue-overlay/`
+- **Swift build fails**: ensure Xcode CLT installed; `swift build` from `native/macos/cue-whisper/`
 - **Keyring tests fail**: `secrets::tests::roundtrip` is `#[ignore]` — requires interactive Keychain access
+- **Whisper model missing**: run `infra/scripts/download-whisper-model.sh` to fetch tiny.en-q5_1.bin
 
 ## Contact points
 

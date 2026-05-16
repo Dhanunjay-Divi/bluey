@@ -25,11 +25,14 @@ anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
 cue-core = { path = "../cue-core" }
+cue-llm = { path = "../cue-llm" }
+cue-rag = { path = "../cue-rag" }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+obfstr.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 rusqlite.workspace = true
@@ -63,3 +66,7 @@ path = "src/bin/overlay_stub_long.rs"
 [[bin]]
 name = "overlay-stub-crash"
 path = "src/bin/overlay_stub_crash.rs"
+
+[[bin]]
+name = "whisper-stub"
+path = "src/bin/whisper_stub.rs"

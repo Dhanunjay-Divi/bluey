@@ -7,9 +7,12 @@ import { Chats } from "./pages/Chats";
 import { SessionDetail } from "./pages/SessionDetail";
 import { Placeholder } from "./pages/Placeholder";
 import { Search } from "./routes/Search";
+import { LiveTranscript } from "./routes/LiveTranscript";
+import { Responses } from "./routes/Responses";
 import { UpdateToast } from "./components/UpdateToast";
 import { PermissionBanner } from "./components/PermissionBanner";
 import { Onboarding } from "./pages/Onboarding";
+import { Settings } from "./pages/Settings";
 
 /** Listens for tray "navigate_to" events and routes accordingly. */
 function NavigateListener() {
@@ -37,7 +40,7 @@ function HotkeyListener() {
           console.warn("daemon_set_push_to_talk failed:", e)
         );
       }),
-      listen("hotkey_toggle_overlay", () => {
+      listen("hotkey_request_cue", () => {        invoke("request_cue", { kind: "answer" }).catch((e) =>          console.warn("request_cue failed:", e)        );      }),      listen("hotkey_toggle_overlay", () => {
         invoke("daemon_toggle_overlay").catch((e) =>
           console.warn("daemon_toggle_overlay failed:", e)
         );
@@ -112,10 +115,11 @@ function App() {
           <Route path="session/:id" element={<SessionDetail />} />
           <Route path="prompts" element={<Placeholder name="Prompts" />} />
           <Route path="shortcuts" element={<Placeholder name="Shortcuts" />} />
-          <Route path="settings" element={<Placeholder name="Settings" />} />
-          <Route path="responses" element={<Placeholder name="Responses" />} />
+          <Route path="settings" element={<Settings />} />
+          <Route path="responses" element={<Responses />} />
           <Route path="screenshot" element={<Placeholder name="Screenshot" />} />
           <Route path="audio" element={<Placeholder name="Audio" />} />
+          <Route path="live" element={<LiveTranscript />} />
           <Route path="search" element={<Search />} />
           <Route path="dev" element={<Placeholder name="Dev Tools" />} />
         </Route>

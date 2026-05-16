@@ -1,0 +1,247 @@
+# Release workflow for Bluey.
+#
+# Artifact naming convention (keep in sync with):
+#   - Makefile (package-* targets)
+#   - infra/homebrew/bluey.rb
+#   - infra/scoop/bluey.json
+#   - INSTALL.md
+#
+# Canonical pattern: bluey-{version}-{os}-{arch}.{ext}
+#   os:   darwin | windows | linux
+#   arch: arm64 | x86_64
+#   ext:  tar.gz (unix) | zip (windows)
+#
+# Binary names (from Cargo.toml [[bin]] entries):
+#   - cue-daemon crate produces: "cue-daemon" and "bluey-daemon"
+#   - cue-cli crate produces: "cue" and "bluey"
+# We package the "bluey" / "bluey-daemon" variants.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            platform: darwin-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            platform: darwin-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows-x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf build-essential libssl-dev libayatana-appindicator3-dev libxdo-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Configure MSVC
+        if: matrix.os == 'windows-latest'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ matrix.target }}-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.target }}-release-
+
+      - name: Build daemon and CLI
+        run: cargo build --release --target ${{ matrix.target }} -p cue-daemon -p cue-cli
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --locked || true
+
+      # Tauri build runs from crates/cue-dashboard where tauri.conf.json lives.
+      - name: Build dashboard
+        working-directory: crates/cue-dashboard
+        run: cargo tauri build --target ${{ matrix.target }}
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Build macOS native helpers
+        if: matrix.os == 'macos-latest'
+        run: |
+          for helper in native/macos/*/build.sh; do
+            [ -f "$helper" ] && bash "$helper" || true
+          done
+
+      - name: Build Windows native helpers
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Push-Location native/windows/cue-overlay; ./build.ps1; Pop-Location
+          Push-Location native/windows/cue-audio; ./build.ps1; Pop-Location
+          Push-Location native/windows/cue-whisper; ./build.ps1; Pop-Location
+
+      - name: Package (Unix)
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          mkdir -p staging/bin
+          # Canonical binary: bluey-daemon (fallback: cue-daemon from same crate)
+          cp "target/${{ matrix.target }}/release/bluey-daemon" staging/bin/ 2>/dev/null || \
+            cp "target/${{ matrix.target }}/release/cue-daemon" staging/bin/bluey-daemon
+          # Canonical binary: bluey (fallback: cue from same crate)
+          cp "target/${{ matrix.target }}/release/bluey" staging/bin/ 2>/dev/null || \
+            cp "target/${{ matrix.target }}/release/cue" staging/bin/bluey
+          # Dashboard app bundle
+          find "target/${{ matrix.target }}/release/bundle" -name "*.app" -exec cp -R {} staging/ \; 2>/dev/null || true
+          find "target/${{ matrix.target }}/release/bundle" -name "*.AppImage" -exec cp {} staging/ \; 2>/dev/null || true
+          # Native helpers
+          find native -name "*.dylib" -o -name "cue-*" -type f -perm +111 | while read f; do cp "$f" staging/bin/ 2>/dev/null || true; done
+          tar -czf "bluey-${VERSION}-${{ matrix.platform }}.tar.gz" -C staging .
+
+      - name: Package (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $VERSION = "${{ steps.version.outputs.version }}"
+          New-Item -ItemType Directory -Force staging/bin
+          # Canonical binary: bluey-daemon.exe (fallback: cue-daemon.exe)
+          if (Test-Path "target/${{ matrix.target }}/release/bluey-daemon.exe") {
+            Copy-Item "target/${{ matrix.target }}/release/bluey-daemon.exe" staging/bin/
+          } else {
+            Copy-Item "target/${{ matrix.target }}/release/cue-daemon.exe" staging/bin/bluey-daemon.exe
+          }
+          # Canonical binary: bluey.exe (fallback: cue.exe)
+          if (Test-Path "target/${{ matrix.target }}/release/bluey.exe") {
+            Copy-Item "target/${{ matrix.target }}/release/bluey.exe" staging/bin/
+          } else {
+            Copy-Item "target/${{ matrix.target }}/release/cue.exe" staging/bin/bluey.exe
+          }
+          # Native helpers
+          Copy-Item native/windows/cue-overlay/cue-overlay.exe staging/bin/ -ErrorAction SilentlyContinue
+          Copy-Item native/windows/cue-audio/cue-audio.exe staging/bin/ -ErrorAction SilentlyContinue
+          Copy-Item native/windows/cue-whisper/cue-whisper.exe staging/bin/ -ErrorAction SilentlyContinue
+          # Dashboard MSI
+          Get-ChildItem -Recurse "target/${{ matrix.target }}/release/bundle" -Filter "*.msi" | Copy-Item -Destination staging/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path staging/* -DestinationPath "bluey-${VERSION}-${{ matrix.platform }}.zip"
+
+      - name: Compute SHA256
+        id: sha
+        shell: bash
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          FILE="bluey-${VERSION}-${{ matrix.platform }}"
+          if [ -f "${FILE}.tar.gz" ]; then
+            echo "sha256=$(shasum -a 256 ${FILE}.tar.gz | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+            echo "file=${FILE}.tar.gz" >> "$GITHUB_OUTPUT"
+          else
+            echo "sha256=$(shasum -a 256 ${FILE}.zip | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+            echo "file=${FILE}.zip" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bluey-${{ steps.version.outputs.version }}-${{ matrix.platform }}
+          path: ${{ steps.sha.outputs.file }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      # Need the repo checked out so infra/scripts/build-sha256-manifest.py
+      # is available in the runner workspace.
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Compute SHA256 manifest
+        shell: bash
+        run: |
+          cd artifacts
+          # Generate both human-readable and machine-readable SHA256 manifests.
+          # bump-formulae.sh consumes sha256-manifest.json in post-release.
+          for f in *; do shasum -a 256 "$f"; done | tee ../SHA256SUMS.txt
+          cd ..
+          python3 infra/scripts/build-sha256-manifest.py
+
+      - name: Generate Tauri updater manifest (latest.json)
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cat > latest.json << EOF
+          {
+            "version": "$VERSION",
+            "notes": "Release $VERSION",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "darwin-aarch64": {
+                "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/bluey-${VERSION}-darwin-arm64.tar.gz",
+                "signature": ""
+              },
+              "darwin-x86_64": {
+                "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/bluey-${VERSION}-darwin-x86_64.tar.gz",
+                "signature": ""
+              },
+              "windows-x86_64": {
+                "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/bluey-${VERSION}-windows-x86_64.zip",
+                "signature": ""
+              },
+              "linux-x86_64": {
+                "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/bluey-${VERSION}-linux-x86_64.tar.gz",
+                "signature": ""
+              }
+            }
+          }
+          EOF
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/*
+            SHA256SUMS.txt
+            sha256-manifest.json
+            latest.json

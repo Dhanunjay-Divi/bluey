@@ -1,27 +1,24 @@
 //! Integration test: SessionSwitched round-trip through the native-overlay
-//! pipe using the `overlay-stub` binary as a stand-in for the real Swift/C
+//! pipe using the  binary as a stand-in for the real Swift/C
 //! overlay.
 //!
 //! Exercises:
 //!   1. Spawning the child process
-//!   2. Sending `OverlayMessage::SessionSwitched` over stdin as NDJSON
-//!   3. Receiving `OverlayIpcCommand::Pong` back over stdout
-//!   4. Receiving `OverlayIpcCommand::Echo { payload }` carrying the exact
-//!      JSON-serialized message — proves payload fidelity, not just
-//!      decodability of the variant
+//!   2. Sending  over stdin as NDJSON
+//!   3. Receiving  back over stdout
+//!   4. Receiving  carrying the exact
+//!      JSON-serialized message
 //!   5. Clean shutdown
-//!
-//! The stub binary's path is injected via `CARGO_BIN_EXE_overlay-stub`
-//! (Cargo automatically sets this env var for any integration test in a
-//! crate that has a matching `[[bin]]`).
+//!   6. Session token validation (Item 3 hardening)
 
 use std::time::Duration;
 
 use cue_core::overlay_ipc::{OverlayIpcCommand, OverlayMessage};
-use cue_daemon::overlay::{NativeOverlayHandle, OverlayProcessState, OverlaySpawnOptions};
+use cue_daemon::overlay::{
+    generate_session_token, NativeOverlayHandle, OverlayProcessState, OverlaySpawnOptions,
+};
 
 fn stub_path() -> String {
-    // Cargo sets this for every bin in the crate under test.
     env!("CARGO_BIN_EXE_overlay-stub").to_string()
 }
 
@@ -48,7 +45,6 @@ async fn session_switched_round_trips_through_overlay_pipe() {
 
     assert_eq!(handle.state(), OverlayProcessState::Running);
 
-    // Send three SessionSwitched events with distinct payloads.
     let messages = vec![
         OverlayMessage::SessionSwitched {
             session_id: Some("abc-001".into()),
@@ -68,11 +64,8 @@ async fn session_switched_round_trips_through_overlay_pipe() {
         handle.send(msg.clone()).expect("send to stub");
     }
 
-    // Each message yields two commands: Pong then Echo{payload}.
     let commands = collect_commands(&mut handle, messages.len() * 2, Duration::from_secs(3)).await;
 
-    // Verify the interleaved (Pong, Echo) pattern AND that each Echo
-    // payload round-trips to the exact OverlayMessage we sent.
     for (i, expected) in messages.iter().enumerate() {
         let pong = &commands[i * 2];
         let echo = &commands[i * 2 + 1];
@@ -116,8 +109,43 @@ async fn overlay_shutdown_is_graceful() {
     let handle = NativeOverlayHandle::spawn(opts).await.unwrap();
     assert_eq!(handle.state(), OverlayProcessState::Running);
 
-    // Shutdown should return within the handle's 2-second-per-task budget.
     tokio::time::timeout(Duration::from_secs(5), handle.shutdown())
         .await
         .expect("shutdown did not complete in time");
+}
+
+// Item 3: Token handshake integration tests
+
+#[tokio::test]
+async fn token_handshake_valid_token_accepted() {
+    let token = generate_session_token();
+    let opts = OverlaySpawnOptions::new(stub_path()).with_session_token(token);
+    let mut handle = NativeOverlayHandle::spawn(opts).await.expect("spawn");
+
+    handle.send(OverlayMessage::Ping).expect("send");
+
+    let cmd = tokio::time::timeout(Duration::from_secs(3), handle.next_command())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+    assert_eq!(cmd, OverlayIpcCommand::Pong);
+
+    handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn token_handshake_no_token_legacy_accepted_when_disabled() {
+    // When session_token is empty, legacy messages are accepted
+    let opts = OverlaySpawnOptions::new(stub_path());
+    let mut handle = NativeOverlayHandle::spawn(opts).await.expect("spawn");
+
+    handle.send(OverlayMessage::Ping).expect("send");
+
+    let cmd = tokio::time::timeout(Duration::from_secs(3), handle.next_command())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+    assert_eq!(cmd, OverlayIpcCommand::Pong);
+
+    handle.shutdown().await;
 }

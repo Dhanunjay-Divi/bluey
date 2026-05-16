@@ -222,10 +222,15 @@ pub fn save_stt_api_key(provider: String, key: String) -> Result<(), String> {
 pub fn load_stt_api_key(provider: String) -> Result<Option<String>, String> {
     let raw = cue_daemon::secrets::load_api_key(&provider).map_err(|e| e.to_string())?;
     Ok(raw.map(|s| {
-        if s.len() <= 4 {
+        // Mask all but the LAST 4 chars (codepoints, not bytes — string-slicing
+        // by bytes panics on multi-byte UTF-8). Provider keys are normally ASCII
+        // but this guards against future non-ASCII secrets.
+        let total = s.chars().count();
+        if total <= 4 {
             "****".to_string()
         } else {
-            format!("****{}", &s[s.len() - 4..])
+            let suffix: String = s.chars().skip(total - 4).collect();
+            format!("****{suffix}")
         }
     }))
 }
@@ -250,6 +255,18 @@ pub fn save_settings(
     settings: std::collections::HashMap<String, String>,
     db: State<DbState>,
 ) -> Result<(), String> {
+    // Reject any keys that look like secrets BEFORE we open a db transaction.
+    // Secrets must go through save_stt_api_key (keyring-backed). Returning an
+    // explicit error makes accidental writes visible in dev tooling instead of
+    // being silently dropped.
+    for k in settings.keys() {
+        if k.contains("api_key") {
+            return Err(format!(
+                "refusing to persist secret-shaped key {k} through save_settings; \
+                 use save_stt_api_key instead"
+            ));
+        }
+    }
     let db = db.0.lock().map_err(|e| e.to_string())?;
     for (k, v) in &settings {
         db.save_setting(k, v).map_err(|e| e.to_string())?;
@@ -539,6 +556,40 @@ pub async fn poll_audio_permission(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// ===== Phase 3 Round 9: LLM / Cue commands =====
+
+#[tauri::command]
+pub fn save_llm_api_key(provider: String, key: String) -> Result<(), String> {
+    cue_daemon::secrets::store_api_key(&format!("llm_{provider}"), &key).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn list_llm_providers() -> Result<Vec<String>, String> {
+    Ok(vec![
+        "anthropic".to_string(),
+        "openai".to_string(),
+        "ollama".to_string(),
+    ])
+}
+
+#[tauri::command]
+pub fn list_responses(
+    session_id: String,
+    limit: usize,
+    db: State<DbState>,
+) -> Result<Vec<cue_daemon::llm::CueResponse>, String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    db.list_cue_responses(&session_id, limit)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_llm_chain(providers: Vec<String>, db: State<DbState>) -> Result<(), String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    let chain = providers.join(",");
+    db.save_setting("llm.chain", &chain)
+        .map_err(|e| e.to_string())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,5 +659,427 @@ mod tests {
         };
         let json = serde_json::to_string(&payload).unwrap();
         assert!(json.contains("microphone"));
+    }
+}
+
+// ===== Phase 3 Round 7: Live Transcript =====
+
+/// Payload matching the  Tauri event shape.
+#[derive(Clone, Serialize)]
+pub struct LiveTranscriptPayload {
+    pub index: usize,
+    pub session_id: String,
+    pub source: String,
+    pub text: String,
+    pub is_final: bool,
+    pub speaker: Option<u8>,
+    pub ts_ms: u64,
+}
+
+/// Return recent transcript segments from the daemon's active meeting file.
+/// The UI calls this on mount for catch-up, and the background poller uses
+/// it to detect new segments and emit  Tauri events.
+#[tauri::command]
+pub fn get_live_transcripts(since_index: usize) -> Result<Vec<LiveTranscriptPayload>, String> {
+    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+    let store = cue_daemon::storage::MeetingStore::new(&paths).map_err(|e| e.to_string())?;
+    let Some(meeting) = store.load_active().map_err(|e| e.to_string())? else {
+        return Ok(Vec::new());
+    };
+    let session_id = meeting.id.to_string();
+    let segments: Vec<LiveTranscriptPayload> = meeting
+        .transcript
+        .iter()
+        .enumerate()
+        .skip(since_index)
+        .map(|(i, seg)| {
+            let source = match seg.speaker {
+                cue_core::Speaker::System => "system",
+                cue_core::Speaker::User => "microphone",
+                _ => "unknown",
+            };
+            LiveTranscriptPayload {
+                index: i,
+                session_id: session_id.clone(),
+                source: source.to_string(),
+                text: seg.text.clone(),
+                is_final: seg.is_final,
+                speaker: None,
+                ts_ms: seg.created_at.parse::<u64>().unwrap_or(0),
+            }
+        })
+        .collect();
+    Ok(segments)
+}
+
+// ===== Phase 3 Round 8: Process Masquerading =====
+
+/// Apply a disguise mode and persist it. Updates all open windows.
+#[tauri::command]
+pub fn set_disguise(mode: String, app: AppHandle) -> Result<(), String> {
+    let disguise_mode = cue_stealth::DisguiseMode::from_str_loose(&mode);
+    let req = cue_stealth::build_request(disguise_mode, None);
+    cue_stealth::apply_disguise(&req).map_err(|e| e.to_string())?;
+
+    // Update all window titles
+    let title = req.app_name.trim();
+    for (_label, window) in app.webview_windows() {
+        let _ = window.set_title(title);
+    }
+
+    // Persist setting
+    let db_state: State<DbState> = app.state();
+    let db = db_state.0.lock().map_err(|e| e.to_string())?;
+    db.save_setting("disguise_mode", disguise_mode.as_str())
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Get the current disguise mode from persisted settings.
+#[tauri::command]
+pub fn get_disguise(db: State<DbState>) -> Result<String, String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    let mode = db
+        .load_setting("disguise_mode")
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| "none".to_string());
+    Ok(mode)
+}
+
+// ===== Phase 3 Round 9: Mouse Passthrough Toggle =====
+
+/// Set overlay mouse passthrough state and persist it.
+#[tauri::command]
+pub fn set_mouse_passthrough(enabled: bool, db: State<DbState>) -> Result<(), String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    db.save_setting(
+        "overlay_passthrough",
+        if enabled { "true" } else { "false" },
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Get the current overlay mouse passthrough state.
+#[tauri::command]
+pub fn get_mouse_passthrough(db: State<DbState>) -> Result<bool, String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    let val = db
+        .load_setting("overlay_passthrough")
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| "true".to_string());
+    Ok(val == "true")
+}
+
+// ===== Phase 3 Round 9: User-Rebindable Keybinds =====
+
+/// A keybind entry returned to the frontend.
+#[derive(Clone, Serialize)]
+pub struct KeybindEntry {
+    pub action: String,
+    pub accelerator: String,
+}
+
+/// Default keybinds for known actions.
+fn default_keybinds() -> Vec<(&'static str, &'static str)> {
+    if cfg!(target_os = "macos") {
+        vec![
+            ("toggle_listening", "CmdOrCtrl+Shift+L"),
+            ("push_to_talk", "CmdOrCtrl+Shift+P"),
+            ("toggle_overlay", "CmdOrCtrl+Shift+H"),
+            ("toggle_dashboard", "CmdOrCtrl+Shift+D"),
+        ]
+    } else {
+        vec![
+            ("toggle_listening", "Ctrl+Shift+L"),
+            ("push_to_talk", "Ctrl+Shift+P"),
+            ("toggle_overlay", "Ctrl+Shift+H"),
+            ("toggle_dashboard", "Ctrl+Shift+D"),
+        ]
+    }
+}
+
+/// List all keybinds (from DB, falling back to defaults).
+#[tauri::command]
+pub fn list_keybinds(db: State<DbState>) -> Result<Vec<KeybindEntry>, String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    db.ensure_keybinds_table().map_err(|e| e.to_string())?;
+    let mut entries = Vec::new();
+    for (action, default_accel) in default_keybinds() {
+        let accel = db
+            .load_keybind(action)
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| default_accel.to_string());
+        entries.push(KeybindEntry {
+            action: action.to_string(),
+            accelerator: accel,
+        });
+    }
+    Ok(entries)
+}
+
+/// Set a keybind for an action. Validates the accelerator string.
+#[tauri::command]
+pub fn set_keybind(action: String, accelerator: String, db: State<DbState>) -> Result<(), String> {
+    // Validate accelerator by attempting to parse
+    accelerator
+        .parse::<tauri_plugin_global_shortcut::Shortcut>()
+        .map_err(|e| format!("invalid accelerator: {e}"))?;
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    db.ensure_keybinds_table().map_err(|e| e.to_string())?;
+    db.save_keybind(&action, &accelerator)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Reset all keybinds to defaults.
+#[tauri::command]
+pub fn reset_keybinds(db: State<DbState>) -> Result<(), String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    db.ensure_keybinds_table().map_err(|e| e.to_string())?;
+    db.reset_keybinds().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+// ===== Phase 3 Round 10: Cmd+Shift+A → request_cue =====
+
+/// Payload emitted per streaming chunk on `cue_response_chunk`.
+#[derive(Clone, Serialize)]
+pub struct CueResponseChunkPayload {
+    pub response_id: String,
+    pub kind: String,
+    pub partial_text: String,
+    pub finished: bool,
+}
+
+/// Trigger a cue response. If a recent question is detected in the transcript
+/// (last ~30s), runs AnswerLlm; otherwise runs WhatToAnswerLlm (suggestion).
+/// Emits `cue_response_chunk` per streaming chunk, then `cue_response` on completion.
+#[tauri::command]
+pub async fn request_cue(
+    kind: String,
+    db: State<'_, DbState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    use cue_daemon::llm::{ends_with_question, AnswerLlm, WhatToAnswerLlm};
+
+    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+    let store = cue_daemon::storage::MeetingStore::new(&paths).map_err(|e| e.to_string())?;
+    let meeting = store
+        .load_active()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "no active session".to_string())?;
+
+    let session_id = meeting.id.to_string();
+
+    // Recent transcript text (last ~30s worth, approx last 10 segments).
+    let recent: String = meeting
+        .transcript
+        .iter()
+        .rev()
+        .take(10)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if recent.trim().is_empty() {
+        return Err("no recent transcript to analyze".to_string());
+    }
+
+    let llm =
+        build_llm_provider_from_env(&db).ok_or_else(|| "no LLM provider configured".to_string())?;
+
+    // Generate response_id up-front so chunks and final event share it.
+    let response_id = Uuid::new_v4().to_string();
+
+    // Detect question in recent transcript and dispatch with streaming.
+    let cue_resp = if kind == "answer" && ends_with_question(&recent) {
+        let question = recent
+            .rsplit('.')
+            .find(|s| s.trim().ends_with('?'))
+            .unwrap_or(&recent)
+            .trim();
+        let app2 = app.clone();
+        let rid = response_id.clone();
+        AnswerLlm
+            .run_streaming(question, &session_id, llm.as_ref(), |partial, finished| {
+                let _ = app2.emit(
+                    "cue_response_chunk",
+                    CueResponseChunkPayload {
+                        response_id: rid.clone(),
+                        kind: "answer".to_string(),
+                        partial_text: partial.to_string(),
+                        finished,
+                    },
+                );
+            })
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        let app2 = app.clone();
+        let rid = response_id.clone();
+        WhatToAnswerLlm
+            .run_streaming(&recent, &session_id, llm.as_ref(), |partial, finished| {
+                let _ = app2.emit(
+                    "cue_response_chunk",
+                    CueResponseChunkPayload {
+                        response_id: rid.clone(),
+                        kind: "suggestion".to_string(),
+                        partial_text: partial.to_string(),
+                        finished,
+                    },
+                );
+            })
+            .await
+            .map_err(|e| e.to_string())?
+    };
+
+    // Override the CueResponse id with our pre-generated response_id for consistency.
+    let mut cue_resp = cue_resp;
+    cue_resp.id = response_id;
+
+    persist_cue_response(&db, &cue_resp)?;
+    let _ = app.emit("cue_response", &cue_resp);
+    Ok(cue_resp.text.clone())
+}
+
+/// Auto-recap: runs RecapLlm on a session's full transcript.
+/// Emits `cue_response_chunk` per streaming chunk, then `cue_response` on completion.
+#[tauri::command]
+pub async fn auto_recap(
+    session_id: String,
+    db: State<'_, DbState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    use cue_daemon::llm::RecapLlm;
+
+    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+    let store = cue_daemon::storage::MeetingStore::new(&paths).map_err(|e| e.to_string())?;
+
+    let meetings = store.all_meetings().map_err(|e| e.to_string())?;
+    let meeting = meetings
+        .iter()
+        .find(|m| m.id.to_string() == session_id)
+        .ok_or_else(|| "session not found".to_string())?;
+
+    let transcript: String = meeting
+        .transcript
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if transcript.trim().is_empty() {
+        return Err("empty transcript".to_string());
+    }
+
+    let llm = match build_llm_provider_from_env(&db) {
+        Some(p) => p,
+        None => {
+            tracing::warn!("auto-recap skipped: no LLM provider configured");
+            return Err("no LLM provider configured".to_string());
+        }
+    };
+
+    let response_id = Uuid::new_v4().to_string();
+    let rid = response_id.clone();
+    let app2 = app.clone();
+
+    let cue_resp = RecapLlm
+        .run_streaming(
+            &transcript,
+            &session_id,
+            llm.as_ref(),
+            |partial, finished| {
+                let _ = app2.emit(
+                    "cue_response_chunk",
+                    CueResponseChunkPayload {
+                        response_id: rid.clone(),
+                        kind: "recap".to_string(),
+                        partial_text: partial.to_string(),
+                        finished,
+                    },
+                );
+            },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut cue_resp = cue_resp;
+    cue_resp.id = response_id;
+
+    persist_cue_response(&db, &cue_resp)?;
+    let _ = app.emit("cue_response", &cue_resp);
+    Ok(cue_resp.text.clone())
+}
+
+fn persist_cue_response(
+    db: &State<DbState>,
+    resp: &cue_daemon::llm::CueResponse,
+) -> Result<(), String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    db.insert_cue_response(
+        &resp.id,
+        &resp.source_session_id,
+        &resp.kind,
+        &resp.text,
+        resp.source_text.as_deref(),
+        resp.ts_ms as i64,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Build an LLM provider from environment variables or stored secrets.
+fn build_llm_provider_from_env(_db: &State<DbState>) -> Option<Box<dyn cue_llm::LlmProvider>> {
+    let openai_key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .or_else(|| {
+            cue_daemon::secrets::load_api_key("llm_openai")
+                .ok()
+                .flatten()
+        })?;
+    Some(Box::new(cue_llm::openai::OpenAiProvider::new(openai_key)))
+}
+
+// ─── R8 nit hardening tests (recheck rollout) ───────────────────────────────
+
+#[cfg(test)]
+mod r8_nit_tests {
+    /// Char-safe last-4 masking matches the new load_stt_api_key behavior:
+    /// must NOT panic on multi-byte UTF-8 trailing bytes.
+    fn mask_last_four(s: &str) -> String {
+        let total = s.chars().count();
+        if total <= 4 {
+            "****".to_string()
+        } else {
+            let suffix: String = s.chars().skip(total - 4).collect();
+            format!("****{suffix}")
+        }
+    }
+
+    #[test]
+    fn mask_short_key() {
+        assert_eq!(mask_last_four("ab"), "****");
+        assert_eq!(mask_last_four("abcd"), "****");
+    }
+
+    #[test]
+    fn mask_ascii_key() {
+        assert_eq!(mask_last_four("sk-abcd1234"), "****1234");
+    }
+
+    #[test]
+    fn mask_multibyte_key_does_not_panic() {
+        // Trailing 4 chars are emoji + ASCII — would have panicked under
+        // byte-slicing. Char-based skip is safe.
+        let key = "secret-key-🦀🎉ab";
+        let masked = mask_last_four(key);
+        assert!(masked.starts_with("****"));
+        assert_eq!(masked.chars().count(), 4 + 4);
     }
 }

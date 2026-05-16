@@ -1,3 +1,4 @@
+pub mod rag;
 pub mod search;
 pub mod speakers;
 
@@ -43,6 +44,8 @@ impl Database {
         const MIGRATION_007: &str = include_str!("../../../../infra/migrations/007_speakers.sql");
         const MIGRATION_008: &str =
             include_str!("../../../../infra/migrations/008_fts_cascade_fix.sql");
+        const MIGRATION_009: &str =
+            include_str!("../../../../infra/migrations/009_cue_responses.sql");
         self.conn
             .execute_batch(MIGRATION_002)
             .context("failed to run session migration")?;
@@ -64,6 +67,9 @@ impl Database {
         self.conn
             .execute_batch(MIGRATION_008)
             .context("failed to run fts cascade fix migration")?;
+        self.conn
+            .execute_batch(MIGRATION_009)
+            .context("failed to run cue_responses migration")?;
         Ok(())
     }
 
@@ -324,6 +330,88 @@ impl Database {
             map.insert(k, v);
         }
         Ok(map)
+    }
+
+    // ===== Phase 3 Round 9: Cue Responses =====
+
+    pub fn insert_cue_response(
+        &self,
+        id: &str,
+        session_id: &str,
+        kind: &str,
+        text: &str,
+        source_text: Option<&str>,
+        ts_ms: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO cue_responses (id, session_id, kind, text, source_text, ts_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, session_id, kind, text, source_text, ts_ms],
+        )?;
+        Ok(())
+    }
+
+    // ===== Keybinds (Phase 3 Round 9) =====
+
+    /// Ensure the user_keybinds table exists.
+    pub fn ensure_keybinds_table(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS user_keybinds (
+                action TEXT PRIMARY KEY,
+                accelerator TEXT NOT NULL
+            );",
+        )?;
+        Ok(())
+    }
+
+    pub fn list_cue_responses(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::llm::CueResponse>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, kind, text, source_text, ts_ms \
+             FROM cue_responses WHERE session_id = ?1 ORDER BY ts_ms DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![session_id, limit as i64], |row| {
+            Ok(crate::llm::CueResponse {
+                id: row.get(0)?,
+                source_session_id: row.get(1)?,
+                kind: row.get(2)?,
+                text: row.get(3)?,
+                source_text: row.get(4)?,
+                ts_ms: row.get::<_, i64>(5)? as u64,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Load a keybind for a given action.
+    pub fn load_keybind(&self, action: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT accelerator FROM user_keybinds WHERE action = ?1")?;
+        let result = stmt
+            .query_row(params![action], |row| row.get::<_, String>(0))
+            .ok();
+        Ok(result)
+    }
+
+    /// Save a keybind for a given action (upsert).
+    pub fn save_keybind(&self, action: &str, accelerator: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO user_keybinds (action, accelerator) VALUES (?1, ?2)
+             ON CONFLICT(action) DO UPDATE SET accelerator = excluded.accelerator",
+            params![action, accelerator],
+        )?;
+        Ok(())
+    }
+
+    /// Reset all keybinds (delete all custom entries).
+    pub fn reset_keybinds(&self) -> Result<()> {
+        self.conn.execute_batch("DELETE FROM user_keybinds;")?;
+        Ok(())
     }
 }
 
@@ -918,5 +1006,58 @@ mod fts_tests {
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().any(|h| h.text.contains("second")));
         assert!(hits.iter().any(|h| h.text.contains("third")));
+    }
+
+    #[test]
+    fn keybind_save_load_roundtrip() {
+        let db = test_db();
+        db.ensure_keybinds_table().unwrap();
+        db.save_keybind("toggle_listening", "CmdOrCtrl+Shift+L")
+            .unwrap();
+        let loaded = db.load_keybind("toggle_listening").unwrap();
+        assert_eq!(loaded, Some("CmdOrCtrl+Shift+L".to_string()));
+    }
+
+    #[test]
+    fn keybind_upsert_overwrites() {
+        let db = test_db();
+        db.ensure_keybinds_table().unwrap();
+        db.save_keybind("toggle_listening", "CmdOrCtrl+Shift+L")
+            .unwrap();
+        db.save_keybind("toggle_listening", "CmdOrCtrl+Shift+K")
+            .unwrap();
+        let loaded = db.load_keybind("toggle_listening").unwrap();
+        assert_eq!(loaded, Some("CmdOrCtrl+Shift+K".to_string()));
+    }
+
+    #[test]
+    fn keybind_load_missing_returns_none() {
+        let db = test_db();
+        db.ensure_keybinds_table().unwrap();
+        assert_eq!(db.load_keybind("nonexistent").unwrap(), None);
+    }
+
+    #[test]
+    fn keybind_reset_clears_all() {
+        let db = test_db();
+        db.ensure_keybinds_table().unwrap();
+        db.save_keybind("toggle_listening", "CmdOrCtrl+Shift+L")
+            .unwrap();
+        db.save_keybind("push_to_talk", "CmdOrCtrl+Shift+P")
+            .unwrap();
+        db.reset_keybinds().unwrap();
+        assert_eq!(db.load_keybind("toggle_listening").unwrap(), None);
+        assert_eq!(db.load_keybind("push_to_talk").unwrap(), None);
+    }
+
+    #[test]
+    fn passthrough_setting_persists() {
+        let db = test_db();
+        db.save_setting("overlay_passthrough", "false").unwrap();
+        let val = db.load_setting("overlay_passthrough").unwrap();
+        assert_eq!(val, Some("false".to_string()));
+        db.save_setting("overlay_passthrough", "true").unwrap();
+        let val = db.load_setting("overlay_passthrough").unwrap();
+        assert_eq!(val, Some("true".to_string()));
     }
 }

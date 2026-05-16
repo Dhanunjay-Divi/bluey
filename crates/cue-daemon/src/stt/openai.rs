@@ -353,7 +353,8 @@ async fn run_connection(
     audio_rx: &mut UnboundedReceiver<Vec<u8>>,
     events_tx: &UnboundedSender<Result<TranscriptEvent, SttError>>,
 ) -> Result<(), SttError> {
-    let base = cfg.base_url.as_deref().unwrap_or("wss://api.openai.com");
+    let default_url = obfstr::obfstr!("wss://api.openai.com").to_string();
+    let base = cfg.base_url.as_deref().unwrap_or(&default_url);
     let url_str = format!(
         "{base}/v1/realtime?model={}&intent=transcription",
         cfg.model
@@ -363,12 +364,15 @@ async fn run_connection(
 
     let mut request = url.as_str().into_client_request().map_err(map_ws_error)?;
     let headers = request.headers_mut();
-    headers.insert(
-        "Authorization",
-        format!("Bearer {}", cfg.api_key)
-            .parse()
-            .map_err(|_| SttError::Auth)?,
-    );
+    {
+        let hdr = obfstr::obfstr!("authorization").to_string();
+        headers.insert(
+            tokio_tungstenite::tungstenite::http::HeaderName::from_bytes(hdr.as_bytes()).unwrap(),
+            format!("Bearer {}", cfg.api_key)
+                .parse()
+                .map_err(|_| SttError::Auth)?,
+        );
+    }
     headers.insert(
         "OpenAI-Beta",
         "realtime=v1"

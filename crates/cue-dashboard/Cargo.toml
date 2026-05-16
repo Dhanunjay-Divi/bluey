@@ -26,6 +26,8 @@ tauri-plugin-global-shortcut = "2"
 tauri-plugin-updater = "2"
 cue-core = { path = "../cue-core" }
 cue-daemon = { path = "../cue-daemon" }
+cue-llm = { path = "../cue-llm" }
+cue-stealth = { path = "../cue-stealth" }
 cpal.workspace = true
 dirs = { workspace = true }
 serde = { workspace = true }

@@ -74,3 +74,4 @@ jobs:
         run: |
           native\windows\cue-overlay\build.ps1
           native\windows\cue-audio\build.ps1
+          native\windows\cue-whisper\build.ps1
