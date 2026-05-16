@@ -62,6 +62,9 @@ pub fn run() {
             commands::open_privacy_settings,
             commands::emit_permission_denied,
             commands::poll_audio_permission,
+            // R8: Process Masquerading
+            commands::set_disguise,
+            commands::get_disguise,
         ])
         .setup(|app| {
             // Open database
@@ -77,6 +80,41 @@ pub fn run() {
             });
             app.manage(DbState(Mutex::new(db)));
             app.manage(ActiveSessionState(Mutex::new(restored)));
+
+            // R8: Apply process disguise on startup
+            {
+                let db_state: tauri::State<DbState> = app.state();
+                let mode_str = db_state
+                    .0
+                    .lock()
+                    .ok()
+                    .and_then(|db| db.load_setting("disguise_mode").ok().flatten())
+                    .unwrap_or_else(|| "none".to_string());
+                let mode = cue_stealth::DisguiseMode::from_str_loose(&mode_str);
+                let req = cue_stealth::build_request(mode, None);
+                if let Err(e) = cue_stealth::apply_disguise(&req) {
+                    tracing::warn!(error = %e, "failed to apply startup disguise");
+                }
+                // Re-assertion timers: OS sometimes drifts the process title
+                let app_name = req.app_name.clone();
+                std::thread::spawn(move || {
+                    for delay_ms in [200, 1000, 5000] {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        let re_req = cue_stealth::build_request(
+                            cue_stealth::DisguiseMode::from_str_loose(&mode_str),
+                            None,
+                        );
+                        let _ = cue_stealth::apply_disguise(&re_req);
+                    }
+                });
+                // Set window title if disguise is active
+                if mode != cue_stealth::DisguiseMode::None {
+                    let title = app_name.trim().to_owned();
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.set_title(&title);
+                    }
+                }
+            }
 
             // R7: Live transcript poller — reads daemon meeting file and emits
             // Tauri events for new segments.
