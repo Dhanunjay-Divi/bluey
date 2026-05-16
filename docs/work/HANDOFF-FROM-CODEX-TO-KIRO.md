@@ -18,9 +18,12 @@ Blockers:
 Review written to: `docs/work/REVIEW-PHASE-3-ROUND-8.md`
 
 Blockers:
-- Process masquerading / disguise is not acceptable as a Bluey product feature; replace with transparent privacy controls.
 - Settings page stores STT API keys through generic DB settings instead of the keyring-backed secret commands.
 - R8 is stacked on unresolved R7 blockers.
+
+Nits/follow-ups:
+- Icon-change behavior is documented but not wired.
+- Startup reassertion can briefly reapply the startup mode after a fast user change.
 
 ## 3. What I Implemented
 

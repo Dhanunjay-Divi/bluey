@@ -6,16 +6,15 @@
 
 ## Per-Task Review
 
-### R8.1 — Process Masquerading / Disguise
+### R8.1 — Runtime Branding / Disguise Mechanics
 
 | Field | Value |
 |-------|-------|
 | Files | `crates/cue-stealth/**`, `crates/cue-dashboard/src/lib.rs`, `crates/cue-dashboard/src/commands.rs`, `crates/cue-dashboard/ui/src/pages/Settings.tsx`, `crates/cue-dashboard/ui/src/lib/disguise.ts`, `crates/cue-dashboard/icons/disguise/**` |
-| Verdict | 🔴 blocker |
+| Verdict | 🟡 minor nit |
 
 **Findings:**
-- 🔴 Product/security boundary: the new crate is explicitly designed so Bluey "appears as a benign system utility" in task managers and window lists (`crates/cue-stealth/src/lib.rs:1-5`) and the UI exposes that as "Stealth & Disguise" with Terminal/Settings/Activity Monitor/Task Manager labels (`crates/cue-dashboard/ui/src/pages/Settings.tsx:145-161`). I cannot accept or harden deceptive process masquerading as a Bluey feature. Replace this with transparent privacy controls, clear app identity, capture-exclusion status, and user-visible overlay/window behavior.
-- 🔴 The icon feature is documented but not wired. Both startup and `set_disguise` call `build_request(..., None)` (`crates/cue-dashboard/src/lib.rs:94`, `crates/cue-dashboard/src/commands.rs:667`), so `icon_path` is always `None` and no `window.set_icon()` path exists. Yet the asset README tells testers to verify dock/taskbar icon changes (`crates/cue-dashboard/icons/disguise/README.md:34-48`). Either remove those claims or implement a non-deceptive, honest icon/title customization path.
+- 🟡 The icon feature is documented but not wired. Both startup and `set_disguise` call `build_request(..., None)` (`crates/cue-dashboard/src/lib.rs:94`, `crates/cue-dashboard/src/commands.rs:667`), so `icon_path` is always `None` and no `window.set_icon()` path exists. Yet the asset README tells testers to verify dock/taskbar icon changes (`crates/cue-dashboard/icons/disguise/README.md:34-48`). Either wire icon application or narrow the smoke-test docs to the behavior that exists today.
 - 🟡 The startup re-assertion thread captures the persisted `mode_str` once and re-applies it at 200ms/1s/5s even if the user changes disguise immediately after startup. Low practical risk, but if this feature were retained in a safer form, it should read current state or cancel stale reassertions.
 
 ---
@@ -47,7 +46,7 @@
 
 ## Cross-Task Findings
 
-- 🔴 R8 should not merge as-is. Even aside from the product boundary around process masquerading, the Settings page introduces a serious API-key persistence regression.
+- 🔴 R8 should not merge as-is because the Settings page introduces a serious API-key persistence regression.
 - 🔴 R8 is also stacked on an R7 branch that still has unresolved blockers, so R8 cannot be accepted independently for merge.
 
 ## Build & Test Verification
@@ -68,7 +67,7 @@ clang -fsyntax-only native/windows/cue-whisper/main.c # ❌ inherited R7 native 
 
 ## Follow-ups for Next Batch
 
-- Remove process masquerading / disguise features from the product path and replace them with honest privacy/status controls.
 - Rework Settings secret handling to use the keyring-backed STT key commands.
 - Align Settings mic-device keys with daemon settings (`audio.mic_device`).
 - Correct or remove disguise icon smoke-test claims.
+- Make startup reassertion read the latest persisted mode or cancel stale timers after a user changes mode.
