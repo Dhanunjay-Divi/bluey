@@ -43,29 +43,30 @@ export PATH=/opt/homebrew/bin:/Users/uno/.cargo/bin:/usr/local/bin:$PATH
 cargo build --all-targets 2>&1 | tail -20'
 ```
 
-## Current state (as of 2026-05-16, post-R9 implementation)
+## Current state (as of 2026-05-16, post-R10 implementation)
 
 - **main tip:** `6126b28` — R3-R6 merged, 201 tests passing
-- **Branch `feat/phase-3-round-7`:** 10 commits ahead of main, 213 tests
-- **Branch `feat/phase-3-round-8`:** 7 commits ahead of R7, 224 tests (process masquerade)
-- **Branch `feat/phase-3-round-9`:** 16 commits ahead of R8, 281 tests — **awaiting codex review**
+- **Branch `feat/phase-3-round-7`:** 10 commits ahead of main, 213 tests — awaiting codex final verdict (R7-fix-3 recheck: `a5991b2`)
+- **Branch `feat/phase-3-round-8`:** 7 commits ahead of R7, 224 tests — 🟡 accepted with nits
+- **Branch `feat/phase-3-round-9`:** 16 commits ahead of R8, 284 tests — awaiting codex review
+- **Branch `feat/phase-3-round-10`:** 12 commits ahead of R9, **299 tests** — current, awaiting codex review
 
-### R9 deliverables shipped:
-- **AI features (headline "cue" product magic):** `cue-llm` crate with `LlmRouter` failover + 3 providers (Anthropic/OpenAI/Ollama). 3 specialized LLMs: `AnswerLlm` (question detection), `RecapLlm` (structured summary), `WhatToAnswerLlm` (1-2 bullet suggestions). `cue_responses` table + Tauri event. Responses route + Settings AI provider config.
-- **Local RAG:** `cue-rag` crate with character-based chunker (sentence-boundary preference), in-memory cosine VectorStore (SQLite-backed), OpenAI embedder (text-embedding-3-small). Live indexing on every Final transcript.
-- **Small wins:** Token bucket rate limiter (lock-free, unwired). Mouse passthrough toggle via `OverlayMessage::SetPassthrough` IPC + Tauri commands. User-rebindable keybinds with DB persistence (8 defaults).
-- **R7 fix wave:** All 6 codex blockers resolved — STT factory wiring, deterministic factory test, Windows whisper compile, artifact name reconciliation, transcript dedup.
+### R10 deliverables shipped:
+- **AI hookup completion:** Cmd+Shift+A global shortcut → `request_cue` command → question-detect → AnswerLlm/WhatToAnswerLlm dispatch → persist + emit. Auto-recap on session end via `spawn_auto_recap()`. Whisper-stub e2e factory test. Live transcript dedup by `{session_id, index}` map keys.
+- **Streaming LLM responses:** `LlmProvider` trait gains `complete_stream()` returning `LlmChunkStream`. Anthropic SSE (`content_block_delta`), OpenAI SSE (`chat.completion.chunk`), Ollama NDJSON. Default fallback wraps `complete()`. Dashboard Responses route subscribes to `cue_response_chunk` with typing indicator.
+- **Hardening basics:** Anti-debug via PT_DENY_ATTACH (macOS), IsDebuggerPresent + watchdog (Windows), TracerPid (Linux). obfstr for API endpoint URLs + auth header names — `strings` grep verified zero matches in release binary.
+- **Real whisper.cpp on macOS:** SwiftWhisper v1.2.0 (bundles whisper.cpp source), `whisper_full()` C API, RMS silence gate, NDJSON ABI preserved. Model: `tiny.en-q5_1.bin` (31 MB). Windows kept as stub.
 
 ### v0.1 alpha status:
-Feature-complete pending codex review. All core product functionality implemented. Deferred items are enhancements, not blockers for alpha.
+Feature-complete. All core product functionality implemented across R7-R10. Shipping over the weekend pending codex review chain acceptance.
 
-### All checks green (R9 tip):
+### All checks green (R10 tip):
 - `cargo fmt --all --check` ✅
 - `cargo clippy --all-targets -- -D warnings` ✅
 - `cargo build --all-targets` ✅
-- `cargo test --all-targets` ✅ 281 pass
+- `cargo test --all-targets` ✅ 299 pass, 10 ignored
 - `cd crates/cue-dashboard/ui && npm run build` ✅
-- `git -P diff --check feat/phase-3-round-8..HEAD` ✅
+- `git -P diff --check feat/phase-3-round-9..HEAD` ✅
 
 ## Workflow loop (kiro ↔ codex ↔ user)
 
@@ -107,7 +108,7 @@ docs/work/TEMPLATE-IMPL.md
 6. **Commit messages** follow Conventional Commits, e.g.:
    `feat(daemon): system audio capture via native helpers [P3.R4]`
 
-## Parallel subagent strategy (established in R6, continued in R7+R8+R9)
+## Parallel subagent strategy (established in R6, continued in R7-R10)
 
 Each parallel subagent uses an isolated git worktree. Commits are cherry-picked onto the main feature branch after completion. A single lint/fmt commit normalizes formatting. Reconciliation commits resolve Cargo.toml/mod.rs conflicts from parallel work. **Continue this pattern for future parallel work.**
 
@@ -121,91 +122,99 @@ Each parallel subagent uses an isolated git worktree. Commits are cherry-picked 
 ├── .github/workflows/release.yml         # R7 — release pipeline
 ├── crates/
 │   ├── cue-core/                         # types: pcm, vad, stt, overlay_ipc, session, audio
-│   ├── cue-llm/                          # R9 — LLM provider abstraction + router
+│   ├── cue-llm/                          # R9+R10 — LLM provider abstraction + router + streaming
 │   │   └── src/{lib,router,anthropic,openai,ollama}.rs
 │   ├── cue-rag/                          # R9 — RAG: chunker + vector store + embedder
 │   │   └── src/{lib,chunker,store,embedder}.rs
-│   ├── cue-stealth/                      # R8 — process masquerading
+│   ├── cue-stealth/                      # R8+R10 — process masquerading + anti-debug
 │   │   └── src/{lib,macos,linux,windows}.rs
 │   ├── cue-daemon/
 │   │   ├── src/
 │   │   │   ├── audio/
 │   │   │   ├── stt/
-│   │   │   │   ├── deepgram.rs           # R3 — Nova-3 provider
-│   │   │   │   ├── openai.rs             # R6 — OpenAI Realtime transcription
+│   │   │   │   ├── deepgram.rs           # R3+R10 — Nova-3 provider + obfstr
+│   │   │   │   ├── openai.rs             # R6+R10 — OpenAI Realtime + obfstr
 │   │   │   │   ├── router.rs             # R5+R7 — SttRouter 3-tier failover
 │   │   │   │   ├── factory.rs            # R9(R7fix) — build_stt_chain()
 │   │   │   │   ├── whisper/              # R7 — LocalWhisperProvider + parser
 │   │   │   │   ├── echo.rs              # R5 — EchoProvider stub
 │   │   │   │   └── mock.rs
-│   │   │   ├── llm/                      # R9 — specialized LLMs
+│   │   │   ├── llm/                      # R9+R10 — specialized LLMs + streaming
 │   │   │   │   ├── mod.rs               # CueResponse type + ends_with_question
-│   │   │   │   ├── answer.rs            # AnswerLlm
-│   │   │   │   ├── recap.rs             # RecapLlm
-│   │   │   │   └── suggest.rs           # WhatToAnswerLlm
+│   │   │   │   ├── answer.rs            # AnswerLlm (uses complete_stream)
+│   │   │   │   ├── recap.rs             # RecapLlm (uses complete_stream)
+│   │   │   │   └── suggest.rs           # WhatToAnswerLlm (uses complete_stream)
 │   │   │   ├── util/
 │   │   │   │   ├── mod.rs
 │   │   │   │   └── rate_limiter.rs      # R9 — token bucket
 │   │   │   ├── db/
-│   │   │   │   └── mod.rs               # migrations 009 (cue_responses), 011 (user_keybinds)
-│   │   │   ├── app.rs                    # R6+R7+R9 — live transcript + RAG indexing
+│   │   │   │   └── mod.rs               # migrations 009-011
+│   │   │   ├── app.rs                    # R6-R10 — live transcript + RAG + auto-recap + hotkey
 │   │   │   └── bin/
 │   │   │       └── whisper_stub.rs       # R7 — test stub binary
 │   │   └── tests/
 │   │       ├── live_transcript_emit.rs   # R7 — 3 tests
 │   │       ├── live_transcript_dedup.rs  # R9(R7fix) — 4 tests
 │   │       ├── whisper_integration.rs    # R7 — 9 tests
-│   │       └── stt_factory_integration.rs # R9(R7fix) — 4 tests
+│   │       ├── stt_factory_integration.rs # R9(R7fix) — 4 tests
+│   │       ├── whisper_stub_e2e.rs       # R10 — 2 tests (ignored)
+│   │       └── auto_recap_integration.rs # R10 — 2 tests
 │   └── cue-dashboard/                    # Tauri + React UI
 │       ├── src/
-│       │   ├── lib.rs                    # R7+R8 — live transcript poller + startup disguise
-│       │   └── commands.rs               # R7+R8+R9 — all Tauri commands
+│       │   ├── lib.rs                    # R7-R10 — poller + disguise + hotkey + anti-debug
+│       │   └── commands.rs               # R7-R10 — all Tauri commands
 │       ├── ui/src/
 │       │   ├── pages/Settings.tsx        # R8+R9 — settings with disguise + AI config
 │       │   ├── pages/Responses.tsx       # R9 — AI responses page
-│       │   ├── routes/Responses.tsx      # R9 — AI responses route component
-│       │   ├── lib/disguise.ts           # R8 — invoke wrappers
-│       │   ├── routes/LiveTranscript.tsx  # R7 — live transcript route
+│       │   ├── routes/Responses.tsx      # R9+R10 — streaming chunk subscription
+│       │   ├── routes/LiveTranscript.tsx  # R7+R10 — Map-based dedup
+│       │   ├── App.tsx                   # R10 — HotkeyListener
 │       │   └── components/LiveTranscriptList.tsx  # R7 — auto-scroll list
 │       └── icons/disguise/               # R8 — placeholder PNGs + README
 ├── native/
 │   ├── macos/
 │   │   ├── cue-audio/                    # Swift: ScreenCaptureKit + AVAudioEngine
 │   │   ├── cue-overlay/                  # Swift: NSWindow overlay
-│   │   └── cue-whisper/                  # R7 — Swift whisper helper stub
+│   │   └── cue-whisper/                  # R7+R10 — real whisper.cpp via SwiftWhisper
 │   └── windows/
 │       ├── cue-audio/main.c              # C: WASAPI loopback
 │       ├── cue-overlay/main.c            # C: Direct2D overlay
-│       └── cue-whisper/main.c            # R7+R9fix — C whisper helper stub (compiles)
+│       └── cue-whisper/main.c            # R7+R10 — stub with model env check
 ├── infra/
-│   ├── homebrew/bluey.rb                 # R7+R9fix — Homebrew formula (correct names)
-│   ├── scoop/bluey.json                  # R7+R9fix — Scoop manifest (correct names)
+│   ├── homebrew/bluey.rb                 # R7+R9fix — Homebrew formula
+│   ├── scoop/bluey.json                  # R7+R9fix — Scoop manifest
 │   └── scripts/
 └── docs/work/
-    ├── IMPL-PHASE-3-ROUND-{1..9}.md
-    ├── FIX-PHASE-3-ROUND-7.md            # R9 — fix doc for R7 blockers
-    ├── PHASE-3-ROUND-{1..9}-HANDOFF-FOR-CODEX-REVIEW.md
-    ├── REVIEW-PHASE-3-ROUND-{1,2,3,5,6,7}.md
+    ├── IMPL-PHASE-3-ROUND-{1..10}.md
+    ├── FIX-PHASE-3-ROUND-7.md
+    ├── PHASE-3-ROUND-{1..10}-HANDOFF-FOR-CODEX-REVIEW.md
+    ├── REVIEW-PHASE-3-ROUND-{1,2,3,5,6,7,8}.md
     ├── HANDOFF-TO-CODEX-FROM-KIRO.md
     ├── AGENT-ONBOARDING.md               # this file
     ├── PLAN-STT-FALLBACK-CHAIN.md
     └── PLAN-DISTRIBUTION.md
 ```
 
-## Pending work (after R9 review passes → v0.1 alpha ships)
+## Pending work (after R7-R10 review chain passes → v0.1 alpha ships)
 
 ### Next rounds (user-prioritized order)
 
-1. **Real whisper.cpp integration** — replace stub helpers with actual whisper.cpp inference; bundle `tiny.en` model.
-2. **Streaming LLM responses** — SSE/chunked response handling for all 3 providers.
-3. **Auto-recap session-lifecycle hook** — trigger RecapLlm on session end.
-4. **Native overlay passthrough handlers** — macOS Swift `window.ignoresMouseEvents` + Windows C `WS_EX_TRANSPARENT`.
-5. **sqlite-vec swap** — replace in-memory cosine with native ANN search in VectorStore.
-6. **Logging + crash reporting** — `tracing-appender` file rotation + panic dump files.
-7. **More specialized LLMs** — the other 17 from natively-cluely (AssistLLM, SummaryLLM, ActionItemsLLM, etc.).
-8. **Long-session stress tests** — `#[ignore]` test running 5-minute synthetic pipeline.
-9. **Screenshot + cropper window** — capture screen region for context injection into LLM prompts.
-10. **Calendar / meeting-platform integration** — auto-detect meeting start/end.
+1. **R11: sqlite-vec swap + native overlay passthrough + multi-provider embedding** — replace in-memory cosine with native ANN; macOS Swift `window.ignoresMouseEvents` + Windows C `WS_EX_TRANSPARENT`; Ollama/local ONNX embedding support.
+2. **R12: Hardening deep** — Tauri signing keypair, mlock for API keys, SQLCipher migration, anti-RE deeper measures, Windows real anti-debug with process termination.
+3. **R13: Observability** — structured logging (`tracing-appender` file rotation), crash reporting (panic dump files), long-session stress tests, mic hot-swap mid-session.
+4. **R14: Distribution publishing** — homebrew tap repo, scoop bucket repo, first tagged release, GitHub release automation end-to-end.
+5. **R15: Polish** — production icons, README overhaul, privacy policy, onboarding videos, telemetry opt-in.
+
+### Remaining feature backlog (post-v0.1)
+
+- More specialized LLMs (the other 17 from natively-cluely reference)
+- Function-calling / tool use in LLM requests
+- Screenshot + cropper window for context injection
+- Calendar / meeting-platform integration
+- Bookmarks / highlights
+- Session metadata (title, tags, participants)
+- Multi-language whisper support
+- CoreML acceleration for whisper.cpp
 
 ## First actions for a new agent
 
@@ -217,9 +226,9 @@ Each parallel subagent uses an isolated git worktree. Commits are cherry-picked 
    git -P branch --show-current'
    ```
 2. Read these docs on uno in order:
-   - `docs/work/IMPL-PHASE-3-ROUND-9.md` (latest round's context)
-   - `docs/work/PHASE-3-ROUND-9-HANDOFF-FOR-CODEX-REVIEW.md`
-   - `docs/work/FIX-PHASE-3-ROUND-7.md` (R7 blocker resolution)
+   - `docs/work/IMPL-PHASE-3-ROUND-10.md` (latest round's context)
+   - `docs/work/PHASE-3-ROUND-10-HANDOFF-FOR-CODEX-REVIEW.md`
+   - `docs/work/AGENT-ONBOARDING.md` (this file)
 3. Ask the user what the current task is — don't guess. Possible states:
    - Waiting on codex review → nothing to do, just read and be ready
    - Codex gave 🔴 → need to write FIX doc and address feedback
@@ -233,8 +242,9 @@ Each parallel subagent uses an isolated git worktree. Commits are cherry-picked 
 - **SSH hangs**: verify key permissions (`chmod 600 ~/.ssh/id_ed25519`)
 - **Build takes forever**: release builds are ~55 s; incremental dev builds are <10 s
 - **Cargo complains about workspace dep**: check root `Cargo.toml` `[workspace.dependencies]` first
-- **Swift build fails**: ensure Xcode CLT installed; `swift build` from `native/macos/cue-overlay/`
+- **Swift build fails**: ensure Xcode CLT installed; `swift build` from `native/macos/cue-whisper/`
 - **Keyring tests fail**: `secrets::tests::roundtrip` is `#[ignore]` — requires interactive Keychain access
+- **Whisper model missing**: run `infra/scripts/download-whisper-model.sh` to fetch tiny.en-q5_1.bin
 
 ## Contact points
 
