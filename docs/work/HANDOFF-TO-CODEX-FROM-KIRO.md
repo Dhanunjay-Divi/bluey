@@ -1,18 +1,19 @@
-# HANDOFF — R7 Review + Remaining Work (Codex Picks Up)
+# HANDOFF — R7 + R8 Review + Remaining Work (Codex Picks Up)
 
 **Author:** kiro
-**Date:** 2026-05-15
-**Branch:** `feat/phase-3-round-7` (10 commits ahead of main)
+**Date:** 2026-05-16
+**Branches:** `feat/phase-3-round-7` (10 commits, 213 tests) + `feat/phase-3-round-8` (7 commits, 224 tests)
 **Repo (on uno):** `/Users/uno/Downloads/cue/`
 
 ---
 
 ## 1. What this doc is for
 
-Single comprehensive handoff to Codex covering two jobs:
+Single comprehensive handoff to Codex covering three jobs:
 
 1. **Review** Phase 3 Round 7 (3 themes, 10 commits, 213 tests).
-2. **Implement** remaining pending items if time permits.
+2. **Review** Phase 3 Round 8 (2 themes, 7 commits, 224 tests).
+3. **Implement** remaining pending items if time permits.
 
 Expected flow:
 
@@ -20,6 +21,8 @@ Expected flow:
 codex reads this doc
    ↓
 codex reviews R7 (verdict in REVIEW-PHASE-3-ROUND-7.md)
+   ↓
+codex reviews R8 (verdict in REVIEW-PHASE-3-ROUND-8.md)
    ↓
 if time: codex implements pending items (separate branches OK)
    ↓
@@ -34,14 +37,15 @@ kiro reads that doc, verifies, decides next action
 
 ```
 main                              (R3-R6 merged: 6126b28, 201 tests)
-  └── feat/phase-3-round-7       (10 commits, 213 tests, 🟢 pipeline green, awaiting review)
+  └── feat/phase-3-round-7       (10 commits, 213 tests, 🟢 pipeline green)
+       └── feat/phase-3-round-8  (7 commits, 224 tests, 🟢 pipeline green)
 ```
 
 Previous round branches (`feat/phase-3-round-{4,5,6}`) are merged to main and can be ignored.
 
 ---
 
-## 3. Job 1: Review R7
+## 3. Job 1a: Review R7
 
 ### Scope: 3 themes
 
@@ -75,67 +79,100 @@ git -P diff --check main..HEAD                       ✅ clean
 
 Create: `docs/work/REVIEW-PHASE-3-ROUND-7.md` using `docs/work/TEMPLATE-REVIEW.md` skeleton.
 
-Detailed per-commit checklist is in: `docs/work/PHASE-3-ROUND-7-HANDOFF-FOR-CODEX-REVIEW.md`
+Detailed per-commit checklist: `docs/work/PHASE-3-ROUND-7-HANDOFF-FOR-CODEX-REVIEW.md`
 
 ---
 
-## 4. Job 2: Implement remaining pending work (if time permits)
+## 4. Job 1b: Review R8
 
-Items completed in R7 (remove from pending):
-- ~~Live transcript UX~~ ✅
-- ~~Local whisper fallback (stub)~~ ✅
-- ~~Distribution scaffolding~~ ✅
-- ~~Wire OpenAI into SttRouter~~ ✅ (done in R7 as part of 3-tier chain)
+### Scope: 2 themes
 
-### Still pending (priority order)
+| Theme | Commits | What it does |
+|-------|---------|--------------|
+| Process masquerading | `268a138`, `e068044`, `862e480`, `237123d`, `e19c1b4` | `cue-stealth` crate with per-platform FFI (macOS argv[0], Linux prctl, Windows AUMID); startup apply + re-assertion timers; Tauri commands; Settings UI dropdown; placeholder icons |
+| Settings regression fix | `972a92b` | Route was mounting `<Placeholder>` instead of real `<Settings />`; fixed |
+| Formatting | `d00880a` | cargo fmt normalization across cherry-picks |
 
-#### P0 — Required for alpha
+### Key review points
 
-1. **Real whisper.cpp integration** — replace stub helpers with actual whisper.cpp inference. Bundle `tiny.en` model (~75MB). macOS: link whisper.cpp via SPM or vendored source. Windows: link via CMake.
+1. **FFI safety:** macOS argv[0] overwrite bounded by original strlen, null-padded. No UB.
+2. **Re-assertion timers:** 200ms/1s/5s pattern mirrors natively-cluely. Thread does not block Tauri setup.
+3. **Tauri commands:** `set_disguise` round-trips correctly; updates all open windows; persists to DB.
+4. **Settings regression:** Codex should grep for any other `<Placeholder name="..."` that masks a real component.
+5. **Icons:** 6 PNGs at 256×256, simple Pillow generation, documented replacement path.
 
-2. **LocalWhisperProvider crash restart loop** — supervisor pattern: if helper process dies, wait 1s, respawn up to 3 times, then return permanent error to router.
+### Verification (kiro ran on uno)
 
-#### P1 — Important quality / reliability
+```
+cargo fmt --all --check                              ✅ pass
+cargo clippy --all-targets -- -D warnings            ✅ pass
+cargo build --all-targets                            ✅ pass
+cargo test --all-targets                             ✅ 224 pass, 2 ignored
+cd crates/cue-dashboard/ui && npm run build          ✅ pass
+git -P diff --check feat/phase-3-round-7..HEAD       ✅ clean
+```
 
-3. **Structured logging + log rotation** — `tracing-appender` `RollingFileAppender`, daily rotation, 7-day retention. Path: `dirs::data_local_dir().join("bluey/logs")`. `--log-level` CLI flag.
+### Review deliverable
 
-4. **Crash reporting** — on panic, write stack trace + recent log tail to `bluey/crashes/<timestamp>.log`. Dashboard shows "previous session crashed" toast if fresh crash file exists.
+Create: `docs/work/REVIEW-PHASE-3-ROUND-8.md` using `docs/work/TEMPLATE-REVIEW.md` skeleton.
 
-5. **Long-session stress test** — `#[ignore]` test running pipeline for 5 minutes with synthetic audio. Assert no panic, no monotonic memory growth above threshold.
+Detailed per-commit checklist: `docs/work/PHASE-3-ROUND-8-HANDOFF-FOR-CODEX-REVIEW.md`
 
-6. **Bookmarks / highlights** — SQLite migration `009_bookmarks.sql`. Tauri commands. Keyboard shortcut during live session. Markers in transcript view.
+---
 
-7. **Session metadata** — title (auto-suggest from first transcript), tags, participants, notes. New migration. Edit UI in session detail.
+## 5. Job 2: Implement remaining pending work (if time permits)
 
-8. **Mic device hot-swap mid-session** — detect device disappearance, pause session, emit Tauri event for UI prompt.
+### Still pending (user-prioritized order)
 
-#### P2 — Differentiators (the "cue" in the product)
+#### P0 — The "cue" differentiator (headline features)
 
-9. **AI features** — LLM API key in Settings. During session: rolling transcript → LLM for action items, 60s summary, follow-up suggestions. End-of-session: full summary + extracted action items + decisions. Custom "cues" (user-defined prompts).
+1. **LLM router with 7 providers + provider chain** — OpenAI, Anthropic, Gemini, Groq, Ollama, Together, Fireworks. Failover + load balancing. API key per provider in Settings.
 
-10. **Auto-update endpoint signing keys** — `tauri signer generate`, store private key as GitHub Secret, commit public key.
+2. **20+ specialized LLMs** — AnswerLLM, AssistLLM, RecapLLM, SummaryLLM, ActionItemsLLM, FollowUpLLM, etc. Each wraps a system prompt + model selection. During session: rolling transcript → LLM for action items, 60s summary, follow-up suggestions. End-of-session: full summary + extracted action items + decisions. Custom "cues" (user-defined prompts).
+
+3. **Local RAG** — SQLite + sqlite-vec for embedding storage. Semantic search over past sessions. Context injection into LLM prompts.
+
+4. **Screenshot + cropper window** — capture screen region for context injection into LLM prompts.
+
+#### P1 — Small wins
+
+5. **Mouse passthrough toggle** — overlay click-through mode.
+6. **User-rebindable keybinds** — settings UI for global shortcut customization.
+7. **Token bucket rate limiter** — per-provider rate limiting for LLM API calls.
+
+#### P2 — Infrastructure + reliability
+
+8. **Real whisper.cpp integration** — replace stub helpers with actual whisper.cpp inference; bundle `tiny.en` model (~75MB).
+9. **Structured logging + crash reporting** — `tracing-appender` file rotation + panic dump files.
+10. **Long-session stress tests** — `#[ignore]` test running 5-minute synthetic pipeline.
+11. **Bookmarks / highlights** — SQLite migration + keyboard shortcut + transcript markers.
+12. **Session metadata** — title, tags, participants, notes.
+13. **Mic device hot-swap mid-session** — detect disappearance, pause, emit UI event.
 
 ### Time guidance
 
-- ~2 hours: items 1-2 (real whisper + crash restart)
-- ~4 hours: add items 3-4 (logging + crash reporting)
-- ~8 hours: add items 5-7 + starter AI features (end-of-session summary)
+- ~4 hours: item 1 (LLM router with provider chain)
+- ~8 hours: add item 2 (specialized LLMs — at least 5 core ones)
+- ~12 hours: add items 3-4 (RAG + screenshot)
 
 ---
 
-## 5. Codex's final deliverable
+## 6. Codex's final deliverable
 
 Write (overwriting the existing stale file):
 
 **`docs/work/HANDOFF-FROM-CODEX-TO-KIRO.md`** with this structure:
 
 ```markdown
-# Codex → Kiro: R7 Review + Implementation Handoff
+# Codex → Kiro: R7 + R8 Review + Implementation Handoff
 
 ## 1. R7 Verdict
 (verdict + REVIEW-PHASE-3-ROUND-7.md path)
 
-## 2. What I Implemented
+## 2. R8 Verdict
+(verdict + REVIEW-PHASE-3-ROUND-8.md path)
+
+## 3. What I Implemented
 For each item completed:
 - Item name
 - Branch + commit hashes
@@ -144,21 +181,19 @@ For each item completed:
 - Design notes
 - Known limitations
 
-## 3. What I Skipped and Why
+## 4. What I Skipped and Why
 
-## 4. Pipeline Status
+## 5. Pipeline Status
 (fmt / clippy / build / test counts per branch)
 
-## 5. New Test Count
+## 6. New Test Count
 
-## 6. Branches Ready for Kiro Review
-
-## 7. Pending Followups
+## 7. Branches Ready for Kiro Review
 ```
 
 ---
 
-## 6. Standing rules (carry-forward)
+## 7. Standing rules (carry-forward)
 
 - Do **not** push to any remote.
 - Do **not** rewrite pushed history.
@@ -176,10 +211,12 @@ For each item completed:
 
 ---
 
-## 7. Reference docs on uno
+## 8. Reference docs on uno
 
-- `docs/work/IMPL-PHASE-3-ROUND-7.md` — detailed implementation record
-- `docs/work/PHASE-3-ROUND-7-HANDOFF-FOR-CODEX-REVIEW.md` — per-commit review checklist
+- `docs/work/IMPL-PHASE-3-ROUND-7.md` — R7 detailed implementation record
+- `docs/work/IMPL-PHASE-3-ROUND-8.md` — R8 detailed implementation record
+- `docs/work/PHASE-3-ROUND-7-HANDOFF-FOR-CODEX-REVIEW.md` — R7 per-commit review checklist
+- `docs/work/PHASE-3-ROUND-8-HANDOFF-FOR-CODEX-REVIEW.md` — R8 per-commit review checklist
 - `docs/work/PLAN-STT-FALLBACK-CHAIN.md` — STT architecture design
 - `docs/work/PLAN-DISTRIBUTION.md` — distribution design decisions
 - `docs/work/AGENT-ONBOARDING.md` — full project context for new agents
