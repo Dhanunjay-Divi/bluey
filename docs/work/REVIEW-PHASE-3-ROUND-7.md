@@ -59,30 +59,55 @@
 **Findings:**
 - 🟡 R7 documentation says "10 commits ahead" in some places and "9 unique commits" in others. Actual `git log main..feat/phase-3-round-7` has 10 commits including the docs commit `1f5a829`.
 
+## Fix-Wave Re-review
+
+**Re-reviewed branch:** `feat/phase-3-round-9`
+**Fix commits reviewed:** `0ef0e1d`, `2a8cabc`, `04ee1d0`, `13ed133`, `af0bd0d`, `628a347`, `901a117`, `1a19535`, `2b71262`
+**Date:** 2026-05-16
+
+### Resolved Items
+
+- 🟢 Windows whisper helper now compiles under a strict C syntax check. `native/windows/cue-whisper/main.c:53-55` uses valid quoted JSON strings, and `clang -fsyntax-only -std=c89 -pedantic -Wall -Wextra native/windows/cue-whisper/main.c` passes locally.
+- 🟢 The dashboard Tauri build now runs from `crates/cue-dashboard` in both `.github/workflows/release.yml` and `Makefile`.
+- 🟢 Binary names are largely aligned to canonical `bluey` / `bluey-daemon` names across release packaging, Homebrew, Scoop, and install docs.
+- 🟢 Windows helper build steps were added to the release workflow.
+
+### Remaining Findings
+
+- 🔴 `LocalWhisper` is still not a real production fallback when the primary cloud provider is absent or cannot connect. `crates/cue-daemon/src/stt/factory.rs:25-35` returns `Err("no STT API key configured")` before it ever reaches the OpenAI or LocalWhisper branches, so `BLUEY_STT_LOCAL_WHISPER=1` cannot run local-only. Also, `DeepgramProvider::connect(...).await.map_err(...)?` at `crates/cue-daemon/src/stt/factory.rs:30-32` makes a Deepgram connection failure fatal before OpenAI/LocalWhisper are attempted. That means "Deepgram offline -> local fallback" is not true at startup. The factory should collect providers opportunistically, warn on unavailable providers, and succeed if any enabled fallback is available.
+- 🔴 The main real-audio startup path still requires a cloud API key before local STT can participate. `crates/cue-daemon/src/app.rs:1403-1405` returns `Ok(None)` when `BLUEY_STT_API_KEY` / `OPENAI_API_KEY` are unset, even if `BLUEY_STT_LOCAL_WHISPER=1` and a helper binary are configured. `build_mic_stt_provider()` exists but is not called anywhere in production, so the mic path is still not actually using the new factory chain.
+- 🔴 The release workflow's SHA256 manifest generation is broken. `.github/workflows/release.yml:203-213` runs Python with unquoted file names/mode (`open(SHA256SUMS.txt)` and `open(sha256-manifest.json, w)`), which fails with `NameError` before `sha256-manifest.json` can be uploaded. Use a heredoc or quote `"SHA256SUMS.txt"`, `"sha256-manifest.json"`, and `"w"`.
+- 🟡 The live transcript startup duplicate issue is not actually fixed. `LiveTranscript.tsx` still appends every `live_transcript` event without checking the new `index`, `LiveTranscriptList.tsx` does not include `index` in `TranscriptSegment`, and the background poller still starts with `last_count = 0` in `crates/cue-dashboard/src/lib.rs:142`. The new test simulates `last_count` starting at the catch-up count, but production has no connection between route catch-up and the global poller. This can stay a nit if acceptable for alpha, but the previous duplicate path remains.
+
 ## Cross-Task Findings
 
-- 🔴 R7 overstates two core deliverables: Local Whisper exists as a provider/test seam but is unreachable from the daemon runtime, and distribution scaffolding exists but would generate broken or incomplete install artifacts.
+- 🔴 R7 no longer has the original Windows C or binary-name blockers, but it still overstates the STT fallback deliverable: LocalWhisper is present in a factory branch, yet cloud startup failure/no-key paths prevent it from acting as a true fallback.
+- 🔴 Distribution is closer, but release tags will still fail in the manifest step until `.github/workflows/release.yml` is fixed.
 
 ## Build & Test Verification
 
 ```bash
-cargo fmt --all --check                              # ✅ pass on current R8 tip
-cargo clippy --all-targets -- -D warnings            # ✅ pass on current R8 tip
-cargo build --all-targets                            # ✅ pass on current R8 tip
-cargo test --all-targets                             # ✅ pass on current R8 tip (224 passed, 2 ignored)
-cd crates/cue-dashboard/ui && npm run build          # ✅ pass on current R8 tip
-git diff --check                                     # ✅ clean
-clang -fsyntax-only native/windows/cue-whisper/main.c # ❌ invalid C at lines 46-47
+cargo fmt --all --check                                      # ✅ pass per Kiro
+cargo clippy --all-targets -- -D warnings                    # ✅ pass per Kiro
+cargo build --all-targets                                    # ✅ pass per Kiro
+cargo test --all-targets                                     # ✅ pass per Kiro
+cd crates/cue-dashboard/ui && npm run build                  # ✅ pass per Kiro
+git diff --check                                             # ✅ clean before doc updates
+clang -fsyntax-only -std=c89 -pedantic -Wall -Wextra \
+  native/windows/cue-whisper/main.c                          # ✅ pass
+cargo test --test stt_factory_integration -- --ignored \
+  --test-threads=1                                           # ✅ 6 passed
+cargo test --test live_transcript_emit                       # ✅ 4 passed
+python3 -c '<release manifest snippet>'                      # ❌ NameError: SHA256SUMS
 ```
 
 ## Overall Verdict
 
-🔴 **REQUEST CHANGES** — Blockers must be resolved.
+🔴 **REQUEST CHANGES** — Remaining blockers must be resolved before R7/R8/R9 can merge.
 
 ## Follow-ups for Next Batch
 
-- Wire the real production STT provider factory so the daemon can build the documented provider chain.
-- Fix and compile-check the Windows whisper helper.
-- Reconcile binary and artifact names across release workflow, Makefile, Homebrew, Scoop, and INSTALL.
-- Move Tauri release builds to the dashboard crate/config.
-- Add live transcript de-dupe.
+- Make `build_stt_chain()` fallback-friendly at construction time: do not return before enabled fallback providers are attempted, and allow local-only STT when `BLUEY_STT_LOCAL_WHISPER=1`.
+- Wire the main microphone/real-audio path to the same STT provider factory, or explicitly document that LocalWhisper only applies to the continuous system-audio path.
+- Fix `.github/workflows/release.yml` SHA256 manifest generation and add a cheap workflow syntax/shell test so this does not regress.
+- Add real live transcript event de-dupe by using the segment `index` in the route state or by initializing the global poller from the current transcript count.
