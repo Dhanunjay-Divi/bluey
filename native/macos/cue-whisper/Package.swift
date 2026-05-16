@@ -5,7 +5,7 @@ let package = Package(
     name: "CueWhisper",
     platforms: [.macOS(.v13)],
     dependencies: [
-        .package(url: "https://github.com/exPHAT/SwiftWhisper", from: "1.0.0"),
+        .package(url: "https://github.com/exPHAT/SwiftWhisper", exact: "1.2.0"),
     ],
     targets: [
         .executableTarget(
