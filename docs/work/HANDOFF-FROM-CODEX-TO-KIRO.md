@@ -1,4 +1,4 @@
-# Codex → Kiro: Phase 3 Round 11 Review Handoff
+# Codex → Kiro: Phase 3 Round 11 Recheck Handoff
 
 ## 1. R11 Verdict
 
@@ -7,15 +7,23 @@
 Review written to: `docs/work/REVIEW-PHASE-3-ROUND-11.md`
 
 Blockers:
-- Streaming chunks are still wrong in the UI. The daemon emits cumulative text while `Responses.tsx` appends each payload, so live responses duplicate text.
-- Overlay hardening is not wired into the production daemon path. `app.rs` still starts/restarts the overlay through the legacy `spawn_overlay()` function, bypassing the new gated resolver, binary verification, session token, state machine, and length checks.
-- The legacy production overlay path still accepts `BLUEY_OVERLAY_BIN` / `CUE_OVERLAY_BIN` without requiring `BLUEY_DEV_OVERLAY=1`.
-- The new `NativeOverlayHandle` reader validates token only; it does not enforce command length limits or `OverlayUiState`.
-- The Windows native overlay still emits tokenless JSON events, so the documented cross-platform token handshake is incomplete.
+- The production overlay path is now mostly hardened, but Windows `emit_ask_event()` still omits the token. That breaks the Send/Enter ask path on Windows once token validation is active.
+- The new validator over-gates `AttachRequested` and `InstructionsRequested`. Those are the idle-state button-click events that should open the attach/style workflows, but they are currently rejected unless the state is already `AttachOpen` / `InstructionsOpen`.
+- `overlay_ui_state` is not yet a real shared state machine. The initial spawn passes a separate idle mutex to the reader, and the daemon field is not updated anywhere after initialization.
+
+Resolved from the prior R11 review:
+- Specialized LLM callbacks now emit delta chunks instead of cumulative text.
+- `app.rs::spawn_overlay()` now calls the gated overlay path resolver, binary verifier, token env wiring, and line validator.
+- Tokenless/mismatched events are rejected when the daemon has a session token.
+- Field length and state validation are covered by new production-path validator tests.
+- Most Windows overlay simple events now carry the token.
+
+Nit:
+- `Responses.tsx` still discards non-empty `partial_text` when `finished: true`. Current OpenAI/Anthropic terminal chunks are empty, so this is not a blocker, but it is worth hardening.
 
 ## 2. R10 Verdict Status
 
-🔴 **Still blocked by the R11 fix wave**
+🔴 **Still blocked by the R11 recheck**
 
 Good R10 fixes landed:
 - Streaming auth header names are obfuscated.
@@ -23,7 +31,7 @@ Good R10 fixes landed:
 - PCM16 decode uses `loadUnaligned`.
 
 Still not closed:
-- The user-facing streaming fix is incomplete because the dashboard appends cumulative text. R10 should remain blocked until the streaming payload/UI contract is fixed and covered by a UI/reducer test.
+- The streaming delta bug is fixed, but the stacked R10/R11 branch still has R11 overlay blockers. Keep R10 status tied to the stacked recheck until this fix wave is clean.
 
 ## 3. Older Pending Verdicts
 
@@ -36,8 +44,8 @@ Still not closed:
 No product code changes.
 
 Documentation changes only:
-- Added `docs/work/REVIEW-PHASE-3-ROUND-11.md`.
-- Overwrote this handoff with the R11 verdict and current pending-status summary.
+- Appended the recheck section in `docs/work/REVIEW-PHASE-3-ROUND-11.md`.
+- Overwrote this handoff with the R11 recheck verdict and current pending-status summary.
 
 ## 5. What I Skipped and Why
 
@@ -51,18 +59,11 @@ Checks run locally on `feat/phase-3-round-11`:
 
 ```bash
 cargo fmt --all --check                              # ✅
-cargo clippy --all-targets -- -D warnings            # ✅
-cargo build --all-targets                            # ✅
-cargo test --all-targets                             # ✅ 331 passed, 14 ignored locally
-cd crates/cue-dashboard/ui && npm run build          # ✅
 cargo test -p cue-daemon --test cue_streaming_integration
                                                        # ✅ 5 passed
-cargo test -p cue-daemon --test overlay_security_integration --test overlay_pipe_integration
-                                                       # ✅ 13 passed
-cd native/macos/cue-overlay && swift build            # ✅
-cd native/macos/cue-whisper && swift build            # ✅
-cd native/macos/cue-audio && swift build              # ✅
-git diff --check feat/phase-3-round-10..HEAD          # ✅
+cargo test -p cue-daemon --test overlay_production_path
+                                                       # ✅ 14 passed
+git diff --check 030a63c..HEAD                        # ✅
 ```
 
 ## 7. Next Action for Kiro
@@ -70,8 +71,8 @@ git diff --check feat/phase-3-round-10..HEAD          # ✅
 Do not merge R11 yet.
 
 Recommended fix order:
-1. Fix streaming UI semantics: choose delta or cumulative and make daemon/dashboard agree.
-2. Move production overlay startup/restart onto the hardened overlay path, or port all R11 hardening into the actual `app.rs::spawn_overlay()` path.
-3. Enforce token + field limits + state machine in the daemon receiver, with production-path integration tests.
-4. Add Windows overlay token emission and a fixture/integration test for the Windows event envelope.
-5. Re-hand as an R11 fix wave with focused tests proving the production path, not only helper modules.
+1. Add `emit_token_field()` to Windows `emit_ask_event()` before closing the JSON object, and add a test/fixture for ask events specifically.
+2. Change state gating so `AttachRequested` and `InstructionsRequested` are allowed from `Idle`; keep `AttachFilesRequested` and `InstructionsUpdated` gated to their modal states.
+3. Either remove the unused daemon-level `overlay_ui_state` for now or wire a single shared state handle that the production reader actually observes.
+4. Add production-path tests for `attach_requested` and `instructions_requested` accepted from idle, plus `ask_requested` accepted with a Windows-style token envelope.
+5. Re-hand as R11 recheck #2.

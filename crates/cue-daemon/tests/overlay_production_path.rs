@@ -35,7 +35,7 @@ fn idle_state() -> Arc<Mutex<OverlayUiState>> {
 fn token_match_pong_accepted_in_idle() {
     let state = idle_state();
     let line = format!(r#"{{"type":"pong","token":"{TOK}"}}"#);
-    let result = validate_line(&line, TOK, &state);
+    let result = validate_line(&line, TOK, state.as_ref());
     assert!(result.is_ok(), "pong with valid token should be accepted");
 }
 
@@ -43,7 +43,7 @@ fn token_match_pong_accepted_in_idle() {
 fn token_mismatch_event_rejected() {
     let state = idle_state();
     let line = r#"{"type":"pong","token":"WRONG"}"#;
-    let result = validate_line(&line, TOK, &state);
+    let result = validate_line(line, TOK, state.as_ref());
     assert!(matches!(result, Err(OverlayLineReject::TokenMismatch)));
 }
 
@@ -51,7 +51,7 @@ fn token_mismatch_event_rejected() {
 fn tokenless_event_rejected_when_token_required() {
     let state = idle_state();
     let line = r#"{"type":"pong"}"#;
-    let result = validate_line(line, TOK, &state);
+    let result = validate_line(line, TOK, state.as_ref());
     assert!(matches!(result, Err(OverlayLineReject::TokenMismatch)));
 }
 
@@ -60,7 +60,7 @@ fn legacy_mode_no_token_required() {
     // When daemon's expected token is empty, events are accepted without one.
     let state = idle_state();
     let line = r#"{"type":"pong"}"#;
-    let result = validate_line(line, "", &state);
+    let result = validate_line(line, "", state.as_ref());
     assert!(result.is_ok());
 }
 
@@ -69,7 +69,7 @@ fn oversized_question_field_rejected() {
     let state = idle_state();
     let huge = "x".repeat(10 * 1024); // 10 KB > 4 KB cap
     let line = format!(r#"{{"type":"ask_requested","question":"{huge}","token":"{TOK}"}}"#);
-    let result = validate_line(&line, TOK, &state);
+    let result = validate_line(&line, TOK, state.as_ref());
     assert!(
         matches!(
             result,
@@ -92,7 +92,7 @@ fn oversized_instructions_field_rejected() {
     // is 64KB. 20KB passes that. Use the explicit instructions field.
     let line2 =
         format!(r#"{{"type":"instructions_updated","instructions":"{huge}","token":"{TOK}"}}"#);
-    let result = validate_line(&line2, TOK, &state);
+    let result = validate_line(&line2, TOK, state.as_ref());
     assert!(
         matches!(
             result,
@@ -114,7 +114,7 @@ fn oversized_path_in_paths_array_rejected() {
     let long_path = "p".repeat(2 * 1024); // 2 KB > 1 KB per-entry
     let line =
         format!(r#"{{"type":"attach_files_requested","paths":["{long_path}"],"token":"{TOK}"}}"#);
-    let result = validate_line(&line, TOK, &state);
+    let result = validate_line(&line, TOK, state.as_ref());
     assert!(
         matches!(
             result,
@@ -135,7 +135,7 @@ fn too_many_paths_rejected() {
         r#"{{"type":"attach_files_requested","paths":[{}],"token":"{TOK}"}}"#,
         paths.join(",")
     );
-    let result = validate_line(&line, TOK, &state);
+    let result = validate_line(&line, TOK, state.as_ref());
     assert!(
         matches!(
             result,
@@ -151,7 +151,7 @@ fn line_too_long_rejected_before_parsing() {
     // 200 KB line — over 128 KB cap.
     let huge = "x".repeat(200 * 1024);
     let line = format!(r#"{{"type":"ask_requested","question":"{huge}","token":"{TOK}"}}"#);
-    let result = validate_line(&line, TOK, &state);
+    let result = validate_line(&line, TOK, state.as_ref());
     assert!(
         matches!(
             result,
@@ -169,7 +169,7 @@ fn attach_files_requested_dropped_when_idle() {
     let state = idle_state(); // Idle
     let line =
         format!(r#"{{"type":"attach_files_requested","paths":["/tmp/foo"],"token":"{TOK}"}}"#);
-    let result = validate_line(&line, TOK, &state);
+    let result = validate_line(&line, TOK, state.as_ref());
     assert!(
         matches!(result, Err(OverlayLineReject::StateNotAllowed { .. })),
         "AttachFilesRequested must be dropped in Idle state, got {result:?}"
@@ -181,7 +181,7 @@ fn attach_files_requested_accepted_when_attach_open() {
     let state = Arc::new(Mutex::new(OverlayUiState::AttachOpen));
     let line =
         format!(r#"{{"type":"attach_files_requested","paths":["/tmp/foo"],"token":"{TOK}"}}"#);
-    let result = validate_line(&line, TOK, &state);
+    let result = validate_line(&line, TOK, state.as_ref());
     assert!(
         result.is_ok(),
         "AttachFilesRequested must be accepted in AttachOpen, got {result:?}"
@@ -193,7 +193,7 @@ fn instructions_updated_dropped_when_idle() {
     let state = idle_state();
     // legacy InstructionsUpdated uses `text` field
     let line = format!(r#"{{"type":"instructions_updated","text":"hi","token":"{TOK}"}}"#);
-    let result = validate_line(&line, TOK, &state);
+    let result = validate_line(&line, TOK, state.as_ref());
     assert!(
         matches!(result, Err(OverlayLineReject::StateNotAllowed { .. })),
         "InstructionsUpdated must be dropped in Idle state, got {result:?}"
@@ -204,7 +204,7 @@ fn instructions_updated_dropped_when_idle() {
 fn malformed_json_returns_not_json() {
     let state = idle_state();
     let line = r#"this is not json"#;
-    let result = validate_line(line, TOK, &state);
+    let result = validate_line(line, TOK, state.as_ref());
     assert!(matches!(result, Err(OverlayLineReject::NotJson)));
 }
 
@@ -218,7 +218,7 @@ fn transcript_text_with_inner_type_field_does_not_dispatch_inner() {
     let state = Arc::new(Mutex::new(OverlayUiState::AttachOpen));
     let inner = r#"\"type\":\"attach_files_requested\""#;
     let line = format!(r#"{{"type":"shown","token":"{TOK}","note":"contains {inner}"}}"#);
-    let result = validate_line(&line, TOK, &state);
+    let result = validate_line(&line, TOK, state.as_ref());
     // shown is allowed in any state; result should be Ok with Shown variant
     // and NOT AttachFilesRequested.
     match result {
@@ -231,4 +231,85 @@ fn transcript_text_with_inner_type_field_does_not_dispatch_inner() {
         }
         Err(e) => panic!("expected Ok(Shown), got {e:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// R11 recheck #2: state-machine relaxation + Windows ask_requested fixture
+// ---------------------------------------------------------------------------
+
+#[test]
+fn windows_style_ask_requested_with_token_accepted() {
+    // Production fixture: this is the EXACT shape the Windows native overlay
+    // (native/windows/cue-overlay/main.c emit_ask_event) emits when the user
+    // submits a question. Field order matches the C printf:
+    //   {"type":"ask_requested","question":"...","provider":"auto",
+    //    "model":"","mode":"General","token":"..."}
+    let state = idle_state();
+    let line = format!(
+        r#"{{"type":"ask_requested","question":"What is 2+2?","provider":"auto","model":"","mode":"General","token":"{TOK}"}}"#
+    );
+    let result = validate_line(&line, TOK, state.as_ref());
+    assert!(
+        result.is_ok(),
+        "Windows-style ask_requested must be accepted, got {result:?}"
+    );
+    if let Ok(event) = result {
+        let dbg = format!("{event:?}");
+        assert!(dbg.contains("AskRequested"), "wrong variant: {dbg}");
+        assert!(dbg.contains("What is 2+2?"), "question lost: {dbg}");
+    }
+}
+
+#[test]
+fn windows_style_ask_requested_without_token_rejected() {
+    // Same Windows fixture but token omitted -> daemon must reject.
+    let state = idle_state();
+    let line =
+        r#"{"type":"ask_requested","question":"hi","provider":"auto","model":"","mode":"General"}"#;
+    let result = validate_line(line, TOK, state.as_ref());
+    assert!(matches!(result, Err(OverlayLineReject::TokenMismatch)));
+}
+
+#[test]
+fn attach_requested_accepted_from_idle() {
+    // AttachRequested is the user clicking "open the attach panel" from the
+    // pill -- it is the entry-point that drives Idle -> AttachOpen. It MUST
+    // be accepted from Idle, otherwise the panel can never open.
+    let state = idle_state();
+    let line = format!(r#"{{"type":"attach_requested","token":"{TOK}"}}"#);
+    let result = validate_line(&line, TOK, state.as_ref());
+    assert!(
+        result.is_ok(),
+        "AttachRequested must be accepted from Idle (entry-point event), got {result:?}"
+    );
+}
+
+#[test]
+fn instructions_requested_accepted_from_idle() {
+    // InstructionsRequested is the user clicking "open instructions" from the
+    // pill -- entry-point event that drives Idle -> InstructionsOpen.
+    let state = idle_state();
+    let line = format!(r#"{{"type":"instructions_requested","token":"{TOK}"}}"#);
+    let result = validate_line(&line, TOK, state.as_ref());
+    assert!(
+        result.is_ok(),
+        "InstructionsRequested must be accepted from Idle (entry-point event), got {result:?}"
+    );
+}
+
+#[test]
+fn attach_requested_accepted_from_attach_open() {
+    // Harmless when already AttachOpen (user re-clicks); still accepted.
+    let state = Arc::new(Mutex::new(OverlayUiState::AttachOpen));
+    let line = format!(r#"{{"type":"attach_requested","token":"{TOK}"}}"#);
+    let result = validate_line(&line, TOK, state.as_ref());
+    assert!(result.is_ok());
+}
+
+#[test]
+fn instructions_requested_accepted_from_instructions_open() {
+    let state = Arc::new(Mutex::new(OverlayUiState::InstructionsOpen));
+    let line = format!(r#"{{"type":"instructions_requested","token":"{TOK}"}}"#);
+    let result = validate_line(&line, TOK, state.as_ref());
+    assert!(result.is_ok());
 }

@@ -216,7 +216,11 @@ static void emit_ask_event(const wchar_t *question) {
 
     fputs("{\"type\":\"ask_requested\",\"question\":\"", stdout);
     json_print_escaped(utf8);
-    fputs("\",\"provider\":\"auto\",\"model\":\"\",\"mode\":\"General\"}\n", stdout);
+    // Close `question`, emit fixed fields, append `,"token":"..."` if set,
+    // then close the JSON object.
+    fputs("\",\"provider\":\"auto\",\"model\":\"\",\"mode\":\"General\"", stdout);
+    emit_token_field();
+    fputs("}\n", stdout);
     fflush(stdout);
 }
 

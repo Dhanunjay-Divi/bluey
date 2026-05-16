@@ -102,10 +102,34 @@ git diff --check feat/phase-3-round-10..HEAD          # ✅
 
 The individual tests are green, and several R10 fixes are good, but R11 does not yet close the overlay injection class in the running daemon. The hardened overlay implementation must be wired into production, and the streaming UI contract must be corrected before this can merge.
 
+## Recheck 1 — Commit `2524154`
+
+**Date:** 2026-05-16
+
+**Verdict:** 🔴 **REQUEST CHANGES**
+
+The fix wave addressed the largest integration gap: `app.rs::spawn_overlay()` now uses the gated resolver, verifies the overlay binary path, passes `BLUEY_OVERLAY_SESSION_TOKEN`, and validates overlay lines before forwarding. Streaming callbacks also now emit deltas instead of cumulative text.
+
+Remaining blockers:
+
+- 🔴 Windows `ask_requested` events are still tokenless. `native/windows/cue-overlay/main.c:205-209` correctly appends the token for simple events, but `emit_ask_event` in `native/windows/cue-overlay/main.c:217-220` writes the full JSON object and closes it without calling `emit_token_field()`. This means the Send button / Enter path on Windows will be rejected by the hardened daemon as `TokenMismatch`, so blocker 4 is only partially fixed.
+- 🔴 The production state machine now rejects the request events that are supposed to open the relevant workflows. `validate_and_decode_overlay_line` gates `OverlayEvent::AttachRequested` and `OverlayEvent::InstructionsRequested` behind `AttachOpen` / `InstructionsOpen` in `crates/cue-daemon/src/app.rs:5051-5057`, but those events are the initial user requests handled by `handle_attach_requested` and `handle_instructions_requested` in `crates/cue-daemon/src/app.rs:1140-1147`. The Windows overlay emits them directly from normal idle button clicks in `native/windows/cue-overlay/main.c:1209` and `native/windows/cue-overlay/main.c:1223`, so Attach and Style are dropped in the default state. Keep `AttachFilesRequested` and `InstructionsUpdated` gated, but allow `AttachRequested` / `InstructionsRequested` in idle.
+- 🟡 The daemon owns `overlay_ui_state`, but the initial spawn passes a separate `Arc<Mutex<Idle>>` into the reader in `crates/cue-daemon/src/app.rs:496-503`, and `overlay_ui_state` is not updated anywhere outside initialization/restart. If future UI-modal states are needed, wire a single shared state handle and add tests for state transitions.
+- 🟡 The dashboard still ignores the text on a `finished: true` streaming chunk in `crates/cue-dashboard/ui/src/routes/Responses.tsx:58-65`. The current OpenAI/Anthropic parsers send an empty terminal chunk, so this is not blocking the current providers, but Ollama or mocks can produce a final chunk containing text. Safer behavior is to append non-empty `partial_text` before deleting the in-flight card.
+
+Additional verification run for recheck:
+
+```bash
+cargo fmt --all --check                              # ✅
+cargo test -p cue-daemon --test overlay_production_path --test cue_streaming_integration
+                                                       # ✅ 19 passed
+git diff --check 030a63c..HEAD                        # ✅
+```
+
 ## Follow-ups for Next Batch
 
-- Replace or refactor `app.rs::spawn_overlay()` so production uses the hardened overlay resolver, binary verification, session token, validated command reader, and restart behavior.
-- Add production-path tests that fail if `BLUEY_OVERLAY_BIN` is accepted without `BLUEY_DEV_OVERLAY=1`, if tokenless events are accepted, or if state/length-invalid commands reach the daemon.
-- Add Windows overlay token emission and a Windows-format fixture test that proves the emitted JSON matches the daemon envelope.
-- Fix the streaming text contract and add a reducer/component test that catches cumulative-vs-delta duplication.
-- Decide whether `AskRequested` is intentionally valid in modal states; then align docs, tests, and enforcement.
+- Add token emission to Windows `emit_ask_event()` and a Windows-style ask-event fixture/test.
+- Allow `AttachRequested` and `InstructionsRequested` from idle; keep only the follow-up payload events (`AttachFilesRequested`, `InstructionsUpdated`) modal-gated.
+- Wire a single shared overlay UI state if modal states are still needed, or remove the unused daemon-level field until there is a real transition source.
+- Add production-path tests for idle attach/style request acceptance and Windows ask-token acceptance.
+- Harden `Responses.tsx` to append non-empty text before deleting an in-flight card on `finished: true`.

@@ -413,7 +413,10 @@ struct Daemon {
     overlay_session_token: String,
     /// State-machine of the overlay UI (Idle / AttachOpen / InstructionsOpen).
     /// Events are validated against this state before being forwarded; e.g.
-    /// AttachFilesRequested only accepted while AttachOpen.
+    /// AttachFilesRequested only accepted while AttachOpen,
+    /// InstructionsUpdated only accepted while InstructionsOpen.
+    /// AttachRequested and InstructionsRequested are entry-point events
+    /// allowed from any state (they drive the transition INTO the open states).
     overlay_ui_state: parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>,
 }
 
@@ -5049,12 +5052,17 @@ pub fn validate_and_decode_overlay_line(
     let current_state = *ui_state.lock();
     use cue_core::overlay_ipc::OverlayUiState as S;
     let allowed = match &event {
-        OverlayEvent::AttachRequested | OverlayEvent::AttachFilesRequested { .. } => {
-            current_state == S::AttachOpen
-        }
-        OverlayEvent::InstructionsRequested | OverlayEvent::InstructionsUpdated { .. } => {
-            current_state == S::InstructionsOpen
-        }
+        // AttachRequested / InstructionsRequested are user-initiated *entry*
+        // events: clicking "open attach" or "open instructions" from any state.
+        // They drive the transition Idle -> AttachOpen / InstructionsOpen.
+        // They MUST be accepted from Idle (otherwise the panels can never open).
+        OverlayEvent::AttachRequested | OverlayEvent::InstructionsRequested => true,
+        // AttachFilesRequested is the inner submit from the attach picker;
+        // it makes sense only while the attach panel is open.
+        OverlayEvent::AttachFilesRequested { .. } => current_state == S::AttachOpen,
+        // InstructionsUpdated is the inner submit from the instructions form;
+        // only valid while the instructions panel is open.
+        OverlayEvent::InstructionsUpdated { .. } => current_state == S::InstructionsOpen,
         // All other events allowed in any state.
         _ => true,
     };

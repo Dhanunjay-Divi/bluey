@@ -212,6 +212,11 @@ pub fn is_debugger_attached() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Serializes tests that mutate process-global env vars (CFBundleName etc.)
+    /// across the cue-stealth crate test binary. Without this, parallel cargo
+    /// test threads race on these vars and the env-checking test sometimes
+    /// observes a value set by a different test.
+    pub(super) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn mode_from_str_round_trip() {
@@ -295,6 +300,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn apply_disguise_terminal_macos() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let req = build_request(DisguiseMode::Terminal, None);
         let result = apply_disguise(&req);
         assert!(result.is_ok());
@@ -306,12 +312,14 @@ mod tests {
 #[cfg(test)]
 mod reassertion_tests {
     use super::*;
-
     /// Simulates rapid mode switches and verifies the final mode wins.
     /// This validates the pattern used by the re-assertion timers: reading
     /// the current mode at fire time rather than using a stale captured value.
     #[test]
     fn rapid_mode_switch_final_mode_wins() {
+        let _guard = super::tests::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Simulate: user switches terminal -> settings -> activity rapidly
         let modes = [
             DisguiseMode::Terminal,
