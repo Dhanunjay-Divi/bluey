@@ -85,6 +85,7 @@ static IDWriteTextFormat *g_fmt_partial = NULL;
 static wchar_t g_transcript_partial[1024] = L"";
 static wchar_t g_transcript_final[1024] = L"";
 static wchar_t g_session_banner[256] = L"";
+static char g_session_token[256] = "";
 static ULONGLONG g_session_banner_tick = 0;
 
 #ifdef __cplusplus
@@ -152,7 +153,16 @@ static void apply_capture_exclusion(HWND hwnd) {
     }
 }
 
+static void json_print_escaped(const char *text);  /* forward decl */
+
 static void emit_ready(void) {
+    if (g_session_token[0]) {
+        printf("{\"type\":\"ready\",\"token\":\"");
+        json_print_escaped(g_session_token);
+        printf("\",\"platform\":\"windows\",\"capture_excluded\":true}\n");
+        fflush(stdout);
+        return;
+    }
     printf("{\"type\":\"ready\",\"platform\":\"windows\",\"capture_excluded\":true}\n");
     fflush(stdout);
 }
@@ -176,7 +186,13 @@ static void json_print_escaped(const char *text) {
 }
 
 static void emit_simple_event(const char *type) {
-    printf("{\"type\":\"%s\"}\n", type);
+    if (g_session_token[0]) {
+        printf("{\"type\":\"%s\",\"token\":\"", type);
+        json_print_escaped(g_session_token);
+        printf("\"}\n");
+    } else {
+        printf("{\"type\":\"%s\"}\n", type);
+    }
     fflush(stdout);
 }
 
@@ -694,8 +710,7 @@ static DWORD WINAPI stdin_thread(LPVOID unused) {
             g_transcript_final[0] = L'\0';
             InvalidateRect(g_hwnd, NULL, TRUE);
         } else if (strstr(line, "\"type\":\"ping\"")) {
-            printf("{\"type\":\"pong\"}\n");
-            fflush(stdout);
+            emit_simple_event("pong");
         }
     }
     return 0;
@@ -1401,6 +1416,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     (void)prev;
     (void)cmd;
     (void)show;
+
+    /* Read session token from environment */
+    {
+        const char *env_token = getenv("BLUEY_OVERLAY_SESSION_TOKEN");
+        if (env_token && strlen(env_token) < sizeof(g_session_token)) {
+            strncpy(g_session_token, env_token, sizeof(g_session_token) - 1);
+            g_session_token[sizeof(g_session_token) - 1] = ' ';
+        }
+    }
 
     const wchar_t *class_name = L"BlueyOverlayWindow";
     WNDCLASSW wc = {0};

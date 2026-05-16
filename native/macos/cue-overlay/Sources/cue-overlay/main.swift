@@ -15,6 +15,7 @@ private enum OverlayMessage {
 
 /// Outbound commands to daemon.
 private struct IpcCommand: Encodable {
+    var token: String?
     let type: String
     var payload: String?
 }
@@ -52,8 +53,12 @@ private func parseMessage(_ line: String) -> OverlayMessage {
     }
 }
 
+private let sessionToken: String? = ProcessInfo.processInfo.environment["BLUEY_OVERLAY_SESSION_TOKEN"]
+
 private func sendCommand(_ cmd: IpcCommand) {
-    guard let data = try? JSONEncoder().encode(cmd),
+    var cmdWithToken = cmd
+    cmdWithToken.token = sessionToken
+    guard let data = try? JSONEncoder().encode(cmdWithToken),
           var json = String(data: data, encoding: .utf8) else { return }
     json += "\n"
     FileHandle.standardOutput.write(json.data(using: .utf8)!)
