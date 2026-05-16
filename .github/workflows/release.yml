@@ -1,3 +1,16 @@
+# Release workflow for Bluey.
+#
+# Artifact naming convention (keep in sync with):
+#   - Makefile (package-* targets)
+#   - infra/homebrew/bluey.rb
+#   - infra/scoop/bluey.json
+#   - INSTALL.md
+#
+# Canonical pattern: bluey-{version}-{os}-{arch}.{ext}
+#   os:   darwin | windows | linux
+#   arch: arm64 | x86_64
+#   ext:  tar.gz (unix) | zip (windows)
+
 name: Release
 
 on:
@@ -15,19 +28,24 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: bluey-darwin-arm64
+            platform: darwin-arm64
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact: bluey-darwin-x86_64
+            platform: darwin-x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: bluey-windows-x86_64
+            platform: windows-x86_64
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            artifact: bluey-linux-x86_64
+            platform: linux-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-latest'
@@ -70,6 +88,7 @@ jobs:
         run: cargo install tauri-cli --locked || true
 
       - name: Build dashboard
+        working-directory: crates/cue-dashboard
         run: cargo tauri build --target ${{ matrix.target }}
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -82,46 +101,67 @@ jobs:
             [ -f "$helper" ] && bash "$helper" || true
           done
 
+      - name: Build Windows native helpers
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Push-Location native/windows/cue-overlay; ./build.ps1; Pop-Location
+          Push-Location native/windows/cue-audio; ./build.ps1; Pop-Location
+          Push-Location native/windows/cue-whisper; ./build.ps1; Pop-Location
+
       - name: Package (Unix)
         if: matrix.os != 'windows-latest'
+        shell: bash
         run: |
+          VERSION="${{ steps.version.outputs.version }}"
           mkdir -p staging
-          cp target/${{ matrix.target }}/release/cue-daemon staging/bluey-daemon || true
-          cp target/${{ matrix.target }}/release/cue-cli staging/bluey || true
-          # Copy Tauri bundle app if exists
+          cp target/${{ matrix.target }}/release/bluey-daemon staging/ || \
+            cp target/${{ matrix.target }}/release/cue-daemon staging/bluey-daemon || true
+          cp target/${{ matrix.target }}/release/bluey staging/ || \
+            cp target/${{ matrix.target }}/release/cue-cli staging/bluey || true
           find target/${{ matrix.target }}/release/bundle -name "*.app" -exec cp -R {} staging/ \; 2>/dev/null || true
           find target/${{ matrix.target }}/release/bundle -name "*.AppImage" -exec cp {} staging/ \; 2>/dev/null || true
-          # Copy native helpers
           find native -name "*.dylib" -o -name "cue-*" -type f -perm +111 | while read f; do cp "$f" staging/ 2>/dev/null || true; done
-          tar -czf ${{ matrix.artifact }}.tar.gz -C staging .
+          tar -czf "bluey-${VERSION}-${{ matrix.platform }}.tar.gz" -C staging .
 
       - name: Package (Windows)
         if: matrix.os == 'windows-latest'
         shell: pwsh
         run: |
+          $VERSION = "${{ steps.version.outputs.version }}"
           New-Item -ItemType Directory -Force staging
-          Copy-Item target/${{ matrix.target }}/release/cue-daemon.exe staging/bluey-daemon.exe -ErrorAction SilentlyContinue
-          Copy-Item target/${{ matrix.target }}/release/cue-cli.exe staging/bluey.exe -ErrorAction SilentlyContinue
+          Copy-Item target/${{ matrix.target }}/release/bluey-daemon.exe staging/ -ErrorAction SilentlyContinue
+          if (-not (Test-Path staging/bluey-daemon.exe)) {
+            Copy-Item target/${{ matrix.target }}/release/cue-daemon.exe staging/bluey-daemon.exe -ErrorAction SilentlyContinue
+          }
+          Copy-Item target/${{ matrix.target }}/release/bluey.exe staging/ -ErrorAction SilentlyContinue
+          if (-not (Test-Path staging/bluey.exe)) {
+            Copy-Item target/${{ matrix.target }}/release/cue-cli.exe staging/bluey.exe -ErrorAction SilentlyContinue
+          }
+          Copy-Item native/windows/cue-overlay/cue-overlay.exe staging/ -ErrorAction SilentlyContinue
+          Copy-Item native/windows/cue-audio/cue-audio.exe staging/ -ErrorAction SilentlyContinue
+          Copy-Item native/windows/cue-whisper/cue-whisper.exe staging/ -ErrorAction SilentlyContinue
           Get-ChildItem -Recurse target/${{ matrix.target }}/release/bundle -Filter "*.msi" | Copy-Item -Destination staging/ -ErrorAction SilentlyContinue
-          Get-ChildItem -Recurse target/${{ matrix.target }}/release/bundle -Filter "*.exe" | Copy-Item -Destination staging/ -ErrorAction SilentlyContinue
-          Compress-Archive -Path staging/* -DestinationPath ${{ matrix.artifact }}.zip
+          Compress-Archive -Path staging/* -DestinationPath "bluey-${VERSION}-${{ matrix.platform }}.zip"
 
       - name: Compute SHA256
         id: sha
         shell: bash
         run: |
-          if [ -f "${{ matrix.artifact }}.tar.gz" ]; then
-            echo "sha256=$(shasum -a 256 ${{ matrix.artifact }}.tar.gz | cut -d  -f1)" >> "$GITHUB_OUTPUT"
-            echo "file=${{ matrix.artifact }}.tar.gz" >> "$GITHUB_OUTPUT"
+          VERSION="${{ steps.version.outputs.version }}"
+          FILE="bluey-${VERSION}-${{ matrix.platform }}"
+          if [ -f "${FILE}.tar.gz" ]; then
+            echo "sha256=$(shasum -a 256 ${FILE}.tar.gz | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+            echo "file=${FILE}.tar.gz" >> "$GITHUB_OUTPUT"
           else
-            echo "sha256=$(shasum -a 256 ${{ matrix.artifact }}.zip | cut -d  -f1)" >> "$GITHUB_OUTPUT"
-            echo "file=${{ matrix.artifact }}.zip" >> "$GITHUB_OUTPUT"
+            echo "sha256=$(shasum -a 256 ${FILE}.zip | cut -d ' ' -f1)" >> "$GITHUB_OUTPUT"
+            echo "file=${FILE}.zip" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
+          name: bluey-${{ steps.version.outputs.version }}-${{ matrix.platform }}
           path: ${{ steps.sha.outputs.file }}
 
     outputs:
@@ -155,19 +195,19 @@ jobs:
             "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
             "platforms": {
               "darwin-aarch64": {
-                "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/bluey-darwin-arm64.tar.gz",
+                "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/bluey-${VERSION}-darwin-arm64.tar.gz",
                 "signature": ""
               },
               "darwin-x86_64": {
-                "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/bluey-darwin-x86_64.tar.gz",
+                "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/bluey-${VERSION}-darwin-x86_64.tar.gz",
                 "signature": ""
               },
               "windows-x86_64": {
-                "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/bluey-windows-x86_64.zip",
+                "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/bluey-${VERSION}-windows-x86_64.zip",
                 "signature": ""
               },
               "linux-x86_64": {
-                "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/bluey-linux-x86_64.tar.gz",
+                "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/bluey-${VERSION}-linux-x86_64.tar.gz",
                 "signature": ""
               }
             }

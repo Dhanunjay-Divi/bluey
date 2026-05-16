@@ -25,15 +25,20 @@ scoop install bluey
 
 ### macOS / Linux
 
+Download the release archive matching your platform:
+- `bluey-{version}-darwin-arm64.tar.gz` (Apple Silicon)
+- `bluey-{version}-darwin-x86_64.tar.gz` (Intel Mac)
+- `bluey-{version}-linux-x86_64.tar.gz` (Linux x86_64)
+
 ```bash
-# Download the latest release for your platform
-curl -LO https://github.com/<org>/bluey/releases/latest/download/bluey-darwin-arm64.tar.gz
-tar -xzf bluey-darwin-arm64.tar.gz -C /usr/local/bin
+# Example for Apple Silicon:
+curl -LO https://github.com/<org>/bluey/releases/latest/download/bluey-0.1.0-darwin-arm64.tar.gz
+tar -xzf bluey-0.1.0-darwin-arm64.tar.gz -C /usr/local/bin
 ```
 
 ### Windows
 
-Download `bluey-windows-x86_64.zip` from the
+Download `bluey-{version}-windows-x86_64.zip` from the
 [latest release](https://github.com/<org>/bluey/releases/latest),
 extract, and add the folder to your PATH.
 

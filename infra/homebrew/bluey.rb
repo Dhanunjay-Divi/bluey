@@ -4,6 +4,9 @@ class Bluey < Formula
   version "0.1.0"
   license "UNLICENSED"
 
+  # Artifact naming: bluey-{version}-{os}-{arch}.tar.gz
+  # Keep in sync with: .github/workflows/release.yml, Makefile,
+  #                     infra/scoop/bluey.json, INSTALL.md
   on_macos do
     on_arm do
       url "https://github.com/<org>/bluey/releases/download/v#{version}/bluey-#{version}-darwin-arm64.tar.gz"
@@ -16,8 +19,8 @@ class Bluey < Formula
   end
 
   def install
-    bin.install "cue-daemon" => "bluey-daemon"
-    bin.install "cue-cli" => "bluey"
+    bin.install "bluey-daemon"
+    bin.install "bluey"
     # Install dashboard app bundle if present
     if File.directory?("Bluey.app")
       prefix.install "Bluey.app"

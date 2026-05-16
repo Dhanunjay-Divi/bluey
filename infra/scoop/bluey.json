@@ -3,7 +3,7 @@
   "description": "Lightweight native AI work copilot",
   "homepage": "https://github.com/<org>/bluey",
   "license": "UNLICENSED",
-  "url": "https://github.com/<org>/bluey/releases/download/v0.1.0/bluey-windows-x86_64.zip",
+  "url": "https://github.com/<org>/bluey/releases/download/v0.1.0/bluey-0.1.0-windows-x86_64.zip",
   "hash": "REPLACE_AT_RELEASE",
   "bin": [
     ["bluey.exe", "bluey"],
@@ -20,6 +20,6 @@
     "github": "https://github.com/<org>/bluey"
   },
   "autoupdate": {
-    "url": "https://github.com/<org>/bluey/releases/download/v$version/bluey-windows-x86_64.zip"
+    "url": "https://github.com/<org>/bluey/releases/download/v$version/bluey-$version-windows-x86_64.zip"
   }
 }
