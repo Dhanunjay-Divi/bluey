@@ -2,6 +2,7 @@ pub mod app;
 pub mod audio;
 pub mod db;
 pub mod export;
+pub mod llm;
 pub mod overlay;
 pub mod secrets;
 pub mod storage;
