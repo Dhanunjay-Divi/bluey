@@ -1,3 +1,4 @@
+#![allow(clippy::single_match)]
 //! Stub overlay process used in integration tests ONLY.
 //!
 //! Reads NDJSON [`OverlayMessage`]s from stdin (one per line). For each

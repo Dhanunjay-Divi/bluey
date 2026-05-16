@@ -24,10 +24,20 @@ pub enum OverlayMessage {
         session_id: Option<String>,
         title: Option<String>,
     },
-    ListeningStateChanged { state: ListeningState },
-    TranscriptPartial { source: String, text: String },
-    TranscriptFinal { source: String, text: String },
-    SetPassthrough { enabled: bool },
+    ListeningStateChanged {
+        state: ListeningState,
+    },
+    TranscriptPartial {
+        source: String,
+        text: String,
+    },
+    TranscriptFinal {
+        source: String,
+        text: String,
+    },
+    SetPassthrough {
+        enabled: bool,
+    },
     Ping,
 }
 
@@ -52,6 +62,19 @@ pub enum OverlayIpcCommand {
     AskRequested { question: String },
     AttachFilesRequested { paths: Vec<String> },
     InstructionsUpdated { instructions: String },
+}
+
+/// Wrapper for overlay events that includes the session token for validation.
+/// Every message from the overlay to the daemon is wrapped in this envelope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OverlayEvent {
+    /// Session token provided by the daemon at spawn time.
+    /// Must match the daemon's current session token or the event is dropped.
+    #[serde(default)]
+    pub token: String,
+    /// The actual IPC command from the overlay.
+    #[serde(flatten)]
+    pub command: OverlayIpcCommand,
 }
 
 /// Overlay UI state for event validation (Item 4).
@@ -182,6 +205,7 @@ pub fn decode_command_ndjson(line: &str) -> Result<OverlayIpcCommand, String> {
     Ok(cmd)
 }
 
+#[allow(clippy::collapsible_if, clippy::collapsible_match)]
 fn validate_message_lengths(msg: &OverlayMessage) -> Result<(), String> {
     match msg {
         OverlayMessage::TranscriptPartial { text, .. }
@@ -293,14 +317,18 @@ mod tests {
     fn attach_files_only_allowed_when_attach_open() {
         assert!(!OverlayEventKind::AttachFilesRequested.is_allowed_in(OverlayUiState::Idle));
         assert!(OverlayEventKind::AttachFilesRequested.is_allowed_in(OverlayUiState::AttachOpen));
-        assert!(!OverlayEventKind::AttachFilesRequested.is_allowed_in(OverlayUiState::InstructionsOpen));
+        assert!(
+            !OverlayEventKind::AttachFilesRequested.is_allowed_in(OverlayUiState::InstructionsOpen)
+        );
     }
 
     #[test]
     fn instructions_updated_only_allowed_when_instructions_open() {
         assert!(!OverlayEventKind::InstructionsUpdated.is_allowed_in(OverlayUiState::Idle));
         assert!(!OverlayEventKind::InstructionsUpdated.is_allowed_in(OverlayUiState::AttachOpen));
-        assert!(OverlayEventKind::InstructionsUpdated.is_allowed_in(OverlayUiState::InstructionsOpen));
+        assert!(
+            OverlayEventKind::InstructionsUpdated.is_allowed_in(OverlayUiState::InstructionsOpen)
+        );
     }
 
     #[test]

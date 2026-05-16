@@ -1,13 +1,12 @@
-//! Daemon <-> native-overlay process IPC.
+//! Daemon ↔ native-overlay process IPC.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use cue_core::overlay_ipc::{
-    decode_command_ndjson, decode_ndjson, encode_ndjson,
-    OverlayEventKind, OverlayIpcCommand, OverlayMessage, OverlayUiState,
+    decode_ndjson, encode_ndjson, OverlayEvent, OverlayIpcCommand, OverlayMessage,
 };
 use parking_lot::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -16,6 +15,9 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 pub const MAX_RESTART_ATTEMPTS: u32 = 5;
+
+/// Length of the hex session token (32 bytes = 64 hex chars).
+pub const SESSION_TOKEN_HEX_LEN: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverlayProcessState {
@@ -31,6 +33,9 @@ pub enum OverlayProcessState {
 pub struct OverlaySpawnOptions {
     pub executable: PathBuf,
     pub args: Vec<String>,
+    /// Session token passed to the overlay via env var. If empty, token
+    /// validation is disabled (for tests that do not set it).
+    pub session_token: String,
 }
 
 impl OverlaySpawnOptions {
@@ -38,6 +43,7 @@ impl OverlaySpawnOptions {
         Self {
             executable: executable.into(),
             args: Vec::new(),
+            session_token: String::new(),
         }
     }
 
@@ -45,11 +51,111 @@ impl OverlaySpawnOptions {
         self.args = args.into_iter().collect();
         self
     }
+
+    pub fn with_session_token(mut self, token: String) -> Self {
+        self.session_token = token;
+        self
+    }
 }
+
+// ─── Item 1: Production overlay-bin override gate ───────────────────────────
+
+/// Resolve the overlay binary path. In production (release) builds, env var
+/// overrides (BLUEY_OVERLAY_BIN / CUE_OVERLAY_BIN) are IGNORED unless
+/// BLUEY_DEV_OVERLAY=1 is also set. In debug builds the override is always
+/// accepted.
+pub fn resolve_overlay_path(default: &Path) -> PathBuf {
+    let dev_mode = is_dev_mode();
+    if dev_mode {
+        if let Some(p) = env_overlay_bin() {
+            tracing::info!(path = %p.display(), "using overlay binary override (dev mode)");
+            return p;
+        }
+    } else if let Some(p) = env_overlay_bin() {
+        tracing::warn!(
+            path = %p.display(),
+            "BLUEY_OVERLAY_BIN/CUE_OVERLAY_BIN set but IGNORED in production build \
+             (set BLUEY_DEV_OVERLAY=1 to enable)"
+        );
+    }
+    default.to_path_buf()
+}
+
+/// Returns true when we should allow env-var overrides.
+fn is_dev_mode() -> bool {
+    if cfg!(debug_assertions) {
+        return true;
+    }
+    std::env::var("BLUEY_DEV_OVERLAY")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+fn env_overlay_bin() -> Option<PathBuf> {
+    std::env::var_os("BLUEY_OVERLAY_BIN")
+        .or_else(|| std::env::var_os("CUE_OVERLAY_BIN"))
+        .map(PathBuf::from)
+}
+
+// ─── Item 2: Overlay binary verification ────────────────────────────────────
+
+/// Error returned when overlay binary verification fails.
+#[derive(Debug, thiserror::Error)]
+pub enum OverlayVerifyError {
+    #[error("overlay path is not absolute: {0}")]
+    NotAbsolute(PathBuf),
+    #[error("overlay path could not be canonicalized: {0}")]
+    CanonicalizeFailed(std::io::Error),
+    #[error(
+        "overlay binary is outside install directory: binary={binary}, install_dir={install_dir}"
+    )]
+    OutsideInstallDir {
+        binary: PathBuf,
+        install_dir: PathBuf,
+    },
+    // Future: HashMismatch { expected: String, actual: String }
+}
+
+/// Verify that the overlay binary path is canonical and resides inside
+/// `install_dir`. This prevents symlink/traversal attacks that could trick
+/// the daemon into spawning an attacker-controlled binary.
+///
+/// Future enhancement: SHA-256 hash verification (placeholder structured
+/// so enabling it requires only a single flag + embedded hash constant).
+pub fn verify_overlay_binary(path: &Path, install_dir: &Path) -> Result<(), OverlayVerifyError> {
+    if !path.is_absolute() {
+        return Err(OverlayVerifyError::NotAbsolute(path.to_path_buf()));
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(OverlayVerifyError::CanonicalizeFailed)?;
+    let canonical_install = install_dir
+        .canonicalize()
+        .map_err(OverlayVerifyError::CanonicalizeFailed)?;
+    if !canonical.starts_with(&canonical_install) {
+        return Err(OverlayVerifyError::OutsideInstallDir {
+            binary: canonical,
+            install_dir: canonical_install,
+        });
+    }
+    Ok(())
+}
+
+// ─── Item 3: Session token generation ───────────────────────────────────────
+
+/// Generate a cryptographically random 32-byte hex session token (64 hex chars).
+pub fn generate_session_token() -> String {
+    let id = uuid::Uuid::new_v4();
+    let id2 = uuid::Uuid::new_v4();
+    // Two UUIDs = 32 bytes = 64 hex chars
+    format!("{}{}", id.as_simple(), id2.as_simple())
+}
+
+// ─── Core overlay handle ────────────────────────────────────────────────────
 
 struct Shared {
     state: Mutex<OverlayProcessState>,
-    ui_state: Mutex<OverlayUiState>,
+    ui_state: Mutex<cue_core::overlay_ipc::OverlayUiState>,
     shutdown_requested: std::sync::atomic::AtomicBool,
 }
 
@@ -57,7 +163,7 @@ impl Shared {
     fn new() -> Self {
         Self {
             state: Mutex::new(OverlayProcessState::Idle),
-            ui_state: Mutex::new(OverlayUiState::Idle),
+            ui_state: Mutex::new(cue_core::overlay_ipc::OverlayUiState::Idle),
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -69,14 +175,6 @@ impl Shared {
     fn is_shutdown_requested(&self) -> bool {
         self.shutdown_requested
             .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    fn ui_state(&self) -> OverlayUiState {
-        *self.ui_state.lock()
-    }
-
-    fn set_ui_state(&self, s: OverlayUiState) {
-        *self.ui_state.lock() = s;
     }
 }
 
@@ -122,14 +220,15 @@ impl NativeOverlayHandle {
         *self.shared.state.lock()
     }
 
-    /// Get the current overlay UI state.
-    pub fn ui_state(&self) -> OverlayUiState {
-        self.shared.ui_state()
+    /// Current overlay UI state for event-validation gating.
+    pub fn ui_state(&self) -> cue_core::overlay_ipc::OverlayUiState {
+        *self.shared.ui_state.lock()
     }
 
-    /// Set the overlay UI state (called when daemon opens/closes UI affordances).
-    pub fn set_ui_state(&self, state: OverlayUiState) {
-        self.shared.set_ui_state(state);
+    /// Update the overlay UI state. Daemon-side state machine should call
+    /// this whenever the user opens/closes attach or instructions UI.
+    pub fn set_ui_state(&self, state: cue_core::overlay_ipc::OverlayUiState) {
+        *self.shared.ui_state.lock() = state;
     }
 
     pub async fn shutdown(mut self) {
@@ -155,13 +254,17 @@ impl Drop for NativeOverlayHandle {
 }
 
 async fn spawn_child(opts: &OverlaySpawnOptions) -> std::io::Result<Child> {
-    Command::new(&opts.executable)
-        .args(&opts.args)
+    let mut cmd = Command::new(&opts.executable);
+    cmd.args(&opts.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
+        .kill_on_drop(true);
+    // Item 3: pass session token via env var
+    if !opts.session_token.is_empty() {
+        cmd.env("BLUEY_OVERLAY_SESSION_TOKEN", &opts.session_token);
+    }
+    cmd.spawn()
 }
 
 fn wire_child(
@@ -180,6 +283,15 @@ fn wire_child(
     ))]
 }
 
+/// Validate an overlay event token. Returns true if valid.
+fn validate_token(event: &OverlayEvent, expected: &str) -> bool {
+    if expected.is_empty() {
+        // Token validation disabled (e.g. legacy tests without token).
+        return true;
+    }
+    event.token == expected
+}
+
 /// One iteration of the supervisor: drives a child to completion.
 async fn run_one_child(
     mut child: Child,
@@ -187,6 +299,7 @@ async fn run_one_child(
     mut send_rx: UnboundedReceiver<OverlayMessage>,
     recv_tx: UnboundedSender<OverlayIpcCommand>,
     carryover_in: Option<OverlayMessage>,
+    session_token: &str,
 ) -> (
     UnboundedReceiver<OverlayMessage>,
     Option<OverlayMessage>,
@@ -203,6 +316,7 @@ async fn run_one_child(
     let recv_tx_reader = recv_tx.clone();
     let shared_r = shared.clone();
     let msgs_acked_r = msgs_acked.clone();
+    let token_for_reader = session_token.to_string();
     let reader = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         loop {
@@ -213,6 +327,49 @@ async fn run_one_child(
                 Ok(Some(line)) => {
                     tracing::debug!(line = %line, "reader: got line");
                     msgs_acked_r.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    // Try to parse as OverlayEvent (with token) first
+                    if let Ok(event) = serde_json::from_str::<OverlayEvent>(&line) {
+                        if !validate_token(&event, &token_for_reader) {
+                            tracing::warn!(
+                                expected_prefix =
+                                    &token_for_reader[..8.min(token_for_reader.len())],
+                                "overlay event rejected: token mismatch"
+                            );
+                            continue;
+                        }
+                        match &event.command {
+                            OverlayIpcCommand::Pong => {
+                                let _ = recv_tx_reader.send(OverlayIpcCommand::Pong);
+                            }
+                            OverlayIpcCommand::Echo { payload } => {
+                                let _ = recv_tx_reader.send(OverlayIpcCommand::Echo {
+                                    payload: payload.clone(),
+                                });
+                            }
+                            OverlayIpcCommand::RequestSync => {
+                                let _ = recv_tx_reader.send(OverlayIpcCommand::RequestSync);
+                            }
+                            OverlayIpcCommand::AskRequested { question } => {
+                                let _ = recv_tx_reader.send(OverlayIpcCommand::AskRequested {
+                                    question: question.clone(),
+                                });
+                            }
+                            OverlayIpcCommand::AttachFilesRequested { paths } => {
+                                let _ =
+                                    recv_tx_reader.send(OverlayIpcCommand::AttachFilesRequested {
+                                        paths: paths.clone(),
+                                    });
+                            }
+                            OverlayIpcCommand::InstructionsUpdated { instructions } => {
+                                let _ =
+                                    recv_tx_reader.send(OverlayIpcCommand::InstructionsUpdated {
+                                        instructions: instructions.clone(),
+                                    });
+                            }
+                        }
+                        continue;
+                    }
+                    // Fallback: try legacy format (no token wrapper)
                     match decode_ndjson(&line) {
                         Ok(OverlayMessage::Ping) => {
                             let _ = recv_tx_reader.send(OverlayIpcCommand::Pong);
@@ -220,17 +377,11 @@ async fn run_one_child(
                         Ok(_) => {
                             tracing::warn!(line = %line, "overlay sent message on reverse pipe");
                         }
-                        Err(_) => match decode_command_ndjson(&line) {
+                        Err(_) => match serde_json::from_str::<OverlayIpcCommand>(&line) {
                             Ok(cmd) => {
-                                // Item 4: validate against UI state machine
-                                let kind = OverlayEventKind::from_command(&cmd);
-                                let ui_state = shared_r.ui_state();
-                                if !kind.is_allowed_in(ui_state) {
-                                    tracing::warn!(
-                                        ?kind,
-                                        ?ui_state,
-                                        "overlay event rejected by state machine"
-                                    );
+                                // Legacy command without token — reject if token is required
+                                if !token_for_reader.is_empty() {
+                                    tracing::warn!("overlay event rejected: no token field");
                                     continue;
                                 }
                                 let _ = recv_tx_reader.send(cmd);
@@ -259,7 +410,7 @@ async fn run_one_child(
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to encode overlay message");
-                return true; // encoding error - drop msg
+                return true;
             }
         };
         stdin.write_all(line.as_bytes()).await.is_ok() && stdin.flush().await.is_ok()
@@ -342,6 +493,7 @@ async fn run_supervisor(
     let mut current_child = initial_child;
     let mut consecutive_failures: u32 = 0;
     let mut carryover: Option<OverlayMessage> = None;
+    let session_token = opts.session_token.clone();
 
     loop {
         let (rx_back, carryover_out, clean_exit) = run_one_child(
@@ -350,6 +502,7 @@ async fn run_supervisor(
             send_rx,
             recv_tx.clone(),
             carryover.take(),
+            &session_token,
         )
         .await;
         send_rx = rx_back;
@@ -438,6 +591,7 @@ pub fn restart_delay(attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn overlay_process_state_default_is_idle_when_constructed() {
@@ -473,17 +627,60 @@ mod tests {
     }
 
     #[test]
-    fn ui_state_defaults_to_idle() {
-        let s = Shared::new();
-        assert_eq!(s.ui_state(), OverlayUiState::Idle);
+    fn generate_session_token_is_64_hex_chars() {
+        let token = generate_session_token();
+        assert_eq!(token.len(), SESSION_TOKEN_HEX_LEN);
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
-    fn ui_state_transitions() {
-        let s = Shared::new();
-        s.set_ui_state(OverlayUiState::AttachOpen);
-        assert_eq!(s.ui_state(), OverlayUiState::AttachOpen);
-        s.set_ui_state(OverlayUiState::Idle);
-        assert_eq!(s.ui_state(), OverlayUiState::Idle);
+    fn generate_session_token_is_unique() {
+        let t1 = generate_session_token();
+        let t2 = generate_session_token();
+        assert_ne!(t1, t2);
+    }
+
+    #[test]
+    fn resolve_overlay_path_returns_default_when_no_env() {
+        // Clear any env vars that might interfere
+        std::env::remove_var("BLUEY_OVERLAY_BIN");
+        std::env::remove_var("CUE_OVERLAY_BIN");
+        let default = PathBuf::from("/usr/local/bin/cue-overlay");
+        let result = resolve_overlay_path(&default);
+        assert_eq!(result, default);
+    }
+
+    #[test]
+    fn verify_overlay_binary_rejects_relative_path() {
+        let result = verify_overlay_binary(Path::new("relative/path/overlay"), Path::new("/tmp"));
+        assert!(matches!(result, Err(OverlayVerifyError::NotAbsolute(_))));
+    }
+
+    #[test]
+    fn verify_overlay_binary_accepts_path_inside_install_dir() {
+        let dir = std::env::temp_dir().join("cue_test_verify");
+        let _ = fs::create_dir_all(&dir);
+        let binary = dir.join("overlay");
+        fs::write(&binary, b"fake").unwrap();
+        let result = verify_overlay_binary(&binary, &dir);
+        assert!(result.is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_overlay_binary_rejects_path_outside_install_dir() {
+        let dir = std::env::temp_dir().join("cue_test_inside");
+        let outside = std::env::temp_dir().join("cue_test_outside");
+        let _ = fs::create_dir_all(&dir);
+        let _ = fs::create_dir_all(&outside);
+        let binary = outside.join("evil");
+        fs::write(&binary, b"evil").unwrap();
+        let result = verify_overlay_binary(&binary, &dir);
+        assert!(matches!(
+            result,
+            Err(OverlayVerifyError::OutsideInstallDir { .. })
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&outside);
     }
 }

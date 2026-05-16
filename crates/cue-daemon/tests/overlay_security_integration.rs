@@ -96,10 +96,15 @@ async fn overlong_question_field_is_rejected() {
     };
     let result = validate_command_lengths(&cmd);
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("question field exceeds max length"));
+    assert!(result
+        .unwrap_err()
+        .contains("question field exceeds max length"));
 
     // Also test via decode_command_ndjson
-    let json = format!(r#"{{"type":"ask_requested","question":"{}"}}"#, big_question);
+    let json = format!(
+        r#"{{"type":"ask_requested","question":"{}"}}"#,
+        big_question
+    );
     let result = decode_command_ndjson(&json);
     assert!(result.is_err());
 }
@@ -113,7 +118,9 @@ async fn overlong_instructions_is_rejected() {
     };
     let result = validate_command_lengths(&cmd);
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("instructions field exceeds max length"));
+    assert!(result
+        .unwrap_err()
+        .contains("instructions field exceeds max length"));
 }
 
 /// Item 7 test 5: path traversal in attached file is rejected.
@@ -148,9 +155,7 @@ async fn state_machine_drops_attach_when_idle() {
     assert_eq!(handle.ui_state(), OverlayUiState::Idle);
 
     // Send a valid message first to confirm the pipe works
-    handle
-        .send(OverlayMessage::Ping)
-        .unwrap();
+    handle.send(OverlayMessage::Ping).unwrap();
 
     let commands = collect_commands(&mut handle, 1, Duration::from_secs(2)).await;
     assert_eq!(commands.len(), 1);
