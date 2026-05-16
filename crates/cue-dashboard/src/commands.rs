@@ -830,9 +830,18 @@ pub fn reset_keybinds(db: State<DbState>) -> Result<(), String> {
 
 // ===== Phase 3 Round 10: Cmd+Shift+A → request_cue =====
 
+/// Payload emitted per streaming chunk on `cue_response_chunk`.
+#[derive(Clone, Serialize)]
+pub struct CueResponseChunkPayload {
+    pub response_id: String,
+    pub kind: String,
+    pub partial_text: String,
+    pub finished: bool,
+}
+
 /// Trigger a cue response. If a recent question is detected in the transcript
 /// (last ~30s), runs AnswerLlm; otherwise runs WhatToAnswerLlm (suggestion).
-/// Persists the response and emits `cue_response` Tauri event.
+/// Emits `cue_response_chunk` per streaming chunk, then `cue_response` on completion.
 #[tauri::command]
 pub async fn request_cue(
     kind: String,
@@ -870,23 +879,54 @@ pub async fn request_cue(
     let llm =
         build_llm_provider_from_env(&db).ok_or_else(|| "no LLM provider configured".to_string())?;
 
-    // Detect question in recent transcript and dispatch.
+    // Generate response_id up-front so chunks and final event share it.
+    let response_id = Uuid::new_v4().to_string();
+
+    // Detect question in recent transcript and dispatch with streaming.
     let cue_resp = if kind == "answer" && ends_with_question(&recent) {
         let question = recent
             .rsplit('.')
             .find(|s| s.trim().ends_with('?'))
             .unwrap_or(&recent)
             .trim();
+        let app2 = app.clone();
+        let rid = response_id.clone();
         AnswerLlm
-            .run(question, &session_id, llm.as_ref())
+            .run_streaming(question, &session_id, llm.as_ref(), |partial, finished| {
+                let _ = app2.emit(
+                    "cue_response_chunk",
+                    CueResponseChunkPayload {
+                        response_id: rid.clone(),
+                        kind: "answer".to_string(),
+                        partial_text: partial.to_string(),
+                        finished,
+                    },
+                );
+            })
             .await
             .map_err(|e| e.to_string())?
     } else {
+        let app2 = app.clone();
+        let rid = response_id.clone();
         WhatToAnswerLlm
-            .run(&recent, &session_id, llm.as_ref())
+            .run_streaming(&recent, &session_id, llm.as_ref(), |partial, finished| {
+                let _ = app2.emit(
+                    "cue_response_chunk",
+                    CueResponseChunkPayload {
+                        response_id: rid.clone(),
+                        kind: "suggestion".to_string(),
+                        partial_text: partial.to_string(),
+                        finished,
+                    },
+                );
+            })
             .await
             .map_err(|e| e.to_string())?
     };
+
+    // Override the CueResponse id with our pre-generated response_id for consistency.
+    let mut cue_resp = cue_resp;
+    cue_resp.id = response_id;
 
     persist_cue_response(&db, &cue_resp)?;
     let _ = app.emit("cue_response", &cue_resp);
@@ -894,7 +934,7 @@ pub async fn request_cue(
 }
 
 /// Auto-recap: runs RecapLlm on a session's full transcript.
-/// Best-effort: logs and skips if no LLM provider is available.
+/// Emits `cue_response_chunk` per streaming chunk, then `cue_response` on completion.
 #[tauri::command]
 pub async fn auto_recap(
     session_id: String,
@@ -931,10 +971,32 @@ pub async fn auto_recap(
         }
     };
 
+    let response_id = Uuid::new_v4().to_string();
+    let rid = response_id.clone();
+    let app2 = app.clone();
+
     let cue_resp = RecapLlm
-        .run(&transcript, &session_id, llm.as_ref())
+        .run_streaming(
+            &transcript,
+            &session_id,
+            llm.as_ref(),
+            |partial, finished| {
+                let _ = app2.emit(
+                    "cue_response_chunk",
+                    CueResponseChunkPayload {
+                        response_id: rid.clone(),
+                        kind: "recap".to_string(),
+                        partial_text: partial.to_string(),
+                        finished,
+                    },
+                );
+            },
+        )
         .await
         .map_err(|e| e.to_string())?;
+
+    let mut cue_resp = cue_resp;
+    cue_resp.id = response_id;
 
     persist_cue_response(&db, &cue_resp)?;
     let _ = app.emit("cue_response", &cue_resp);

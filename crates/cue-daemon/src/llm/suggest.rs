@@ -8,13 +8,24 @@ const SYSTEM_PROMPT: &str = "Given the recent conversation, suggest a concise ne
 pub struct WhatToAnswerLlm;
 
 impl WhatToAnswerLlm {
-    /// Run the suggestion LLM. Uses streaming when the provider supports it,
-    /// falling back to `complete()` otherwise.
+    /// Run the suggestion LLM with an optional per-chunk callback for streaming.
     pub async fn run(
         &self,
         transcript: &str,
         session_id: &str,
         llm: &dyn LlmProvider,
+    ) -> Result<CueResponse, cue_llm::LlmError> {
+        self.run_streaming(transcript, session_id, llm, |_, _| {})
+            .await
+    }
+
+    /// Run with a callback invoked on each chunk: (accumulated_text, finished).
+    pub async fn run_streaming(
+        &self,
+        transcript: &str,
+        session_id: &str,
+        llm: &dyn LlmProvider,
+        on_chunk: impl Fn(&str, bool),
     ) -> Result<CueResponse, cue_llm::LlmError> {
         let req = LlmRequest {
             system: SYSTEM_PROMPT.to_string(),
@@ -28,13 +39,16 @@ impl WhatToAnswerLlm {
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
                 acc.push_str(&chunk.text);
+                on_chunk(&acc, chunk.finished);
                 if chunk.finished {
                     break;
                 }
             }
             acc
         } else {
-            llm.complete(&req).await?.text
+            let resp = llm.complete(&req).await?.text;
+            on_chunk(&resp, true);
+            resp
         };
         Ok(CueResponse::new(
             "suggestion",
