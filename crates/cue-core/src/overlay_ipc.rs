@@ -80,6 +80,19 @@ pub enum OverlayIpcCommand {
     Echo { payload: String },
 }
 
+/// Wrapper for overlay events that includes the session token for validation.
+/// Every message from the overlay to the daemon is wrapped in this envelope.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OverlayEvent {
+    /// Session token provided by the daemon at spawn time.
+    /// Must match the daemon's current session token or the event is dropped.
+    #[serde(default)]
+    pub token: String,
+    /// The actual IPC command from the overlay.
+    #[serde(flatten)]
+    pub command: OverlayIpcCommand,
+}
+
 /// Serialize an `OverlayMessage` to a single-line NDJSON string (newline
 /// appended). This is the exact format the daemon writes to the overlay's
 /// stdin and lets the receiver read messages line-by-line.
@@ -169,5 +182,26 @@ mod tests {
         assert!(line.contains("set_passthrough"));
         let parsed = decode_ndjson(&line).unwrap();
         assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn overlay_event_with_token_roundtrip() {
+        let event = OverlayEvent {
+            token: "abc123def456".into(),
+            command: OverlayIpcCommand::Pong,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("abc123def456"));
+        assert!(json.contains("pong"));
+        let back: OverlayEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn overlay_event_missing_token_defaults_empty() {
+        let json = r#"{"type":"pong"}"#;
+        let event: OverlayEvent = serde_json::from_str(json).unwrap();
+        assert_eq!(event.token, "");
+        assert_eq!(event.command, OverlayIpcCommand::Pong);
     }
 }
