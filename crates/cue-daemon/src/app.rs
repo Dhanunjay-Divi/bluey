@@ -758,6 +758,8 @@ async fn handle_request_inner(
             .with_source(path.display().to_string());
             let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
             write_state(daemon).await?;
+            // R10: Auto-recap via LLM (best-effort, fire-and-forget).
+            spawn_auto_recap(daemon, &meeting);
             Ok(DaemonResponse::Recap { recap })
         }
         DaemonRequest::TranscriptAdd {
@@ -5531,6 +5533,66 @@ fn init_rag_pipeline(paths: &AppPaths) -> Option<Arc<crate::db::rag::RagPipeline
             None
         }
     }
+}
+
+/// Spawn a best-effort auto-recap via LLM after a session ends.
+/// If no LLM provider is configured, logs a warning and returns.
+fn spawn_auto_recap(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
+    let transcript: String = meeting
+        .transcript
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if transcript.trim().is_empty() {
+        return;
+    }
+    let session_id = meeting.id.to_string();
+    let db_dir = daemon.paths.data_dir.clone();
+    tokio::spawn(async move {
+        let llm = match build_recap_llm_from_env() {
+            Some(p) => p,
+            None => {
+                warn!("auto-recap skipped: no LLM provider configured");
+                return;
+            }
+        };
+        let result = crate::llm::RecapLlm
+            .run(&transcript, &session_id, llm.as_ref())
+            .await;
+        match result {
+            Ok(resp) => {
+                let db_path = db_dir.join("sessions.db");
+                if let Ok(db) = crate::db::Database::open(db_path.to_str().unwrap_or("sessions.db"))
+                {
+                    if let Err(e) = db.insert_cue_response(
+                        &resp.id,
+                        &resp.source_session_id,
+                        &resp.kind,
+                        &resp.text,
+                        resp.source_text.as_deref(),
+                        resp.ts_ms as i64,
+                    ) {
+                        warn!(error = %e, "auto-recap: failed to persist");
+                    } else {
+                        info!(session = %session_id, "auto-recap persisted");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "auto-recap LLM call failed");
+            }
+        }
+    });
+}
+
+/// Build an LLM provider from env for auto-recap (best-effort).
+fn build_recap_llm_from_env() -> Option<Box<dyn cue_llm::LlmProvider>> {
+    let key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .or_else(|| crate::secrets::load_api_key("llm_openai").ok().flatten())?;
+    Some(Box::new(cue_llm::openai::OpenAiProvider::new(key)))
 }
 
 #[cfg(test)]
