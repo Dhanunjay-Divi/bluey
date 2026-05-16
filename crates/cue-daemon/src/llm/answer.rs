@@ -1,4 +1,5 @@
 use cue_llm::{LlmProvider, LlmRequest};
+use futures_util::StreamExt;
 
 use super::CueResponse;
 
@@ -7,6 +8,8 @@ const SYSTEM_PROMPT: &str = "You are a helpful assistant during a meeting. The u
 pub struct AnswerLlm;
 
 impl AnswerLlm {
+    /// Run the answer LLM. Uses streaming when the provider supports it,
+    /// falling back to `complete()` otherwise.
     pub async fn run(
         &self,
         question: &str,
@@ -19,10 +22,23 @@ impl AnswerLlm {
             max_tokens: Some(256),
             temperature: Some(0.3),
         };
-        let resp = llm.complete(&req).await?;
+        let text = if llm.supports_streaming() {
+            let mut stream = llm.complete_stream(&req).await?;
+            let mut acc = String::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                acc.push_str(&chunk.text);
+                if chunk.finished {
+                    break;
+                }
+            }
+            acc
+        } else {
+            llm.complete(&req).await?.text
+        };
         Ok(CueResponse::new(
             "answer",
-            resp.text,
+            text,
             session_id,
             Some(question.to_string()),
         ))

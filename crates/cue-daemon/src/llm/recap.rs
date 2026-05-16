@@ -1,4 +1,5 @@
 use cue_llm::{LlmProvider, LlmRequest};
+use futures_util::StreamExt;
 
 use super::CueResponse;
 
@@ -7,6 +8,8 @@ const SYSTEM_PROMPT: &str = "Summarize this meeting transcript. Extract key deci
 pub struct RecapLlm;
 
 impl RecapLlm {
+    /// Run the recap LLM. Uses streaming when the provider supports it,
+    /// falling back to `complete()` otherwise.
     pub async fn run(
         &self,
         transcript: &str,
@@ -19,8 +22,21 @@ impl RecapLlm {
             max_tokens: Some(1024),
             temperature: Some(0.2),
         };
-        let resp = llm.complete(&req).await?;
-        Ok(CueResponse::new("recap", resp.text, session_id, None))
+        let text = if llm.supports_streaming() {
+            let mut stream = llm.complete_stream(&req).await?;
+            let mut acc = String::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                acc.push_str(&chunk.text);
+                if chunk.finished {
+                    break;
+                }
+            }
+            acc
+        } else {
+            llm.complete(&req).await?.text
+        };
+        Ok(CueResponse::new("recap", text, session_id, None))
     }
 }
 
