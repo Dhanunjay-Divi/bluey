@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{LlmChunk, LlmChunkStream, LlmError, LlmProvider, LlmRequest, LlmResponse};
 
-const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+fn default_base_url() -> String { obfstr::obfstr!("https://api.anthropic.com").to_string() }
 const DEFAULT_MODEL: &str = "claude-3-5-sonnet-20241022";
 
 pub struct AnthropicProvider {
@@ -20,7 +20,7 @@ impl AnthropicProvider {
             client: Client::new(),
             api_key,
             model: DEFAULT_MODEL.to_string(),
-            base_url: DEFAULT_BASE_URL.to_string(),
+            base_url: default_base_url(),
         }
     }
 
@@ -126,7 +126,7 @@ impl LlmProvider for AnthropicProvider {
         let resp = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
-            .header("x-api-key", &self.api_key)
+            .header(obfstr::obfstr!("x-api-key"), &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&body)

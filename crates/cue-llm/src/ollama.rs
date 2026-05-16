@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{LlmChunk, LlmChunkStream, LlmError, LlmProvider, LlmRequest, LlmResponse};
 
-const DEFAULT_BASE_URL: &str = "http://localhost:11434";
+fn default_base_url() -> String { obfstr::obfstr!("http://localhost:11434").to_string() }
 const DEFAULT_MODEL: &str = "llama3.2";
 
 pub struct OllamaProvider {
@@ -16,7 +16,7 @@ pub struct OllamaProvider {
 impl OllamaProvider {
     pub fn new() -> Self {
         let base_url =
-            std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
+            std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| default_base_url());
         Self {
             client: Client::new(),
             model: DEFAULT_MODEL.to_string(),

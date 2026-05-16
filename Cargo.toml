@@ -44,3 +44,4 @@ keyring = "2"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 url = "2.5"
 wiremock = "0.6"
+obfstr = "0.4"

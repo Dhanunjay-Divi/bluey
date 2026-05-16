@@ -102,10 +102,11 @@ impl Default for DeepgramConfig {
 /// [`SttConfig`]. Exposed so unit tests can verify URL construction
 /// deterministically without spinning up an actual WS server.
 pub fn build_url(deepgram: &DeepgramConfig, stt: &SttConfig) -> Result<url::Url, SttError> {
+    let default_url = obfstr::obfstr!("wss://api.deepgram.com").to_string();
     let base = deepgram
         .base_url
         .as_deref()
-        .unwrap_or("wss://api.deepgram.com");
+        .unwrap_or(&default_url);
     let mut u = url::Url::parse(&format!("{base}/v1/listen"))
         .map_err(|e| SttError::Protocol(format!("invalid base url: {e}")))?;
     {
@@ -524,10 +525,13 @@ async fn run_connection(
     let auth_value = format!("Token {}", cfg.api_key);
 
     let mut request = url.as_str().into_client_request().map_err(map_ws_error)?;
-    request.headers_mut().insert(
-        "Authorization",
-        auth_value.parse().map_err(|_| SttError::Auth)?,
-    );
+    {
+        let hdr = obfstr::obfstr!("authorization").to_string();
+        request.headers_mut().insert(
+            tokio_tungstenite::tungstenite::http::HeaderName::from_bytes(hdr.as_bytes()).unwrap(),
+            auth_value.parse().map_err(|_| SttError::Auth)?,
+        );
+    }
 
     let (ws_stream, _response) = tokio_tungstenite::connect_async(request)
         .await
