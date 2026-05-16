@@ -256,3 +256,20 @@ git -P diff --check feat/phase-3-round-8..HEAD       ✅ clean
 - [ ] R7 fixes: artifact names consistent across all infra files
 - [ ] No secrets logged, no PII in stdout
 - [ ] Code style matches CLAUDE.md rules
+
+---
+
+## Update: STT factory scope clarification (R7-recheck-2)
+
+The `build_stt_chain` factory applies **only** to streaming providers used
+by the continuous system-audio path. The default mic + chunked-REST path
+(`real_audio_loop` → `transcribe_audio_file`) is **not** routed through
+the factory: it posts WAV chunks to `runtime.stt_endpoint` and bypasses
+the streaming `SttProvider` trait entirely.
+
+Therefore: `BLUEY_STT_FALLBACK_OPENAI=1` and `BLUEY_STT_LOCAL_WHISPER=1`
+do NOT affect the chunked-REST mic path today.
+
+Unifying the two paths (streaming providers everywhere) is a deferred
+follow-up. The factory module doc-comment in
+`crates/cue-daemon/src/stt/factory.rs` carries this caveat inline.
