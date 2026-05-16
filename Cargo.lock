@@ -1056,6 +1056,7 @@ dependencies = [
  "cpal",
  "cue-core",
  "cue-llm",
+ "cue-rag",
  "futures-util",
  "keyring",
  "parking_lot",

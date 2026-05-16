@@ -18,10 +18,7 @@ pub struct RagPipeline {
 
 impl RagPipeline {
     /// Create a new RAG pipeline.
-    pub fn new(
-        store_path: PathBuf,
-        embedder: Arc<dyn EmbeddingProvider>,
-    ) -> Result<Self> {
+    pub fn new(store_path: PathBuf, embedder: Arc<dyn EmbeddingProvider>) -> Result<Self> {
         let dim = embedder.dim();
         let store = VectorStore::open(&store_path, dim)?;
         Ok(Self {
@@ -61,7 +58,10 @@ impl RagPipeline {
         limit: usize,
         session_id: Option<&str>,
     ) -> Result<Vec<RagHit>> {
-        let query_embedding = self.embedder.embed(query_text).await
+        let query_embedding = self
+            .embedder
+            .embed(query_text)
+            .await
             .map_err(|e| anyhow::anyhow!("embedding query failed: {e}"))?;
         let store = self.store.lock().await;
         store.query(&query_embedding, limit, session_id)

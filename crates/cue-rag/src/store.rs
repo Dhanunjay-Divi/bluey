@@ -52,18 +52,14 @@ impl VectorStore {
             CREATE TABLE IF NOT EXISTS rag_embeddings (
                 chunk_id INTEGER PRIMARY KEY REFERENCES rag_chunks(id) ON DELETE CASCADE,
                 embedding BLOB NOT NULL
-            );"
-        ).context("failed to run RAG migrations")?;
+            );",
+        )
+        .context("failed to run RAG migrations")?;
         Ok(())
     }
 
     /// Index a chunk with its embedding.
-    pub fn index(
-        &self,
-        session_id: &str,
-        chunk: &crate::Chunk,
-        embedding: &[f32],
-    ) -> Result<()> {
+    pub fn index(&self, session_id: &str, chunk: &crate::Chunk, embedding: &[f32]) -> Result<()> {
         anyhow::ensure!(
             embedding.len() == self.dim,
             "embedding dim mismatch: expected {}, got {}",
@@ -109,7 +105,11 @@ impl VectorStore {
                     let blob: Vec<u8> = row.get(2)?;
                     let emb = blob_to_embedding(&blob);
                     let score = cosine_similarity(query_embedding, &emb);
-                    scored.push(RagHit { session_id: s, chunk_text: text, score });
+                    scored.push(RagHit {
+                        session_id: s,
+                        chunk_text: text,
+                        score,
+                    });
                 }
             }
             None => {
@@ -123,12 +123,20 @@ impl VectorStore {
                     let blob: Vec<u8> = row.get(2)?;
                     let emb = blob_to_embedding(&blob);
                     let score = cosine_similarity(query_embedding, &emb);
-                    scored.push(RagHit { session_id: s, chunk_text: text, score });
+                    scored.push(RagHit {
+                        session_id: s,
+                        chunk_text: text,
+                        score,
+                    });
                 }
             }
         }
 
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         scored.truncate(limit);
         Ok(scored)
     }
@@ -171,7 +179,11 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         norm_b += bi * bi;
     }
     let denom = norm_a.sqrt() * norm_b.sqrt();
-    if denom == 0.0 { 0.0 } else { dot / denom }
+    if denom == 0.0 {
+        0.0
+    } else {
+        dot / denom
+    }
 }
 
 fn now_ms() -> i64 {
@@ -223,8 +235,28 @@ mod tests {
         let store = mem_store(dim);
 
         let emb = vec![1.0, 0.0, 0.0, 0.0];
-        store.index("s1", &Chunk { text: "s1 chunk".into(), start_char: 0, end_char: 8 }, &emb).unwrap();
-        store.index("s2", &Chunk { text: "s2 chunk".into(), start_char: 0, end_char: 8 }, &emb).unwrap();
+        store
+            .index(
+                "s1",
+                &Chunk {
+                    text: "s1 chunk".into(),
+                    start_char: 0,
+                    end_char: 8,
+                },
+                &emb,
+            )
+            .unwrap();
+        store
+            .index(
+                "s2",
+                &Chunk {
+                    text: "s2 chunk".into(),
+                    start_char: 0,
+                    end_char: 8,
+                },
+                &emb,
+            )
+            .unwrap();
 
         let results = store.query(&emb, 10, Some("s1")).unwrap();
         assert_eq!(results.len(), 1);
@@ -240,8 +272,28 @@ mod tests {
         let store = mem_store(dim);
         let emb = vec![1.0, 0.0, 0.0, 0.0];
 
-        store.index("s1", &Chunk { text: "keep".into(), start_char: 0, end_char: 4 }, &emb).unwrap();
-        store.index("s2", &Chunk { text: "delete me".into(), start_char: 0, end_char: 9 }, &emb).unwrap();
+        store
+            .index(
+                "s1",
+                &Chunk {
+                    text: "keep".into(),
+                    start_char: 0,
+                    end_char: 4,
+                },
+                &emb,
+            )
+            .unwrap();
+        store
+            .index(
+                "s2",
+                &Chunk {
+                    text: "delete me".into(),
+                    start_char: 0,
+                    end_char: 9,
+                },
+                &emb,
+            )
+            .unwrap();
 
         let deleted = store.delete_session("s2").unwrap();
         assert_eq!(deleted, 1);
@@ -250,7 +302,8 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].session_id, "s1");
 
-        let emb_count: i64 = store.conn
+        let emb_count: i64 = store
+            .conn
             .query_row("SELECT COUNT(*) FROM rag_embeddings", [], |r| r.get(0))
             .unwrap();
         assert_eq!(emb_count, 1);
@@ -259,7 +312,11 @@ mod tests {
     #[test]
     fn vector_store_dim_mismatch_rejected() {
         let store = mem_store(4);
-        let chunk = Chunk { text: "x".into(), start_char: 0, end_char: 1 };
+        let chunk = Chunk {
+            text: "x".into(),
+            start_char: 0,
+            end_char: 1,
+        };
         let wrong_dim = vec![1.0, 2.0];
         assert!(store.index("s", &chunk, &wrong_dim).is_err());
     }

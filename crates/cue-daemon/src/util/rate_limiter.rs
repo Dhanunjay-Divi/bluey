@@ -187,11 +187,8 @@ mod tests {
         let rl = Arc::new(RateLimiter::new(1, 50.0));
         assert!(rl.try_acquire(1));
         let rl2 = rl.clone();
-        tokio::time::timeout(
-            tokio::time::Duration::from_millis(200),
-            rl2.acquire(1),
-        )
-        .await
-        .expect("acquire should complete within 200ms");
+        tokio::time::timeout(tokio::time::Duration::from_millis(200), rl2.acquire(1))
+            .await
+            .expect("acquire should complete within 200ms");
     }
 }

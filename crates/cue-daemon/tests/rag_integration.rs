@@ -20,7 +20,12 @@ impl EmbeddingProvider for MockEmbedder {
     async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
         // Deterministic embedding based on text content
         let len = text.len() as f32;
-        Ok(vec![len.sin(), len.cos(), (len * 0.5).sin(), (len * 0.5).cos()])
+        Ok(vec![
+            len.sin(),
+            len.cos(),
+            (len * 0.5).sin(),
+            (len * 0.5).cos(),
+        ])
     }
 }
 
@@ -29,7 +34,11 @@ fn chunker_basic() {
     let text = "A".repeat(2000);
     let chunker = Chunker::new();
     let chunks = chunker.chunk(&text);
-    assert!(chunks.len() >= 3, "expected >=3 chunks, got {}", chunks.len());
+    assert!(
+        chunks.len() >= 3,
+        "expected >=3 chunks, got {}",
+        chunks.len()
+    );
     for c in &chunks {
         assert!(c.text.len() <= chunker.max_chars);
     }
@@ -78,7 +87,11 @@ fn vector_store_index_and_query() {
     let results = store.query(&query, 3, None).unwrap();
     assert_eq!(results.len(), 3);
     // Top result should be chunk 3 (exact match = score 1.0)
-    assert!(results[0].score > 0.99, "top score should be ~1.0, got {}", results[0].score);
+    assert!(
+        results[0].score > 0.99,
+        "top score should be ~1.0, got {}",
+        results[0].score
+    );
     assert!(results[0].chunk_text.contains("chunk number 3"));
     // Ordering by score
     assert!(results[0].score >= results[1].score);
@@ -91,9 +104,39 @@ fn vector_store_session_filter() {
     let store = VectorStore::open(Path::new(":memory:"), dim).unwrap();
     let emb = vec![1.0, 0.0, 0.0, 0.0];
 
-    store.index("s1", &Chunk { text: "s1 data".into(), start_char: 0, end_char: 7 }, &emb).unwrap();
-    store.index("s2", &Chunk { text: "s2 data".into(), start_char: 0, end_char: 7 }, &emb).unwrap();
-    store.index("s2", &Chunk { text: "s2 more".into(), start_char: 7, end_char: 14 }, &emb).unwrap();
+    store
+        .index(
+            "s1",
+            &Chunk {
+                text: "s1 data".into(),
+                start_char: 0,
+                end_char: 7,
+            },
+            &emb,
+        )
+        .unwrap();
+    store
+        .index(
+            "s2",
+            &Chunk {
+                text: "s2 data".into(),
+                start_char: 0,
+                end_char: 7,
+            },
+            &emb,
+        )
+        .unwrap();
+    store
+        .index(
+            "s2",
+            &Chunk {
+                text: "s2 more".into(),
+                start_char: 7,
+                end_char: 14,
+            },
+            &emb,
+        )
+        .unwrap();
 
     // Filter to s1 only
     let results = store.query(&emb, 10, Some("s1")).unwrap();
@@ -115,9 +158,39 @@ fn vector_store_delete_session_cascade() {
     let store = VectorStore::open(Path::new(":memory:"), dim).unwrap();
     let emb = vec![0.5, 0.5, 0.5, 0.5];
 
-    store.index("keep", &Chunk { text: "keeper".into(), start_char: 0, end_char: 6 }, &emb).unwrap();
-    store.index("remove", &Chunk { text: "goner1".into(), start_char: 0, end_char: 6 }, &emb).unwrap();
-    store.index("remove", &Chunk { text: "goner2".into(), start_char: 6, end_char: 12 }, &emb).unwrap();
+    store
+        .index(
+            "keep",
+            &Chunk {
+                text: "keeper".into(),
+                start_char: 0,
+                end_char: 6,
+            },
+            &emb,
+        )
+        .unwrap();
+    store
+        .index(
+            "remove",
+            &Chunk {
+                text: "goner1".into(),
+                start_char: 0,
+                end_char: 6,
+            },
+            &emb,
+        )
+        .unwrap();
+    store
+        .index(
+            "remove",
+            &Chunk {
+                text: "goner2".into(),
+                start_char: 6,
+                end_char: 12,
+            },
+            &emb,
+        )
+        .unwrap();
 
     assert_eq!(store.chunk_count().unwrap(), 3);
     let deleted = store.delete_session("remove").unwrap();

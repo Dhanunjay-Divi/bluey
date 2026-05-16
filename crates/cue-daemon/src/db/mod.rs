@@ -347,6 +347,10 @@ impl Database {
             "INSERT INTO cue_responses (id, session_id, kind, text, source_text, ts_ms) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, session_id, kind, text, source_text, ts_ms],
+        )?;
+        Ok(())
+    }
+
     // ===== Keybinds (Phase 3 Round 9) =====
 
     /// Ensure the user_keybinds table exists.
@@ -355,7 +359,7 @@ impl Database {
             "CREATE TABLE IF NOT EXISTS user_keybinds (
                 action TEXT PRIMARY KEY,
                 accelerator TEXT NOT NULL
-            );"
+            );",
         )?;
         Ok(())
     }
@@ -381,11 +385,13 @@ impl Database {
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
     /// Load a keybind for a given action.
     pub fn load_keybind(&self, action: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT accelerator FROM user_keybinds WHERE action = ?1"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT accelerator FROM user_keybinds WHERE action = ?1")?;
         let result = stmt
             .query_row(params![action], |row| row.get::<_, String>(0))
             .ok();
@@ -1006,7 +1012,8 @@ mod fts_tests {
     fn keybind_save_load_roundtrip() {
         let db = test_db();
         db.ensure_keybinds_table().unwrap();
-        db.save_keybind("toggle_listening", "CmdOrCtrl+Shift+L").unwrap();
+        db.save_keybind("toggle_listening", "CmdOrCtrl+Shift+L")
+            .unwrap();
         let loaded = db.load_keybind("toggle_listening").unwrap();
         assert_eq!(loaded, Some("CmdOrCtrl+Shift+L".to_string()));
     }
@@ -1015,8 +1022,10 @@ mod fts_tests {
     fn keybind_upsert_overwrites() {
         let db = test_db();
         db.ensure_keybinds_table().unwrap();
-        db.save_keybind("toggle_listening", "CmdOrCtrl+Shift+L").unwrap();
-        db.save_keybind("toggle_listening", "CmdOrCtrl+Shift+K").unwrap();
+        db.save_keybind("toggle_listening", "CmdOrCtrl+Shift+L")
+            .unwrap();
+        db.save_keybind("toggle_listening", "CmdOrCtrl+Shift+K")
+            .unwrap();
         let loaded = db.load_keybind("toggle_listening").unwrap();
         assert_eq!(loaded, Some("CmdOrCtrl+Shift+K".to_string()));
     }
@@ -1032,8 +1041,10 @@ mod fts_tests {
     fn keybind_reset_clears_all() {
         let db = test_db();
         db.ensure_keybinds_table().unwrap();
-        db.save_keybind("toggle_listening", "CmdOrCtrl+Shift+L").unwrap();
-        db.save_keybind("push_to_talk", "CmdOrCtrl+Shift+P").unwrap();
+        db.save_keybind("toggle_listening", "CmdOrCtrl+Shift+L")
+            .unwrap();
+        db.save_keybind("push_to_talk", "CmdOrCtrl+Shift+P")
+            .unwrap();
         db.reset_keybinds().unwrap();
         assert_eq!(db.load_keybind("toggle_listening").unwrap(), None);
         assert_eq!(db.load_keybind("push_to_talk").unwrap(), None);
@@ -1049,5 +1060,4 @@ mod fts_tests {
         let val = db.load_setting("overlay_passthrough").unwrap();
         assert_eq!(val, Some("true".to_string()));
     }
-
 }

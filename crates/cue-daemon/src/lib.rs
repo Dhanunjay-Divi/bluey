@@ -1,4 +1,3 @@
-pub mod util;
 pub mod app;
 pub mod audio;
 pub mod db;
@@ -8,3 +7,4 @@ pub mod overlay;
 pub mod secrets;
 pub mod storage;
 pub mod stt;
+pub mod util;

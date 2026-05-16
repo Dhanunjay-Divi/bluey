@@ -73,7 +73,9 @@ impl Chunker {
                 break;
             }
             // Advance by (chunk_size - overlap), ensuring forward progress
-            let advance = actual_end.saturating_sub(start).saturating_sub(self.overlap_chars);
+            let advance = actual_end
+                .saturating_sub(start)
+                .saturating_sub(self.overlap_chars);
             start += advance.max(1);
         }
 
@@ -90,7 +92,11 @@ mod tests {
         let text = "A".repeat(2000);
         let chunker = Chunker::new();
         let chunks = chunker.chunk(&text);
-        assert!(chunks.len() >= 3, "expected >=3 chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 3,
+            "expected >=3 chunks, got {}",
+            chunks.len()
+        );
         // All chunks should be <= max_chars
         for c in &chunks {
             assert!(c.text.len() <= chunker.max_chars);

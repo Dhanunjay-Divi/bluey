@@ -733,8 +733,11 @@ pub fn get_disguise(db: State<DbState>) -> Result<String, String> {
 #[tauri::command]
 pub fn set_mouse_passthrough(enabled: bool, db: State<DbState>) -> Result<(), String> {
     let db = db.0.lock().map_err(|e| e.to_string())?;
-    db.save_setting("overlay_passthrough", if enabled { "true" } else { "false" })
-        .map_err(|e| e.to_string())?;
+    db.save_setting(
+        "overlay_passthrough",
+        if enabled { "true" } else { "false" },
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 

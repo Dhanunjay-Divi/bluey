@@ -2459,7 +2459,6 @@ async fn add_audio_transcript_segment(
         ts_ms,
     });
 
-
     // Live RAG indexing on Final transcripts (fire-and-forget).
     if segment.is_final {
         if let Some(rag) = daemon.rag.as_ref() {
@@ -5493,7 +5492,6 @@ async fn update_state_from_meeting(
     }
     write_state(daemon).await
 }
-
 
 /// Initialize the RAG pipeline if an OpenAI API key is available.
 /// Returns None (with a log) if no key is configured — RAG is optional.
