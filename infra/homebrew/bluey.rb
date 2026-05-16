@@ -5,6 +5,7 @@ class Bluey < Formula
   license "UNLICENSED"
 
   # Artifact naming: bluey-{version}-{os}-{arch}.tar.gz
+  # Archive layout: bin/bluey, bin/bluey-daemon (+ optional .app bundle at top level)
   # Keep in sync with: .github/workflows/release.yml, Makefile,
   #                     infra/scoop/bluey.json, INSTALL.md
   on_macos do
@@ -19,8 +20,8 @@ class Bluey < Formula
   end
 
   def install
-    bin.install "bluey-daemon"
-    bin.install "bluey"
+    bin.install "bin/bluey-daemon"
+    bin.install "bin/bluey"
     # Install dashboard app bundle if present
     if File.directory?("Bluey.app")
       prefix.install "Bluey.app"

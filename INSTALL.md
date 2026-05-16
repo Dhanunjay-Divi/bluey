@@ -30,17 +30,21 @@ Download the release archive matching your platform:
 - `bluey-{version}-darwin-x86_64.tar.gz` (Intel Mac)
 - `bluey-{version}-linux-x86_64.tar.gz` (Linux x86_64)
 
+Archives contain binaries under a `bin/` subdirectory:
+
 ```bash
 # Example for Apple Silicon:
 curl -LO https://github.com/<org>/bluey/releases/latest/download/bluey-0.1.0-darwin-arm64.tar.gz
-tar -xzf bluey-0.1.0-darwin-arm64.tar.gz -C /usr/local/bin
+mkdir -p /usr/local/lib/bluey && tar -xzf bluey-0.1.0-darwin-arm64.tar.gz -C /usr/local/lib/bluey
+ln -sf /usr/local/lib/bluey/bin/bluey /usr/local/bin/bluey
+ln -sf /usr/local/lib/bluey/bin/bluey-daemon /usr/local/bin/bluey-daemon
 ```
 
 ### Windows
 
 Download `bluey-{version}-windows-x86_64.zip` from the
 [latest release](https://github.com/<org>/bluey/releases/latest),
-extract, and add the folder to your PATH.
+extract, and add the `bin\` folder to your PATH.
 
 ## Running
 

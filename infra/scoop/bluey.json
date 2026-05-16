@@ -5,6 +5,7 @@
   "license": "UNLICENSED",
   "url": "https://github.com/<org>/bluey/releases/download/v0.1.0/bluey-0.1.0-windows-x86_64.zip",
   "hash": "REPLACE_AT_RELEASE",
+  "extract_dir": "bin",
   "bin": [
     ["bluey.exe", "bluey"],
     ["bluey-daemon.exe", "bluey-daemon"]

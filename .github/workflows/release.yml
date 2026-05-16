@@ -10,6 +10,11 @@
 #   os:   darwin | windows | linux
 #   arch: arm64 | x86_64
 #   ext:  tar.gz (unix) | zip (windows)
+#
+# Binary names (from Cargo.toml [[bin]] entries):
+#   - cue-daemon crate produces: "cue-daemon" and "bluey-daemon"
+#   - cue-cli crate produces: "cue" and "bluey"
+# We package the "bluey" / "bluey-daemon" variants.
 
 name: Release
 
@@ -87,6 +92,7 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --locked || true
 
+      # Tauri build runs from crates/cue-dashboard where tauri.conf.json lives.
       - name: Build dashboard
         working-directory: crates/cue-dashboard
         run: cargo tauri build --target ${{ matrix.target }}
@@ -114,14 +120,18 @@ jobs:
         shell: bash
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          mkdir -p staging
-          cp target/${{ matrix.target }}/release/bluey-daemon staging/ || \
-            cp target/${{ matrix.target }}/release/cue-daemon staging/bluey-daemon || true
-          cp target/${{ matrix.target }}/release/bluey staging/ || \
-            cp target/${{ matrix.target }}/release/cue-cli staging/bluey || true
-          find target/${{ matrix.target }}/release/bundle -name "*.app" -exec cp -R {} staging/ \; 2>/dev/null || true
-          find target/${{ matrix.target }}/release/bundle -name "*.AppImage" -exec cp {} staging/ \; 2>/dev/null || true
-          find native -name "*.dylib" -o -name "cue-*" -type f -perm +111 | while read f; do cp "$f" staging/ 2>/dev/null || true; done
+          mkdir -p staging/bin
+          # Canonical binary: bluey-daemon (fallback: cue-daemon from same crate)
+          cp "target/${{ matrix.target }}/release/bluey-daemon" staging/bin/ 2>/dev/null || \
+            cp "target/${{ matrix.target }}/release/cue-daemon" staging/bin/bluey-daemon
+          # Canonical binary: bluey (fallback: cue from same crate)
+          cp "target/${{ matrix.target }}/release/bluey" staging/bin/ 2>/dev/null || \
+            cp "target/${{ matrix.target }}/release/cue" staging/bin/bluey
+          # Dashboard app bundle
+          find "target/${{ matrix.target }}/release/bundle" -name "*.app" -exec cp -R {} staging/ \; 2>/dev/null || true
+          find "target/${{ matrix.target }}/release/bundle" -name "*.AppImage" -exec cp {} staging/ \; 2>/dev/null || true
+          # Native helpers
+          find native -name "*.dylib" -o -name "cue-*" -type f -perm +111 | while read f; do cp "$f" staging/bin/ 2>/dev/null || true; done
           tar -czf "bluey-${VERSION}-${{ matrix.platform }}.tar.gz" -C staging .
 
       - name: Package (Windows)
@@ -129,19 +139,25 @@ jobs:
         shell: pwsh
         run: |
           $VERSION = "${{ steps.version.outputs.version }}"
-          New-Item -ItemType Directory -Force staging
-          Copy-Item target/${{ matrix.target }}/release/bluey-daemon.exe staging/ -ErrorAction SilentlyContinue
-          if (-not (Test-Path staging/bluey-daemon.exe)) {
-            Copy-Item target/${{ matrix.target }}/release/cue-daemon.exe staging/bluey-daemon.exe -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force staging/bin
+          # Canonical binary: bluey-daemon.exe (fallback: cue-daemon.exe)
+          if (Test-Path "target/${{ matrix.target }}/release/bluey-daemon.exe") {
+            Copy-Item "target/${{ matrix.target }}/release/bluey-daemon.exe" staging/bin/
+          } else {
+            Copy-Item "target/${{ matrix.target }}/release/cue-daemon.exe" staging/bin/bluey-daemon.exe
           }
-          Copy-Item target/${{ matrix.target }}/release/bluey.exe staging/ -ErrorAction SilentlyContinue
-          if (-not (Test-Path staging/bluey.exe)) {
-            Copy-Item target/${{ matrix.target }}/release/cue-cli.exe staging/bluey.exe -ErrorAction SilentlyContinue
+          # Canonical binary: bluey.exe (fallback: cue.exe)
+          if (Test-Path "target/${{ matrix.target }}/release/bluey.exe") {
+            Copy-Item "target/${{ matrix.target }}/release/bluey.exe" staging/bin/
+          } else {
+            Copy-Item "target/${{ matrix.target }}/release/cue.exe" staging/bin/bluey.exe
           }
-          Copy-Item native/windows/cue-overlay/cue-overlay.exe staging/ -ErrorAction SilentlyContinue
-          Copy-Item native/windows/cue-audio/cue-audio.exe staging/ -ErrorAction SilentlyContinue
-          Copy-Item native/windows/cue-whisper/cue-whisper.exe staging/ -ErrorAction SilentlyContinue
-          Get-ChildItem -Recurse target/${{ matrix.target }}/release/bundle -Filter "*.msi" | Copy-Item -Destination staging/ -ErrorAction SilentlyContinue
+          # Native helpers
+          Copy-Item native/windows/cue-overlay/cue-overlay.exe staging/bin/ -ErrorAction SilentlyContinue
+          Copy-Item native/windows/cue-audio/cue-audio.exe staging/bin/ -ErrorAction SilentlyContinue
+          Copy-Item native/windows/cue-whisper/cue-whisper.exe staging/bin/ -ErrorAction SilentlyContinue
+          # Dashboard MSI
+          Get-ChildItem -Recurse "target/${{ matrix.target }}/release/bundle" -Filter "*.msi" | Copy-Item -Destination staging/ -ErrorAction SilentlyContinue
           Compress-Archive -Path staging/* -DestinationPath "bluey-${VERSION}-${{ matrix.platform }}.zip"
 
       - name: Compute SHA256
@@ -164,9 +180,6 @@ jobs:
           name: bluey-${{ steps.version.outputs.version }}-${{ matrix.platform }}
           path: ${{ steps.sha.outputs.file }}
 
-    outputs:
-      sha256: ${{ steps.sha.outputs.sha256 }}
-
   release:
     needs: build
     runs-on: ubuntu-latest
@@ -179,10 +192,25 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Compute all SHA256 sums
+      - name: Compute SHA256 manifest
+        shell: bash
         run: |
           cd artifacts
+          # Generate both human-readable and machine-readable SHA256 manifests.
+          # bump-formulae.sh consumes sha256-manifest.json in post-release.
           for f in *; do shasum -a 256 "$f"; done | tee ../SHA256SUMS.txt
+          cd ..
+          python3 -c "
+          import json, re
+          sums = {}
+          with open(SHA256SUMS.txt) as f:
+              for line in f:
+                  parts = line.strip().split()
+                  if len(parts) == 2:
+                      sums[parts[1]] = parts[0]
+          with open(sha256-manifest.json, w) as out:
+              json.dump(sums, out, indent=2)
+          "
 
       - name: Generate Tauri updater manifest (latest.json)
         shell: bash
@@ -221,4 +249,5 @@ jobs:
           files: |
             artifacts/*
             SHA256SUMS.txt
+            sha256-manifest.json
             latest.json
