@@ -8,9 +8,10 @@ to connect to uno and pick up the bluey/cue project work.
 ## Project
 
 **bluey/cue** — A Rust+Tauri desktop app that listens to mic/system audio,
-runs VAD, streams STT, and shows transcripts with live overlay.
+runs VAD, streams STT, shows transcripts with live overlay, and provides
+real-time AI assistance during meetings (the "cue" feature).
 
-- Current phase: **Phase 3 (Listening upgrade)** — streaming STT + overlay IPC + system audio + user-facing alpha features
+- Current phase: **Phase 3 (Listening upgrade)** — streaming STT + overlay IPC + system audio + AI features + v0.1 alpha
 
 ## Remote machine (uno)
 
@@ -42,29 +43,29 @@ export PATH=/opt/homebrew/bin:/Users/uno/.cargo/bin:/usr/local/bin:$PATH
 cargo build --all-targets 2>&1 | tail -20'
 ```
 
-## Current state (as of 2026-05-16, post-R8 implementation)
+## Current state (as of 2026-05-16, post-R9 implementation)
 
 - **main tip:** `6126b28` — R3-R6 merged, 201 tests passing
-- **Branch `feat/phase-3-round-7`:** 10 commits ahead of main, 213 tests — awaiting codex review (per HANDOFF-TO-CODEX-FROM-KIRO.md)
-- **Branch `feat/phase-3-round-8`:** 7 commits ahead of R7, 224 tests — awaiting codex review
+- **Branch `feat/phase-3-round-7`:** 10 commits ahead of main, 213 tests
+- **Branch `feat/phase-3-round-8`:** 7 commits ahead of R7, 224 tests (process masquerade)
+- **Branch `feat/phase-3-round-9`:** 16 commits ahead of R8, 281 tests — **awaiting codex review**
 
-### R7 deliverables shipped:
-- **Live transcript UX:** daemon broadcast channel → file-polling bridge → Tauri event → LiveTranscript route with rolling 200-segment buffer + auto-scroll
-- **Local Whisper fallback (stub):** macOS Swift + Windows C helper stubs (NDJSON IPC); `LocalWhisperProvider` Rust impl; SttRouter 3-tier chain (Deepgram → OpenAI → LocalWhisper) gated by `BLUEY_STT_LOCAL_WHISPER=1`
-- **Distribution scaffolding:** GitHub Actions release pipeline (matrix build), Makefile targets, Homebrew formula, Scoop manifest, Tauri updater endpoint, INSTALL.md, bump-formulae.sh
+### R9 deliverables shipped:
+- **AI features (headline "cue" product magic):** `cue-llm` crate with `LlmRouter` failover + 3 providers (Anthropic/OpenAI/Ollama). 3 specialized LLMs: `AnswerLlm` (question detection), `RecapLlm` (structured summary), `WhatToAnswerLlm` (1-2 bullet suggestions). `cue_responses` table + Tauri event. Responses route + Settings AI provider config.
+- **Local RAG:** `cue-rag` crate with character-based chunker (sentence-boundary preference), in-memory cosine VectorStore (SQLite-backed), OpenAI embedder (text-embedding-3-small). Live indexing on every Final transcript.
+- **Small wins:** Token bucket rate limiter (lock-free, unwired). Mouse passthrough toggle via `OverlayMessage::SetPassthrough` IPC + Tauri commands. User-rebindable keybinds with DB persistence (8 defaults).
+- **R7 fix wave:** All 6 codex blockers resolved — STT factory wiring, deterministic factory test, Windows whisper compile, artifact name reconciliation, transcript dedup.
 
-### R8 deliverables shipped:
-- **Process masquerading:** `cue-stealth` crate with per-platform process-name spoofing (macOS argv[0] + CFBundleName, Linux prctl, Windows AUMID). Startup application + re-assertion timers (200ms/1s/5s). Tauri commands + Settings UI dropdown.
-- **Settings regression fix:** Route was mounting Placeholder instead of real Settings.tsx; fixed.
-- **Disguise icons:** 6 placeholder PNGs (256×256) for mac + win with documented replacement path.
+### v0.1 alpha status:
+Feature-complete pending codex review. All core product functionality implemented. Deferred items are enhancements, not blockers for alpha.
 
-### All checks green (R8 tip):
+### All checks green (R9 tip):
 - `cargo fmt --all --check` ✅
 - `cargo clippy --all-targets -- -D warnings` ✅
 - `cargo build --all-targets` ✅
-- `cargo test --all-targets` ✅ 224 pass
+- `cargo test --all-targets` ✅ 281 pass
 - `cd crates/cue-dashboard/ui && npm run build` ✅
-- `git -P diff --check feat/phase-3-round-7..HEAD` ✅
+- `git -P diff --check feat/phase-3-round-8..HEAD` ✅
 
 ## Workflow loop (kiro ↔ codex ↔ user)
 
@@ -106,9 +107,9 @@ docs/work/TEMPLATE-IMPL.md
 6. **Commit messages** follow Conventional Commits, e.g.:
    `feat(daemon): system audio capture via native helpers [P3.R4]`
 
-## Parallel subagent strategy (established in R6, continued in R7+R8)
+## Parallel subagent strategy (established in R6, continued in R7+R8+R9)
 
-Each parallel subagent uses an isolated git worktree. Commits are cherry-picked onto the main feature branch after completion. A single lint/fmt commit normalizes formatting. **Zero conflicts, zero reconciliation needed.** Continue this pattern for future parallel work.
+Each parallel subagent uses an isolated git worktree. Commits are cherry-picked onto the main feature branch after completion. A single lint/fmt commit normalizes formatting. Reconciliation commits resolve Cargo.toml/mod.rs conflicts from parallel work. **Continue this pattern for future parallel work.**
 
 ## Key files + locations on uno
 
@@ -120,7 +121,11 @@ Each parallel subagent uses an isolated git worktree. Commits are cherry-picked 
 ├── .github/workflows/release.yml         # R7 — release pipeline
 ├── crates/
 │   ├── cue-core/                         # types: pcm, vad, stt, overlay_ipc, session, audio
-│   ├── cue-stealth/                      # R8 — process masquerading (DisguiseMode, apply_disguise)
+│   ├── cue-llm/                          # R9 — LLM provider abstraction + router
+│   │   └── src/{lib,router,anthropic,openai,ollama}.rs
+│   ├── cue-rag/                          # R9 — RAG: chunker + vector store + embedder
+│   │   └── src/{lib,chunker,store,embedder}.rs
+│   ├── cue-stealth/                      # R8 — process masquerading
 │   │   └── src/{lib,macos,linux,windows}.rs
 │   ├── cue-daemon/
 │   │   ├── src/
@@ -129,21 +134,36 @@ Each parallel subagent uses an isolated git worktree. Commits are cherry-picked 
 │   │   │   │   ├── deepgram.rs           # R3 — Nova-3 provider
 │   │   │   │   ├── openai.rs             # R6 — OpenAI Realtime transcription
 │   │   │   │   ├── router.rs             # R5+R7 — SttRouter 3-tier failover
+│   │   │   │   ├── factory.rs            # R9(R7fix) — build_stt_chain()
 │   │   │   │   ├── whisper/              # R7 — LocalWhisperProvider + parser
 │   │   │   │   ├── echo.rs              # R5 — EchoProvider stub
 │   │   │   │   └── mock.rs
-│   │   │   ├── app.rs                    # R6+R7 — live transcript broadcast
+│   │   │   ├── llm/                      # R9 — specialized LLMs
+│   │   │   │   ├── mod.rs               # CueResponse type + ends_with_question
+│   │   │   │   ├── answer.rs            # AnswerLlm
+│   │   │   │   ├── recap.rs             # RecapLlm
+│   │   │   │   └── suggest.rs           # WhatToAnswerLlm
+│   │   │   ├── util/
+│   │   │   │   ├── mod.rs
+│   │   │   │   └── rate_limiter.rs      # R9 — token bucket
+│   │   │   ├── db/
+│   │   │   │   └── mod.rs               # migrations 009 (cue_responses), 011 (user_keybinds)
+│   │   │   ├── app.rs                    # R6+R7+R9 — live transcript + RAG indexing
 │   │   │   └── bin/
 │   │   │       └── whisper_stub.rs       # R7 — test stub binary
 │   │   └── tests/
 │   │       ├── live_transcript_emit.rs   # R7 — 3 tests
-│   │       └── whisper_integration.rs    # R7 — 9 tests
+│   │       ├── live_transcript_dedup.rs  # R9(R7fix) — 4 tests
+│   │       ├── whisper_integration.rs    # R7 — 9 tests
+│   │       └── stt_factory_integration.rs # R9(R7fix) — 4 tests
 │   └── cue-dashboard/                    # Tauri + React UI
 │       ├── src/
 │       │   ├── lib.rs                    # R7+R8 — live transcript poller + startup disguise
-│       │   └── commands.rs               # R7+R8 — get_live_transcripts + set/get_disguise
+│       │   └── commands.rs               # R7+R8+R9 — all Tauri commands
 │       ├── ui/src/
-│       │   ├── pages/Settings.tsx        # R8 — full settings page with disguise dropdown
+│       │   ├── pages/Settings.tsx        # R8+R9 — settings with disguise + AI config
+│       │   ├── pages/Responses.tsx       # R9 — AI responses page
+│       │   ├── routes/Responses.tsx      # R9 — AI responses route component
 │       │   ├── lib/disguise.ts           # R8 — invoke wrappers
 │       │   ├── routes/LiveTranscript.tsx  # R7 — live transcript route
 │       │   └── components/LiveTranscriptList.tsx  # R7 — auto-scroll list
@@ -156,42 +176,36 @@ Each parallel subagent uses an isolated git worktree. Commits are cherry-picked 
 │   └── windows/
 │       ├── cue-audio/main.c              # C: WASAPI loopback
 │       ├── cue-overlay/main.c            # C: Direct2D overlay
-│       └── cue-whisper/main.c            # R7 — C whisper helper stub
+│       └── cue-whisper/main.c            # R7+R9fix — C whisper helper stub (compiles)
 ├── infra/
-│   ├── homebrew/bluey.rb                 # R7 — Homebrew formula
-│   ├── scoop/bluey.json                  # R7 — Scoop manifest
-│   ├── scripts/
-│   │   ├── bump-formulae.sh             # R7 — post-release SHA256 updater
-│   │   └── download-whisper-model.sh    # R7 — model downloader
-│   └── migrations/
+│   ├── homebrew/bluey.rb                 # R7+R9fix — Homebrew formula (correct names)
+│   ├── scoop/bluey.json                  # R7+R9fix — Scoop manifest (correct names)
+│   └── scripts/
 └── docs/work/
-    ├── IMPL-PHASE-3-ROUND-{1..8}.md
-    ├── PHASE-3-ROUND-{1..8}-HANDOFF-FOR-CODEX-REVIEW.md
-    ├── REVIEW-PHASE-3-ROUND-{1,2,3,5,6}.md
-    ├── HANDOFF-TO-CODEX-FROM-KIRO.md     # R7+R8 bundled review request
-    ├── HANDOFF-FROM-CODEX-TO-KIRO.md     # (stale — codex will overwrite)
+    ├── IMPL-PHASE-3-ROUND-{1..9}.md
+    ├── FIX-PHASE-3-ROUND-7.md            # R9 — fix doc for R7 blockers
+    ├── PHASE-3-ROUND-{1..9}-HANDOFF-FOR-CODEX-REVIEW.md
+    ├── REVIEW-PHASE-3-ROUND-{1,2,3,5,6,7}.md
+    ├── HANDOFF-TO-CODEX-FROM-KIRO.md
     ├── AGENT-ONBOARDING.md               # this file
     ├── PLAN-STT-FALLBACK-CHAIN.md
     └── PLAN-DISTRIBUTION.md
 ```
 
-## Pending work (after R7+R8 reviews pass)
+## Pending work (after R9 review passes → v0.1 alpha ships)
 
 ### Next rounds (user-prioritized order)
 
-1. **LLM router with 7 providers + provider chain** — OpenAI, Anthropic, Gemini, Groq, Ollama, Together, Fireworks. Failover + load balancing.
-2. **20+ specialized LLMs** — AnswerLLM, AssistLLM, RecapLLM, SummaryLLM, ActionItemsLLM, etc. The headline "cue" feature: context-aware AI assistance during meetings.
-3. **Local RAG** — SQLite + sqlite-vec for embedding storage; semantic search over past sessions.
-4. **Screenshot + cropper window** — capture screen region for context injection into LLM prompts.
-5. **Mouse passthrough toggle** — overlay click-through mode.
-6. **User-rebindable keybinds** — settings UI for global shortcut customization.
-7. **Token bucket rate limiter** — per-provider rate limiting for LLM API calls.
-8. **Real whisper.cpp integration** — replace stub helpers with actual whisper.cpp inference; bundle `tiny.en` model.
-9. **Structured logging + crash reporting** — `tracing-appender` file rotation + panic dump files.
-10. **Long-session stress tests** — `#[ignore]` test running 5-minute synthetic pipeline.
-11. **Bookmarks / highlights** — SQLite migration + keyboard shortcut + transcript markers.
-12. **Session metadata** — title, tags, participants, notes.
-13. **Mic device hot-swap mid-session** — detect disappearance, pause, emit UI event.
+1. **Real whisper.cpp integration** — replace stub helpers with actual whisper.cpp inference; bundle `tiny.en` model.
+2. **Streaming LLM responses** — SSE/chunked response handling for all 3 providers.
+3. **Auto-recap session-lifecycle hook** — trigger RecapLlm on session end.
+4. **Native overlay passthrough handlers** — macOS Swift `window.ignoresMouseEvents` + Windows C `WS_EX_TRANSPARENT`.
+5. **sqlite-vec swap** — replace in-memory cosine with native ANN search in VectorStore.
+6. **Logging + crash reporting** — `tracing-appender` file rotation + panic dump files.
+7. **More specialized LLMs** — the other 17 from natively-cluely (AssistLLM, SummaryLLM, ActionItemsLLM, etc.).
+8. **Long-session stress tests** — `#[ignore]` test running 5-minute synthetic pipeline.
+9. **Screenshot + cropper window** — capture screen region for context injection into LLM prompts.
+10. **Calendar / meeting-platform integration** — auto-detect meeting start/end.
 
 ## First actions for a new agent
 
@@ -203,9 +217,9 @@ Each parallel subagent uses an isolated git worktree. Commits are cherry-picked 
    git -P branch --show-current'
    ```
 2. Read these docs on uno in order:
-   - `docs/work/IMPL-PHASE-3-ROUND-8.md` (latest round's context)
-   - `docs/work/PHASE-3-ROUND-8-HANDOFF-FOR-CODEX-REVIEW.md`
-   - `docs/work/HANDOFF-TO-CODEX-FROM-KIRO.md` (full task assignment)
+   - `docs/work/IMPL-PHASE-3-ROUND-9.md` (latest round's context)
+   - `docs/work/PHASE-3-ROUND-9-HANDOFF-FOR-CODEX-REVIEW.md`
+   - `docs/work/FIX-PHASE-3-ROUND-7.md` (R7 blocker resolution)
 3. Ask the user what the current task is — don't guess. Possible states:
    - Waiting on codex review → nothing to do, just read and be ready
    - Codex gave 🔴 → need to write FIX doc and address feedback
