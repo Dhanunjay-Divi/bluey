@@ -187,6 +187,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Need the repo checked out so infra/scripts/build-sha256-manifest.py
+      # is available in the runner workspace.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
