@@ -2,6 +2,9 @@ import { useEffect, useRef } from "react";
 import { Mic, Monitor } from "lucide-react";
 
 export interface TranscriptSegment {
+  /** Absolute index of this segment in the active session’s transcript.
+   *  Used by `LiveTranscript` to dedup catch-up vs live events. */
+  index?: number;
   session_id: string;
   source: string;
   text: string;

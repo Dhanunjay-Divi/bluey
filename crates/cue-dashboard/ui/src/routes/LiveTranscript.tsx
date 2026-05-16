@@ -8,28 +8,46 @@ const MAX_SEGMENTS = 200;
 export function LiveTranscript() {
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
   const sessionRef = useRef<string | null>(null);
+  // Per-session highest index already rendered. Live events with
+  // `index <= lastSeenIndexRef.current` are duplicates of catch-up
+  // segments and must be skipped to avoid the catch-up/poller race.
+  const lastSeenIndexRef = useRef<number>(-1);
 
   // Catch-up: load existing segments on mount.
   useEffect(() => {
     invoke<TranscriptSegment[]>("get_live_transcripts", { sinceIndex: 0 })
       .then((segs) => {
-        if (segs.length > 0) {
-          sessionRef.current = segs[0].session_id;
-          setSegments(segs.slice(-MAX_SEGMENTS));
-        }
+        if (segs.length === 0) return;
+        sessionRef.current = segs[0].session_id;
+        const tail = segs.slice(-MAX_SEGMENTS);
+        // Highest index in catch-up — anything <= this is a duplicate.
+        lastSeenIndexRef.current = Math.max(
+          ...tail.map((s) => s.index ?? -1),
+          -1,
+        );
+        setSegments(tail);
       })
       .catch((e) => console.warn("get_live_transcripts failed:", e));
   }, []);
 
-  // Subscribe to live events.
+  // Subscribe to live events with index-based dedup.
   const handleEvent = useCallback((seg: TranscriptSegment) => {
-    // Session change: clear and start fresh.
+    // Session change: clear, start fresh, reset cursor.
     if (sessionRef.current && seg.session_id !== sessionRef.current) {
-      setSegments([seg]);
       sessionRef.current = seg.session_id;
+      lastSeenIndexRef.current = seg.index ?? -1;
+      setSegments([seg]);
       return;
     }
     sessionRef.current = seg.session_id;
+
+    // Skip duplicates: catch-up may have already rendered this index.
+    const incomingIdx = seg.index ?? -1;
+    if (incomingIdx >= 0 && incomingIdx <= lastSeenIndexRef.current) {
+      return;
+    }
+    lastSeenIndexRef.current = Math.max(lastSeenIndexRef.current, incomingIdx);
+
     setSegments((prev) => {
       const next = [...prev, seg];
       return next.length > MAX_SEGMENTS ? next.slice(-MAX_SEGMENTS) : next;
