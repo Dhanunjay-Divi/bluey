@@ -4,6 +4,7 @@ members = [
     "crates/cue-core",
     "crates/cue-daemon",
     "crates/cue-dashboard",
+    "crates/cue-llm",
     "crates/cue-stealth",
 ]
 resolver = "2"
@@ -40,3 +41,4 @@ thiserror = "1.0"
 keyring = "2"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 url = "2.5"
+wiremock = "0.6"
