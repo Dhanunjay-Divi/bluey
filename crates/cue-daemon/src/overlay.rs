@@ -81,6 +81,12 @@ pub fn resolve_overlay_path(default: &Path) -> PathBuf {
     default.to_path_buf()
 }
 
+/// Public alias for the dev-overlay gate so the production daemon path
+/// can decide whether to allow path overrides outside the install dir.
+pub fn is_dev_overlay_enabled() -> bool {
+    is_dev_mode()
+}
+
 /// Returns true when we should allow env-var overrides.
 fn is_dev_mode() -> bool {
     if cfg!(debug_assertions) {

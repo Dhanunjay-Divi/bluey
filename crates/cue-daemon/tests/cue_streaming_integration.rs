@@ -1,6 +1,6 @@
 //! Integration tests for end-to-end cue streaming.
 //!
-//! Verifies that the specialized LLMs emit per-chunk callbacks with cumulative
+//! Verifies that the specialized LLMs emit per-chunk callbacks with DELTA
 //! partial_text, and that the final response is consistent.
 
 use async_trait::async_trait;
@@ -52,7 +52,7 @@ struct ChunkRecord {
 }
 
 #[tokio::test]
-async fn answer_llm_emits_chunks_with_cumulative_text() {
+async fn answer_llm_emits_chunks_as_deltas() {
     use cue_daemon::llm::AnswerLlm;
 
     let chunks: Arc<Mutex<Vec<ChunkRecord>>> = Arc::new(Mutex::new(Vec::new()));
@@ -76,10 +76,12 @@ async fn answer_llm_emits_chunks_with_cumulative_text() {
     let recorded = chunks.lock().unwrap().clone();
     assert_eq!(recorded.len(), 3, "expected 3 chunk callbacks");
 
-    // Verify cumulative text
+    // Verify delta semantics: each chunk text is the NEW text, not cumulative
+    // Daemon emits DELTAS (just the new chunk text), not cumulative.
+    // The dashboard appends these to build the full response.
     assert_eq!(recorded[0].partial_text, "Hello");
-    assert_eq!(recorded[1].partial_text, "Hello world");
-    assert_eq!(recorded[2].partial_text, "Hello world!");
+    assert_eq!(recorded[1].partial_text, " world");
+    assert_eq!(recorded[2].partial_text, "!");
 
     // Verify finished flags
     assert!(!recorded[0].finished);
@@ -92,7 +94,7 @@ async fn answer_llm_emits_chunks_with_cumulative_text() {
 }
 
 #[tokio::test]
-async fn recap_llm_emits_chunks_with_cumulative_text() {
+async fn recap_llm_emits_chunks_as_deltas() {
     use cue_daemon::llm::RecapLlm;
 
     let chunks: Arc<Mutex<Vec<ChunkRecord>>> = Arc::new(Mutex::new(Vec::new()));
@@ -115,14 +117,20 @@ async fn recap_llm_emits_chunks_with_cumulative_text() {
 
     let recorded = chunks.lock().unwrap().clone();
     assert_eq!(recorded.len(), 3);
-    assert_eq!(recorded[2].partial_text, "Hello world!");
+    // Deltas, not cumulative
+    assert_eq!(recorded[0].partial_text, "Hello");
+    assert_eq!(recorded[1].partial_text, " world");
+    assert_eq!(recorded[2].partial_text, "!");
     assert!(recorded[2].finished);
+    // Accumulated final response is the concatenation
+    let accumulated: String = recorded.iter().map(|r| r.partial_text.as_str()).collect();
+    assert_eq!(accumulated, "Hello world!");
     assert_eq!(resp.text, "Hello world!");
     assert_eq!(resp.kind, "recap");
 }
 
 #[tokio::test]
-async fn suggest_llm_emits_chunks_with_cumulative_text() {
+async fn suggest_llm_emits_chunks_as_deltas() {
     use cue_daemon::llm::WhatToAnswerLlm;
 
     let chunks: Arc<Mutex<Vec<ChunkRecord>>> = Arc::new(Mutex::new(Vec::new()));
@@ -145,8 +153,13 @@ async fn suggest_llm_emits_chunks_with_cumulative_text() {
 
     let recorded = chunks.lock().unwrap().clone();
     assert_eq!(recorded.len(), 3);
-    assert_eq!(recorded[2].partial_text, "Hello world!");
+    // Deltas, not cumulative
+    assert_eq!(recorded[0].partial_text, "Hello");
+    assert_eq!(recorded[1].partial_text, " world");
+    assert_eq!(recorded[2].partial_text, "!");
     assert!(recorded[2].finished);
+    let accumulated: String = recorded.iter().map(|r| r.partial_text.as_str()).collect();
+    assert_eq!(accumulated, "Hello world!");
     assert_eq!(resp.text, "Hello world!");
     assert_eq!(resp.kind, "suggestion");
 }

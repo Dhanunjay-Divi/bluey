@@ -408,6 +408,13 @@ struct Daemon {
     system_audio: Mutex<Option<crate::audio::system_capture::SystemAudioCapture>>,
     live_transcript_tx: broadcast::Sender<LiveTranscriptEvent>,
     rag: Option<Arc<crate::db::rag::RagPipeline>>,
+    /// Per-session token issued at boot. Native overlay must echo this in
+    /// every event; mismatched / missing token -> event dropped.
+    overlay_session_token: String,
+    /// State-machine of the overlay UI (Idle / AttachOpen / InstructionsOpen).
+    /// Events are validated against this state before being forwarded; e.g.
+    /// AttachFilesRequested only accepted while AttachOpen.
+    overlay_ui_state: parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>,
 }
 
 struct OverlayProcess {
@@ -481,10 +488,19 @@ pub async fn run() -> Result<()> {
         system_audio: Mutex::new(None),
         live_transcript_tx: broadcast::channel(64).0,
         rag: rag_pipeline,
+        overlay_session_token: crate::overlay::generate_session_token(),
+        overlay_ui_state: parking_lot::Mutex::new(cue_core::overlay_ipc::OverlayUiState::Idle),
     });
 
     if !args.no_overlay {
-        match spawn_overlay(overlay_bin.as_deref(), overlay_events_tx.clone()) {
+        match spawn_overlay(
+            overlay_bin.as_deref(),
+            overlay_events_tx.clone(),
+            daemon.overlay_session_token.clone(),
+            Arc::new(parking_lot::Mutex::new(
+                cue_core::overlay_ipc::OverlayUiState::Idle,
+            )),
+        ) {
             Ok(overlay) => {
                 info!("native overlay started");
                 *daemon.overlay.lock().await = Some(overlay);
@@ -1064,6 +1080,8 @@ async fn ensure_overlay_ready(
         let process = spawn_overlay(
             daemon.overlay_bin.as_deref(),
             daemon.overlay_events_tx.clone(),
+            daemon.overlay_session_token.clone(),
+            Arc::new(parking_lot::Mutex::new(*daemon.overlay_ui_state.lock())),
         )
         .context("failed to start native overlay")?;
         *overlay = Some(process);
@@ -4797,37 +4815,99 @@ async fn shutdown_daemon(daemon: &Arc<Daemon>) {
     let _ = tokio::fs::remove_file(&daemon.paths.state_file).await;
 }
 
+/// Production overlay path with R11 hardening:
+/// - Env-override gating (BLUEY_DEV_OVERLAY required for overrides in release builds)
+/// - Binary path canonicalization + install-dir containment check
+/// - Per-session token passed via env var; events without matching token dropped
+/// - Per-event field length limits; oversized events dropped + logged
+/// - UI state-machine: AttachFilesRequested allowed only when AttachOpen, etc.
 fn spawn_overlay(
     explicit: Option<&Path>,
     events: mpsc::UnboundedSender<OverlayEvent>,
+    expected_token: String,
+    ui_state: Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
 ) -> Result<OverlayProcess> {
-    let overlay_bin = if let Some(path) = explicit {
+    // Step 1: resolve path. In production builds, env overrides require
+    // BLUEY_DEV_OVERLAY=1 (handled by overlay::resolve_overlay_path).
+    let resolved = if let Some(path) = explicit {
         path.to_path_buf()
-    } else if let Ok(path) = env::var("BLUEY_OVERLAY_BIN").or_else(|_| env::var("CUE_OVERLAY_BIN"))
-    {
-        PathBuf::from(path)
     } else {
-        discover_overlay_bin()?
+        let default = discover_overlay_bin()?;
+        crate::overlay::resolve_overlay_path(&default)
     };
 
-    let mut child = Command::new(&overlay_bin)
+    // Step 2: verify the binary path is canonical + inside the install dir.
+    // The install dir is the parent of the daemon's own current_exe (Tauri+helpers
+    // ship side-by-side). For dev builds we allow any path under the cwd.
+    let install_dir = if cfg!(debug_assertions) || crate::overlay::is_dev_overlay_enabled() {
+        env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    } else {
+        env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("/"))
+    };
+    if let Err(e) = crate::overlay::verify_overlay_binary(&resolved, &install_dir) {
+        warn!(
+            error = %e,
+            binary = %resolved.display(),
+            install_dir = %install_dir.display(),
+            "overlay binary verification failed; refusing to spawn"
+        );
+        return Err(anyhow!("overlay binary verification failed: {e}"));
+    }
+
+    // Step 3: spawn with the per-session token in env var.
+    let mut child = Command::new(&resolved)
+        .env("BLUEY_OVERLAY_SESSION_TOKEN", &expected_token)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .with_context(|| format!("failed to spawn overlay {}", overlay_bin.display()))?;
+        .with_context(|| format!("failed to spawn overlay {}", resolved.display()))?;
 
     let stdin = child.stdin.take().context("overlay stdin is not piped")?;
 
+    // Step 4: line reader with token + length + state validation before forwarding.
     if let Some(stdout) = child.stdout.take() {
+        let token_for_reader = expected_token;
+        let ui_state_for_reader = ui_state.clone();
         std::thread::spawn(move || {
             let reader = std::io::BufReader::new(stdout);
             for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
-                if let Ok(event) = serde_json::from_str::<OverlayEvent>(&line) {
-                    info!("overlay event: {:?}", event);
-                    let _ = events.send(event);
-                } else {
-                    info!("overlay: {line}");
+                match validate_and_decode_overlay_line(
+                    &line,
+                    &token_for_reader,
+                    &ui_state_for_reader,
+                ) {
+                    Ok(event) => {
+                        info!("overlay event: {:?}", event);
+                        let _ = events.send(event);
+                    }
+                    Err(OverlayLineReject::NotJson) => {
+                        // Plain log line from overlay (non-event output).
+                        info!("overlay: {line}");
+                    }
+                    Err(OverlayLineReject::TokenMismatch) => {
+                        warn!("overlay event rejected: token mismatch");
+                    }
+                    Err(OverlayLineReject::FieldTooLong { field, len, max }) => {
+                        warn!(
+                            field = %field,
+                            len, max,
+                            "overlay event rejected: field exceeds max length"
+                        );
+                    }
+                    Err(OverlayLineReject::StateNotAllowed { kind, state }) => {
+                        warn!(
+                            kind = %kind,
+                            state = ?state,
+                            "overlay event rejected: not allowed in current UI state"
+                        );
+                    }
+                    Err(OverlayLineReject::ParseError(e)) => {
+                        warn!(error = %e, "overlay event parse error; line dropped");
+                    }
                 }
             }
             let _ = events.send(OverlayEvent::Exited);
@@ -4835,6 +4915,157 @@ fn spawn_overlay(
     }
 
     Ok(OverlayProcess { child, stdin })
+}
+
+/// Reasons a line from the overlay child can be rejected before being forwarded.
+#[derive(Debug)]
+pub enum OverlayLineReject {
+    NotJson,
+    TokenMismatch,
+    FieldTooLong {
+        field: &'static str,
+        len: usize,
+        max: usize,
+    },
+    StateNotAllowed {
+        kind: String,
+        state: cue_core::overlay_ipc::OverlayUiState,
+    },
+    ParseError(String),
+}
+
+impl std::fmt::Display for OverlayLineReject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+/// Per-field length caps for the production overlay path.
+/// Mirrors `cue_core::overlay_ipc` limits.
+const OVERLAY_MAX_QUESTION: usize = 4 * 1024;
+const OVERLAY_MAX_INSTRUCTIONS: usize = 16 * 1024;
+const OVERLAY_MAX_PATH: usize = 1024;
+const OVERLAY_MAX_PATHS: usize = 16;
+const OVERLAY_MAX_TEXT: usize = 64 * 1024;
+const OVERLAY_MAX_LINE: usize = 128 * 1024;
+
+pub fn validate_and_decode_overlay_line(
+    line: &str,
+    expected_token: &str,
+    ui_state: &parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>,
+) -> Result<OverlayEvent, OverlayLineReject> {
+    if line.len() > OVERLAY_MAX_LINE {
+        return Err(OverlayLineReject::FieldTooLong {
+            field: "<line>",
+            len: line.len(),
+            max: OVERLAY_MAX_LINE,
+        });
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(line).map_err(|_| OverlayLineReject::NotJson)?;
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => return Err(OverlayLineReject::NotJson),
+    };
+
+    // Token validation. If the daemon has a non-empty token, the event MUST
+    // include a matching `token` field. Empty expected token means legacy mode.
+    if !expected_token.is_empty() {
+        let supplied = obj.get("token").and_then(|v| v.as_str()).unwrap_or("");
+        if supplied != expected_token {
+            return Err(OverlayLineReject::TokenMismatch);
+        }
+    }
+
+    // Field length limits BEFORE state-machine check (cheaper to reject).
+    if let Some(s) = obj.get("question").and_then(|v| v.as_str()) {
+        if s.len() > OVERLAY_MAX_QUESTION {
+            return Err(OverlayLineReject::FieldTooLong {
+                field: "question",
+                len: s.len(),
+                max: OVERLAY_MAX_QUESTION,
+            });
+        }
+    }
+    if let Some(s) = obj.get("text").and_then(|v| v.as_str()) {
+        if s.len() > OVERLAY_MAX_TEXT {
+            return Err(OverlayLineReject::FieldTooLong {
+                field: "text",
+                len: s.len(),
+                max: OVERLAY_MAX_TEXT,
+            });
+        }
+    }
+    if let Some(s) = obj.get("instructions").and_then(|v| v.as_str()) {
+        if s.len() > OVERLAY_MAX_INSTRUCTIONS {
+            return Err(OverlayLineReject::FieldTooLong {
+                field: "instructions",
+                len: s.len(),
+                max: OVERLAY_MAX_INSTRUCTIONS,
+            });
+        }
+    }
+    if let Some(arr) = obj.get("paths").and_then(|v| v.as_array()) {
+        if arr.len() > OVERLAY_MAX_PATHS {
+            return Err(OverlayLineReject::FieldTooLong {
+                field: "paths",
+                len: arr.len(),
+                max: OVERLAY_MAX_PATHS,
+            });
+        }
+        for p in arr {
+            if let Some(s) = p.as_str() {
+                if s.len() > OVERLAY_MAX_PATH {
+                    return Err(OverlayLineReject::FieldTooLong {
+                        field: "paths[entry]",
+                        len: s.len(),
+                        max: OVERLAY_MAX_PATH,
+                    });
+                }
+            }
+        }
+    }
+    if let Some(s) = obj.get("error").and_then(|v| v.as_str()) {
+        if s.len() > OVERLAY_MAX_QUESTION {
+            return Err(OverlayLineReject::FieldTooLong {
+                field: "error",
+                len: s.len(),
+                max: OVERLAY_MAX_QUESTION,
+            });
+        }
+    }
+
+    // Deserialize into typed event after stripping token (serde will ignore
+    // unknown fields by default for #[serde(tag = "type", ...)] enums).
+    let event: OverlayEvent =
+        serde_json::from_value(value).map_err(|e| OverlayLineReject::ParseError(e.to_string()))?;
+
+    // State-machine validation: certain events are only allowed in certain UI states.
+    let kind_str: String = format!("{event:?}")
+        .split_whitespace()
+        .next()
+        .unwrap_or("Unknown")
+        .to_string();
+    let current_state = *ui_state.lock();
+    use cue_core::overlay_ipc::OverlayUiState as S;
+    let allowed = match &event {
+        OverlayEvent::AttachRequested | OverlayEvent::AttachFilesRequested { .. } => {
+            current_state == S::AttachOpen
+        }
+        OverlayEvent::InstructionsRequested | OverlayEvent::InstructionsUpdated { .. } => {
+            current_state == S::InstructionsOpen
+        }
+        // All other events allowed in any state.
+        _ => true,
+    };
+    if !allowed {
+        return Err(OverlayLineReject::StateNotAllowed {
+            kind: kind_str,
+            state: current_state,
+        });
+    }
+
+    Ok(event)
 }
 
 fn discover_overlay_bin() -> Result<PathBuf> {

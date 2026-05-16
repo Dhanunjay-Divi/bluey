@@ -19,7 +19,9 @@ impl WhatToAnswerLlm {
             .await
     }
 
-    /// Run with a callback invoked on each chunk: (accumulated_text, finished).
+    /// Run with a callback invoked on each chunk: (delta_text, finished).
+    ///  is the NEW text in this chunk, not the cumulative response.
+    /// The caller is responsible for accumulating if needed.
     pub async fn run_streaming(
         &self,
         transcript: &str,
@@ -38,8 +40,9 @@ impl WhatToAnswerLlm {
             let mut acc = String::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
+                // Emit DELTA (just the new text), not cumulative — the dashboard appends.
+                on_chunk(&chunk.text, chunk.finished);
                 acc.push_str(&chunk.text);
-                on_chunk(&acc, chunk.finished);
                 if chunk.finished {
                     break;
                 }

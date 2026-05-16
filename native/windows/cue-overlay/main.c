@@ -153,8 +153,34 @@ static void apply_capture_exclusion(HWND hwnd) {
     }
 }
 
+
+// Per-session token from the daemon (BLUEY_OVERLAY_SESSION_TOKEN env var).
+// Embedded in every emitted JSON event. Daemon validates + drops events
+// whose token does not match its own per-session value.
+static char g_session_token[129] = {0}; // 128-char max + NUL
+
+static void load_session_token(void) {
+    DWORD n = GetEnvironmentVariableA(
+        "BLUEY_OVERLAY_SESSION_TOKEN",
+        g_session_token,
+        (DWORD)sizeof(g_session_token));
+    if (n == 0 || n >= sizeof(g_session_token)) {
+        g_session_token[0] = '\0';
+    }
+}
+
+// Print `,"token":"..."` if a token is set, else nothing.
+// Caller must have already opened the JSON object and emitted >= 1 field.
+static void emit_token_field(void) {
+    if (g_session_token[0] != '\0') {
+        printf(",\"token\":\"%s\"", g_session_token);
+    }
+}
+
 static void emit_ready(void) {
-    printf("{\"type\":\"ready\",\"platform\":\"windows\",\"capture_excluded\":true}\n");
+    printf("{\"type\":\"ready\",\"platform\":\"windows\",\"capture_excluded\":true");
+    emit_token_field();
+    printf("}\n");
     fflush(stdout);
 }
 
@@ -177,7 +203,9 @@ static void json_print_escaped(const char *text) {
 }
 
 static void emit_simple_event(const char *type) {
-    printf("{\"type\":\"%s\"}\n", type);
+    printf("{\"type\":\"%s\"", type);
+    emit_token_field();
+    printf("}\n");
     fflush(stdout);
 }
 
@@ -730,7 +758,7 @@ static DWORD WINAPI stdin_thread(LPVOID unused) {
             g_transcript_final[0] = L'\0';
             InvalidateRect(g_hwnd, NULL, TRUE);
         } else if (strcmp(msg_type, "ping") == 0) {
-            printf("{\"type\":\"pong\"}\n");
+            emit_simple_event("pong");
             fflush(stdout);
         }
     }
@@ -1471,6 +1499,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     set_window_opacity(g_opacity);
     apply_capture_exclusion(g_hwnd);
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
+    load_session_token();
     emit_ready();
     CreateThread(NULL, 0, stdin_thread, NULL, 0, NULL);
 
