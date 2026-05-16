@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use tracing::warn;
 
-use crate::{LlmError, LlmProvider, LlmRequest, LlmResponse};
+use crate::{LlmChunkStream, LlmError, LlmProvider, LlmRequest, LlmResponse};
 
 /// Failover router: tries providers in order, advancing on Auth/Quota errors.
 pub struct LlmRouter {
@@ -55,6 +55,37 @@ impl LlmProvider for LlmRouter {
             }
         }
         Err(last_err.unwrap_or(LlmError::Provider("all providers failed".into())))
+    }
+
+    async fn complete_stream(&self, req: &LlmRequest) -> Result<LlmChunkStream, LlmError> {
+        if self.providers.is_empty() {
+            return Err(LlmError::Provider("no providers configured".into()));
+        }
+        let start = self.active.load(Ordering::Relaxed);
+        let len = self.providers.len();
+        let mut last_err = None;
+
+        for i in 0..len {
+            let idx = (start + i) % len;
+            let provider = &self.providers[idx];
+            match provider.complete_stream(req).await {
+                Ok(stream) => {
+                    self.active.store(idx, Ordering::Relaxed);
+                    return Ok(stream);
+                }
+                Err(e) if e.should_failover() => {
+                    warn!(provider = provider.name(), error = %e, "stream failover");
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.unwrap_or(LlmError::Provider("all providers failed".into())))
+    }
+
+    fn supports_streaming(&self) -> bool {
+        self.providers.iter().any(|p| p.supports_streaming())
     }
 }
 
@@ -207,5 +238,21 @@ mod tests {
             }),
         ]);
         assert_eq!(router.provider_names(), vec!["x", "y"]);
+    }
+
+    #[tokio::test]
+    async fn test_stream_default_fallback() {
+        use futures_util::StreamExt;
+        let router = LlmRouter::new(vec![Box::new(MockProvider {
+            name: "a",
+            result: Ok(LlmResponse {
+                text: "hello".into(),
+            }),
+        })]);
+        let mut stream = router.complete_stream(&test_req()).await.unwrap();
+        let chunk = stream.next().await.unwrap().unwrap();
+        assert_eq!(chunk.text, "hello");
+        assert!(chunk.finished);
+        assert!(stream.next().await.is_none());
     }
 }
