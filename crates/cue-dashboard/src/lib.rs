@@ -106,13 +106,20 @@ pub fn run() {
                 if let Err(e) = cue_stealth::apply_disguise(&req) {
                     tracing::warn!(error = %e, "failed to apply startup disguise");
                 }
-                // Re-assertion timers: OS sometimes drifts the process title
+                // Re-assertion timers: OS sometimes drifts the process title.
+                // Read the CURRENT persisted mode at each tick so rapid user
+                // changes are respected (no stale overrides).
                 let app_name = req.app_name.clone();
+                let db_path = db_path.to_str().unwrap_or("bluey.db").to_owned();
                 std::thread::spawn(move || {
                     for delay_ms in [200, 1000, 5000] {
                         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        let current_mode = cue_daemon::db::Database::open(&db_path)
+                            .ok()
+                            .and_then(|db| db.load_setting("disguise_mode").ok().flatten())
+                            .unwrap_or_else(|| "none".to_string());
                         let re_req = cue_stealth::build_request(
-                            cue_stealth::DisguiseMode::from_str_loose(&mode_str),
+                            cue_stealth::DisguiseMode::from_str_loose(&current_mode),
                             None,
                         );
                         let _ = cue_stealth::apply_disguise(&re_req);
@@ -158,13 +165,14 @@ pub fn run() {
                         if total <= last_count {
                             continue;
                         }
-                        for seg in meeting.transcript.iter().skip(last_count) {
+                        for (i, seg) in meeting.transcript.iter().enumerate().skip(last_count) {
                             let source = match seg.speaker {
                                 cue_core::Speaker::System => "system",
                                 cue_core::Speaker::User => "microphone",
                                 _ => "unknown",
                             };
                             let payload = commands::LiveTranscriptPayload {
+                                index: i,
                                 session_id: sid.clone(),
                                 source: source.to_string(),
                                 text: seg.text.clone(),

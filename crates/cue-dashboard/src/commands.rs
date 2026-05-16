@@ -650,6 +650,7 @@ mod tests {
 /// Payload matching the  Tauri event shape.
 #[derive(Clone, Serialize)]
 pub struct LiveTranscriptPayload {
+    pub index: usize,
     pub session_id: String,
     pub source: String,
     pub text: String,
@@ -672,14 +673,16 @@ pub fn get_live_transcripts(since_index: usize) -> Result<Vec<LiveTranscriptPayl
     let segments: Vec<LiveTranscriptPayload> = meeting
         .transcript
         .iter()
+        .enumerate()
         .skip(since_index)
-        .map(|seg| {
+        .map(|(i, seg)| {
             let source = match seg.speaker {
                 cue_core::Speaker::System => "system",
                 cue_core::Speaker::User => "microphone",
                 _ => "unknown",
             };
             LiveTranscriptPayload {
+                index: i,
                 session_id: session_id.clone(),
                 source: source.to_string(),
                 text: seg.text.clone(),

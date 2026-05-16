@@ -84,3 +84,63 @@ fn transcript_segment_persists_to_meeting_json() {
     // Cleanup.
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+/// Verify that the poller deduplication logic (skip segments at indices < last_count)
+/// delivers each segment exactly once across catch-up + live path.
+#[test]
+fn live_transcript_dedup_no_duplicates_across_catchup_and_poller() {
+    let tmp_dir = std::env::temp_dir().join(format!("cue-dedup-test-{}", std::process::id()));
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    let meeting_path = tmp_dir.join("active-meeting.json");
+
+    // Create meeting with 3 initial segments (simulating existing data)
+    let mut meeting = MeetingRecord::new(Some("Dedup test".to_string()));
+    for i in 0..3 {
+        meeting.transcript.push(cue_core::TranscriptSegment::new(
+            cue_core::Speaker::User,
+            format!("segment {i}"),
+            true,
+        ));
+    }
+    std::fs::write(&meeting_path, serde_json::to_vec_pretty(&meeting).unwrap()).unwrap();
+
+    // Simulate catch-up: UI reads all segments (since_index=0), gets indices 0,1,2
+    let catchup_count = meeting.transcript.len();
+    assert_eq!(catchup_count, 3);
+
+    // Simulate poller state: last_count starts at catchup_count (3)
+    let mut last_count: usize = catchup_count;
+
+    // Add 2 more segments (simulating daemon writing new data)
+    meeting.transcript.push(cue_core::TranscriptSegment::new(
+        cue_core::Speaker::System,
+        "segment 3",
+        true,
+    ));
+    meeting.transcript.push(cue_core::TranscriptSegment::new(
+        cue_core::Speaker::User,
+        "segment 4",
+        true,
+    ));
+    std::fs::write(&meeting_path, serde_json::to_vec_pretty(&meeting).unwrap()).unwrap();
+
+    // Poller tick: only emit segments at index >= last_count
+    let total = meeting.transcript.len();
+    let mut emitted: Vec<(usize, String)> = Vec::new();
+    for (i, seg) in meeting.transcript.iter().enumerate().skip(last_count) {
+        emitted.push((i, seg.text.clone()));
+    }
+    last_count = total;
+
+    // Verify: only segments 3 and 4 were emitted (no duplicates of 0,1,2)
+    assert_eq!(emitted.len(), 2);
+    assert_eq!(emitted[0], (3, "segment 3".to_string()));
+    assert_eq!(emitted[1], (4, "segment 4".to_string()));
+    assert_eq!(last_count, 5);
+
+    // Another poller tick with no new data: nothing emitted
+    let total2 = meeting.transcript.len();
+    assert!(total2 <= last_count); // no new segments
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
