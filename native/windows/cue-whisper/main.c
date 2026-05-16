@@ -22,29 +22,37 @@
 #define CHUNK_BYTES (CHUNK_SAMPLES * 2)
 
 int main(void) {
+    short *buf;
+    size_t rd;
+
 #ifdef _WIN32
     _setmode(_fileno(stdin), _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
 #endif
 
-    short *buf = (short *)malloc(CHUNK_BYTES);
+    buf = (short *)malloc(CHUNK_BYTES);
     if (!buf) return 1;
 
     while (1) {
-        size_t rd = fread(buf, 1, CHUNK_BYTES, stdin);
+        size_t n_samples;
+        double sum_sq;
+        double rms;
+        size_t i;
+
+        rd = fread(buf, 1, CHUNK_BYTES, stdin);
         if (rd == 0) break;
 
         /* Compute RMS to detect speech vs silence */
-        size_t n_samples = rd / 2;
-        double sum_sq = 0.0;
-        for (size_t i = 0; i < n_samples; i++) {
+        n_samples = rd / 2;
+        sum_sq = 0.0;
+        for (i = 0; i < n_samples; i++) {
             sum_sq += (double)buf[i] * (double)buf[i];
         }
-        double rms = sqrt(sum_sq / (double)(n_samples > 0 ? n_samples : 1));
+        rms = sqrt(sum_sq / (double)(n_samples > 0 ? n_samples : 1));
 
         if (rms > 500.0) {
-            printf({"type":"partial","text":"[speech detected]"}n);
-            printf({"type":"final","text":"[stub transcription]","confidence":0.0}n);
+            printf("{\"type\":\"partial\",\"text\":\"[speech detected]\"}\n");
+            printf("{\"type\":\"final\",\"text\":\"[stub transcription]\",\"confidence\":0.0}\n");
             fflush(stdout);
         }
     }
