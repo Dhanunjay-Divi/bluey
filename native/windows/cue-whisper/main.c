@@ -31,11 +31,11 @@ int main(void) {
     if (!buf) return 1;
 
     while (1) {
-        size_t read = fread(buf, 1, CHUNK_BYTES, stdin);
-        if (read == 0) break;
+        size_t rd = fread(buf, 1, CHUNK_BYTES, stdin);
+        if (rd == 0) break;
 
         /* Compute RMS to detect speech vs silence */
-        size_t n_samples = read / 2;
+        size_t n_samples = rd / 2;
         double sum_sq = 0.0;
         for (size_t i = 0; i < n_samples; i++) {
             sum_sq += (double)buf[i] * (double)buf[i];
