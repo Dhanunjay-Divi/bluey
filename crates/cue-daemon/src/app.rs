@@ -407,6 +407,7 @@ struct Daemon {
     active_answer_card: Mutex<Option<(u64, uuid::Uuid)>>,
     system_audio: Mutex<Option<crate::audio::system_capture::SystemAudioCapture>>,
     live_transcript_tx: broadcast::Sender<LiveTranscriptEvent>,
+    rag: Option<Arc<crate::db::rag::RagPipeline>>,
 }
 
 struct OverlayProcess {
@@ -454,6 +455,7 @@ pub async fn run() -> Result<()> {
     let cloud_status = cloud_status_from_env(&paths);
     let (overlay_events_tx, overlay_events_rx) = mpsc::unbounded_channel();
     let overlay_bin = args.overlay_bin.clone();
+    let rag_pipeline = init_rag_pipeline(&paths);
 
     let daemon = Arc::new(Daemon {
         paths,
@@ -478,6 +480,7 @@ pub async fn run() -> Result<()> {
         active_answer_card: Mutex::new(None),
         system_audio: Mutex::new(None),
         live_transcript_tx: broadcast::channel(64).0,
+        rag: rag_pipeline,
     });
 
     if !args.no_overlay {
@@ -2456,6 +2459,18 @@ async fn add_audio_transcript_segment(
         ts_ms,
     });
 
+
+    // Live RAG indexing on Final transcripts (fire-and-forget).
+    if segment.is_final {
+        if let Some(rag) = daemon.rag.as_ref() {
+            let rag = Arc::clone(rag);
+            let sid = meeting_snapshot.id.to_string();
+            let t = text.to_string();
+            tokio::spawn(async move {
+                rag.index_transcript(&sid, &t).await;
+            });
+        }
+    }
     Ok(())
 }
 
@@ -5477,6 +5492,31 @@ async fn update_state_from_meeting(
         }
     }
     write_state(daemon).await
+}
+
+
+/// Initialize the RAG pipeline if an OpenAI API key is available.
+/// Returns None (with a log) if no key is configured — RAG is optional.
+fn init_rag_pipeline(paths: &AppPaths) -> Option<Arc<crate::db::rag::RagPipeline>> {
+    let api_key = match crate::secrets::load_api_key("openai") {
+        Ok(Some(key)) => key,
+        _ => {
+            info!("RAG pipeline disabled: no OpenAI API key configured");
+            return None;
+        }
+    };
+    let embedder = Arc::new(cue_rag::embedder::OpenAiEmbedder::new(api_key));
+    let store_path = paths.data_dir.join("rag_vectors.db");
+    match crate::db::rag::RagPipeline::new(store_path, embedder) {
+        Ok(pipeline) => {
+            info!("RAG pipeline initialized");
+            Some(Arc::new(pipeline))
+        }
+        Err(e) => {
+            warn!("RAG pipeline init failed: {e:#}");
+            None
+        }
+    }
 }
 
 #[cfg(test)]

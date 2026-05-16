@@ -1,3 +1,4 @@
+pub mod rag;
 pub mod search;
 pub mod speakers;
 
