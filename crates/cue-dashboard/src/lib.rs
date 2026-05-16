@@ -81,6 +81,11 @@ pub fn run() {
             commands::auto_recap,
         ])
         .setup(|app| {
+
+            // R10: Install anti-debug protections (best-effort, non-fatal)
+            if let Err(e) = cue_stealth::install_anti_debug() {
+                tracing::warn!(error = %e, "anti-debug installation failed (degraded mode)");
+            }
             // Open database
             let db_path = dirs::data_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("."))

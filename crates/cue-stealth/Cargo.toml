@@ -17,4 +17,9 @@ libc.workspace = true
 libc.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.58", features = ["Win32_UI_Shell"] }
+windows = { version = "0.58", features = [
+    "Win32_UI_Shell",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Threading",
+    "Win32_Foundation",
+] }

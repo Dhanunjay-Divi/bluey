@@ -163,6 +163,53 @@ pub fn apply_disguise(req: &DisguiseRequest) -> Result<(), StealthError> {
     Ok(())
 }
 
+
+// ─── Anti-debug public API ───────────────────────────────────────────────────
+
+/// Install anti-debug protections for the current platform.
+///
+/// - **macOS:** Calls `ptrace(PT_DENY_ATTACH)` to prevent future debugger attachment.
+/// - **Windows:** Spawns a watchdog thread that polls `IsDebuggerPresent` / `CheckRemoteDebuggerPresent` every 5s and logs warnings.
+/// - **Linux:** Spawns a watchdog thread that reads `/proc/self/status` TracerPid every 5s and logs warnings.
+///
+/// This is best-effort and defeatable by determined attackers, but raises the
+/// bar against casual inspection of the running process.
+pub fn install_anti_debug() -> Result<(), StealthError> {
+    tracing::info!("installing anti-debug protections");
+
+    #[cfg(target_os = "macos")]
+    macos::install_anti_debug()?;
+
+    #[cfg(target_os = "windows")]
+    windows::install_anti_debug()?;
+
+    #[cfg(target_os = "linux")]
+    linux::install_anti_debug()?;
+
+    Ok(())
+}
+
+/// Check if a debugger is currently attached to this process.
+///
+/// - **macOS:** sysctl P_TRACED flag check.
+/// - **Windows:** `IsDebuggerPresent()` + `CheckRemoteDebuggerPresent()`.
+/// - **Linux:** `/proc/self/status` TracerPid field.
+///
+/// Returns `false` on unsupported platforms or if the check fails.
+pub fn is_debugger_attached() -> bool {
+    #[cfg(target_os = "macos")]
+    return macos::is_debugger_attached();
+
+    #[cfg(target_os = "windows")]
+    return windows::is_debugger_attached();
+
+    #[cfg(target_os = "linux")]
+    return linux::is_debugger_attached();
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
