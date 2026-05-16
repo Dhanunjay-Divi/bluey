@@ -61,9 +61,11 @@ while true {
     let data = stdinHandle.readData(ofLength: chunkBytes)
     if data.isEmpty { break }
 
-    let floats: [Float] = data.withUnsafeBytes { buf in
-        let ptr = buf.bindMemory(to: Int16.self)
-        return ptr.map { Float($0) / 32768.0 }
+    let floats: [Float] = data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) in
+        let count = buf.count / 2
+        return (0..<count).map { i in
+            Float(buf.loadUnaligned(fromByteOffset: i * 2, as: Int16.self)) / 32768.0
+        }
     }
 
     // Skip silence (RMS threshold)
