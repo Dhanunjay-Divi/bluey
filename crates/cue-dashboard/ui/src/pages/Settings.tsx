@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { type DisguiseMode, getDisguise, setDisguise } from "../lib/disguise";
 
 interface SettingsState {
   stt_provider: string;
@@ -10,6 +11,24 @@ interface SettingsState {
 
 const STT_PROVIDERS = ["deepgram", "echo", "openai", "local_whisper"];
 
+const MAC_LABELS: Record<DisguiseMode, string> = {
+  none: "None",
+  terminal: "Terminal",
+  settings: "System Settings",
+  activity: "Activity Monitor",
+};
+
+const WIN_LABELS: Record<DisguiseMode, string> = {
+  none: "None",
+  terminal: "Command Prompt",
+  settings: "Settings",
+  activity: "Task Manager",
+};
+
+function isMac(): boolean {
+  return navigator.platform.toLowerCase().includes("mac");
+}
+
 export function Settings() {
   const [settings, setSettings] = useState<SettingsState>({
     stt_provider: "deepgram",
@@ -18,6 +37,7 @@ export function Settings() {
     language_hint: "en",
   });
   const [saving, setSaving] = useState(false);
+  const [disguise, setDisguiseState] = useState<DisguiseMode>("none");
 
   useEffect(() => {
     invoke<Record<string, string>>("load_settings")
@@ -30,6 +50,10 @@ export function Settings() {
         });
       })
       .catch((e) => console.warn("load_settings failed:", e));
+
+    getDisguise()
+      .then(setDisguiseState)
+      .catch((e) => console.warn("get_disguise failed:", e));
   }, []);
 
   const save = () => {
@@ -38,6 +62,15 @@ export function Settings() {
       .catch((e) => console.warn("save_settings failed:", e))
       .finally(() => setSaving(false));
   };
+
+  const handleDisguiseChange = (mode: DisguiseMode) => {
+    setDisguiseState(mode);
+    setDisguise(mode).catch((e) =>
+      console.warn("set_disguise failed:", e)
+    );
+  };
+
+  const labels = isMac() ? MAC_LABELS : WIN_LABELS;
 
   return (
     <div className="p-6 max-w-xl space-y-6">
@@ -106,6 +139,28 @@ export function Settings() {
       >
         {saving ? "Saving…" : "Save"}
       </button>
+
+      <hr className="border-neutral-700" />
+
+      <section className="space-y-3">
+        <h2 className="text-lg font-semibold">Stealth &amp; Disguise</h2>
+        <label className="block">
+          <span className="text-sm font-medium">Disguise Mode</span>
+          <select
+            className="mt-1 block w-full rounded border border-neutral-600 bg-neutral-800 px-3 py-2"
+            value={disguise}
+            onChange={(e) =>
+              handleDisguiseChange(e.target.value as DisguiseMode)
+            }
+          >
+            {(Object.keys(labels) as DisguiseMode[]).map((mode) => (
+              <option key={mode} value={mode}>
+                {labels[mode]}
+              </option>
+            ))}
+          </select>
+        </label>
+      </section>
     </div>
   );
 }
