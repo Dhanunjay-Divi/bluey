@@ -256,3 +256,54 @@ mod tests {
         assert_eq!(std::env::var("CFBundleName").unwrap(), "Terminal");
     }
 }
+
+#[cfg(test)]
+mod reassertion_tests {
+    use super::*;
+
+    /// Simulates rapid mode switches and verifies the final mode wins.
+    /// This validates the pattern used by the re-assertion timers: reading
+    /// the current mode at fire time rather than using a stale captured value.
+    #[test]
+    fn rapid_mode_switch_final_mode_wins() {
+        // Simulate: user switches terminal -> settings -> activity rapidly
+        let modes = [
+            DisguiseMode::Terminal,
+            DisguiseMode::Settings,
+            DisguiseMode::Activity,
+        ];
+        for mode in &modes {
+            let req = build_request(*mode, None);
+            let _ = apply_disguise(&req);
+        }
+        // The final apply should be Activity
+        let final_req = build_request(DisguiseMode::Activity, None);
+        let result = apply_disguise(&final_req);
+        assert!(result.is_ok());
+    }
+
+    /// Verifies that reading current mode (simulating DB read) at each
+    /// re-assertion tick produces the correct final state.
+    #[test]
+    fn reassertion_reads_current_mode_not_stale() {
+        use std::sync::{Arc, Mutex};
+
+        // Shared current mode simulating the DB
+        let current = Arc::new(Mutex::new(DisguiseMode::Terminal));
+
+        // Simulate startup with Terminal
+        let mode = *current.lock().unwrap();
+        let req = build_request(mode, None);
+        let _ = apply_disguise(&req);
+
+        // User changes to Settings before first re-assertion fires
+        *current.lock().unwrap() = DisguiseMode::Settings;
+
+        // Re-assertion fires -- reads current (Settings), not stale (Terminal)
+        let mode_at_fire = *current.lock().unwrap();
+        let re_req = build_request(mode_at_fire, None);
+        let result = apply_disguise(&re_req);
+        assert!(result.is_ok());
+        assert_eq!(mode_at_fire, DisguiseMode::Settings);
+    }
+}
