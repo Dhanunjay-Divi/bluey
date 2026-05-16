@@ -222,10 +222,15 @@ pub fn save_stt_api_key(provider: String, key: String) -> Result<(), String> {
 pub fn load_stt_api_key(provider: String) -> Result<Option<String>, String> {
     let raw = cue_daemon::secrets::load_api_key(&provider).map_err(|e| e.to_string())?;
     Ok(raw.map(|s| {
-        if s.len() <= 4 {
+        // Mask all but the LAST 4 chars (codepoints, not bytes — string-slicing
+        // by bytes panics on multi-byte UTF-8). Provider keys are normally ASCII
+        // but this guards against future non-ASCII secrets.
+        let total = s.chars().count();
+        if total <= 4 {
             "****".to_string()
         } else {
-            format!("****{}", &s[s.len() - 4..])
+            let suffix: String = s.chars().skip(total - 4).collect();
+            format!("****{suffix}")
         }
     }))
 }
@@ -250,11 +255,20 @@ pub fn save_settings(
     settings: std::collections::HashMap<String, String>,
     db: State<DbState>,
 ) -> Result<(), String> {
+    // Reject any keys that look like secrets BEFORE we open a db transaction.
+    // Secrets must go through save_stt_api_key (keyring-backed). Returning an
+    // explicit error makes accidental writes visible in dev tooling instead of
+    // being silently dropped.
+    for k in settings.keys() {
+        if k.contains("api_key") {
+            return Err(format!(
+                "refusing to persist secret-shaped key {k} through save_settings; \
+                 use save_stt_api_key instead"
+            ));
+        }
+    }
     let db = db.0.lock().map_err(|e| e.to_string())?;
     for (k, v) in &settings {
-        if k.contains("api_key") {
-            continue;
-        }
         db.save_setting(k, v).map_err(|e| e.to_string())?;
     }
     Ok(())
@@ -1030,4 +1044,42 @@ fn build_llm_provider_from_env(_db: &State<DbState>) -> Option<Box<dyn cue_llm::
                 .flatten()
         })?;
     Some(Box::new(cue_llm::openai::OpenAiProvider::new(openai_key)))
+}
+
+// ─── R8 nit hardening tests (recheck rollout) ───────────────────────────────
+
+#[cfg(test)]
+mod r8_nit_tests {
+    /// Char-safe last-4 masking matches the new load_stt_api_key behavior:
+    /// must NOT panic on multi-byte UTF-8 trailing bytes.
+    fn mask_last_four(s: &str) -> String {
+        let total = s.chars().count();
+        if total <= 4 {
+            "****".to_string()
+        } else {
+            let suffix: String = s.chars().skip(total - 4).collect();
+            format!("****{suffix}")
+        }
+    }
+
+    #[test]
+    fn mask_short_key() {
+        assert_eq!(mask_last_four("ab"), "****");
+        assert_eq!(mask_last_four("abcd"), "****");
+    }
+
+    #[test]
+    fn mask_ascii_key() {
+        assert_eq!(mask_last_four("sk-abcd1234"), "****1234");
+    }
+
+    #[test]
+    fn mask_multibyte_key_does_not_panic() {
+        // Trailing 4 chars are emoji + ASCII — would have panicked under
+        // byte-slicing. Char-based skip is safe.
+        let key = "secret-key-🦀🎉ab";
+        let masked = mask_last_four(key);
+        assert!(masked.starts_with("****"));
+        assert_eq!(masked.chars().count(), 4 + 4);
+    }
 }
