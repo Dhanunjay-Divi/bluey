@@ -195,7 +195,7 @@ fn is_near_duplicate_transcript(
     })
 }
 
-fn normalize_transcript_text(text: &str) -> String {
+pub fn normalize_transcript_text(text: &str) -> String {
     text.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -208,6 +208,32 @@ fn transcript_age_ms(created_at: &str, now_ms: u64) -> u64 {
         .ok()
         .map(|created_ms| now_ms.saturating_sub(created_ms))
         .unwrap_or(u64::MAX)
+}
+
+/// Partial→Final dedup: when a final transcript arrives, remove the most recent
+/// partial from the same speaker if the final text starts with (or equals) the
+/// partial text (case-insensitive, whitespace-normalized).
+/// Returns true if a partial was removed.
+pub fn dedup_partial_on_final(
+    meeting: &mut MeetingRecord,
+    speaker: Speaker,
+    final_text: &str,
+) -> bool {
+    let norm_final = normalize_transcript_text(final_text);
+    // Search backwards for the most recent non-final segment from same speaker
+    if let Some(idx) = meeting
+        .transcript
+        .iter()
+        .rposition(|seg| !seg.is_final && seg.speaker == speaker)
+    {
+        let norm_partial = normalize_transcript_text(&meeting.transcript[idx].text);
+        // Final supersedes partial if final starts with partial text
+        if norm_final.starts_with(&norm_partial) || norm_partial.starts_with(&norm_final) {
+            meeting.transcript.remove(idx);
+            return true;
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1343,40 +1369,9 @@ async fn build_system_audio_stt_provider() -> anyhow::Result<Box<dyn cue_core::s
         ..Default::default()
     };
 
-    if crate::stt::router::is_router_enabled() {
-        let mut providers: Vec<Box<dyn cue_core::stt::SttProvider>> = Vec::new();
-
-        if let Some(api_key) = env_first(&["BLUEY_STT_API_KEY", "DEEPGRAM_API_KEY"]) {
-            let dg_cfg = crate::stt::deepgram::DeepgramConfig {
-                api_key,
-                ..Default::default()
-            };
-            let provider = crate::stt::deepgram::DeepgramProvider::connect(
-                dg_cfg,
-                stt_cfg.clone(),
-                AudioSource::System,
-            )
-            .await?;
-            providers.push(Box::new(provider));
-        }
-
-        providers.push(Box::new(crate::stt::echo::EchoProvider::new(
-            AudioSource::System,
-        )));
-
-        Ok(Box::new(crate::stt::router::SttRouter::new(providers)))
-    } else {
-        let api_key = env_first(&["BLUEY_STT_API_KEY", "DEEPGRAM_API_KEY"])
-            .ok_or_else(|| anyhow::anyhow!("no STT API key configured for system audio"))?;
-        let dg_cfg = crate::stt::deepgram::DeepgramConfig {
-            api_key,
-            ..Default::default()
-        };
-        let provider =
-            crate::stt::deepgram::DeepgramProvider::connect(dg_cfg, stt_cfg, AudioSource::System)
-                .await?;
-        Ok(Box::new(provider))
-    }
+    crate::stt::factory::build_stt_chain(&stt_cfg, AudioSource::System)
+        .await
+        .map_err(|e| anyhow::anyhow!("STT factory: {e}"))
 }
 
 async fn build_real_audio_runtime_config(
@@ -2411,6 +2406,10 @@ async fn add_audio_transcript_segment(
         let meeting = meeting_guard.as_mut().expect("meeting exists");
         if is_near_duplicate_transcript(meeting, speaker, text, segment.is_final) {
             return Ok(());
+        }
+        // Dedup: if this is a final, remove superseded partial from same speaker
+        if segment.is_final {
+            dedup_partial_on_final(meeting, speaker, text);
         }
         let transcript_segment = TranscriptSegment::new(speaker, text, segment.is_final);
         meeting.transcript.push(transcript_segment.clone());

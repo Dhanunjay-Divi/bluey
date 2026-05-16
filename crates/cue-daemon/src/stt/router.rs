@@ -32,6 +32,11 @@ impl SttRouter {
     }
 
     /// Index of the currently active provider.
+    /// Returns the names of all providers in the chain, in order.
+    pub fn provider_names(&self) -> Vec<&'static str> {
+        self.providers.iter().map(|p| p.name()).collect()
+    }
+
     pub fn active_index(&self) -> usize {
         self.active
     }
