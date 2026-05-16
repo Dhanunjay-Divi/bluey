@@ -657,3 +657,38 @@ pub fn get_live_transcripts(since_index: usize) -> Result<Vec<LiveTranscriptPayl
         .collect();
     Ok(segments)
 }
+
+// ===== Phase 3 Round 8: Process Masquerading =====
+
+/// Apply a disguise mode and persist it. Updates all open windows.
+#[tauri::command]
+pub fn set_disguise(mode: String, app: AppHandle) -> Result<(), String> {
+    let disguise_mode = cue_stealth::DisguiseMode::from_str_loose(&mode);
+    let req = cue_stealth::build_request(disguise_mode, None);
+    cue_stealth::apply_disguise(&req).map_err(|e| e.to_string())?;
+
+    // Update all window titles
+    let title = req.app_name.trim();
+    for (_label, window) in app.webview_windows() {
+        let _ = window.set_title(title);
+    }
+
+    // Persist setting
+    let db_state: State<DbState> = app.state();
+    let db = db_state.0.lock().map_err(|e| e.to_string())?;
+    db.save_setting("disguise_mode", disguise_mode.as_str())
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Get the current disguise mode from persisted settings.
+#[tauri::command]
+pub fn get_disguise(db: State<DbState>) -> Result<String, String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    let mode = db
+        .load_setting("disguise_mode")
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| "none".to_string());
+    Ok(mode)
+}
