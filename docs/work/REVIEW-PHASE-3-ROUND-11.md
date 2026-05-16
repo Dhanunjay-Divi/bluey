@@ -133,3 +133,39 @@ git diff --check 030a63c..HEAD                        # ✅
 - Wire a single shared overlay UI state if modal states are still needed, or remove the unused daemon-level field until there is a real transition source.
 - Add production-path tests for idle attach/style request acceptance and Windows ask-token acceptance.
 - Harden `Responses.tsx` to append non-empty text before deleting an in-flight card on `finished: true`.
+
+## Recheck 2 — Stacked Tip `b199058`
+
+**Date:** 2026-05-16
+
+**Verdict:** 🟢 **ACCEPT**
+
+The remaining R11 blockers from Recheck 1 are resolved:
+
+- 🟢 Windows `emit_ask_event()` now appends `emit_token_field()` before closing the JSON object, so Send/Enter ask events carry the session token.
+- 🟢 `AttachRequested` and `InstructionsRequested` are now accepted from idle as workflow entry events.
+- 🟢 `AttachFilesRequested` and `InstructionsUpdated` remain gated to `AttachOpen` / `InstructionsOpen`.
+- 🟢 Production-path tests now include Windows-style ask-token fixtures and idle entry-event acceptance.
+- 🟢 The R8 key masking and explicit secret-write rejection nits are also fixed on this tip.
+
+Remaining non-blocking nits:
+
+- 🟡 `overlay_ui_state` is still mostly future-facing because current native overlays use daemon-owned OS dialogs for attach/style flows. Keep it simple or wire a real state transition source in Round 12 if modal IPC expands.
+- 🟡 `generate_session_token()` still uses two UUID v4 values. This is strong enough for the alpha overlay handshake, but the comment should stop calling it a literal random 32-byte token, or the implementation should switch to 32 random bytes.
+- 🟡 Harden `Responses.tsx` to append non-empty text before removing an in-flight card on `finished: true`.
+
+Additional verification run:
+
+```bash
+cargo fmt --all --check                              # ✅
+cargo clippy --all-targets -- -D warnings            # ✅
+cargo build --all-targets --release                  # ✅
+cargo test --all-targets                             # ✅ 354 passed, 14 ignored
+cd crates/cue-dashboard/ui && npm run build          # ✅
+swift build -c release --package-path native/macos/cue-overlay   # ✅
+swift build -c release --package-path native/macos/cue-whisper   # ✅
+cargo test -p cue-daemon --test overlay_production_path --test cue_streaming_integration
+                                                       # ✅ 25 passed
+cargo test -p cue-dashboard r8_nit_tests --lib        # ✅ 3 passed
+git diff --check                                      # ✅
+```

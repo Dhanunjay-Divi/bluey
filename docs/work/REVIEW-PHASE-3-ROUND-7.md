@@ -134,3 +134,16 @@ git diff --check                                             # ✅ pass locally
 - Add `actions/checkout@v4` to the `release` job before `python3 infra/scripts/build-sha256-manifest.py`, or inline the manifest builder so no repository file is required.
 - Add an end-to-end local-only Whisper factory smoke test with `whisper_stub`.
 - Merge live transcript catch-up/live state by `{ session_id, index }` to eliminate the remaining startup overwrite race.
+
+## Final Recheck — Stacked Tip `b199058`
+
+**Date:** 2026-05-16
+
+### Resolved Items
+
+- 🟢 The release job now checks out the repository before running `infra/scripts/build-sha256-manifest.py`.
+- 🟢 LocalWhisper/OpenAI fallback construction, Windows whisper compile, artifact naming, Tauri build cwd, Windows helper packaging, and live transcript de-dupe are all fixed in the stacked branch.
+
+### Final Verdict
+
+🟢 **ACCEPT** — R7 blockers are resolved in the current stacked branch.

@@ -74,3 +74,20 @@ clang -fsyntax-only -std=c89 -pedantic -Wall -Wextra \
 - Consider making `save_settings` return an error when a secret-shaped key is supplied instead of silently dropping it.
 - Make `load_stt_api_key` masking char-safe.
 - Runtime icon changes remain deferred; keep docs aligned until `window.set_icon()` is actually wired.
+
+## Final Recheck — Stacked Tip `b199058`
+
+**Date:** 2026-05-16
+
+### Resolved Items
+
+- 🟢 `save_settings` now explicitly rejects secret-shaped `api_key` keys instead of silently skipping them.
+- 🟢 `load_stt_api_key` masking is char-safe and covered by multibyte tests.
+
+### Remaining Nits
+
+- Runtime icon changes remain deferred by product decision. Docs now reflect that.
+
+### Final Verdict
+
+🟢 **ACCEPT** — R8 technical nits are cleared in the current stacked branch.
