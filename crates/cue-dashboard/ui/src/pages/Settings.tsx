@@ -4,8 +4,7 @@ import { type DisguiseMode, getDisguise, setDisguise } from "../lib/disguise";
 
 interface SettingsState {
   stt_provider: string;
-  stt_api_key: string;
-  mic_device: string;
+  "audio.mic_device": string;
   language_hint: string;
 }
 
@@ -32,10 +31,10 @@ function isMac(): boolean {
 export function Settings() {
   const [settings, setSettings] = useState<SettingsState>({
     stt_provider: "deepgram",
-    stt_api_key: "",
-    mic_device: "",
+    "audio.mic_device": "",
     language_hint: "en",
   });
+  const [sttKeyDisplay, setSttKeyDisplay] = useState("");
   const [saving, setSaving] = useState(false);
   const [disguise, setDisguiseState] = useState<DisguiseMode>("none");
   const [passthrough, setPassthrough] = useState(true);
@@ -47,12 +46,17 @@ export function Settings() {
       .then((s) => {
         setSettings({
           stt_provider: s.stt_provider ?? "deepgram",
-          stt_api_key: s.stt_api_key ?? "",
-          mic_device: s.mic_device ?? "",
+          "audio.mic_device": s["audio.mic_device"] ?? "",
           language_hint: s.language_hint ?? "en",
         });
+        // Load masked API key from keyring for the current provider
+        const provider = s.stt_provider ?? "deepgram";
+        return invoke<string | null>("load_stt_api_key", { provider });
       })
-      .catch((e) => console.warn("load_settings failed:", e));
+      .then((masked) => {
+        if (masked) setSttKeyDisplay(masked);
+      })
+      .catch((e) => console.warn("load_settings/key failed:", e));
 
     getDisguise()
       .then(setDisguiseState)
@@ -69,9 +73,30 @@ export function Settings() {
 
   const save = () => {
     setSaving(true);
+    // Save non-secret settings only (api_key is stripped server-side too)
     invoke("save_settings", { settings })
       .catch((e) => console.warn("save_settings failed:", e))
       .finally(() => setSaving(false));
+  };
+
+  const handleSttKeyChange = (key: string) => {
+    setSttKeyDisplay(key);
+  };
+
+  const handleSttKeyCommit = (key: string) => {
+    if (!key || key.startsWith("****")) return;
+    invoke("save_stt_api_key", { provider: settings.stt_provider, key })
+      .then(() => invoke<string | null>("load_stt_api_key", { provider: settings.stt_provider }))
+      .then((masked) => { if (masked) setSttKeyDisplay(masked); })
+      .catch((e) => console.warn("save_stt_api_key failed:", e));
+  };
+
+  const handleProviderChange = (provider: string) => {
+    setSettings({ ...settings, stt_provider: provider });
+    setSttKeyDisplay("");
+    invoke<string | null>("load_stt_api_key", { provider })
+      .then((masked) => { if (masked) setSttKeyDisplay(masked); })
+      .catch(() => {});
   };
 
   const handleDisguiseChange = (mode: DisguiseMode) => {
@@ -117,9 +142,7 @@ export function Settings() {
         <select
           className="mt-1 block w-full rounded border border-neutral-600 bg-neutral-800 px-3 py-2"
           value={settings.stt_provider}
-          onChange={(e) =>
-            setSettings({ ...settings, stt_provider: e.target.value })
-          }
+          onChange={(e) => handleProviderChange(e.target.value)}
         >
           {STT_PROVIDERS.map((p) => (
             <option key={p} value={p}>
@@ -134,12 +157,12 @@ export function Settings() {
         <input
           type="password"
           className="mt-1 block w-full rounded border border-neutral-600 bg-neutral-800 px-3 py-2"
-          value={settings.stt_api_key}
-          onChange={(e) =>
-            setSettings({ ...settings, stt_api_key: e.target.value })
-          }
+          value={sttKeyDisplay}
+          onChange={(e) => handleSttKeyChange(e.target.value)}
+          onBlur={(e) => handleSttKeyCommit(e.target.value)}
           placeholder="••••••••"
         />
+        <span className="text-xs text-zinc-500">Stored securely in system keyring</span>
       </label>
 
       <label className="block">
@@ -147,9 +170,9 @@ export function Settings() {
         <input
           type="text"
           className="mt-1 block w-full rounded border border-neutral-600 bg-neutral-800 px-3 py-2"
-          value={settings.mic_device}
+          value={settings["audio.mic_device"]}
           onChange={(e) =>
-            setSettings({ ...settings, mic_device: e.target.value })
+            setSettings({ ...settings, "audio.mic_device": e.target.value })
           }
           placeholder="default"
         />
@@ -262,7 +285,8 @@ export function Settings() {
 }
 
 // ===== Phase 3 Round 9: AI Provider Settings =====
-
+// LLM API keys are stored via keyring (save_llm_api_key command).
+// Ollama does not require an API key (local inference).
 
 const LLM_PROVIDERS = ["anthropic", "openai", "ollama"];
 

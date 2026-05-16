@@ -252,6 +252,9 @@ pub fn save_settings(
 ) -> Result<(), String> {
     let db = db.0.lock().map_err(|e| e.to_string())?;
     for (k, v) in &settings {
+        if k.contains("api_key") {
+            continue;
+        }
         db.save_setting(k, v).map_err(|e| e.to_string())?;
     }
     Ok(())
