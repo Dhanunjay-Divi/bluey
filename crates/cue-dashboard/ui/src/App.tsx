@@ -11,6 +11,7 @@ import { LiveTranscript } from "./routes/LiveTranscript";
 import { UpdateToast } from "./components/UpdateToast";
 import { PermissionBanner } from "./components/PermissionBanner";
 import { Onboarding } from "./pages/Onboarding";
+import { Settings } from "./pages/Settings";
 
 /** Listens for tray "navigate_to" events and routes accordingly. */
 function NavigateListener() {
@@ -113,7 +114,7 @@ function App() {
           <Route path="session/:id" element={<SessionDetail />} />
           <Route path="prompts" element={<Placeholder name="Prompts" />} />
           <Route path="shortcuts" element={<Placeholder name="Shortcuts" />} />
-          <Route path="settings" element={<Placeholder name="Settings" />} />
+          <Route path="settings" element={<Settings />} />
           <Route path="responses" element={<Placeholder name="Responses" />} />
           <Route path="screenshot" element={<Placeholder name="Screenshot" />} />
           <Route path="audio" element={<Placeholder name="Audio" />} />
