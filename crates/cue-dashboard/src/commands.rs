@@ -539,6 +539,40 @@ pub async fn poll_audio_permission(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+// ===== Phase 3 Round 9: LLM / Cue commands =====
+
+#[tauri::command]
+pub fn save_llm_api_key(provider: String, key: String) -> Result<(), String> {
+    cue_daemon::secrets::store_api_key(&format!("llm_{provider}"), &key).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn list_llm_providers() -> Result<Vec<String>, String> {
+    Ok(vec![
+        "anthropic".to_string(),
+        "openai".to_string(),
+        "ollama".to_string(),
+    ])
+}
+
+#[tauri::command]
+pub fn list_responses(
+    session_id: String,
+    limit: usize,
+    db: State<DbState>,
+) -> Result<Vec<cue_daemon::llm::CueResponse>, String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    db.list_cue_responses(&session_id, limit)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_llm_chain(providers: Vec<String>, db: State<DbState>) -> Result<(), String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    let chain = providers.join(",");
+    db.save_setting("llm.chain", &chain)
+        .map_err(|e| e.to_string())
+}
 #[cfg(test)]
 mod tests {
     use super::*;

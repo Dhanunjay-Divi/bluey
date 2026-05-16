@@ -65,6 +65,11 @@ pub fn run() {
             // R8: Process Masquerading
             commands::set_disguise,
             commands::get_disguise,
+            // R9: LLM / Cue
+            commands::save_llm_api_key,
+            commands::list_llm_providers,
+            commands::list_responses,
+            commands::set_llm_chain,
         ])
         .setup(|app| {
             // Open database
