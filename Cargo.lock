@@ -1082,6 +1082,7 @@ dependencies = [
  "cpal",
  "cue-core",
  "cue-daemon",
+ "cue-llm",
  "cue-stealth",
  "dirs",
  "serde",

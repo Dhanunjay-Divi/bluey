@@ -76,6 +76,9 @@ pub fn run() {
             commands::list_keybinds,
             commands::set_keybind,
             commands::reset_keybinds,
+            // R10: Cue AI hotkey
+            commands::request_cue,
+            commands::auto_recap,
         ])
         .setup(|app| {
             // Open database
@@ -288,6 +291,21 @@ fn register_global_shortcut(app: &tauri::App) -> Result<(), Box<dyn std::error::
         move |_app, _shortcut, event| {
             if event.state == ShortcutState::Pressed {
                 let _ = handle3.emit("hotkey_push_to_talk", ());
+            }
+        },
+    )?;
+
+    // Request cue (AI answer): Cmd/Ctrl+Shift+A
+    let handle_a = app.handle().clone();
+    app.global_shortcut().on_shortcut(
+        if cfg!(target_os = "macos") {
+            "CmdOrCtrl+Shift+A"
+        } else {
+            "Ctrl+Shift+A"
+        },
+        move |_app, _shortcut, event| {
+            if event.state == ShortcutState::Pressed {
+                let _ = handle_a.emit("hotkey_request_cue", ());
             }
         },
     )?;

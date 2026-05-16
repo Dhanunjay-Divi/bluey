@@ -40,7 +40,7 @@ function HotkeyListener() {
           console.warn("daemon_set_push_to_talk failed:", e)
         );
       }),
-      listen("hotkey_toggle_overlay", () => {
+      listen("hotkey_request_cue", () => {        invoke("request_cue", { kind: "answer" }).catch((e) =>          console.warn("request_cue failed:", e)        );      }),      listen("hotkey_toggle_overlay", () => {
         invoke("daemon_toggle_overlay").catch((e) =>
           console.warn("daemon_toggle_overlay failed:", e)
         );

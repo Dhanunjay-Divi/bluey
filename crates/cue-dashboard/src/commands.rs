@@ -827,3 +827,145 @@ pub fn reset_keybinds(db: State<DbState>) -> Result<(), String> {
     db.reset_keybinds().map_err(|e| e.to_string())?;
     Ok(())
 }
+
+// ===== Phase 3 Round 10: Cmd+Shift+A → request_cue =====
+
+/// Trigger a cue response. If a recent question is detected in the transcript
+/// (last ~30s), runs AnswerLlm; otherwise runs WhatToAnswerLlm (suggestion).
+/// Persists the response and emits `cue_response` Tauri event.
+#[tauri::command]
+pub async fn request_cue(
+    kind: String,
+    db: State<'_, DbState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    use cue_daemon::llm::{ends_with_question, AnswerLlm, WhatToAnswerLlm};
+
+    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+    let store = cue_daemon::storage::MeetingStore::new(&paths).map_err(|e| e.to_string())?;
+    let meeting = store
+        .load_active()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "no active session".to_string())?;
+
+    let session_id = meeting.id.to_string();
+
+    // Recent transcript text (last ~30s worth, approx last 10 segments).
+    let recent: String = meeting
+        .transcript
+        .iter()
+        .rev()
+        .take(10)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if recent.trim().is_empty() {
+        return Err("no recent transcript to analyze".to_string());
+    }
+
+    let llm =
+        build_llm_provider_from_env(&db).ok_or_else(|| "no LLM provider configured".to_string())?;
+
+    // Detect question in recent transcript and dispatch.
+    let cue_resp = if kind == "answer" && ends_with_question(&recent) {
+        let question = recent
+            .rsplit('.')
+            .find(|s| s.trim().ends_with('?'))
+            .unwrap_or(&recent)
+            .trim();
+        AnswerLlm
+            .run(question, &session_id, llm.as_ref())
+            .await
+            .map_err(|e| e.to_string())?
+    } else {
+        WhatToAnswerLlm
+            .run(&recent, &session_id, llm.as_ref())
+            .await
+            .map_err(|e| e.to_string())?
+    };
+
+    persist_cue_response(&db, &cue_resp)?;
+    let _ = app.emit("cue_response", &cue_resp);
+    Ok(cue_resp.text.clone())
+}
+
+/// Auto-recap: runs RecapLlm on a session's full transcript.
+/// Best-effort: logs and skips if no LLM provider is available.
+#[tauri::command]
+pub async fn auto_recap(
+    session_id: String,
+    db: State<'_, DbState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    use cue_daemon::llm::RecapLlm;
+
+    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+    let store = cue_daemon::storage::MeetingStore::new(&paths).map_err(|e| e.to_string())?;
+
+    let meetings = store.all_meetings().map_err(|e| e.to_string())?;
+    let meeting = meetings
+        .iter()
+        .find(|m| m.id.to_string() == session_id)
+        .ok_or_else(|| "session not found".to_string())?;
+
+    let transcript: String = meeting
+        .transcript
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if transcript.trim().is_empty() {
+        return Err("empty transcript".to_string());
+    }
+
+    let llm = match build_llm_provider_from_env(&db) {
+        Some(p) => p,
+        None => {
+            tracing::warn!("auto-recap skipped: no LLM provider configured");
+            return Err("no LLM provider configured".to_string());
+        }
+    };
+
+    let cue_resp = RecapLlm
+        .run(&transcript, &session_id, llm.as_ref())
+        .await
+        .map_err(|e| e.to_string())?;
+
+    persist_cue_response(&db, &cue_resp)?;
+    let _ = app.emit("cue_response", &cue_resp);
+    Ok(cue_resp.text.clone())
+}
+
+fn persist_cue_response(
+    db: &State<DbState>,
+    resp: &cue_daemon::llm::CueResponse,
+) -> Result<(), String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    db.insert_cue_response(
+        &resp.id,
+        &resp.source_session_id,
+        &resp.kind,
+        &resp.text,
+        resp.source_text.as_deref(),
+        resp.ts_ms as i64,
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// Build an LLM provider from environment variables or stored secrets.
+fn build_llm_provider_from_env(_db: &State<DbState>) -> Option<Box<dyn cue_llm::LlmProvider>> {
+    let openai_key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .or_else(|| {
+            cue_daemon::secrets::load_api_key("llm_openai")
+                .ok()
+                .flatten()
+        })?;
+    Some(Box::new(cue_llm::openai::OpenAiProvider::new(openai_key)))
+}
