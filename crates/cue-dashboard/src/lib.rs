@@ -70,6 +70,12 @@ pub fn run() {
             commands::list_llm_providers,
             commands::list_responses,
             commands::set_llm_chain,
+            // R9: Mouse passthrough + Keybinds
+            commands::set_mouse_passthrough,
+            commands::get_mouse_passthrough,
+            commands::list_keybinds,
+            commands::set_keybind,
+            commands::reset_keybinds,
         ])
         .setup(|app| {
             // Open database

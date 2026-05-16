@@ -38,6 +38,9 @@ export function Settings() {
   });
   const [saving, setSaving] = useState(false);
   const [disguise, setDisguiseState] = useState<DisguiseMode>("none");
+  const [passthrough, setPassthrough] = useState(true);
+  const [keybinds, setKeybinds] = useState<{action: string; accelerator: string}[]>([]);
+  const [recordingAction, setRecordingAction] = useState<string | null>(null);
 
   useEffect(() => {
     invoke<Record<string, string>>("load_settings")
@@ -54,6 +57,14 @@ export function Settings() {
     getDisguise()
       .then(setDisguiseState)
       .catch((e) => console.warn("get_disguise failed:", e));
+
+    invoke<boolean>("get_mouse_passthrough")
+      .then(setPassthrough)
+      .catch((e) => console.warn("get_mouse_passthrough failed:", e));
+
+    invoke<{action: string; accelerator: string}[]>("list_keybinds")
+      .then(setKeybinds)
+      .catch((e) => console.warn("list_keybinds failed:", e));
   }, []);
 
   const save = () => {
@@ -68,6 +79,31 @@ export function Settings() {
     setDisguise(mode).catch((e) =>
       console.warn("set_disguise failed:", e)
     );
+  };
+
+  const handlePassthroughChange = (enabled: boolean) => {
+    setPassthrough(enabled);
+    invoke("set_mouse_passthrough", { enabled }).catch((e) =>
+      console.warn("set_mouse_passthrough failed:", e)
+    );
+  };
+
+  const handleSetKeybind = (action: string, accelerator: string) => {
+    invoke("set_keybind", { action, accelerator })
+      .then(() => {
+        setKeybinds((prev) =>
+          prev.map((k) => (k.action === action ? { ...k, accelerator } : k))
+        );
+      })
+      .catch((e) => console.warn("set_keybind failed:", e));
+    setRecordingAction(null);
+  };
+
+  const handleResetKeybinds = () => {
+    invoke("reset_keybinds")
+      .then(() => invoke<{action: string; accelerator: string}[]>("list_keybinds"))
+      .then(setKeybinds)
+      .catch((e) => console.warn("reset_keybinds failed:", e));
   };
 
   const labels = isMac() ? MAC_LABELS : WIN_LABELS;
@@ -165,6 +201,62 @@ export function Settings() {
       <hr className="border-neutral-700" />
 
       <AiProviderSettings />
+      <section className="space-y-3">
+        <h2 className="text-lg font-semibold">Overlay</h2>
+        <label className="flex items-center gap-3">
+          <input
+            type="checkbox"
+            checked={passthrough}
+            onChange={(e) => handlePassthroughChange(e.target.checked)}
+            className="h-4 w-4 rounded border-neutral-600 bg-neutral-800"
+          />
+          <span className="text-sm">Click-through (mouse passthrough)</span>
+        </label>
+      </section>
+
+      <hr className="border-neutral-700" />
+
+      <section className="space-y-3">
+        <h2 className="text-lg font-semibold">Keybinds</h2>
+        {keybinds.map((kb) => (
+          <div key={kb.action} className="flex items-center gap-3">
+            <span className="w-40 text-sm">{kb.action.replace(/_/g, " ")}</span>
+            {recordingAction === kb.action ? (
+              <input
+                autoFocus
+                className="flex-1 rounded border border-blue-500 bg-neutral-800 px-3 py-1 text-sm"
+                placeholder="Press keys..."
+                onKeyDown={(e) => {
+                  e.preventDefault();
+                  const parts: string[] = [];
+                  if (e.metaKey || e.ctrlKey) parts.push("CmdOrCtrl");
+                  if (e.shiftKey) parts.push("Shift");
+                  if (e.altKey) parts.push("Alt");
+                  const key = e.key.length === 1 ? e.key.toUpperCase() : e.key;
+                  if (!["Control", "Shift", "Alt", "Meta"].includes(e.key)) {
+                    parts.push(key);
+                    handleSetKeybind(kb.action, parts.join("+"));
+                  }
+                }}
+                onBlur={() => setRecordingAction(null)}
+              />
+            ) : (
+              <button
+                onClick={() => setRecordingAction(kb.action)}
+                className="flex-1 rounded border border-neutral-600 bg-neutral-800 px-3 py-1 text-left text-sm hover:border-neutral-400"
+              >
+                {kb.accelerator}
+              </button>
+            )}
+          </div>
+        ))}
+        <button
+          onClick={handleResetKeybinds}
+          className="rounded border border-neutral-600 px-3 py-1 text-sm hover:bg-neutral-700"
+        >
+          Reset to Defaults
+        </button>
+      </section>
     </div>
   );
 }

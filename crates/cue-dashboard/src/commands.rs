@@ -726,3 +726,95 @@ pub fn get_disguise(db: State<DbState>) -> Result<String, String> {
         .unwrap_or_else(|| "none".to_string());
     Ok(mode)
 }
+
+// ===== Phase 3 Round 9: Mouse Passthrough Toggle =====
+
+/// Set overlay mouse passthrough state and persist it.
+#[tauri::command]
+pub fn set_mouse_passthrough(enabled: bool, db: State<DbState>) -> Result<(), String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    db.save_setting("overlay_passthrough", if enabled { "true" } else { "false" })
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Get the current overlay mouse passthrough state.
+#[tauri::command]
+pub fn get_mouse_passthrough(db: State<DbState>) -> Result<bool, String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    let val = db
+        .load_setting("overlay_passthrough")
+        .map_err(|e| e.to_string())?
+        .unwrap_or_else(|| "true".to_string());
+    Ok(val == "true")
+}
+
+// ===== Phase 3 Round 9: User-Rebindable Keybinds =====
+
+/// A keybind entry returned to the frontend.
+#[derive(Clone, Serialize)]
+pub struct KeybindEntry {
+    pub action: String,
+    pub accelerator: String,
+}
+
+/// Default keybinds for known actions.
+fn default_keybinds() -> Vec<(&'static str, &'static str)> {
+    if cfg!(target_os = "macos") {
+        vec![
+            ("toggle_listening", "CmdOrCtrl+Shift+L"),
+            ("push_to_talk", "CmdOrCtrl+Shift+P"),
+            ("toggle_overlay", "CmdOrCtrl+Shift+H"),
+            ("toggle_dashboard", "CmdOrCtrl+Shift+D"),
+        ]
+    } else {
+        vec![
+            ("toggle_listening", "Ctrl+Shift+L"),
+            ("push_to_talk", "Ctrl+Shift+P"),
+            ("toggle_overlay", "Ctrl+Shift+H"),
+            ("toggle_dashboard", "Ctrl+Shift+D"),
+        ]
+    }
+}
+
+/// List all keybinds (from DB, falling back to defaults).
+#[tauri::command]
+pub fn list_keybinds(db: State<DbState>) -> Result<Vec<KeybindEntry>, String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    db.ensure_keybinds_table().map_err(|e| e.to_string())?;
+    let mut entries = Vec::new();
+    for (action, default_accel) in default_keybinds() {
+        let accel = db
+            .load_keybind(action)
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| default_accel.to_string());
+        entries.push(KeybindEntry {
+            action: action.to_string(),
+            accelerator: accel,
+        });
+    }
+    Ok(entries)
+}
+
+/// Set a keybind for an action. Validates the accelerator string.
+#[tauri::command]
+pub fn set_keybind(action: String, accelerator: String, db: State<DbState>) -> Result<(), String> {
+    // Validate accelerator by attempting to parse
+    accelerator
+        .parse::<tauri_plugin_global_shortcut::Shortcut>()
+        .map_err(|e| format!("invalid accelerator: {e}"))?;
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    db.ensure_keybinds_table().map_err(|e| e.to_string())?;
+    db.save_keybind(&action, &accelerator)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Reset all keybinds to defaults.
+#[tauri::command]
+pub fn reset_keybinds(db: State<DbState>) -> Result<(), String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    db.ensure_keybinds_table().map_err(|e| e.to_string())?;
+    db.reset_keybinds().map_err(|e| e.to_string())?;
+    Ok(())
+}
