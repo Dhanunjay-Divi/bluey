@@ -5,13 +5,24 @@ import { LiveTranscriptList, TranscriptSegment } from "../components/LiveTranscr
 
 const MAX_SEGMENTS = 200;
 
+/** Unique key for dedup: (session_id, index) */
+function segKey(seg: TranscriptSegment): string {
+  return `${seg.session_id}:${seg.index ?? -1}`;
+}
+
 export function LiveTranscript() {
+  // Map keyed by "session_id:index" for O(1) dedup on both catch-up and live.
+  const segMapRef = useRef<Map<string, TranscriptSegment>>(new Map());
   const [segments, setSegments] = useState<TranscriptSegment[]>([]);
   const sessionRef = useRef<string | null>(null);
-  // Per-session highest index already rendered. Live events with
-  // `index <= lastSeenIndexRef.current` are duplicates of catch-up
-  // segments and must be skipped to avoid the catch-up/poller race.
-  const lastSeenIndexRef = useRef<number>(-1);
+
+  const rebuildFromMap = useCallback(() => {
+    const sorted = Array.from(segMapRef.current.values()).sort(
+      (a, b) => (a.index ?? 0) - (b.index ?? 0),
+    );
+    const tail = sorted.length > MAX_SEGMENTS ? sorted.slice(-MAX_SEGMENTS) : sorted;
+    setSegments(tail);
+  }, []);
 
   // Catch-up: load existing segments on mount.
   useEffect(() => {
@@ -19,40 +30,37 @@ export function LiveTranscript() {
       .then((segs) => {
         if (segs.length === 0) return;
         sessionRef.current = segs[0].session_id;
-        const tail = segs.slice(-MAX_SEGMENTS);
-        // Highest index in catch-up — anything <= this is a duplicate.
-        lastSeenIndexRef.current = Math.max(
-          ...tail.map((s) => s.index ?? -1),
-          -1,
-        );
-        setSegments(tail);
+        const map = segMapRef.current;
+        for (const seg of segs) {
+          map.set(segKey(seg), seg);
+        }
+        rebuildFromMap();
       })
       .catch((e) => console.warn("get_live_transcripts failed:", e));
-  }, []);
+  }, [rebuildFromMap]);
 
-  // Subscribe to live events with index-based dedup.
+  // Subscribe to live events with {session_id, index} dedup.
   const handleEvent = useCallback((seg: TranscriptSegment) => {
-    // Session change: clear, start fresh, reset cursor.
+    // Session change: clear map, start fresh.
     if (sessionRef.current && seg.session_id !== sessionRef.current) {
+      segMapRef.current.clear();
       sessionRef.current = seg.session_id;
-      lastSeenIndexRef.current = seg.index ?? -1;
-      setSegments([seg]);
-      return;
     }
     sessionRef.current = seg.session_id;
 
-    // Skip duplicates: catch-up may have already rendered this index.
-    const incomingIdx = seg.index ?? -1;
-    if (incomingIdx >= 0 && incomingIdx <= lastSeenIndexRef.current) {
-      return;
+    const key = segKey(seg);
+    const map = segMapRef.current;
+    // Only insert if not already present (dedup).
+    if (!map.has(key)) {
+      map.set(key, seg);
+      // Trim oldest if over limit.
+      if (map.size > MAX_SEGMENTS) {
+        const firstKey = map.keys().next().value;
+        if (firstKey !== undefined) map.delete(firstKey);
+      }
+      rebuildFromMap();
     }
-    lastSeenIndexRef.current = Math.max(lastSeenIndexRef.current, incomingIdx);
-
-    setSegments((prev) => {
-      const next = [...prev, seg];
-      return next.length > MAX_SEGMENTS ? next.slice(-MAX_SEGMENTS) : next;
-    });
-  }, []);
+  }, [rebuildFromMap]);
 
   useEffect(() => {
     const unlisten = listen<TranscriptSegment>("live_transcript", (event) => {
