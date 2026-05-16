@@ -63,11 +63,9 @@ impl RateLimiter {
             let needed = n as u64 * SCALE;
             let current = self.tokens_scaled.load(Ordering::Acquire);
             let deficit = needed.saturating_sub(current);
-            let wait_ms = if self.refill_per_sec_scaled > 0 {
-                (deficit * 1000) / self.refill_per_sec_scaled
-            } else {
-                100
-            };
+            let wait_ms = (deficit * 1000)
+                .checked_div(self.refill_per_sec_scaled)
+                .unwrap_or(100);
             tokio::time::sleep(tokio::time::Duration::from_millis(wait_ms.max(1))).await;
         }
     }
