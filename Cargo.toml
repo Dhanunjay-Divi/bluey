@@ -6,6 +6,7 @@ members = [
     "crates/cue-dashboard",
     "crates/cue-llm",
     "crates/cue-stealth",
+    "crates/cue-rag",
 ]
 resolver = "2"
 
@@ -38,6 +39,7 @@ async-trait = "0.1"
 futures-util = "0.3"
 parking_lot = "0.12"
 thiserror = "1.0"
+zerocopy = { version = "0.8", features = ["derive"] }
 keyring = "2"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 url = "2.5"
