@@ -95,7 +95,7 @@ Mirrors the natively-cluely Electron pattern. macOS and some Linux desktop envir
 
 ### 3. Window-level changes via Tauri
 
-`window.set_title()` is fully effective and orthogonal to process-level changes. The `set_disguise` command iterates all open webview windows and updates their titles. Icon changes via `window.set_icon()` are supported but deferred until production icons land.
+`window.set_title()` is fully effective and orthogonal to process-level changes. The `set_disguise` command iterates all open webview windows and updates their titles. Icon changes via `window.set_icon()` are NOT wired — the icon path is constructed by `build_request()` but never applied at runtime. This is a deferred feature pending production-quality icon assets.
 
 ### 4. Honest deferrals
 

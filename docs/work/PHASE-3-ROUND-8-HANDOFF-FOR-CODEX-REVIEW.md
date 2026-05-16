@@ -99,7 +99,7 @@ git -P diff --check feat/phase-3-round-7..HEAD       ✅ clean
 - [ ] `DisguiseMode` serde round-trips correctly (rename_all = "lowercase")
 - [ ] `from_str_loose` is case-insensitive and defaults to None for unknown input
 - [ ] `mode_metadata` returns platform-conditional names (e.g. "Command Prompt" on Windows, "Terminal" on macOS)
-- [ ] `build_request` constructs icon paths with correct platform subdirectory (mac/win/linux)
+- [ ] `build_request` constructs icon paths with correct platform subdirectory (mac/win/linux) — NOTE: paths are built but NOT applied at runtime (deferred feature)
 - [ ] macOS `set_process_name`: uses `_NSGetArgv()` safely — null checks on all 3 pointer levels
 - [ ] macOS: truncates new name to original argv[0] length (no buffer overflow)
 - [ ] macOS: null-pads remainder after copy (no stale bytes)
