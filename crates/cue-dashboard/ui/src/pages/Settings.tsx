@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { type DisguiseMode, getDisguise, setDisguise } from "../lib/disguise";
 
@@ -161,6 +161,91 @@ export function Settings() {
           </select>
         </label>
       </section>
+
+      <hr className="border-neutral-700" />
+
+      <AiProviderSettings />
     </div>
+  );
+}
+
+// ===== Phase 3 Round 9: AI Provider Settings =====
+
+
+const LLM_PROVIDERS = ["anthropic", "openai", "ollama"];
+
+export function AiProviderSettings() {
+  const [keys, setKeys] = useState<Record<string, string>>({});
+  const [chain, setChain] = useState<string[]>(LLM_PROVIDERS);
+
+  useEffect(() => {
+    invoke<Record<string, string>>("load_settings").then((s) => {
+      if (s["llm.chain"]) {
+        setChain(s["llm.chain"].split(",").filter(Boolean));
+      }
+    });
+  }, []);
+
+  const saveKey = useCallback((provider: string, key: string) => {
+    setKeys((prev) => ({ ...prev, [provider]: key }));
+    invoke("save_llm_api_key", { provider, key }).catch((e) =>
+      console.warn("save_llm_api_key failed:", e)
+    );
+  }, []);
+
+  const saveChain = useCallback((newChain: string[]) => {
+    setChain(newChain);
+    invoke("set_llm_chain", { providers: newChain }).catch((e) =>
+      console.warn("set_llm_chain failed:", e)
+    );
+  }, []);
+
+  const moveUp = (idx: number) => {
+    if (idx === 0) return;
+    const next = [...chain];
+    [next[idx - 1], next[idx]] = [next[idx], next[idx - 1]];
+    saveChain(next);
+  };
+
+  const moveDown = (idx: number) => {
+    if (idx >= chain.length - 1) return;
+    const next = [...chain];
+    [next[idx], next[idx + 1]] = [next[idx + 1], next[idx]];
+    saveChain(next);
+  };
+
+  return (
+    <section className="space-y-3">
+      <h2 className="text-lg font-semibold">AI Providers</h2>
+      {LLM_PROVIDERS.map((provider) => (
+        <div key={provider} className="flex items-center gap-2">
+          <span className="w-24 text-sm capitalize">{provider}</span>
+          {provider !== "ollama" && (
+            <input
+              type="password"
+              className="flex-1 rounded border border-neutral-600 bg-neutral-800 px-2 py-1 text-sm"
+              placeholder="API key"
+              value={keys[provider] ?? ""}
+              onChange={(e) => setKeys((p) => ({ ...p, [provider]: e.target.value }))}
+              onBlur={(e) => { if (e.target.value) saveKey(provider, e.target.value); }}
+            />
+          )}
+          {provider === "ollama" && (
+            <span className="text-xs text-zinc-500">No key needed (local)</span>
+          )}
+        </div>
+      ))}
+
+      <h3 className="text-sm font-medium mt-4">Provider Chain (failover order)</h3>
+      <div className="space-y-1">
+        {chain.map((p, i) => (
+          <div key={p} className="flex items-center gap-2 text-sm">
+            <span className="w-24 capitalize">{p}</span>
+            <button onClick={() => moveUp(i)} disabled={i === 0} className="text-xs text-zinc-400 hover:text-white disabled:opacity-30">↑</button>
+            <button onClick={() => moveDown(i)} disabled={i === chain.length - 1} className="text-xs text-zinc-400 hover:text-white disabled:opacity-30">↓</button>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }

@@ -8,6 +8,7 @@ import { SessionDetail } from "./pages/SessionDetail";
 import { Placeholder } from "./pages/Placeholder";
 import { Search } from "./routes/Search";
 import { LiveTranscript } from "./routes/LiveTranscript";
+import { Responses } from "./routes/Responses";
 import { UpdateToast } from "./components/UpdateToast";
 import { PermissionBanner } from "./components/PermissionBanner";
 import { Onboarding } from "./pages/Onboarding";
@@ -115,7 +116,7 @@ function App() {
           <Route path="prompts" element={<Placeholder name="Prompts" />} />
           <Route path="shortcuts" element={<Placeholder name="Shortcuts" />} />
           <Route path="settings" element={<Settings />} />
-          <Route path="responses" element={<Placeholder name="Responses" />} />
+          <Route path="responses" element={<Responses />} />
           <Route path="screenshot" element={<Placeholder name="Screenshot" />} />
           <Route path="audio" element={<Placeholder name="Audio" />} />
           <Route path="live" element={<LiveTranscript />} />
