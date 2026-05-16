@@ -200,17 +200,7 @@ jobs:
           # bump-formulae.sh consumes sha256-manifest.json in post-release.
           for f in *; do shasum -a 256 "$f"; done | tee ../SHA256SUMS.txt
           cd ..
-          python3 -c "
-          import json, re
-          sums = {}
-          with open(SHA256SUMS.txt) as f:
-              for line in f:
-                  parts = line.strip().split()
-                  if len(parts) == 2:
-                      sums[parts[1]] = parts[0]
-          with open(sha256-manifest.json, w) as out:
-              json.dump(sums, out, indent=2)
-          "
+          python3 infra/scripts/build-sha256-manifest.py
 
       - name: Generate Tauri updater manifest (latest.json)
         shell: bash
