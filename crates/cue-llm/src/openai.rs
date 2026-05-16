@@ -140,7 +140,7 @@ impl LlmProvider for OpenAiProvider {
             .post(format!("{}/v1/chat/completions", self.base_url))
             .header(
                 obfstr::obfstr!("Authorization"),
-                format!("Bearer {}", self.api_key),
+                format!("{} {}", obfstr::obfstr!("Bearer"), self.api_key),
             )
             .json(&body)
             .send()
@@ -194,7 +194,10 @@ impl LlmProvider for OpenAiProvider {
         let resp = self
             .client
             .post(format!("{}/v1/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header(
+                obfstr::obfstr!("Authorization"),
+                format!("{} {}", obfstr::obfstr!("Bearer"), self.api_key),
+            )
             .json(&body)
             .send()
             .await

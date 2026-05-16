@@ -129,7 +129,10 @@ impl LlmProvider for AnthropicProvider {
             .client
             .post(format!("{}/v1/messages", self.base_url))
             .header(obfstr::obfstr!("x-api-key"), &self.api_key)
-            .header("anthropic-version", "2023-06-01")
+            .header(
+                obfstr::obfstr!("anthropic-version"),
+                obfstr::obfstr!("2023-06-01"),
+            )
             .header("content-type", "application/json")
             .json(&body)
             .send()
@@ -178,8 +181,11 @@ impl LlmProvider for AnthropicProvider {
         let resp = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
+            .header(obfstr::obfstr!("x-api-key"), &self.api_key)
+            .header(
+                obfstr::obfstr!("anthropic-version"),
+                obfstr::obfstr!("2023-06-01"),
+            )
             .header("content-type", "application/json")
             .json(&body)
             .send()
