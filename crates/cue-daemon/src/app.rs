@@ -1377,6 +1377,22 @@ async fn build_system_audio_stt_provider() -> anyhow::Result<Box<dyn cue_core::s
         .map_err(|e| anyhow::anyhow!("STT factory: {e}"))
 }
 
+/// Build an STT provider for the microphone path via the factory chain.
+/// Called when the streaming factory is preferred (e.g. LocalWhisper enabled).
+pub async fn build_mic_stt_provider() -> anyhow::Result<Box<dyn cue_core::stt::SttProvider>> {
+    use cue_core::pcm::AudioSource;
+    use cue_core::stt::SttConfig;
+
+    let stt_cfg = SttConfig {
+        source: AudioSource::Microphone,
+        ..Default::default()
+    };
+
+    crate::stt::factory::build_stt_chain(&stt_cfg, AudioSource::Microphone)
+        .await
+        .map_err(|e| anyhow::anyhow!("STT factory (mic): {e}"))
+}
+
 async fn build_real_audio_runtime_config(
     config: &AudioCaptureConfig,
 ) -> Result<Option<RealAudioRuntimeConfig>> {

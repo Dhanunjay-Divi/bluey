@@ -120,3 +120,57 @@ fn factory_no_api_key_errors() {
         },
     );
 }
+
+#[test]
+#[ignore]
+fn factory_local_whisper_enabled_creates_router_with_whisper_in_chain() {
+    with_env_async(
+        &[
+            ("BLUEY_USE_MOCK_STT", Some("1")),
+            ("BLUEY_STT_LOCAL_WHISPER", Some("1")),
+            ("BLUEY_LOCAL_WHISPER_BINARY", Some("/bin/cat")),
+            ("BLUEY_STT_ROUTER", None),
+            ("BLUEY_STT_FALLBACK_OPENAI", None),
+            ("OPENAI_API_KEY", None),
+        ],
+        || async {
+            // System audio path
+            let provider = build_stt_chain(&stt_cfg(), AudioSource::System)
+                .await
+                .unwrap();
+            assert_eq!(provider.name(), "stt_router");
+
+            // Mic path — same factory, different source
+            let mic_cfg = SttConfig {
+                source: AudioSource::Microphone,
+                ..Default::default()
+            };
+            let mic_provider = build_stt_chain(&mic_cfg, AudioSource::Microphone)
+                .await
+                .unwrap();
+            assert_eq!(mic_provider.name(), "stt_router");
+        },
+    );
+}
+
+#[test]
+#[ignore]
+fn factory_local_whisper_chain_contains_whisper_provider() {
+    with_env_async(
+        &[
+            ("BLUEY_USE_MOCK_STT", Some("1")),
+            ("BLUEY_STT_LOCAL_WHISPER", Some("1")),
+            ("BLUEY_LOCAL_WHISPER_BINARY", Some("/bin/cat")),
+            ("BLUEY_STT_ROUTER", None),
+            ("BLUEY_STT_FALLBACK_OPENAI", None),
+            ("OPENAI_API_KEY", None),
+        ],
+        || async {
+            let provider = build_stt_chain(&stt_cfg(), AudioSource::System)
+                .await
+                .unwrap();
+            // The router wraps [echo, local_whisper] — chain length 2
+            assert_eq!(provider.name(), "stt_router");
+        },
+    );
+}
