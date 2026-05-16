@@ -42,6 +42,10 @@ pub enum OverlayMessage {
     /// Finalized transcript for a completed utterance.
     TranscriptFinal { source: String, text: String },
 
+    /// Toggle mouse passthrough on the overlay window.
+    /// When enabled (true), clicks pass through to underlying windows.
+    SetPassthrough { enabled: bool },
+
     /// Health check ping, for the overlay to acknowledge so daemon knows
     /// the receiver is alive. No payload needed.
     Ping,
@@ -156,5 +160,14 @@ mod tests {
     fn unknown_type_fails_to_decode() {
         let res = decode_ndjson(r#"{"type":"nonsense"}"#);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn set_passthrough_roundtrip() {
+        let msg = OverlayMessage::SetPassthrough { enabled: false };
+        let line = encode_ndjson(&msg).unwrap();
+        assert!(line.contains("set_passthrough"));
+        let parsed = decode_ndjson(&line).unwrap();
+        assert_eq!(parsed, msg);
     }
 }
