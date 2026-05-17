@@ -143,12 +143,21 @@ $ git -P diff --check main..HEAD                                 ✅
 
 ## Distribution model
 
-**Decision (user, 2026-05-17):** Bluey ships as terminal-installed CLI binaries + small native overlay helpers. No .app bundle, no .dmg, no Mac App Store. Distribution channel is `curl | sh` or a brew tap consuming the same tarball that the alpha already produced. **Code signing / notarization are out of scope** — Gatekeeper applies to browser-downloaded GUI apps; CLI binaries fetched from terminal are not subject to it. The Swift overlay binaries are launched by the daemon as child processes, which bypasses quarantine even when their parent (the tarball) was downloaded from a browser.
+**Decision (user, 2026-05-17):** Bluey ships as terminal-installed CLI binaries + small native overlay helpers. No .app bundle, no .dmg, no Mac App Store. Distribution channel is `curl | sh` or a brew tap consuming the same tarball that the alpha already produced. **Code signing / notarization are deferred to a later release.**
 
-This simplifies the production checklist:
-- No Apple Developer ID required.
-- No `codesign` / `xcrun notarytool` pipeline to maintain.
-- Distribution = tarball + sha256 manifest + a thin install script (or brew formula) that places binaries in `~/.local/bin` or `/usr/local/bin`.
+This is a deferral, not a guarantee that Gatekeeper or quarantine will silently let unsigned binaries through. Actual behaviour depends on:
+
+- whether the user obtained the archive via browser download (typically attaches `com.apple.quarantine`) or via `curl` from a terminal (typically does not, but this is not guaranteed),
+- whether they launch the binaries directly or via a parent process,
+- and the enforcement defaults of the user's macOS version.
+
+Per release we will validate the install path on a clean Mac before promoting any artifact. `INSTALL.md` documents the standard `xattr -d com.apple.quarantine` remediation so users can recover when the attribute does get attached.
+
+This still simplifies the v0.1.0 production checklist:
+
+- No Apple Developer ID required for v0.1.0.
+- No `codesign` / `xcrun notarytool` pipeline yet.
+- Distribution = tarball + sha256 manifest + (eventually) a tested install script or brew formula.
 
 ## Open questions for the reviewer
 

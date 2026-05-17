@@ -1,66 +1,66 @@
-# Codex → Kiro: Final v0.1 Alpha Chain Review
+# Codex → Kiro: Phase 3 Round 12 Review
 
 ## 1. Overall Verdict
 
-🟢 **ACCEPT** — R7-fix-3 → R8 → R9 → R10 → R11 are merge-ready on `feat/phase-3-round-11` tip `b199058`.
+🟡 **ACCEPT WITH NITS** — R12 implementation is mergeable, but do not drop the `-alpha` suffix and tag v0.1.0 GA until the release/support-matrix wording is corrected.
 
-## 2. Per-Round Verdicts
+## 2. Round Verdict
 
-- R7-fix-3: 🟢 **ACCEPT** — release job checkout/script blocker is resolved.
-- R8: 🟢 **ACCEPT** — key masking and explicit secret-write rejection nits are cleared.
-- R9: 🟢 **ACCEPT** — AI/RAG/small-wins round is acceptable with documented follow-ups.
-- R10: 🟢 **ACCEPT** — original R10 blockers are resolved by the R11 fix wave.
-- R11: 🟢 **ACCEPT** — production overlay hardening and streaming fixes are now wired and tested.
+- R12.1 Responses final-chunk handling: 🟢 **ACCEPT**
+- R12.2 shared overlay UI state: 🟡 **ACCEPT WITH NIT**
+- R12.3 true 256-bit random session token: 🟢 **ACCEPT**
+- R12.4 sqlite-vec / ANN RAG deferral: 🟢 **ACCEPT DEFERRAL**
+- R12.5 Windows real whisper.cpp deferral: 🟢 **ACCEPT DEFERRAL**
 
-## 3. Review Docs Written / Updated
+Full review is in `docs/work/REVIEW-PHASE-3-ROUND-12.md`.
 
-- Updated `docs/work/REVIEW-PHASE-3-ROUND-7.md` with final accept.
-- Updated `docs/work/REVIEW-PHASE-3-ROUND-8.md` with final accept.
-- Added `docs/work/REVIEW-PHASE-3-ROUND-9.md`.
-- Added `docs/work/REVIEW-PHASE-3-ROUND-10.md`.
-- Updated `docs/work/REVIEW-PHASE-3-ROUND-11.md` with Recheck 2 accept.
-- Overwrote this handoff with the final chain verdict.
+## 3. What Codex Reviewed
 
-## 4. Residual Round 12 Nits
+- `crates/cue-dashboard/ui/src/routes/responseReducer.ts`
+- `crates/cue-dashboard/ui/src/routes/responseReducer.test.ts`
+- `crates/cue-dashboard/ui/src/routes/Responses.tsx`
+- `crates/cue-daemon/src/app.rs`
+- `crates/cue-daemon/src/overlay.rs`
+- `crates/cue-daemon/tests/overlay_production_path.rs`
+- `docs/work/PHASE-3-ROUND-12-HANDOFF-FOR-CODEX-REVIEW.md`
+- Public release surfaces that affect the GA call: `INSTALL.md`, `web/index.html`, `.github/workflows/release.yml`
 
-- `Responses.tsx` should append non-empty text before deleting an in-flight card on `finished: true`.
-- `overlay_ui_state` is mostly future-facing; wire real transitions if modal overlay IPC expands, or simplify it.
-- `generate_session_token()` should either use 32 random bytes or adjust its comment away from "random 32-byte token"; two UUID v4 values are strong enough for alpha but not literally 256 random bits.
-- RAG still uses in-memory cosine search; move to sqlite-vec/ANN before large-scale data.
-- Windows real whisper.cpp remains deferred.
+## 4. Residual Nits
 
-## 5. What I Implemented
+- Before GA, align support-matrix wording with actual artifacts. The handoff says v0.1.0 only ships macOS arm64, while install/site surfaces still imply broader macOS/Windows/Linux availability.
+- Before GA, soften the terminal-only distribution note. It should say signing/notarization are deferred and require clean-machine validation, not that Gatekeeper/quarantine are bypassed.
+- Round 13: reset `overlay_ui_state` back to `Idle` on attach/instructions dialog cancellation/error, or make that modal lifecycle explicit if overlay-owned submit flows expand.
+- Round 13: add optional counters for production overlay-reader rejections once telemetry/log aggregation exists.
+- Future distribution: add a tested `scripts/install.sh` only if `curl | sh` is the primary v0.1.0 install path.
+
+## 5. What Codex Changed
+
+Documentation only:
+
+- Added `docs/work/REVIEW-PHASE-3-ROUND-12.md`
+- Updated `docs/work/HANDOFF-FROM-CODEX-TO-KIRO.md`
 
 No product code changes.
 
-Documentation changes only: review docs and this handoff.
-
-## 6. What I Skipped and Why
-
-- Product naming/white-label/runtime wording: intentionally not revisited per user direction.
-- Full manual execution of GitHub Actions release packaging on hosted runners. The workflow blocker was reviewed statically and the relevant local pipeline is green.
-- Ignored hardware/keychain tests remain ignored by design.
-
-## 7. Pipeline Status
-
-Checks run locally on `feat/phase-3-round-11`:
+## 6. Verification Run
 
 ```bash
-cargo fmt --all --check                              # ✅
-cargo clippy --all-targets -- -D warnings            # ✅
-cargo build --all-targets --release                  # ✅
-cargo test --all-targets                             # ✅ 354 passed, 14 ignored
-cd crates/cue-dashboard/ui && npm run build          # ✅
-swift build -c release --package-path native/macos/cue-overlay   # ✅
-swift build -c release --package-path native/macos/cue-whisper   # ✅
-cargo test -p cue-daemon --test cue_streaming_integration
-                                                       # ✅ 5 passed
-cargo test -p cue-daemon --test overlay_production_path
-                                                       # ✅ 20 passed
-cargo test -p cue-dashboard r8_nit_tests --lib        # ✅ 3 passed
-git diff --check                                      # ✅
+cargo fmt --all --check                                             # ✅
+cargo clippy --all-targets -- -D warnings                           # ✅
+cargo build --all-targets --release                                 # ✅
+cargo test --all-targets                                            # ✅ 361 passed, 14 ignored
+cd crates/cue-dashboard/ui && npm test                              # ✅ 13 passed
+cd crates/cue-dashboard/ui && npm run build                         # ✅
+swift build -c release --package-path native/macos/cue-overlay      # ✅
+swift build -c release --package-path native/macos/cue-whisper      # ✅
+git diff --check main..HEAD                                         # ✅
 ```
 
-## 8. Next Action for Kiro
+## 7. Next Action for Kiro
 
-Merge the stacked branch to main and start the v0.1 alpha rollout. Fold residual nits into Round 12 rather than blocking the merge.
+Treat R12 code as accepted. Before tagging v0.1.0 GA, make one small release-doc cleanup commit that either:
+
+1. scopes v0.1.0 to macOS arm64 only, or
+2. proves/builds/tests the full advertised macOS x86_64 + Windows + Linux matrix.
+
+Also replace the Gatekeeper/quarantine wording with a conservative terminal-only distribution note.

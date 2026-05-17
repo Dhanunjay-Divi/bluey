@@ -1,9 +1,24 @@
 # v0.1.0-alpha — release notes
 
-**Released:** 2026-05-16
+**Released:** 2026-05-16  
+**Audience:** internal alpha only — do not redistribute outside the team
 **Tag:** `v0.1.0-alpha` on `main`
 **Merge commit:** `1f8e626 Merge: Phase 3 Rounds 7-11 (v0.1 alpha)`
 **Codex final chain review:** 🟢 ACCEPT (R7-fix-3 / R8 / R9 / R10 / R11)
+
+## Supported platforms (v0.1.0-alpha)
+
+| Platform | Status | Notes |
+|---|---|---|
+| macOS arm64 (Apple Silicon, macOS 13+) | ✅ shipped | The only artifact built and smoke-tested for this release. |
+| macOS x86_64 (Intel) | ❌ not shipped | Cross-compile + clean-machine smoke test scheduled for a later round. |
+| Linux x86_64 | ❌ not shipped | Cross-compile + audio-capture validation scheduled for a later round. |
+| Windows x86_64 | ❌ not shipped | Codebase has Windows overlay + anti-debug helpers, but the Windows whisper.cpp port is still a stub (R12.5 deferred). End-to-end testing on a clean Windows machine is also pending. |
+
+The codebase contains code paths for all four platforms (the Windows overlay
+is written in C, anti-debug helpers exist for Linux, etc.). v0.1.0 only
+**ships and supports** macOS arm64; the other platforms are works in progress
+and should not be installed from this release.
 
 ## What's in this release
 

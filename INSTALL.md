@@ -1,50 +1,51 @@
 # Installing Bluey
 
-## macOS (Homebrew)
+> **v0.1.0 scope:** macOS arm64 (Apple Silicon) only. Intel Macs, Windows, and
+> Linux are not supported in this release; their builds and end-to-end testing
+> are scheduled for a later round (see `docs/work/PHASE-3-ROUND-13-PLAN.md`).
+> If you are on an unsupported platform, please wait for a later release.
+
+## Requirements
+
+- macOS 13 (Ventura) or newer on Apple Silicon (M1, M2, M3, …)
+- Microphone, Screen Recording, and Accessibility permissions (granted at first
+  launch via the standard macOS prompts)
+
+## Manual install (recommended for v0.1.0)
+
+Download the release archive and extract it:
 
 ```bash
-brew tap <org>/bluey
-brew install bluey
+curl -LO https://github.com/<org>/bluey/releases/latest/download/bluey-0.1.0-alpha-macos-arm64.tar.gz
+shasum -a 256 -c bluey-0.1.0-alpha-macos-arm64.tar.gz.sha256
+
+mkdir -p /usr/local/lib/bluey
+tar -xzf bluey-0.1.0-alpha-macos-arm64.tar.gz -C /usr/local/lib/bluey
+
+ln -sf /usr/local/lib/bluey/bluey-macos-arm64/bluey       /usr/local/bin/bluey
+ln -sf /usr/local/lib/bluey/bluey-macos-arm64/bluey-daemon /usr/local/bin/bluey-daemon
 ```
 
-On first launch, grant permissions when prompted:
-- **Microphone** — meeting audio capture
-- **Screen Recording** — screen-aware context
-- **Accessibility** — overlay positioning
+## Code signing and Gatekeeper
 
-These can be managed in **System Settings → Privacy & Security**.
+The v0.1.0-alpha tarball is **not** code-signed or notarized. Code signing
+is deferred to a later release; do not assume Gatekeeper or quarantine will
+silently allow unsigned binaries.
 
-## Windows (Scoop)
-
-```powershell
-scoop bucket add bluey https://github.com/<org>/scoop-bluey
-scoop install bluey
-```
-
-## Manual Install
-
-### macOS / Linux
-
-Download the release archive matching your platform:
-- `bluey-{version}-darwin-arm64.tar.gz` (Apple Silicon)
-- `bluey-{version}-darwin-x86_64.tar.gz` (Intel Mac)
-- `bluey-{version}-linux-x86_64.tar.gz` (Linux x86_64)
-
-Archives contain binaries under a `bin/` subdirectory:
+If you download the archive through a browser, macOS may attach the
+`com.apple.quarantine` extended attribute. The standard remediation is:
 
 ```bash
-# Example for Apple Silicon:
-curl -LO https://github.com/<org>/bluey/releases/latest/download/bluey-0.1.0-darwin-arm64.tar.gz
-mkdir -p /usr/local/lib/bluey && tar -xzf bluey-0.1.0-darwin-arm64.tar.gz -C /usr/local/lib/bluey
-ln -sf /usr/local/lib/bluey/bin/bluey /usr/local/bin/bluey
-ln -sf /usr/local/lib/bluey/bin/bluey-daemon /usr/local/bin/bluey-daemon
+xattr -d com.apple.quarantine /usr/local/lib/bluey/bluey-macos-arm64/*
 ```
 
-### Windows
+If you `curl` the archive from a terminal, quarantine is typically not
+attached, but this is not a guaranteed bypass — it depends on the network
+client and macOS version. Validate behaviour on a clean machine before
+distributing internally.
 
-Download `bluey-{version}-windows-x86_64.zip` from the
-[latest release](https://github.com/<org>/bluey/releases/latest),
-extract, and add the `bin\` folder to your PATH.
+We will revisit signing + notarization once we are ready to publish a
+public release outside our internal alpha.
 
 ## Running
 
@@ -55,31 +56,35 @@ bluey-daemon &
 # Use the CLI
 bluey on --title "My meeting"
 bluey off
-
-# Open the dashboard (macOS Homebrew install)
-bluey-dashboard
 ```
+
+The dashboard (`bluey-dashboard`) is a developer tool and is **not** part of
+the v0.1.0 distribution. It will be reintroduced in a later release once it
+has been bundled and signed properly.
 
 ## Auto-Update
 
-The dashboard includes a built-in updater (Tauri updater plugin) that checks
-GitHub Releases for new versions. No action needed — you'll be prompted when
-an update is available.
+There is no auto-update mechanism in v0.1.0. Future releases will document
+the upgrade path explicitly.
 
 ## Uninstall
 
-### Homebrew
 ```bash
-brew uninstall bluey
-brew untap <org>/bluey
+rm /usr/local/bin/bluey /usr/local/bin/bluey-daemon
+rm -rf /usr/local/lib/bluey
 ```
 
-### Scoop
-```powershell
-scoop uninstall bluey
-scoop bucket rm bluey
-```
+User data lives under `~/Library/Application Support/bluey/`; remove it
+manually if you want a fully clean uninstall.
 
-### Manual
-Remove the binaries from wherever you placed them and delete `~/.bluey/`
-(macOS/Linux) or `%USERPROFILE%\.bluey\` (Windows).
+## Other platforms
+
+Intel Macs, Linux, and Windows are tracked as future work:
+
+- macOS x86_64 (Intel): cross-compile + smoke-test on a clean Intel Mac.
+- Linux x86_64: cross-compile + audio capture validation on Linux.
+- Windows x86_64: blocked on the Windows whisper.cpp port (R12.5) plus
+  end-to-end testing on a clean Windows machine.
+
+When those land, this document will be updated. Until then, please do not
+treat the older multi-platform install instructions as a support promise.
