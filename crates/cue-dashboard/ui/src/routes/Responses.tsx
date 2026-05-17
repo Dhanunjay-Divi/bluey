@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { applyChunk, clearInflight, type CueResponseChunk, type InflightResponse } from "./responseReducer";
 
 interface CueResponse {
   id: string;
@@ -11,17 +12,10 @@ interface CueResponse {
   source_text: string | null;
 }
 
-interface CueResponseChunk {
-  response_id: string;
-  kind: string;
-  partial_text: string;
-  finished: boolean;
-}
-
 export function Responses() {
   const [responses, setResponses] = useState<CueResponse[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
-  const [inflight, setInflight] = useState<Map<string, { kind: string; text: string }>>(new Map());
+  const [inflight, setInflight] = useState<Map<string, InflightResponse>>(new Map());
   const inflightRef = useRef(inflight);
   inflightRef.current = inflight;
 
@@ -40,11 +34,7 @@ export function Responses() {
     const unlisten = listen<CueResponse>("cue_response", (event) => {
       const r = event.payload;
       // Remove from inflight when final arrives
-      setInflight((prev) => {
-        const next = new Map(prev);
-        next.delete(r.id);
-        return next;
-      });
+      setInflight((prev) => clearInflight(prev, r.id));
       setResponses((prev) => [r, ...prev]);
     });
     return () => { unlisten.then((fn) => fn()); };
@@ -53,19 +43,7 @@ export function Responses() {
   useEffect(() => {
     const unlisten = listen<CueResponseChunk>("cue_response_chunk", (event) => {
       const chunk = event.payload;
-      setInflight((prev) => {
-        const next = new Map(prev);
-        if (chunk.finished) {
-          next.delete(chunk.response_id);
-        } else {
-          const existing = next.get(chunk.response_id);
-          next.set(chunk.response_id, {
-            kind: chunk.kind || existing?.kind || "answer",
-            text: (existing?.text || "") + chunk.partial_text,
-          });
-        }
-        return next;
-      });
+      setInflight((prev) => applyChunk(prev, chunk));
     });
     return () => { unlisten.then((fn) => fn()); };
   }, []);
@@ -100,7 +78,7 @@ export function Responses() {
     </div>
   );
 
-  const renderInflightCard = (id: string, data: { kind: string; text: string }) => (
+  const renderInflightCard = (id: string, data: InflightResponse) => (
     <div key={`inflight-${id}`} className="rounded border border-blue-600 bg-zinc-800 p-3 space-y-1 animate-pulse">
       <div className="flex items-center gap-2">
         <span className="text-xs text-blue-400 font-medium">Streaming…</span>
