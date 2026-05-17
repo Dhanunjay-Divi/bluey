@@ -141,8 +141,17 @@ $ git -P diff --check main..HEAD                                 ✅
 >
 > All-green pipeline, 361 cargo tests + 13 new vitest tests. Please re-review for production readiness; if 🟢, we drop the `-alpha` suffix and tag v0.1.0.
 
+## Distribution model
+
+**Decision (user, 2026-05-17):** Bluey ships as terminal-installed CLI binaries + small native overlay helpers. No .app bundle, no .dmg, no Mac App Store. Distribution channel is `curl | sh` or a brew tap consuming the same tarball that the alpha already produced. **Code signing / notarization are out of scope** — Gatekeeper applies to browser-downloaded GUI apps; CLI binaries fetched from terminal are not subject to it. The Swift overlay binaries are launched by the daemon as child processes, which bypasses quarantine even when their parent (the tarball) was downloaded from a browser.
+
+This simplifies the production checklist:
+- No Apple Developer ID required.
+- No `codesign` / `xcrun notarytool` pipeline to maintain.
+- Distribution = tarball + sha256 manifest + a thin install script (or brew formula) that places binaries in `~/.local/bin` or `/usr/local/bin`.
+
 ## Open questions for the reviewer
 
-1. **Distribution scope:** v0.1.0 today only ships macOS arm64 binaries. Should "production-ready" require macOS x86_64 + Windows builds in the same release, or is single-arch arm64 acceptable for the first GA?
-2. **Code signing:** the alpha tarball is unsigned. Notarized .dmg / .pkg requires an Apple Developer ID cert. If you want this gated on signing, flag it and we'll wire up the codesign + notarytool pipeline as a separate round.
-3. **Telemetry:** the production overlay reader thread logs warnings on token / length / state rejections but has no metric counter. Operationally we'd want to know if these spike in real use. Counter as separate round, or fold into R12?
+1. **Distribution scope:** v0.1.0 today only ships macOS arm64 binaries. Should "production-ready" require macOS x86_64 + Windows + Linux builds in the same release, or is single-arch arm64 acceptable for the first GA?
+2. **Telemetry:** the production overlay reader thread logs warnings on token / length / state rejections but has no metric counter. Operationally we'd want to know if these spike in real use. Counter as separate round, or fold into R12?
+3. **Install ergonomics:** do you want a `scripts/install.sh` (curl | sh installer that drops binaries into PATH and sets up the LaunchAgent for the daemon) wired up before GA, or is `tar xzf` + manual PATH the v0.1.0 install path?
