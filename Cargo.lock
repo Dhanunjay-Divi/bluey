@@ -1058,6 +1058,7 @@ dependencies = [
  "cue-llm",
  "cue-rag",
  "futures-util",
+ "getrandom 0.2.17",
  "keyring",
  "obfstr",
  "parking_lot",

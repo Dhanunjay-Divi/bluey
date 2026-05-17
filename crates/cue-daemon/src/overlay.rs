@@ -150,11 +150,26 @@ pub fn verify_overlay_binary(path: &Path, install_dir: &Path) -> Result<(), Over
 // ─── Item 3: Session token generation ───────────────────────────────────────
 
 /// Generate a cryptographically random 32-byte hex session token (64 hex chars).
+///
+/// Uses `getrandom` to draw 256 bits of entropy from the OS source
+/// (`/dev/urandom` on Linux/macOS, `BCryptGenRandom` on Windows).
+///
+/// Previously this concatenated two `Uuid::new_v4()` values, which gives
+/// 244 bits of randomness (each UUIDv4 has 122 random bits — the other
+/// 6 are version/variant). 244 bits is well past the security threshold,
+/// but the doc/comment claimed "32 bytes" so codex flagged the discrepancy
+/// in the R11 chain review. R12 fixes it: now the bytes are *actually*
+/// 256 random bits, drawn directly from the OS entropy pool.
 pub fn generate_session_token() -> String {
-    let id = uuid::Uuid::new_v4();
-    let id2 = uuid::Uuid::new_v4();
-    // Two UUIDs = 32 bytes = 64 hex chars
-    format!("{}{}", id.as_simple(), id2.as_simple())
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).expect("OS random source unavailable");
+    // Format as lowercase hex without pulling in the `hex` crate.
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(64);
+    for b in bytes {
+        write!(&mut out, "{b:02x}").expect("writing to String cannot fail");
+    }
+    out
 }
 
 // ─── Core overlay handle ────────────────────────────────────────────────────
@@ -597,6 +612,49 @@ pub fn restart_delay(attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_is_64_hex_chars() {
+        let t = generate_session_token();
+        assert_eq!(t.len(), 64, "expected 64 hex chars (32 bytes)");
+        assert!(
+            t.chars()
+                .all(|c| c.is_ascii_hexdigit() && (c.is_ascii_digit() || c.is_ascii_lowercase())),
+            "token must be lowercase hex: {t}"
+        );
+    }
+
+    #[test]
+    fn token_is_unique_across_calls() {
+        // 1000 fresh tokens — collision probability is negligible at 256 bits
+        // (and any collision indicates a serious entropy bug).
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let t = generate_session_token();
+            assert!(seen.insert(t), "duplicate token within 1000 calls");
+        }
+    }
+
+    #[test]
+    fn token_has_no_prefix_pattern_from_old_uuid_impl() {
+        // The old UUID-based impl always set bits 6-7 of byte 6 to specific
+        // values (UUID variant) and bits 12-15 of byte 6 to 4 (UUID version).
+        // The new impl draws from getrandom, so the 7th hex char (= upper
+        // nibble of byte 6) should NOT be biased toward 4.
+        // Sample 200 tokens and assert variety in that position.
+        let mut seventh_char_set = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let t = generate_session_token();
+            seventh_char_set.insert(t.chars().nth(12).unwrap());
+        }
+        // With true randomness across 200 samples we should see >= 8 distinct
+        // hex digits in any single position.
+        assert!(
+            seventh_char_set.len() >= 8,
+            "position 12 seems biased: only {} distinct values",
+            seventh_char_set.len()
+        );
+    }
     use std::fs;
 
     #[test]
