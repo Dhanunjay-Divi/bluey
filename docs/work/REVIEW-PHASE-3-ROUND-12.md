@@ -102,3 +102,32 @@ There are no R12 code blockers. The reducer fix, shared overlay state, and 256-b
 - Round 13: reset `overlay_ui_state` to `Idle` on attach/instructions dialog cancellation/error, or make the modal lifecycle explicit if the overlay will own those submit events later.
 - Round 13: add optional counters for production overlay-reader rejections once telemetry/log aggregation exists.
 - Future distribution: add a tested `scripts/install.sh` only if `curl | sh` is the intended primary install path.
+
+## Recheck 1 — Commit `27dc114`
+
+**Date:** 2026-05-17
+
+**Verdict:** 🔴 **REQUEST CHANGES**
+
+The two original R12 release-scope nits are substantively fixed:
+
+- 🟢 Platform support is now scoped to macOS arm64 in `INSTALL.md`, `web/index.html`, and the release notes. Windows/Linux/Intel are described as future work instead of supported platforms.
+- 🟢 Gatekeeper/quarantine wording is now conservative. It describes signing/notarization as deferred, calls out quarantine as environment-dependent, and documents `xattr -d com.apple.quarantine` as remediation rather than promising bypass behavior.
+
+Remaining blockers before tagging `v0.1.0` GA:
+
+- 🔴 `git diff --check main..HEAD` fails on `docs/release/RELEASE-v0.1.0-alpha.md:3` because of trailing whitespace. This means the stated pipeline is not green on the reviewed tip.
+- 🔴 The branch is not ready to tag as `v0.1.0` GA on the same tip because release-facing docs still point to alpha artifacts and alpha audience language: `INSTALL.md` downloads `bluey-0.1.0-alpha-macos-arm64.tar.gz`, and `docs/release/RELEASE-v0.1.0-alpha.md` still says `v0.1.0-alpha`, `internal alpha only`, `Tag: v0.1.0-alpha`, and lists the alpha tarball name. Either keep this as a narrowed alpha release, or make the GA naming/docs consistent before tagging `v0.1.0`.
+
+Additional nit:
+
+- 🟡 `docs/work/FIX-PHASE-3-ROUND-12.md` says tip `27af6b5`, but the reviewed branch tip is `27dc114`. Update the handoff text so the next agent is not chasing a non-tip commit.
+
+Verification for the recheck:
+
+```bash
+git diff --check main..HEAD          # ❌ trailing whitespace in docs/release/RELEASE-v0.1.0-alpha.md:3
+git diff --check 27dc114^..27dc114   # ❌ same trailing whitespace
+```
+
+Fix should be tiny: remove the trailing spaces and decide whether this branch is still an alpha-support cleanup or the actual GA tag source. If it is the GA tag source, update install/release artifact names and audience/tag wording to `v0.1.0` before re-handing.

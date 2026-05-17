@@ -1,66 +1,64 @@
-# Codex → Kiro: Phase 3 Round 12 Review
+# Codex → Kiro: Phase 3 Round 12 Recheck 1
 
 ## 1. Overall Verdict
 
-🟡 **ACCEPT WITH NITS** — R12 implementation is mergeable, but do not drop the `-alpha` suffix and tag v0.1.0 GA until the release/support-matrix wording is corrected.
+🔴 **REQUEST CHANGES** — The original R12 doc-scope nits are substantively fixed, but this reviewed tip cannot be tagged `v0.1.0` GA yet.
 
 ## 2. Round Verdict
 
-- R12.1 Responses final-chunk handling: 🟢 **ACCEPT**
-- R12.2 shared overlay UI state: 🟡 **ACCEPT WITH NIT**
-- R12.3 true 256-bit random session token: 🟢 **ACCEPT**
-- R12.4 sqlite-vec / ANN RAG deferral: 🟢 **ACCEPT DEFERRAL**
-- R12.5 Windows real whisper.cpp deferral: 🟢 **ACCEPT DEFERRAL**
+- R12 implementation code: 🟢 **ACCEPTED** from the first R12 review.
+- Platform support-matrix wording: 🟢 **FIXED** — v0.1.0 is now scoped to macOS arm64; Windows/Linux/Intel are future work.
+- Gatekeeper/quarantine wording: 🟢 **FIXED** — wording is conservative and no longer promises bypass behavior.
+- GA tag readiness: 🔴 **BLOCKED** — alpha artifact/audience naming remains, and `git diff --check` fails.
 
-Full review is in `docs/work/REVIEW-PHASE-3-ROUND-12.md`.
+Full review is in `docs/work/REVIEW-PHASE-3-ROUND-12.md` under "Recheck 1 — Commit `27dc114`".
 
 ## 3. What Codex Reviewed
 
-- `crates/cue-dashboard/ui/src/routes/responseReducer.ts`
-- `crates/cue-dashboard/ui/src/routes/responseReducer.test.ts`
-- `crates/cue-dashboard/ui/src/routes/Responses.tsx`
-- `crates/cue-daemon/src/app.rs`
-- `crates/cue-daemon/src/overlay.rs`
-- `crates/cue-daemon/tests/overlay_production_path.rs`
+- `INSTALL.md`
+- `web/index.html`
+- `docs/release/RELEASE-v0.1.0-alpha.md`
 - `docs/work/PHASE-3-ROUND-12-HANDOFF-FOR-CODEX-REVIEW.md`
-- Public release surfaces that affect the GA call: `INSTALL.md`, `web/index.html`, `.github/workflows/release.yml`
+- `docs/work/FIX-PHASE-3-ROUND-12.md`
+- `docs/work/PHASE-3-ROUND-13-PLAN.md`
+- `docs/work/REVIEW-PHASE-3-ROUND-12.md`
 
-## 4. Residual Nits
+## 4. Blockers
 
-- Before GA, align support-matrix wording with actual artifacts. The handoff says v0.1.0 only ships macOS arm64, while install/site surfaces still imply broader macOS/Windows/Linux availability.
-- Before GA, soften the terminal-only distribution note. It should say signing/notarization are deferred and require clean-machine validation, not that Gatekeeper/quarantine are bypassed.
-- Round 13: reset `overlay_ui_state` back to `Idle` on attach/instructions dialog cancellation/error, or make that modal lifecycle explicit if overlay-owned submit flows expand.
-- Round 13: add optional counters for production overlay-reader rejections once telemetry/log aggregation exists.
-- Future distribution: add a tested `scripts/install.sh` only if `curl | sh` is the primary v0.1.0 install path.
+1. `git diff --check main..HEAD` fails:
+
+   ```text
+   docs/release/RELEASE-v0.1.0-alpha.md:3: trailing whitespace.
+   ```
+
+2. The branch is not internally consistent as a `v0.1.0` GA tag source. `INSTALL.md` still instructs users to download `bluey-0.1.0-alpha-macos-arm64.tar.gz`, and `docs/release/RELEASE-v0.1.0-alpha.md` still says `v0.1.0-alpha`, `internal alpha only`, `Tag: v0.1.0-alpha`, and lists the alpha tarball.
 
 ## 5. What Codex Changed
 
 Documentation only:
 
-- Added `docs/work/REVIEW-PHASE-3-ROUND-12.md`
-- Updated `docs/work/HANDOFF-FROM-CODEX-TO-KIRO.md`
+- Updated `docs/work/REVIEW-PHASE-3-ROUND-12.md` with Recheck 1.
+- Updated `docs/work/HANDOFF-FROM-CODEX-TO-KIRO.md` with the current blocker summary.
 
 No product code changes.
 
 ## 6. Verification Run
 
 ```bash
-cargo fmt --all --check                                             # ✅
-cargo clippy --all-targets -- -D warnings                           # ✅
-cargo build --all-targets --release                                 # ✅
-cargo test --all-targets                                            # ✅ 361 passed, 14 ignored
-cd crates/cue-dashboard/ui && npm test                              # ✅ 13 passed
-cd crates/cue-dashboard/ui && npm run build                         # ✅
-swift build -c release --package-path native/macos/cue-overlay      # ✅
-swift build -c release --package-path native/macos/cue-whisper      # ✅
-git diff --check main..HEAD                                         # ✅
+git diff --check main..HEAD          # ❌ trailing whitespace in release notes
+git diff --check 27dc114^..27dc114   # ❌ same trailing whitespace
 ```
+
+I did not rerun the full Rust/UI/Swift pipeline because this fix wave is documentation-only and the first failing release gate is `git diff --check`.
 
 ## 7. Next Action for Kiro
 
-Treat R12 code as accepted. Before tagging v0.1.0 GA, make one small release-doc cleanup commit that either:
+Make a tiny follow-up commit:
 
-1. scopes v0.1.0 to macOS arm64 only, or
-2. proves/builds/tests the full advertised macOS x86_64 + Windows + Linux matrix.
+1. Remove the trailing whitespace in `docs/release/RELEASE-v0.1.0-alpha.md`.
+2. Decide the release identity:
+   - If this remains an internal alpha cleanup, do **not** tag `v0.1.0` GA yet.
+   - If this is the actual GA tag source, update install/release artifact names and audience/tag wording from `v0.1.0-alpha` to `v0.1.0`.
+3. Update `docs/work/FIX-PHASE-3-ROUND-12.md` tip text from `27af6b5` to the actual new tip.
 
-Also replace the Gatekeeper/quarantine wording with a conservative terminal-only distribution note.
+After that, hand back for a quick recheck. This should be a small green once those strings and whitespace are corrected.

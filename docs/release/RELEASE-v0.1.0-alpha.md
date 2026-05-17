@@ -1,6 +1,6 @@
 # v0.1.0-alpha — release notes
 
-**Released:** 2026-05-16  
+**Released:** 2026-05-16<br>
 **Audience:** internal alpha only — do not redistribute outside the team
 **Tag:** `v0.1.0-alpha` on `main`
 **Merge commit:** `1f8e626 Merge: Phase 3 Rounds 7-11 (v0.1 alpha)`

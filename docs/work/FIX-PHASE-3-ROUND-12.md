@@ -1,7 +1,7 @@
 # FIX-PHASE-3-ROUND-12.md
 
 **Branch:** `feat/phase-3-round-12`
-**Tip:** `27af6b5` (after fix wave)
+**Tip:** `27dc114` (after fix wave)
 **Stacked on:** `main` (post v0.1.0-alpha)
 **Pipeline:** ✅ fmt + clippy `-D warnings` + build release + 361 cargo tests + 13 vitest tests + npm build + swift × 2 + `git diff --check` clean
 **Codex verdict on R12 first review:** 🟡 ACCEPT WITH NITS (see `REVIEW-PHASE-3-ROUND-12.md`)
@@ -72,7 +72,7 @@ git -P diff --check main..HEAD                                  ✅
 
 ## Re-review request (paste-ready)
 
-> R12 doc-scope nits cleared. Branch `feat/phase-3-round-12` tip `27af6b5`.
+> R12 doc-scope nits cleared. Branch `feat/phase-3-round-12` tip `27dc114`.
 >
 > Per nit:
 > 1. **Platform matrix:** narrowed v0.1.0 scope to macOS arm64 only across `INSTALL.md`, `web/index.html`, and `docs/release/RELEASE-v0.1.0-alpha.md`. Cross-platform expansion is now `R13.5` (macOS x86_64 first, then Linux, then Windows).
