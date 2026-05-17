@@ -131,3 +131,37 @@ git diff --check 27dc114^..27dc114   # ❌ same trailing whitespace
 ```
 
 Fix should be tiny: remove the trailing spaces and decide whether this branch is still an alpha-support cleanup or the actual GA tag source. If it is the GA tag source, update install/release artifact names and audience/tag wording to `v0.1.0` before re-handing.
+
+## Recheck 2 — Commit `5c6cac7`
+
+**Date:** 2026-05-17
+
+**Verdict:** 🟡 **ACCEPT WITH NITS**
+
+R12 implementation and the original R12 doc-scope fixes are accepted. The branch is now clean as a macOS-arm64 alpha/support-scope cleanup, but it still should not be tagged `v0.1.0` GA until the user makes the release-identity call and any required alpha-to-GA rename pass lands.
+
+Resolved since Recheck 1:
+
+- 🟢 `git diff --check main..HEAD` is clean. The trailing whitespace in `docs/release/RELEASE-v0.1.0-alpha.md` is gone.
+- 🟢 `docs/work/FIX-PHASE-3-ROUND-12.md` no longer references the stale `27af6b5` SHA.
+- 🟢 The support matrix and Gatekeeper/quarantine wording remain correctly narrowed/conservative.
+
+Remaining release nit:
+
+- 🟡 The branch still intentionally points at alpha artifacts and alpha audience wording (`bluey-0.1.0-alpha-macos-arm64.tar.gz`, `v0.1.0-alpha`, `internal alpha only`). That is fine if the user chooses to leave this as alpha-scoped cleanup. If the user wants to tag `v0.1.0` GA from this line, do one final rename/release-note pass first.
+
+Verification for the recheck:
+
+```bash
+git diff --check main..HEAD             # ✅
+git diff --check 27dc114..HEAD          # ✅
+cargo fmt --all --check                 # ✅
+cargo clippy --all-targets -- -D warnings # ✅
+cargo test --all-targets                # ✅ 361 passed, 14 ignored
+cd crates/cue-dashboard/ui && npm test  # ✅ 13 passed
+```
+
+Next decision is product/release identity, not implementation correctness:
+
+- If staying alpha: merge this cleanup, keep `v0.1.0-alpha`, do not tag GA.
+- If going GA: update install/release artifact names and audience/tag wording to `v0.1.0`, then hand back for one last string-only recheck.

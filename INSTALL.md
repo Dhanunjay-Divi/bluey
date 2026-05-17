@@ -11,16 +11,16 @@
 - Microphone, Screen Recording, and Accessibility permissions (granted at first
   launch via the standard macOS prompts)
 
-## Manual install (recommended for v0.1.0)
+## Manual install
 
 Download the release archive and extract it:
 
 ```bash
-curl -LO https://github.com/<org>/bluey/releases/latest/download/bluey-0.1.0-alpha-macos-arm64.tar.gz
-shasum -a 256 -c bluey-0.1.0-alpha-macos-arm64.tar.gz.sha256
+curl -LO https://github.com/<org>/bluey/releases/latest/download/bluey-0.1.0-macos-arm64.tar.gz
+shasum -a 256 -c bluey-0.1.0-macos-arm64.tar.gz.sha256
 
 mkdir -p /usr/local/lib/bluey
-tar -xzf bluey-0.1.0-alpha-macos-arm64.tar.gz -C /usr/local/lib/bluey
+tar -xzf bluey-0.1.0-macos-arm64.tar.gz -C /usr/local/lib/bluey
 
 ln -sf /usr/local/lib/bluey/bluey-macos-arm64/bluey       /usr/local/bin/bluey
 ln -sf /usr/local/lib/bluey/bluey-macos-arm64/bluey-daemon /usr/local/bin/bluey-daemon
@@ -28,7 +28,7 @@ ln -sf /usr/local/lib/bluey/bluey-macos-arm64/bluey-daemon /usr/local/bin/bluey-
 
 ## Code signing and Gatekeeper
 
-The v0.1.0-alpha tarball is **not** code-signed or notarized. Code signing
+The v0.1.0 tarball is **not** code-signed or notarized. Code signing
 is deferred to a later release; do not assume Gatekeeper or quarantine will
 silently allow unsigned binaries.
 
@@ -45,7 +45,7 @@ client and macOS version. Validate behaviour on a clean machine before
 distributing internally.
 
 We will revisit signing + notarization once we are ready to publish a
-public release outside our internal alpha.
+public release outside our internal distribution.
 
 ## Running
 
@@ -83,8 +83,8 @@ Intel Macs, Linux, and Windows are tracked as future work:
 
 - macOS x86_64 (Intel): cross-compile + smoke-test on a clean Intel Mac.
 - Linux x86_64: cross-compile + audio capture validation on Linux.
-- Windows x86_64: blocked on the Windows whisper.cpp port (R12.5) plus
-  end-to-end testing on a clean Windows machine.
+- Windows x86_64: blocked on the Windows whisper.cpp port (R12.5 / R13.4)
+  plus end-to-end testing on a clean Windows machine.
 
 When those land, this document will be updated. Until then, please do not
 treat the older multi-platform install instructions as a support promise.
