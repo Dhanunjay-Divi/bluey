@@ -412,12 +412,23 @@ struct Daemon {
     /// every event; mismatched / missing token -> event dropped.
     overlay_session_token: String,
     /// State-machine of the overlay UI (Idle / AttachOpen / InstructionsOpen).
-    /// Events are validated against this state before being forwarded; e.g.
-    /// AttachFilesRequested only accepted while AttachOpen,
-    /// InstructionsUpdated only accepted while InstructionsOpen.
-    /// AttachRequested and InstructionsRequested are entry-point events
-    /// allowed from any state (they drive the transition INTO the open states).
-    overlay_ui_state: parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>,
+    ///
+    /// SINGLE source of truth (R12.2): the Arc is cloned into the production
+    /// overlay reader thread so the gate at validate_and_decode_overlay_line
+    /// observes live transitions written by event handlers in this file.
+    ///
+    /// Event handlers transition as follows:
+    ///   AttachRequested        -> AttachOpen
+    ///   AttachFilesRequested   -> Idle    (panel closes after submit)
+    ///   InstructionsRequested  -> InstructionsOpen
+    ///   InstructionsUpdated    -> Idle    (form closes after save)
+    ///
+    /// The gate then rejects:
+    ///   AttachFilesRequested when state != AttachOpen
+    ///   InstructionsUpdated  when state != InstructionsOpen
+    /// while AttachRequested + InstructionsRequested are entry-point events
+    /// allowed from any state.
+    overlay_ui_state: std::sync::Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
 }
 
 struct OverlayProcess {
@@ -492,7 +503,9 @@ pub async fn run() -> Result<()> {
         live_transcript_tx: broadcast::channel(64).0,
         rag: rag_pipeline,
         overlay_session_token: crate::overlay::generate_session_token(),
-        overlay_ui_state: parking_lot::Mutex::new(cue_core::overlay_ipc::OverlayUiState::Idle),
+        overlay_ui_state: std::sync::Arc::new(parking_lot::Mutex::new(
+            cue_core::overlay_ipc::OverlayUiState::Idle,
+        )),
     });
 
     if !args.no_overlay {
@@ -500,9 +513,7 @@ pub async fn run() -> Result<()> {
             overlay_bin.as_deref(),
             overlay_events_tx.clone(),
             daemon.overlay_session_token.clone(),
-            Arc::new(parking_lot::Mutex::new(
-                cue_core::overlay_ipc::OverlayUiState::Idle,
-            )),
+            daemon.overlay_ui_state.clone(),
         ) {
             Ok(overlay) => {
                 info!("native overlay started");
@@ -1084,7 +1095,7 @@ async fn ensure_overlay_ready(
             daemon.overlay_bin.as_deref(),
             daemon.overlay_events_tx.clone(),
             daemon.overlay_session_token.clone(),
-            Arc::new(parking_lot::Mutex::new(*daemon.overlay_ui_state.lock())),
+            daemon.overlay_ui_state.clone(),
         )
         .context("failed to start native overlay")?;
         *overlay = Some(process);
@@ -1141,12 +1152,21 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             let _ = answer_with_provider_runtime(daemon, request, "overlay ask").await?;
         }
         OverlayEvent::AttachRequested => {
+            // Drive Idle -> AttachOpen so the production reader thread starts
+            // accepting AttachFilesRequested events from the now-open panel.
+            *daemon.overlay_ui_state.lock() = cue_core::overlay_ipc::OverlayUiState::AttachOpen;
             handle_attach_requested(daemon).await?;
         }
         OverlayEvent::AttachFilesRequested { paths } => {
             handle_attach_paths(daemon, paths.into_iter().map(PathBuf::from).collect()).await?;
+            // Panel closes after submit; revert to Idle so any later stray
+            // AttachFilesRequested is rejected by the gate.
+            *daemon.overlay_ui_state.lock() = cue_core::overlay_ipc::OverlayUiState::Idle;
         }
         OverlayEvent::InstructionsRequested => {
+            // Drive Idle -> InstructionsOpen so the reader accepts the form-submit.
+            *daemon.overlay_ui_state.lock() =
+                cue_core::overlay_ipc::OverlayUiState::InstructionsOpen;
             handle_instructions_requested(daemon).await?;
         }
         OverlayEvent::InstructionsUpdated { text } => {
@@ -1167,6 +1187,8 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
                     .unwrap_or_else(|| "Bluey will use the default answer style.".to_string()),
             )
             .await;
+            // Form closes after save; revert to Idle.
+            *daemon.overlay_ui_state.lock() = cue_core::overlay_ipc::OverlayUiState::Idle;
         }
         OverlayEvent::SessionContinueRequested => {
             continue_session(daemon, "overlay session").await?;

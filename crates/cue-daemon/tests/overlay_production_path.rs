@@ -313,3 +313,110 @@ fn instructions_requested_accepted_from_instructions_open() {
     let result = validate_line(&line, TOK, state.as_ref());
     assert!(result.is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// R12.2: single Arc<Mutex<OverlayUiState>> — handler-driven transitions
+// reach the production reader-thread gate.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn handler_transition_idle_to_attach_open_unblocks_attach_files() {
+    // Simulate the wiring in app.rs:
+    //   1. Daemon owns Arc<Mutex<OverlayUiState>>.
+    //   2. spawn_overlay clones the same Arc into the reader thread.
+    //   3. An event handler (AttachRequested) flips Daemon-side state to
+    //      AttachOpen.
+    //   4. The reader-thread clone now sees AttachOpen, so the next
+    //      AttachFilesRequested is accepted instead of rejected.
+    let daemon_state = Arc::new(Mutex::new(OverlayUiState::Idle));
+    let reader_state = daemon_state.clone();
+
+    // Step 1: while still Idle, AttachFilesRequested is rejected.
+    let line = format!(r#"{{"type":"attach_files_requested","paths":["/tmp/x"],"token":"{TOK}"}}"#);
+    let r1 = validate_line(&line, TOK, reader_state.as_ref());
+    assert!(matches!(r1, Err(OverlayLineReject::StateNotAllowed { .. })));
+
+    // Step 2: handler-side mutation simulating
+    //   *daemon.overlay_ui_state.lock() = OverlayUiState::AttachOpen;
+    *daemon_state.lock() = OverlayUiState::AttachOpen;
+
+    // Step 3: reader sees the mutation through its clone of the SAME Arc.
+    let r2 = validate_line(&line, TOK, reader_state.as_ref());
+    assert!(
+        r2.is_ok(),
+        "after handler flipped to AttachOpen, AttachFilesRequested must be accepted; got {r2:?}"
+    );
+}
+
+#[test]
+fn handler_transition_back_to_idle_blocks_late_attach_files() {
+    // After a successful attach submit, the handler reverts state to Idle.
+    // A late stray AttachFilesRequested (e.g. duplicate event) must be rejected.
+    let daemon_state = Arc::new(Mutex::new(OverlayUiState::AttachOpen));
+    let reader_state = daemon_state.clone();
+
+    let line = format!(r#"{{"type":"attach_files_requested","paths":["/tmp/x"],"token":"{TOK}"}}"#);
+
+    // Step 1: first AttachFilesRequested is accepted.
+    let r = validate_line(&line, TOK, reader_state.as_ref());
+    assert!(r.is_ok());
+
+    // Step 2: handler reverts to Idle after processing the submit.
+    *daemon_state.lock() = OverlayUiState::Idle;
+
+    // Step 3: any later stray AttachFilesRequested is rejected.
+    let r2 = validate_line(&line, TOK, reader_state.as_ref());
+    assert!(matches!(r2, Err(OverlayLineReject::StateNotAllowed { .. })));
+}
+
+#[test]
+fn instructions_handler_round_trip_idle_to_open_to_idle() {
+    let daemon_state = Arc::new(Mutex::new(OverlayUiState::Idle));
+    let reader_state = daemon_state.clone();
+
+    let upd_line = format!(r#"{{"type":"instructions_updated","text":"x","token":"{TOK}"}}"#);
+
+    // Idle: rejected.
+    assert!(matches!(
+        validate_line(&upd_line, TOK, reader_state.as_ref()),
+        Err(OverlayLineReject::StateNotAllowed { .. })
+    ));
+
+    // Open: accepted.
+    *daemon_state.lock() = OverlayUiState::InstructionsOpen;
+    assert!(validate_line(&upd_line, TOK, reader_state.as_ref()).is_ok());
+
+    // Back to Idle: rejected again.
+    *daemon_state.lock() = OverlayUiState::Idle;
+    assert!(matches!(
+        validate_line(&upd_line, TOK, reader_state.as_ref()),
+        Err(OverlayLineReject::StateNotAllowed { .. })
+    ));
+}
+
+#[test]
+fn cross_thread_arc_visibility() {
+    // Stress: a writer thread flips state; a reader thread observes the
+    // change after a barrier. This pins down the Arc semantics rather than
+    // a same-thread accidental sequencing.
+    use std::sync::Barrier;
+    use std::thread;
+
+    let state = Arc::new(Mutex::new(OverlayUiState::Idle));
+    let writer_state = state.clone();
+    let reader_state = state.clone();
+    let barrier = Arc::new(Barrier::new(2));
+    let writer_barrier = barrier.clone();
+    let reader_barrier = barrier.clone();
+
+    let writer = thread::spawn(move || {
+        *writer_state.lock() = OverlayUiState::AttachOpen;
+        writer_barrier.wait();
+    });
+
+    reader_barrier.wait();
+    let observed = *reader_state.lock();
+    writer.join().unwrap();
+
+    assert_eq!(observed, OverlayUiState::AttachOpen);
+}
