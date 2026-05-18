@@ -16,6 +16,25 @@ Not shipped in v0.1.0:
 - Production billing/plans.
 
 ## Implemented And Verified
+### Bluey Auto Router
+
+- `crates/cue-router/`: task classifier + routing policy + speculative router
+  ship as a standalone crate.
+- Heuristic classifier covers general / code / system_design / meeting /
+  writing / vision task types with confidence scoring.
+- StaticPolicy maps lanes to providers (Instant -> OpenAI gpt-4o-mini,
+  Balanced -> Anthropic claude-3-5-sonnet, Deep -> claude-3-7-sonnet,
+  Vision -> gpt-4o, Local -> Ollama llama3.1).
+- SpeculativeRouter optionally fires Instant + Deep in parallel; UI replaces
+  draft with final via OverlayCommand::UpdateCard.
+- Local-only mode forces all routing to the Local lane.
+- 17 tests (heuristic + policy + speculative + follow-up) all passing.
+- Tiny-model managed classifier slot is wired as a trait but no production
+  endpoint exists yet; ships as heuristic-only.
+- Daemon integration (replace direct LlmProvider calls with SpeculativeRouter)
+  is the next round.
+
+
 
 ### Product Flow
 

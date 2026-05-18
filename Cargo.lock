@@ -1135,6 +1135,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "cue-router"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cue-llm",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "cue-stealth"
 version = "0.1.0"
 dependencies = [

@@ -43,3 +43,28 @@ not be marketed as a finished SaaS until cloud auth/sync/RAG/billing are real.
 - Managed model routing, fallbacks, and latency budgets.
 - Personas/modes for different meeting types.
 - Secure admin controls for retention and deletion.
+
+## Bluey Auto Router (USP)
+
+Bluey Auto is the product differentiator: the user does not pick a model, and
+hard questions get a fast draft + a refined final answer in the same flow.
+
+See `docs/AUTO-ROUTING-USP.md` for the architecture and lane mapping. The
+routing crate ships in `crates/cue-router/` with a local heuristic classifier
+(no network call), a routing policy that maps task type + difficulty + latency
+lane onto provider/model pairs, and a speculative router that can run an
+Instant draft and a Deep refinement in parallel.
+
+The classifier covers six task types (general / code / system_design /
+meeting / writing / vision), three difficulty levels, three latency lanes
+(instant / balanced / deep), context-need flags (transcript / page / files /
+screenshot / memory), and a confidence score. Vision is auto-detected from
+attachments and overrides the latency lane.
+
+Local-only mode forces every classification onto the Local lane (Ollama by
+default), so the same routing layer powers privacy / offline runs.
+
+The tiny-model classifier escalation path is wired as an optional trait
+implementation; the managed Bluey cloud router will plug in there once the
+endpoint exists. Until then, the heuristic classifier alone covers the
+shipping Auto Router product surface.
