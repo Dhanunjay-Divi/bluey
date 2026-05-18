@@ -1,41 +1,40 @@
 # Roadmap
 
-## Version 0.1: Private Meeting Loop
+## Version 0.1: macOS Arm64 Local-First Overlay
 
 - Native overlay sidecar.
-- Capture-excluded overlay on macOS and Windows.
-- Movable, resizable, opacity-adjustable overlay controls.
+- Capture-excluded overlay on macOS.
+- Compact pill-first launch, movable/resizable panel, click-through readable feed,
+  and opacity-adjustable background glass.
 - CLI/daemon process model.
-- Durable active meeting state.
+- Durable active session state.
 - Manual transcript ingestion.
 - User-selected screenshot/diagram/code/document context attachments.
 - macOS user-triggered screenshot capture with preview and confirmation.
 - Explicit support-only periodic screen context capture, separate from the primary user-confirmed Analyse Screen action.
 - Deterministic question/action/decision cards.
-- Audio, AI routing, and cloud/RAG runtime status scaffolds.
+- Native macOS audio helper path, two-stage VAD, Deepgram/OpenAI Realtime/LocalWhisper-capable STT routing, and source-labeled transcript storage.
+- Streaming LLM answer cards with compacted transcript/context/attachment memory.
+- Local SQLite session storage, FTS search, export, local RAG primitives, and OS-keyring-backed settings where wired.
+- Terminal tarball package and installer script for macOS arm64.
 - Recap and action-item commands.
 
-## Version 0.2: Audio and STT
+## Version 0.2: Reliability And Local RAG
 
-- macOS system audio via ScreenCaptureKit.
-- macOS microphone capture via CoreAudio/AVFoundation.
-- Windows system audio via native WASAPI loopback.
-- Windows microphone capture via native WASAPI.
-- VAD before STT.
-- Streaming STT provider trait.
-- OpenAI/Deepgram/local adapters behind the same interface.
-- Feed final STT segments into the existing transcript engine.
+- Clean-machine macOS arm64 install validation.
+- Long-session stress tests for overlay, audio, STT reconnects, and answer streaming.
+- Device hot-swap, sleep/wake, permission repair, and health diagnostics.
+- sqlite-vec or another ANN index for local RAG.
+- Attachment drawer and visible context management.
+- Provider cancellation/abort semantics for superseded answer requests.
 
-## Version 0.3: Intelligence
+## Version 0.3: Platform Expansion
 
-- LLM provider abstraction.
-- Vision provider abstraction for user-selected screenshots, diagrams, and code context.
-- Provider routing, fallback, and key rotation.
-- Streaming answer cards.
-- Managed Bluey cloud routing as the production default.
-- Rolling context compaction.
-- Meeting-mode detection.
-- Confidence and cooldown logic so Bluey does not spam cards.
+- macOS x86_64 artifact if Intel support is required.
+- Windows whisper.cpp integration and Windows 10/11 QA for overlay, audio,
+  page capture, installer, and update paths.
+- Linux build decision after audio/capture feasibility review.
+- Signed installers and auto-update only after the supported platform matrix is real.
 
 ## Version 0.4: Commercial Cloud Memory
 

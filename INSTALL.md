@@ -16,14 +16,22 @@
 Download the release archive and extract it:
 
 ```bash
-curl -LO https://github.com/<org>/bluey/releases/latest/download/bluey-0.1.0-macos-arm64.tar.gz
-shasum -a 256 -c bluey-0.1.0-macos-arm64.tar.gz.sha256
+curl -LO https://github.com/Dhanunjay-Divi/bluey/releases/latest/download/bluey-0.1.0-darwin-arm64.tar.gz
+curl -LO https://github.com/Dhanunjay-Divi/bluey/releases/latest/download/SHA256SUMS.txt
+grep ' bluey-0.1.0-darwin-arm64.tar.gz$' SHA256SUMS.txt | shasum -a 256 -c -
 
-mkdir -p /usr/local/lib/bluey
-tar -xzf bluey-0.1.0-macos-arm64.tar.gz -C /usr/local/lib/bluey
+mkdir -p /usr/local/lib/bluey/0.1.0
+tar -xzf bluey-0.1.0-darwin-arm64.tar.gz -C /usr/local/lib/bluey/0.1.0
 
-ln -sf /usr/local/lib/bluey/bluey-macos-arm64/bluey       /usr/local/bin/bluey
-ln -sf /usr/local/lib/bluey/bluey-macos-arm64/bluey-daemon /usr/local/bin/bluey-daemon
+ln -sf /usr/local/lib/bluey/0.1.0/bin/bluey        /usr/local/bin/bluey
+ln -sf /usr/local/lib/bluey/0.1.0/bin/bluey-daemon /usr/local/bin/bluey-daemon
+```
+
+For local/dev validation, the same install layout can be produced with:
+
+```bash
+make package-darwin-arm64
+BLUEY_ARCHIVE=dist/bluey-0.1.0-darwin-arm64.tar.gz scripts/install.sh
 ```
 
 ## Code signing and Gatekeeper
@@ -36,7 +44,7 @@ If you download the archive through a browser, macOS may attach the
 `com.apple.quarantine` extended attribute. The standard remediation is:
 
 ```bash
-xattr -d com.apple.quarantine /usr/local/lib/bluey/bluey-macos-arm64/*
+xattr -d com.apple.quarantine /usr/local/lib/bluey/0.1.0/bin/*
 ```
 
 If you `curl` the archive from a terminal, quarantine is typically not

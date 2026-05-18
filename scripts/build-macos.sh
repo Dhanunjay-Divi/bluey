@@ -21,6 +21,7 @@ cp native/macos/cue-overlay/.build/bluey-overlay-macos "$DIST/bluey-overlay-maco
 cp native/macos/cue-overlay/.build/cue-overlay-macos "$DIST/cue-overlay-macos"
 cp native/macos/cue-audio/.build/bluey-audio-macos "$DIST/bluey-audio-macos"
 cp native/macos/cue-audio/.build/cue-audio-macos "$DIST/cue-audio-macos"
-cp "$(swift build -c release --package-path native/macos/cue-whisper --show-bin-path)/CueWhisper" "$DIST/cue-whisper"
+cp native/macos/cue-whisper/.build/cue-whisper "$DIST/cue-whisper"
+cp native/macos/cue-whisper/.build/bluey-whisper-macos "$DIST/bluey-whisper-macos"
 
 echo "$DIST"

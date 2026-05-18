@@ -25,7 +25,8 @@ The overlay or settings UI should absorb these user-visible capabilities before 
 
 ## APIs Needed
 
-Bluey cloud needs a small set of production APIs before the desktop can move beyond a local prototype:
+Bluey cloud needs a small set of production APIs before the desktop can move
+from a local-first macOS product into a paid SaaS:
 
 - Auth, refresh, logout, and device registration.
 - Workspace membership, role, and policy lookup.
@@ -111,14 +112,16 @@ Web dashboard:
 
 The biggest commercial blockers are:
 
-- Real macOS and Windows audio capture with system/microphone labels.
-- Streaming STT and restartable capture.
-- Managed provider answer streaming, including markdown and citations.
-- Vision/OCR extraction for screenshots and documents.
+- Clean-machine macOS arm64 install validation and support diagnostics.
+- Windows parity: real whisper.cpp, overlay/audio/page capture QA, and clean Windows packaging.
+- Managed cloud auth/device registration and tenant-scoped sync.
+- Managed provider answer streaming with Bluey-owned credentials, metering, budgets, and citations.
+- Production vision/OCR extraction for screenshots and documents with artifact status and citations.
 - Attachment drawer and richer visible session context management.
 - Authenticated cloud sync and tenant-scoped RAG.
-- Settings/onboarding UI and web dashboard.
-- Signed installers, auto-update, crash diagnostics, and support bundle collection.
-- Windows parity QA for overlay, file picker, prompts, screenshot capture, and audio.
+- Customer settings/onboarding UI and bundled web/dashboard surface.
+- Signed installers, auto-update, crash diagnostics, telemetry opt-in, and support bundle collection.
 
-Until these are implemented, Bluey should be described as a strong local prototype with commercial architecture scaffolding, not as a production SaaS.
+Until these are implemented, Bluey should be described as a strong macOS arm64 local-first product candidate with commercial architecture scaffolding, not as a production SaaS.
+
+For the current implementation matrix, use `docs/PRODUCTION-READINESS.md` as the source of truth.

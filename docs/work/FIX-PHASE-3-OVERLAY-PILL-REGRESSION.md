@@ -1,7 +1,8 @@
 # FIX-PHASE-3-OVERLAY-PILL-REGRESSION.md
 
 **Branch:** `feat/phase-3-round-12`
-**Tip:** `5776295`
+**Reviewed base:** `896b8a1`
+**Codex follow-up:** worktree fix after `896b8a1` for pill-first startup and branded pill rendering
 **Stacked on:** v0.1.0 GA tag candidate (`dd264a8`)
 **Status:** restoration of regressed pill UX. v0.1.0 GA tagging deferred until this lands and codex reviews.
 
@@ -21,7 +22,7 @@ This was a regression introduced during the R10–R12 hardening work: the daemon
 
 ## What landed
 
-A full rewrite of `native/macos/cue-overlay/Sources/cue-overlay/main.swift` (~675 lines) reconciled with the current daemon protocol and the documented pill UX.
+A full rewrite of `native/macos/cue-overlay/Sources/cue-overlay/main.swift` (~675 lines) reconciled with the current daemon protocol and the documented pill UX. Codex then added the missing startup semantics and visual restoration: `bluey on` no longer sends `OverlayShow` before `OverlayBoot`, and the collapsed pill now draws a compact Bluey logo mark, dark-blue glass, cyan border/glow, wordmark, and status dot.
 
 ### Protocol reconciliation (item 6)
 
@@ -53,7 +54,7 @@ $ env BLUEY_OVERLAY_SESSION_TOKEN=… bluey-overlay-macos < cmd-stream
 
 ### UX layers (items 1–5)
 
-1. **Top pill on `bluey on`:** the overlay defaults to a 160×32 pill anchored at the top center of the visible screen. It renders immediately on launch and is the visible signal that the daemon is alive.
+1. **Top pill on `bluey on`:** the overlay defaults to a compact 146×32 Bluey-branded pill anchored at the top center of the visible screen. It renders immediately on launch and is the visible signal that the daemon is alive.
 2. **Click-to-open:** the pill is a real `NSView` with mouse handling. `mouseDown` distinguishes click (no movement >4 px) from drag; click expands the feed/composer panel under the pill via `expand()`, which emits `shown`.
 3. **Movable pill:** the pill window has `isMovableByWindowBackground = true`, and the `mouseDown` loop calls `performDrag(with:)` on every drag event. Users can park the pill anywhere on screen.
 4. **Full overlay feed/composer/buttons:** the expanded panel is a 480×560 borderless capture-excluded `NSWindow` containing:
@@ -89,12 +90,14 @@ bash native/macos/cue-overlay/build.sh                           ✅ produces bl
 cargo fmt --all --check                                          ✅
 cargo clippy --all-targets -- -D warnings                        ✅
 cargo build --all-targets --release                              ✅
-cargo test --all-targets                                         ✅ 361 tests, 0 failures
+cargo test --all-targets                                         ✅ 363 tests, 0 failures
 (cd crates/cue-dashboard/ui && npm test)                         ✅ 13 vitest tests
 (cd crates/cue-dashboard/ui && npm run build)                    ✅
 swift build -c release --package-path native/macos/cue-whisper   ✅
 git -P diff --check main..HEAD                                   ✅
 bash scripts/smoke-test.sh                                       ✅ daemon + overlay + transcript + instructions + context + memory + audio + AI routing + cloud + ask + action-items + recap + archive
+make package-darwin-arm64                                        ✅ local release archive with helpers
+scripts/install.sh with BLUEY_ARCHIVE + temp dirs                ✅ bluey on/off launches daemon + overlay from installed paths
 ```
 
 Direct overlay protocol smoke (running the binary in isolation, feeding NDJSON via stdin):
@@ -112,7 +115,7 @@ Items 1–4 (pill rendering, click expansion, drag, composer interactions) requi
 
 ## Re-review request
 
-> R12 overlay-pill regression fixed. Branch `feat/phase-3-round-12` tip `5776295`.
+> R12 overlay-pill regression fixed. Branch `feat/phase-3-round-12` reviewed base `896b8a1`, with a Codex follow-up worktree fix for pill-first startup and branded pill visuals.
 >
 > The active macOS overlay source has been rewritten end-to-end so the daemon's full `OverlayCommand` surface is parsed and the pill / click-to-open / drag / feed / composer / boot-card UX is restored. Token handshake (R11) preserved on every emitted event. `bluey on` end-to-end smoke passes.
 >
@@ -120,6 +123,12 @@ Items 1–4 (pill rendering, click expansion, drag, composer interactions) requi
 >
 > v0.1.0 GA tagging is held until this regression review returns 🟢. If accepted, tag `v0.1.0` GA on this same tip.
 
-## Round 13 carry-over remains unchanged
+## Round 13 carry-over after Codex production pass
 
-This fix only restores the pill UX. The R13 plan (sqlite-vec RAG, Windows whisper, cancel-path state reset, `Result<>` token, cross-platform matrix, telemetry, install.sh) is unaffected.
+Codex also completed the two small R13 hardening items and the first installer/package alignment slice:
+
+- R13.1 cancel/error overlay state reset: done.
+- R13.2 `generate_session_token() -> Result<_>`: done.
+- R13.7 initial macOS arm64 `scripts/install.sh` + local archive smoke: done.
+
+Remaining R13+ product work: sqlite-vec / ANN RAG, Windows real whisper.cpp, broader platform matrix, telemetry counters after a telemetry/privacy decision, and clean-machine installer validation.

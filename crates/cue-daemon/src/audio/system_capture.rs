@@ -88,10 +88,20 @@ fn resolve_binary() -> std::io::Result<PathBuf> {
 fn platform_binary_path() -> PathBuf {
     // Look relative to the daemon binary first
     if let Ok(exe) = std::env::current_exe() {
+        let mut dirs = Vec::new();
         if let Some(dir) = exe.parent() {
-            let candidate = dir.join("bluey-audio-macos");
-            if candidate.exists() {
-                return candidate;
+            dirs.push(dir.to_path_buf());
+        }
+        if let Ok(canonical) = exe.canonicalize() {
+            if let Some(dir) = canonical.parent() {
+                dirs.push(dir.to_path_buf());
+            }
+        }
+        for dir in dirs {
+            for candidate in [dir.join("bluey-audio-macos"), dir.join("cue-audio-macos")] {
+                if candidate.exists() {
+                    return candidate;
+                }
             }
         }
     }
@@ -101,10 +111,20 @@ fn platform_binary_path() -> PathBuf {
 #[cfg(target_os = "windows")]
 fn platform_binary_path() -> PathBuf {
     if let Ok(exe) = std::env::current_exe() {
+        let mut dirs = Vec::new();
         if let Some(dir) = exe.parent() {
-            let candidate = dir.join("bluey-audio.exe");
-            if candidate.exists() {
-                return candidate;
+            dirs.push(dir.to_path_buf());
+        }
+        if let Ok(canonical) = exe.canonicalize() {
+            if let Some(dir) = canonical.parent() {
+                dirs.push(dir.to_path_buf());
+            }
+        }
+        for dir in dirs {
+            for candidate in [dir.join("bluey-audio.exe"), dir.join("cue-audio.exe")] {
+                if candidate.exists() {
+                    return candidate;
+                }
             }
         }
     }

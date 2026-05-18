@@ -1,32 +1,43 @@
 # Deployment And Scaling Plan
 
-Bluey should ship as a desktop product backed by a managed cloud service. The CLI remains a developer/debug surface.
+Bluey should become a desktop product backed by a managed cloud service. The
+current v0.1.0 release scope is narrower: macOS arm64, terminal-distributed,
+local-first, with the native overlay and helper binaries bundled in a tarball.
+The CLI remains the install/launch surface for v0.1.0 and a developer/support
+surface long term.
 
 ## User-Facing Surfaces
 
 - Desktop overlay: daily use, launched by `bluey on`.
-- Desktop settings window: login, permissions, audio devices, hotkeys, privacy, workspace, plan.
-- Web dashboard: meeting history, search, recaps, action items, attached files, admin controls.
-- CLI: internal diagnostics, smoke tests, support workflows.
+- CLI: v0.1.0 install/launch plus internal diagnostics, smoke tests, and support workflows.
+- Desktop settings window: future customer UI for login, permissions, audio devices, hotkeys, privacy, workspace, and plan.
+- Web dashboard: future meeting history, search, recaps, action items, attached files, and admin controls.
 
-The commercial promise should be that normal users only need `bluey on` or the packaged app launcher. CLI commands are still valuable for development and support, but they should not appear in onboarding as required customer steps.
+The commercial promise should be that normal users only need `bluey on` or a
+packaged app launcher. Until the app launcher exists, v0.1.0 should be described
+as a terminal-distributed build, not a polished GUI installer.
 
 ## Desktop Packaging
 
 macOS:
 
-- Bundle `bluey`, `bluey-daemon`, and `bluey-overlay-macos` into a signed `.app`.
-- Notarize the app.
-- Request microphone and screen-recording permissions through visible onboarding.
+- Current v0.1.0: bundle `bluey`, `bluey-daemon`, `bluey-overlay-macos`,
+  `bluey-audio-macos`, and `bluey-whisper-macos` into the macOS arm64 tarball.
+- Current v0.1.0: install with `scripts/install.sh` or a downloaded release
+  archive plus checksum verification.
+- Future: signed `.app`, notarization, and GUI onboarding.
+- Future: request microphone and screen-recording permissions through visible onboarding.
 - Store local config in the per-user app config directory.
 - Use launch agent or login item only after explicit user opt-in.
 
 Windows:
 
-- Package `bluey.exe`, `bluey-daemon.exe`, and `bluey-overlay.exe` with an installer.
-- Code sign binaries and installer.
-- Use WASAPI loopback for system audio and standard microphone permissions.
-- Add Windows notification/tray/settings entry.
+- Source exists for Win32 overlay rendering and WASAPI audio helpers, but Windows
+  is not shipped in v0.1.0.
+- Before claiming support, package `bluey.exe`, `bluey-daemon.exe`, overlay,
+  audio, and whisper helpers with a tested installer.
+- Replace the Windows whisper stub with real whisper.cpp integration.
+- Code sign binaries/installer when Windows distribution becomes public.
 - QA `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` behavior on Windows 10/11.
 
 ## Cloud Services
@@ -120,15 +131,15 @@ Reliability:
 
 ## Product Gaps To Prioritize
 
-1. Inline overlay composer instead of native ask popup.
-2. Global hotkeys for ask, show/hide, capture, attach.
-3. Real macOS and Windows audio capture.
-4. Streaming STT with system/mic source labels.
-5. Streaming provider answer cards with markdown and citations.
-6. Vision/OCR for screen captures and attached images/documents.
-7. Auth, secure sync, and cloud RAG.
-8. Settings/onboarding UI.
-9. Signed installers and auto-update.
+1. Clean-machine validation of the macOS arm64 tarball and installer script.
+2. Runtime health view for overlay/audio/STT/provider/cloud status.
+3. Long-session stress tests, sleep/wake, device hot-swap, and permission repair.
+4. sqlite-vec or another ANN index for local RAG.
+5. Production OCR/vision pipeline with citations and artifact status.
+6. Auth, secure sync, managed provider routing, billing, and cloud RAG.
+7. Customer settings/onboarding UI.
+8. Windows whisper.cpp and Windows 10/11 hardware QA.
+9. Signed installers and auto-update after the platform matrix is real.
 10. Web dashboard for meeting history and admin.
 
 Related production readiness docs:
@@ -136,3 +147,4 @@ Related production readiness docs:
 - `BACKEND-CONTRACTS.md`
 - `SETTINGS-UI-CONTRACT.md`
 - `INSTALLER-CHECKLIST.md`
+- `PRODUCTION-READINESS.md`

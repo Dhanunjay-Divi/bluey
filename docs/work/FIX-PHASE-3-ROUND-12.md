@@ -37,6 +37,10 @@
 
 ### Non-blocking code nits → R13
 
+> 2026-05-18 update: Codex completed both R13.1 and R13.2 in the follow-up
+> production-hardening pass. This section is retained as the original R12 fix
+> record, not as the current open-work list.
+
 The two non-blocking code nits raised in REVIEW-PHASE-3-ROUND-12.md are tracked in `PHASE-3-ROUND-13-PLAN.md`:
 
 | Codex finding | R13 item | Estimate |

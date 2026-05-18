@@ -1,6 +1,8 @@
 # PHASE-3-ROUND-13-PLAN.md
 
-**Status:** Planning. Will be opened after codex 🟢s R12 fix wave (the doc-scope nits) and we cut v0.1.0 GA. R13 itself is non-blocking polish + matrix expansion.
+**Status:** In progress. Codex completed R13.1, R13.2, and the installer/package
+alignment slice on 2026-05-18. Larger RAG, Windows whisper, and platform-matrix
+items remain separate implementation rounds.
 
 R13 absorbs:
 
@@ -11,6 +13,8 @@ R13 absorbs:
 ---
 
 ## R13.1 — Reset overlay UI state on cancel/error, not just on submit
+
+**Status:** Done in Codex R13 pass.
 
 **Source:** codex R12 review, R12.2 finding.
 
@@ -30,6 +34,8 @@ Recommend A — it is a 10-line change.
 ---
 
 ## R13.2 — `generate_session_token` returns `Result<String>` instead of panicking
+
+**Status:** Done in Codex R13 pass.
 
 **Source:** codex R12 review, R12.3 finding.
 
@@ -89,6 +95,12 @@ Today the production reader thread logs `warn!` on every rejected line (token mi
 
 ## R13.7 — Optional: tested `scripts/install.sh` for `curl | sh`
 
+**Status:** Partially done in Codex R13 pass. `scripts/install.sh` now supports
+macOS arm64 release/archive installs, checksum verification via
+`SHA256SUMS.txt`, a local `BLUEY_ARCHIVE` path for validation, and the
+versioned `~/.local/bluey/<version>` layout. Clean-machine validation is still
+required before we make `curl | sh` the public primary install path.
+
 **Source:** codex R12 review, cross-task finding.
 
 If the GA call-to-action is `curl https://… | sh`, we need an actual install script: places binaries in `~/.local/bin` (or `/usr/local/bin` with sudo), sets up the launchd plist, smoke-tests on a clean Mac. If we keep manual `tar xzf` for v0.1.0, this is not needed.
@@ -103,15 +115,18 @@ If the GA call-to-action is `curl https://… | sh`, we need an actual install s
 
 For "drop the -alpha suffix" GA path:
 
-1. **R12 doc-scope fix wave** (this round; addressing codex's two doc nits) — already in progress.
-2. **R13.1** (overlay state reset on cancel) — 1 hr; tightens R12.2 correctness.
-3. **R13.2** (token Result return) — 30 min; small hardening.
-4. **(decision: cross-platform scope)** — if user wants Intel Macs in v0.1.0, do R13.5 macOS x86_64 portion.
-5. **Cut v0.1.0 GA** — drop -alpha suffix, tag v0.1.0.
+1. **R12 doc-scope fix wave** — done.
+2. **R13.1** (overlay state reset on cancel) — done.
+3. **R13.2** (token Result return) — done.
+4. **Installer/package alignment** — done for macOS arm64 archive installs;
+   clean-machine validation still pending.
+5. **(decision: cross-platform scope)** — if user wants Intel Macs in v0.1.0,
+   do R13.5 macOS x86_64 portion.
+6. **Cut v0.1.0 GA** — drop -alpha suffix, tag v0.1.0 after validation.
 
 For everything else:
 
-6. **R13.3** (sqlite-vec) — separate dedicated round, 1 day.
-7. **R13.4** (Windows whisper) — separate, when bench available.
-8. **R13.6** (telemetry) — when sink/privacy land.
-9. **R13.7** (install.sh) — only if `curl | sh` becomes the primary install path.
+7. **R13.3** (sqlite-vec) — separate dedicated round, 1 day.
+8. **R13.4** (Windows whisper) — separate, when bench available.
+9. **R13.6** (telemetry) — when sink/privacy land.
+10. **R13.7 clean-machine validation** — only if `curl | sh` becomes the primary install path.

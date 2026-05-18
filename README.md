@@ -2,15 +2,15 @@
 
 Bluey is a lightweight native AI work copilot. This repo is starting from a clean Rust/native foundation, using the reference packages in this folder as architectural inspiration.
 
-Product direction: Bluey is a commercial managed-cloud product, not an open-source/BYOK clone. Local storage, deterministic fallback intelligence, and the simulated development audio path remain useful for offline testing while managed cloud sync, managed providers, deeper native capture, and RAG memory move toward production.
+Product direction: Bluey is a commercial managed-cloud product, not an open-source/BYOK clone. The current v0.1.0 track is a macOS arm64, local-first terminal distribution with a native overlay and bundled helpers. Managed cloud sync, managed provider routing, cloud RAG, billing, and workspace controls remain the paid-product path.
 
 Current shape:
 
 - `bluey` CLI: terminal-first lifecycle, account, session history, settings, and overlay commands.
 - `bluey-daemon`: local background process and IPC server.
 - `cue-core`: shared protocol, cards, state, paths.
-- `native/macos/cue-overlay`: AppKit overlay sidecar, excluded from screen capture with `NSWindow.sharingType = .none`; draggable, resizable, opacity-adjustable, and frame-persistent.
-- `native/windows/cue-overlay`: Win32 overlay sidecar source, using `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` with drag/resize hit testing, opacity commands, ask/send, mic, capture, recap, attach, style, and close controls.
+- `native/macos/cue-overlay`: AppKit overlay sidecar, excluded from screen capture with `NSWindow.sharingType = .none`; compact pill-first startup, click-to-open feed/composer, tokenized IPC, attach/instructions/recap/ask events, and opacity controls.
+- `native/windows/cue-overlay`: Win32 overlay sidecar source with Direct2D rendering and capture-exclusion work, kept for the Windows parity round. Windows is not shipped in v0.1.0 until hardware QA and Windows whisper.cpp are complete.
 
 ## Build
 
@@ -83,7 +83,7 @@ Use the Session icon to continue the active session with its existing transcript
 Use the Analyse chip when a browser page has more text than is visible on screen. Bluey asks supported browsers for readable page text, attaches it as session context, and generates an answer; macOS may show the normal Automation permission prompt, and Windows uses user-level UI Automation when browsers expose document text. If page text is unavailable, Bluey can fall back to one permissioned screenshot plus an OpenAI-compatible vision route when `OPENAI_API_KEY`, `BLUEY_VISION_PROVIDER`, or Bluey managed vision is configured.
 Use the paperclip icon to select session files or show what is already attached. Use the notepad icon to set how Bluey should answer questions. Use the eye-slash icon to collapse the overlay into a small Bluey button; click that button to reopen. Use X/Quit when you want to stop Bluey completely.
 
-Real audio transcription is wired through bundled native helpers plus an OpenAI-compatible transcription endpoint. Set `OPENAI_API_KEY` or `BLUEY_STT_API_KEY`, then press the mic button. On macOS, Bluey uses ScreenCaptureKit for system audio and CoreAudio/AVFoundation for microphone capture; on Windows, Bluey uses WASAPI loopback and microphone capture. Users do not need to install loopback drivers for the primary path. FFmpeg remains a fallback/dev path, with optional `BLUEY_FFMPEG_PATH`, `BLUEY_MIC_AUDIO_DEVICE`, and `BLUEY_SYSTEM_AUDIO_DEVICE` overrides. Bluey removes transient WAV chunks after transcription and stores only source-labeled transcript text in the session.
+Real audio transcription is wired through bundled native helpers and the streaming STT provider chain. On macOS, Bluey uses native system/mic capture helpers, two-stage VAD, Deepgram/OpenAI Realtime/LocalWhisper-capable STT routing, and source-labeled transcript storage. Windows audio helper source exists but is not part of the v0.1.0 support matrix until Windows QA is complete. Users do not need loopback drivers for the primary macOS path. FFmpeg remains a fallback/dev path, with optional `BLUEY_FFMPEG_PATH`, `BLUEY_MIC_AUDIO_DEVICE`, and `BLUEY_SYSTEM_AUDIO_DEVICE` overrides.
 
 The live feed is chronological and scrollable: system audio appears as `System transcript`, microphone audio appears as `Mic transcript`, submitted questions appear as `You`, and generated responses appear as `Bluey / Response` cards directly after the question. Recent turns are stored in the active session so follow-up questions continue from the previous answer.
 
@@ -123,6 +123,7 @@ See `docs/ICON-GUIDE.md` for every overlay icon, dot, and card type.
 See `docs/SESSION-FLOW.md` for the overlay-first user flow.
 See `docs/PRODUCT-STRATEGY.md` and `docs/CLOUD-RAG.md` for commercial cloud/RAG direction.
 See `docs/COMPETITIVE-GAPS.md` for the paid-product gap list.
+See `docs/PRODUCTION-READINESS.md` for the current implemented/missing production matrix.
 See `docs/PRE-PRICING-REVIEW.md` for the working checklist before pricing plans.
 See `docs/IMPLEMENTATION-SEAMS.md` for the code seams that native audio, STT, managed AI, and cloud RAG should plug into next.
 See `docs/DEPLOYMENT-SCALING.md` for packaging, cloud APIs, storage, provider keys, and scaling plan.

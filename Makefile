@@ -25,24 +25,27 @@ build-helpers-release:
 
 build-darwin-arm64:
 	cargo build --release --target aarch64-apple-darwin -p cue-daemon -p cue-cli
-	cd crates/cue-dashboard && cargo tauri build --target aarch64-apple-darwin
 
 build-darwin-x86_64:
 	cargo build --release --target x86_64-apple-darwin -p cue-daemon -p cue-cli
-	cd crates/cue-dashboard && cargo tauri build --target x86_64-apple-darwin
 
 build-windows-x86_64:
 	cargo build --release --target x86_64-pc-windows-msvc -p cue-daemon -p cue-cli
-	cd crates/cue-dashboard && cargo tauri build --target x86_64-pc-windows-msvc
 
 build-all: build-darwin-arm64 build-darwin-x86_64
 
-package-darwin-arm64: build-darwin-arm64
+package-darwin-arm64: build-darwin-arm64 build-helpers-release
 	mkdir -p dist staging-arm64/bin
 	cp target/aarch64-apple-darwin/release/bluey-daemon staging-arm64/bin/ 2>/dev/null || \
 		cp target/aarch64-apple-darwin/release/cue-daemon staging-arm64/bin/bluey-daemon
 	cp target/aarch64-apple-darwin/release/bluey staging-arm64/bin/ 2>/dev/null || \
 		cp target/aarch64-apple-darwin/release/cue staging-arm64/bin/bluey
+	cp native/macos/cue-overlay/.build/bluey-overlay-macos staging-arm64/bin/ 2>/dev/null || true
+	cp native/macos/cue-overlay/.build/cue-overlay-macos staging-arm64/bin/ 2>/dev/null || true
+	cp native/macos/cue-audio/.build/bluey-audio-macos staging-arm64/bin/ 2>/dev/null || true
+	cp native/macos/cue-audio/.build/cue-audio-macos staging-arm64/bin/ 2>/dev/null || true
+	cp native/macos/cue-whisper/.build/cue-whisper staging-arm64/bin/ 2>/dev/null || true
+	cp native/macos/cue-whisper/.build/bluey-whisper-macos staging-arm64/bin/ 2>/dev/null || true
 	tar -czf dist/bluey-$(VERSION)-darwin-arm64.tar.gz -C staging-arm64 .
 	rm -rf staging-arm64
 

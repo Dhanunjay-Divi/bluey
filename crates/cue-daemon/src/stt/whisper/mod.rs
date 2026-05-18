@@ -67,10 +67,34 @@ fn resolve_binary() -> Result<String, WhisperError> {
     // 2. Platform default
     #[cfg(target_os = "macos")]
     {
-        let candidates = ["cue-whisper", "/usr/local/bin/cue-whisper"];
-        for c in &candidates {
-            if std::path::Path::new(c).exists() {
-                return Ok(c.to_string());
+        let mut candidates = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            let mut dirs = Vec::new();
+            if let Some(dir) = exe.parent() {
+                dirs.push(dir.to_path_buf());
+            }
+            if let Ok(canonical) = exe.canonicalize() {
+                if let Some(dir) = canonical.parent() {
+                    dirs.push(dir.to_path_buf());
+                }
+            }
+            for dir in dirs {
+                candidates.extend([
+                    dir.join("cue-whisper"),
+                    dir.join("bluey-whisper-macos"),
+                    dir.join("bin/cue-whisper"),
+                    dir.join("bin/bluey-whisper-macos"),
+                ]);
+            }
+        }
+        candidates.extend([
+            std::path::PathBuf::from("cue-whisper"),
+            std::path::PathBuf::from("native/macos/cue-whisper/.build/cue-whisper"),
+            std::path::PathBuf::from("/usr/local/bin/cue-whisper"),
+        ]);
+        for c in candidates {
+            if c.exists() {
+                return Ok(c.display().to_string());
             }
         }
         Err(WhisperError::BinaryNotFound(
@@ -80,13 +104,28 @@ fn resolve_binary() -> Result<String, WhisperError> {
 
     #[cfg(target_os = "windows")]
     {
-        let candidates = [
-            "cue-whisper.exe",
-            "C:\\Program Files\\Bluey\\cue-whisper.exe",
-        ];
-        for c in &candidates {
-            if std::path::Path::new(c).exists() {
-                return Ok(c.to_string());
+        let mut candidates = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            let mut dirs = Vec::new();
+            if let Some(dir) = exe.parent() {
+                dirs.push(dir.to_path_buf());
+            }
+            if let Ok(canonical) = exe.canonicalize() {
+                if let Some(dir) = canonical.parent() {
+                    dirs.push(dir.to_path_buf());
+                }
+            }
+            for dir in dirs {
+                candidates.extend([dir.join("cue-whisper.exe"), dir.join("bin/cue-whisper.exe")]);
+            }
+        }
+        candidates.extend([
+            std::path::PathBuf::from("cue-whisper.exe"),
+            std::path::PathBuf::from("C:\\Program Files\\Bluey\\cue-whisper.exe"),
+        ]);
+        for c in candidates {
+            if c.exists() {
+                return Ok(c.display().to_string());
             }
         }
         Err(WhisperError::BinaryNotFound(

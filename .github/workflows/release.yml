@@ -31,18 +31,11 @@ jobs:
     strategy:
       matrix:
         include:
+          # v0.1.0 GA scope is macOS arm64 only. Re-enable the other
+          # platforms after R13.5 expands the tested support matrix.
           - os: macos-latest
             target: aarch64-apple-darwin
             platform: darwin-arm64
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            platform: darwin-x86_64
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            platform: windows-x86_64
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            platform: linux-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -69,11 +62,6 @@ jobs:
         if: matrix.os == 'windows-latest'
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -89,22 +77,12 @@ jobs:
       - name: Build daemon and CLI
         run: cargo build --release --target ${{ matrix.target }} -p cue-daemon -p cue-cli
 
-      - name: Install Tauri CLI
-        run: cargo install tauri-cli --locked || true
-
-      # Tauri build runs from crates/cue-dashboard where tauri.conf.json lives.
-      - name: Build dashboard
-        working-directory: crates/cue-dashboard
-        run: cargo tauri build --target ${{ matrix.target }}
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-
       - name: Build macOS native helpers
         if: matrix.os == 'macos-latest'
         run: |
+          shopt -s nullglob
           for helper in native/macos/*/build.sh; do
-            [ -f "$helper" ] && bash "$helper" || true
+            bash "$helper"
           done
 
       - name: Build Windows native helpers
@@ -127,11 +105,13 @@ jobs:
           # Canonical binary: bluey (fallback: cue from same crate)
           cp "target/${{ matrix.target }}/release/bluey" staging/bin/ 2>/dev/null || \
             cp "target/${{ matrix.target }}/release/cue" staging/bin/bluey
-          # Dashboard app bundle
-          find "target/${{ matrix.target }}/release/bundle" -name "*.app" -exec cp -R {} staging/ \; 2>/dev/null || true
-          find "target/${{ matrix.target }}/release/bundle" -name "*.AppImage" -exec cp {} staging/ \; 2>/dev/null || true
-          # Native helpers
-          find native -name "*.dylib" -o -name "cue-*" -type f -perm +111 | while read f; do cp "$f" staging/bin/ 2>/dev/null || true; done
+          # Native helpers. Keep both canonical bluey-* names and legacy cue-*
+          # aliases because older dev scripts still probe the cue-* fallback.
+          find native \( -name "bluey-*" -o -name "cue-*" -o -name "*.dylib" \) -type f | while read f; do
+            if [ -x "$f" ] || [[ "$f" == *.dylib ]]; then
+              cp "$f" staging/bin/ 2>/dev/null || true
+            fi
+          done
           tar -czf "bluey-${VERSION}-${{ matrix.platform }}.tar.gz" -C staging .
 
       - name: Package (Windows)
@@ -153,11 +133,11 @@ jobs:
             Copy-Item "target/${{ matrix.target }}/release/cue.exe" staging/bin/bluey.exe
           }
           # Native helpers
-          Copy-Item native/windows/cue-overlay/cue-overlay.exe staging/bin/ -ErrorAction SilentlyContinue
-          Copy-Item native/windows/cue-audio/cue-audio.exe staging/bin/ -ErrorAction SilentlyContinue
+          Copy-Item native/windows/cue-overlay/build/bluey-overlay.exe staging/bin/ -ErrorAction SilentlyContinue
+          Copy-Item native/windows/cue-overlay/build/cue-overlay.exe staging/bin/ -ErrorAction SilentlyContinue
+          Copy-Item native/windows/cue-audio/build/bluey-audio.exe staging/bin/ -ErrorAction SilentlyContinue
+          Copy-Item native/windows/cue-audio/build/cue-audio.exe staging/bin/ -ErrorAction SilentlyContinue
           Copy-Item native/windows/cue-whisper/cue-whisper.exe staging/bin/ -ErrorAction SilentlyContinue
-          # Dashboard MSI
-          Get-ChildItem -Recurse "target/${{ matrix.target }}/release/bundle" -Filter "*.msi" | Copy-Item -Destination staging/ -ErrorAction SilentlyContinue
           Compress-Archive -Path staging/* -DestinationPath "bluey-${VERSION}-${{ matrix.platform }}.zip"
 
       - name: Compute SHA256
@@ -206,36 +186,6 @@ jobs:
           cd ..
           python3 infra/scripts/build-sha256-manifest.py
 
-      - name: Generate Tauri updater manifest (latest.json)
-        shell: bash
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          cat > latest.json << EOF
-          {
-            "version": "$VERSION",
-            "notes": "Release $VERSION",
-            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
-            "platforms": {
-              "darwin-aarch64": {
-                "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/bluey-${VERSION}-darwin-arm64.tar.gz",
-                "signature": ""
-              },
-              "darwin-x86_64": {
-                "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/bluey-${VERSION}-darwin-x86_64.tar.gz",
-                "signature": ""
-              },
-              "windows-x86_64": {
-                "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/bluey-${VERSION}-windows-x86_64.zip",
-                "signature": ""
-              },
-              "linux-x86_64": {
-                "url": "https://github.com/${{ github.repository }}/releases/download/${GITHUB_REF_NAME}/bluey-${VERSION}-linux-x86_64.tar.gz",
-                "signature": ""
-              }
-            }
-          }
-          EOF
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -244,4 +194,3 @@ jobs:
             artifacts/*
             SHA256SUMS.txt
             sha256-manifest.json
-            latest.json

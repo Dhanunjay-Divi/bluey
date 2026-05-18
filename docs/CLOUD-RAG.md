@@ -7,9 +7,9 @@ Bluey's production memory should be cloud-backed and account-scoped. The current
 Implemented:
 
 ```bash
-cue memory search "native overlay"
-cue cloud status
-cue cloud sync
+bluey memory search "native overlay"
+bluey cloud status
+bluey cloud sync
 ```
 
 This searches active and archived local meeting records across:

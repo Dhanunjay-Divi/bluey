@@ -165,3 +165,145 @@ Next decision is product/release identity, not implementation correctness:
 
 - If staying alpha: merge this cleanup, keep `v0.1.0-alpha`, do not tag GA.
 - If going GA: update install/release artifact names and audience/tag wording to `v0.1.0`, then hand back for one last string-only recheck.
+
+## Recheck 3 — Overlay Pill Regression Fix `896b8a1`
+
+**Date:** 2026-05-18
+
+**Verdict:** 🔴 **REQUEST CHANGES**
+
+The Swift overlay rewrite fixes the core protocol drift: it now builds, launches as a native helper, parses the current `OverlayCommand` variants, emits token-bearing `OverlayEvent` lines, produces both expected binary names, and passes a direct NDJSON protocol smoke. However, one launch-flow blocker remains before this can be accepted as the restored pill UX.
+
+### Findings
+
+- 🔴 `bluey on` still opens the expanded 480x560 panel immediately, not the promised small pill-first click-to-open state. The CLI sends `DaemonRequest::OverlayShow` during `cue_on` before the boot card (`crates/cue-cli/src/app.rs:663-679`), and the new Swift overlay handles `show` by calling `expand()` (`native/macos/cue-overlay/Sources/cue-overlay/main.swift:571-573`). I verified this locally by running `./target/debug/bluey off && ./target/debug/bluey on`; the overlay process then exposed both the 480x560 panel window and the 160x32 pill window. That contradicts the fix doc's stated launch UX: "Top pill on `bluey on`" plus "Click-to-open".
+- 🟢 Protocol reconciliation is otherwise good. Direct isolated smoke against `native/macos/cue-overlay/.build/bluey-overlay-macos` produced token-bearing `ready`, `pong`, `card_rendered` for `boot`, `card_rendered` for `push_card`, and `hidden` for `hide`.
+- 🟢 Build/install path is fixed. `native/macos/cue-overlay/build.sh` now produces both `.build/bluey-overlay-macos` and `.build/cue-overlay-macos`, matching daemon discovery and release packaging expectations.
+- 🟢 The old `ignoresMouseEvents = true` click-through transcript-only implementation is gone. The new source uses real `NSView` controls and capture-excluded windows, so the original "nothing clickable" regression is addressed.
+- 🟡 Handoff-doc nit: `docs/work/FIX-PHASE-3-OVERLAY-PILL-REGRESSION.md` says the tip is `5776295`, but the reviewed tip is `896b8a1`.
+
+### Required Fix
+
+Make the startup semantics match the product contract:
+
+- Either remove/avoid the `OverlayShow` call from `cue_on` so daemon startup + `OverlayBoot` leaves the pill visible and the panel collapsed; or
+- Change the overlay command semantics so `show` means "ensure pill is visible" while expansion is driven by pill click / `toggle` / a future explicit expand command.
+
+Whichever path is chosen, re-test `bluey on` on the Mac desktop and confirm the initial state is a 160x32 pill only; clicking the pill expands the feed/composer panel.
+
+### Verification Run
+
+```bash
+swift build -c release --package-path native/macos/cue-overlay      # ✅
+bash native/macos/cue-overlay/build.sh                              # ✅
+cargo fmt --all --check                                             # ✅
+cargo clippy --all-targets -- -D warnings                           # ✅
+cargo build --all-targets --release                                 # ✅
+cargo test --all-targets                                            # ✅ 361 passed, 14 ignored
+cd crates/cue-dashboard/ui && npm test                              # ✅ 13 passed
+cd crates/cue-dashboard/ui && npm run build                         # ✅
+swift build -c release --package-path native/macos/cue-whisper      # ✅
+git diff --check main..HEAD                                         # ✅
+bash scripts/smoke-test.sh                                          # ✅
+```
+
+Additional targeted checks:
+
+```bash
+# Direct overlay protocol smoke with BLUEY_OVERLAY_SESSION_TOKEN set:
+# ready, pong, boot card_rendered, push_card card_rendered, hide hidden  # ✅
+
+./target/debug/bluey off && ./target/debug/bluey on
+# ❌ Observed both expanded 480x560 panel and 160x32 pill windows after startup.
+```
+
+Once the launch state is corrected and the stale tip in the fix doc is updated, this regression fix should be a fast recheck.
+
+## Recheck 4 — Codex Follow-Up Pill Fix
+
+**Date:** 2026-05-18
+
+**Verdict:** 🟢 **ACCEPT**
+
+Codex implemented the remaining overlay-pill blocker directly in the worktree and rechecked the product path.
+
+### Changes
+
+- 🟢 `bluey on` now launches pill-first. `cue_on()` no longer sends `OverlayShow` before `OverlayBoot`, so the native overlay process starts with only the collapsed pill visible. The boot card is still buffered/rendered into the hidden feed for when the user clicks the pill.
+- 🟢 The macOS pill is now compact and closer to the Pinky-style reference: `146x32`, dark-blue glass, subtle cyan edge/glow, Bluey logo mark, one green/red status dot, `Bluey` wordmark, and a small chevron. The overlarge `196x40` badge and secondary `ready` text were removed.
+- 🟢 `docs/work/FIX-PHASE-3-OVERLAY-PILL-REGRESSION.md` no longer points at the stale `5776295` tip and now records the Codex follow-up.
+
+### Verification
+
+```bash
+swift build -c release --package-path native/macos/cue-overlay      # ✅
+bash native/macos/cue-overlay/build.sh                              # ✅
+cargo fmt --all --check                                             # ✅
+cargo clippy --all-targets -- -D warnings                           # ✅
+cargo build --all-targets --release                                 # ✅
+cargo test --all-targets                                            # ✅ 361 passed, 14 ignored
+cd crates/cue-dashboard/ui && npm test && npm run build             # ✅ 13 passed + build
+swift build -c release --package-path native/macos/cue-whisper      # ✅
+cargo build --all-targets                                           # ✅
+git diff --check main..HEAD && git diff --check                     # ✅
+bash scripts/smoke-test.sh                                          # ✅
+```
+
+Interactive/startup validation:
+
+```bash
+./target/debug/bluey off && ./target/debug/bluey on
+CGWindowListCopyWindowInfo(.optionOnScreenOnly) for bluey-overlay-macos
+# ✅ one on-screen window only: 146x32 pill
+./target/debug/bluey off
+```
+
+The earlier false positive from Accessibility (`System Events`) listed both allocated `NSWindow` objects even when the panel was hidden. The authoritative on-screen CoreGraphics check now shows only the compact pill at startup.
+
+## Recheck 5 — Codex R13 Production Hardening Pass
+
+**Date:** 2026-05-18
+
+**Verdict:** 🟢 **ACCEPT**
+
+Codex implemented the two R13 hardening nits from this review and tightened the release/install path discovered during production-style smoke testing.
+
+### Changes
+
+- 🟢 R13.1 is fixed. `AttachRequested`, `AttachFilesRequested`, `InstructionsRequested`, and `InstructionsUpdated` now reset the shared `OverlayUiState` back to `Idle` via a scope guard, including cancel/error paths.
+- 🟢 R13.2 is fixed. `generate_session_token()` now returns `Result<String, getrandom::Error>` and daemon startup propagates entropy failure instead of panicking.
+- 🟢 The macOS arm64 terminal package now includes native overlay/audio/whisper helpers, and the daemon discovers helpers from the canonical installed daemon directory even when launched through a `~/.local/bin` symlink.
+- 🟢 The release workflow is scoped to the documented v0.1.0 support matrix: macOS arm64 only, terminal binaries/helpers only, no dashboard/Tauri updater artifact in the v0.1.0 tarball.
+- 🟢 `scripts/install.sh` exists and passed a local archive install smoke using temporary install/bin directories.
+
+### Verification
+
+```bash
+cargo fmt --all --check                                             # ✅
+cargo clippy --all-targets -- -D warnings                           # ✅
+cargo build --all-targets --release                                 # ✅
+cargo test --all-targets                                            # ✅ 363 passed, 14 ignored
+cd crates/cue-dashboard/ui && npm test && npm run build             # ✅ 13 passed + build
+swift build -c release --package-path native/macos/cue-overlay      # ✅
+bash native/macos/cue-overlay/build.sh                              # ✅
+swift build -c release --package-path native/macos/cue-whisper      # ✅
+bash native/macos/cue-whisper/build.sh                              # ✅
+bash -n scripts/install.sh                                          # ✅
+make package-darwin-arm64                                           # ✅
+BLUEY_ARCHIVE=dist/bluey-0.1.0-darwin-arm64.tar.gz scripts/install.sh # ✅ temp dirs
+```
+
+Installed-path smoke:
+
+```bash
+"$tmp_install/bin/bluey" on
+# ✅ daemon launched from symlink path
+# ✅ overlay launched from canonical versioned install dir
+"$tmp_install/bin/bluey" off
+```
+
+### Remaining Follow-Ups
+
+- Clean-machine validate the installer before making `curl | sh` public primary install.
+- R13.3 sqlite-vec / ANN RAG remains the next substantial product capability.
+- R13.4 Windows real whisper.cpp and R13.5 platform expansion remain separate rounds with hardware/QA needs.

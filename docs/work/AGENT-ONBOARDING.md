@@ -15,8 +15,10 @@ real-time AI assistance during meetings (the "cue" feature).
 
 ## Remote machine (uno)
 
-All code lives on **uno** (user's Mac Mini). The agent runs on divii and
-drives uno over SSH.
+All code lives on **uno** (user's Mac Mini). Some agent sessions run directly
+inside `/Users/uno/Downloads/cue`; older Kiro sessions ran from divii and drove
+uno over SSH. If you are already on uno, work locally and skip the SSH/scp
+recipe.
 
 ```
 SSH:        ssh -i ~/.ssh/id_ed25519 uno@192.168.4.25
@@ -43,22 +45,29 @@ export PATH=/opt/homebrew/bin:/Users/uno/.cargo/bin:/usr/local/bin:$PATH
 cargo build --all-targets 2>&1 | tail -20'
 ```
 
-## Current state (as of 2026-05-16, post-R11 implementation)
+## Current state (updated 2026-05-18, post-R12/R13 Codex pass)
 
-- **main tip:** `6126b28` — R3-R6 merged, 201 tests passing
-- **Branch `feat/phase-3-round-7`:** 10 commits ahead of main, 213 tests — awaiting codex final verdict (R7-fix-3 recheck: `a5991b2`)
-- **Branch `feat/phase-3-round-8`:** 7 commits ahead of R7, 224 tests — 🟡 accepted with nits
-- **Branch `feat/phase-3-round-9`:** 16 commits ahead of R8, 284 tests — awaiting codex review
-- **Branch `feat/phase-3-round-10`:** 12 commits ahead of R9, 299 tests — awaiting codex review
-- **Branch `feat/phase-3-round-11`:** 11 commits ahead of R10, **331 tests** — current, awaiting codex review
+- **Active branch:** `feat/phase-3-round-12`
+- **Release target:** v0.1.0 macOS arm64, terminal-distributed, local-first.
+- **Verification:** 363 cargo tests passing, 14 ignored; 13 Vitest tests passing.
+- **Latest Codex worktree:** compact pill-first startup, overlay modal-state reset,
+  fallible session-token generation, macOS arm64 packaging/helper discovery,
+  and `scripts/install.sh`.
+- **Current source of truth:** read `docs/PRODUCTION-READINESS.md` and
+  `docs/work/HANDOFF-FROM-CODEX-TO-KIRO.md` before older round docs.
+
+Older R7-R11 notes below are historical and useful for code archaeology, but
+they are no longer the current release state.
 
 ### R11 deliverables shipped:
 - **R10 codex fixes (4):** End-to-end UI streaming via `run_streaming(callback)` + `cue_response_chunk` events; obfstr on streaming auth header names; SwiftWhisper exact 1.2.0 pin; alignment-safe PCM16 decode with `loadUnaligned`.
 - **Overlay injection hardening (7):** Production overlay-bin override gate (`BLUEY_DEV_OVERLAY=1` required); IPC session token handshake (64-hex-char via env var); native overlay token implementation (macOS Swift + Windows C); safe JSON type extractor replacing `strstr`; event state machine with UI-state allowlist (`OverlayUiState`); field length limits (question 4KB, instructions 16KB, etc.); 8 prompt-injection security tests.
 - **Reconciliation:** Parallel subagent C+D merge with 2 clippy allows for readability.
 
-### v0.1 alpha status:
-Feature-complete + hardened. All core product functionality implemented across R7-R11. Shipping pending codex review chain acceptance (R7→R11).
+### v0.1 status:
+MacOS arm64 local-first GA candidate. Shipping decision is now gated by
+clean-machine install validation and the user's platform-scope decision, not
+by the older R7→R11 review chain.
 
 ### All checks green (R11 tip):
 - `cargo fmt --all --check` ✅
@@ -198,15 +207,16 @@ Each parallel subagent uses an isolated git worktree. Commits are cherry-picked 
     └── PLAN-DISTRIBUTION.md
 ```
 
-## Pending work (after R7-R11 review chain passes → v0.1 alpha ships)
+## Pending work (current)
 
 ### Next rounds (user-prioritized order)
 
-1. **R12: Hardening deep** — Tauri signing keypair, mlock for API keys, SQLCipher migration, SHA-256 overlay binary verification (enable scaffolded check), Windows real anti-debug with process termination, token rotation on session boundaries.
-2. **R13: sqlite-vec + native overlay passthrough** — replace in-memory cosine with native ANN; macOS Swift `window.ignoresMouseEvents` + Windows C `WS_EX_TRANSPARENT`; multi-provider embedding (Ollama/local ONNX).
-3. **R14: Observability** — structured logging (`tracing-appender` file rotation), crash reporting (panic dump files), long-session stress tests, mic hot-swap mid-session.
-4. **R15: Distribution publishing** — homebrew tap repo, scoop bucket repo, first tagged release, GitHub release automation end-to-end.
-5. **R16: Polish** — production icons, README overhaul, privacy policy, onboarding videos, telemetry opt-in.
+1. **R13 clean-machine validation** — install from `scripts/install.sh`, run `bluey on/off`, confirm helper discovery and pill-first overlay on a fresh Apple Silicon Mac.
+2. **R13.3 sqlite-vec / ANN RAG** — replace local linear cosine scan, preserve small-dataset fallback.
+3. **R13.4 Windows whisper.cpp + QA** — replace the Windows whisper stub and validate overlay/audio/page capture on Windows 10/11.
+4. **R13.5 platform expansion** — macOS x86_64 first if v0.1.0 must support Intel; Linux/Windows after real QA.
+5. **R14 Observability** — structured log rotation, crash reports/support bundles, long-session stress, mic hot-swap, telemetry opt-in.
+6. **Cloud/commercial** — auth/device registration, sync queue, managed provider router, tenant RAG, billing/admin.
 
 ### Remaining feature backlog (post-v0.1)
 
@@ -229,8 +239,9 @@ Each parallel subagent uses an isolated git worktree. Commits are cherry-picked 
    git -P branch --show-current'
    ```
 2. Read these docs on uno in order:
-   - `docs/work/IMPL-PHASE-3-ROUND-11.md` (latest round's context)
-   - `docs/work/PHASE-3-ROUND-11-HANDOFF-FOR-CODEX-REVIEW.md`
+   - `docs/PRODUCTION-READINESS.md`
+   - `docs/work/HANDOFF-FROM-CODEX-TO-KIRO.md`
+   - `docs/work/PHASE-3-ROUND-13-PLAN.md`
    - `docs/work/AGENT-ONBOARDING.md` (this file)
 3. Ask the user what the current task is — don't guess. Possible states:
    - Waiting on codex review → nothing to do, just read and be ready

@@ -13,16 +13,15 @@ This is the working checklist before we discuss pricing plans. The goal is to kn
 - Attached text/code/Markdown files get bounded local previews so answers can use actual file content.
 - PDF and Word/RTF attachments attempt real text extraction and are rejected if Bluey cannot read them yet, keeping session context honest.
 - Permissioned screenshot capture attaches screenshots as context through terminal/support flows, while the primary overlay Analyse Screen action attaches readable active-page text and generates an answer. If page text is unavailable, Analyse Screen can fall back to a single screenshot routed through a configured OpenAI-compatible vision provider.
-- Real chunked audio/STT is wired through bundled native helpers plus an OpenAI-compatible transcription endpoint when `OPENAI_API_KEY` or `BLUEY_STT_API_KEY` is configured. macOS uses ScreenCaptureKit/CoreAudio, Windows uses WASAPI, and the simulated development runtime remains the no-key fallback on the same source-labeled meeting path. FFmpeg remains a fallback/dev path.
+- Real chunked audio/STT is wired through bundled native helpers, VAD, Deepgram/OpenAI Realtime/LocalWhisper-capable routing, and the same source-labeled meeting path. macOS arm64 is the v0.1.0 release target; Windows helper source exists but needs real Windows whisper.cpp and hardware QA before support is claimed. FFmpeg remains a fallback/dev path.
 - Meeting engine detects questions, action items, decisions, recaps, and memory hits.
 - Cloud/RAG, backend APIs, workers, storage schema, settings contract, and installer checklist are documented under `docs/` and `infra/`.
 
 ## Reference-App Gaps Still Missing
 
-- VAD, partial transcripts, reconnects, and STT provider fallback on top of native desktop capture.
+- Long-session audio/STT hardening: device hot-swap, sleep/wake, reconnect stress, and production health UI.
 - Windows audio hardware QA for the native WASAPI helper.
-- Streaming STT with partial/final transcript updates, VAD, reconnects, and provider fallback.
-- Streaming answer cards that update token-by-token instead of full-card replacement.
+- Windows real whisper.cpp.
 - Rich OCR/vision for screenshots and diagrams with citations, thumbnails, multi-screenshot queueing, and cloud status. The first provider-backed screenshot fallback is wired for Analyse Screen.
 - Production-grade cloud document parsing for PDFs and office files where local extraction is unavailable or too weak.
 - Rich attachment drawer showing selected files, captured screenshots, page captures, upload status, and processing status.
@@ -60,6 +59,8 @@ Do not finalize pricing until these are at least partially real:
 - Real STT route for microphone plus system audio with production-grade reliability, billing meters, VAD, and device setup.
 - Basic dashboard or settings UI.
 - Plan enforcement points for answer requests, audio minutes, artifact storage, RAG queries, and retention.
+
+For the current implementation/missing matrix, see `docs/PRODUCTION-READINESS.md`.
 
 Pricing can then map cleanly to:
 

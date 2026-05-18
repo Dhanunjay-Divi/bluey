@@ -1,6 +1,8 @@
 # Product Strategy
 
-Bluey is a commercial SaaS product, not an open-source/BYOK clone.
+Bluey is intended to become a commercial SaaS product, not an open-source/BYOK
+clone. The current v0.1.0 track is a macOS arm64 local-first release that should
+not be marketed as a finished SaaS until cloud auth/sync/RAG/billing are real.
 
 ## Product Positioning
 

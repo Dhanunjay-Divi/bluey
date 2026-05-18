@@ -10,7 +10,8 @@ Start Bluey:
 bluey on --title "Session name"
 ```
 
-The overlay appears with a short boot animation and a persistent ask tray at the bottom.
+Bluey first appears as a compact pill. Click the pill or use the show/toggle
+path to open the full overlay with a persistent ask tray at the bottom.
 
 The header, resize edges, and bottom ask tray accept clicks. The middle feed remains click-through so the app behind Bluey stays usable, but wheel/trackpad scrolling over the feed scrolls Bluey's transcript and answer history.
 
@@ -21,7 +22,14 @@ Use the bottom tray for the main loop:
 - Send: submit the question without leaving the overlay.
 - Quick chips: answer, recap, or analyse the active browser page.
 
-Audio/STT text appears as source-labeled transcript cards: `System transcript` for system/browser audio and `Mic transcript` for microphone audio. Typed questions render as `You` cards, and model output renders as `Bluey / Response` cards. When `OPENAI_API_KEY` or `BLUEY_STT_API_KEY` is present, Bluey captures short chunks through bundled native helpers, sends them to the configured transcription endpoint, deletes the transient WAV files, and stores the transcript text in the session. macOS uses ScreenCaptureKit/CoreAudio; Windows uses WASAPI. When that runtime is unavailable, the development simulator still exercises the same transcript path. FFmpeg remains a fallback/dev path.
+Audio/STT text appears as source-labeled transcript cards: `System transcript`
+for system/browser audio and `Mic transcript` for microphone audio. Typed
+questions render as `You` cards, and model output renders as `Bluey / Response`
+cards. On the v0.1.0 macOS path, Bluey captures audio through bundled native
+helpers, applies VAD, and routes transcription through configured Deepgram,
+OpenAI Realtime, or LocalWhisper providers. Windows WASAPI source exists for the
+parity round but is not shipped in v0.1.0 until Windows whisper.cpp and hardware
+QA are complete. FFmpeg and mock/echo providers remain fallback/dev paths.
 
 Use the header icons for setup and window control:
 

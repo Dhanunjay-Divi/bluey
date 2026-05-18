@@ -21,19 +21,21 @@ invisible + tiny + instant startup + meeting-grade audio + streaming answers
 
 Implemented or scaffolded:
 
-- Native overlay with capture exclusion on macOS and Windows source.
-- Command bar with model route and answer mode selection on macOS.
+- Native pill-first overlay with capture exclusion on macOS and Windows source.
+- Command bar/composer with model route and answer mode selection on macOS.
 - Consent-based screen capture through support flows, plus overlay active-page capture for long browser content.
 - File/context attachment and text/code preview extraction.
-- Provider route contracts and OpenAI-compatible HTTP path for configured providers.
-- Simulated dual audio/STT runtime that feeds the real transcript path.
-- Cloud/RAG API, schema, queue, and deployment skeleton.
+- Native macOS audio helper, two-stage VAD, Deepgram/OpenAI Realtime/LocalWhisper-capable STT routing, and source-labeled transcript storage.
+- Provider route contracts, streaming answer cards, OpenAI/Anthropic/Ollama/OpenAI-compatible adapters, and deterministic local fallback when explicitly selected.
+- Local SQLite session storage, FTS search, export, local RAG primitives, and cloud/RAG API/schema/queue/deployment skeletons.
+- macOS arm64 terminal package and installer script.
 
 Still missing:
 
-- Real native audio capture and streaming STT.
-- Streaming answer rendering with citations.
-- OCR/vision extraction for screenshots and documents.
+- Clean-machine macOS arm64 install validation.
+- Citations and richer answer metadata on streamed responses.
+- Production OCR/vision extraction for screenshots and documents.
 - Settings/onboarding UI and meeting history dashboard.
-- Windows parity and signed installers.
+- Windows real whisper.cpp, Windows hardware QA, and broader platform artifacts.
+- Signed installers and auto-update after the platform matrix is real.
 - Production cloud auth/sync/RAG/billing services.

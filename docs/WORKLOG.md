@@ -676,3 +676,85 @@ Read deeper implementation paths from the local reference packages and applied t
 - Recent final STT duplicates are skipped per speaker so retry/re-emission noise does not poison transcript context.
 - The macOS overlay now shows a small `Latest` button when streaming continues while the user is reading older feed content.
 - Local fallback answers now clearly say they are context-only fallbacks and prompt for a live provider key instead of looking like a finished model answer.
+
+## Round 59: Pill-First Release Hardening
+
+Closed the most visible v0.1.0 regression and hardened the terminal release path:
+
+- Changed `bluey on` to launch pill-first instead of immediately expanding the overlay.
+- Restyled the macOS pill into a compact dark Bluey command capsule with logo,
+  status dot, wordmark, border, and glow.
+- Made overlay UI-state validation use one shared guarded state path so attach
+  and instructions flows reset to Idle on success, cancel, or error.
+- Changed overlay session-token generation to return a real OS-random result
+  instead of panicking on entropy failure.
+- Hardened helper discovery so an installed `bluey` symlink can still find the
+  canonical daemon, overlay, audio, and whisper helper binaries from the
+  versioned install directory.
+- Narrowed the release workflow and Makefile package path to the actual
+  v0.1.0 support matrix: macOS arm64 terminal tarball, not a dashboard/Tauri
+  GUI bundle or unverified Windows/Linux artifacts.
+- Added `scripts/install.sh` for checksum-verified macOS arm64 installs into a
+  versioned `~/.local/bluey/<version>` layout with `~/.local/bin` symlinks.
+- Verified packaging and installed-path launch locally with `bluey on` and
+  `bluey off` through symlinks.
+
+## Round 60: Production Readiness Documentation Audit
+
+Turned scattered phase notes into a current production-readiness source of truth:
+
+- Added `docs/PRODUCTION-READINESS.md` to separate implemented macOS arm64
+  local-first capability from unpaid cloud/SaaS/platform work.
+- Updated README, feature map, handoff, commercial path, competitive gaps,
+  pre-pricing review, implementation seams, self-review, roadmap, deployment,
+  installer checklist, first-version test notes, and agent onboarding so they
+  no longer under-report implemented streaming/STT/RAG/local packaging work.
+- Marked the real remaining blockers clearly: clean-machine macOS validation,
+  cloud auth/sync/RAG/billing/admin, Windows whisper.cpp and Windows QA,
+  broader platform artifacts, production OCR/vision, observability/support
+  bundle, and signed installers/auto-update.
+- Left historical review/design docs intact as audit records rather than
+  rewriting past implementation context.
+
+## Round 61: Reference-Informed UI Direction And Native Polish
+
+Started a senior-product UI pass from the actual reference apps instead of
+guessing from screenshots:
+
+- Reviewed Pinky's compact native pill, heartbeat/status dot, split
+  interactive/readable zones, scroll history, and resize stability notes.
+- Reviewed Natively's chat overlay for streamed markdown, copy controls, code
+  block rendering, and meeting-context follow-up flow.
+- Reviewed Pluely's sticky composer/history rhythm and screenshot-selection
+  affordances.
+- Reviewed Aura/OpenCluely's markdown streaming, code-block headers, and visible
+  recording/interaction states.
+- Added `docs/UX-UI-PRODUCT-DIRECTION.md` as the current UX/UI brief and
+  scenario checklist.
+- Polished the macOS expanded overlay from a plain debug panel into a darker
+  product surface with a status strip, bordered feed, composer capsule,
+  icon-led actions, role-labeled cards, accent rails, and streaming status.
+- Fixed local release smoke for `./target/release/bluey on`: the macOS overlay
+  build script now mirrors `bluey-overlay-macos` and `cue-overlay-macos` into
+  existing Cargo target directories, so the hardened install-dir verifier can
+  still require side-by-side helpers without breaking local release runs.
+
+## Round 62: Launch Flow And Compact Pill Pass
+
+Tightened the first-run/product flow after comparing the current overlay against
+the earlier native transcript overlay and the Pinky/Natively/Pluely references:
+
+- Reduced the macOS pill from a chunky badge to a smaller command-layer control
+  (`112x28`) with tighter logo/dot/type spacing.
+- Changed plain `bluey on` to open the launcher without silently creating a
+  session. `bluey on --title ...` still creates immediately for scripted/smoke
+  flows.
+- Added visible session actions in the expanded overlay: `New` starts a fresh
+  session and `Continue` restores the latest saved session when no active
+  session exists.
+- Added `Analyse` to the native action row and kept `Answer`, `Attach`, `Rules`,
+  and `Recap` available from the composer.
+- Changed empty `Answer` clicks to ask Bluey for the latest clear question or
+  useful session context instead of doing nothing.
+- Added a parent-process watchdog so future orphaned macOS overlay helpers exit
+  if the daemon disappears unexpectedly.

@@ -22,7 +22,8 @@ Use Bluey interactively:
 ./target/debug/bluey on --title "Bluey real test"
 ```
 
-The overlay should appear with the boot animation. Use the overlay controls first:
+Bluey should first appear as a compact pill. Click the pill/show control to open
+the full overlay and use the overlay controls first:
 
 ```text
 bottom mic: start/stop recording
@@ -60,7 +61,7 @@ Or run the same flow manually:
 Expected behavior:
 
 - The macOS overlay appears when cards are pushed.
-- `bluey on` starts/reuses a session, shows the overlay, and renders the boot card.
+- `bluey on` starts/reuses a session, launches the compact pill, and renders the boot card into the overlay feed.
 - The overlay stays excluded from screen capture through the native privacy API.
 - Opacity can be adjusted from the overlay header or CLI.
 - `context add` stores user-selected screenshots, diagrams, documents, and code files in the meeting record.
@@ -68,7 +69,7 @@ Expected behavior:
 - The Analyse Screen chip attaches active browser page text and generates an answer after confirmation. macOS uses browser scripting; Windows uses UI Automation where the browser exposes document text.
 - The paperclip and answer-style overlay buttons reduce terminal-only setup.
 - The bottom ask tray sends questions and renders answers as overlay cards.
-- `audio status/start/stop` exposes the dual system/microphone runtime. With `OPENAI_API_KEY` or `BLUEY_STT_API_KEY`, Bluey uses bundled native helpers to capture short chunks and transcribe them: ScreenCaptureKit/CoreAudio on macOS and WASAPI on Windows. Without credentials it uses the labeled development simulator. FFmpeg remains a fallback/dev path.
+- `audio status/start/stop` exposes the dual system/microphone runtime. On the supported macOS path, Bluey uses bundled native helpers, VAD, and configured Deepgram/OpenAI Realtime/LocalWhisper STT routing. Windows WASAPI source exists but is not a v0.1.0 shipped path until Windows whisper.cpp and hardware QA are complete. FFmpeg and mock/echo providers remain fallback/dev paths.
 - `ai status` exposes managed routing, fallbacks, and provider readiness.
 - `cloud status` exposes secure sync/RAG readiness.
 - `status` shows an active meeting while it is running.
@@ -80,10 +81,10 @@ For isolated manual runs, set `BLUEY_DATA_DIR`, `BLUEY_CONFIG_DIR`, `BLUEY_RUNTI
 
 ## Current Limits
 
-- Audio capture has working native helper code for macOS ScreenCaptureKit/CoreAudio chunks and Windows WASAPI chunks. Windows still needs hardware QA on an actual Windows machine.
-- STT is chunked near-real-time through an OpenAI-compatible transcription endpoint. True partial-token streaming, VAD, reconnects, and provider failover are still next.
-- LLM routing can call OpenAI, Groq, Cerebras, or an OpenAI-compatible Bluey managed endpoint when keys are configured, and falls back to local deterministic answers when they are not.
+- Audio capture has working native helper code for macOS system/mic chunks and Windows WASAPI source. Windows still needs hardware QA on an actual Windows machine.
+- STT has two-stage VAD, Deepgram/OpenAI Realtime streaming providers, LocalWhisper on macOS, and fallback routing. Remaining work is long-session stress, device hot-swap, clean-machine permission QA, and Windows whisper.cpp.
+- LLM routing can call OpenAI, Anthropic, Ollama, Groq/Cerebras-compatible routes, or an OpenAI-compatible Bluey managed endpoint when keys are configured, and falls back to local deterministic answers when they are not.
 - Cloud/RAG has sync and retrieval models, but authenticated upload/vector search is not wired yet.
 - Windows overlay source is present and cross-compiled from macOS, but must still be QA-tested on Windows hardware. Windows page-text extraction uses UI Automation and should fall back to screenshot/file attach when a browser does not expose text.
 
-The next production slice is hardening the audio/STT loop: VAD, partial transcripts, provider fallback, Windows hardware QA, and a settings UI for selecting devices and permissions.
+The next production slice is clean-machine macOS arm64 release validation, then sqlite-vec/ANN RAG or Windows whisper.cpp depending on the release goal. See `docs/PRODUCTION-READINESS.md`.

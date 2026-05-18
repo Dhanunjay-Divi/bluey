@@ -25,7 +25,7 @@ This note summarizes the safe engineering lessons from the local reference packa
 - Direct provider labels used managed proxy model names such as `managed-reasoning`, which are not valid raw API model IDs.
 - Selected answer mode instructions were overriding notepad/session answer rules instead of combining with them.
 - General mode needed an explicit product rule: auto-detect coding questions and still use code-shaped output.
-- The daemon returns structured `AnswerStreamEvent`s only after completion; the overlay streams live, but IPC clients do not yet get true incremental events.
+- UI streaming is now wired through response chunk events and overlay card updates. CLI/dashboard parity should still be checked per route, but the old "overlay only" streaming limitation is gone.
 - Answer generation now has stale-update protection, but true upstream request cancellation is still pending.
 - Context compaction is character-budget based; it needs relevance and recency ranking for production-scale RAG.
 - Windows overlay parity still lags the macOS overlay for scroll history, model/mode controls, and robust JSON handling.
@@ -57,9 +57,8 @@ This note summarizes the safe engineering lessons from the local reference packa
 
 ## Next Product-Quality AI Work
 
-- Stream `AnswerStreamEvent` frames over IPC for CLI/dashboard clients, not only overlay cards.
 - Add provider-level abort/cancellation so superseded HTTP requests stop consuming provider latency and tokens.
 - Add provider-specific adapters for Anthropic, Google, and future multimodal APIs instead of only OpenAI-compatible chat completions.
 - Add ranked context selection: recent transcript, recent Bluey answers, attached docs, page/screenshot context, then long-term memory.
-- Add partial STT rows with final/partial replacement semantics so live audio feels continuous without polluting prompt context.
+- Keep hardening partial/final STT replacement semantics under long sessions and provider reconnects.
 - Add Windows overlay history parity and smoke tests for pass-through clicks, scroll, resize, hide/collapse, and capture exclusion.

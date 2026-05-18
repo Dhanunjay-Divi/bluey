@@ -27,7 +27,8 @@ This document is the quick-start map for the next agent or engineer picking up B
 - PDF uses local `pdftotext` if installed.
 - macOS DOC/DOCX/RTF uses `textutil`.
 - Windows DOCX uses a PowerShell XML extraction path; legacy DOC/RTF needs the cloud parser.
-- Native audio helper paths exist for macOS and Windows. Without STT credentials, the daemon falls back to simulated source-labeled transcript flow for development.
+- Native audio helper paths exist for macOS and Windows source builds. v0.1.0 ships the macOS arm64 path; without a configured remote/local STT path, the daemon can still fall back to dev-only mock/echo transcript flow for testing.
+- v0.1.0 packaging is macOS arm64-only: `make package-darwin-arm64` creates a terminal tarball with CLI, daemon, overlay helper, audio helper, and whisper helper; `scripts/install.sh` installs it into a versioned local prefix.
 
 ## Keys And Local Models Needed For Real Testing
 
@@ -42,10 +43,10 @@ For real answer generation:
 
 For STT/audio:
 
-- `OPENAI_API_KEY` or `BLUEY_STT_API_KEY`.
-- Optional `BLUEY_STT_API_URL` for a non-OpenAI-compatible transcription endpoint.
-- Optional `BLUEY_STT_MODEL`, defaulting to the configured daemon model.
-- Optional `BLUEY_STT_CHUNK_MS` for chunk size tuning.
+- `DEEPGRAM_API_KEY` for Deepgram Nova-3 streaming STT.
+- `OPENAI_API_KEY` or `BLUEY_STT_API_KEY` for OpenAI Realtime / compatible STT.
+- `BLUEY_STT_LOCAL_WHISPER=1` plus a local whisper model for macOS LocalWhisper testing.
+- Optional STT/provider env vars documented in `docs/work/PLAN-STT-FALLBACK-CHAIN.md`.
 
 For local/offline model testing:
 
@@ -63,12 +64,14 @@ For document/context testing:
 Use these after meaningful changes:
 
 ```sh
-cargo fmt --check
-cargo check
-cargo test
-swiftc native/macos/cue-overlay/main.swift -o target/debug/bluey-overlay-smoke
-x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c
-cargo check --target x86_64-pc-windows-gnu
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo build --all-targets --release
+cargo test --all-targets
+cd crates/cue-dashboard/ui && npm test && npm run build
+swift build -c release --package-path native/macos/cue-overlay
+swift build -c release --package-path native/macos/cue-whisper
+git diff --check
 ```
 
 Product smoke:
@@ -82,14 +85,14 @@ Product smoke:
 
 ## Next Engineering Slices
 
-- Add streaming answer card updates instead of full-answer push.
-- Add real partial/final streaming STT, VAD, reconnects, and provider fallback.
+- Clean-machine validate `scripts/install.sh` + `bluey on/off` on Apple Silicon.
+- Replace local RAG linear cosine with sqlite-vec / ANN.
+- Port real whisper.cpp to Windows and QA overlay/audio/page capture on Windows hardware.
 - Add richer OCR/vision extraction with citations, thumbnail previews, queueing, and cloud processing status. The first screenshot-to-vision fallback path is wired for Analyse Screen.
 - Add cloud auth/device registration, artifact upload, document parsing, embeddings, and tenant-scoped RAG.
 - Add settings/onboarding UI for account, permissions, audio devices, models, hotkeys, retention, export, and deletion.
 - Add a history/dashboard UI for sessions, transcripts, recaps, answers, and attachments.
-- QA Windows overlay/audio behavior on real Windows hardware.
-- Package signed macOS/Windows builds and add update/support diagnostics when ready for distribution.
+- Add signed macOS/Windows installers, auto-update, telemetry opt-in, and support diagnostics when ready for public distribution.
 
 ## Review Notes
 

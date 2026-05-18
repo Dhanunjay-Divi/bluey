@@ -161,6 +161,11 @@ This still simplifies the v0.1.0 production checklist:
 
 ## Open questions for the reviewer
 
+> 2026-05-18 update: Codex answered part of this in the R13 production-hardening
+> pass. v0.1.0 remains macOS arm64-only, and `scripts/install.sh` now exists
+> for release/local archive installs. Clean-machine validation is still needed
+> before making `curl | sh` the public primary install path.
+
 1. **Distribution scope:** v0.1.0 today only ships macOS arm64 binaries. Should "production-ready" require macOS x86_64 + Windows + Linux builds in the same release, or is single-arch arm64 acceptable for the first GA?
 2. **Telemetry:** the production overlay reader thread logs warnings on token / length / state rejections but has no metric counter. Operationally we'd want to know if these spike in real use. Counter as separate round, or fold into R12?
 3. **Install ergonomics:** do you want a `scripts/install.sh` (curl | sh installer that drops binaries into PATH and sets up the LaunchAgent for the daemon) wired up before GA, or is `tar xzf` + manual PATH the v0.1.0 install path?

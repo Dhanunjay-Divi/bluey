@@ -12,7 +12,7 @@ This translates the reference-app comparison language into Bluey's ethical produ
 - Simple session setup: overlay paperclip attaches files or shows attached context, and overlay notepad sets answer instructions.
 - Overlay ask flow: the speech-bubble button asks Bluey a question and renders the answer back into the overlay.
 - Source-labeled transcript cards: audio/STT segments render as system-audio or microphone transcript cards in the overlay.
-- Real chunked audio/STT runtime: when an STT key is configured, Bluey records short mic/system chunks through bundled native helpers, sends them to an OpenAI-compatible transcription endpoint, deletes the transient audio file, and stores only source-labeled transcript text. macOS uses ScreenCaptureKit/CoreAudio, Windows uses WASAPI, and the development simulator remains as an explicit fallback. FFmpeg remains a fallback/dev path.
+- Real audio/STT runtime: when STT is configured, Bluey captures mic/system audio through bundled native helpers, applies VAD, routes through Deepgram/OpenAI Realtime/LocalWhisper-capable providers, and stores source-labeled transcript text. macOS is the v0.1.0 supported path; Windows helper source exists but awaits hardware QA and real Windows whisper.cpp.
 - Live provider answer path: OpenAI, Groq, Cerebras, and OpenAI-compatible Bluey managed endpoints can answer when credentials are present; local deterministic answers remain available for offline tests.
 - Built-in control legend: the overlay explains every icon, dot, quick action, and card type from the question-mark/Help control.
 - Safe shutdown: overlay close button asks for confirmation before stopping Bluey.
@@ -24,8 +24,8 @@ This translates the reference-app comparison language into Bluey's ethical produ
 ## Next Ethical Slices
 
 - Vision analysis: provider trait for screenshot/diagram/code interpretation, using attached context artifacts as inputs.
-- Provider routing: primary/fallback providers, key rotation, richer budgets, and streaming answer cards.
-- Audio/STT hardening: VAD, partial transcripts, reconnects, provider fallback, device settings, and Windows hardware QA.
+- Provider routing: managed server-side keys, richer budgets, cost metering, and citations.
+- Audio/STT hardening: long-session stress, sleep/wake, device hot-swap, permission UX, and Windows hardware QA.
 - Cloud RAG: authenticated sync, embeddings, cross-meeting recall, and deletion/export controls.
 - Active page capture parity: Windows has a user-level UI Automation backend, but it still needs Windows hardware QA and browser coverage testing.
 - Inline overlay input: compact macOS composer is implemented; Windows parity and richer answer streaming remain.
