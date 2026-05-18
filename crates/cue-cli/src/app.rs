@@ -157,7 +157,7 @@ struct RunArgs {
 
 #[derive(Debug, Args)]
 struct OnArgs {
-    /// Meeting title for the session Bluey should create if none is active.
+    /// Optional title for immediately creating a session. Without this, Bluey opens the launcher.
     #[arg(long)]
     title: Option<String>,
 }
@@ -641,12 +641,14 @@ async fn cue_on(args: OnArgs) -> Result<()> {
     let settings = load_settings(&paths)?;
     ensure_daemon_quiet(false).await?;
 
-    match request(DaemonRequest::MeetingStart { title: args.title }).await? {
-        DaemonResponse::Text { text } if text.contains("already active") => {}
-        DaemonResponse::Text { .. } | DaemonResponse::Recap { .. } | DaemonResponse::Ok => {}
-        DaemonResponse::Error { message } => bail!("daemon error: {message}"),
-        other => {
-            print_response(other)?;
+    if args.title.is_some() {
+        match request(DaemonRequest::MeetingStart { title: args.title }).await? {
+            DaemonResponse::Text { text } if text.contains("already active") => {}
+            DaemonResponse::Text { .. } | DaemonResponse::Recap { .. } | DaemonResponse::Ok => {}
+            DaemonResponse::Error { message } => bail!("daemon error: {message}"),
+            other => {
+                print_response(other)?;
+            }
         }
     }
 
@@ -664,15 +666,17 @@ async fn cue_on(args: OnArgs) -> Result<()> {
         opacity: settings.overlay_opacity,
     })
     .await;
-    let _ = request(DaemonRequest::OverlayShow).await;
+    // The native overlay orders the branded pill front when the child process
+    // starts. Do not send OverlayShow here: in the current protocol it expands
+    // the full feed, while `bluey on` should launch pill-first.
     let boot = request(DaemonRequest::OverlayBoot {
         title: "Bluey online".to_string(),
         lines: vec![
             "daemon link established".to_string(),
-            "private overlay active".to_string(),
-            "session memory loaded".to_string(),
-            "attach files with paperclip".to_string(),
-            "screen context waits for eye consent".to_string(),
+            "private overlay ready".to_string(),
+            "click the pill, then choose New or Continue".to_string(),
+            "attach files with Attach".to_string(),
+            "screen context waits for Analyse consent".to_string(),
             "audio transcripts appear as source-labeled cards".to_string(),
             "answers appear as overlay cards".to_string(),
         ],

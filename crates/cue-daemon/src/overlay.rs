@@ -160,16 +160,16 @@ pub fn verify_overlay_binary(path: &Path, install_dir: &Path) -> Result<(), Over
 /// but the doc/comment claimed "32 bytes" so codex flagged the discrepancy
 /// in the R11 chain review. R12 fixes it: now the bytes are *actually*
 /// 256 random bits, drawn directly from the OS entropy pool.
-pub fn generate_session_token() -> String {
+pub fn generate_session_token() -> Result<String, getrandom::Error> {
     let mut bytes = [0u8; 32];
-    getrandom::getrandom(&mut bytes).expect("OS random source unavailable");
+    getrandom::getrandom(&mut bytes)?;
     // Format as lowercase hex without pulling in the `hex` crate.
     use std::fmt::Write as _;
     let mut out = String::with_capacity(64);
     for b in bytes {
         write!(&mut out, "{b:02x}").expect("writing to String cannot fail");
     }
-    out
+    Ok(out)
 }
 
 // ─── Core overlay handle ────────────────────────────────────────────────────
@@ -615,7 +615,7 @@ mod tests {
 
     #[test]
     fn token_is_64_hex_chars() {
-        let t = generate_session_token();
+        let t = generate_session_token().expect("generate token");
         assert_eq!(t.len(), 64, "expected 64 hex chars (32 bytes)");
         assert!(
             t.chars()
@@ -630,7 +630,7 @@ mod tests {
         // (and any collision indicates a serious entropy bug).
         let mut seen = std::collections::HashSet::new();
         for _ in 0..1000 {
-            let t = generate_session_token();
+            let t = generate_session_token().expect("generate token");
             assert!(seen.insert(t), "duplicate token within 1000 calls");
         }
     }
@@ -644,7 +644,7 @@ mod tests {
         // Sample 200 tokens and assert variety in that position.
         let mut seventh_char_set = std::collections::HashSet::new();
         for _ in 0..200 {
-            let t = generate_session_token();
+            let t = generate_session_token().expect("generate token");
             seventh_char_set.insert(t.chars().nth(12).unwrap());
         }
         // With true randomness across 200 samples we should see >= 8 distinct
@@ -692,15 +692,15 @@ mod tests {
 
     #[test]
     fn generate_session_token_is_64_hex_chars() {
-        let token = generate_session_token();
+        let token = generate_session_token().expect("generate token");
         assert_eq!(token.len(), SESSION_TOKEN_HEX_LEN);
         assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
     fn generate_session_token_is_unique() {
-        let t1 = generate_session_token();
-        let t2 = generate_session_token();
+        let t1 = generate_session_token().expect("generate token");
+        let t2 = generate_session_token().expect("generate token");
         assert_ne!(t1, t2);
     }
 

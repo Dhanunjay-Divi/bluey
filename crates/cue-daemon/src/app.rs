@@ -502,7 +502,8 @@ pub async fn run() -> Result<()> {
         system_audio: Mutex::new(None),
         live_transcript_tx: broadcast::channel(64).0,
         rag: rag_pipeline,
-        overlay_session_token: crate::overlay::generate_session_token(),
+        overlay_session_token: crate::overlay::generate_session_token()
+            .context("failed to generate overlay session token")?,
         overlay_ui_state: std::sync::Arc::new(parking_lot::Mutex::new(
             cue_core::overlay_ipc::OverlayUiState::Idle,
         )),
@@ -1126,6 +1127,34 @@ fn spawn_overlay_event_handler(
     });
 }
 
+struct OverlayUiStateScope {
+    state: std::sync::Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
+}
+
+impl Drop for OverlayUiStateScope {
+    fn drop(&mut self) {
+        *self.state.lock() = cue_core::overlay_ipc::OverlayUiState::Idle;
+    }
+}
+
+fn enter_overlay_ui_state(
+    state: &std::sync::Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
+    next: cue_core::overlay_ipc::OverlayUiState,
+) -> OverlayUiStateScope {
+    *state.lock() = next;
+    OverlayUiStateScope {
+        state: state.clone(),
+    }
+}
+
+fn reset_overlay_ui_state_on_scope_exit(
+    state: &std::sync::Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
+) -> OverlayUiStateScope {
+    OverlayUiStateScope {
+        state: state.clone(),
+    }
+}
+
 async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Result<()> {
     match event {
         OverlayEvent::Ready {
@@ -1152,24 +1181,30 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             let _ = answer_with_provider_runtime(daemon, request, "overlay ask").await?;
         }
         OverlayEvent::AttachRequested => {
-            // Drive Idle -> AttachOpen so the production reader thread starts
-            // accepting AttachFilesRequested events from the now-open panel.
-            *daemon.overlay_ui_state.lock() = cue_core::overlay_ipc::OverlayUiState::AttachOpen;
+            // Drive Idle -> AttachOpen while the daemon-owned picker is open.
+            // The guard resets on success, cancel, or error so stale submit
+            // events cannot pass through after the picker closes.
+            let _ui_state = enter_overlay_ui_state(
+                &daemon.overlay_ui_state,
+                cue_core::overlay_ipc::OverlayUiState::AttachOpen,
+            );
             handle_attach_requested(daemon).await?;
         }
         OverlayEvent::AttachFilesRequested { paths } => {
+            let _ui_state = reset_overlay_ui_state_on_scope_exit(&daemon.overlay_ui_state);
             handle_attach_paths(daemon, paths.into_iter().map(PathBuf::from).collect()).await?;
-            // Panel closes after submit; revert to Idle so any later stray
-            // AttachFilesRequested is rejected by the gate.
-            *daemon.overlay_ui_state.lock() = cue_core::overlay_ipc::OverlayUiState::Idle;
         }
         OverlayEvent::InstructionsRequested => {
-            // Drive Idle -> InstructionsOpen so the reader accepts the form-submit.
-            *daemon.overlay_ui_state.lock() =
-                cue_core::overlay_ipc::OverlayUiState::InstructionsOpen;
+            // Drive Idle -> InstructionsOpen while the daemon-owned prompt is
+            // open. The guard resets on save, cancel, or error.
+            let _ui_state = enter_overlay_ui_state(
+                &daemon.overlay_ui_state,
+                cue_core::overlay_ipc::OverlayUiState::InstructionsOpen,
+            );
             handle_instructions_requested(daemon).await?;
         }
         OverlayEvent::InstructionsUpdated { text } => {
+            let _ui_state = reset_overlay_ui_state_on_scope_exit(&daemon.overlay_ui_state);
             let instructions = if text.trim().is_empty() {
                 None
             } else {
@@ -1187,8 +1222,6 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
                     .unwrap_or_else(|| "Bluey will use the default answer style.".to_string()),
             )
             .await;
-            // Form closes after save; revert to Idle.
-            *daemon.overlay_ui_state.lock() = cue_core::overlay_ipc::OverlayUiState::Idle;
         }
         OverlayEvent::SessionContinueRequested => {
             continue_session(daemon, "overlay session").await?;
@@ -4322,40 +4355,58 @@ async fn continue_session(
     source: impl Into<String>,
 ) -> Result<MeetingRecord> {
     let source = source.into();
-    let (meeting, created) = {
+    enum ContinueOutcome {
+        Active(MeetingRecord),
+        Restored(MeetingRecord),
+        Created(MeetingRecord),
+    }
+
+    let outcome = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if let Some(meeting) = meeting_guard.as_ref() {
-            (meeting.clone(), false)
+            ContinueOutcome::Active(meeting.clone())
+        } else if let Some(mut meeting) = daemon.store.last_meeting()? {
+            meeting.ended_at = None;
+            daemon.store.save_active(&meeting)?;
+            *meeting_guard = Some(meeting.clone());
+            ContinueOutcome::Restored(meeting)
         } else {
             let meeting = MeetingRecord::new(Some("Bluey session".to_string()));
             daemon.store.save_active(&meeting)?;
             *meeting_guard = Some(meeting.clone());
-            (meeting, true)
+            ContinueOutcome::Created(meeting)
+        }
+    };
+
+    let (meeting, title, body) = match outcome {
+        ContinueOutcome::Active(meeting) => {
+            let body = format!(
+                "Continuing {} with {} transcript segment(s) and {} context item(s).",
+                meeting.title,
+                meeting.transcript.len(),
+                meeting.context.len()
+            );
+            (meeting, "Session continued", body)
+        }
+        ContinueOutcome::Restored(meeting) => {
+            let body = format!(
+                "Loaded latest saved session: {}.\n{} transcript segment(s), {} context item(s).",
+                meeting.title,
+                meeting.transcript.len(),
+                meeting.context.len()
+            );
+            (meeting, "Session loaded", body)
+        }
+        ContinueOutcome::Created(meeting) => {
+            let body = format!(
+                "Started a new session from {source}. Attach docs/page context when needed."
+            );
+            (meeting, "Session started", body)
         }
     };
 
     update_state_from_meeting(daemon, Some(&meeting)).await?;
-    let body = if created {
-        format!("Started a new session from {source}. Attach docs/page context when needed.")
-    } else {
-        format!(
-            "Continuing {} with {} transcript segment(s) and {} context item(s).",
-            meeting.title,
-            meeting.transcript.len(),
-            meeting.context.len()
-        )
-    };
-    push_system_card(
-        daemon,
-        CardKind::System,
-        if created {
-            "Session started"
-        } else {
-            "Session continued"
-        },
-        body,
-    )
-    .await;
+    push_system_card(daemon, CardKind::System, title, body).await;
     write_state(daemon).await?;
     Ok(meeting)
 }
@@ -4869,6 +4920,7 @@ fn spawn_overlay(
     } else {
         env::current_exe()
             .ok()
+            .map(|p| p.canonicalize().unwrap_or(p))
             .and_then(|p| p.parent().map(PathBuf::from))
             .unwrap_or_else(|| PathBuf::from("/"))
     };
@@ -5102,10 +5154,33 @@ fn discover_overlay_bin() -> Result<PathBuf> {
     let cwd = env::current_dir()?;
     #[cfg(target_os = "macos")]
     {
-        for candidate in [
+        let mut candidates = Vec::new();
+        if let Ok(exe) = env::current_exe() {
+            let mut dirs = Vec::new();
+            if let Some(dir) = exe.parent() {
+                dirs.push(dir.to_path_buf());
+            }
+            if let Ok(canonical) = exe.canonicalize() {
+                if let Some(dir) = canonical.parent() {
+                    dirs.push(dir.to_path_buf());
+                }
+            }
+            for dir in dirs {
+                candidates.extend([
+                    dir.join("bluey-overlay-macos"),
+                    dir.join("cue-overlay-macos"),
+                    dir.join("bin/bluey-overlay-macos"),
+                    dir.join("bin/cue-overlay-macos"),
+                ]);
+            }
+        }
+        candidates.extend([
             cwd.join("native/macos/cue-overlay/.build/bluey-overlay-macos"),
             cwd.join("native/macos/cue-overlay/.build/cue-overlay-macos"),
-        ] {
+            cwd.join("bluey-overlay-macos"),
+            cwd.join("cue-overlay-macos"),
+        ]);
+        for candidate in candidates {
             if candidate.exists() {
                 return Ok(candidate);
             }
@@ -5114,10 +5189,33 @@ fn discover_overlay_bin() -> Result<PathBuf> {
 
     #[cfg(target_os = "windows")]
     {
-        for candidate in [
+        let mut candidates = Vec::new();
+        if let Ok(exe) = env::current_exe() {
+            let mut dirs = Vec::new();
+            if let Some(dir) = exe.parent() {
+                dirs.push(dir.to_path_buf());
+            }
+            if let Ok(canonical) = exe.canonicalize() {
+                if let Some(dir) = canonical.parent() {
+                    dirs.push(dir.to_path_buf());
+                }
+            }
+            for dir in dirs {
+                candidates.extend([
+                    dir.join("bluey-overlay.exe"),
+                    dir.join("cue-overlay.exe"),
+                    dir.join("bin/bluey-overlay.exe"),
+                    dir.join("bin/cue-overlay.exe"),
+                ]);
+            }
+        }
+        candidates.extend([
             cwd.join("native/windows/cue-overlay/build/bluey-overlay.exe"),
             cwd.join("native/windows/cue-overlay/build/cue-overlay.exe"),
-        ] {
+            cwd.join("bluey-overlay.exe"),
+            cwd.join("cue-overlay.exe"),
+        ]);
+        for candidate in candidates {
             if candidate.exists() {
                 return Ok(candidate);
             }
@@ -5960,6 +6058,32 @@ mod tests {
             .instructions
             .as_deref()
             .is_some_and(|instructions| instructions.contains("### Code")));
+    }
+
+    #[test]
+    fn overlay_ui_state_scope_enters_then_resets_to_idle() {
+        use cue_core::overlay_ipc::OverlayUiState;
+
+        let state = std::sync::Arc::new(parking_lot::Mutex::new(OverlayUiState::Idle));
+        {
+            let _scope = enter_overlay_ui_state(&state, OverlayUiState::AttachOpen);
+            assert_eq!(*state.lock(), OverlayUiState::AttachOpen);
+        }
+
+        assert_eq!(*state.lock(), OverlayUiState::Idle);
+    }
+
+    #[test]
+    fn overlay_ui_state_submit_scope_resets_existing_open_state() {
+        use cue_core::overlay_ipc::OverlayUiState;
+
+        let state = std::sync::Arc::new(parking_lot::Mutex::new(OverlayUiState::InstructionsOpen));
+        {
+            let _scope = reset_overlay_ui_state_on_scope_exit(&state);
+            assert_eq!(*state.lock(), OverlayUiState::InstructionsOpen);
+        }
+
+        assert_eq!(*state.lock(), OverlayUiState::Idle);
     }
 
     #[test]

@@ -18,7 +18,7 @@ fn stub_path() -> String {
 #[tokio::test]
 async fn overlay_supervisor_respawns_on_unexpected_exit() {
     let _ = tracing_subscriber::fmt::try_init();
-    let token = generate_session_token();
+    let token = generate_session_token().expect("generate token");
     let opts = OverlaySpawnOptions::new(stub_path()).with_session_token(token);
     let mut handle = NativeOverlayHandle::spawn(opts).await.expect("spawn");
 

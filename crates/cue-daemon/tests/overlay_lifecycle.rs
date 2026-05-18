@@ -51,7 +51,7 @@ async fn overlay_supervisor_caps_at_max_restart_attempts() {
 #[tokio::test]
 async fn overlay_long_running_child_shuts_down_cleanly() {
     let _ = tracing_subscriber::fmt::try_init();
-    let token = generate_session_token();
+    let token = generate_session_token().expect("generate token");
     let opts = OverlaySpawnOptions::new(long_stub_path()).with_session_token(token);
     let mut handle = NativeOverlayHandle::spawn(opts).await.expect("spawn");
 

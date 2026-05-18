@@ -118,7 +118,7 @@ async fn overlay_shutdown_is_graceful() {
 
 #[tokio::test]
 async fn token_handshake_valid_token_accepted() {
-    let token = generate_session_token();
+    let token = generate_session_token().expect("generate token");
     let opts = OverlaySpawnOptions::new(stub_path()).with_session_token(token);
     let mut handle = NativeOverlayHandle::spawn(opts).await.expect("spawn");
 
