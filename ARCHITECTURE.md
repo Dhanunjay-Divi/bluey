@@ -61,6 +61,42 @@ monetization. Keep them separate.
 
 ---
 
+
+
+---
+
+## 1.5. What runs where (v0.1 reality)
+
+A common question: "do we need a server for the models?" Bluey today
+runs the **classifier + routing + storage** on the laptop, but **the
+actual model inference is in the cloud** — at the upstream provider
+(Anthropic / OpenAI) — using the user's BYOK API key.
+
+| Component | Location today (v0.1, BYOK) | Location after v0.2 (managed) |
+|---|---|---|
+| LLM inference | provider cloud (user's API key) | provider cloud, but routed through `bluey-server` (Bluey's API key) |
+| Embeddings | OpenAI cloud (user's API key) | provider cloud, routed through `bluey-server` |
+| RAG vector storage + search | laptop SQLite (~37 ms / 10k chunks) | laptop OR cloud (cross-device search), customer choice |
+| Whisper STT (audio → text) | **laptop** (whisper.cpp, ~30 MB model) | laptop OR cloud STT (Deepgram / Realtime) |
+| Audio capture (system + mic) | **laptop** (CoreAudio) | always laptop |
+| Auto Router classification | **laptop** (in-process heuristic) | laptop heuristic + optional managed tiny-model classifier server-side |
+| Overlay + daemon + dashboard | **laptop** | always laptop |
+
+**Practical implication for a customer's laptop:** modern Macs handle
+the local pieces fine. Whisper tiny.en runs in real-time at <10% CPU
+on Apple Silicon. RAG bounded-heap top-k is sub-second up to 50k
+chunks. The daemon + overlay use <100 MB RAM. The cloud pieces are
+just network I/O — bytes in, bytes out.
+
+**Practical implication for monetization:** in v0.1 the user pays the
+LLM provider directly (BYOK). Bluey gets nothing. The Auto Router
+crate (`cue-router`) was built so a future `BlueyManagedProvider`
+implementation can dispatch through `bluey-server`, which holds
+Bluey-owned API keys, charges the customer, and pays the upstream
+providers — taking a margin. **That is the monetization handle.**
+See Section 5 (Layer 3 product server) and Section 6 (Auto Router
+plug-points).
+
 ## 2. Servers (target topology)
 
 > **State 2026-05-19:** No Bluey servers are stood up yet. v0.1.0 is
