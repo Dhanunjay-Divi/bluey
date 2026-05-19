@@ -85,18 +85,22 @@ impl LlmProvider for BlueyManagedProvider {
 
 fn map_err(e: CloudError) -> LlmError {
     match e {
-        CloudError::Unauthorized => LlmError::Auth,
-        CloudError::TrialEnded => LlmError::Quota(
-            "free trial complete; load $30 to continue at https://bluey.dev/reload".into(),
-        ),
+        // Codex S5.2: managed billing failures terminal (no failover).
+        CloudError::Unauthorized => {
+            LlmError::Billing("bluey account login required (run `bluey login`)".into())
+        }
+        CloudError::TrialEnded => {
+            LlmError::Billing("free trial complete; reload your account to continue".into())
+        }
         CloudError::InsufficientBalance {
             balance_cents,
             needed_cents,
-            ..
-        } => LlmError::Quota(format!(
-            "balance ${:.2} insufficient (need ${:.2}); reload at https://bluey.dev/reload",
+            reload_url,
+        } => LlmError::Billing(format!(
+            "balance ${:.2} insufficient (need ${:.2}); reload at {}",
             balance_cents as f64 / 100.0,
             needed_cents as f64 / 100.0,
+            reload_url,
         )),
         CloudError::RateLimited { retry_after_secs } => {
             LlmError::Provider(format!("rate limited; retry in {retry_after_secs}s"))

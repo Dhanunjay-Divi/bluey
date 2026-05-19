@@ -111,6 +111,7 @@ mod tests {
                 Err(LlmError::Quota(s)) => Err(LlmError::Quota(s.clone())),
                 Err(LlmError::Network(s)) => Err(LlmError::Network(s.clone())),
                 Err(LlmError::Provider(s)) => Err(LlmError::Provider(s.clone())),
+                Err(LlmError::Billing(s)) => Err(LlmError::Billing(s.clone())),
             }
         }
     }
@@ -254,5 +255,36 @@ mod tests {
         assert_eq!(chunk.text, "hello");
         assert!(chunk.finished);
         assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn billing_error_does_not_failover() {
+        // Codex Stage 5 S5.2: a Billing error from a managed provider
+        // must NOT failover to a direct provider. The router returns
+        // the Billing error to the caller terminal.
+        let router = LlmRouter::new(vec![
+            Box::new(MockProvider {
+                name: "managed",
+                result: Err(LlmError::Billing("balance $0.00 insufficient".into())),
+            }),
+            Box::new(MockProvider {
+                name: "openai-direct",
+                result: Ok(LlmResponse {
+                    text: "should never be reached".into(),
+                }),
+            }),
+        ]);
+        let err = router.complete(&test_req()).await.unwrap_err();
+        match err {
+            LlmError::Billing(msg) => assert!(msg.contains("insufficient")),
+            other => panic!("expected Billing, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn billing_error_terminal_helpers() {
+        let e = LlmError::Billing("test".into());
+        assert!(!e.should_failover());
+        assert!(!e.is_retryable());
     }
 }

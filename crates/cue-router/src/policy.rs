@@ -186,40 +186,31 @@ pub type LocalFallbackPolicy = StaticPolicy;
 /// `LocalFallbackPolicy` (formerly `StaticPolicy`) is used only when
 /// the daemon is offline or in privacy-only mode.
 #[derive(Debug, Clone, Default)]
-pub struct ManagedPolicy {
-    /// If true, force the Local lane regardless of classification.
-    /// Used when the customer has explicitly opted into privacy mode.
-    pub force_local: bool,
-}
+pub struct ManagedPolicy {}
 
 impl ManagedPolicy {
     /// Construct the default `ManagedPolicy` (route everything through
     /// the cloud, vision overrides latency lane).
+    ///
+    /// **Codex Stage 5 S5.1:** there is intentionally NO `local_only`
+    /// constructor on `ManagedPolicy`. The managed cloud does not run
+    /// local models; sending a Local-lane request to bluey-server
+    /// would 400. Callers who need true on-device dispatch must
+    /// construct a `LocalFallbackPolicy` directly at registry
+    /// construction time (or compose with an offline-aware switch).
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Force every request onto the Local lane regardless of
-    /// classification. Used when the customer has explicitly opted
-    /// into privacy-only mode.
-    pub fn local_only() -> Self {
-        Self { force_local: true }
     }
 }
 
 impl RoutingPolicy for ManagedPolicy {
     fn route(&self, classification: &TaskClassification) -> ProviderRoute {
-        if self.force_local {
-            return ProviderRoute {
-                lane: ProviderLane::Local,
-                provider_name: "bluey-managed-local".to_string(),
-                model: "managed".to_string(),
-                max_tokens: classification.difficulty_max_tokens(),
-                temperature: Some(0.3),
-                stream: false,
-            };
-        }
-        // Vision overrides latency lane.
+        // Codex S5.1: ManagedPolicy never produces a bluey-managed-local
+        // provider. The classifier LatencyLane has no Local variant
+        // (true local dispatch is selected at registry time via
+        // LocalFallbackPolicy, not by the classifier). Vision still
+        // overrides latency lane below.
+
         if classification.task_type == TaskType::Vision {
             return ProviderRoute {
                 lane: ProviderLane::Vision,
@@ -289,10 +280,31 @@ mod managed_tests {
     }
 
     #[test]
-    fn managed_local_only_overrides_everything() {
-        let p = ManagedPolicy::local_only();
-        let r = p.route(&make_classification(TaskType::Vision, LatencyLane::Deep));
-        assert_eq!(r.lane, ProviderLane::Local);
-        assert_eq!(r.provider_name, "bluey-managed-local");
+    fn managed_never_emits_managed_local_provider() {
+        // Codex S5.1: scan all task/lane combinations and assert no
+        // ManagedPolicy::route() path produces bluey-managed-local.
+        // The managed cloud does not run local models; callers who
+        // need true local dispatch must construct LocalFallbackPolicy.
+        let p = ManagedPolicy::new();
+        for task in [
+            TaskType::General,
+            TaskType::Code,
+            TaskType::Vision,
+            TaskType::SystemDesign,
+            TaskType::Meeting,
+            TaskType::Writing,
+        ] {
+            for lane in [
+                LatencyLane::Instant,
+                LatencyLane::Balanced,
+                LatencyLane::Deep,
+            ] {
+                let r = p.route(&make_classification(task, lane));
+                assert_ne!(
+                    r.provider_name, "bluey-managed-local",
+                    "managed path produced local provider for {task:?}/{lane:?}"
+                );
+            }
+        }
     }
 }

@@ -44,6 +44,14 @@ pub enum LlmError {
     Network(String),
     #[error("provider error: {0}")]
     Provider(String),
+    /// Terminal billing failure from a managed provider. Codex Stage 5
+    /// S5.2: managed-cloud auth/quota/balance failures must NOT trigger
+    /// failover to a direct OpenAI/Anthropic provider that the daemon
+    /// might also have registered, because that would be unmetered use.
+    /// Any error of this variant short-circuits the failover loop and
+    /// surfaces directly to the caller.
+    #[error("billing failure: {0}")]
+    Billing(String),
 }
 
 impl LlmError {
