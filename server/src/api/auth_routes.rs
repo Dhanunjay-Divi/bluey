@@ -284,27 +284,26 @@ pub async fn device_poll(
 
 pub async fn device_approve(
     State(state): State<AppState>,
+    axum::Extension(crate::auth::AuthedAccount(account)): axum::Extension<crate::auth::AuthedAccount>,
     Json(req): Json<DeviceApproveRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
-    // For this endpoint the caller is already authenticated via the
-    // /device verification UI on bluey.dev (the customer is logged in
-    // through the regular session cookie or token). v0.2 will wire that
-    // session lookup; for v0.1-of-server we stub by accepting the email
-    // header `X-Bluey-Account-Id` as a back-door for testing. The
-    // REAL impl uses the auth middleware (Stage 3).
     let conn = state
         .pool
         .get()
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
+    // Bind the device_code to the *currently authenticated* customer's account.
+    // The auth middleware has already verified the JWT and loaded the account;
+    // we use that account_id to mark the device approved.
+    let now = chrono::Utc::now().to_rfc3339();
     let n = conn
         .execute(
-            "UPDATE device_codes SET approved = 1, account_id = COALESCE(account_id, ?1)
-             WHERE user_code = ?2",
-            rusqlite::params!["test-account-id-stub", &req.user_code],
+            "UPDATE device_codes SET approved = 1, account_id = ?1
+             WHERE user_code = ?2 AND expires_at > ?3",
+            rusqlite::params![&account.id, &req.user_code, &now],
         )
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
     if n == 0 {
-        return Err(err(StatusCode::NOT_FOUND, "unknown user_code"));
+        return Err(err(StatusCode::NOT_FOUND, "unknown or expired user_code"));
     }
     Ok(StatusCode::OK)
 }
