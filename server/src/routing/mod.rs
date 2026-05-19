@@ -1,16 +1,5 @@
-//! Upstream provider dispatcher. Stub for now; full proxying
-//! implementation in subsequent commits.
+//! Routing module aggregator.
 
-pub struct Dispatcher;
+pub mod dispatcher;
 
-impl Dispatcher {
-    pub fn new() -> Self {
-        Self
-    }
-}
-
-impl Default for Dispatcher {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+pub use dispatcher::{complete, resolve_route, Completion};

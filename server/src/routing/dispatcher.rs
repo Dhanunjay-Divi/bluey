@@ -1,0 +1,255 @@
+//! Upstream provider proxying. Speaks the OpenAI Chat Completions API
+//! and the Anthropic Messages API directly; returns a normalised
+//! response with token counts.
+//!
+//! v0.2 scope: non-streaming. Streaming proxy lands later (R14.x).
+
+use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::config::UpstreamKeys;
+
+/// Normalised completion response.
+#[derive(Debug)]
+pub struct Completion {
+    pub text: String,
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+}
+
+/// Resolve the lane/task to a concrete provider+model.
+/// Mirrors `cue_router::policy::StaticPolicy::defaults`.
+pub fn resolve_route(lane: &str) -> (&'static str, &'static str) {
+    match lane {
+        "instant" => ("openai", "gpt-4o-mini"),
+        "deep" => ("anthropic", "claude-3-7-sonnet-latest"),
+        "vision" => ("openai", "gpt-4o"),
+        "local" => ("ollama", "llama3.1"),
+        _ => ("anthropic", "claude-3-5-sonnet-latest"), // balanced default
+    }
+}
+
+/// Run a single non-streaming completion against the upstream provider.
+pub async fn complete(
+    keys: &UpstreamKeys,
+    provider: &str,
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+) -> Result<Completion> {
+    match provider {
+        "openai" => openai_complete(keys, model, system, user, max_tokens, temperature).await,
+        "anthropic" => {
+            anthropic_complete(keys, model, system, user, max_tokens, temperature).await
+        }
+        other => Err(anyhow!("unsupported provider: {other}")),
+    }
+}
+
+// ─── OpenAI ──────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct OpenAiChatReq<'a> {
+    model: &'a str,
+    messages: Vec<OpenAiMessage<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+}
+
+#[derive(Serialize)]
+struct OpenAiMessage<'a> {
+    role: &'static str,
+    content: &'a str,
+}
+
+#[derive(Deserialize)]
+struct OpenAiChatResp {
+    choices: Vec<OpenAiChoice>,
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiChoice {
+    message: OpenAiResponseMessage,
+}
+
+#[derive(Deserialize)]
+struct OpenAiResponseMessage {
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct OpenAiUsage {
+    prompt_tokens: i64,
+    completion_tokens: i64,
+}
+
+async fn openai_complete(
+    keys: &UpstreamKeys,
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+) -> Result<Completion> {
+    let key = keys
+        .openai_api_key
+        .as_ref()
+        .ok_or_else(|| anyhow!("OPENAI_API_KEY not configured on bluey-server"))?;
+    let req = OpenAiChatReq {
+        model,
+        messages: vec![
+            OpenAiMessage { role: "system", content: system },
+            OpenAiMessage { role: "user", content: user },
+        ],
+        max_tokens,
+        temperature,
+    };
+    let resp = reqwest::Client::new()
+        .post("https://api.openai.com/v1/chat/completions")
+        .bearer_auth(key)
+        .json(&req)
+        .send()
+        .await
+        .context("openai http")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("openai {status}: {body}"));
+    }
+    let parsed: OpenAiChatResp = resp.json().await.context("openai json")?;
+    let text = parsed
+        .choices
+        .into_iter()
+        .next()
+        .map(|c| c.message.content)
+        .unwrap_or_default();
+    let (input_tokens, output_tokens) = parsed
+        .usage
+        .map(|u| (u.prompt_tokens, u.completion_tokens))
+        .unwrap_or((0, 0));
+    Ok(Completion {
+        text,
+        provider: "openai".to_string(),
+        model: model.to_string(),
+        input_tokens,
+        output_tokens,
+    })
+}
+
+// ─── Anthropic ───────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct AnthropicReq<'a> {
+    model: &'a str,
+    max_tokens: u32,
+    system: &'a str,
+    messages: Vec<AnthropicMessage<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+}
+
+#[derive(Serialize)]
+struct AnthropicMessage<'a> {
+    role: &'static str,
+    content: &'a str,
+}
+
+#[derive(Deserialize)]
+struct AnthropicResp {
+    content: Vec<AnthropicContent>,
+    usage: AnthropicUsage,
+}
+
+#[derive(Deserialize)]
+struct AnthropicContent {
+    #[serde(default)]
+    text: String,
+    #[serde(rename = "type")]
+    _type: String,
+}
+
+#[derive(Deserialize)]
+struct AnthropicUsage {
+    input_tokens: i64,
+    output_tokens: i64,
+}
+
+async fn anthropic_complete(
+    keys: &UpstreamKeys,
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+) -> Result<Completion> {
+    let key = keys
+        .anthropic_api_key
+        .as_ref()
+        .ok_or_else(|| anyhow!("ANTHROPIC_API_KEY not configured on bluey-server"))?;
+    let req = AnthropicReq {
+        model,
+        max_tokens: max_tokens.unwrap_or(2048),
+        system,
+        messages: vec![AnthropicMessage { role: "user", content: user }],
+        temperature,
+    };
+    let resp = reqwest::Client::new()
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&req)
+        .send()
+        .await
+        .context("anthropic http")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("anthropic {status}: {body}"));
+    }
+    let parsed: AnthropicResp = resp.json().await.context("anthropic json")?;
+    let text = parsed
+        .content
+        .into_iter()
+        .map(|c| c.text)
+        .collect::<Vec<_>>()
+        .join("");
+    Ok(Completion {
+        text,
+        provider: "anthropic".to_string(),
+        model: model.to_string(),
+        input_tokens: parsed.usage.input_tokens,
+        output_tokens: parsed.usage.output_tokens,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_route_known_lanes() {
+        assert_eq!(resolve_route("instant"), ("openai", "gpt-4o-mini"));
+        assert_eq!(
+            resolve_route("balanced"),
+            ("anthropic", "claude-3-5-sonnet-latest"),
+        );
+        assert_eq!(
+            resolve_route("deep"),
+            ("anthropic", "claude-3-7-sonnet-latest"),
+        );
+        assert_eq!(resolve_route("vision"), ("openai", "gpt-4o"));
+        assert_eq!(resolve_route("local"), ("ollama", "llama3.1"));
+        // Unknown → balanced default.
+        assert_eq!(
+            resolve_route("???"),
+            ("anthropic", "claude-3-5-sonnet-latest"),
+        );
+    }
+}
