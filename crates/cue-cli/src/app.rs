@@ -54,7 +54,9 @@ enum Commands {
     Settings(SettingsArgs),
     /// Show your Bluey balance, last-7-days usage, and tier projection.
     Usage,
-    /// Show credit-batch expiration info.
+    /// Show your current Bluey balance and 1-year credit-validity reminder.
+    /// (Per-batch expiration listing is not yet available; coming in a
+    /// future release.)
     Credits,
     /// Start the Bluey daemon.
     #[command(hide = true)]
@@ -771,6 +773,39 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
     };
 
     save_account(&paths, &account)?;
+
+    // Codex Stage 8 S8.1: also save tokens to the cue-cloud-client
+    // keyring store so `bluey usage` and `bluey credits` (which read
+    // from keyring) can find them after `bluey login`. Best-effort:
+    // if keyring unavailable (e.g. headless dev container), we log
+    // and continue; the legacy AccountConfig path still works.
+    if let (Some(access), Some(refresh)) = (
+        account.access_token.as_deref(),
+        account.refresh_token.as_deref(),
+    ) {
+        match cue_cloud_client::CloudClient::with_default_keyring() {
+            Ok(client) => {
+                let email = account.user_id.clone();
+                if let Err(e) = client.save_tokens(cue_cloud_client::Tokens {
+                    access: access.to_string(),
+                    refresh: refresh.to_string(),
+                    email,
+                }) {
+                    eprintln!(
+                        "warning: could not save tokens to keyring: {e}\n\
+                         (legacy AccountConfig path still works; `bluey usage` may report not-logged-in until keyring is available)"
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: cloud client keyring unavailable: {e}\n\
+                     (legacy AccountConfig path still works; `bluey usage` may report not-logged-in until keyring is available)"
+                );
+            }
+        }
+    }
+
     println!(
         "Bluey account linked: {} ({})",
         account.provider, account.api_url

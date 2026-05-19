@@ -34,4 +34,5 @@ pub use auth::{DeviceFlow, DeviceFlowState};
 pub use client::CloudClient;
 pub use error::Error;
 pub use tokens::TokenStore;
+pub use tokens::Tokens;
 pub use types::*;
