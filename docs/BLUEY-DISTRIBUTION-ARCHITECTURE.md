@@ -1,176 +1,193 @@
 # Bluey Distribution Architecture — v0.1
 
-> **Decision (2026-05-19, user):** v0.1 ships terminal-only, BYOK, no SaaS.
-> Distribution should follow a similar architecture to the existing Pinky
-> daemon hosting on uno's Pinky API server, NOT a parallel reinvention.
+> **Decision (2026-05-19, user):** Bluey is a separate product from Pinky.
+> Bluey distribution is on its own infrastructure, not piggybacked on the
+> Pinky API server. v0.1 ships terminal-only, BYOK, no SaaS surface.
 
-This doc captures the architecture, not the implementation. Implementation
-lands in a follow-up commit (publish.sh + install.sh changes + Pinky-side
-config update).
+This doc captures the architecture choice. Implementation lands in a
+follow-up commit (publish.sh + install.sh + the chosen server scaffold).
 
-## Reference: how Pinky distributes
+---
 
+## What we need (minimum viable)
+
+For v0.1 the only server-side concern is binary distribution:
+
+1. Hosted artifacts: `bluey-<ver>-darwin-arm64.tar.gz` + universal +
+   per-asset sha256 + `SHA256SUMS.txt` + release notes.
+2. A versioned URL contract:
+   - `https://<host>/downloads/bluey/v<ver>/<asset>`     (immutable)
+   - `https://<host>/downloads/bluey/latest.json`        (manifest pointer)
+   - `https://<host>/install`                             (templated bash)
+   - `https://<host>/install.sh`                          (alias)
+   - `https://<host>/install.ps1`                         (templated pwsh)
+3. A safe promotion flow: dev (uno) → preprod → prod, with versioned
+   directory swap as the atomic promote step.
+4. TLS termination + a vanity domain (e.g. `bluey.dev`).
+
+Future cloud features (auth, sync, managed Auto Router endpoint, billing)
+are out of v0.1 scope. The architecture should NOT prevent adding them
+but should NOT pre-build them either.
+
+---
+
+## Two paths to pick from
+
+### Path A — Standalone `bluey-server` Go service
+
+Mirrors Pinky's known-good pattern but Bluey-only. Single Go binary that:
+
+- Serves `/downloads/bluey/` from a local `downloads/` directory.
+- Serves `/install`, `/install.sh`, `/install.ps1` as templated text
+  (read `downloads/bluey/latest.json` at request time, fill in the
+  current version + sha + asset URL into the install body).
+- Serves `/latest.json` as a manifest pass-through.
+- Emits a tiny admin endpoint `/admin/health` for monitoring.
+- No DB. No auth on the read path. ~250 lines of Go.
+
+**Pros:**
+- Same operational shape as Pinky → familiar deploys, familiar logs,
+  familiar admin pattern. Easy to evolve into a full SaaS server later
+  if Bluey grows cloud features.
+- Templated install scripts can vary the latest version atomically
+  without ever touching client install URLs.
+- Cleanly testable in CI (Go HTTP test harness).
+
+**Cons:**
+- Need to provision a host (DigitalOcean droplet, ~$6/mo).
+- Need TLS (LetsEncrypt) + DNS (`bluey.dev` or a subdomain on a domain
+  you already own).
+- Slightly more code than strictly necessary for v0.1.
+
+**Repo layout:**
 ```
-Source of truth:    /tmp/pinky-full/cmd/pinky-server/main.go
-                    /tmp/pinky-full/internal/api/server.go (Routes())
-Production server:  161.35.177.238  (pinky.sh)
-Relay server:       167.71.175.146  (relay.pinky.sh)
-
-Endpoints relevant to distribution:
-  GET /downloads/                  -> http.FileServer(http.Dir("downloads"))
-  GET /install                     -> handleInstallScript     (templated bash)
-  GET /install.sh                  -> same
-  GET /install.ps1                 -> handleInstallPS1        (templated pwsh)
-```
-
-So Pinky's distribution is:
-
-1. **Static file root** `downloads/` next to the running pinky-server binary.
-   Files placed there are served unauthenticated at `/downloads/<file>`.
-2. **Templated install scripts** at `/install`, `/install.sh`, `/install.ps1`
-   that read the latest version + sha from server config and emit a
-   shell/pwsh script the user can `curl | sh`.
-3. **Promotion** is done by the existing CI/CD pipeline (preprod → prod via
-   GitHub Actions). The `internal/api/deployments.go` admin page shows
-   per-environment status and lets ops trigger promotions.
-
-## Bluey v0.1 distribution: piggyback on Pinky's API server
-
-**Why piggyback rather than stand up a new service:**
-
-- Bluey v0.1 has no SaaS surface (no auth, no sync, no captions storage,
-  no billing). The only server-side concern is binary distribution.
-- Pinky's server already runs on `pinky.sh`, has TLS, has deploy automation,
-  has admin UI, has the static-file route pattern.
-- Adding `downloads/bluey/` and a `/install/bluey.sh` route is ~50 lines of
-  Go + a new staging directory, vs ~3 days of work to provision/maintain
-  a separate `bluey-api` service.
-- If Bluey ever needs SaaS features (managed Auto Router endpoint, cloud
-  RAG, billing), we either extend Pinky's server multi-product OR fork
-  to `bluey-server` then. Don't pre-emptively complicate.
-
-**Layout on the Pinky API host (`161.35.177.238`):**
-
-```
-/opt/pinky-api/
-├── pinky-server                       (existing binary)
-├── pinky.db                           (existing)
-├── downloads/                         (existing static root)
-│   ├── pinky-windows.exe
-│   ├── pinky-mac/...
-│   └── bluey/                         (NEW)
-│       ├── latest.json                (manifest: version + asset URLs + sha)
-│       ├── latest -> v0.1.0           (symlink)
-│       └── v0.1.0/
-│           ├── bluey-0.1.0-darwin-arm64.tar.gz
-│           ├── bluey-0.1.0-darwin-arm64.tar.gz.sha256
-│           ├── bluey-0.1.0-darwin-universal.tar.gz
-│           ├── bluey-0.1.0-darwin-universal.tar.gz.sha256
-│           ├── SHA256SUMS.txt
-│           └── RELEASE.md
-```
-
-**Server-side route additions (Pinky-side, ~50 lines of Go):**
-
-```go
-// internal/api/server.go — add inside Routes()
-mux.HandleFunc("GET /install/bluey", s.handleBlueyInstallScript)
-mux.HandleFunc("GET /install/bluey.sh", s.handleBlueyInstallScript)
-mux.HandleFunc("GET /install/bluey.ps1", s.handleBlueyInstallPS1)
-mux.HandleFunc("GET /downloads/bluey/latest.json", s.handleBlueyLatestJSON)
-// /downloads/bluey/v<ver>/* served by the existing /downloads/ handler.
+crates/cue-distribution-server/   (NEW Rust crate, OR sibling Go module)
+├── main.go                       (or src/main.rs if Rust)
+├── handlers.go
+├── deploy/
+│   ├── Dockerfile
+│   └── systemd/bluey-server.service
+└── README.md
 ```
 
-`handleBlueyInstallScript` reads `downloads/bluey/latest.json`, templates
-the version + URL into the standard installer body, returns it.
+Estimate: 4–6 hrs scaffolding + 2 hrs deploy.
 
-`handleBlueyLatestJSON` is a thin pass-through with `Content-Type:
-application/json` and short cache.
+### Path B — Pure static hosting (no Bluey-side server)
 
-**Client-side discovery (Bluey-side):**
+Use a CDN-fronted object store. Concretely:
 
-User runs:
+- Cloudflare R2 OR AWS S3 + CloudFront for storage + TLS.
+- The `install.sh` / `install.ps1` are STATIC files in the object store
+  (regenerated by `publish.sh` on every release with the latest version
+  baked in).
+- Manifest discovery via `https://bluey.dev/latest.json` which is also
+  a static file updated on each release.
+- Atomic promotion via cache invalidation + replacing `latest.json`.
 
+**Pros:**
+- Zero server code. Zero hosts to maintain.
+- Cheap (R2 free tier covers v0.1; CloudFront pennies).
+- Globally fast.
+
+**Cons:**
+- Requires Cloudflare or AWS account + CDN setup.
+- No path for future SaaS features without standing up a separate
+  service later.
+- `install.sh` is regenerated on every release rather than templated
+  per-request → if you forget to regen on rollback, the installer is
+  stale until the next publish.
+
+Estimate: 2–3 hrs setup if you have a CDN account already, 4–6 hrs
+including LetsEncrypt + DNS + storage account creation.
+
+### Path C — Hybrid (nginx + static files on existing droplet)
+
+Same idea as Path B but on a single droplet you already have access to
+(167.71.175.146 or 161.35.177.238 are reachable from uno; the relay
+droplet is the better candidate since the Pinky API server is on the
+other one).
+
+- nginx serving `/var/www/bluey/` directly.
+- LetsEncrypt for TLS.
+- `publish.sh` rsyncs to the droplet.
+
+**Pros:**
+- Reuses droplet you already pay for.
+- Zero server code.
+- Operationally identical to Path B but no CDN dependency.
+
+**Cons:**
+- Single region (no edge cache).
+- You must keep nginx config + cert renewals working.
+- Single point of failure (droplet down = downloads down).
+
+Estimate: 1.5–2 hrs setup.
+
+---
+
+## My recommendation
+
+For v0.1 internal-testing scale (you + a small handful of testers):
+
+**Path C** (nginx + static + your existing droplet). It's the smallest
+amount of new infrastructure that delivers a usable distribution
+endpoint. We keep the URL contract identical to Path A so a future
+migration to a real bluey-server (Path A) is purely a routing change.
+
+Translation: even though we use static-file hosting today, we build the
+client-side installer and the publish flow as if there were a Bluey
+server, so we can swap the backend without touching any client code or
+docs later.
+
+**If you want to grow toward a real cloud service for Bluey** (because
+managed Auto Router endpoint or sync is in the near roadmap), do Path A
+now — the marginal cost is small and you avoid migrating later.
+
+## Concrete URL contract (server-agnostic)
+
+These URLs MUST stabilise now so the install script and future Bluey
+Auto router can rely on them:
+
+| URL | Content | Cache |
+|---|---|---|
+| `https://bluey.dev/install`           | templated bash (or static) | no-cache |
+| `https://bluey.dev/install.sh`        | alias for `/install`       | no-cache |
+| `https://bluey.dev/install.ps1`       | templated pwsh             | no-cache |
+| `https://bluey.dev/latest.json`       | release manifest           | 60s |
+| `https://bluey.dev/downloads/v<ver>/` | versioned release dir      | immutable |
+| `https://bluey.dev/admin/health`      | health check               | no-cache |
+
+`latest.json` shape (already drafted in `scripts/publish.sh`):
+
+```json
+{
+  "version": "0.1.0",
+  "released_at": "2026-05-19T02:30:00Z",
+  "platforms": {
+    "darwin-arm64":     { "url": "downloads/v0.1.0/bluey-0.1.0-darwin-arm64.tar.gz",     "sha256": "...", "size_bytes": 6355342 },
+    "darwin-universal": { "url": "downloads/v0.1.0/bluey-0.1.0-darwin-universal.tar.gz", "sha256": "...", "size_bytes": 12301978 }
+  },
+  "platforms_pending": ["darwin-x86_64", "linux-x86_64", "windows-x86_64"],
+  "release_notes_url": "downloads/v0.1.0/RELEASE.md"
+}
 ```
-curl https://pinky.sh/install/bluey.sh | sh
-```
 
-The templated script:
+## Next concrete steps (Bluey-side, regardless of which path)
 
-1. Fetches `https://pinky.sh/downloads/bluey/latest.json`.
-2. Reads the `darwin-universal` (or `darwin-arm64`) asset URL + sha256.
-3. Downloads the tarball.
-4. Verifies sha256 against the manifest.
-5. Extracts to `~/.local/bluey/<version>/`, symlinks
-   `~/.local/bin/bluey` and `~/.local/bin/bluey-daemon`.
-6. Prints next steps.
+1. `scripts/publish.sh` — finalise (host-agnostic; takes `PUBLISH_HOST`
+   + `PUBLISH_PATH` env vars; produces release-staging dir + manifest;
+   rsyncs on `PUBLISH_DO=1`).
+2. `scripts/install.sh` — add `latest.json` discovery with
+   `BLUEY_RELEASE_BASE_URL` override; keep `BLUEY_ARCHIVE` fallback.
+3. `Makefile` — `publish-preprod` / `publish-prod` chained targets.
+4. `docs/INSTALL-FROM-SERVER.md` — user-facing install guide pointing
+   at `curl https://bluey.dev/install.sh | sh`.
 
-This is the same shape as the existing `scripts/install.sh` but with the
-URL discovery driven by `latest.json` instead of hard-coded.
+## Pending: your call
 
-**Promotion flow (mirrors Pinky's):**
-
-```
-dev box (uno)            preprod                  prod
-make package-darwin*  →  /downloads/bluey/   →  /downloads/bluey/
-                         (preprod env)            (prod env)
-    publish.sh              promote.sh
-                            via admin UI
-                            or workflow_dispatch
-```
-
-`scripts/publish.sh` (already drafted in /tmp/) targets the preprod env
-first; promotion to prod is an explicit step (not auto).
-
-## What changes on the Bluey side
-
-1. `scripts/install.sh` — add a discovery path that reads `latest.json`
-   from a base URL controlled by `BLUEY_RELEASE_BASE_URL`
-   (default: `https://pinky.sh/downloads/bluey/`).
-2. `scripts/publish.sh` — finish the staging + rsync logic targeting
-   the Pinky API host.
-3. `Makefile` — `publish-darwin` target chains
-   `package-darwin-universal` → `publish.sh`.
-
-## What changes on the Pinky side
-
-> NOTE: Pinky source on uno is at `/tmp/pinky-full/`. Changes there must
-> follow the existing Pinky preprod → prod pipeline. **I do not push
-> Pinky changes from this Bluey repo without explicit permission.**
-
-1. Add the four route handlers above (`internal/api/server.go` +
-   new `internal/api/bluey_install.go`).
-2. `internal/api/bluey_install.go` reads
-   `downloads/bluey/latest.json` and templates the installer body.
-3. Add admin-page entry showing the latest Bluey version per environment
-   (mirrors `adminDeploymentEnv` for Pinky).
-4. Deploy via the existing Pinky pipeline.
-
-## Open questions
-
-1. **Server-side ownership.** Who owns the Pinky-side route additions —
-   Kiro (me, this repo), the Pinky codex agent, or the user? My
-   recommendation: write the Bluey-side install script + publish script,
-   stub the Pinky-side change as a PR description for whichever agent
-   touches Pinky next. Do NOT cross repos without permission.
-2. **Naming.** Is the customer-facing install URL `pinky.sh/install/bluey`
-   or do we want a separate domain like `bluey.dev`? If separate, that's
-   nginx + DNS work on top of this design.
-3. **Channel split.** Pinky has preprod + prod environments. Bluey for
-   v0.1 is dev → prod (no real preprod consumers). Worth preserving the
-   `preprod/` staging directory anyway for safety, or drop it for v0.1?
-
-## What I'm doing next (Bluey-side only)
-
-Bluey-side scaffolding lands in this repo without touching Pinky:
-
-- finalise `scripts/publish.sh` to stage + manifest-generate + rsync
-  to a configurable host:path
-- finalise `scripts/install.sh` with `latest.json` discovery and a
-  fallback to `BLUEY_ARCHIVE` for offline install
-- add `Makefile` targets `publish-preprod` and `publish-prod`
-- add `docs/INSTALL-FROM-SERVER.md` user-facing guide
-
-When the Pinky-side route additions are ready, the URL `pinky.sh/install/bluey`
-just works. Until then, `BLUEY_RELEASE_BASE_URL` can point at any static
-file host (e.g. an S3 bucket) for early testing.
+- Which path (A / B / C / something else)?
+- Domain — register `bluey.dev` (or another) and where? Cloudflare?
+  Existing registrar?
+- For path A specifically: where does `bluey-server` live in this repo?
+  Sibling crate `crates/cue-distribution-server/` (Rust, fits the workspace)
+  or a separate Go module under `cmd/bluey-server/` like Pinky?
