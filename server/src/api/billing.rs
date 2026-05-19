@@ -198,7 +198,7 @@ pub async fn webhook(
     );
 
     if event_type == "checkout.session.completed" {
-        if let Err(e) = handle_checkout_completed(&state, &event) {
+        if let Err(e) = handle_checkout_completed(&state, &event).await {
             tracing::error!(error = %e, event_id, "checkout.session.completed handler failed");
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
@@ -212,7 +212,74 @@ pub async fn webhook(
     Ok(StatusCode::OK)
 }
 
-fn handle_checkout_completed(state: &AppState, event: &serde_json::Value) -> Result<()> {
+/// Extract the PaymentIntent id from a Stripe session.payment_intent
+/// field, which Stripe sends as either a bare string (the id) or an
+/// expanded object (with .id + other fields).
+fn extract_payment_intent_id(session: &serde_json::Value) -> Option<String> {
+    let pi = session.get("payment_intent")?;
+    if let Some(s) = pi.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(id) = pi.get("id").and_then(|v| v.as_str()) {
+        return Some(id.to_string());
+    }
+    None
+}
+
+/// Extract the saved PaymentMethod id from a Stripe session, trying
+/// (in order):
+///
+///   1. session.payment_intent.payment_method (when PI is expanded)
+///   2. session.setup_intent.payment_method (alternate flow)
+///
+/// Returns None if neither is present; in that case the caller should
+/// fetch the PaymentIntent via /v1/payment_intents/{id} to expand it.
+fn extract_payment_method_id_from_session(session: &serde_json::Value) -> Option<String> {
+    if let Some(pm) = session
+        .pointer("/payment_intent/payment_method")
+        .and_then(|v| v.as_str())
+    {
+        return Some(pm.to_string());
+    }
+    if let Some(pm) = session
+        .pointer("/setup_intent/payment_method")
+        .and_then(|v| v.as_str())
+    {
+        return Some(pm.to_string());
+    }
+    None
+}
+
+/// Fetch a PaymentIntent from Stripe and read its payment_method field.
+/// Used when the webhook's session.payment_intent is a bare string
+/// (Stripe's default Checkout webhook shape) so we can still persist
+/// stripe_payment_method_id for off-session auto top-up.
+async fn fetch_payment_method_from_stripe(
+    stripe_key: &str,
+    payment_intent_id: &str,
+) -> Result<Option<String>> {
+    let url = format!("https://api.stripe.com/v1/payment_intents/{payment_intent_id}");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .basic_auth(stripe_key, Some(""))
+        .send()
+        .await
+        .context("stripe payment_intents.retrieve http")?;
+    if !resp.status().is_success() {
+        return Err(anyhow!(
+            "stripe payment_intents.retrieve {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+    let body: serde_json::Value = resp.json().await.context("stripe payment_intents json")?;
+    Ok(body
+        .get("payment_method")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string()))
+}
+
+async fn handle_checkout_completed(state: &AppState, event: &serde_json::Value) -> Result<()> {
     let session = event
         .pointer("/data/object")
         .ok_or_else(|| anyhow!("no data.object"))?;
@@ -233,10 +300,11 @@ fn handle_checkout_completed(state: &AppState, event: &serde_json::Value) -> Res
         .or_else(|| session.get("amount_total").and_then(|v| v.as_i64()))
         .ok_or_else(|| anyhow!("no amount in session"))?;
 
-    let payment_intent_id = session
-        .get("payment_intent")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    // Codex round-2 blocker 1: normalize payment_intent for both string
+    // AND expanded-object shapes so credit idempotency always gets the
+    // PI id (defending against duplicate-charge replay) regardless of
+    // which webhook expansion mode Stripe is using.
+    let payment_intent_id = extract_payment_intent_id(session);
 
     let credited = balance::credit(
         &state.pool,
@@ -246,30 +314,45 @@ fn handle_checkout_completed(state: &AppState, event: &serde_json::Value) -> Res
     )
     .context("credit account")?;
 
-    // Codex Stage 6 S6.3: persist BOTH the customer id AND the payment
-    // method id for auto top-up. The setup_future_usage=off_session
-    // hint at checkout time means Stripe attaches the PaymentMethod to
-    // the customer. We read it from the session\'s payment_intent_data
-    // (when expanded) or fall back to charging via customer-default at
-    // top-up time.
+    // Codex round-2 blocker 1: persist stripe_payment_method_id for
+    // auto top-up. Try the expanded session first; if PI was a bare
+    // string, fetch /v1/payment_intents/{id} to read .payment_method.
+    let mut payment_method_id = extract_payment_method_id_from_session(session);
+    if payment_method_id.is_none() {
+        if let (Some(pi_id), Some(stripe_key)) = (
+            payment_intent_id.as_deref(),
+            state.config.stripe_secret_key.as_deref(),
+        ) {
+            match fetch_payment_method_from_stripe(stripe_key, pi_id).await {
+                Ok(Some(pm)) => payment_method_id = Some(pm),
+                Ok(None) => {
+                    tracing::warn!(
+                        account_id,
+                        payment_intent_id = pi_id,
+                        "PaymentIntent retrieve returned no payment_method; auto top-up will rely on customer-default"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        account_id,
+                        payment_intent_id = pi_id,
+                        error = %e,
+                        "PaymentIntent retrieve failed; will use customer-default at auto top-up time"
+                    );
+                }
+            }
+        }
+    }
+
     if let Ok(conn) = state.pool.get() {
         let customer_id = session.get("customer").and_then(|v| v.as_str());
-        let payment_method_id = session
-            .pointer("/payment_intent/payment_method")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                session
-                    .get("setup_intent")
-                    .and_then(|v| v.get("payment_method"))
-                    .and_then(|v| v.as_str())
-            });
         if customer_id.is_some() || payment_method_id.is_some() {
             let _ = conn.execute(
                 "UPDATE accounts
                     SET stripe_customer_id = COALESCE(?1, stripe_customer_id),
                         stripe_payment_method_id = COALESCE(?2, stripe_payment_method_id)
                   WHERE id = ?3",
-                rusqlite::params![customer_id, payment_method_id, &account_id],
+                rusqlite::params![customer_id, payment_method_id.as_deref(), &account_id],
             );
         }
     }

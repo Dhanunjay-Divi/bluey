@@ -68,7 +68,7 @@ pub async fn show_usage(client: &CloudClient) -> Result<()> {
     }
 
     println!();
-    println!("Credits expire 1 year from purchase. Run `bluey credits` for batch-by-batch dates.");
+    println!("Credits expire 1 year from purchase. Per-batch expiration listing is coming in a future release.");
     Ok(())
 }
 
