@@ -9,6 +9,29 @@
 
 ---
 
+## 2026-05-19 — bluey-server is Rust, not Go
+
+**Source:** user direction.
+**Decision:** the future Bluey product server (Layer 3) is written in
+Rust, not Go. Lives in a separate repo (`bluey-server`) but stays in
+the Bluey language family.
+**Earlier proposal (rejected):** Go, to mirror the Pinky daemon stack
+for operational familiarity.
+**Why rejected:** Bluey is end-to-end Rust today (workspace crates,
+native helpers via Swift on macOS, C on Windows). Introducing Go for
+one new component would mean two stacks for one product family: extra
+toolchain, extra build pipeline, extra deploy story, extra hire-able
+profile. The marginal upside (Pinky-style operational familiarity)
+does not pay for the friction.
+**What carries over from Pinky:** the operational shape (single binary
++ SQLite + Caddy + LetsEncrypt + droplet) is fine to mirror. The
+language changes.
+**Don't retry without new context.** If a future requirement makes Rust
+genuinely awkward (e.g. a vendor SDK only exists for Go), revisit
+deliberately. Don't drift back to Go silently.
+
+---
+
 ## 2026-05-19 — Bluey distribution is separate from Pinky
 
 **Source:** user direction.

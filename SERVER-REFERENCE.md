@@ -81,7 +81,7 @@ explicit step (not auto).
 |---|---|
 | Production IP / DNS | TBD |
 | SSH user | TBD |
-| Stack | Go + SQLite + Caddy (mirrors Pinky pattern) |
+| Stack | Rust + SQLite + Caddy (Pinky operational shape, Bluey Rust stack) |
 | Database | `/opt/bluey-api/bluey-preprod.db` |
 | Stripe | test mode |
 | Public URL | TBD (e.g. `https://api-preprod.bluey.dev`) |

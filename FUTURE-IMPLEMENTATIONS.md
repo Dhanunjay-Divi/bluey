@@ -101,6 +101,10 @@ not exercised on a real Windows machine.
 **Status:** parked until monetization is greenlit (the user's call).
 **See:** `ARCHITECTURE.md` Section 5 + Section 7 Stage 2.
 **Estimate:** ~1 week dedicated work in a separate `bluey-server` repo.
+**Language:** Rust (locked in 2026-05-19; see `DECISIONS.md`). The
+operational shape mirrors Pinky's API droplet pattern (single binary
++ SQLite + Caddy + LetsEncrypt) but the language stays in the Bluey
+family.
 **Trigger to ship:** user explicitly greenlights the monetization
 track.
 

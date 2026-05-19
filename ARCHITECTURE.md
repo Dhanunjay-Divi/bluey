@@ -165,8 +165,9 @@ GET  /admin/customers               (Bluey-team only)
 ```
 
 **Lives in a separate repo (`bluey-server`).** Different deploy cadence,
-different security review surface, different language is fine. Mirrors
-Pinky's API droplet pattern but Bluey-only.
+different security review surface, **same language as the rest of Bluey
+(Rust).** Mirrors Pinky's API droplet operational shape but uses Rust
+so the team is not maintaining two stacks for one product family.
 
 **Why this is necessary for monetization:** if the user supplies their
 own OpenAI/Anthropic keys, what are they paying Bluey for? The honest
@@ -257,7 +258,7 @@ both know how to talk to the cloud service.
 | Distribution path | A (Go server) / B (CDN) / C (nginx static) | C — smallest infra to unblock |
 | Distribution domain | `bluey.dev` / other / "no domain yet" | "raw IP for v0.1 testing" |
 | Monetization timeline | X (slow) / **Y (medium, recommended)** / Z (aggressive) | Y |
-| Product server language | Go (Pinky pattern) / Rust (workspace fit) | Go |
+| Product server language | **Rust (locked-in 2026-05-19)** | Rust |
 | Managed Router endpoint | proxy upstreams as-is / Bluey-specific protocol | proxy as-is for v0.2 |
 
 ---
