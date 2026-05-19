@@ -58,6 +58,22 @@ package-darwin-x86_64: build-darwin-x86_64
 	tar -czf dist/bluey-$(VERSION)-darwin-x86_64.tar.gz -C staging-x86 .
 	rm -rf staging-x86
 
+build-darwin-universal: build-darwin-arm64 build-darwin-x86_64
+	@bash scripts/build-macos-universal.sh
+
+package-darwin-universal: build-darwin-universal
+	mkdir -p dist staging-universal/bin
+	cp dist/bluey-macos-universal/bluey staging-universal/bin/bluey
+	cp dist/bluey-macos-universal/bluey-daemon staging-universal/bin/bluey-daemon
+	cp dist/bluey-macos-universal/bluey-overlay-macos staging-universal/bin/bluey-overlay-macos 2>/dev/null || true
+	cp dist/bluey-macos-universal/bluey-audio-macos staging-universal/bin/bluey-audio-macos 2>/dev/null || true
+	cp dist/bluey-macos-universal/bluey-whisper-macos staging-universal/bin/bluey-whisper-macos 2>/dev/null || true
+	tar -czf dist/bluey-$(VERSION)-darwin-universal.tar.gz -C staging-universal .
+	shasum -a 256 dist/bluey-$(VERSION)-darwin-universal.tar.gz \
+	  > dist/bluey-$(VERSION)-darwin-universal.tar.gz.sha256
+	rm -rf staging-universal
+
+
 package-windows-x86_64: build-windows-x86_64
 	mkdir -p dist staging-win/bin
 	cp target/x86_64-pc-windows-msvc/release/bluey-daemon.exe staging-win/bin/ 2>/dev/null || \
