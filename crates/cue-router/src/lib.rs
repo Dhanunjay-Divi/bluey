@@ -50,5 +50,5 @@ pub use heuristic::HeuristicClassifier;
 pub use model::{
     ContextNeeds, Difficulty, LatencyLane, ProviderRoute, TaskClassification, TaskType,
 };
-pub use policy::{RoutingPolicy, StaticPolicy};
+pub use policy::{LocalFallbackPolicy, ManagedPolicy, RoutingPolicy, StaticPolicy};
 pub use speculative::{SpeculativeChunk, SpeculativeRouter};

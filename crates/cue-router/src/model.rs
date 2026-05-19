@@ -125,3 +125,14 @@ pub struct TaskClassification {
     /// to escalate to a tiny-model classifier.
     pub confidence: f32,
 }
+
+impl TaskClassification {
+    /// Sensible max_tokens default given the difficulty level.
+    pub fn difficulty_max_tokens(&self) -> Option<u32> {
+        Some(match self.difficulty {
+            Difficulty::Easy => 512,
+            Difficulty::Medium => 2048,
+            Difficulty::Hard => 8192,
+        })
+    }
+}

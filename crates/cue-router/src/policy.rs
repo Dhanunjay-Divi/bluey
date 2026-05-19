@@ -169,3 +169,135 @@ mod tests {
         assert_eq!(r.lane, ProviderLane::Local);
     }
 }
+
+
+/// Backward-compat alias for `StaticPolicy`. The product decision
+/// (DECISIONS.md 2026-05-19) renames the BYOK-targeted policy to
+/// `LocalFallbackPolicy` because that is what it really is now —
+/// the fallback used when the customer is offline / privacy-only.
+/// Existing call sites continue to work via this alias.
+pub type LocalFallbackPolicy = StaticPolicy;
+
+/// `ManagedPolicy` routes every lane through `bluey-server`. The
+/// daemon attaches `BlueyManagedProvider` for whichever lane the
+/// classifier asks for; bluey-server then picks the actual upstream
+/// provider+model server-side.
+///
+/// In v0.2 production, this is the default `RoutingPolicy`. The
+/// `LocalFallbackPolicy` (formerly `StaticPolicy`) is used only when
+/// the daemon is offline or in privacy-only mode.
+#[derive(Debug, Clone, Default)]
+pub struct ManagedPolicy {
+    /// If true, force the Local lane regardless of classification.
+    /// Used when the customer has explicitly opted into privacy mode.
+    pub force_local: bool,
+}
+
+impl ManagedPolicy {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn local_only() -> Self {
+        Self { force_local: true }
+    }
+}
+
+impl RoutingPolicy for ManagedPolicy {
+    fn route(&self, classification: &TaskClassification) -> ProviderRoute {
+        if self.force_local {
+            return ProviderRoute {
+                lane: ProviderLane::Local,
+                provider_name: "bluey-managed-local".to_string(),
+                model: "managed".to_string(),
+                max_tokens: classification.difficulty_max_tokens(),
+                temperature: Some(0.3),
+                stream: false,
+            };
+        }
+        // Vision overrides latency lane.
+        if classification.task_type == TaskType::Vision {
+            return ProviderRoute {
+                lane: ProviderLane::Vision,
+                provider_name: "bluey-managed-vision".to_string(),
+                model: "managed".to_string(),
+                max_tokens: classification.difficulty_max_tokens(),
+                temperature: Some(0.2),
+                stream: false,
+            };
+        }
+        let (lane, provider_name, temperature) = match classification.latency_lane {
+            LatencyLane::Instant => (
+                ProviderLane::Instant,
+                "bluey-managed-instant",
+                Some(0.3),
+            ),
+            LatencyLane::Balanced => (
+                ProviderLane::Balanced,
+                "bluey-managed-balanced",
+                Some(0.3),
+            ),
+            LatencyLane::Deep => (
+                ProviderLane::Deep,
+                "bluey-managed-deep",
+                Some(0.2),
+            ),
+        };
+        ProviderRoute {
+            lane,
+            provider_name: provider_name.to_string(),
+            model: "managed".to_string(),
+            max_tokens: classification.difficulty_max_tokens(),
+            temperature,
+            stream: false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod managed_tests {
+    use super::*;
+    use crate::model::{ContextNeeds, Difficulty};
+
+    fn make_classification(task_type: TaskType, lane: LatencyLane) -> TaskClassification {
+        TaskClassification {
+            task_type,
+            difficulty: Difficulty::Medium,
+            needed_context: ContextNeeds::default(),
+            latency_lane: lane,
+            confidence: 0.8,
+        }
+    }
+
+    #[test]
+    fn managed_routes_instant_to_managed_instant() {
+        let p = ManagedPolicy::new();
+        let r = p.route(&make_classification(TaskType::General, LatencyLane::Instant));
+        assert_eq!(r.lane, ProviderLane::Instant);
+        assert_eq!(r.provider_name, "bluey-managed-instant");
+    }
+
+    #[test]
+    fn managed_routes_deep_to_managed_deep() {
+        let p = ManagedPolicy::new();
+        let r = p.route(&make_classification(TaskType::Code, LatencyLane::Deep));
+        assert_eq!(r.lane, ProviderLane::Deep);
+        assert_eq!(r.provider_name, "bluey-managed-deep");
+    }
+
+    #[test]
+    fn managed_vision_overrides_lane() {
+        let p = ManagedPolicy::new();
+        let r = p.route(&make_classification(TaskType::Vision, LatencyLane::Instant));
+        assert_eq!(r.lane, ProviderLane::Vision);
+        assert_eq!(r.provider_name, "bluey-managed-vision");
+    }
+
+    #[test]
+    fn managed_local_only_overrides_everything() {
+        let p = ManagedPolicy::local_only();
+        let r = p.route(&make_classification(TaskType::Vision, LatencyLane::Deep));
+        assert_eq!(r.lane, ProviderLane::Local);
+        assert_eq!(r.provider_name, "bluey-managed-local");
+    }
+}

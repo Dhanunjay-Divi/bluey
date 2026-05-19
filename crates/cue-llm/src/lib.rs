@@ -2,6 +2,7 @@
 
 pub mod anthropic;
 pub mod ollama;
+pub mod bluey_managed;
 pub mod openai;
 mod router;
 
