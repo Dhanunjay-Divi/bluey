@@ -273,6 +273,25 @@ pub async fn complete(
 
     let balance_after = balance::current_balance(&state.pool, &account.id).unwrap_or(0);
 
+    // Codex Stage 10: auto top-up trigger. Fire-and-forget; the actual
+    // charge resolves on the executor and the webhook for the
+    // resulting payment_intent.succeeded credits the balance via the
+    // existing /billing/webhook flow. This closes the v0.2 dealbreaker
+    // gap: customers no longer hit hard-stop without an obvious recovery.
+    if !on_trial {
+        crate::billing::topup::maybe_spawn(
+            state.pool.clone(),
+            state.config.clone(),
+            account.id.clone(),
+            balance_after,
+            account.auto_topup_enabled,
+            account.auto_topup_threshold_cents,
+            account.stripe_customer_id.clone(),
+            account.stripe_payment_method_id.clone(),
+            account.auto_topup_amount_cents,
+        );
+    }
+
     // 8. Record usage event. Reuse the client-supplied request_id so
     //    Stage 7's idempotent ingest dedupes correctly across retries.
     let event = UsageEvent {
@@ -316,12 +335,9 @@ pub async fn complete(
     // /admin/metrics.
     match serde_json::to_string(&response) {
         Ok(json) => {
-            if let Err(e) = idempotency::mark_complete(
-                &state.pool,
-                &account.id,
-                &req.request_id,
-                &json,
-            ) {
+            if let Err(e) =
+                idempotency::mark_complete(&state.pool, &account.id, &req.request_id, &json)
+            {
                 tracing::error!(
                     account_id = %account.id,
                     request_id = %req.request_id,

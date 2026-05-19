@@ -149,3 +149,29 @@ pub(crate) struct InsufficientBalanceBody {
     #[serde(default)]
     pub reload_url: Option<String>,
 }
+
+/// Codex Stage 10: server-owned tier numbers from /pricing/tiers.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PricingTiers {
+    pub reload_amount_cents: i64,
+    pub minimum_cue_cents: i64,
+    pub tiers: Vec<Tier>,
+    pub markup_percent: MarkupPercent,
+    pub snapshot_date: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Tier {
+    pub name: String,
+    pub label: String,
+    pub cues_per_reload: i64,
+    pub typical_duration_label: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct MarkupPercent {
+    pub easy: u32,
+    pub medium: u32,
+    pub deep: u32,
+    pub vision: u32,
+}

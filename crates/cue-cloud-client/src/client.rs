@@ -231,6 +231,23 @@ impl CloudClient {
             }
         }
     }
+
+    /// Codex Stage 10: GET an unauthenticated public endpoint
+    /// (e.g. /pricing/tiers, /admin/health). No Authorization header
+    /// attached. Suitable for endpoints in the bluey-server public
+    /// router gate.
+    pub async fn public_get<Resp: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Resp> {
+        let resp = self.http.get(self.url(path)).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(status = %status, body = %body, "public_get error");
+            return Err(Error::Server {
+                status: status.as_u16(),
+            });
+        }
+        Ok(resp.json().await?)
+    }
 }
 
 #[cfg(test)]

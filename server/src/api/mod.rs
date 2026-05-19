@@ -10,6 +10,7 @@ pub mod account;
 pub mod admin;
 pub mod auth_routes;
 pub mod billing;
+pub mod pricing;
 pub mod router;
 pub mod usage;
 
@@ -40,7 +41,8 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
             "/auth/device/poll",
             axum::routing::post(auth_routes::device_poll),
         )
-        .route("/billing/webhook", axum::routing::post(billing::webhook));
+        .route("/billing/webhook", axum::routing::post(billing::webhook))
+        .route("/pricing/tiers", get(pricing::get_tiers));
 
     // ---- Admin-only (require_auth + require_admin) -------------------------
     let admin_only = Router::new()

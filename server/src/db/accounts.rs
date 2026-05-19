@@ -15,6 +15,14 @@ pub struct Account {
     pub auto_topup_threshold_cents: i64,
     pub auto_topup_amount_cents: i64,
     pub is_admin: bool,
+    /// Codex Stage 10: present once the customer has completed their
+    /// first Stripe Checkout. Used as the customer reference for
+    /// off-session auto top-up charges.
+    pub stripe_customer_id: Option<String>,
+    /// Codex Stage 10: present once the PaymentMethod has been
+    /// retrieved (Stage 6 round-2 fix). Used as the saved card for
+    /// off-session auto top-up.
+    pub stripe_payment_method_id: Option<String>,
 }
 
 impl Account {
@@ -23,7 +31,8 @@ impl Account {
         let mut stmt = conn.prepare(
             "SELECT id, email, balance_cents, trial_seconds_remaining,
                     auto_topup_enabled, auto_topup_threshold_cents,
-                    auto_topup_amount_cents, is_admin
+                    auto_topup_amount_cents, is_admin,
+                    stripe_customer_id, stripe_payment_method_id
              FROM accounts WHERE id = ?1",
         )?;
         let row = stmt
@@ -37,6 +46,8 @@ impl Account {
                     auto_topup_threshold_cents: r.get(5)?,
                     auto_topup_amount_cents: r.get(6)?,
                     is_admin: r.get::<_, i64>(7)? == 1,
+                    stripe_customer_id: r.get(8)?,
+                    stripe_payment_method_id: r.get(9)?,
                 })
             })
             .ok();
@@ -48,7 +59,8 @@ impl Account {
         let mut stmt = conn.prepare(
             "SELECT id, email, balance_cents, trial_seconds_remaining,
                     auto_topup_enabled, auto_topup_threshold_cents,
-                    auto_topup_amount_cents, is_admin
+                    auto_topup_amount_cents, is_admin,
+                    stripe_customer_id, stripe_payment_method_id
              FROM accounts WHERE email = ?1",
         )?;
         let row = stmt
@@ -62,6 +74,8 @@ impl Account {
                     auto_topup_threshold_cents: r.get(5)?,
                     auto_topup_amount_cents: r.get(6)?,
                     is_admin: r.get::<_, i64>(7)? == 1,
+                    stripe_customer_id: r.get(8)?,
+                    stripe_payment_method_id: r.get(9)?,
                 })
             })
             .ok();
@@ -71,10 +85,29 @@ impl Account {
     pub fn create(pool: &DbPool, email: &str, password_hash: &str) -> Result<Self> {
         let id = uuid::Uuid::new_v4().to_string();
         let conn = pool.get()?;
-        conn.execute(
+        match conn.execute(
             "INSERT INTO accounts (id, email, password_hash) VALUES (?1, ?2, ?3)",
             params![id, email, password_hash],
-        )?;
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                // Codex Stage 10 (S2.4 nit): map SQLite UNIQUE violation
+                // on `email` to a typed marker error so signup can
+                // return 409 atomically (no race window between
+                // pre-check and INSERT).
+                if let rusqlite::Error::SqliteFailure(ref ff, ref msg) = e {
+                    let is_unique = ff.code == rusqlite::ErrorCode::ConstraintViolation
+                        && msg
+                            .as_deref()
+                            .map(|m| m.to_lowercase().contains("unique"))
+                            .unwrap_or(false);
+                    if is_unique {
+                        return Err(anyhow::anyhow!("duplicate-email"));
+                    }
+                }
+                return Err(e.into());
+            }
+        }
         Ok(Self {
             id,
             email: email.to_string(),
@@ -84,6 +117,8 @@ impl Account {
             auto_topup_threshold_cents: 500,
             auto_topup_amount_cents: 3000,
             is_admin: false,
+            stripe_customer_id: None,
+            stripe_payment_method_id: None,
         })
     }
 
@@ -95,5 +130,29 @@ impl Account {
             .query_row(params![email], |r| r.get::<_, String>(0))
             .ok();
         Ok(hash)
+    }
+}
+#[cfg(test)]
+mod create_dup_tests {
+    use super::*;
+    use crate::db::{open_pool, run_migrations, DbPool};
+
+    fn temp_pool() -> DbPool {
+        let path = std::env::temp_dir().join(format!("bluey-acc-{}.db", uuid::Uuid::new_v4()));
+        let pool = open_pool(&path).unwrap();
+        run_migrations(&pool).unwrap();
+        pool
+    }
+
+    #[test]
+    fn create_returns_duplicate_email_marker_on_unique_violation() {
+        // Codex Stage 10 (S2.4): atomic UNIQUE-violation -> typed marker.
+        let pool = temp_pool();
+        Account::create(&pool, "dup@example.com", "hash1").unwrap();
+        let err = Account::create(&pool, "dup@example.com", "hash2").unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate-email"),
+            "expected duplicate-email marker, got: {err}"
+        );
     }
 }

@@ -76,6 +76,8 @@ mod admin_tests {
             auto_topup_threshold_cents: 0,
             auto_topup_amount_cents: 0,
             is_admin,
+            stripe_customer_id: None,
+            stripe_payment_method_id: None,
         }
     }
 

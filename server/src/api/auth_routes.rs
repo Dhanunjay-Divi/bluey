@@ -129,10 +129,14 @@ pub async fn signup(
         .map_err(|e| err(StatusCode::BAD_REQUEST, &e.to_string()))?;
 
     let account = Account::create(&state.pool, &email, &password_hash).map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("create account: {e}"),
-        )
+        // Codex Stage 10 (S2.4 nit): map the UNIQUE-violation marker
+        // from Account::create to 409 so the signup endpoint is
+        // race-free (the pre-check above is opportunistic; this is
+        // the authoritative atomic check).
+        if e.to_string().contains("duplicate-email") {
+            return err(StatusCode::CONFLICT, "email already registered");
+        }
+        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("create: {e}"))
     })?;
 
     Ok(Json(auth_response(&state, &account)?))

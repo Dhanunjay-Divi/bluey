@@ -1,4 +1,19 @@
 //! Usage event ingestion. Daemon emits a usage event after every cue.
+//!
+//! **Codex Stage 10 / S7.3 (round-2 nit):** the cost_cents_to_bluey,
+//! cost_cents_to_customer, provider, and model fields on incoming
+//! `/usage/event` requests are CLIENT-SUPPLIED and therefore UNTRUSTED.
+//! /router/complete writes its own authoritative usage_event row with
+//! the same request_id (Stage 4 idempotency wired both endpoints to
+//! the same id). The /account/usage SQL aggregation reads the union;
+//! UNIQUE(account_id, request_id, kind) means router-side rows take
+//! precedence on tie because they arrive first.
+//!
+//! In practice, daemon-side /usage/event is now only useful for
+//! *analytics-only* counters that the server can't observe (e.g.
+//! local-Ollama spend with cost=$0, time-on-task histograms). For
+//! billing/tier projection, treat the server-recorded row as
+//! authoritative.
 
 use axum::{extract::State, http::StatusCode, Extension, Json};
 

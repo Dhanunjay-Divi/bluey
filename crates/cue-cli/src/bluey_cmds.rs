@@ -48,12 +48,26 @@ pub async fn show_usage(client: &CloudClient) -> Result<()> {
         println!("Free trial      {mins:.0} minutes remaining");
     }
 
+    // Codex Stage 10 (S8.3 nit): tier numbers fetched from server.
+    let tiers = fetch_pricing_tiers(client).await;
+
     if !usage.mix.is_empty() {
         println!();
         println!("Tier comparison:");
-        println!("  Light       ~3,000 cues per $30 (~3 months)");
-        println!("  Typical     ~1,380 cues per $30 (~5 weeks)");
-        println!("  Heavy         ~825 cues per $30 (~10 days)");
+        if let Some(t) = tiers.as_ref() {
+            for tier in &t.tiers {
+                let dollars = t.reload_amount_cents as f64 / 100.0;
+                println!(
+                    "  {:<11} ~{:>5} cues per ${:.0} ({})",
+                    tier.label, tier.cues_per_reload, dollars, tier.typical_duration_label,
+                );
+            }
+        } else {
+            // Fallback to canonical defaults if /pricing/tiers unreachable.
+            println!("  Light       ~3,000 cues per $30 (~3 months)");
+            println!("  Typical     ~1,380 cues per $30 (~5 weeks)");
+            println!("  Heavy         ~825 cues per $30 (~10 days)");
+        }
         println!();
         println!("Last 7 days breakdown:");
         for entry in &usage.mix {
@@ -86,4 +100,18 @@ pub async fn show_credits(client: &CloudClient) -> Result<()> {
     println!("Per-batch expiration listing is coming in a future release.");
     println!("For now: every $30 reload stays active for 1 year from its purchase date.");
     Ok(())
+}
+
+async fn fetch_pricing_tiers(client: &CloudClient) -> Option<cue_cloud_client::PricingTiers> {
+    // /pricing/tiers is public (no auth). Use the unauthenticated GET path.
+    match client
+        .public_get::<cue_cloud_client::PricingTiers>("/pricing/tiers")
+        .await
+    {
+        Ok(t) => Some(t),
+        Err(e) => {
+            eprintln!("could not fetch /pricing/tiers: {e}");
+            None
+        }
+    }
 }
