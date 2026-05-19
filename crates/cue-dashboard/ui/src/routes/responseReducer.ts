@@ -7,16 +7,42 @@
 // in the final chunk so this happens to work, but the contract is fragile.
 // Round 12 hardens it: always append the delta first, then mark complete.
 //
+// Round 14 (R14.4 + R14.5) extends the contract for Bluey Auto:
+// - `replace_body: true` on a chunk means "replace the entire card body
+//   with this text, do not append" — used by the SpeculativeRouter when the
+//   Deep lane completes and we want to swap the draft for the refined
+//   answer cleanly.
+// - `router_meta` carries Auto Router classification + chosen provider so
+//   the UI can render a lane badge.
+//
 // The function is pure so we can unit-test it deterministically without
 // driving Tauri events.
 
 export type CueResponseKind = "answer" | "suggestion" | "recap";
+
+/** Auto Router metadata mirrored from the daemon's RouterMeta. */
+export interface RouterMeta {
+  task_type: string;
+  latency_lane: string;
+  provider_lane: string;
+  provider_name: string;
+  model: string;
+  confidence: number;
+}
 
 export interface InflightResponse {
   kind: CueResponseKind;
   text: string;
   /** True once the daemon has emitted a chunk with `finished: true`. */
   done: boolean;
+  /** Auto Router classification + provider for this entry, if known. */
+  routerMeta?: RouterMeta;
+  /**
+   * True if a `replace_body` chunk has fired for this entry. Used by the UI
+   * to render a "refined" indicator distinguishing the deep answer from the
+   * earlier draft.
+   */
+  refined?: boolean;
 }
 
 export interface CueResponseChunk {
@@ -24,6 +50,19 @@ export interface CueResponseChunk {
   kind?: CueResponseKind;
   partial_text: string;
   finished: boolean;
+  /**
+   * When true, the chunk REPLACES the entire current text instead of
+   * appending. Used by the SpeculativeRouter Deep lane Final chunk so the
+   * draft → final transition is a clean swap instead of a "[refined]\n…"
+   * concatenation hack.
+   */
+  replace_body?: boolean;
+  /**
+   * Auto Router metadata. Daemon emits this on the FIRST chunk only;
+   * subsequent chunks carry None. The reducer pins it onto the inflight
+   * entry so it persists across all chunks.
+   */
+  router_meta?: RouterMeta;
 }
 
 /**
@@ -41,7 +80,13 @@ export interface CueResponseChunk {
  *      from "answer" to a more specific kind).
  *   4. Out-of-order chunks (impossible in our daemon today, but possible
  *      if the underlying transport ever reordered) are appended in the
- *      order received \u2014 we have no sequence numbers to reorder by.
+ *      order received — we have no sequence numbers to reorder by.
+ *   5. NEW (R14.4): if `replace_body: true`, the entry's text is set to
+ *      `partial_text` instead of being appended; the entry is also
+ *      marked `refined: true` for UI hinting.
+ *   6. NEW (R14.5): if `router_meta` is present, it is stored on the
+ *      entry; subsequent chunks without `router_meta` keep the previously
+ *      stored value.
  */
 export function applyChunk(
   prev: ReadonlyMap<string, InflightResponse>,
@@ -50,16 +95,24 @@ export function applyChunk(
   const next = new Map(prev);
   const existing = next.get(chunk.response_id);
 
-  // Always append the delta, even on the finished chunk. This preserves any
-  // trailing text the daemon includes in the last chunk (punctuation, final
-  // tokens) instead of silently dropping it.
-  const text = (existing?.text ?? "") + chunk.partial_text;
+  const text = chunk.replace_body
+    ? chunk.partial_text
+    : (existing?.text ?? "") + chunk.partial_text;
+
   const kind: CueResponseKind = chunk.kind ?? existing?.kind ?? "answer";
+
+  // Sticky router_meta: keep prior value if this chunk does not include one.
+  const routerMeta = chunk.router_meta ?? existing?.routerMeta;
+
+  // Refined flag: sticky once set true.
+  const refined = chunk.replace_body || existing?.refined || false;
 
   next.set(chunk.response_id, {
     kind,
     text,
     done: chunk.finished,
+    routerMeta,
+    refined,
   });
 
   return next;

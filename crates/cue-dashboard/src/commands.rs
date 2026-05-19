@@ -857,6 +857,12 @@ pub struct CueResponseChunkPayload {
     /// subsequent chunks (router_meta = None on those).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub router_meta: Option<RouterMeta>,
+    /// R14.4: when true, the UI replaces the entire card body with
+    /// `partial_text` instead of appending. Used by the SpeculativeRouter
+    /// Deep lane Final chunk so the draft -> final transition is a clean
+    /// swap rather than a `\"[refined]\n...\"` concatenation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replace_body: Option<bool>,
 }
 
 /// Subset of cue_router::TaskClassification + ProviderRoute exposed to the UI.
@@ -1015,6 +1021,7 @@ async fn try_speculative_dispatch(
                         partial_text: text,
                         finished,
                         router_meta: meta_for_chunk,
+                        replace_body: None,
                     },
                 );
             }
@@ -1027,9 +1034,10 @@ async fn try_speculative_dispatch(
                     CueResponseChunkPayload {
                         response_id: response_id.to_string(),
                         kind: kind.to_string(),
-                        partial_text: format!("\n\n[refined]\n{text}"),
+                        partial_text: text.clone(),
                         finished: true,
                         router_meta: None,
+                        replace_body: Some(true),
                     },
                 );
                 final_text = Some(text);
@@ -1176,6 +1184,7 @@ pub async fn request_cue(
                         partial_text: partial.to_string(),
                         finished,
                         router_meta: meta_for_chunk,
+                        replace_body: None,
                     },
                 );
             })
@@ -1200,6 +1209,7 @@ pub async fn request_cue(
                         partial_text: partial.to_string(),
                         finished,
                         router_meta: meta_for_chunk,
+                        replace_body: None,
                     },
                 );
             })
@@ -1272,6 +1282,7 @@ pub async fn auto_recap(
                         partial_text: partial.to_string(),
                         finished,
                         router_meta: None, // recap is not yet routed via AutoRouter
+                        replace_body: None,
                     },
                 );
             },

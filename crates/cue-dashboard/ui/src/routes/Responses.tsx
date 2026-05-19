@@ -2,6 +2,7 @@ import { useEffect, useState, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { applyChunk, clearInflight, type CueResponseChunk, type InflightResponse } from "./responseReducer";
+import { LaneBadge } from "./LaneBadge";
 
 interface CueResponse {
   id: string;
@@ -80,13 +81,22 @@ export function Responses() {
 
   const renderInflightCard = (id: string, data: InflightResponse) => (
     <div key={`inflight-${id}`} className="rounded border border-blue-600 bg-zinc-800 p-3 space-y-1 animate-pulse">
-      <div className="flex items-center gap-2">
-        <span className="text-xs text-blue-400 font-medium">Streaming…</span>
-        <span className="text-xs text-zinc-500">{data.kind}</span>
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-blue-400 font-medium">
+            {data.refined ? "Refined" : "Streaming…"}
+          </span>
+          <span className="text-xs text-zinc-500">{data.kind}</span>
+        </div>
+        {data.routerMeta ? (
+          <LaneBadge meta={data.routerMeta} refined={data.refined} />
+        ) : null}
       </div>
       <p className="text-sm text-zinc-200 whitespace-pre-wrap">
         {data.text || "⏳"}
-        <span className="inline-block w-1 h-4 bg-blue-400 ml-0.5 animate-pulse" />
+        {!data.done ? (
+          <span className="inline-block w-1 h-4 bg-blue-400 ml-0.5 animate-pulse" />
+        ) : null}
       </p>
     </div>
   );
