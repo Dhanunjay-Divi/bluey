@@ -23,6 +23,7 @@ pub mod billing;
 pub mod config;
 pub mod db;
 pub mod pricing;
+pub mod rate_limit;
 pub mod routing;
 
 pub use config::Config;

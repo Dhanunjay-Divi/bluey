@@ -19,27 +19,59 @@ pub mod usage;
 pub struct AppState {
     pub pool: DbPool,
     pub config: Arc<Config>,
+    /// Codex Stage 11: per-IP rate limiters for sensitive endpoints.
+    pub rate_limiters: crate::rate_limit::RateLimiters,
 }
 
 pub fn build_router(pool: DbPool, config: Config) -> Router {
     let state = AppState {
         pool,
         config: Arc::new(config),
+        rate_limiters: crate::rate_limit::RateLimiters::default(),
     };
 
     // ---- Public (no auth) ---------------------------------------------------
     let public = Router::new()
         .route("/admin/health", get(admin::health))
-        .route("/auth/signup", axum::routing::post(auth_routes::signup))
-        .route("/auth/login", axum::routing::post(auth_routes::login))
-        .route("/auth/refresh", axum::routing::post(auth_routes::refresh))
+        .route(
+            "/auth/signup",
+            axum::routing::post(auth_routes::signup).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_signup,
+                ),
+            ),
+        )
+        .route(
+            "/auth/login",
+            axum::routing::post(auth_routes::login).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_login,
+                ),
+            ),
+        )
+        .route(
+            "/auth/refresh",
+            axum::routing::post(auth_routes::refresh).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_refresh,
+                ),
+            ),
+        )
         .route(
             "/auth/device/start",
             axum::routing::post(auth_routes::device_start),
         )
         .route(
             "/auth/device/poll",
-            axum::routing::post(auth_routes::device_poll),
+            axum::routing::post(auth_routes::device_poll).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_device_poll,
+                ),
+            ),
         )
         .route("/billing/webhook", axum::routing::post(billing::webhook))
         .route("/pricing/tiers", get(pricing::get_tiers));
@@ -53,7 +85,15 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
     let protected = Router::new()
         .route("/account/me", get(account::me))
         .route("/account/usage", get(account::usage))
-        .route("/router/complete", axum::routing::post(router::complete))
+        .route(
+            "/router/complete",
+            axum::routing::post(router::complete).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_router_complete,
+                ),
+            ),
+        )
         .route("/router/embed", axum::routing::post(router::embed))
         .route(
             "/router/transcribe",
