@@ -7,6 +7,7 @@ members = [
     "crates/cue-llm",
     "crates/cue-stealth",
     "crates/cue-rag",
+    "crates/cue-cloud-client",
     "crates/cue-router",
 ]
 resolver = "2"

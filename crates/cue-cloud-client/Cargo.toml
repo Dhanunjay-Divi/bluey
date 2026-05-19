@@ -1,0 +1,19 @@
+[package]
+name = "cue-cloud-client"
+version.workspace = true
+edition = "2021"
+description = "Bluey daemon's HTTPS client for bluey-server (auth, license, managed router)."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+keyring = "2"
+url.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true
