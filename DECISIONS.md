@@ -9,6 +9,40 @@
 
 ---
 
+## 2026-05-19 — Pricing tiers visible in product UI
+
+**Source:** user direction.
+**Decision:** the pricing model is not a back-end-only concern. The
+three usage tiers (Light / Typical / Heavy), the per-question cost
+table, and the customer's current tier projection MUST be visible in
+the product. Specifically:
+
+- Onboarding screen after first $30 reload shows the three tier table.
+- `/account/usage` dashboard shows the customer's rolling-7-day mix,
+  which tier they fall into, and how many days $30 lasts at their
+  current rate.
+- `bluey usage` CLI command prints the same.
+- Each cue card in the overlay shows a per-card cost label below the
+  body (e.g. `$0.04 · 412 in / 89 out · 1.8s`).
+- Overlay top strip shows live balance only (intentionally minimal).
+
+**Markup tiers locked:**
+- Easy / Medium → 200% markup (×3 over Bluey's upstream cost)
+- Deep speculative → 150% markup (×2.5)
+- Vision → 150% markup (×2.5)
+
+**Why "always visible" matters:** transparent metering is the trust
+contract. Customers must never be surprised by their balance, never be
+unsure what a cue cost, and never have to guess how long $30 lasts.
+
+**Don't retry without new context.** Hiding cost from customers is the
+fast path to chargebacks + churn. The Bluey product UX explicitly
+opts into transparency.
+
+See `docs/PRICING-MODEL.md` for the locked numbers + UI mockups.
+
+---
+
 ## 2026-05-19 — Prepaid wallet + auto top-up + 10-min free trial
 
 **Source:** user direction.

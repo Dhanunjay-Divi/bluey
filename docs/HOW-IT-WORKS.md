@@ -352,6 +352,23 @@ Customer ──$──► Bluey ──$──► OpenAI            Customer has 
                 Deepgram (cloud STT, when used)
 ```
 
+## 10.5. Pricing model + tier visibility
+
+The exact per-question costs, the three usage tiers, and the UI
+surfaces that show this to the customer live in
+**`docs/PRICING-MODEL.md`**. Read that doc for:
+
+- Locked markup tiers (200% Easy/Medium, 150% Deep, 150% Vision).
+- Per-question cost table for every task type.
+- Light / Typical / Heavy usage profiles + cues-per-$30 numbers.
+- Mockups for: onboarding screen, `/account/usage` dashboard,
+  `bluey usage` CLI command, overlay top strip, per-cue cost label.
+- Bluey gross margin per lane.
+- Levers for future tuning.
+
+The rule: **customers always see the cost.** Per-card label, live
+balance, tier projection. No hidden charges, no opaque billing.
+
 ## 11. Architecture cross-references
 
 - `ARCHITECTURE.md` — three-layer model, monetization plug-points.

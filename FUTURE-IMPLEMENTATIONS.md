@@ -245,6 +245,34 @@ just see errors).
 **Estimate:** 5-7 days code + tests + Stripe integration.
 **Trigger to ship:** R14.9 server + R14.11 ManagedProvider land.
 
+### R14.14 — Cost-label UX + tier visibility (daemon + dashboard)
+
+**Status:** required for v0.2 launch.
+**See:** `docs/PRICING-MODEL.md` Section 4 for the exact mockups.
+
+**Approach:**
+
+- Server-side: `/account/usage` returns rolling-7-day mix + projected
+  duration + which tier the user falls into. Computed nightly, cached
+  for 60s. Hits SQLite `usage_events` table aggregated by
+  `task_type`/`lane`.
+- Daemon-side: `bluey usage` CLI command formats and prints the
+  server response. `bluey credits` shows per-batch expiration dates.
+- Overlay top strip: live balance display from `RouterMeta`/account
+  poll. Compact, minimal, no tier info.
+- Cue card: per-card cost label (`$0.04 · 412 in / 89 out · 1.8s`)
+  rendered from the response trailer's `cost_cents`,
+  `input_tokens`, `output_tokens`, `latency_ms` fields.
+- Dashboard `/account/usage` page: rolling-7-day breakdown chart,
+  tier comparison panel, "your $X.XX lasts ~N days" projection.
+- Onboarding screen `/onboarding/welcome` (after first reload):
+  static tier table from `PRICING-MODEL.md` + auto-top-up + credit
+  validity disclosure.
+
+**Estimate:** 3-4 days (UI work split across overlay, dashboard,
+CLI, plus the server-side aggregation endpoint).
+**Trigger to ship:** R14.13 wallet + R14.11 ManagedProvider land.
+
 ### Stripe live mode (Stage 4)
 
 **Status:** parked until product server scaffold + Stage 3 daemon

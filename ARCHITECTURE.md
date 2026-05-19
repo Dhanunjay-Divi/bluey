@@ -340,6 +340,8 @@ both know how to talk to the cloud service.
 - `FUTURE-IMPLEMENTATIONS.md` — canonical tracker for deferred work.
 - **`docs/HOW-IT-WORKS.md` — end-to-end v0.2 customer flow (signup,
   login, request, billing, hard-stop, fallback).**
+- **`docs/PRICING-MODEL.md` — locked pricing tiers, per-question
+  cost table, usage profiles, UI surfaces.**
 - `docs/AUTO-ROUTING-USP.md` — Auto Router product framing.
 - `docs/BLUEY-DISTRIBUTION-ARCHITECTURE.md` — Layer 2 path comparison.
 - `docs/PRODUCTION-READINESS.md` — what ships vs what's pending matrix.

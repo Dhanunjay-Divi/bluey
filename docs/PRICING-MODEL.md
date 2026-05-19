@@ -1,0 +1,263 @@
+# Bluey Pricing Model
+
+> **Source of truth for v0.2 pricing, markup, tiers, and where this
+> info appears in the product UI.**
+>
+> Locked decisions live here; rationale + math live in the
+> per-decision sections. Cross-referenced from `DECISIONS.md`,
+> `docs/HOW-IT-WORKS.md`, `FUTURE-IMPLEMENTATIONS.md` R14.13.
+>
+> Last updated: 2026-05-19.
+
+---
+
+## 1. Locked decisions
+
+| Field | Value | Why |
+|---|---|---|
+| First reload | $30 (flat) | clean entry; covers a typical month |
+| Auto-reload trigger | balance < $5 | small enough to be invisible, large enough to avoid mid-stream cuts |
+| Auto-reload amount | $30 minimum, configurable higher | heavy users can set $50/$100 to reload less often |
+| Credit validity | **1 year from purchase** | per-batch, FIFO; balance carries forward across reloads as long as oldest batch < 365 days |
+| Markup floor | **150%** | user direction 2026-05-19 |
+| Markup tier — Easy/Medium | 200% | absolute cents are tiny; small markup absurd |
+| Markup tier — Deep speculative | 150% | absolute cost is more visible to customer |
+| Markup tier — Vision | 150% | gpt-4o vision pricing already high |
+| Hard stop | balance < estimated cost → 402 | no debt, no surprise charges |
+| Mid-stream cut | running cost > balance → cut + Bluey eats overrun | customer never sees overrun deduction |
+| Free trial | 10 minutes of active session time | mirrors Pinky |
+
+---
+
+## 2. Per-question-type cost table
+
+| Type | Tokens / images | Provider/model | Bluey raw | Customer pays |
+|---|---|---|---|---|
+| Easy code | ~250 tokens | gpt-4o-mini Instant | $0.00008 | **$0.0003** (0.03¢) |
+| Medium code | ~1,400 tokens | claude-3-5-sonnet Balanced | $0.011 | **$0.034** (3.4¢) |
+| Hard code (speculative: Instant + Deep) | ~4,000 tokens | gpt-4o-mini + claude-3-7 | $0.020 | **$0.050** (5¢) |
+| System design (speculative) | ~5,000 tokens | gpt-4o-mini + claude-3-7 | $0.041 | **$0.104** (10.4¢) |
+| Vision ("what's on this screen") | 1 image + ~500 tokens | gpt-4o vision | $0.018 | **$0.046** (4.6¢) |
+| Easy general tech | ~300 tokens | gpt-4o-mini Instant | $0.00008 | **$0.0003** (0.03¢) |
+| Medium general tech | ~900 tokens | claude-3-5-sonnet | $0.009 | **$0.026** (2.6¢) |
+
+The customer-facing app shows `$0.034` style values rounded to the
+nearest tenth of a cent in real time. Internal accounting uses
+fractional cents (the daemon emits 4-decimal cents to bluey-server;
+bluey-server does the integer arithmetic).
+
+---
+
+## 3. Three usage tiers (the product MUST show these to customers)
+
+These are realistic mixes used to project wallet duration. The product
+UI shows the customer their current rolling-7-day mix and tells them
+which tier they're in, so the $30 → time projection makes sense.
+
+### Light — quick lookups, occasional medium
+
+```
+Mix:    55% Easy code · 15% Medium code · 3% Hard ·
+        1% System design · 3% Vision ·
+        18% Easy general · 5% Medium general
+
+Avg per cue:        $0.011
+Cues per $30:       ~2,850
+Hours focused work: ~60–95
+$30 lasts:          ~3 months at 30 min/day
+```
+
+### Typical tech user — real coding + occasional design + few screenshots
+
+```
+Mix:    35% Easy code · 22% Medium code · 8% Hard ·
+        6% System design · 5% Vision ·
+        18% Easy general · 6% Medium general
+
+Avg per cue:        $0.022
+Cues per $30:       ~1,380
+Hours focused work: ~25–45
+$30 lasts:          ~5 weeks at 1 hr/day → 1 reload/month
+```
+
+### Heavy user — lots of Hard, vision attachments, design work
+
+```
+Mix:    18% Easy code · 28% Medium code · 18% Hard ·
+        12% System design · 8% Vision ·
+        10% Easy general · 6% Medium general
+
+Avg per cue:        $0.036
+Cues per $30:       ~825
+Hours focused work: ~15–25
+$30 lasts:          ~10 days at multi-hour daily use → 2–3 reloads/month
+```
+
+---
+
+## 4. Where this appears in the product UI
+
+**Decision (2026-05-19, user):** keep tier breakdown ON SCREEN —
+customers should see what they're getting before they pay. Three
+surfaces:
+
+### 4.1 Onboarding screen (after first $30 reload)
+
+Bluey dashboard at `https://bluey.dev/onboarding/welcome` shows:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Welcome to Bluey — your $30 is loaded.                         │
+│                                                                 │
+│  Here's roughly what $30 buys, depending on how you use Bluey:  │
+│                                                                 │
+│    💼  Light user        ~2,850 cues   ~3 months                │
+│    ⚙️   Typical tech     ~1,380 cues   ~5 weeks                  │
+│    🔥  Heavy user        ~825 cues     ~10 days                 │
+│                                                                 │
+│  Auto top-up is ON (default). When your balance drops below $5, │
+│  we'll charge $30. You can change the amount or turn it off in  │
+│  Settings.                                                      │
+│                                                                 │
+│  Credits stay active for 1 year. Unused balance after 365 days  │
+│  expires — we'll email you 30 days before that happens.         │
+│                                                                 │
+│                          [   Got it   ]                         │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 Live dashboard `/account/usage`
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│  Balance:  $27.43           Auto top-up:  ON, $30 at <$5         │
+│                                                                  │
+│  Your last 7 days:                                               │
+│    132 cues · $4.12 spent                                        │
+│    ┌────────────────────────────────────────┐                    │
+│    │ Easy code       ████████████  40%      │                    │
+│    │ Medium code     ████          14%      │                    │
+│    │ Hard code       █             5%       │                    │
+│    │ System design   ▎             2%       │                    │
+│    │ Vision          ██            7%       │                    │
+│    │ Easy general    ████████      28%      │                    │
+│    │ Medium general  █             4%       │                    │
+│    └────────────────────────────────────────┘                    │
+│                                                                  │
+│  You're a Typical tech user.                                     │
+│  At your current rate, $27.43 lasts ~32 more days.               │
+│                                                                  │
+│  ┌────── Tier comparison ──────┐                                 │
+│  │ Light      ~2,850 cues / $30  ~3 months                      │
+│  │ Typical    ~1,380 cues / $30  ~5 weeks  ← you                │
+│  │ Heavy      ~825 cues / $30   ~10 days                        │
+│  └─────────────────────────────┘                                 │
+│                                                                  │
+│  [ Add $30 now ]  [ Change auto top-up settings ]                │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+### 4.3 CLI command `bluey usage`
+
+```
+$ bluey usage
+
+Balance         $27.43      (auto top-up: ON, $30 at <$5)
+Last 7 days     132 cues, $4.12 spent
+Tier            Typical tech user
+Projection      $27.43 lasts ~32 days at your current rate
+
+Tier comparison:
+  Light       ~2,850 cues per $30 (~3 months)
+  Typical     ~1,380 cues per $30 (~5 weeks)   ← you
+  Heavy         ~825 cues per $30 (~10 days)
+
+Per-cue cost (last 50):
+  $0.0003   Easy code        (×18)
+  $0.034    Medium code      (×9)
+  $0.050    Hard code        (×3)
+  $0.046    Vision           (×2)
+  ...
+
+Credits expire 1 year from purchase. Run `bluey credits` for
+batch-by-batch expiration dates.
+```
+
+### 4.4 Overlay top strip (always visible, minimal)
+
+```
+💰 $27.43   ●  Bluey   ▾
+```
+
+The overlay top strip is intentionally minimal — just the live
+balance + status dot. Tier info and projections live in the
+expanded panel + dashboard + CLI to avoid cluttering the pill.
+
+### 4.5 Per-cue cost label (inline in the feed)
+
+```
+$0.04 · 412 in / 89 out · 1.8s
+```
+
+This appears below each cue card after the stream completes.
+Always visible, always honest.
+
+---
+
+## 5. Bluey gross margin
+
+Per-request margin given the markup tiers:
+
+| Lane | Bluey raw | Customer pays | Bluey margin per request |
+|---|---|---|---|
+| Easy/Medium (200% markup) | $0.0001–$0.011 | 3× raw | ~67% |
+| Deep speculative (150% markup) | $0.020–$0.041 | 2.5× raw | ~60% |
+| Vision (150% markup) | $0.018 | 2.5× raw | ~60% |
+
+After Stripe processing fees (~3% per top-up) and cloud infra costs,
+the per-request margin floor stays above 55%. Healthy SaaS economics.
+
+---
+
+## 6. Competitive positioning
+
+| Product | Cost | What's included |
+|---|---|---|
+| ChatGPT Plus | $20/mo | unlimited GPT-4 (rate-limited) |
+| Cursor Pro | $20/mo | 500 fast requests + unlimited slow |
+| GitHub Copilot | $10–19/mo | autocomplete + chat |
+| **Bluey, light** | **~$10/mo equivalent** | managed routing + auto draft+refine + RAG memory + transcript-aware cues |
+| **Bluey, typical** | **~$25–30/mo equivalent** | same |
+| **Bluey, heavy** | **~$60–90/mo equivalent** | same, more usage |
+
+Bluey lands in the standard SaaS pricing band for light/typical
+users and scales naturally for heavy users via the wallet model.
+
+---
+
+## 7. Levers if we want to tune later
+
+These are NOT changes for v0.2; they're knobs for future iterations
+once we have real usage data.
+
+| Want | Lever | Effect |
+|---|---|---|
+| Cheaper for light users | Drop Easy markup to 100% | $30 lasts ~30% longer for light tier; margin drops to 50% |
+| More premium positioning | Raise Easy markup to 300% | $30 lasts 25% less; absolute cents still tiny ($0.0004) |
+| More predictable revenue | Add a $20/mo flat tier alongside wallet | classic SaaS funnel; complicates billing UI |
+| Encourage Hard usage | Drop Deep markup to 100% | speculative cost more attractive; margin still 50% |
+| Discourage Hard usage | Raise Deep markup to 200% | $30 lasts shorter for heavy users; pushes Easy/Medium |
+
+---
+
+## 8. Implementation references
+
+- `FUTURE-IMPLEMENTATIONS.md::R14.13` — server-side wallet implementation.
+- `FUTURE-IMPLEMENTATIONS.md::R14.14` (NEW, see below) — daemon-side
+  cost label + balance display + tier visibility UX.
+- `docs/HOW-IT-WORKS.md::Section 3` — overlay UI mockup including
+  per-card cost label.
+- `docs/HOW-IT-WORKS.md::Section 4–7` — request flow, balance check,
+  hard stop, mid-stream cut.
+- `DECISIONS.md` — the prepaid-wallet, no-BYOK, markup, and "always
+  visible" decisions.
