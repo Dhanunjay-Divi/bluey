@@ -1,8 +1,14 @@
 # PHASE-3-ROUND-14-PLAN.md
 
-**Status:** Planning. Tracks R13.3 follow-on (sqlite-vec / true ANN), R13.4
-(Windows whisper.cpp), and R13.5 (cross-platform matrix). None of these block
-v0.1.0 internal testing.
+**Status:** In progress. v0.1.0 GA tagged on `c34592a` (macOS arm64 +
+universal). R14.3 (macOS x86_64), R14.4 (replace_body for clean draft -> final),
+and R14.5 (LaneBadge UI) **shipped** in commits `0340aad`, `c34592a`. Auto
+Router default flipped to ON (`8a3051d`). Distribution server architecture
+chosen (`78b171c`).
+
+Outstanding: R14.1 ANN, R14.2 Windows whisper, R14.3 Linux portion, R14.6
+telemetry, R14.7 clean-machine validation, R14.8 distribution server build,
+R14.9 product server scaffold.
 
 R13 left these items deliberately. Round 13 prioritised local correctness +
 Auto Router observability + heap-based top-k for the existing RAG store. This
@@ -76,6 +82,8 @@ toolchain pollution).
 
 ## R14.3 — Cross-platform support matrix expansion
 
+**Status:** 🟡 PARTIAL. macOS x86_64 + universal lipo done in `0340aad` (`scripts/build-macos-universal.sh`, Makefile `package-darwin-universal` target, link-tested only). Linux x86_64 and Windows still pending.
+
 **Source:** R12 review cross-task finding / R13.5.
 
 R13 honestly scoped v0.1.0 to macOS arm64. R14 expands:
@@ -99,6 +107,8 @@ actual support matrix. Until then v0.1.0 stays macOS arm64-only.
 
 ## R14.4 — Replace draft "[refined]" tag with real card replacement
 
+**Status:** ✅ DONE in `c34592a`. Daemon emits `replace_body: true` on the deep Final chunk; reducer + LaneBadge handle the swap. Vitest tests cover the contract.
+
 **Source:** R13.x speculative wiring follow-up.
 
 **Today:** when `BLUEY_SPECULATIVE_ROUTING=1` and a Hard question fires the
@@ -116,6 +126,8 @@ Or extend `CueResponseChunkPayload` with a `replace_body: bool` field.
 ---
 
 ## R14.5 — Dashboard lane-badge UI
+
+**Status:** ✅ DONE in `c34592a`. `LaneBadge.tsx` renders above each in-flight card showing latency lane (color), task type, provider/model, confidence, and a REFINED tag once the deep lane has replaced the draft. Tooltip shows full RouterMeta JSON.
 
 **Source:** R13.x router-meta wiring follow-up.
 
@@ -174,3 +186,73 @@ Output: a checklist that becomes the GA gate.
 6. **R14.2** — Windows whisper.cpp (2-3 days, requires Windows bench).
 7. **R14.3 Linux** — Linux build (3 hours).
 8. **R14.6** — telemetry (gated on sink + privacy review).
+
+---
+
+## R14.8 — Distribution server (NEW)
+
+**Source:** user direction 2026-05-19.
+
+**Today:** `make package-darwin-arm64` + `make package-darwin-universal`
+produce `dist/bluey-0.1.0-darwin-*.tar.gz`. Bits live on uno only. No
+network endpoint. Internal testers cannot install without ssh access to
+uno.
+
+**Decided architecture:** see `docs/BLUEY-DISTRIBUTION-ARCHITECTURE.md`.
+Bluey distribution is a **separate** infrastructure from Pinky (per user
+2026-05-19, Pinky and Bluey are different products). Three paths
+laid out (A: standalone Go server, B: CDN + object store, C: nginx
+static + droplet). Recommendation pending user pick.
+
+**URL contract is locked regardless of backend choice:**
+
+```
+GET /install                  templated bash
+GET /install.sh               alias
+GET /install.ps1              templated pwsh (Windows)
+GET /latest.json              release manifest
+GET /downloads/v<ver>/        versioned assets (immutable)
+GET /admin/health             liveness check
+```
+
+**Estimate:**
+- Path C (nginx+static): 1.5–2 hr setup + DNS.
+- Path A (Go server): 4–6 hr scaffolding + 2 hr deploy.
+- Path B (CDN): 2–3 hr if CDN account exists, 4–6 hr from scratch.
+
+**Blocker:** user must pick path + provide droplet IP / domain / CDN account.
+
+---
+
+## R14.9 — Product server scaffold (deferred)
+
+**Source:** user direction 2026-05-19 (monetization conversation).
+
+**Scope:** when monetization is the goal, distribution server alone is
+not enough. Need an additional product server with auth, billing, license
+check, managed Auto Router endpoint, account dashboard, and admin UI.
+
+**Recommended timeline (Timeline Y in the conversation):**
+
+1. Ship distribution server (R14.8) for internal v0.1 testing.
+2. In parallel, scaffold product server skeleton:
+   - Auth (signup/login/refresh/reset, device registration).
+   - Stripe in test mode (subscription state, webhook handler, plan
+     enforcement stub).
+   - Managed Auto Router endpoint stub (Bluey-owned API keys server-side,
+     proxy + budget cap per tenant).
+   - Account dashboard (Tauri or web).
+   - Admin dashboard (Bluey-team only, read + refund + ban).
+3. Flip Stripe to live mode when v0.2 paid alpha launches.
+
+**Why this matters:** without a managed router endpoint, BYOK leaves Bluey
+with no monetization handle. The Auto Router crate (`cue-router`) is the
+foundation; the product server makes it Bluey-managed instead of
+user-managed.
+
+**Estimate:** 1–2 weeks dedicated work. Separate repo
+(`bluey-server`?) so Bluey-the-app keeps its current local-first
+shape while the cloud service evolves independently.
+
+**Blocker:** user must explicitly green-light the monetization track. This
+item is parked until then.
