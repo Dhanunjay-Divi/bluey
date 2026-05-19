@@ -1,7 +1,7 @@
-# REVIEW: Server Stage 2 — Auth
+# REVIEW: Server Stage 2 — Auth Recheck
 
-**Commit:** `07136ed feat(server): real auth - signup, login, refresh, device flow (Stage 2)`
-**Builds on:** `853be40`
+**Original commit:** `07136ed feat(server): real auth - signup, login, refresh, device flow (Stage 2)`
+**Re-review tip:** `20cd0b3 fix(R14): clear remaining codex blockers — stale paths + speculative doc comment`
 **Reviewer:** Codex
 **Date:** 2026-05-19
 
@@ -15,22 +15,24 @@
 | Verdict | 🟢 accept |
 
 **Findings:**
-- HS256 with one server-held secret is acceptable for a single-instance v0.2 server where no third party verifies tokens.
-- 15-minute access tokens and 30-day rotating refresh tokens are a sane default.
-- Bcrypt cost 12, min length 8, and reject-over-72-byte behavior are all reasonable. Add breached-password screening later with rate limiting, not as a blocker for this stage.
+
+- HS256 with one server-held secret is acceptable for the current single-server v0.2 shape.
+- 15-minute access tokens and 30-day rotating refresh tokens remain sane defaults.
+- Bcrypt cost 12, min length 8, and reject-over-72-byte behavior are reasonable for this stage. Rate limiting and breached-password screening remain later hardening work.
 
 ---
 
-### S2.2 — Public Route Table / Auth Boundary
+### S2.2 — Protected Route Boundary
 
 | Field | Value |
 |-------|-------|
-| Files | `server/src/api/mod.rs`, `server/src/api/admin.rs`, `server/src/api/auth.rs` |
+| Files | `server/src/api/mod.rs`, `server/src/api/admin.rs` |
 | Verdict | 🔴 blocker |
 
 **Findings:**
-- 🔴 Stage 2 still mounts every route publicly (`server/src/api/mod.rs:29-55`). That includes `GET /admin/customers`, which returns customer IDs, emails, and balances (`server/src/api/admin.rs:33-67`), and `POST /auth/device/approve`, which mutates device-code state (`server/src/api/auth.rs:285-310`). Even if most product endpoints return 501, these two are live and should not be public.
-- 🔴 `device_approve` is not a safe placeholder. It writes `account_id = "test-account-id-stub"` for any submitted user code (`server/src/api/auth.rs:299-304`), so a public caller can approve a device code into a broken state; subsequent poll tries to fetch that fake account and fails. Either keep approve unimplemented until middleware exists, or implement access-token auth and bind the real account now.
+
+- 🟢 The original public-route blocker is partially fixed: `/account/*`, `/router/*`, `/billing/checkout`, `/usage/event`, `/auth/device/approve`, and `/admin/customers` now sit behind `auth::require_auth` (`server/src/api/mod.rs:45-65`).
+- 🔴 `/admin/customers` is still only normal-auth protected, not admin-role protected (`server/src/api/mod.rs:61`, `server/src/api/admin.rs:33-67`). Any logged-in customer can list other customer IDs, emails, and balances. Because Stage 2 introduced `Account::is_admin`, the fix should be either a `require_admin` middleware or an explicit `AuthedAccount(account)` check in the handler.
 
 ---
 
@@ -38,12 +40,13 @@
 
 | Field | Value |
 |-------|-------|
-| Files | `server/src/api/auth.rs`, `server/src/auth/refresh_store.rs` |
-| Verdict | 🔴 blocker |
+| Files | `server/src/api/auth_routes.rs`, `server/src/auth/refresh_store.rs` |
+| Verdict | 🟢 accept |
 
 **Findings:**
-- 🔴 Refresh rotation is not single-use under concurrency. `/auth/refresh` validates the old token, then later revokes it in a separate DB operation (`server/src/api/auth.rs:144-159`). Two concurrent refreshes can both pass `validate_and_touch()` before either `revoke()` runs, and both can mint a new pair. Replace this with an atomic consume operation, e.g. one transaction or `UPDATE refresh_tokens SET revoked_at = now WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > now`, then only issue the replacement if exactly one row was updated.
-- 🟡 `validate_and_touch()` maps query errors to `None` via `.ok()` (`server/src/auth/refresh_store.rs:41-48`). For auth failures that is fine, but DB/schema errors should not be silently treated as invalid tokens. Return errors for DB failures and `Ok(None)` only for a real not-found row.
+
+- The original refresh race is fixed. `/auth/refresh` calls `refresh_store::consume()`, and `consume()` uses one `UPDATE ... WHERE revoked_at IS NULL AND expires_at > ? RETURNING account_id` operation (`server/src/auth/refresh_store.rs:72-105`).
+- `validate_and_touch()` now distinguishes DB errors from real token misses; the old silent `.ok()` issue is gone.
 
 ---
 
@@ -51,13 +54,13 @@
 
 | Field | Value |
 |-------|-------|
-| Files | `server/src/api/auth.rs`, `server/src/db/accounts.rs` |
+| Files | `server/src/api/auth_routes.rs`, `server/src/db/accounts.rs` |
 | Verdict | 🟡 minor nit |
 
 **Findings:**
-- 🟢 Login returns the same 401 for unknown email and bad password, which is the right shape before rate limiting.
-- 🟡 Signup has a duplicate-check race: it pre-checks email (`server/src/api/auth.rs:91-98`) then inserts (`server/src/api/auth.rs:103-104`). A concurrent duplicate can still hit the UNIQUE constraint and return 500. Map SQLite unique violations to 409 at the insert boundary too.
-- 🟡 Add max email length / normalized email tests before public signup. Lowercase+trim+contains-`@` is adequate for internal testing but too loose for a paid account surface.
+
+- Login still returns the same 401 for unknown email and bad password, which is the right shape before rate limiting.
+- The duplicate-signup pre-check is still naturally race-prone; the insert boundary should map SQLite unique violations to 409 as well. This is not the current blocker, but it should be fixed before public signup.
 
 ---
 
@@ -65,42 +68,43 @@
 
 | Field | Value |
 |-------|-------|
-| Files | `server/src/api/auth.rs`, `server/src/db/mod.rs` |
-| Verdict | 🔴 blocker |
+| Files | `server/src/api/auth_routes.rs`, `server/src/api/mod.rs` |
+| Verdict | 🟢 accept |
 
 **Findings:**
-- 🔴 The committed Stage 2 device flow is not end-to-end real despite the stage title. `device_start` and `device_poll` exist, but `device_approve` is public and binds a fake account, so a normal start -> approve -> poll flow cannot produce valid tokens unless a fake account happens to exist.
-- 🟡 Keep 8-character user codes and 10-minute TTL; that is enough once `/auth/device/approve` and `/auth/device/poll` are rate-limited.
-- 🟡 Consider marking consumed device rows rather than deleting them if support/audit matters. Delete-on-success is acceptable for the first product cut.
 
-## Follow-up Commit Note
+- The original fake `device_approve` blocker is fixed. The endpoint now requires `AuthedAccount` from the auth middleware and writes the authenticated account id into `device_codes` (`server/src/api/auth_routes.rs:329-355`).
+- `device_approve` is mounted behind `auth::require_auth` with the rest of the protected router (`server/src/api/mod.rs:57-65`).
+- 8-character user codes and 10-minute TTL are still acceptable once endpoint rate limiting lands.
 
-A follow-up commit landed during review: `293f78a feat(server): auth middleware + protected routes + real device_approve (Stage 3a)`. It starts addressing the public-route and device-approval blockers above, but it is not part of the reviewed Stage 2 commit. As of this review, the branch-tip `server` crate passes:
+---
 
-```bash
-cd /Users/uno/Downloads/cue/server && cargo test                         # ✅ 20 passed
-cd /Users/uno/Downloads/cue/server && cargo clippy --all-targets -- -D warnings  # ✅
-```
+### S2.6 — Docs / Follow-Up Consistency
 
-That follow-up should be reviewed separately as Stage 3a or as a Stage 2 fix wave. The Stage 2 verdict remains based on commit `07136ed`.
+| Field | Value |
+|-------|-------|
+| Files | `docs/PRODUCTION-READINESS.md`, `docs/PRICING-MODEL.md`, `crates/cue-router/src/speculative.rs` |
+| Verdict | 🟢 accept |
+
+**Findings:**
+
+- `auto_recap` is now scoped correctly in docs: request-cue paths route through classifier metadata, while `auto_recap` remains direct/default and has `router_meta: None`.
+- Pricing source-of-truth and speculative default-ON docs are now explicit enough for future agents.
 
 ## Build & Test Verification
 
-Committed Stage 2 snapshot, reviewed in a detached worktree:
-
 ```bash
-cd /tmp/bluey-stage2-review/server && cargo test                         # ✅ 20 passed
-cd /tmp/bluey-stage2-review/server && cargo clippy --all-targets -- -D warnings  # ✅
+cd server && cargo test --lib          # ✅ 30 passed
+cargo test -p cue-router --lib         # ✅ 30 passed
+cargo test -p cue-cloud-client --lib   # ✅ 4 passed
 ```
 
 ## Overall Verdict
 
-🔴 **REQUEST CHANGES** — Signup/login/JWT/password pieces are sound, but public admin/customer data, public fake device approval, and non-atomic refresh rotation must be fixed before Stage 3 builds cloud-client or auth middleware on top.
+🔴 **REQUEST CHANGES** — The refresh and device-flow blockers are fixed, but the admin customer endpoint still lacks an `is_admin` gate. This must be fixed before accepting Stage 2 as a safe auth boundary.
 
 ## Follow-ups for Next Batch
 
-- Add real auth middleware and apply it to account, router, billing checkout, usage ingestion, device approve, and admin routes.
-- Require admin role for `/admin/customers`.
-- Replace refresh validate+revoke with atomic consume-and-rotate.
-- Make `device_approve` bind the authenticated account or return 501 until browser session auth exists.
-- Add endpoint-level integration tests for signup/login/refresh rotation replay, protected route unauthorized/authorized, and device start -> approve -> poll.
+- Add `require_admin` middleware or an explicit `AuthedAccount(account)` admin check to `/admin/customers`, plus unauthenticated / non-admin / admin tests.
+- Map duplicate-email insert races to 409 at the DB insert boundary.
+- Add auth/device rate limiting before public rollout.

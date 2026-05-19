@@ -1,6 +1,7 @@
-# REVIEW: Server Stage 1 — Rust Skeleton
+# REVIEW: Server Stage 1 — Rust Skeleton Recheck
 
-**Commit:** `853be40 feat(server): bluey-server Rust skeleton (R14.9 stage 1)`
+**Original commit:** `853be40 feat(server): bluey-server Rust skeleton (R14.9 stage 1)`
+**Re-review tip:** `20cd0b3 fix(R14): clear remaining codex blockers — stale paths + speculative doc comment`
 **Reviewer:** Codex
 **Date:** 2026-05-19
 
@@ -14,7 +15,8 @@
 | Verdict | 🟢 accept |
 
 **Findings:**
-- `server/` as a temporary isolated crate is fine. The `[workspace]` marker keeps it out of the main Cue workspace, and splitting to a separate `bluey-server` repo later is mostly CI/deploy/doc work rather than code architecture.
+
+- `server/` as a temporary isolated crate remains fine. The `[workspace]` marker keeps it out of the main Cue workspace, and moving to a separate `bluey-server` repo later is mostly CI/deploy/doc work.
 
 ---
 
@@ -23,10 +25,12 @@
 | Field | Value |
 |-------|-------|
 | Files | `server/src/api/mod.rs`, `server/src/api/admin.rs` |
-| Verdict | 🔴 blocker |
+| Verdict | 🟢 accept for Stage 1 skeleton |
 
 **Findings:**
-- 🔴 `GET /admin/customers` is implemented and mounted on the public router with no auth (`server/src/api/mod.rs:51-52`, `server/src/api/admin.rs:33-67`). Once Stage 2 creates accounts, anyone who can reach the server can list customer IDs, emails, and balances. For Stage 1, make this route return 501 like the other protected stubs, or move it behind an auth/admin middleware before real accounts land.
+
+- The original Stage 1 blocker was that `GET /admin/customers` was mounted publicly. At tip `20cd0b3`, it is now in the protected router behind `auth::require_auth` (`server/src/api/mod.rs:45-65`), so the public leak from the skeleton stage is fixed.
+- Residual production issue: the route is still not admin-role gated. That is tracked as a Stage 2 / Stage 6 blocker, not a Stage 1 skeleton blocker.
 
 ---
 
@@ -35,12 +39,12 @@
 | Field | Value |
 |-------|-------|
 | Files | `server/src/db/mod.rs` |
-| Verdict | 🟡 minor nit |
+| Verdict | 🟢 accept with later migration hardening |
 
 **Findings:**
-- 🟢 The table set is a reasonable v0.2 starting point: accounts, refresh tokens, device codes, credit batches, usage events, and Stripe webhook idempotency cover the planned flow.
-- 🟡 Before the usage dashboard lands, add an index that supports aggregation by account + task/lane over a time window, or be explicit that `idx_usage_events_account_ts` is enough for first pass and aggregation happens after filtering.
-- 🟡 Inline migrations are acceptable at this stage, but once real customer data exists, switch to numbered migration files or a migrator with applied-state tracking. `CREATE TABLE IF NOT EXISTS` cannot safely express column/type/index evolution.
+
+- The table set is still a reasonable v0.2 starting point: accounts, refresh tokens, device codes, credit batches, usage events, and Stripe webhook idempotency cover the planned flow.
+- Inline idempotent migrations are acceptable for the scaffold. Once customer data exists, move to applied-state migrations; `CREATE TABLE IF NOT EXISTS` cannot safely express all future schema evolution.
 
 ---
 
@@ -49,12 +53,12 @@
 | Field | Value |
 |-------|-------|
 | Files | `server/src/db/balance.rs` |
-| Verdict | 🟡 minor nit |
+| Verdict | 🟢 original FIFO blocker cleared |
 
 **Findings:**
-- 🟢 The account-level deduction query is the right race-free primitive: `UPDATE accounts ... WHERE balance_cents >= ?` serializes concurrent deductions at the SQLite write lock and only one set of updates can spend the same balance.
-- 🟡 `deduct()` does not decrement `credit_batches.remaining_cents` (`server/src/db/balance.rs:25-39`). The handoff calls this out, and I agree with the direction: do the FIFO batch consumption in the same transaction as the account deduction before any wallet endpoint consumes this function.
-- 🟡 `credit()` and `sweep_expired()` each perform multi-statement balance changes without an explicit transaction (`server/src/db/balance.rs:53-67`, `server/src/db/balance.rs:106-118`). Wrap them in transactions before billing is live so a partial failure cannot desynchronize account balance and batch state.
+
+- The original Stage 1 FIFO gap has been addressed at the current tip: `deduct()` now wraps the account balance deduction and oldest-live-batch consumption in one transaction (`server/src/db/balance.rs:21-64`).
+- Residual production issue: `credit()` and `sweep_expired()` still need stronger transaction/idempotency treatment before live Stripe billing. That is recorded in the Stage 6 review.
 
 ---
 
@@ -62,25 +66,43 @@
 
 | Field | Value |
 |-------|-------|
-| Files | `server/src/pricing/mod.rs` |
-| Verdict | 🔴 blocker before wallet/router work |
+| Files | `server/src/pricing/mod.rs`, `docs/PRICING-MODEL.md` |
+| Verdict | 🟢 original unit blocker cleared |
 
 **Findings:**
-- 🔴 The known microcent scale bug is real and should be fixed before any `/router/complete`, wallet, estimate, or usage-label implementation is built on top. The constants are off by 100x (`server/src/pricing/mod.rs:24-58`), and the tests deliberately avoid asserting the correct values (`server/src/pricing/mod.rs:133-164`). It is okay that Stage 1 skeleton compiles, but do not defer this past the next server stage that touches spend or pricing.
+
+- The original microcent constant bug is fixed at tip `20cd0b3`: `gpt-4o-mini` uses `150_000 / 600_000`, `gpt-4o` uses `2_500_000 / 10_000_000`, and Anthropic Sonnet placeholders use `3_000_000 / 15_000_000` microcents per 1M tokens (`server/src/pricing/mod.rs:32-72`).
+- Residual product issue: code rounds billable customer cost up to whole cents while `docs/PRICING-MODEL.md` still advertises fractional-cent examples. That is recorded in the Stage 4 review because it affects customer-facing billing.
+
+---
+
+### S1.6 — Docs / Round References
+
+| Field | Value |
+|-------|-------|
+| Files | `docs/PRODUCTION-READINESS.md`, `docs/PRICING-MODEL.md`, `crates/cue-router/src/speculative.rs` |
+| Verdict | 🟢 accept |
+
+**Findings:**
+
+- `auto_recap` is now accurately documented as not routed through the classifier yet.
+- Pricing docs have a snapshot date and formula source-of-truth language.
+- Moved-path references are cleared except the expected self-reference inside `docs/work/HANDOFF-FROM-CODEX-TO-KIRO.md`.
+- `SpeculativeRouter` now documents the default-ON internal-testing semantics and `BLUEY_SPECULATIVE_ROUTING` gate.
 
 ## Build & Test Verification
 
 ```bash
-cd /tmp/bluey-stage1-review/server && cargo test                         # ✅ 8 passed
-cd /tmp/bluey-stage1-review/server && cargo clippy --all-targets -- -D warnings  # ✅
+cd server && cargo test --lib          # ✅ 30 passed
+cargo test -p cue-router --lib         # ✅ 30 passed
+cargo test -p cue-cloud-client --lib   # ✅ 4 passed
 ```
 
 ## Overall Verdict
 
-🔴 **REQUEST CHANGES** — The public admin customer route must be removed/protected before this skeleton becomes the base for auth/account work. Pricing and FIFO issues can be folded into the wallet/router stage, but the admin leak should be fixed immediately.
+🟢 **ACCEPT** — The Stage 1 skeleton blockers are cleared at tip `20cd0b3`. Remaining production concerns are properly carried by later-stage reviews.
 
 ## Follow-ups for Next Batch
 
-- Move `/admin/customers` behind real admin auth or return 501 until middleware exists.
-- Fix pricing unit constants and add exact-value tests before implementing metered router calls.
-- Make balance mutations transactional when FIFO credit consumption lands.
+- Keep admin role gating in the Stage 2 / Stage 6 fix wave.
+- Reconcile whole-cent billing with fractional-cent pricing docs in the Stage 4 fix wave.

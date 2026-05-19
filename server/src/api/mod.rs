@@ -42,6 +42,11 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         )
         .route("/billing/webhook", axum::routing::post(billing::webhook));
 
+    // ---- Admin-only (require_auth + require_admin) -------------------------
+    let admin_only = Router::new()
+        .route("/admin/customers", get(admin::customers))
+        .route_layer(axum::middleware::from_fn(auth::require_admin));
+
     // ---- Authenticated (Bearer JWT) -----------------------------------------
     let protected = Router::new()
         .route("/account/me", get(account::me))
@@ -58,7 +63,7 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
             "/auth/device/approve",
             axum::routing::post(auth_routes::device_approve),
         )
-        .route("/admin/customers", get(admin::customers))
+        .merge(admin_only)
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,

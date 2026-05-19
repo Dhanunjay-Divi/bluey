@@ -5,4 +5,4 @@ pub mod middleware;
 pub mod password;
 pub mod refresh_store;
 
-pub use middleware::{require_auth, AuthedAccount};
+pub use middleware::{require_admin, require_auth, AuthedAccount};
