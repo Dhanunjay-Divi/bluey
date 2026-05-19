@@ -112,3 +112,35 @@ cargo test -p cue-router managed_never_emits_managed_local_provider
 - Save keyring tokens on any successful `bluey login` with an access token, even when no refresh token is present.
 - Before ProviderRegistry rewire ships, plumb a stable logical request id into `BlueyManagedProvider` and make managed local-lane construction impossible or explicitly rejected.
 - Keep the existing deferred nits queued: server-owned pricing/tier numbers, sanitized cloud-client server bodies, and authoritative server-recorded usage events.
+
+---
+
+## Recheck 1 — Commit `3d514f2`
+
+**Date:** 2026-05-19
+
+### Updated Findings
+
+- 🟢 `server/src/api/billing.rs:218` / `server/src/api/billing.rs:257` — Stage 6 blocker is cleared. `extract_payment_intent_id()` now handles both string and expanded-object `payment_intent` shapes, and `handle_checkout_completed()` always passes the normalized PaymentIntent id into `balance::credit()`. If the session did not include an expanded payment method, `fetch_payment_method_from_stripe()` retrieves `/v1/payment_intents/{id}` and persists the returned `payment_method` when available. The missing wiremock seam is acceptable as a follow-up, not a blocker.
+- 🔴 `crates/cue-cli/src/app.rs:782` — Stage 8 blocker is **not** cleared on this tip. Commit `3d514f2` says it changed `cue_login`, but `git show --name-only 3d514f2` does not include `crates/cue-cli/src/app.rs`, and the code still uses `if let (Some(access), Some(refresh)) = (...)`. Access-only logins still do not populate the keyring used by `bluey usage` and `bluey credits`.
+- 🟢 `crates/cue-cli/src/bluey_cmds.rs:71` — The copy nit is cleared. `bluey usage` no longer tells users to run `bluey credits` for unavailable batch-by-batch dates.
+
+### Recheck Verification
+
+```bash
+cd server && cargo test
+# ✅ 44 passed
+
+cargo test -p cue-cloud-client
+# ✅ 4 passed
+
+cargo test -p cue-llm billing_error
+# ✅ 2 passed
+
+cargo test -p cue-router managed_never_emits_managed_local_provider
+# ✅ 1 passed
+```
+
+### Recheck Verdict
+
+🔴 **REQUEST CHANGES** — Stage 6 is now acceptable, but Stage 8 remains blocked because the access-only login bridge was described in the commit message but not actually applied to `crates/cue-cli/src/app.rs`.

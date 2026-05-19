@@ -5155,6 +5155,12 @@ fn discover_overlay_bin() -> Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         let mut candidates = Vec::new();
+        if cfg!(debug_assertions) {
+            candidates.extend([
+                cwd.join("native/macos/cue-overlay/.build/bluey-overlay-macos"),
+                cwd.join("native/macos/cue-overlay/.build/cue-overlay-macos"),
+            ]);
+        }
         if let Ok(exe) = env::current_exe() {
             let mut dirs = Vec::new();
             if let Some(dir) = exe.parent() {
@@ -5174,9 +5180,13 @@ fn discover_overlay_bin() -> Result<PathBuf> {
                 ]);
             }
         }
+        if !cfg!(debug_assertions) {
+            candidates.extend([
+                cwd.join("native/macos/cue-overlay/.build/bluey-overlay-macos"),
+                cwd.join("native/macos/cue-overlay/.build/cue-overlay-macos"),
+            ]);
+        }
         candidates.extend([
-            cwd.join("native/macos/cue-overlay/.build/bluey-overlay-macos"),
-            cwd.join("native/macos/cue-overlay/.build/cue-overlay-macos"),
             cwd.join("bluey-overlay-macos"),
             cwd.join("cue-overlay-macos"),
         ]);

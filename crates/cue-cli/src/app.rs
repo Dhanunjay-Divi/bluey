@@ -774,21 +774,22 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
 
     save_account(&paths, &account)?;
 
-    // Codex Stage 8 S8.1: also save tokens to the cue-cloud-client
-    // keyring store so `bluey usage` and `bluey credits` (which read
-    // from keyring) can find them after `bluey login`. Best-effort:
-    // if keyring unavailable (e.g. headless dev container), we log
-    // and continue; the legacy AccountConfig path still works.
-    if let (Some(access), Some(refresh)) = (
-        account.access_token.as_deref(),
-        account.refresh_token.as_deref(),
-    ) {
+    // Codex Stage 8 S8.1 (round 3): save tokens to the cue-cloud-client
+    // keyring store whenever access_token exists so `bluey usage` and
+    // `bluey credits` (which read from keyring) can find them after
+    // any successful `bluey login` path. Token-only / env-token /
+    // browser-without-refresh logins all produce access-only sessions;
+    // cue-cloud-client treats refresh as optional/defaultable so an
+    // empty string is safe. Best-effort: keyring failure prints a
+    // warning but does not fail login.
+    if let Some(access) = account.access_token.clone() {
+        let refresh = account.refresh_token.clone().unwrap_or_default();
         match cue_cloud_client::CloudClient::with_default_keyring() {
             Ok(client) => {
                 let email = account.user_id.clone();
                 if let Err(e) = client.save_tokens(cue_cloud_client::Tokens {
-                    access: access.to_string(),
-                    refresh: refresh.to_string(),
+                    access,
+                    refresh,
                     email,
                 }) {
                     eprintln!(
