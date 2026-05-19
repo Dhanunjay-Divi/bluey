@@ -6,33 +6,57 @@ implemented locally, and what remains before a paid cloud product launch.
 ## Release Scope
 
 **v0.1.0 target:** macOS arm64, terminal-distributed, local-first Bluey with a
-native overlay and bundled helper binaries.
+native overlay and bundled helper binaries. **Tagged on `c34592a` 2026-05-19.**
+
+Shipped artifacts:
+
+- `dist/bluey-0.1.0-darwin-arm64.tar.gz` (6.3 MB; arm64-only).
+- `dist/bluey-0.1.0-darwin-universal.tar.gz` (12 MB; arm64+x86_64 via lipo;
+  the Intel slice is link-tested only on uno and needs clean-Intel-Mac
+  validation before being recommended as the primary download).
 
 Not shipped in v0.1.0:
 
-- macOS x86_64, Linux, and Windows release artifacts.
-- Signed/notarized GUI installer.
-- Public managed Bluey cloud account system.
+- Linux and Windows release artifacts.
+- Signed/notarized installer.
+- Public Bluey distribution endpoint (R14.8 architecture chosen, server
+  not yet stood up).
+- Public managed Bluey cloud account system / managed Auto Router endpoint
+  (R14.9, parked until monetization is greenlit).
 - Production billing/plans.
 
 ## Implemented And Verified
 ### Bluey Auto Router
 
 - `crates/cue-router/`: task classifier + routing policy + speculative router
-  ship as a standalone crate.
-- Heuristic classifier covers general / code / system_design / meeting /
-  writing / vision task types with confidence scoring.
+  ship as a standalone crate. **26 tests passing.**
+- HeuristicClassifier covers general / code / system_design / meeting /
+  writing / vision task types with confidence scoring; vision keywords
+  narrowed so text-only "diagram" / "chart" do not misroute design
+  questions to Vision.
 - StaticPolicy maps lanes to providers (Instant -> OpenAI gpt-4o-mini,
   Balanced -> Anthropic claude-3-5-sonnet, Deep -> claude-3-7-sonnet,
-  Vision -> gpt-4o, Local -> Ollama llama3.1).
-- SpeculativeRouter optionally fires Instant + Deep in parallel; UI replaces
-  draft with final via OverlayCommand::UpdateCard.
-- Local-only mode forces all routing to the Local lane.
-- 17 tests (heuristic + policy + speculative + follow-up) all passing.
+  Vision -> gpt-4o, Local -> Ollama llama3.1). Vision overrides latency.
+- AutoRouter coordinator takes ClassifierInput + RouteOptions { local_only }
+  and returns a RoutedRequest. local_only forces Local lane regardless of
+  classification.
+- SpeculativeRouter honors ProviderRoute.stream and survives Instant-lane
+  unavailability by emitting a non-fatal Error chunk and continuing Deep.
+- **Daemon wiring shipped**: `request_cue` / `auto_recap` classify every
+  prompt and emit RouterMeta on the first cue_response_chunk. Speculative
+  dispatch fires through SpeculativeRouter when `BLUEY_SPECULATIVE_ROUTING`
+  is unset (default ON) or set to a truthy value; explicitly disable with
+  `=0/false/off`.
+- ProviderRegistry builds Arc<dyn LlmProvider> for every configured
+  provider (OpenAI, Anthropic, Ollama) and impls SpeculativeProvider with
+  per-route lookup + any-other-available fallback.
+- Dashboard UI shipped: LaneBadge component renders above each in-flight
+  card showing latency lane (color), task type, provider/model, confidence,
+  and a REFINED tag when the deep lane has replaced the draft. Daemon
+  emits replace_body=true on the deep Final chunk for clean draft -> final
+  swap (no [refined] tag prefix hack).
 - Tiny-model managed classifier slot is wired as a trait but no production
-  endpoint exists yet; ships as heuristic-only.
-- Daemon integration (replace direct LlmProvider calls with SpeculativeRouter)
-  is the next round.
+  endpoint exists yet (R14.9 Bluey product server).
 
 
 
@@ -91,6 +115,17 @@ Not shipped in v0.1.0:
 - Installed-path smoke passes locally: `bluey` can be launched through a
   symlink and still discover its helper binaries from the canonical install
   directory.
+
+## Architecture and Roadmap Cross-References
+
+- `docs/BLUEY-ARCHITECTURE.md` is the source of truth for the 3-layer
+  architecture (local client / distribution server / product server) and
+  the staged Stage 0-5 monetization rollout.
+- `docs/AUTO-ROUTING-USP.md` covers the Auto Router product framing.
+- `docs/BLUEY-DISTRIBUTION-ARCHITECTURE.md` covers the v0.1 distribution
+  server choice (paths A / B / C, pending user pick).
+- `docs/work/PHASE-3-ROUND-14-PLAN.md` tracks current-round work items
+  including R14.8 (distribution server) and R14.9 (product server scaffold).
 
 ## Remaining Before Public Paid Launch
 
