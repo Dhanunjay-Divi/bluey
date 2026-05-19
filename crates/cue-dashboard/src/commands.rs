@@ -884,10 +884,6 @@ pub struct RouterMeta {
     pub confidence: f32,
 }
 
-/// Build a `RouterMeta` for the given prompt + active context surfaces.
-/// Local-only is read from the BLUEY_LOCAL_ONLY env var (until we surface it
-/// in the dashboard settings UI).
-
 /// Same classification logic as `classify_for_router` but returns the raw
 /// TaskClassification (used by the speculative path which needs the actual
 /// classification object to drive routing decisions).
@@ -904,7 +900,6 @@ fn classify_only_for_router(
         has_page: false,
         file_attachment_count: 0,
         has_screenshot,
-        ..Default::default()
     };
     futures::executor::block_on(classifier.classify(&input))
 }
@@ -930,7 +925,6 @@ fn classify_for_router(prompt: &str, has_transcript: bool, has_screenshot: bool)
         has_page: false,
         file_attachment_count: 0,
         has_screenshot,
-        ..Default::default()
     };
 
     // Synchronous wrapper: AutoRouter::route is async only because future
@@ -973,10 +967,16 @@ async fn try_speculative_dispatch(
     use futures::stream::StreamExt;
     use std::sync::Arc;
 
-    let speculative_on = std::env::var("BLUEY_SPECULATIVE_ROUTING")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    // Bluey Auto speculative dispatch: default-ON for v0.1 (user is internal
+    // tester, cost is BYOK, USP demos better with draft+final out of the box).
+    // Explicitly disable via BLUEY_SPECULATIVE_ROUTING=0 / false / off.
+    let speculative_off = std::env::var("BLUEY_SPECULATIVE_ROUTING")
+        .map(|v| {
+            let v = v.trim();
+            v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off")
+        })
         .unwrap_or(false);
-    if !speculative_on || registry.is_empty() {
+    if speculative_off || registry.is_empty() {
         return Ok(None);
     }
 

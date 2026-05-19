@@ -114,9 +114,14 @@ impl VectorStore {
         // f32 does not implement Ord; use OrderedFloat-style wrapper here.
         // We sidestep adding the ordered_float crate by using a tiny tuple
         // wrapper that converts NaN to f32::NEG_INFINITY for ordering.
-        #[derive(PartialEq, PartialOrd)]
+        #[derive(PartialEq)]
         struct OrdF32(f32);
         impl Eq for OrdF32 {}
+        impl PartialOrd for OrdF32 {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
         impl Ord for OrdF32 {
             fn cmp(&self, other: &Self) -> std::cmp::Ordering {
                 let a = if self.0.is_nan() {

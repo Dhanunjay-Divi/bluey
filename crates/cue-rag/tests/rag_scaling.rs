@@ -1,4 +1,4 @@
-//! Benchmark / scaling test for VectorStore::query.
+//  Benchmark / scaling test for VectorStore::query.
 //!
 //! Confirms the heap-based top-k path stays sub-second at realistic v0.1
 //! per-user RAG sizes and gives us a regression baseline before any
@@ -67,9 +67,9 @@ fn empty_limit_returns_empty() {
         end_char: 1,
     };
     store
-        .index("s1", &chunk, &vec![1.0, 0.0, 0.0, 0.0])
+        .index("s1", &chunk, &[1.0, 0.0, 0.0, 0.0])
         .unwrap();
-    let hits = store.query(&vec![1.0, 0.0, 0.0, 0.0], 0, None).unwrap();
+    let hits = store.query(&[1.0, 0.0, 0.0, 0.0], 0, None).unwrap();
     assert!(hits.is_empty());
 }
 
