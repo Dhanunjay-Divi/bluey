@@ -82,7 +82,7 @@ by the older R7→R11 review chain.
 This project uses a **two-agent review loop**:
 
 1. **kiro** (this agent, on divii) — implements rounds on `feat/phase-3-round-N` branches
-2. **codex** (separate agent, runs on uno directly) — reviews and writes verdicts to `docs/work/REVIEW-PHASE-N-ROUND-N.md`
+2. **codex** (separate agent, runs on uno directly) — reviews and writes verdicts to `docs/reviews/REVIEW-PHASE-N-ROUND-N.md`
 3. **user** shuttles the review doc back by pasting codex's output or syncing files
 
 **Round flow:**
@@ -241,7 +241,7 @@ Each parallel subagent uses an isolated git worktree. Commits are cherry-picked 
 2. Read these docs on uno in order:
    - `docs/PRODUCTION-READINESS.md`
    - `docs/work/HANDOFF-FROM-CODEX-TO-KIRO.md`
-   - `docs/work/PHASE-3-ROUND-13-PLAN.md`
+   - `docs/rounds/PHASE-3-ROUND-13-PLAN.md`
    - `docs/work/AGENT-ONBOARDING.md` (this file)
 3. Ask the user what the current task is — don't guess. Possible states:
    - Waiting on codex review → nothing to do, just read and be ready

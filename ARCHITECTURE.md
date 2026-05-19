@@ -149,7 +149,7 @@ binary (arm64+x86_64 lipo). BYOK (user supplies own provider keys).
 - `native/macos/cue-overlay`  — Swift NSWindow pill UX
 - `native/macos/cue-audio`    — CoreAudio capture
 - `native/macos/cue-whisper`  — whisper.cpp via SwiftPM
-- `native/windows/*`          — equivalents (NOT shipped; see `docs/work/PHASE-3-WINDOWS-BRIEF-FOR-CODEX.md`)
+- `native/windows/*`          — equivalents (NOT shipped; see `docs/rounds/PHASE-3-WINDOWS-BRIEF-FOR-CODEX.md`)
 
 **Future additions:**
 - `cue-cloud-client` — when Layer 3 lands; thin HTTP client for auth +
@@ -193,7 +193,7 @@ migration is a routing change, not a client change.
 ## 5. Layer 3 — Product server (forward-looking)
 
 **State:** REQUIRED for v0.2 launch (per 2026-05-19 no-BYOK decision).
-Scaffold tracked as R14.9 in `docs/work/PHASE-3-ROUND-14-PLAN.md`. v0.1
+Scaffold tracked as R14.9 in `docs/rounds/PHASE-3-ROUND-14-PLAN.md`. v0.1
 ships without it (dev BYOK only); v0.2 cannot ship without it because
 managed-only is now the default.
 
@@ -295,7 +295,7 @@ both know how to talk to the cloud service.
 - `bluey login` / `bluey logout`.
 - `cue-daemon` calls cloud-client for auth + license + managed router
   dispatch.
-- BYOK still works when no account is logged in.
+- Dev-mode BYOK remains gated for internal testing only (BYOK is NOT exposed in the production UI per DECISIONS.md no-BYOK decision).
 - **Time to land:** ~3–5 days.
 
 ### Stage 4 — paid alpha launch
@@ -346,4 +346,4 @@ both know how to talk to the cloud service.
 - `docs/BLUEY-DISTRIBUTION-ARCHITECTURE.md` — Layer 2 path comparison.
 - `docs/PRODUCTION-READINESS.md` — what ships vs what's pending matrix.
 - `docs/release/RELEASE-v0.1.0.md` — release notes.
-- `docs/work/PHASE-3-ROUND-14-PLAN.md` — current-round work items.
+- `docs/rounds/PHASE-3-ROUND-14-PLAN.md` — current-round work items.

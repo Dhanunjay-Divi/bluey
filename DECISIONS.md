@@ -71,14 +71,18 @@ Specifics:
 - **Customer always sees:** live balance at the top of the overlay,
   per-card cost label after each cue, LaneBadge with provider/model.
 
-**Pricing rationale (target):** 100-200% markup keeps the wallet
-usable. At ~$0.04 per Easy cue (gpt-4o-mini Instant lane, 200% markup)
-and ~$0.30 per Hard cue (Instant + claude-3-7 Deep, 200% markup), the
-typical user (~50 cues/day mixed) burns ~$21/month and reloads the
-$30 wallet ~once a month. Heavy users (~200 cues/day) reload 2-3
-times per month. Bluey gross margin sits in the 87-99% band per
-request because most of the value is routing intelligence + UX, not
-inference markup.
+**Pricing rationale (target):** the locked markup tiers
+(`docs/PRICING-MODEL.md`) are 200% on Easy/Medium / 150% on Deep
+speculative / 150% on Vision. Customer prices range from $0.0003
+(Easy) to $0.104 (System design speculative). The typical user
+(~50 cues/day mixed) burns ~$21/month and reloads the $30 wallet
+roughly once a month. Heavy users (~200 cues/day) reload 2-3 times
+per month. **Gross margin per request is ~67% on 200%-markup lanes
+and ~60% on 150%-markup lanes** (see `docs/PRICING-MODEL.md` Section 5
+for the per-lane breakdown). The earlier 87-99% claim in this doc
+was wrong — it conflated Bluey-vs-upstream with Bluey-vs-customer-cost.
+The 60-67% number is the correct one to quote and is what the
+PRICING-MODEL.md table proves out per-lane.
 
 **What this changes for the codebase:**
 

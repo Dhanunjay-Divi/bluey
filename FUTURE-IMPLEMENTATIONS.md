@@ -5,7 +5,7 @@
 >
 > If an item is "we should do this but not now," it lives here. If an
 > item is in active development, it lives in the corresponding
-> `docs/work/PHASE-3-ROUND-N-PLAN.md`. New items get added here; items
+> `docs/rounds/PHASE-3-ROUND-N-PLAN.md`. New items get added here; items
 > get **removed** when they ship (linked to the commit that landed
 > them).
 >
@@ -23,7 +23,7 @@
 itself dominates; that's when we want a real ANN index.
 **Estimate:** 1 day.
 **Recommended approach:** usearch (pure Rust, sidecar file) — see
-`docs/work/PHASE-3-ROUND-14-PLAN.md::R14.1` for the full A/B/C
+`docs/rounds/PHASE-3-ROUND-14-PLAN.md::R14.1` for the full A/B/C
 tradeoff.
 **Trigger to ship:** any per-user corpus exceeds 50k chunks OR Linux/Windows
 support requires a new RAG path.
@@ -37,7 +37,7 @@ into `cue-whisper.exe`) AND a clean Windows test machine for QA.
 **Estimate:** 2–3 days code + clean-Windows QA.
 **Owner:** **codex** (per user direction 2026-05-19; uno's Tailscale
 reaches the Windows test machine).
-**Brief:** `docs/work/PHASE-3-WINDOWS-BRIEF-FOR-CODEX.md` (W1).
+**Brief:** `docs/rounds/PHASE-3-WINDOWS-BRIEF-FOR-CODEX.md` (W1).
 
 ### R14.3 — Linux x86_64 build
 

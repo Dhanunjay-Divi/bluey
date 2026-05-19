@@ -126,7 +126,7 @@ The dashboard / overlay treats `Final` as a card-body replacement (the existing 
 | `RoutingPolicy` + `StaticPolicy` | ✅ shipped |
 | `SpeculativeRouter` | ✅ shipped (structural; needs daemon wiring) |
 | Tiny-model classifier (managed) | 📋 stub trait, no implementation yet — needs Bluey routing endpoint |
-| Daemon integration: replace direct `LlmProvider` calls in `crates/cue-daemon/src/llm/` with `SpeculativeRouter` | 📋 next round |
+| Daemon integration via `request_cue` (Auto Router classifier + speculative dispatch on Hard) | ✅ shipped |
 | Dashboard: surface lane choice + draft→final replacement visually | 📋 next round |
 | Cost telemetry + per-lane spend caps | 📋 future round |
 

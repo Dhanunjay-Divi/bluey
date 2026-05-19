@@ -1102,11 +1102,13 @@ pub async fn request_cue(
     let router_meta = classify_for_router(&recent, true, false);
     let emitted_meta = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Optional: speculative routing path. Opt-in via BLUEY_SPECULATIVE_ROUTING=1.
+    // Speculative routing path. **Default ON** for v0.1 internal testing
+    // (per DECISIONS.md 2026-05-19). Disable explicitly with
+    // BLUEY_SPECULATIVE_ROUTING=0 / false / off.
     // When ON, dispatches through cue-router::SpeculativeRouter and (for Hard /
     // Deep questions) emits a streaming Draft from the Instant lane plus a
-    // Final from the Deep lane. When OFF or not configured, falls through to
-    // the legacy AnswerLlm / WhatToAnswerLlm path below — zero regression.
+    // Final from the Deep lane. When OFF or no providers configured, falls
+    // through to the legacy AnswerLlm / WhatToAnswerLlm path — zero regression.
     {
         use cue_daemon::llm::{answer as answer_mod, suggest as suggest_mod};
         let registry = ProviderRegistry::from_env_and_secrets(&db);

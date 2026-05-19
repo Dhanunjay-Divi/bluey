@@ -42,11 +42,19 @@ Not shipped in v0.1.0:
   classification.
 - SpeculativeRouter honors ProviderRoute.stream and survives Instant-lane
   unavailability by emitting a non-fatal Error chunk and continuing Deep.
-- **Daemon wiring shipped**: `request_cue` / `auto_recap` classify every
-  prompt and emit RouterMeta on the first cue_response_chunk. Speculative
-  dispatch fires through SpeculativeRouter when `BLUEY_SPECULATIVE_ROUTING`
-  is unset (default ON) or set to a truthy value; explicitly disable with
-  `=0/false/off`.
+- **Daemon wiring shipped**: `request_cue` classifies every prompt and
+  emits RouterMeta on the first cue_response_chunk. Speculative dispatch
+  fires through SpeculativeRouter when `BLUEY_SPECULATIVE_ROUTING` is
+  unset (default ON) or set to a truthy value; explicitly disable with
+  `=0/false/off`. **`auto_recap` is NOT yet routed through the
+  classifier** — it emits `router_meta: None` and uses the default
+  RecapLlm provider directly. Routing recap is queued as a v0.2-class
+  follow-up because recap input/output shapes (whole transcripts in,
+  structured markdown out) need a separate classifier branch.
+
+Stale comments referencing speculative-routing as "opt-in" in
+`crates/cue-dashboard/src/commands.rs` and `crates/cue-router/src/speculative.rs`
+were updated alongside this change to match the default-ON behaviour.
 - ProviderRegistry builds Arc<dyn LlmProvider> for every configured
   provider (OpenAI, Anthropic, Ollama) and impls SpeculativeProvider with
   per-route lookup + any-other-available fallback.
@@ -124,7 +132,7 @@ Not shipped in v0.1.0:
 - `docs/AUTO-ROUTING-USP.md` covers the Auto Router product framing.
 - `docs/BLUEY-DISTRIBUTION-ARCHITECTURE.md` covers the v0.1 distribution
   server choice (paths A / B / C, pending user pick).
-- `docs/work/PHASE-3-ROUND-14-PLAN.md` tracks current-round work items
+- `docs/rounds/PHASE-3-ROUND-14-PLAN.md` tracks current-round work items
   including R14.8 (distribution server) and R14.9 (product server scaffold).
 
 ## Remaining Before Public Paid Launch

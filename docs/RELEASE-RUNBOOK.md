@@ -15,7 +15,7 @@ checklist.
 
 - [ ] All branches in scope are merged into `main` (no rebase needed).
 - [ ] Codex chain review on the merge target has returned 🟢.
-- [ ] `docs/work/PHASE-3-ROUND-N-PLAN.md` is up to date for the round.
+- [ ] `docs/rounds/PHASE-3-ROUND-N-PLAN.md` is up to date for the round.
 - [ ] `FUTURE-IMPLEMENTATIONS.md` has the items shipped this release moved
       to its `## Cleanup / archived` section.
 - [ ] `docs/release/RELEASE-vX.Y.Z.md` is drafted (release notes).
@@ -173,7 +173,7 @@ PUBLISH_HOST=<prod-host> PUBLISH_PATH=/var/www/bluey \
 - [ ] Move shipped items in `FUTURE-IMPLEMENTATIONS.md` from active sections to
       Cleanup section.
 - [ ] Append entries to `DECISIONS.md` for any decisions made this round.
-- [ ] Open the next round's plan: `docs/work/PHASE-3-ROUND-{N+1}-PLAN.md`.
+- [ ] Open the next round's plan: `docs/rounds/PHASE-3-ROUND-{N+1}-PLAN.md`.
 - [ ] Notify codex via `docs/work/HANDOFF-TO-CODEX-FROM-KIRO.md` if the
       next round needs review setup.
 

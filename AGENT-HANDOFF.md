@@ -22,8 +22,8 @@
 7. **`docs/BLUEY-DISTRIBUTION-ARCHITECTURE.md`** — Layer 2 path
    comparison.
 8. **`docs/release/RELEASE-v0.1.0.md`** — current release notes.
-9. **`docs/work/PHASE-3-ROUND-14-PLAN.md`** — current-round work.
-10. **`docs/work/PHASE-3-WINDOWS-BRIEF-FOR-CODEX.md`** — Windows scope
+9. **`docs/rounds/PHASE-3-ROUND-14-PLAN.md`** — current-round work.
+10. **`docs/rounds/PHASE-3-WINDOWS-BRIEF-FOR-CODEX.md`** — Windows scope
     for the codex agent.
 
 `README.md`, `INSTALL.md`, `CONTRIBUTING.md` are user-facing and OK as a
@@ -55,7 +55,7 @@ quick orient, but the docs above are the engineering source of truth.
 | Local RAG | shipping; 37ms at 10k chunks / 1536-dim |
 | Distribution server | not stood up; design = `docs/BLUEY-DISTRIBUTION-ARCHITECTURE.md` |
 | Product server (cloud) | not built; spec = `ARCHITECTURE.md` Section 5, R14.9 |
-| Windows native overlay | source exists, not shipping; brief for codex at `docs/work/PHASE-3-WINDOWS-BRIEF-FOR-CODEX.md` |
+| Windows native overlay | source exists, not shipping; brief for codex at `docs/rounds/PHASE-3-WINDOWS-BRIEF-FOR-CODEX.md` |
 
 ---
 
@@ -134,7 +134,7 @@ These are baked into how this codebase is reviewed:
 - **Cargo.toml stays at workspace version `0.1.0`.** Tags carry the
   release identity (`v0.1.0`, `v0.1.0-alpha`).
 - **No new features without a round plan.** Update
-  `docs/work/PHASE-3-ROUND-N-PLAN.md` first or as part of the same
+  `docs/rounds/PHASE-3-ROUND-N-PLAN.md` first or as part of the same
   commit.
 - **Tests required.** New behaviour gets at least one Rust test or
   Vitest test. Pipeline must stay green.
@@ -161,7 +161,7 @@ Handoffs:
   in-place on uno's worktree. Kiro reviews + commits per codex's
   suggested split, then verifies the pipeline.
 
-For Windows specifically: `docs/work/PHASE-3-WINDOWS-BRIEF-FOR-CODEX.md`
+For Windows specifically: `docs/rounds/PHASE-3-WINDOWS-BRIEF-FOR-CODEX.md`
 is the canonical W1–W7 spec. Codex picks that up when ready.
 
 ---
@@ -169,7 +169,7 @@ is the canonical W1–W7 spec. Codex picks that up when ready.
 ## 7. When something is broken
 
 1. Read `DECISIONS.md` first. The bug may be a deliberate decision.
-2. Read the latest `docs/work/PHASE-3-ROUND-N-PLAN.md` to see if the
+2. Read the latest `docs/rounds/PHASE-3-ROUND-N-PLAN.md` to see if the
    item is already tracked.
 3. If genuinely new, open the next round plan (R15+) before fixing.
 4. Fix in the smallest commit that captures the problem + the test

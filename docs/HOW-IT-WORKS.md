@@ -123,7 +123,7 @@ POST /auth/device/poll ───────────────────
 │      │ REFINED │                           │  ← appeared after
 │      └─────────┘                           │     deep replaced draft
 │      Architectural choices: …              │
-│      $0.32 · draft+deep · 4.7s             │  ← shows BOTH costs
+│      $0.050 · draft+deep · 4.7s             │  ← shows BOTH costs
 ├────────────────────────────────────────────┤
 │  [ Ask Bluey…           ] [Ask] [Attach]   │
 │  [Instructions] [Recap]                    │
@@ -211,10 +211,13 @@ SpeculativeRouter fires BOTH lanes:
 Daemon emits cue_response_chunk with replace_body: true
   → UI swaps draft for refined answer
   → LaneBadge gains REFINED tag
-  → cost label shows "$0.32 · draft+deep · 4.7s"
+  → cost label shows "$0.050 · draft+deep · 4.7s"
 
-Total deducted: $0.04 + $0.28 = $0.32
-Customer balance: $27.39 → $27.07
+Total deducted: $0.001 (Instant draft) + $0.049 (Deep refine) = $0.050
+Customer balance: $27.39 → $27.34
+
+(Per-question costs come from `docs/PRICING-MODEL.md` Section 2 — the
+canonical source of truth for the locked markup tiers.)
 ```
 
 ## 6. Hard stop on $0 balance

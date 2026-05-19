@@ -66,9 +66,7 @@ fn empty_limit_returns_empty() {
         start_char: 0,
         end_char: 1,
     };
-    store
-        .index("s1", &chunk, &[1.0, 0.0, 0.0, 0.0])
-        .unwrap();
+    store.index("s1", &chunk, &[1.0, 0.0, 0.0, 0.0]).unwrap();
     let hits = store.query(&[1.0, 0.0, 0.0, 0.0], 0, None).unwrap();
     assert!(hits.is_empty());
 }

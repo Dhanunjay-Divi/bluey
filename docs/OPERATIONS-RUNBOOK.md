@@ -166,6 +166,6 @@ First build is slow (~3-5 min). Subsequent builds use the cargo cache.
 
 1. `docs/PRODUCTION-READINESS.md` — what's actually shipping.
 2. `DECISIONS.md` — historical decisions; the bug may be deliberate.
-3. `docs/work/PHASE-3-ROUND-N-PLAN.md` — current-round work in progress.
+3. `docs/rounds/PHASE-3-ROUND-N-PLAN.md` — current-round work in progress.
 4. `~/Library/Application Support/bluey/logs/` — daemon logs.
 5. `docs/work/HANDOFF-FROM-CODEX-TO-KIRO.md` — codex's last-known view.

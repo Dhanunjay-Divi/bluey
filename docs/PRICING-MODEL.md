@@ -31,22 +31,53 @@
 
 ## 2. Per-question-type cost table
 
-| Type | Tokens / images | Provider/model | Bluey raw | Customer pays |
-|---|---|---|---|---|
-| Easy code | ~250 tokens | gpt-4o-mini Instant | $0.00008 | **$0.0003** (0.03¢) |
-| Medium code | ~1,400 tokens | claude-3-5-sonnet Balanced | $0.011 | **$0.034** (3.4¢) |
-| Hard code (speculative: Instant + Deep) | ~4,000 tokens | gpt-4o-mini + claude-3-7 | $0.020 | **$0.050** (5¢) |
-| System design (speculative) | ~5,000 tokens | gpt-4o-mini + claude-3-7 | $0.041 | **$0.104** (10.4¢) |
-| Vision ("what's on this screen") | 1 image + ~500 tokens | gpt-4o vision | $0.018 | **$0.046** (4.6¢) |
-| Easy general tech | ~300 tokens | gpt-4o-mini Instant | $0.00008 | **$0.0003** (0.03¢) |
-| Medium general tech | ~900 tokens | claude-3-5-sonnet | $0.009 | **$0.026** (2.6¢) |
+> **Provider price snapshot date:** 2026-05-19. List prices from
+> `https://platform.openai.com/docs/pricing` and
+> `https://docs.anthropic.com/en/docs/about-claude/pricing`. Refresh
+> at every minor release. Models named here (`gpt-4o-mini`,
+> `claude-3-5-sonnet-latest`, `claude-3-7-sonnet-latest`) are
+> intentional placeholders pending the v0.2 launch model-selection
+> review; if any of these are deprecated by Anthropic / OpenAI by
+> launch, the substitute model is documented in DECISIONS.md and
+> the table is regenerated.
+>
+> **Vision tokenization caveat:** "1 image" in the table below is a
+> simplification. OpenAI gpt-4o vision charges based on the
+> `detail` parameter and image dimensions: a 1280×720 screenshot at
+> auto detail decomposes into ~3-4 256×256 tiles (~85 tokens per
+> tile) plus a 85-token base. Real per-image cost ranges $0.0010 to
+> $0.0030 depending on size + detail. The PRICING table below uses
+> $0.018 as the typical cost for "what's on this screen" (~3 tiles,
+> auto detail) which empirically falls in that range.
 
-The customer-facing app shows `$0.034` style values rounded to the
-nearest tenth of a cent in real time. Internal accounting uses
-fractional cents (the daemon emits 4-decimal cents to bluey-server;
-bluey-server does the integer arithmetic).
+| Type | Input tokens | Output tokens | Image tokens | Provider/model | Bluey raw cost (input/output split) | Customer pays |
+|---|---|---|---|---|---|---|
+| Easy code | ~150 | ~100 | 0 | gpt-4o-mini Instant | in: $0.000023 + out: $0.000060 = **$0.000083** | $0.0003 (0.03¢) |
+| Medium code | ~800 | ~600 | 0 | claude-3-5-sonnet Balanced | in: $0.0024 + out: $0.0090 = **$0.0114** | $0.034 (3.4¢) |
+| Hard code (speculative) | ~1500 + ~1000 | ~500 + ~500 | 0 | gpt-4o-mini + claude-3-7 | Instant: $0.00053 + Deep: $0.0195 = **$0.020** | $0.050 (5¢) |
+| System design (speculative) | ~2000 + ~1200 | ~500 + ~2500 | 0 | gpt-4o-mini + claude-3-7 | Instant: $0.00060 + Deep: $0.0411 = **$0.042** | $0.104 (10.4¢) |
+| Vision | ~200 | ~300 | ~3 tiles | gpt-4o vision | image: ~$0.015 + in: $0.0005 + out: $0.0030 = **$0.0185** | $0.046 (4.6¢) |
+| Easy general | ~150 | ~150 | 0 | gpt-4o-mini Instant | in: $0.000023 + out: $0.000090 = **$0.000113** | $0.0003 (0.03¢) |
+| Medium general | ~400 | ~500 | 0 | claude-3-5-sonnet | in: $0.0012 + out: $0.0075 = **$0.0087** | $0.026 (2.6¢) |
 
----
+**Raw-cost formula:**
+
+```
+LLM cost  = (input_tokens  / 1_000_000) * provider_input_price_per_1M
+          + (output_tokens / 1_000_000) * provider_output_price_per_1M
+
+Vision    = (n_tiles * 85 + 85) tokens at the model's input price
+          + output_tokens at the model's output price
+
+Customer = LLM cost * (1 + markup_percent / 100)
+
+Markup tiers: 200% Easy/Medium, 150% Deep speculative, 150% Vision.
+```
+
+The table above is a rounded view; the running implementation in
+`server/src/pricing/mod.rs::compute_cost` does the full integer-microcent
+arithmetic without floats.
+
 
 ## 3. Three usage tiers (the product MUST show these to customers)
 

@@ -74,7 +74,7 @@ explicit step (not auto).
 ## 2. Product server — preprod (Layer 3)
 
 **Status:** ❌ not provisioned. Scaffolded as R14.9 in
-`docs/work/PHASE-3-ROUND-14-PLAN.md`. Lives in a separate repo
+`docs/rounds/PHASE-3-ROUND-14-PLAN.md`. Lives in a separate repo
 (`bluey-server`) when stood up.
 
 | Field | Value |

@@ -76,10 +76,12 @@ the speculative-mode contract (Draft chunks delta-append; Final replaces).
 
 Two integration steps:
 
-- **Classifier observation** (`87c85b7`): every `request_cue` /
-  `auto_recap` classifies its prompt and emits `router_meta` on the FIRST
-  `cue_response_chunk`. Existing AnswerLlm / RecapLlm / WhatToAnswerLlm
-  call paths are untouched.
+- **Classifier observation** (`87c85b7`): every `request_cue` classifies its
+  prompt and emits `router_meta` on the FIRST
+  `cue_response_chunk`. Existing AnswerLlm / WhatToAnswerLlm call paths are untouched.
+  `auto_recap` (RecapLlm) is NOT routed through the classifier yet —
+  recap inputs/outputs are large and require a separate classifier branch;
+  queued for v0.2 follow-up.
 - **Speculative dispatch** (`4bf7a73`): opt-in via
   `BLUEY_SPECULATIVE_ROUTING=1`. New `ProviderRegistry` builds
   `Arc<dyn LlmProvider>` for every configured provider (OpenAI,

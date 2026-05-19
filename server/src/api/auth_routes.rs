@@ -141,8 +141,10 @@ pub async fn refresh(
         return Err(err(StatusCode::UNAUTHORIZED, "not a refresh token"));
     }
 
-    // 2. Verify the DB-side state (not revoked, not expired).
-    let account_id = auth::refresh_store::validate_and_touch(&state.pool, &req.refresh_token)
+    // 2. ATOMICALLY consume the refresh token: revoke if and only if we are
+    // the unique caller to claim it. Race-free against concurrent /auth/refresh
+    // calls. (Codex S2.3 blocker fix.)
+    let account_id = auth::refresh_store::consume(&state.pool, &req.refresh_token)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "refresh token revoked or expired"))?;
 
@@ -154,8 +156,7 @@ pub async fn refresh(
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "account not found"))?;
 
-    // 3. Rotate the refresh token: revoke the old, issue a new pair.
-    let _ = auth::refresh_store::revoke(&state.pool, &req.refresh_token);
+    // 3. Issue a new pair (the old token is already revoked atomically above).
     Ok(Json(auth_response(&state, &account)?))
 }
 
