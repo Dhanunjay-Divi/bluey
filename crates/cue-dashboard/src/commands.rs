@@ -980,7 +980,16 @@ async fn try_speculative_dispatch(
         return Ok(None);
     }
 
-    let policy: Arc<dyn RoutingPolicy> = Arc::new(StaticPolicy::defaults());
+    // Codex Stage 9 round-2 Blocker 2: lane-correct policy selection.
+    // StaticPolicy emits openai/anthropic provider names; a managed
+    // registry contains only bluey-managed-* names. Detect from the
+    // registry contents and pick ManagedPolicy when managed; otherwise
+    // StaticPolicy for legacy BYOK.
+    let policy: Arc<dyn RoutingPolicy> = if registry.is_managed_only() {
+        Arc::new(cue_router::ManagedPolicy::new())
+    } else {
+        Arc::new(StaticPolicy::defaults())
+    };
     let provider: Arc<dyn cue_router::speculative::SpeculativeProvider> = Arc::new(registry);
     // speculative_when_deep is true so a Hard question gets draft + final in
     // parallel. Easy/Medium runs single-lane (still streamed).
@@ -1433,9 +1442,22 @@ impl ProviderRegistry {
     fn is_empty(&self) -> bool {
         self.providers.is_empty()
     }
-
+    #[allow(dead_code)]
     fn fallback(&self) -> Option<std::sync::Arc<dyn cue_llm::LlmProvider>> {
         self.providers.values().next().cloned()
+    }
+}
+
+impl ProviderRegistry {
+    /// Codex Stage 9 round-2: true when every registered LLM provider is
+    /// a `bluey-managed-*` name. Used to pick the right RoutingPolicy.
+    pub fn is_managed_only(&self) -> bool {
+        if self.providers.is_empty() {
+            return false;
+        }
+        self.providers
+            .keys()
+            .all(|k| k.starts_with("bluey-managed-"))
     }
 }
 
@@ -1448,14 +1470,46 @@ impl cue_router::speculative::SpeculativeProvider for ProviderRegistry {
         if let Some(p) = self.providers.get(&route.provider_name) {
             return Ok(p.clone());
         }
-        // Fallback: any other configured provider rather than failing the lane.
-        self.fallback()
-            .ok_or_else(|| cue_llm::LlmError::Provider("no providers configured".into()))
+        // Codex Stage 9 round-2 Blocker 2: NO arbitrary HashMap fallback.
+        // Returning an arbitrary provider can silently misroute a Deep
+        // classification to (e.g.) bluey-managed-instant. If the named
+        // provider is missing it is a registry-construction bug; surface
+        // it as an error so the caller falls back to legacy single-shot.
+        Err(cue_llm::LlmError::Provider(format!(
+            "no provider registered for route {} (managed_only={}, registered={:?})",
+            route.provider_name,
+            self.is_managed_only(),
+            self.providers.keys().collect::<Vec<_>>()
+        )))
     }
 }
 
 /// Build an LLM provider from environment variables or stored secrets.
+///
+/// Codex Stage 9 round-2 Blocker 1: managed-mode customers (Bluey
+/// account token in keyring, no direct OPENAI_API_KEY) used to be
+/// rejected here. We now check managed mode first and return a
+/// BlueyManagedProvider bound to the Balanced lane as the legacy
+/// single-shot fallback. The speculative path (`try_speculative_
+/// dispatch`) picks per-lane providers separately.
 fn build_llm_provider_from_env(_db: &State<DbState>) -> Option<Box<dyn cue_llm::LlmProvider>> {
+    // Managed mode first: Bluey account tokens take priority over BYOK
+    // unless BLUEY_DEV_BYOK=1 explicitly opts in (matching the
+    // ProviderRegistry policy).
+    let allow_byok = std::env::var("BLUEY_DEV_BYOK")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !allow_byok {
+        if let Ok(client) = cue_cloud_client::CloudClient::with_default_keyring() {
+            if client.current_tokens().is_some() {
+                return Some(Box::new(cue_llm::bluey_managed::BlueyManagedProvider::new(
+                    client,
+                    cue_llm::bluey_managed::ManagedLane::Balanced,
+                )));
+            }
+        }
+    }
+
     let openai_key = std::env::var("OPENAI_API_KEY")
         .ok()
         .filter(|k| !k.is_empty())
