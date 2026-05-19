@@ -1,8 +1,8 @@
 //! Specialized LLMs for the cue feature.
 
-mod answer;
-mod recap;
-mod suggest;
+pub mod answer;
+pub mod recap;
+pub mod suggest;
 
 pub use answer::AnswerLlm;
 pub use recap::RecapLlm;

@@ -3,7 +3,7 @@ use futures_util::StreamExt;
 
 use super::CueResponse;
 
-const SYSTEM_PROMPT: &str = "Given the recent conversation, suggest a concise next thing the user could say. Output 1-2 short bullet points.";
+pub const SYSTEM_PROMPT: &str = "Given the recent conversation, suggest a concise next thing the user could say. Output 1-2 short bullet points.";
 
 pub struct WhatToAnswerLlm;
 

@@ -3,7 +3,7 @@ use futures_util::StreamExt;
 
 use super::CueResponse;
 
-const SYSTEM_PROMPT: &str = "You are a helpful assistant during a meeting. The user just heard the following question. Reply concisely in 1-3 sentences.";
+pub const SYSTEM_PROMPT: &str = "You are a helpful assistant during a meeting. The user just heard the following question. Reply concisely in 1-3 sentences.";
 
 pub struct AnswerLlm;
 

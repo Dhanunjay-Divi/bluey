@@ -28,6 +28,7 @@ cue-core = { path = "../cue-core" }
 cue-daemon = { path = "../cue-daemon" }
 cue-router = { path = "../cue-router" }
 futures = "0.3"
+async-trait = "0.1"
 cue-llm = { path = "../cue-llm" }
 cue-stealth = { path = "../cue-stealth" }
 cpal.workspace = true

@@ -881,6 +881,28 @@ pub struct RouterMeta {
 /// Build a `RouterMeta` for the given prompt + active context surfaces.
 /// Local-only is read from the BLUEY_LOCAL_ONLY env var (until we surface it
 /// in the dashboard settings UI).
+
+/// Same classification logic as `classify_for_router` but returns the raw
+/// TaskClassification (used by the speculative path which needs the actual
+/// classification object to drive routing decisions).
+fn classify_only_for_router(
+    prompt: &str,
+    has_transcript: bool,
+    has_screenshot: bool,
+) -> cue_router::TaskClassification {
+    use cue_router::{ClassifierInput, HeuristicClassifier, TaskClassifier};
+    let classifier = HeuristicClassifier::new();
+    let input = ClassifierInput {
+        prompt,
+        has_transcript,
+        has_page: false,
+        file_attachment_count: 0,
+        has_screenshot,
+        ..Default::default()
+    };
+    futures::executor::block_on(classifier.classify(&input))
+}
+
 fn classify_for_router(prompt: &str, has_transcript: bool, has_screenshot: bool) -> RouterMeta {
     use cue_router::{
         AutoRouter, ClassifierInput, HeuristicClassifier, RouteOptions, RoutingPolicy,
@@ -918,6 +940,110 @@ fn classify_for_router(prompt: &str, has_transcript: bool, has_screenshot: bool)
         model: routed.route.model.clone(),
         confidence: routed.classification.confidence,
     }
+}
+
+/// Try the speculative routing path. Returns:
+///   Ok(Some(text)) if speculation succeeded and produced a final answer.
+///   Ok(None)       if speculation is OFF or unconfigured (caller should fall
+///                  back to the legacy AnswerLlm/WhatToAnswerLlm path).
+///   Err(e)         if speculation was ON and failed mid-stream.
+///
+/// Forwards every chunk through the existing `cue_response_chunk` Tauri event
+/// so the dashboard UI does not need to know the answer was speculative.
+#[allow(clippy::too_many_arguments)]
+async fn try_speculative_dispatch(
+    user_text: &str,
+    system_prompt: &str,
+    kind: &str,
+    response_id: &str,
+    classification: cue_router::TaskClassification,
+    router_meta: RouterMeta,
+    registry: ProviderRegistry,
+    app: tauri::AppHandle,
+) -> Result<Option<String>, String> {
+    use cue_router::{
+        policy::StaticPolicy, speculative::SpeculativeChunk, RoutingPolicy, SpeculativeRouter,
+    };
+    use futures::stream::StreamExt;
+    use std::sync::Arc;
+
+    let speculative_on = std::env::var("BLUEY_SPECULATIVE_ROUTING")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if !speculative_on || registry.is_empty() {
+        return Ok(None);
+    }
+
+    let policy: Arc<dyn RoutingPolicy> = Arc::new(StaticPolicy::defaults());
+    let provider: Arc<dyn cue_router::speculative::SpeculativeProvider> = Arc::new(registry);
+    // speculative_when_deep is true so a Hard question gets draft + final in
+    // parallel. Easy/Medium runs single-lane (still streamed).
+    let router = SpeculativeRouter::new(policy, provider, true);
+
+    let req = cue_llm::LlmRequest {
+        system: system_prompt.to_string(),
+        user: user_text.to_string(),
+        max_tokens: None,
+        temperature: None,
+    };
+
+    let stream = router
+        .run(&classification, req)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut stream = Box::pin(stream);
+
+    let mut accumulated_draft = String::new();
+    let mut final_text: Option<String> = None;
+    let mut emitted_meta = false;
+
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            SpeculativeChunk::Draft { text, finished } => {
+                accumulated_draft.push_str(&text);
+                let meta_for_chunk = if !emitted_meta {
+                    emitted_meta = true;
+                    Some(router_meta.clone())
+                } else {
+                    None
+                };
+                let _ = app.emit(
+                    "cue_response_chunk",
+                    CueResponseChunkPayload {
+                        response_id: response_id.to_string(),
+                        kind: kind.to_string(),
+                        partial_text: text,
+                        finished,
+                        router_meta: meta_for_chunk,
+                    },
+                );
+            }
+            SpeculativeChunk::Final { text } => {
+                // Replace: emit a synthetic chunk that the UI's reducer will
+                // append to. The dashboard'''s responseReducer keeps the entry
+                // marked done after this. The card body is the FULL final text.
+                let _ = app.emit(
+                    "cue_response_chunk",
+                    CueResponseChunkPayload {
+                        response_id: response_id.to_string(),
+                        kind: kind.to_string(),
+                        partial_text: format!("\n\n[refined]\n{text}"),
+                        finished: true,
+                        router_meta: None,
+                    },
+                );
+                final_text = Some(text);
+            }
+            SpeculativeChunk::Error { lane, message } => {
+                tracing::warn!(lane, message, "speculative router lane error");
+                // Non-fatal: keep collecting the other lane'''s output.
+            }
+        }
+    }
+
+    Ok(Some(
+        final_text.unwrap_or(accumulated_draft).trim().to_string(),
+    ))
 }
 
 /// Trigger a cue response. If a recent question is detected in the transcript
@@ -967,6 +1093,59 @@ pub async fn request_cue(
     // a lane badge before the answer text starts streaming.
     let router_meta = classify_for_router(&recent, true, false);
     let emitted_meta = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Optional: speculative routing path. Opt-in via BLUEY_SPECULATIVE_ROUTING=1.
+    // When ON, dispatches through cue-router::SpeculativeRouter and (for Hard /
+    // Deep questions) emits a streaming Draft from the Instant lane plus a
+    // Final from the Deep lane. When OFF or not configured, falls through to
+    // the legacy AnswerLlm / WhatToAnswerLlm path below — zero regression.
+    {
+        use cue_daemon::llm::{answer as answer_mod, suggest as suggest_mod};
+        let registry = ProviderRegistry::from_env_and_secrets(&db);
+        let classification = classify_only_for_router(&recent, true, false);
+        let is_question = kind == "answer" && ends_with_question(&recent);
+        let user_text = if is_question {
+            recent
+                .rsplit('.')
+                .find(|s| s.trim().ends_with('?'))
+                .unwrap_or(&recent)
+                .trim()
+                .to_string()
+        } else {
+            recent.clone()
+        };
+        let system_prompt = if is_question {
+            answer_mod::SYSTEM_PROMPT
+        } else {
+            suggest_mod::SYSTEM_PROMPT
+        };
+        let kind_str = if is_question { "answer" } else { "suggestion" };
+        if let Some(text) = try_speculative_dispatch(
+            &user_text,
+            system_prompt,
+            kind_str,
+            &response_id,
+            classification,
+            router_meta.clone(),
+            registry,
+            app.clone(),
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        {
+            let cue_resp = cue_daemon::llm::CueResponse::new(
+                kind_str,
+                text.clone(),
+                &session_id,
+                Some(recent.clone()),
+            );
+            let mut cue_resp = cue_resp;
+            cue_resp.id = response_id.clone();
+            persist_cue_response(&db, &cue_resp)?;
+            let _ = app.emit("cue_response", &cue_resp);
+            return Ok(text);
+        }
+    }
 
     // Detect question in recent transcript and dispatch with streaming.
     let emitted_meta_a = emitted_meta.clone();
@@ -1122,6 +1301,101 @@ fn persist_cue_response(
         resp.ts_ms as i64,
     )
     .map_err(|e| e.to_string())
+}
+
+/// Multi-provider registry: builds every LLM provider for which credentials
+/// are configured (env var or keyring) and exposes them by `LlmProvider::name()`.
+///
+/// This is what the SpeculativeRouter dispatches against. If the chosen route
+/// targets a provider that is not in the registry, we fall back to whichever
+/// provider IS available so a misconfigured Anthropic key does not block an
+/// OpenAI-only setup from running the deep lane.
+struct ProviderRegistry {
+    providers: std::collections::HashMap<String, std::sync::Arc<dyn cue_llm::LlmProvider>>,
+}
+
+impl ProviderRegistry {
+    fn from_env_and_secrets(_db: &tauri::State<DbState>) -> Self {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let mut providers: HashMap<String, Arc<dyn cue_llm::LlmProvider>> = HashMap::new();
+
+        if let Some(key) = std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+            .or_else(|| {
+                cue_daemon::secrets::load_api_key("llm_openai")
+                    .ok()
+                    .flatten()
+            })
+        {
+            let provider: Arc<dyn cue_llm::LlmProvider> =
+                Arc::new(cue_llm::openai::OpenAiProvider::new(key));
+            providers.insert("openai".to_string(), provider);
+        }
+
+        if let Some(key) = std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+            .or_else(|| {
+                cue_daemon::secrets::load_api_key("llm_anthropic")
+                    .ok()
+                    .flatten()
+            })
+        {
+            let provider: Arc<dyn cue_llm::LlmProvider> =
+                Arc::new(cue_llm::anthropic::AnthropicProvider::new(key));
+            providers.insert("anthropic".to_string(), provider);
+        }
+
+        // Ollama is local; no key required. We always register if the env var
+        // BLUEY_OLLAMA_HOST is set, OR if it is unset and we want the default
+        // localhost. Be conservative: only register if the user opted in via
+        // env var so we do not silently dispatch to a non-running local daemon.
+        // Ollama: register if user opted in via BLUEY_OLLAMA_HOST. The provider
+        // reads OLLAMA_BASE_URL itself; we propagate BLUEY_OLLAMA_HOST into
+        // OLLAMA_BASE_URL if the user has not set it explicitly so a single
+        // env var is enough to point at a non-default Ollama instance.
+        if let Ok(host) = std::env::var("BLUEY_OLLAMA_HOST") {
+            if !host.is_empty() {
+                if std::env::var("OLLAMA_BASE_URL").is_err() {
+                    // SAFETY: this is the daemon process at request time.
+                    // No other thread mutates this env var.
+                    unsafe {
+                        std::env::set_var("OLLAMA_BASE_URL", &host);
+                    }
+                }
+                let provider: Arc<dyn cue_llm::LlmProvider> =
+                    Arc::new(cue_llm::ollama::OllamaProvider::new());
+                providers.insert("ollama".to_string(), provider);
+            }
+        }
+
+        Self { providers }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+
+    fn fallback(&self) -> Option<std::sync::Arc<dyn cue_llm::LlmProvider>> {
+        self.providers.values().next().cloned()
+    }
+}
+
+#[async_trait::async_trait]
+impl cue_router::speculative::SpeculativeProvider for ProviderRegistry {
+    async fn provider_for(
+        &self,
+        route: &cue_router::ProviderRoute,
+    ) -> Result<std::sync::Arc<dyn cue_llm::LlmProvider>, cue_llm::LlmError> {
+        if let Some(p) = self.providers.get(&route.provider_name) {
+            return Ok(p.clone());
+        }
+        // Fallback: any other configured provider rather than failing the lane.
+        self.fallback()
+            .ok_or_else(|| cue_llm::LlmError::Provider("no providers configured".into()))
+    }
 }
 
 /// Build an LLM provider from environment variables or stored secrets.

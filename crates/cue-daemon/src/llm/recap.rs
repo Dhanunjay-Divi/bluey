@@ -3,7 +3,7 @@ use futures_util::StreamExt;
 
 use super::CueResponse;
 
-const SYSTEM_PROMPT: &str = "Summarize this meeting transcript. Extract key decisions, action items (with owners if named), and unresolved questions. Format as structured markdown.";
+pub const SYSTEM_PROMPT: &str = "Summarize this meeting transcript. Extract key decisions, action items (with owners if named), and unresolved questions. Format as structured markdown.";
 
 pub struct RecapLlm;
 
