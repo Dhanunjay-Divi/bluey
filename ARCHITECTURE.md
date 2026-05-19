@@ -338,6 +338,8 @@ both know how to talk to the cloud service.
 - `DECISIONS.md` — historical decisions + dead ends ("what not to retry").
 - `AGENT-HANDOFF.md` — operational notes for the next agent.
 - `FUTURE-IMPLEMENTATIONS.md` — canonical tracker for deferred work.
+- **`docs/HOW-IT-WORKS.md` — end-to-end v0.2 customer flow (signup,
+  login, request, billing, hard-stop, fallback).**
 - `docs/AUTO-ROUTING-USP.md` — Auto Router product framing.
 - `docs/BLUEY-DISTRIBUTION-ARCHITECTURE.md` — Layer 2 path comparison.
 - `docs/PRODUCTION-READINESS.md` — what ships vs what's pending matrix.

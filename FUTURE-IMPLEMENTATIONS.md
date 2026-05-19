@@ -201,23 +201,48 @@ just see errors).
 **Estimate:** 2 days code + tests.
 **Trigger to ship:** R14.11 ManagedProvider + LocalFallbackPolicy land.
 
-### R14.13 — Per-use metering (server side)
+### R14.13 — Prepaid wallet + per-use metering + auto top-up (server side)
 
-**Status:** required for v0.2 launch (so we can actually bill).
+**Status:** required for v0.2 launch.
+**See:** `DECISIONS.md` 2026-05-19 prepaid-wallet entry,
+`docs/HOW-IT-WORKS.md` Sections 0, 4-7.
+
 **Approach:**
 
-- Daemon emits a structured usage event after every cue request:
-  `{ request_id, account_id, lane, provider, model, input_tokens,
-     output_tokens, ms, cost_estimate_cents }`.
-- bluey-server `POST /usage/event` ingests, stores in SQLite,
-  aggregates by billing period.
-- Stripe metered billing pushes aggregated usage at end of each
-  invoice cycle.
-- Per-tenant budget cap enforced server-side: when cap is hit,
-  bluey-server returns `429 quota_exceeded` and the daemon shows a
-  clear UI message.
+- Account schema gains `balance_cents`, `trial_seconds_remaining`,
+  `auto_topup_enabled`, `stripe_payment_method_id`.
+- Per-model pricing table (input cents/1M tokens, output cents/1M
+  tokens) with Bluey markup 100-200% over upstream provider cost.
+- `/router/complete` flow:
+  1. Estimate cost from `input_tokens * markup_in + max_output_tokens * markup_out`.
+  2. **Entry check:** if `balance_cents < estimated_cost`, return
+     `402 Payment Required { balance_cents, estimated_cost_cents,
+     reason: "insufficient_balance", reload_url }`.
+  3. Stream upstream provider response.
+  4. **Mid-stream check** (every N tokens or every chunk): if running
+     cost exceeds remaining balance, cut the upstream stream, emit a
+     final chunk with `balance_exhausted: true`, deduct the
+     remaining balance (NOT the overrun), log overrun for audit.
+  5. On clean completion: atomic `UPDATE accounts SET balance_cents =
+     balance_cents - actual_cost WHERE id = ?`. Return new balance in
+     response trailer.
+- Free trial: during trial, skip balance deduction; decrement
+  `trial_seconds_remaining` by request duration.
+- Auto top-up: when balance < $5 (configurable), trigger Stripe
+  charge for $30 against saved PaymentMethod. On webhook success,
+  increment balance + push notification to daemon.
+- Daemon polls `/account/me` every 30s OR receives WebSocket push to
+  keep the live balance in the overlay top strip current.
+- Daemon emits the `RouterMeta` per-cue with `cost_cents` so the UI
+  can render the per-card cost label.
 
-**Estimate:** 3–4 days code + tests.
+**Hard guarantees baked into the implementation:**
+1. Customer cannot rack up debt. Overruns are absorbed by Bluey.
+2. No surprise charges. Auto top-up is opt-out. Customer always sees
+   the balance.
+3. No silent failures. 402 is always accompanied by a clear reason.
+
+**Estimate:** 5-7 days code + tests + Stripe integration.
 **Trigger to ship:** R14.9 server + R14.11 ManagedProvider land.
 
 ### Stripe live mode (Stage 4)

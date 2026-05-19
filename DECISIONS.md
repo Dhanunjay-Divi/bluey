@@ -9,6 +9,68 @@
 
 ---
 
+## 2026-05-19 — Prepaid wallet + auto top-up + 10-min free trial
+
+**Source:** user direction.
+**Decision:** v0.2 monetization model is a **prepaid wallet** with
+**auto top-up** plus a **10-minute free trial** for new accounts.
+
+Specifics:
+
+- New account starts with `balance_cents = 0` and
+  `trial_seconds_remaining = 600`.
+- During trial: `/router/complete` returns successfully without
+  deducting balance; trial seconds decrement by request duration.
+- After trial ends: customer must load $30 to continue. No partial
+  reloads; minimum is $30.
+- Each request is metered server-side: `cost = input_tokens *
+  markup_in + output_tokens * markup_out` with **100-200% markup
+  over the upstream provider cost**.
+- Auto top-up: when balance drops below $5, bluey-server triggers a
+  $30 Stripe charge against the saved card. Customer can disable in
+  Settings (default ON).
+- **Hard stop:** if balance is insufficient for the *estimated*
+  cost of a request, server returns 402 Payment Required and
+  daemon shows "Add $30 to continue" — no streaming starts. If
+  balance becomes insufficient mid-stream, server cuts the stream
+  and Bluey eats the overrun (customer is NEVER put in the red).
+- **Customer always sees:** live balance at the top of the overlay,
+  per-card cost label after each cue, LaneBadge with provider/model.
+
+**Pricing rationale (target):** 100-200% markup keeps the wallet
+usable. At ~$0.04 per Easy cue (gpt-4o-mini Instant lane, 200% markup)
+and ~$0.30 per Hard cue (Instant + claude-3-7 Deep, 200% markup), the
+typical user (~50 cues/day mixed) burns ~$21/month and reloads the
+$30 wallet ~once a month. Heavy users (~200 cues/day) reload 2-3
+times per month. Bluey gross margin sits in the 87-99% band per
+request because most of the value is routing intelligence + UX, not
+inference markup.
+
+**What this changes for the codebase:**
+
+- Server-side: prepaid balance state in account record. Every
+  `/router/complete` does an entry check (balance >= estimated_cost)
+  and a mid-stream check. Atomic deduction via SQL UPDATE on
+  completion.
+- Daemon-side: live-balance display in the overlay top strip.
+  Per-card cost label below each cue (already supported by
+  `RouterMeta`; just add `cost_cents` field).
+- Hard-stop UI: "balance_exhausted" event from server →
+  daemon shows banner with reload button.
+- Auto top-up: Stripe SetupIntent at first $30 reload to save the
+  card, subsequent charges use saved PaymentMethod.
+
+**Don't retry without new context:**
+- Don't allow debt. Customer overrun is on Bluey, not the customer.
+- Don't surprise-charge. Auto top-up is opt-out; customer always
+  sees the balance.
+- Don't hide cost. Per-card cost label is non-negotiable.
+
+See `docs/HOW-IT-WORKS.md` for the full v0.2 customer flow including
+free trial, hard-stop, and offline fallback.
+
+---
+
 ## 2026-05-19 — No BYOK; managed-only with local fallback
 
 **Source:** user direction.
