@@ -5,6 +5,20 @@ use rusqlite::params;
 
 use crate::db::DbPool;
 
+/// Codex Stage 10 round-2 typed-error nit: signup needs to distinguish
+/// "this email already exists" from generic DB errors without
+/// string-matching error messages. AccountCreateError is the typed
+/// variant; it is downcast via anyhow at the handler boundary.
+#[derive(Debug, thiserror::Error)]
+pub enum AccountCreateError {
+    #[error("duplicate-email")]
+    DuplicateEmail,
+    #[error("db: {0}")]
+    Db(#[from] rusqlite::Error),
+    #[error("pool: {0}")]
+    Pool(#[from] r2d2::Error),
+}
+
 #[derive(Debug, Clone)]
 pub struct Account {
     pub id: String,
@@ -91,10 +105,10 @@ impl Account {
         ) {
             Ok(_) => {}
             Err(e) => {
-                // Codex Stage 10 (S2.4 nit): map SQLite UNIQUE violation
-                // on `email` to a typed marker error so signup can
-                // return 409 atomically (no race window between
-                // pre-check and INSERT).
+                // Codex Stage 10 round-2 typed-error nit: emit the typed
+                // AccountCreateError::DuplicateEmail (wrapped in anyhow)
+                // so the signup handler can downcast cleanly. Generic
+                // DB errors propagate as AccountCreateError::Db.
                 if let rusqlite::Error::SqliteFailure(ref ff, ref msg) = e {
                     let is_unique = ff.code == rusqlite::ErrorCode::ConstraintViolation
                         && msg
@@ -102,10 +116,10 @@ impl Account {
                             .map(|m| m.to_lowercase().contains("unique"))
                             .unwrap_or(false);
                     if is_unique {
-                        return Err(anyhow::anyhow!("duplicate-email"));
+                        return Err(AccountCreateError::DuplicateEmail.into());
                     }
                 }
-                return Err(e.into());
+                return Err(AccountCreateError::Db(e).into());
             }
         }
         Ok(Self {
@@ -150,9 +164,13 @@ mod create_dup_tests {
         let pool = temp_pool();
         Account::create(&pool, "dup@example.com", "hash1").unwrap();
         let err = Account::create(&pool, "dup@example.com", "hash2").unwrap_err();
+        // Codex Stage 10 round-2: assert via typed downcast, not string match.
         assert!(
-            err.to_string().contains("duplicate-email"),
-            "expected duplicate-email marker, got: {err}"
+            matches!(
+                err.downcast_ref::<AccountCreateError>(),
+                Some(AccountCreateError::DuplicateEmail)
+            ),
+            "expected AccountCreateError::DuplicateEmail, got: {err}"
         );
     }
 }

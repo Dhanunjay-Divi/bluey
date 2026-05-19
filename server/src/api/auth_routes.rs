@@ -129,11 +129,13 @@ pub async fn signup(
         .map_err(|e| err(StatusCode::BAD_REQUEST, &e.to_string()))?;
 
     let account = Account::create(&state.pool, &email, &password_hash).map_err(|e| {
-        // Codex Stage 10 (S2.4 nit): map the UNIQUE-violation marker
-        // from Account::create to 409 so the signup endpoint is
-        // race-free (the pre-check above is opportunistic; this is
-        // the authoritative atomic check).
-        if e.to_string().contains("duplicate-email") {
+        // Codex Stage 10 round-2 typed-error nit: downcast to the typed
+        // AccountCreateError::DuplicateEmail variant instead of
+        // string-matching the error message. Race-free 409 mapping.
+        if matches!(
+            e.downcast_ref::<crate::db::accounts::AccountCreateError>(),
+            Some(crate::db::accounts::AccountCreateError::DuplicateEmail)
+        ) {
             return err(StatusCode::CONFLICT, "email already registered");
         }
         err(StatusCode::INTERNAL_SERVER_ERROR, &format!("create: {e}"))
