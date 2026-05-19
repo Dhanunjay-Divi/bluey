@@ -1014,6 +1014,9 @@ async fn try_speculative_dispatch(
 
     let mut accumulated_draft = String::new();
     let mut final_text: Option<String> = None;
+    // Codex Stage 9 round-2 Blocker 4: collect lane errors for diagnosis
+    // when all-lanes-failed.
+    let mut lane_errors: Vec<String> = Vec::new();
     let mut emitted_meta = false;
 
     while let Some(chunk) = stream.next().await {
@@ -1057,7 +1060,8 @@ async fn try_speculative_dispatch(
             }
             SpeculativeChunk::Error { lane, message } => {
                 tracing::warn!(lane, message, "speculative router lane error");
-                // Non-fatal: keep collecting the other lane'''s output.
+                lane_errors.push(format!("{lane}: {message}"));
+                // Non-fatal individually: keep collecting the other lane.
             }
         }
     }
