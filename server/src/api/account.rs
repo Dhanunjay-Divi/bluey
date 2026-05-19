@@ -1,6 +1,7 @@
-//! Account endpoints — real implementations using auth middleware.
+//! Account endpoints — real implementations.
 
 use axum::{extract::State, http::StatusCode, Extension, Json};
+use chrono::{Duration, Utc};
 use serde::Serialize;
 
 use super::AppState;
@@ -47,11 +48,102 @@ pub struct MixEntry {
     pub percent: f64,
 }
 
+const PERIOD_DAYS: i64 = 7;
+
 pub async fn usage(
-    State(_state): State<AppState>,
-    Extension(_account): Extension<AuthedAccount>,
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
 ) -> Result<Json<UsageWindow>, StatusCode> {
-    // Real aggregation lands in Stage 7. Stub returns 501 for now so
-    // clients consuming the route get a clear signal.
-    Err(StatusCode::NOT_IMPLEMENTED)
+    let conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let cutoff = (Utc::now() - Duration::days(PERIOD_DAYS)).to_rfc3339();
+
+    // Total cues + cents in window.
+    let (total_cues, total_cents_spent): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(cost_cents_to_customer), 0)
+             FROM usage_events
+             WHERE account_id = ?1 AND ts >= ?2",
+            rusqlite::params![&account.id, &cutoff],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Per-task-type breakdown. Uses lane as the bucket when task_type
+    // is NULL because v0.1 client-side classifier metadata isn't always
+    // forwarded into usage_events. Coalesce to "general" for legibility.
+    let mut stmt = conn
+        .prepare(
+            "SELECT COALESCE(task_type, lane, 'general') AS bucket,
+                    COUNT(*) AS cnt,
+                    COALESCE(SUM(cost_cents_to_customer), 0) AS cost
+             FROM usage_events
+             WHERE account_id = ?1 AND ts >= ?2
+             GROUP BY bucket
+             ORDER BY cost DESC",
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mix_raw: Vec<(String, i64, i64)> = stmt
+        .query_map(rusqlite::params![&account.id, &cutoff], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mix: Vec<MixEntry> = mix_raw
+        .into_iter()
+        .map(|(t, count, cost)| {
+            let percent = if total_cues > 0 {
+                100.0 * (count as f64) / (total_cues as f64)
+            } else {
+                0.0
+            };
+            MixEntry {
+                task_type: t,
+                count,
+                cost_cents: cost,
+                percent,
+            }
+        })
+        .collect();
+
+    // Tier classification + projection.
+    let avg_cost_per_cue_cents = if total_cues > 0 {
+        (total_cents_spent as f64) / (total_cues as f64)
+    } else {
+        2.2 // typical-tier default ~2.2 cents/cue
+    };
+    let cues_per_30 = if avg_cost_per_cue_cents > 0.0 {
+        3000.0 / avg_cost_per_cue_cents
+    } else {
+        f64::INFINITY
+    };
+    let tier_label = if cues_per_30 >= 2200.0 {
+        "Light"
+    } else if cues_per_30 >= 1100.0 {
+        "Typical tech"
+    } else {
+        "Heavy"
+    };
+
+    // Projected days remaining at current burn rate.
+    let cues_per_day = (total_cues as f64) / (PERIOD_DAYS as f64);
+    let avg_cents_per_day = cues_per_day * avg_cost_per_cue_cents;
+    let projected_days_remaining = if avg_cents_per_day > 0.01 {
+        (account.balance_cents as f64) / avg_cents_per_day
+    } else {
+        365.0 // no usage yet → cap at 1 year (credit-validity boundary)
+    };
+
+    Ok(Json(UsageWindow {
+        period_days: PERIOD_DAYS,
+        total_cues,
+        total_cents_spent,
+        mix,
+        tier_label: tier_label.to_string(),
+        projected_days_remaining: (projected_days_remaining * 10.0).round() / 10.0,
+    }))
 }
