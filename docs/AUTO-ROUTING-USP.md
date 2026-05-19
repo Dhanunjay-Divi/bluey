@@ -138,3 +138,23 @@ The dashboard / overlay treats `Final` as a card-body replacement (the existing 
 - The Hard questions are the minority of asks.
 
 Auto routing keeps Bluey "fast for 80% of questions, smart for the 20% that need it" without making the user choose.
+
+
+## Post-decision update (2026-05-19): no-BYOK
+
+The 2026-05-19 product decision (`DECISIONS.md`) makes Bluey
+**managed-only**. The Auto Router classifier and policy stay exactly
+the same; what changes is the dispatcher:
+
+- v0.1 BYOK code path (`StaticPolicy::defaults` + `OpenAiProvider`
+  reading `OPENAI_API_KEY`) is **dev-mode only**.
+- v0.2 production default is `ManagedPolicy` + `BlueyManagedProvider`
+  which dispatches through `bluey-server`. Bluey owns the keys; the
+  customer pays Bluey.
+- Local Ollama / whisper.cpp stay as the **offline / privacy fallback**.
+  The classifier and the `SpeculativeRouter` work identically against
+  fallback providers; only the underlying transport changes.
+
+**This is exactly the plug-point design described above** — the
+classifier is decoupled from the dispatcher precisely so the BYOK →
+managed swap is a config change, not a rewrite.

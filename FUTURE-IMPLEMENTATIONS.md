@@ -96,19 +96,38 @@ not exercised on a real Windows machine.
 
 ## Layer 3 — Product server / monetization
 
-### R14.9 — Product server scaffold (Stage 2)
+### R14.9 — Product server (BLOCKING for v0.2)
 
-**Status:** parked until monetization is greenlit (the user's call).
+**Status:** **REQUIRED for v0.2 launch** per the no-BYOK decision
+(2026-05-19, `DECISIONS.md`). No longer optional.
 **See:** `ARCHITECTURE.md` Section 5 + Section 7 Stage 2.
-**Estimate:** ~1 week dedicated work in a separate `bluey-server` repo.
-**Language:** Rust (locked in 2026-05-19; see `DECISIONS.md`). The
-operational shape mirrors Pinky's API droplet pattern (single binary
-+ SQLite + Caddy + LetsEncrypt) but the language stays in the Bluey
-family.
-**Trigger to ship:** user explicitly greenlights the monetization
-track.
+**Estimate:** ~1–2 weeks dedicated work in a separate `bluey-server`
+repo.
+**Language:** Rust (locked in 2026-05-19; `DECISIONS.md`). Operational
+shape mirrors Pinky's API droplet pattern (single binary + SQLite +
+Caddy + LetsEncrypt) but the language stays in the Bluey family.
+**Endpoints required for v0.2:**
 
-### Daemon talks to product server (Stage 3)
+- `POST /auth/{signup,login,refresh,logout,reset}`
+- `POST /billing/{checkout,webhook}` (Stripe; test mode through
+  Stage 3, live at Stage 4)
+- `GET  /account/me` (license + plan + usage summary)
+- `POST /router/complete` (managed LLM dispatch — this is the
+  monetization handle)
+- `POST /router/embed` (managed embedding dispatch)
+- `POST /router/transcribe` (managed STT dispatch)
+- `POST /usage/event` (per-call metering ingestion from daemon)
+- `GET  /admin/customers` (Bluey-team only)
+- `GET  /admin/health`
+
+**Trigger to ship:** v0.2 launch is the trigger. Until then, BYOK
+remains a dev-only path.
+
+### Daemon talks to product server (Stage 3) — superseded by R14.10
+
+**Status:** Superseded by R14.10–R14.13 (the no-BYOK decision broke
+this single "daemon talks to server" item into four concrete pieces).
+Kept here as a pointer for git-history-divers.
 
 **Status:** parked until R14.9 lands.
 **Approach:** new `cue-cloud-client` crate in this repo;
@@ -118,6 +137,88 @@ dispatches over HTTPS to the product server.
 **Estimate:** 3–5 days.
 **Trigger to ship:** product server has a working stub
 `POST /router/complete` endpoint + an auth flow.
+
+### R14.10 — `cue-cloud-client` crate + `bluey login` flow (BLOCKING for v0.2)
+
+**Status:** required for v0.2 launch. Daemon must authenticate with
+`bluey-server` instead of using BYOK keys.
+**Where deferred:** spawned by 2026-05-19 no-BYOK decision.
+**Approach:**
+
+- New `crates/cue-cloud-client/` Rust crate.
+- HTTPS client with refresh-token handling, retry on 401, exponential
+  backoff on 5xx.
+- Token stored in keyring under `bluey_account` (separate namespace
+  from the dev BYOK `llm_*` keys).
+- `bluey login` runs OAuth-style device flow: daemon prints a code,
+  user opens `https://bluey.dev/device` in a browser, enters the code,
+  daemon polls until token is issued.
+- `bluey logout` clears the keyring entry.
+
+**Estimate:** 3–4 days code + tests.
+**Trigger to ship:** R14.9 server has working auth + token endpoints.
+
+### R14.11 — `BlueyManagedProvider` + `ManagedPolicy` (BLOCKING for v0.2)
+
+**Status:** required for v0.2 launch.
+**Approach:**
+
+- New `cue_llm::bluey_managed::BlueyManagedProvider` impl that
+  speaks HTTPS to `bluey-server::POST /router/complete` and
+  `/router/embed`. Reuses the existing `LlmProvider` /
+  `EmbeddingProvider` traits so callers do not change.
+- New `cue_router::policy::ManagedPolicy` impl that calls
+  `bluey-server::POST /router/route` (or embeds the policy in the
+  ManagedProvider response) to pick lane + provider + model.
+- The daemon's existing `ProviderRegistry` is rewired so the
+  production code path uses `BlueyManagedProvider` exclusively.
+  BYOK providers stay behind a `BLUEY_DEV_BYOK=1` env flag for
+  dogfooding only.
+- `cue_router::policy::StaticPolicy` is renamed
+  `LocalFallbackPolicy` and used only when offline / privacy-mode
+  is active.
+
+**Estimate:** 2–3 days code + integration tests.
+**Trigger to ship:** R14.10 cloud client + R14.9 server endpoints.
+
+### R14.12 — Local-fallback mode + offline detection
+
+**Status:** required for v0.2 launch (so offline customers do not
+just see errors).
+**Approach:**
+
+- Daemon tracks bluey-server reachability via the cloud-client.
+- When unreachable for >N seconds, switches to local-fallback mode:
+  - LLM lane → local Ollama (`llama3.1` or whatever model is on disk)
+  - STT → local whisper.cpp
+  - Router policy → `LocalFallbackPolicy`
+- Daemon emits a clear UI signal (LaneBadge "OFFLINE" tag, a status
+  chip in the dashboard).
+- When connectivity returns, daemon switches back automatically.
+- An explicit `bluey privacy-mode on/off` toggle pins the daemon to
+  local-fallback regardless of connectivity.
+
+**Estimate:** 2 days code + tests.
+**Trigger to ship:** R14.11 ManagedProvider + LocalFallbackPolicy land.
+
+### R14.13 — Per-use metering (server side)
+
+**Status:** required for v0.2 launch (so we can actually bill).
+**Approach:**
+
+- Daemon emits a structured usage event after every cue request:
+  `{ request_id, account_id, lane, provider, model, input_tokens,
+     output_tokens, ms, cost_estimate_cents }`.
+- bluey-server `POST /usage/event` ingests, stores in SQLite,
+  aggregates by billing period.
+- Stripe metered billing pushes aggregated usage at end of each
+  invoice cycle.
+- Per-tenant budget cap enforced server-side: when cap is hit,
+  bluey-server returns `429 quota_exceeded` and the daemon shows a
+  clear UI message.
+
+**Estimate:** 3–4 days code + tests.
+**Trigger to ship:** R14.9 server + R14.11 ManagedProvider land.
 
 ### Stripe live mode (Stage 4)
 

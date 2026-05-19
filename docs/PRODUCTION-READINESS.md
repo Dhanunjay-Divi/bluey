@@ -137,7 +137,11 @@ Not shipped in v0.1.0:
 - Crash diagnostics/support bundle with explicit user consent.
 - Runtime health view for audio/STT/provider/cloud status.
 
-### P0 Cloud / Commercial
+### P0 Cloud / Commercial (REQUIRED for v0.2 — no-BYOK decision 2026-05-19)
+
+The 2026-05-19 no-BYOK decision (see `DECISIONS.md`) makes every item
+in this section a hard blocker for v0.2 launch. v0.1 BYOK is dev-mode
+only.
 
 - Bluey account auth, refresh, logout, and device registration.
 - Cloud sync queue with encrypted event/artifact upload and server ack.

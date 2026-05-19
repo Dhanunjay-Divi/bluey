@@ -182,8 +182,9 @@ is the canonical W1–W7 spec. Codex picks that up when ready.
 These are perma-pending and require user input:
 
 - **Distribution path** (A / B / C) and **domain** for Layer 2.
-- **Monetization timeline** (X / Y / Z) and **product server language**
-  (Go / Rust) for Layer 3.
+- **Monetization model:** decided 2026-05-19. No-BYOK; managed-only;
+  local fallback. Layer 3 is BLOCKING for v0.2. Product server
+  language: Rust. See `DECISIONS.md`.
 - **Where do bits go** when a release is cut and we want external
   testers to install? (As of 2026-05-19: still uno-only.)
 
