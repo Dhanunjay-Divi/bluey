@@ -139,7 +139,10 @@ mod tests {
     #[test]
     fn instant_lane_routes_to_instant_provider() {
         let p = StaticPolicy::defaults();
-        let r = p.route(&make_classification(TaskType::General, LatencyLane::Instant));
+        let r = p.route(&make_classification(
+            TaskType::General,
+            LatencyLane::Instant,
+        ));
         assert_eq!(r.lane, ProviderLane::Instant);
         assert!(r.stream);
     }

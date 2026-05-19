@@ -23,38 +23,114 @@ use crate::model::{ContextNeeds, Difficulty, LatencyLane, TaskClassification, Ta
 
 /// Default keyword sets, exposed so callers / tests can extend or override.
 const CODE_KEYWORDS: &[&str] = &[
-    "function", "method", "class", "struct", "trait", "impl",
-    "implement", "rewrite", "refactor", "debug", "stack trace",
-    "compile", "compiler", "linter", "test", "unit test", "fix this",
-    "panic", "error[", "lifetime", "borrow checker", "type error",
-    "rust ", "python ", "typescript ", "javascript ", "swift ",
-    "golang", " go ", " js ", " ts ", " sql ",
+    "function",
+    "method",
+    "class",
+    "struct",
+    "trait",
+    "impl",
+    "implement",
+    "rewrite",
+    "refactor",
+    "debug",
+    "stack trace",
+    "compile",
+    "compiler",
+    "linter",
+    "test",
+    "unit test",
+    "fix this",
+    "panic",
+    "error[",
+    "lifetime",
+    "borrow checker",
+    "type error",
+    "rust ",
+    "python ",
+    "typescript ",
+    "javascript ",
+    "swift ",
+    "golang",
+    " go ",
+    " js ",
+    " ts ",
+    " sql ",
 ];
 
 const DESIGN_KEYWORDS: &[&str] = &[
-    "design", "architecture", "system design", "scalability", "tradeoff",
-    "trade-off", "throughput", "latency", "consistency", "availability",
-    "load balanc", "shard", "replica", "queue", "high-level", "diagram",
-    "service-oriented", "microservice", "monolith", "event-driven",
-    "design a ", "how would you build", "build a system",
+    "design",
+    "architecture",
+    "system design",
+    "scalability",
+    "tradeoff",
+    "trade-off",
+    "throughput",
+    "latency",
+    "consistency",
+    "availability",
+    "load balanc",
+    "shard",
+    "replica",
+    "queue",
+    "high-level",
+    "diagram",
+    "service-oriented",
+    "microservice",
+    "monolith",
+    "event-driven",
+    "design a ",
+    "how would you build",
+    "build a system",
 ];
 
 const MEETING_KEYWORDS: &[&str] = &[
-    "in the meeting", "what did", "they said", "decision", "action item",
-    "transcript", "the call", "the discussion", "talked about", "mentioned",
-    "agreed", "follow-up", "follow up", "what was decided",
+    "in the meeting",
+    "what did",
+    "they said",
+    "decision",
+    "action item",
+    "transcript",
+    "the call",
+    "the discussion",
+    "talked about",
+    "mentioned",
+    "agreed",
+    "follow-up",
+    "follow up",
+    "what was decided",
 ];
 
 const WRITING_KEYWORDS: &[&str] = &[
-    "draft", "write an email", "summarize", "rewrite this", "polish",
-    "tone", "rephrase", "make it shorter", "make it longer", "edit this",
-    "blog post", "release note", "changelog", "documentation",
+    "draft",
+    "write an email",
+    "summarize",
+    "rewrite this",
+    "polish",
+    "tone",
+    "rephrase",
+    "make it shorter",
+    "make it longer",
+    "edit this",
+    "blog post",
+    "release note",
+    "changelog",
+    "documentation",
 ];
 
 const VISION_KEYWORDS: &[&str] = &[
-    "screenshot", "image", "picture", "diagram", "this screen",
-    "what'\''s on the screen", "what is in the image", "the chart",
-    "the graph", "the figure",
+    // Only unambiguous vision markers. We deliberately do NOT include
+    // "diagram" / "the chart" / "the graph" / "the figure" because those
+    // routinely appear in text-only design discussions ("include a diagram of
+    // the data flow") and would misroute a SystemDesign question to Vision.
+    // Vision still wins by attachment (has_screenshot=true) and by these
+    // phrases that only make sense when a real image is in scope.
+    "screenshot",
+    "this screen",
+    "on the screen",
+    "what is in the image",
+    "what'\''s in the image",
+    "in the picture",
+    "this picture",
 ];
 
 /// Heuristic-only classifier.
@@ -86,20 +162,27 @@ impl TaskClassifier for HeuristicClassifier {
         // Vision wins if a screenshot is attached or the prompt explicitly
         // mentions vision. Vision overrides other classifications because the
         // routing target (vision-capable provider) is different.
-        let vision_signal_count =
-            VISION_KEYWORDS.iter().filter(|k| prompt_lower.contains(*k)).count();
+        let vision_signal_count = VISION_KEYWORDS
+            .iter()
+            .filter(|k| prompt_lower.contains(*k))
+            .count();
         let vision_by_attachment = input.has_screenshot;
         let is_vision = vision_by_attachment || vision_signal_count > 0;
 
         // Score each non-vision task type by keyword hits.
-        let code_hits = count_hits(&prompt_lower, CODE_KEYWORDS) + if has_code_fence { 2 } else { 0 };
+        let code_hits =
+            count_hits(&prompt_lower, CODE_KEYWORDS) + if has_code_fence { 2 } else { 0 };
         let design_hits = count_hits(&prompt_lower, DESIGN_KEYWORDS);
-        let meeting_hits = count_hits(&prompt_lower, MEETING_KEYWORDS)
-            + if input.has_transcript { 1 } else { 0 };
+        let meeting_hits =
+            count_hits(&prompt_lower, MEETING_KEYWORDS) + if input.has_transcript { 1 } else { 0 };
         let writing_hits = count_hits(&prompt_lower, WRITING_KEYWORDS);
 
         let (task_type, top_hits, runner_up) = if is_vision {
-            (TaskType::Vision, vision_signal_count + if vision_by_attachment { 2 } else { 0 }, 0)
+            (
+                TaskType::Vision,
+                vision_signal_count + if vision_by_attachment { 2 } else { 0 },
+                0,
+            )
         } else {
             // Pick the highest-scoring non-vision bucket; default to General if all zero.
             let mut buckets: [(TaskType, usize); 4] = [
@@ -108,7 +191,7 @@ impl TaskClassifier for HeuristicClassifier {
                 (TaskType::Meeting, meeting_hits),
                 (TaskType::Writing, writing_hits),
             ];
-            buckets.sort_by(|a, b| b.1.cmp(&a.1));
+            buckets.sort_by_key(|x| std::cmp::Reverse(x.1));
             if buckets[0].1 == 0 {
                 (TaskType::General, 0, 0)
             } else {
@@ -188,7 +271,10 @@ impl TaskClassifier for HeuristicClassifier {
 }
 
 fn count_hits(prompt_lower: &str, keywords: &[&str]) -> usize {
-    keywords.iter().filter(|k| prompt_lower.contains(*k)).count()
+    keywords
+        .iter()
+        .filter(|k| prompt_lower.contains(*k))
+        .count()
 }
 
 #[cfg(test)]
@@ -196,7 +282,10 @@ mod tests {
     use super::*;
 
     fn make_input(prompt: &str) -> ClassifierInput<'_> {
-        ClassifierInput { prompt, ..Default::default() }
+        ClassifierInput {
+            prompt,
+            ..Default::default()
+        }
     }
 
     #[tokio::test]
@@ -258,7 +347,9 @@ mod tests {
     async fn writing_polish_request() {
         let c = HeuristicClassifier::new();
         let r = c
-            .classify(&make_input("polish this email to make it shorter and more direct"))
+            .classify(&make_input(
+                "polish this email to make it shorter and more direct",
+            ))
             .await;
         assert_eq!(r.task_type, TaskType::Writing);
     }
@@ -280,7 +371,6 @@ mod tests {
         assert!(r.confidence <= 0.5);
     }
 
-
     #[tokio::test]
     async fn followup_routing_brings_in_transcript_context() {
         // A two-word follow-up during an active meeting session should still
@@ -289,20 +379,56 @@ mod tests {
         let mut input = make_input("more details?");
         input.has_transcript = true;
         let r = c.classify(&input).await;
-        assert!(r.needed_context.transcript, "transcript context should be needed");
+        assert!(
+            r.needed_context.transcript,
+            "transcript context should be needed"
+        );
         // Confidence is allowed to be moderate — the prompt itself is vague.
         assert!(r.confidence < 0.9);
     }
 
+    // local_only is now a routing-policy concern (it does not appear on
+    // ClassifierInput). The end-to-end test that AutoRouter honors local_only
+    // lives in `auto.rs::tests::auto_router_local_only_forces_local_lane`.
+
     #[tokio::test]
-    async fn local_only_does_not_change_classification() {
-        // Forcing local-only is a routing-policy concern, not a classifier concern.
-        // The classifier should produce the same task type regardless.
+    async fn text_only_diagram_in_design_question_is_not_vision() {
+        // Regression for the codex-flagged bug: VISION_KEYWORDS used to include
+        // "diagram", "the chart", etc, so a normal text-only design question
+        // mentioning a diagram of the data flow was being misrouted to Vision.
+        // Vision should only fire on actual visual attachments or unambiguous
+        // wording like "the screenshot" / "in the image".
         let c = HeuristicClassifier::new();
-        let mut input = make_input("design a system for 100k qps");
-        input.local_only = true;
-        let r = c.classify(&input).await;
-        assert_eq!(r.task_type, TaskType::SystemDesign);
+        let r = c
+            .classify(&make_input(
+                "design a system for 10k qps writes; include a diagram of the data flow",
+            ))
+            .await;
+        assert_eq!(
+            r.task_type,
+            TaskType::SystemDesign,
+            "diagram should not flip to Vision"
+        );
     }
 
+    #[tokio::test]
+    async fn text_only_chart_mention_is_not_vision() {
+        let c = HeuristicClassifier::new();
+        let r = c
+            .classify(&make_input(
+                "write a blog post about the unit-economics chart",
+            ))
+            .await;
+        assert_ne!(r.task_type, TaskType::Vision);
+    }
+
+    #[tokio::test]
+    async fn vision_still_wins_on_explicit_screen_wording() {
+        // The narrowed keyword set still catches unambiguous phrases.
+        let c = HeuristicClassifier::new();
+        let r = c
+            .classify(&make_input("what is in the image i just sent"))
+            .await;
+        assert_eq!(r.task_type, TaskType::Vision);
+    }
 }

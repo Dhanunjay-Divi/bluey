@@ -9,6 +9,11 @@ use crate::model::TaskClassification;
 /// `attachments` covers files / screenshots / page captures. The exact content
 /// is irrelevant to the heuristic classifier; only the count and kind matter
 /// for routing.
+///
+/// **Note:** `local_only` is intentionally NOT a field here — it is a routing
+/// policy concern, not a classification concern. Callers wanting privacy /
+/// offline routing should use `AutoRouter::route(&input, RouteOptions {
+/// local_only: true })` or construct a `StaticPolicy::local_only()` directly.
 #[derive(Debug, Clone, Default)]
 pub struct ClassifierInput<'a> {
     /// The user's natural-language prompt.
@@ -21,8 +26,6 @@ pub struct ClassifierInput<'a> {
     pub file_attachment_count: usize,
     /// Whether a screenshot artifact is on the request.
     pub has_screenshot: bool,
-    /// Whether the user opted into a privacy-only / local-only run.
-    pub local_only: bool,
 }
 
 /// Trait every classifier (heuristic, tiny-model, future managed router) implements.

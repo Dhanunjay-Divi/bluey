@@ -37,14 +37,18 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod auto;
 pub mod classifier;
 pub mod heuristic;
 pub mod model;
 pub mod policy;
 pub mod speculative;
 
-pub use classifier::{LayeredClassifier, TaskClassifier};
+pub use auto::{AutoRouter, RouteOptions, RoutedRequest};
+pub use classifier::{ClassifierInput, LayeredClassifier, TaskClassifier};
 pub use heuristic::HeuristicClassifier;
-pub use model::{ContextNeeds, Difficulty, LatencyLane, ProviderRoute, TaskClassification, TaskType};
+pub use model::{
+    ContextNeeds, Difficulty, LatencyLane, ProviderRoute, TaskClassification, TaskType,
+};
 pub use policy::{RoutingPolicy, StaticPolicy};
 pub use speculative::{SpeculativeChunk, SpeculativeRouter};

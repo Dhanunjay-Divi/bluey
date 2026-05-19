@@ -27,7 +27,6 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use cue_llm::{LlmChunk, LlmError, LlmProvider, LlmRequest};
 use futures_util::{Stream, StreamExt};
-use tokio::sync::Mutex;
 
 use crate::model::ProviderRoute;
 use crate::policy::RoutingPolicy;
@@ -62,10 +61,7 @@ pub enum SpeculativeChunk {
 #[async_trait]
 pub trait SpeculativeProvider: Send + Sync {
     /// Resolve a `ProviderRoute` to a concrete provider implementation.
-    async fn provider_for(
-        &self,
-        route: &ProviderRoute,
-    ) -> Result<Arc<dyn LlmProvider>, LlmError>;
+    async fn provider_for(&self, route: &ProviderRoute) -> Result<Arc<dyn LlmProvider>, LlmError>;
 }
 
 /// Speculative router. Configurable: callers decide whether speculation is
@@ -85,7 +81,11 @@ impl SpeculativeRouter {
         provider: Arc<dyn SpeculativeProvider>,
         speculative_when_deep: bool,
     ) -> Self {
-        Self { policy, provider, speculative_when_deep }
+        Self {
+            policy,
+            provider,
+            speculative_when_deep,
+        }
     }
 
     /// Run a classified request and return a stream of speculative chunks.
@@ -110,25 +110,55 @@ impl SpeculativeRouter {
         let should_speculate = self.speculative_when_deep
             && matches!(primary_route.lane, crate::model::ProviderLane::Deep);
 
-        // Channel to fan in chunks.
+        // Channel to fan in chunks from both lanes.
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         if should_speculate {
-            // Build the Instant route by routing a temp classification with Instant lane.
+            // Try to build the Instant draft lane. If the Instant provider is
+            // unavailable (auth failure, quota, missing key), we MUST still
+            // run the Deep lane on its own — dropping the Hard answer just
+            // because the cheap draft is unreachable would be a regression.
             let instant_class = TaskClassification {
                 latency_lane: crate::model::LatencyLane::Instant,
                 ..classification.clone()
             };
             let instant_route = self.policy.route(&instant_class);
-            let instant_provider = self.provider.provider_for(&instant_route).await?;
-
             let request = Arc::new(request);
-            spawn_draft_lane(instant_provider, request.clone(), instant_route, tx.clone());
-            spawn_deep_lane(primary_provider, request, primary_route, tx);
+            match self.provider.provider_for(&instant_route).await {
+                Ok(instant_provider) => {
+                    spawn_lane(
+                        LaneRole::Draft,
+                        instant_provider,
+                        request.clone(),
+                        instant_route,
+                        tx.clone(),
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "speculative router: instant lane unavailable; running deep-only",
+                    );
+                    // Surface a non-fatal Error chunk so the UI can show a
+                    // subtle "draft skipped" indicator if it wants to.
+                    let _ = tx.send(SpeculativeChunk::Error {
+                        lane: "draft",
+                        message: format!("instant lane unavailable: {e}"),
+                    });
+                }
+            }
+            spawn_lane(LaneRole::Deep, primary_provider, request, primary_route, tx);
         } else {
-            // Single-lane: emit as drafts (callers treat all chunks as deltas).
+            // Single-lane: emit chunks as drafts (callers treat all chunks as
+            // deltas + the final-flagged chunk as completion).
             let request = Arc::new(request);
-            spawn_draft_lane(primary_provider, request, primary_route, tx);
+            spawn_lane(
+                LaneRole::Draft,
+                primary_provider,
+                request,
+                primary_route,
+                tx,
+            );
         }
 
         // Adapt the unbounded receiver into a Stream.
@@ -139,88 +169,102 @@ impl SpeculativeRouter {
     }
 }
 
-fn spawn_draft_lane(
+#[derive(Clone, Copy)]
+enum LaneRole {
+    /// Draft lane (Instant): chunks emit as `SpeculativeChunk::Draft`.
+    Draft,
+    /// Deep lane: completion emits as a single `SpeculativeChunk::Final`.
+    Deep,
+}
+
+impl LaneRole {
+    fn label(self) -> &'static str {
+        match self {
+            LaneRole::Draft => "draft",
+            LaneRole::Deep => "deep",
+        }
+    }
+}
+
+fn spawn_lane(
+    role: LaneRole,
     provider: Arc<dyn LlmProvider>,
     request: Arc<LlmRequest>,
     route: ProviderRoute,
     tx: tokio::sync::mpsc::UnboundedSender<SpeculativeChunk>,
 ) {
     tokio::spawn(async move {
-        let req: LlmRequest = LlmRequest {
+        let req = LlmRequest {
+            system: request.system.clone(),
+            user: request.user.clone(),
             max_tokens: route.max_tokens.or(request.max_tokens),
             temperature: route.temperature.or(request.temperature),
-            ..LlmRequest {
-                system: request.system.clone(),
-                user: request.user.clone(),
-                max_tokens: request.max_tokens,
-                temperature: request.temperature,
-            }
         };
-        match provider.complete_stream(&req).await {
-            Ok(mut stream) => {
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(LlmChunk { text, finished }) => {
-                            let _ = tx.send(SpeculativeChunk::Draft { text, finished });
-                            if finished {
-                                break;
+        // Honor route.stream: if the lane wants streaming, use complete_stream;
+        // otherwise use complete() and emit a single synthetic chunk in the
+        // shape appropriate for the role.
+        if route.stream {
+            match provider.complete_stream(&req).await {
+                Ok(mut stream) => {
+                    let mut accumulated = String::new();
+                    while let Some(chunk) = stream.next().await {
+                        match chunk {
+                            Ok(LlmChunk { text, finished }) => match role {
+                                LaneRole::Draft => {
+                                    let _ = tx.send(SpeculativeChunk::Draft { text, finished });
+                                    if finished {
+                                        break;
+                                    }
+                                }
+                                LaneRole::Deep => {
+                                    accumulated.push_str(&text);
+                                    if finished {
+                                        let _ =
+                                            tx.send(SpeculativeChunk::Final { text: accumulated });
+                                        return;
+                                    }
+                                }
+                            },
+                            Err(e) => {
+                                let _ = tx.send(SpeculativeChunk::Error {
+                                    lane: role.label(),
+                                    message: e.to_string(),
+                                });
+                                return;
                             }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(SpeculativeChunk::Error {
-                                lane: "draft",
-                                message: e.to_string(),
-                            });
-                            return;
                         }
                     }
                 }
+                Err(e) => {
+                    let _ = tx.send(SpeculativeChunk::Error {
+                        lane: role.label(),
+                        message: e.to_string(),
+                    });
+                }
             }
-            Err(e) => {
-                let _ = tx.send(SpeculativeChunk::Error {
-                    lane: "draft",
-                    message: e.to_string(),
-                });
-            }
-        }
-    });
-}
-
-fn spawn_deep_lane(
-    provider: Arc<dyn LlmProvider>,
-    request: Arc<LlmRequest>,
-    route: ProviderRoute,
-    tx: tokio::sync::mpsc::UnboundedSender<SpeculativeChunk>,
-) {
-    tokio::spawn(async move {
-        let req: LlmRequest = LlmRequest {
-            max_tokens: route.max_tokens.or(request.max_tokens),
-            temperature: route.temperature.or(request.temperature),
-            ..LlmRequest {
-                system: request.system.clone(),
-                user: request.user.clone(),
-                max_tokens: request.max_tokens,
-                temperature: request.temperature,
-            }
-        };
-        match provider.complete(&req).await {
-            Ok(resp) => {
-                let _ = tx.send(SpeculativeChunk::Final { text: resp.text });
-            }
-            Err(e) => {
-                let _ = tx.send(SpeculativeChunk::Error {
-                    lane: "deep",
-                    message: e.to_string(),
-                });
+        } else {
+            match provider.complete(&req).await {
+                Ok(resp) => match role {
+                    LaneRole::Draft => {
+                        let _ = tx.send(SpeculativeChunk::Draft {
+                            text: resp.text,
+                            finished: true,
+                        });
+                    }
+                    LaneRole::Deep => {
+                        let _ = tx.send(SpeculativeChunk::Final { text: resp.text });
+                    }
+                },
+                Err(e) => {
+                    let _ = tx.send(SpeculativeChunk::Error {
+                        lane: role.label(),
+                        message: e.to_string(),
+                    });
+                }
             }
         }
     });
 }
-
-// Suppress an unused-import warning when the `cue_llm` re-export of `Mutex`
-// is not needed (kept for future internal state).
-#[allow(dead_code)]
-type _M = Mutex<()>;
 
 #[cfg(test)]
 mod tests {
@@ -252,17 +296,31 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LlmProvider for MockProvider {
-        fn name(&self) -> &'static str { "mock" }
-        fn supports_streaming(&self) -> bool { true }
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+        fn supports_streaming(&self) -> bool {
+            true
+        }
         async fn complete(&self, _req: &LlmRequest) -> Result<LlmResponse, LlmError> {
             self.completion_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(LlmResponse { text: self.deep_text.to_string() })
+            Ok(LlmResponse {
+                text: self.deep_text.to_string(),
+            })
         }
         async fn complete_stream(&self, _req: &LlmRequest) -> Result<LlmChunkStream, LlmError> {
             self.stream_calls.fetch_add(1, Ordering::Relaxed);
-            let chunks: Vec<_> = self.chunks.iter().enumerate().map(|(i, c)| {
-                Ok(LlmChunk { text: c.to_string(), finished: i == self.chunks.len() - 1 })
-            }).collect();
+            let chunks: Vec<_> = self
+                .chunks
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    Ok(LlmChunk {
+                        text: c.to_string(),
+                        finished: i == self.chunks.len() - 1,
+                    })
+                })
+                .collect();
             Ok(Box::pin(stream::iter(chunks)))
         }
     }
@@ -296,13 +354,20 @@ mod tests {
     }
 
     fn req() -> LlmRequest {
-        LlmRequest { system: "s".into(), user: "u".into(), max_tokens: None, temperature: None }
+        LlmRequest {
+            system: "s".into(),
+            user: "u".into(),
+            max_tokens: None,
+            temperature: None,
+        }
     }
 
     #[tokio::test]
     async fn single_lane_emits_draft_chunks() {
         let provider = Arc::new(MockProvider::new(vec!["Hello", " world"], "deep"));
-        let dispatch = Arc::new(MockDispatch { provider: provider.clone() });
+        let dispatch = Arc::new(MockDispatch {
+            provider: provider.clone(),
+        });
         let policy: Arc<dyn RoutingPolicy> = Arc::new(StaticPolicy::defaults());
         let router = SpeculativeRouter::new(policy, dispatch, false);
 
@@ -310,8 +375,12 @@ mod tests {
         let stream = router.run(&class, req()).await.unwrap();
         let chunks: Vec<_> = stream.collect::<Vec<_>>().await;
         assert_eq!(chunks.len(), 2);
-        assert!(matches!(chunks[0], SpeculativeChunk::Draft { ref text, finished: false } if text == "Hello"));
-        assert!(matches!(chunks[1], SpeculativeChunk::Draft { ref text, finished: true } if text == " world"));
+        assert!(
+            matches!(chunks[0], SpeculativeChunk::Draft { ref text, finished: false } if text == "Hello")
+        );
+        assert!(
+            matches!(chunks[1], SpeculativeChunk::Draft { ref text, finished: true } if text == " world")
+        );
         assert_eq!(provider.stream_calls.load(Ordering::Relaxed), 1);
         assert_eq!(provider.completion_calls.load(Ordering::Relaxed), 0);
     }
@@ -322,7 +391,9 @@ mod tests {
             vec!["draft-part-1", "draft-part-2"],
             "DEEP_FINAL_ANSWER",
         ));
-        let dispatch = Arc::new(MockDispatch { provider: provider.clone() });
+        let dispatch = Arc::new(MockDispatch {
+            provider: provider.clone(),
+        });
         let policy: Arc<dyn RoutingPolicy> = Arc::new(StaticPolicy::defaults());
         let router = SpeculativeRouter::new(policy, dispatch, true);
 
@@ -336,7 +407,9 @@ mod tests {
         for c in chunks {
             match c {
                 SpeculativeChunk::Draft { text, .. } => draft_texts.push(text),
-                SpeculativeChunk::Final { text } => { final_text = Some(text); }
+                SpeculativeChunk::Final { text } => {
+                    final_text = Some(text);
+                }
                 SpeculativeChunk::Error { lane, message } => panic!("error from {lane}: {message}"),
             }
         }
@@ -350,7 +423,9 @@ mod tests {
     #[tokio::test]
     async fn deep_without_speculation_does_not_fire_draft() {
         let provider = Arc::new(MockProvider::new(vec!["should-not-stream"], "DEEP"));
-        let dispatch = Arc::new(MockDispatch { provider: provider.clone() });
+        let dispatch = Arc::new(MockDispatch {
+            provider: provider.clone(),
+        });
         let policy: Arc<dyn RoutingPolicy> = Arc::new(StaticPolicy::defaults());
         let router = SpeculativeRouter::new(policy, dispatch, false);
 
@@ -363,7 +438,104 @@ mod tests {
         // complete_stream() on the provider here, so the mock will yield from
         // its streaming path. Either way: there should be NO Final chunk.
         for c in &chunks {
-            assert!(!matches!(c, SpeculativeChunk::Final { .. }), "unexpected Final without speculation");
+            assert!(
+                !matches!(c, SpeculativeChunk::Final { .. }),
+                "unexpected Final without speculation"
+            );
         }
+    }
+
+    /// Mock dispatcher that fails on Instant routes but succeeds on Deep.
+    struct InstantFailDispatch {
+        deep_provider: Arc<MockProvider>,
+    }
+    #[async_trait::async_trait]
+    impl SpeculativeProvider for InstantFailDispatch {
+        async fn provider_for(
+            &self,
+            route: &ProviderRoute,
+        ) -> Result<Arc<dyn LlmProvider>, LlmError> {
+            match route.lane {
+                ProviderLane::Instant => Err(LlmError::Provider("instant lane unavailable".into())),
+                _ => Ok(self.deep_provider.clone()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deep_runs_even_when_instant_lane_unavailable() {
+        // Regression: codex flagged that the previous run() impl returned `?`
+        // on Instant provider failure, killing the Deep lane too. We must
+        // surface the Deep answer even if the cheap draft is gone.
+        let deep = Arc::new(MockProvider::new(vec![], "DEEP_ANSWER"));
+        let dispatch = Arc::new(InstantFailDispatch {
+            deep_provider: deep.clone(),
+        });
+        let policy: Arc<dyn RoutingPolicy> = Arc::new(StaticPolicy::defaults());
+        let router = SpeculativeRouter::new(policy, dispatch, true);
+
+        let class = classification(LatencyLane::Deep);
+        let stream = router.run(&class, req()).await.expect("must not fail");
+        let chunks: Vec<_> = stream.collect::<Vec<_>>().await;
+
+        // Must have at least one Final, and a non-fatal Error for the missing draft.
+        let has_final = chunks
+            .iter()
+            .any(|c| matches!(c, SpeculativeChunk::Final { .. }));
+        let has_draft_error = chunks
+            .iter()
+            .any(|c| matches!(c, SpeculativeChunk::Error { lane: "draft", .. }));
+        assert!(
+            has_final,
+            "Deep lane must still produce Final: got {chunks:?}"
+        );
+        assert!(
+            has_draft_error,
+            "draft-failure must surface as non-fatal Error chunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn honors_stream_false_on_draft_lane_emits_single_chunk() {
+        // Build a route with stream:false. The lane spawner must use complete()
+        // not complete_stream() and emit a single Draft chunk with finished:true.
+        let provider = Arc::new(MockProvider::new(
+            vec!["should-not-stream-anything"],
+            "NON_STREAM_DRAFT",
+        ));
+        let dispatch = Arc::new(MockDispatch {
+            provider: provider.clone(),
+        });
+
+        // Custom policy that returns stream:false for all lanes.
+        struct NonStreamPolicy;
+        impl RoutingPolicy for NonStreamPolicy {
+            fn route(&self, _c: &TaskClassification) -> ProviderRoute {
+                ProviderRoute {
+                    lane: ProviderLane::Balanced,
+                    provider_name: "mock".into(),
+                    model: "any".into(),
+                    max_tokens: None,
+                    temperature: None,
+                    stream: false,
+                }
+            }
+        }
+        let policy: Arc<dyn RoutingPolicy> = Arc::new(NonStreamPolicy);
+        let router = SpeculativeRouter::new(policy, dispatch, false);
+
+        let class = classification(LatencyLane::Balanced);
+        let chunks: Vec<_> = router.run(&class, req()).await.unwrap().collect().await;
+        assert_eq!(chunks.len(), 1);
+        match &chunks[0] {
+            SpeculativeChunk::Draft { text, finished } => {
+                assert_eq!(text, "NON_STREAM_DRAFT");
+                assert!(*finished);
+            }
+            other => panic!("expected single Draft, got {other:?}"),
+        }
+        // complete() called, complete_stream() NOT called.
+        assert_eq!(provider.completion_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(provider.stream_calls.load(Ordering::Relaxed), 0);
     }
 }
