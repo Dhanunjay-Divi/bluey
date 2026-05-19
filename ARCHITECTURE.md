@@ -72,15 +72,23 @@ runs the **classifier + routing + storage** on the laptop, but **the
 actual model inference is in the cloud** — at the upstream provider
 (Anthropic / OpenAI) — using the user's BYOK API key.
 
-| Component | Location today (v0.1, BYOK) | Location after v0.2 (managed) |
-|---|---|---|
-| LLM inference | provider cloud (user's API key) | provider cloud, but routed through `bluey-server` (Bluey's API key) |
-| Embeddings | OpenAI cloud (user's API key) | provider cloud, routed through `bluey-server` |
-| RAG vector storage + search | laptop SQLite (~37 ms / 10k chunks) | laptop OR cloud (cross-device search), customer choice |
-| Whisper STT (audio → text) | **laptop** (whisper.cpp, ~30 MB model) | laptop OR cloud STT (Deepgram / Realtime) |
-| Audio capture (system + mic) | **laptop** (CoreAudio) | always laptop |
-| Auto Router classification | **laptop** (in-process heuristic) | laptop heuristic + optional managed tiny-model classifier server-side |
-| Overlay + daemon + dashboard | **laptop** | always laptop |
+| Component | Location v0.1 (dev BYOK) | Location v0.2+ (managed-only) | Local fallback (offline / privacy) |
+|---|---|---|---|
+| LLM inference | provider cloud, user's API key | provider cloud via `bluey-server` (Bluey's API key) | local Ollama on laptop |
+| Embeddings | OpenAI cloud, user's API key | provider cloud via `bluey-server` | local sentence-transformer on laptop (R14.x) |
+| RAG vector storage + search | laptop SQLite | laptop SQLite + optional cloud RAG (cross-device) | always laptop |
+| Whisper STT (audio → text) | **laptop** (whisper.cpp) | cloud STT via `bluey-server` (Deepgram / Realtime) | local whisper.cpp on laptop |
+| Audio capture (system + mic) | **laptop** (CoreAudio) | **laptop** | **laptop** |
+| Auto Router classification | **laptop** (heuristic) | laptop heuristic + optional server-side tiny-model | always laptop heuristic |
+| Overlay + daemon + dashboard | **laptop** | **laptop** | **laptop** |
+
+**Key product decision (2026-05-19):** Bluey is **managed-only**. The
+customer's BYOK keys are NOT exposed in the production UI. Every paid
+inference goes through `bluey-server` so Bluey is the billing entity.
+**Local models (whisper.cpp, Ollama) exist as an offline / privacy
+fallback only** — the customer is still on a paid Bluey subscription
+during fallback; the cost just shifts to their hardware. See
+`DECISIONS.md` for the rationale.
 
 **Practical implication for a customer's laptop:** modern Macs handle
 the local pieces fine. Whisper tiny.en runs in real-time at <10% CPU
@@ -184,7 +192,10 @@ migration is a routing change, not a client change.
 
 ## 5. Layer 3 — Product server (forward-looking)
 
-**State:** scaffolded as R14.9, parked until monetization is greenlit.
+**State:** REQUIRED for v0.2 launch (per 2026-05-19 no-BYOK decision).
+Scaffold tracked as R14.9 in `docs/work/PHASE-3-ROUND-14-PLAN.md`. v0.1
+ships without it (dev BYOK only); v0.2 cannot ship without it because
+managed-only is now the default.
 
 **Job:** the actual paid SaaS. Sells the value Bluey wraps the user's
 provider keys with (or replaces them entirely with Bluey-managed keys).
@@ -221,15 +232,23 @@ endpoint. That's the monetization handle the Auto Router crate
 // cue-router/src/policy.rs
 pub trait RoutingPolicy { fn route(&self, ...) -> ProviderRoute; }
 
-// Today (v0.1 BYOK):
-StaticPolicy::defaults()  // hard-coded local lane → provider mapping
+// v0.1 dev mode (BYOK, internal-only, NOT exposed to customers):
+StaticPolicy::defaults()  // hard-coded lane → provider, daemon
+                          // reads keys from env/keyring directly
 
-// Future (v0.2 paid):
+// v0.2 production default (managed-only, what customers see):
 ManagedPolicy::from_bluey_account(token)
-//   asks bluey-server which provider/model to use
-//   bluey-server enforces tenant budget + rate limits
-//   bluey-server returns a ProviderRoute pointing the daemon at
-//   bluey-server itself, which proxies to the upstream provider
+//   - daemon authenticates with bluey-server using the customer's
+//     Bluey account token (stored in keyring after `bluey login`)
+//   - bluey-server picks lane + provider + model
+//   - bluey-server uses Bluey-owned upstream API keys
+//   - bluey-server enforces tenant budget + rate limits
+//   - bluey-server meters usage for billing
+//
+// Local fallback (offline / privacy-only):
+LocalFallbackPolicy::default()  // routes all lanes to local Ollama
+                                // + local whisper.cpp; customer still
+                                // on paid Bluey subscription
 ```
 
 The `SpeculativeProvider` trait is the integration point. The dashboard's
@@ -259,12 +278,16 @@ both know how to talk to the cloud service.
 - Internal testers run `curl bluey.dev/install.sh | sh`.
 - **Time to land:** 1.5–6 hr.
 
-### Stage 2 — product server scaffold (parallel with Stage 1)
+### Stage 2 — product server (BLOCKING for v0.2 launch)
 
-- New repo `bluey-server`, Go (mirrors Pinky operational pattern).
-- Endpoints stubbed; Stripe in test mode.
-- No real billing yet.
-- **Time to land:** ~1 week dedicated work.
+- New repo `bluey-server`, **Rust** (per 2026-05-19 lang decision).
+- All endpoints required for v0.2 paid launch (managed Auto Router
+  endpoint, auth, billing, license check). No more "scaffold + flip
+  later" — the no-BYOK decision (2026-05-19) makes Stage 2 the gating
+  dependency for v0.2.
+- Stripe stays in test mode through Stage 3 dogfooding; flipped to live
+  at Stage 4.
+- **Time to land:** ~1–2 weeks dedicated work.
 
 ### Stage 3 — daemon talks to product server (this repo)
 

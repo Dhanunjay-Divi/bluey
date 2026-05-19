@@ -9,6 +9,64 @@
 
 ---
 
+## 2026-05-19 — No BYOK; managed-only with local fallback
+
+**Source:** user direction.
+**Decision:** Bluey ships **managed-only**. Customer pays Bluey for use.
+Bluey owns all upstream API keys (Anthropic, OpenAI, Deepgram, etc.).
+The customer's daemon dispatches every LLM call, every embedding,
+every cloud STT call through `bluey-server`, which proxies to upstream
+providers using Bluey-owned keys. There is **no BYOK exposure to
+customers** in the product UI.
+**Local models are an offline / privacy fallback only.** When the
+customer is on a paid Bluey plan but momentarily disconnected, OR they
+explicitly toggle on a privacy-only mode, the daemon falls back to
+local whisper.cpp + local Ollama. The customer is still on a paid
+Bluey subscription; the inference cost just shifts to their hardware
+during the fallback window.
+**Earlier proposal (rejected):** BYOK as a default with an optional
+managed mode. Rejected because:
+
+- Two billing models means two integrations, two support stories, two
+  pricing pages. Each adds friction without proportional revenue.
+- BYOK means Bluey only sells "the wrapper." Margin is thin and the
+  product differentiation is harder to defend.
+- Cluely / Pluely / similar overlays are already managed-only; that is
+  the working pattern in this category.
+
+**What this changes for the codebase:**
+
+- `cue-llm`'s `OpenAiProvider` / `AnthropicProvider` / `OllamaProvider`
+  are demoted to **dev-mode-only**. The daemon no longer reads user
+  API keys from keyring or env in production; those code paths stay
+  but are gated behind a `dev` feature OR `BLUEY_DEV_BYOK=1`.
+- A new `BlueyManagedProvider` becomes the production default. It
+  speaks HTTPS to `bluey-server` and authenticates with the customer's
+  Bluey account token (stored in keyring after `bluey login`).
+- `cue-router::StaticPolicy` is renamed `LocalFallbackPolicy` and
+  becomes the offline-mode fallback. The new default is
+  `cue-router::ManagedPolicy` which delegates lane choice to
+  `bluey-server`.
+- `bluey login` / `bluey logout` flows are added. v0.2 launch is
+  gated on these.
+- Per-use metering happens server-side; the daemon emits usage events
+  to `bluey-server` after every cue request.
+
+**What this changes for the rollout:**
+
+- Layer 3 (`bluey-server`) is **REQUIRED for v0.2**, not optional.
+  Previously framed as "parallel scaffold during Layer 2 testing"; now
+  it is the gating dependency for monetization.
+- v0.1 (BYOK) keeps working for internal dev / dogfooding only. We do
+  not invite external users to the BYOK flow because that creates
+  expectations we won't honor in v0.2.
+
+**Don't retry without new context.** If we ever offer a self-hosted
+or "bring your own keys for compliance reasons" enterprise tier, that's
+a deliberate revisit, not silent drift.
+
+---
+
 ## 2026-05-19 — bluey-server is Rust, not Go
 
 **Source:** user direction.
