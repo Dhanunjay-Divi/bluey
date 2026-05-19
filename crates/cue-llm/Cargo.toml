@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+uuid = { version = "1", features = ["v4"] }
 cue-cloud-client = { path = "../cue-cloud-client" }
 async-trait.workspace = true
 futures-util.workspace = true

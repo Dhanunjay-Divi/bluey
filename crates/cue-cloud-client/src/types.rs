@@ -69,6 +69,10 @@ pub struct MixEntry {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CompleteRequest {
+    /// Idempotency key. REQUIRED. Codex Stage 4 S4.1: a retry after a
+    /// network timeout would otherwise be charged twice. Caller mints
+    /// a fresh UUID per logical request and reuses it on retry.
+    pub request_id: String,
     pub system: String,
     pub user: String,
     #[serde(skip_serializing_if = "Option::is_none")]

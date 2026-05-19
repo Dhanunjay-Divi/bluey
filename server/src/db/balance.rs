@@ -119,7 +119,14 @@ pub fn current_balance(pool: &DbPool, account_id: &str) -> Result<i64> {
 
 /// Decrement trial seconds. Returns the remaining count.
 pub fn consume_trial_seconds(pool: &DbPool, account_id: &str, ms: i64) -> Result<i64> {
-    let secs = (ms / 1000).max(0);
+    // Codex S4.2: floor of 1 second per successful trial request so
+    // sub-second instant-lane requests do not give effectively
+    // unlimited free calls. The 600s trial budget remains honest.
+    let secs = if ms <= 0 {
+        1
+    } else {
+        ((ms + 999) / 1000).max(1)
+    };
     let conn = pool.get()?;
     conn.execute(
         "UPDATE accounts
@@ -255,12 +262,27 @@ mod tests {
         let pool = temp_pool();
         let id = make_account(&pool, "trial@example.com");
         // start: 600s
+        // Ceiling-divide: 250_000ms = 250s consumed; 600 - 250 = 350.
         let r = consume_trial_seconds(&pool, &id, 250_000).unwrap();
         assert_eq!(r, 350);
+        // Way over: 1_000_000ms = 1000s consumed; clamped to 0.
         let r = consume_trial_seconds(&pool, &id, 1_000_000).unwrap();
         assert_eq!(r, 0);
+        // Already 0; stays 0.
         let r = consume_trial_seconds(&pool, &id, 500_000).unwrap();
-        assert_eq!(r, 0); // never goes negative
+        assert_eq!(r, 0);
+    }
+
+    #[test]
+    fn trial_seconds_min_1s_per_request() {
+        let pool = temp_pool();
+        let id = make_account(&pool, "trialmin@example.com");
+        // Sub-second request must consume >=1s of trial budget.
+        let r = consume_trial_seconds(&pool, &id, 100).unwrap();
+        assert_eq!(r, 599);
+        // 0ms (impossible in practice) still consumes 1s defensively.
+        let r = consume_trial_seconds(&pool, &id, 0).unwrap();
+        assert_eq!(r, 598);
     }
 
     #[test]

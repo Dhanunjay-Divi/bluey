@@ -50,7 +50,12 @@ impl LlmProvider for BlueyManagedProvider {
     }
 
     async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        // Codex Stage 4 S4.1 + Stage 7 S7.1: mint a per-request UUID
+        // so retries hit the cached idempotency response and usage
+        // events dedupe. v0.2.x will plumb a stable request id from
+        // the higher-level cue-router context.
         let cloud_req = CloudCompleteRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
             system: req.system.clone(),
             user: req.user.clone(),
             max_tokens: req.max_tokens,

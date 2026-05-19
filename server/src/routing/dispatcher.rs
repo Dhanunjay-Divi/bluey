@@ -32,6 +32,7 @@ pub fn resolve_route(lane: &str) -> (&'static str, &'static str) {
 }
 
 /// Run a single non-streaming completion against the upstream provider.
+#[allow(clippy::too_many_arguments)]
 pub async fn complete(
     keys: &UpstreamKeys,
     provider: &str,
@@ -40,11 +41,42 @@ pub async fn complete(
     user: &str,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
+    // Codex S4.5: fallback estimate when upstream omits `usage`. The
+    // server passes its entry-cost ceiling so we charge the best
+    // available approximation rather than $0.
+    fallback_input_tokens: Option<i64>,
 ) -> Result<Completion> {
     match provider {
-        "openai" => openai_complete(keys, model, system, user, max_tokens, temperature).await,
-        "anthropic" => anthropic_complete(keys, model, system, user, max_tokens, temperature).await,
-        other => Err(anyhow!("unsupported provider: {other}")),
+        "openai" => {
+            openai_complete(
+                keys,
+                model,
+                system,
+                user,
+                max_tokens,
+                temperature,
+                fallback_input_tokens,
+            )
+            .await
+        }
+        "anthropic" => {
+            anthropic_complete(
+                keys,
+                model,
+                system,
+                user,
+                max_tokens,
+                temperature,
+                fallback_input_tokens,
+            )
+            .await
+        }
+        // Codex S4.4: explicit failure for unsupported providers
+        // including `ollama` (which only the daemon's local fallback
+        // path should run).
+        other => Err(anyhow!(
+            "unsupported provider for managed dispatch: {other}"
+        )),
     }
 }
 
@@ -88,6 +120,7 @@ struct OpenAiUsage {
     completion_tokens: i64,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn openai_complete(
     keys: &UpstreamKeys,
     model: &str,
@@ -95,6 +128,7 @@ async fn openai_complete(
     user: &str,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
+    fallback_input_tokens: Option<i64>,
 ) -> Result<Completion> {
     let key = keys
         .openai_api_key
@@ -137,7 +171,7 @@ async fn openai_complete(
     let (input_tokens, output_tokens) = parsed
         .usage
         .map(|u| (u.prompt_tokens, u.completion_tokens))
-        .unwrap_or((0, 0));
+        .unwrap_or((fallback_input_tokens.unwrap_or(0), 0));
     Ok(Completion {
         text,
         provider: "openai".to_string(),
@@ -168,7 +202,7 @@ struct AnthropicMessage<'a> {
 #[derive(Deserialize)]
 struct AnthropicResp {
     content: Vec<AnthropicContent>,
-    usage: AnthropicUsage,
+    usage: Option<AnthropicUsage>,
 }
 
 #[derive(Deserialize)]
@@ -185,6 +219,7 @@ struct AnthropicUsage {
     output_tokens: i64,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn anthropic_complete(
     keys: &UpstreamKeys,
     model: &str,
@@ -192,6 +227,7 @@ async fn anthropic_complete(
     user: &str,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
+    fallback_input_tokens: Option<i64>,
 ) -> Result<Completion> {
     let key = keys
         .anthropic_api_key
@@ -231,8 +267,12 @@ async fn anthropic_complete(
         text,
         provider: "anthropic".to_string(),
         model: model.to_string(),
-        input_tokens: parsed.usage.input_tokens,
-        output_tokens: parsed.usage.output_tokens,
+        input_tokens: parsed
+            .usage
+            .as_ref()
+            .map(|u| u.input_tokens)
+            .unwrap_or_else(|| fallback_input_tokens.unwrap_or(0)),
+        output_tokens: parsed.usage.as_ref().map(|u| u.output_tokens).unwrap_or(0),
     })
 }
 

@@ -31,6 +31,19 @@
 
 ## 2. Per-question-type cost table
 
+> **Billing precision (Codex S4.3 reconciliation, 2026-05-19):** all
+> customer charges and balance accounting are in **whole cents**.
+> Costs below 1¢ round up to 1¢ at charge time. The "raw" cost
+> column below shows the formula output to 4 decimal places of a
+> cent for transparency, but the actual amount deducted is the
+> ceiling-rounded **customer cents** column. This means:
+>
+> - An "Easy" cue with a raw cost of $0.0008 is billed as **1¢**.
+> - A "Medium code" cue with a raw cost of $0.0345 is billed as **4¢**
+>   (0.0345 → 0.04, rounded up).
+> - The Light tier projection (~3,000 cues per $30) reflects the
+>   1¢ floor; under fractional-cent billing it would be ~10x higher.
+
 > **Provider price snapshot date:** 2026-05-19. List prices from
 > `https://platform.openai.com/docs/pricing` and
 > `https://docs.anthropic.com/en/docs/about-claude/pricing`. Refresh
@@ -142,7 +155,7 @@ Bluey dashboard at `https://bluey.dev/onboarding/welcome` shows:
 │                                                                 │
 │  Here's roughly what $30 buys, depending on how you use Bluey:  │
 │                                                                 │
-│    💼  Light user        ~2,850 cues   ~3 months                │
+│    💼  Light user        ~3,000 cues   ~3 months                │
 │    ⚙️   Typical tech     ~1,380 cues   ~5 weeks                  │
 │    🔥  Heavy user        ~825 cues     ~10 days                 │
 │                                                                 │
@@ -179,7 +192,7 @@ Bluey dashboard at `https://bluey.dev/onboarding/welcome` shows:
 │  At your current rate, $27.43 lasts ~32 more days.               │
 │                                                                  │
 │  ┌────── Tier comparison ──────┐                                 │
-│  │ Light      ~2,850 cues / $30  ~3 months                      │
+│  │ Light      ~3,000 cues / $30  ~3 months                      │
 │  │ Typical    ~1,380 cues / $30  ~5 weeks  ← you                │
 │  │ Heavy      ~825 cues / $30   ~10 days                        │
 │  └─────────────────────────────┘                                 │
@@ -199,7 +212,7 @@ Tier            Typical tech user
 Projection      $27.43 lasts ~32 days at your current rate
 
 Tier comparison:
-  Light       ~2,850 cues per $30 (~3 months)
+  Light       ~3,000 cues per $30 (~3 months)
   Typical     ~1,380 cues per $30 (~5 weeks)   ← you
   Heavy         ~825 cues per $30 (~10 days)
 

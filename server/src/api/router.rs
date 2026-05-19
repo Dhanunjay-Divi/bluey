@@ -1,4 +1,4 @@
-//! Real router endpoints: managed dispatch + atomic deduction.
+//! Real router endpoints: managed dispatch + atomic deduction + idempotency.
 
 use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde::{Deserialize, Serialize};
@@ -6,12 +6,18 @@ use std::time::Instant;
 
 use super::AppState;
 use crate::auth::AuthedAccount;
-use crate::db::{balance, usage::UsageEvent};
+use crate::db::{balance, idempotency, usage::UsageEvent};
 use crate::pricing;
 use crate::routing;
 
 #[derive(Deserialize)]
 pub struct CompleteRequest {
+    /// Client-supplied idempotency key. REQUIRED. Codex S4.1: a retry
+    /// after a network timeout/lost response must not be charged twice.
+    /// The server rejects duplicate (account_id, request_id) pairs by
+    /// returning the cached response (200 if completed) or 409 (if the
+    /// original is still in flight).
+    pub request_id: String,
     pub system: String,
     pub user: String,
     #[serde(default)]
@@ -23,7 +29,7 @@ pub struct CompleteRequest {
     pub estimated_input_tokens: Option<i64>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct CompleteResponse {
     pub text: String,
     pub provider: String,
@@ -35,7 +41,7 @@ pub struct CompleteResponse {
     pub trial_seconds_remaining: i64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 pub struct ApiError {
     pub error: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -53,9 +59,84 @@ pub async fn complete(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Json(req): Json<CompleteRequest>,
 ) -> Result<Json<CompleteResponse>, (StatusCode, Json<ApiError>)> {
-    // 1. Resolve lane → provider+model.
+    // 0. Validate request_id is non-empty.
+    if req.request_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "request_id is required and must be non-empty".into(),
+                reason: Some("missing_request_id".into()),
+                ..Default::default()
+            }),
+        ));
+    }
+
+    // Codex S4.4: managed dispatcher does not run local models.
+    // The daemon's LocalFallbackPolicy must dispatch local-lane work
+    // directly to on-device Ollama; the managed cloud path is not the
+    // right home for it.
+    if req.lane == "local" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "local lane is daemon-only; managed cloud does not run local models".into(),
+                reason: Some("local_lane_unsupported".into()),
+                ..Default::default()
+            }),
+        ));
+    }
+
+    // 1. Idempotency check + reservation. Codex S4.1.
+    match idempotency::reserve(&state.pool, &account.id, &req.request_id).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("idempotency: {e}"),
+                ..Default::default()
+            }),
+        )
+    })? {
+        idempotency::ReserveOutcome::FreshReservation => { /* fall through */ }
+        idempotency::ReserveOutcome::CachedComplete(json) => {
+            // Replay: return the cached terminal response.
+            let cached: CompleteResponse = serde_json::from_str(&json).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError {
+                        error: format!("idempotency cache decode: {e}"),
+                        ..Default::default()
+                    }),
+                )
+            })?;
+            return Ok(Json(cached));
+        }
+        idempotency::ReserveOutcome::InProgress => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: "request already in progress; wait for original to complete".into(),
+                    reason: Some("request_in_progress".into()),
+                    ..Default::default()
+                }),
+            ));
+        }
+        idempotency::ReserveOutcome::CachedFailed => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: "previous attempt with this request_id failed; use a new request_id"
+                        .into(),
+                    reason: Some("request_failed_terminal".into()),
+                    ..Default::default()
+                }),
+            ));
+        }
+    }
+
+    // 2. Resolve lane → provider+model.
     let (provider, model) = routing::resolve_route(&req.lane);
     let pricing_entry = pricing::lookup(provider, model).ok_or_else(|| {
+        let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiError {
@@ -65,7 +146,7 @@ pub async fn complete(
         )
     })?;
 
-    // 2. Estimate cost ceiling for the entry check.
+    // 3. Estimate cost ceiling for the entry check.
     let max_out = req.max_tokens.unwrap_or(2048) as i64;
     let est_in = req.estimated_input_tokens.unwrap_or_else(|| {
         // Crude fallback: ~4 chars/token
@@ -75,9 +156,10 @@ pub async fn complete(
 
     let on_trial = account.trial_seconds_remaining > 0;
 
-    // 3. Entry check — unless the account is still on the free trial.
+    // 4. Entry check — unless the account is still on the free trial.
     if !on_trial {
         let can = balance::can_afford(&state.pool, &account.id, est_cost).map_err(|e| {
+            let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiError {
@@ -87,6 +169,7 @@ pub async fn complete(
             )
         })?;
         if !can {
+            let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
             let bal = balance::current_balance(&state.pool, &account.id).unwrap_or(0);
             return Err((
                 StatusCode::PAYMENT_REQUIRED,
@@ -101,7 +184,9 @@ pub async fn complete(
         }
     }
 
-    // 4. Dispatch to upstream provider.
+    // 5. Dispatch to upstream provider. Pass the entry estimate so the
+    //    dispatcher can fall back to it if the upstream omits `usage`.
+    //    Codex S4.5.
     let started = Instant::now();
     let result = routing::complete(
         &state.config.upstream,
@@ -111,28 +196,49 @@ pub async fn complete(
         &req.user,
         req.max_tokens,
         req.temperature,
+        Some(est_in),
     )
     .await;
     let elapsed = started.elapsed();
     let elapsed_ms = elapsed.as_millis() as i64;
 
-    let comp = result.map_err(|e| {
-        (
-            StatusCode::BAD_GATEWAY,
-            Json(ApiError {
-                error: format!("upstream: {e}"),
-                ..Default::default()
-            }),
-        )
-    })?;
+    let comp = match result {
+        Ok(c) => c,
+        Err(e) => {
+            // Codex S4.6: log raw upstream details, return sanitized
+            // message to the customer. We DO NOT mark the idempotency
+            // row as failed-terminal because a transient upstream error
+            // should be retryable with the same request_id (the
+            // alternative — making the customer mint a new id — is
+            // user-hostile for ephemeral 503s).
+            tracing::warn!(
+                account_id = %account.id,
+                request_id = %req.request_id,
+                provider = %provider,
+                model = %model,
+                error = %e,
+                "upstream dispatch failed"
+            );
+            let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError {
+                    error: "upstream provider error; please retry".into(),
+                    reason: Some("upstream_error".into()),
+                    ..Default::default()
+                }),
+            ));
+        }
+    };
 
-    // 5. Compute actual cost from real token counts.
+    // 6. Compute actual cost from real token counts.
     let (bluey_cost, customer_cost) =
         pricing::compute_cost(pricing_entry, comp.input_tokens, comp.output_tokens);
 
-    // 6. Charge: trial decrement OR balance deduction.
+    // 7. Charge: trial decrement OR balance deduction.
     let trial_remaining = if on_trial {
         balance::consume_trial_seconds(&state.pool, &account.id, elapsed_ms).map_err(|e| {
+            let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiError {
@@ -143,6 +249,7 @@ pub async fn complete(
         })?
     } else {
         let ok = balance::deduct(&state.pool, &account.id, customer_cost).map_err(|e| {
+            let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ApiError {
@@ -166,9 +273,10 @@ pub async fn complete(
 
     let balance_after = balance::current_balance(&state.pool, &account.id).unwrap_or(0);
 
-    // 7. Record usage event.
+    // 8. Record usage event. Reuse the client-supplied request_id so
+    //    Stage 7's idempotent ingest dedupes correctly across retries.
     let event = UsageEvent {
-        request_id: uuid::Uuid::new_v4().to_string(),
+        request_id: req.request_id.clone(),
         kind: "llm".into(),
         task_type: None,
         lane: Some(req.lane.clone()),
@@ -186,7 +294,7 @@ pub async fn complete(
         tracing::warn!(error = %e, "failed to record usage event");
     }
 
-    Ok(Json(CompleteResponse {
+    let response = CompleteResponse {
         text: comp.text,
         provider: comp.provider,
         model: comp.model,
@@ -195,66 +303,21 @@ pub async fn complete(
         cost_cents: customer_cost,
         balance_cents_after: balance_after,
         trial_seconds_remaining: trial_remaining,
-    }))
-}
+    };
 
-impl Default for ApiError {
-    fn default() -> Self {
-        Self {
-            error: String::new(),
-            balance_cents: None,
-            estimated_cost_cents: None,
-            reason: None,
-            reload_url: None,
-        }
+    // 9. Cache the terminal response in the idempotency row so a retry
+    //    returns this exact body without re-dispatching.
+    if let Ok(json) = serde_json::to_string(&response) {
+        let _ = idempotency::mark_complete(&state.pool, &account.id, &req.request_id, &json);
     }
+
+    Ok(Json(response))
 }
 
-// ─── Embed + transcribe (stubs; real impls land later) ──────────────────
-
-#[derive(Deserialize)]
-pub struct EmbedRequest {
-    pub text: String,
-    pub model: Option<String>,
+pub async fn embed() -> StatusCode {
+    StatusCode::NOT_IMPLEMENTED
 }
 
-#[derive(Serialize)]
-pub struct EmbedResponse {
-    pub embedding: Vec<f32>,
-    pub provider: String,
-    pub model: String,
-    pub cost_cents: i64,
-    pub balance_cents_after: i64,
-}
-
-pub async fn embed(
-    State(_state): State<AppState>,
-    Extension(_account): Extension<AuthedAccount>,
-    Json(_req): Json<EmbedRequest>,
-) -> Result<Json<EmbedResponse>, StatusCode> {
-    Err(StatusCode::NOT_IMPLEMENTED)
-}
-
-#[derive(Deserialize)]
-pub struct TranscribeRequest {
-    pub audio_base64: String,
-    pub language: Option<String>,
-    pub format: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct TranscribeResponse {
-    pub text: String,
-    pub provider: String,
-    pub duration_ms: i64,
-    pub cost_cents: i64,
-    pub balance_cents_after: i64,
-}
-
-pub async fn transcribe(
-    State(_state): State<AppState>,
-    Extension(_account): Extension<AuthedAccount>,
-    Json(_req): Json<TranscribeRequest>,
-) -> Result<Json<TranscribeResponse>, StatusCode> {
-    Err(StatusCode::NOT_IMPLEMENTED)
+pub async fn transcribe() -> StatusCode {
+    StatusCode::NOT_IMPLEMENTED
 }

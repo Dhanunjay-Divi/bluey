@@ -11,6 +11,7 @@ use std::path::Path;
 
 pub mod accounts;
 pub mod balance;
+pub mod idempotency;
 pub mod usage;
 
 pub type DbPool = Pool<SqliteConnectionManager>;
@@ -129,6 +130,27 @@ const MIGRATIONS: &[&str] = &[
         processed_at  DATETIME,
         body          TEXT NOT NULL                     -- raw JSON for audit
     );
+    "#,
+    // 0007 — request_idempotency: dedupe /router/complete retries.
+    //
+    // Stage 4 codex blocker S4.1: clients can retry after a timeout/lost
+    // response and double-charge. We require a client-supplied
+    // request_id and reserve (account_id, request_id) at entry. A retry
+    // with the same id either returns the cached terminal response or
+    // 409 Conflict if the original request is still in-flight.
+    r#"
+    CREATE TABLE IF NOT EXISTS request_idempotency (
+        account_id    TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        request_id    TEXT NOT NULL,
+        status        TEXT NOT NULL,            -- in_progress | complete | failed
+        response_json TEXT,                      -- cached CompleteResponse for retries
+        http_status   INTEGER,                   -- cached HTTP status
+        created_at    DATETIME NOT NULL DEFAULT (datetime('now')),
+        completed_at  DATETIME,
+        PRIMARY KEY (account_id, request_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_request_idempotency_created
+        ON request_idempotency(created_at);
     "#,
 ];
 

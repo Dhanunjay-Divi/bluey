@@ -51,7 +51,7 @@ pub async fn show_usage(client: &CloudClient) -> Result<()> {
     if !usage.mix.is_empty() {
         println!();
         println!("Tier comparison:");
-        println!("  Light       ~2,850 cues per $30 (~3 months)");
+        println!("  Light       ~3,000 cues per $30 (~3 months)");
         println!("  Typical     ~1,380 cues per $30 (~5 weeks)");
         println!("  Heavy         ~825 cues per $30 (~10 days)");
         println!();
