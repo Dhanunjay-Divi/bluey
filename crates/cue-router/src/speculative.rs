@@ -204,6 +204,11 @@ fn spawn_lane(
             user: request.user.clone(),
             max_tokens: route.max_tokens.or(request.max_tokens),
             temperature: route.temperature.or(request.temperature),
+            // Codex Stage 9b: per-lane LlmRequest inherits the outer
+            // logical request_id so both lanes (draft + final) hit
+            // the same idempotency row server-side. Without this,
+            // speculative dispatch would charge twice.
+            request_id: request.request_id.clone(),
         };
         // Honor route.stream: if the lane wants streaming, use complete_stream;
         // otherwise use complete() and emit a single synthetic chunk in the
@@ -364,6 +369,7 @@ mod tests {
             user: "u".into(),
             max_tokens: None,
             temperature: None,
+            request_id: None,
         }
     }
 

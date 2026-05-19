@@ -34,6 +34,7 @@ impl AnswerLlm {
             user: question.to_string(),
             max_tokens: Some(256),
             temperature: Some(0.3),
+            request_id: None,
         };
         let text = if llm.supports_streaming() {
             let mut stream = llm.complete_stream(&req).await?;

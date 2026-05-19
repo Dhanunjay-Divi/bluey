@@ -122,6 +122,7 @@ mod tests {
             user: "hi".into(),
             max_tokens: None,
             temperature: None,
+            request_id: None,
         }
     }
 

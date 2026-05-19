@@ -224,9 +224,9 @@ impl CloudClient {
             }
             other => {
                 let body = resp.text().await.unwrap_or_default();
+                tracing::warn!(status = %other, body = %body, "cue-cloud-client server error");
                 Err(Error::Server {
                     status: other.as_u16(),
-                    body,
                 })
             }
         }

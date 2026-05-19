@@ -34,8 +34,13 @@ pub enum Error {
     TrialEnded,
 
     /// Other server errors (5xx, malformed responses, etc.).
-    #[error("server error {status}: {body}")]
-    Server { status: u16, body: String },
+    /// Codex Stage 9d (S8.4 round-2 nit): body intentionally NOT
+    /// surfaced to consumers — production error bodies can leak
+    /// provider-internal details. Raw body is logged at warn level
+    /// inside `client::parse_or_err` / `auth::*` where the error is
+    /// constructed.
+    #[error("server error {status}")]
+    Server { status: u16 },
 
     /// Keyring / token storage error.
     #[error("token store: {0}")]

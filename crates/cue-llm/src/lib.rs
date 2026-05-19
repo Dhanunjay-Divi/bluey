@@ -14,12 +14,20 @@ use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use thiserror::Error;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LlmRequest {
     pub system: String,
     pub user: String,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// Codex Stage 9b: stable logical request id. When present, the
+    /// managed provider passes it through to bluey-server's idempotency
+    /// layer so retries (network timeout, daemon-side retry) hit the
+    /// cached response instead of double-charging. `None` means the
+    /// caller doesn't care about cross-call dedupe; the managed
+    /// provider then mints a per-call UUID for safety inside one call's
+    /// token-refresh retry window.
+    pub request_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

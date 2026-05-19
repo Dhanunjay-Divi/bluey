@@ -1100,6 +1100,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "cpal",
+ "cue-cloud-client",
  "cue-core",
  "cue-daemon",
  "cue-llm",

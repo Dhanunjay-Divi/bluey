@@ -144,3 +144,28 @@ cargo test -p cue-router managed_never_emits_managed_local_provider
 ### Recheck Verdict
 
 🔴 **REQUEST CHANGES** — Stage 6 is now acceptable, but Stage 8 remains blocked because the access-only login bridge was described in the commit message but not actually applied to `crates/cue-cli/src/app.rs`.
+
+---
+
+## Recheck 2 — Commit `fbd43e1`
+
+**Date:** 2026-05-19
+
+### Updated Findings
+
+- 🟢 `crates/cue-cli/src/app.rs:785` — Stage 8 blocker is cleared. `cue_login()` now saves keyring tokens whenever `account.access_token` is present, using `account.refresh_token.clone().unwrap_or_default()` for access-only login paths. The old `if let (Some(access), Some(refresh)) = (...)` shape is gone.
+- 🟢 Stage 6 remains accepted from Recheck 1. No new Stripe regression found in this recheck.
+
+### Recheck Verification
+
+```bash
+cargo test -p cue-cloud-client
+# ✅ 4 passed
+
+cargo test -p cue-cli
+# ✅ builds/tests pass; 0 test functions in this crate layer
+```
+
+### Recheck Verdict
+
+🟢 **ACCEPT** — Round-2 blockers are cleared. Remaining items are accepted nits already queued for the daemon ProviderRegistry / v0.2 follow-up stage: stable logical request id into `BlueyManagedProvider`, `mark_complete()` hard-error metric, invalid managed local lane made unrepresentable, server-owned tier numbers, sanitized cloud-client server bodies, and authoritative server-recorded usage events.

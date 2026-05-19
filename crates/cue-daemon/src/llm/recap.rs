@@ -34,6 +34,7 @@ impl RecapLlm {
             user: transcript.to_string(),
             max_tokens: Some(1024),
             temperature: Some(0.2),
+            request_id: None,
         };
         let text = if llm.supports_streaming() {
             let mut stream = llm.complete_stream(&req).await?;

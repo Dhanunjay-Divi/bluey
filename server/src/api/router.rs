@@ -307,8 +307,37 @@ pub async fn complete(
 
     // 9. Cache the terminal response in the idempotency row so a retry
     //    returns this exact body without re-dispatching.
-    if let Ok(json) = serde_json::to_string(&response) {
-        let _ = idempotency::mark_complete(&state.pool, &account.id, &req.request_id, &json);
+    // Codex Stage 9c (S4 round-2 nit): mark_complete failure must NOT
+    // be silently dropped. The customer has been billed and the upstream
+    // call has finished; if we cannot persist the cached response, a
+    // retry hits the in_progress reservation and 409s the customer
+    // permanently. Log at error with the request_id so SREs can
+    // reconcile manually. A future stage adds a Prometheus counter at
+    // /admin/metrics.
+    match serde_json::to_string(&response) {
+        Ok(json) => {
+            if let Err(e) = idempotency::mark_complete(
+                &state.pool,
+                &account.id,
+                &req.request_id,
+                &json,
+            ) {
+                tracing::error!(
+                    account_id = %account.id,
+                    request_id = %req.request_id,
+                    error = %e,
+                    "idempotency::mark_complete failed AFTER customer billed; retry will return 409 — manual reconciliation required"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                account_id = %account.id,
+                request_id = %req.request_id,
+                error = %e,
+                "failed to serialize response for idempotency cache; retry will return 409 — manual reconciliation required"
+            );
+        }
     }
 
     Ok(Json(response))

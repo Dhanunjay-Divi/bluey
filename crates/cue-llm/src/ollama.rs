@@ -265,6 +265,7 @@ mod tests {
             user: "Hello".into(),
             max_tokens: Some(100),
             temperature: None,
+            request_id: None,
         }
     }
 

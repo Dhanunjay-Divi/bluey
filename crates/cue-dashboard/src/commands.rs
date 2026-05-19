@@ -991,6 +991,10 @@ async fn try_speculative_dispatch(
         user: user_text.to_string(),
         max_tokens: None,
         temperature: None,
+        // Codex Stage 9b: thread the daemon's response_id as the
+        // stable logical request id so retries / failover hit the
+        // server idempotency cache instead of double-charging.
+        request_id: Some(response_id.to_string()),
     };
 
     let stream = router
@@ -1331,49 +1335,88 @@ impl ProviderRegistry {
     fn from_env_and_secrets(_db: &tauri::State<DbState>) -> Self {
         use std::collections::HashMap;
         use std::sync::Arc;
+
         let mut providers: HashMap<String, Arc<dyn cue_llm::LlmProvider>> = HashMap::new();
 
-        if let Some(key) = std::env::var("OPENAI_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty())
-            .or_else(|| {
-                cue_daemon::secrets::load_api_key("llm_openai")
-                    .ok()
-                    .flatten()
-            })
-        {
-            let provider: Arc<dyn cue_llm::LlmProvider> =
-                Arc::new(cue_llm::openai::OpenAiProvider::new(key));
-            providers.insert("openai".to_string(), provider);
+        // Codex Stage 9a: managed-mode detection. If a Bluey account
+        // token is in the keyring, register BlueyManagedProvider for
+        // every cloud lane; bluey-server will pick the actual upstream
+        // provider+model. Customer pays Bluey; Bluey owns the API keys.
+        //
+        // Legacy BYOK direct providers (OpenAI/Anthropic from env or
+        // keyring) are gated behind BLUEY_DEV_BYOK=1 so dev workflows
+        // still work without surprising customers in production.
+        let managed_mode = match cue_cloud_client::CloudClient::with_default_keyring() {
+            Ok(client) => client.current_tokens().is_some(),
+            Err(_) => false,
+        };
+
+        if managed_mode {
+            tracing::info!("ProviderRegistry: managed mode active (token in keyring)");
+            // One BlueyManagedProvider per cloud lane. The provider
+            // name (bluey-managed-{lane}) matches what
+            // cue_router::ManagedPolicy emits, so the registry lookup
+            // dispatches correctly.
+            if let Ok(client) = cue_cloud_client::CloudClient::with_default_keyring() {
+                for lane in [
+                    cue_llm::bluey_managed::ManagedLane::Instant,
+                    cue_llm::bluey_managed::ManagedLane::Balanced,
+                    cue_llm::bluey_managed::ManagedLane::Deep,
+                    cue_llm::bluey_managed::ManagedLane::Vision,
+                ] {
+                    let provider: Arc<dyn cue_llm::LlmProvider> = Arc::new(
+                        cue_llm::bluey_managed::BlueyManagedProvider::new(client.clone(), lane),
+                    );
+                    providers.insert(provider.name().to_string(), provider);
+                }
+            }
         }
 
-        if let Some(key) = std::env::var("ANTHROPIC_API_KEY")
-            .ok()
-            .filter(|k| !k.is_empty())
-            .or_else(|| {
-                cue_daemon::secrets::load_api_key("llm_anthropic")
-                    .ok()
-                    .flatten()
-            })
-        {
-            let provider: Arc<dyn cue_llm::LlmProvider> =
-                Arc::new(cue_llm::anthropic::AnthropicProvider::new(key));
-            providers.insert("anthropic".to_string(), provider);
+        let allow_byok = std::env::var("BLUEY_DEV_BYOK")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+            || !managed_mode;
+
+        if allow_byok {
+            if let Some(key) = std::env::var("OPENAI_API_KEY")
+                .ok()
+                .filter(|k| !k.is_empty())
+                .or_else(|| {
+                    cue_daemon::secrets::load_api_key("llm_openai")
+                        .ok()
+                        .flatten()
+                })
+            {
+                let provider: Arc<dyn cue_llm::LlmProvider> =
+                    Arc::new(cue_llm::openai::OpenAiProvider::new(key));
+                providers.insert("openai".to_string(), provider);
+            }
+
+            if let Some(key) = std::env::var("ANTHROPIC_API_KEY")
+                .ok()
+                .filter(|k| !k.is_empty())
+                .or_else(|| {
+                    cue_daemon::secrets::load_api_key("llm_anthropic")
+                        .ok()
+                        .flatten()
+                })
+            {
+                let provider: Arc<dyn cue_llm::LlmProvider> =
+                    Arc::new(cue_llm::anthropic::AnthropicProvider::new(key));
+                providers.insert("anthropic".to_string(), provider);
+            }
         }
 
-        // Ollama is local; no key required. We always register if the env var
-        // BLUEY_OLLAMA_HOST is set, OR if it is unset and we want the default
-        // localhost. Be conservative: only register if the user opted in via
-        // env var so we do not silently dispatch to a non-running local daemon.
-        // Ollama: register if user opted in via BLUEY_OLLAMA_HOST. The provider
-        // reads OLLAMA_BASE_URL itself; we propagate BLUEY_OLLAMA_HOST into
-        // OLLAMA_BASE_URL if the user has not set it explicitly so a single
-        // env var is enough to point at a non-default Ollama instance.
+        // Ollama: register if user opted in via BLUEY_OLLAMA_HOST. The
+        // provider reads OLLAMA_BASE_URL itself; we propagate
+        // BLUEY_OLLAMA_HOST into OLLAMA_BASE_URL if the user has not
+        // set it explicitly so a single env var is enough.
+        // ALWAYS available regardless of managed mode — it is the
+        // privacy/offline LocalFallbackPolicy target.
         if let Ok(host) = std::env::var("BLUEY_OLLAMA_HOST") {
             if !host.is_empty() {
                 if std::env::var("OLLAMA_BASE_URL").is_err() {
                     // SAFETY: this is the daemon process at request time.
-                    // No other thread mutates this env var.
                     unsafe {
                         std::env::set_var("OLLAMA_BASE_URL", &host);
                     }

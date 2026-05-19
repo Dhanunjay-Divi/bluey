@@ -10,28 +10,47 @@ use cue_cloud_client::{CloudClient, CompleteRequest as CloudCompleteRequest, Err
 
 use crate::{LlmChunk, LlmChunkStream, LlmError, LlmProvider, LlmRequest, LlmResponse};
 
-/// LLM provider that routes through bluey-server.
-///
-/// Each instance is bound to a specific `lane` (instant / balanced /
-/// deep / vision / local). Higher-level routing decides which lane to
-/// pick; this provider is "the dispatcher for one lane".
+/// Codex Stage 9a (S5 round-2 nit): make managed local lane
+/// unrepresentable. The managed cloud has no local models — Stage 4 S4.4
+/// returns 400 for `lane=local` server-side. Constructing a
+/// `BlueyManagedProvider` for a local lane is now a type error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedLane {
+    Instant,
+    Balanced,
+    Deep,
+    Vision,
+}
+
+impl ManagedLane {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Instant => "instant",
+            Self::Balanced => "balanced",
+            Self::Deep => "deep",
+            Self::Vision => "vision",
+        }
+    }
+
+    fn provider_name(&self) -> &'static str {
+        match self {
+            Self::Instant => "bluey-managed-instant",
+            Self::Balanced => "bluey-managed-balanced",
+            Self::Deep => "bluey-managed-deep",
+            Self::Vision => "bluey-managed-vision",
+        }
+    }
+}
+
 pub struct BlueyManagedProvider {
     client: CloudClient,
-    lane: String,
+    lane: ManagedLane,
     name: &'static str,
 }
 
 impl BlueyManagedProvider {
-    pub fn new(client: CloudClient, lane: impl Into<String>) -> Self {
-        let lane = lane.into();
-        let name = match lane.as_str() {
-            "instant" => "bluey-managed-instant",
-            "balanced" => "bluey-managed-balanced",
-            "deep" => "bluey-managed-deep",
-            "vision" => "bluey-managed-vision",
-            "local" => "bluey-managed-local",
-            _ => "bluey-managed",
-        };
+    pub fn new(client: CloudClient, lane: ManagedLane) -> Self {
+        let name = lane.provider_name();
         Self { client, lane, name }
     }
 }
@@ -43,24 +62,25 @@ impl LlmProvider for BlueyManagedProvider {
     }
 
     fn supports_streaming(&self) -> bool {
-        // v0.2 server returns full text in one shot; we adapt by emitting
-        // a single chunk in complete_stream(). Real streaming through
-        // bluey-server lands in v0.2.x.
         false
     }
 
     async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse, LlmError> {
-        // Codex Stage 4 S4.1 + Stage 7 S7.1: mint a per-request UUID
-        // so retries hit the cached idempotency response and usage
-        // events dedupe. v0.2.x will plumb a stable request id from
-        // the higher-level cue-router context.
+        // Codex Stage 9b: prefer the caller-supplied stable request_id
+        // (cue-router mints it once per logical request). Fall back to
+        // a per-call UUID for older code paths that haven\'t threaded
+        // through yet.
+        let request_id = req
+            .request_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let cloud_req = CloudCompleteRequest {
-            request_id: uuid::Uuid::new_v4().to_string(),
+            request_id,
             system: req.system.clone(),
             user: req.user.clone(),
             max_tokens: req.max_tokens,
             temperature: req.temperature,
-            lane: self.lane.clone(),
+            lane: self.lane.as_str().to_string(),
             estimated_input_tokens: None,
         };
         let resp = self
@@ -105,9 +125,7 @@ fn map_err(e: CloudError) -> LlmError {
         CloudError::RateLimited { retry_after_secs } => {
             LlmError::Provider(format!("rate limited; retry in {retry_after_secs}s"))
         }
-        CloudError::Server { status, body } => {
-            LlmError::Provider(format!("server {status}: {body}"))
-        }
+        CloudError::Server { status } => LlmError::Provider(format!("server error: {status}")),
         other => LlmError::Provider(other.to_string()),
     }
 }
