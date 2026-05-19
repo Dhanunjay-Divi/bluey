@@ -28,7 +28,10 @@ pub fn open_pool(path: &Path) -> Result<DbPool> {
              PRAGMA busy_timeout = 5000;",
         )
     });
-    let pool = Pool::builder().max_size(8).build(manager).context("build pool")?;
+    let pool = Pool::builder()
+        .max_size(8)
+        .build(manager)
+        .context("build pool")?;
     Ok(pool)
 }
 

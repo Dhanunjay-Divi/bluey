@@ -21,8 +21,8 @@ pub fn store(
     account_id: &str,
     device_label: Option<&str>,
 ) -> Result<()> {
-    let expires_at = (Utc::now() + Duration::seconds(crate::auth::jwt::REFRESH_TTL_SECS))
-        .to_rfc3339();
+    let expires_at =
+        (Utc::now() + Duration::seconds(crate::auth::jwt::REFRESH_TTL_SECS)).to_rfc3339();
     let conn = pool.get()?;
     conn.execute(
         "INSERT OR REPLACE INTO refresh_tokens (token_hash, account_id, device_label, expires_at)
@@ -44,13 +44,12 @@ pub fn validate_and_touch(pool: &DbPool, token: &str) -> Result<Option<String>> 
     let conn = pool.get()?;
     let now = Utc::now();
     let token_hash = hash_token(token);
-    let result: rusqlite::Result<(String, Option<String>, String)> = conn
-        .query_row(
-            "SELECT account_id, revoked_at, expires_at
+    let result: rusqlite::Result<(String, Option<String>, String)> = conn.query_row(
+        "SELECT account_id, revoked_at, expires_at
              FROM refresh_tokens WHERE token_hash = ?1",
-            params![&token_hash],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        );
+        params![&token_hash],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    );
     let (account_id, revoked_at, expires_at) = match result {
         Ok(row) => row,
         Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
@@ -149,7 +148,10 @@ mod tests {
         let pool = temp_pool();
         let account_id = make_account(&pool);
         store(&pool, "tok-1", &account_id, Some("test-laptop")).unwrap();
-        assert_eq!(validate_and_touch(&pool, "tok-1").unwrap(), Some(account_id));
+        assert_eq!(
+            validate_and_touch(&pool, "tok-1").unwrap(),
+            Some(account_id)
+        );
     }
 
     #[test]
@@ -210,5 +212,4 @@ mod tests {
         let pool = temp_pool();
         assert_eq!(consume(&pool, "no-such-token").unwrap(), None);
     }
-
 }

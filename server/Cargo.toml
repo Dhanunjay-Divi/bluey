@@ -47,6 +47,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Hex / base
 hex = "0.4"
 sha2 = "0.10"
+hmac = "0.12"
 base64 = "0.22"
 
 # HTTP client (for proxying to upstream providers)

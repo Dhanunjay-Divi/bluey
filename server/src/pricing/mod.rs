@@ -73,20 +73,17 @@ pub const PRICING: &[ModelPricing] = &[
 ];
 
 pub fn lookup(provider: &str, model: &str) -> Option<&'static ModelPricing> {
-    PRICING.iter().find(|p| p.provider == provider && p.model == model)
+    PRICING
+        .iter()
+        .find(|p| p.provider == provider && p.model == model)
 }
 
 /// Compute the cost in cents (rounded up to the nearest cent).
 /// Returns (bluey_cost_cents, customer_cost_cents).
-pub fn compute_cost(
-    pricing: &ModelPricing,
-    input_tokens: i64,
-    output_tokens: i64,
-) -> (i64, i64) {
+pub fn compute_cost(pricing: &ModelPricing, input_tokens: i64, output_tokens: i64) -> (i64, i64) {
     let bluey_microcents = pricing.upstream_in_microcents_per_1m * input_tokens / 1_000_000
         + pricing.upstream_out_microcents_per_1m * output_tokens / 1_000_000;
-    let customer_microcents =
-        bluey_microcents * (100 + pricing.markup_percent) / 100;
+    let customer_microcents = bluey_microcents * (100 + pricing.markup_percent) / 100;
 
     let bluey_cents = (bluey_microcents + MICROCENTS_PER_CENT - 1) / MICROCENTS_PER_CENT;
     let customer_cents = (customer_microcents + MICROCENTS_PER_CENT - 1) / MICROCENTS_PER_CENT;
@@ -115,11 +112,15 @@ mod tests {
         assert_eq!(lookup("openai", "gpt-4o-mini").unwrap().markup_percent, 200);
         assert_eq!(lookup("openai", "gpt-4o").unwrap().markup_percent, 150);
         assert_eq!(
-            lookup("anthropic", "claude-3-5-sonnet-latest").unwrap().markup_percent,
+            lookup("anthropic", "claude-3-5-sonnet-latest")
+                .unwrap()
+                .markup_percent,
             200
         );
         assert_eq!(
-            lookup("anthropic", "claude-3-7-sonnet-latest").unwrap().markup_percent,
+            lookup("anthropic", "claude-3-7-sonnet-latest")
+                .unwrap()
+                .markup_percent,
             150
         );
     }
@@ -138,10 +139,10 @@ mod tests {
         let (bluey, customer) = compute_cost(p, 150, 100);
         assert_eq!(bluey, 1); // ceil 0.0083 cents → 1
         assert_eq!(customer, 1); // ceil 0.0248 cents → 1
-        // Note: the 0.0003 cents headline number from PRICING-MODEL.md
-        // section 2 describes the *fractional* cost; the per-request
-        // billing rounds up to 1 cent because that's the unit of currency.
-        // For aggregation/reporting we use microcents internally.
+                                 // Note: the 0.0003 cents headline number from PRICING-MODEL.md
+                                 // section 2 describes the *fractional* cost; the per-request
+                                 // billing rounds up to 1 cent because that's the unit of currency.
+                                 // For aggregation/reporting we use microcents internally.
     }
 
     #[test]

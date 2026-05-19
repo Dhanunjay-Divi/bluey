@@ -32,8 +32,14 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         .route("/auth/signup", axum::routing::post(auth_routes::signup))
         .route("/auth/login", axum::routing::post(auth_routes::login))
         .route("/auth/refresh", axum::routing::post(auth_routes::refresh))
-        .route("/auth/device/start", axum::routing::post(auth_routes::device_start))
-        .route("/auth/device/poll", axum::routing::post(auth_routes::device_poll))
+        .route(
+            "/auth/device/start",
+            axum::routing::post(auth_routes::device_start),
+        )
+        .route(
+            "/auth/device/poll",
+            axum::routing::post(auth_routes::device_poll),
+        )
         .route("/billing/webhook", axum::routing::post(billing::webhook));
 
     // ---- Authenticated (Bearer JWT) -----------------------------------------
@@ -42,10 +48,16 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         .route("/account/usage", get(account::usage))
         .route("/router/complete", axum::routing::post(router::complete))
         .route("/router/embed", axum::routing::post(router::embed))
-        .route("/router/transcribe", axum::routing::post(router::transcribe))
+        .route(
+            "/router/transcribe",
+            axum::routing::post(router::transcribe),
+        )
         .route("/usage/event", axum::routing::post(usage::ingest))
         .route("/billing/checkout", axum::routing::post(billing::checkout))
-        .route("/auth/device/approve", axum::routing::post(auth_routes::device_approve))
+        .route(
+            "/auth/device/approve",
+            axum::routing::post(auth_routes::device_approve),
+        )
         .route("/admin/customers", get(admin::customers))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),

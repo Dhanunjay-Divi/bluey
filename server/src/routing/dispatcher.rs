@@ -43,9 +43,7 @@ pub async fn complete(
 ) -> Result<Completion> {
     match provider {
         "openai" => openai_complete(keys, model, system, user, max_tokens, temperature).await,
-        "anthropic" => {
-            anthropic_complete(keys, model, system, user, max_tokens, temperature).await
-        }
+        "anthropic" => anthropic_complete(keys, model, system, user, max_tokens, temperature).await,
         other => Err(anyhow!("unsupported provider: {other}")),
     }
 }
@@ -105,8 +103,14 @@ async fn openai_complete(
     let req = OpenAiChatReq {
         model,
         messages: vec![
-            OpenAiMessage { role: "system", content: system },
-            OpenAiMessage { role: "user", content: user },
+            OpenAiMessage {
+                role: "system",
+                content: system,
+            },
+            OpenAiMessage {
+                role: "user",
+                content: user,
+            },
         ],
         max_tokens,
         temperature,
@@ -197,7 +201,10 @@ async fn anthropic_complete(
         model,
         max_tokens: max_tokens.unwrap_or(2048),
         system,
-        messages: vec![AnthropicMessage { role: "user", content: user }],
+        messages: vec![AnthropicMessage {
+            role: "user",
+            content: user,
+        }],
         temperature,
     };
     let resp = reqwest::Client::new()

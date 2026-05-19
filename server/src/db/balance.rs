@@ -45,7 +45,9 @@ pub fn deduct(pool: &DbPool, account_id: &str, cost_cents: i64) -> Result<bool> 
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .ok();
-        let Some((batch_id, batch_remaining)) = row else { break };
+        let Some((batch_id, batch_remaining)) = row else {
+            break;
+        };
         let take = remaining.min(batch_remaining);
         tx.execute(
             "UPDATE credit_batches SET remaining_cents = remaining_cents - ?1
@@ -79,7 +81,13 @@ pub fn credit(
         "INSERT INTO credit_batches
             (id, account_id, amount_cents, remaining_cents, expires_at, stripe_charge_id)
          VALUES (?1, ?2, ?3, ?3, ?4, ?5)",
-        params![batch_id, account_id, amount_cents, expires_at, stripe_charge_id],
+        params![
+            batch_id,
+            account_id,
+            amount_cents,
+            expires_at,
+            stripe_charge_id
+        ],
     )?;
 
     conn.execute(
@@ -136,7 +144,11 @@ pub fn sweep_expired(pool: &DbPool) -> Result<i64> {
     )?;
     let rows: Vec<(String, String, i64)> = stmt
         .query_map(params![now], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
         })?
         .filter_map(|r| r.ok())
         .collect();
@@ -152,7 +164,12 @@ pub fn sweep_expired(pool: &DbPool) -> Result<i64> {
             params![now, batch_id],
         )?;
         total += remaining;
-        tracing::info!(account_id, batch_id, remaining_cents = remaining, "credit batch expired");
+        tracing::info!(
+            account_id,
+            batch_id,
+            remaining_cents = remaining,
+            "credit batch expired"
+        );
     }
     Ok(total)
 }
@@ -169,7 +186,9 @@ mod tests {
     }
 
     fn make_account(pool: &DbPool, email: &str) -> String {
-        crate::db::accounts::Account::create(pool, email, "stub").unwrap().id
+        crate::db::accounts::Account::create(pool, email, "stub")
+            .unwrap()
+            .id
     }
 
     #[test]

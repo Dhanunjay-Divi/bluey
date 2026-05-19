@@ -17,9 +17,7 @@ pub struct AccountMe {
     pub auto_topup_amount_cents: i64,
 }
 
-pub async fn me(
-    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
-) -> Json<AccountMe> {
+pub async fn me(Extension(AuthedAccount(account)): Extension<AuthedAccount>) -> Json<AccountMe> {
     Json(AccountMe {
         id: account.id,
         email: account.email,

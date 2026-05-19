@@ -80,7 +80,10 @@ pub async fn complete(
         let can = balance::can_afford(&state.pool, &account.id, est_cost).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError { error: format!("balance: {e}"), ..Default::default() }),
+                Json(ApiError {
+                    error: format!("balance: {e}"),
+                    ..Default::default()
+                }),
             )
         })?;
         if !can {
@@ -132,14 +135,20 @@ pub async fn complete(
         balance::consume_trial_seconds(&state.pool, &account.id, elapsed_ms).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError { error: format!("trial: {e}"), ..Default::default() }),
+                Json(ApiError {
+                    error: format!("trial: {e}"),
+                    ..Default::default()
+                }),
             )
         })?
     } else {
         let ok = balance::deduct(&state.pool, &account.id, customer_cost).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError { error: format!("deduct: {e}"), ..Default::default() }),
+                Json(ApiError {
+                    error: format!("deduct: {e}"),
+                    ..Default::default()
+                }),
             )
         })?;
         // If !ok here we'd be in a "completed upstream call but couldn't

@@ -90,9 +90,10 @@ impl Account {
     /// Look up password hash for login validation.
     pub fn password_hash(pool: &DbPool, email: &str) -> Result<Option<String>> {
         let conn = pool.get()?;
-        let mut stmt =
-            conn.prepare("SELECT password_hash FROM accounts WHERE email = ?1")?;
-        let hash = stmt.query_row(params![email], |r| r.get::<_, String>(0)).ok();
+        let mut stmt = conn.prepare("SELECT password_hash FROM accounts WHERE email = ?1")?;
+        let hash = stmt
+            .query_row(params![email], |r| r.get::<_, String>(0))
+            .ok();
         Ok(hash)
     }
 }

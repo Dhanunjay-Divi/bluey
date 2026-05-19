@@ -41,9 +41,9 @@ pub async fn customers(State(state): State<AppState>) -> impl IntoResponse {
                 .into_response();
         }
     };
-    let mut stmt = match conn.prepare(
-        "SELECT id, email, balance_cents FROM accounts ORDER BY created_at DESC LIMIT 100",
-    ) {
+    let mut stmt = match conn
+        .prepare("SELECT id, email, balance_cents FROM accounts ORDER BY created_at DESC LIMIT 100")
+    {
         Ok(s) => s,
         Err(e) => {
             return (

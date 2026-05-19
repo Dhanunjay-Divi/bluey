@@ -1,10 +1,6 @@
 //! Auth endpoints — real implementations.
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
@@ -51,18 +47,47 @@ pub struct ApiError {
 }
 
 fn err(status: StatusCode, msg: &str) -> (StatusCode, Json<ApiError>) {
-    (status, Json(ApiError { error: msg.to_string() }))
+    (
+        status,
+        Json(ApiError {
+            error: msg.to_string(),
+        }),
+    )
 }
 
-fn auth_response(state: &AppState, account: &Account) -> Result<AuthResponse, (StatusCode, Json<ApiError>)> {
-    let access = auth::jwt::issue(&state.config.jwt_secret, &account.id, auth::jwt::TokenKind::Access)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("issue access: {e}")))?;
-    let refresh =
-        auth::jwt::issue(&state.config.jwt_secret, &account.id, auth::jwt::TokenKind::Refresh)
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("issue refresh: {e}")))?;
+fn auth_response(
+    state: &AppState,
+    account: &Account,
+) -> Result<AuthResponse, (StatusCode, Json<ApiError>)> {
+    let access = auth::jwt::issue(
+        &state.config.jwt_secret,
+        &account.id,
+        auth::jwt::TokenKind::Access,
+    )
+    .map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("issue access: {e}"),
+        )
+    })?;
+    let refresh = auth::jwt::issue(
+        &state.config.jwt_secret,
+        &account.id,
+        auth::jwt::TokenKind::Refresh,
+    )
+    .map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("issue refresh: {e}"),
+        )
+    })?;
 
-    auth::refresh_store::store(&state.pool, &refresh, &account.id, None)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("store refresh: {e}")))?;
+    auth::refresh_store::store(&state.pool, &refresh, &account.id, None).map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("store refresh: {e}"),
+        )
+    })?;
 
     Ok(AuthResponse {
         access_token: access,
@@ -85,7 +110,10 @@ pub async fn signup(
 ) -> Result<Json<AuthResponse>, (StatusCode, Json<ApiError>)> {
     let email = req.email.trim().to_lowercase();
     if email.is_empty() || !email.contains('@') {
-        return Err(err(StatusCode::BAD_REQUEST, "email is required and must contain @"));
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "email is required and must contain @",
+        ));
     }
 
     // Reject duplicate email up-front (DB UNIQUE catches it too, but the
@@ -100,8 +128,12 @@ pub async fn signup(
     let password_hash = auth::password::hash_password(&req.password)
         .map_err(|e| err(StatusCode::BAD_REQUEST, &e.to_string()))?;
 
-    let account = Account::create(&state.pool, &email, &password_hash)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("create account: {e}")))?;
+    let account = Account::create(&state.pool, &email, &password_hash).map_err(|e| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("create account: {e}"),
+        )
+    })?;
 
     Ok(Json(auth_response(&state, &account)?))
 }
@@ -125,7 +157,12 @@ pub async fn login(
 
     let account = Account::fetch_by_email(&state.pool, &email)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?
-        .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "account vanished after auth"))?;
+        .ok_or_else(|| {
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "account vanished after auth",
+            )
+        })?;
 
     Ok(Json(auth_response(&state, &account)?))
 }
@@ -149,7 +186,10 @@ pub async fn refresh(
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "refresh token revoked or expired"))?;
 
     if account_id != claims.sub {
-        return Err(err(StatusCode::UNAUTHORIZED, "refresh token / claim mismatch"));
+        return Err(err(
+            StatusCode::UNAUTHORIZED,
+            "refresh token / claim mismatch",
+        ));
     }
 
     let account = Account::fetch_by_id(&state.pool, &account_id)
@@ -213,8 +253,8 @@ pub async fn device_start(
 ) -> Result<Json<DeviceStartResponse>, (StatusCode, Json<ApiError>)> {
     let device_code = random_device_code();
     let user_code = random_user_code();
-    let expires_at = (chrono::Utc::now() + chrono::Duration::seconds(DEVICE_CODE_TTL_SECS))
-        .to_rfc3339();
+    let expires_at =
+        (chrono::Utc::now() + chrono::Duration::seconds(DEVICE_CODE_TTL_SECS)).to_rfc3339();
     let conn = state
         .pool
         .get()
@@ -268,7 +308,10 @@ pub async fn device_poll(
         return Err(err(StatusCode::ACCEPTED, "authorization_pending"));
     }
     let Some(account_id) = account_id_opt else {
-        return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "approved but no account"));
+        return Err(err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "approved but no account",
+        ));
     };
 
     // Fetch account and issue tokens. Delete the device_code row to
@@ -285,7 +328,9 @@ pub async fn device_poll(
 
 pub async fn device_approve(
     State(state): State<AppState>,
-    axum::Extension(crate::auth::AuthedAccount(account)): axum::Extension<crate::auth::AuthedAccount>,
+    axum::Extension(crate::auth::AuthedAccount(account)): axum::Extension<
+        crate::auth::AuthedAccount,
+    >,
     Json(req): Json<DeviceApproveRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     let conn = state

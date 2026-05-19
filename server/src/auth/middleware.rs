@@ -23,8 +23,8 @@ pub async fn require_auth(
     next: Next,
 ) -> Result<Response, StatusCode> {
     let token = extract_bearer(&req).ok_or(StatusCode::UNAUTHORIZED)?;
-    let claims = jwt::verify(&state.config.jwt_secret, &token)
-        .map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let claims =
+        jwt::verify(&state.config.jwt_secret, &token).map_err(|_| StatusCode::UNAUTHORIZED)?;
     if claims.kind != "access" {
         return Err(StatusCode::UNAUTHORIZED);
     }

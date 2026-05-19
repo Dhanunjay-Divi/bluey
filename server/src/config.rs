@@ -49,15 +49,26 @@ impl Config {
         let public_url = std::env::var("BLUEY_PUBLIC_URL")
             .unwrap_or_else(|_| "http://localhost:8080".to_string());
 
-        let stripe_secret_key = std::env::var("STRIPE_SECRET_KEY").ok().filter(|v| !v.is_empty());
-        let stripe_webhook_secret =
-            std::env::var("STRIPE_WEBHOOK_SECRET").ok().filter(|v| !v.is_empty());
+        let stripe_secret_key = std::env::var("STRIPE_SECRET_KEY")
+            .ok()
+            .filter(|v| !v.is_empty());
+        let stripe_webhook_secret = std::env::var("STRIPE_WEBHOOK_SECRET")
+            .ok()
+            .filter(|v| !v.is_empty());
 
         let upstream = UpstreamKeys {
-            openai_api_key: std::env::var("OPENAI_API_KEY").ok().filter(|v| !v.is_empty()),
-            anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").ok().filter(|v| !v.is_empty()),
-            deepgram_api_key: std::env::var("DEEPGRAM_API_KEY").ok().filter(|v| !v.is_empty()),
-            ollama_base_url: std::env::var("OLLAMA_BASE_URL").ok().filter(|v| !v.is_empty()),
+            openai_api_key: std::env::var("OPENAI_API_KEY")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            anthropic_api_key: std::env::var("ANTHROPIC_API_KEY")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            deepgram_api_key: std::env::var("DEEPGRAM_API_KEY")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            ollama_base_url: std::env::var("OLLAMA_BASE_URL")
+                .ok()
+                .filter(|v| !v.is_empty()),
         };
 
         Ok(Self {
