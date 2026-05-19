@@ -851,6 +851,73 @@ pub struct CueResponseChunkPayload {
     pub kind: String,
     pub partial_text: String,
     pub finished: bool,
+    /// Auto Router metadata (Bluey Auto). Optional because future managed
+    /// routing may attach more fields; for v0.1 we emit task_type, lane, and
+    /// confidence on the FIRST chunk and reuse the same payload schema for
+    /// subsequent chunks (router_meta = None on those).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub router_meta: Option<RouterMeta>,
+}
+
+/// Subset of cue_router::TaskClassification + ProviderRoute exposed to the UI.
+#[derive(Clone, Serialize)]
+pub struct RouterMeta {
+    /// Task type the heuristic classifier picked (general / code /
+    /// system_design / meeting / writing / vision).
+    pub task_type: String,
+    /// Latency lane the policy picked (instant / balanced / deep).
+    pub latency_lane: String,
+    /// Provider lane the policy resolved to (instant / balanced / deep /
+    /// vision / local).
+    pub provider_lane: String,
+    /// Provider name dispatched to (e.g. "openai", "anthropic", "ollama").
+    pub provider_name: String,
+    /// Model dispatched to.
+    pub model: String,
+    /// Heuristic classifier confidence in [0.0, 1.0].
+    pub confidence: f32,
+}
+
+/// Build a `RouterMeta` for the given prompt + active context surfaces.
+/// Local-only is read from the BLUEY_LOCAL_ONLY env var (until we surface it
+/// in the dashboard settings UI).
+fn classify_for_router(prompt: &str, has_transcript: bool, has_screenshot: bool) -> RouterMeta {
+    use cue_router::{
+        AutoRouter, ClassifierInput, HeuristicClassifier, RouteOptions, RoutingPolicy,
+        StaticPolicy, TaskClassifier,
+    };
+    use std::sync::Arc;
+
+    let classifier: Arc<dyn TaskClassifier> = Arc::new(HeuristicClassifier::new());
+    let policy: Arc<dyn RoutingPolicy> = Arc::new(StaticPolicy::defaults());
+    let router = AutoRouter::new(classifier, policy);
+
+    let local_only = std::env::var("BLUEY_LOCAL_ONLY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let input = ClassifierInput {
+        prompt,
+        has_transcript,
+        has_page: false,
+        file_attachment_count: 0,
+        has_screenshot,
+        ..Default::default()
+    };
+
+    // Synchronous wrapper: AutoRouter::route is async only because future
+    // managed classifiers may RPC. The heuristic path is in-process and
+    // returns immediately; we block the async runtime briefly.
+    let routed = futures::executor::block_on(router.route(&input, RouteOptions { local_only }));
+
+    RouterMeta {
+        task_type: format!("{:?}", routed.classification.task_type).to_lowercase(),
+        latency_lane: format!("{:?}", routed.classification.latency_lane).to_lowercase(),
+        provider_lane: format!("{:?}", routed.route.lane).to_lowercase(),
+        provider_name: routed.route.provider_name.clone(),
+        model: routed.route.model.clone(),
+        confidence: routed.classification.confidence,
+    }
 }
 
 /// Trigger a cue response. If a recent question is detected in the transcript
@@ -896,7 +963,16 @@ pub async fn request_cue(
     // Generate response_id up-front so chunks and final event share it.
     let response_id = Uuid::new_v4().to_string();
 
+    // Auto Router classification: emit on the first chunk so the UI can render
+    // a lane badge before the answer text starts streaming.
+    let router_meta = classify_for_router(&recent, true, false);
+    let emitted_meta = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Detect question in recent transcript and dispatch with streaming.
+    let emitted_meta_a = emitted_meta.clone();
+    let emitted_meta_b = emitted_meta.clone();
+    let router_meta_a = router_meta.clone();
+    let router_meta_b = router_meta.clone();
     let cue_resp = if kind == "answer" && ends_with_question(&recent) {
         let question = recent
             .rsplit('.')
@@ -907,6 +983,12 @@ pub async fn request_cue(
         let rid = response_id.clone();
         AnswerLlm
             .run_streaming(question, &session_id, llm.as_ref(), |partial, finished| {
+                let meta_for_chunk =
+                    if !emitted_meta_a.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        Some(router_meta_a.clone())
+                    } else {
+                        None
+                    };
                 let _ = app2.emit(
                     "cue_response_chunk",
                     CueResponseChunkPayload {
@@ -914,6 +996,7 @@ pub async fn request_cue(
                         kind: "answer".to_string(),
                         partial_text: partial.to_string(),
                         finished,
+                        router_meta: meta_for_chunk,
                     },
                 );
             })
@@ -924,6 +1007,12 @@ pub async fn request_cue(
         let rid = response_id.clone();
         WhatToAnswerLlm
             .run_streaming(&recent, &session_id, llm.as_ref(), |partial, finished| {
+                let meta_for_chunk =
+                    if !emitted_meta_b.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        Some(router_meta_b.clone())
+                    } else {
+                        None
+                    };
                 let _ = app2.emit(
                     "cue_response_chunk",
                     CueResponseChunkPayload {
@@ -931,6 +1020,7 @@ pub async fn request_cue(
                         kind: "suggestion".to_string(),
                         partial_text: partial.to_string(),
                         finished,
+                        router_meta: meta_for_chunk,
                     },
                 );
             })
@@ -1002,6 +1092,7 @@ pub async fn auto_recap(
                         kind: "recap".to_string(),
                         partial_text: partial.to_string(),
                         finished,
+                        router_meta: None, // recap is not yet routed via AutoRouter
                     },
                 );
             },
