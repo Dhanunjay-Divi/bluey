@@ -13,6 +13,7 @@ name = "bluey"
 path = "src/bin/bluey.rs"
 
 [dependencies]
+cue-cloud-client = { path = "../cue-cloud-client" }
 anyhow.workspace = true
 clap.workspace = true
 cue-core = { path = "../cue-core" }

@@ -1025,6 +1025,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "cue-cloud-client",
  "cue-core",
  "libc",
  "serde_json",

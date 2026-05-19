@@ -52,6 +52,10 @@ enum Commands {
     Sessions(SessionsArgs),
     /// Show or update terminal-first Bluey settings.
     Settings(SettingsArgs),
+    /// Show your Bluey balance, last-7-days usage, and tier projection.
+    Usage,
+    /// Show credit-batch expiration info.
+    Credits,
     /// Start the Bluey daemon.
     #[command(hide = true)]
     Start(StartArgs),
@@ -441,6 +445,8 @@ pub async fn cli_main() -> Result<()> {
         Commands::Account => print_account().await,
         Commands::Sessions(args) => print_sessions(args),
         Commands::Settings(args) => cue_settings(args),
+        Commands::Usage => bluey_usage_cmd().await,
+        Commands::Credits => bluey_credits_cmd().await,
         Commands::Start(args) => start(args).await,
         Commands::Stop => {
             let response = request(DaemonRequest::Shutdown).await?;
@@ -2252,4 +2258,41 @@ fn env_present(name: &str) -> bool {
     env::var_os(name)
         .filter(|value| !value.is_empty())
         .is_some()
+}
+
+async fn bluey_usage_cmd() -> Result<()> {
+    let client = match cue_cloud_client::CloudClient::with_default_keyring() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("bluey: cloud client init failed: {e}");
+            eprintln!("Run `bluey login` first if you have not already.");
+            return Ok(());
+        }
+    };
+    if client.current_tokens().is_none() {
+        eprintln!("bluey: not logged in. Run `bluey login` first.");
+        return Ok(());
+    }
+    if let Err(e) = crate::bluey_cmds::show_usage(&client).await {
+        eprintln!("bluey: usage failed: {e}");
+    }
+    Ok(())
+}
+
+async fn bluey_credits_cmd() -> Result<()> {
+    let client = match cue_cloud_client::CloudClient::with_default_keyring() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("bluey: cloud client init failed: {e}");
+            return Ok(());
+        }
+    };
+    if client.current_tokens().is_none() {
+        eprintln!("bluey: not logged in. Run `bluey login` first.");
+        return Ok(());
+    }
+    if let Err(e) = crate::bluey_cmds::show_credits(&client).await {
+        eprintln!("bluey: credits failed: {e}");
+    }
+    Ok(())
 }
