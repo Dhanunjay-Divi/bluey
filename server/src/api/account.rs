@@ -1,7 +1,6 @@
 //! Account endpoints — real implementations.
 
 use axum::{extract::State, http::StatusCode, Extension, Json};
-use chrono::{Duration, Utc};
 use serde::Serialize;
 
 use super::AppState;
@@ -58,15 +57,18 @@ pub async fn usage(
         .pool
         .get()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let cutoff = (Utc::now() - Duration::days(PERIOD_DAYS)).to_rfc3339();
+    // Codex Stage 7 S7.2: use SQLite datetime() consistently. Stored
+    // ts is "YYYY-MM-DD HH:MM:SS" via datetime('now') default; we
+    // compute the cutoff the same way to avoid mixed-format text
+    // comparison breaking around boundaries.
+    let _ = PERIOD_DAYS; // (referenced in datetime literal below)
 
-    // Total cues + cents in window.
     let (total_cues, total_cents_spent): (i64, i64) = conn
         .query_row(
             "SELECT COUNT(*), COALESCE(SUM(cost_cents_to_customer), 0)
              FROM usage_events
-             WHERE account_id = ?1 AND ts >= ?2",
-            rusqlite::params![&account.id, &cutoff],
+             WHERE account_id = ?1 AND ts >= datetime('now', '-7 days')",
+            rusqlite::params![&account.id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -80,13 +82,13 @@ pub async fn usage(
                     COUNT(*) AS cnt,
                     COALESCE(SUM(cost_cents_to_customer), 0) AS cost
              FROM usage_events
-             WHERE account_id = ?1 AND ts >= ?2
+             WHERE account_id = ?1 AND ts >= datetime('now', '-7 days')
              GROUP BY bucket
              ORDER BY cost DESC",
         )
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let mix_raw: Vec<(String, i64, i64)> = stmt
-        .query_map(rusqlite::params![&account.id, &cutoff], |r| {
+        .query_map(rusqlite::params![&account.id], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?

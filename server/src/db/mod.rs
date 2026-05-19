@@ -160,6 +160,20 @@ const MIGRATIONS: &[&str] = &[
         ON credit_batches(stripe_charge_id)
         WHERE stripe_charge_id IS NOT NULL;
     "#,
+    // 0009 — usage_events idempotency. Codex Stage 7 S7.1.
+    //
+    // Daemon retries of /usage/event with the same request_id would
+    // otherwise double-count cues + spend. UNIQUE constraint enforced
+    // via partial index because we want to allow multiple kinds (llm,
+    // embed, stt, vision) per request_id where they semantically
+    // represent different physical events on the same logical request.
+    //
+    // INSERT OR IGNORE in usage::record handles the dedupe path
+    // gracefully.
+    r#"
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_dedupe
+        ON usage_events(account_id, request_id, kind);
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
