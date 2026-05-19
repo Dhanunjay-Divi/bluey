@@ -152,6 +152,14 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_request_idempotency_created
         ON request_idempotency(created_at);
     "#,
+    // 0008 — unique index on stripe_charge_id for idempotent credit.
+    // Codex Stage 6 S6.1: prevents duplicate-charge double-credit even
+    // if webhook fires twice for the same payment.
+    r#"
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_credit_batches_stripe_charge
+        ON credit_batches(stripe_charge_id)
+        WHERE stripe_charge_id IS NOT NULL;
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {

@@ -107,20 +107,24 @@ pub async fn checkout(
         .send()
         .await
         .map_err(|e| {
+            // Codex Stage 6 S6.6: log raw upstream details, return
+            // sanitized message to the customer.
+            tracing::warn!(error = %e, "stripe checkout http failed");
             (
                 StatusCode::BAD_GATEWAY,
                 Json(ApiError {
-                    error: format!("stripe http: {e}"),
+                    error: "billing provider unavailable; please retry".into(),
                 }),
             )
         })?;
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
     if !status.is_success() {
+        tracing::warn!(stripe_status = %status, stripe_body = %body, "stripe checkout error");
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(ApiError {
-                error: format!("stripe {status}: {body}"),
+                error: "billing checkout failed; please retry".into(),
             }),
         ));
     }
@@ -234,7 +238,7 @@ fn handle_checkout_completed(state: &AppState, event: &serde_json::Value) -> Res
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    balance::credit(
+    let credited = balance::credit(
         &state.pool,
         &account_id,
         amount_cents,
@@ -242,26 +246,56 @@ fn handle_checkout_completed(state: &AppState, event: &serde_json::Value) -> Res
     )
     .context("credit account")?;
 
-    // Persist the PaymentMethod for future auto top-ups.
-    if let Some(customer_id) = session.get("customer").and_then(|v| v.as_str()) {
-        if let Ok(conn) = state.pool.get() {
+    // Codex Stage 6 S6.3: persist BOTH the customer id AND the payment
+    // method id for auto top-up. The setup_future_usage=off_session
+    // hint at checkout time means Stripe attaches the PaymentMethod to
+    // the customer. We read it from the session\'s payment_intent_data
+    // (when expanded) or fall back to charging via customer-default at
+    // top-up time.
+    if let Ok(conn) = state.pool.get() {
+        let customer_id = session.get("customer").and_then(|v| v.as_str());
+        let payment_method_id = session
+            .pointer("/payment_intent/payment_method")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                session
+                    .get("setup_intent")
+                    .and_then(|v| v.get("payment_method"))
+                    .and_then(|v| v.as_str())
+            });
+        if customer_id.is_some() || payment_method_id.is_some() {
             let _ = conn.execute(
-                "UPDATE accounts SET stripe_customer_id = ?1 WHERE id = ?2",
-                rusqlite::params![customer_id, &account_id],
+                "UPDATE accounts
+                    SET stripe_customer_id = COALESCE(?1, stripe_customer_id),
+                        stripe_payment_method_id = COALESCE(?2, stripe_payment_method_id)
+                  WHERE id = ?3",
+                rusqlite::params![customer_id, payment_method_id, &account_id],
             );
         }
+    }
+
+    if !credited {
+        tracing::info!(
+            account_id,
+            "checkout.session.completed: charge already credited, no-op"
+        );
     }
 
     tracing::info!(account_id, amount_cents, "credited from Stripe webhook");
     Ok(())
 }
 
-/// Verify Stripe's `t=...,v1=...` signature header against the body.
-/// Implements the standard scheme: `signed_payload = "t.body"`,
-/// HMAC-SHA256 with the webhook secret, hex-compared to v1.
+/// Verify Stripe `t=...,v1=...` signature header against the body.
+/// Implements the standard scheme: signed_payload = "t.body",
+/// HMAC-SHA256 with the webhook secret, constant-time compared to v1.
+///
+/// Codex Stage 6 S6.5:
+///   - Constant-time signature compare via subtle::ConstantTimeEq.
+///   - Timestamp tolerance: reject events outside +/- 5 minutes of now.
 fn verify_stripe_signature(secret: &str, sig_header: &str, body: &str) -> Result<()> {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
+    use subtle::ConstantTimeEq;
 
     let mut timestamp = None;
     let mut signatures: Vec<&str> = Vec::new();
@@ -279,13 +313,38 @@ fn verify_stripe_signature(secret: &str, sig_header: &str, body: &str) -> Result
     if signatures.is_empty() {
         return Err(anyhow!("no v1 signature in Stripe-Signature"));
     }
+
+    // Reject events outside +/- 5 minutes (Stripe-recommended tolerance).
+    let event_ts: i64 = t
+        .parse()
+        .map_err(|e| anyhow!("invalid timestamp {t}: {e}"))?;
+    let now = chrono::Utc::now().timestamp();
+    let skew = (now - event_ts).abs();
+    const TOLERANCE_SECS: i64 = 300;
+    if skew > TOLERANCE_SECS {
+        return Err(anyhow!(
+            "timestamp outside tolerance ({skew}s > {TOLERANCE_SECS}s)"
+        ));
+    }
+
     let signed_payload = format!("{t}.{body}");
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes())
         .map_err(|e| anyhow!("hmac key: {e}"))?;
     mac.update(signed_payload.as_bytes());
     let computed = mac.finalize().into_bytes();
     let computed_hex = hex::encode(computed);
-    if !signatures.iter().any(|s| **s == *computed_hex) {
+    let computed_bytes = computed_hex.as_bytes();
+    let mut any_match = false;
+    for sig in &signatures {
+        let sig_bytes = sig.as_bytes();
+        if sig_bytes.len() != computed_bytes.len() {
+            continue;
+        }
+        if sig_bytes.ct_eq(computed_bytes).into() {
+            any_match = true;
+        }
+    }
+    if !any_match {
         return Err(anyhow!("signature mismatch"));
     }
     Ok(())
@@ -301,7 +360,8 @@ mod tests {
         use sha2::Sha256;
         let secret = "whsec_test_abc";
         let body = r#"{"id":"evt_1","type":"checkout.session.completed"}"#;
-        let t = "1700000000";
+        let t = chrono::Utc::now().timestamp().to_string();
+        let t = t.as_str();
         let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).unwrap();
         mac.update(format!("{t}.{body}").as_bytes());
         let v1 = hex::encode(mac.finalize().into_bytes());
@@ -314,11 +374,34 @@ mod tests {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
         let body = r#"{"id":"evt_1"}"#;
-        let t = "1700000000";
+        let t = chrono::Utc::now().timestamp().to_string();
+        let t = t.as_str();
         let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(b"correct").unwrap();
         mac.update(format!("{t}.{body}").as_bytes());
         let v1 = hex::encode(mac.finalize().into_bytes());
         let header = format!("t={t},v1={v1}");
         assert!(verify_stripe_signature("wrong", &header, body).is_err());
+    }
+
+    #[test]
+    fn signature_rejects_stale_timestamp() {
+        // Codex Stage 6 S6.5: reject events outside +/- 5 minutes.
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let secret = "whsec_stale";
+        let body = r#"{"id":"evt_stale"}"#;
+        // 2023 timestamp — far outside tolerance.
+        let t = "1700000000";
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(format!("{t}.{body}").as_bytes());
+        let v1 = hex::encode(mac.finalize().into_bytes());
+        let header = format!("t={t},v1={v1}");
+        let res = verify_stripe_signature(secret, &header, body);
+        assert!(res.is_err());
+        let msg = format!("{}", res.unwrap_err());
+        assert!(
+            msg.contains("tolerance"),
+            "expected tolerance error, got {msg}"
+        );
     }
 }

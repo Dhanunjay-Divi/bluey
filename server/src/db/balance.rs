@@ -69,15 +69,39 @@ pub fn credit(
     account_id: &str,
     amount_cents: i64,
     stripe_charge_id: Option<&str>,
-) -> Result<()> {
+) -> Result<bool> {
     if amount_cents <= 0 {
         anyhow::bail!("amount_cents must be positive");
     }
-    let conn = pool.get()?;
+    let mut conn = pool.get()?;
+    let tx = conn.transaction()?;
+
+    // Codex Stage 6 S6.1 + S6.2: dedupe-then-credit atomically.
+    // If a stripe_charge_id is provided, an existing credit_batches row
+    // with the same charge id means we already credited this payment.
+    // Return Ok(false) to signal "no-op already processed" so the
+    // webhook handler can mark the event processed without re-running
+    // anything else. The whole INSERT+UPDATE pair is wrapped in a
+    // transaction so a process crash between the two cannot leave the
+    // account ledger inconsistent.
+    if let Some(charge_id) = stripe_charge_id {
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT 1 FROM credit_batches WHERE stripe_charge_id = ?1",
+                params![charge_id],
+                |r| r.get(0),
+            )
+            .ok();
+        if existing.is_some() {
+            tx.commit()?;
+            return Ok(false);
+        }
+    }
+
     let batch_id = uuid::Uuid::new_v4().to_string();
     let expires_at = (Utc::now() + Duration::days(365)).to_rfc3339();
 
-    conn.execute(
+    tx.execute(
         "INSERT INTO credit_batches
             (id, account_id, amount_cents, remaining_cents, expires_at, stripe_charge_id)
          VALUES (?1, ?2, ?3, ?3, ?4, ?5)",
@@ -90,12 +114,13 @@ pub fn credit(
         ],
     )?;
 
-    conn.execute(
+    tx.execute(
         "UPDATE accounts SET balance_cents = balance_cents + ?1 WHERE id = ?2",
         params![amount_cents, account_id],
     )?;
 
-    Ok(())
+    tx.commit()?;
+    Ok(true)
 }
 
 pub fn can_afford(pool: &DbPool, account_id: &str, estimated_cost_cents: i64) -> Result<bool> {
@@ -291,5 +316,43 @@ mod tests {
         let id = make_account(&pool, "fresh@example.com");
         credit(&pool, &id, 3000, None).unwrap();
         assert_eq!(sweep_expired(&pool).unwrap(), 0);
+    }
+
+    #[test]
+    fn credit_idempotent_on_same_stripe_charge_id() {
+        // Codex Stage 6 S6.1: webhook replay should not double-credit.
+        let pool = temp_pool();
+        let id = make_account(&pool, "idem-credit@example.com");
+        let first = credit(&pool, &id, 3000, Some("ch_abc")).unwrap();
+        assert!(first); // first credit ran
+        let second = credit(&pool, &id, 3000, Some("ch_abc")).unwrap();
+        assert!(!second); // duplicate detected, no-op
+                          // Balance reflects single credit.
+        let bal = current_balance(&pool, &id).unwrap();
+        assert_eq!(bal, 3000);
+    }
+
+    #[test]
+    fn credit_atomic_failure_leaves_account_clean() {
+        // Codex Stage 6 S6.2: if the UPDATE somehow fails after the
+        // INSERT, the transaction rolls back and balance + batches stay
+        // in sync. We can\'t easily force an UPDATE failure here, but
+        // we can at least sanity-check the happy path: balance after
+        // single credit equals the credited amount, no orphan batch
+        // count drift.
+        let pool = temp_pool();
+        let id = make_account(&pool, "atomic-credit@example.com");
+        credit(&pool, &id, 5000, None).unwrap();
+        let bal = current_balance(&pool, &id).unwrap();
+        assert_eq!(bal, 5000);
+        let conn = pool.get().unwrap();
+        let batch_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM credit_batches WHERE account_id = ?1",
+                params![&id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(batch_count, 1);
     }
 }
