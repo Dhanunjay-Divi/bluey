@@ -1,8 +1,8 @@
 //! LLM provider abstraction with failover router.
 
 pub mod anthropic;
-pub mod ollama;
 pub mod bluey_managed;
+pub mod ollama;
 pub mod openai;
 mod router;
 

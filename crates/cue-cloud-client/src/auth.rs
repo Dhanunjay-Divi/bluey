@@ -63,7 +63,10 @@ impl DeviceFlow {
             reqwest::StatusCode::GONE => Ok(DeviceFlowState::Expired),
             other => {
                 let body = resp.text().await.unwrap_or_default();
-                Err(Error::Server { status: other.as_u16(), body })
+                Err(Error::Server {
+                    status: other.as_u16(),
+                    body,
+                })
             }
         }
     }
@@ -78,9 +81,7 @@ impl DeviceFlow {
                 DeviceFlowState::Pending => {
                     tokio::time::sleep(interval).await;
                 }
-                DeviceFlowState::Expired => {
-                    return Err(Error::Other("device_code expired".into()))
-                }
+                DeviceFlowState::Expired => return Err(Error::Other("device_code expired".into())),
             }
         }
     }

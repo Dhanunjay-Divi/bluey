@@ -49,7 +49,12 @@ impl CloudClient {
             .timeout(config.timeout)
             .build()?;
         let cached = Arc::new(Mutex::new(tokens.load()?));
-        Ok(Self { config, http, tokens, cached })
+        Ok(Self {
+            config,
+            http,
+            tokens,
+            cached,
+        })
     }
 
     /// Convenience constructor: keyring-backed store, default config.
@@ -142,10 +147,7 @@ impl CloudClient {
         path: &str,
         body: Option<&Req>,
     ) -> Result<Response> {
-        let access = self
-            .current_tokens()
-            .ok_or(Error::Unauthorized)?
-            .access;
+        let access = self.current_tokens().ok_or(Error::Unauthorized)?.access;
         let mut req = self
             .http
             .request(method, self.url(path))
@@ -166,7 +168,12 @@ impl CloudClient {
             return Ok(false);
         }
         let body = serde_json::json!({ "refresh_token": cur.refresh });
-        let resp = self.http.post(self.url("/auth/refresh")).json(&body).send().await?;
+        let resp = self
+            .http
+            .post(self.url("/auth/refresh"))
+            .json(&body)
+            .send()
+            .await?;
         if resp.status() != StatusCode::OK {
             return Ok(false);
         }
@@ -188,13 +195,14 @@ impl CloudClient {
         match status {
             StatusCode::UNAUTHORIZED => Err(Error::Unauthorized),
             StatusCode::PAYMENT_REQUIRED => {
-                let body: InsufficientBalanceBody = resp.json().await.unwrap_or(InsufficientBalanceBody {
-                    balance_cents: 0,
-                    estimated_cost_cents: None,
-                    needed_cents: None,
-                    reason: None,
-                    reload_url: None,
-                });
+                let body: InsufficientBalanceBody =
+                    resp.json().await.unwrap_or(InsufficientBalanceBody {
+                        balance_cents: 0,
+                        estimated_cost_cents: None,
+                        needed_cents: None,
+                        reason: None,
+                        reload_url: None,
+                    });
                 if body.reason.as_deref() == Some("trial_ended") {
                     return Err(Error::TrialEnded);
                 }
@@ -216,7 +224,10 @@ impl CloudClient {
             }
             other => {
                 let body = resp.text().await.unwrap_or_default();
-                Err(Error::Server { status: other.as_u16(), body })
+                Err(Error::Server {
+                    status: other.as_u16(),
+                    body,
+                })
             }
         }
     }
@@ -244,14 +255,12 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/router/complete"))
-            .respond_with(
-                ResponseTemplate::new(402).set_body_json(serde_json::json!({
-                    "balance_cents": 18,
-                    "estimated_cost_cents": 30,
-                    "reason": "insufficient_balance",
-                    "reload_url": "https://bluey.dev/reload"
-                })),
-            )
+            .respond_with(ResponseTemplate::new(402).set_body_json(serde_json::json!({
+                "balance_cents": 18,
+                "estimated_cost_cents": 30,
+                "reason": "insufficient_balance",
+                "reload_url": "https://bluey.dev/reload"
+            })))
             .mount(&server)
             .await;
         let client = client_for(server.uri());
@@ -273,7 +282,11 @@ mod tests {
             )
             .await;
         match result {
-            Err(Error::InsufficientBalance { balance_cents, needed_cents, .. }) => {
+            Err(Error::InsufficientBalance {
+                balance_cents,
+                needed_cents,
+                ..
+            }) => {
                 assert_eq!(balance_cents, 18);
                 assert_eq!(needed_cents, 30);
             }

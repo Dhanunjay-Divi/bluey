@@ -11,7 +11,10 @@ use cue_cloud_client::{AccountMe, CloudClient, UsageWindow};
 /// Print the user's current balance + auto-top-up status + tier
 /// projection.
 pub async fn show_usage(client: &CloudClient) -> Result<()> {
-    let me: AccountMe = client.auth_get("/account/me").await.context("/account/me")?;
+    let me: AccountMe = client
+        .auth_get("/account/me")
+        .await
+        .context("/account/me")?;
     let usage: UsageWindow = client
         .auth_get("/account/usage")
         .await
@@ -27,9 +30,7 @@ pub async fn show_usage(client: &CloudClient) -> Result<()> {
     };
 
     println!();
-    println!(
-        "Balance         ${balance_dollars:.2}      (auto top-up: {topup})"
-    );
+    println!("Balance         ${balance_dollars:.2}      (auto top-up: {topup})");
     println!(
         "Last 7 days     {} cues, ${:.2} spent",
         usage.total_cues,
@@ -67,9 +68,7 @@ pub async fn show_usage(client: &CloudClient) -> Result<()> {
     }
 
     println!();
-    println!(
-        "Credits expire 1 year from purchase. Run `bluey credits` for batch-by-batch dates."
-    );
+    println!("Credits expire 1 year from purchase. Run `bluey credits` for batch-by-batch dates.");
     Ok(())
 }
 
@@ -77,18 +76,14 @@ pub async fn show_usage(client: &CloudClient) -> Result<()> {
 /// per-batch listing isn't built yet; will be added when needed. For
 /// now we print the headline reminder.)
 pub async fn show_credits(client: &CloudClient) -> Result<()> {
-    let me: AccountMe = client.auth_get("/account/me").await.context("/account/me")?;
+    let me: AccountMe = client
+        .auth_get("/account/me")
+        .await
+        .context("/account/me")?;
     println!();
-    println!(
-        "Balance: ${:.2}",
-        me.balance_cents as f64 / 100.0,
-    );
+    println!("Balance: ${:.2}", me.balance_cents as f64 / 100.0,);
     println!();
-    println!(
-        "Per-batch expiration listing is coming in a future release."
-    );
-    println!(
-        "For now: every $30 reload stays active for 1 year from its purchase date."
-    );
+    println!("Per-batch expiration listing is coming in a future release.");
+    println!("For now: every $30 reload stays active for 1 year from its purchase date.");
     Ok(())
 }

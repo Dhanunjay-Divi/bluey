@@ -170,7 +170,6 @@ mod tests {
     }
 }
 
-
 /// Backward-compat alias for `StaticPolicy`. The product decision
 /// (DECISIONS.md 2026-05-19) renames the BYOK-targeted policy to
 /// `LocalFallbackPolicy` because that is what it really is now —
@@ -194,10 +193,15 @@ pub struct ManagedPolicy {
 }
 
 impl ManagedPolicy {
+    /// Construct the default `ManagedPolicy` (route everything through
+    /// the cloud, vision overrides latency lane).
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Force every request onto the Local lane regardless of
+    /// classification. Used when the customer has explicitly opted
+    /// into privacy-only mode.
     pub fn local_only() -> Self {
         Self { force_local: true }
     }
@@ -227,21 +231,9 @@ impl RoutingPolicy for ManagedPolicy {
             };
         }
         let (lane, provider_name, temperature) = match classification.latency_lane {
-            LatencyLane::Instant => (
-                ProviderLane::Instant,
-                "bluey-managed-instant",
-                Some(0.3),
-            ),
-            LatencyLane::Balanced => (
-                ProviderLane::Balanced,
-                "bluey-managed-balanced",
-                Some(0.3),
-            ),
-            LatencyLane::Deep => (
-                ProviderLane::Deep,
-                "bluey-managed-deep",
-                Some(0.2),
-            ),
+            LatencyLane::Instant => (ProviderLane::Instant, "bluey-managed-instant", Some(0.3)),
+            LatencyLane::Balanced => (ProviderLane::Balanced, "bluey-managed-balanced", Some(0.3)),
+            LatencyLane::Deep => (ProviderLane::Deep, "bluey-managed-deep", Some(0.2)),
         };
         ProviderRoute {
             lane,
@@ -272,7 +264,10 @@ mod managed_tests {
     #[test]
     fn managed_routes_instant_to_managed_instant() {
         let p = ManagedPolicy::new();
-        let r = p.route(&make_classification(TaskType::General, LatencyLane::Instant));
+        let r = p.route(&make_classification(
+            TaskType::General,
+            LatencyLane::Instant,
+        ));
         assert_eq!(r.lane, ProviderLane::Instant);
         assert_eq!(r.provider_name, "bluey-managed-instant");
     }

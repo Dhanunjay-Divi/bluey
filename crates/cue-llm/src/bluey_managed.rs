@@ -66,14 +66,14 @@ impl LlmProvider for BlueyManagedProvider {
         Ok(LlmResponse { text: resp.text })
     }
 
-    async fn complete_stream(
-        &self,
-        req: &LlmRequest,
-    ) -> Result<LlmChunkStream, LlmError> {
+    async fn complete_stream(&self, req: &LlmRequest) -> Result<LlmChunkStream, LlmError> {
         // Wrap complete() in a single-chunk stream until server-side
         // streaming proxy lands.
         let resp = self.complete(req).await?;
-        let chunk = Ok(LlmChunk { text: resp.text, finished: true });
+        let chunk = Ok(LlmChunk {
+            text: resp.text,
+            finished: true,
+        });
         Ok(Box::pin(futures_util::stream::once(async move { chunk })))
     }
 }

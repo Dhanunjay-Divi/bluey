@@ -65,7 +65,12 @@ pub trait SpeculativeProvider: Send + Sync {
 }
 
 /// Speculative router. Configurable: callers decide whether speculation is
-/// active (it is opt-in because of the parallel-spend cost).
+/// active. As of v0.1 internal testing it is **default-ON** (controlled
+/// via the `BLUEY_SPECULATIVE_ROUTING` env var in the daemon dispatcher);
+/// the parallel-spend cost is acceptable while we are still refining the
+/// classifier confidence calibration. See
+/// `crates/cue-dashboard/src/commands.rs::try_speculative_dispatch` for
+/// the env-gating logic.
 pub struct SpeculativeRouter {
     policy: Arc<dyn RoutingPolicy>,
     provider: Arc<dyn SpeculativeProvider>,

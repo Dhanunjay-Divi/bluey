@@ -2,7 +2,7 @@
 
 > **v0.1.0 scope:** macOS arm64 (Apple Silicon) only. Intel Macs, Windows, and
 > Linux are not supported in this release; their builds and end-to-end testing
-> are scheduled for a later round (see `docs/work/PHASE-3-ROUND-13-PLAN.md`).
+> are scheduled for a later round (see `docs/rounds/PHASE-3-ROUND-13-PLAN.md`).
 > If you are on an unsupported platform, please wait for a later release.
 
 ## Requirements

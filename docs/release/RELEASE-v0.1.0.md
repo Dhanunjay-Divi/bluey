@@ -73,7 +73,7 @@ downloads may need `xattr -d com.apple.quarantine` remediation.
 | Telemetry counter for overlay reader rejections | Codex R12 review | R13.6 — gated on telemetry sink + privacy review |
 | Tested `scripts/install.sh` | Codex R12 review | Installer script added in R13 Codex pass; clean-machine validation still pending |
 
-See `docs/work/PHASE-3-ROUND-13-PLAN.md`.
+See `docs/rounds/PHASE-3-ROUND-13-PLAN.md`.
 
 ## Verification at release time
 

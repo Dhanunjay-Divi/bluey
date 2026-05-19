@@ -55,11 +55,13 @@ impl TokenStore for KeyringStore {
             Err(keyring::Error::NoEntry) => return Ok(None),
             Err(e) => return Err(Error::TokenStore(e.to_string())),
         };
-        let refresh = Self::entry(KEY_REFRESH)?
-            .get_password()
-            .unwrap_or_default();
+        let refresh = Self::entry(KEY_REFRESH)?.get_password().unwrap_or_default();
         let email = Self::entry(KEY_EMAIL)?.get_password().unwrap_or_default();
-        Ok(Some(Tokens { access, refresh, email }))
+        Ok(Some(Tokens {
+            access,
+            refresh,
+            email,
+        }))
     }
 
     fn clear(&self) -> Result<()> {

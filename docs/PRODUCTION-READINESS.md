@@ -52,8 +52,9 @@ Not shipped in v0.1.0:
   follow-up because recap input/output shapes (whole transcripts in,
   structured markdown out) need a separate classifier branch.
 
-Stale comments referencing speculative-routing as "opt-in" in
-`crates/cue-dashboard/src/commands.rs` and `crates/cue-router/src/speculative.rs`
+Speculative-routing comments in `crates/cue-dashboard/src/commands.rs`
+and `crates/cue-router/src/speculative.rs` accurately describe the
+current default-ON behaviour as of round 14
 were updated alongside this change to match the default-ON behaviour.
 - ProviderRegistry builds Arc<dyn LlmProvider> for every configured
   provider (OpenAI, Anthropic, Ollama) and impls SpeculativeProvider with
