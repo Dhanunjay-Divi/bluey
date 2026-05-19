@@ -199,16 +199,26 @@ fn spawn_lane(
     tx: tokio::sync::mpsc::UnboundedSender<SpeculativeChunk>,
 ) {
     tokio::spawn(async move {
+        // Codex Stage 9 round-2 Blocker 3: lane-scoped idempotency keys.
+        // Draft + Final are TWO distinct provider calls; if they share
+        // the same request_id, the server idempotency row collides
+        // (second call returns InProgress or CachedComplete instead of
+        // running). Append ":draft" or ":final" so each lane has its
+        // own server-side idempotency cell. Caller-side correlation is
+        // preserved by the shared logical prefix.
+        let lane_request_id = request.request_id.as_ref().map(|id| {
+            let suffix = match role {
+                LaneRole::Draft => ":draft",
+                LaneRole::Deep => ":final",
+            };
+            format!("{id}{suffix}")
+        });
         let req = LlmRequest {
             system: request.system.clone(),
             user: request.user.clone(),
             max_tokens: route.max_tokens.or(request.max_tokens),
             temperature: route.temperature.or(request.temperature),
-            // Codex Stage 9b: per-lane LlmRequest inherits the outer
-            // logical request_id so both lanes (draft + final) hit
-            // the same idempotency row server-side. Without this,
-            // speculative dispatch would charge twice.
-            request_id: request.request_id.clone(),
+            request_id: lane_request_id,
         };
         // Honor route.stream: if the lane wants streaming, use complete_stream;
         // otherwise use complete() and emit a single synthetic chunk in the
@@ -548,5 +558,109 @@ mod tests {
         // complete() called, complete_stream() NOT called.
         assert_eq!(provider.completion_calls.load(Ordering::Relaxed), 1);
         assert_eq!(provider.stream_calls.load(Ordering::Relaxed), 0);
+    }
+
+    /// Codex Stage 9 round-2 Blocker 3: prove draft and final lanes
+    /// receive DIFFERENT request_ids when speculation fires, so the
+    /// server idempotency row does not collide.
+    #[tokio::test]
+    async fn lane_scoped_request_ids_when_speculating_deep() {
+        use std::sync::Mutex as StdMutex;
+
+        // Shared collector for the request_ids each lane sees.
+        let seen_ids: Arc<StdMutex<Vec<Option<String>>>> = Arc::new(StdMutex::new(Vec::new()));
+
+        struct CapturingProvider {
+            seen: Arc<StdMutex<Vec<Option<String>>>>,
+            name: &'static str,
+        }
+        #[async_trait]
+        impl LlmProvider for CapturingProvider {
+            fn name(&self) -> &'static str {
+                self.name
+            }
+            async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse, LlmError> {
+                self.seen.lock().unwrap().push(req.request_id.clone());
+                Ok(LlmResponse {
+                    text: format!("from-{}", self.name),
+                })
+            }
+            async fn complete_stream(&self, req: &LlmRequest) -> Result<LlmChunkStream, LlmError> {
+                self.seen.lock().unwrap().push(req.request_id.clone());
+                let chunk = Ok(LlmChunk {
+                    text: format!("from-{}", self.name),
+                    finished: true,
+                });
+                Ok(Box::pin(futures_util::stream::once(async move { chunk })))
+            }
+        }
+
+        struct CapturingRegistry {
+            seen: Arc<StdMutex<Vec<Option<String>>>>,
+        }
+        #[async_trait]
+        impl SpeculativeProvider for CapturingRegistry {
+            async fn provider_for(
+                &self,
+                route: &ProviderRoute,
+            ) -> Result<Arc<dyn LlmProvider>, LlmError> {
+                let name: &'static str = match route.lane {
+                    ProviderLane::Instant => "instant",
+                    ProviderLane::Deep => "deep",
+                    _ => "other",
+                };
+                Ok(Arc::new(CapturingProvider {
+                    seen: self.seen.clone(),
+                    name,
+                }))
+            }
+        }
+
+        let policy: Arc<dyn RoutingPolicy> = Arc::new(crate::policy::StaticPolicy::defaults());
+        let registry: Arc<dyn SpeculativeProvider> = Arc::new(CapturingRegistry {
+            seen: seen_ids.clone(),
+        });
+        let router = SpeculativeRouter::new(policy, registry, true);
+
+        // Hard classification triggers Deep + speculative draft.
+        let classification = TaskClassification {
+            task_type: crate::TaskType::General,
+            difficulty: crate::Difficulty::Hard,
+            needed_context: crate::ContextNeeds::default(),
+            latency_lane: LatencyLane::Deep,
+            confidence: 0.9,
+        };
+        let mut req = req();
+        req.request_id = Some("logical-id-1".into());
+
+        let mut stream = std::pin::pin!(router.run(&classification, req).await.unwrap());
+        // Drain.
+        while let Some(_chunk) = stream.next().await {}
+
+        let ids = seen_ids.lock().unwrap().clone();
+        assert_eq!(ids.len(), 2, "draft + final lanes should both fire");
+        let draft_id = ids
+            .iter()
+            .find(|id| {
+                id.as_deref()
+                    .map(|s| s.ends_with(":draft"))
+                    .unwrap_or(false)
+            })
+            .expect("expected a :draft id");
+        let final_id = ids
+            .iter()
+            .find(|id| {
+                id.as_deref()
+                    .map(|s| s.ends_with(":final"))
+                    .unwrap_or(false)
+            })
+            .expect("expected a :final id");
+        assert_ne!(
+            draft_id, final_id,
+            "draft and final must NOT share the same request_id (idempotency collision)"
+        );
+        // Both should retain the logical prefix for correlation.
+        assert!(draft_id.as_deref().unwrap().starts_with("logical-id-1"));
+        assert!(final_id.as_deref().unwrap().starts_with("logical-id-1"));
     }
 }
