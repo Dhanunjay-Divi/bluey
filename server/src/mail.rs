@@ -73,9 +73,7 @@ async fn send_transactional(
     Ok(MailDelivery::Sent)
 }
 
-fn transport(
-    smtp: &SmtpConfig,
-) -> anyhow::Result<AsyncSmtpTransport<Tokio1Executor>> {
+fn transport(smtp: &SmtpConfig) -> anyhow::Result<AsyncSmtpTransport<Tokio1Executor>> {
     let mut builder = if smtp.starttls {
         AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&smtp.host)
             .context("create STARTTLS SMTP transport")?
@@ -110,10 +108,13 @@ mod tests {
 
     #[tokio::test]
     async fn verification_email_is_noop_when_smtp_unconfigured() {
-        let result =
-            send_email_verification(&test_config(), "user@example.com", "http://localhost/verify")
-                .await
-                .unwrap();
+        let result = send_email_verification(
+            &test_config(),
+            "user@example.com",
+            "http://localhost/verify",
+        )
+        .await
+        .unwrap();
         assert_eq!(result, MailDelivery::NotConfigured);
     }
 

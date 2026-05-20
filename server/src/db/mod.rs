@@ -13,6 +13,7 @@ pub mod accounts;
 pub mod auth_tokens;
 pub mod balance;
 pub mod idempotency;
+pub mod link_codes;
 pub mod usage;
 
 pub type DbPool = Pool<SqliteConnectionManager>;
@@ -196,6 +197,24 @@ const MIGRATIONS: &[&str] = &[
         consumed_at   DATETIME
     );
     CREATE INDEX IF NOT EXISTS idx_password_reset_account ON password_reset_tokens(account_id);
+    "#,
+    // 0011 — auth_link_codes: one-time codes for browser→app deep-link
+    // handoff (Onboarding Option A). Codex Stage 18.
+    //
+    // Stores access+refresh tokens at rest (sha256-hashed PK).
+    // 5-minute expiry. Single-use via atomic UPDATE...RETURNING.
+    r#"
+    CREATE TABLE IF NOT EXISTS auth_link_codes (
+        code_hash      TEXT PRIMARY KEY,
+        account_id     TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        access_token   TEXT NOT NULL,
+        refresh_token  TEXT NOT NULL,
+        created_at     DATETIME NOT NULL DEFAULT (datetime('now')),
+        expires_at     DATETIME NOT NULL,
+        consumed_at    DATETIME
+    );
+    CREATE INDEX IF NOT EXISTS idx_auth_link_codes_account
+        ON auth_link_codes(account_id);
     "#,
 ];
 

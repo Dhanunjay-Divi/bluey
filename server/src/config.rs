@@ -118,7 +118,10 @@ impl Config {
 }
 
 fn env_bool(name: &str) -> Option<bool> {
-    std::env::var(name)
-        .ok()
-        .map(|value| !matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+    std::env::var(name).ok().map(|value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
 }

@@ -82,8 +82,10 @@ pub async fn complete_stream(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Json(req): Json<CompleteRequest>,
-) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<ApiError>)>
-{
+) -> Result<
+    Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
+    (StatusCode, Json<ApiError>),
+> {
     let response = complete_inner(state, account, req).await?;
     let events = response_to_sse_events(response);
     Ok(Sse::new(stream::iter(events.into_iter().map(Ok))))
@@ -411,14 +413,16 @@ fn response_to_sse_events(response: CompleteResponse) -> Vec<Event> {
         })
         .collect::<Vec<_>>();
     if events.is_empty() {
-        events.push(Event::default().data(
-            serde_json::json!({
-                "choices": [
-                    { "delta": { "content": "" } }
-                ]
-            })
-            .to_string(),
-        ));
+        events.push(
+            Event::default().data(
+                serde_json::json!({
+                    "choices": [
+                        { "delta": { "content": "" } }
+                    ]
+                })
+                .to_string(),
+            ),
+        );
     }
     let billing = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
     events.push(Event::default().event("billing").data(billing));

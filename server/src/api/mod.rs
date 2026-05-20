@@ -87,6 +87,10 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         .route(
             "/auth/password-reset/confirm",
             axum::routing::post(auth_routes::password_reset_confirm),
+        )
+        .route(
+            "/auth/link/exchange",
+            axum::routing::post(auth_routes::link_exchange),
         );
 
     // ---- Admin-only (require_auth + require_admin) -------------------------
@@ -137,6 +141,10 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         .route(
             "/auth/verify-email/start",
             axum::routing::post(auth_routes::verify_email_start),
+        )
+        .route(
+            "/auth/link/mint",
+            axum::routing::post(auth_routes::link_mint),
         )
         .merge(admin_only)
         .route_layer(axum::middleware::from_fn_with_state(
