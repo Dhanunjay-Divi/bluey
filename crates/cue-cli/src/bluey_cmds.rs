@@ -115,3 +115,82 @@ async fn fetch_pricing_tiers(client: &CloudClient) -> Option<cue_cloud_client::P
         }
     }
 }
+
+/// Codex Stage 16: bluey logout — clear the keyring tokens.
+pub async fn logout(client: &CloudClient) -> Result<()> {
+    if client.current_tokens().is_none() {
+        println!("Already logged out.");
+        return Ok(());
+    }
+    client.clear_tokens()?;
+    println!("Bluey account logged out (keyring cleared).");
+    Ok(())
+}
+
+/// Codex Stage 16: bluey portal — open Stripe Customer Portal in browser.
+pub async fn portal(client: &CloudClient) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct PortalResponse {
+        portal_url: String,
+    }
+    let resp: PortalResponse = client
+        .auth_post("/billing/portal", &serde_json::json!({}))
+        .await
+        .context("/billing/portal")?;
+    println!("Opening Stripe Customer Portal:");
+    println!("  {}", resp.portal_url);
+    if let Err(e) = webbrowser::open(&resp.portal_url) {
+        eprintln!("(could not open browser: {e}; copy the URL above)");
+    }
+    Ok(())
+}
+
+/// Codex Stage 16: bluey export — download account data as JSON.
+pub async fn export_data(client: &CloudClient) -> Result<()> {
+    let bundle: serde_json::Value = client
+        .auth_get("/account/export")
+        .await
+        .context("/account/export")?;
+    let pretty = serde_json::to_string_pretty(&bundle)?;
+    let filename = format!(
+        "bluey-export-{}.json",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+    );
+    std::fs::write(&filename, pretty)?;
+    println!("Exported account data to {filename}");
+    Ok(())
+}
+
+/// Codex Stage 16: bluey delete-account. REQUIRES interactive confirmation.
+pub async fn delete_account(client: &CloudClient, force: bool) -> Result<()> {
+    if !force {
+        println!();
+        println!("⚠  This will PERMANENTLY DELETE your Bluey account.");
+        println!("   - All credit batches forfeited (1-year validity does NOT apply on delete).");
+        println!("   - All usage history removed.");
+        println!("   - Refund eligibility check via support@bluey.dev BEFORE deletion if you have unused credits.");
+        println!();
+        println!("Type DELETE to confirm:");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if input.trim() != "DELETE" {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+    #[derive(serde::Deserialize)]
+    struct DeleteAck {
+        deleted: bool,
+        deleted_at: String,
+    }
+    let ack: DeleteAck = client
+        .auth_post("/account/delete", &serde_json::json!({}))
+        .await
+        .context("/account/delete")?;
+    if ack.deleted {
+        let _ = client.clear_tokens();
+        println!("Account deleted at {}.", ack.deleted_at);
+        println!("Local keyring tokens cleared.");
+    }
+    Ok(())
+}

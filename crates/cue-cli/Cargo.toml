@@ -13,11 +13,14 @@ name = "bluey"
 path = "src/bin/bluey.rs"
 
 [dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+webbrowser = "1"
 cue-cloud-client = { path = "../cue-cloud-client" }
 anyhow.workspace = true
 clap.workspace = true
 cue-core = { path = "../cue-core" }
 libc.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 

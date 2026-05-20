@@ -58,6 +58,17 @@ enum Commands {
     /// (Per-batch expiration listing is not yet available; coming in a
     /// future release.)
     Credits,
+    /// Log out of Bluey: clear keyring tokens.
+    Logout,
+    /// Open the Stripe Customer Portal in your browser to manage card / cancel auto top-up / view invoices.
+    Portal,
+    /// Export your Bluey account data as a JSON file (GDPR).
+    Export,
+    /// Permanently delete your Bluey account (interactive confirmation; --force to skip prompt).
+    DeleteAccount {
+        #[arg(long)]
+        force: bool,
+    },
     /// Start the Bluey daemon.
     #[command(hide = true)]
     Start(StartArgs),
@@ -449,6 +460,10 @@ pub async fn cli_main() -> Result<()> {
         Commands::Settings(args) => cue_settings(args),
         Commands::Usage => bluey_usage_cmd().await,
         Commands::Credits => bluey_credits_cmd().await,
+        Commands::Logout => bluey_logout_cmd().await,
+        Commands::Portal => bluey_portal_cmd().await,
+        Commands::Export => bluey_export_cmd().await,
+        Commands::DeleteAccount { force } => bluey_delete_account_cmd(force).await,
         Commands::Start(args) => start(args).await,
         Commands::Stop => {
             let response = request(DaemonRequest::Shutdown).await?;
@@ -2329,6 +2344,74 @@ async fn bluey_credits_cmd() -> Result<()> {
     }
     if let Err(e) = crate::bluey_cmds::show_credits(&client).await {
         eprintln!("bluey: credits failed: {e}");
+    }
+    Ok(())
+}
+
+async fn bluey_logout_cmd() -> Result<()> {
+    let client = match cue_cloud_client::CloudClient::with_default_keyring() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("bluey: cloud client init failed: {e}");
+            return Ok(());
+        }
+    };
+    if let Err(e) = crate::bluey_cmds::logout(&client).await {
+        eprintln!("bluey: logout failed: {e}");
+    }
+    Ok(())
+}
+
+async fn bluey_portal_cmd() -> Result<()> {
+    let client = match cue_cloud_client::CloudClient::with_default_keyring() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("bluey: cloud client init failed: {e}");
+            return Ok(());
+        }
+    };
+    if client.current_tokens().is_none() {
+        eprintln!("bluey: not logged in. Run `bluey login` first.");
+        return Ok(());
+    }
+    if let Err(e) = crate::bluey_cmds::portal(&client).await {
+        eprintln!("bluey: portal failed: {e}");
+    }
+    Ok(())
+}
+
+async fn bluey_export_cmd() -> Result<()> {
+    let client = match cue_cloud_client::CloudClient::with_default_keyring() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("bluey: cloud client init failed: {e}");
+            return Ok(());
+        }
+    };
+    if client.current_tokens().is_none() {
+        eprintln!("bluey: not logged in. Run `bluey login` first.");
+        return Ok(());
+    }
+    if let Err(e) = crate::bluey_cmds::export_data(&client).await {
+        eprintln!("bluey: export failed: {e}");
+    }
+    Ok(())
+}
+
+async fn bluey_delete_account_cmd(force: bool) -> Result<()> {
+    let client = match cue_cloud_client::CloudClient::with_default_keyring() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("bluey: cloud client init failed: {e}");
+            return Ok(());
+        }
+    };
+    if client.current_tokens().is_none() {
+        eprintln!("bluey: not logged in. Run `bluey login` first.");
+        return Ok(());
+    }
+    if let Err(e) = crate::bluey_cmds::delete_account(&client, force).await {
+        eprintln!("bluey: delete-account failed: {e}");
     }
     Ok(())
 }

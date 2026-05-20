@@ -248,6 +248,14 @@ impl CloudClient {
         }
         Ok(resp.json().await?)
     }
+
+    /// Codex Stage 16: bluey logout — forget tokens both in-cache and
+    /// in the persistent store.
+    pub fn clear_tokens(&self) -> Result<()> {
+        self.tokens.clear()?;
+        *self.cached.lock().unwrap() = None;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
