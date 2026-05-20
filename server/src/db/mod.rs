@@ -10,6 +10,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use std::path::Path;
 
 pub mod accounts;
+pub mod auth_tokens;
 pub mod balance;
 pub mod idempotency;
 pub mod usage;
@@ -173,6 +174,28 @@ const MIGRATIONS: &[&str] = &[
     r#"
     CREATE UNIQUE INDEX IF NOT EXISTS idx_usage_events_dedupe
         ON usage_events(account_id, request_id, kind);
+    "#,
+    // 0010 — email verification + password reset tokens (Stage 13).
+    // Both tables follow the same shape as refresh_tokens: sha256-hashed
+    // at rest, single-use, 24-hour expiry. consume() rotates the row.
+    r#"
+    CREATE TABLE IF NOT EXISTS email_verification_tokens (
+        token_hash    TEXT PRIMARY KEY,
+        account_id    TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        created_at    DATETIME NOT NULL DEFAULT (datetime('now')),
+        expires_at    DATETIME NOT NULL,
+        consumed_at   DATETIME
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_verify_account ON email_verification_tokens(account_id);
+
+    CREATE TABLE IF NOT EXISTS password_reset_tokens (
+        token_hash    TEXT PRIMARY KEY,
+        account_id    TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        created_at    DATETIME NOT NULL DEFAULT (datetime('now')),
+        expires_at    DATETIME NOT NULL,
+        consumed_at   DATETIME
+    );
+    CREATE INDEX IF NOT EXISTS idx_password_reset_account ON password_reset_tokens(account_id);
     "#,
 ];
 

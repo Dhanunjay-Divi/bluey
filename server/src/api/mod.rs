@@ -74,7 +74,19 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
             ),
         )
         .route("/billing/webhook", axum::routing::post(billing::webhook))
-        .route("/pricing/tiers", get(pricing::get_tiers));
+        .route("/pricing/tiers", get(pricing::get_tiers))
+        .route(
+            "/auth/verify-email/confirm",
+            axum::routing::post(auth_routes::verify_email_confirm),
+        )
+        .route(
+            "/auth/password-reset/start",
+            axum::routing::post(auth_routes::password_reset_start),
+        )
+        .route(
+            "/auth/password-reset/confirm",
+            axum::routing::post(auth_routes::password_reset_confirm),
+        );
 
     // ---- Admin-only (require_auth + require_admin) -------------------------
     let admin_only = Router::new()
@@ -104,6 +116,10 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         .route(
             "/auth/device/approve",
             axum::routing::post(auth_routes::device_approve),
+        )
+        .route(
+            "/auth/verify-email/start",
+            axum::routing::post(auth_routes::verify_email_start),
         )
         .merge(admin_only)
         .route_layer(axum::middleware::from_fn_with_state(

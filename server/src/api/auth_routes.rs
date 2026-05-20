@@ -1,6 +1,6 @@
 //! Auth endpoints — real implementations.
 
-use axum::{extract::State, http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode, Extension, Json};
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
@@ -358,4 +358,167 @@ pub async fn device_approve(
         return Err(err(StatusCode::NOT_FOUND, "unknown or expired user_code"));
     }
     Ok(StatusCode::OK)
+}
+
+// ─── Codex Stage 13: email verification + password reset ────────────────
+
+#[derive(Deserialize)]
+pub struct ConfirmEmailVerify {
+    pub token: String,
+}
+
+pub async fn verify_email_start(
+    State(state): State<AppState>,
+    Extension(crate::auth::AuthedAccount(account)): Extension<crate::auth::AuthedAccount>,
+) -> Result<axum::http::StatusCode, (axum::http::StatusCode, Json<ApiError>)> {
+    use crate::db::auth_tokens;
+    let tok = auth_tokens::mint(
+        &state.pool,
+        &account.id,
+        auth_tokens::TokenKind::EmailVerification,
+    )
+    .map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("mint: {e}"),
+            }),
+        )
+    })?;
+    // SMTP integration deferred — log the verification URL when SMTP
+    // is unconfigured so dev can copy-paste during testing.
+    if std::env::var("BLUEY_SMTP_HOST").is_err() {
+        tracing::info!(
+            account_id = %account.id,
+            email = %account.email,
+            verify_url = %format!("{}/verify-email?token={tok}", state.config.public_url),
+            "email verification (SMTP unconfigured; logging dev URL)"
+        );
+    }
+    Ok(axum::http::StatusCode::ACCEPTED)
+}
+
+pub async fn verify_email_confirm(
+    State(state): State<AppState>,
+    Json(req): Json<ConfirmEmailVerify>,
+) -> Result<axum::http::StatusCode, (axum::http::StatusCode, Json<ApiError>)> {
+    use crate::db::auth_tokens;
+    let account_id = auth_tokens::consume(
+        &state.pool,
+        &req.token,
+        auth_tokens::TokenKind::EmailVerification,
+    )
+    .map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("consume: {e}"),
+            }),
+        )
+    })?
+    .ok_or((
+        axum::http::StatusCode::BAD_REQUEST,
+        Json(ApiError {
+            error: "invalid or expired verification token".into(),
+        }),
+    ))?;
+    let conn = state.pool.get().map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("pool: {e}"),
+            }),
+        )
+    })?;
+    let _ = conn.execute(
+        "UPDATE accounts SET email_verified_at = datetime('now') WHERE id = ?1",
+        rusqlite::params![&account_id],
+    );
+    Ok(axum::http::StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+pub struct StartPasswordReset {
+    pub email: String,
+}
+
+#[derive(Deserialize)]
+pub struct ConfirmPasswordReset {
+    pub token: String,
+    pub new_password: String,
+}
+
+pub async fn password_reset_start(
+    State(state): State<AppState>,
+    Json(req): Json<StartPasswordReset>,
+) -> axum::http::StatusCode {
+    use crate::db::accounts::Account;
+    use crate::db::auth_tokens;
+    // Always return 202 (don't leak whether the email exists).
+    let email = req.email.trim().to_lowercase();
+    if let Ok(Some(account)) = Account::fetch_by_email(&state.pool, &email) {
+        if let Ok(tok) = auth_tokens::mint(
+            &state.pool,
+            &account.id,
+            auth_tokens::TokenKind::PasswordReset,
+        ) {
+            if std::env::var("BLUEY_SMTP_HOST").is_err() {
+                tracing::info!(
+                    account_id = %account.id,
+                    email = %account.email,
+                    reset_url = %format!("{}/password-reset?token={tok}", state.config.public_url),
+                    "password reset (SMTP unconfigured; logging dev URL)"
+                );
+            }
+        }
+    }
+    axum::http::StatusCode::ACCEPTED
+}
+
+pub async fn password_reset_confirm(
+    State(state): State<AppState>,
+    Json(req): Json<ConfirmPasswordReset>,
+) -> Result<axum::http::StatusCode, (axum::http::StatusCode, Json<ApiError>)> {
+    use crate::auth::password;
+    use crate::db::auth_tokens;
+    let account_id = auth_tokens::consume(
+        &state.pool,
+        &req.token,
+        auth_tokens::TokenKind::PasswordReset,
+    )
+    .map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("consume: {e}"),
+            }),
+        )
+    })?
+    .ok_or((
+        axum::http::StatusCode::BAD_REQUEST,
+        Json(ApiError {
+            error: "invalid or expired reset token".into(),
+        }),
+    ))?;
+    let new_hash = password::hash_password(&req.new_password).map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+    let conn = state.pool.get().map_err(|e| {
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("pool: {e}"),
+            }),
+        )
+    })?;
+    let _ = conn.execute(
+        "UPDATE accounts SET password_hash = ?1 WHERE id = ?2",
+        rusqlite::params![&new_hash, &account_id],
+    );
+    Ok(axum::http::StatusCode::OK)
 }
