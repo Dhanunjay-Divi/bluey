@@ -501,6 +501,7 @@ private final class FeedView: NSView {
     private func makeCardView(_ card: RenderedCard) -> NSView {
         let accent = BlueyTheme.accent(for: card.kind)
         let rightAligned = isUserSide(card)
+        let answerLike = card.kind == "answer"
         let row = NSView()
         row.translatesAutoresizingMaskIntoConstraints = false
 
@@ -508,14 +509,14 @@ private final class FeedView: NSView {
         bubble.wantsLayer = true
         bubble.layer?.backgroundColor = rightAligned
             ? NSColor(red: 0.90, green: 0.93, blue: 0.95, alpha: 0.96).cgColor
-            : BlueyTheme.surface.cgColor
-        bubble.layer?.cornerRadius = 16
-        bubble.layer?.borderWidth = 1
+            : (answerLike ? NSColor.clear : BlueyTheme.surface).cgColor
+        bubble.layer?.cornerRadius = rightAligned ? 16 : 12
+        bubble.layer?.borderWidth = answerLike ? 0 : 1
         bubble.layer?.borderColor = rightAligned
             ? NSColor.white.withAlphaComponent(0.20).cgColor
             : accent.withAlphaComponent(card.kind == "answer" ? 0.24 : 0.14).cgColor
         bubble.layer?.shadowColor = NSColor.black.cgColor
-        bubble.layer?.shadowOpacity = 0.16
+        bubble.layer?.shadowOpacity = answerLike ? 0 : 0.14
         bubble.layer?.shadowRadius = 10
         bubble.layer?.shadowOffset = NSSize(width: 0, height: -4)
         bubble.translatesAutoresizingMaskIntoConstraints = false
@@ -525,7 +526,8 @@ private final class FeedView: NSView {
         metaLabel.textColor = rightAligned ? NSColor.black.withAlphaComponent(0.58) : accent
         metaLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        let titleLabel = NSTextField(labelWithString: card.title.isEmpty ? kindTitle(card.kind) : card.title)
+        let titleText = displayTitle(for: card)
+        let titleLabel = NSTextField(labelWithString: titleText)
         titleLabel.font = NSFont.systemFont(ofSize: 12.5, weight: .semibold)
         titleLabel.textColor = rightAligned ? NSColor.black.withAlphaComponent(0.74) : BlueyTheme.text
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -536,7 +538,7 @@ private final class FeedView: NSView {
         bodyLabel.font = bodyFont(for: card)
         bodyLabel.textColor = rightAligned ? NSColor.black : BlueyTheme.text
         bodyLabel.translatesAutoresizingMaskIntoConstraints = false
-        bodyLabel.preferredMaxLayoutWidth = 390
+        bodyLabel.preferredMaxLayoutWidth = rightAligned ? 360 : 480
 
         let statusLabel = NSTextField(labelWithString: statusText(for: card))
         statusLabel.font = NSFont.monospacedSystemFont(ofSize: 9.5, weight: .semibold)
@@ -565,14 +567,14 @@ private final class FeedView: NSView {
             bubble.bottomAnchor.constraint(equalTo: row.bottomAnchor),
             leading,
             trailing,
-            bubble.widthAnchor.constraint(lessThanOrEqualTo: row.widthAnchor, multiplier: rightAligned ? 0.72 : 0.78),
-            bubble.widthAnchor.constraint(greaterThanOrEqualToConstant: 190),
+            bubble.widthAnchor.constraint(lessThanOrEqualTo: row.widthAnchor, multiplier: answerLike ? 0.90 : (rightAligned ? 0.70 : 0.78)),
+            bubble.widthAnchor.constraint(greaterThanOrEqualToConstant: answerLike ? 240 : 170),
 
             metaLabel.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 10),
             metaLabel.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 14),
 
             titleLabel.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
-            titleLabel.leadingAnchor.constraint(equalTo: metaLabel.leadingAnchor),
+            titleLabel.leadingAnchor.constraint(equalTo: metaLabel.trailingAnchor, constant: 8),
             titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: statusLabel.leadingAnchor, constant: -10),
 
             statusLabel.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
@@ -597,6 +599,15 @@ private final class FeedView: NSView {
         case "warning":     return "WARNING"
         case "system":      return "SYSTEM"
         default:            return "BLUEY"
+        }
+    }
+
+    private func displayTitle(for card: RenderedCard) -> String {
+        switch card.kind {
+        case "answer", "question", "transcript":
+            return ""
+        default:
+            return card.title.isEmpty ? kindTitle(card.kind) : card.title
         }
     }
 
@@ -682,6 +693,8 @@ private final class ExpandedPanelView: NSView {
     private var recordingActive = false
     private var transcriptSnippets: [String] = []
     private var sessionItems: [OverlaySessionItem] = []
+    private var editingSessionId: String?
+    private var renameField: NSTextField?
 
     override init(frame frameRect: NSRect) {
         feed = FeedView(frame: .zero)
@@ -934,6 +947,8 @@ private final class ExpandedPanelView: NSView {
         answerStyleSaveButton.action = #selector(saveAnswerStyleClicked)
         closeButton.target = self
         closeButton.action = #selector(closeClicked)
+        composer.target = self
+        composer.action = #selector(askClicked)
         recordingButton.target = self
         recordingButton.action = #selector(recordingClicked)
         askButton.target = self
@@ -957,6 +972,7 @@ private final class ExpandedPanelView: NSView {
         styleIconButton(analyzeButton, symbol: "sparkle.magnifyingglass", fallback: "?")
         styleIconButton(askButton, symbol: "arrow.up", fallback: "^", accent: true)
         styleIconButton(closeButton, symbol: "xmark", fallback: "x")
+        configureTooltips()
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -1089,6 +1105,21 @@ private final class ExpandedPanelView: NSView {
         composer.placeholderAttributedString = NSAttributedString(
             string: "Ask anything...",
             attributes: [.foregroundColor: BlueyTheme.textDim])
+    }
+
+    private func configureTooltips() {
+        navButton.toolTip = "Show recordings"
+        newSessionButton.toolTip = "Start a new recording"
+        modelMenu.toolTip = "Choose routing lane"
+        balanceLabel.toolTip = "Remaining Bluey balance"
+        closeButton.toolTip = "Hide Bluey"
+        recordingButton.toolTip = "Start or stop listening"
+        instructionsButton.toolTip = "Set answer style"
+        attachButton.toolTip = "Attach files"
+        analyzeButton.toolTip = "Analyse screen"
+        askButton.toolTip = "Send"
+        latestSessionButton.toolTip = "Continue the latest recording"
+        answerStyleSaveButton.toolTip = "Save answer style for this session"
     }
 
     private func styleControlButton(_ button: NSButton, symbol: String, accent: Bool) {
@@ -1260,6 +1291,7 @@ private final class ExpandedPanelView: NSView {
 
     func setSessions(_ sessions: [OverlaySessionItem]) {
         sessionItems = sessions
+        renameField = nil
         for view in sessionStack.arrangedSubviews {
             sessionStack.removeArrangedSubview(view)
             view.removeFromSuperview()
@@ -1370,6 +1402,10 @@ private final class ExpandedPanelView: NSView {
             ? BlueyTheme.cyan.withAlphaComponent(0.34).cgColor
             : BlueyTheme.hairline.cgColor
 
+        if editingSessionId == session.id {
+            return configureRenameRow(row, session: session)
+        }
+
         let openButton = NSButton(title: "", target: self, action: #selector(sessionRowClicked(_:)))
         openButton.translatesAutoresizingMaskIntoConstraints = false
         openButton.isBordered = false
@@ -1430,6 +1466,58 @@ private final class ExpandedPanelView: NSView {
         return row
     }
 
+    private func configureRenameRow(_ row: NSView, session: OverlaySessionItem) -> NSView {
+        let field = NSTextField()
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.stringValue = session.title
+        field.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+        field.textColor = BlueyTheme.text
+        field.isBezeled = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.target = self
+        field.action = #selector(saveInlineRenameClicked(_:))
+        field.tag = sessionIndex(session.id)
+        renameField = field
+
+        let save = NSButton(title: "", target: self, action: #selector(saveInlineRenameClicked(_:)))
+        save.translatesAutoresizingMaskIntoConstraints = false
+        save.isBordered = false
+        save.tag = sessionIndex(session.id)
+        save.contentTintColor = BlueyTheme.cyan
+        save.toolTip = "Save recording name"
+        if let image = symbolImage("checkmark") {
+            image.isTemplate = true
+            save.image = image
+            save.imagePosition = .imageOnly
+            save.imageScaling = .scaleProportionallyDown
+        } else {
+            save.title = "Save"
+            save.font = NSFont.systemFont(ofSize: 9, weight: .bold)
+        }
+
+        row.addSubview(field)
+        row.addSubview(save)
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 44),
+            field.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
+            field.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            field.trailingAnchor.constraint(equalTo: save.leadingAnchor, constant: -6),
+            field.heightAnchor.constraint(equalToConstant: 28),
+
+            save.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -6),
+            save.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            save.widthAnchor.constraint(equalToConstant: 28),
+            save.heightAnchor.constraint(equalToConstant: 28),
+        ])
+        DispatchQueue.main.async { [weak self, weak field] in
+            guard self?.editingSessionId == session.id else { return }
+            self?.window?.makeFirstResponder(field)
+            field?.selectText(nil)
+        }
+        return row
+    }
+
     private func sessionIndex(_ id: String) -> Int {
         sessionItems.firstIndex(where: { $0.id == id }) ?? -1
     }
@@ -1445,20 +1533,24 @@ private final class ExpandedPanelView: NSView {
     @objc private func renameSessionClicked(_ sender: NSButton) {
         guard sender.tag >= 0, sender.tag < sessionItems.count else { return }
         let session = sessionItems[sender.tag]
-        let alert = NSAlert()
-        alert.messageText = "Rename recording"
-        alert.informativeText = "Give this Bluey session a useful name."
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Cancel")
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 28))
-        field.stringValue = session.title
-        alert.accessoryView = field
-        if alert.runModal() == .alertFirstButtonReturn {
-            let title = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !title.isEmpty {
-                emitSessionRename(id: session.id, title: title)
-            }
-        }
+        editingSessionId = session.id
+        setSessions(sessionItems)
+    }
+
+    @objc private func saveInlineRenameClicked(_ sender: NSControl) {
+        guard sender.tag >= 0, sender.tag < sessionItems.count else { return }
+        let session = sessionItems[sender.tag]
+        let title = (renameField?.stringValue ?? session.title)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return }
+        sessionItems[sender.tag] = OverlaySessionItem(
+            id: session.id,
+            title: title,
+            subtitle: session.subtitle,
+            isActive: session.isActive)
+        editingSessionId = nil
+        emitSessionRename(id: session.id, title: title)
+        setSessions(sessionItems)
     }
 
     private func fileSymbol(for kind: String) -> String {

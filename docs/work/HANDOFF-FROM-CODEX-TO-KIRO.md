@@ -63,6 +63,8 @@ This is not a full upstream-token streaming proxy yet. The server deliberately p
   - Adds a real recordings drawer with clickable rows and per-row rename buttons.
   - Adds inline “How Bluey should answer” textbox and save button.
   - Keeps attachments horizontally scrollable above the compact composer row.
+  - Follow-up senior UX pass: answer cards now render as lighter left-side response blocks, the role/title row no longer overlaps, Return sends the composer,
+    icon-only controls have tooltips, and recording rename now edits inline instead of opening an alert modal.
 
 ## 3. What Was Already Present And Verified
 
