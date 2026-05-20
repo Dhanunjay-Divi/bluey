@@ -10,6 +10,7 @@ pub mod account;
 pub mod admin;
 pub mod auth_routes;
 pub mod billing;
+pub mod metrics;
 pub mod pricing;
 pub mod router;
 pub mod usage;
@@ -91,6 +92,7 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
     // ---- Admin-only (require_auth + require_admin) -------------------------
     let admin_only = Router::new()
         .route("/admin/customers", get(admin::customers))
+        .route("/admin/metrics", get(metrics::get_metrics))
         .route_layer(axum::middleware::from_fn(auth::require_admin));
 
     // ---- Authenticated (Bearer JWT) -----------------------------------------
