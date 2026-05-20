@@ -8,6 +8,7 @@ license.workspace = true
 uuid = { version = "1", features = ["v4"] }
 cue-cloud-client = { path = "../cue-cloud-client" }
 async-trait.workspace = true
+async-stream.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true
 serde.workspace = true

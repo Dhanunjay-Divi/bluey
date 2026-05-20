@@ -25,6 +25,16 @@ d451852 feat(server): Stage 13 email verification + password reset endpoints
 | SMTP transactional email | ✅ implemented | `BLUEY_SMTP_*` config + `lettre` delivery for verification/reset; unconfigured dev mode still logs local URLs. |
 | 5-minute no-transcript stop | ✅ already implemented | `real_audio_loop` auto-stops after `DEFAULT_AUDIO_IDLE_STOP_SECS = 300` and refreshes final balance. Codex verified the path and refreshed manual stop as well. |
 
+## Codex follow-up work on top, pass 2
+
+| Area | Status | Reviewer notes |
+|---|---|---|
+| Managed streaming contract | ✅ implemented | Added `POST /router/complete/stream`, cloud-client raw SSE POST, and `BlueyManagedProvider::complete_stream`. The first server version preserves the safe billing/idempotency lifecycle by dispatching/charging once, then streaming OpenAI-compatible SSE deltas plus a `billing` event. |
+| Per-answer cost data contract | ✅ implemented | `LlmResponse` / `LlmChunk` now carry `LlmCostMetadata`; `CueResponse` persists provider/model/token/cost/balance fields through SQLite and Tauri events. |
+| Dashboard cost labels | ✅ implemented | Response cards and in-flight cards can render `$X.XX · model · bal $Y.YY`; reducer keeps billing metadata sticky across chunks. |
+| Native overlay cost labels | ✅ implemented | `CueCard` and `UpdateCard` carry optional `cost_label`; macOS overlay renders it in the answer status slot once final metadata is available. |
+| Speculative Bluey Auto billing metadata | ✅ implemented | `SpeculativeChunk` carries optional managed cost metadata. Draft + final lane costs are merged before persisting the final `CueResponse`, so the default-ON Auto path does not silently drop cost. |
+
 ## Prior blocker closure carried into this chain
 
 | Finding | Status |
@@ -97,8 +107,8 @@ git -P diff --check main..HEAD
 
 ## Known pending work after this review
 
-- `/router/complete/stream` SSE proxy through `bluey-server`.
-- Per-card cost labels in the native overlay and dashboard. Server cost fields exist, but `cue-llm`/`cue_response` metadata propagation is still a separate data-contract change.
+- True upstream-token streaming inside `bluey-server` is still future work. The new `/router/complete/stream` endpoint streams the metered terminal response as SSE after the safe charge/idempotency path completes.
+- Per-card cost labels now exist in the native overlay and dashboard. Follow-up: include exact latency/cost labels for every native overlay provider path once the direct overlay HTTP adapter reports real provider pricing instead of estimated usage only.
 - Onboarding web pages on `bluey.sh`.
 - SMTP provider production smoke with real credentials.
 - Wiremock harness for Stripe, OpenAI, Anthropic, and Deepgram.

@@ -1,11 +1,19 @@
 //! Real router endpoints: managed dispatch + atomic deduction + idempotency.
 
-use axum::{extract::State, http::StatusCode, Extension, Json};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::sse::{Event, Sse},
+    Extension, Json,
+};
+use futures_util::stream;
 use serde::{Deserialize, Serialize};
+use std::convert::Infallible;
 use std::time::Instant;
 
 use super::AppState;
 use crate::auth::AuthedAccount;
+use crate::db::accounts::Account;
 use crate::db::{balance, idempotency, usage::UsageEvent};
 use crate::pricing;
 use crate::routing;
@@ -59,6 +67,33 @@ pub async fn complete(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Json(req): Json<CompleteRequest>,
 ) -> Result<Json<CompleteResponse>, (StatusCode, Json<ApiError>)> {
+    Ok(Json(complete_inner(state, account, req).await?))
+}
+
+/// Streaming variant of `/router/complete`.
+///
+/// The v0.2 managed billing invariant is "dispatch once, charge once, cache
+/// once". To preserve that invariant, this handler runs the same atomic
+/// `complete_inner` lifecycle and then emits the final answer as small
+/// OpenAI-compatible SSE deltas plus one `billing` event. Future stages can
+/// swap the internals to true upstream streaming as long as the same
+/// idempotency/deduction contract remains intact.
+pub async fn complete_stream(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Json(req): Json<CompleteRequest>,
+) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, (StatusCode, Json<ApiError>)>
+{
+    let response = complete_inner(state, account, req).await?;
+    let events = response_to_sse_events(response);
+    Ok(Sse::new(stream::iter(events.into_iter().map(Ok))))
+}
+
+async fn complete_inner(
+    state: AppState,
+    account: Account,
+    req: CompleteRequest,
+) -> Result<CompleteResponse, (StatusCode, Json<ApiError>)> {
     // 0. Validate request_id is non-empty.
     if req.request_id.trim().is_empty() {
         return Err((
@@ -108,7 +143,7 @@ pub async fn complete(
                     }),
                 )
             })?;
-            return Ok(Json(cached));
+            return Ok(cached);
         }
         idempotency::ReserveOutcome::InProgress => {
             return Err((
@@ -356,7 +391,39 @@ pub async fn complete(
         }
     }
 
-    Ok(Json(response))
+    Ok(response)
+}
+
+fn response_to_sse_events(response: CompleteResponse) -> Vec<Event> {
+    let mut events = response
+        .text
+        .split_inclusive(char::is_whitespace)
+        .filter(|chunk| !chunk.is_empty())
+        .map(|chunk| {
+            Event::default().data(
+                serde_json::json!({
+                    "choices": [
+                        { "delta": { "content": chunk } }
+                    ]
+                })
+                .to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if events.is_empty() {
+        events.push(Event::default().data(
+            serde_json::json!({
+                "choices": [
+                    { "delta": { "content": "" } }
+                ]
+            })
+            .to_string(),
+        ));
+    }
+    let billing = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+    events.push(Event::default().event("billing").data(billing));
+    events.push(Event::default().data("[DONE]"));
+    events
 }
 
 #[derive(Deserialize)]

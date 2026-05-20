@@ -1,80 +1,73 @@
-# Codex -> Kiro: Stage 12-17 Follow-Up Implementation
+# Codex -> Kiro: Stage 18 Follow-Up Implementation
 
 ## 1. Overall Verdict
 
-🟡 **IMPLEMENTED, READY FOR KIRO REVIEW** — I finished the highest-priority missing pieces around the latest server/customer loop instead of starting a new architecture branch:
+🟡 **IMPLEMENTED, READY FOR KIRO REVIEW** — I cleared the two highest-priority pending managed-product gaps from the Stage 12-17 recap:
 
-- live wallet balance now reaches the native overlay and dashboard;
-- manual audio stop refreshes final balance, matching the existing 5-minute no-transcript auto-stop behavior;
-- SMTP verification/reset delivery is real when `BLUEY_SMTP_*` is configured;
-- the Stage 12-17 recap/review doc is now in `docs/rounds/`.
+- managed `/router/complete/stream` now exists and `BlueyManagedProvider` consumes it as SSE;
+- managed billing metadata now survives the full path: server -> cloud client -> `cue-llm` -> Auto Router/speculative path -> daemon `CueResponse` -> SQLite -> dashboard/native overlay labels.
+
+This is not a full upstream-token streaming proxy yet. The server deliberately preserves the existing safe billing/idempotency lifecycle, then streams the metered terminal response as SSE deltas plus a final billing event. That gives the UI and managed client the streaming contract without reopening double-charge or unmetered-fallback risks.
 
 ## 2. What Codex Changed
 
-### Live balance path
+### Managed streaming contract
 
-- `crates/cue-daemon/src/cloud/balance.rs`
-  - Added `BalanceWatch::publish()` so manual balance refreshes and poll-loop refreshes feed the same subscribers.
-  - Updated module docs: overlay/dashboard consumption is now implemented, not a future stage.
-- `crates/cue-daemon/src/app.rs`
-  - Added `balance_watch` to `Daemon`.
-  - Spawns balance polling when a Bluey token is already in keyring.
-  - Bridges `BalanceWatch` snapshots into `OverlayCommand::SetBalance`.
-  - Publishes manual refresh snapshots.
-  - `AudioStop` now refreshes balance after stopping.
+- `server/src/api/router.rs`
+  - Added `complete_inner()` shared by JSON and streaming handlers.
+  - Added `POST /router/complete/stream`.
+  - Emits OpenAI-compatible `data: {"choices":[{"delta":{"content":"..."}}]}` SSE chunks.
+  - Emits `event: billing` carrying the exact `CompleteResponse`, then `data: [DONE]`.
+- `server/src/api/mod.rs`
+  - Registered `/router/complete/stream` behind the same auth and `limit_router_complete` rate limiter.
+- `crates/cue-cloud-client/src/client.rs`
+  - Added `auth_post_stream()`, preserving auth refresh and typed 402/429 error mapping before handing raw bytes to callers.
+- `crates/cue-llm/src/bluey_managed.rs`
+  - `supports_streaming()` now returns true.
+  - `complete_stream()` calls `/router/complete/stream`, parses SSE frames, yields deltas, and converts the billing event into `LlmCostMetadata`.
 
-### Dashboard balance UI
+### Cost metadata and card labels
 
+- `crates/cue-llm/src/lib.rs`
+  - Added `LlmCostMetadata`.
+  - Added optional `cost` to `LlmResponse` and `LlmChunk`.
+- `crates/cue-daemon/src/llm/*`
+  - `AnswerLlm`, `RecapLlm`, and `WhatToAnswerLlm` preserve cost metadata from streaming and non-streaming providers.
+- `crates/cue-daemon/src/db/mod.rs`
+  - Adds missing `cue_responses` billing columns at migration time.
+  - Persists/loads `cost_cents`, `balance_cents_after`, `provider`, `model`, `input_tokens`, and `output_tokens`.
 - `crates/cue-dashboard/src/commands.rs`
-  - Added `get_balance_snapshot`.
-- `crates/cue-dashboard/src/lib.rs`
-  - Registered the new Tauri command.
-- `crates/cue-dashboard/ui/src/components/BalanceIndicator.tsx`
-  - New top-right dashboard balance pill with low-balance and auto-top-up state.
-- `crates/cue-dashboard/ui/src/components/DashboardLayout.tsx`
-  - Mounts the balance indicator.
-
-### Transactional email
-
-- `server/src/config.rs`
-  - Added optional `SmtpConfig` and env parsing for `BLUEY_SMTP_HOST`, `BLUEY_SMTP_PORT`, `BLUEY_SMTP_USERNAME`, `BLUEY_SMTP_PASSWORD`, `BLUEY_SMTP_FROM`, `BLUEY_SMTP_STARTTLS`.
-- `server/src/mail.rs`
-  - New `lettre`-backed verification/password-reset email delivery.
-  - Returns `NotConfigured` in dev mode instead of pretending mail sent.
-- `server/src/api/auth_routes.rs`
-  - Verification start now sends email when SMTP is configured.
-  - Password reset start sends email when SMTP is configured but still always returns `202` to avoid account enumeration.
-- `server/Cargo.toml` / `Cargo.lock`
-  - Added `lettre`.
-- `server/README.md`, `docs/OPERATIONS-RUNBOOK.md`, `server/src/db/auth_tokens.rs`
-  - Docs updated for real SMTP.
-
-### Review docs
-
-- `docs/rounds/STAGES-12-17-RECAP-FOR-CODEX-REVIEW.md`
-  - New consolidated review entry point for Stage 12-17 plus this follow-up implementation.
+  - Tauri `cue_response_chunk` payloads now carry optional cost metadata.
+  - Speculative Bluey Auto merges draft + final managed lane costs before emitting/persisting the final response.
+- `crates/cue-dashboard/ui/src/routes/Responses.tsx`
+  - Response and in-flight cards render compact cost/balance/model pills.
+- `crates/cue-core/src/cards.rs` and `crates/cue-core/src/overlay.rs`
+  - Native overlay cards/update events carry optional `cost_label`.
+- `native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+  - The macOS overlay renders final answer cost/usage labels in the status slot instead of the old permanent "cost syncing" text.
 
 ## 3. What Was Already Present And Verified
 
-- The 5-minute no-transcript auto-stop already existed in `real_audio_loop` and `maybe_auto_stop_idle_audio`.
-- Default timeout is `DEFAULT_AUDIO_IDLE_STOP_SECS = 5 * 60`.
-- On auto-stop, Bluey stops recording, refreshes balance, and pushes a system card with final balance.
-- Native macOS overlay already supports `SetBalance`, context chips, transcript ticker, one-row composer controls, new-session/continue events, and attached file chips.
+- Live wallet balance in overlay/dashboard from the prior Codex pass.
+- 5-minute no-transcript audio auto-stop and final balance refresh.
+- SMTP transactional delivery via `BLUEY_SMTP_*`.
+- Managed server money path through `/router/complete`, `/router/embed`, `/router/transcribe`, Stripe Checkout/webhook, usage, metrics, and account actions.
 
 ## 4. Remaining Gaps
 
-- Per-card cost label is still not complete. Server returns `cost_cents`, but `cue-llm::LlmResponse`, `CueResponse`, DB persistence, and UI cards do not yet carry that metadata end-to-end.
-- `/router/complete/stream` SSE proxy is still pending; managed provider stream still wraps a single complete call.
-- SMTP needs a production smoke test with real provider credentials.
-- `BalanceWatch` starts only if tokens exist at daemon startup or if a manual refresh path runs; login-during-running-daemon can be tightened later.
-- Wiremock coverage for OpenAI/Deepgram/Stripe/SMTP remains pending.
+- True upstream-token streaming inside `bluey-server`: current stream endpoint streams after the safe managed completion finishes. To make it truly token-live, Stage 19 should add upstream streaming dispatch with usage accounting/trailer handling and mid-stream balance checks.
+- Native overlay direct-provider cost is still estimated from token usage/latency; exact dollar labels are only available when managed billing metadata exists.
+- Onboarding web pages on `bluey.sh` remain pending.
+- SMTP production smoke still needs real credentials.
+- Wiremock harness for Stripe/OpenAI/Anthropic/Deepgram remains pending.
+- Backup rotation and deployment automation remain operational follow-ups.
 
 ## 5. What Codex Did Not Change
 
 - No push.
 - No history rewrite.
-- No product naming or white-label wording changes.
-- No Windows implementation changes.
+- No product naming / white-label wording changes.
+- No Windows overlay parity work.
 - No new pricing/product decisions.
 
 ## 6. Verification
@@ -82,51 +75,53 @@
 Run by Codex in this pass:
 
 ```bash
-cargo fmt --all
+cargo check -p cue-core -p cue-daemon -p cue-dashboard -p cue-router -p cue-llm
+swift build -c release --package-path native/macos/cue-overlay
+cargo test -p cue-router -p cue-daemon -p cue-llm -p cue-cloud-client --all-targets
+cd server && cargo test
+cd crates/cue-dashboard/ui && npm test && npm run build
 cargo fmt --all --check
-cargo check -p cue-daemon -p cue-dashboard --all-targets
-cd server && cargo check --all-targets
 cargo clippy --all-targets -- -D warnings
-cd server && cargo clippy --all-targets -- -D warnings
 cargo build --all-targets --release
 cargo test --all-targets
-cd server && cargo test
+cd server && cargo clippy --all-targets -- -D warnings
 cd server && cargo build --all-targets --release
-cd crates/cue-dashboard/ui && npm test
-cd crates/cue-dashboard/ui && npm run build
-swift build -c release --package-path native/macos/cue-overlay
 swift build -c release --package-path native/macos/cue-whisper
-git -P diff --check
 git -P diff --check main..HEAD
 ```
 
 Observed counts:
 
-- Workspace `cargo test --all-targets`: 406 passed, 14 ignored.
-- Server `cargo test`: 58 passed.
+- workspace `cargo test --all-targets`: 417 passed, 14 ignored.
+- `cue-daemon`: 167 library tests passed, 2 ignored, plus integration suites passed.
+- `cue-llm`: 36 passed.
+- `cue-router`: 31 passed.
+- `cue-cloud-client`: 6 passed.
+- `server`: 58 passed.
 - Dashboard Vitest: 15 passed.
 
 ## 7. Next Action For Kiro
 
-Review these first:
+Review this batch first:
 
-1. `docs/rounds/STAGES-12-17-RECAP-FOR-CODEX-REVIEW.md`
-2. `docs/work/HANDOFF-FROM-CODEX-TO-KIRO.md`
+1. `docs/work/HANDOFF-FROM-CODEX-TO-KIRO.md`
+2. `docs/rounds/STAGES-12-17-RECAP-FOR-CODEX-REVIEW.md`
 3. Diff for:
-   - `crates/cue-daemon/src/app.rs`
-   - `crates/cue-daemon/src/cloud/balance.rs`
+   - `server/src/api/router.rs`
+   - `crates/cue-llm/src/bluey_managed.rs`
+   - `crates/cue-router/src/speculative.rs`
    - `crates/cue-dashboard/src/commands.rs`
-   - `crates/cue-dashboard/ui/src/components/BalanceIndicator.tsx`
-   - `server/src/config.rs`
-   - `server/src/mail.rs`
-   - `server/src/api/auth_routes.rs`
+   - `crates/cue-dashboard/ui/src/routes/Responses.tsx`
+   - `crates/cue-daemon/src/db/mod.rs`
+   - `native/macos/cue-overlay/Sources/cue-overlay/main.swift`
 
 Recommended next implementation round:
 
 ```text
-Stage 18:
-1. Propagate managed response billing metadata into LlmResponse -> CueResponse -> DB -> overlay/dashboard cards.
-2. Add /router/complete/stream SSE proxy and BlueyManagedProvider streaming consumer.
-3. Add wiremock tests for SMTP/Stripe/OpenAI/Deepgram production-style paths.
-4. Tighten balance watcher startup after login without requiring daemon restart.
+Stage 19:
+1. Replace synthetic managed SSE with true upstream streaming in bluey-server.
+2. Add mid-stream balance checks / balance_exhausted SSE event.
+3. Add wiremock integration tests for OpenAI/Anthropic streaming usage trailers.
+4. Add bluey.sh onboarding/account pages.
+5. Add deployment backup rotation + clean operational smoke.
 ```

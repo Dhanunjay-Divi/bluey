@@ -108,6 +108,15 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
                 ),
             ),
         )
+        .route(
+            "/router/complete/stream",
+            axum::routing::post(router::complete_stream).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_router_complete,
+                ),
+            ),
+        )
         .route("/router/embed", axum::routing::post(router::embed))
         .route(
             "/router/transcribe",

@@ -892,6 +892,14 @@ pub struct CueResponseChunkPayload {
     pub kind: String,
     pub partial_text: String,
     pub finished: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_cents: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balance_cents_after: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Auto Router metadata (Bluey Auto). Optional because future managed
     /// routing may attach more fields; for v0.1 we emit task_type, lane, and
     /// confidence on the FIRST chunk and reuse the same payload schema for
@@ -984,10 +992,10 @@ fn classify_for_router(prompt: &str, has_transcript: bool, has_screenshot: bool)
 }
 
 /// Try the speculative routing path. Returns:
-///   Ok(Some(text)) if speculation succeeded and produced a final answer.
-///   Ok(None)       if speculation is OFF or unconfigured (caller should fall
-///                  back to the legacy AnswerLlm/WhatToAnswerLlm path).
-///   Err(e)         if speculation was ON and failed mid-stream.
+///   Ok(Some((text, cost))) if speculation succeeded and produced a final answer.
+///   Ok(None)               if speculation is OFF or unconfigured (caller should
+///                          fall back to the legacy AnswerLlm/WhatToAnswerLlm path).
+///   Err(e)                 if speculation was ON and failed mid-stream.
 ///
 /// Forwards every chunk through the existing `cue_response_chunk` Tauri event
 /// so the dashboard UI does not need to know the answer was speculative.
@@ -1001,7 +1009,7 @@ async fn try_speculative_dispatch(
     router_meta: RouterMeta,
     registry: ProviderRegistry,
     app: tauri::AppHandle,
-) -> Result<Option<String>, String> {
+) -> Result<Option<(String, Option<cue_llm::LlmCostMetadata>)>, String> {
     use cue_router::{
         policy::StaticPolicy, speculative::SpeculativeChunk, RoutingPolicy, SpeculativeRouter,
     };
@@ -1055,6 +1063,7 @@ async fn try_speculative_dispatch(
 
     let mut accumulated_draft = String::new();
     let mut final_text: Option<String> = None;
+    let mut cost: Option<cue_llm::LlmCostMetadata> = None;
     // Codex Stage 9 round-2 Blocker 4: collect lane errors for diagnosis
     // when all-lanes-failed.
     let mut lane_errors: Vec<String> = Vec::new();
@@ -1062,7 +1071,14 @@ async fn try_speculative_dispatch(
 
     while let Some(chunk) = stream.next().await {
         match chunk {
-            SpeculativeChunk::Draft { text, finished } => {
+            SpeculativeChunk::Draft {
+                text,
+                finished,
+                cost: chunk_cost,
+            } => {
+                if let Some(chunk_cost) = chunk_cost.as_ref() {
+                    merge_cost_metadata(&mut cost, chunk_cost.clone());
+                }
                 accumulated_draft.push_str(&text);
                 let meta_for_chunk = if !emitted_meta {
                     emitted_meta = true;
@@ -1077,12 +1093,24 @@ async fn try_speculative_dispatch(
                         kind: kind.to_string(),
                         partial_text: text,
                         finished,
+                        cost_cents: chunk_cost.as_ref().map(|cost| cost.cost_cents),
+                        balance_cents_after: chunk_cost
+                            .as_ref()
+                            .and_then(|cost| cost.balance_cents_after),
+                        provider: chunk_cost.as_ref().map(|cost| cost.provider.clone()),
+                        model: chunk_cost.as_ref().map(|cost| cost.model.clone()),
                         router_meta: meta_for_chunk,
                         replace_body: None,
                     },
                 );
             }
-            SpeculativeChunk::Final { text } => {
+            SpeculativeChunk::Final {
+                text,
+                cost: chunk_cost,
+            } => {
+                if let Some(chunk_cost) = chunk_cost.as_ref() {
+                    merge_cost_metadata(&mut cost, chunk_cost.clone());
+                }
                 // Replace: emit a synthetic chunk that the UI's reducer will
                 // append to. The dashboard'''s responseReducer keeps the entry
                 // marked done after this. The card body is the FULL final text.
@@ -1093,6 +1121,12 @@ async fn try_speculative_dispatch(
                         kind: kind.to_string(),
                         partial_text: text.clone(),
                         finished: true,
+                        cost_cents: chunk_cost.as_ref().map(|cost| cost.cost_cents),
+                        balance_cents_after: chunk_cost
+                            .as_ref()
+                            .and_then(|cost| cost.balance_cents_after),
+                        provider: chunk_cost.as_ref().map(|cost| cost.provider.clone()),
+                        model: chunk_cost.as_ref().map(|cost| cost.model.clone()),
                         router_meta: None,
                         replace_body: Some(true),
                     },
@@ -1107,9 +1141,34 @@ async fn try_speculative_dispatch(
         }
     }
 
-    Ok(Some(
+    Ok(Some((
         final_text.unwrap_or(accumulated_draft).trim().to_string(),
-    ))
+        cost,
+    )))
+}
+
+fn merge_cost_metadata(
+    existing: &mut Option<cue_llm::LlmCostMetadata>,
+    next: cue_llm::LlmCostMetadata,
+) {
+    match existing {
+        Some(current) => {
+            if current.provider != next.provider {
+                current.provider = format!("{}, {}", current.provider, next.provider);
+            }
+            if current.model != next.model {
+                current.model = format!("{}, {}", current.model, next.model);
+            }
+            current.input_tokens = current.input_tokens.saturating_add(next.input_tokens);
+            current.output_tokens = current.output_tokens.saturating_add(next.output_tokens);
+            current.cost_cents = current.cost_cents.saturating_add(next.cost_cents);
+            current.balance_cents_after = next.balance_cents_after.or(current.balance_cents_after);
+            current.trial_seconds_remaining = next
+                .trial_seconds_remaining
+                .or(current.trial_seconds_remaining);
+        }
+        None => *existing = Some(next),
+    }
 }
 
 /// Trigger a cue response. If a recent question is detected in the transcript
@@ -1188,7 +1247,7 @@ pub async fn request_cue(
             suggest_mod::SYSTEM_PROMPT
         };
         let kind_str = if is_question { "answer" } else { "suggestion" };
-        if let Some(text) = try_speculative_dispatch(
+        if let Some((text, cost)) = try_speculative_dispatch(
             &user_text,
             system_prompt,
             kind_str,
@@ -1209,6 +1268,7 @@ pub async fn request_cue(
             );
             let mut cue_resp = cue_resp;
             cue_resp.id = response_id.clone();
+            cue_resp = cue_resp.with_cost_metadata(cost.as_ref());
             persist_cue_response(&db, &cue_resp)?;
             let _ = app.emit("cue_response", &cue_resp);
             return Ok(text);
@@ -1243,6 +1303,10 @@ pub async fn request_cue(
                         kind: "answer".to_string(),
                         partial_text: partial.to_string(),
                         finished,
+                        cost_cents: None,
+                        balance_cents_after: None,
+                        provider: None,
+                        model: None,
                         router_meta: meta_for_chunk,
                         replace_body: None,
                     },
@@ -1268,6 +1332,10 @@ pub async fn request_cue(
                         kind: "suggestion".to_string(),
                         partial_text: partial.to_string(),
                         finished,
+                        cost_cents: None,
+                        balance_cents_after: None,
+                        provider: None,
+                        model: None,
                         router_meta: meta_for_chunk,
                         replace_body: None,
                     },
@@ -1341,6 +1409,10 @@ pub async fn auto_recap(
                         kind: "recap".to_string(),
                         partial_text: partial.to_string(),
                         finished,
+                        cost_cents: None,
+                        balance_cents_after: None,
+                        provider: None,
+                        model: None,
                         router_meta: None, // recap is not yet routed via AutoRouter
                         replace_body: None,
                     },
@@ -1363,14 +1435,20 @@ fn persist_cue_response(
     resp: &cue_daemon::llm::CueResponse,
 ) -> Result<(), String> {
     let db = db.0.lock().map_err(|e| e.to_string())?;
-    db.insert_cue_response(
-        &resp.id,
-        &resp.source_session_id,
-        &resp.kind,
-        &resp.text,
-        resp.source_text.as_deref(),
-        resp.ts_ms as i64,
-    )
+    db.insert_cue_response(cue_daemon::db::NewCueResponse {
+        id: &resp.id,
+        session_id: &resp.source_session_id,
+        kind: &resp.kind,
+        text: &resp.text,
+        source_text: resp.source_text.as_deref(),
+        ts_ms: resp.ts_ms as i64,
+        cost_cents: resp.cost_cents,
+        balance_cents_after: resp.balance_cents_after,
+        provider: resp.provider.as_deref(),
+        model: resp.model.as_deref(),
+        input_tokens: resp.input_tokens,
+        output_tokens: resp.output_tokens,
+    })
     .map_err(|e| e.to_string())
 }
 

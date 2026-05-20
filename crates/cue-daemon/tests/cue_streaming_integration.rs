@@ -23,6 +23,7 @@ impl LlmProvider for MockStreamingLlm {
     async fn complete(&self, _req: &LlmRequest) -> Result<LlmResponse, LlmError> {
         Ok(LlmResponse {
             text: "Hello world!".into(),
+            cost: None,
         })
     }
 
@@ -31,14 +32,17 @@ impl LlmProvider for MockStreamingLlm {
             Ok(LlmChunk {
                 text: "Hello".into(),
                 finished: false,
+                cost: None,
             }),
             Ok(LlmChunk {
                 text: " world".into(),
                 finished: false,
+                cost: None,
             }),
             Ok(LlmChunk {
                 text: "!".into(),
                 finished: true,
+                cost: None,
             }),
         ];
         Ok(Box::pin(futures_util::stream::iter(chunks)))
@@ -195,6 +199,7 @@ async fn non_streaming_provider_still_calls_callback() {
         async fn complete(&self, _req: &LlmRequest) -> Result<LlmResponse, LlmError> {
             Ok(LlmResponse {
                 text: "Final answer.".into(),
+                cost: None,
             })
         }
     }

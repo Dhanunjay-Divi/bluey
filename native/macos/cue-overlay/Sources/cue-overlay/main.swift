@@ -67,11 +67,13 @@ private struct CueCard: Decodable {
     let body: String
     let createdAt: String?
     let source: String?
+    let costLabel: String?
 
     enum CodingKeys: String, CodingKey {
         case id, kind, title, body
         case createdAt = "created_at"
         case source
+        case costLabel = "cost_label"
     }
 }
 
@@ -95,7 +97,7 @@ private enum OverlayCommand {
     case setBalance(String)
     case setContextItems([OverlayContextItem])
     case pushCard(CueCard)
-    case updateCard(id: String, body: String, done: Bool)
+    case updateCard(id: String, body: String, done: Bool, costLabel: String?)
     case shutdown
     case unknown(String)
 }
@@ -148,7 +150,8 @@ private func parseCommand(_ line: String) -> OverlayCommand {
         let id = obj["id"] as? String ?? ""
         let body = obj["body"] as? String ?? ""
         let done = obj["done"] as? Bool ?? false
-        return .updateCard(id: id, body: body, done: done)
+        let costLabel = obj["cost_label"] as? String
+        return .updateCard(id: id, body: body, done: done, costLabel: costLabel)
     default:
         return .unknown(line)
     }
@@ -393,6 +396,7 @@ private struct RenderedCard {
     let title: String
     var body: String
     var done: Bool
+    var costLabel: String?
 }
 
 private final class FeedView: NSView {
@@ -442,10 +446,13 @@ private final class FeedView: NSView {
         emitCardRendered(id: card.id)
     }
 
-    func update(id: String, body: String, done: Bool) {
+    func update(id: String, body: String, done: Bool, costLabel: String?) {
         guard let idx = cards.firstIndex(where: { $0.id == id }) else { return }
         cards[idx].body = body
         cards[idx].done = done
+        if let costLabel {
+            cards[idx].costLabel = costLabel
+        }
         // Replace the corresponding subview.
         let existing = stack.arrangedSubviews[idx]
         stack.removeArrangedSubview(existing)
@@ -579,8 +586,9 @@ private final class FeedView: NSView {
 
     private func statusText(for card: RenderedCard) -> String {
         if !card.done { return "streaming..." }
+        if let costLabel = card.costLabel, !costLabel.isEmpty { return costLabel }
         switch card.kind {
-        case "answer":   return "cost syncing"
+        case "answer":   return ""
         case "question": return "sent"
         default:         return ""
         }
@@ -1359,9 +1367,9 @@ private final class OverlayApp {
         case .pushCard(let card):
             expandedView?.feed.push(RenderedCard(
                 id: card.id, kind: card.kind, title: card.title,
-                body: card.body, done: true))
-        case .updateCard(let id, let body, let done):
-            expandedView?.feed.update(id: id, body: body, done: done)
+                body: card.body, done: true, costLabel: card.costLabel))
+        case .updateCard(let id, let body, let done, let costLabel):
+            expandedView?.feed.update(id: id, body: body, done: done, costLabel: costLabel)
         case .shutdown:
             NSApp.terminate(nil)
         case .unknown:
@@ -1380,7 +1388,8 @@ private final class OverlayApp {
             kind: "system",
             title: title,
             body: body,
-            done: true)
+            done: true,
+            costLabel: nil)
         view.feed.push(card)
         // Briefly flash the pill to indicate boot activity.
         pillView?.dotColor = NSColor.systemBlue

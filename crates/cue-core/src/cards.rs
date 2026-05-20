@@ -24,6 +24,8 @@ pub struct CueCard {
     pub body: String,
     pub created_at: String,
     pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_label: Option<String>,
 }
 
 impl CueCard {
@@ -35,11 +37,17 @@ impl CueCard {
             body: body.into(),
             created_at: clock::now_epoch_ms_string(),
             source: None,
+            cost_label: None,
         }
     }
 
     pub fn with_source(mut self, source: impl Into<String>) -> Self {
         self.source = Some(source.into());
+        self
+    }
+
+    pub fn with_cost_label(mut self, label: impl Into<String>) -> Self {
+        self.cost_label = Some(label.into());
         self
     }
 }

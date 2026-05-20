@@ -19,6 +19,18 @@ pub struct CueResponse {
     pub ts_ms: u64,
     pub source_session_id: String,
     pub source_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_cents: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_cents_after: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<i64>,
 }
 
 impl CueResponse {
@@ -33,7 +45,25 @@ impl CueResponse {
                 .as_millis() as u64,
             source_session_id: session_id.to_string(),
             source_text,
+            cost_cents: None,
+            balance_cents_after: None,
+            provider: None,
+            model: None,
+            input_tokens: None,
+            output_tokens: None,
         }
+    }
+
+    pub fn with_cost_metadata(mut self, cost: Option<&cue_llm::LlmCostMetadata>) -> Self {
+        if let Some(cost) = cost {
+            self.cost_cents = Some(cost.cost_cents);
+            self.balance_cents_after = cost.balance_cents_after;
+            self.provider = Some(cost.provider.clone());
+            self.model = Some(cost.model.clone());
+            self.input_tokens = Some(cost.input_tokens);
+            self.output_tokens = Some(cost.output_tokens);
+        }
+        self
     }
 }
 

@@ -25,7 +25,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use cue_llm::{LlmChunk, LlmError, LlmProvider, LlmRequest};
+use cue_llm::{LlmChunk, LlmCostMetadata, LlmError, LlmProvider, LlmRequest};
 use futures_util::{Stream, StreamExt};
 
 use crate::model::ProviderRoute;
@@ -41,11 +41,15 @@ pub enum SpeculativeChunk {
         text: String,
         /// True on the final draft chunk.
         finished: bool,
+        /// Optional managed billing metadata emitted on the terminal chunk.
+        cost: Option<LlmCostMetadata>,
     },
     /// Replacement final answer from the Deep lane. Replace the entire card body.
     Final {
         /// Full final answer text. Replace any draft body with this.
         text: String,
+        /// Optional managed billing metadata for the final lane.
+        cost: Option<LlmCostMetadata>,
     },
     /// A non-recoverable error from one or both lanes.
     Error {
@@ -227,20 +231,34 @@ fn spawn_lane(
             match provider.complete_stream(&req).await {
                 Ok(mut stream) => {
                     let mut accumulated = String::new();
+                    let mut cost = None;
                     while let Some(chunk) = stream.next().await {
                         match chunk {
-                            Ok(LlmChunk { text, finished }) => match role {
+                            Ok(LlmChunk {
+                                text,
+                                finished,
+                                cost: chunk_cost,
+                            }) => match role {
                                 LaneRole::Draft => {
-                                    let _ = tx.send(SpeculativeChunk::Draft { text, finished });
+                                    let _ = tx.send(SpeculativeChunk::Draft {
+                                        text,
+                                        finished,
+                                        cost: chunk_cost,
+                                    });
                                     if finished {
                                         break;
                                     }
                                 }
                                 LaneRole::Deep => {
                                     accumulated.push_str(&text);
+                                    if chunk_cost.is_some() {
+                                        cost = chunk_cost;
+                                    }
                                     if finished {
-                                        let _ =
-                                            tx.send(SpeculativeChunk::Final { text: accumulated });
+                                        let _ = tx.send(SpeculativeChunk::Final {
+                                            text: accumulated,
+                                            cost,
+                                        });
                                         return;
                                     }
                                 }
@@ -269,10 +287,14 @@ fn spawn_lane(
                         let _ = tx.send(SpeculativeChunk::Draft {
                             text: resp.text,
                             finished: true,
+                            cost: resp.cost,
                         });
                     }
                     LaneRole::Deep => {
-                        let _ = tx.send(SpeculativeChunk::Final { text: resp.text });
+                        let _ = tx.send(SpeculativeChunk::Final {
+                            text: resp.text,
+                            cost: resp.cost,
+                        });
                     }
                 },
                 Err(e) => {
@@ -326,6 +348,7 @@ mod tests {
             self.completion_calls.fetch_add(1, Ordering::Relaxed);
             Ok(LlmResponse {
                 text: self.deep_text.to_string(),
+                cost: None,
             })
         }
         async fn complete_stream(&self, _req: &LlmRequest) -> Result<LlmChunkStream, LlmError> {
@@ -338,6 +361,7 @@ mod tests {
                     Ok(LlmChunk {
                         text: c.to_string(),
                         finished: i == self.chunks.len() - 1,
+                        cost: None,
                     })
                 })
                 .collect();
@@ -397,10 +421,10 @@ mod tests {
         let chunks: Vec<_> = stream.collect::<Vec<_>>().await;
         assert_eq!(chunks.len(), 2);
         assert!(
-            matches!(chunks[0], SpeculativeChunk::Draft { ref text, finished: false } if text == "Hello")
+            matches!(chunks[0], SpeculativeChunk::Draft { ref text, finished: false, .. } if text == "Hello")
         );
         assert!(
-            matches!(chunks[1], SpeculativeChunk::Draft { ref text, finished: true } if text == " world")
+            matches!(chunks[1], SpeculativeChunk::Draft { ref text, finished: true, .. } if text == " world")
         );
         assert_eq!(provider.stream_calls.load(Ordering::Relaxed), 1);
         assert_eq!(provider.completion_calls.load(Ordering::Relaxed), 0);
@@ -428,7 +452,7 @@ mod tests {
         for c in chunks {
             match c {
                 SpeculativeChunk::Draft { text, .. } => draft_texts.push(text),
-                SpeculativeChunk::Final { text } => {
+                SpeculativeChunk::Final { text, .. } => {
                     final_text = Some(text);
                 }
                 SpeculativeChunk::Error { lane, message } => panic!("error from {lane}: {message}"),
@@ -549,7 +573,7 @@ mod tests {
         let chunks: Vec<_> = router.run(&class, req()).await.unwrap().collect().await;
         assert_eq!(chunks.len(), 1);
         match &chunks[0] {
-            SpeculativeChunk::Draft { text, finished } => {
+            SpeculativeChunk::Draft { text, finished, .. } => {
                 assert_eq!(text, "NON_STREAM_DRAFT");
                 assert!(*finished);
             }
@@ -583,6 +607,7 @@ mod tests {
                 self.seen.lock().unwrap().push(req.request_id.clone());
                 Ok(LlmResponse {
                     text: format!("from-{}", self.name),
+                    cost: None,
                 })
             }
             async fn complete_stream(&self, req: &LlmRequest) -> Result<LlmChunkStream, LlmError> {
@@ -590,6 +615,7 @@ mod tests {
                 let chunk = Ok(LlmChunk {
                     text: format!("from-{}", self.name),
                     finished: true,
+                    cost: None,
                 });
                 Ok(Box::pin(futures_util::stream::once(async move { chunk })))
             }

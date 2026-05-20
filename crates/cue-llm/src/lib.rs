@@ -33,6 +33,8 @@ pub struct LlmRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmResponse {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<LlmCostMetadata>,
 }
 
 /// A single chunk from a streaming LLM completion.
@@ -40,6 +42,23 @@ pub struct LlmResponse {
 pub struct LlmChunk {
     pub text: String,
     pub finished: bool,
+    pub cost: Option<LlmCostMetadata>,
+}
+
+/// Billing/provider metadata returned by managed Bluey requests.
+///
+/// Direct BYOK/local providers leave this as `None`; managed providers fill it
+/// so the daemon, overlay, and dashboard can show per-answer cost and the
+/// post-request balance without re-querying the server.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmCostMetadata {
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost_cents: i64,
+    pub balance_cents_after: Option<i64>,
+    pub trial_seconds_remaining: Option<i64>,
 }
 
 #[derive(Debug, Error)]
@@ -88,6 +107,7 @@ pub trait LlmProvider: Send + Sync {
             Ok(LlmChunk {
                 text: resp.text,
                 finished: true,
+                cost: resp.cost,
             })
         })))
     }

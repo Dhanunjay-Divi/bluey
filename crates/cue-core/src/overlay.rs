@@ -59,6 +59,8 @@ pub enum OverlayCommand {
         body: String,
         #[serde(default)]
         done: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_label: Option<String>,
     },
     Shutdown,
 }

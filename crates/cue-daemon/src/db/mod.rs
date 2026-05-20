@@ -14,6 +14,21 @@ pub struct Database {
     conn: Connection,
 }
 
+pub struct NewCueResponse<'a> {
+    pub id: &'a str,
+    pub session_id: &'a str,
+    pub kind: &'a str,
+    pub text: &'a str,
+    pub source_text: Option<&'a str>,
+    pub ts_ms: i64,
+    pub cost_cents: Option<i64>,
+    pub balance_cents_after: Option<i64>,
+    pub provider: Option<&'a str>,
+    pub model: Option<&'a str>,
+    pub input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+}
+
 impl Database {
     /// Open (or create) the SQLite database at `path` and run migrations.
     /// Pass ":memory:" for an in-memory database (tests).
@@ -70,6 +85,31 @@ impl Database {
         self.conn
             .execute_batch(MIGRATION_009)
             .context("failed to run cue_responses migration")?;
+        self.ensure_cue_response_billing_columns()
+            .context("failed to ensure cue_response billing columns")?;
+        Ok(())
+    }
+
+    fn ensure_cue_response_billing_columns(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(cue_responses)")?;
+        let columns = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<std::collections::HashSet<_>, _>>()?;
+        for (name, ty) in [
+            ("cost_cents", "INTEGER"),
+            ("balance_cents_after", "INTEGER"),
+            ("provider", "TEXT"),
+            ("model", "TEXT"),
+            ("input_tokens", "INTEGER"),
+            ("output_tokens", "INTEGER"),
+        ] {
+            if !columns.contains(name) {
+                self.conn.execute(
+                    &format!("ALTER TABLE cue_responses ADD COLUMN {name} {ty}"),
+                    [],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -334,19 +374,26 @@ impl Database {
 
     // ===== Phase 3 Round 9: Cue Responses =====
 
-    pub fn insert_cue_response(
-        &self,
-        id: &str,
-        session_id: &str,
-        kind: &str,
-        text: &str,
-        source_text: Option<&str>,
-        ts_ms: i64,
-    ) -> Result<()> {
+    pub fn insert_cue_response(&self, response: NewCueResponse<'_>) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO cue_responses (id, session_id, kind, text, source_text, ts_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, session_id, kind, text, source_text, ts_ms],
+            "INSERT INTO cue_responses (
+                id, session_id, kind, text, source_text, ts_ms,
+                cost_cents, balance_cents_after, provider, model, input_tokens, output_tokens
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                response.id,
+                response.session_id,
+                response.kind,
+                response.text,
+                response.source_text,
+                response.ts_ms,
+                response.cost_cents,
+                response.balance_cents_after,
+                response.provider,
+                response.model,
+                response.input_tokens,
+                response.output_tokens,
+            ],
         )?;
         Ok(())
     }
@@ -370,7 +417,8 @@ impl Database {
         limit: usize,
     ) -> Result<Vec<crate::llm::CueResponse>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, kind, text, source_text, ts_ms \
+            "SELECT id, session_id, kind, text, source_text, ts_ms,
+                    cost_cents, balance_cents_after, provider, model, input_tokens, output_tokens \
              FROM cue_responses WHERE session_id = ?1 ORDER BY ts_ms DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![session_id, limit as i64], |row| {
@@ -381,6 +429,12 @@ impl Database {
                 text: row.get(3)?,
                 source_text: row.get(4)?,
                 ts_ms: row.get::<_, i64>(5)? as u64,
+                cost_cents: row.get(6)?,
+                balance_cents_after: row.get(7)?,
+                provider: row.get(8)?,
+                model: row.get(9)?,
+                input_tokens: row.get(10)?,
+                output_tokens: row.get(11)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -1028,6 +1082,37 @@ mod fts_tests {
             .unwrap();
         let loaded = db.load_keybind("toggle_listening").unwrap();
         assert_eq!(loaded, Some("CmdOrCtrl+Shift+K".to_string()));
+    }
+
+    #[test]
+    fn cue_response_billing_metadata_roundtrips() {
+        let db = test_db();
+        let session = db.create_session(Some("Billing Response".into())).unwrap();
+        db.insert_cue_response(NewCueResponse {
+            id: "resp-1",
+            session_id: &session.id.to_string(),
+            kind: "answer",
+            text: "A managed answer",
+            source_text: Some("question?"),
+            ts_ms: 1234,
+            cost_cents: Some(7),
+            balance_cents_after: Some(2993),
+            provider: Some("openai"),
+            model: Some("gpt-4o-mini"),
+            input_tokens: Some(20),
+            output_tokens: Some(12),
+        })
+        .unwrap();
+
+        let responses = db.list_cue_responses(&session.id.to_string(), 10).unwrap();
+        assert_eq!(responses.len(), 1);
+        let response = &responses[0];
+        assert_eq!(response.cost_cents, Some(7));
+        assert_eq!(response.balance_cents_after, Some(2993));
+        assert_eq!(response.provider.as_deref(), Some("openai"));
+        assert_eq!(response.model.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(response.input_tokens, Some(20));
+        assert_eq!(response.output_tokens, Some(12));
     }
 
     #[test]

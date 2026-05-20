@@ -37,6 +37,10 @@ export interface InflightResponse {
   done: boolean;
   /** Auto Router classification + provider for this entry, if known. */
   routerMeta?: RouterMeta;
+  cost_cents?: number | null;
+  balance_cents_after?: number | null;
+  provider?: string | null;
+  model?: string | null;
   /**
    * True if a `replace_body` chunk has fired for this entry. Used by the UI
    * to render a "refined" indicator distinguishing the deep answer from the
@@ -63,6 +67,10 @@ export interface CueResponseChunk {
    * entry so it persists across all chunks.
    */
   router_meta?: RouterMeta;
+  cost_cents?: number | null;
+  balance_cents_after?: number | null;
+  provider?: string | null;
+  model?: string | null;
 }
 
 /**
@@ -103,6 +111,10 @@ export function applyChunk(
 
   // Sticky router_meta: keep prior value if this chunk does not include one.
   const routerMeta = chunk.router_meta ?? existing?.routerMeta;
+  const cost_cents = chunk.cost_cents ?? existing?.cost_cents;
+  const balance_cents_after = chunk.balance_cents_after ?? existing?.balance_cents_after;
+  const provider = chunk.provider ?? existing?.provider;
+  const model = chunk.model ?? existing?.model;
 
   // Refined flag: sticky once set true.
   const refined = chunk.replace_body || existing?.refined || false;
@@ -112,6 +124,10 @@ export function applyChunk(
     text,
     done: chunk.finished,
     routerMeta,
+    cost_cents,
+    balance_cents_after,
+    provider,
+    model,
     refined,
   });
 

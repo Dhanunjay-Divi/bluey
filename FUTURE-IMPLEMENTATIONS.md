@@ -247,7 +247,10 @@ just see errors).
 
 ### R14.14 — Cost-label UX + tier visibility (daemon + dashboard)
 
-**Status:** required for v0.2 launch.
+**Status:** partially shipped in Stage 12-17 Codex follow-up. Live balance,
+dashboard cost labels, persisted response billing metadata, and macOS overlay
+answer status labels are implemented. Remaining work is the richer account
+usage dashboard and web onboarding screen.
 **See:** `docs/PRICING-MODEL.md` Section 4 for the exact mockups.
 
 **Approach:**
@@ -258,11 +261,11 @@ just see errors).
   `task_type`/`lane`.
 - Daemon-side: `bluey usage` CLI command formats and prints the
   server response. `bluey credits` shows per-batch expiration dates.
-- Overlay top strip: live balance display from `RouterMeta`/account
-  poll. Compact, minimal, no tier info.
-- Cue card: per-card cost label (`$0.04 · 412 in / 89 out · 1.8s`)
-  rendered from the response trailer's `cost_cents`,
-  `input_tokens`, `output_tokens`, `latency_ms` fields.
+- ✅ Overlay top strip: live balance display from account polling.
+  Compact, minimal, no tier info.
+- ✅ Cue card / dashboard response cards: per-card cost label rendered
+  from managed response metadata (`cost_cents`, provider/model, token
+  counts, post-request balance when available).
 - Dashboard `/account/usage` page: rolling-7-day breakdown chart,
   tier comparison panel, "your $X.XX lasts ~N days" projection.
 - Onboarding screen `/onboarding/welcome` (after first reload):
@@ -391,3 +394,5 @@ git-history-divers can find the trail; remove after one round.
 ### ✅ R14.4 replace_body for clean draft → final (shipped 2026-05-19, `c34592a`)
 ### ✅ R14.5 Dashboard LaneBadge (shipped 2026-05-19, `c34592a`)
 ### ✅ Speculative routing default-ON (shipped 2026-05-19, `8a3051d`)
+### ✅ Stage 17 live balance bridge (shipped 2026-05-20, `7c01c93`)
+### ✅ Managed SSE stream contract + cost labels (shipped 2026-05-20, this Codex batch)

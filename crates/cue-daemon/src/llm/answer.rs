@@ -1,4 +1,4 @@
-use cue_llm::{LlmProvider, LlmRequest};
+use cue_llm::{LlmCostMetadata, LlmProvider, LlmRequest};
 use futures_util::StreamExt;
 
 use super::CueResponse;
@@ -36,11 +36,15 @@ impl AnswerLlm {
             temperature: Some(0.3),
             request_id: None,
         };
+        let mut cost: Option<LlmCostMetadata> = None;
         let text = if llm.supports_streaming() {
             let mut stream = llm.complete_stream(&req).await?;
             let mut acc = String::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
+                if chunk.cost.is_some() {
+                    cost = chunk.cost.clone();
+                }
                 // Emit DELTA (just the new text), not cumulative — the dashboard appends.
                 on_chunk(&chunk.text, chunk.finished);
                 acc.push_str(&chunk.text);
@@ -50,16 +54,15 @@ impl AnswerLlm {
             }
             acc
         } else {
-            let resp = llm.complete(&req).await?.text;
-            on_chunk(&resp, true);
-            resp
+            let resp = llm.complete(&req).await?;
+            cost = resp.cost.clone();
+            on_chunk(&resp.text, true);
+            resp.text
         };
-        Ok(CueResponse::new(
-            "answer",
-            text,
-            session_id,
-            Some(question.to_string()),
-        ))
+        Ok(
+            CueResponse::new("answer", text, session_id, Some(question.to_string()))
+                .with_cost_metadata(cost.as_ref()),
+        )
     }
 }
 
@@ -67,7 +70,7 @@ impl AnswerLlm {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use cue_llm::{LlmError, LlmResponse};
+    use cue_llm::{LlmCostMetadata, LlmError, LlmResponse};
 
     struct FakeLlm;
 
@@ -80,6 +83,30 @@ mod tests {
             assert!(req.system.contains("meeting"));
             Ok(LlmResponse {
                 text: "The answer is 42.".into(),
+                cost: None,
+            })
+        }
+    }
+
+    struct CostedLlm;
+
+    #[async_trait]
+    impl LlmProvider for CostedLlm {
+        fn name(&self) -> &'static str {
+            "costed"
+        }
+        async fn complete(&self, _req: &LlmRequest) -> Result<LlmResponse, LlmError> {
+            Ok(LlmResponse {
+                text: "Costed answer.".into(),
+                cost: Some(LlmCostMetadata {
+                    provider: "openai".into(),
+                    model: "gpt-4o-mini".into(),
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    cost_cents: 2,
+                    balance_cents_after: Some(2998),
+                    trial_seconds_remaining: Some(0),
+                }),
             })
         }
     }
@@ -95,5 +122,16 @@ mod tests {
         assert_eq!(resp.text, "The answer is 42.");
         assert_eq!(resp.source_session_id, "sess-1");
         assert!(resp.source_text.unwrap().contains("meaning of life"));
+    }
+
+    #[tokio::test]
+    async fn test_answer_preserves_cost_metadata() {
+        let llm = AnswerLlm;
+        let resp = llm.run("Question?", "sess-cost", &CostedLlm).await.unwrap();
+        assert_eq!(resp.text, "Costed answer.");
+        assert_eq!(resp.cost_cents, Some(2));
+        assert_eq!(resp.balance_cents_after, Some(2998));
+        assert_eq!(resp.provider.as_deref(), Some("openai"));
+        assert_eq!(resp.model.as_deref(), Some("gpt-4o-mini"));
     }
 }

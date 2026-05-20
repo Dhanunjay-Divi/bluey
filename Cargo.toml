@@ -25,7 +25,7 @@ dirs = "6.0"
 libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls", "stream"] }
 tokio = { version = "1.48", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -40,6 +40,7 @@ webrtc-vad = "0.4"
 bytemuck = "1"
 async-trait = "0.1"
 futures-util = "0.3"
+async-stream = "0.3"
 parking_lot = "0.12"
 thiserror = "1.0"
 zerocopy = { version = "0.8", features = ["derive"] }

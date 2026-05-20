@@ -117,6 +117,27 @@ impl CloudClient {
         self.auth_request(Method::POST, path, Some(body)).await
     }
 
+    /// Authenticated POST returning the raw response body stream.
+    ///
+    /// Used by `/router/complete/stream`; keeps the same 401 refresh and typed
+    /// billing/error mapping as `auth_post`, but lets callers consume SSE bytes
+    /// themselves on success.
+    pub async fn auth_post_stream<Req: Serialize>(
+        &self,
+        path: &str,
+        body: &Req,
+    ) -> Result<Response> {
+        let resp = self.send_with_auth(Method::POST, path, Some(body)).await?;
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            if !self.refresh_tokens().await? {
+                return Err(Error::Unauthorized);
+            }
+            let resp = self.send_with_auth(Method::POST, path, Some(body)).await?;
+            return Self::stream_or_err(resp).await;
+        }
+        Self::stream_or_err(resp).await
+    }
+
     async fn auth_request<Req, Resp>(
         &self,
         method: Method,
@@ -229,6 +250,16 @@ impl CloudClient {
                     status: other.as_u16(),
                 })
             }
+        }
+    }
+
+    async fn stream_or_err(resp: Response) -> Result<Response> {
+        if resp.status().is_success() {
+            return Ok(resp);
+        }
+        match Self::parse_or_err::<serde_json::Value>(resp).await {
+            Ok(_) => Err(Error::Server { status: 500 }),
+            Err(e) => Err(e),
         }
     }
 
@@ -381,6 +412,78 @@ mod tests {
         match r {
             Err(Error::RateLimited { retry_after_secs }) => assert_eq!(retry_after_secs, 12),
             other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_post_stream_returns_raw_success_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/router/complete/stream"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: hello\n\n"),
+            )
+            .mount(&server)
+            .await;
+        let client = client_for(server.uri());
+        client
+            .save_tokens(Tokens {
+                access: "a".into(),
+                refresh: "r".into(),
+                email: "e@example.com".into(),
+            })
+            .unwrap();
+
+        let response = client
+            .auth_post_stream(
+                "/router/complete/stream",
+                &serde_json::json!({ "ok": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text().await.unwrap(), "data: hello\n\n");
+    }
+
+    #[tokio::test]
+    async fn auth_post_stream_maps_402_before_streaming() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/router/complete/stream"))
+            .respond_with(ResponseTemplate::new(402).set_body_json(serde_json::json!({
+                "balance_cents": 1,
+                "needed_cents": 9,
+                "reason": "insufficient_balance",
+                "reload_url": "https://bluey.dev/reload"
+            })))
+            .mount(&server)
+            .await;
+        let client = client_for(server.uri());
+        client
+            .save_tokens(Tokens {
+                access: "a".into(),
+                refresh: "r".into(),
+                email: "e@example.com".into(),
+            })
+            .unwrap();
+
+        let result = client
+            .auth_post_stream(
+                "/router/complete/stream",
+                &serde_json::json!({ "ok": true }),
+            )
+            .await;
+        match result {
+            Err(Error::InsufficientBalance {
+                balance_cents,
+                needed_cents,
+                ..
+            }) => {
+                assert_eq!(balance_cents, 1);
+                assert_eq!(needed_cents, 9);
+            }
+            other => panic!("expected InsufficientBalance, got {other:?}"),
         }
     }
 }

@@ -23,6 +23,7 @@ impl LlmProvider for MockLlm {
                 "## Recap\n- Discussed: {}",
                 &req.user[..req.user.len().min(40)]
             ),
+            cost: None,
         })
     }
 }

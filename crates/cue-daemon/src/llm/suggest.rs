@@ -1,4 +1,4 @@
-use cue_llm::{LlmProvider, LlmRequest};
+use cue_llm::{LlmCostMetadata, LlmProvider, LlmRequest};
 use futures_util::StreamExt;
 
 use super::CueResponse;
@@ -36,11 +36,15 @@ impl WhatToAnswerLlm {
             temperature: Some(0.5),
             request_id: None,
         };
+        let mut cost: Option<LlmCostMetadata> = None;
         let text = if llm.supports_streaming() {
             let mut stream = llm.complete_stream(&req).await?;
             let mut acc = String::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
+                if chunk.cost.is_some() {
+                    cost = chunk.cost.clone();
+                }
                 // Emit DELTA (just the new text), not cumulative — the dashboard appends.
                 on_chunk(&chunk.text, chunk.finished);
                 acc.push_str(&chunk.text);
@@ -50,16 +54,15 @@ impl WhatToAnswerLlm {
             }
             acc
         } else {
-            let resp = llm.complete(&req).await?.text;
-            on_chunk(&resp, true);
-            resp
+            let resp = llm.complete(&req).await?;
+            cost = resp.cost.clone();
+            on_chunk(&resp.text, true);
+            resp.text
         };
-        Ok(CueResponse::new(
-            "suggestion",
-            text,
-            session_id,
-            Some(transcript.to_string()),
-        ))
+        Ok(
+            CueResponse::new("suggestion", text, session_id, Some(transcript.to_string()))
+                .with_cost_metadata(cost.as_ref()),
+        )
     }
 }
 
@@ -80,6 +83,7 @@ mod tests {
             assert!(req.system.contains("suggest"));
             Ok(LlmResponse {
                 text: "- Ask about timeline\n- Confirm budget".into(),
+                cost: None,
             })
         }
     }

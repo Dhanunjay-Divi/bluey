@@ -82,6 +82,7 @@ fn parse_openai_sse_chunks(buffer: &mut String) -> Vec<Result<LlmChunk, LlmError
                     chunks.push(Ok(LlmChunk {
                         text: String::new(),
                         finished: true,
+                        cost: None,
                     }));
                     continue;
                 }
@@ -97,6 +98,7 @@ fn parse_openai_sse_chunks(buffer: &mut String) -> Vec<Result<LlmChunk, LlmError
                             chunks.push(Ok(LlmChunk {
                                 text: delta.to_string(),
                                 finished: false,
+                                cost: None,
                             }));
                         }
                     }
@@ -170,7 +172,7 @@ impl LlmProvider for OpenAiProvider {
             .and_then(|c| c.message.content)
             .unwrap_or_default();
 
-        Ok(LlmResponse { text })
+        Ok(LlmResponse { text, cost: None })
     }
 
     async fn complete_stream(&self, req: &LlmRequest) -> Result<LlmChunkStream, LlmError> {

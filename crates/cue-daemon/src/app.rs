@@ -90,13 +90,25 @@ impl OverlayAnswerStream {
     }
 
     async fn finish(&mut self, final_body: &str) -> Result<()> {
+        self.finish_with_cost_label(final_body, None).await
+    }
+
+    async fn finish_with_cost_label(
+        &mut self,
+        final_body: &str,
+        cost_label: Option<String>,
+    ) -> Result<()> {
         if self.body != final_body {
             self.body = final_body.to_string();
         }
-        self.flush(true).await
+        self.flush_with_cost_label(true, cost_label).await
     }
 
     async fn flush(&self, done: bool) -> Result<()> {
+        self.flush_with_cost_label(done, None).await
+    }
+
+    async fn flush_with_cost_label(&self, done: bool, cost_label: Option<String>) -> Result<()> {
         if !is_answer_generation_current(&self.daemon, self.generation_id) {
             return Ok(());
         }
@@ -106,6 +118,7 @@ impl OverlayAnswerStream {
                 id: self.card_id,
                 body: self.body.clone(),
                 done,
+                cost_label,
             },
         )
         .await;
@@ -157,6 +170,7 @@ async fn register_active_answer_card(
                     id: previous_card_id,
                     body: "Superseded by a newer Bluey answer.".to_string(),
                     done: true,
+                    cost_label: None,
                 },
             )
             .await;
@@ -3054,7 +3068,12 @@ async fn answer_with_provider_runtime(
     if !overlay_stream.has_text() {
         overlay_stream.replay_text(&response.answer).await?;
     }
-    overlay_stream.finish(&response.answer).await?;
+    overlay_stream
+        .finish_with_cost_label(
+            &response.answer,
+            answer_overlay_cost_label(&response.metadata),
+        )
+        .await?;
     let still_current = is_answer_generation_current(daemon, generation_id);
     clear_active_answer_card(daemon, generation_id, answer_card_id).await;
     if !still_current {
@@ -3080,6 +3099,37 @@ async fn answer_with_provider_runtime(
     update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
     write_state(daemon).await?;
     Ok((response, events))
+}
+
+fn answer_overlay_cost_label(metadata: &AnswerResponseMetadata) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(cost) = metadata
+        .cost_estimate
+        .as_ref()
+        .filter(|cost| cost.amount > 0.0)
+    {
+        if cost.currency.eq_ignore_ascii_case("usd") {
+            let prefix = if cost.estimated { "~" } else { "" };
+            parts.push(format!("{prefix}${:.4}", cost.amount));
+        } else {
+            let prefix = if cost.estimated { "~" } else { "" };
+            parts.push(format!("{prefix}{:.4} {}", cost.amount, cost.currency));
+        }
+    }
+    if let Some(usage) = metadata.token_usage.as_ref() {
+        parts.push(format!(
+            "{} in / {} out",
+            usage.input_tokens, usage.output_tokens
+        ));
+    }
+    if let Some(latency_ms) = metadata.latency_ms {
+        parts.push(format!("{latency_ms} ms"));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" · "))
+    }
 }
 
 fn visible_question_for_source(question: &str, source: &str) -> (String, String) {
@@ -6177,14 +6227,20 @@ fn spawn_auto_recap(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
                 let db_path = db_dir.join("sessions.db");
                 if let Ok(db) = crate::db::Database::open(db_path.to_str().unwrap_or("sessions.db"))
                 {
-                    if let Err(e) = db.insert_cue_response(
-                        &resp.id,
-                        &resp.source_session_id,
-                        &resp.kind,
-                        &resp.text,
-                        resp.source_text.as_deref(),
-                        resp.ts_ms as i64,
-                    ) {
+                    if let Err(e) = db.insert_cue_response(crate::db::NewCueResponse {
+                        id: &resp.id,
+                        session_id: &resp.source_session_id,
+                        kind: &resp.kind,
+                        text: &resp.text,
+                        source_text: resp.source_text.as_deref(),
+                        ts_ms: resp.ts_ms as i64,
+                        cost_cents: resp.cost_cents,
+                        balance_cents_after: resp.balance_cents_after,
+                        provider: resp.provider.as_deref(),
+                        model: resp.model.as_deref(),
+                        input_tokens: resp.input_tokens,
+                        output_tokens: resp.output_tokens,
+                    }) {
                         warn!(error = %e, "auto-recap: failed to persist");
                     } else {
                         info!(session = %session_id, "auto-recap persisted");
@@ -6373,6 +6429,25 @@ mod tests {
     fn streaming_word_chunks_preserve_spacing() {
         let chunks = streaming_word_chunks("one two\nthree");
         assert_eq!(chunks, vec!["one ", "two\n", "three"]);
+    }
+
+    #[test]
+    fn answer_overlay_cost_label_includes_usage_and_latency() {
+        let metadata = AnswerResponseMetadata::new(
+            uuid::Uuid::new_v4(),
+            ProviderSelector::openai("gpt-4o-mini"),
+        )
+        .with_usage(TokenUsage {
+            input_tokens: 123,
+            output_tokens: 45,
+            total_tokens: 168,
+        })
+        .with_latency(812);
+
+        assert_eq!(
+            answer_overlay_cost_label(&metadata),
+            Some("123 in / 45 out · 812 ms".to_string())
+        );
     }
 
     #[test]

@@ -98,6 +98,7 @@ fn parse_ndjson_chunks(buffer: &mut String) -> Vec<Result<LlmChunk, LlmError>> {
                 chunks.push(Ok(LlmChunk {
                     text,
                     finished: parsed.done,
+                    cost: None,
                 }));
             }
             Err(e) => {
@@ -168,6 +169,7 @@ impl LlmProvider for OllamaProvider {
 
         Ok(LlmResponse {
             text: chat.message.content,
+            cost: None,
         })
     }
 

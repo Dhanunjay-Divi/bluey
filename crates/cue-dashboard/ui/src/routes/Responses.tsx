@@ -11,6 +11,12 @@ interface CueResponse {
   ts_ms: number;
   source_session_id: string;
   source_text: string | null;
+  cost_cents?: number | null;
+  balance_cents_after?: number | null;
+  provider?: string | null;
+  model?: string | null;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
 }
 
 export function Responses() {
@@ -61,10 +67,31 @@ export function Responses() {
 
   const formatTime = (ts: number) => new Date(ts).toLocaleTimeString();
 
+  const formatCents = (cents?: number | null) => {
+    if (cents === null || cents === undefined) return null;
+    return `$${(cents / 100).toFixed(2)}`;
+  };
+
+  const renderCostPill = (r: Pick<CueResponse, "cost_cents" | "balance_cents_after" | "provider" | "model">) => {
+    const cost = formatCents(r.cost_cents);
+    if (!cost) return null;
+    const balance = formatCents(r.balance_cents_after);
+    return (
+      <span className="rounded-full border border-cyan-500/40 bg-cyan-500/10 px-2 py-0.5 text-[11px] font-medium text-cyan-200">
+        {cost}
+        {r.model ? <span className="text-cyan-300/70"> · {r.model}</span> : null}
+        {balance ? <span className="text-cyan-300/70"> · bal {balance}</span> : null}
+      </span>
+    );
+  };
+
   const renderCard = (r: CueResponse) => (
     <div key={r.id} className="rounded border border-zinc-700 bg-zinc-800 p-3 space-y-1">
       <div className="flex items-center justify-between">
-        <span className="text-xs text-zinc-500">{formatTime(r.ts_ms)}</span>
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-zinc-500">{formatTime(r.ts_ms)}</span>
+          {renderCostPill(r)}
+        </div>
         <button
           onClick={() => copyToClipboard(r.text)}
           className="text-xs text-blue-400 hover:text-blue-300"
@@ -87,6 +114,7 @@ export function Responses() {
             {data.refined ? "Refined" : "Streaming…"}
           </span>
           <span className="text-xs text-zinc-500">{data.kind}</span>
+          {renderCostPill(data)}
         </div>
         {data.routerMeta ? (
           <LaneBadge meta={data.routerMeta} refined={data.refined} />

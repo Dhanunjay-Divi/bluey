@@ -133,12 +133,14 @@ mod tests {
                 name: "a",
                 result: Ok(LlmResponse {
                     text: "from a".into(),
+                    cost: None,
                 }),
             }),
             Box::new(MockProvider {
                 name: "b",
                 result: Ok(LlmResponse {
                     text: "from b".into(),
+                    cost: None,
                 }),
             }),
         ]);
@@ -157,6 +159,7 @@ mod tests {
                 name: "b",
                 result: Ok(LlmResponse {
                     text: "from b".into(),
+                    cost: None,
                 }),
             }),
         ]);
@@ -175,6 +178,7 @@ mod tests {
                 name: "b",
                 result: Ok(LlmResponse {
                     text: "from b".into(),
+                    cost: None,
                 }),
             }),
         ]);
@@ -193,6 +197,7 @@ mod tests {
                 name: "b",
                 result: Ok(LlmResponse {
                     text: "from b".into(),
+                    cost: None,
                 }),
             }),
         ]);
@@ -230,12 +235,14 @@ mod tests {
                 name: "x",
                 result: Ok(LlmResponse {
                     text: String::new(),
+                    cost: None,
                 }),
             }),
             Box::new(MockProvider {
                 name: "y",
                 result: Ok(LlmResponse {
                     text: String::new(),
+                    cost: None,
                 }),
             }),
         ]);
@@ -249,6 +256,7 @@ mod tests {
             name: "a",
             result: Ok(LlmResponse {
                 text: "hello".into(),
+                cost: None,
             }),
         })]);
         let mut stream = router.complete_stream(&test_req()).await.unwrap();
@@ -272,6 +280,7 @@ mod tests {
                 name: "openai-direct",
                 result: Ok(LlmResponse {
                     text: "should never be reached".into(),
+                    cost: None,
                 }),
             }),
         ]);
