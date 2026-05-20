@@ -488,3 +488,78 @@ mod tests {
         );
     }
 }
+
+#[derive(serde::Serialize)]
+pub struct PortalResponse {
+    pub portal_url: String,
+}
+
+/// Codex Stage 14: Stripe Customer Portal session.
+/// Customer clicks "manage billing" -> redirected to Stripe-hosted UI
+/// for managing their saved card / canceling auto top-up / viewing
+/// invoices. Returns the session URL.
+pub async fn portal(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+) -> Result<Json<PortalResponse>, (StatusCode, Json<ApiError>)> {
+    let stripe_key = state.config.stripe_secret_key.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError {
+                error: "billing not configured".into(),
+            }),
+        )
+    })?;
+    let customer_id = account.stripe_customer_id.as_ref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "no Stripe customer on file; complete a reload first".into(),
+            }),
+        )
+    })?;
+    let return_url = format!("{}/account", state.config.public_url);
+    let form = [
+        ("customer", customer_id.as_str()),
+        ("return_url", return_url.as_str()),
+    ];
+    let resp = reqwest::Client::new()
+        .post("https://api.stripe.com/v1/billing_portal/sessions")
+        .basic_auth(stripe_key, Some(""))
+        .form(&form)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "stripe portal http failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError {
+                    error: "billing provider unavailable; please retry".into(),
+                }),
+            )
+        })?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        tracing::warn!(stripe_status = %status, stripe_body = %body, "stripe portal error");
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ApiError {
+                error: "billing portal session failed; please retry".into(),
+            }),
+        ));
+    }
+    let url = body
+        .get("url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError {
+                    error: "stripe portal response missing url".into(),
+                }),
+            )
+        })?
+        .to_string();
+    Ok(Json(PortalResponse { portal_url: url }))
+}

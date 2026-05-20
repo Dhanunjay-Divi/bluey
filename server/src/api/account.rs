@@ -149,3 +149,176 @@ pub async fn usage(
         projected_days_remaining: (projected_days_remaining * 10.0).round() / 10.0,
     }))
 }
+
+// ─── Codex Stage 14: GDPR delete + export ───────────────────────────────
+
+#[derive(serde::Serialize)]
+pub struct ExportBundle {
+    pub account: ExportAccount,
+    pub credit_batches: Vec<serde_json::Value>,
+    pub usage_events: Vec<serde_json::Value>,
+    pub refresh_tokens_count: i64,
+    pub stripe_webhook_events_count: i64,
+    pub exported_at: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct ExportAccount {
+    pub id: String,
+    pub email: String,
+    pub balance_cents: i64,
+    pub trial_seconds_remaining: i64,
+    pub created_at: Option<String>,
+    pub last_login_at: Option<String>,
+    pub stripe_customer_id: Option<String>,
+}
+
+pub async fn export_data(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+) -> Result<Json<ExportBundle>, axum::http::StatusCode> {
+    let conn = state
+        .pool
+        .get()
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    let exp_account: ExportAccount = conn
+        .query_row(
+            "SELECT id, email, balance_cents, trial_seconds_remaining,
+                    created_at, last_login_at, stripe_customer_id
+             FROM accounts WHERE id = ?1",
+            rusqlite::params![&account.id],
+            |r| {
+                Ok(ExportAccount {
+                    id: r.get(0)?,
+                    email: r.get(1)?,
+                    balance_cents: r.get(2)?,
+                    trial_seconds_remaining: r.get(3)?,
+                    created_at: r.get(4)?,
+                    last_login_at: r.get(5)?,
+                    stripe_customer_id: r.get(6)?,
+                })
+            },
+        )
+        .map_err(|_| axum::http::StatusCode::NOT_FOUND)?;
+
+    // Credit batches.
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, amount_cents, remaining_cents, purchased_at,
+                    expires_at, stripe_charge_id, expired_at
+             FROM credit_batches WHERE account_id = ?1 ORDER BY purchased_at",
+        )
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let batches: Vec<serde_json::Value> = stmt
+        .query_map(rusqlite::params![&account.id], |r| {
+            Ok(serde_json::json!({
+                "id": r.get::<_, String>(0)?,
+                "amount_cents": r.get::<_, i64>(1)?,
+                "remaining_cents": r.get::<_, i64>(2)?,
+                "purchased_at": r.get::<_, Option<String>>(3)?,
+                "expires_at": r.get::<_, Option<String>>(4)?,
+                "stripe_charge_id": r.get::<_, Option<String>>(5)?,
+                "expired_at": r.get::<_, Option<String>>(6)?,
+            }))
+        })
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    // Usage events.
+    let mut stmt = conn
+        .prepare(
+            "SELECT request_id, ts, kind, task_type, lane, provider, model,
+                    input_tokens, output_tokens, latency_ms,
+                    cost_cents_to_customer
+             FROM usage_events WHERE account_id = ?1 ORDER BY ts DESC LIMIT 10000",
+        )
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let events: Vec<serde_json::Value> = stmt
+        .query_map(rusqlite::params![&account.id], |r| {
+            Ok(serde_json::json!({
+                "request_id": r.get::<_, String>(0)?,
+                "ts": r.get::<_, String>(1)?,
+                "kind": r.get::<_, String>(2)?,
+                "task_type": r.get::<_, Option<String>>(3)?,
+                "lane": r.get::<_, Option<String>>(4)?,
+                "provider": r.get::<_, Option<String>>(5)?,
+                "model": r.get::<_, Option<String>>(6)?,
+                "input_tokens": r.get::<_, i64>(7)?,
+                "output_tokens": r.get::<_, i64>(8)?,
+                "latency_ms": r.get::<_, i64>(9)?,
+                "cost_cents_to_customer": r.get::<_, i64>(10)?,
+            }))
+        })
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let refresh_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM refresh_tokens WHERE account_id = ?1",
+            rusqlite::params![&account.id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    // Stripe webhook events are not joined to accounts directly in the
+    // schema (account_id lives in metadata); we count via JSON extract.
+    let stripe_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM stripe_webhook_events
+             WHERE json_extract(body, '$.data.object.client_reference_id') = ?1",
+            rusqlite::params![&account.id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    Ok(Json(ExportBundle {
+        account: exp_account,
+        credit_batches: batches,
+        usage_events: events,
+        refresh_tokens_count: refresh_count,
+        stripe_webhook_events_count: stripe_count,
+        exported_at: chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
+#[derive(serde::Serialize)]
+pub struct DeleteAck {
+    pub deleted: bool,
+    pub deleted_at: String,
+    pub note: &'static str,
+}
+
+pub async fn delete_account(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+) -> Result<Json<DeleteAck>, axum::http::StatusCode> {
+    // Hard delete. ON DELETE CASCADE on the foreign keys (accounts ->
+    // credit_batches, refresh_tokens, usage_events,
+    // email_verification_tokens, password_reset_tokens, request_idempotency)
+    // takes care of dependent rows.
+    let conn = state
+        .pool
+        .get()
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let n = conn
+        .execute(
+            "DELETE FROM accounts WHERE id = ?1",
+            rusqlite::params![&account.id],
+        )
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    if n == 0 {
+        return Err(axum::http::StatusCode::NOT_FOUND);
+    }
+    tracing::info!(
+        account_id = %account.id,
+        email = %account.email,
+        "account deleted (GDPR hard-delete)"
+    );
+    Ok(Json(DeleteAck {
+        deleted: true,
+        deleted_at: chrono::Utc::now().to_rfc3339(),
+        note: "All account data has been removed. Re-signup is allowed with the same email.",
+    }))
+}

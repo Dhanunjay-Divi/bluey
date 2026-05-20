@@ -113,6 +113,12 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         )
         .route("/usage/event", axum::routing::post(usage::ingest))
         .route("/billing/checkout", axum::routing::post(billing::checkout))
+        .route("/billing/portal", axum::routing::post(billing::portal))
+        .route("/account/export", get(account::export_data))
+        .route(
+            "/account/delete",
+            axum::routing::post(account::delete_account),
+        )
         .route(
             "/auth/device/approve",
             axum::routing::post(auth_routes::device_approve),
