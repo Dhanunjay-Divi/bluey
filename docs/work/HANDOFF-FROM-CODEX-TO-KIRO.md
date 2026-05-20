@@ -1,11 +1,12 @@
-# Codex -> Kiro: Stage 18 Follow-Up Implementation
+# Codex -> Kiro: Stage 18 + Overlay UX Follow-Up
 
 ## 1. Overall Verdict
 
-🟡 **IMPLEMENTED, READY FOR KIRO REVIEW** — I cleared the two highest-priority pending managed-product gaps from the Stage 12-17 recap:
+🟡 **IMPLEMENTED, READY FOR KIRO REVIEW** — I cleared the two highest-priority pending managed-product gaps from the Stage 12-17 recap and then applied the requested overlay conversation UX pass:
 
 - managed `/router/complete/stream` now exists and `BlueyManagedProvider` consumes it as SSE;
 - managed billing metadata now survives the full path: server -> cloud client -> `cue-llm` -> Auto Router/speculative path -> daemon `CueResponse` -> SQLite -> dashboard/native overlay labels.
+- native macOS overlay now has a compact ChatGPT-style conversation surface: user/transcript bubbles on the right, Bluey answers on the left, compact one-row composer controls, previous-recording drawer, rename flow, and an inline “How Bluey should answer” textbox.
 
 This is not a full upstream-token streaming proxy yet. The server deliberately preserves the existing safe billing/idempotency lifecycle, then streams the metered terminal response as SSE deltas plus a final billing event. That gives the UI and managed client the streaming contract without reopening double-charge or unmetered-fallback risks.
 
@@ -46,6 +47,23 @@ This is not a full upstream-token streaming proxy yet. The server deliberately p
 - `native/macos/cue-overlay/Sources/cue-overlay/main.swift`
   - The macOS overlay renders final answer cost/usage labels in the status slot instead of the old permanent "cost syncing" text.
 
+### Native overlay conversation UX
+
+- `crates/cue-core/src/overlay.rs`
+  - Added `OverlaySessionItem`, `SetSessions`, `SessionOpenRequested`, and `SessionRenameRequested`.
+- `crates/cue-daemon/src/storage.rs`
+  - Added meeting-history lookup and rename helpers so the overlay can continue or rename prior recordings.
+- `crates/cue-daemon/src/app.rs`
+  - Pushes recent recordings to the overlay on ready/session changes.
+  - Handles open-session and rename-session overlay events.
+  - Allows token-validated inline answer-instruction saves without opening a separate modal.
+- `native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+  - Reduced expanded panel size to `590x510` and tightened header/composer controls.
+  - Shows right-aligned user/question/transcript bubbles and left-aligned Bluey answers.
+  - Adds a real recordings drawer with clickable rows and per-row rename buttons.
+  - Adds inline “How Bluey should answer” textbox and save button.
+  - Keeps attachments horizontally scrollable above the compact composer row.
+
 ## 3. What Was Already Present And Verified
 
 - Live wallet balance in overlay/dashboard from the prior Codex pass.
@@ -57,6 +75,7 @@ This is not a full upstream-token streaming proxy yet. The server deliberately p
 
 - True upstream-token streaming inside `bluey-server`: current stream endpoint streams after the safe managed completion finishes. To make it truly token-live, Stage 19 should add upstream streaming dispatch with usage accounting/trailer handling and mid-stream balance checks.
 - Native overlay direct-provider cost is still estimated from token usage/latency; exact dollar labels are only available when managed billing metadata exists.
+- Overlay visual QA still needs one real desktop click-through pass after rebuilding/installing the macOS helper, because headless tests cannot validate final pixel feel.
 - Onboarding web pages on `bluey.sh` remain pending.
 - SMTP production smoke still needs real credentials.
 - Wiremock harness for Stripe/OpenAI/Anthropic/Deepgram remains pending.
@@ -88,12 +107,15 @@ cd server && cargo clippy --all-targets -- -D warnings
 cd server && cargo build --all-targets --release
 swift build -c release --package-path native/macos/cue-whisper
 git -P diff --check main..HEAD
+cargo clippy -p cue-core -p cue-daemon --all-targets -- -D warnings
+swift build -c release --package-path native/macos/cue-overlay
 ```
 
 Observed counts:
 
-- workspace `cargo test --all-targets`: 417 passed, 14 ignored.
+- workspace `cargo test --all-targets`: 418 passed, 14 ignored.
 - `cue-daemon`: 167 library tests passed, 2 ignored, plus integration suites passed.
+- `overlay_production_path`: 24 passed after updating the inline-instructions contract.
 - `cue-llm`: 36 passed.
 - `cue-router`: 31 passed.
 - `cue-cloud-client`: 6 passed.
@@ -113,15 +135,18 @@ Review this batch first:
    - `crates/cue-dashboard/src/commands.rs`
    - `crates/cue-dashboard/ui/src/routes/Responses.tsx`
    - `crates/cue-daemon/src/db/mod.rs`
+   - `crates/cue-daemon/src/storage.rs`
+   - `crates/cue-core/src/overlay.rs`
    - `native/macos/cue-overlay/Sources/cue-overlay/main.swift`
 
 Recommended next implementation round:
 
 ```text
-Stage 19:
+Next:
 1. Replace synthetic managed SSE with true upstream streaming in bluey-server.
 2. Add mid-stream balance checks / balance_exhausted SSE event.
 3. Add wiremock integration tests for OpenAI/Anthropic streaming usage trailers.
 4. Add bluey.sh onboarding/account pages.
 5. Add deployment backup rotation + clean operational smoke.
+6. Rebuild/install the macOS overlay helper and do one visual QA pass on `bluey on`.
 ```

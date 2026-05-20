@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use cue_core::app_paths::AppPaths;
@@ -105,5 +105,72 @@ impl MeetingStore {
 
         meetings.sort_by(|left, right| right.started_at.cmp(&left.started_at));
         Ok(meetings)
+    }
+
+    pub fn load_by_id(&self, id: uuid::Uuid) -> Result<Option<MeetingRecord>> {
+        if let Some(active) = self.load_active()? {
+            if active.id == id {
+                return Ok(Some(active));
+            }
+        }
+
+        let Some(path) = self.archive_path_for(id)? else {
+            return Ok(None);
+        };
+        self.read_meeting(&path).map(Some)
+    }
+
+    pub fn rename(&self, id: uuid::Uuid, title: &str) -> Result<MeetingRecord> {
+        let title = title.trim();
+        if title.is_empty() {
+            anyhow::bail!("meeting title cannot be empty");
+        }
+
+        if let Some(mut active) = self.load_active()? {
+            if active.id == id {
+                active.title = title.to_string();
+                self.save_active(&active)?;
+                return Ok(active);
+            }
+        }
+
+        let path = self
+            .archive_path_for(id)?
+            .with_context(|| format!("meeting {id} not found"))?;
+        let mut meeting = self.read_meeting(&path)?;
+        meeting.title = title.to_string();
+        let bytes = serde_json::to_vec_pretty(&meeting)?;
+        fs::write(&path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
+        Ok(meeting)
+    }
+
+    fn archive_path_for(&self, id: uuid::Uuid) -> Result<Option<PathBuf>> {
+        if !self.archive_dir.exists() {
+            return Ok(None);
+        }
+
+        for entry in fs::read_dir(&self.archive_dir)
+            .with_context(|| format!("failed to read {}", self.archive_dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            if path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.ends_with(&id.to_string()))
+            {
+                return Ok(Some(path));
+            }
+        }
+        Ok(None)
+    }
+
+    fn read_meeting(&self, path: &Path) -> Result<MeetingRecord> {
+        let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+        serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to parse {}", path.display()))
     }
 }

@@ -27,6 +27,15 @@ pub struct OverlayContextItem {
     pub path: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OverlaySessionItem {
+    pub id: uuid::Uuid,
+    pub title: String,
+    pub subtitle: String,
+    #[serde(default)]
+    pub is_active: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OverlayCommand {
@@ -50,6 +59,9 @@ pub enum OverlayCommand {
     },
     SetContextItems {
         items: Vec<OverlayContextItem>,
+    },
+    SetSessions {
+        sessions: Vec<OverlaySessionItem>,
     },
     PushCard {
         card: CueCard,
@@ -91,6 +103,13 @@ pub enum OverlayEvent {
     InstructionsRequested,
     InstructionsUpdated {
         text: String,
+    },
+    SessionOpenRequested {
+        id: uuid::Uuid,
+    },
+    SessionRenameRequested {
+        id: uuid::Uuid,
+        title: String,
     },
     SessionContinueRequested,
     SessionNewRequested,
@@ -142,6 +161,25 @@ mod tests {
         assert_eq!(
             json,
             r#"{"type":"set_context_items","items":[{"id":"00000000-0000-0000-0000-000000000000","title":"GenAI Engineer JD.pdf","kind":"document","path":"/tmp/GenAI Engineer JD.pdf"}]}"#
+        );
+    }
+
+    #[test]
+    fn set_sessions_serializes_as_overlay_command() {
+        let id = uuid::Uuid::nil();
+        let json = serde_json::to_string(&OverlayCommand::SetSessions {
+            sessions: vec![OverlaySessionItem {
+                id,
+                title: "System design prep".to_string(),
+                subtitle: "3 transcripts · 2 files".to_string(),
+                is_active: true,
+            }],
+        })
+        .expect("serialize overlay sessions command");
+
+        assert_eq!(
+            json,
+            r#"{"type":"set_sessions","sessions":[{"id":"00000000-0000-0000-0000-000000000000","title":"System design prep","subtitle":"3 transcripts · 2 files","is_active":true}]}"#
         );
     }
 }

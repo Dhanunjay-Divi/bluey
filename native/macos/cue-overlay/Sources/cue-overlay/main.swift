@@ -84,6 +84,13 @@ private struct OverlayContextItem {
     let path: String?
 }
 
+private struct OverlaySessionItem {
+    let id: String
+    let title: String
+    let subtitle: String
+    let isActive: Bool
+}
+
 /// Inbound commands from the daemon.
 private enum OverlayCommand {
     case ping
@@ -96,6 +103,7 @@ private enum OverlayCommand {
     case setPosition(String)
     case setBalance(String)
     case setContextItems([OverlayContextItem])
+    case setSessions([OverlaySessionItem])
     case pushCard(CueCard)
     case updateCard(id: String, body: String, done: Bool, costLabel: String?)
     case shutdown
@@ -140,6 +148,17 @@ private func parseCommand(_ line: String) -> OverlayCommand {
             )
         }
         return .setContextItems(items)
+    case "set_sessions":
+        let rawSessions = obj["sessions"] as? [[String: Any]] ?? []
+        let sessions = rawSessions.map { item in
+            OverlaySessionItem(
+                id: item["id"] as? String ?? "",
+                title: item["title"] as? String ?? "Bluey session",
+                subtitle: item["subtitle"] as? String ?? "",
+                isActive: item["is_active"] as? Bool ?? false
+            )
+        }.filter { !$0.id.isEmpty }
+        return .setSessions(sessions)
     case "push_card":
         guard let cardObj = obj["card"] as? [String: Any],
               let cardData = try? JSONSerialization.data(withJSONObject: cardObj),
@@ -200,6 +219,14 @@ private func emitAttachFiles(paths: [String]) {
 
 private func emitInstructions(text: String) {
     emitEvent(["type": "instructions_updated", "text": text])
+}
+
+private func emitSessionOpen(id: String) {
+    emitEvent(["type": "session_open_requested", "id": id])
+}
+
+private func emitSessionRename(id: String, title: String) {
+    emitEvent(["type": "session_rename_requested", "id": id, "title": title])
 }
 
 private func emitCardRendered(id: String) {
@@ -633,6 +660,11 @@ private final class ExpandedPanelView: NSView {
     let drawerTitleLabel: NSTextField
     let drawerSubtitleLabel: NSTextField
     let latestSessionButton: NSButton
+    let sessionScroll: NSScrollView
+    let sessionStack: NSStackView
+    let answerStyleLabel: NSTextField
+    let answerStyleBox: NSTextField
+    let answerStyleSaveButton: NSButton
     let transcriptStrip: NSView
     let transcriptLabel: NSTextField
     let attachmentStrip: NSScrollView
@@ -649,6 +681,7 @@ private final class ExpandedPanelView: NSView {
     var onClose: (() -> Void)?
     private var recordingActive = false
     private var transcriptSnippets: [String] = []
+    private var sessionItems: [OverlaySessionItem] = []
 
     override init(frame frameRect: NSRect) {
         feed = FeedView(frame: .zero)
@@ -660,9 +693,14 @@ private final class ExpandedPanelView: NSView {
         navButton = NSButton(title: "", target: nil, action: nil)
         newSessionButton = NSButton(title: "", target: nil, action: nil)
         sessionDrawer = NSView()
-        drawerTitleLabel = NSTextField(labelWithString: "Chats")
-        drawerSubtitleLabel = NSTextField(labelWithString: "Saved recordings stay here.")
-        latestSessionButton = NSButton(title: "Latest recording", target: nil, action: nil)
+        drawerTitleLabel = NSTextField(labelWithString: "Recordings")
+        drawerSubtitleLabel = NSTextField(labelWithString: "Click to continue. Pencil to rename.")
+        latestSessionButton = NSButton(title: "Continue latest", target: nil, action: nil)
+        sessionScroll = NSScrollView()
+        sessionStack = NSStackView()
+        answerStyleLabel = NSTextField(labelWithString: "How Bluey should answer")
+        answerStyleBox = NSTextField()
+        answerStyleSaveButton = NSButton(title: "Save", target: nil, action: nil)
         transcriptStrip = NSView()
         transcriptLabel = NSTextField(labelWithString: "Transcript will appear here while you listen")
         attachmentStrip = NSScrollView()
@@ -703,6 +741,11 @@ private final class ExpandedPanelView: NSView {
             drawerTitleLabel,
             drawerSubtitleLabel,
             latestSessionButton,
+            sessionScroll,
+            sessionStack,
+            answerStyleLabel,
+            answerStyleBox,
+            answerStyleSaveButton,
             feed,
             transcriptStrip,
             transcriptLabel,
@@ -731,6 +774,10 @@ private final class ExpandedPanelView: NSView {
         sessionDrawer.addSubview(drawerTitleLabel)
         sessionDrawer.addSubview(drawerSubtitleLabel)
         sessionDrawer.addSubview(latestSessionButton)
+        sessionDrawer.addSubview(sessionScroll)
+        sessionDrawer.addSubview(answerStyleLabel)
+        sessionDrawer.addSubview(answerStyleBox)
+        sessionDrawer.addSubview(answerStyleSaveButton)
         addSubview(transcriptStrip)
         transcriptStrip.addSubview(transcriptLabel)
         addSubview(attachmentStrip)
@@ -746,32 +793,32 @@ private final class ExpandedPanelView: NSView {
             headerBar.topAnchor.constraint(equalTo: topAnchor, constant: 10),
             headerBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             headerBar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            headerBar.heightAnchor.constraint(equalToConstant: 40),
+            headerBar.heightAnchor.constraint(equalToConstant: 36),
 
             navButton.leadingAnchor.constraint(equalTo: headerBar.leadingAnchor, constant: 8),
             navButton.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
-            navButton.widthAnchor.constraint(equalToConstant: 32),
-            navButton.heightAnchor.constraint(equalToConstant: 32),
+            navButton.widthAnchor.constraint(equalToConstant: 30),
+            navButton.heightAnchor.constraint(equalToConstant: 30),
 
             newSessionButton.leadingAnchor.constraint(equalTo: navButton.trailingAnchor, constant: 6),
             newSessionButton.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
-            newSessionButton.widthAnchor.constraint(equalToConstant: 32),
-            newSessionButton.heightAnchor.constraint(equalToConstant: 32),
+            newSessionButton.widthAnchor.constraint(equalToConstant: 30),
+            newSessionButton.heightAnchor.constraint(equalToConstant: 30),
 
             modelMenu.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
             modelMenu.leadingAnchor.constraint(equalTo: newSessionButton.trailingAnchor, constant: 14),
-            modelMenu.widthAnchor.constraint(equalToConstant: 164),
-            modelMenu.heightAnchor.constraint(equalToConstant: 32),
+            modelMenu.widthAnchor.constraint(equalToConstant: 150),
+            modelMenu.heightAnchor.constraint(equalToConstant: 30),
 
             closeButton.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
             closeButton.trailingAnchor.constraint(equalTo: headerBar.trailingAnchor, constant: -8),
-            closeButton.widthAnchor.constraint(equalToConstant: 28),
-            closeButton.heightAnchor.constraint(equalToConstant: 28),
+            closeButton.widthAnchor.constraint(equalToConstant: 26),
+            closeButton.heightAnchor.constraint(equalToConstant: 26),
 
             balanceLabel.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
             balanceLabel.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -8),
-            balanceLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 92),
-            balanceLabel.heightAnchor.constraint(equalToConstant: 28),
+            balanceLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 86),
+            balanceLabel.heightAnchor.constraint(equalToConstant: 26),
             modelMenu.trailingAnchor.constraint(lessThanOrEqualTo: balanceLabel.leadingAnchor, constant: -10),
 
             feed.topAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: 8),
@@ -795,7 +842,32 @@ private final class ExpandedPanelView: NSView {
             latestSessionButton.topAnchor.constraint(equalTo: drawerSubtitleLabel.bottomAnchor, constant: 16),
             latestSessionButton.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 12),
             latestSessionButton.trailingAnchor.constraint(equalTo: sessionDrawer.trailingAnchor, constant: -12),
-            latestSessionButton.heightAnchor.constraint(equalToConstant: 34),
+            latestSessionButton.heightAnchor.constraint(equalToConstant: 32),
+
+            sessionScroll.topAnchor.constraint(equalTo: latestSessionButton.bottomAnchor, constant: 10),
+            sessionScroll.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 8),
+            sessionScroll.trailingAnchor.constraint(equalTo: sessionDrawer.trailingAnchor, constant: -8),
+            sessionScroll.bottomAnchor.constraint(equalTo: answerStyleLabel.topAnchor, constant: -12),
+
+            sessionStack.leadingAnchor.constraint(equalTo: sessionScroll.contentView.leadingAnchor),
+            sessionStack.topAnchor.constraint(equalTo: sessionScroll.contentView.topAnchor),
+            sessionStack.trailingAnchor.constraint(equalTo: sessionScroll.contentView.trailingAnchor),
+            sessionStack.bottomAnchor.constraint(lessThanOrEqualTo: sessionScroll.contentView.bottomAnchor),
+            sessionStack.widthAnchor.constraint(equalTo: sessionScroll.widthAnchor),
+
+            answerStyleLabel.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 12),
+            answerStyleLabel.trailingAnchor.constraint(equalTo: sessionDrawer.trailingAnchor, constant: -12),
+            answerStyleLabel.bottomAnchor.constraint(equalTo: answerStyleBox.topAnchor, constant: -6),
+
+            answerStyleBox.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 12),
+            answerStyleBox.trailingAnchor.constraint(equalTo: sessionDrawer.trailingAnchor, constant: -12),
+            answerStyleBox.bottomAnchor.constraint(equalTo: answerStyleSaveButton.topAnchor, constant: -8),
+            answerStyleBox.heightAnchor.constraint(equalToConstant: 46),
+
+            answerStyleSaveButton.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 12),
+            answerStyleSaveButton.trailingAnchor.constraint(equalTo: sessionDrawer.trailingAnchor, constant: -12),
+            answerStyleSaveButton.bottomAnchor.constraint(equalTo: sessionDrawer.bottomAnchor, constant: -12),
+            answerStyleSaveButton.heightAnchor.constraint(equalToConstant: 30),
 
             transcriptStrip.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             transcriptStrip.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
@@ -819,37 +891,37 @@ private final class ExpandedPanelView: NSView {
             composerBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             composerBar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             composerBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
-            composerBar.heightAnchor.constraint(equalToConstant: 52),
+            composerBar.heightAnchor.constraint(equalToConstant: 48),
 
             recordingButton.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 8),
             recordingButton.centerYAnchor.constraint(equalTo: composerBar.centerYAnchor),
-            recordingButton.widthAnchor.constraint(equalToConstant: 82),
-            recordingButton.heightAnchor.constraint(equalToConstant: 36),
+            recordingButton.widthAnchor.constraint(equalToConstant: 76),
+            recordingButton.heightAnchor.constraint(equalToConstant: 32),
 
             askButton.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -8),
             askButton.centerYAnchor.constraint(equalTo: composerBar.centerYAnchor),
-            askButton.widthAnchor.constraint(equalToConstant: 36),
-            askButton.heightAnchor.constraint(equalToConstant: 36),
+            askButton.widthAnchor.constraint(equalToConstant: 32),
+            askButton.heightAnchor.constraint(equalToConstant: 32),
 
             analyzeButton.trailingAnchor.constraint(equalTo: askButton.leadingAnchor, constant: -7),
             analyzeButton.centerYAnchor.constraint(equalTo: composerBar.centerYAnchor),
-            analyzeButton.widthAnchor.constraint(equalToConstant: 36),
-            analyzeButton.heightAnchor.constraint(equalToConstant: 36),
+            analyzeButton.widthAnchor.constraint(equalToConstant: 32),
+            analyzeButton.heightAnchor.constraint(equalToConstant: 32),
 
             attachButton.trailingAnchor.constraint(equalTo: analyzeButton.leadingAnchor, constant: -7),
             attachButton.centerYAnchor.constraint(equalTo: composerBar.centerYAnchor),
-            attachButton.widthAnchor.constraint(equalToConstant: 36),
-            attachButton.heightAnchor.constraint(equalToConstant: 36),
+            attachButton.widthAnchor.constraint(equalToConstant: 32),
+            attachButton.heightAnchor.constraint(equalToConstant: 32),
 
             instructionsButton.trailingAnchor.constraint(equalTo: attachButton.leadingAnchor, constant: -7),
             instructionsButton.centerYAnchor.constraint(equalTo: composerBar.centerYAnchor),
-            instructionsButton.widthAnchor.constraint(equalToConstant: 36),
-            instructionsButton.heightAnchor.constraint(equalToConstant: 36),
+            instructionsButton.widthAnchor.constraint(equalToConstant: 32),
+            instructionsButton.heightAnchor.constraint(equalToConstant: 32),
 
             composer.leadingAnchor.constraint(equalTo: recordingButton.trailingAnchor, constant: 10),
             composer.trailingAnchor.constraint(equalTo: instructionsButton.leadingAnchor, constant: -10),
             composer.centerYAnchor.constraint(equalTo: composerBar.centerYAnchor),
-            composer.heightAnchor.constraint(equalToConstant: 34),
+            composer.heightAnchor.constraint(equalToConstant: 32),
         ])
 
         navButton.target = self
@@ -858,6 +930,8 @@ private final class ExpandedPanelView: NSView {
         newSessionButton.action = #selector(newSessionClicked)
         latestSessionButton.target = self
         latestSessionButton.action = #selector(continueSessionClicked)
+        answerStyleSaveButton.target = self
+        answerStyleSaveButton.action = #selector(saveAnswerStyleClicked)
         closeButton.target = self
         closeButton.action = #selector(closeClicked)
         recordingButton.target = self
@@ -876,6 +950,7 @@ private final class ExpandedPanelView: NSView {
         styleHeaderIconButton(newSessionButton, symbol: "square.and.pencil", fallback: "+")
         styleDrawer()
         styleControlButton(latestSessionButton, symbol: "clock.arrow.circlepath", accent: false)
+        styleControlButton(answerStyleSaveButton, symbol: "checkmark", accent: true)
         styleControlButton(recordingButton, symbol: "waveform", accent: false)
         styleIconButton(instructionsButton, symbol: "text.badge.checkmark", fallback: "T")
         styleIconButton(attachButton, symbol: "paperclip", fallback: "+")
@@ -966,6 +1041,36 @@ private final class ExpandedPanelView: NSView {
         drawerSubtitleLabel.textColor = BlueyTheme.textDim
         drawerSubtitleLabel.lineBreakMode = .byWordWrapping
         drawerSubtitleLabel.maximumNumberOfLines = 2
+
+        sessionStack.orientation = .vertical
+        sessionStack.alignment = .centerX
+        sessionStack.spacing = 6
+        sessionStack.edgeInsets = NSEdgeInsets(top: 2, left: 0, bottom: 2, right: 0)
+
+        sessionScroll.drawsBackground = false
+        sessionScroll.hasVerticalScroller = true
+        sessionScroll.hasHorizontalScroller = false
+        sessionScroll.autohidesScrollers = true
+        sessionScroll.borderType = .noBorder
+        sessionScroll.documentView = sessionStack
+        sessionScroll.scrollerStyle = .overlay
+
+        answerStyleLabel.font = NSFont.systemFont(ofSize: 10.5, weight: .bold)
+        answerStyleLabel.textColor = BlueyTheme.textDim
+        answerStyleBox.placeholderString = "Concise, structured, implementation-first..."
+        answerStyleBox.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        answerStyleBox.isBezeled = false
+        answerStyleBox.drawsBackground = false
+        answerStyleBox.focusRingType = .none
+        answerStyleBox.textColor = BlueyTheme.text
+        answerStyleBox.placeholderAttributedString = NSAttributedString(
+            string: "Concise, structured, implementation-first...",
+            attributes: [.foregroundColor: BlueyTheme.textDim.withAlphaComponent(0.78)])
+        answerStyleBox.wantsLayer = true
+        answerStyleBox.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.18).cgColor
+        answerStyleBox.layer?.cornerRadius = 10
+        answerStyleBox.layer?.borderWidth = 1
+        answerStyleBox.layer?.borderColor = BlueyTheme.hairline.cgColor
     }
 
     private func configureComposer() {
@@ -1089,6 +1194,12 @@ private final class ExpandedPanelView: NSView {
         emitSimple("session_continue_requested")
     }
 
+    @objc private func saveAnswerStyleClicked() {
+        let text = answerStyleBox.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        emitInstructions(text: text)
+        statusLabel.stringValue = text.isEmpty ? "Default style" : "Answer style saved"
+    }
+
     @objc private func recordingClicked() {
         if recordingActive {
             emitSimple("recording_stop_requested")
@@ -1124,7 +1235,8 @@ private final class ExpandedPanelView: NSView {
     }
 
     @objc private func instructionsClicked() {
-        emitSimple("instructions_requested")
+        sessionDrawer.isHidden = false
+        window?.makeFirstResponder(answerStyleBox)
     }
 
     func setBalanceLabel(_ label: String) {
@@ -1143,6 +1255,31 @@ private final class ExpandedPanelView: NSView {
 
         for item in items {
             attachmentStack.addArrangedSubview(makeAttachmentChip(item))
+        }
+    }
+
+    func setSessions(_ sessions: [OverlaySessionItem]) {
+        sessionItems = sessions
+        for view in sessionStack.arrangedSubviews {
+            sessionStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+
+        if sessions.isEmpty {
+            let empty = NSTextField(wrappingLabelWithString: "No saved recordings yet.")
+            empty.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+            empty.textColor = BlueyTheme.textDim
+            empty.alignment = .center
+            empty.translatesAutoresizingMaskIntoConstraints = false
+            sessionStack.addArrangedSubview(empty)
+            empty.widthAnchor.constraint(equalTo: sessionStack.widthAnchor, constant: -20).isActive = true
+            return
+        }
+
+        for session in sessions {
+            let row = makeSessionRow(session)
+            sessionStack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: sessionStack.widthAnchor, constant: -2).isActive = true
         }
     }
 
@@ -1220,6 +1357,110 @@ private final class ExpandedPanelView: NSView {
         return chip
     }
 
+    private func makeSessionRow(_ session: OverlaySessionItem) -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.wantsLayer = true
+        row.layer?.backgroundColor = session.isActive
+            ? BlueyTheme.cyanSoft.cgColor
+            : NSColor.white.withAlphaComponent(0.035).cgColor
+        row.layer?.cornerRadius = 12
+        row.layer?.borderWidth = 1
+        row.layer?.borderColor = session.isActive
+            ? BlueyTheme.cyan.withAlphaComponent(0.34).cgColor
+            : BlueyTheme.hairline.cgColor
+
+        let openButton = NSButton(title: "", target: self, action: #selector(sessionRowClicked(_:)))
+        openButton.translatesAutoresizingMaskIntoConstraints = false
+        openButton.isBordered = false
+        openButton.tag = sessionIndex(session.id)
+
+        let title = NSTextField(labelWithString: session.title)
+        title.translatesAutoresizingMaskIntoConstraints = false
+        title.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+        title.textColor = BlueyTheme.text
+        title.lineBreakMode = .byTruncatingTail
+
+        let subtitle = NSTextField(labelWithString: session.subtitle)
+        subtitle.translatesAutoresizingMaskIntoConstraints = false
+        subtitle.font = NSFont.systemFont(ofSize: 9.5, weight: .medium)
+        subtitle.textColor = BlueyTheme.textDim
+        subtitle.lineBreakMode = .byTruncatingTail
+
+        let rename = NSButton(title: "", target: self, action: #selector(renameSessionClicked(_:)))
+        rename.translatesAutoresizingMaskIntoConstraints = false
+        rename.isBordered = false
+        rename.tag = sessionIndex(session.id)
+        rename.contentTintColor = BlueyTheme.cyan
+        if let image = symbolImage("pencil") {
+            image.isTemplate = true
+            rename.image = image
+            rename.imagePosition = .imageOnly
+            rename.imageScaling = .scaleProportionallyDown
+        } else {
+            rename.title = "Edit"
+            rename.font = NSFont.systemFont(ofSize: 9, weight: .bold)
+        }
+
+        row.addSubview(openButton)
+        row.addSubview(title)
+        row.addSubview(subtitle)
+        row.addSubview(rename)
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 52),
+
+            openButton.topAnchor.constraint(equalTo: row.topAnchor),
+            openButton.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            openButton.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+            openButton.trailingAnchor.constraint(equalTo: rename.leadingAnchor),
+
+            title.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
+            title.topAnchor.constraint(equalTo: row.topAnchor, constant: 8),
+            title.trailingAnchor.constraint(equalTo: rename.leadingAnchor, constant: -6),
+
+            subtitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 2),
+            subtitle.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+
+            rename.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -6),
+            rename.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            rename.widthAnchor.constraint(equalToConstant: 28),
+            rename.heightAnchor.constraint(equalToConstant: 28),
+        ])
+        return row
+    }
+
+    private func sessionIndex(_ id: String) -> Int {
+        sessionItems.firstIndex(where: { $0.id == id }) ?? -1
+    }
+
+    @objc private func sessionRowClicked(_ sender: NSButton) {
+        guard sender.tag >= 0, sender.tag < sessionItems.count else { return }
+        let session = sessionItems[sender.tag]
+        sessionDrawer.isHidden = true
+        statusLabel.stringValue = session.title
+        emitSessionOpen(id: session.id)
+    }
+
+    @objc private func renameSessionClicked(_ sender: NSButton) {
+        guard sender.tag >= 0, sender.tag < sessionItems.count else { return }
+        let session = sessionItems[sender.tag]
+        let alert = NSAlert()
+        alert.messageText = "Rename recording"
+        alert.informativeText = "Give this Bluey session a useful name."
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 28))
+        field.stringValue = session.title
+        alert.accessoryView = field
+        if alert.runModal() == .alertFirstButtonReturn {
+            let title = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !title.isEmpty {
+                emitSessionRename(id: session.id, title: title)
+            }
+        }
+    }
+
     private func fileSymbol(for kind: String) -> String {
         switch kind {
         case "image", "diagram": return "photo"
@@ -1283,7 +1524,7 @@ private final class OverlayApp {
 
         // Expanded window: anchored under the pill, compact enough to feel
         // like a command layer instead of a dashboard window.
-        let expandedSize = NSSize(width: 620, height: 540)
+        let expandedSize = NSSize(width: 590, height: 510)
         let expandedOrigin = NSPoint(
             x: screen.midX - expandedSize.width / 2,
             y: pillOrigin.y - expandedSize.height - 8)
@@ -1364,6 +1605,8 @@ private final class OverlayApp {
             expandedView?.setBalanceLabel(label)
         case .setContextItems(let items):
             expandedView?.setContextItems(items)
+        case .setSessions(let sessions):
+            expandedView?.setSessions(sessions)
         case .pushCard(let card):
             expandedView?.feed.push(RenderedCard(
                 id: card.id, kind: card.kind, title: card.title,

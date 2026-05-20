@@ -46,5 +46,7 @@ pub use meeting::{
     ActionItem, ContextArtifact, ContextKind, ContextProcessingStatus, ConversationTurn, Decision,
     MeetingRecap, MeetingRecord, MemoryHit, Speaker, TranscriptSegment,
 };
-pub use overlay::{OverlayCommand, OverlayContextItem, OverlayEvent, OverlayPosition};
+pub use overlay::{
+    OverlayCommand, OverlayContextItem, OverlayEvent, OverlayPosition, OverlaySessionItem,
+};
 pub use state::{DaemonState, MeetingState};

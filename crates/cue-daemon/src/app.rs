@@ -26,8 +26,8 @@ use cue_core::{
     AudioPipelineStatus, AudioSourceKind, CardKind, CloudEndpointConfig, CloudEnvironment,
     CloudSyncState, CloudSyncStatus, ContextArtifact, ContextKind, ContextProcessingStatus,
     ConversationTurn, CueCard, DaemonState, MeetingRecord, MeetingState, MemoryHit, OverlayCommand,
-    OverlayContextItem, OverlayEvent, PrivacyFlags, ProviderRoute, ProviderSelector,
-    ProviderStatus, RouteBudget, Speaker, TranscriptSegment,
+    OverlayContextItem, OverlayEvent, OverlaySessionItem, PrivacyFlags, ProviderRoute,
+    ProviderSelector, ProviderStatus, RouteBudget, Speaker, TranscriptSegment,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -1229,6 +1229,7 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             if let Some(meeting) = daemon.meeting.lock().await.clone() {
                 refresh_overlay_context_items(daemon, &meeting).await;
             }
+            refresh_overlay_sessions(daemon).await;
             let daemon_balance = Arc::clone(daemon);
             tokio::spawn(async move {
                 let _ = refresh_overlay_balance(&daemon_balance).await;
@@ -1293,6 +1294,12 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
                     .unwrap_or_else(|| "Bluey will use the default answer style.".to_string()),
             )
             .await;
+        }
+        OverlayEvent::SessionOpenRequested { id } => {
+            open_meeting_session(daemon, id).await?;
+        }
+        OverlayEvent::SessionRenameRequested { id, title } => {
+            rename_meeting_session(daemon, id, &title).await?;
         }
         OverlayEvent::SessionContinueRequested => {
             continue_session(daemon, "overlay session").await?;
@@ -2322,6 +2329,65 @@ async fn refresh_overlay_context_items(daemon: &Arc<Daemon>, meeting: &MeetingRe
     .await;
 }
 
+async fn refresh_overlay_sessions(daemon: &Arc<Daemon>) {
+    let active_id = daemon.meeting.lock().await.as_ref().map(|m| m.id);
+    match overlay_session_items(daemon, active_id) {
+        Ok(sessions) => {
+            let _ = send_overlay(daemon, OverlayCommand::SetSessions { sessions }).await;
+        }
+        Err(error) => {
+            debug!("overlay session list refresh skipped: {error:#}");
+        }
+    }
+}
+
+fn overlay_session_items(
+    daemon: &Arc<Daemon>,
+    active_id: Option<uuid::Uuid>,
+) -> Result<Vec<OverlaySessionItem>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut items = Vec::new();
+    for meeting in daemon.store.all_meetings()? {
+        if !seen.insert(meeting.id) {
+            continue;
+        }
+        let mut bits = Vec::new();
+        if Some(meeting.id) == active_id || meeting.ended_at.is_none() {
+            bits.push("active".to_string());
+        }
+        bits.push(format!("{} transcript", meeting.transcript.len()));
+        if !meeting.context.is_empty() {
+            bits.push(format!(
+                "{} file{}",
+                meeting.context.len(),
+                plural_s(meeting.context.len())
+            ));
+        }
+        if !meeting.conversation.is_empty() {
+            bits.push(format!(
+                "{} answer{}",
+                meeting.conversation.len(),
+                plural_s(meeting.conversation.len())
+            ));
+        }
+        items.push(OverlaySessionItem {
+            id: meeting.id,
+            title: meeting.title,
+            subtitle: bits.join(" · "),
+            is_active: Some(meeting.id) == active_id,
+        });
+    }
+    Ok(items.into_iter().take(8).collect())
+}
+
+fn plural_s(count: usize) -> &'static str {
+    if count == 1 {
+        ""
+    } else {
+        "s"
+    }
+}
+
 fn overlay_context_items(meeting: &MeetingRecord) -> Vec<OverlayContextItem> {
     meeting
         .context
@@ -2863,6 +2929,7 @@ async fn handle_attach_paths(daemon: &Arc<Daemon>, paths: Vec<PathBuf>) -> Resul
     let meeting_snapshot = attach_context_artifacts(daemon, attached.clone()).await?;
     update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
     refresh_overlay_context_items(daemon, &meeting_snapshot).await;
+    refresh_overlay_sessions(daemon).await;
     push_system_card(
         daemon,
         CardKind::Context,
@@ -4698,9 +4765,85 @@ async fn continue_session(
 
     update_state_from_meeting(daemon, Some(&meeting)).await?;
     refresh_overlay_context_items(daemon, &meeting).await;
+    refresh_overlay_sessions(daemon).await;
     push_system_card(daemon, CardKind::System, title, body).await;
     write_state(daemon).await?;
     Ok(meeting)
+}
+
+async fn open_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<MeetingRecord> {
+    let selected = daemon
+        .store
+        .load_by_id(id)?
+        .with_context(|| format!("session {id} not found"))?;
+
+    let archived_summary = {
+        let mut meeting_guard = daemon.meeting.lock().await;
+        if let Some(mut current) = meeting_guard.take().filter(|current| current.id != id) {
+            current.ended_at = Some(clock::now_epoch_ms_string());
+            let recap = generate_recap(&current);
+            current.summary = Some(recap.summary);
+            let title = current.title.clone();
+            let path = daemon.store.archive(&current)?;
+            Some(format!("{title} archived to {}.", path.display()))
+        } else {
+            None
+        }
+    };
+
+    let mut selected = selected;
+    selected.ended_at = None;
+    daemon.store.save_active(&selected)?;
+    {
+        let mut meeting_guard = daemon.meeting.lock().await;
+        *meeting_guard = Some(selected.clone());
+    }
+
+    update_state_from_meeting(daemon, Some(&selected)).await?;
+    refresh_overlay_context_items(daemon, &selected).await;
+    refresh_overlay_sessions(daemon).await;
+    push_system_card(
+        daemon,
+        CardKind::System,
+        "Session loaded",
+        format!(
+            "Continuing {}.\n{} transcript segment(s), {} context item(s).{}",
+            selected.title,
+            selected.transcript.len(),
+            selected.context.len(),
+            archived_summary
+                .map(|summary| format!("\n{summary}"))
+                .unwrap_or_default()
+        ),
+    )
+    .await;
+    write_state(daemon).await?;
+    Ok(selected)
+}
+
+async fn rename_meeting_session(
+    daemon: &Arc<Daemon>,
+    id: uuid::Uuid,
+    title: &str,
+) -> Result<MeetingRecord> {
+    let renamed = daemon.store.rename(id, title)?;
+    {
+        let mut meeting_guard = daemon.meeting.lock().await;
+        if let Some(active) = meeting_guard.as_mut().filter(|active| active.id == id) {
+            active.title = renamed.title.clone();
+            daemon.store.save_active(active)?;
+        }
+    }
+    refresh_overlay_sessions(daemon).await;
+    push_system_card(
+        daemon,
+        CardKind::System,
+        "Session renamed",
+        format!("Now called {}.", renamed.title),
+    )
+    .await;
+    write_state(daemon).await?;
+    Ok(renamed)
 }
 
 async fn start_new_session(
@@ -4732,6 +4875,7 @@ async fn start_new_session(
 
     update_state_from_meeting(daemon, Some(&meeting)).await?;
     refresh_overlay_context_items(daemon, &meeting).await;
+    refresh_overlay_sessions(daemon).await;
     push_system_card(
         daemon,
         CardKind::System,
@@ -5366,6 +5510,15 @@ pub fn validate_and_decode_overlay_line(
             });
         }
     }
+    if let Some(s) = obj.get("title").and_then(|v| v.as_str()) {
+        if s.len() > OVERLAY_MAX_QUESTION {
+            return Err(OverlayLineReject::FieldTooLong {
+                field: "title",
+                len: s.len(),
+                max: OVERLAY_MAX_QUESTION,
+            });
+        }
+    }
     if let Some(s) = obj.get("instructions").and_then(|v| v.as_str()) {
         if s.len() > OVERLAY_MAX_INSTRUCTIONS {
             return Err(OverlayLineReject::FieldTooLong {
@@ -5427,9 +5580,10 @@ pub fn validate_and_decode_overlay_line(
         // AttachFilesRequested is the inner submit from the attach picker;
         // it makes sense only while the attach panel is open.
         OverlayEvent::AttachFilesRequested { .. } => current_state == S::AttachOpen,
-        // InstructionsUpdated is the inner submit from the instructions form;
-        // only valid while the instructions panel is open.
-        OverlayEvent::InstructionsUpdated { .. } => current_state == S::InstructionsOpen,
+        // InstructionsUpdated may come from the inline native overlay textbox.
+        // Token validation and length caps still apply; no separate modal state
+        // is required for this product flow.
+        OverlayEvent::InstructionsUpdated { .. } => true,
         // All other events allowed in any state.
         _ => true,
     };

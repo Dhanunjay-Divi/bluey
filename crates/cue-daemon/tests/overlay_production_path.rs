@@ -189,14 +189,14 @@ fn attach_files_requested_accepted_when_attach_open() {
 }
 
 #[test]
-fn instructions_updated_dropped_when_idle() {
+fn instructions_updated_accepted_when_idle_for_inline_overlay_textbox() {
     let state = idle_state();
     // legacy InstructionsUpdated uses `text` field
     let line = format!(r#"{{"type":"instructions_updated","text":"hi","token":"{TOK}"}}"#);
     let result = validate_line(&line, TOK, state.as_ref());
     assert!(
-        matches!(result, Err(OverlayLineReject::StateNotAllowed { .. })),
-        "InstructionsUpdated must be dropped in Idle state, got {result:?}"
+        result.is_ok(),
+        "InstructionsUpdated must be accepted in Idle for the inline overlay textbox, got {result:?}"
     );
 }
 
@@ -370,28 +370,22 @@ fn handler_transition_back_to_idle_blocks_late_attach_files() {
 }
 
 #[test]
-fn instructions_handler_round_trip_idle_to_open_to_idle() {
+fn instructions_inline_textbox_is_accepted_across_state_round_trips() {
     let daemon_state = Arc::new(Mutex::new(OverlayUiState::Idle));
     let reader_state = daemon_state.clone();
 
     let upd_line = format!(r#"{{"type":"instructions_updated","text":"x","token":"{TOK}"}}"#);
 
-    // Idle: rejected.
-    assert!(matches!(
-        validate_line(&upd_line, TOK, reader_state.as_ref()),
-        Err(OverlayLineReject::StateNotAllowed { .. })
-    ));
+    // Idle: accepted by the inline native overlay textbox.
+    assert!(validate_line(&upd_line, TOK, reader_state.as_ref()).is_ok());
 
     // Open: accepted.
     *daemon_state.lock() = OverlayUiState::InstructionsOpen;
     assert!(validate_line(&upd_line, TOK, reader_state.as_ref()).is_ok());
 
-    // Back to Idle: rejected again.
+    // Back to Idle: still accepted. Token and length validation remain the gate.
     *daemon_state.lock() = OverlayUiState::Idle;
-    assert!(matches!(
-        validate_line(&upd_line, TOK, reader_state.as_ref()),
-        Err(OverlayLineReject::StateNotAllowed { .. })
-    ));
+    assert!(validate_line(&upd_line, TOK, reader_state.as_ref()).is_ok());
 }
 
 #[test]
