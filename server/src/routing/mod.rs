@@ -2,4 +2,4 @@
 
 pub mod dispatcher;
 
-pub use dispatcher::{complete, resolve_route, Completion};
+pub use dispatcher::{complete, embed, resolve_route, Completion, EmbedCompletion};

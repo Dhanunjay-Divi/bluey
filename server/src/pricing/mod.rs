@@ -70,6 +70,14 @@ pub const PRICING: &[ModelPricing] = &[
         upstream_out_microcents_per_1m: 0,
         markup_percent: 0,
     },
+    ModelPricing {
+        // OpenAI text-embedding-3-small: $0.02/1M input. No output token cost.
+        provider: "openai",
+        model: "text-embedding-3-small",
+        upstream_in_microcents_per_1m: 200_000,
+        upstream_out_microcents_per_1m: 0,
+        markup_percent: 200,
+    },
 ];
 
 pub fn lookup(provider: &str, model: &str) -> Option<&'static ModelPricing> {

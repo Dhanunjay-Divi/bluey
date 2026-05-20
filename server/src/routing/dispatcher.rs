@@ -276,6 +276,85 @@ async fn anthropic_complete(
     })
 }
 
+/// Codex Stage 12: OpenAI embeddings via /v1/embeddings.
+pub async fn embed(
+    keys: &UpstreamKeys,
+    provider: &str,
+    model: &str,
+    input: &str,
+) -> Result<EmbedCompletion> {
+    match provider {
+        "openai" => openai_embed(keys, model, input).await,
+        other => Err(anyhow!(
+            "unsupported embedding provider for managed dispatch: {other}"
+        )),
+    }
+}
+
+/// One embedding response. `vector` is float32, length depends on model
+/// (text-embedding-3-small returns 1536-dim by default).
+#[derive(Debug, Clone)]
+pub struct EmbedCompletion {
+    pub vector: Vec<f32>,
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: i64,
+}
+
+#[derive(serde::Serialize)]
+struct OpenAiEmbedReq<'a> {
+    model: &'a str,
+    input: &'a str,
+}
+
+#[derive(Deserialize)]
+struct OpenAiEmbedResp {
+    data: Vec<OpenAiEmbedData>,
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiEmbedData {
+    embedding: Vec<f32>,
+}
+
+async fn openai_embed(keys: &UpstreamKeys, model: &str, input: &str) -> Result<EmbedCompletion> {
+    let key = keys
+        .openai_api_key
+        .as_ref()
+        .ok_or_else(|| anyhow!("OPENAI_API_KEY not configured on bluey-server"))?;
+    let req = OpenAiEmbedReq { model, input };
+    let resp = reqwest::Client::new()
+        .post("https://api.openai.com/v1/embeddings")
+        .bearer_auth(key)
+        .json(&req)
+        .send()
+        .await
+        .context("openai embed http")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("openai embed {status}: {body}"));
+    }
+    let parsed: OpenAiEmbedResp = resp.json().await.context("openai embed json")?;
+    let vector = parsed
+        .data
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("openai embed: no data returned"))?
+        .embedding;
+    let input_tokens = parsed
+        .usage
+        .map(|u| u.prompt_tokens)
+        .unwrap_or((input.len() as i64) / 4);
+    Ok(EmbedCompletion {
+        vector,
+        provider: "openai".to_string(),
+        model: model.to_string(),
+        input_tokens,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

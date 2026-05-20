@@ -359,8 +359,239 @@ pub async fn complete(
     Ok(Json(response))
 }
 
-pub async fn embed() -> StatusCode {
-    StatusCode::NOT_IMPLEMENTED
+#[derive(Deserialize)]
+pub struct EmbedRequest {
+    pub request_id: String,
+    pub input: String,
+    /// Optional model override. Defaults to text-embedding-3-small.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct EmbedResponse {
+    pub vector: Vec<f32>,
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: i64,
+    pub cost_cents: i64,
+    pub balance_cents_after: i64,
+}
+
+pub async fn embed(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Json(req): Json<EmbedRequest>,
+) -> Result<Json<EmbedResponse>, (StatusCode, Json<ApiError>)> {
+    if req.request_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "request_id is required and must be non-empty".into(),
+                reason: Some("missing_request_id".into()),
+                ..Default::default()
+            }),
+        ));
+    }
+
+    // Idempotency reservation (same scheme as /router/complete).
+    match idempotency::reserve(&state.pool, &account.id, &req.request_id).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("idempotency: {e}"),
+                ..Default::default()
+            }),
+        )
+    })? {
+        idempotency::ReserveOutcome::FreshReservation => { /* fall through */ }
+        idempotency::ReserveOutcome::CachedComplete(json) => {
+            let cached: EmbedResponse = serde_json::from_str(&json).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError {
+                        error: format!("idempotency cache decode: {e}"),
+                        ..Default::default()
+                    }),
+                )
+            })?;
+            return Ok(Json(cached));
+        }
+        idempotency::ReserveOutcome::InProgress => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: "request already in progress".into(),
+                    reason: Some("request_in_progress".into()),
+                    ..Default::default()
+                }),
+            ));
+        }
+        idempotency::ReserveOutcome::CachedFailed => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: "previous attempt failed; use a new request_id".into(),
+                    reason: Some("request_failed_terminal".into()),
+                    ..Default::default()
+                }),
+            ));
+        }
+    }
+
+    let provider = "openai";
+    let model = req.model.as_deref().unwrap_or("text-embedding-3-small");
+    let pricing_entry = pricing::lookup(provider, model).ok_or_else(|| {
+        let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("no pricing for {provider}/{model}"),
+                ..Default::default()
+            }),
+        )
+    })?;
+
+    // Entry check (skipped on trial).
+    let on_trial = account.trial_seconds_remaining > 0;
+    let est_in = (req.input.len() as i64) / 4;
+    let est_cost = pricing::estimate_cost_ceiling(pricing_entry, est_in, 0);
+    if !on_trial {
+        let can = balance::can_afford(&state.pool, &account.id, est_cost).map_err(|e| {
+            let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: format!("balance: {e}"),
+                    ..Default::default()
+                }),
+            )
+        })?;
+        if !can {
+            let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+            let bal = balance::current_balance(&state.pool, &account.id).unwrap_or(0);
+            return Err((
+                StatusCode::PAYMENT_REQUIRED,
+                Json(ApiError {
+                    error: "insufficient balance".into(),
+                    balance_cents: Some(bal),
+                    estimated_cost_cents: Some(est_cost),
+                    reason: Some("insufficient_balance".into()),
+                    reload_url: Some(format!("{}/reload", state.config.public_url)),
+                }),
+            ));
+        }
+    }
+
+    // Dispatch.
+    let result = routing::embed(&state.config.upstream, provider, model, &req.input).await;
+
+    let comp = match result {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                account_id = %account.id,
+                request_id = %req.request_id,
+                provider = %provider,
+                model = %model,
+                error = %e,
+                "embed dispatch failed"
+            );
+            let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError {
+                    error: "upstream embed error; please retry".into(),
+                    reason: Some("upstream_error".into()),
+                    ..Default::default()
+                }),
+            ));
+        }
+    };
+
+    // Cost (no output tokens for embeddings).
+    let (bluey_cost, customer_cost) = pricing::compute_cost(pricing_entry, comp.input_tokens, 0);
+
+    // Charge.
+    if !on_trial {
+        let ok = balance::deduct(&state.pool, &account.id, customer_cost).map_err(|e| {
+            let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: format!("deduct: {e}"),
+                    ..Default::default()
+                }),
+            )
+        })?;
+        if !ok {
+            tracing::warn!(
+                account_id = %account.id,
+                cost_cents = customer_cost,
+                "embed post-completion deduct failed; bluey absorbs overrun"
+            );
+        }
+    }
+
+    let balance_after = balance::current_balance(&state.pool, &account.id).unwrap_or(0);
+
+    // Auto top-up trigger (same as /router/complete).
+    if !on_trial {
+        crate::billing::topup::maybe_spawn(
+            state.pool.clone(),
+            state.config.clone(),
+            account.id.clone(),
+            balance_after,
+            account.auto_topup_enabled,
+            account.auto_topup_threshold_cents,
+            account.stripe_customer_id.clone(),
+            account.stripe_payment_method_id.clone(),
+            account.auto_topup_amount_cents,
+        );
+    }
+
+    // Usage event.
+    let event = UsageEvent {
+        request_id: req.request_id.clone(),
+        kind: "embed".into(),
+        task_type: None,
+        lane: None,
+        provider: Some(comp.provider.clone()),
+        model: Some(comp.model.clone()),
+        input_tokens: comp.input_tokens,
+        output_tokens: 0,
+        latency_ms: 0,
+        cost_cents_to_bluey: bluey_cost,
+        cost_cents_to_customer: customer_cost,
+        was_speculative: false,
+        was_fallback: false,
+    };
+    if let Err(e) = crate::db::usage::record(&state.pool, &account.id, &event) {
+        tracing::warn!(error = %e, "failed to record embed usage event");
+    }
+
+    let response = EmbedResponse {
+        vector: comp.vector,
+        provider: comp.provider,
+        model: comp.model,
+        input_tokens: comp.input_tokens,
+        cost_cents: customer_cost,
+        balance_cents_after: balance_after,
+    };
+
+    if let Ok(json) = serde_json::to_string(&response) {
+        if let Err(e) = idempotency::mark_complete(&state.pool, &account.id, &req.request_id, &json)
+        {
+            tracing::error!(
+                account_id = %account.id,
+                request_id = %req.request_id,
+                error = %e,
+                "embed mark_complete failed AFTER customer billed"
+            );
+        }
+    }
+
+    Ok(Json(response))
 }
 
 pub async fn transcribe() -> StatusCode {
