@@ -355,6 +355,108 @@ async fn openai_embed(keys: &UpstreamKeys, model: &str, input: &str) -> Result<E
     })
 }
 
+/// Codex Stage 12b: Deepgram transcription.
+pub async fn transcribe(
+    keys: &UpstreamKeys,
+    provider: &str,
+    model: &str,
+    audio_bytes: &[u8],
+    content_type: &str,
+) -> Result<TranscribeCompletion> {
+    match provider {
+        "deepgram" => deepgram_transcribe(keys, model, audio_bytes, content_type).await,
+        other => Err(anyhow!(
+            "unsupported transcribe provider for managed dispatch: {other}"
+        )),
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TranscribeCompletion {
+    pub text: String,
+    pub provider: String,
+    pub model: String,
+    /// Audio duration in seconds (used as "input tokens" for billing).
+    pub duration_seconds: i64,
+}
+
+#[derive(Deserialize)]
+struct DeepgramResp {
+    metadata: Option<DeepgramMetadata>,
+    results: DeepgramResults,
+}
+
+#[derive(Deserialize)]
+struct DeepgramMetadata {
+    duration: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct DeepgramResults {
+    channels: Vec<DeepgramChannel>,
+}
+
+#[derive(Deserialize)]
+struct DeepgramChannel {
+    alternatives: Vec<DeepgramAlternative>,
+}
+
+#[derive(Deserialize)]
+struct DeepgramAlternative {
+    transcript: String,
+}
+
+async fn deepgram_transcribe(
+    keys: &UpstreamKeys,
+    model: &str,
+    audio_bytes: &[u8],
+    content_type: &str,
+) -> Result<TranscribeCompletion> {
+    let key = keys
+        .deepgram_api_key
+        .as_ref()
+        .ok_or_else(|| anyhow!("DEEPGRAM_API_KEY not configured on bluey-server"))?;
+    // POST to /v1/listen?model=...&punctuate=true with the raw audio
+    // bytes as the body. Deepgram accepts audio/wav, audio/mpeg, etc.
+    let url = format!(
+        "https://api.deepgram.com/v1/listen?model={model}&punctuate=true&smart_format=true"
+    );
+    let resp = reqwest::Client::new()
+        .post(&url)
+        .header("Authorization", format!("Token {key}"))
+        .header("Content-Type", content_type)
+        .body(audio_bytes.to_vec())
+        .send()
+        .await
+        .context("deepgram transcribe http")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("deepgram {status}: {body}"));
+    }
+    let parsed: DeepgramResp = resp.json().await.context("deepgram json")?;
+    let text = parsed
+        .results
+        .channels
+        .into_iter()
+        .next()
+        .and_then(|c| c.alternatives.into_iter().next())
+        .map(|a| a.transcript)
+        .unwrap_or_default();
+    let duration_seconds = parsed
+        .metadata
+        .and_then(|m| m.duration)
+        .map(|d| d.ceil() as i64)
+        .unwrap_or(0)
+        .max(1); // bill minimum 1 second
+    Ok(TranscribeCompletion {
+        text,
+        provider: "deepgram".to_string(),
+        model: model.to_string(),
+        duration_seconds,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

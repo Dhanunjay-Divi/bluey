@@ -78,6 +78,20 @@ pub const PRICING: &[ModelPricing] = &[
         upstream_out_microcents_per_1m: 0,
         markup_percent: 200,
     },
+    ModelPricing {
+        // Deepgram nova-3: $0.0043/minute. Stored as microcents
+        // per 1M "tokens" where one token = one second of audio.
+        // 1 minute = 60 seconds; cost = $0.0043 = 43000 microcents.
+        // microcents per 1M seconds = 43000 * 1_000_000 / 60 ≈ 716_666_667.
+        // We use a simpler integer: store cost per 1M "tokens" so each
+        // billed second = 716.67 microcents (rounded to whole cents
+        // per request like every other lane).
+        provider: "deepgram",
+        model: "nova-3",
+        upstream_in_microcents_per_1m: 716_666_667,
+        upstream_out_microcents_per_1m: 0,
+        markup_percent: 150,
+    },
 ];
 
 pub fn lookup(provider: &str, model: &str) -> Option<&'static ModelPricing> {

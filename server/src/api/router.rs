@@ -594,6 +594,256 @@ pub async fn embed(
     Ok(Json(response))
 }
 
-pub async fn transcribe() -> StatusCode {
-    StatusCode::NOT_IMPLEMENTED
+#[derive(Deserialize)]
+pub struct TranscribeQuery {
+    pub request_id: String,
+    /// Optional Deepgram model override. Defaults to nova-3.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct TranscribeResponse {
+    pub text: String,
+    pub provider: String,
+    pub model: String,
+    pub duration_seconds: i64,
+    pub cost_cents: i64,
+    pub balance_cents_after: i64,
+}
+
+pub async fn transcribe(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    axum::extract::Query(q): axum::extract::Query<TranscribeQuery>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<TranscribeResponse>, (StatusCode, Json<ApiError>)> {
+    if q.request_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "request_id query param is required".into(),
+                reason: Some("missing_request_id".into()),
+                ..Default::default()
+            }),
+        ));
+    }
+    if body.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "audio body is empty".into(),
+                reason: Some("empty_audio".into()),
+                ..Default::default()
+            }),
+        ));
+    }
+
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("audio/wav")
+        .to_string();
+
+    match idempotency::reserve(&state.pool, &account.id, &q.request_id).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("idempotency: {e}"),
+                ..Default::default()
+            }),
+        )
+    })? {
+        idempotency::ReserveOutcome::FreshReservation => {}
+        idempotency::ReserveOutcome::CachedComplete(json) => {
+            let cached: TranscribeResponse = serde_json::from_str(&json).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError {
+                        error: format!("idempotency cache decode: {e}"),
+                        ..Default::default()
+                    }),
+                )
+            })?;
+            return Ok(Json(cached));
+        }
+        idempotency::ReserveOutcome::InProgress => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: "request already in progress".into(),
+                    reason: Some("request_in_progress".into()),
+                    ..Default::default()
+                }),
+            ));
+        }
+        idempotency::ReserveOutcome::CachedFailed => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: "previous attempt failed; use a new request_id".into(),
+                    reason: Some("request_failed_terminal".into()),
+                    ..Default::default()
+                }),
+            ));
+        }
+    }
+
+    let provider = "deepgram";
+    let model = q.model.as_deref().unwrap_or("nova-3");
+    let pricing_entry = pricing::lookup(provider, model).ok_or_else(|| {
+        let _ = idempotency::mark_failed(&state.pool, &account.id, &q.request_id);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("no pricing for {provider}/{model}"),
+                ..Default::default()
+            }),
+        )
+    })?;
+
+    let on_trial = account.trial_seconds_remaining > 0;
+    // Estimate ~1s per ~16KB of audio (rough). Real cost from upstream metadata.
+    let est_seconds = (body.len() as i64 / 16_000).max(1);
+    let est_cost = pricing::estimate_cost_ceiling(pricing_entry, est_seconds, 0);
+    if !on_trial {
+        let can = balance::can_afford(&state.pool, &account.id, est_cost).map_err(|e| {
+            let _ = idempotency::mark_failed(&state.pool, &account.id, &q.request_id);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: format!("balance: {e}"),
+                    ..Default::default()
+                }),
+            )
+        })?;
+        if !can {
+            let _ = idempotency::mark_failed(&state.pool, &account.id, &q.request_id);
+            let bal = balance::current_balance(&state.pool, &account.id).unwrap_or(0);
+            return Err((
+                StatusCode::PAYMENT_REQUIRED,
+                Json(ApiError {
+                    error: "insufficient balance".into(),
+                    balance_cents: Some(bal),
+                    estimated_cost_cents: Some(est_cost),
+                    reason: Some("insufficient_balance".into()),
+                    reload_url: Some(format!("{}/reload", state.config.public_url)),
+                }),
+            ));
+        }
+    }
+
+    let result = routing::transcribe(
+        &state.config.upstream,
+        provider,
+        model,
+        &body,
+        &content_type,
+    )
+    .await;
+
+    let comp = match result {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                account_id = %account.id,
+                request_id = %q.request_id,
+                provider = %provider,
+                model = %model,
+                error = %e,
+                "transcribe dispatch failed"
+            );
+            let _ = idempotency::release(&state.pool, &account.id, &q.request_id);
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError {
+                    error: "upstream transcribe error; please retry".into(),
+                    reason: Some("upstream_error".into()),
+                    ..Default::default()
+                }),
+            ));
+        }
+    };
+
+    // Cost billed against duration_seconds as input "tokens".
+    let (bluey_cost, customer_cost) =
+        pricing::compute_cost(pricing_entry, comp.duration_seconds, 0);
+
+    if !on_trial {
+        let ok = balance::deduct(&state.pool, &account.id, customer_cost).map_err(|e| {
+            let _ = idempotency::mark_failed(&state.pool, &account.id, &q.request_id);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: format!("deduct: {e}"),
+                    ..Default::default()
+                }),
+            )
+        })?;
+        if !ok {
+            tracing::warn!(
+                account_id = %account.id,
+                cost_cents = customer_cost,
+                "transcribe post-completion deduct failed; bluey absorbs overrun"
+            );
+        }
+    }
+
+    let balance_after = balance::current_balance(&state.pool, &account.id).unwrap_or(0);
+
+    if !on_trial {
+        crate::billing::topup::maybe_spawn(
+            state.pool.clone(),
+            state.config.clone(),
+            account.id.clone(),
+            balance_after,
+            account.auto_topup_enabled,
+            account.auto_topup_threshold_cents,
+            account.stripe_customer_id.clone(),
+            account.stripe_payment_method_id.clone(),
+            account.auto_topup_amount_cents,
+        );
+    }
+
+    let event = UsageEvent {
+        request_id: q.request_id.clone(),
+        kind: "stt".into(),
+        task_type: None,
+        lane: None,
+        provider: Some(comp.provider.clone()),
+        model: Some(comp.model.clone()),
+        input_tokens: comp.duration_seconds,
+        output_tokens: 0,
+        latency_ms: 0,
+        cost_cents_to_bluey: bluey_cost,
+        cost_cents_to_customer: customer_cost,
+        was_speculative: false,
+        was_fallback: false,
+    };
+    if let Err(e) = crate::db::usage::record(&state.pool, &account.id, &event) {
+        tracing::warn!(error = %e, "failed to record transcribe usage event");
+    }
+
+    let response = TranscribeResponse {
+        text: comp.text,
+        provider: comp.provider,
+        model: comp.model,
+        duration_seconds: comp.duration_seconds,
+        cost_cents: customer_cost,
+        balance_cents_after: balance_after,
+    };
+
+    if let Ok(json) = serde_json::to_string(&response) {
+        if let Err(e) = idempotency::mark_complete(&state.pool, &account.id, &q.request_id, &json) {
+            tracing::error!(
+                account_id = %account.id,
+                request_id = %q.request_id,
+                error = %e,
+                "transcribe mark_complete failed AFTER customer billed"
+            );
+        }
+    }
+
+    Ok(Json(response))
 }
