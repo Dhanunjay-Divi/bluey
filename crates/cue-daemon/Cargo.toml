@@ -13,6 +13,8 @@ name = "bluey-daemon"
 path = "src/bin/bluey-daemon.rs"
 
 [dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+cue-cloud-client = { path = "../cue-cloud-client" }
 thiserror.workspace = true
 keyring.workspace = true
 parking_lot.workspace = true
