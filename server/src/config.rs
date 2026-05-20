@@ -19,6 +19,9 @@ pub struct Config {
     /// Upstream provider keys held by Bluey. The managed Auto Router endpoint
     /// uses these to dispatch LLM / embedding / vision / STT calls.
     pub upstream: UpstreamKeys,
+    /// Transactional email transport. Optional in dev; when unset the server
+    /// logs local verification/reset URLs instead of sending mail.
+    pub smtp: Option<SmtpConfig>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -27,6 +30,16 @@ pub struct UpstreamKeys {
     pub anthropic_api_key: Option<String>,
     pub deepgram_api_key: Option<String>,
     pub ollama_base_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SmtpConfig {
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub from: String,
+    pub starttls: bool,
 }
 
 impl Config {
@@ -71,6 +84,26 @@ impl Config {
                 .filter(|v| !v.is_empty()),
         };
 
+        let smtp = std::env::var("BLUEY_SMTP_HOST")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map(|host| SmtpConfig {
+                host,
+                port: std::env::var("BLUEY_SMTP_PORT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(587),
+                username: std::env::var("BLUEY_SMTP_USERNAME")
+                    .ok()
+                    .filter(|v| !v.is_empty()),
+                password: std::env::var("BLUEY_SMTP_PASSWORD")
+                    .ok()
+                    .filter(|v| !v.is_empty()),
+                from: std::env::var("BLUEY_SMTP_FROM")
+                    .unwrap_or_else(|_| "Bluey <no-reply@bluey.sh>".to_string()),
+                starttls: env_bool("BLUEY_SMTP_STARTTLS").unwrap_or(true),
+            });
+
         Ok(Self {
             port,
             db_path,
@@ -79,6 +112,13 @@ impl Config {
             stripe_secret_key,
             stripe_webhook_secret,
             upstream,
+            smtp,
         })
     }
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    std::env::var(name)
+        .ok()
+        .map(|value| !matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
 }

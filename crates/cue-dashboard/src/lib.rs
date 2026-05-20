@@ -29,6 +29,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             commands::get_app_version,
+            commands::get_balance_snapshot,
             commands::list_sessions,
             commands::create_session,
             commands::get_session,

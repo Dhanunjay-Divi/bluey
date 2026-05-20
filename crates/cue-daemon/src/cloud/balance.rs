@@ -2,9 +2,9 @@
 //!
 //! When a Bluey account token is in the keyring, this module spawns a
 //! background task that polls `/account/me` every 30s and emits a
-//! `BalanceSnapshot` over the daemon's existing event channel. The
-//! overlay top-strip (separate stage that needs a Tauri/SwiftUI commit)
-//! subscribes and renders the live $X.XX figure.
+//! `BalanceSnapshot` over a watch channel. The daemon bridges that
+//! snapshot to the native overlay with `SetBalance`, while the dashboard
+//! can also fetch a snapshot on demand.
 //!
 //! This module ONLY owns the data path. Subscribers of the
 //! `BalanceWatch` channel render however they want.
@@ -52,6 +52,13 @@ impl BalanceWatch {
     /// Subscribe to receive every new snapshot.
     pub fn subscribe(&self) -> watch::Receiver<Option<BalanceSnapshot>> {
         self.inner.subscribe()
+    }
+
+    /// Publish a snapshot produced by a manual refresh path. This keeps
+    /// overlay/dashboard subscribers in sync even when a user action refreshes
+    /// balance outside the background poll interval.
+    pub fn publish(&self, snapshot: BalanceSnapshot) {
+        let _ = self.inner.send(Some(snapshot));
     }
 }
 

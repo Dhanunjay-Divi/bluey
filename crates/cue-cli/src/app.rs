@@ -174,7 +174,7 @@ struct RunArgs {
 
 #[derive(Debug, Args)]
 struct OnArgs {
-    /// Optional title for immediately creating a session. Without this, Bluey opens the launcher.
+    /// Optional title for the fresh session that `bluey on` starts.
     #[arg(long)]
     title: Option<String>,
 }
@@ -664,14 +664,16 @@ async fn cue_on(args: OnArgs) -> Result<()> {
     let settings = load_settings(&paths)?;
     ensure_daemon_quiet(false).await?;
 
-    if args.title.is_some() {
-        match request(DaemonRequest::MeetingStart { title: args.title }).await? {
-            DaemonResponse::Text { text } if text.contains("already active") => {}
-            DaemonResponse::Text { .. } | DaemonResponse::Recap { .. } | DaemonResponse::Ok => {}
-            DaemonResponse::Error { message } => bail!("daemon error: {message}"),
-            other => {
-                print_response(other)?;
-            }
+    // Product flow: every `bluey on` starts a fresh recording. Existing active
+    // sessions are archived first; users can restore the latest recording from
+    // the overlay's `Latest` control.
+    let _ = request(DaemonRequest::MeetingEnd).await;
+    match request(DaemonRequest::MeetingStart { title: args.title }).await? {
+        DaemonResponse::Text { text } if text.contains("already active") => {}
+        DaemonResponse::Text { .. } | DaemonResponse::Recap { .. } | DaemonResponse::Ok => {}
+        DaemonResponse::Error { message } => bail!("daemon error: {message}"),
+        other => {
+            print_response(other)?;
         }
     }
 
@@ -696,8 +698,9 @@ async fn cue_on(args: OnArgs) -> Result<()> {
         title: "Bluey online".to_string(),
         lines: vec![
             "daemon link established".to_string(),
-            "private overlay ready".to_string(),
-            "click the pill, then choose New or Continue".to_string(),
+            "new recording started".to_string(),
+            "click the pill for chat, files, and screen analysis".to_string(),
+            "restore the latest recording from the sidebar".to_string(),
             "attach files with Attach".to_string(),
             "screen context waits for Analyse consent".to_string(),
             "audio transcripts appear as source-labeled cards".to_string(),

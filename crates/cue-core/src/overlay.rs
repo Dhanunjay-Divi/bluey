@@ -18,6 +18,15 @@ impl Default for OverlayPosition {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OverlayContextItem {
+    pub id: uuid::Uuid,
+    pub title: String,
+    pub kind: String,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OverlayCommand {
@@ -35,6 +44,12 @@ pub enum OverlayCommand {
     },
     SetPosition {
         position: OverlayPosition,
+    },
+    SetBalance {
+        label: String,
+    },
+    SetContextItems {
+        items: Vec<OverlayContextItem>,
     },
     PushCard {
         card: CueCard,
@@ -93,4 +108,38 @@ pub enum OverlayEvent {
         message: String,
     },
     Exited,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_balance_serializes_as_overlay_command() {
+        let json = serde_json::to_string(&OverlayCommand::SetBalance {
+            label: "$12.34".to_string(),
+        })
+        .expect("serialize overlay balance command");
+
+        assert_eq!(json, r#"{"type":"set_balance","label":"$12.34"}"#);
+    }
+
+    #[test]
+    fn set_context_items_serializes_as_overlay_command() {
+        let id = uuid::Uuid::nil();
+        let json = serde_json::to_string(&OverlayCommand::SetContextItems {
+            items: vec![OverlayContextItem {
+                id,
+                title: "GenAI Engineer JD.pdf".to_string(),
+                kind: "document".to_string(),
+                path: Some("/tmp/GenAI Engineer JD.pdf".to_string()),
+            }],
+        })
+        .expect("serialize overlay context command");
+
+        assert_eq!(
+            json,
+            r#"{"type":"set_context_items","items":[{"id":"00000000-0000-0000-0000-000000000000","title":"GenAI Engineer JD.pdf","kind":"document","path":"/tmp/GenAI Engineer JD.pdf"}]}"#
+        );
+    }
 }

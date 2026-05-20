@@ -385,15 +385,26 @@ pub async fn verify_email_start(
             }),
         )
     })?;
-    // SMTP integration deferred — log the verification URL when SMTP
-    // is unconfigured so dev can copy-paste during testing.
-    if std::env::var("BLUEY_SMTP_HOST").is_err() {
-        tracing::info!(
-            account_id = %account.id,
-            email = %account.email,
-            verify_url = %format!("{}/verify-email?token={tok}", state.config.public_url),
-            "email verification (SMTP unconfigured; logging dev URL)"
-        );
+    let verify_url = format!("{}/verify-email?token={tok}", state.config.public_url);
+    match crate::mail::send_email_verification(&state.config, &account.email, &verify_url).await {
+        Ok(crate::mail::MailDelivery::Sent) => {
+            tracing::info!(account_id = %account.id, email = %account.email, "email verification sent");
+        }
+        Ok(crate::mail::MailDelivery::NotConfigured) => {
+            tracing::info!(
+                account_id = %account.id,
+                email = %account.email,
+                verify_url = %verify_url,
+                "email verification (SMTP unconfigured; logging dev URL)"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(account_id = %account.id, email = %account.email, %error, "email verification delivery failed");
+            return Err(err(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "email delivery failed",
+            ));
+        }
     }
     Ok(axum::http::StatusCode::ACCEPTED)
 }
@@ -462,13 +473,23 @@ pub async fn password_reset_start(
             &account.id,
             auth_tokens::TokenKind::PasswordReset,
         ) {
-            if std::env::var("BLUEY_SMTP_HOST").is_err() {
-                tracing::info!(
-                    account_id = %account.id,
-                    email = %account.email,
-                    reset_url = %format!("{}/password-reset?token={tok}", state.config.public_url),
-                    "password reset (SMTP unconfigured; logging dev URL)"
-                );
+            let reset_url = format!("{}/password-reset?token={tok}", state.config.public_url);
+            match crate::mail::send_password_reset(&state.config, &account.email, &reset_url).await
+            {
+                Ok(crate::mail::MailDelivery::Sent) => {
+                    tracing::info!(account_id = %account.id, email = %account.email, "password reset sent");
+                }
+                Ok(crate::mail::MailDelivery::NotConfigured) => {
+                    tracing::info!(
+                        account_id = %account.id,
+                        email = %account.email,
+                        reset_url = %reset_url,
+                        "password reset (SMTP unconfigured; logging dev URL)"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(account_id = %account.id, email = %account.email, %error, "password reset delivery failed");
+                }
             }
         }
     }

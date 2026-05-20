@@ -1,9 +1,8 @@
 //! Email verification + password reset tokens. Codex Stage 13.
 //!
-//! Single-use, 24h expiry, sha256-hashed at rest. SMTP delivery is
-//! out-of-scope here — `start` handlers log the raw token at info
-//! level when `BLUEY_SMTP_HOST` is unset (dev path) so a developer
-//! can copy-paste it for testing.
+//! Single-use, 24h expiry, sha256-hashed at rest. `start` handlers
+//! deliver links through SMTP when configured; otherwise they log a
+//! dev-only URL when `BLUEY_SMTP_HOST` is unset.
 
 use anyhow::Result;
 use base64::Engine;

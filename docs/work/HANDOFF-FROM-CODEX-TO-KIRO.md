@@ -1,287 +1,132 @@
-# Codex -> Kiro: R12 Pill Regression + R13 Production Hardening + Docs/UX Audit
+# Codex -> Kiro: Stage 12-17 Follow-Up Implementation
 
 ## 1. Overall Verdict
 
-🟢 **ACCEPT / IMPLEMENTED** — Codex kept the R12 pill-regression fix, then moved the highest-risk R13 production items forward in the same worktree:
+🟡 **IMPLEMENTED, READY FOR KIRO REVIEW** — I finished the highest-priority missing pieces around the latest server/customer loop instead of starting a new architecture branch:
 
-- restored compact pill-first `bluey on` startup;
-- fixed overlay modal state cleanup on cancel/error/success;
-- changed overlay session-token generation to return `Result`;
-- aligned macOS arm64 release packaging, helper discovery, and install docs;
-- added a tested `scripts/install.sh` path for local archives / release archives;
-- added a production-readiness source of truth and updated stale product docs;
-- started a reference-informed native UI polish pass and wrote the UX direction
-  brief.
+- live wallet balance now reaches the native overlay and dashboard;
+- manual audio stop refreshes final balance, matching the existing 5-minute no-transcript auto-stop behavior;
+- SMTP verification/reset delivery is real when `BLUEY_SMTP_*` is configured;
+- the Stage 12-17 recap/review doc is now in `docs/rounds/`.
 
-## 2. Round Verdict
+## 2. What Codex Changed
 
-- R12 overlay-pill regression: 🟢 **ACCEPTED after Codex follow-up**
-- R13.1 overlay UI state reset: 🟢 **IMPLEMENTED**
-- R13.2 session token `Result`: 🟢 **IMPLEMENTED**
-- R13.7 install/package alignment: 🟢 **PARTIALLY IMPLEMENTED**
-  - local archive installer smoke passes;
-  - clean-machine validation is still required before `curl | sh` becomes public primary install.
-- R13 documentation/readiness audit: 🟢 **IMPLEMENTED**
-  - `docs/PRODUCTION-READINESS.md` is now the current implementation matrix;
-  - stale active docs no longer claim streaming, VAD, STT routing, or the inline
-    composer are future work.
-- R13 UI/UX direction pass: 🟡 **STARTED**
-  - reference apps were inspected for actual UI patterns;
-  - macOS native overlay received a low-risk product-surface polish;
-  - remaining markdown/code/copy/status-chip work is documented for the next UI
-    round.
+### Live balance path
 
-## 3. What Codex Changed
-
-### Pill-first overlay UX
-
-- `crates/cue-cli/src/app.rs`
-  - `bluey on` no longer sends `OverlayShow`, because `show` expands the full panel. Startup now launches the native overlay pill first and sends `OverlayBoot` to seed the hidden feed.
-- `native/macos/cue-overlay/Sources/cue-overlay/main.swift`
-  - collapsed pill is now `146x32`, compact, dark-blue glass, with a Swift-drawn Bluey mark, subtle cyan border/glow, status dot, `Bluey` wordmark, and chevron.
-
-### R13.1 overlay state cleanup
-
+- `crates/cue-daemon/src/cloud/balance.rs`
+  - Added `BalanceWatch::publish()` so manual balance refreshes and poll-loop refreshes feed the same subscribers.
+  - Updated module docs: overlay/dashboard consumption is now implemented, not a future stage.
 - `crates/cue-daemon/src/app.rs`
-  - Added an `OverlayUiStateScope` guard.
-  - `AttachRequested` and `InstructionsRequested` enter modal state while the daemon-owned picker/prompt is open and always reset to `Idle` when the handler returns.
-  - `AttachFilesRequested` and `InstructionsUpdated` also reset to `Idle` on scope exit, so errors do not leave the production reader gate permissive.
-  - Added unit coverage for state guard enter/reset behavior.
+  - Added `balance_watch` to `Daemon`.
+  - Spawns balance polling when a Bluey token is already in keyring.
+  - Bridges `BalanceWatch` snapshots into `OverlayCommand::SetBalance`.
+  - Publishes manual refresh snapshots.
+  - `AudioStop` now refreshes balance after stopping.
 
-### R13.2 token hardening
+### Dashboard balance UI
 
-- `crates/cue-daemon/src/overlay.rs`
-  - `generate_session_token()` now returns `Result<String, getrandom::Error>`.
-  - Daemon startup propagates entropy failure with normal `anyhow` context instead of panicking.
-  - Token tests and overlay IPC tests now explicitly unwrap token generation.
+- `crates/cue-dashboard/src/commands.rs`
+  - Added `get_balance_snapshot`.
+- `crates/cue-dashboard/src/lib.rs`
+  - Registered the new Tauri command.
+- `crates/cue-dashboard/ui/src/components/BalanceIndicator.tsx`
+  - New top-right dashboard balance pill with low-balance and auto-top-up state.
+- `crates/cue-dashboard/ui/src/components/DashboardLayout.tsx`
+  - Mounts the balance indicator.
 
-### Release/install production path
+### Transactional email
 
-- `.github/workflows/release.yml`
-  - v0.1.0 release matrix narrowed to macOS arm64 only, matching the documented support matrix.
-  - Removed dashboard/Tauri build and updater manifest from the terminal-only release path.
-  - macOS helper build failures now fail the release job instead of being swallowed by `|| true`.
-  - Packager copies both `bluey-*` and `cue-*` helper aliases into `staging/bin`.
-- `Makefile`
-  - Terminal package targets build CLI/daemon only; dashboard remains a separate dev-tool target.
-  - `package-darwin-arm64` now includes overlay, audio, and whisper helpers.
-- `native/macos/cue-whisper/build.sh`
-  - Produces `.build/cue-whisper` and `.build/bluey-whisper-macos` for stable packaging.
-- `scripts/build-macos.sh`
-  - Copies both whisper helper names into the local dist folder.
-- `scripts/install.sh`
-  - New macOS arm64 installer.
-  - Supports `BLUEY_ARCHIVE` for local tarball validation.
-  - Supports release download with `SHA256SUMS.txt` verification.
-  - Installs to `~/.local/bluey/<version>` with symlinks in `~/.local/bin`.
-- `INSTALL.md` and `docs/release/RELEASE-v0.1.0.md`
-  - Updated artifact naming to `bluey-0.1.0-darwin-arm64.tar.gz`.
-  - Documented `SHA256SUMS.txt` / `sha256-manifest.json`.
+- `server/src/config.rs`
+  - Added optional `SmtpConfig` and env parsing for `BLUEY_SMTP_HOST`, `BLUEY_SMTP_PORT`, `BLUEY_SMTP_USERNAME`, `BLUEY_SMTP_PASSWORD`, `BLUEY_SMTP_FROM`, `BLUEY_SMTP_STARTTLS`.
+- `server/src/mail.rs`
+  - New `lettre`-backed verification/password-reset email delivery.
+  - Returns `NotConfigured` in dev mode instead of pretending mail sent.
+- `server/src/api/auth_routes.rs`
+  - Verification start now sends email when SMTP is configured.
+  - Password reset start sends email when SMTP is configured but still always returns `202` to avoid account enumeration.
+- `server/Cargo.toml` / `Cargo.lock`
+  - Added `lettre`.
+- `server/README.md`, `docs/OPERATIONS-RUNBOOK.md`, `server/src/db/auth_tokens.rs`
+  - Docs updated for real SMTP.
 
-### Installed-helper discovery
+### Review docs
 
-- `crates/cue-daemon/src/app.rs`
-  - Overlay helper discovery now checks both the symlink directory and the canonical daemon executable directory, so `~/.local/bin/bluey` symlinks work.
-  - Release-mode overlay verification uses the canonical daemon path as the install root.
-- `crates/cue-daemon/src/audio/system_capture.rs`
-  - System-audio helper discovery also checks canonical daemon sibling paths and `cue-*` aliases.
-- `crates/cue-daemon/src/stt/whisper/mod.rs`
-  - Local whisper discovery checks canonical daemon sibling paths, `cue-whisper`, and `bluey-whisper-macos`.
+- `docs/rounds/STAGES-12-17-RECAP-FOR-CODEX-REVIEW.md`
+  - New consolidated review entry point for Stage 12-17 plus this follow-up implementation.
 
-### Production-readiness docs sweep
+## 3. What Was Already Present And Verified
 
-- `docs/PRODUCTION-READINESS.md`
-  - New source of truth for v0.1.0 scope, implemented features, and remaining
-    paid-product gaps.
-  - Calls the current release a macOS arm64 local-first product candidate, not a
-    finished SaaS.
-- Updated active product docs:
-  - `README.md`
-  - `docs/ROADMAP.md`
-  - `docs/DEPLOYMENT-SCALING.md`
-  - `docs/INSTALLER-CHECKLIST.md`
-  - `docs/IMPLEMENTATION-SEAMS.md`
-  - `docs/SELF-REVIEW.md`
-  - `docs/ICON-GUIDE.md`
-  - `docs/HANDOFF.md`
-  - `docs/PRE-PRICING-REVIEW.md`
-  - `docs/COMMERCIAL-PATH.md`
-  - `docs/COMPETITIVE-GAPS.md`
-  - `docs/REFERENCE-MAP.md`
-  - `docs/SESSION-FLOW.md`
-  - `docs/CLOUD-RAG.md`
-  - `docs/FIRST-VERSION-TEST.md`
-  - `docs/PRODUCT-STRATEGY.md`
-  - `docs/FEATURE-MAP.md`
-  - `docs/AI-COMPETITIVE-STUDY.md`
-  - `docs/work/AGENT-ONBOARDING.md`
-  - `docs/WORKLOG.md`
-- Historical review/design docs under `docs/reviews` and old phase records were
-  left intact as audit records.
+- The 5-minute no-transcript auto-stop already existed in `real_audio_loop` and `maybe_auto_stop_idle_audio`.
+- Default timeout is `DEFAULT_AUDIO_IDLE_STOP_SECS = 5 * 60`.
+- On auto-stop, Bluey stops recording, refreshes balance, and pushes a system card with final balance.
+- Native macOS overlay already supports `SetBalance`, context chips, transcript ticker, one-row composer controls, new-session/continue events, and attached file chips.
 
-### Reference-informed UI pass
+## 4. Remaining Gaps
 
-- `docs/UX-UI-PRODUCT-DIRECTION.md`
-  - New design brief covering reference lessons, visual direction, overlay
-    architecture, card system, required user states, current status, and next UI
-    slice.
-- `native/macos/cue-overlay/Sources/cue-overlay/main.swift`
-  - Expanded panel now has a darker product surface, top status strip,
-    composer capsule, equal-width icon-led action buttons, styled close button,
-    and role-labeled cards with accent rails.
-  - This is intentionally low-risk: it keeps the existing NDJSON protocol and
-    event names (`ask_requested`, `attach_requested`, `instructions_requested`,
-    `recap_requested`) unchanged.
-- `native/macos/cue-overlay/build.sh`
-  - Mirrors the built overlay helper into existing `target/debug` and
-    `target/release` directories. This preserves the hardened production
-    verifier's side-by-side helper requirement while making local
-    `./target/release/bluey on` smoke tests work after the native build step.
-- `crates/cue-cli/src/app.rs`
-  - Plain `bluey on` now opens Bluey's launcher state without silently creating
-    a new session. `bluey on --title ...` still creates a titled session, which
-    preserves scripted and smoke-test flows.
-- `crates/cue-daemon/src/app.rs`
-  - `Continue` now restores the latest saved meeting when no active meeting is
-    loaded, instead of always creating a brand-new session.
-- `native/macos/cue-overlay/Sources/cue-overlay/main.swift`
-  - Follow-up launch-flow polish: smaller `112x28` pill, visible `New` and
-    `Continue` session controls, `Analyse` action, and empty `Answer` now asks
-    for the latest useful session context.
-  - Added a parent-process watchdog so future orphaned overlay helpers exit if
-    the daemon disappears unexpectedly.
-
-## 4. Remaining Blockers
-
-No blocker remains for macOS arm64 v0.1.0 terminal packaging or pill-first startup.
-
-Still not completed from the broader product backlog:
-
-- R13.3 sqlite-vec / ANN RAG.
-- R13.4 Windows real whisper.cpp.
-- R13.5 wider platform matrix and clean-machine QA.
-- R13.6 telemetry counter for overlay-reader rejections, gated on telemetry/privacy decision.
-- Clean-machine validation of `scripts/install.sh` before making `curl | sh` public primary install.
-- Native overlay markdown/code rendering, answer/code copy controls, status
-  chips, attachment drawer, recent-session picker, warning-card patterns, and
-  visual regression harness.
-- Cloud auth/device registration, encrypted sync, managed provider router,
-  billing/plans, admin, and cloud RAG.
-- Production OCR/vision artifact pipeline with citations and visible status.
-- Crash diagnostics/support bundle and user-facing health view.
+- Per-card cost label is still not complete. Server returns `cost_cents`, but `cue-llm::LlmResponse`, `CueResponse`, DB persistence, and UI cards do not yet carry that metadata end-to-end.
+- `/router/complete/stream` SSE proxy is still pending; managed provider stream still wraps a single complete call.
+- SMTP needs a production smoke test with real provider credentials.
+- `BalanceWatch` starts only if tokens exist at daemon startup or if a manual refresh path runs; login-during-running-daemon can be tightened later.
+- Wiremock coverage for OpenAI/Deepgram/Stripe/SMTP remains pending.
 
 ## 5. What Codex Did Not Change
 
-- No remote push.
+- No push.
 - No history rewrite.
-- No naming/product-wording cleanup beyond release artifact/support-matrix accuracy.
-- No Windows whisper.cpp implementation; still blocked on Windows bench validation.
-- No cloud/billing/auth production service work; credentials and deployment plan still needed.
+- No product naming or white-label wording changes.
+- No Windows implementation changes.
+- No new pricing/product decisions.
 
-## 6. Verification Run
+## 6. Verification
 
-```bash
-cargo fmt --all --check                                             # ✅
-cargo clippy --all-targets -- -D warnings                           # ✅
-cargo build --all-targets --release                                 # ✅
-cargo test --all-targets                                            # ✅ 363 passed, 14 ignored
-cd crates/cue-dashboard/ui && npm test && npm run build             # ✅ 13 passed + build
-swift build -c release --package-path native/macos/cue-overlay      # ✅
-bash native/macos/cue-overlay/build.sh                              # ✅
-swift build -c release --package-path native/macos/cue-whisper      # ✅
-bash native/macos/cue-whisper/build.sh                              # ✅
-bash scripts/build-macos.sh                                         # ✅ dist/bluey-macos-arm64
-bash -n scripts/install.sh                                          # ✅
-git diff --check main..HEAD && git diff --check                     # ✅
-make package-darwin-arm64                                           # ✅
-BLUEY_ARCHIVE=dist/bluey-0.1.0-darwin-arm64.tar.gz scripts/install.sh # ✅ with temp install dirs
-scripts/smoke-test.sh                                               # ✅
-```
-
-Local release smoke:
+Run by Codex in this pass:
 
 ```bash
-./target/release/bluey on                                           # ✅ starts daemon + overlay
-pgrep -fl 'bluey|bluey-overlay'                                     # ✅ bluey-daemon + bluey-overlay-macos
-./target/release/bluey off                                          # ✅ stops both
+cargo fmt --all
+cargo fmt --all --check
+cargo check -p cue-daemon -p cue-dashboard --all-targets
+cd server && cargo check --all-targets
+cargo clippy --all-targets -- -D warnings
+cd server && cargo clippy --all-targets -- -D warnings
+cargo build --all-targets --release
+cargo test --all-targets
+cd server && cargo test
+cd server && cargo build --all-targets --release
+cd crates/cue-dashboard/ui && npm test
+cd crates/cue-dashboard/ui && npm run build
+swift build -c release --package-path native/macos/cue-overlay
+swift build -c release --package-path native/macos/cue-whisper
+git -P diff --check
+git -P diff --check main..HEAD
 ```
 
-Installed-path smoke:
+Observed counts:
 
-```bash
-tmp_install=$(mktemp -d)
-BLUEY_ARCHIVE=dist/bluey-0.1.0-darwin-arm64.tar.gz \
-  BLUEY_INSTALL_DIR="$tmp_install/bluey" \
-  BLUEY_BIN_DIR="$tmp_install/bin" \
-  scripts/install.sh
-"$tmp_install/bin/bluey" on
-# ✅ bluey-daemon starts from symlink path
-# ✅ bluey-overlay-macos starts from canonical versioned install dir
-"$tmp_install/bin/bluey" off
-```
+- Workspace `cargo test --all-targets`: 406 passed, 14 ignored.
+- Server `cargo test`: 58 passed.
+- Dashboard Vitest: 15 passed.
 
-Observed processes during the installed-path smoke:
+## 7. Next Action For Kiro
+
+Review these first:
+
+1. `docs/rounds/STAGES-12-17-RECAP-FOR-CODEX-REVIEW.md`
+2. `docs/work/HANDOFF-FROM-CODEX-TO-KIRO.md`
+3. Diff for:
+   - `crates/cue-daemon/src/app.rs`
+   - `crates/cue-daemon/src/cloud/balance.rs`
+   - `crates/cue-dashboard/src/commands.rs`
+   - `crates/cue-dashboard/ui/src/components/BalanceIndicator.tsx`
+   - `server/src/config.rs`
+   - `server/src/mail.rs`
+   - `server/src/api/auth_routes.rs`
+
+Recommended next implementation round:
 
 ```text
-.../tmp.../bin/bluey-daemon
-.../tmp.../bluey/0.1.0/bin/bluey-overlay-macos
-```
-
-## 7. Next Action for Kiro
-
-Review this worktree and commit it as one production-hardening commit or split it into two commits:
-
-```bash
-git add .github/workflows/release.yml INSTALL.md Makefile \
-  crates/cue-cli/src/app.rs \
-  crates/cue-daemon/src/app.rs \
-  crates/cue-daemon/src/audio/system_capture.rs \
-  crates/cue-daemon/src/overlay.rs \
-  crates/cue-daemon/src/stt/whisper/mod.rs \
-  crates/cue-daemon/tests/overlay_lifecycle.rs \
-  crates/cue-daemon/tests/overlay_pipe_integration.rs \
-  crates/cue-daemon/tests/overlay_restart_integration.rs \
-  docs/release/RELEASE-v0.1.0.md \
-  docs/PRODUCTION-READINESS.md \
-  docs/AI-COMPETITIVE-STUDY.md \
-  docs/CLOUD-RAG.md \
-  docs/COMMERCIAL-PATH.md \
-  docs/COMPETITIVE-GAPS.md \
-  docs/DEPLOYMENT-SCALING.md \
-  docs/FEATURE-MAP.md \
-  docs/FIRST-VERSION-TEST.md \
-  docs/HANDOFF.md \
-  docs/ICON-GUIDE.md \
-  docs/IMPLEMENTATION-SEAMS.md \
-  docs/INSTALLER-CHECKLIST.md \
-  docs/PRE-PRICING-REVIEW.md \
-  docs/PRODUCT-STRATEGY.md \
-  docs/REFERENCE-MAP.md \
-  docs/ROADMAP.md \
-  docs/SELF-REVIEW.md \
-  docs/SESSION-FLOW.md \
-  docs/UX-UI-PRODUCT-DIRECTION.md \
-  docs/WORKLOG.md \
-  docs/work/AGENT-ONBOARDING.md \
-  docs/work/FIX-PHASE-3-OVERLAY-PILL-REGRESSION.md \
-  docs/work/HANDOFF-FROM-CODEX-TO-KIRO.md \
-  docs/work/PHASE-3-ROUND-13-PLAN.md \
-  docs/work/REVIEW-PHASE-3-ROUND-12.md \
-  native/macos/cue-overlay/Sources/cue-overlay/main.swift \
-  native/macos/cue-overlay/build.sh \
-  native/macos/cue-whisper/build.sh \
-  scripts/build-macos.sh \
-  scripts/install.sh
-
-git commit -m "fix(release): harden macOS arm64 terminal install path"
-```
-
-Suggested next implementation round:
-
-```text
-Phase 3 Round 13 continuation:
-1. Clean-machine validate scripts/install.sh on a fresh Apple Silicon Mac.
-2. Decide if v0.1.0 GA remains macOS arm64-only or if macOS x86_64 is required before tag.
-3. If GA stays arm64-only, tag v0.1.0 after clean-machine install + bluey on/off smoke.
-4. Start R13.3 sqlite-vec / ANN RAG as the next product capability round.
+Stage 18:
+1. Propagate managed response billing metadata into LlmResponse -> CueResponse -> DB -> overlay/dashboard cards.
+2. Add /router/complete/stream SSE proxy and BlueyManagedProvider streaming consumer.
+3. Add wiremock tests for SMTP/Stripe/OpenAI/Deepgram production-style paths.
+4. Tighten balance watcher startup after login without requiring daemon restart.
 ```

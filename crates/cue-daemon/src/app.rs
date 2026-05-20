@@ -26,8 +26,8 @@ use cue_core::{
     AudioPipelineStatus, AudioSourceKind, CardKind, CloudEndpointConfig, CloudEnvironment,
     CloudSyncState, CloudSyncStatus, ContextArtifact, ContextKind, ContextProcessingStatus,
     ConversationTurn, CueCard, DaemonState, MeetingRecord, MeetingState, MemoryHit, OverlayCommand,
-    OverlayEvent, PrivacyFlags, ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget,
-    Speaker, TranscriptSegment,
+    OverlayContextItem, OverlayEvent, PrivacyFlags, ProviderRoute, ProviderSelector,
+    ProviderStatus, RouteBudget, Speaker, TranscriptSegment,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -403,6 +403,7 @@ struct Daemon {
     audio: Mutex<AudioPipelineStatus>,
     audio_runtime: Mutex<AudioRuntime>,
     cloud: Mutex<CloudSyncStatus>,
+    balance_watch: crate::cloud::balance::BalanceWatch,
     answer_generation: AtomicU64,
     active_answer_card: Mutex<Option<(u64, uuid::Uuid)>>,
     system_audio: Mutex<Option<crate::audio::system_capture::SystemAudioCapture>>,
@@ -446,6 +447,8 @@ struct AudioRuntime {
     session_id: Option<String>,
 }
 
+const DEFAULT_AUDIO_IDLE_STOP_SECS: u64 = 5 * 60;
+
 impl OverlayProcess {
     fn send(&mut self, command: &OverlayCommand) -> Result<()> {
         use std::io::Write;
@@ -477,6 +480,7 @@ pub async fn run() -> Result<()> {
     let (overlay_events_tx, overlay_events_rx) = mpsc::unbounded_channel();
     let overlay_bin = args.overlay_bin.clone();
     let rag_pipeline = init_rag_pipeline(&paths);
+    let balance_watch = crate::cloud::balance::BalanceWatch::default();
 
     let daemon = Arc::new(Daemon {
         paths,
@@ -497,6 +501,7 @@ pub async fn run() -> Result<()> {
             session_id: None,
         }),
         cloud: Mutex::new(cloud_status),
+        balance_watch,
         answer_generation: AtomicU64::new(0),
         active_answer_card: Mutex::new(None),
         system_audio: Mutex::new(None),
@@ -508,6 +513,8 @@ pub async fn run() -> Result<()> {
             cue_core::overlay_ipc::OverlayUiState::Idle,
         )),
     });
+
+    maybe_spawn_balance_polling(&daemon);
 
     if !args.no_overlay {
         match spawn_overlay(
@@ -527,6 +534,7 @@ pub async fn run() -> Result<()> {
         }
     }
     spawn_overlay_event_handler(daemon.clone(), overlay_events_rx);
+    spawn_overlay_balance_bridge(daemon.clone());
 
     // System audio continuous capture (opt-in via env var).
     if std::env::var("BLUEY_SYSTEM_AUDIO_CONTINUOUS")
@@ -997,6 +1005,7 @@ async fn handle_request_inner(
         }
         DaemonRequest::AudioStop => {
             let status = stop_audio_capture(daemon).await;
+            let _ = refresh_overlay_balance(daemon).await;
             Ok(DaemonResponse::AudioStatus { status })
         }
         DaemonRequest::AiStatus => Ok(DaemonResponse::AiStatus {
@@ -1074,6 +1083,47 @@ async fn send_overlay(daemon: &Arc<Daemon>, command: OverlayCommand) -> Result<(
     }
 
     return Err(anyhow!("overlay process is not running"));
+}
+
+fn maybe_spawn_balance_polling(daemon: &Arc<Daemon>) {
+    let Ok(client) = cue_cloud_client::CloudClient::with_default_keyring() else {
+        debug!("balance polling skipped; keyring unavailable");
+        return;
+    };
+    if client.current_tokens().is_none() {
+        debug!("balance polling skipped; no Bluey account token");
+        return;
+    }
+
+    crate::cloud::balance::spawn_loop(client, daemon.balance_watch.clone());
+}
+
+fn spawn_overlay_balance_bridge(daemon: Arc<Daemon>) {
+    let mut rx = daemon.balance_watch.subscribe();
+    tokio::spawn(async move {
+        let initial = rx.borrow().clone();
+        if let Some(snapshot) = initial {
+            push_overlay_balance_snapshot(&daemon, snapshot).await;
+        }
+
+        while rx.changed().await.is_ok() {
+            let next = rx.borrow().clone();
+            if let Some(snapshot) = next {
+                push_overlay_balance_snapshot(&daemon, snapshot).await;
+            }
+        }
+    });
+}
+
+async fn push_overlay_balance_snapshot(
+    daemon: &Arc<Daemon>,
+    snapshot: crate::cloud::balance::BalanceSnapshot,
+) {
+    let mut label = format_balance_cents(snapshot.balance_cents);
+    if snapshot.low_balance_warning {
+        label.push_str(" low");
+    }
+    let _ = send_overlay(daemon, OverlayCommand::SetBalance { label }).await;
 }
 
 async fn ensure_overlay_ready(
@@ -1162,6 +1212,13 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         } => {
             daemon.state.lock().await.overlay_capture_excluded = Some(capture_excluded);
             write_state(daemon).await?;
+            if let Some(meeting) = daemon.meeting.lock().await.clone() {
+                refresh_overlay_context_items(daemon, &meeting).await;
+            }
+            let daemon_balance = Arc::clone(daemon);
+            tokio::spawn(async move {
+                let _ = refresh_overlay_balance(&daemon_balance).await;
+            });
         }
         OverlayEvent::Shown => {
             daemon.state.lock().await.overlay_visible = true;
@@ -1273,25 +1330,38 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         }
         OverlayEvent::RecordingStartRequested => {
             let status = start_audio_capture(daemon, AudioCaptureConfig::dual_default()).await?;
+            let balance = refresh_overlay_balance(daemon).await;
+            let balance_line = balance
+                .map(|label| format!("\nBalance: {label}."))
+                .unwrap_or_default();
             push_system_card(
                 daemon,
                 CardKind::System,
                 "Recording on",
                 format!(
-                    "{} source(s), {:?} runtime.",
+                    "{} source(s), {:?} runtime. Auto-stop after {} with no transcript.{}",
                     status.active_source_count(),
-                    status.runtime_mode
+                    status.runtime_mode,
+                    format_duration(audio_idle_stop_timeout()),
+                    balance_line
                 ),
             )
             .await;
         }
         OverlayEvent::RecordingStopRequested => {
             let status = stop_audio_capture(daemon).await;
+            let balance = refresh_overlay_balance(daemon).await;
+            let balance_line = balance
+                .map(|label| format!("\nFinal balance: {label}."))
+                .unwrap_or_default();
             push_system_card(
                 daemon,
                 CardKind::System,
                 "Recording off",
-                format!("Audio runtime stopped: {:?}.", status.capture.state),
+                format!(
+                    "Audio runtime stopped: {:?}.{}",
+                    status.capture.state, balance_line
+                ),
             )
             .await;
         }
@@ -2041,6 +2111,8 @@ async fn real_audio_loop(
     let mut system_sequence = 0_u64;
     let mut microphone_sequence = 0_u64;
     let mut warned_stt_error = false;
+    let idle_timeout = audio_idle_stop_timeout();
+    let mut last_transcript_at = Instant::now();
 
     loop {
         for source in &runtime.sources {
@@ -2066,6 +2138,7 @@ async fn real_audio_loop(
             .await;
             match result {
                 Ok(Some(segment)) => {
+                    last_transcript_at = Instant::now();
                     if let Err(error) = add_audio_transcript_segment(&daemon, &segment).await {
                         warn!("real audio transcript emission failed: {error:#}");
                     } else {
@@ -2111,13 +2184,183 @@ async fn real_audio_loop(
             if daemon.audio.lock().await.session_id.as_deref() != Some(session_id.as_str()) {
                 return;
             }
+            if maybe_auto_stop_idle_audio(&daemon, &session_id, last_transcript_at, idle_timeout)
+                .await
+            {
+                return;
+            }
         }
 
         tokio::select! {
             _ = &mut stop_rx => return,
-            _ = sleep(Duration::from_millis(80)) => {}
+            _ = sleep(Duration::from_millis(80)) => {
+                if maybe_auto_stop_idle_audio(
+                    &daemon,
+                    &session_id,
+                    last_transcript_at,
+                    idle_timeout,
+                )
+                .await
+                {
+                    return;
+                }
+            }
         }
     }
+}
+
+async fn maybe_auto_stop_idle_audio(
+    daemon: &Arc<Daemon>,
+    session_id: &str,
+    last_transcript_at: Instant,
+    idle_timeout: Duration,
+) -> bool {
+    if last_transcript_at.elapsed() < idle_timeout {
+        return false;
+    }
+
+    let is_current_session = daemon
+        .audio
+        .lock()
+        .await
+        .session_id
+        .as_deref()
+        .is_some_and(|active| active == session_id);
+    if !is_current_session {
+        return true;
+    }
+
+    let _status = stop_audio_capture(daemon).await;
+    {
+        let mut audio = daemon.audio.lock().await;
+        audio.note = Some(format!(
+            "Recording auto-stopped after {} with no transcribed audio.",
+            format_duration(idle_timeout)
+        ));
+        audio.updated_at = clock::now_epoch_ms_string();
+    }
+
+    let balance = refresh_overlay_balance(daemon).await;
+    let balance_line = balance
+        .map(|label| format!("\nFinal balance: {label}."))
+        .unwrap_or_else(|| {
+            "\nFinal balance unavailable; sign in to Bluey to show wallet balance.".to_string()
+        });
+    push_system_card(
+        daemon,
+        CardKind::System,
+        "Recording auto-stopped",
+        format!(
+            "No audio was transcribed for {}. Bluey stopped recording to cut STT costs.{}",
+            format_duration(idle_timeout),
+            balance_line
+        ),
+    )
+    .await;
+    true
+}
+
+fn audio_idle_stop_timeout() -> Duration {
+    let secs = env_first(&["BLUEY_AUDIO_IDLE_STOP_SECS", "CUE_AUDIO_IDLE_STOP_SECS"])
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_AUDIO_IDLE_STOP_SECS)
+        .max(1);
+    Duration::from_secs(secs)
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total = duration.as_secs();
+    let minutes = total / 60;
+    let seconds = total % 60;
+    match (minutes, seconds) {
+        (0, 1) => "1 second".to_string(),
+        (0, s) => format!("{s} seconds"),
+        (1, 0) => "1 minute".to_string(),
+        (m, 0) => format!("{m} minutes"),
+        (1, 1) => "1 minute 1 second".to_string(),
+        (1, s) => format!("1 minute {s} seconds"),
+        (m, 1) => format!("{m} minutes 1 second"),
+        (m, s) => format!("{m} minutes {s} seconds"),
+    }
+}
+
+async fn refresh_overlay_balance(daemon: &Arc<Daemon>) -> Option<String> {
+    let snapshot = fetch_current_balance_snapshot().await?;
+    let label = format_balance_cents(snapshot.balance_cents);
+    daemon.balance_watch.publish(snapshot);
+    let _ = send_overlay(
+        daemon,
+        OverlayCommand::SetBalance {
+            label: label.clone(),
+        },
+    )
+    .await;
+    Some(label)
+}
+
+async fn refresh_overlay_context_items(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
+    let _ = send_overlay(
+        daemon,
+        OverlayCommand::SetContextItems {
+            items: overlay_context_items(meeting),
+        },
+    )
+    .await;
+}
+
+fn overlay_context_items(meeting: &MeetingRecord) -> Vec<OverlayContextItem> {
+    meeting
+        .context
+        .iter()
+        .map(|item| OverlayContextItem {
+            id: item.id,
+            title: item.title.clone(),
+            kind: item.kind.to_string(),
+            path: Some(item.path.clone()),
+        })
+        .collect()
+}
+
+async fn fetch_current_balance_snapshot() -> Option<crate::cloud::balance::BalanceSnapshot> {
+    let client = match cue_cloud_client::CloudClient::with_default_keyring() {
+        Ok(client) => client,
+        Err(error) => {
+            debug!("balance lookup skipped; keyring unavailable: {error}");
+            return None;
+        }
+    };
+
+    match tokio::time::timeout(
+        Duration::from_secs(3),
+        client.auth_get::<cue_cloud_client::AccountMe>("/account/me"),
+    )
+    .await
+    {
+        Ok(Ok(me)) => Some(crate::cloud::balance::BalanceSnapshot {
+            balance_cents: me.balance_cents,
+            trial_seconds_remaining: me.trial_seconds_remaining,
+            auto_topup_enabled: me.auto_topup_enabled,
+            auto_topup_threshold_cents: me.auto_topup_threshold_cents,
+            auto_topup_amount_cents: me.auto_topup_amount_cents,
+            fetched_at_unix_ms: clock::now_epoch_ms_string().parse().unwrap_or_default(),
+            low_balance_warning: me.balance_cents < me.auto_topup_threshold_cents
+                && me.balance_cents > 0,
+        }),
+        Ok(Err(error)) => {
+            debug!("balance lookup skipped: {error}");
+            None
+        }
+        Err(_) => {
+            debug!("balance lookup skipped: timed out");
+            None
+        }
+    }
+}
+
+fn format_balance_cents(cents: i64) -> String {
+    let sign = if cents < 0 { "-" } else { "" };
+    let abs = cents.saturating_abs();
+    format!("{sign}${}.{:02}", abs / 100, abs % 100)
 }
 
 async fn capture_transcribe_audio_chunk(
@@ -2568,11 +2811,7 @@ async fn add_audio_transcript_segment(
 }
 
 async fn handle_attach_requested(daemon: &Arc<Daemon>) -> Result<()> {
-    let _ = send_overlay(daemon, OverlayCommand::Hide).await;
     let paths = choose_context_files().await?;
-    if paths.is_empty() {
-        let _ = send_overlay(daemon, OverlayCommand::Show).await;
-    }
     handle_attach_paths(daemon, paths).await
 }
 
@@ -2609,6 +2848,7 @@ async fn handle_attach_paths(daemon: &Arc<Daemon>, paths: Vec<PathBuf>) -> Resul
 
     let meeting_snapshot = attach_context_artifacts(daemon, attached.clone()).await?;
     update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
+    refresh_overlay_context_items(daemon, &meeting_snapshot).await;
     push_system_card(
         daemon,
         CardKind::Context,
@@ -2620,7 +2860,6 @@ async fn handle_attach_paths(daemon: &Arc<Daemon>, paths: Vec<PathBuf>) -> Resul
 }
 
 async fn handle_instructions_requested(daemon: &Arc<Daemon>) -> Result<()> {
-    let _ = send_overlay(daemon, OverlayCommand::Hide).await;
     let current = daemon
         .meeting
         .lock()
@@ -2629,7 +2868,6 @@ async fn handle_instructions_requested(daemon: &Arc<Daemon>) -> Result<()> {
         .and_then(|meeting| meeting.answer_instructions.clone())
         .unwrap_or_default();
     let Some(text) = prompt_answer_instructions(current).await? else {
-        let _ = send_overlay(daemon, OverlayCommand::Show).await;
         return Ok(());
     };
 
@@ -3830,6 +4068,7 @@ async fn capture_once_and_attach(daemon: &Arc<Daemon>) -> Result<()> {
 
     let meeting_snapshot = attach_context_artifacts(daemon, vec![artifact.clone()]).await?;
     update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
+    refresh_overlay_context_items(daemon, &meeting_snapshot).await;
 
     let card = CueCard::new(
         CardKind::Context,
@@ -3876,6 +4115,7 @@ async fn capture_active_page_context(
 
     let meeting_snapshot = attach_context_artifacts(daemon, vec![artifact.clone()]).await?;
     update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
+    refresh_overlay_context_items(daemon, &meeting_snapshot).await;
     push_system_card(
         daemon,
         CardKind::Context,
@@ -3947,6 +4187,7 @@ async fn analyze_screen_with_screenshot_fallback(
     )?;
     let meeting_snapshot = attach_context_artifacts(daemon, vec![artifact.clone()]).await?;
     update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
+    refresh_overlay_context_items(daemon, &meeting_snapshot).await;
 
     let card = CueCard::new(
         CardKind::Context,
@@ -4406,6 +4647,7 @@ async fn continue_session(
     };
 
     update_state_from_meeting(daemon, Some(&meeting)).await?;
+    refresh_overlay_context_items(daemon, &meeting).await;
     push_system_card(daemon, CardKind::System, title, body).await;
     write_state(daemon).await?;
     Ok(meeting)
@@ -4439,6 +4681,7 @@ async fn start_new_session(
     };
 
     update_state_from_meeting(daemon, Some(&meeting)).await?;
+    refresh_overlay_context_items(daemon, &meeting).await;
     push_system_card(
         daemon,
         CardKind::System,
@@ -6159,6 +6402,24 @@ mod tests {
             "we should cache a different answer.",
             true,
         ));
+    }
+
+    #[test]
+    fn duration_labels_are_human_readable_for_idle_guard() {
+        assert_eq!(format_duration(Duration::from_secs(1)), "1 second");
+        assert_eq!(format_duration(Duration::from_secs(59)), "59 seconds");
+        assert_eq!(format_duration(Duration::from_secs(60)), "1 minute");
+        assert_eq!(
+            format_duration(Duration::from_secs(301)),
+            "5 minutes 1 second"
+        );
+    }
+
+    #[test]
+    fn balance_labels_are_dollar_amounts() {
+        assert_eq!(format_balance_cents(0), "$0.00");
+        assert_eq!(format_balance_cents(1234), "$12.34");
+        assert_eq!(format_balance_cents(-75), "-$0.75");
     }
 
     #[test]

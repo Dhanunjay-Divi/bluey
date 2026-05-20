@@ -33,6 +33,15 @@ Full spec: `../ARCHITECTURE.md`, `../docs/HOW-IT-WORKS.md`,
 export BLUEY_JWT_SECRET=$(openssl rand -hex 32)
 export BLUEY_PORT=8080
 export BLUEY_DB_PATH=./bluey-dev.db
+
+# Optional. If unset, verification/reset flows log dev URLs instead.
+export BLUEY_SMTP_HOST=smtp.example.com
+export BLUEY_SMTP_PORT=587
+export BLUEY_SMTP_USERNAME=apikey
+export BLUEY_SMTP_PASSWORD=...
+export BLUEY_SMTP_FROM="Bluey <no-reply@bluey.sh>"
+export BLUEY_SMTP_STARTTLS=true
+
 cargo run
 
 curl http://127.0.0.1:8080/admin/health
@@ -40,6 +49,7 @@ curl http://127.0.0.1:8080/admin/health
 
 ## Status
 
-🟡 **Skeleton.** All routes wired; most return `501 NOT_IMPLEMENTED`.
-Real impls land in subsequent commits per `FUTURE-IMPLEMENTATIONS.md`
-R14.9–R14.13.
+🟡 **v0.2 server loop in progress.** Auth, billing, managed routing,
+embedding, transcription, account export/delete, metrics, and transactional
+email scaffolding are now implemented. Streaming proxy, onboarding web UI,
+and production infrastructure still land in later stages.

@@ -34,6 +34,9 @@ When Layer 2/3 are stood up, fill in their details below + in
 | `BLUEY_SPECULATIVE_ROUTING` | env var, default ON | toggle speculative draft+final |
 | Stripe API keys (future, Layer 3) | server env file `/opt/bluey-api/env` | bluey-server |
 | `BLUEY_JWT_SECRET` (future, Layer 3) | server env file | bluey-server auth |
+| `BLUEY_SMTP_HOST` / `BLUEY_SMTP_PORT` | server env file | verification + password reset email |
+| `BLUEY_SMTP_USERNAME` / `BLUEY_SMTP_PASSWORD` | server env file | SMTP auth |
+| `BLUEY_SMTP_FROM` / `BLUEY_SMTP_STARTTLS` | server env file | SMTP sender + transport mode |
 
 **Rule:** never commit secret values to this repo. The `secrets`
 module reads from keyring for client-side, env files for server-side.

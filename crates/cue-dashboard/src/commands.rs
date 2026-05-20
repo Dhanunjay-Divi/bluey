@@ -25,6 +25,17 @@ pub struct SessionSwitchedPayload {
     pub id: Option<String>,
 }
 
+#[derive(Clone, Serialize)]
+pub struct BalanceSnapshotPayload {
+    pub balance_cents: i64,
+    pub balance_label: String,
+    pub trial_seconds_remaining: i64,
+    pub auto_topup_enabled: bool,
+    pub auto_topup_threshold_cents: i64,
+    pub auto_topup_amount_cents: i64,
+    pub low_balance_warning: bool,
+}
+
 // ===== Daemon IPC helper =====
 
 /// Send a request to the running daemon over TCP and return the response.
@@ -60,6 +71,36 @@ async fn daemon_ipc(request: DaemonRequest) -> Result<DaemonResponse, String> {
 #[tauri::command]
 pub fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+#[tauri::command]
+pub async fn get_balance_snapshot() -> Result<Option<BalanceSnapshotPayload>, String> {
+    let client = cue_cloud_client::CloudClient::with_default_keyring()
+        .map_err(|e| format!("balance keyring unavailable: {e}"))?;
+    if client.current_tokens().is_none() {
+        return Ok(None);
+    }
+
+    let me: cue_cloud_client::AccountMe = client
+        .auth_get("/account/me")
+        .await
+        .map_err(|e| format!("balance lookup failed: {e}"))?;
+    Ok(Some(BalanceSnapshotPayload {
+        balance_cents: me.balance_cents,
+        balance_label: format_cents(me.balance_cents),
+        trial_seconds_remaining: me.trial_seconds_remaining,
+        auto_topup_enabled: me.auto_topup_enabled,
+        auto_topup_threshold_cents: me.auto_topup_threshold_cents,
+        auto_topup_amount_cents: me.auto_topup_amount_cents,
+        low_balance_warning: me.balance_cents < me.auto_topup_threshold_cents
+            && me.balance_cents > 0,
+    }))
+}
+
+fn format_cents(cents: i64) -> String {
+    let sign = if cents < 0 { "-" } else { "" };
+    let abs = cents.saturating_abs();
+    format!("{sign}${}.{:02}", abs / 100, abs % 100)
 }
 
 #[tauri::command]
