@@ -1,7 +1,8 @@
 // bluey-overlay-macos / cue-overlay-macos
 //
-// Native macOS overlay process. Speaks NDJSON IPC over stdin/stdout with the
-// Bluey daemon. Provides:
+// Native macOS overlay process. Speaks NDJSON IPC over a local Unix socket
+// when BLUEY_OVERLAY_SOCKET is set, with stdin/stdout retained for test stubs
+// and manual protocol checks. Provides:
 //
 //   - A small top-center pill (collapsed default state), draggable, click to
 //     expand into the full feed.
@@ -20,6 +21,7 @@
 // our events.
 
 import AppKit
+import Darwin
 import Foundation
 
 // MARK: - Visual system
@@ -179,8 +181,96 @@ private func parseCommand(_ line: String) -> OverlayCommand {
 /// Outbound events to the daemon. Every event carries the session token
 /// embedded as the top-level "token" field; the daemon's
 /// validate_and_decode_overlay_line function rejects events without it.
+private func argumentValue(_ name: String) -> String? {
+    let args = CommandLine.arguments
+    guard let idx = args.firstIndex(of: name),
+          args.indices.contains(idx + 1)
+    else {
+        return nil
+    }
+    return args[idx + 1]
+}
+
+private func argumentFlag(_ name: String) -> Bool {
+    CommandLine.arguments.contains(name)
+}
+
 private let sessionToken: String = ProcessInfo.processInfo
-    .environment["BLUEY_OVERLAY_SESSION_TOKEN"] ?? ""
+    .environment["BLUEY_OVERLAY_SESSION_TOKEN"]
+    ?? argumentValue("--bluey-overlay-session-token")
+    ?? ""
+private let overlaySocketPath: String? = argumentValue("--bluey-overlay-socket")
+    ?? ProcessInfo.processInfo
+        .environment["BLUEY_OVERLAY_SOCKET"]
+
+private let ipcLock = NSLock()
+private var ipcInputHandle: FileHandle?
+private var ipcOutputHandle: FileHandle = FileHandle.standardOutput
+
+private let captureVisibleForDebug: Bool = {
+    if argumentFlag("--bluey-overlay-capture-visible") {
+        return true
+    }
+    let raw = ProcessInfo.processInfo.environment["BLUEY_OVERLAY_CAPTURE_VISIBLE"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
+}()
+
+private func connectUnixSocket(path: String) -> Int32? {
+    let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+    guard fd >= 0 else { return nil }
+
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let bytes = Array(path.utf8CString)
+    let maxPathBytes = MemoryLayout.size(ofValue: addr.sun_path)
+    guard bytes.count <= maxPathBytes else {
+        Darwin.close(fd)
+        return nil
+    }
+
+    withUnsafeMutableBytes(of: &addr.sun_path) { rawBuffer in
+        let dest = rawBuffer.bindMemory(to: CChar.self)
+        for idx in bytes.indices {
+            dest[idx] = bytes[idx]
+        }
+    }
+
+    let result = withUnsafePointer(to: &addr) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+            Darwin.connect(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    }
+    guard result == 0 else {
+        Darwin.close(fd)
+        return nil
+    }
+
+    return fd
+}
+
+private func connectIpcIfNeeded() {
+    guard let path = overlaySocketPath,
+          !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    else {
+        return
+    }
+
+    guard let inputFd = connectUnixSocket(path: path) else {
+        fputs("bluey-overlay: failed to connect IPC socket \(path)\n", stderr)
+        return
+    }
+    let outputFd = Darwin.dup(inputFd)
+    guard outputFd >= 0 else {
+        Darwin.close(inputFd)
+        fputs("bluey-overlay: failed to duplicate IPC socket fd\n", stderr)
+        return
+    }
+
+    ipcInputHandle = FileHandle(fileDescriptor: inputFd, closeOnDealloc: true)
+    ipcOutputHandle = FileHandle(fileDescriptor: outputFd, closeOnDealloc: true)
+}
 
 private func emitEvent(_ payload: [String: Any]) {
     var withToken = payload
@@ -190,14 +280,17 @@ private func emitEvent(_ payload: [String: Any]) {
     guard let data = try? JSONSerialization.data(withJSONObject: withToken),
           let json = String(data: data, encoding: .utf8)
     else { return }
-    FileHandle.standardOutput.write((json + "\n").data(using: .utf8)!)
+    guard let line = (json + "\n").data(using: .utf8) else { return }
+    ipcLock.lock()
+    ipcOutputHandle.write(line)
+    ipcLock.unlock()
 }
 
 private func emitReady() {
     emitEvent([
         "type": "ready",
         "platform": "macos",
-        "capture_excluded": true,
+        "capture_excluded": !captureVisibleForDebug,
     ])
 }
 
@@ -233,22 +326,23 @@ private func emitCardRendered(id: String) {
     emitEvent(["type": "card_rendered", "id": id])
 }
 
-// MARK: - Capture-excluded NSWindow
+// MARK: - Overlay NSWindow
 
-/// Borderless, transparent, always-on-top, excluded from screen capture.
+/// Borderless, transparent, always-on-top overlay window.
 /// Configured for either the small pill or the expanded feed depending on
 /// the size passed at construction time.
 private final class OverlayWindow: NSWindow {
     init(contentRect: NSRect, draggable: Bool) {
         super.init(
             contentRect: contentRect,
-            styleMask: [.borderless, .nonactivatingPanel],
+            styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
         self.isOpaque = false
         self.backgroundColor = .clear
         self.hasShadow = true
+        self.isReleasedWhenClosed = false
         self.level = .floating
         self.collectionBehavior = [
             .canJoinAllSpaces,
@@ -258,78 +352,160 @@ private final class OverlayWindow: NSWindow {
         ]
         self.isMovableByWindowBackground = draggable
         self.hidesOnDeactivate = false
-        // sharingType = .none excludes the window from ScreenCaptureKit /
-        // legacy CGWindowList captures so screenshares do not show it.
-        self.sharingType = .none
+        // Production keeps the overlay out of screen capture. UI review can
+        // opt in to capture-visible rendering with BLUEY_OVERLAY_CAPTURE_VISIBLE=1.
+        self.sharingType = captureVisibleForDebug ? .readOnly : .none
     }
 
     override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { false }
+    override var canBecomeMain: Bool { true }
 }
 
 // MARK: - Pill view
 
 private final class PillView: NSView {
-    var statusText: String = "Bluey" { didSet { needsDisplay = true } }
-    var dotColor: NSColor = NSColor.systemGreen { didSet { needsDisplay = true } }
+    var statusText: String = "Bluey" {
+        didSet {
+            titleField.stringValue = statusText
+            needsDisplay = true
+        }
+    }
+    var dotColor: NSColor = NSColor.systemGreen {
+        didSet {
+            dotView.layer?.backgroundColor = dotColor.cgColor
+            needsDisplay = true
+        }
+    }
     var onClick: (() -> Void)?
+
+    private let logoTile = NSView()
+    private let logoGlyph = NSTextField(labelWithString: ">_")
+    private let titleField = NSTextField(labelWithString: "Bluey")
+    private let dotView = NSView()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        self.wantsLayer = true
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(red: 0.010, green: 0.020, blue: 0.030, alpha: 0.98).cgColor
+        layer?.cornerRadius = frameRect.height / 2
+        layer?.borderWidth = 1.2
+        layer?.borderColor = NSColor(red: 0.30, green: 0.78, blue: 0.96, alpha: 0.62).cgColor
+        layer?.shadowColor = NSColor(red: 0.10, green: 0.70, blue: 0.96, alpha: 1.0).cgColor
+        layer?.shadowOpacity = 0.24
+        layer?.shadowRadius = 12
+        layer?.shadowOffset = .zero
+
+        logoTile.wantsLayer = true
+        logoTile.layer?.backgroundColor = NSColor(red: 0.03, green: 0.25, blue: 0.38, alpha: 1.0).cgColor
+        logoTile.layer?.cornerRadius = 10
+        logoTile.layer?.borderWidth = 1.4
+        logoTile.layer?.borderColor = NSColor(red: 0.42, green: 0.92, blue: 1.0, alpha: 0.9).cgColor
+        logoTile.layer?.shadowColor = NSColor(red: 0.15, green: 0.66, blue: 1.0, alpha: 1.0).cgColor
+        logoTile.layer?.shadowOpacity = 0.42
+        logoTile.layer?.shadowRadius = 10
+        logoTile.layer?.shadowOffset = .zero
+        addSubview(logoTile)
+
+        logoGlyph.font = NSFont.monospacedSystemFont(ofSize: 14, weight: .bold)
+        logoGlyph.textColor = NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0)
+        logoGlyph.alignment = .center
+        logoTile.addSubview(logoGlyph)
+
+        titleField.font = NSFont.systemFont(ofSize: 17, weight: .bold)
+        titleField.textColor = NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0)
+        titleField.alignment = .left
+        addSubview(titleField)
+
+        dotView.wantsLayer = true
+        dotView.layer?.backgroundColor = dotColor.cgColor
+        dotView.layer?.cornerRadius = 4
+        dotView.layer?.shadowColor = dotColor.cgColor
+        dotView.layer?.shadowOpacity = 0.70
+        dotView.layer?.shadowRadius = 9
+        dotView.layer?.shadowOffset = .zero
+        addSubview(dotView)
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() {
+        super.layout()
+        layer?.cornerRadius = bounds.height / 2
+
+        let logoSide: CGFloat = 36
+        logoTile.frame = NSRect(x: 7, y: (bounds.height - logoSide) / 2, width: logoSide, height: logoSide)
+        logoTile.layer?.cornerRadius = 10
+        logoGlyph.frame = logoTile.bounds.insetBy(dx: 4, dy: 8)
+
+        titleField.frame = NSRect(x: 52, y: (bounds.height - 22) / 2 + 1, width: bounds.width - 72, height: 22)
+
+        let labelWidth = ceil((titleField.stringValue as NSString).size(withAttributes: [
+            .font: titleField.font ?? NSFont.systemFont(ofSize: 17, weight: .bold),
+        ]).width)
+        let dotSize: CGFloat = 8
+        let dotX = min(titleField.frame.minX + labelWidth + 8, bounds.width - dotSize - 12)
+        dotView.frame = NSRect(x: dotX, y: bounds.midY + 4, width: dotSize, height: dotSize)
+        dotView.layer?.cornerRadius = dotSize / 2
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         NSGraphicsContext.saveGraphicsState()
 
-        let outer = bounds.insetBy(dx: 1, dy: 1)
-        let path = NSBezierPath(roundedRect: outer, xRadius: outer.height / 2, yRadius: outer.height / 2)
+        let outer = bounds.insetBy(dx: 1.5, dy: 1.5)
+        let radius = outer.height / 2
+        let path = NSBezierPath(roundedRect: outer, xRadius: radius, yRadius: radius)
         let shadow = NSShadow()
-        shadow.shadowColor = NSColor(red: 0.08, green: 0.58, blue: 0.90, alpha: 0.16)
-        shadow.shadowBlurRadius = 8
+        shadow.shadowColor = NSColor(red: 0.10, green: 0.70, blue: 0.96, alpha: 0.24)
+        shadow.shadowBlurRadius = 12
         shadow.shadowOffset = .zero
         shadow.set()
 
         let bg = NSGradient(colors: [
-            NSColor(red: 0.015, green: 0.045, blue: 0.075, alpha: 0.96),
-            NSColor(red: 0.025, green: 0.090, blue: 0.135, alpha: 0.93),
+            NSColor(red: 0.015, green: 0.018, blue: 0.025, alpha: 0.98),
+            NSColor(red: 0.020, green: 0.055, blue: 0.070, alpha: 0.96),
+            NSColor(red: 0.010, green: 0.020, blue: 0.030, alpha: 0.98),
         ])
-        bg?.draw(in: path, angle: 0)
+        bg?.draw(in: path, angle: -12)
 
         NSGraphicsContext.restoreGraphicsState()
 
-        NSColor(red: 0.26, green: 0.74, blue: 0.95, alpha: 0.55).setStroke()
-        path.lineWidth = 1
+        NSColor(red: 0.30, green: 0.78, blue: 0.96, alpha: 0.62).setStroke()
+        path.lineWidth = 1.2
         path.stroke()
 
-        let inner = outer.insetBy(dx: 2, dy: 2)
+        let inner = outer.insetBy(dx: 3, dy: 3)
         let innerPath = NSBezierPath(roundedRect: inner, xRadius: inner.height / 2, yRadius: inner.height / 2)
-        NSColor.white.withAlphaComponent(0.06).setStroke()
+        NSColor.white.withAlphaComponent(0.08).setStroke()
         innerPath.lineWidth = 1
         innerPath.stroke()
 
-        drawLogo(in: NSRect(x: 5, y: 3, width: 18, height: 18))
+        let gloss = NSBezierPath(roundedRect: outer.insetBy(dx: 2, dy: 2), xRadius: radius - 2, yRadius: radius - 2)
+        NSGradient(colors: [
+            NSColor.white.withAlphaComponent(0.12),
+            NSColor.white.withAlphaComponent(0.00),
+        ])?.draw(in: gloss, angle: 90)
 
-        let labelRect = NSRect(x: 30, y: 4.5, width: bounds.width - 44, height: 15)
+        let logoSide: CGFloat = 36
+        drawLogo(in: NSRect(x: 7, y: (bounds.height - logoSide) / 2, width: logoSide, height: logoSide))
+
+        let labelRect = NSRect(x: 52, y: (bounds.height - 22) / 2 + 1, width: bounds.width - 72, height: 22)
         let label = statusText as NSString
         let labelAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 12, weight: .semibold),
+            .font: NSFont.systemFont(ofSize: 17, weight: .bold),
             .foregroundColor: NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0),
         ]
         label.draw(in: labelRect, withAttributes: labelAttrs)
 
         let labelWidth = ceil(label.size(withAttributes: labelAttrs).width)
-        let dotSize: CGFloat = 5
-        let dotX = min(labelRect.minX + labelWidth + 3, bounds.width - dotSize - 8)
+        let dotSize: CGFloat = 8
+        let dotX = min(labelRect.minX + labelWidth + 8, bounds.width - dotSize - 12)
         let dotRect = NSRect(
             x: dotX,
-            y: bounds.height - dotSize - 5,
+            y: bounds.midY + 4,
             width: dotSize,
             height: dotSize)
         let dotGlow = NSShadow()
         dotGlow.shadowColor = dotColor.withAlphaComponent(0.70)
-        dotGlow.shadowBlurRadius = 6
+        dotGlow.shadowBlurRadius = 9
         dotGlow.shadowOffset = .zero
         NSGraphicsContext.saveGraphicsState()
         dotGlow.set()
@@ -341,44 +517,55 @@ private final class PillView: NSView {
     }
 
     private func drawLogo(in rect: NSRect) {
-        let bgPath = NSBezierPath(roundedRect: rect, xRadius: 8, yRadius: 8)
+        let bgPath = NSBezierPath(roundedRect: rect, xRadius: 10, yRadius: 10)
+        let glow = NSShadow()
+        glow.shadowColor = NSColor(red: 0.15, green: 0.66, blue: 1.0, alpha: 0.42)
+        glow.shadowBlurRadius = 10
+        glow.shadowOffset = .zero
+        NSGraphicsContext.saveGraphicsState()
+        glow.set()
+        NSColor(red: 0.03, green: 0.28, blue: 0.42, alpha: 0.75).setFill()
+        bgPath.fill()
+        NSGraphicsContext.restoreGraphicsState()
+
         NSGradient(colors: [
             NSColor(red: 0.03, green: 0.12, blue: 0.23, alpha: 1.0),
-            NSColor(red: 0.06, green: 0.36, blue: 0.52, alpha: 1.0),
-        ])?.draw(in: bgPath, angle: -40)
+            NSColor(red: 0.05, green: 0.34, blue: 0.56, alpha: 1.0),
+            NSColor(red: 0.08, green: 0.55, blue: 0.72, alpha: 1.0),
+        ])?.draw(in: bgPath, angle: -35)
         NSColor(red: 0.42, green: 0.92, blue: 1.0, alpha: 0.9).setStroke()
-        bgPath.lineWidth = 1.5
+        bgPath.lineWidth = 1.4
         bgPath.stroke()
 
-        let screen = rect.insetBy(dx: 4.5, dy: 5.5)
+        let screen = rect.insetBy(dx: 7, dy: 9)
         let screenPath = NSBezierPath(roundedRect: screen, xRadius: 4.5, yRadius: 4.5)
         NSColor(red: 0.015, green: 0.055, blue: 0.10, alpha: 1.0).setFill()
         screenPath.fill()
         NSColor(red: 0.36, green: 0.90, blue: 1.0, alpha: 0.95).setStroke()
-        screenPath.lineWidth = 1.4
+        screenPath.lineWidth = 1.7
         screenPath.stroke()
 
         let prompt = NSBezierPath()
-        prompt.move(to: NSPoint(x: screen.minX + 3.5, y: screen.midY + 3.5))
-        prompt.line(to: NSPoint(x: screen.minX + 7, y: screen.midY))
-        prompt.line(to: NSPoint(x: screen.minX + 3.5, y: screen.midY - 3.5))
+        prompt.move(to: NSPoint(x: screen.minX + 4, y: screen.midY + 4))
+        prompt.line(to: NSPoint(x: screen.minX + 8, y: screen.midY))
+        prompt.line(to: NSPoint(x: screen.minX + 4, y: screen.midY - 4))
         NSColor.white.setStroke()
-        prompt.lineWidth = 1.8
+        prompt.lineWidth = 2.1
         prompt.lineCapStyle = .round
         prompt.lineJoinStyle = .round
         prompt.stroke()
 
         let cursor = NSBezierPath()
-        cursor.move(to: NSPoint(x: screen.minX + 9.5, y: screen.midY - 3.5))
-        cursor.line(to: NSPoint(x: screen.maxX - 3.5, y: screen.midY - 3.5))
+        cursor.move(to: NSPoint(x: screen.minX + 11, y: screen.midY - 4))
+        cursor.line(to: NSPoint(x: screen.maxX - 3.5, y: screen.midY - 4))
         NSColor(red: 0.45, green: 0.96, blue: 1.0, alpha: 1.0).setStroke()
         cursor.lineWidth = 2
         cursor.lineCapStyle = .round
         cursor.stroke()
 
         let sparkle = NSBezierPath()
-        let cx = rect.maxX - 4
-        let cy = rect.maxY - 5
+        let cx = rect.maxX - 6
+        let cy = rect.maxY - 6
         sparkle.move(to: NSPoint(x: cx, y: cy + 3))
         sparkle.line(to: NSPoint(x: cx, y: cy - 3))
         sparkle.move(to: NSPoint(x: cx - 3, y: cy))
@@ -1591,20 +1778,20 @@ private final class ExpandedPanelView: NSView {
 
 private final class OverlayApp {
     private var pillWindow: OverlayWindow!
-    private var expandedWindow: OverlayWindow!
+    private var expandedWindow: OverlayWindow?
     private var pillView: PillView!
-    private var expandedView: ExpandedPanelView!
+    private var expandedView: ExpandedPanelView?
 
     /// Pending boot card, if a Boot command arrived before windows materialised.
     private var pendingBoot: (title: String, lines: [String])?
 
     func start() {
         // Pill window: compact, parked at the top-right by default.
-        let pillSize = NSSize(width: 110, height: 24)
+        let pillSize = NSSize(width: 132, height: 46)
         let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
         let pillOrigin = NSPoint(
-            x: screen.maxX - pillSize.width - 14,
-            y: screen.maxY - pillSize.height - 12)
+            x: screen.maxX - pillSize.width - 18,
+            y: screen.maxY - pillSize.height - 14)
         pillWindow = OverlayWindow(
             contentRect: NSRect(origin: pillOrigin, size: pillSize),
             draggable: true)
@@ -1614,33 +1801,31 @@ private final class OverlayApp {
         pillView.statusText = "Bluey"
         pillView.onClick = { [weak self] in self?.expand() }
 
-        // Expanded window: anchored under the pill, compact enough to feel
-        // like a command layer instead of a dashboard window.
-        let expandedSize = NSSize(width: 590, height: 510)
-        let expandedOrigin = NSPoint(
-            x: screen.midX - expandedSize.width / 2,
-            y: pillOrigin.y - expandedSize.height - 8)
-        expandedWindow = OverlayWindow(
-            contentRect: NSRect(origin: expandedOrigin, size: expandedSize),
-            draggable: false)
-        expandedView = ExpandedPanelView(
-            frame: NSRect(origin: .zero, size: expandedSize))
-        expandedWindow.contentView = expandedView
-        expandedView.onClose = { [weak self] in self?.collapse() }
-
-        pillWindow.orderFrontRegardless()
-        // Expanded starts hidden.
-        expandedWindow.orderOut(nil)
-
-        // If a boot card arrived before windows existed, render it now.
-        if let pending = pendingBoot {
-            pushBootCard(title: pending.title, lines: pending.lines)
-            pendingBoot = nil
+        if captureVisibleForDebug {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        bringPillToFront()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            self?.bringPillToFront()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self] in
+            self?.bringPillToFront()
         }
 
         emitReady()
         startParentWatchdog()
-        startStdinLoop()
+        startIpcLoop()
+    }
+
+    private func bringPillToFront() {
+        pillWindow.setIsVisible(true)
+        pillWindow.orderFrontRegardless()
+        pillWindow.makeKeyAndOrderFront(nil)
+        pillView.needsDisplay = true
+        pillView.needsLayout = true
+        pillView.layoutSubtreeIfNeeded()
+        pillView.displayIfNeeded()
+        pillWindow.displayIfNeeded()
     }
 
     private func startParentWatchdog() {
@@ -1653,8 +1838,10 @@ private final class OverlayApp {
     }
 
     private func expand() {
+        ensureExpandedWindow()
         // Reposition expanded just below pill's current frame so the user's
         // dragging is honoured.
+        guard let expandedWindow else { return }
         if let pillFrame = pillWindow?.frame {
             let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
             let inset: CGFloat = 12
@@ -1669,8 +1856,34 @@ private final class OverlayApp {
         emitSimple("shown")
     }
 
+    private func ensureExpandedWindow() {
+        guard expandedWindow == nil else { return }
+        let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
+        let expandedSize = NSSize(width: 590, height: 510)
+        let pillFrame = pillWindow?.frame ?? NSRect(
+            x: screen.midX - 66,
+            y: screen.maxY - 60,
+            width: 132,
+            height: 46)
+        let expandedOrigin = NSPoint(
+            x: screen.midX - expandedSize.width / 2,
+            y: pillFrame.minY - expandedSize.height - 8)
+        let window = OverlayWindow(
+            contentRect: NSRect(origin: expandedOrigin, size: expandedSize),
+            draggable: false)
+        let view = ExpandedPanelView(frame: NSRect(origin: .zero, size: expandedSize))
+        window.contentView = view
+        view.onClose = { [weak self] in self?.collapse() }
+        expandedWindow = window
+        expandedView = view
+        if let pending = pendingBoot {
+            pushBootCard(title: pending.title, lines: pending.lines)
+            pendingBoot = nil
+        }
+    }
+
     private func collapse() {
-        expandedWindow.orderOut(nil)
+        expandedWindow?.orderOut(nil)
         emitSimple("hidden")
     }
 
@@ -1683,14 +1896,14 @@ private final class OverlayApp {
         case .hide:
             collapse()
         case .toggle:
-            if expandedWindow.isVisible { collapse() } else { expand() }
+            if expandedWindow?.isVisible == true { collapse() } else { expand() }
         case .clear:
             expandedView?.resetSessionSurface()
         case .boot(let title, let lines):
             pushBootCard(title: title, lines: lines)
         case .setOpacity(let o):
             pillWindow.alphaValue = CGFloat(o)
-            expandedWindow.alphaValue = CGFloat(o)
+            expandedWindow?.alphaValue = CGFloat(o)
         case .setPosition(let pos):
             applyPosition(pos)
         case .setBalance(let label):
@@ -1700,10 +1913,12 @@ private final class OverlayApp {
         case .setSessions(let sessions):
             expandedView?.setSessions(sessions)
         case .pushCard(let card):
+            ensureExpandedWindow()
             expandedView?.feed.push(RenderedCard(
                 id: card.id, kind: card.kind, title: card.title,
                 body: card.body, done: true, costLabel: card.costLabel))
         case .updateCard(let id, let body, let done, let costLabel):
+            ensureExpandedWindow()
             expandedView?.feed.update(id: id, body: body, done: done, costLabel: costLabel)
         case .shutdown:
             NSApp.terminate(nil)
@@ -1749,10 +1964,11 @@ private final class OverlayApp {
         pillWindow.setFrameOrigin(origin)
     }
 
-    private func startStdinLoop() {
-        // Background thread reads NDJSON from stdin and dispatches commands
-        // onto the main thread (AppKit must run on main).
-        let handle = FileHandle.standardInput
+    private func startIpcLoop() {
+        // Background thread reads NDJSON from the socket in production, or
+        // stdin in tests/manual protocol checks, then dispatches commands onto
+        // the main thread because AppKit must run on main.
+        let handle = ipcInputHandle ?? FileHandle.standardInput
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             var buffer = Data()
             while true {
@@ -1782,12 +1998,16 @@ private final class OverlayApp {
 private final class AppDelegate: NSObject, NSApplicationDelegate {
     private let coord = OverlayApp()
     func applicationDidFinishLaunching(_ notification: Notification) {
+        connectIpcIfNeeded()
         coord.start()
     }
 }
 
 private let app = NSApplication.shared
-app.setActivationPolicy(.accessory)
+app.setActivationPolicy(captureVisibleForDebug ? .regular : .accessory)
 private let delegate = AppDelegate()
 app.delegate = delegate
+if captureVisibleForDebug {
+    app.activate(ignoringOtherApps: true)
+}
 app.run()

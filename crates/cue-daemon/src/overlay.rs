@@ -257,6 +257,8 @@ impl NativeOverlayHandle {
             .shutdown_requested
             .store(true, std::sync::atomic::Ordering::Release);
         self.shared.set_state(OverlayProcessState::ShuttingDown);
+        // Drop send_tx so the supervisor's send_rx.recv() returns None,
+        // which triggers stdin close → child sees EOF → exits cleanly.
         let (dead_tx, _dead_rx) = unbounded_channel();
         let _ = std::mem::replace(&mut self.send_tx, dead_tx);
         let tasks = std::mem::take(&mut self._tasks);
@@ -457,6 +459,7 @@ async fn run_one_child(
 
     let status = loop {
         if shared.is_shutdown_requested() {
+            // Drop stdin so child sees EOF and exits cleanly.
             drop(stdin);
             break (&mut wait_fut).await;
         }
@@ -475,6 +478,7 @@ async fn run_one_child(
                         last_msg = Some(m);
                     }
                     None => {
+                        // Channel closed (shutdown). Close stdin so child exits.
                         drop(stdin);
                         break (&mut wait_fut).await;
                     }
@@ -484,6 +488,8 @@ async fn run_one_child(
     };
 
     let clean_exit = matches!(&status, Ok(s) if s.success());
+
+    // Ensure reader task completes.
     let _ = reader.await;
 
     let written = msgs_written.load(std::sync::atomic::Ordering::Acquire);
@@ -546,6 +552,7 @@ async fn run_supervisor(
                 "overlay child failed too many times; giving up"
             );
             shared.set_state(OverlayProcessState::Failed);
+            // Drain pending messages so senders see backpressure immediately.
             let mut drained: u64 = 0;
             while send_rx.try_recv().is_ok() {
                 drained += 1;
@@ -553,6 +560,7 @@ async fn run_supervisor(
             if drained > 0 {
                 tracing::warn!(drained, "drained pending messages after cap exhaustion");
             }
+            // Drop recv_tx so downstream readers see channel close.
             drop(recv_tx);
             return;
         }

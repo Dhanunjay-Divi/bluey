@@ -1,5 +1,5 @@
 use std::env;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{
@@ -448,7 +448,13 @@ struct Daemon {
 
 struct OverlayProcess {
     child: Child,
-    stdin: ChildStdin,
+    transport: OverlayTransport,
+}
+
+enum OverlayTransport {
+    Stdio(ChildStdin),
+    #[cfg(unix)]
+    Socket(std::os::unix::net::UnixStream),
 }
 
 struct CaptureRuntime {
@@ -465,12 +471,20 @@ const DEFAULT_AUDIO_IDLE_STOP_SECS: u64 = 5 * 60;
 
 impl OverlayProcess {
     fn send(&mut self, command: &OverlayCommand) -> Result<()> {
-        use std::io::Write;
-
         let line = serde_json::to_string(command)?;
-        self.stdin.write_all(line.as_bytes())?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
+        match &mut self.transport {
+            OverlayTransport::Stdio(stdin) => {
+                stdin.write_all(line.as_bytes())?;
+                stdin.write_all(b"\n")?;
+                stdin.flush()?;
+            }
+            #[cfg(unix)]
+            OverlayTransport::Socket(stream) => {
+                stream.write_all(line.as_bytes())?;
+                stream.write_all(b"\n")?;
+                stream.flush()?;
+            }
+        }
         Ok(())
     }
 }
@@ -5371,7 +5385,20 @@ fn spawn_overlay(
         return Err(anyhow!("overlay binary verification failed: {e}"));
     }
 
-    // Step 3: spawn with the per-session token in env var.
+    #[cfg(target_os = "macos")]
+    if should_use_macos_socket_overlay(&resolved) {
+        return spawn_macos_socket_overlay(resolved, events, expected_token, ui_state);
+    }
+
+    spawn_stdio_overlay(resolved, events, expected_token, ui_state)
+}
+
+fn spawn_stdio_overlay(
+    resolved: PathBuf,
+    events: mpsc::UnboundedSender<OverlayEvent>,
+    expected_token: String,
+    ui_state: Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
+) -> Result<OverlayProcess> {
     let mut child = Command::new(&resolved)
         .env("BLUEY_OVERLAY_SESSION_TOKEN", &expected_token)
         .stdin(Stdio::piped())
@@ -5382,53 +5409,227 @@ fn spawn_overlay(
 
     let stdin = child.stdin.take().context("overlay stdin is not piped")?;
 
-    // Step 4: line reader with token + length + state validation before forwarding.
     if let Some(stdout) = child.stdout.take() {
-        let token_for_reader = expected_token;
-        let ui_state_for_reader = ui_state.clone();
-        std::thread::spawn(move || {
-            let reader = std::io::BufReader::new(stdout);
-            for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
-                match validate_and_decode_overlay_line(
-                    &line,
-                    &token_for_reader,
-                    &ui_state_for_reader,
-                ) {
-                    Ok(event) => {
-                        info!("overlay event: {:?}", event);
-                        let _ = events.send(event);
-                    }
-                    Err(OverlayLineReject::NotJson) => {
-                        // Plain log line from overlay (non-event output).
-                        info!("overlay: {line}");
-                    }
-                    Err(OverlayLineReject::TokenMismatch) => {
-                        warn!("overlay event rejected: token mismatch");
-                    }
-                    Err(OverlayLineReject::FieldTooLong { field, len, max }) => {
-                        warn!(
-                            field = %field,
-                            len, max,
-                            "overlay event rejected: field exceeds max length"
-                        );
-                    }
-                    Err(OverlayLineReject::StateNotAllowed { kind, state }) => {
-                        warn!(
-                            kind = %kind,
-                            state = ?state,
-                            "overlay event rejected: not allowed in current UI state"
-                        );
-                    }
-                    Err(OverlayLineReject::ParseError(e)) => {
-                        warn!(error = %e, "overlay event parse error; line dropped");
-                    }
-                }
-            }
-            let _ = events.send(OverlayEvent::Exited);
-        });
+        spawn_overlay_reader(stdout, events, expected_token, ui_state, None);
     }
 
-    Ok(OverlayProcess { child, stdin })
+    Ok(OverlayProcess {
+        child,
+        transport: OverlayTransport::Stdio(stdin),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn should_use_macos_socket_overlay(path: &Path) -> bool {
+    if std::env::var("BLUEY_OVERLAY_FORCE_STDIO")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name == "bluey-overlay-macos" || name == "cue-overlay-macos")
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_macos_socket_overlay(
+    resolved: PathBuf,
+    events: mpsc::UnboundedSender<OverlayEvent>,
+    expected_token: String,
+    ui_state: Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
+) -> Result<OverlayProcess> {
+    use std::os::unix::net::UnixListener;
+
+    let token_prefix = expected_token.get(..8).unwrap_or("notoken");
+    let socket_path = std::env::temp_dir().join(format!(
+        "bluey-overlay-{}-{token_prefix}.sock",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = UnixListener::bind(&socket_path)
+        .with_context(|| format!("failed to bind overlay socket {}", socket_path.display()))?;
+    listener
+        .set_nonblocking(true)
+        .context("failed to set overlay socket nonblocking")?;
+
+    let mut launch = macos_overlay_launch_command(&resolved, &socket_path, &expected_token);
+    let mut child = launch
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("failed to spawn overlay {}", resolved.display()))?;
+
+    let deadline = Instant::now() + std::time::Duration::from_secs(3);
+    let stream = loop {
+        match listener.accept() {
+            Ok((stream, _addr)) => break stream,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if let Some(status) = child
+                    .try_wait()
+                    .context("failed to poll overlay child during socket handshake")?
+                {
+                    let _ = std::fs::remove_file(&socket_path);
+                    return Err(anyhow!("overlay exited before socket handshake: {status}"));
+                }
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = std::fs::remove_file(&socket_path);
+                    return Err(anyhow!("overlay did not connect to socket before timeout"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&socket_path);
+                return Err(error).context("failed to accept overlay socket connection");
+            }
+        }
+    };
+    stream
+        .set_nonblocking(false)
+        .context("failed to set overlay socket blocking")?;
+    let reader = stream
+        .try_clone()
+        .context("failed to clone overlay socket reader")?;
+    spawn_overlay_reader(reader, events, expected_token, ui_state, Some(socket_path));
+
+    Ok(OverlayProcess {
+        child,
+        transport: OverlayTransport::Socket(stream),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_overlay_launch_command(
+    resolved: &Path,
+    socket_path: &Path,
+    expected_token: &str,
+) -> Command {
+    if !macos_overlay_force_raw_helper() {
+        if let Some(app_bundle) = macos_overlay_app_bundle_for_binary(resolved) {
+            return macos_overlay_open_app_command(&app_bundle, socket_path, expected_token);
+        }
+    }
+
+    let mut command = Command::new(resolved);
+    command
+        .env("BLUEY_OVERLAY_SESSION_TOKEN", expected_token)
+        .env("BLUEY_OVERLAY_SOCKET", socket_path);
+    command
+}
+
+#[cfg(target_os = "macos")]
+fn macos_overlay_open_app_command(
+    app_bundle: &Path,
+    socket_path: &Path,
+    expected_token: &str,
+) -> Command {
+    let mut command = Command::new("/usr/bin/open");
+    command
+        .arg("-n")
+        .arg("-W")
+        .arg(app_bundle)
+        .arg("--args")
+        .arg("--bluey-overlay-socket")
+        .arg(socket_path)
+        .arg("--bluey-overlay-session-token")
+        .arg(expected_token);
+    if macos_overlay_capture_visible_for_debug() {
+        command.arg("--bluey-overlay-capture-visible");
+    }
+    command
+}
+
+#[cfg(target_os = "macos")]
+fn macos_overlay_force_raw_helper() -> bool {
+    std::env::var("BLUEY_OVERLAY_FORCE_RAW_HELPER")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_overlay_app_bundle_for_binary(binary: &Path) -> Option<PathBuf> {
+    let dir = binary.parent()?;
+    let candidates = [
+        dir.join("BlueyOverlay.app"),
+        dir.join("bluey-overlay-macos.app"),
+        dir.join("cue-overlay-macos.app"),
+    ];
+    candidates.into_iter().find(|candidate| candidate.exists())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_overlay_capture_visible_for_debug() -> bool {
+    std::env::var("BLUEY_OVERLAY_CAPTURE_VISIBLE")
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn spawn_overlay_reader<R>(
+    reader: R,
+    events: mpsc::UnboundedSender<OverlayEvent>,
+    expected_token: String,
+    ui_state: Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
+    cleanup_path: Option<PathBuf>,
+) where
+    R: std::io::Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let token_for_reader = expected_token;
+        let ui_state_for_reader = ui_state;
+        let reader = std::io::BufReader::new(reader);
+        for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
+            match validate_and_decode_overlay_line(&line, &token_for_reader, &ui_state_for_reader) {
+                Ok(event) => {
+                    info!("overlay event: {:?}", event);
+                    let _ = events.send(event);
+                }
+                Err(OverlayLineReject::NotJson) => {
+                    // Plain log line from overlay (non-event output).
+                    info!("overlay: {line}");
+                }
+                Err(OverlayLineReject::TokenMismatch) => {
+                    warn!("overlay event rejected: token mismatch");
+                }
+                Err(OverlayLineReject::FieldTooLong { field, len, max }) => {
+                    warn!(
+                        field = %field,
+                        len, max,
+                        "overlay event rejected: field exceeds max length"
+                    );
+                }
+                Err(OverlayLineReject::StateNotAllowed { kind, state }) => {
+                    warn!(
+                        kind = %kind,
+                        state = ?state,
+                        "overlay event rejected: not allowed in current UI state"
+                    );
+                }
+                Err(OverlayLineReject::ParseError(e)) => {
+                    warn!(error = %e, "overlay event parse error; line dropped");
+                }
+            }
+        }
+        if let Some(path) = cleanup_path {
+            let _ = std::fs::remove_file(path);
+        }
+        let _ = events.send(OverlayEvent::Exited);
+    });
 }
 
 /// Reasons a line from the overlay child can be rejected before being forwarded.
