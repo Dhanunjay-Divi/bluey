@@ -1807,7 +1807,12 @@ private final class OverlayApp {
         case .show:
             expand()
         case .hide:
-            collapse()
+            // Codex Stage 18 commit 5: smooth fade on the visible windows
+            // + center-screen restore-toast for 2s.
+            pillWindow?.fadeOutAndHide()
+            expandedWindow?.fadeOutAndHide()
+            RestoreToast.shared.show()
+            
         case .toggle:
             if expandedWindow?.isVisible == true { collapse() } else { expand() }
         case .clear:
@@ -1924,3 +1929,119 @@ if captureVisibleForDebug {
     app.activate(ignoringOtherApps: true)
 }
 app.run()
+
+
+// ─── Codex Stage 18 commit 5: smooth fade + restore toast ───────────────
+
+extension NSWindow {
+    func fadeOutAndHide(duration: TimeInterval = 0.25) {
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = duration
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            self.animator().alphaValue = 0
+        }, completionHandler: {
+            self.orderOut(nil)
+            self.alphaValue = 1.0  // restore for next show
+        })
+    }
+
+    func fadeInAndShow(duration: TimeInterval = 0.18) {
+        self.alphaValue = 0
+        self.makeKeyAndOrderFront(nil)
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = duration
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            self.animator().alphaValue = 1.0
+        }
+    }
+}
+
+private final class RestoreToast {
+    static let shared = RestoreToast()
+    private var window: NSWindow?
+    private var dismissTimer: Timer?
+
+    func show() {
+        // Singleton: dismiss any existing toast first.
+        dismiss(animated: false)
+
+        guard let mainScreen = NSScreen.main else { return }
+        let screenFrame = mainScreen.visibleFrame
+        let toastWidth: CGFloat = 280
+        let toastHeight: CGFloat = 44
+        let frame = NSRect(
+            x: screenFrame.midX - toastWidth / 2,
+            y: screenFrame.minY + 80,
+            width: toastWidth,
+            height: toastHeight
+        )
+
+        let win = NSWindow(
+            contentRect: frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        win.isOpaque = false
+        win.backgroundColor = .clear
+        win.level = .statusBar
+        win.ignoresMouseEvents = true
+        win.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+
+        let bg = NSVisualEffectView(frame: NSRect(origin: .zero, size: frame.size))
+        bg.material = .hudWindow
+        bg.blendingMode = .behindWindow
+        bg.state = .active
+        bg.wantsLayer = true
+        bg.layer?.cornerRadius = 12
+        bg.layer?.masksToBounds = true
+
+        let label = NSTextField(labelWithString: "Bluey hidden — press F19 to restore")
+        label.alignment = .center
+        label.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        label.textColor = NSColor(white: 0.95, alpha: 1.0)
+        label.frame = NSRect(x: 12, y: 12, width: frame.size.width - 24, height: 20)
+        bg.addSubview(label)
+
+        win.contentView = bg
+        win.alphaValue = 0
+        win.orderFront(nil)
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.18
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            win.animator().alphaValue = 1.0
+        }
+        self.window = win
+
+        // Dismiss after 2 seconds.
+        dismissTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self] _ in
+            self?.dismiss(animated: true)
+        }
+    }
+
+    func dismiss(animated: Bool) {
+        dismissTimer?.invalidate()
+        dismissTimer = nil
+        guard let win = window else { return }
+        if animated {
+            NSAnimationContext.runAnimationGroup({ ctx in
+                ctx.duration = 0.18
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                win.animator().alphaValue = 0
+            }, completionHandler: {
+                win.orderOut(nil)
+                self.window = nil
+            })
+        } else {
+            win.orderOut(nil)
+            window = nil
+        }
+    }
+}
+
+// Convenience for OverlayWindowController to call.
+extension NSWindow {
+    func showRestoreToast() {
+        RestoreToast.shared.show()
+    }
+}
