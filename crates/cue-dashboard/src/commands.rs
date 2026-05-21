@@ -862,32 +862,45 @@ pub fn set_disguise(mode: String, app: AppHandle) -> Result<(), String> {
     let req = cue_stealth::build_request(disguise_mode, None);
     cue_stealth::apply_disguise(&req).map_err(|e| e.to_string())?;
 
-    // Codex follow-up: also swap the menu-bar tray icon so the visible
-    // pictogram matches the disguised process name. macOS draws the
-    // Activity Monitor / Terminal / Settings icons via SF Symbols;
-    // none-mode shows the Bluey logo. Best-effort — failure to swap
-    // does not block the disguise from applying.
-    if let Some(_tray) = app.tray_by_id("main") {
-        let symbol_name = match disguise_mode {
-            cue_stealth::DisguiseMode::None => "BlueyIconTemplate",
-            cue_stealth::DisguiseMode::Activity => "chart.bar.xaxis",
-            cue_stealth::DisguiseMode::Terminal => "terminal",
-            cue_stealth::DisguiseMode::Settings => "gearshape",
+    // Codex follow-up: real menu-bar tray icon swap. Disguise PNGs are
+    // embedded at compile time via include_bytes! so they are part of
+    // the signed app bundle (no runtime path lookup, no missing-file
+    // class). None mode restores the default Bluey icon.
+    if let Some(tray) = app.tray_by_id("main") {
+        let icon_bytes: Option<&'static [u8]> = match disguise_mode {
+            cue_stealth::DisguiseMode::None => None,
+            cue_stealth::DisguiseMode::Activity => {
+                Some(include_bytes!("../icons/disguise/mac/activity.png"))
+            }
+            cue_stealth::DisguiseMode::Terminal => {
+                Some(include_bytes!("../icons/disguise/mac/terminal.png"))
+            }
+            cue_stealth::DisguiseMode::Settings => {
+                Some(include_bytes!("../icons/disguise/mac/settings.png"))
+            }
         };
-        // Tauri 2 doesn't have direct SF Symbol API; we set the icon to
-        // a bundled PNG when one exists at icons/disguise/<mode>.png.
-        let icon_path = std::path::PathBuf::from("icons/disguise")
-            .join(format!("{}.png", disguise_mode.as_str()));
-        if icon_path.exists() {
-            tracing::debug!(
-                ?icon_path,
-                "tray icon swap queued; Tauri 2 Image::from_path not available in this version"
-            );
-        } else {
-            tracing::debug!(
-                symbol = symbol_name,
-                "tray icon swap requested but icons/disguise/<mode>.png missing; skipping"
-            );
+        match icon_bytes {
+            Some(bytes) => match tauri::image::Image::from_bytes(bytes) {
+                Ok(img) => {
+                    if let Err(e) = tray.set_icon(Some(img)) {
+                        tracing::warn!(error = %e, "tray icon swap failed");
+                    } else {
+                        tracing::debug!(mode = %disguise_mode.as_str(), "tray icon swapped");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "tray icon decode failed");
+                }
+            },
+            None => {
+                if let Some(default_img) = app.default_window_icon().cloned() {
+                    if let Err(e) = tray.set_icon(Some(default_img)) {
+                        tracing::warn!(error = %e, "tray icon restore failed");
+                    } else {
+                        tracing::debug!("tray icon restored to default");
+                    }
+                }
+            }
         }
     }
 
