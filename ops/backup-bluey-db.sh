@@ -22,6 +22,14 @@ DAILY_KEEP=14
 #   OFFSITE_DESTINATION=user@backuphost:/srv/backups/bluey-api/
 OFFSITE_DESTINATION="${OFFSITE_DESTINATION:-}"
 
+file_size_bytes() {
+    if stat -c%s "$1" >/dev/null 2>&1; then
+        stat -c%s "$1"
+    else
+        stat -f%z "$1"
+    fi
+}
+
 if [ ! -f "$DB_PATH" ]; then
     echo "no DB at $DB_PATH" >&2
     exit 1
@@ -62,13 +70,21 @@ if [ -n "$OFFSITE_DESTINATION" ]; then
             if command -v aws >/dev/null; then
                 aws s3 cp "$hourly_target" "$OFFSITE_DESTINATION" --quiet
                 aws s3 cp "${hourly_target}.sha256" "$OFFSITE_DESTINATION" --quiet
+            else
+                echo "OFFSITE_DESTINATION is s3:// but aws CLI is not installed" >&2
+                exit 1
             fi
             ;;
         *)
             # Treat as rsync-able destination (user@host:/path).
-            rsync -a --quiet "$hourly_target" "${hourly_target}.sha256" "$OFFSITE_DESTINATION" || true
+            if command -v rsync >/dev/null; then
+                rsync -a --quiet "$hourly_target" "${hourly_target}.sha256" "$OFFSITE_DESTINATION"
+            else
+                echo "OFFSITE_DESTINATION requires rsync, but rsync is not installed" >&2
+                exit 1
+            fi
             ;;
     esac
 fi
 
-echo "$(date -u +%FT%TZ) backup ok: $hourly_target ($(stat -c%s "$hourly_target") bytes)"
+echo "$(date -u +%FT%TZ) backup ok: $hourly_target ($(file_size_bytes "$hourly_target") bytes)"

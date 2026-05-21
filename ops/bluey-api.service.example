@@ -14,9 +14,6 @@ WorkingDirectory=/opt/bluey-api
 # keys, BLUEY_TRUSTED_PROXIES, etc.
 EnvironmentFile=/etc/bluey-api/bluey-api.env
 
-# Keep a copy of the previous binary so a failed deploy can roll back.
-ExecStartPre=/bin/sh -c 'mkdir -p /var/backups/bluey-api/bin && cp -f /usr/local/bin/bluey-server /var/backups/bluey-api/bin/bluey-server.previous 2>/dev/null || true'
-
 ExecStart=/usr/local/bin/bluey-server
 
 Restart=on-failure

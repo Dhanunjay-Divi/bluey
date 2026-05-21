@@ -34,7 +34,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "macOS": {}
+    "macOS": {
+      "infoPlist": "Info.plist"
+    }
   },
   "plugins": {
     "updater": {

@@ -36,3 +36,37 @@ pub fn setup_nspanel(app: &App) -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+/// Codex follow-up: exclude every macOS NSWindow this Tauri app owns
+/// from screen-share / screen-recording capture. Walks all webview
+/// windows on the AppHandle and sets NSWindow.sharingType = .none.
+///
+/// macOS API: NSWindow.SharingType.none == 0 == NSWindowSharingNone.
+/// The window is excluded from CGDisplayStream / ScreenCaptureKit /
+/// screencapture / AirPlay, identical to what the floating overlay
+/// already does. Without this, opening the dashboard window during
+/// a screen share leaks Bluey to the meeting.
+pub fn set_sharing_type_none<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2_foundation::NSInteger;
+
+    for (_label, window) in app.webview_windows() {
+        let Ok(ns_window_ptr) = window.ns_window() else {
+            continue;
+        };
+        // ns_window() returns *mut std::ffi::c_void pointing at NSWindow.
+        let ns_window = ns_window_ptr as *mut AnyObject;
+        if ns_window.is_null() {
+            continue;
+        }
+        // SAFETY: Tauri guarantees the pointer is a valid retained
+        // NSWindow on macOS. NSWindow.sharingType is a Cocoa property
+        // backed by setSharingType:; passing 0 (NSWindowSharingNone)
+        // is safe.
+        unsafe {
+            let _: () = msg_send![ns_window, setSharingType: 0 as NSInteger];
+        }
+    }
+    tracing::info!("dashboard windows set to NSWindowSharingNone (screen-share invisible)");
+}

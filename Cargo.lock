@@ -1175,6 +1175,8 @@ dependencies = [
  "cue-stealth",
  "dirs",
  "futures",
+ "objc2 0.5.2",
+ "objc2-foundation 0.2.2",
  "serde",
  "serde_json",
  "tauri",

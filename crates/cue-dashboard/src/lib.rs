@@ -261,6 +261,8 @@ pub fn run() {
 
             #[cfg(target_os = "macos")]
             macos::setup_nspanel(app)?;
+            #[cfg(target_os = "macos")]
+            crate::macos::set_sharing_type_none(app.handle());
 
             Ok(())
         })

@@ -21,7 +21,7 @@ Before starting, you must already have:
 ```bash
 # As root on the fresh droplet.
 apt-get update && apt-get -y upgrade
-apt-get -y install ufw curl ca-certificates rsync sqlite3
+apt-get -y install ufw curl ca-certificates rsync sqlite3 jq gnupg
 
 # Firewall: only 22 (SSH), 80, 443 open.
 ufw default deny incoming
@@ -148,7 +148,7 @@ cp ops/backup-bluey-db.sh /usr/local/sbin/backup-bluey-db.sh
 chmod 750 /usr/local/sbin/backup-bluey-db.sh
 chown root:root /usr/local/sbin/backup-bluey-db.sh
 
-# Cron entry: hourly snapshots, kept for 14 days.
+# Cron entry: hourly snapshots; script keeps 14 hourly + 14 daily snapshots.
 cat > /etc/cron.d/bluey-api-backup <<'EOF'
 0 * * * * root /usr/local/sbin/backup-bluey-db.sh
 EOF
@@ -180,8 +180,13 @@ cd cue/server && cargo build --release
 scp target/release/bluey-server root@<droplet>:/usr/local/bin/bluey-server.new
 ssh root@<droplet> '
   set -e
-  /usr/local/bin/bluey-server.new --version
+  chmod 755 /usr/local/bin/bluey-server.new
+  mkdir -p /var/backups/bluey-api/bin
+  if [ -x /usr/local/bin/bluey-server ]; then
+    cp -f /usr/local/bin/bluey-server /var/backups/bluey-api/bin/bluey-server.previous
+  fi
   mv /usr/local/bin/bluey-server.new /usr/local/bin/bluey-server
+  chown root:root /usr/local/bin/bluey-server
   systemctl restart bluey-api.service
   sleep 2
   curl -fsS https://bluey.sh/admin/health
@@ -194,7 +199,7 @@ If `/admin/health` fails, roll back:
 ssh root@<droplet> 'cp /var/backups/bluey-api/bin/bluey-server.previous /usr/local/bin/bluey-server && systemctl restart bluey-api.service'
 ```
 
-(The systemd unit's `ExecStartPre` keeps a copy of the previous binary at `/var/backups/bluey-api/bin/bluey-server.previous` after each restart.)
+The rollout command copies the old binary to `/var/backups/bluey-api/bin/bluey-server.previous` before replacing it. Keep that step before the `mv`; doing it from `ExecStartPre` would copy the newly deployed binary and make rollback useless.
 
 ## 12. Pre-launch sign-off checklist
 
