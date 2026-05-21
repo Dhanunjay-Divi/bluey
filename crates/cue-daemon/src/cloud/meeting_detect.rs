@@ -83,32 +83,17 @@ pub fn spawn_loop(_watcher: MeetingWatch) -> tokio::task::JoinHandle<()> {
 
 #[cfg(target_os = "macos")]
 fn frontmost_bundle_id() -> Option<String> {
-    // Use the `objc2` runtime that the rest of the daemon already uses
-    // for NSWorkspace queries. For MVP we shell out to `lsappinfo`
-    // because it works without adding a Cocoa dep here. Production swaps
-    // to direct NSWorkspace.shared().frontmostApplication.
-    let out = std::process::Command::new("lsappinfo")
-        .arg("front")
-        .output()
-        .ok()?;
-    let txt = String::from_utf8_lossy(&out.stdout);
-    // Output: ASN:0x0-0x12345678:"AppName"
-    // Better: lsappinfo info -only bundleid <psn>
-    // We re-run with -only bundleid:
-    let psn = txt.lines().next()?.trim().to_string();
-    if psn.is_empty() {
-        return None;
-    }
-    let out2 = std::process::Command::new("lsappinfo")
-        .args(["info", "-only", "bundleid", "front"])
-        .output()
-        .ok()?;
-    let txt2 = String::from_utf8_lossy(&out2.stdout);
-    // Output: "kCFBundleIdentifierKey"="us.zoom.xos"
-    let idx = txt2.find(r#""kCFBundleIdentifierKey"=""#)?;
-    let rest = &txt2[idx + r#""kCFBundleIdentifierKey"=""#.len()..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+    // Codex review remaining nit closure: direct NSWorkspace query
+    // instead of shelling out to lsappinfo. No fork+exec, no fragile
+    // string parsing.
+    use objc2::rc::autoreleasepool;
+    use objc2_app_kit::NSWorkspace;
+
+    autoreleasepool(|_| unsafe {
+        let workspace = NSWorkspace::sharedWorkspace();
+        let app = workspace.frontmostApplication()?;
+        app.bundleIdentifier().map(|s| s.to_string())
+    })
 }
 
 #[cfg(test)]
