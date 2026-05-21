@@ -137,7 +137,7 @@ pub fn run() {
                     .lock()
                     .ok()
                     .and_then(|db| db.load_setting("disguise_mode").ok().flatten())
-                    .unwrap_or_else(|| "none".to_string());
+                    .unwrap_or_else(|| "activity".to_string());
                 let mode = cue_stealth::DisguiseMode::from_str_loose(&mode_str);
                 let req = cue_stealth::build_request(mode, None);
                 if let Err(e) = cue_stealth::apply_disguise(&req) {
@@ -229,6 +229,13 @@ pub fn run() {
 
             // Setup system tray
             setup_tray(app)?;
+            let startup_disguise =
+                crate::commands::get_disguise(app.state()).unwrap_or_else(|_| "activity".into());
+            if let Err(error) =
+                crate::commands::set_disguise(startup_disguise, app.handle().clone())
+            {
+                tracing::warn!(%error, "failed to apply startup tray disguise");
+            }
 
             // Stage 18 auto-disguise watch must be installed in the single
             // effective setup closure. Tauri stores only one setup callback.
@@ -295,8 +302,7 @@ fn register_global_shortcut(app: &tauri::App) -> Result<(), Box<dyn std::error::
                     if window.is_visible().unwrap_or(false) {
                         let _ = window.hide();
                     } else {
-                        let _ = window.show();
-                        let _ = window.set_focus();
+                        show_main_window(&handle);
                     }
                 }
             }
@@ -444,10 +450,7 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 let _ = app.emit("hotkey_toggle_listening", ());
             }
             "show_dashboard" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+                show_main_window(app);
             }
             "toggle_overlay" => {
                 let _ = app.emit("hotkey_toggle_overlay", ());
@@ -468,18 +471,12 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             "signin" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
+                show_main_window(app);
                 let _ = app.emit("navigate_to", "/onboarding");
             }
             "settings" => {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                    let _ = app.emit("navigate_to", "/settings");
-                }
+                show_main_window(app);
+                let _ = app.emit("navigate_to", "/settings");
             }
             "check_updates" => {
                 let handle = app.clone();
@@ -511,6 +508,18 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .build(app)?;
 
     Ok(())
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    #[cfg(target_os = "macos")]
+    crate::macos::set_sharing_type_none(app);
+    #[cfg(target_os = "macos")]
+    crate::macos::activate_ignoring_other_apps();
+
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
 }
 
 // ─── Codex Stage 18 commit 2: deep-link onboarding handoff ──────────────

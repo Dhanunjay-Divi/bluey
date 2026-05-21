@@ -70,3 +70,25 @@ pub fn set_sharing_type_none<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     }
     tracing::info!("dashboard windows set to NSWindowSharingNone (screen-share invisible)");
 }
+
+/// Bring the LSUIElement/menu-bar-only app forward before focusing a
+/// dashboard window. Without this explicit activation, some macOS
+/// versions show the window but leave keyboard focus with the previous app.
+pub fn activate_ignoring_other_apps() {
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject};
+
+    let Some(class) = AnyClass::get("NSApplication") else {
+        return;
+    };
+    // SAFETY: NSApplication.sharedApplication is process-global and
+    // activateIgnoringOtherApps: is a main-thread AppKit selector. Calls
+    // into this helper come from Tauri UI/menu callbacks during normal app
+    // operation.
+    unsafe {
+        let app: *mut AnyObject = msg_send![class, sharedApplication];
+        if !app.is_null() {
+            let _: () = msg_send![app, activateIgnoringOtherApps: true];
+        }
+    }
+}
