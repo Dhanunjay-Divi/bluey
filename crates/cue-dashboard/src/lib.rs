@@ -19,6 +19,7 @@ pub struct DbState(pub Mutex<Database>);
 
 pub fn run() {
     tauri::Builder::default()
+        .manage(InvisibilityState::default())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
@@ -33,6 +34,43 @@ pub fn run() {
                     });
                 }
             });
+            // Codex Stage 18 commit 4: Invisible toggle in tray menu.
+            // We add a simple menu item that triggers invisibility_toggle.
+            // The tray itself is initialized by Tauri's tray plugin; this
+            // listener watches for menu_event and dispatches.
+            use tauri::menu::{MenuBuilder, MenuItemBuilder};
+            let invisible_item =
+                MenuItemBuilder::with_id("invisible_toggle", "Invisible (F19)").build(app)?;
+            let signin_item = MenuItemBuilder::with_id("signin", "Sign in / Out").build(app)?;
+            let quit_item = MenuItemBuilder::with_id("quit", "Quit Bluey").build(app)?;
+            let menu = MenuBuilder::new(app)
+                .item(&invisible_item)
+                .separator()
+                .item(&signin_item)
+                .separator()
+                .item(&quit_item)
+                .build()?;
+            if let Some(tray) = app.tray_by_id("main") {
+                let _ = tray.set_menu(Some(menu));
+            }
+            let app_handle = app.handle().clone();
+            app.on_menu_event(move |app, event| match event.id().as_ref() {
+                "invisible_toggle" => {
+                    let h = app_handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let state: tauri::State<'_, InvisibilityState> = h.state();
+                        let _ = invisibility_toggle(state, h.clone()).await;
+                    });
+                }
+                "signin" => {
+                    let _ = app.emit("navigate_to", "/onboarding");
+                }
+                "quit" => {
+                    app.exit(0);
+                }
+                _ => {}
+            });
+
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
@@ -95,6 +133,8 @@ pub fn run() {
             // R10: Cue AI hotkey
             commands::request_cue,
             commands::auto_recap,
+            invisibility_toggle,
+            invisibility_state
         ])
         .setup(|app| {
             // R10: Install anti-debug protections (best-effort, non-fatal)
@@ -540,4 +580,45 @@ async fn handle_deep_link_url(url: String, app: tauri::AppHandle) {
             );
         }
     }
+}
+
+// ─── Codex Stage 18 commit 4: invisibility state + tray "Invisible" toggle ──
+
+#[derive(Clone, Default)]
+struct InvisibilityState {
+    invisible: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl InvisibilityState {
+    fn is_invisible(&self) -> bool {
+        self.invisible.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn set(&self, v: bool) {
+        self.invisible
+            .store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[tauri::command]
+async fn invisibility_toggle(
+    state: tauri::State<'_, InvisibilityState>,
+    app: tauri::AppHandle,
+) -> Result<bool, String> {
+    use tauri::Emitter;
+    let next = !state.is_invisible();
+    state.set(next);
+    // Toggle overlay visibility (existing daemon command).
+    let _ = app.emit("hotkey_toggle_overlay", next);
+    // Toggle disguise on/off (default disguise mode is "activity").
+    let mode = if next { "activity" } else { "none" };
+    if let Err(e) = crate::commands::set_disguise(mode.to_string(), app.clone()) {
+        tracing::warn!(error = %e, "set_disguise failed during invisibility toggle");
+    }
+    let _ = app.emit("invisibility_changed", next);
+    Ok(next)
+}
+
+#[tauri::command]
+fn invisibility_state(state: tauri::State<'_, InvisibilityState>) -> bool {
+    state.is_invisible()
 }
