@@ -20,7 +20,21 @@ pub struct DbState(pub Mutex<Database>);
 pub fn run() {
     tauri::Builder::default()
         .manage(InvisibilityState::default())
-        .manage(AutoDisguiseConfig::default())
+        .manage({
+            let cfg = AutoDisguiseConfig::default();
+            if let Ok(paths) = cue_core::app_paths::AppPaths::discover() {
+                let st = cue_core::load_settings(&paths).unwrap_or_default();
+                cfg.prompted.store(
+                    st.auto_disguise_prompted,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                cfg.enabled.store(
+                    st.auto_disguise_enabled,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
+            cfg
+        })
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {

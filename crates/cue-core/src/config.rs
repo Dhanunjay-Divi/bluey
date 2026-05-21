@@ -53,6 +53,17 @@ pub struct CueSettings {
     pub cloud_sync_enabled: bool,
     pub retention_days: u32,
     pub updated_at: String,
+
+    /// Codex Stage 24: has the customer been asked once whether they
+    /// want auto-disguise during meeting apps?
+    #[serde(default)]
+    pub auto_disguise_prompted: bool,
+    /// Codex Stage 24: customer accepted auto-disguise during meeting apps.
+    #[serde(default)]
+    pub auto_disguise_enabled: bool,
+    /// Codex Stage 24: persisted disguise mode (none / activity / terminal / settings).
+    #[serde(default = "default_disguise_mode")]
+    pub disguise_mode: String,
 }
 
 impl Default for CueSettings {
@@ -67,6 +78,9 @@ impl Default for CueSettings {
             cloud_sync_enabled: false,
             retention_days: 30,
             updated_at: clock::now_epoch_ms_string(),
+            auto_disguise_prompted: false,
+            auto_disguise_enabled: false,
+            disguise_mode: "activity".to_string(),
         }
     }
 }
@@ -124,4 +138,8 @@ fn write_private_json<T: Serialize>(path: &std::path::Path, value: &T) -> Result
     }
 
     Ok(())
+}
+
+fn default_disguise_mode() -> String {
+    "activity".to_string()
 }
