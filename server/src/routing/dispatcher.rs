@@ -4,6 +4,19 @@
 //!
 //! v0.2 scope: non-streaming. Streaming proxy lands later (R14.x).
 
+fn override_url(default: &str, env_var: &str) -> String {
+    std::env::var(env_var)
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(|base| {
+            format!(
+                "{base}{}",
+                &default[default.find("/v1").unwrap_or(default.len())..]
+            )
+        })
+        .unwrap_or_else(|| default.to_string())
+}
+
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -150,7 +163,13 @@ async fn openai_complete(
         temperature,
     };
     let resp = reqwest::Client::new()
-        .post("https://api.openai.com/v1/chat/completions")
+        .post(
+            override_url(
+                "https://api.openai.com/v1/chat/completions",
+                "BLUEY_TEST_OPENAI_URL",
+            )
+            .as_str(),
+        )
         .bearer_auth(key)
         .json(&req)
         .send()
@@ -244,7 +263,13 @@ async fn anthropic_complete(
         temperature,
     };
     let resp = reqwest::Client::new()
-        .post("https://api.anthropic.com/v1/messages")
+        .post(
+            override_url(
+                "https://api.anthropic.com/v1/messages",
+                "BLUEY_TEST_ANTHROPIC_URL",
+            )
+            .as_str(),
+        )
         .header("x-api-key", key)
         .header("anthropic-version", "2023-06-01")
         .json(&req)
@@ -325,7 +350,13 @@ async fn openai_embed(keys: &UpstreamKeys, model: &str, input: &str) -> Result<E
         .ok_or_else(|| anyhow!("OPENAI_API_KEY not configured on bluey-server"))?;
     let req = OpenAiEmbedReq { model, input };
     let resp = reqwest::Client::new()
-        .post("https://api.openai.com/v1/embeddings")
+        .post(
+            override_url(
+                "https://api.openai.com/v1/embeddings",
+                "BLUEY_TEST_OPENAI_URL",
+            )
+            .as_str(),
+        )
         .bearer_auth(key)
         .json(&req)
         .send()

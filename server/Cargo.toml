@@ -67,4 +67,7 @@ clap = { version = "4", features = ["derive", "env"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+wiremock = "0.6"
+serial_test = "3"
+bluey-server = { path = "." }
 tokio-test = "0.4"
