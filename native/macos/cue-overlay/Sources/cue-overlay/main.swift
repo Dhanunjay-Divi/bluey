@@ -366,9 +366,40 @@ private final class OverlayWindow: NSWindow {
 private final class PillView: NSView {
     var statusText: String = "Bluey" {
         didSet {
-            titleField.stringValue = statusText
+            updateTitleDisplay()
             needsDisplay = true
         }
+    }
+    /// Codex Stage 19 commit 1 follow-up: live balance text rendered
+    /// next to status. Daemon sends "$4.98" (or "$4.98 low" when below
+    /// auto-topup threshold). Empty string clears.
+    var balanceText: String = "" {
+        didSet {
+            updateTitleDisplay()
+            needsDisplay = true
+        }
+    }
+    private func updateTitleDisplay() {
+        let trimmed = balanceText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            titleField.stringValue = statusText
+            titleField.textColor = NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0)
+        } else {
+            // Compose "<status> · <balance>" but use orange tint when
+            // the daemon flagged it as low.
+            let isLow = trimmed.lowercased().hasSuffix("low")
+            let displayBalance = isLow
+                ? trimmed.replacingOccurrences(of: " low", with: "")
+                    .replacingOccurrences(of: " LOW", with: "")
+                : trimmed
+            titleField.stringValue = "\(statusText) · \(displayBalance)"
+            titleField.textColor = isLow
+                ? NSColor(red: 0.98, green: 0.74, blue: 0.34, alpha: 1.0)
+                : NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0)
+        }
+    }
+    func setBalanceLabel(_ label: String) {
+        balanceText = label
     }
     var dotColor: NSColor = NSColor.systemGreen {
         didSet {
@@ -1826,6 +1857,7 @@ private final class OverlayApp {
             applyPosition(pos)
         case .setBalance(let label):
             expandedView?.setBalanceLabel(label)
+            pillView?.setBalanceLabel(label)
         case .setContextItems(let items):
             expandedView?.setContextItems(items)
         case .setSessions(let sessions):
