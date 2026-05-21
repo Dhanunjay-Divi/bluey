@@ -502,6 +502,17 @@ pub async fn password_reset_confirm(
 ) -> Result<axum::http::StatusCode, (axum::http::StatusCode, Json<ApiError>)> {
     use crate::auth::password;
     use crate::db::auth_tokens;
+    // Codex S12-17 nit: validate + hash BEFORE consuming the token, so
+    // a 400 (password too short / too long / etc) does not burn the
+    // single-use reset and force the customer to start over.
+    let new_hash = password::hash_password(&req.new_password).map_err(|e| {
+        (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: e.to_string(),
+            }),
+        )
+    })?;
     let account_id = auth_tokens::consume(
         &state.pool,
         &req.token,
@@ -521,14 +532,6 @@ pub async fn password_reset_confirm(
             error: "invalid or expired reset token".into(),
         }),
     ))?;
-    let new_hash = password::hash_password(&req.new_password).map_err(|e| {
-        (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(ApiError {
-                error: e.to_string(),
-            }),
-        )
-    })?;
     let conn = state.pool.get().map_err(|e| {
         (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,

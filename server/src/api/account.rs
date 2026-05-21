@@ -302,11 +302,32 @@ pub async fn delete_account(
         .pool
         .get()
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    let n = conn
+    // Codex S12-17 blocker 4: stripe_webhook_events has no FK to
+    // accounts; account_id is buried in the JSON body via
+    // client_reference_id / metadata.bluey_account_id. Hard-delete must
+    // remove (or scrub) those rows too. We do BOTH:
+    //   1. DELETE rows where the JSON-extracted client_reference_id
+    //      matches this account.
+    //   2. DELETE rows where metadata.bluey_account_id matches.
+    // Done in the same transaction so a partial crash leaves no
+    // PII-bearing webhook rows tied to a deleted account.
+    let mut conn = conn;
+    let tx = conn
+        .transaction()
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let _ = tx.execute(
+        "DELETE FROM stripe_webhook_events
+            WHERE json_extract(body, $.data.object.client_reference_id) = ?1
+               OR json_extract(body, $.data.object.metadata.bluey_account_id) = ?1",
+        rusqlite::params![&account.id],
+    );
+    let n = tx
         .execute(
             "DELETE FROM accounts WHERE id = ?1",
             rusqlite::params![&account.id],
         )
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    tx.commit()
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     if n == 0 {
         return Err(axum::http::StatusCode::NOT_FOUND);
