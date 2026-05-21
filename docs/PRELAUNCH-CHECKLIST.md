@@ -81,15 +81,31 @@ These are NOT in this repo (separate web codebase). Must exist before public alp
 - [ ] `/docs/terms` — terms of service
 - [ ] OG / favicon assets
 
-### macOS app
+### macOS app distribution (Pinky-style: NO Apple Developer ID required for v0.2 alpha)
 
-- [ ] Apple Developer ID certificate available + valid
-- [ ] App built `cargo tauri build --release` with proper signing identity
-- [ ] App notarized via `notarytool submit` + stapled
-- [ ] DMG signed
-- [ ] Gatekeeper opens the DMG without warnings on a clean Mac
-- [ ] `bluey://` URL scheme registers post-install (verify `lsregister -dump | grep bluey` shows the app)
-- [ ] First-run onboarding deep-link flow works end-to-end against production server
+We ship the `.app` bundle without a paid Apple Developer ID. The
+installer ad-hoc signs the bundle and strips the quarantine bit so
+first-launch is clean. Two distribution paths, ship both:
+
+#### Path A: One-line installer (`curl ... | bash`)
+- [ ] `ops/install/install.sh` hosted at `https://bluey.dev/install.sh`
+- [ ] Release tarballs hosted at `https://bluey.dev/releases/v0.2.0/Bluey-aarch64.tar.gz` and `Bluey-x86_64.tar.gz`
+- [ ] Smoke on a clean Mac: `curl -fsSL https://bluey.dev/install.sh | bash` finishes cleanly
+- [ ] Bluey.app launches from /Applications without a Gatekeeper hard-block
+- [ ] `bluey://` URL scheme registers (verify `lsregister -dump | grep bluey`)
+- [ ] First-run onboarding deep-link flow works end-to-end
+
+#### Path B: Homebrew cask (`brew install --cask bluey`)
+- [ ] `bluey-dev/homebrew-bluey` GitHub repo created
+- [ ] `ops/Casks/bluey.rb` published in that tap
+- [ ] `brew tap bluey-dev/bluey` + `brew install --cask bluey` succeeds on a clean Mac
+- [ ] Postflight ad-hoc sign + quarantine strip runs cleanly
+- [ ] `bluey` CLI is on `$PATH` after install (binary stanza)
+
+#### Optional (v1.0 GA polish, NOT v0.2 gate)
+- [ ] Apple Developer Program ($99/yr) + Developer ID Application cert
+- [ ] Notarized DMG via `notarytool submit` + `stapler staple`
+- [ ] Replaces ad-hoc-signed alpha distribution path
 
 ### Monitoring
 
