@@ -20,6 +20,7 @@ pub struct DbState(pub Mutex<Database>);
 pub fn run() {
     tauri::Builder::default()
         .manage(InvisibilityState::default())
+        .manage(AutoDisguiseConfig::default())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
@@ -112,6 +113,7 @@ pub fn run() {
                 }
                 _ => {}
             });
+            spawn_meeting_watch(app.handle().clone());
 
             Ok(())
         })
@@ -176,7 +178,9 @@ pub fn run() {
             commands::request_cue,
             commands::auto_recap,
             invisibility_toggle,
-            invisibility_state
+            invisibility_state,
+            auto_disguise_accept,
+            auto_disguise_decline
         ])
         .setup(|app| {
             // R10: Install anti-debug protections (best-effort, non-fatal)
@@ -680,4 +684,58 @@ async fn invisibility_toggle(
 #[tauri::command]
 fn invisibility_state(state: tauri::State<'_, InvisibilityState>) -> bool {
     state.is_invisible()
+}
+
+// ─── Codex Stage 18 commit 8: meeting-app auto-disguise wiring ──────────
+
+#[derive(Default, Clone)]
+struct AutoDisguiseConfig {
+    /// Has the customer been asked once already?
+    pub prompted: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Did they say yes?
+    pub enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[tauri::command]
+fn auto_disguise_accept(
+    cfg: tauri::State<'_, AutoDisguiseConfig>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    cfg.enabled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    cfg.prompted
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Err(e) = crate::commands::set_disguise("activity".to_string(), app) {
+        tracing::warn!(error = %e, "set_disguise failed during auto_disguise_accept");
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn auto_disguise_decline(cfg: tauri::State<'_, AutoDisguiseConfig>) -> Result<(), String> {
+    cfg.prompted
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+fn spawn_meeting_watch(app: tauri::AppHandle) {
+    use tauri::Emitter;
+    let watcher = cue_daemon::cloud::meeting_detect::MeetingWatch::default();
+    let _handle = cue_daemon::cloud::meeting_detect::spawn_loop(watcher.clone());
+    let mut rx = watcher.subscribe();
+    tauri::async_runtime::spawn(async move {
+        while rx.changed().await.is_ok() {
+            let cur = rx.borrow().clone();
+            if let Some(evt) = cur {
+                let cfg: tauri::State<'_, AutoDisguiseConfig> = app.state();
+                let prompted = cfg.prompted.load(std::sync::atomic::Ordering::Relaxed);
+                let enabled = cfg.enabled.load(std::sync::atomic::Ordering::Relaxed);
+                if !prompted {
+                    let _ = app.emit("auto_disguise_offer", &evt);
+                } else if enabled {
+                    let _ = crate::commands::set_disguise("activity".to_string(), app.clone());
+                }
+            }
+        }
+    });
 }
