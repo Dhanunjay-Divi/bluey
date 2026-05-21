@@ -385,6 +385,23 @@ fn register_global_shortcut(app: &tauri::App) -> Result<(), Box<dyn std::error::
         },
     )?;
 
+    // Codex Stage 18 commit 6: F19 system-wide invisibility toggle.
+    let handle_f19 = app.handle().clone();
+    if let Err(e) = app
+        .global_shortcut()
+        .on_shortcut("F19", move |_app, _sc, event| {
+            if event.state == ShortcutState::Pressed {
+                let h = handle_f19.clone();
+                tauri::async_runtime::spawn(async move {
+                    let state: tauri::State<'_, InvisibilityState> = h.state();
+                    let _ = invisibility_toggle(state, h.clone()).await;
+                });
+            }
+        })
+    {
+        tracing::warn!(error = %e, "F19 shortcut registration failed (Accessibility permission?)");
+    }
+
     Ok(())
 }
 
