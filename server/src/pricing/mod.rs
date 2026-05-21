@@ -71,24 +71,23 @@ pub const PRICING: &[ModelPricing] = &[
         markup_percent: 0,
     },
     ModelPricing {
-        // OpenAI text-embedding-3-small: $0.02/1M input. No output token cost.
+        // OpenAI text-embedding-3-small: $0.02 per 1M input tokens.
+        // $0.02 = 2 cents = 20_000 microcents. No output cost.
         provider: "openai",
         model: "text-embedding-3-small",
-        upstream_in_microcents_per_1m: 200_000,
+        upstream_in_microcents_per_1m: 20_000,
         upstream_out_microcents_per_1m: 0,
         markup_percent: 200,
     },
     ModelPricing {
-        // Deepgram nova-3: $0.0043/minute. Stored as microcents
-        // per 1M "tokens" where one token = one second of audio.
-        // 1 minute = 60 seconds; cost = $0.0043 = 43000 microcents.
-        // microcents per 1M seconds = 43000 * 1_000_000 / 60 ≈ 716_666_667.
-        // We use a simpler integer: store cost per 1M "tokens" so each
-        // billed second = 716.67 microcents (rounded to whole cents
-        // per request like every other lane).
+        // Deepgram nova-3: \$0.0043/minute = 0.43 cents/minute = 4_300
+        // microcents/minute. With 1 minute = 60 seconds, microcents per
+        // 1M seconds = 4_300 * 1_000_000 / 60 = 71_666_667 (rounded).
+        // We use seconds as the input_tokens unit so the existing
+        // pricing::compute_cost flow works unchanged.
         provider: "deepgram",
         model: "nova-3",
-        upstream_in_microcents_per_1m: 716_666_667,
+        upstream_in_microcents_per_1m: 71_666_667,
         upstream_out_microcents_per_1m: 0,
         markup_percent: 150,
     },
@@ -207,5 +206,33 @@ mod tests {
         let (bluey, customer) = compute_cost(p, 1000, 1000);
         assert_eq!(bluey, 0);
         assert_eq!(customer, 0);
+    }
+
+    #[test]
+    fn embed_pricing_dollar_to_microcents_conversion() {
+        // OpenAI text-embedding-3-small list price is $0.02 per 1M input tokens.
+        // $0.02 = 0.02 * 100 cents/dollar = 2 cents = 2 * 10_000 microcents = 20_000 microcents/1M.
+        let pricing = lookup("openai", "text-embedding-3-small").unwrap();
+        assert_eq!(pricing.upstream_in_microcents_per_1m, 20_000);
+        assert_eq!(pricing.upstream_out_microcents_per_1m, 0);
+    }
+
+    #[test]
+    fn deepgram_pricing_dollar_per_minute_to_microcents_per_1m_seconds() {
+        // Deepgram nova-3: $0.0043/minute = 0.43 cents/minute = 4_300 microcents/minute.
+        // microcents per second = 4_300 / 60 ≈ 71.667
+        // microcents per 1M seconds = 71.667 * 1_000_000 ≈ 71_666_667.
+        let pricing = lookup("deepgram", "nova-3").unwrap();
+        assert_eq!(pricing.upstream_in_microcents_per_1m, 71_666_667);
+    }
+
+    #[test]
+    fn embed_compute_cost_reasonable_for_1k_tokens() {
+        let pricing = lookup("openai", "text-embedding-3-small").unwrap();
+        // 1000 input tokens. Upstream cost: 1000 * 20_000 / 1_000_000 = 20 microcents = 0.002 cents.
+        // Customer pays markup 200% = 3x = 0.006 cents. Rounds UP to 1 cent (whole-cent floor).
+        let (bluey, customer) = compute_cost(pricing, 1_000, 0);
+        assert_eq!(bluey, 1); // both bluey and customer round UP to 1c minimum
+        assert_eq!(customer, 1); // customer pays 1c minimum (S4.3 floor)
     }
 }
