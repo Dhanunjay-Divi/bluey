@@ -17,6 +17,8 @@ path = "src/lib.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+url = "2"
+tauri-plugin-deep-link = "2"
 cue-cloud-client = { path = "../cue-cloud-client" }
 tauri = { version = "2", features = ["macos-private-api", "tray-icon"] }
 tauri-plugin-shell = "2"

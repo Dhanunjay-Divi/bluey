@@ -33,7 +33,8 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "macOS": {}
   },
   "plugins": {
     "updater": {
@@ -41,6 +42,13 @@
         "https://github.com/<org>/bluey/releases/latest/download/latest.json"
       ],
       "pubkey": "REPLACE_BEFORE_RELEASE"
+    },
+    "deep-link": {
+      "desktop": {
+        "schemes": [
+          "bluey"
+        ]
+      }
     }
   }
 }

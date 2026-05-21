@@ -287,6 +287,25 @@ impl CloudClient {
         *self.cached.lock().unwrap() = None;
         Ok(())
     }
+
+    /// Codex Stage 18 commit 2: public POST without bearer auth (used
+    /// by /auth/link/exchange before tokens are available).
+    pub async fn public_post<Req, Resp>(&self, path: &str, body: &Req) -> Result<Resp>
+    where
+        Req: serde::Serialize,
+        Resp: serde::de::DeserializeOwned,
+    {
+        let resp = self.http.post(self.url(path)).json(body).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(status = %status, body = %body, "public_post error");
+            return Err(Error::Server {
+                status: status.as_u16(),
+            });
+        }
+        Ok(resp.json().await?)
+    }
 }
 
 #[cfg(test)]

@@ -20,6 +20,21 @@ pub struct DbState(pub Mutex<Database>);
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_deep_link::init())
+        .setup(|app| {
+            use tauri_plugin_deep_link::DeepLinkExt;
+            let app_handle = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                for url in event.urls() {
+                    let url_str = url.to_string();
+                    let h = app_handle.clone();
+                    tauri::async_runtime::spawn(async move {
+                        handle_deep_link_url(url_str, h).await;
+                    });
+                }
+            });
+            Ok(())
+        })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -407,4 +422,122 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .build(app)?;
 
     Ok(())
+}
+
+// ─── Codex Stage 18 commit 2: deep-link onboarding handoff ──────────────
+
+#[derive(serde::Serialize, Clone)]
+struct DeepLinkLoginResult {
+    success: bool,
+    email: Option<String>,
+    error: Option<String>,
+}
+
+/// Handle an incoming bluey://link?code=... URL: exchange the one-time
+/// code for tokens, persist them in the keyring via CloudClient, and
+/// emit a "deep_link_login" event the dashboard subscribes to.
+async fn handle_deep_link_url(url: String, app: tauri::AppHandle) {
+    use tauri::Emitter;
+
+    let parsed = match url::Url::parse(&url) {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!(url = %url, error = %e, "deep link parse failed");
+            return;
+        }
+    };
+
+    if parsed.scheme() != "bluey" {
+        tracing::warn!(scheme = %parsed.scheme(), "unexpected deep link scheme");
+        return;
+    }
+
+    if parsed.host_str() != Some("link") {
+        tracing::warn!(host = ?parsed.host_str(), "unexpected deep link host");
+        return;
+    }
+
+    let code = parsed
+        .query_pairs()
+        .find(|(k, _)| k == "code")
+        .map(|(_, v)| v.into_owned());
+    let Some(code) = code else {
+        tracing::warn!("deep link missing code query param");
+        let _ = app.emit(
+            "deep_link_login",
+            DeepLinkLoginResult {
+                success: false,
+                email: None,
+                error: Some("missing code".into()),
+            },
+        );
+        return;
+    };
+
+    let client = match cue_cloud_client::CloudClient::with_default_keyring() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "cloud client init failed");
+            let _ = app.emit(
+                "deep_link_login",
+                DeepLinkLoginResult {
+                    success: false,
+                    email: None,
+                    error: Some(format!("client init: {e}")),
+                },
+            );
+            return;
+        }
+    };
+
+    #[derive(serde::Deserialize)]
+    struct LinkExchange {
+        access_token: String,
+        refresh_token: String,
+        account: cue_cloud_client::AuthAccountSummary,
+    }
+
+    match client
+        .public_post::<_, LinkExchange>("/auth/link/exchange", &serde_json::json!({ "code": code }))
+        .await
+    {
+        Ok(resp) => {
+            if let Err(e) = client.save_tokens(cue_cloud_client::Tokens {
+                access: resp.access_token,
+                refresh: resp.refresh_token,
+                email: resp.account.email.clone(),
+            }) {
+                tracing::warn!(error = %e, "save_tokens failed");
+                let _ = app.emit(
+                    "deep_link_login",
+                    DeepLinkLoginResult {
+                        success: false,
+                        email: Some(resp.account.email),
+                        error: Some(format!("keyring: {e}")),
+                    },
+                );
+                return;
+            }
+            tracing::info!(email = %resp.account.email, "deep-link login success");
+            let _ = app.emit(
+                "deep_link_login",
+                DeepLinkLoginResult {
+                    success: true,
+                    email: Some(resp.account.email),
+                    error: None,
+                },
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "/auth/link/exchange failed");
+            let _ = app.emit(
+                "deep_link_login",
+                DeepLinkLoginResult {
+                    success: false,
+                    email: None,
+                    error: Some(format!("exchange: {e}")),
+                },
+            );
+        }
+    }
 }
