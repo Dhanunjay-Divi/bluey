@@ -73,10 +73,25 @@ pub fn spawn_loop(
     client: cue_cloud_client::CloudClient,
     watch_handle: BalanceWatch,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move { run_loop(client, watch_handle).await })
+    spawn_loop_with_shutdown(client, watch_handle, None)
 }
 
-async fn run_loop(client: cue_cloud_client::CloudClient, watch_handle: BalanceWatch) -> () {
+/// Codex S12-17 nit: variant that accepts a graceful-shutdown signal.
+/// When the signal fires, the poll loop exits cleanly. Used by
+/// dashboard restart paths so we do not leak the task across reloads.
+pub fn spawn_loop_with_shutdown(
+    client: cue_cloud_client::CloudClient,
+    watch_handle: BalanceWatch,
+    shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move { run_loop_inner(client, watch_handle, shutdown).await })
+}
+
+async fn run_loop_inner(
+    client: cue_cloud_client::CloudClient,
+    watch_handle: BalanceWatch,
+    mut shutdown: Option<tokio::sync::watch::Receiver<bool>>,
+) -> () {
     let interval_secs: u64 = std::env::var("BLUEY_BALANCE_POLL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -86,7 +101,19 @@ async fn run_loop(client: cue_cloud_client::CloudClient, watch_handle: BalanceWa
 
     let mut consecutive_errors: u32 = 0;
     loop {
-        interval.tick().await;
+        if let Some(rx) = shutdown.as_mut() {
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = rx.changed() => {
+                    if *rx.borrow() {
+                        tracing::info!("balance poll loop shutting down");
+                        return;
+                    }
+                }
+            }
+        } else {
+            interval.tick().await;
+        }
         match poll_once(&client).await {
             Ok(snap) => {
                 consecutive_errors = 0;
