@@ -271,3 +271,123 @@ async fn router_transcribe_happy_path_with_mocked_deepgram() {
     assert_eq!(v["model"], "nova-3");
     assert_eq!(v["duration_seconds"], 2);
 }
+
+#[tokio::test]
+#[serial]
+async fn billing_portal_creates_session_via_mocked_stripe() {
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "portal@example.com", "longenoughpw").await;
+
+    // Seed: customer must have stripe_customer_id (the portal endpoint
+    // 400s if missing). We poke it directly into the DB to simulate a
+    // prior successful Checkout.
+    let conn = h.pool.get().unwrap();
+    conn.execute(
+        "UPDATE accounts SET stripe_customer_id = ?1 WHERE email = ?2",
+        rusqlite::params!["cus_test_portal", "portal@example.com"],
+    )
+    .unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/v1/billing_portal/sessions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "bps_test",
+            "url": "https://billing.stripe.com/p/session/test_session_url"
+        })))
+        .expect(1)
+        .mount(&h.stripe)
+        .await;
+
+    let req = Request::post("/billing/portal")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["portal_url"]
+        .as_str()
+        .unwrap()
+        .starts_with("https://billing.stripe.com/"));
+}
+
+#[tokio::test]
+#[serial]
+async fn billing_portal_400s_without_stripe_customer() {
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "no-cus@example.com", "longenoughpw").await;
+
+    let req = Request::post("/billing/portal")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+#[serial]
+async fn auto_topup_off_by_default_does_not_fire_charge() {
+    // New accounts default to auto_topup_enabled=1 in schema, but with
+    // no PaymentMethod on file the topup helper short-circuits. We
+    // exercise that path: low balance + no PM -> NO charge.
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "topup@example.com", "longenoughpw").await;
+
+    // Drain trial seconds + balance to force the post-deduct branch to
+    // be reached, but no Stripe customer/PM means topup is skipped.
+    let conn = h.pool.get().unwrap();
+    conn.execute(
+        "UPDATE accounts SET trial_seconds_remaining = 0, balance_cents = 100 WHERE email = ?1",
+        rusqlite::params!["topup@example.com"],
+    )
+    .unwrap();
+
+    // No Stripe mock for /v1/payment_intents — if topup fired, it would
+    // hit a non-existent endpoint and the test would still pass because
+    // the spawn is fire-and-forget. But we assert the wiremock has
+    // received ZERO matching POSTs to /v1/payment_intents.
+    Mock::given(method("POST"))
+        .and(path("/v1/payment_intents"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "pi_should_not_fire",
+            "status": "succeeded"
+        })))
+        .expect(0) // strict: must NOT be called.
+        .mount(&h.stripe)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        })))
+        .mount(&h.openai)
+        .await;
+
+    let req = Request::post("/router/complete")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "request_id": "topup-test-no-pm",
+                "system": "",
+                "user": "hi",
+                "lane": "instant"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    // Either 200 (cue completed despite low balance via trial absorb) or
+    // 402 (insufficient balance). Both are acceptable — the assertion is
+    // that the Stripe payment_intents mock was NOT called.
+    assert!(resp.status() == 200 || resp.status() == 402);
+
+    // Give the spawned topup task a chance to run if it would.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+}
