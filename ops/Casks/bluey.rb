@@ -1,12 +1,15 @@
 cask "bluey" do
-  arch arm: "aarch64", intel: "x86_64"
+  arch arm: "arm64"
   version "0.2.0"
+  # TODO: replace :no_check with the release SHA256 once v0.2.0
+  # artifacts are published from the release workflow.
   sha256 :no_check
 
-  url "https://bluey.dev/releases/v#{version}/Bluey-#{arch}.tar.gz"
+  url "https://bluey.dev/releases/v#{version}/bluey-#{version}-darwin-#{arch}.tar.gz"
   name "Bluey"
   desc "Quiet AI copilot — listens, suggests answers, stays out of the way"
   homepage "https://bluey.dev"
+  depends_on arch: :arm64
 
   app "Bluey.app"
 
@@ -25,19 +28,19 @@ cask "bluey" do
                    sudo: false
   end
 
-  binary "#{appdir}/Bluey.app/Contents/Resources/bluey-cli", target: "bluey"
+  binary "bin/bluey", target: "bluey"
 
-  uninstall quit:    "com.bluey.app",
+  uninstall quit:    "com.bluey.dashboard",
             delete:  [
                        "~/Library/Application Support/Bluey",
                        "~/Library/Logs/Bluey",
-                       "~/Library/Preferences/com.bluey.app.plist",
+                       "~/Library/Preferences/com.bluey.dashboard.plist",
                      ]
 
   zap trash: [
         "~/Library/Application Support/Bluey",
-        "~/Library/Caches/com.bluey.app",
+        "~/Library/Caches/com.bluey.dashboard",
         "~/Library/Logs/Bluey",
-        "~/Library/Preferences/com.bluey.app.plist",
+        "~/Library/Preferences/com.bluey.dashboard.plist",
       ]
 end

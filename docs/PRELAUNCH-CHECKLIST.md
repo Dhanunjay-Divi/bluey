@@ -89,7 +89,9 @@ first-launch is clean. Two distribution paths, ship both:
 
 #### Path A: One-line installer (`curl ... | bash`)
 - [ ] `ops/install/install.sh` hosted at `https://bluey.dev/install.sh`
-- [ ] Release tarballs hosted at `https://bluey.dev/releases/v0.2.0/Bluey-aarch64.tar.gz` and `Bluey-x86_64.tar.gz`
+- [ ] Release tarball hosted at `https://bluey.dev/releases/v0.2.0/bluey-0.2.0-darwin-arm64.tar.gz`
+- [ ] Each release tarball contains top-level `Bluey.app` and `bin/bluey`
+- [ ] `SHA256SUMS.txt` hosted next to the tarballs, and `install.sh` verifies it
 - [ ] Smoke on a clean Mac: `curl -fsSL https://bluey.dev/install.sh | bash` finishes cleanly
 - [ ] Bluey.app launches from /Applications without a Gatekeeper hard-block
 - [ ] `bluey://` URL scheme registers (verify `lsregister -dump | grep bluey`)

@@ -58,6 +58,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Setup Node.js
+        if: matrix.os == 'macos-latest'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/cue-dashboard/ui/package-lock.json
+
       - name: Configure MSVC
         if: matrix.os == 'windows-latest'
         uses: ilammy/msvc-dev-cmd@v1
@@ -76,6 +84,16 @@ jobs:
 
       - name: Build daemon and CLI
         run: cargo build --release --target ${{ matrix.target }} -p cue-daemon -p cue-cli
+
+      - name: Build macOS dashboard app
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          cd crates/cue-dashboard/ui
+          npm ci
+          cd ..
+          cargo install tauri-cli --version "^2.0.0" --locked
+          cargo tauri build --release --target ${{ matrix.target }} --bundles app
 
       - name: Build macOS native helpers
         if: matrix.os == 'macos-latest'
@@ -112,6 +130,39 @@ jobs:
               cp "$f" staging/bin/ 2>/dev/null || true
             fi
           done
+          if [ "${{ matrix.os }}" = "macos-latest" ]; then
+            APP_SRC=""
+            for app_dir in "target/${{ matrix.target }}/release/bundle/macos" "target/release/bundle/macos"; do
+              if [ -d "$app_dir" ]; then
+                for candidate in "$app_dir"/*.app; do
+                  if [ -d "$candidate" ]; then
+                    APP_SRC="$candidate"
+                    break 2
+                  fi
+                done
+              fi
+            done
+            if [ -z "$APP_SRC" ]; then
+              echo "missing Tauri .app bundle for macOS distribution" >&2
+              exit 1
+            fi
+            cp -R "$APP_SRC" staging/Bluey.app
+            mkdir -p staging/Bluey.app/Contents/Resources
+            cp staging/bin/bluey staging/Bluey.app/Contents/Resources/bluey-cli
+            cp staging/bin/bluey-daemon staging/Bluey.app/Contents/Resources/bluey-daemon
+            for helper in \
+              bluey-overlay-macos cue-overlay-macos \
+              bluey-audio-macos cue-audio-macos \
+              bluey-whisper-macos cue-whisper; do
+              if [ -f "staging/bin/$helper" ]; then
+                cp "staging/bin/$helper" "staging/Bluey.app/Contents/Resources/$helper"
+              fi
+            done
+            if [ -d "target/release/BlueyOverlay.app" ]; then
+              cp -R "target/release/BlueyOverlay.app" \
+                staging/Bluey.app/Contents/Resources/BlueyOverlay.app
+            fi
+          fi
           tar -czf "bluey-${VERSION}-${{ matrix.platform }}.tar.gz" -C staging .
 
       - name: Package (Windows)

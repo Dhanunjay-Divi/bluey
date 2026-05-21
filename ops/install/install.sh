@@ -14,7 +14,7 @@
 set -euo pipefail
 
 # ── Configuration ────────────────────────────────────────────────────
-BLUEY_VERSION="${BLUEY_VERSION:-latest}"
+BLUEY_VERSION="${BLUEY_VERSION:-0.2.0}"
 DOWNLOAD_HOST="${BLUEY_DOWNLOAD_HOST:-https://bluey.dev}"
 INSTALL_DIR="${BLUEY_INSTALL_DIR:-/Applications}"
 CLI_DIR="${BLUEY_CLI_DIR:-/usr/local/bin}"
@@ -44,8 +44,8 @@ esac
 
 ARCH="$(uname -m)"
 case "$ARCH" in
-    arm64|aarch64) ARCH=aarch64 ;;
-    x86_64|amd64)  ARCH=x86_64 ;;
+    arm64|aarch64) PLATFORM=darwin-arm64 ;;
+    x86_64|amd64)  fail "Bluey v0.2 alpha installer currently supports Apple Silicon Macs only." ;;
     *) fail "Unsupported architecture: $ARCH" ;;
 esac
 
@@ -59,20 +59,43 @@ if [ "$EUID" -eq 0 ]; then
 fi
 
 # ── Download ─────────────────────────────────────────────────────────
-say "Downloading Bluey ($BLUEY_VERSION, $ARCH)..."
-TARBALL="$(mktemp -t bluey).tar.gz"
-trap 'rm -f "$TARBALL"' EXIT
+VERSION_TAG="$BLUEY_VERSION"
+VERSION_NUMBER="${BLUEY_VERSION#v}"
+case "$VERSION_TAG" in
+    latest) ARTIFACT="bluey-latest-$PLATFORM.tar.gz" ;;
+    v*)     ARTIFACT="bluey-$VERSION_NUMBER-$PLATFORM.tar.gz" ;;
+    *)      VERSION_TAG="v$VERSION_NUMBER"; ARTIFACT="bluey-$VERSION_NUMBER-$PLATFORM.tar.gz" ;;
+esac
 
-URL="$DOWNLOAD_HOST/releases/$BLUEY_VERSION/Bluey-$ARCH.tar.gz"
+say "Downloading Bluey ($VERSION_TAG, $PLATFORM)..."
+DOWNLOAD_TMP="$(mktemp -d -t bluey-download)"
+TARBALL="$DOWNLOAD_TMP/$ARTIFACT"
+trap 'rm -rf "$DOWNLOAD_TMP"' EXIT
+
+URL="$DOWNLOAD_HOST/releases/$VERSION_TAG/$ARTIFACT"
 if ! curl -fsSL --retry 3 -o "$TARBALL" "$URL"; then
     fail "Download failed from $URL"
 fi
 ok "Downloaded $(stat -f%z "$TARBALL" 2>/dev/null || stat -c%s "$TARBALL") bytes"
 
+if [ "${BLUEY_SKIP_CHECKSUM:-0}" != "1" ] && command -v shasum >/dev/null; then
+    CHECKSUMS="$DOWNLOAD_TMP/SHA256SUMS.txt"
+    if curl -fsSL --retry 3 -o "$CHECKSUMS" "$DOWNLOAD_HOST/releases/$VERSION_TAG/SHA256SUMS.txt"; then
+        if grep " $ARTIFACT\$" "$CHECKSUMS" > "$CHECKSUMS.one"; then
+            (cd "$(dirname "$CHECKSUMS")" && shasum -a 256 -c "$CHECKSUMS.one")
+            ok "Checksum verified"
+        else
+            fail "Checksum for $ARTIFACT not found in SHA256SUMS.txt"
+        fi
+    else
+        warn "Checksum manifest unavailable; relying on HTTPS download."
+    fi
+fi
+
 # ── Extract ──────────────────────────────────────────────────────────
 say "Installing to $INSTALL_DIR/Bluey.app..."
 WORKDIR="$(mktemp -d -t bluey-install)"
-trap 'rm -rf "$WORKDIR" "$TARBALL"' EXIT
+trap 'rm -rf "$WORKDIR" "$DOWNLOAD_TMP"' EXIT
 
 tar -xzf "$TARBALL" -C "$WORKDIR"
 
@@ -115,12 +138,19 @@ if [ -x "$LSREGISTER" ]; then
 fi
 
 # ── CLI symlink ──────────────────────────────────────────────────────
-if [ -d "$CLI_DIR" ] && [ -w "$CLI_DIR" ]; then
-    if [ -f "$INSTALL_DIR/Bluey.app/Contents/Resources/bluey-cli" ]; then
-        ln -sf "$INSTALL_DIR/Bluey.app/Contents/Resources/bluey-cli" \
-            "$CLI_DIR/bluey"
-        ok "CLI symlink: $CLI_DIR/bluey"
-    fi
+CLI_SOURCE=""
+if [ -f "$INSTALL_DIR/Bluey.app/Contents/Resources/bluey-cli" ]; then
+    CLI_SOURCE="$INSTALL_DIR/Bluey.app/Contents/Resources/bluey-cli"
+elif [ -f "$WORKDIR/bin/bluey" ]; then
+    mkdir -p "$INSTALL_DIR/Bluey.app/Contents/Resources"
+    cp "$WORKDIR/bin/bluey" "$INSTALL_DIR/Bluey.app/Contents/Resources/bluey-cli"
+    chmod +x "$INSTALL_DIR/Bluey.app/Contents/Resources/bluey-cli"
+    CLI_SOURCE="$INSTALL_DIR/Bluey.app/Contents/Resources/bluey-cli"
+fi
+
+if [ -n "$CLI_SOURCE" ] && [ -d "$CLI_DIR" ] && [ -w "$CLI_DIR" ]; then
+    ln -sf "$CLI_SOURCE" "$CLI_DIR/bluey"
+    ok "CLI symlink: $CLI_DIR/bluey"
 fi
 
 # ── Done ─────────────────────────────────────────────────────────────
