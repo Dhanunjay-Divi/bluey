@@ -43,8 +43,42 @@ pub fn run() {
                 MenuItemBuilder::with_id("invisible_toggle", "Invisible (F19)").build(app)?;
             let signin_item = MenuItemBuilder::with_id("signin", "Sign in / Out").build(app)?;
             let quit_item = MenuItemBuilder::with_id("quit", "Quit Bluey").build(app)?;
+
+            // Codex Stage 18 commit 7: Disguise submenu in tray.
+            use tauri::menu::SubmenuBuilder;
+            let current_disguise = crate::commands::get_disguise(app.state())
+                .unwrap_or_else(|_| "activity".to_string());
+            let label = |v: &str, name: &str| {
+                if v == current_disguise {
+                    format!("✓ {name}")
+                } else {
+                    format!("  {name}")
+                }
+            };
+            let disguise_submenu = SubmenuBuilder::new(app, "Disguise")
+                .item(&MenuItemBuilder::with_id("disguise:none", label("none", "Off")).build(app)?)
+                .item(
+                    &MenuItemBuilder::with_id(
+                        "disguise:activity",
+                        label("activity", "Activity Monitor"),
+                    )
+                    .build(app)?,
+                )
+                .item(
+                    &MenuItemBuilder::with_id("disguise:terminal", label("terminal", "Terminal"))
+                        .build(app)?,
+                )
+                .item(
+                    &MenuItemBuilder::with_id(
+                        "disguise:settings",
+                        label("settings", "System Settings"),
+                    )
+                    .build(app)?,
+                )
+                .build()?;
             let menu = MenuBuilder::new(app)
                 .item(&invisible_item)
+                .item(&disguise_submenu)
                 .separator()
                 .item(&signin_item)
                 .separator()
@@ -61,6 +95,14 @@ pub fn run() {
                         let state: tauri::State<'_, InvisibilityState> = h.state();
                         let _ = invisibility_toggle(state, h.clone()).await;
                     });
+                }
+                id if id.starts_with("disguise:") => {
+                    let mode = id.trim_start_matches("disguise:").to_string();
+                    if let Err(e) = crate::commands::set_disguise(mode.clone(), app.clone()) {
+                        tracing::warn!(error = %e, "set_disguise from tray failed");
+                    } else {
+                        tracing::info!(mode = %mode, "disguise changed via tray");
+                    }
                 }
                 "signin" => {
                     let _ = app.emit("navigate_to", "/onboarding");

@@ -1,3 +1,4 @@
+import { Check } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { type DisguiseMode, getDisguise, setDisguise } from "../lib/disguise";
@@ -135,6 +136,7 @@ export function Settings() {
 
   return (
     <div className="p-6 max-w-xl space-y-6">
+      <DisguiseSection />
       <h1 className="text-2xl font-bold">Settings</h1>
 
       <label className="block">
@@ -363,5 +365,87 @@ export function AiProviderSettings() {
         ))}
       </div>
     </section>
+  );
+}
+
+
+// ─── Codex Stage 18 commit 7: Disguise picker section ────────────────────
+
+const DISGUISE_OPTIONS = [
+  { value: "none", label: "Off (visible as Bluey)", desc: "Bluey shows up as itself in your menu bar." },
+  { value: "activity", label: "Activity Monitor", desc: "Recommended. Looks like the system process viewer." },
+  { value: "terminal", label: "Terminal", desc: "Looks like an open terminal window." },
+  { value: "settings", label: "System Settings", desc: "Looks like an open settings pane." },
+];
+
+function DisguiseSection() {
+  const [mode, setMode] = useState<string>("activity");
+
+  useEffect(() => {
+    invoke<string>("get_disguise").then((m) => setMode(m)).catch(() => {});
+  }, []);
+
+  async function update(next: string) {
+    setMode(next);
+    try {
+      await invoke("set_disguise", { mode: next });
+    } catch (e) {
+      console.warn("set_disguise failed", e);
+    }
+  }
+
+  const current = DISGUISE_OPTIONS.find((o) => o.value === mode) ?? DISGUISE_OPTIONS[0];
+
+  return (
+    <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-5 space-y-4">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h3 className="font-semibold text-zinc-100">Disguise</h3>
+          <p className="text-xs text-zinc-400 mt-1 leading-relaxed">
+            How Bluey appears in your menu bar and to screen-shares. We
+            recommend leaving this on Activity Monitor unless you have a
+            specific reason.{" "}
+            <a
+              href="https://bluey.dev/docs/disguise"
+              target="_blank"
+              rel="noreferrer"
+              className="text-blue-400 hover:text-blue-300 underline"
+            >
+              Why?
+            </a>
+          </p>
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        {DISGUISE_OPTIONS.map((opt) => {
+          const active = opt.value === mode;
+          return (
+            <button
+              key={opt.value}
+              onClick={() => update(opt.value)}
+              className={
+                "w-full text-left rounded-lg border p-3 transition-colors " +
+                (active
+                  ? "bg-blue-500/10 border-blue-500/40"
+                  : "bg-zinc-950 border-zinc-800 hover:border-zinc-700")
+              }
+            >
+              <div className="flex items-center justify-between">
+                <span className={"text-sm font-medium " + (active ? "text-blue-300" : "text-zinc-200")}>
+                  {opt.label}
+                </span>
+                {active && <Check className="h-4 w-4 text-blue-400" />}
+              </div>
+              <p className="text-xs text-zinc-500 mt-1">{opt.desc}</p>
+            </button>
+          );
+        })}
+      </div>
+
+      <p className="text-xs text-zinc-500">
+        Currently disguised as <span className="text-zinc-300">{current.label}</span>.
+      </p>
+    </div>
   );
 }
