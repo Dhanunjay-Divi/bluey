@@ -1,0 +1,48 @@
+[Unit]
+Description=Bluey API server (managed bluey-server)
+Documentation=https://bluey.dev/docs/server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bluey
+Group=bluey
+WorkingDirectory=/opt/bluey-api
+
+# Environment file holds JWT_SECRET, STRIPE keys, OPENAI/ANTHROPIC/DEEPGRAM
+# keys, BLUEY_TRUSTED_PROXIES, etc.
+EnvironmentFile=/etc/bluey-api/bluey-api.env
+
+# Keep a copy of the previous binary so a failed deploy can roll back.
+ExecStartPre=/bin/sh -c 'mkdir -p /var/backups/bluey-api/bin && cp -f /usr/local/bin/bluey-server /var/backups/bluey-api/bin/bluey-server.previous 2>/dev/null || true'
+
+ExecStart=/usr/local/bin/bluey-server
+
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=30s
+
+# Hardening.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/opt/bluey-api /var/log/bluey-api /var/backups/bluey-api
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+# Resource limits (tune as fleet grows).
+LimitNOFILE=8192
+MemoryMax=1G
+CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target

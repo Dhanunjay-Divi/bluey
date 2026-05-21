@@ -1,0 +1,47 @@
+# Caddyfile for bluey-server.
+#
+# Replace `bluey.sh` with your domain. Caddy auto-provisions Let's Encrypt
+# certificates on first request. Reverse-proxies to the local bluey-api
+# systemd service on 127.0.0.1:8080.
+
+bluey.sh {
+    encode gzip zstd
+
+    # Health endpoint can be polled by external monitors; expose freely.
+    handle /admin/health {
+        reverse_proxy 127.0.0.1:8080
+    }
+
+    # All other traffic.
+    reverse_proxy 127.0.0.1:8080 {
+        # Strip any client-provided X-Forwarded-* headers and write our own.
+        # rate_limit::client_key() trusts XFF only when the immediate peer
+        # IP is in BLUEY_TRUSTED_PROXIES. Caddy → bluey-server is loopback,
+        # so 127.0.0.1 must be in BLUEY_TRUSTED_PROXIES on the server side.
+        header_up -X-Forwarded-For
+        header_up X-Forwarded-For {client_ip}
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-Host {host}
+    }
+
+    # Hardening headers.
+    header {
+        Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "interest-cohort=()"
+        # CSP: server returns JSON only; no HTML to render scripts from.
+        Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+    }
+
+    # Standard log to syslog so journalctl shows access patterns.
+    log {
+        output file /var/log/caddy/bluey.access.log {
+            roll_size 100mb
+            roll_keep 14
+            roll_keep_for 720h
+        }
+        format json
+    }
+}
