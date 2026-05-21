@@ -1,3 +1,4 @@
+#![allow(clippy::doc_lazy_continuation)]
 //! Codex Stage 18: one-time link codes for browser→app handoff.
 //!
 //! The browser-authenticated user hits POST /auth/link/mint, which
