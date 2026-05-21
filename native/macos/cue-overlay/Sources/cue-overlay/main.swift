@@ -833,6 +833,7 @@ private final class ExpandedPanelView: NSView {
         configureHeader()
         configureContextRows()
         configureComposer()
+        styleDrawer()
         feed.onTranscript = { [weak self] card in
             self?.appendTranscriptSnippet(card)
         }
@@ -1058,7 +1059,6 @@ private final class ExpandedPanelView: NSView {
         sessionDrawer.isHidden = true
         styleHeaderIconButton(navButton, symbol: "sidebar.left", fallback: "[]")
         styleHeaderIconButton(newSessionButton, symbol: "square.and.pencil", fallback: "+")
-        styleDrawer()
         styleControlButton(latestSessionButton, symbol: "clock.arrow.circlepath", accent: false)
         styleControlButton(answerStyleSaveButton, symbol: "checkmark", accent: true)
         styleControlButton(recordingButton, symbol: "waveform", accent: false)
