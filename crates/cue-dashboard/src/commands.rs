@@ -1141,10 +1141,25 @@ async fn try_speculative_dispatch(
         }
     }
 
-    Ok(Some((
-        final_text.unwrap_or(accumulated_draft).trim().to_string(),
-        cost,
-    )))
+    // Codex review S9 round-3 blocker: actually use lane_errors. If
+    // every lane errored AND no text was produced, return Ok(None) so
+    // the caller falls back to the legacy single-shot path. Returning
+    // empty Ok(Some("")) made try_speculative_dispatch silently
+    // persist an empty cue card.
+    let resolved = final_text.unwrap_or(accumulated_draft);
+    let trimmed = resolved.trim().to_string();
+    if trimmed.is_empty() && !lane_errors.is_empty() {
+        tracing::warn!(
+            lane_errors = ?lane_errors,
+            "speculative dispatch: every lane errored; falling back to legacy"
+        );
+        return Ok(None);
+    }
+    if trimmed.is_empty() {
+        // No errors AND no text — nothing to render either way.
+        return Ok(None);
+    }
+    Ok(Some((trimmed, cost)))
 }
 
 fn merge_cost_metadata(

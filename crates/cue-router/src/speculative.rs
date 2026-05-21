@@ -689,4 +689,56 @@ mod tests {
         assert!(draft_id.as_deref().unwrap().starts_with("logical-id-1"));
         assert!(final_id.as_deref().unwrap().starts_with("logical-id-1"));
     }
+
+    /// Codex review S9 round-3 blocker: every-lane-errors should emit
+    /// only Error chunks so the dashboard returns Ok(None) and runs
+    /// the legacy fallback instead of persisting an empty card.
+    #[tokio::test]
+    async fn all_lanes_error_yields_only_error_chunks() {
+        struct ErroringInner;
+        #[async_trait]
+        impl LlmProvider for ErroringInner {
+            fn name(&self) -> &'static str {
+                "erroring"
+            }
+            async fn complete(&self, _req: &LlmRequest) -> Result<LlmResponse, LlmError> {
+                Err(LlmError::Provider("upstream blocked for test".into()))
+            }
+            async fn complete_stream(&self, _req: &LlmRequest) -> Result<LlmChunkStream, LlmError> {
+                Err(LlmError::Provider("upstream blocked for test".into()))
+            }
+        }
+        struct AlwaysErrorProvider;
+        #[async_trait]
+        impl SpeculativeProvider for AlwaysErrorProvider {
+            async fn provider_for(
+                &self,
+                _route: &ProviderRoute,
+            ) -> Result<Arc<dyn LlmProvider>, LlmError> {
+                Ok(Arc::new(ErroringInner))
+            }
+        }
+        let policy: Arc<dyn RoutingPolicy> = Arc::new(crate::policy::StaticPolicy::defaults());
+        let registry: Arc<dyn SpeculativeProvider> = Arc::new(AlwaysErrorProvider);
+        let router = SpeculativeRouter::new(policy, registry, true);
+
+        let classification = TaskClassification {
+            task_type: crate::TaskType::General,
+            difficulty: crate::Difficulty::Hard,
+            needed_context: crate::ContextNeeds::default(),
+            latency_lane: LatencyLane::Deep,
+            confidence: 0.9,
+        };
+        let mut stream = std::pin::pin!(router.run(&classification, req()).await.unwrap());
+        let mut errors = 0;
+        let mut texts = 0;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                SpeculativeChunk::Draft { .. } | SpeculativeChunk::Final { .. } => texts += 1,
+                SpeculativeChunk::Error { .. } => errors += 1,
+            }
+        }
+        assert!(errors >= 1, "expected at least one Error chunk");
+        assert_eq!(texts, 0, "no Draft/Final chunks should be produced");
+    }
 }
