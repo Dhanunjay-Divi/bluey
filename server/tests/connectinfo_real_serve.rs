@@ -91,5 +91,4 @@ async fn real_serve_path_installs_connect_info_and_rate_limit_sees_peer_ip() {
     );
 
     server.abort();
-    
 }

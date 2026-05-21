@@ -277,4 +277,3 @@ mod tests {
         assert_eq!(key, "198.51.100.99");
     }
 }
-
