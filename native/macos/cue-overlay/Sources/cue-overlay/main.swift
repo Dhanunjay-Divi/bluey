@@ -386,42 +386,41 @@ private final class PillView: NSView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
-        layer?.backgroundColor = NSColor(red: 0.010, green: 0.020, blue: 0.030, alpha: 0.98).cgColor
+        layer?.backgroundColor = NSColor.clear.cgColor
         layer?.cornerRadius = frameRect.height / 2
-        layer?.borderWidth = 1.2
-        layer?.borderColor = NSColor(red: 0.30, green: 0.78, blue: 0.96, alpha: 0.62).cgColor
+        layer?.borderWidth = 0
         layer?.shadowColor = NSColor(red: 0.10, green: 0.70, blue: 0.96, alpha: 1.0).cgColor
-        layer?.shadowOpacity = 0.24
-        layer?.shadowRadius = 12
+        layer?.shadowOpacity = 0.18
+        layer?.shadowRadius = 7
         layer?.shadowOffset = .zero
 
         logoTile.wantsLayer = true
-        logoTile.layer?.backgroundColor = NSColor(red: 0.03, green: 0.25, blue: 0.38, alpha: 1.0).cgColor
-        logoTile.layer?.cornerRadius = 10
-        logoTile.layer?.borderWidth = 1.4
-        logoTile.layer?.borderColor = NSColor(red: 0.42, green: 0.92, blue: 1.0, alpha: 0.9).cgColor
+        logoTile.layer?.backgroundColor = NSColor(red: 0.025, green: 0.140, blue: 0.190, alpha: 1.0).cgColor
+        logoTile.layer?.cornerRadius = 6
+        logoTile.layer?.borderWidth = 1
+        logoTile.layer?.borderColor = NSColor(red: 0.42, green: 0.92, blue: 1.0, alpha: 0.72).cgColor
         logoTile.layer?.shadowColor = NSColor(red: 0.15, green: 0.66, blue: 1.0, alpha: 1.0).cgColor
-        logoTile.layer?.shadowOpacity = 0.42
-        logoTile.layer?.shadowRadius = 10
+        logoTile.layer?.shadowOpacity = 0.22
+        logoTile.layer?.shadowRadius = 5
         logoTile.layer?.shadowOffset = .zero
         addSubview(logoTile)
 
-        logoGlyph.font = NSFont.monospacedSystemFont(ofSize: 14, weight: .bold)
+        logoGlyph.font = NSFont.monospacedSystemFont(ofSize: 9.5, weight: .bold)
         logoGlyph.textColor = NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0)
         logoGlyph.alignment = .center
         logoTile.addSubview(logoGlyph)
 
-        titleField.font = NSFont.systemFont(ofSize: 17, weight: .bold)
+        titleField.font = NSFont.systemFont(ofSize: 12.5, weight: .semibold)
         titleField.textColor = NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0)
         titleField.alignment = .left
         addSubview(titleField)
 
         dotView.wantsLayer = true
         dotView.layer?.backgroundColor = dotColor.cgColor
-        dotView.layer?.cornerRadius = 4
+        dotView.layer?.cornerRadius = 3
         dotView.layer?.shadowColor = dotColor.cgColor
-        dotView.layer?.shadowOpacity = 0.70
-        dotView.layer?.shadowRadius = 9
+        dotView.layer?.shadowOpacity = 0.62
+        dotView.layer?.shadowRadius = 6
         dotView.layer?.shadowOffset = .zero
         addSubview(dotView)
     }
@@ -431,149 +430,58 @@ private final class PillView: NSView {
         super.layout()
         layer?.cornerRadius = bounds.height / 2
 
-        let logoSide: CGFloat = 36
+        let logoSide: CGFloat = 20
         logoTile.frame = NSRect(x: 7, y: (bounds.height - logoSide) / 2, width: logoSide, height: logoSide)
-        logoTile.layer?.cornerRadius = 10
-        logoGlyph.frame = logoTile.bounds.insetBy(dx: 4, dy: 8)
+        logoTile.layer?.cornerRadius = 6
+        logoGlyph.frame = logoTile.bounds.insetBy(dx: 3, dy: 5)
 
-        titleField.frame = NSRect(x: 52, y: (bounds.height - 22) / 2 + 1, width: bounds.width - 72, height: 22)
+        titleField.frame = NSRect(x: 34, y: (bounds.height - 17) / 2 + 1, width: bounds.width - 50, height: 17)
 
         let labelWidth = ceil((titleField.stringValue as NSString).size(withAttributes: [
-            .font: titleField.font ?? NSFont.systemFont(ofSize: 17, weight: .bold),
+            .font: titleField.font ?? NSFont.systemFont(ofSize: 12.5, weight: .semibold),
         ]).width)
-        let dotSize: CGFloat = 8
-        let dotX = min(titleField.frame.minX + labelWidth + 8, bounds.width - dotSize - 12)
-        dotView.frame = NSRect(x: dotX, y: bounds.midY + 4, width: dotSize, height: dotSize)
+        let dotSize: CGFloat = 6
+        let dotX = min(titleField.frame.minX + labelWidth + 4, bounds.width - dotSize - 9)
+        dotView.frame = NSRect(x: dotX, y: bounds.midY + 3, width: dotSize, height: dotSize)
         dotView.layer?.cornerRadius = dotSize / 2
     }
 
     override func draw(_ dirtyRect: NSRect) {
         NSGraphicsContext.saveGraphicsState()
 
-        let outer = bounds.insetBy(dx: 1.5, dy: 1.5)
+        let outer = bounds.insetBy(dx: 1, dy: 1)
         let radius = outer.height / 2
         let path = NSBezierPath(roundedRect: outer, xRadius: radius, yRadius: radius)
         let shadow = NSShadow()
-        shadow.shadowColor = NSColor(red: 0.10, green: 0.70, blue: 0.96, alpha: 0.24)
-        shadow.shadowBlurRadius = 12
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.38)
+        shadow.shadowBlurRadius = 9
         shadow.shadowOffset = .zero
         shadow.set()
 
         let bg = NSGradient(colors: [
-            NSColor(red: 0.015, green: 0.018, blue: 0.025, alpha: 0.98),
-            NSColor(red: 0.020, green: 0.055, blue: 0.070, alpha: 0.96),
-            NSColor(red: 0.010, green: 0.020, blue: 0.030, alpha: 0.98),
+            NSColor(red: 0.012, green: 0.016, blue: 0.022, alpha: 0.97),
+            NSColor(red: 0.018, green: 0.038, blue: 0.046, alpha: 0.94),
+            NSColor(red: 0.011, green: 0.014, blue: 0.020, alpha: 0.98),
         ])
         bg?.draw(in: path, angle: -12)
 
         NSGraphicsContext.restoreGraphicsState()
 
-        NSColor(red: 0.30, green: 0.78, blue: 0.96, alpha: 0.62).setStroke()
-        path.lineWidth = 1.2
+        NSColor(red: 0.30, green: 0.78, blue: 0.96, alpha: 0.40).setStroke()
+        path.lineWidth = 1
         path.stroke()
 
-        let inner = outer.insetBy(dx: 3, dy: 3)
+        let inner = outer.insetBy(dx: 2, dy: 2)
         let innerPath = NSBezierPath(roundedRect: inner, xRadius: inner.height / 2, yRadius: inner.height / 2)
-        NSColor.white.withAlphaComponent(0.08).setStroke()
+        NSColor.white.withAlphaComponent(0.055).setStroke()
         innerPath.lineWidth = 1
         innerPath.stroke()
 
         let gloss = NSBezierPath(roundedRect: outer.insetBy(dx: 2, dy: 2), xRadius: radius - 2, yRadius: radius - 2)
         NSGradient(colors: [
-            NSColor.white.withAlphaComponent(0.12),
+            NSColor.white.withAlphaComponent(0.08),
             NSColor.white.withAlphaComponent(0.00),
         ])?.draw(in: gloss, angle: 90)
-
-        let logoSide: CGFloat = 36
-        drawLogo(in: NSRect(x: 7, y: (bounds.height - logoSide) / 2, width: logoSide, height: logoSide))
-
-        let labelRect = NSRect(x: 52, y: (bounds.height - 22) / 2 + 1, width: bounds.width - 72, height: 22)
-        let label = statusText as NSString
-        let labelAttrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 17, weight: .bold),
-            .foregroundColor: NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0),
-        ]
-        label.draw(in: labelRect, withAttributes: labelAttrs)
-
-        let labelWidth = ceil(label.size(withAttributes: labelAttrs).width)
-        let dotSize: CGFloat = 8
-        let dotX = min(labelRect.minX + labelWidth + 8, bounds.width - dotSize - 12)
-        let dotRect = NSRect(
-            x: dotX,
-            y: bounds.midY + 4,
-            width: dotSize,
-            height: dotSize)
-        let dotGlow = NSShadow()
-        dotGlow.shadowColor = dotColor.withAlphaComponent(0.70)
-        dotGlow.shadowBlurRadius = 9
-        dotGlow.shadowOffset = .zero
-        NSGraphicsContext.saveGraphicsState()
-        dotGlow.set()
-        dotColor.setFill()
-        NSBezierPath(ovalIn: dotRect).fill()
-        NSGraphicsContext.restoreGraphicsState()
-        NSColor.white.withAlphaComponent(0.45).setStroke()
-        NSBezierPath(ovalIn: dotRect.insetBy(dx: -1, dy: -1)).stroke()
-    }
-
-    private func drawLogo(in rect: NSRect) {
-        let bgPath = NSBezierPath(roundedRect: rect, xRadius: 10, yRadius: 10)
-        let glow = NSShadow()
-        glow.shadowColor = NSColor(red: 0.15, green: 0.66, blue: 1.0, alpha: 0.42)
-        glow.shadowBlurRadius = 10
-        glow.shadowOffset = .zero
-        NSGraphicsContext.saveGraphicsState()
-        glow.set()
-        NSColor(red: 0.03, green: 0.28, blue: 0.42, alpha: 0.75).setFill()
-        bgPath.fill()
-        NSGraphicsContext.restoreGraphicsState()
-
-        NSGradient(colors: [
-            NSColor(red: 0.03, green: 0.12, blue: 0.23, alpha: 1.0),
-            NSColor(red: 0.05, green: 0.34, blue: 0.56, alpha: 1.0),
-            NSColor(red: 0.08, green: 0.55, blue: 0.72, alpha: 1.0),
-        ])?.draw(in: bgPath, angle: -35)
-        NSColor(red: 0.42, green: 0.92, blue: 1.0, alpha: 0.9).setStroke()
-        bgPath.lineWidth = 1.4
-        bgPath.stroke()
-
-        let screen = rect.insetBy(dx: 7, dy: 9)
-        let screenPath = NSBezierPath(roundedRect: screen, xRadius: 4.5, yRadius: 4.5)
-        NSColor(red: 0.015, green: 0.055, blue: 0.10, alpha: 1.0).setFill()
-        screenPath.fill()
-        NSColor(red: 0.36, green: 0.90, blue: 1.0, alpha: 0.95).setStroke()
-        screenPath.lineWidth = 1.7
-        screenPath.stroke()
-
-        let prompt = NSBezierPath()
-        prompt.move(to: NSPoint(x: screen.minX + 4, y: screen.midY + 4))
-        prompt.line(to: NSPoint(x: screen.minX + 8, y: screen.midY))
-        prompt.line(to: NSPoint(x: screen.minX + 4, y: screen.midY - 4))
-        NSColor.white.setStroke()
-        prompt.lineWidth = 2.1
-        prompt.lineCapStyle = .round
-        prompt.lineJoinStyle = .round
-        prompt.stroke()
-
-        let cursor = NSBezierPath()
-        cursor.move(to: NSPoint(x: screen.minX + 11, y: screen.midY - 4))
-        cursor.line(to: NSPoint(x: screen.maxX - 3.5, y: screen.midY - 4))
-        NSColor(red: 0.45, green: 0.96, blue: 1.0, alpha: 1.0).setStroke()
-        cursor.lineWidth = 2
-        cursor.lineCapStyle = .round
-        cursor.stroke()
-
-        let sparkle = NSBezierPath()
-        let cx = rect.maxX - 6
-        let cy = rect.maxY - 6
-        sparkle.move(to: NSPoint(x: cx, y: cy + 3))
-        sparkle.line(to: NSPoint(x: cx, y: cy - 3))
-        sparkle.move(to: NSPoint(x: cx - 3, y: cy))
-        sparkle.line(to: NSPoint(x: cx + 3, y: cy))
-        NSColor(red: 0.55, green: 1.0, blue: 0.62, alpha: 0.95).setStroke()
-        sparkle.lineWidth = 1.4
-        sparkle.lineCapStyle = .round
-        sparkle.stroke()
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -1787,11 +1695,11 @@ private final class OverlayApp {
 
     func start() {
         // Pill window: compact, parked at the top-right by default.
-        let pillSize = NSSize(width: 132, height: 46)
+        let pillSize = NSSize(width: 110, height: 30)
         let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
         let pillOrigin = NSPoint(
-            x: screen.maxX - pillSize.width - 18,
-            y: screen.maxY - pillSize.height - 14)
+            x: screen.maxX - pillSize.width - 16,
+            y: screen.maxY - pillSize.height - 12)
         pillWindow = OverlayWindow(
             contentRect: NSRect(origin: pillOrigin, size: pillSize),
             draggable: true)
@@ -1829,6 +1737,11 @@ private final class OverlayApp {
     }
 
     private func startParentWatchdog() {
+        // LaunchServices helper apps are reparented by macOS, so getppid()
+        // is not a reliable daemon-liveness signal in socket IPC mode.
+        // The socket reader below exits on EOF when the daemon goes away.
+        if overlaySocketPath != nil { return }
+
         Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { timer in
             if getppid() == 1 {
                 timer.invalidate()
@@ -1863,8 +1776,8 @@ private final class OverlayApp {
         let pillFrame = pillWindow?.frame ?? NSRect(
             x: screen.midX - 66,
             y: screen.maxY - 60,
-            width: 132,
-            height: 46)
+            width: 110,
+            height: 30)
         let expandedOrigin = NSPoint(
             x: screen.midX - expandedSize.width / 2,
             y: pillFrame.minY - expandedSize.height - 8)
