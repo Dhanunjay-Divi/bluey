@@ -167,6 +167,42 @@ async fn router_complete_idempotency_replay_returns_cached() {
 
 #[tokio::test]
 #[serial]
+async fn billing_checkout_uses_mocked_stripe() {
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "stripe@example.com", "longenoughpw").await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/checkout/sessions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "cs_test_123",
+            "url": "https://checkout.stripe.test/session/cs_test_123"
+        })))
+        .expect(1)
+        .mount(&h.stripe)
+        .await;
+
+    let req = Request::post("/billing/checkout")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "amount_cents": 3000 })).unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        v["checkout_url"],
+        "https://checkout.stripe.test/session/cs_test_123"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn auth_link_mint_then_exchange_roundtrip() {
     let h = boot_harness().await;
     let access = signup_and_login(&h, "link@example.com", "longenoughpw").await;
@@ -196,4 +232,42 @@ async fn auth_link_mint_then_exchange_roundtrip() {
         .unwrap();
     let resp = h.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+#[serial]
+async fn router_transcribe_happy_path_with_mocked_deepgram() {
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "stt@example.com", "longenoughpw").await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/listen"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "metadata": { "duration": 1.4 },
+            "results": {
+                "channels": [
+                    { "alternatives": [ { "transcript": "hello from deepgram" } ] }
+                ]
+            }
+        })))
+        .expect(1)
+        .mount(&h.deepgram)
+        .await;
+
+    let req = Request::post("/router/transcribe?request_id=test-stt-1")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "audio/wav")
+        .body(Body::from(vec![1u8; 32_000]))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["text"], "hello from deepgram");
+    assert_eq!(v["provider"], "deepgram");
+    assert_eq!(v["model"], "nova-3");
+    assert_eq!(v["duration_seconds"], 2);
 }

@@ -37,6 +37,16 @@ static AUTO_TOPUP_INFLIGHT: std::sync::OnceLock<
 
 const INFLIGHT_DEDUPE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
+fn stripe_api_url(path: &str) -> String {
+    let base =
+        std::env::var("BLUEY_TEST_STRIPE_URL").unwrap_or_else(|_| "https://api.stripe.com".into());
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Spawn an async auto top-up if conditions are met. Non-blocking.
 /// Returns immediately; the actual Stripe call runs on the executor.
@@ -137,7 +147,7 @@ async fn run_topup(
     ];
 
     let resp = reqwest::Client::new()
-        .post("https://api.stripe.com/v1/payment_intents")
+        .post(stripe_api_url("/v1/payment_intents"))
         .basic_auth(stripe_key, Some(""))
         .header("Idempotency-Key", &idempotency_key)
         .form(&form)

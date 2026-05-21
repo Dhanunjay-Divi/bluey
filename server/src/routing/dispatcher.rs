@@ -449,9 +449,10 @@ async fn deepgram_transcribe(
         .ok_or_else(|| anyhow!("DEEPGRAM_API_KEY not configured on bluey-server"))?;
     // POST to /v1/listen?model=...&punctuate=true with the raw audio
     // bytes as the body. Deepgram accepts audio/wav, audio/mpeg, etc.
-    let url = format!(
+    let default_url = format!(
         "https://api.deepgram.com/v1/listen?model={model}&punctuate=true&smart_format=true"
     );
+    let url = override_url(&default_url, "BLUEY_TEST_DEEPGRAM_URL");
     let resp = reqwest::Client::new()
         .post(&url)
         .header("Authorization", format!("Token {key}"))

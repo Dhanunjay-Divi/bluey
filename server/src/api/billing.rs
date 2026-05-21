@@ -47,6 +47,16 @@ pub struct ApiError {
 
 const MINIMUM_RELOAD_CENTS: i64 = 3000;
 
+fn stripe_api_url(path: &str) -> String {
+    let base =
+        std::env::var("BLUEY_TEST_STRIPE_URL").unwrap_or_else(|_| "https://api.stripe.com".into());
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
 pub async fn checkout(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
@@ -101,7 +111,7 @@ pub async fn checkout(
     ];
 
     let resp = reqwest::Client::new()
-        .post("https://api.stripe.com/v1/checkout/sessions")
+        .post(stripe_api_url("/v1/checkout/sessions"))
         .basic_auth(stripe_key, Some(""))
         .form(&form)
         .send()
@@ -258,7 +268,7 @@ async fn fetch_payment_method_from_stripe(
     stripe_key: &str,
     payment_intent_id: &str,
 ) -> Result<Option<String>> {
-    let url = format!("https://api.stripe.com/v1/payment_intents/{payment_intent_id}");
+    let url = stripe_api_url(&format!("/v1/payment_intents/{payment_intent_id}"));
     let resp = reqwest::Client::new()
         .get(&url)
         .basic_auth(stripe_key, Some(""))
@@ -524,7 +534,7 @@ pub async fn portal(
         ("return_url", return_url.as_str()),
     ];
     let resp = reqwest::Client::new()
-        .post("https://api.stripe.com/v1/billing_portal/sessions")
+        .post(stripe_api_url("/v1/billing_portal/sessions"))
         .basic_auth(stripe_key, Some(""))
         .form(&form)
         .send()

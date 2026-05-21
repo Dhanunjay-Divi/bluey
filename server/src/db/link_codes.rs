@@ -12,7 +12,7 @@ use anyhow::Result;
 use base64::Engine;
 use chrono::{Duration, Utc};
 use rand::RngCore;
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
 
 use crate::db::DbPool;
@@ -72,7 +72,7 @@ pub fn exchange(pool: &DbPool, raw: &str) -> Result<Option<(String, String, Stri
             params![hash, now],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
-        .ok();
+        .optional()?;
     Ok(row)
 }
 

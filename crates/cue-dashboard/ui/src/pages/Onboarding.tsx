@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { Loader2, Shield, ArrowRight, Check, Eye, EyeOff } from "lucide-react";
 
 /**
@@ -31,7 +30,7 @@ interface DeepLinkResult {
   error?: string | null;
 }
 
-export function Onboarding() {
+export function Onboarding({ onComplete }: { onComplete?: () => void }) {
   const [step, setStep] = useState<Step>("welcome");
   const [email, setEmail] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -63,7 +62,7 @@ export function Onboarding() {
       // lib.rs catches and turns into the "deep_link_login" event we
       // listen for above.
       const url = await invoke<string>("get_signin_url");
-      await openUrl(url);
+      window.open(url, "_blank");
     } catch (e) {
       setError(typeof e === "string" ? e : (e as Error).message);
       setStep("error");
@@ -80,7 +79,9 @@ export function Onboarding() {
       <div className="w-full max-w-md">
         {step === "welcome" && <WelcomeStep onSignIn={startSignIn} />}
         {step === "authorizing" && <AuthorizingStep onCancel={cancel} />}
-        {step === "linked" && email && <LinkedStep email={email} />}
+        {step === "linked" && email && (
+          <LinkedStep email={email} onComplete={onComplete} />
+        )}
         {step === "error" && error && (
           <ErrorStep error={error} onRetry={startSignIn} />
         )}
@@ -163,14 +164,18 @@ function AuthorizingStep({ onCancel }: { onCancel: () => void }) {
   );
 }
 
-function LinkedStep({ email }: { email: string }) {
+function LinkedStep({ email, onComplete }: { email: string; onComplete?: () => void }) {
   async function finish() {
     try {
       await invoke("complete_onboarding");
     } catch (e) {
       console.warn("complete_onboarding failed", e);
     }
-    window.location.href = "/";
+    if (onComplete) {
+      onComplete();
+    } else {
+      window.location.href = "/";
+    }
   }
   return (
     <div className="space-y-6 text-center">

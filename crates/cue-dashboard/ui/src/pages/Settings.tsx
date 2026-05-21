@@ -44,7 +44,7 @@ export function Settings() {
 function AccountCard() {
   const [me, setMe] = useState<AccountMe | null>(null);
   useEffect(() => {
-    invoke<AccountMe>("account_me").then(setMe).catch(() => {});
+    invoke<AccountMe | null>("account_me").then(setMe).catch(() => {});
   }, []);
 
   async function openPortal() {
@@ -56,13 +56,13 @@ function AccountCard() {
     }
   }
   async function signOut() {
-    try { await invoke("sign_out"); window.location.href = "/onboarding"; }
+    try { await invoke("sign_out"); window.location.href = "/"; }
     catch (e) { console.warn("sign_out failed", e); }
   }
   async function deleteAccount() {
     if (!confirm("This will permanently delete your account. Continue?")) return;
     if (prompt("Type DELETE to confirm") !== "DELETE") return;
-    try { await invoke("delete_account_now"); window.location.href = "/onboarding"; }
+    try { await invoke("delete_account_now"); window.location.href = "/"; }
     catch (e) { console.warn("delete_account failed", e); }
   }
 

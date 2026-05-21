@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use cue_daemon::db::Database;
 use tauri::{
-    menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem},
+    menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder},
     tray::TrayIconBuilder,
     Emitter, Manager,
 };
@@ -37,100 +37,6 @@ pub fn run() {
         })
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_deep_link::init())
-        .setup(|app| {
-            use tauri_plugin_deep_link::DeepLinkExt;
-            let app_handle = app.handle().clone();
-            app.deep_link().on_open_url(move |event| {
-                for url in event.urls() {
-                    let url_str = url.to_string();
-                    let h = app_handle.clone();
-                    tauri::async_runtime::spawn(async move {
-                        handle_deep_link_url(url_str, h).await;
-                    });
-                }
-            });
-            // Codex Stage 18 commit 4: Invisible toggle in tray menu.
-            // We add a simple menu item that triggers invisibility_toggle.
-            // The tray itself is initialized by Tauri's tray plugin; this
-            // listener watches for menu_event and dispatches.
-            use tauri::menu::{MenuBuilder, MenuItemBuilder};
-            let invisible_item =
-                MenuItemBuilder::with_id("invisible_toggle", "Invisible (F19)").build(app)?;
-            let signin_item = MenuItemBuilder::with_id("signin", "Sign in / Out").build(app)?;
-            let quit_item = MenuItemBuilder::with_id("quit", "Quit Bluey").build(app)?;
-
-            // Codex Stage 18 commit 7: Disguise submenu in tray.
-            use tauri::menu::SubmenuBuilder;
-            let current_disguise = crate::commands::get_disguise(app.state())
-                .unwrap_or_else(|_| "activity".to_string());
-            let label = |v: &str, name: &str| {
-                if v == current_disguise {
-                    format!("✓ {name}")
-                } else {
-                    format!("  {name}")
-                }
-            };
-            let disguise_submenu = SubmenuBuilder::new(app, "Disguise")
-                .item(&MenuItemBuilder::with_id("disguise:none", label("none", "Off")).build(app)?)
-                .item(
-                    &MenuItemBuilder::with_id(
-                        "disguise:activity",
-                        label("activity", "Activity Monitor"),
-                    )
-                    .build(app)?,
-                )
-                .item(
-                    &MenuItemBuilder::with_id("disguise:terminal", label("terminal", "Terminal"))
-                        .build(app)?,
-                )
-                .item(
-                    &MenuItemBuilder::with_id(
-                        "disguise:settings",
-                        label("settings", "System Settings"),
-                    )
-                    .build(app)?,
-                )
-                .build()?;
-            let menu = MenuBuilder::new(app)
-                .item(&invisible_item)
-                .item(&disguise_submenu)
-                .separator()
-                .item(&signin_item)
-                .separator()
-                .item(&quit_item)
-                .build()?;
-            if let Some(tray) = app.tray_by_id("main") {
-                let _ = tray.set_menu(Some(menu));
-            }
-            let app_handle = app.handle().clone();
-            app.on_menu_event(move |app, event| match event.id().as_ref() {
-                "invisible_toggle" => {
-                    let h = app_handle.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let state: tauri::State<'_, InvisibilityState> = h.state();
-                        let _ = invisibility_toggle(state, h.clone()).await;
-                    });
-                }
-                id if id.starts_with("disguise:") => {
-                    let mode = id.trim_start_matches("disguise:").to_string();
-                    if let Err(e) = crate::commands::set_disguise(mode.clone(), app.clone()) {
-                        tracing::warn!(error = %e, "set_disguise from tray failed");
-                    } else {
-                        tracing::info!(mode = %mode, "disguise changed via tray");
-                    }
-                }
-                "signin" => {
-                    let _ = app.emit("navigate_to", "/onboarding");
-                }
-                "quit" => {
-                    app.exit(0);
-                }
-                _ => {}
-            });
-            spawn_meeting_watch(app.handle().clone());
-
-            Ok(())
-        })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -141,6 +47,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::get_app_version,
             commands::get_balance_snapshot,
+            commands::account_me,
+            commands::billing_portal_url,
+            commands::sign_out,
+            commands::delete_account_now,
+            commands::get_signin_url,
+            commands::complete_onboarding,
             commands::list_sessions,
             commands::create_session,
             commands::get_session,
@@ -197,6 +109,8 @@ pub fn run() {
             auto_disguise_decline
         ])
         .setup(|app| {
+            install_deep_link_handler(app);
+
             // R10: Install anti-debug protections (best-effort, non-fatal)
             if let Err(e) = cue_stealth::install_anti_debug() {
                 tracing::warn!(error = %e, "anti-debug installation failed (degraded mode)");
@@ -315,6 +229,10 @@ pub fn run() {
 
             // Setup system tray
             setup_tray(app)?;
+
+            // Stage 18 auto-disguise watch must be installed in the single
+            // effective setup closure. Tauri stores only one setup callback.
+            spawn_meeting_watch(app.handle().clone());
 
             // Auto-update: silent background check after 30s delay
             let handle = app.handle().clone();
@@ -470,16 +388,46 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         MenuItemBuilder::with_id("toggle_listening", "Toggle Listening").build(app)?;
     let show_dashboard = MenuItemBuilder::with_id("show_dashboard", "Show Dashboard").build(app)?;
     let toggle_overlay = MenuItemBuilder::with_id("toggle_overlay", "Toggle Overlay").build(app)?;
+    let invisible = MenuItemBuilder::with_id("invisible_toggle", "Invisible (F19)").build(app)?;
+    let signin = MenuItemBuilder::with_id("signin", "Sign in / Out").build(app)?;
     let settings = MenuItemBuilder::with_id("settings", "Settings…").build(app)?;
     let check_updates =
         MenuItemBuilder::with_id("check_updates", "Check for Updates…").build(app)?;
     let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
 
+    let current_disguise =
+        crate::commands::get_disguise(app.state()).unwrap_or_else(|_| "activity".to_string());
+    let label = |value: &str, name: &str| {
+        if value == current_disguise {
+            format!("✓ {name}")
+        } else {
+            format!("  {name}")
+        }
+    };
+    let disguise_submenu = SubmenuBuilder::new(app, "Disguise")
+        .item(&MenuItemBuilder::with_id("disguise:none", label("none", "Off")).build(app)?)
+        .item(
+            &MenuItemBuilder::with_id("disguise:activity", label("activity", "Activity Monitor"))
+                .build(app)?,
+        )
+        .item(
+            &MenuItemBuilder::with_id("disguise:terminal", label("terminal", "Terminal"))
+                .build(app)?,
+        )
+        .item(
+            &MenuItemBuilder::with_id("disguise:settings", label("settings", "System Settings"))
+                .build(app)?,
+        )
+        .build()?;
+
     let menu = MenuBuilder::new(app)
         .item(&toggle_listening)
         .item(&show_dashboard)
         .item(&toggle_overlay)
+        .item(&invisible)
+        .item(&disguise_submenu)
         .item(&PredefinedMenuItem::separator(app)?)
+        .item(&signin)
         .item(&settings)
         .item(&check_updates)
         .item(&PredefinedMenuItem::separator(app)?)
@@ -501,6 +449,28 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             }
             "toggle_overlay" => {
                 let _ = app.emit("hotkey_toggle_overlay", ());
+            }
+            "invisible_toggle" => {
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let state: tauri::State<'_, InvisibilityState> = handle.state();
+                    let _ = invisibility_toggle(state, handle.clone()).await;
+                });
+            }
+            id if id.starts_with("disguise:") => {
+                let mode = id.trim_start_matches("disguise:").to_string();
+                if let Err(e) = crate::commands::set_disguise(mode.clone(), app.clone()) {
+                    tracing::warn!(error = %e, "set_disguise from tray failed");
+                } else {
+                    tracing::info!(mode = %mode, "disguise changed via tray");
+                }
+            }
+            "signin" => {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+                let _ = app.emit("navigate_to", "/onboarding");
             }
             "settings" => {
                 if let Some(window) = app.get_webview_window("main") {
@@ -542,6 +512,21 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // ─── Codex Stage 18 commit 2: deep-link onboarding handoff ──────────────
+
+fn install_deep_link_handler(app: &tauri::App) {
+    use tauri_plugin_deep_link::DeepLinkExt;
+
+    let app_handle = app.handle().clone();
+    app.deep_link().on_open_url(move |event| {
+        for url in event.urls() {
+            let url_str = url.to_string();
+            let handle = app_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                handle_deep_link_url(url_str, handle).await;
+            });
+        }
+    });
+}
 
 #[derive(serde::Serialize, Clone)]
 struct DeepLinkLoginResult {
@@ -719,6 +704,7 @@ fn auto_disguise_accept(
         .store(true, std::sync::atomic::Ordering::Relaxed);
     cfg.prompted
         .store(true, std::sync::atomic::Ordering::Relaxed);
+    persist_auto_disguise_settings(true, true)?;
     if let Err(e) = crate::commands::set_disguise("activity".to_string(), app) {
         tracing::warn!(error = %e, "set_disguise failed during auto_disguise_accept");
     }
@@ -729,7 +715,17 @@ fn auto_disguise_accept(
 fn auto_disguise_decline(cfg: tauri::State<'_, AutoDisguiseConfig>) -> Result<(), String> {
     cfg.prompted
         .store(true, std::sync::atomic::Ordering::Relaxed);
+    persist_auto_disguise_settings(true, false)?;
     Ok(())
+}
+
+fn persist_auto_disguise_settings(prompted: bool, enabled: bool) -> Result<(), String> {
+    let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
+    let mut settings = cue_core::load_settings(&paths).map_err(|e| e.to_string())?;
+    settings.auto_disguise_prompted = prompted;
+    settings.auto_disguise_enabled = enabled;
+    settings.touch();
+    cue_core::save_settings(&paths, &settings).map_err(|e| e.to_string())
 }
 
 fn spawn_meeting_watch(app: tauri::AppHandle) {

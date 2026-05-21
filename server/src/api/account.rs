@@ -315,12 +315,13 @@ pub async fn delete_account(
     let tx = conn
         .transaction()
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    let _ = tx.execute(
+    tx.execute(
         "DELETE FROM stripe_webhook_events
-            WHERE json_extract(body, $.data.object.client_reference_id) = ?1
-               OR json_extract(body, $.data.object.metadata.bluey_account_id) = ?1",
+            WHERE json_extract(body, '$.data.object.client_reference_id') = ?1
+               OR json_extract(body, '$.data.object.metadata.bluey_account_id') = ?1",
         rusqlite::params![&account.id],
-    );
+    )
+    .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     let n = tx
         .execute(
             "DELETE FROM accounts WHERE id = ?1",

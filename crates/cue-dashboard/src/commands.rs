@@ -36,6 +36,17 @@ pub struct BalanceSnapshotPayload {
     pub low_balance_warning: bool,
 }
 
+#[derive(Clone, Serialize)]
+pub struct AccountMePayload {
+    pub id: String,
+    pub email: String,
+    pub balance_cents: i64,
+    pub trial_seconds_remaining: i64,
+    pub auto_topup_enabled: bool,
+    pub auto_topup_threshold_cents: i64,
+    pub auto_topup_amount_cents: i64,
+}
+
 // ===== Daemon IPC helper =====
 
 /// Send a request to the running daemon over TCP and return the response.
@@ -95,6 +106,95 @@ pub async fn get_balance_snapshot() -> Result<Option<BalanceSnapshotPayload>, St
         low_balance_warning: me.balance_cents < me.auto_topup_threshold_cents
             && me.balance_cents > 0,
     }))
+}
+
+#[tauri::command]
+pub async fn account_me() -> Result<Option<AccountMePayload>, String> {
+    let client = cue_cloud_client::CloudClient::with_default_keyring()
+        .map_err(|e| format!("account keyring unavailable: {e}"))?;
+    if client.current_tokens().is_none() {
+        return Ok(None);
+    }
+
+    let me: cue_cloud_client::AccountMe = client
+        .auth_get("/account/me")
+        .await
+        .map_err(|e| format!("account lookup failed: {e}"))?;
+    Ok(Some(AccountMePayload {
+        id: me.id,
+        email: me.email,
+        balance_cents: me.balance_cents,
+        trial_seconds_remaining: me.trial_seconds_remaining,
+        auto_topup_enabled: me.auto_topup_enabled,
+        auto_topup_threshold_cents: me.auto_topup_threshold_cents,
+        auto_topup_amount_cents: me.auto_topup_amount_cents,
+    }))
+}
+
+#[tauri::command]
+pub async fn billing_portal_url() -> Result<String, String> {
+    #[derive(serde::Deserialize)]
+    struct PortalResponse {
+        portal_url: String,
+    }
+
+    let client = cue_cloud_client::CloudClient::with_default_keyring()
+        .map_err(|e| format!("account keyring unavailable: {e}"))?;
+    let resp: PortalResponse = client
+        .auth_post("/billing/portal", &serde_json::json!({}))
+        .await
+        .map_err(|e| format!("billing portal failed: {e}"))?;
+    Ok(resp.portal_url)
+}
+
+#[tauri::command]
+pub fn sign_out(db: State<DbState>) -> Result<(), String> {
+    let client = cue_cloud_client::CloudClient::with_default_keyring()
+        .map_err(|e| format!("account keyring unavailable: {e}"))?;
+    client
+        .clear_tokens()
+        .map_err(|e| format!("sign out failed: {e}"))?;
+    mark_onboarding_incomplete(db)
+}
+
+#[tauri::command]
+pub async fn delete_account_now(db: State<'_, DbState>) -> Result<(), String> {
+    #[derive(serde::Deserialize)]
+    struct DeleteAck {
+        deleted: bool,
+    }
+
+    let client = cue_cloud_client::CloudClient::with_default_keyring()
+        .map_err(|e| format!("account keyring unavailable: {e}"))?;
+    let ack: DeleteAck = client
+        .auth_post("/account/delete", &serde_json::json!({}))
+        .await
+        .map_err(|e| format!("delete account failed: {e}"))?;
+    if ack.deleted {
+        client
+            .clear_tokens()
+            .map_err(|e| format!("account deleted, but local sign out failed: {e}"))?;
+        mark_onboarding_incomplete(db)?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_signin_url() -> String {
+    std::env::var("BLUEY_SIGNIN_URL").unwrap_or_else(|_| "https://bluey.dev/link".to_string())
+}
+
+#[tauri::command]
+pub fn complete_onboarding(db: State<DbState>) -> Result<(), String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    db.save_setting("onboarding_complete", "true")
+        .map_err(|e| e.to_string())
+}
+
+fn mark_onboarding_incomplete(db: State<DbState>) -> Result<(), String> {
+    let db = db.0.lock().map_err(|e| e.to_string())?;
+    db.save_setting("onboarding_complete", "false")
+        .map_err(|e| e.to_string())
 }
 
 fn format_cents(cents: i64) -> String {
@@ -773,8 +873,27 @@ pub fn set_disguise(mode: String, app: AppHandle) -> Result<(), String> {
     let db = db_state.0.lock().map_err(|e| e.to_string())?;
     db.save_setting("disguise_mode", disguise_mode.as_str())
         .map_err(|e| e.to_string())?;
+    persist_core_disguise_mode(disguise_mode.as_str());
 
     Ok(())
+}
+
+fn persist_core_disguise_mode(mode: &str) {
+    let Ok(paths) = cue_core::app_paths::AppPaths::discover() else {
+        return;
+    };
+    let mut settings = match cue_core::load_settings(&paths) {
+        Ok(settings) => settings,
+        Err(error) => {
+            tracing::warn!(%error, "failed to load core settings for disguise persistence");
+            return;
+        }
+    };
+    settings.disguise_mode = mode.to_string();
+    settings.touch();
+    if let Err(error) = cue_core::save_settings(&paths, &settings) {
+        tracing::warn!(%error, "failed to persist core disguise setting");
+    }
 }
 
 /// Get the current disguise mode from persisted settings.
