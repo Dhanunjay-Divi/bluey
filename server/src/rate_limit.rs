@@ -183,6 +183,15 @@ make_middleware!(limit_auth_refresh, auth_refresh);
 make_middleware!(limit_auth_device_poll, auth_device_poll);
 make_middleware!(limit_router_complete, router_complete);
 
+/// Test-only helper: expose `client_key()` so an integration test can
+/// hit a real `axum::serve(...)` path and assert the peer IP arrives
+/// from `ConnectInfo<SocketAddr>` rather than falling back to "unknown".
+/// Codex S12-17 blocker 2 production-path proof.
+#[doc(hidden)]
+pub fn client_key_for_test(req: &axum::extract::Request) -> String {
+    client_key(req)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,3 +277,4 @@ mod tests {
         assert_eq!(key, "198.51.100.99");
     }
 }
+

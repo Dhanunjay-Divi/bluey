@@ -96,6 +96,7 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
     // ---- Admin-only (require_auth + require_admin) -------------------------
     let admin_only = Router::new()
         .route("/admin/customers", get(admin::customers))
+        .route("/admin/echo-peer", get(admin::echo_peer_key))
         .route("/admin/metrics", get(metrics::get_metrics))
         .route_layer(axum::middleware::from_fn(auth::require_admin));
 

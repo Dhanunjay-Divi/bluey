@@ -65,3 +65,10 @@ pub async fn customers(State(state): State<AppState>) -> impl IntoResponse {
         .unwrap_or_default();
     (StatusCode::OK, Json(rows)).into_response()
 }
+
+/// Codex S12-17 blocker 2 production-path proof: returns the
+/// rate-limiter-computed peer key for the current request. Admin-only.
+pub async fn echo_peer_key(req: axum::extract::Request) -> impl IntoResponse {
+    let key = crate::rate_limit::client_key_for_test(&req);
+    (StatusCode::OK, Json(serde_json::json!({"peer_key": key})))
+}

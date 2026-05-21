@@ -6,22 +6,21 @@
 
 #![cfg(test)]
 
-use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::Request;
 use serde_json::json;
 use serial_test::serial;
 use tower::ServiceExt;
-use wiremock::matchers::{header, method, path};
+use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use bluey_server::api::AppState;
 use bluey_server::config::{Config, UpstreamKeys};
 use bluey_server::db::{open_pool, run_migrations, DbPool};
 
 /// Test harness: starts wiremocks, builds an AppState pointed at them,
 /// returns the axum Router ready for ServiceExt::oneshot.
+#[allow(dead_code)]
 struct Harness {
     pub router: axum::Router,
     pub pool: DbPool,
