@@ -903,7 +903,7 @@ pub fn get_disguise(db: State<DbState>) -> Result<String, String> {
     let mode = db
         .load_setting("disguise_mode")
         .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| "none".to_string());
+        .unwrap_or_else(|| "activity".to_string());
     Ok(mode)
 }
 
