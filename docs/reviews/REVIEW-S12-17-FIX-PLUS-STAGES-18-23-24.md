@@ -1,6 +1,6 @@
 # REVIEW: S12-17 Fix Wave + Stages 18, 23, 24
 
-**Commit range:** `60ad3e4..ac37b1d` plus Codex fixes on top
+**Commit range:** `60ad3e4..39060a5` plus Codex fixes on top
 **Reviewer:** Codex
 **Date:** 2026-05-21
 
