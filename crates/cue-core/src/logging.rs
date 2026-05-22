@@ -14,6 +14,7 @@ use tracing::{Event, Subscriber};
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::field::Visit;
 use tracing_subscriber::fmt::format::Writer;
+#[cfg(debug_assertions)]
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::EnvFilter;
