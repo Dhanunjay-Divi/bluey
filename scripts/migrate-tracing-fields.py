@@ -30,6 +30,11 @@ TARGETS = [
     "server/src/api/stt.rs",
     "server/src/api/usage.rs",
     "crates/cue-dashboard/src/lib.rs",
+    # Added after Phase 6 close: a single `session = %session_id` site
+    # the original analyzer flagged but my targeted sweep missed. The
+    # site lives at cue-daemon/src/app.rs:6996 and migrates the bare
+    # `session` alias to `session_id`.
+    "crates/cue-daemon/src/app.rs",
 ]
 
 

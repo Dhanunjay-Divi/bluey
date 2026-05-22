@@ -243,24 +243,33 @@ FIELD_PATTERN = re.compile(
 
 
 def parse_args(args: str) -> tuple[list[str], dict[str, str], str]:
-    """Return (field_names, field_values, message_string)."""
+    """Return (field_names, field_values, message_string).
+
+    Filters out matches that fall inside string-literal ranges so that
+    a quoted message containing the substring `name = ...` does not get
+    misclassified as a field.
+    """
     fields = []
     values = {}
-    # Find the message — first quoted string literal not inside an existing
-    # `field = "..."` form. Approximation: find LAST quoted string in args
-    # which usually is the message.
+    # Collect string-literal (start, end) ranges so field-name matches
+    # inside them can be filtered out.
+    literal_ranges = []
     message = ""
     for m in re.finditer(r'(?<!\\)"((?:[^"\\]|\\.)*)"', args):
+        literal_ranges.append((m.start(), m.end()))
         message = m.group(1)
-    # Find named fields.
+
+    def in_literal(pos: int) -> bool:
+        return any(start <= pos < end for start, end in literal_ranges)
+
+    # Find named fields, skipping any whose name match starts inside a
+    # string literal (false positive in earlier analyzer output).
     for m in FIELD_PATTERN.finditer(args):
+        if in_literal(m.start(1)):
+            continue
         name = m.group(1)
         sigil = m.group(2)
         rawval = m.group(3).strip()
-        # Skip if this looks like the message format string itself
-        # (rare false-positive: name == something + value is a long
-        # quoted string). Fallback: keep it; downstream consumers will
-        # see this and ignore.
         fields.append(name)
         values[name] = (sigil + rawval).strip()
     return fields, values, message
@@ -441,9 +450,53 @@ def main() -> int:
     ap.add_argument("--json", action="store_true", help="Emit JSON")
     ap.add_argument("--pii-only", action="store_true", help="Only print PII findings")
     ap.add_argument("--fields", action="store_true", help="Only print field histogram")
+    ap.add_argument(
+        "--check-only",
+        action="store_true",
+        help=(
+            "CI mode: exit 1 if any transitional or PII findings remain. "
+            "Use as a policy gate to keep the tracing surface clean."
+        ),
+    )
     args = ap.parse_args()
 
     report = analyze()
+
+    if args.check_only:
+        problems = []
+        if report.transitional_findings:
+            problems.append(
+                f"{len(report.transitional_findings)} transitional findings "
+                f"(account_id, email, user_id, device_id fields)"
+            )
+        if report.pii_findings:
+            problems.append(
+                f"{len(report.pii_findings)} PII findings in tracing "
+                f"message strings"
+            )
+        if report.alias_counter:
+            n = sum(report.alias_counter.values())
+            aliases = ", ".join(
+                f"{a}->{b}" for (a, b) in sorted(report.alias_counter)
+            )
+            problems.append(
+                f"{n} field-name alias inconsistencies: {aliases}"
+            )
+        if problems:
+            print("CI gate FAILED:", file=sys.stderr)
+            for p in problems:
+                print(f"  - {p}", file=sys.stderr)
+            print(
+                "\nRun `python3 scripts/analyze-tracing-calls.py` for full "
+                "report.\nRun `python3 scripts/migrate-tracing-fields.py "
+                "--apply` to migrate transitional fields.",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            "CI gate PASSED: 0 transitional findings, 0 PII findings."
+        )
+        return 0
 
     if args.json:
         print(emit_json(report))
