@@ -47,6 +47,7 @@ bluey-daemon: **all assertions PASS**.
 | 3 | Server emits `request received` + `request done` lines with both IDs |
 | 4 | Server mints fresh UUIDs when client omits IDs |
 | 5 | Daemon honors `BLUEY_TRACE_ID` env on IPC dispatch |
+| 6 | Phase 3 regression tests pass + direct Tauri invoke is centralized |
 | 6 | Phase 3 overlay lifecycle + frontend error capture regression tests pass, and direct frontend Tauri `invoke` imports are centralized |
 
 CI workflow at `.github/workflows/observability-policy.yml` runs
