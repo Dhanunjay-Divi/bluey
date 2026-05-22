@@ -122,7 +122,10 @@ def migrate_session_alias(text: str) -> tuple[str, int]:
     in_tracing_call = False
     paren_depth = 0
     for line in text.splitlines(keepends=True):
-        if re.search(r"\btracing::(?:trace|debug|info|warn|error)!\s*\(", line):
+        if re.search(
+            r"(?<![A-Za-z0-9_])(?:tracing::)?(trace|debug|info|warn|error)!\s*\(",
+            line,
+        ):
             in_tracing_call = True
             paren_depth = line.count("(") - line.count(")")
         elif in_tracing_call:

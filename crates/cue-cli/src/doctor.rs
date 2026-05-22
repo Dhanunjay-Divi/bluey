@@ -274,19 +274,12 @@ fn print_log_tail_section() -> Result<()> {
 }
 
 fn log_dir_for_doctor() -> std::path::PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(home) = std::env::var_os("HOME") {
-            return std::path::PathBuf::from(home).join("Library/Logs/Bluey");
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(home) = std::env::var_os("HOME") {
-            return std::path::PathBuf::from(home).join(".local/state/bluey/log");
-        }
-    }
-    std::path::PathBuf::from(".")
+    // Delegates to cue_core::local_log_dir which respects BLUEY_LOG_DIR /
+    // CUE_LOG_DIR overrides + platform-specific defaults. Phase 4 originally
+    // hardcoded the macOS path, which broke when Phase 2 added env-var
+    // override support. Centralizing on cue_core means this Just Works
+    // wherever the daemon writes.
+    cue_core::local_log_dir()
 }
 
 fn utc_iso8601_now() -> String {

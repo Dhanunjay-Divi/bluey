@@ -103,19 +103,10 @@ pub fn export(args: LogsExportArgs) -> Result<()> {
 }
 
 fn log_dir() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join("Library/Logs/Bluey");
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(".local/state/bluey/log");
-        }
-    }
-    PathBuf::from(".")
+    // Delegates to cue_core::local_log_dir which respects BLUEY_LOG_DIR /
+    // CUE_LOG_DIR overrides + platform-specific defaults. Centralized here
+    // so Phase 2 env-var support is automatically honored by logs export.
+    cue_core::local_log_dir()
 }
 
 fn age_cutoff(days: u32) -> std::time::SystemTime {

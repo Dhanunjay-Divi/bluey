@@ -6993,7 +6993,7 @@ fn spawn_auto_recap(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
                     }) {
                         warn!(error = %e, "auto-recap: failed to persist");
                     } else {
-                        info!(session = %session_id, "auto-recap persisted");
+                        info!(session_id = %session_id, "auto-recap persisted");
                     }
                 }
             }
