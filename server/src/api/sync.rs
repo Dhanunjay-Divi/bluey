@@ -14,9 +14,8 @@ use serde::{Deserialize, Serialize};
 use super::AppState;
 use crate::auth::AuthedAccount;
 use crate::db::sync::{
-    self, CloudSessionBundle, CloudSessionSummary, RagMatch, SyncContextArtifactRecord,
-    SyncCounts, SyncCueResponseRecord, SyncRagChunkRecord, SyncSessionRecord,
-    SyncTranscriptSegment,
+    self, CloudSessionBundle, CloudSessionSummary, RagMatch, SyncContextArtifactRecord, SyncCounts,
+    SyncCueResponseRecord, SyncRagChunkRecord, SyncSessionRecord, SyncTranscriptSegment,
 };
 
 #[derive(Debug, Deserialize)]

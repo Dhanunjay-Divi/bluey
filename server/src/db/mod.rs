@@ -365,7 +365,9 @@ fn ensure_column(
         .filter_map(|row| row.ok())
         .any(|name| name == column);
     if !exists {
-        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition};"))?;
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition};"
+        ))?;
     }
     Ok(())
 }

@@ -8,6 +8,7 @@ pub mod config;
 pub mod intelligence;
 pub mod ipc;
 pub mod meeting;
+pub mod observability;
 pub mod overlay;
 pub mod session;
 pub mod state;
@@ -46,7 +47,36 @@ pub use meeting::{
     ActionItem, ContextArtifact, ContextKind, ContextProcessingStatus, ConversationTurn, Decision,
     MeetingRecap, MeetingRecord, MemoryHit, Speaker, TranscriptSegment,
 };
+pub use observability::{
+    account_id_hash_prefix, new_request_id, new_trace_id, platform, sanitize_observability_id,
+    trace_id_from_env, ObserveFields, BLUEY_REQUEST_ID_HEADER, BLUEY_TRACE_ID_ENV,
+    BLUEY_TRACE_ID_HEADER,
+};
 pub use overlay::{
     OverlayCommand, OverlayContextItem, OverlayEvent, OverlayPosition, OverlaySessionItem,
 };
 pub use state::{DaemonState, MeetingState};
+
+#[macro_export]
+macro_rules! observe {
+    ($level:expr, $fields:expr, $message:literal $(,)?) => {{
+        let fields = $fields;
+        tracing::event!(
+            $level,
+            component = %fields.component,
+            version = %fields.version,
+            platform = %fields.platform,
+            trace_id = %fields.trace_id_value(),
+            request_id = %fields.request_id_value(),
+            session_id = %fields.session_id_value(),
+            account_id_hash = %fields.account_id_hash_value(),
+            status = %fields.status_value(),
+            latency_ms = fields.latency_ms,
+            provider = %fields.provider_value(),
+            model = %fields.model_value(),
+            cost_cents_to_customer = fields.cost_cents_to_customer,
+            cost_cents_to_bluey = fields.cost_cents_to_bluey,
+            $message
+        );
+    }};
+}

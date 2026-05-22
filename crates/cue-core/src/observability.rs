@@ -1,0 +1,237 @@
+//! Shared observability primitives for Bluey clients, daemon, and server.
+//!
+//! This module intentionally stays small: stable header names, stable
+//! non-PII account hashing, standard log fields, and a thin `observe!`
+//! macro that expands to `tracing::event!`.
+
+use std::fmt::Write as _;
+
+use uuid::Uuid;
+
+/// Standard trace header propagated across UI/daemon/cloud/server hops.
+pub const BLUEY_TRACE_ID_HEADER: &str = "x-bluey-trace-id";
+/// Standard per-hop request header. Server echoes this header on response.
+pub const BLUEY_REQUEST_ID_HEADER: &str = "x-bluey-request-id";
+/// Environment fallback used by CLI-launched flows before Phase 5's explicit
+/// Tauri/IPC trace propagation lands.
+pub const BLUEY_TRACE_ID_ENV: &str = "BLUEY_TRACE_ID";
+
+/// Stable, redaction-safe fields that can be attached to Bluey log events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObserveFields {
+    pub component: String,
+    pub version: String,
+    pub platform: String,
+    pub trace_id: Option<String>,
+    pub request_id: Option<String>,
+    pub session_id: Option<String>,
+    pub account_id_hash: Option<String>,
+    pub status: Option<String>,
+    pub latency_ms: Option<u64>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub cost_cents_to_customer: Option<i64>,
+    pub cost_cents_to_bluey: Option<i64>,
+}
+
+impl ObserveFields {
+    pub fn new(component: impl Into<String>) -> Self {
+        Self {
+            component: component.into(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            platform: platform(),
+            trace_id: None,
+            request_id: None,
+            session_id: None,
+            account_id_hash: None,
+            status: None,
+            latency_ms: None,
+            provider: None,
+            model: None,
+            cost_cents_to_customer: None,
+            cost_cents_to_bluey: None,
+        }
+    }
+
+    pub fn trace_id(mut self, trace_id: impl Into<String>) -> Self {
+        self.trace_id = Some(trace_id.into());
+        self
+    }
+
+    pub fn request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
+    }
+
+    pub fn session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    pub fn account_id(mut self, account_id: impl AsRef<str>) -> Self {
+        self.account_id_hash = Some(account_id_hash_prefix(account_id.as_ref()));
+        self
+    }
+
+    pub fn status(mut self, status: impl Into<String>) -> Self {
+        self.status = Some(status.into());
+        self
+    }
+
+    pub fn latency_ms(mut self, latency_ms: u64) -> Self {
+        self.latency_ms = Some(latency_ms);
+        self
+    }
+
+    pub fn provider(mut self, provider: impl Into<String>) -> Self {
+        self.provider = Some(provider.into());
+        self
+    }
+
+    pub fn model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
+    pub fn customer_cost_cents(mut self, cost: i64) -> Self {
+        self.cost_cents_to_customer = Some(cost);
+        self
+    }
+
+    pub fn bluey_cost_cents(mut self, cost: i64) -> Self {
+        self.cost_cents_to_bluey = Some(cost);
+        self
+    }
+
+    pub fn trace_id_value(&self) -> &str {
+        self.trace_id.as_deref().unwrap_or("")
+    }
+
+    pub fn request_id_value(&self) -> &str {
+        self.request_id.as_deref().unwrap_or("")
+    }
+
+    pub fn session_id_value(&self) -> &str {
+        self.session_id.as_deref().unwrap_or("")
+    }
+
+    pub fn account_id_hash_value(&self) -> &str {
+        self.account_id_hash.as_deref().unwrap_or("")
+    }
+
+    pub fn status_value(&self) -> &str {
+        self.status.as_deref().unwrap_or("")
+    }
+
+    pub fn provider_value(&self) -> &str {
+        self.provider.as_deref().unwrap_or("")
+    }
+
+    pub fn model_value(&self) -> &str {
+        self.model.as_deref().unwrap_or("")
+    }
+}
+
+pub fn platform() -> String {
+    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+pub fn new_trace_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+pub fn new_request_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+pub fn trace_id_from_env() -> Option<String> {
+    std::env::var(BLUEY_TRACE_ID_ENV)
+        .ok()
+        .and_then(|value| sanitize_observability_id(&value))
+}
+
+pub fn sanitize_observability_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 128 {
+        return None;
+    }
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+    {
+        Some(value.to_string())
+    } else {
+        None
+    }
+}
+
+/// SHA-256 of account id, first 12 hex chars. This is the support join key
+/// used by doctor/logs without placing raw account ids in local logs.
+pub fn account_id_hash_prefix(account_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(account_id.as_bytes());
+    let hash = hasher.finalize();
+    let mut out = String::with_capacity(12);
+    for byte in &hash[..6] {
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_hash_is_stable_short_and_hex() {
+        let hash = account_id_hash_prefix("acct_12345");
+        assert_eq!(hash.len(), 12);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(hash, account_id_hash_prefix("acct_12345"));
+        assert_ne!(hash, account_id_hash_prefix("acct_other"));
+    }
+
+    #[test]
+    fn sanitize_observability_id_rejects_bad_values() {
+        assert_eq!(
+            sanitize_observability_id(" trace-123 "),
+            Some("trace-123".to_string())
+        );
+        assert_eq!(sanitize_observability_id("bad\nid"), None);
+        assert_eq!(sanitize_observability_id(""), None);
+        assert_eq!(sanitize_observability_id(&"x".repeat(129)), None);
+    }
+
+    #[test]
+    fn observe_fields_builder_sets_standard_values() {
+        let fields = ObserveFields::new("cue-daemon")
+            .trace_id("trace")
+            .request_id("request")
+            .account_id("acct_123")
+            .status("ok")
+            .latency_ms(42)
+            .provider("bluey-managed")
+            .model("auto");
+        assert_eq!(fields.component, "cue-daemon");
+        assert_eq!(fields.trace_id_value(), "trace");
+        assert_eq!(fields.request_id_value(), "request");
+        assert_eq!(fields.status_value(), "ok");
+        assert_eq!(fields.latency_ms, Some(42));
+        assert_eq!(fields.provider_value(), "bluey-managed");
+        assert_eq!(fields.model_value(), "auto");
+        assert_eq!(fields.account_id_hash_value().len(), 12);
+    }
+
+    #[test]
+    fn observe_macro_compiles_with_standard_fields() {
+        crate::observe!(
+            tracing::Level::INFO,
+            ObserveFields::new("cue-core")
+                .trace_id("trace")
+                .request_id("request")
+                .status("ok"),
+            "observability smoke"
+        );
+    }
+}

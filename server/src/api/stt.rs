@@ -287,9 +287,10 @@ async fn run_deepgram_relay(
     let started = Instant::now();
     let url = deepgram_realtime_url(&session);
     let mut request = url.into_client_request()?;
-    request
-        .headers_mut()
-        .insert("Authorization", HeaderValue::from_str(&format!("Token {deepgram_key}"))?);
+    request.headers_mut().insert(
+        "Authorization",
+        HeaderValue::from_str(&format!("Token {deepgram_key}"))?,
+    );
 
     let (upstream, _) = tokio_tungstenite::connect_async(request).await?;
     let (mut client_tx, mut client_rx) = socket.split();
@@ -394,7 +395,8 @@ fn finalize_relay_session(
 
     let free_seconds = trial_remaining.max(0).min(elapsed_seconds);
     if free_seconds > 0 {
-        let _ = balance::consume_trial_seconds(&state.pool, &session.account_id, free_seconds * 1000)?;
+        let _ =
+            balance::consume_trial_seconds(&state.pool, &session.account_id, free_seconds * 1000)?;
     }
     let billable_seconds = elapsed_seconds - free_seconds;
     let pricing = pricing::lookup("deepgram", &session.model)

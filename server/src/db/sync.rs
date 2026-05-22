@@ -371,7 +371,11 @@ pub fn upsert_batch(
     })
 }
 
-pub fn list_sessions(pool: &DbPool, account_id: &str, limit: i64) -> Result<Vec<CloudSessionSummary>> {
+pub fn list_sessions(
+    pool: &DbPool,
+    account_id: &str,
+    limit: i64,
+) -> Result<Vec<CloudSessionSummary>> {
     let conn = pool.get().context("get db conn")?;
     let mut stmt = conn.prepare(
         "SELECT s.session_id, s.title, s.status, s.updated_at_ms, s.last_active_at_ms,
@@ -478,8 +482,16 @@ pub fn query_rag(
     let query_terms = terms(query);
     let mut scored = Vec::new();
     for row in rows {
-        let (chunk_id, session_id, source_kind, source_id, chunk_index, text, embedding_json, embedding_model) =
-            row?;
+        let (
+            chunk_id,
+            session_id,
+            source_kind,
+            source_id,
+            chunk_index,
+            text,
+            embedding_json,
+            embedding_model,
+        ) = row?;
         let vector_score = match (embedding, embedding_json.as_deref()) {
             (Some(q), Some(json)) => serde_json::from_str::<Vec<f32>>(json)
                 .ok()
@@ -756,7 +768,10 @@ mod tests {
 
         let bundle = load_session(&pool, account_id, "s1").unwrap().unwrap();
         assert_eq!(bundle.session.answer_style.as_deref(), Some("concise"));
-        assert_eq!(bundle.cue_responses[0].artifact_type.as_deref(), Some("system_design"));
+        assert_eq!(
+            bundle.cue_responses[0].artifact_type.as_deref(),
+            Some("system_design")
+        );
 
         let matches = query_rag(&pool, account_id, "cache", Some(&[1.0, 0.0]), 5).unwrap();
         assert_eq!(matches[0].chunk_id, "c1");

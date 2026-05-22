@@ -319,8 +319,14 @@ async fn sync_batch_session_bundle_and_rag_roundtrip() {
         .await
         .unwrap();
     let bundle: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(bundle["transcript_segments"][0]["segment_id"], "seg-cloud-1");
-    assert_eq!(bundle["cue_responses"][0]["cost_label"], "$0.01 · balance $29.99");
+    assert_eq!(
+        bundle["transcript_segments"][0]["segment_id"],
+        "seg-cloud-1"
+    );
+    assert_eq!(
+        bundle["cue_responses"][0]["cost_label"],
+        "$0.01 · balance $29.99"
+    );
 
     let req = Request::post("/rag/query")
         .header("content-type", "application/json")

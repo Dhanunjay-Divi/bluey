@@ -143,12 +143,12 @@ fn print_account_section() -> Result<()> {
             println!("  api_url       : {}", account.api_url);
             println!(
                 "  user_id       : {}",
-                account_id_hash_prefix(&account.user_id)
+                cue_core::account_id_hash_prefix(&account.user_id)
             );
             println!("  workspace_id  : {}", account.workspace_id);
             println!(
                 "  device_id     : {}",
-                account_id_hash_prefix(&account.device_id)
+                cue_core::account_id_hash_prefix(&account.device_id)
             );
             println!("  linked_at     : {}", account.linked_at);
             let has_token = account.access_token.is_some();
@@ -287,31 +287,19 @@ fn utc_iso8601_now() -> String {
     format!("(unix={secs})")
 }
 
-/// Account ID is stable but is the join key for a customer's data — hash
-/// it for support output. SHA-256 first 12 hex chars (48 bits) is enough
-/// to disambiguate within a customer's logs without making the doctor
-/// output a customer-tracking key for unrelated parties.
-pub fn account_id_hash_prefix(account_id: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(account_id.as_bytes());
-    let hash = hasher.finalize();
-    hex::encode(&hash[..6])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn account_id_hash_prefix_is_stable_and_short() {
-        let h = account_id_hash_prefix("acct_12345");
+        let h = cue_core::account_id_hash_prefix("acct_12345");
         assert_eq!(h.len(), 12);
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
         // Stable across calls
-        assert_eq!(h, account_id_hash_prefix("acct_12345"));
+        assert_eq!(h, cue_core::account_id_hash_prefix("acct_12345"));
         // Different input → different hash
-        assert_ne!(h, account_id_hash_prefix("acct_67890"));
+        assert_ne!(h, cue_core::account_id_hash_prefix("acct_67890"));
     }
 
     #[test]

@@ -7,6 +7,11 @@ use std::time::Duration;
 use reqwest::{header, Client, Method, Response, StatusCode};
 use serde::{de::DeserializeOwned, Serialize};
 
+use cue_core::{
+    new_request_id, sanitize_observability_id, trace_id_from_env, BLUEY_REQUEST_ID_HEADER,
+    BLUEY_TRACE_ID_HEADER,
+};
+
 use crate::{
     error::{Error, Result},
     tokens::{TokenStore, Tokens},
@@ -23,6 +28,7 @@ pub struct ClientConfig {
     pub base_url: String,
     pub user_agent: String,
     pub timeout: Duration,
+    pub trace_id: Option<String>,
 }
 
 impl Default for ClientConfig {
@@ -32,6 +38,7 @@ impl Default for ClientConfig {
                 .unwrap_or_else(|_| "https://api.bluey.dev".into()),
             user_agent: format!("bluey-cloud-client/{}", env!("CARGO_PKG_VERSION")),
             timeout: Duration::from_secs(60),
+            trace_id: None,
         }
     }
 }
@@ -85,6 +92,13 @@ impl CloudClient {
         self.cached.lock().unwrap().clone()
     }
 
+    /// Return a copy of this client that attaches a fixed trace id to all
+    /// outgoing HTTP calls. Phase 5 will use this for UI/IPC-originated traces.
+    pub fn with_trace_id(mut self, trace_id: impl Into<String>) -> Self {
+        self.config.trace_id = sanitize_observability_id(&trace_id.into());
+        self
+    }
+
     /// Forget tokens in store + cache. Used by `bluey logout`.
     pub fn logout(&self) -> Result<()> {
         self.tokens.clear()?;
@@ -98,13 +112,21 @@ impl CloudClient {
         Req: Serialize,
         Resp: DeserializeOwned,
     {
-        let resp = self.http.post(self.url(path)).json(body).send().await?;
+        let resp = self
+            .request_builder(Method::POST, path)
+            .json(body)
+            .send()
+            .await?;
         Self::parse_or_err(resp).await
     }
 
     /// Raw POST returning the unparsed Response (caller inspects status).
     pub async fn raw_post<Req: Serialize>(&self, path: &str, body: &Req) -> Result<Response> {
-        Ok(self.http.post(self.url(path)).json(body).send().await?)
+        Ok(self
+            .request_builder(Method::POST, path)
+            .json(body)
+            .send()
+            .await?)
     }
 
     /// Authenticated GET. Auto-refresh on 401.
@@ -201,13 +223,31 @@ impl CloudClient {
     ) -> Result<Response> {
         let access = self.current_tokens().ok_or(Error::Unauthorized)?.access;
         let mut req = self
-            .http
-            .request(method, self.url(path))
+            .request_builder(method, path)
             .header(header::AUTHORIZATION, format!("Bearer {access}"));
         if let Some(b) = body {
             req = req.json(b);
         }
         Ok(req.send().await?)
+    }
+
+    fn request_builder(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
+        let mut req = self
+            .http
+            .request(method, self.url(path))
+            .header(BLUEY_REQUEST_ID_HEADER, new_request_id());
+        if let Some(trace_id) = self.current_trace_id() {
+            req = req.header(BLUEY_TRACE_ID_HEADER, trace_id);
+        }
+        req
+    }
+
+    fn current_trace_id(&self) -> Option<String> {
+        self.config
+            .trace_id
+            .as_deref()
+            .and_then(sanitize_observability_id)
+            .or_else(trace_id_from_env)
     }
 
     /// Try to refresh the token pair. Returns true on success.
@@ -221,8 +261,7 @@ impl CloudClient {
         }
         let body = serde_json::json!({ "refresh_token": cur.refresh });
         let resp = self
-            .http
-            .post(self.url("/auth/refresh"))
+            .request_builder(Method::POST, "/auth/refresh")
             .json(&body)
             .send()
             .await?;
@@ -303,7 +342,7 @@ impl CloudClient {
     /// attached. Suitable for endpoints in the bluey-server public
     /// router gate.
     pub async fn public_get<Resp: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Resp> {
-        let resp = self.http.get(self.url(path)).send().await?;
+        let resp = self.request_builder(Method::GET, path).send().await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -334,7 +373,11 @@ impl CloudClient {
         Req: serde::Serialize,
         Resp: serde::de::DeserializeOwned,
     {
-        let resp = self.http.post(self.url(path)).json(body).send().await?;
+        let resp = self
+            .request_builder(Method::POST, path)
+            .json(body)
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -415,7 +458,7 @@ fn truncate_log_value(value: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use crate::tokens::MemoryStore;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn client_for(server_url: String) -> CloudClient {
@@ -423,6 +466,7 @@ mod tests {
             base_url: server_url,
             user_agent: "test".into(),
             timeout: Duration::from_secs(10),
+            trace_id: None,
         };
         let store = Arc::new(MemoryStore::new());
         CloudClient::new(config, store).unwrap()
@@ -626,5 +670,45 @@ mod tests {
             }
             other => panic!("expected InsufficientBalance, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn auth_requests_send_trace_and_request_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/account/me"))
+            .and(header(BLUEY_TRACE_ID_HEADER, "trace-test"))
+            .and(header_exists(BLUEY_REQUEST_ID_HEADER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_for(server.uri()).with_trace_id("trace-test");
+        client
+            .save_tokens(Tokens {
+                access: "a".into(),
+                refresh: "r".into(),
+                email: "e@example.com".into(),
+            })
+            .unwrap();
+        let _: serde_json::Value = client.auth_get("/account/me").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_requests_send_request_header_without_trace_when_unset() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pricing/tiers"))
+            .and(header_exists(BLUEY_REQUEST_ID_HEADER))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "tiers": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = client_for(server.uri());
+        let _: serde_json::Value = client.public_get("/pricing/tiers").await.unwrap();
     }
 }

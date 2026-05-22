@@ -1,8 +1,7 @@
 //! HTTP API. Builds the axum router with all routes wired in.
 
-use axum::{routing::get, Router};
+use axum::{middleware::from_fn, routing::get, Router};
 use std::sync::Arc;
-use tower_http::trace::TraceLayer;
 
 use crate::{auth, config::Config, db::DbPool};
 
@@ -11,6 +10,7 @@ pub mod admin;
 pub mod auth_routes;
 pub mod billing;
 pub mod metrics;
+pub mod middleware;
 pub mod pricing;
 pub mod router;
 pub mod stt;
@@ -164,6 +164,6 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
     Router::new()
         .merge(public)
         .merge(protected)
-        .layer(TraceLayer::new_for_http())
+        .layer(from_fn(middleware::request_id::request_id_middleware))
         .with_state(state)
 }

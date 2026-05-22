@@ -12,6 +12,8 @@ dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+tracing.workspace = true
+sha2 = "0.10"
 
 [lints.clippy]
 derivable_impls = "allow"

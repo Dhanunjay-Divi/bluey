@@ -1110,6 +1110,7 @@ name = "cue-cloud-client"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "cue-core",
  "keyring",
  "reqwest 0.12.28",
  "serde",
@@ -1130,7 +1131,9 @@ dependencies = [
  "dirs",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
+ "tracing",
  "uuid",
 ]
 
