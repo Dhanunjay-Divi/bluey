@@ -20,6 +20,9 @@ pub fn run() -> Result<()> {
     println!("============================================================");
     println!();
 
+    print_health_summary();
+    println!();
+
     print_section("Build", print_build_section);
     print_section("Platform", print_platform_section);
     print_section("Paths", print_paths_section);
@@ -174,6 +177,75 @@ pub fn run_json() -> Result<()> {
 pub fn collect_json_string() -> Result<String> {
     let value = build_doctor_json()?;
     Ok(serde_json::to_string_pretty(&value)?)
+}
+
+/// Quick at-a-glance triage line at the top of the doctor output.
+/// Computes a one-shot health summary across the major categories so
+/// support can read the first few lines and know if the customer is
+/// blocked on something obvious (logged-out, missing permissions,
+/// log rotation not active, etc.).
+fn print_health_summary() {
+    use crate::macos_perms::{
+        accessibility_status, microphone_status, screen_recording_status, PermissionStatus,
+    };
+
+    let paths = AppPaths::discover().ok();
+    let account = paths
+        .as_ref()
+        .and_then(|p| cue_core::load_account(p).ok())
+        .flatten();
+
+    let logged_in = account.is_some();
+    let perms = [
+        accessibility_status(),
+        microphone_status(),
+        screen_recording_status(),
+    ];
+    let granted = perms
+        .iter()
+        .filter(|p| matches!(p, PermissionStatus::Granted))
+        .count();
+    let total_perms = perms.len();
+    let log_dir = log_dir_for_doctor();
+    let log_active = log_dir.exists();
+
+    let issues: Vec<String> = {
+        let mut v = Vec::new();
+        if !logged_in {
+            v.push("not logged in (run `bluey login`)".to_string());
+        }
+        if granted < total_perms {
+            v.push(format!(
+                "{} of {} macOS permissions not granted",
+                total_perms - granted,
+                total_perms
+            ));
+        }
+        if !log_active {
+            v.push(format!("no log dir at {}", log_dir.display()));
+        }
+        v
+    };
+
+    println!("── Summary ──");
+    println!("  bluey version : {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "  account       : {}",
+        if logged_in { "logged in" } else { "logged out" }
+    );
+    println!("  permissions   : {}/{} granted", granted, total_perms);
+    println!(
+        "  log rotation  : {}",
+        if log_active { "active" } else { "not active" }
+    );
+    if issues.is_empty() {
+        println!("  status        : OK no obvious issues");
+    } else {
+        println!("  status        : {} issue(s):", issues.len());
+        for issue in issues {
+            println!("                  -> {issue}");
+        }
+    }
 }
 
 fn print_section<F: FnOnce() -> Result<()>>(name: &str, f: F) {
