@@ -44,6 +44,7 @@ cd server && cargo clippy --all-targets -- -D warnings ✅
 cd server && cargo test                              ✅
 cd crates/cue-dashboard/ui && npm test -- --run      ✅
 cd crates/cue-dashboard/ui && npm run build          ✅
+scripts/observability-acceptance-smoke.sh            ✅
 git diff --check                                     ✅
 ```
 

@@ -59,10 +59,18 @@ async fn daemon_ipc_with_trace(
     request: DaemonRequest,
     trace_id: &str,
 ) -> Result<DaemonResponse, String> {
+    daemon_ipc_with_trace_to_addr(request, trace_id, &daemon_addr()).await
+}
+
+async fn daemon_ipc_with_trace_to_addr(
+    request: DaemonRequest,
+    trace_id: &str,
+    addr: &str,
+) -> Result<DaemonResponse, String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
 
-    let stream = TcpStream::connect(DEFAULT_DAEMON_ADDR)
+    let stream = TcpStream::connect(addr)
         .await
         .map_err(|e| format!("failed to connect to daemon: {e}"))?;
     let (reader, mut writer) = stream.into_split();
@@ -86,6 +94,14 @@ async fn daemon_ipc_with_trace(
         return Err("daemon closed connection without a response".to_string());
     }
     serde_json::from_str(response.trim_end()).map_err(|e| e.to_string())
+}
+
+fn daemon_addr() -> String {
+    std::env::var("BLUEY_DAEMON_ADDR")
+        .or_else(|_| std::env::var("CUE_DAEMON_ADDR"))
+        .ok()
+        .filter(|addr| !addr.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_DAEMON_ADDR.to_string())
 }
 
 fn dashboard_trace_id() -> String {
@@ -758,6 +774,46 @@ pub fn set_llm_chain(providers: Vec<String>, db: State<DbState>) -> Result<(), S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn daemon_ipc_wraps_dashboard_request_with_trace() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            writer.write_all(br#"{"type":"pong"}"#).await.unwrap();
+            writer.write_all(b"\n").await.unwrap();
+            line
+        });
+
+        let response =
+            daemon_ipc_with_trace_to_addr(DaemonRequest::Ping, "dashboard-smoke-trace", &addr)
+                .await
+                .unwrap();
+        assert!(matches!(response, DaemonResponse::Pong));
+
+        let line = server.await.unwrap();
+        let request: DaemonRequest = serde_json::from_str(line.trim()).unwrap();
+        match request {
+            DaemonRequest::WithTrace { trace_id, request } => {
+                assert_eq!(trace_id, "dashboard-smoke-trace");
+                assert!(matches!(*request, DaemonRequest::Ping));
+            }
+            other => panic!("dashboard request was not trace-wrapped: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn daemon_addr_defaults_to_standard_addr() {
+        assert_eq!(DEFAULT_DAEMON_ADDR, "127.0.0.1:57321");
+    }
 
     #[test]
     fn test_session_switched_payload_serializes() {

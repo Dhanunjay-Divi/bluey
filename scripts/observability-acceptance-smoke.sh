@@ -16,16 +16,16 @@
 # Exits 0 on pass, non-zero on any failure with a clear report.
 #
 # What this currently covers:
+#   * dashboard Rust command layer → daemon IPC: trace wrapper minted before
+#     the daemon/cloud-client boundary
 #   * cloud-client → server: trace propagation through X-Bluey-Trace-Id
 #   * server: request_id middleware mints + echoes trace_id + request_id
 #   * server log line emits with both ids
 #   * daemon log file format is JSON with standard fields
 #
-# What this does NOT yet cover (gated on Phase 5 trace minting):
-#   * UI invoke → daemon: trace_id is currently not propagated through
-#     Tauri IPC; Phase 5 lands that. When Phase 5 ships, this script
-#     should be extended to spawn the dashboard and verify the trace
-#     starts at the UI.
+# What this does NOT yet cover:
+#   * Visible Tauri window automation: this smoke runs the dashboard Rust
+#     command boundary deterministically instead of clicking a GUI window.
 #   * overlay lifecycle emits: gated on Phase 3.
 
 set -euo pipefail
@@ -99,6 +99,17 @@ if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     fail "server failed to start"
 fi
 ok "server pid=$SERVER_PID"
+
+# ── Assertion 0: dashboard command layer wraps daemon IPC with trace id ─
+step "Verify dashboard command layer trace wraps daemon IPC"
+DASHBOARD_TRACE_TEST="$WORK/dashboard_trace_test.log"
+if ! ( cd "$WORKSPACE" && cargo test -p cue-dashboard commands::tests::daemon_ipc_wraps_dashboard_request_with_trace -- --nocapture ) \
+    >"$DASHBOARD_TRACE_TEST" 2>&1; then
+    echo "--- dashboard trace test log ---"
+    cat "$DASHBOARD_TRACE_TEST"
+    fail "dashboard command-layer trace test failed"
+fi
+ok "dashboard command layer emits WithTrace before daemon IPC"
 
 # ── Send a request that the request-id middleware should handle ─────────
 step "Send request with caller-supplied trace_id and request_id"
@@ -186,12 +197,13 @@ step "All assertions passed"
 ok "Observability acceptance smoke: PASS"
 echo ""
 echo "Coverage:"
+echo "  - Dashboard command layer wraps daemon IPC with trace ids"
 echo "  - X-Bluey-Trace-Id round-trips client → server → response"
 echo "  - X-Bluey-Request-Id round-trips client → server → response"
 echo "  - Server logs request received + request done with both ids"
 echo "  - Server mints fresh ids when client omits them"
 echo ""
 echo "Gaps (gated on remaining phases):"
-echo "  - UI invoke → daemon trace minting     : Phase 5 codex"
+echo "  - Visible Tauri window click automation: optional GUI QA"
 echo "  - daemon → cloud-client trace forward  : verified by cue-cloud-client unit tests"
 echo "  - overlay lifecycle emits              : Phase 3 codex"
