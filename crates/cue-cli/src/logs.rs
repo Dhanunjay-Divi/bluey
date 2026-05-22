@@ -206,6 +206,15 @@ pub fn redact_log_content(content: &str) -> String {
         Lazy::new(|| Regex::new(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b").unwrap());
     static IPV4: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}\b").unwrap());
+    // Mask the macOS-style /Users/<name>/ home prefix and the Linux-style
+    // /home/<name>/ home prefix. The username is PII-adjacent and gets
+    // stamped into log lines whenever a path reference is emitted (e.g.
+    // Phase 2's `local log rotation initialized` message includes
+    // `log_dir = /Users/<name>/Library/Logs/Bluey/`). Preserve the rest
+    // of the path so support can still see what subtree the log refers
+    // to (e.g. Library/Logs/Bluey).
+    static USERS_HOME: Lazy<Regex> = Lazy::new(|| Regex::new(r"/Users/[^/]+/").unwrap());
+    static LINUX_HOME: Lazy<Regex> = Lazy::new(|| Regex::new(r"/home/[^/]+/").unwrap());
     static JWT: Lazy<Regex> = Lazy::new(|| {
         // JWT-shaped: three base64url segments separated by '.'.
         Regex::new(r"\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b").unwrap()
@@ -234,6 +243,12 @@ pub fn redact_log_content(content: &str) -> String {
     out = DEEPGRAM.replace_all(&out, "<provider_key>").into_owned();
     out = EMAIL.replace_all(&out, "<email>").into_owned();
     out = IPV4.replace_all(&out, "$1.0/24").into_owned();
+    out = USERS_HOME
+        .replace_all(&out, "/Users/<redacted>/")
+        .into_owned();
+    out = LINUX_HOME
+        .replace_all(&out, "/home/<redacted>/")
+        .into_owned();
     out = DEVICE_CODE
         .replace_all(&out, "code=<redacted>")
         .into_owned();
@@ -324,6 +339,31 @@ mod tests {
         let r = redact_log_line(line);
         assert!(!r.contains("USER_ABC42"));
         assert!(r.contains("code=<redacted>"));
+    }
+
+    #[test]
+    fn redact_masks_users_home_path() {
+        let line = "log_dir=/Users/alice/Library/Logs/Bluey/daemon-log.2026-05-22.log";
+        let r = redact_log_line(line);
+        assert!(!r.contains("/Users/alice/"));
+        assert!(r.contains("/Users/<redacted>/"));
+        assert!(r.contains("/Library/Logs/Bluey/"));
+    }
+
+    #[test]
+    fn redact_masks_linux_home_path() {
+        let line = "config=/home/bob/.config/bluey/account.json";
+        let r = redact_log_line(line);
+        assert!(!r.contains("/home/bob/"));
+        assert!(r.contains("/home/<redacted>/"));
+    }
+
+    #[test]
+    fn redact_users_home_only_swaps_username() {
+        let line = "stat /Users/uno/Library/Logs ok";
+        let r = redact_log_line(line);
+        assert!(!r.contains("/Users/uno/"));
+        assert!(r.contains("/Users/<redacted>/Library"));
     }
 
     #[test]
