@@ -49,14 +49,14 @@ pub fn bundle(args: SupportArgs) -> Result<()> {
         .unix_permissions(0o600);
 
     // ── 1. doctor.json ──────────────────────────────────────────────
-    let doctor_json = capture_doctor_json()?;
+    let doctor_json = redact_bundle_text(&capture_doctor_json()?, args.redact);
     zip.start_file("doctor.json", entry_options)
         .context("zip doctor.json")?;
     zip.write_all(doctor_json.as_bytes())
         .context("write doctor.json")?;
 
     // ── 2. system-info.txt ──────────────────────────────────────────
-    let sysinfo = capture_system_info();
+    let sysinfo = redact_bundle_text(&capture_system_info(), args.redact);
     zip.start_file("system-info.txt", entry_options)
         .context("zip system-info.txt")?;
     zip.write_all(sysinfo.as_bytes())
@@ -181,6 +181,14 @@ fn capture_doctor_json() -> Result<String> {
     crate::doctor::collect_json_string()
 }
 
+fn redact_bundle_text(content: &str, redact: bool) -> String {
+    if redact {
+        crate::logs::redact_log_content(content)
+    } else {
+        content.to_string()
+    }
+}
+
 fn capture_system_info() -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -246,5 +254,22 @@ mod tests {
         let s = current_yyyymmdd();
         assert_eq!(s.len(), 8);
         assert!(s.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn redacted_bundle_text_masks_paths_inside_doctor_json() {
+        let raw = r#"{"path":"/Users/alice/Library/Application Support/Bluey/sessions.db","email":"alice@example.com"}"#;
+        let redacted = redact_bundle_text(raw, true);
+
+        assert!(!redacted.contains("/Users/alice/"));
+        assert!(!redacted.contains("alice@example.com"));
+        assert!(redacted.contains("/Users/<redacted>/"));
+        assert!(redacted.contains("<email>"));
+    }
+
+    #[test]
+    fn raw_bundle_text_is_preserved_when_redaction_is_disabled() {
+        let raw = r#"{"path":"/Users/alice/Library/Application Support/Bluey/sessions.db"}"#;
+        assert_eq!(redact_bundle_text(raw, false), raw);
     }
 }

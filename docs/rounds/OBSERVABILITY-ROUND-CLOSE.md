@@ -213,7 +213,7 @@ every push and PR. Pre-commit hook at
 
 | Layer | Before round | After round |
 |---|---|---|
-| Workspace cargo tests | 422 | 477 (+55) |
+| Workspace cargo tests | 422 | 479 (+57) |
 | Server cargo tests | 75 | 90 (+15) |
 | Dashboard vitest | 15 | 15 (unchanged) |
 | Acceptance smoke coverage checks | 0 | 7 |
@@ -225,7 +225,7 @@ every push and PR. Pre-commit hook at
 ```
 ✅ cargo fmt --all --check
 ✅ cargo clippy --all-targets -- -D warnings (workspace + server)
-✅ cargo test --all-targets — 477 passed (workspace) + 90 (server)
+✅ cargo test --all-targets — 479 passed (workspace) + 90 (server)
 ✅ npm test --run — 15 passed (dashboard ui)
 ✅ npm run build — clean
 ✅ swift build (overlay) — clean
