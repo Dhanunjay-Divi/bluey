@@ -757,15 +757,17 @@ private final class FeedView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     func push(_ card: RenderedCard) {
+        if card.kind == "transcript" {
+            onTranscript?(card)
+            emitCardRendered(id: card.id)
+            return
+        }
         cards.append(card)
         emptyState.isHidden = true
         let view = makeCardView(card)
         stack.addArrangedSubview(view)
         view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         scrollToBottom()
-        if card.kind == "transcript" {
-            onTranscript?(card)
-        }
         emitCardRendered(id: card.id)
     }
 
@@ -788,9 +790,6 @@ private final class FeedView: NSView {
         stack.insertArrangedSubview(view, at: idx)
         view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         scrollToBottom()
-        if cards[idx].kind == "transcript" {
-            onTranscript?(cards[idx])
-        }
         return cards[idx]
     }
 
@@ -1257,6 +1256,7 @@ private final class ExpandedPanelView: NSView {
     let answerStyleBox: NSTextField
     let answerStyleSaveButton: NSButton
     let transcriptStrip: NSView
+    let transcriptScroll: NSScrollView
     let transcriptLabel: NSTextField
     let attachmentStrip: NSScrollView
     let attachmentStack: NSStackView
@@ -1314,6 +1314,7 @@ private final class ExpandedPanelView: NSView {
         answerStyleBox = NSTextField()
         answerStyleSaveButton = NSButton(title: "Save", target: nil, action: nil)
         transcriptStrip = NSView()
+        transcriptScroll = NSScrollView()
         transcriptLabel = NSTextField(labelWithString: "Live captions preview")
         attachmentStrip = NSScrollView()
         attachmentStack = NSStackView()
@@ -1378,6 +1379,7 @@ private final class ExpandedPanelView: NSView {
             feed,
             canvasPane,
             transcriptStrip,
+            transcriptScroll,
             transcriptLabel,
             attachmentStrip,
             attachmentStack,
@@ -1430,7 +1432,9 @@ private final class ExpandedPanelView: NSView {
         sessionDrawer.addSubview(answerStyleBox)
         sessionDrawer.addSubview(answerStyleSaveButton)
         addSubview(transcriptStrip)
-        transcriptStrip.addSubview(transcriptLabel)
+        transcriptStrip.addSubview(transcriptScroll)
+        transcriptScroll.documentView = transcriptLabel
+        transcriptLabel.translatesAutoresizingMaskIntoConstraints = true
         addSubview(attachmentStrip)
         addSubview(composerBar)
         composerBar.addSubview(recordingButton)
@@ -1557,9 +1561,10 @@ private final class ExpandedPanelView: NSView {
             transcriptStrip.bottomAnchor.constraint(equalTo: attachmentStrip.topAnchor, constant: -6),
             transcriptStrip.heightAnchor.constraint(equalToConstant: 26),
 
-            transcriptLabel.leadingAnchor.constraint(equalTo: transcriptStrip.leadingAnchor, constant: 12),
-            transcriptLabel.trailingAnchor.constraint(equalTo: transcriptStrip.trailingAnchor, constant: -12),
-            transcriptLabel.centerYAnchor.constraint(equalTo: transcriptStrip.centerYAnchor),
+            transcriptScroll.topAnchor.constraint(equalTo: transcriptStrip.topAnchor, constant: 2),
+            transcriptScroll.leadingAnchor.constraint(equalTo: transcriptStrip.leadingAnchor, constant: 10),
+            transcriptScroll.trailingAnchor.constraint(equalTo: transcriptStrip.trailingAnchor, constant: -10),
+            transcriptScroll.bottomAnchor.constraint(equalTo: transcriptStrip.bottomAnchor, constant: -2),
 
             attachmentStrip.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             attachmentStrip.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
@@ -1707,6 +1712,11 @@ private final class ExpandedPanelView: NSView {
     }
     required init?(coder: NSCoder) { fatalError() }
 
+    override func layout() {
+        super.layout()
+        resizeTranscriptLabelToContent()
+    }
+
     private func configureHeader() {
         headerBar.wantsLayer = true
         headerBar.layer?.backgroundColor = NSColor(red: 0.030, green: 0.034, blue: 0.042, alpha: 0.96).cgColor
@@ -1763,10 +1773,25 @@ private final class ExpandedPanelView: NSView {
         transcriptStrip.layer?.borderWidth = 1
         transcriptStrip.layer?.borderColor = BlueyTheme.hairline.cgColor
 
+        transcriptScroll.drawsBackground = false
+        transcriptScroll.hasVerticalScroller = false
+        transcriptScroll.hasHorizontalScroller = true
+        transcriptScroll.autohidesScrollers = true
+        transcriptScroll.borderType = .noBorder
+        transcriptScroll.scrollerStyle = .overlay
+
+        transcriptLabel.isBezeled = false
+        transcriptLabel.drawsBackground = false
         transcriptLabel.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
         transcriptLabel.textColor = BlueyTheme.textDim
-        transcriptLabel.lineBreakMode = .byTruncatingHead
+        transcriptLabel.lineBreakMode = .byClipping
         transcriptLabel.maximumNumberOfLines = 1
+        transcriptLabel.alignment = .left
+        if let cell = transcriptLabel.cell as? NSTextFieldCell {
+            cell.isScrollable = true
+            cell.wraps = false
+            cell.lineBreakMode = .byClipping
+        }
 
         attachmentStack.orientation = .horizontal
         attachmentStack.alignment = .centerY
@@ -2180,7 +2205,7 @@ private final class ExpandedPanelView: NSView {
         feed.clear()
         setContextItems([])
         transcriptSnippets.removeAll()
-        transcriptLabel.stringValue = "Live captions preview"
+        updateTranscriptStripText("Live captions preview", scrollToEnd: false)
         latestCanvas = nil
         setCanvasOpen(false)
         canvasToggleButton.isHidden = true
@@ -2361,7 +2386,37 @@ private final class ExpandedPanelView: NSView {
         if transcriptSnippets.count > 6 {
             transcriptSnippets.removeFirst(transcriptSnippets.count - 6)
         }
-        transcriptLabel.stringValue = transcriptSnippets.joined(separator: "   ")
+        updateTranscriptStripText(transcriptSnippets.joined(separator: "   "), scrollToEnd: true)
+    }
+
+    private func updateTranscriptStripText(_ text: String, scrollToEnd: Bool) {
+        transcriptLabel.stringValue = text
+        resizeTranscriptLabelToContent()
+        guard scrollToEnd else {
+            transcriptScroll.contentView.scroll(to: .zero)
+            transcriptScroll.reflectScrolledClipView(transcriptScroll.contentView)
+            return
+        }
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.resizeTranscriptLabelToContent()
+            let maxX = max(0, self.transcriptLabel.frame.width - self.transcriptScroll.contentView.bounds.width)
+            self.transcriptScroll.contentView.scroll(to: NSPoint(x: maxX, y: 0))
+            self.transcriptScroll.reflectScrolledClipView(self.transcriptScroll.contentView)
+        }
+    }
+
+    private func resizeTranscriptLabelToContent() {
+        let viewport = max(0, transcriptScroll.contentView.bounds.width)
+        let height = max(22, transcriptScroll.contentView.bounds.height)
+        let font = transcriptLabel.font ?? NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        let textWidth = ceil((transcriptLabel.stringValue as NSString).size(
+            withAttributes: [.font: font]).width) + 24
+        transcriptLabel.frame = NSRect(
+            x: 0,
+            y: max(0, (height - 18) / 2),
+            width: max(viewport, textWidth),
+            height: 18)
     }
 
     private func makeAttachmentChip(_ item: OverlayContextItem) -> NSView {

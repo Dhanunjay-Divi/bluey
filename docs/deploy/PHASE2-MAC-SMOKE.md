@@ -78,6 +78,8 @@ In the expanded overlay, click "Start Bluey" (or the listening toggle).
 **Expect:**
 - Daemon starts capturing audio; overlay shows live transcript preview ("Live captions preview" strip)
 - Live transcription text scrolls as you speak
+- Transcript snippets stay inside the fixed bottom preview strip; they do not render as chat cards
+- Expanded overlay remains fixed at the Step 2 size while captions update
 - "Stop Bluey" button replaces "Start"
 - Session is created in `~/Library/Application Support/Bluey/active-meeting.json` (perms 0600)
 
@@ -88,6 +90,8 @@ Click Stop. **Expect:**
 
 **Fail signals:**
 - "No microphone access" → System Settings → Privacy & Security → Microphone → check "Bluey" or "cue-daemon"
+- Transcript appears as repeated right-side bubbles → transcript card routing regression
+- Overlay grows taller/wider while captions arrive → fixed-size/layout regression
 - Capture starts but no transcription → STT routing: if logged in, should be using managed `/router/transcribe`; check daemon log for `router/transcribe` HTTP errors
 - "STT not configured" with developer keys NOT set → confirm logged in (`bluey usage` should show balance)
 
