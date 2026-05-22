@@ -1,0 +1,63 @@
+name: Observability Policy
+
+# Runs on every PR + push to feat/* + main. Enforces the policy gates
+# that emerged from the Observability Round so new commits don't
+# silently regress field hygiene.
+#
+# Three gates:
+#   1. cargo fmt --all --check
+#   2. cargo clippy --all-targets -- -D warnings (workspace + server)
+#   3. python3 scripts/analyze-tracing-calls.py --check-only
+#      (zero transitional findings, zero PII findings, zero alias inconsistencies)
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/*"
+  pull_request:
+
+jobs:
+  observability-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy workspace -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo clippy server -D warnings
+        working-directory: server
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Observability tracing-call policy gate
+        run: python3 scripts/analyze-tracing-calls.py --check-only
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo target
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test workspace
+        run: cargo test --all-targets
+
+      - name: cargo test server
+        working-directory: server
+        run: cargo test
