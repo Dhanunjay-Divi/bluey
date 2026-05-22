@@ -2,7 +2,7 @@
 
 ```
 Branch:     feat/phase-3-round-12
-Tip before: 8b9c24a
+Tip before: 35bcf84
 Tip after:  9cd66d4
 Author:     Codex
 Reviewer:   Kiro
@@ -25,9 +25,10 @@ Round shape: shared observability contract + cloud-client headers + server middl
 | `server/Cargo.toml` | Adds `cue-core` dependency for shared constants and id helpers. |
 | `server/src/api/stt.rs`, `server/src/api/sync.rs`, `server/src/db/mod.rs`, `server/src/db/sync.rs`, `server/tests/integration_e2e.rs` | `cargo fmt` normalization from running the server workspace gate. No behavior change. |
 
-Related but separate commit:
+Related but separate commits:
 
 - `8ab84ef docs(reviews): accept observability phase 4`
+- `35bcf84 docs(observability): phase 6 pre-plan + tracing-call analyzer` was already present before the Phase 1 implementation commit and is not part of this Phase 1 code review.
 
 ## 2. Why
 
