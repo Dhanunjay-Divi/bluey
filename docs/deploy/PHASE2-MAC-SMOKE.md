@@ -57,7 +57,8 @@ bluey on
 Click the pill or use the F19 hotkey.
 
 **Expect:**
-- Overlay expands to ~720x520 panel
+- Overlay expands to a 520px-tall panel that fits the visible screen
+  (up to ~820px wide without canvas; narrower screens must not crop chrome)
 - Top header shows: Bluey label, balance (e.g. "Bluey · $4.98" or "Sign in to start"), Hide (eye-slash) and Close (X) icons
 - Disguise menu accessible (click the Bluey icon header)
 - Empty state explains the session surface; not a blank debug panel

@@ -53,6 +53,24 @@ private enum BlueyTheme {
     }
 }
 
+private enum ExpandedPanelMetrics {
+    static let maxCompactWidth: CGFloat = 820
+    static let minCompactWidth: CGFloat = 680
+    static let maxCanvasWidth: CGFloat = 960
+    static let height: CGFloat = 520
+    static let screenInset: CGFloat = 12
+
+    static func fittingWidth(for screen: NSRect, preferred: CGFloat) -> CGFloat {
+        let available = max(360, screen.width - screenInset * 2)
+        return min(preferred, available)
+    }
+
+    static func fittingMinimumWidth(for screen: NSRect, targetWidth: CGFloat) -> CGFloat {
+        let available = max(360, screen.width - screenInset * 2)
+        return min(minCompactWidth, targetWidth, available)
+    }
+}
+
 private func symbolImage(_ name: String) -> NSImage? {
     guard let image = NSImage(systemSymbolName: name, accessibilityDescription: nil) else {
         return nil
@@ -438,8 +456,11 @@ private final class OverlayWindow: NSWindow {
         let visibleFrame = screen?.visibleFrame
             ?? NSScreen.main?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let screenMaxWidth = max(minimumFrameWidth ?? 0, visibleFrame.width - inset * 2)
+        let screenMaxWidth = max(360, visibleFrame.width - inset * 2)
         clamped.size.width = min(clamped.size.width, screenMaxWidth)
+        if let minimumFrameWidth, minimumFrameWidth <= screenMaxWidth {
+            clamped.size.width = max(minimumFrameWidth, clamped.size.width)
+        }
         clamped.origin.x = min(
             max(visibleFrame.minX + inset, clamped.origin.x),
             visibleFrame.maxX - clamped.size.width - inset)
@@ -1217,6 +1238,8 @@ private final class ExpandedPanelView: NSView {
     let workspace: NSView
     let canvasPane: CanvasPaneView
     let headerBar: NSView
+    let headerStack: NSStackView
+    let headerSpacer: NSView
     let titleLabel: NSTextField
     let statusLabel: NSTextField
     let modelMenu: NSPopUpButton
@@ -1267,12 +1290,13 @@ private final class ExpandedPanelView: NSView {
     private var canvasWidthConstraint: NSLayoutConstraint?
     private var latestCanvas: CanvasArtifact?
     private var canvasOpen = false
-
     override init(frame frameRect: NSRect) {
         feed = FeedView(frame: .zero)
         workspace = NSView()
         canvasPane = CanvasPaneView(frame: .zero)
         headerBar = NSView()
+        headerStack = NSStackView()
+        headerSpacer = NSView()
         titleLabel = NSTextField(labelWithString: "Bluey")
         statusLabel = NSTextField(labelWithString: "New recording")
         modelMenu = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -1332,6 +1356,8 @@ private final class ExpandedPanelView: NSView {
 
         for view in [
             headerBar,
+            headerStack,
+            headerSpacer,
             titleLabel,
             statusLabel,
             modelMenu,
@@ -1378,13 +1404,19 @@ private final class ExpandedPanelView: NSView {
             view.translatesAutoresizingMaskIntoConstraints = false
         }
 
-        headerBar.addSubview(navButton)
-        headerBar.addSubview(newSessionButton)
-        headerBar.addSubview(modelMenu)
-        headerBar.addSubview(canvasToggleButton)
-        headerBar.addSubview(balanceLabel)
-        headerBar.addSubview(hideButton)
-        headerBar.addSubview(closeButton)
+        headerBar.addSubview(headerStack)
+        for view in [
+            navButton,
+            newSessionButton,
+            modelMenu,
+            headerSpacer,
+            canvasToggleButton,
+            balanceLabel,
+            hideButton,
+            closeButton,
+        ] {
+            headerStack.addArrangedSubview(view)
+        }
         addSubview(headerBar)
         addSubview(workspace)
         workspace.addSubview(feed)
@@ -1417,6 +1449,12 @@ private final class ExpandedPanelView: NSView {
         closeConfirmPanel.addSubview(closeConfirmBody)
         closeConfirmPanel.addSubview(closeConfirmCancelButton)
         closeConfirmPanel.addSubview(closeConfirmTurnOffButton)
+        // Keep the fixed chrome rows above transparent scroll/canvas surfaces
+        // even when AppKit re-lays out the dense center workspace.
+        headerBar.layer?.zPosition = 50
+        transcriptStrip.layer?.zPosition = 40
+        attachmentStrip.layer?.zPosition = 40
+        composerBar.layer?.zPosition = 50
 
         let canvasWidth = canvasPane.widthAnchor.constraint(equalToConstant: 0)
         canvasWidthConstraint = canvasWidth
@@ -1427,42 +1465,33 @@ private final class ExpandedPanelView: NSView {
             headerBar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             headerBar.heightAnchor.constraint(equalToConstant: 36),
 
-            navButton.leadingAnchor.constraint(equalTo: headerBar.leadingAnchor, constant: 8),
-            navButton.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
+            headerStack.leadingAnchor.constraint(equalTo: headerBar.leadingAnchor, constant: 8),
+            headerStack.trailingAnchor.constraint(equalTo: headerBar.trailingAnchor, constant: -8),
+            headerStack.topAnchor.constraint(equalTo: headerBar.topAnchor, constant: 3),
+            headerStack.bottomAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: -3),
+
             navButton.widthAnchor.constraint(equalToConstant: 30),
             navButton.heightAnchor.constraint(equalToConstant: 30),
 
-            newSessionButton.leadingAnchor.constraint(equalTo: navButton.trailingAnchor, constant: 6),
-            newSessionButton.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
             newSessionButton.widthAnchor.constraint(equalToConstant: 30),
             newSessionButton.heightAnchor.constraint(equalToConstant: 30),
 
-            modelMenu.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
-            modelMenu.leadingAnchor.constraint(equalTo: newSessionButton.trailingAnchor, constant: 14),
-            modelMenu.widthAnchor.constraint(equalToConstant: 150),
+            modelMenu.widthAnchor.constraint(greaterThanOrEqualToConstant: 118),
+            modelMenu.widthAnchor.constraint(lessThanOrEqualToConstant: 152),
             modelMenu.heightAnchor.constraint(equalToConstant: 30),
 
-            closeButton.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
-            closeButton.trailingAnchor.constraint(equalTo: headerBar.trailingAnchor, constant: -8),
             closeButton.widthAnchor.constraint(equalToConstant: 26),
             closeButton.heightAnchor.constraint(equalToConstant: 26),
 
-            hideButton.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
-            hideButton.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -6),
             hideButton.widthAnchor.constraint(equalToConstant: 26),
             hideButton.heightAnchor.constraint(equalToConstant: 26),
 
-            balanceLabel.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
-            balanceLabel.trailingAnchor.constraint(equalTo: hideButton.leadingAnchor, constant: -8),
-            balanceLabel.widthAnchor.constraint(equalToConstant: 108),
+            balanceLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 84),
+            balanceLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 116),
             balanceLabel.heightAnchor.constraint(equalToConstant: 26),
 
-            canvasToggleButton.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
-            canvasToggleButton.trailingAnchor.constraint(equalTo: balanceLabel.leadingAnchor, constant: -8),
             canvasToggleButton.widthAnchor.constraint(equalToConstant: 30),
             canvasToggleButton.heightAnchor.constraint(equalToConstant: 30),
-
-            modelMenu.trailingAnchor.constraint(lessThanOrEqualTo: canvasToggleButton.leadingAnchor, constant: -10),
 
             workspace.topAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: 8),
             workspace.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
@@ -1549,12 +1578,12 @@ private final class ExpandedPanelView: NSView {
 
             recordingButton.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 8),
             recordingButton.centerYAnchor.constraint(equalTo: composerBar.centerYAnchor),
-            recordingButton.widthAnchor.constraint(equalToConstant: 108),
+            recordingButton.widthAnchor.constraint(equalToConstant: 110),
             recordingButton.heightAnchor.constraint(equalToConstant: 38),
 
             opacityControl.leadingAnchor.constraint(equalTo: recordingButton.trailingAnchor, constant: 8),
             opacityControl.centerYAnchor.constraint(equalTo: composerBar.centerYAnchor),
-            opacityControl.widthAnchor.constraint(equalToConstant: 118),
+            opacityControl.widthAnchor.constraint(equalToConstant: 112),
             opacityControl.heightAnchor.constraint(equalToConstant: 38),
 
             opacityLabel.leadingAnchor.constraint(equalTo: opacityControl.leadingAnchor, constant: 10),
@@ -1685,6 +1714,13 @@ private final class ExpandedPanelView: NSView {
         headerBar.layer?.borderWidth = 1
         headerBar.layer?.borderColor = BlueyTheme.hairline.cgColor
 
+        headerStack.orientation = .horizontal
+        headerStack.alignment = .centerY
+        headerStack.distribution = .fill
+        headerStack.spacing = 6
+        headerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        headerSpacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
         titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .bold)
         titleLabel.textColor = BlueyTheme.text
         statusLabel.font = NSFont.systemFont(ofSize: 9.5, weight: .semibold)
@@ -1703,10 +1739,16 @@ private final class ExpandedPanelView: NSView {
         modelMenu.layer?.borderColor = BlueyTheme.hairline.cgColor
         modelMenu.font = NSFont.systemFont(ofSize: 12, weight: .bold)
         modelMenu.contentTintColor = BlueyTheme.text
+        modelMenu.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        modelMenu.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         balanceLabel.font = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .bold)
         balanceLabel.textColor = BlueyTheme.text
         balanceLabel.alignment = .center
+        balanceLabel.lineBreakMode = .byTruncatingMiddle
+        balanceLabel.maximumNumberOfLines = 1
+        balanceLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        balanceLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         balanceLabel.wantsLayer = true
         balanceLabel.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.18).cgColor
         balanceLabel.layer?.cornerRadius = 14
@@ -2195,14 +2237,18 @@ private final class ExpandedPanelView: NSView {
 
     private func ensureRoomForCanvas() {
         guard let window else { return }
-        let targetWidth: CGFloat = 820
+        let targetWidth = ExpandedPanelMetrics.maxCanvasWidth
         let screen = window.screen?.visibleFrame
             ?? NSScreen.main?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let clampedTargetWidth = min(targetWidth, screen.width - 24)
+        let clampedTargetWidth = ExpandedPanelMetrics.fittingWidth(for: screen, preferred: targetWidth)
+        let minimumWidth = ExpandedPanelMetrics.fittingMinimumWidth(for: screen, targetWidth: clampedTargetWidth)
         if let overlayWindow = window as? OverlayWindow {
+            overlayWindow.minimumFrameWidth = minimumWidth
             overlayWindow.maximumFrameWidth = clampedTargetWidth
         }
+        window.minSize = NSSize(width: minimumWidth, height: window.minSize.height)
+        window.contentMinSize = NSSize(width: minimumWidth, height: window.contentMinSize.height)
         window.maxSize = NSSize(width: clampedTargetWidth, height: window.maxSize.height)
         window.contentMaxSize = NSSize(width: clampedTargetWidth, height: window.contentMaxSize.height)
         guard window.frame.width < clampedTargetWidth else { return }
@@ -2214,10 +2260,19 @@ private final class ExpandedPanelView: NSView {
 
     private func restoreCompactWidth() {
         guard let window else { return }
-        let compactWidth: CGFloat = 720
+        let screen = window.screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let compactWidth = ExpandedPanelMetrics.fittingWidth(
+            for: screen,
+            preferred: ExpandedPanelMetrics.maxCompactWidth)
+        let minimumWidth = ExpandedPanelMetrics.fittingMinimumWidth(for: screen, targetWidth: compactWidth)
         if let overlayWindow = window as? OverlayWindow {
+            overlayWindow.minimumFrameWidth = minimumWidth
             overlayWindow.maximumFrameWidth = compactWidth
         }
+        window.minSize = NSSize(width: minimumWidth, height: window.minSize.height)
+        window.contentMinSize = NSSize(width: minimumWidth, height: window.contentMinSize.height)
         window.maxSize = NSSize(width: compactWidth, height: window.maxSize.height)
         window.contentMaxSize = NSSize(width: compactWidth, height: window.contentMaxSize.height)
         guard window.frame.width > compactWidth else { return }
@@ -2781,7 +2836,11 @@ private final class OverlayApp {
     private func ensureExpandedWindow() {
         guard expandedWindow == nil else { return }
         let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
-        let expandedSize = NSSize(width: 720, height: 520)
+        let expandedWidth = ExpandedPanelMetrics.fittingWidth(
+            for: screen,
+            preferred: ExpandedPanelMetrics.maxCompactWidth)
+        let minimumWidth = ExpandedPanelMetrics.fittingMinimumWidth(for: screen, targetWidth: expandedWidth)
+        let expandedSize = NSSize(width: expandedWidth, height: ExpandedPanelMetrics.height)
         let pillFrame = pillWindow?.frame ?? NSRect(
             x: screen.midX - 66,
             y: screen.maxY - 60,
@@ -2793,15 +2852,15 @@ private final class OverlayApp {
         let window = OverlayWindow(
             contentRect: NSRect(origin: expandedOrigin, size: expandedSize),
             draggable: false)
-        window.minimumFrameWidth = expandedSize.width
+        window.minimumFrameWidth = minimumWidth
         window.lockedFrameHeight = expandedSize.height
         // The expanded surface must stay compact vertically; otherwise AppKit can
         // grow the borderless window to satisfy dense feed/composer constraints.
         // Width can still expand intentionally for the canvas panel.
-        let maxExpandedWidth = expandedSize.width
-        window.minSize = expandedSize
+        let maxExpandedWidth = expandedWidth
+        window.minSize = NSSize(width: minimumWidth, height: expandedSize.height)
         window.maxSize = NSSize(width: maxExpandedWidth, height: expandedSize.height)
-        window.contentMinSize = expandedSize
+        window.contentMinSize = NSSize(width: minimumWidth, height: expandedSize.height)
         window.contentMaxSize = NSSize(width: maxExpandedWidth, height: expandedSize.height)
         window.maximumFrameWidth = maxExpandedWidth
         let view = ExpandedPanelView(frame: NSRect(origin: .zero, size: expandedSize))

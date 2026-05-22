@@ -181,10 +181,13 @@ additional AppKit/autolayout follow-ups:
    from AppKit sizing and move the expanded window off-screen
    (`Y = 10107`). `OverlayWindow` now clamps later `setFrame` /
    `setContentSize` calls back into the visible screen.
-2. Dense composer constraints could ask the window for an oversized
-   width (`Width = 1704`). The normal expanded window now has a maximum
-   width of 720; the canvas path explicitly raises that cap to 820 only
-   while the canvas is open, then restores 720 when it closes.
+2. Dense composer/header constraints could ask the window for an oversized
+   width (`Width = 1704`). The normal expanded window now chooses a
+   screen-fitting adaptive width capped at 820px, with a lower minimum on
+   smaller displays so the nav, model selector, balance, and composer
+   controls fit instead of being cropped. The canvas path explicitly
+   raises that cap to 960 only while the canvas is open, then restores the
+   screen-fitting compact width when it closes.
 3. Long composer text could push the Style / Docs / Screen / Answer
    controls out of the 720-wide panel. The composer now has low
    horizontal hugging and compression resistance, uses a scrollable
@@ -195,10 +198,10 @@ Latest local smoke evidence after rebuilding and refreshing
 `/tmp/bluey-internal-test`:
 
 ```text
-Step 3 Start: expanded window stayed 720x520 at a valid on-screen origin.
+Step 3 Start: expanded window stayed compact at a valid on-screen origin.
 Step 3 Stop: transcript segment count stopped advancing and the button
              returned to Start Bluey.
-Step 4 UI:   composer controls remained visible at 720-wide with a long
+Step 4 UI:   header and composer controls remained visible with a long
              prompt typed into the surface.
 Step 6:      normal mode reports overlay_capture_excluded=true and Quartz
              reports the expanded overlay as sharing=0. A standard
