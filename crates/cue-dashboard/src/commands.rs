@@ -1,6 +1,6 @@
 use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
 use cue_core::session::Session;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
@@ -45,6 +45,18 @@ pub struct AccountMePayload {
     pub auto_topup_enabled: bool,
     pub auto_topup_threshold_cents: i64,
     pub auto_topup_amount_cents: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FrontendErrorPayload {
+    pub source: String,
+    pub message: String,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub stack: Option<String>,
 }
 
 // ===== Daemon IPC helper =====
@@ -212,6 +224,34 @@ pub async fn delete_account_now(db: State<'_, DbState>) -> Result<(), String> {
         mark_onboarding_incomplete(db)?;
     }
     Ok(())
+}
+
+#[tauri::command]
+pub fn report_frontend_error(payload: FrontendErrorPayload) -> Result<(), String> {
+    tracing::warn!(
+        source = %truncate_log_field(&payload.source, 120),
+        command = %payload.command.as_deref().map(|v| truncate_log_field(v, 120)).unwrap_or_default(),
+        url = %payload.url.as_deref().map(|v| truncate_log_field(v, 240)).unwrap_or_default(),
+        message = %truncate_log_field(&payload.message, 700),
+        stack = %payload.stack.as_deref().map(|v| truncate_log_field(v, 1200)).unwrap_or_default(),
+        "frontend error captured"
+    );
+    Ok(())
+}
+
+fn truncate_log_field(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for ch in value.chars().take(max_chars) {
+        if ch.is_control() && ch != '\n' && ch != '\t' {
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    if value.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
 }
 
 #[tauri::command]
@@ -813,6 +853,13 @@ mod tests {
     #[test]
     fn daemon_addr_defaults_to_standard_addr() {
         assert_eq!(DEFAULT_DAEMON_ADDR, "127.0.0.1:57321");
+    }
+
+    #[test]
+    fn truncate_log_field_preserves_chars_and_marks_truncation() {
+        assert_eq!(truncate_log_field("hello", 10), "hello");
+        assert_eq!(truncate_log_field("abcdef", 3), "abc…");
+        assert_eq!(truncate_log_field("a\u{0007}b", 10), "a b");
     }
 
     #[test]

@@ -56,6 +56,7 @@ pub fn run() {
             commands::billing_portal_url,
             commands::sign_out,
             commands::delete_account_now,
+            commands::report_frontend_error,
             commands::get_signin_url,
             commands::complete_onboarding,
             commands::list_sessions,

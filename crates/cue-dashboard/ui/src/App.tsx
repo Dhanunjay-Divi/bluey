@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { HashRouter, Routes, Route, useNavigate } from "react-router-dom";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./lib/tauri";
 import { listen } from "@tauri-apps/api/event";
 import { DashboardLayout } from "./components/DashboardLayout";
 import { Chats } from "./pages/Chats";

@@ -1475,6 +1475,18 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         OverlayEvent::Error { message } => {
             warn!("overlay error: {message}");
         }
+        OverlayEvent::Lifecycle {
+            stage,
+            status,
+            detail,
+        } => {
+            info!(
+                overlay_stage = %stage,
+                overlay_status = status.as_deref().unwrap_or(""),
+                overlay_detail = detail.as_deref().unwrap_or(""),
+                "overlay lifecycle"
+            );
+        }
     }
 
     Ok(())
@@ -6172,6 +6184,33 @@ pub fn validate_and_decode_overlay_line(
             });
         }
     }
+    if let Some(s) = obj.get("stage").and_then(|v| v.as_str()) {
+        if s.len() > OVERLAY_MAX_QUESTION {
+            return Err(OverlayLineReject::FieldTooLong {
+                field: "stage",
+                len: s.len(),
+                max: OVERLAY_MAX_QUESTION,
+            });
+        }
+    }
+    if let Some(s) = obj.get("status").and_then(|v| v.as_str()) {
+        if s.len() > OVERLAY_MAX_QUESTION {
+            return Err(OverlayLineReject::FieldTooLong {
+                field: "status",
+                len: s.len(),
+                max: OVERLAY_MAX_QUESTION,
+            });
+        }
+    }
+    if let Some(s) = obj.get("detail").and_then(|v| v.as_str()) {
+        if s.len() > OVERLAY_MAX_TEXT {
+            return Err(OverlayLineReject::FieldTooLong {
+                field: "detail",
+                len: s.len(),
+                max: OVERLAY_MAX_TEXT,
+            });
+        }
+    }
 
     // Deserialize into typed event after stripping token (serde will ignore
     // unknown fields by default for #[serde(tag = "type", ...)] enums).
@@ -7284,6 +7323,30 @@ mod tests {
     #[test]
     fn answer_overlay_artifact_ignores_short_chat() {
         assert!(answer_overlay_artifact("Yes, that is the right next step.").is_none());
+    }
+
+    #[test]
+    fn overlay_lifecycle_event_is_accepted_by_production_validator() {
+        let state = parking_lot::Mutex::new(cue_core::overlay_ipc::OverlayUiState::Idle);
+        let event = validate_and_decode_overlay_line(
+            r#"{"type":"lifecycle","token":"tok","stage":"started","status":"ok","detail":"capture_excluded=true"}"#,
+            "tok",
+            &state,
+        )
+        .expect("lifecycle event should decode");
+
+        match event {
+            OverlayEvent::Lifecycle {
+                stage,
+                status,
+                detail,
+            } => {
+                assert_eq!(stage, "started");
+                assert_eq!(status.as_deref(), Some("ok"));
+                assert_eq!(detail.as_deref(), Some("capture_excluded=true"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[test]

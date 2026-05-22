@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../lib/tauri";
 import { CreditCard } from "lucide-react";
 
 interface BalanceSnapshot {

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../lib/tauri";
 import { Check, Eye, EyeOff, Mail, Trash2, ExternalLink, LogOut } from "lucide-react";
 
 /**

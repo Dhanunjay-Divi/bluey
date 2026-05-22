@@ -322,6 +322,18 @@ private func emitSimple(_ type: String) {
     emitEvent(["type": type])
 }
 
+private func emitLifecycle(_ stage: String, status: String = "ok", detail: String? = nil) {
+    var payload: [String: Any] = [
+        "type": "lifecycle",
+        "stage": stage,
+        "status": status,
+    ]
+    if let detail, !detail.isEmpty {
+        payload["detail"] = detail
+    }
+    emitEvent(payload)
+}
+
 private func emitAsk(question: String, provider: String?, model: String?, mode: String?) {
     var p: [String: Any] = ["type": "ask_requested", "question": question]
     if let provider = provider { p["provider"] = provider }
@@ -2622,6 +2634,7 @@ private final class OverlayApp {
         }
 
         emitReady()
+        emitLifecycle("started", detail: "capture_excluded=\(!captureVisibleForDebug)")
         startParentWatchdog()
         startIpcLoop()
     }
@@ -2668,6 +2681,7 @@ private final class OverlayApp {
         }
         expandedWindow.orderFrontRegardless()
         emitSimple("shown")
+        emitLifecycle("expanded")
     }
 
     private func ensureExpandedWindow() {
@@ -2704,6 +2718,7 @@ private final class OverlayApp {
     private func collapse() {
         expandedWindow?.orderOut(nil)
         emitSimple("hidden")
+        emitLifecycle("collapsed")
     }
 
     func handleCommand(_ cmd: OverlayCommand) {
@@ -2718,6 +2733,7 @@ private final class OverlayApp {
             pillWindow?.fadeOutAndHide()
             expandedWindow?.fadeOutAndHide()
             RestoreToast.shared.show()
+            emitLifecycle("hidden")
 
         case .toggle:
             if expandedWindow?.isVisible == true { collapse() } else { expand() }
@@ -2749,6 +2765,7 @@ private final class OverlayApp {
             ensureExpandedWindow()
             expandedView?.updateCard(id: id, body: body, done: done, costLabel: costLabel, artifact: artifact)
         case .shutdown:
+            emitLifecycle("shutdown")
             NSApp.terminate(nil)
         case .unknown:
             break // log-only on stderr happens elsewhere; silently drop.

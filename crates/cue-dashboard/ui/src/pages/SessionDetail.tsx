@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../lib/tauri";
 import { useActiveSession } from "../hooks/useActiveSession";
 
 interface Session {

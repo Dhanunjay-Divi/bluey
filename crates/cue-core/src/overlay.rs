@@ -130,6 +130,13 @@ pub enum OverlayEvent {
     Error {
         message: String,
     },
+    Lifecycle {
+        stage: String,
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        detail: Option<String>,
+    },
     Exited,
 }
 
@@ -182,6 +189,21 @@ mod tests {
         assert_eq!(
             json,
             r#"{"type":"set_sessions","sessions":[{"id":"00000000-0000-0000-0000-000000000000","title":"System design prep","subtitle":"3 transcripts · 2 files","is_active":true}]}"#
+        );
+    }
+
+    #[test]
+    fn overlay_lifecycle_event_serializes() {
+        let json = serde_json::to_string(&OverlayEvent::Lifecycle {
+            stage: "started".to_string(),
+            status: Some("ok".to_string()),
+            detail: Some("capture_excluded=true".to_string()),
+        })
+        .expect("serialize lifecycle event");
+
+        assert_eq!(
+            json,
+            r#"{"type":"lifecycle","stage":"started","status":"ok","detail":"capture_excluded=true"}"#
         );
     }
 }

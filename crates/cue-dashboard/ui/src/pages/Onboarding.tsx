@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../lib/tauri";
 import { listen } from "@tauri-apps/api/event";
 import { Loader2, Shield, ArrowRight, Check, Eye, EyeOff } from "lucide-react";
 

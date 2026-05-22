@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../lib/tauri";
 import { useNavigate } from "react-router-dom";
 import { useSessionEvents } from "../hooks/useSessionEvents";
 import { useActiveSession } from "../hooks/useActiveSession";

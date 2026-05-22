@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Command } from "cmdk";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../lib/tauri";
 
 interface Session {
   id: string;

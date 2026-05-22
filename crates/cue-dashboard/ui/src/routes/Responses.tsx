@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "../lib/tauri";
 import { listen } from "@tauri-apps/api/event";
 import { applyChunk, clearInflight, type CueResponseChunk, type InflightResponse } from "./responseReducer";
 import { LaneBadge } from "./LaneBadge";
