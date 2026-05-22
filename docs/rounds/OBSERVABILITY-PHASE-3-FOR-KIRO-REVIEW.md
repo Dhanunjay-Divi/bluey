@@ -42,6 +42,7 @@ cd server && cargo test                              ✅
 cd crates/cue-dashboard/ui && npm test -- --run      ✅
 cd crates/cue-dashboard/ui && npm run build          ✅
 swift build -c release --package-path native/macos/cue-overlay ✅
+scripts/observability-acceptance-smoke.sh            ✅
 git diff --check                                     ✅
 ```
 

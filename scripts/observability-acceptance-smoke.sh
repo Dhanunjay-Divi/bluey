@@ -22,11 +22,13 @@
 #   * server: request_id middleware mints + echoes trace_id + request_id
 #   * server log line emits with both ids
 #   * daemon log file format is JSON with standard fields
+#   * Phase 3 overlay lifecycle + frontend error regression tests
 #
 # What this does NOT yet cover:
 #   * Visible Tauri window automation: this smoke runs the dashboard Rust
 #     command boundary deterministically instead of clicking a GUI window.
-#   * overlay lifecycle emits: gated on Phase 3.
+#   * Visible overlay click/expand/collapse automation: native UI visual QA
+#     remains manual on a real macOS desktop.
 
 set -euo pipefail
 
@@ -250,6 +252,25 @@ else
     fi
 fi
 
+step "Verify Phase 3 overlay lifecycle + frontend error capture tests"
+PHASE3_LOG="$WORK/phase3_tests.log"
+if ! ( cd "$WORKSPACE" && \
+    cargo test -p cue-core overlay::tests::overlay_lifecycle_event_serializes -- --nocapture && \
+    cargo test -p cue-daemon app::tests::overlay_lifecycle_event_is_accepted_by_production_validator -- --nocapture && \
+    cargo test -p cue-dashboard commands::tests::truncate_log_field_preserves_chars_and_marks_truncation -- --nocapture ) \
+    >"$PHASE3_LOG" 2>&1; then
+    echo "--- Phase 3 regression test log ---"
+    cat "$PHASE3_LOG"
+    fail "Phase 3 overlay/frontend observability tests failed"
+fi
+
+CORE_IMPORTS="$(grep -R -l '@tauri-apps/api/core' "$WORKSPACE/crates/cue-dashboard/ui/src" | sed "s#^$WORKSPACE/##" | tr '\n' ' ')"
+if [ "$CORE_IMPORTS" != "crates/cue-dashboard/ui/src/lib/tauri.ts " ]; then
+    echo "direct Tauri core imports: $CORE_IMPORTS"
+    fail "frontend invoke wrapper is not the only direct @tauri-apps/api/core consumer"
+fi
+ok "Phase 3 regression tests pass and direct Tauri invoke is centralized"
+
 step "All assertions passed"
 ok "Observability acceptance smoke: PASS"
 
@@ -260,7 +281,7 @@ echo "  - X-Bluey-Request-Id round-trips client -> server -> response (Phase 1)"
 echo "  - Server logs request received + request done with both ids"
 echo "  - Server mints fresh UUIDs when client omits them"
 echo "  - daemon honors BLUEY_TRACE_ID env on IPC dispatch (Phase 5)"
+echo "  - overlay lifecycle + frontend error regression tests pass (Phase 3)"
 echo ""
-echo "Gaps (gated on remaining phases):"
-echo "  - TS-only frontend errors before Tauri Rust boundary : Phase 3 codex"
-echo "  - overlay lifecycle emits                            : Phase 3 codex"
+echo "Remaining manual QA:"
+echo "  - visible dashboard/overlay GUI automation is still manual"
