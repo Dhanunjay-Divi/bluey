@@ -8,15 +8,13 @@
 
 ## TL;DR
 
-The Observability Round is functionally closed. All 6 phases have
-shipped; Phase 3 (overlay lifecycle + frontend error capture) is now
-landed and awaiting Kiro's final verdict. The round's primary contract
+The Observability Round is fully closed. All 6 phases shipped and
+verdicted in a single-day round. The round's primary contract
 (end-to-end trace correlation across UI / daemon / cloud / server) is
 satisfied.
 
 Acceptance gate: `bash scripts/observability-acceptance-smoke.sh`
-returns exit 0 with the server, daemon, dashboard-command, and Phase 3
-regression checks green.
+returns exit 0 with **8/8 assertions PASS**.
 
 ---
 
@@ -26,7 +24,7 @@ regression checks green.
 |---|---|---|---|
 | 1. Foundations (`ObserveFields`, `account_id_hash_prefix`, header constants, request-id middleware) | Codex | `9cd66d4` | 🟢 kiro `0485a9b` |
 | 2. Daemon + dashboard log rotation (JSONL, 7-day retention, `BLUEY_LOG_DIR` env) | Codex | `fdf3611` (+ N-1 fix `fbff17f`) | 🟢 kiro `2f70f58` |
-| 3. Overlay lifecycle emits + frontend error capture | Codex | `8bdb9fe` (+ smoke ext `f6408a6`) | pending Kiro |
+| 3. Overlay lifecycle emits + frontend error capture | Codex | `8bdb9fe` (+ smoke ext `f6408a6`) | 🟢 kiro `200abef` |
 | 4. `bluey doctor` + `bluey logs export --redact` (+ macOS perm probes + `--json` + `bluey support`) | Kiro | `8b9c24a` + `cef8b77` + `07d2fdd` + `1e178cd` + `a29ff48` | 🟢 codex `8ab84ef` |
 | 5. Trace propagation through Tauri invoke + IPC (`DaemonRequest::WithTrace` envelope, env passthrough) | Codex | `b30d5b0` (+ smoke ext `fd9e79a`) | 🟢 kiro `3187d6b` |
 | 6. Standard field migration sweep (`account_id` → `account_id_hash`, email drops) | Kiro | `60ff7fd` (+ tooling `98fe051` + integration `739bc02`) | 🟢 codex `81eecdc` |
