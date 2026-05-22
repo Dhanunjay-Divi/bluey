@@ -35,6 +35,10 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
 
     // ---- Public (no auth) ---------------------------------------------------
     let public = Router::new()
+        // Public unauthenticated health endpoints. /health is the standard
+        // monitoring/uptime path; /admin/health is the legacy alias kept
+        // for backward compat. Both return identical JSON.
+        .route("/health", get(admin::health))
         .route("/admin/health", get(admin::health))
         .route(
             "/auth/signup",

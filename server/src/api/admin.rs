@@ -10,6 +10,8 @@ pub struct Health {
     pub status: &'static str,
     pub version: &'static str,
     pub commit: &'static str,
+    pub platform: String,
+    pub server_time_ms: i64,
 }
 
 pub async fn health() -> impl IntoResponse {
@@ -19,6 +21,8 @@ pub async fn health() -> impl IntoResponse {
             status: "ok",
             version: env!("CARGO_PKG_VERSION"),
             commit: option_env!("BLUEY_GIT_COMMIT").unwrap_or("unknown"),
+            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            server_time_ms: chrono::Utc::now().timestamp_millis(),
         }),
     )
 }
