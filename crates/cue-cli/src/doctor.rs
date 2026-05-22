@@ -175,25 +175,35 @@ fn print_account_section() -> Result<()> {
 }
 
 fn print_permissions_section() -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        // Best-effort: probe each permission via `sqlite3` against TCC.db
-        // is fragile and requires Full Disk Access. Use lighter probes:
-        // shell out to `tccutil` and check `tcc reset` exit code, or
-        // probe via NSWorkspace. For doctor we just report the documented
-        // expectation and the user can verify in System Settings.
-        println!("  Accessibility : (verify in System Settings → Privacy & Security)");
-        println!("  Microphone    : (verify in System Settings → Privacy & Security)");
-        println!("  Screen Recording: (verify in System Settings → Privacy & Security)");
-        println!(
-            "  hint          : if F19 hotkey doesn't fire, Accessibility is the most likely cause"
-        );
+    use crate::macos_perms::{
+        accessibility_status, microphone_status, screen_recording_status, PermissionStatus,
+    };
+
+    let acc = accessibility_status();
+    let mic = microphone_status();
+    let scr = screen_recording_status();
+
+    println!("  Accessibility   : {}", acc.label());
+    if let Some(hint) = acc.hint("Accessibility") {
+        println!("                  → {hint}");
+    }
+    println!("  Microphone      : {}", mic.label());
+    if let Some(hint) = mic.hint("Microphone") {
+        println!("                  → {hint}");
+    }
+    println!("  Screen Recording: {}", scr.label());
+    if let Some(hint) = scr.hint("Screen Recording") {
+        println!("                  → {hint}");
     }
 
-    #[cfg(not(target_os = "macos"))]
-    {
-        println!("  (macOS-only permissions probe; not on this platform)");
+    if matches!(
+        acc,
+        PermissionStatus::Denied | PermissionStatus::NotDetermined
+    ) {
+        println!("  hint            : if F19 hotkey does not fire, Accessibility is");
+        println!("                    the most likely cause.");
     }
+
     Ok(())
 }
 
