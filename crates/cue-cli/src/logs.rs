@@ -256,6 +256,12 @@ pub fn redact_log_content(content: &str) -> String {
     out
 }
 
+/// Public helper exposing the same YYYYMMDD format used by logs export
+/// for the support bundle to keep filename stamps consistent.
+pub fn current_yyyymmdd_for_support() -> String {
+    current_yyyymmdd()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

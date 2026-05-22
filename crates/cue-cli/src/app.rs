@@ -83,6 +83,20 @@ enum Commands {
         #[command(subcommand)]
         command: LogsCommands,
     },
+    /// Bundle bluey doctor + logs export into a single zip for support tickets.
+    Support {
+        /// Disable redaction. By default the bundle strips bearer tokens,
+        /// magic-link URLs, Stripe IDs, provider keys, emails, IPv4
+        /// addresses, and /Users/<name>/ paths.
+        #[arg(long = "no-redact", default_value_t = false)]
+        no_redact: bool,
+        /// Include log files modified within the last N days.
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+        /// Output zip path. Defaults to ~/Bluey-support-YYYYMMDD-(redacted|raw).zip
+        #[arg(long, short)]
+        output: Option<std::path::PathBuf>,
+    },
     /// Start the Bluey daemon.
     #[command(hide = true)]
     Start(StartArgs),
@@ -540,6 +554,18 @@ pub async fn cli_main() -> Result<()> {
                 Ok(())
             }
         },
+        Commands::Support {
+            no_redact,
+            days,
+            output,
+        } => {
+            crate::support::bundle(crate::support::SupportArgs {
+                redact: !no_redact,
+                days,
+                output,
+            })?;
+            Ok(())
+        }
         Commands::Start(args) => start(args).await,
         Commands::Stop => {
             let response = request(DaemonRequest::Shutdown).await?;

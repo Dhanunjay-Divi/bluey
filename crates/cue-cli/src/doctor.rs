@@ -39,7 +39,7 @@ pub fn run() -> Result<()> {
 /// Emit the same diagnostic snapshot as `run()` but in structured JSON.
 /// Schema version 1. Same probe calls, same redaction, just a different
 /// formatter for support tooling that wants to parse output.
-pub fn run_json() -> Result<()> {
+fn build_doctor_json() -> Result<serde_json::Value> {
     use crate::macos_perms::{
         accessibility_status, microphone_status, screen_recording_status, PermissionStatus,
     };
@@ -159,8 +159,21 @@ pub fn run_json() -> Result<()> {
         "phase2_log_rotation_active": log_dir.exists(),
     });
 
-    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(output)
+}
+
+pub fn run_json() -> Result<()> {
+    let value = build_doctor_json()?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
+}
+
+/// Build the same JSON snapshot but return it as a pretty-printed
+/// string instead of writing to stdout. Used by the `bluey support`
+/// bundle to embed `doctor.json` directly into the zip.
+pub fn collect_json_string() -> Result<String> {
+    let value = build_doctor_json()?;
+    Ok(serde_json::to_string_pretty(&value)?)
 }
 
 fn print_section<F: FnOnce() -> Result<()>>(name: &str, f: F) {
