@@ -8,14 +8,15 @@
 
 ## TL;DR
 
-The Observability Round is functionally closed. 5 of 6 phases shipped
-with verdicts; Phase 3 (overlay lifecycle + frontend error capture) is
-in flight at codex but blocks no other work — the round's primary
-contract (end-to-end trace correlation across UI / daemon / cloud /
-server) is satisfied.
+The Observability Round is functionally closed. All 6 phases have
+shipped; Phase 3 (overlay lifecycle + frontend error capture) is now
+landed and awaiting Kiro's final verdict. The round's primary contract
+(end-to-end trace correlation across UI / daemon / cloud / server) is
+satisfied.
 
 Acceptance gate: `bash scripts/observability-acceptance-smoke.sh`
-returns exit 0 with 6/6 assertions green.
+returns exit 0 with the server, daemon, dashboard-command, and Phase 3
+regression checks green.
 
 ---
 
@@ -25,7 +26,7 @@ returns exit 0 with 6/6 assertions green.
 |---|---|---|---|
 | 1. Foundations (`ObserveFields`, `account_id_hash_prefix`, header constants, request-id middleware) | Codex | `9cd66d4` | 🟢 kiro `0485a9b` |
 | 2. Daemon + dashboard log rotation (JSONL, 7-day retention, `BLUEY_LOG_DIR` env) | Codex | `fdf3611` (+ N-1 fix `fbff17f`) | 🟢 kiro `2f70f58` |
-| 3. Overlay lifecycle emits + frontend error capture | Codex | in flight | pending |
+| 3. Overlay lifecycle emits + frontend error capture | Codex | `8bdb9fe` (+ smoke ext `f6408a6`) | pending Kiro |
 | 4. `bluey doctor` + `bluey logs export --redact` (+ macOS perm probes + `--json` + `bluey support`) | Kiro | `8b9c24a` + `cef8b77` + `07d2fdd` + `1e178cd` + `a29ff48` | 🟢 codex `8ab84ef` |
 | 5. Trace propagation through Tauri invoke + IPC (`DaemonRequest::WithTrace` envelope, env passthrough) | Codex | `b30d5b0` (+ smoke ext `fd9e79a`) | 🟢 kiro `3187d6b` |
 | 6. Standard field migration sweep (`account_id` → `account_id_hash`, email drops) | Kiro | `60ff7fd` (+ tooling `98fe051` + integration `739bc02`) | 🟢 codex `81eecdc` |
@@ -36,7 +37,7 @@ returns exit 0 with 6/6 assertions green.
 
 `scripts/observability-acceptance-smoke.sh` exercises the round's
 end-to-end contract. Run on uno against debug bluey-server + release
-bluey-daemon: **6/6 assertions PASS**.
+bluey-daemon: **all assertions PASS**.
 
 | Assertion | Verifies |
 |---|---|
@@ -46,6 +47,7 @@ bluey-daemon: **6/6 assertions PASS**.
 | 3 | Server emits `request received` + `request done` lines with both IDs |
 | 4 | Server mints fresh UUIDs when client omits IDs |
 | 5 | Daemon honors `BLUEY_TRACE_ID` env on IPC dispatch |
+| 6 | Phase 3 overlay lifecycle + frontend error capture regression tests pass, and direct frontend Tauri `invoke` imports are centralized |
 
 CI workflow at `.github/workflows/observability-policy.yml` runs
 the analyzer's `--check-only` gate plus fmt + clippy + tests on
@@ -113,6 +115,22 @@ every push and PR. Pre-commit hook at
   cue-daemon/src/app.rs.
 - Reusable migration script at `scripts/migrate-tracing-fields.py`.
 
+### Overlay lifecycle + frontend error capture
+- `OverlayEvent::Lifecycle { stage, status, detail }` shared core
+  contract.
+- Production daemon overlay-line validator bounds lifecycle fields
+  before deserialization.
+- Daemon logs lifecycle events with `overlay_stage`,
+  `overlay_status`, and `overlay_detail`.
+- macOS Swift overlay emits `started`, `expanded`, `collapsed`,
+  `hidden`, and `shutdown`.
+- Dashboard exposes `report_frontend_error` Tauri command with
+  truncation and control-character sanitization.
+- Frontend Tauri `invoke()` calls are centralized through
+  `crates/cue-dashboard/ui/src/lib/tauri.ts`; command rejections,
+  `window.error`, and `window.unhandledrejection` are reported into
+  dashboard logs.
+
 ### CI policy gate
 - `analyze-tracing-calls.py --check-only` exits 1 if any
   transitional findings, PII findings, or alias inconsistencies
@@ -156,11 +174,10 @@ every push and PR. Pre-commit hook at
 
 ## Outstanding items
 
-### Within the round (Phase 3 codex, not blocking)
+### Within the round
 
-- TS-only frontend errors before the Tauri Rust boundary (Phase 3
-  codex)
-- Overlay lifecycle emits in Swift main.swift (Phase 3 codex)
+- Phase 3 is landed at `8bdb9fe` and covered by the acceptance smoke
+  extension at `f6408a6`; final Kiro verdict is pending.
 
 ### Outside the round (deferred to v0.2.x or later)
 
@@ -196,10 +213,10 @@ every push and PR. Pre-commit hook at
 
 | Layer | Before round | After round |
 |---|---|---|
-| Workspace cargo tests | 422 | 474 (+52) |
+| Workspace cargo tests | 422 | 477 (+55) |
 | Server cargo tests | 75 | 90 (+15) |
 | Dashboard vitest | 15 | 15 (unchanged) |
-| Acceptance smoke assertions | 0 | 6 |
+| Acceptance smoke coverage checks | 0 | 7 |
 
 ---
 
@@ -208,12 +225,12 @@ every push and PR. Pre-commit hook at
 ```
 ✅ cargo fmt --all --check
 ✅ cargo clippy --all-targets -- -D warnings (workspace + server)
-✅ cargo test --all-targets — 474 passed (workspace) + 90 (server)
+✅ cargo test --all-targets — 477 passed (workspace) + 90 (server)
 ✅ npm test --run — 15 passed (dashboard ui)
 ✅ npm run build — clean
 ✅ swift build (overlay) — clean
 ✅ scripts/analyze-tracing-calls.py --check-only — exit 0
-✅ scripts/observability-acceptance-smoke.sh — 6/6 PASS
+✅ scripts/observability-acceptance-smoke.sh — PASS
 ```
 
 ---
@@ -240,11 +257,13 @@ In rough priority order:
 ## Summary
 
 The Observability Round closed in a single day across 6 phases, 5
-review verdicts, 1 acceptance smoke, 1 CI workflow, 1 pre-commit
+review verdicts plus the pending Phase 3 verdict, 1 acceptance smoke,
+1 CI workflow, 1 pre-commit
 hook, ~2500 LOC of new code, ~400 LOC of new scripts, and ~600 LOC
-of new docs. Both kiro-owned phases shipped before the codex Phase 3
-final polish landed; codex Phase 3 finishes the round but the
-trace-correlation contract is already satisfied at the current tip.
+of new docs. Both Kiro-owned phases shipped before the Codex Phase 3
+final polish landed; Codex Phase 3 now closes the remaining implementation
+gap while the trace-correlation contract remains satisfied at the current
+tip.
 
 Bluey now has end-to-end observability sufficient for closed alpha:
 support diagnostics, redacted log bundling, persistent local logs,

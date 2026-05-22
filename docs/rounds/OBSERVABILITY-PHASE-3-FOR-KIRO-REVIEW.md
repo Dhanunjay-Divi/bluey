@@ -2,7 +2,7 @@
 
 Branch: `feat/phase-3-round-12`
 Tip before: `2dbd323`
-Tip after: commit containing this handoff
+Tip after: `f6408a6`
 
 ## What changed
 
@@ -42,6 +42,7 @@ cd server && cargo test                              ✅
 cd crates/cue-dashboard/ui && npm test -- --run      ✅
 cd crates/cue-dashboard/ui && npm run build          ✅
 swift build -c release --package-path native/macos/cue-overlay ✅
+scripts/analyze-tracing-calls.py --check-only       ✅
 scripts/observability-acceptance-smoke.sh            ✅
 git diff --check                                     ✅
 ```
