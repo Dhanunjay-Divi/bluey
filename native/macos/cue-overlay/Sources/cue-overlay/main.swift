@@ -368,7 +368,9 @@ private func emitCardRendered(id: String) {
 /// Configured for either the small pill or the expanded feed depending on
 /// the size passed at construction time.
 private final class OverlayWindow: NSWindow {
-    var fixedFrameSize: NSSize?
+    var lockedFrameHeight: CGFloat?
+    var minimumFrameWidth: CGFloat?
+    var maximumFrameWidth: CGFloat?
 
     init(contentRect: NSRect, draggable: Bool) {
         super.init(
@@ -407,13 +409,43 @@ private final class OverlayWindow: NSWindow {
     }
 
     override func setContentSize(_ size: NSSize) {
-        super.setContentSize(fixedFrameSize ?? size)
+        if lockedFrameHeight != nil || minimumFrameWidth != nil {
+            super.setFrame(
+                clampedFrame(NSRect(origin: frame.origin, size: size)),
+                display: true)
+        } else {
+            super.setContentSize(size)
+        }
     }
 
     private func clampedFrame(_ frame: NSRect) -> NSRect {
-        guard let fixedFrameSize else { return frame }
         var clamped = frame
-        clamped.size = fixedFrameSize
+        if let minimumFrameWidth {
+            clamped.size.width = max(minimumFrameWidth, clamped.size.width)
+        }
+        if let maximumFrameWidth {
+            clamped.size.width = min(maximumFrameWidth, clamped.size.width)
+        }
+        if let lockedFrameHeight {
+            clamped.size.height = lockedFrameHeight
+        }
+
+        guard lockedFrameHeight != nil || minimumFrameWidth != nil || maximumFrameWidth != nil else {
+            return clamped
+        }
+
+        let inset: CGFloat = 12
+        let visibleFrame = screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let screenMaxWidth = max(minimumFrameWidth ?? 0, visibleFrame.width - inset * 2)
+        clamped.size.width = min(clamped.size.width, screenMaxWidth)
+        clamped.origin.x = min(
+            max(visibleFrame.minX + inset, clamped.origin.x),
+            visibleFrame.maxX - clamped.size.width - inset)
+        clamped.origin.y = min(
+            max(visibleFrame.minY + inset, clamped.origin.y),
+            visibleFrame.maxY - clamped.size.height - inset)
         return clamped
     }
 }
@@ -1798,6 +1830,25 @@ private final class ExpandedPanelView: NSView {
         composer.placeholderAttributedString = NSAttributedString(
             string: "Ask anything...",
             attributes: [.foregroundColor: BlueyTheme.textDim])
+        composer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        composer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        composer.cell?.lineBreakMode = .byTruncatingTail
+        if let cell = composer.cell as? NSTextFieldCell {
+            cell.isScrollable = true
+            cell.wraps = false
+        }
+
+        for control in [
+            recordingButton,
+            opacityControl,
+            instructionsButton,
+            attachButton,
+            analyzeButton,
+            askButton,
+        ] {
+            control.setContentHuggingPriority(.required, for: .horizontal)
+            control.setContentCompressionResistancePriority(.required, for: .horizontal)
+        }
     }
 
     private func configureCloseConfirm() {
@@ -2133,6 +2184,8 @@ private final class ExpandedPanelView: NSView {
         canvasToggleButton.contentTintColor = open ? BlueyTheme.cyan : BlueyTheme.textDim
         if open {
             ensureRoomForCanvas()
+        } else {
+            restoreCompactWidth()
         }
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.16
@@ -2143,13 +2196,33 @@ private final class ExpandedPanelView: NSView {
     private func ensureRoomForCanvas() {
         guard let window else { return }
         let targetWidth: CGFloat = 820
-        guard window.frame.width < targetWidth else { return }
         let screen = window.screen?.visibleFrame
             ?? NSScreen.main?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let clampedTargetWidth = min(targetWidth, screen.width - 24)
+        if let overlayWindow = window as? OverlayWindow {
+            overlayWindow.maximumFrameWidth = clampedTargetWidth
+        }
+        window.maxSize = NSSize(width: clampedTargetWidth, height: window.maxSize.height)
+        window.contentMaxSize = NSSize(width: clampedTargetWidth, height: window.contentMaxSize.height)
+        guard window.frame.width < clampedTargetWidth else { return }
         var frame = window.frame
-        frame.size.width = min(targetWidth, screen.width - 24)
+        frame.size.width = clampedTargetWidth
         frame.origin.x = min(max(screen.minX + 12, frame.origin.x), screen.maxX - frame.width - 12)
+        window.setFrame(frame, display: true, animate: true)
+    }
+
+    private func restoreCompactWidth() {
+        guard let window else { return }
+        let compactWidth: CGFloat = 720
+        if let overlayWindow = window as? OverlayWindow {
+            overlayWindow.maximumFrameWidth = compactWidth
+        }
+        window.maxSize = NSSize(width: compactWidth, height: window.maxSize.height)
+        window.contentMaxSize = NSSize(width: compactWidth, height: window.contentMaxSize.height)
+        guard window.frame.width > compactWidth else { return }
+        var frame = window.frame
+        frame.size.width = compactWidth
         window.setFrame(frame, display: true, animate: true)
     }
 
@@ -2720,13 +2793,17 @@ private final class OverlayApp {
         let window = OverlayWindow(
             contentRect: NSRect(origin: expandedOrigin, size: expandedSize),
             draggable: false)
-        window.fixedFrameSize = expandedSize
-        // The expanded surface must stay compact; otherwise AppKit can grow the
-        // borderless window to satisfy the dense composer/history constraints.
+        window.minimumFrameWidth = expandedSize.width
+        window.lockedFrameHeight = expandedSize.height
+        // The expanded surface must stay compact vertically; otherwise AppKit can
+        // grow the borderless window to satisfy dense feed/composer constraints.
+        // Width can still expand intentionally for the canvas panel.
+        let maxExpandedWidth = expandedSize.width
         window.minSize = expandedSize
-        window.maxSize = expandedSize
+        window.maxSize = NSSize(width: maxExpandedWidth, height: expandedSize.height)
         window.contentMinSize = expandedSize
-        window.contentMaxSize = expandedSize
+        window.contentMaxSize = NSSize(width: maxExpandedWidth, height: expandedSize.height)
+        window.maximumFrameWidth = maxExpandedWidth
         let view = ExpandedPanelView(frame: NSRect(origin: .zero, size: expandedSize))
         window.contentView = view
         view.onClose = { [weak self] in self?.collapse() }

@@ -171,3 +171,51 @@ Screenshots:
 The `/tmp/bluey-internal-test` overlay helper and
 `Resources/BlueyOverlay.app` were refreshed from the rebuilt
 `target/release` overlay artifacts.
+
+## 2026-05-22 Follow-up Fixes During Step 3/4 Smoke
+
+The initial lock fixed the Step 2 height, but Step 3 exposed two
+additional AppKit/autolayout follow-ups:
+
+1. Clicking **Start Bluey** could preserve an invalid later origin
+   from AppKit sizing and move the expanded window off-screen
+   (`Y = 10107`). `OverlayWindow` now clamps later `setFrame` /
+   `setContentSize` calls back into the visible screen.
+2. Dense composer constraints could ask the window for an oversized
+   width (`Width = 1704`). The normal expanded window now has a maximum
+   width of 720; the canvas path explicitly raises that cap to 820 only
+   while the canvas is open, then restores 720 when it closes.
+3. Long composer text could push the Style / Docs / Screen / Answer
+   controls out of the 720-wide panel. The composer now has low
+   horizontal hugging and compression resistance, uses a scrollable
+   non-wrapping text cell, and the action controls keep required
+   horizontal compression resistance.
+
+Latest local smoke evidence after rebuilding and refreshing
+`/tmp/bluey-internal-test`:
+
+```text
+Step 3 Start: expanded window stayed 720x520 at a valid on-screen origin.
+Step 3 Stop: transcript segment count stopped advancing and the button
+             returned to Start Bluey.
+Step 4 UI:   composer controls remained visible at 720-wide with a long
+             prompt typed into the surface.
+Step 6:      normal mode reports overlay_capture_excluded=true and Quartz
+             reports the expanded overlay as sharing=0. A standard
+             macOS screenshot and 3-second screen recording omitted the
+             expanded overlay while it was on screen.
+```
+
+Smoke artifacts:
+
+- `/tmp/bluey-smoke-shots/step3-start-fixed-width.png`
+- `/tmp/bluey-smoke-shots/step3-stop-fixed.png`
+- `/tmp/bluey-smoke-shots/step4-composer-fit.png`
+- `/tmp/bluey-smoke-shots/step4-after-send-visible-buttons.png`
+- `/tmp/bluey-smoke-shots/step6-capture-excluded-normal.png`
+- `/tmp/bluey-smoke-shots/step6-capture-excluded-normal.mov`
+
+The full Step 4 managed-answer assertions remain account-gated on this
+machine: `bluey doctor` reports the test install is logged out, so
+real answer streaming, cost labels, and managed canvas artifacts need
+either a staging server login or a production test account.
