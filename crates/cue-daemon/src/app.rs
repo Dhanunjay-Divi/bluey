@@ -501,12 +501,10 @@ impl OverlayProcess {
 
 #[tokio::main]
 pub async fn run() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "cue_daemon=info".into()),
-        )
-        .init();
+    let _log_guard = cue_core::init_local_json_logging(
+        "cue-daemon",
+        "cue_daemon=info,cue_core=info,cue_cloud_client=info,cue_llm=info,cue_router=info",
+    );
 
     let args = Args::parse();
     let paths = AppPaths::discover()?;

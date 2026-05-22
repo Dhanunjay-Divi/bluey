@@ -18,6 +18,11 @@ use tauri_plugin_global_shortcut::GlobalShortcutExt;
 pub struct DbState(pub Mutex<Database>);
 
 pub fn run() {
+    let _log_guard = cue_core::init_local_json_logging(
+        "cue-dashboard",
+        "cue_dashboard=info,cue_daemon=info,cue_core=info,cue_cloud_client=info",
+    );
+
     tauri::Builder::default()
         .manage(InvisibilityState::default())
         .manage({

@@ -7,6 +7,7 @@ pub mod cloud;
 pub mod config;
 pub mod intelligence;
 pub mod ipc;
+pub mod logging;
 pub mod meeting;
 pub mod observability;
 pub mod overlay;
@@ -43,6 +44,9 @@ pub use config::{
 };
 pub use intelligence::{analyze_segment, generate_recap, local_answer, SegmentAnalysis};
 pub use ipc::{DaemonRequest, DaemonResponse};
+pub use logging::{
+    init_local_json_logging, local_log_dir, log_file_prefix, retain_recent_log_files, LocalLogGuard,
+};
 pub use meeting::{
     ActionItem, ContextArtifact, ContextKind, ContextProcessingStatus, ConversationTurn, Decision,
     MeetingRecap, MeetingRecord, MemoryHit, Speaker, TranscriptSegment,
