@@ -404,7 +404,7 @@ fn finalize_relay_session(
     let (bluey_cost, customer_cost) = pricing::compute_cost(pricing, billable_seconds, 0);
     if customer_cost > 0 && !balance::deduct(&state.pool, &session.account_id, customer_cost)? {
         tracing::warn!(
-            account_id = %session.account_id,
+            account_id_hash = %cue_core::account_id_hash_prefix(&session.account_id),
             customer_cost,
             billable_seconds,
             "STT relay overrun absorbed by Bluey because balance was exhausted at close"

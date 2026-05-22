@@ -34,7 +34,7 @@ pub async fn ingest(
         // event is no longer "newly accepted".
         Ok(false) => StatusCode::OK,
         Err(e) => {
-            tracing::warn!(error = %e, account_id = %account.id, "usage event record failed");
+            tracing::warn!(error = %e, account_id_hash = %cue_core::account_id_hash_prefix(&account.id), "usage event record failed");
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }

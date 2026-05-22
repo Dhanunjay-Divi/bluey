@@ -398,26 +398,24 @@ pub async fn verify_email_start(
     let verify_url = format!("{}/verify-email?token={tok}", state.config.public_url);
     match crate::mail::send_email_verification(&state.config, &account.email, &verify_url).await {
         Ok(crate::mail::MailDelivery::Sent) => {
-            tracing::info!(account_id = %account.id, email = %account.email, "email verification sent");
+            tracing::info!(account_id_hash = %cue_core::account_id_hash_prefix(&account.id), "email verification sent");
         }
         Ok(crate::mail::MailDelivery::NotConfigured) => {
             if allow_dev_auth_link_logs() {
                 tracing::info!(
-                    account_id = %account.id,
-                    email = %account.email,
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                     verify_url = %verify_url,
                     "email verification (SMTP unconfigured; dev link logging enabled)"
                 );
             } else {
                 tracing::warn!(
-                    account_id = %account.id,
-                    email = %account.email,
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                     "email verification link created but SMTP is unconfigured; link suppressed from logs"
                 );
             }
         }
         Err(error) => {
-            tracing::warn!(account_id = %account.id, email = %account.email, %error, "email verification delivery failed");
+            tracing::warn!(account_id_hash = %cue_core::account_id_hash_prefix(&account.id), %error, "email verification delivery failed");
             return Err(err(
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 "email delivery failed",
@@ -495,26 +493,24 @@ pub async fn password_reset_start(
             match crate::mail::send_password_reset(&state.config, &account.email, &reset_url).await
             {
                 Ok(crate::mail::MailDelivery::Sent) => {
-                    tracing::info!(account_id = %account.id, email = %account.email, "password reset sent");
+                    tracing::info!(account_id_hash = %cue_core::account_id_hash_prefix(&account.id), "password reset sent");
                 }
                 Ok(crate::mail::MailDelivery::NotConfigured) => {
                     if allow_dev_auth_link_logs() {
                         tracing::info!(
-                            account_id = %account.id,
-                            email = %account.email,
+                            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                             reset_url = %reset_url,
                             "password reset (SMTP unconfigured; dev link logging enabled)"
                         );
                     } else {
                         tracing::warn!(
-                            account_id = %account.id,
-                            email = %account.email,
+                            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                             "password reset link created but SMTP is unconfigured; link suppressed from logs"
                         );
                     }
                 }
                 Err(error) => {
-                    tracing::warn!(account_id = %account.id, email = %account.email, %error, "password reset delivery failed");
+                    tracing::warn!(account_id_hash = %cue_core::account_id_hash_prefix(&account.id), %error, "password reset delivery failed");
                 }
             }
         }

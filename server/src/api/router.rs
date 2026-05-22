@@ -257,7 +257,7 @@ async fn complete_inner(
             // alternative — making the customer mint a new id — is
             // user-hostile for ephemeral 503s).
             tracing::warn!(
-                account_id = %account.id,
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 request_id = %req.request_id,
                 provider = %provider,
                 model = %model,
@@ -308,7 +308,7 @@ async fn complete_inner(
         // customer in the red (per DECISIONS.md hard-stop guarantee).
         if !ok {
             tracing::warn!(
-                account_id = %account.id,
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 cost_cents = customer_cost,
                 "post-completion deduct failed; bluey absorbs overrun"
             );
@@ -391,7 +391,7 @@ async fn complete_inner(
                 idempotency::mark_complete(&state.pool, &account.id, &req.request_id, &json)
             {
                 tracing::error!(
-                    account_id = %account.id,
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                     request_id = %req.request_id,
                     error = %e,
                     "idempotency::mark_complete failed AFTER customer billed; retry will return 409 — manual reconciliation required"
@@ -400,7 +400,7 @@ async fn complete_inner(
         }
         Err(e) => {
             tracing::error!(
-                account_id = %account.id,
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 request_id = %req.request_id,
                 error = %e,
                 "failed to serialize response for idempotency cache; retry will return 409 — manual reconciliation required"
@@ -788,7 +788,7 @@ pub async fn embed(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
-                account_id = %account.id,
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 request_id = %req.request_id,
                 provider = %provider,
                 model = %model,
@@ -824,7 +824,7 @@ pub async fn embed(
         })?;
         if !ok {
             tracing::warn!(
-                account_id = %account.id,
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 cost_cents = customer_cost,
                 "embed post-completion deduct failed; bluey absorbs overrun"
             );
@@ -881,7 +881,7 @@ pub async fn embed(
         if let Err(e) = idempotency::mark_complete(&state.pool, &account.id, &req.request_id, &json)
         {
             tracing::error!(
-                account_id = %account.id,
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 request_id = %req.request_id,
                 error = %e,
                 "embed mark_complete failed AFTER customer billed"
@@ -1045,7 +1045,7 @@ pub async fn transcribe(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
-                account_id = %account.id,
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 request_id = %q.request_id,
                 provider = %provider,
                 model = %model,
@@ -1081,7 +1081,7 @@ pub async fn transcribe(
         })?;
         if !ok {
             tracing::warn!(
-                account_id = %account.id,
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 cost_cents = customer_cost,
                 "transcribe post-completion deduct failed; bluey absorbs overrun"
             );
@@ -1135,7 +1135,7 @@ pub async fn transcribe(
     if let Ok(json) = serde_json::to_string(&response) {
         if let Err(e) = idempotency::mark_complete(&state.pool, &account.id, &q.request_id, &json) {
             tracing::error!(
-                account_id = %account.id,
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 request_id = %q.request_id,
                 error = %e,
                 "transcribe mark_complete failed AFTER customer billed"

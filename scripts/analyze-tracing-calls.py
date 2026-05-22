@@ -412,9 +412,12 @@ def emit_json(report: Report) -> str:
         {
             "total_calls": len(report.calls),
             "conformant": sum(1 for c in report.calls if c.is_conformant()),
-            "by_component": dict(
-                Counter((c.component, c.level) for c in report.calls).most_common()
-            ),
+            "by_component": {
+                f"{comp}/{lvl}": n
+                for ((comp, lvl), n) in Counter(
+                    (c.component, c.level) for c in report.calls
+                ).items()
+            },
             "alias_counts": {f"{a}->{b}": n for (a, b), n in report.alias_counter.items()},
             "pii_findings": [
                 {"file": c.file, "line": c.line, "level": c.level, "message": c.message}

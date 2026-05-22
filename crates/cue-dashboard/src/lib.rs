@@ -635,7 +635,7 @@ async fn handle_deep_link_url(url: String, app: tauri::AppHandle) {
                 );
                 return;
             }
-            tracing::info!(email = %resp.account.email, "deep-link login success");
+            tracing::info!("deep-link login success");
             let _ = app.emit(
                 "deep_link_login",
                 DeepLinkLoginResult {

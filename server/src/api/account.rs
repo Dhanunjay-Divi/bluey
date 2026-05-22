@@ -469,8 +469,7 @@ pub async fn delete_account(
         return Err(axum::http::StatusCode::NOT_FOUND);
     }
     tracing::info!(
-        account_id = %account.id,
-        email = %account.email,
+        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
         "account deleted (GDPR hard-delete)"
     );
     Ok(Json(DeleteAck {
