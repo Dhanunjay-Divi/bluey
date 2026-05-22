@@ -71,7 +71,13 @@ enum Commands {
         force: bool,
     },
     /// Print a redacted self-diagnosis snapshot for support tickets.
-    Doctor,
+    Doctor {
+        /// Emit JSON instead of human-readable text. Schema version 1.
+        /// Useful for support automation. Sensitive fields are still
+        /// hashed/redacted exactly as the human-readable output is.
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage local Bluey logs.
     Logs {
         #[command(subcommand)]
@@ -512,8 +518,12 @@ pub async fn cli_main() -> Result<()> {
         Commands::Portal => bluey_portal_cmd().await,
         Commands::Export => bluey_export_cmd().await,
         Commands::DeleteAccount { force } => bluey_delete_account_cmd(force).await,
-        Commands::Doctor => {
-            crate::doctor::run()?;
+        Commands::Doctor { json } => {
+            if json {
+                crate::doctor::run_json()?;
+            } else {
+                crate::doctor::run()?;
+            }
             Ok(())
         }
         Commands::Logs { command } => match command {
