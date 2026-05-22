@@ -23,6 +23,11 @@ libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+regex = "1"
+once_cell = "1"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+sha2 = "0.10"
+hex = "0.4"
 
 [lints.clippy]
 ptr_arg = "allow"

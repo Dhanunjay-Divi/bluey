@@ -70,6 +70,13 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Print a redacted self-diagnosis snapshot for support tickets.
+    Doctor,
+    /// Manage local Bluey logs.
+    Logs {
+        #[command(subcommand)]
+        command: LogsCommands,
+    },
     /// Start the Bluey daemon.
     #[command(hide = true)]
     Start(StartArgs),
@@ -241,6 +248,25 @@ struct SettingsArgs {
     /// Local/cloud retention target in days.
     #[arg(long)]
     retention_days: Option<u32>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum LogsCommands {
+    /// Bundle local Bluey logs into a redacted zip for support.
+    Export {
+        /// Disable redaction. By default the export strips bearer tokens,
+        /// magic-link URLs, Stripe IDs, provider keys, emails, and IPv4
+        /// addresses. Use --no-redact only when you control where the zip
+        /// is going.
+        #[arg(long = "no-redact", default_value_t = false)]
+        no_redact: bool,
+        /// Include log files modified within the last N days.
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+        /// Output zip path. Defaults to ~/Bluey-logs-YYYYMMDD-(redacted|raw).zip
+        #[arg(long, short)]
+        output: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -486,6 +512,24 @@ pub async fn cli_main() -> Result<()> {
         Commands::Portal => bluey_portal_cmd().await,
         Commands::Export => bluey_export_cmd().await,
         Commands::DeleteAccount { force } => bluey_delete_account_cmd(force).await,
+        Commands::Doctor => {
+            crate::doctor::run()?;
+            Ok(())
+        }
+        Commands::Logs { command } => match command {
+            LogsCommands::Export {
+                no_redact,
+                days,
+                output,
+            } => {
+                crate::logs::export(crate::logs::LogsExportArgs {
+                    redact: !no_redact,
+                    days,
+                    output,
+                })?;
+                Ok(())
+            }
+        },
         Commands::Start(args) => start(args).await,
         Commands::Stop => {
             let response = request(DaemonRequest::Shutdown).await?;
