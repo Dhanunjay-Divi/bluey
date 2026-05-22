@@ -368,6 +368,8 @@ private func emitCardRendered(id: String) {
 /// Configured for either the small pill or the expanded feed depending on
 /// the size passed at construction time.
 private final class OverlayWindow: NSWindow {
+    var fixedFrameSize: NSSize?
+
     init(contentRect: NSRect, draggable: Bool) {
         super.init(
             contentRect: contentRect,
@@ -395,6 +397,25 @@ private final class OverlayWindow: NSWindow {
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    override func setFrame(_ frameRect: NSRect, display displayFlag: Bool) {
+        super.setFrame(clampedFrame(frameRect), display: displayFlag)
+    }
+
+    override func setFrame(_ frameRect: NSRect, display displayFlag: Bool, animate animateFlag: Bool) {
+        super.setFrame(clampedFrame(frameRect), display: displayFlag, animate: animateFlag)
+    }
+
+    override func setContentSize(_ size: NSSize) {
+        super.setContentSize(fixedFrameSize ?? size)
+    }
+
+    private func clampedFrame(_ frame: NSRect) -> NSRect {
+        guard let fixedFrameSize else { return frame }
+        var clamped = frame
+        clamped.size = fixedFrameSize
+        return clamped
+    }
 }
 
 // MARK: - Pill view
@@ -2699,6 +2720,13 @@ private final class OverlayApp {
         let window = OverlayWindow(
             contentRect: NSRect(origin: expandedOrigin, size: expandedSize),
             draggable: false)
+        window.fixedFrameSize = expandedSize
+        // The expanded surface must stay compact; otherwise AppKit can grow the
+        // borderless window to satisfy the dense composer/history constraints.
+        window.minSize = expandedSize
+        window.maxSize = expandedSize
+        window.contentMinSize = expandedSize
+        window.contentMaxSize = expandedSize
         let view = ExpandedPanelView(frame: NSRect(origin: .zero, size: expandedSize))
         window.contentView = view
         view.onClose = { [weak self] in self?.collapse() }

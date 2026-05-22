@@ -139,3 +139,35 @@ not from the Observability Round itself. The Observability Round
 remains 🟢 closed; this is a Stage 25 / UI canvas regression that
 slipped through because we never visually-verified the new 720x520
 size on a real Mac after `9babb20`.
+
+## 2026-05-22 Fix
+
+Codex fixed the runtime size regression by clamping the expanded
+`NSWindow` at creation and by making `OverlayWindow` enforce that
+fixed size for later `setFrame` / `setContentSize` calls:
+
+```swift
+window.minSize = expandedSize
+window.maxSize = expandedSize
+window.contentMinSize = expandedSize
+window.contentMaxSize = expandedSize
+```
+
+The smoke doc expectation was also updated from `~590x510` to
+`~720x520` to match the Stage 25 canvas-ready design.
+
+Local verification after rebuilding `native/macos/cue-overlay`:
+
+```text
+pill:     110x30
+expanded: 720x520
+```
+
+Screenshots:
+
+- `/tmp/bluey-smoke-shots/step1-after-size-fix.png`
+- `/tmp/bluey-smoke-shots/step2-after-size-fix.png`
+
+The `/tmp/bluey-internal-test` overlay helper and
+`Resources/BlueyOverlay.app` were refreshed from the rebuilt
+`target/release` overlay artifacts.
