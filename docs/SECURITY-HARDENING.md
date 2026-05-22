@@ -1,203 +1,241 @@
 # Bluey Security Hardening
 
-> **Security posture, what we do today, what we know is missing.**
-> Mirrors Pinky's `SECURITY-HARDENING.md`.
+> Security posture, hard boundaries, client-protection strategy, and known gaps.
 >
-> Last updated: 2026-05-19, post v0.1.0 GA.
+> Last updated: 2026-05-21, after managed cloud sync/RAG/STT auth and local
+> private-permission hardening.
 
-This doc tells the truth about Bluey's security posture. Anything that
-contradicts what's written here is a bug or an outdated doc.
+This doc is intentionally blunt: code that runs on a customer's machine can be
+inspected, patched, dumped, and reverse engineered by a motivated local attacker.
+Bluey's production security model must not depend on the desktop binary being
+unreadable. The hard boundary is the server. The client is treated as an
+untrusted, cache-capable interface.
+
+Anything that contradicts this document is either outdated or a bug.
 
 ---
 
-## 1. Threat model (v0.1)
+## 1. Non-Negotiable Security Model
 
-Bluey v0.1 runs entirely on the user's machine, talks to upstream LLM
-providers using the **user's own API keys** (BYOK), and keeps every
-transcript / cue / RAG embedding in a local SQLite file.
+### What we can protect strongly
 
-| Adversary | What they can do | What we mitigate |
+- Provider API keys.
+- Billing, wallet state, request pricing, and metering.
+- Account/session authorization.
+- Server-side routing policy.
+- Cloud transcript/RAG storage tenancy.
+- Short-lived STT relay sessions.
+- Release/update integrity once manifest signing lands.
+
+### What we cannot make impossible
+
+- Reverse engineering the desktop binary.
+- Reading UI strings, local logic, and static assets from an installed app.
+- Patching local branches in a modified binary.
+- Bypassing client-side checks on a rooted/admin-owned machine.
+- Extracting local plaintext files if the user's account or device is already compromised.
+
+So Bluey's rule is:
+
+> Never put a secret or business-critical decision exclusively in the desktop client.
+
+Obfuscation, anti-debug, process naming, and self-checks are friction. They are
+not security boundaries.
+
+---
+
+## 2. Current Threat Model
+
+| Adversary | What they can do | Bluey posture |
 |---|---|---|
-| Local malware on the user's Mac | read SQLite DB, scrape API keys, watch screen | OS keyring storage for keys, capture-excluded NSWindow for overlay, anti-debug helpers (PT_DENY_ATTACH macOS / IsDebuggerPresent Windows / TracerPid Linux), obfstr on endpoint URLs |
-| Network attacker (passive) | observe LLM provider traffic | TLS 1.2+ via reqwest with rustls-tls (no plaintext) |
-| Network attacker (active) | MitM, redirect to malicious provider | TLS cert validation; provider URLs obfstr'd to discourage trivial replacement |
-| Co-process on the user's Mac | tamper with overlay IPC | per-session token, length caps, state-machine validation in production reader (R12.2) |
-| Curious developer with `xattr` access | read transcript SQLite | not mitigated in v0.1 (BYOK + local-first; full DB encryption is v0.3+ work) |
-| Compromised LLM provider | leak prompt content | inherent to BYOK; user accepts the trust by configuring the provider |
-
-For Layer 3 (cloud) the threat model expands significantly. That doc
-will be written when the product server is built.
+| Curious customer with the installed binary | inspect strings, disassemble, patch local checks | no provider keys in client; server validates account, wallet, routing, STT session, and usage |
+| Local malware in the user's account | read local DB/JSON, screen, process memory | OS keyring for auth tokens/API keys, private local file permissions, capture-excluded overlay, short-lived server tokens |
+| Co-process sending fake overlay events | attempt IPC injection | per-session overlay token, length caps, state-machine validation, install-dir binary verification |
+| Network attacker | observe or tamper with traffic | HTTPS/TLS via rustls; server-side auth; no static provider secrets on desktop |
+| Modified Bluey client | send malformed requests, replay tokens, claim fake usage | server owns billing, idempotency, wallet hard stops, request validation, STT relay token claim |
+| Compromised Bluey server | access managed transcripts/RAG/provider keys | out of client scope; requires server ops hardening, secret rotation, backups, audit trails, and least-privileged infra |
 
 ---
 
-## 2. What's in place today
+## 3. What Is In Place
 
-### Overlay IPC handshake (R11–R12)
+### Server-owned provider access
 
-- **Per-session token** generated at daemon startup via `getrandom`
-  (256 bits OS entropy, R12.3). Passed to the overlay binary via
-  `BLUEY_OVERLAY_SESSION_TOKEN` env var. Every event the overlay
-  emits MUST carry that token in its JSON payload.
-- **Length caps** on every variable-length field of every overlay
-  event. Oversized payloads are dropped + warned.
-- **State-machine validation** on inner-form events: `AttachFilesRequested`
-  is only accepted when the daemon's `OverlayUiState` is `AttachOpen`;
-  `InstructionsUpdated` only when `InstructionsOpen`. Cancel/error paths
-  reset to `Idle` via `OverlayUiStateScope` (R13.1).
-- **Single-`Arc<Mutex<>>`** ownership of the state machine (R12.2) so
-  daemon-side handler transitions are observed by the production
-  reader thread immediately.
+- Managed LLM/STT flow keeps upstream provider keys on `bluey-server`.
+- Desktop login stores only Bluey account tokens in OS keyring.
+- Customer desktop no longer needs Deepgram/OpenAI/Anthropic keys in normal managed mode.
+- Direct BYOK/dev provider paths are gated behind explicit development flags such as `BLUEY_DEV_BYOK=1`.
 
-Production reader implementation: `crates/cue-daemon/src/app.rs::validate_and_decode_overlay_line`.
+### Managed STT relay
 
-### Overlay binary verification (R7+)
+- `POST /stt/session` performs account/balance/trial checks before creating a relay session.
+- `/stt/relay` requires the normal Bearer account token plus a Bluey-scoped session token.
+- Relay tokens are random, short-lived, account-bound, and single-claimed.
+- The server connects to Deepgram using server-held credentials; the desktop never receives the Deepgram key.
+- Relay close records elapsed time so billing can reconcile the STT session.
 
-- `crates/cue-daemon/src/overlay.rs::verify_overlay_binary` resolves
-  the candidate overlay path to its canonical realpath, then asserts
-  it's inside the daemon's install directory. Prevents running an
-  arbitrary binary placed by another process.
-- `BLUEY_OVERLAY_BIN` env override is respected only in dev mode
-  (R10 hardening).
+### Cloud sync and RAG tenancy
 
-### Anti-debug helpers (R10)
+- `/sync/batch`, `/sync/sessions`, `/sync/sessions/:session_id`, and `/rag/query` are auth-protected.
+- Server tables are keyed by `account_id`; handlers load data through the authenticated account boundary.
+- Batch and field sizes are bounded to reduce abuse and accidental giant uploads.
+- Account export/delete paths include cloud sessions, transcripts, responses, artifacts, and RAG counts.
 
-- macOS: `PT_DENY_ATTACH` set during daemon startup, refuses ptrace
-  attach (best-effort; root can still circumvent).
-- Windows: `IsDebuggerPresent()` checked at startup.
-- Linux: `/proc/self/status` `TracerPid` check.
+### Overlay IPC hardening
 
-These are deterrents, not protections. A motivated attacker with root
-on the box owns the daemon either way.
+- Per-session overlay token generated from OS entropy and passed to the helper.
+- Every overlay event must include the token when production validation is active.
+- Length caps on every variable field.
+- Event state machine prevents out-of-context attach/instructions events.
+- Overlay binary resolution verifies that the helper lives inside the install directory.
+- Developer overlay override and capture-visible debug mode are gated; `BLUEY_HOST_OVERLAY_CAPTURE_VISIBLE=1` is ignored unless the dev overlay gate is also enabled.
 
-### Process masquerading (R8)
+### Local filesystem hardening
 
-- macOS: argv overwrite (best-effort; one-time at startup; preserves
-  null-termination).
-- Linux: `prctl(PR_SET_NAME)` (16-byte name limit; non-ASCII may be
-  truncated by the kernel).
-- Windows: source path exists in `cue-stealth/src/windows.rs` but is
-  not exercised on a real Windows machine in v0.1.
+- `AppPaths::ensure()` now creates data/config/runtime directories with private Unix permissions (`0700`).
+- Meeting archive directory is private (`0700`).
+- Active and archived meeting JSON files are written with private Unix permissions (`0600`).
+- Local SQLite DB files are created/normalized with private Unix permissions (`0600`), with WAL/SHM sidecars normalized when present.
+- Account/settings JSON already use private file permissions and API-key-shaped settings are rejected from non-secret settings storage.
 
-### Compile-time obfstr on secrets-of-shape
+### Keyring-backed local secrets
 
-- API endpoint URLs (`https://api.openai.com/...` etc.) and auth
-  header names are wrapped in `obfstr!()` so a `strings(1)` scan over
-  the binary doesn't trivially reveal them. This is friction, not
-  security; a determined disassembler defeats it.
+- Account tokens use `cue-cloud-client` keyring storage.
+- STT API keys in developer paths use keyring-backed commands.
+- Dashboard settings rejects secret-shaped keys instead of storing them in normal settings.
 
-### Keyring storage for API keys
+### Release/install integrity
 
-- `cue_daemon::secrets::store_api_key` / `load_api_key` use the
-  `keyring` crate which talks to:
-  - macOS Keychain
-  - Windows Credential Manager
-  - Linux Secret Service / kwallet
-- Keys are NOT stored in the SQLite settings DB. R8 nit fixed:
-  `save_settings` rejects keys whose name contains `api_key` with an
-  explicit error rather than silently dropping them.
+- `scripts/install.sh` verifies `SHA256SUMS.txt` before installing downloaded archives.
+- Native overlay helper verification enforces canonical install-dir containment,
+  and now verifies a colocated SHA-256 sidecar when one is present.
+- Operational install scripts ad-hoc sign macOS bundles and strip quarantine for the current Pinky-style alpha path.
+- This is not the same as signed release manifests. SHA256 over HTTPS protects against accidental corruption and simple mirror mistakes; it does not protect against a compromised release host.
 
-### Local SQLite database
+### Client-side friction
 
-- WAL mode enabled (`PRAGMA journal_mode=WAL`) for crash safety.
-- Foreign keys enforced (`PRAGMA foreign_keys=ON`).
-- File mode is the OS default (no special permissions). On macOS
-  this is `~/Library/Application Support/bluey/` which is in the
-  user's home + sandboxed by macOS file ACLs.
-
-### LLM provider TLS
-
-- All HTTPS calls go through `reqwest` with the `rustls-tls` feature.
-  Native TLS is not used; rustls is built into the binary.
+- Compile-time `obfstr` wraps provider URLs/header names in direct-provider code paths.
+- Workspace release builds strip symbol tables and use thin LTO so distributed
+  binaries expose less incidental implementation detail.
+- Anti-debug helpers exist for macOS/Windows/Linux as best-effort deterrents.
+- These measures are useful speed bumps, not trust anchors.
 
 ---
 
-## 3. What's missing / honest gaps
+## 4. Pinky Parity Notes
 
-### v0.1 known limitations
+Pinky's security wording maps well to Bluey, with one key adjustment: Bluey is
+more server-managed, so provider access and metering should be even less
+desktop-dependent.
 
-- **Distribution artifacts are not code-signed or notarized.** v0.1 is
-  terminal-only; users may need to `xattr -d com.apple.quarantine`
-  if they downloaded via a browser. Documented in `INSTALL.md`.
-- **No SQLite-level encryption.** Transcripts + RAG embeddings are
-  on disk in plaintext. v0.3 territory; depends on a decision about
-  where the encryption key would live (passphrase-derived vs
-  keyring-stored vs cloud-anchored).
-- **No certificate pinning.** TLS validates the provider's cert chain
-  via the system trust store; we don't pin specific issuers. A
-  compromised CA could MitM provider traffic.
-- **anti-debug is best-effort and macOS-tested.** Windows + Linux
-  paths exist but haven't been exercised against real attack
-  scenarios.
-- **No tamper detection on the binary.** A modified `bluey-daemon`
-  on a user's machine continues to run. Adding a self-integrity
-  check (sha256 of own image vs a manifest) is future work.
+| Pinky control | Bluey status |
+|---|---|
+| Hardened auth: bcrypt, JWT validation, token invalidation | Present in `bluey-server`: bcrypt cost 12, JWT access/refresh split, hashed refresh tokens, atomic refresh consume/revoke paths |
+| Billing/replay/data access ownership gates | Present: managed router uses authenticated account, balance ledger, idempotency, account-scoped sync/RAG/export/delete |
+| SQL parameterization | Present across reviewed Rust/SQLite paths via `rusqlite::params!`; keep reviewing every new raw SQL call |
+| Host helper integrity SHA sidecars | Now partially present: overlay helper verifies sidecar if shipped; signed release manifest is still stronger and still P0 |
+| Debug capture-visible escape hatch blocked from shipping | Present: capture-visible overlay mode is gated behind dev overlay enablement |
+| Capture-excluded overlay | Present for normal macOS overlay paths; privileged capture/EDR can still see anything |
+| Preprod/prod separation | Operationally documented; must be validated during deployment |
+| Stripe multi-`v1` signature validation | Present: webhook verifier accepts any matching `v1`, enforces timestamp tolerance, and uses constant-time comparison |
+| Sensitive logs/docs/session links | Tightened this round: cloud-client error bodies are redacted/truncated, Stripe error body logs redact URL/client-secret/payment-method fields, deep-link parse failures suppress raw URLs, and verification/reset links are not logged unless `BLUEY_DEV_LOG_AUTH_LINKS=1` is explicitly set |
+| Terms/privacy/dispute logging review | Partially documented; legal copy and customer-facing policy still need final pass |
 
-### Gaps that show up at Layer 2
+Recommended Bluey wording mirrors Pinky's honest version:
 
-- **Distribution endpoint is unauthenticated.** Path A/B/C all assume
-  `/downloads/` is public. That's correct for binaries but means
-  anyone who knows the URL can pull them.
-- **No artifact signing.** Tarball sha256s are published, but not
-  signed. A future `bluey-server` can sign manifests with an
-  ed25519 key whose pubkey ships with the client.
+> Low-profile native overlay, capture-excluded in normal OS capture paths,
+> server-managed provider access, account-scoped cloud memory, hardened auth,
+> and audited release controls.
 
-### Gaps that show up at Layer 3
-
-When `bluey-server` lands:
-
-- Auth + session management.
-- Stripe webhook verification.
-- Per-tenant rate limits + budget caps on the managed Auto Router endpoint.
-- Privacy / data deletion endpoints.
-- Audit logs.
-- SOC2-class controls (not promising this; just listing it).
-
-These are all R14.9 / Stage 2+ work.
+Do not use wording like "unbacktraceable", "undetectable", or "impossible to
+reverse engineer".
 
 ---
 
-## 4. Verification commands
+## 5. Still Missing Before A Wider Paid Launch
 
-### Confirm the production-overlay validator is wired
+### P0 Security Work
+
+| Item | Why it matters | Direction |
+|---|---|---|
+| Signed release manifest | prevents compromised hosting from silently swapping binaries | ed25519-sign `latest.json` / archive hashes; embed public key in client installer/update check |
+| Local DB encryption | protects local transcripts/RAG from casual file reads | SQLCipher or application-level envelope encryption using Keychain/DPAPI/Secret Service key |
+| Server-owned transcript/RAG source of truth | avoids relying on local cache for continuity | continue cloud sync; add dashboard cloud session restore |
+| Redaction audit | prevents secrets/tokens/transcripts leaking to logs | keep expanding tests around token/API-key/body logging; operational docs/logs/session links must be treated as private artifacts |
+| Updater verification | unsigned alpha install needs safe update story | `bluey check-update` should verify signed manifest before replacing binaries |
+| Rate-limit and abuse visibility | production API needs operator signals | metrics, alerts, per-account/per-IP throttles, suspicious retry counters |
+
+### P1 Hardening
+
+| Item | Why it matters | Notes |
+|---|---|---|
+| Certificate pinning / trust strategy | reduces CA/MitM blast radius | do carefully; pins can brick clients during cert rotations |
+| Binary self-integrity check | detects naive local binary edits | friction only; modified clients can patch it out |
+| Symbol stripping + release profile hardening | reduces easy static inspection | use `strip`, LTO, `panic = "abort"` where safe |
+| Dependency audit | catches vulnerable crates | add `cargo deny` / `cargo audit` to CI |
+| Cloud KMS/secrets manager | keeps provider keys out of env files long-term | initial droplet can start with env files; migrate before scale |
+| Postgres + pgvector migration | robust multi-user cloud data plane | SQLite is fine for local cache and early server prototype; Postgres is the production cloud store |
+
+---
+
+## 6. What Not To Do
+
+- Do not ship provider API keys in the desktop binary.
+- Do not trust a client-supplied cost, provider, model, or usage number.
+- Do not treat obfuscation as protection for billing or data access.
+- Do not make the local fallback grant free server credits automatically; reconcile explicitly when online.
+- Do not promise that code is unreadable or attack-proof.
+- Do not leave debug visibility flags enabled in customer builds.
+
+---
+
+## 7. Verification Commands
+
+### Local private permissions
+
+```bash
+cargo test -p cue-core app_paths::tests::ensure_uses_private_directory_permissions
+cargo test -p cue-daemon storage::security_tests::meeting_store_writes_private_files
+cargo test -p cue-daemon db::tests::file_database_is_created_private
+```
+
+### Overlay IPC validator
 
 ```bash
 cargo test -p cue-daemon --test overlay_production_path
-# expect 24 tests passing
 ```
 
-Key tests (codex regression coverage):
-
-- `handler_transition_idle_to_attach_open_unblocks_attach_files`
-- `handler_transition_back_to_idle_blocks_late_attach_files`
-- `cross_thread_arc_visibility`
-- `token_match_pong_accepted_in_idle`
-- `token_mismatch_event_rejected`
-- `oversized_question_field_rejected`
-- `production_overlay_drops_overlong_path`
-- `transcript_text_with_inner_type_field_does_not_dispatch_inner`
-
-### Confirm token randomness
+### Managed STT auth path
 
 ```bash
-cargo test -p cue-daemon --lib token
-# expect 6 tests passing including
-#   token_is_64_hex_chars
-#   token_is_unique_across_calls
-#   token_has_no_prefix_pattern_from_old_uuid_impl
+cd server
+cargo test stt::tests
 ```
 
-### Manual: confirm overlay window is capture-excluded
+### Cloud sync/RAG auth path
 
-1. `bluey on` on a real Mac.
-2. Open Snipping Tool / Screenshot.app and capture the screen.
-3. Pill should NOT appear in the capture.
-4. If it does: `sharingType = .none` regression — file as bug
-   immediately.
+```bash
+cd server
+cargo test sync_batch_round_trips_session_bundle_and_rag
+cargo test validate_rejects_empty_or_huge_batches
+```
+
+### Install checksum path
+
+```bash
+bash scripts/install.sh --help
+```
 
 ---
 
-## 5. Reporting a security issue
+## 8. Reporting A Security Issue
 
-For now: file an issue in this repo and tag it `security`. When the
-project goes public + has a paying user base, this section grows into
-a proper coordinated-disclosure policy + a security@ address.
+For now: file an issue in the private repo and tag it `security`.
+
+Before public launch, replace this section with:
+
+- `security@bluey.sh`;
+- coordinated disclosure policy;
+- severity/SLA table;
+- private security advisory workflow;
+- release-note redaction rules.

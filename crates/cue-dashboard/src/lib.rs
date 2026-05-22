@@ -555,7 +555,11 @@ async fn handle_deep_link_url(url: String, app: tauri::AppHandle) {
     let parsed = match url::Url::parse(&url) {
         Ok(u) => u,
         Err(e) => {
-            tracing::warn!(url = %url, error = %e, "deep link parse failed");
+            tracing::warn!(
+                url_len = url.len(),
+                error = %e,
+                "deep link parse failed; raw URL suppressed"
+            );
             return;
         }
     };

@@ -4,7 +4,7 @@
 use std::time::Duration;
 
 use crate::{
-    client::CloudClient,
+    client::{log_safe_response_body, CloudClient},
     error::{Error, Result},
     types::{AuthResponse, DeviceStartResponse},
 };
@@ -63,7 +63,11 @@ impl DeviceFlow {
             reqwest::StatusCode::GONE => Ok(DeviceFlowState::Expired),
             other => {
                 let body = resp.text().await.unwrap_or_default();
-                tracing::warn!(status = %other, body = %body, "cue-cloud-client device flow server error");
+                tracing::warn!(
+                    status = %other,
+                    body = %log_safe_response_body(&body),
+                    "cue-cloud-client device flow server error"
+                );
                 Err(Error::Server {
                     status: other.as_u16(),
                 })

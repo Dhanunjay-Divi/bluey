@@ -31,6 +31,14 @@ pub struct CueResponse {
     pub input_tokens: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_confidence: Option<f32>,
 }
 
 impl CueResponse {
@@ -51,6 +59,10 @@ impl CueResponse {
             model: None,
             input_tokens: None,
             output_tokens: None,
+            cost_label: None,
+            artifact_type: None,
+            artifact_body: None,
+            artifact_confidence: None,
         }
     }
 
@@ -62,6 +74,22 @@ impl CueResponse {
             self.model = Some(cost.model.clone());
             self.input_tokens = Some(cost.input_tokens);
             self.output_tokens = Some(cost.output_tokens);
+        }
+        self
+    }
+
+    pub fn with_llm_metadata(
+        mut self,
+        cost: Option<&cue_llm::LlmCostMetadata>,
+        cost_label: Option<&str>,
+        artifact: Option<&cue_llm::LlmArtifactMetadata>,
+    ) -> Self {
+        self = self.with_cost_metadata(cost);
+        self.cost_label = cost_label.map(ToOwned::to_owned);
+        if let Some(artifact) = artifact {
+            self.artifact_type = Some(artifact.artifact_type.clone());
+            self.artifact_body = Some(artifact.body.clone());
+            self.artifact_confidence = artifact.confidence;
         }
         self
     }

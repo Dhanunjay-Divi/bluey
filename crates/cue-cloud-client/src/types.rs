@@ -94,6 +94,14 @@ pub struct CompleteResponse {
     pub cost_cents: i64,
     pub balance_cents_after: i64,
     pub trial_seconds_remaining: i64,
+    #[serde(default)]
+    pub artifact_type: Option<String>,
+    #[serde(default)]
+    pub artifact_body: Option<String>,
+    #[serde(default)]
+    pub cost_label: Option<String>,
+    #[serde(default)]
+    pub confidence: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -110,6 +118,229 @@ pub struct EmbedResponse {
     pub model: String,
     pub cost_cents: i64,
     pub balance_cents_after: i64,
+}
+
+// ─── Cloud Sync / RAG ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncSessionRecord {
+    pub session_id: String,
+    pub title: String,
+    pub status: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    #[serde(default)]
+    pub last_active_at_ms: Option<i64>,
+    #[serde(default)]
+    pub answer_style: Option<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    #[serde(default)]
+    pub deleted_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncTranscriptSegment {
+    pub segment_id: String,
+    pub session_id: String,
+    pub speaker: String,
+    pub source: String,
+    pub text: String,
+    #[serde(default)]
+    pub start_ms: Option<i64>,
+    #[serde(default)]
+    pub end_ms: Option<i64>,
+    pub ts_ms: i64,
+    pub is_final: bool,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncCueResponseRecord {
+    pub response_id: String,
+    pub session_id: String,
+    pub kind: String,
+    pub text: String,
+    #[serde(default)]
+    pub source_text: Option<String>,
+    pub ts_ms: i64,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub lane: Option<String>,
+    #[serde(default)]
+    pub task_type: Option<String>,
+    #[serde(default)]
+    pub cost_cents: Option<i64>,
+    #[serde(default)]
+    pub balance_cents_after: Option<i64>,
+    #[serde(default)]
+    pub cost_label: Option<String>,
+    #[serde(default)]
+    pub artifact_type: Option<String>,
+    #[serde(default)]
+    pub artifact_body: Option<String>,
+    #[serde(default)]
+    pub artifact_confidence: Option<f32>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncContextArtifactRecord {
+    pub artifact_id: String,
+    pub session_id: String,
+    pub kind: String,
+    pub title: String,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub source_uri: Option<String>,
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    #[serde(default)]
+    pub text_preview: Option<String>,
+    pub created_at_ms: i64,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncRagChunkRecord {
+    pub chunk_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub source_kind: String,
+    pub source_id: String,
+    pub chunk_index: i64,
+    pub text: String,
+    #[serde(default)]
+    pub embedding: Option<Vec<f32>>,
+    #[serde(default)]
+    pub embedding_model: Option<String>,
+    #[serde(default)]
+    pub token_count: Option<i64>,
+    #[serde(default)]
+    pub content_hash: Option<String>,
+    pub updated_at_ms: i64,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SyncBatchRequest {
+    #[serde(default)]
+    pub sessions: Vec<SyncSessionRecord>,
+    #[serde(default)]
+    pub transcript_segments: Vec<SyncTranscriptSegment>,
+    #[serde(default)]
+    pub cue_responses: Vec<SyncCueResponseRecord>,
+    #[serde(default)]
+    pub context_artifacts: Vec<SyncContextArtifactRecord>,
+    #[serde(default)]
+    pub rag_chunks: Vec<SyncRagChunkRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncCounts {
+    pub sessions: usize,
+    pub transcript_segments: usize,
+    pub cue_responses: usize,
+    pub context_artifacts: usize,
+    pub rag_chunks: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncBatchResponse {
+    pub accepted: SyncCounts,
+    pub server_time_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudSessionSummary {
+    pub session_id: String,
+    pub title: String,
+    pub status: String,
+    pub updated_at_ms: i64,
+    #[serde(default)]
+    pub last_active_at_ms: Option<i64>,
+    #[serde(default)]
+    pub answer_style: Option<String>,
+    pub transcript_count: i64,
+    pub response_count: i64,
+    pub context_count: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionListResponse {
+    pub sessions: Vec<CloudSessionSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudSessionBundle {
+    pub session: SyncSessionRecord,
+    pub transcript_segments: Vec<SyncTranscriptSegment>,
+    pub cue_responses: Vec<SyncCueResponseRecord>,
+    pub context_artifacts: Vec<SyncContextArtifactRecord>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RagQueryRequest {
+    pub query: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Vec<f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RagMatch {
+    pub chunk_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub source_kind: String,
+    pub source_id: String,
+    pub chunk_index: i64,
+    pub text: String,
+    pub score: f32,
+    #[serde(default)]
+    pub embedding_model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RagQueryResponse {
+    pub matches: Vec<RagMatch>,
+}
+
+// ─── STT authorization ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SttSessionRequest {
+    pub session_id: String,
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_seconds: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SttSessionResponse {
+    pub mode: String,
+    pub provider: String,
+    pub model: String,
+    pub session_token: String,
+    pub expires_at_ms: i64,
+    pub max_seconds: i64,
+    #[serde(default)]
+    pub websocket_url: Option<String>,
+    #[serde(default)]
+    pub provider_token: Option<String>,
 }
 
 // ─── Usage ──────────────────────────────────────────────────────────────

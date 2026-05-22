@@ -116,6 +116,15 @@ mod tests {
         }
     }
 
+    fn llm_response(text: impl Into<String>) -> LlmResponse {
+        LlmResponse {
+            text: text.into(),
+            cost: None,
+            cost_label: None,
+            artifact: None,
+        }
+    }
+
     fn test_req() -> LlmRequest {
         LlmRequest {
             system: String::new(),
@@ -131,17 +140,11 @@ mod tests {
         let router = LlmRouter::new(vec![
             Box::new(MockProvider {
                 name: "a",
-                result: Ok(LlmResponse {
-                    text: "from a".into(),
-                    cost: None,
-                }),
+                result: Ok(llm_response("from a")),
             }),
             Box::new(MockProvider {
                 name: "b",
-                result: Ok(LlmResponse {
-                    text: "from b".into(),
-                    cost: None,
-                }),
+                result: Ok(llm_response("from b")),
             }),
         ]);
         let resp = router.complete(&test_req()).await.unwrap();
@@ -157,10 +160,7 @@ mod tests {
             }),
             Box::new(MockProvider {
                 name: "b",
-                result: Ok(LlmResponse {
-                    text: "from b".into(),
-                    cost: None,
-                }),
+                result: Ok(llm_response("from b")),
             }),
         ]);
         let resp = router.complete(&test_req()).await.unwrap();
@@ -176,10 +176,7 @@ mod tests {
             }),
             Box::new(MockProvider {
                 name: "b",
-                result: Ok(LlmResponse {
-                    text: "from b".into(),
-                    cost: None,
-                }),
+                result: Ok(llm_response("from b")),
             }),
         ]);
         let resp = router.complete(&test_req()).await.unwrap();
@@ -195,10 +192,7 @@ mod tests {
             }),
             Box::new(MockProvider {
                 name: "b",
-                result: Ok(LlmResponse {
-                    text: "from b".into(),
-                    cost: None,
-                }),
+                result: Ok(llm_response("from b")),
             }),
         ]);
         let err = router.complete(&test_req()).await.unwrap_err();
@@ -233,17 +227,11 @@ mod tests {
         let router = LlmRouter::new(vec![
             Box::new(MockProvider {
                 name: "x",
-                result: Ok(LlmResponse {
-                    text: String::new(),
-                    cost: None,
-                }),
+                result: Ok(llm_response("")),
             }),
             Box::new(MockProvider {
                 name: "y",
-                result: Ok(LlmResponse {
-                    text: String::new(),
-                    cost: None,
-                }),
+                result: Ok(llm_response("")),
             }),
         ]);
         assert_eq!(router.provider_names(), vec!["x", "y"]);
@@ -254,10 +242,7 @@ mod tests {
         use futures_util::StreamExt;
         let router = LlmRouter::new(vec![Box::new(MockProvider {
             name: "a",
-            result: Ok(LlmResponse {
-                text: "hello".into(),
-                cost: None,
-            }),
+            result: Ok(llm_response("hello")),
         })]);
         let mut stream = router.complete_stream(&test_req()).await.unwrap();
         let chunk = stream.next().await.unwrap().unwrap();
@@ -278,10 +263,7 @@ mod tests {
             }),
             Box::new(MockProvider {
                 name: "openai-direct",
-                result: Ok(LlmResponse {
-                    text: "should never be reached".into(),
-                    cost: None,
-                }),
+                result: Ok(llm_response("should never be reached")),
             }),
         ]);
         let err = router.complete(&test_req()).await.unwrap_err();

@@ -1061,6 +1061,14 @@ pub struct CueResponseChunkPayload {
     pub provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_confidence: Option<f32>,
     /// Auto Router metadata (Bluey Auto). Optional because future managed
     /// routing may attach more fields; for v0.1 we emit task_type, lane, and
     /// confidence on the FIRST chunk and reuse the same payload schema for
@@ -1153,10 +1161,10 @@ fn classify_for_router(prompt: &str, has_transcript: bool, has_screenshot: bool)
 }
 
 /// Try the speculative routing path. Returns:
-///   Ok(Some((text, cost))) if speculation succeeded and produced a final answer.
-///   Ok(None)               if speculation is OFF or unconfigured (caller should
-///                          fall back to the legacy AnswerLlm/WhatToAnswerLlm path).
-///   Err(e)                 if speculation was ON and failed mid-stream.
+///   Ok(Some((text, metadata))) if speculation succeeded and produced a final answer.
+///   Ok(None)                   if speculation is OFF or unconfigured (caller should
+///                              fall back to the legacy AnswerLlm/WhatToAnswerLlm path).
+///   Err(e)                     if speculation was ON and failed mid-stream.
 ///
 /// Forwards every chunk through the existing `cue_response_chunk` Tauri event
 /// so the dashboard UI does not need to know the answer was speculative.
@@ -1170,7 +1178,7 @@ async fn try_speculative_dispatch(
     router_meta: RouterMeta,
     registry: ProviderRegistry,
     app: tauri::AppHandle,
-) -> Result<Option<(String, Option<cue_llm::LlmCostMetadata>)>, String> {
+) -> Result<Option<(String, LlmResponseMetadata)>, String> {
     use cue_router::{
         policy::StaticPolicy, speculative::SpeculativeChunk, RoutingPolicy, SpeculativeRouter,
     };
@@ -1224,7 +1232,7 @@ async fn try_speculative_dispatch(
 
     let mut accumulated_draft = String::new();
     let mut final_text: Option<String> = None;
-    let mut cost: Option<cue_llm::LlmCostMetadata> = None;
+    let mut metadata = LlmResponseMetadata::default();
     // Codex Stage 9 round-2 Blocker 4: collect lane errors for diagnosis
     // when all-lanes-failed.
     let mut lane_errors: Vec<String> = Vec::new();
@@ -1236,9 +1244,17 @@ async fn try_speculative_dispatch(
                 text,
                 finished,
                 cost: chunk_cost,
+                cost_label,
+                artifact,
             } => {
                 if let Some(chunk_cost) = chunk_cost.as_ref() {
-                    merge_cost_metadata(&mut cost, chunk_cost.clone());
+                    merge_cost_metadata(&mut metadata.cost, chunk_cost.clone());
+                }
+                if cost_label.is_some() {
+                    metadata.cost_label = cost_label.clone();
+                }
+                if artifact.is_some() {
+                    metadata.artifact = artifact.clone();
                 }
                 accumulated_draft.push_str(&text);
                 let meta_for_chunk = if !emitted_meta {
@@ -1260,6 +1276,10 @@ async fn try_speculative_dispatch(
                             .and_then(|cost| cost.balance_cents_after),
                         provider: chunk_cost.as_ref().map(|cost| cost.provider.clone()),
                         model: chunk_cost.as_ref().map(|cost| cost.model.clone()),
+                        cost_label,
+                        artifact_type: artifact_type(&artifact),
+                        artifact_body: artifact_body(&artifact),
+                        artifact_confidence: artifact_confidence(&artifact),
                         router_meta: meta_for_chunk,
                         replace_body: None,
                     },
@@ -1268,9 +1288,17 @@ async fn try_speculative_dispatch(
             SpeculativeChunk::Final {
                 text,
                 cost: chunk_cost,
+                cost_label,
+                artifact,
             } => {
                 if let Some(chunk_cost) = chunk_cost.as_ref() {
-                    merge_cost_metadata(&mut cost, chunk_cost.clone());
+                    merge_cost_metadata(&mut metadata.cost, chunk_cost.clone());
+                }
+                if cost_label.is_some() {
+                    metadata.cost_label = cost_label.clone();
+                }
+                if artifact.is_some() {
+                    metadata.artifact = artifact.clone();
                 }
                 // Replace: emit a synthetic chunk that the UI's reducer will
                 // append to. The dashboard'''s responseReducer keeps the entry
@@ -1288,6 +1316,10 @@ async fn try_speculative_dispatch(
                             .and_then(|cost| cost.balance_cents_after),
                         provider: chunk_cost.as_ref().map(|cost| cost.provider.clone()),
                         model: chunk_cost.as_ref().map(|cost| cost.model.clone()),
+                        cost_label,
+                        artifact_type: artifact_type(&artifact),
+                        artifact_body: artifact_body(&artifact),
+                        artifact_confidence: artifact_confidence(&artifact),
                         router_meta: None,
                         replace_body: Some(true),
                     },
@@ -1320,7 +1352,7 @@ async fn try_speculative_dispatch(
         // No errors AND no text — nothing to render either way.
         return Ok(None);
     }
-    Ok(Some((trimmed, cost)))
+    Ok(Some((trimmed, metadata)))
 }
 
 fn merge_cost_metadata(
@@ -1345,6 +1377,27 @@ fn merge_cost_metadata(
         }
         None => *existing = Some(next),
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct LlmResponseMetadata {
+    cost: Option<cue_llm::LlmCostMetadata>,
+    cost_label: Option<String>,
+    artifact: Option<cue_llm::LlmArtifactMetadata>,
+}
+
+fn artifact_type(artifact: &Option<cue_llm::LlmArtifactMetadata>) -> Option<String> {
+    artifact
+        .as_ref()
+        .map(|artifact| artifact.artifact_type.clone())
+}
+
+fn artifact_body(artifact: &Option<cue_llm::LlmArtifactMetadata>) -> Option<String> {
+    artifact.as_ref().map(|artifact| artifact.body.clone())
+}
+
+fn artifact_confidence(artifact: &Option<cue_llm::LlmArtifactMetadata>) -> Option<f32> {
+    artifact.as_ref().and_then(|artifact| artifact.confidence)
 }
 
 /// Trigger a cue response. If a recent question is detected in the transcript
@@ -1423,7 +1476,7 @@ pub async fn request_cue(
             suggest_mod::SYSTEM_PROMPT
         };
         let kind_str = if is_question { "answer" } else { "suggestion" };
-        if let Some((text, cost)) = try_speculative_dispatch(
+        if let Some((text, response_metadata)) = try_speculative_dispatch(
             &user_text,
             system_prompt,
             kind_str,
@@ -1444,7 +1497,11 @@ pub async fn request_cue(
             );
             let mut cue_resp = cue_resp;
             cue_resp.id = response_id.clone();
-            cue_resp = cue_resp.with_cost_metadata(cost.as_ref());
+            cue_resp = cue_resp.with_llm_metadata(
+                response_metadata.cost.as_ref(),
+                response_metadata.cost_label.as_deref(),
+                response_metadata.artifact.as_ref(),
+            );
             persist_cue_response(&db, &cue_resp)?;
             let _ = app.emit("cue_response", &cue_resp);
             return Ok(text);
@@ -1483,6 +1540,10 @@ pub async fn request_cue(
                         balance_cents_after: None,
                         provider: None,
                         model: None,
+                        cost_label: None,
+                        artifact_type: None,
+                        artifact_body: None,
+                        artifact_confidence: None,
                         router_meta: meta_for_chunk,
                         replace_body: None,
                     },
@@ -1512,6 +1573,10 @@ pub async fn request_cue(
                         balance_cents_after: None,
                         provider: None,
                         model: None,
+                        cost_label: None,
+                        artifact_type: None,
+                        artifact_body: None,
+                        artifact_confidence: None,
                         router_meta: meta_for_chunk,
                         replace_body: None,
                     },
@@ -1589,6 +1654,10 @@ pub async fn auto_recap(
                         balance_cents_after: None,
                         provider: None,
                         model: None,
+                        cost_label: None,
+                        artifact_type: None,
+                        artifact_body: None,
+                        artifact_confidence: None,
                         router_meta: None, // recap is not yet routed via AutoRouter
                         replace_body: None,
                     },
@@ -1624,6 +1693,10 @@ fn persist_cue_response(
         model: resp.model.as_deref(),
         input_tokens: resp.input_tokens,
         output_tokens: resp.output_tokens,
+        cost_label: resp.cost_label.as_deref(),
+        artifact_type: resp.artifact_type.as_deref(),
+        artifact_body: resp.artifact_body.as_deref(),
+        artifact_confidence: resp.artifact_confidence,
     })
     .map_err(|e| e.to_string())
 }

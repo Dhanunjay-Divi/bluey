@@ -1,4 +1,4 @@
-use cue_llm::{LlmCostMetadata, LlmProvider, LlmRequest};
+use cue_llm::{LlmArtifactMetadata, LlmCostMetadata, LlmProvider, LlmRequest};
 use futures_util::StreamExt;
 
 use super::CueResponse;
@@ -37,6 +37,8 @@ impl WhatToAnswerLlm {
             request_id: None,
         };
         let mut cost: Option<LlmCostMetadata> = None;
+        let mut cost_label: Option<String> = None;
+        let mut artifact: Option<LlmArtifactMetadata> = None;
         let text = if llm.supports_streaming() {
             let mut stream = llm.complete_stream(&req).await?;
             let mut acc = String::new();
@@ -44,6 +46,12 @@ impl WhatToAnswerLlm {
                 let chunk = chunk?;
                 if chunk.cost.is_some() {
                     cost = chunk.cost.clone();
+                }
+                if chunk.cost_label.is_some() {
+                    cost_label = chunk.cost_label.clone();
+                }
+                if chunk.artifact.is_some() {
+                    artifact = chunk.artifact.clone();
                 }
                 // Emit DELTA (just the new text), not cumulative — the dashboard appends.
                 on_chunk(&chunk.text, chunk.finished);
@@ -56,12 +64,14 @@ impl WhatToAnswerLlm {
         } else {
             let resp = llm.complete(&req).await?;
             cost = resp.cost.clone();
+            cost_label = resp.cost_label.clone();
+            artifact = resp.artifact.clone();
             on_chunk(&resp.text, true);
             resp.text
         };
         Ok(
             CueResponse::new("suggestion", text, session_id, Some(transcript.to_string()))
-                .with_cost_metadata(cost.as_ref()),
+                .with_llm_metadata(cost.as_ref(), cost_label.as_deref(), artifact.as_ref()),
         )
     }
 }
@@ -84,6 +94,8 @@ mod tests {
             Ok(LlmResponse {
                 text: "- Ask about timeline\n- Confirm budget".into(),
                 cost: None,
+                cost_label: None,
+                artifact: None,
             })
         }
     }

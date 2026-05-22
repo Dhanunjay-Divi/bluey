@@ -49,4 +49,3 @@ objc2 = "0.5"
 objc2-foundation = "0.2"
 [lints.rust]
 unexpected_cfgs = { level = "allow", check-cfg = ['cfg(feature, values("cargo-clippy"))']  }
-

@@ -57,6 +57,45 @@ fn stripe_api_url(path: &str) -> String {
     )
 }
 
+fn log_safe_stripe_body(body: &serde_json::Value) -> serde_json::Value {
+    let mut safe = body.clone();
+    redact_stripe_json(&mut safe);
+    safe
+}
+
+fn redact_stripe_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map.iter_mut() {
+                if is_sensitive_stripe_log_key(key) {
+                    *value = serde_json::Value::String("<redacted>".to_string());
+                } else {
+                    redact_stripe_json(value);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_stripe_json(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_sensitive_stripe_log_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("secret")
+        || key.contains("token")
+        || key.contains("password")
+        || key.contains("authorization")
+        || key == "url"
+        || key.ends_with("_url")
+        || key == "client_secret"
+        || key == "payment_method"
+        || key.ends_with("_payment_method")
+}
+
 pub async fn checkout(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
@@ -130,7 +169,8 @@ pub async fn checkout(
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
     if !status.is_success() {
-        tracing::warn!(stripe_status = %status, stripe_body = %body, "stripe checkout error");
+        let safe_body = log_safe_stripe_body(&body);
+        tracing::warn!(stripe_status = %status, stripe_body = %safe_body, "stripe checkout error");
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(ApiError {
@@ -463,6 +503,39 @@ mod tests {
     }
 
     #[test]
+    fn signature_verifies_when_any_v1_signature_matches() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let secret = "whsec_test_rotation";
+        let body = r#"{"id":"evt_rotation","type":"checkout.session.completed"}"#;
+        let t = chrono::Utc::now().timestamp().to_string();
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(format!("{t}.{body}").as_bytes());
+        let valid = hex::encode(mac.finalize().into_bytes());
+        let invalid = "0".repeat(64);
+        let header = format!("t={t},v1={invalid},v1={valid}");
+        assert!(verify_stripe_signature(secret, &header, body).is_ok());
+    }
+
+    #[test]
+    fn stripe_log_body_redacts_sensitive_fields() {
+        let body = serde_json::json!({
+            "error": {
+                "message": "bad request",
+                "url": "https://checkout.stripe.com/c/pay/secret",
+                "client_secret": "pi_secret_123",
+                "payment_method": "pm_secret"
+            }
+        });
+
+        let safe = log_safe_stripe_body(&body).to_string();
+        assert!(!safe.contains("checkout.stripe.com"));
+        assert!(!safe.contains("pi_secret_123"));
+        assert!(!safe.contains("pm_secret"));
+        assert!(safe.contains("<redacted>"));
+    }
+
+    #[test]
     fn signature_rejects_wrong_secret() {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
@@ -551,7 +624,8 @@ pub async fn portal(
     let status = resp.status();
     let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
     if !status.is_success() {
-        tracing::warn!(stripe_status = %status, stripe_body = %body, "stripe portal error");
+        let safe_body = log_safe_stripe_body(&body);
+        tracing::warn!(stripe_status = %status, stripe_body = %safe_body, "stripe portal error");
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(ApiError {

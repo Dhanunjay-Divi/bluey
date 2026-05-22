@@ -25,7 +25,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use cue_llm::{LlmChunk, LlmCostMetadata, LlmError, LlmProvider, LlmRequest};
+use cue_llm::{LlmArtifactMetadata, LlmChunk, LlmCostMetadata, LlmError, LlmProvider, LlmRequest};
 use futures_util::{Stream, StreamExt};
 
 use crate::model::ProviderRoute;
@@ -43,6 +43,10 @@ pub enum SpeculativeChunk {
         finished: bool,
         /// Optional managed billing metadata emitted on the terminal chunk.
         cost: Option<LlmCostMetadata>,
+        /// Optional customer-facing cost label emitted by managed billing.
+        cost_label: Option<String>,
+        /// Optional server-classified canvas artifact.
+        artifact: Option<LlmArtifactMetadata>,
     },
     /// Replacement final answer from the Deep lane. Replace the entire card body.
     Final {
@@ -50,6 +54,10 @@ pub enum SpeculativeChunk {
         text: String,
         /// Optional managed billing metadata for the final lane.
         cost: Option<LlmCostMetadata>,
+        /// Optional customer-facing cost label emitted by managed billing.
+        cost_label: Option<String>,
+        /// Optional server-classified canvas artifact.
+        artifact: Option<LlmArtifactMetadata>,
     },
     /// A non-recoverable error from one or both lanes.
     Error {
@@ -238,12 +246,16 @@ fn spawn_lane(
                                 text,
                                 finished,
                                 cost: chunk_cost,
+                                cost_label,
+                                artifact,
                             }) => match role {
                                 LaneRole::Draft => {
                                     let _ = tx.send(SpeculativeChunk::Draft {
                                         text,
                                         finished,
                                         cost: chunk_cost,
+                                        cost_label,
+                                        artifact,
                                     });
                                     if finished {
                                         break;
@@ -258,6 +270,8 @@ fn spawn_lane(
                                         let _ = tx.send(SpeculativeChunk::Final {
                                             text: accumulated,
                                             cost,
+                                            cost_label,
+                                            artifact,
                                         });
                                         return;
                                     }
@@ -288,12 +302,16 @@ fn spawn_lane(
                             text: resp.text,
                             finished: true,
                             cost: resp.cost,
+                            cost_label: resp.cost_label,
+                            artifact: resp.artifact,
                         });
                     }
                     LaneRole::Deep => {
                         let _ = tx.send(SpeculativeChunk::Final {
                             text: resp.text,
                             cost: resp.cost,
+                            cost_label: resp.cost_label,
+                            artifact: resp.artifact,
                         });
                     }
                 },
@@ -349,6 +367,8 @@ mod tests {
             Ok(LlmResponse {
                 text: self.deep_text.to_string(),
                 cost: None,
+                cost_label: None,
+                artifact: None,
             })
         }
         async fn complete_stream(&self, _req: &LlmRequest) -> Result<LlmChunkStream, LlmError> {
@@ -362,6 +382,8 @@ mod tests {
                         text: c.to_string(),
                         finished: i == self.chunks.len() - 1,
                         cost: None,
+                        cost_label: None,
+                        artifact: None,
                     })
                 })
                 .collect();
@@ -608,6 +630,8 @@ mod tests {
                 Ok(LlmResponse {
                     text: format!("from-{}", self.name),
                     cost: None,
+                    cost_label: None,
+                    artifact: None,
                 })
             }
             async fn complete_stream(&self, req: &LlmRequest) -> Result<LlmChunkStream, LlmError> {
@@ -616,6 +640,8 @@ mod tests {
                     text: format!("from-{}", self.name),
                     finished: true,
                     cost: None,
+                    cost_label: None,
+                    artifact: None,
                 });
                 Ok(Box::pin(futures_util::stream::once(async move { chunk })))
             }

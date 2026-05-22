@@ -157,6 +157,11 @@ pub struct ExportBundle {
     pub account: ExportAccount,
     pub credit_batches: Vec<serde_json::Value>,
     pub usage_events: Vec<serde_json::Value>,
+    pub cloud_sessions: Vec<serde_json::Value>,
+    pub cloud_transcript_segments: Vec<serde_json::Value>,
+    pub cloud_cue_responses: Vec<serde_json::Value>,
+    pub cloud_context_artifacts: Vec<serde_json::Value>,
+    pub cloud_rag_chunks_count: i64,
     pub refresh_tokens_count: i64,
     pub stripe_webhook_events_count: i64,
     pub exported_at: String,
@@ -255,6 +260,97 @@ pub async fn export_data(
         .filter_map(|r| r.ok())
         .collect();
 
+    let cloud_sessions = export_rows(
+        &conn,
+        "SELECT session_id, title, status, created_at_ms, updated_at_ms,
+                last_active_at_ms, answer_style, metadata_json
+         FROM cloud_sessions WHERE account_id = ?1 ORDER BY updated_at_ms DESC LIMIT 10000",
+        &account.id,
+        &[
+            "session_id",
+            "title",
+            "status",
+            "created_at_ms",
+            "updated_at_ms",
+            "last_active_at_ms",
+            "answer_style",
+            "metadata_json",
+        ],
+    )?;
+    let cloud_transcript_segments = export_rows(
+        &conn,
+        "SELECT segment_id, session_id, speaker, source, text, start_ms,
+                end_ms, ts_ms, is_final, metadata_json
+         FROM cloud_transcript_segments WHERE account_id = ?1 ORDER BY ts_ms ASC LIMIT 50000",
+        &account.id,
+        &[
+            "segment_id",
+            "session_id",
+            "speaker",
+            "source",
+            "text",
+            "start_ms",
+            "end_ms",
+            "ts_ms",
+            "is_final",
+            "metadata_json",
+        ],
+    )?;
+    let cloud_cue_responses = export_rows(
+        &conn,
+        "SELECT response_id, session_id, kind, text, source_text, ts_ms,
+                provider, model, lane, task_type, cost_cents, balance_cents_after,
+                cost_label, artifact_type, artifact_body, artifact_confidence,
+                metadata_json
+         FROM cloud_cue_responses WHERE account_id = ?1 ORDER BY ts_ms ASC LIMIT 50000",
+        &account.id,
+        &[
+            "response_id",
+            "session_id",
+            "kind",
+            "text",
+            "source_text",
+            "ts_ms",
+            "provider",
+            "model",
+            "lane",
+            "task_type",
+            "cost_cents",
+            "balance_cents_after",
+            "cost_label",
+            "artifact_type",
+            "artifact_body",
+            "artifact_confidence",
+            "metadata_json",
+        ],
+    )?;
+    let cloud_context_artifacts = export_rows(
+        &conn,
+        "SELECT artifact_id, session_id, kind, title, note, source_uri,
+                content_hash, text_preview, created_at_ms, metadata_json
+         FROM cloud_context_artifacts WHERE account_id = ?1 ORDER BY created_at_ms ASC LIMIT 50000",
+        &account.id,
+        &[
+            "artifact_id",
+            "session_id",
+            "kind",
+            "title",
+            "note",
+            "source_uri",
+            "content_hash",
+            "text_preview",
+            "created_at_ms",
+            "metadata_json",
+        ],
+    )?;
+    let cloud_rag_chunks_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM cloud_rag_chunks WHERE account_id = ?1",
+            rusqlite::params![&account.id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
     let refresh_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM refresh_tokens WHERE account_id = ?1",
@@ -277,10 +373,49 @@ pub async fn export_data(
         account: exp_account,
         credit_batches: batches,
         usage_events: events,
+        cloud_sessions,
+        cloud_transcript_segments,
+        cloud_cue_responses,
+        cloud_context_artifacts,
+        cloud_rag_chunks_count,
         refresh_tokens_count: refresh_count,
         stripe_webhook_events_count: stripe_count,
         exported_at: chrono::Utc::now().to_rfc3339(),
     }))
+}
+
+fn export_rows(
+    conn: &rusqlite::Connection,
+    sql: &str,
+    account_id: &str,
+    columns: &[&str],
+) -> Result<Vec<serde_json::Value>, axum::http::StatusCode> {
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let rows = stmt
+        .query_map(rusqlite::params![account_id], |row| {
+            let mut obj = serde_json::Map::new();
+            for (idx, column) in columns.iter().enumerate() {
+                let value: rusqlite::types::Value = row.get(idx)?;
+                obj.insert((*column).to_string(), sqlite_value_to_json(value));
+            }
+            Ok(serde_json::Value::Object(obj))
+        })
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(rows)
+}
+
+fn sqlite_value_to_json(value: rusqlite::types::Value) -> serde_json::Value {
+    match value {
+        rusqlite::types::Value::Null => serde_json::Value::Null,
+        rusqlite::types::Value::Integer(v) => serde_json::json!(v),
+        rusqlite::types::Value::Real(v) => serde_json::json!(v),
+        rusqlite::types::Value::Text(v) => serde_json::Value::String(v),
+        rusqlite::types::Value::Blob(_) => serde_json::Value::String("<blob>".into()),
+    }
 }
 
 #[derive(serde::Serialize)]

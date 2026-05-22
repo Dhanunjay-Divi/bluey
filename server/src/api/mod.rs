@@ -13,6 +13,8 @@ pub mod billing;
 pub mod metrics;
 pub mod pricing;
 pub mod router;
+pub mod stt;
+pub mod sync;
 pub mod usage;
 
 /// Shared app state passed to every handler.
@@ -127,6 +129,12 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
             "/router/transcribe",
             axum::routing::post(router::transcribe),
         )
+        .route("/stt/session", axum::routing::post(stt::create_session))
+        .route("/stt/relay", axum::routing::get(stt::relay))
+        .route("/sync/batch", axum::routing::post(sync::batch))
+        .route("/sync/sessions", get(sync::list_sessions))
+        .route("/sync/sessions/:session_id", get(sync::get_session))
+        .route("/rag/query", axum::routing::post(sync::rag_query))
         .route("/usage/event", axum::routing::post(usage::ingest))
         .route("/billing/checkout", axum::routing::post(billing::checkout))
         .route("/billing/portal", axum::routing::post(billing::portal))

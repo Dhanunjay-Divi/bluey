@@ -17,6 +17,10 @@ interface CueResponse {
   model?: string | null;
   input_tokens?: number | null;
   output_tokens?: number | null;
+  cost_label?: string | null;
+  artifact_type?: string | null;
+  artifact_body?: string | null;
+  artifact_confidence?: number | null;
 }
 
 export function Responses() {
@@ -72,7 +76,14 @@ export function Responses() {
     return `$${(cents / 100).toFixed(2)}`;
   };
 
-  const renderCostPill = (r: Pick<CueResponse, "cost_cents" | "balance_cents_after" | "provider" | "model">) => {
+  const renderCostPill = (r: Pick<CueResponse, "cost_cents" | "balance_cents_after" | "provider" | "model" | "cost_label">) => {
+    if (r.cost_label) {
+      return (
+        <span className="rounded-full border border-cyan-500/40 bg-cyan-500/10 px-2 py-0.5 text-[11px] font-medium text-cyan-200">
+          {r.cost_label}
+        </span>
+      );
+    }
     const cost = formatCents(r.cost_cents);
     if (!cost) return null;
     const balance = formatCents(r.balance_cents_after);
@@ -82,6 +93,30 @@ export function Responses() {
         {r.model ? <span className="text-cyan-300/70"> · {r.model}</span> : null}
         {balance ? <span className="text-cyan-300/70"> · bal {balance}</span> : null}
       </span>
+    );
+  };
+
+  const renderArtifact = (
+    artifact: Pick<CueResponse, "artifact_type" | "artifact_body" | "artifact_confidence">,
+  ) => {
+    if (!artifact.artifact_type || !artifact.artifact_body) return null;
+    const label = artifact.artifact_type.replace(/_/g, " ");
+    const confidence =
+      artifact.artifact_confidence === null || artifact.artifact_confidence === undefined
+        ? null
+        : `${Math.round(artifact.artifact_confidence * 100)}%`;
+    return (
+      <div className="mt-3 rounded border border-cyan-500/30 bg-black/30 p-3">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <span className="text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-300">
+            {label} canvas
+          </span>
+          {confidence ? <span className="text-[11px] text-zinc-500">{confidence}</span> : null}
+        </div>
+        <pre className="max-h-64 overflow-auto whitespace-pre-wrap text-xs leading-relaxed text-zinc-200">
+          {artifact.artifact_body}
+        </pre>
+      </div>
     );
   };
 
@@ -103,6 +138,7 @@ export function Responses() {
         <p className="text-xs text-zinc-500 italic truncate">{r.source_text}</p>
       )}
       <p className="text-sm text-zinc-200 whitespace-pre-wrap">{r.text}</p>
+      {renderArtifact(r)}
     </div>
   );
 
@@ -126,6 +162,7 @@ export function Responses() {
           <span className="inline-block w-1 h-4 bg-blue-400 ml-0.5 animate-pulse" />
         ) : null}
       </p>
+      {renderArtifact(data)}
     </div>
   );
 

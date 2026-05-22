@@ -85,6 +85,8 @@ fn parse_sse_chunks(buffer: &mut String) -> Vec<Result<LlmChunk, LlmError>> {
                                     text: text.to_string(),
                                     finished: false,
                                     cost: None,
+                                    cost_label: None,
+                                    artifact: None,
                                 }));
                             }
                         }
@@ -93,6 +95,8 @@ fn parse_sse_chunks(buffer: &mut String) -> Vec<Result<LlmChunk, LlmError>> {
                                 text: String::new(),
                                 finished: true,
                                 cost: None,
+                                cost_label: None,
+                                artifact: None,
                             }));
                         }
                         _ => {}
@@ -164,7 +168,12 @@ impl LlmProvider for AnthropicProvider {
             .collect::<Vec<_>>()
             .join("");
 
-        Ok(LlmResponse { text, cost: None })
+        Ok(LlmResponse {
+            text,
+            cost: None,
+            cost_label: None,
+            artifact: None,
+        })
     }
 
     async fn complete_stream(&self, req: &LlmRequest) -> Result<LlmChunkStream, LlmError> {

@@ -236,6 +236,114 @@ async fn auth_link_mint_then_exchange_roundtrip() {
 
 #[tokio::test]
 #[serial]
+async fn sync_batch_session_bundle_and_rag_roundtrip() {
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "sync@example.com", "longenoughpw").await;
+
+    let batch = json!({
+        "sessions": [{
+            "session_id": "sess-cloud-1",
+            "title": "Cloud sync test",
+            "status": "active",
+            "created_at_ms": 1000,
+            "updated_at_ms": 2000,
+            "last_active_at_ms": 2000,
+            "answer_style": "be concise",
+            "metadata": {"source": "test"}
+        }],
+        "transcript_segments": [{
+            "segment_id": "seg-cloud-1",
+            "session_id": "sess-cloud-1",
+            "speaker": "system",
+            "source": "system",
+            "text": "We discussed queue backpressure and cache stampede controls.",
+            "ts_ms": 1500,
+            "is_final": true
+        }],
+        "cue_responses": [{
+            "response_id": "resp-cloud-1",
+            "session_id": "sess-cloud-1",
+            "kind": "answer",
+            "text": "Use bounded queues, retries, and admission control.",
+            "ts_ms": 1600,
+            "provider": "bluey-managed-instant",
+            "model": "gpt-4o-mini",
+            "cost_label": "$0.01 · balance $29.99"
+        }],
+        "context_artifacts": [{
+            "artifact_id": "ctx-cloud-1",
+            "session_id": "sess-cloud-1",
+            "kind": "document",
+            "title": "Architecture brief",
+            "text_preview": "The architecture uses bounded queues.",
+            "created_at_ms": 1400
+        }],
+        "rag_chunks": [{
+            "chunk_id": "chunk-cloud-1",
+            "session_id": "sess-cloud-1",
+            "source_kind": "transcript",
+            "source_id": "seg-cloud-1",
+            "chunk_index": 0,
+            "text": "queue backpressure cache stampede",
+            "updated_at_ms": 1500
+        }]
+    });
+
+    let req = Request::post("/sync/batch")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(serde_json::to_vec(&batch).unwrap()))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let req = Request::get("/sync/sessions")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(listed["sessions"][0]["session_id"], "sess-cloud-1");
+
+    let req = Request::get("/sync/sessions/sess-cloud-1")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let bundle: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(bundle["transcript_segments"][0]["segment_id"], "seg-cloud-1");
+    assert_eq!(bundle["cue_responses"][0]["cost_label"], "$0.01 · balance $29.99");
+
+    let req = Request::post("/rag/query")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "query": "cache stampede",
+                "top_k": 3
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let rag: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(rag["matches"][0]["chunk_id"], "chunk-cloud-1");
+}
+
+#[tokio::test]
+#[serial]
 async fn router_transcribe_happy_path_with_mocked_deepgram() {
     let h = boot_harness().await;
     let access = signup_and_login(&h, "stt@example.com", "longenoughpw").await;

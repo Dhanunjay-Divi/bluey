@@ -27,6 +27,10 @@ pub struct NewCueResponse<'a> {
     pub model: Option<&'a str>,
     pub input_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
+    pub cost_label: Option<&'a str>,
+    pub artifact_type: Option<&'a str>,
+    pub artifact_body: Option<&'a str>,
+    pub artifact_confidence: Option<f32>,
 }
 
 impl Database {
@@ -38,11 +42,17 @@ impl Database {
         } else {
             let p = Path::new(path);
             if let Some(parent) = p.parent() {
-                std::fs::create_dir_all(parent)?;
+                if should_harden_db_parent(parent) {
+                    cue_core::app_paths::create_private_dir(parent)?;
+                }
             }
+            ensure_private_sqlite_file(p)?;
             Connection::open(p)?
         };
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        if path != ":memory:" {
+            secure_sqlite_file_family(Path::new(path))?;
+        }
         let db = Self { conn };
         db.run_migrations()?;
         Ok(db)
@@ -102,6 +112,10 @@ impl Database {
             ("model", "TEXT"),
             ("input_tokens", "INTEGER"),
             ("output_tokens", "INTEGER"),
+            ("cost_label", "TEXT"),
+            ("artifact_type", "TEXT"),
+            ("artifact_body", "TEXT"),
+            ("artifact_confidence", "REAL"),
         ] {
             if !columns.contains(name) {
                 self.conn.execute(
@@ -378,8 +392,9 @@ impl Database {
         self.conn.execute(
             "INSERT INTO cue_responses (
                 id, session_id, kind, text, source_text, ts_ms,
-                cost_cents, balance_cents_after, provider, model, input_tokens, output_tokens
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                cost_cents, balance_cents_after, provider, model, input_tokens, output_tokens,
+                cost_label, artifact_type, artifact_body, artifact_confidence
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 response.id,
                 response.session_id,
@@ -393,6 +408,10 @@ impl Database {
                 response.model,
                 response.input_tokens,
                 response.output_tokens,
+                response.cost_label,
+                response.artifact_type,
+                response.artifact_body,
+                response.artifact_confidence,
             ],
         )?;
         Ok(())
@@ -418,7 +437,8 @@ impl Database {
     ) -> Result<Vec<crate::llm::CueResponse>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, kind, text, source_text, ts_ms,
-                    cost_cents, balance_cents_after, provider, model, input_tokens, output_tokens \
+                    cost_cents, balance_cents_after, provider, model, input_tokens, output_tokens,
+                    cost_label, artifact_type, artifact_body, artifact_confidence \
              FROM cue_responses WHERE session_id = ?1 ORDER BY ts_ms DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![session_id, limit as i64], |row| {
@@ -435,6 +455,10 @@ impl Database {
                 model: row.get(9)?,
                 input_tokens: row.get(10)?,
                 output_tokens: row.get(11)?,
+                cost_label: row.get(12)?,
+                artifact_type: row.get(13)?,
+                artifact_body: row.get(14)?,
+                artifact_confidence: row.get(15)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -467,6 +491,74 @@ impl Database {
         self.conn.execute_batch("DELETE FROM user_keybinds;")?;
         Ok(())
     }
+}
+
+fn should_harden_db_parent(parent: &Path) -> bool {
+    !parent.as_os_str().is_empty() && parent != Path::new(".")
+}
+
+fn ensure_private_sqlite_file(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        if path.exists() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+        } else {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .with_context(|| format!("failed to create {}", path.display()))?;
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+
+    Ok(())
+}
+
+fn secure_sqlite_file_family(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        for candidate in [
+            path.to_path_buf(),
+            path.with_file_name(format!(
+                "{}-wal",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("sessions.db")
+            )),
+            path.with_file_name(format!(
+                "{}-shm",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("sessions.db")
+            )),
+        ] {
+            if candidate.exists() {
+                std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o600))
+                    .with_context(|| {
+                        format!("failed to set permissions on {}", candidate.display())
+                    })?;
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+
+    Ok(())
 }
 
 fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
@@ -546,6 +638,42 @@ mod tests {
 
     fn test_db() -> Database {
         Database::open(":memory:").expect("failed to open in-memory db")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_database_is_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("bluey-db-perms-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("sessions.db");
+        let db = Database::open(path.to_str().expect("utf-8 path")).expect("open db");
+        db.create_session(Some("Permissions".to_string()))
+            .expect("write session");
+
+        let db_mode = std::fs::metadata(&path)
+            .expect("db metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(db_mode, 0o600);
+
+        let dir_mode = std::fs::metadata(&dir)
+            .expect("dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn relative_db_parent_does_not_target_current_directory() {
+        assert!(!should_harden_db_parent(Path::new("")));
+        assert!(!should_harden_db_parent(Path::new(".")));
+        assert!(should_harden_db_parent(Path::new("/tmp/bluey")));
     }
 
     #[test]
@@ -1101,6 +1229,10 @@ mod fts_tests {
             model: Some("gpt-4o-mini"),
             input_tokens: Some(20),
             output_tokens: Some(12),
+            cost_label: Some("$0.07 · balance $29.93"),
+            artifact_type: Some("code"),
+            artifact_body: Some("CODE\n----\nfn main() {}"),
+            artifact_confidence: Some(0.95),
         })
         .unwrap();
 
@@ -1113,6 +1245,16 @@ mod fts_tests {
         assert_eq!(response.model.as_deref(), Some("gpt-4o-mini"));
         assert_eq!(response.input_tokens, Some(20));
         assert_eq!(response.output_tokens, Some(12));
+        assert_eq!(
+            response.cost_label.as_deref(),
+            Some("$0.07 · balance $29.93")
+        );
+        assert_eq!(response.artifact_type.as_deref(), Some("code"));
+        assert_eq!(
+            response.artifact_body.as_deref(),
+            Some("CODE\n----\nfn main() {}")
+        );
+        assert_eq!(response.artifact_confidence, Some(0.95));
     }
 
     #[test]

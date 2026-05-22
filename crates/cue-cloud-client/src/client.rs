@@ -10,7 +10,11 @@ use serde::{de::DeserializeOwned, Serialize};
 use crate::{
     error::{Error, Result},
     tokens::{TokenStore, Tokens},
-    types::{AuthResponse, InsufficientBalanceBody},
+    types::{
+        AuthResponse, CloudSessionBundle, InsufficientBalanceBody, RagQueryRequest,
+        RagQueryResponse, SessionListResponse, SttSessionRequest, SttSessionResponse,
+        SyncBatchRequest, SyncBatchResponse,
+    },
 };
 
 /// Configuration for the cloud client.
@@ -115,6 +119,33 @@ impl CloudClient {
         Resp: DeserializeOwned,
     {
         self.auth_request(Method::POST, path, Some(body)).await
+    }
+
+    pub async fn sync_batch(&self, batch: &SyncBatchRequest) -> Result<SyncBatchResponse> {
+        self.auth_post("/sync/batch", batch).await
+    }
+
+    pub async fn list_cloud_sessions(&self, limit: Option<i64>) -> Result<SessionListResponse> {
+        let path = match limit {
+            Some(limit) => format!("/sync/sessions?limit={}", limit.clamp(1, 200)),
+            None => "/sync/sessions".to_string(),
+        };
+        self.auth_get(&path).await
+    }
+
+    pub async fn load_cloud_session(&self, session_id: &str) -> Result<CloudSessionBundle> {
+        self.auth_get(&format!("/sync/sessions/{session_id}")).await
+    }
+
+    pub async fn query_rag(&self, request: &RagQueryRequest) -> Result<RagQueryResponse> {
+        self.auth_post("/rag/query", request).await
+    }
+
+    pub async fn create_stt_session(
+        &self,
+        request: &SttSessionRequest,
+    ) -> Result<SttSessionResponse> {
+        self.auth_post("/stt/session", request).await
     }
 
     /// Authenticated POST returning the raw response body stream.
@@ -245,7 +276,11 @@ impl CloudClient {
             }
             other => {
                 let body = resp.text().await.unwrap_or_default();
-                tracing::warn!(status = %other, body = %body, "cue-cloud-client server error");
+                tracing::warn!(
+                    status = %other,
+                    body = %log_safe_response_body(&body),
+                    "cue-cloud-client server error"
+                );
                 Err(Error::Server {
                     status: other.as_u16(),
                 })
@@ -272,7 +307,11 @@ impl CloudClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            tracing::warn!(status = %status, body = %body, "public_get error");
+            tracing::warn!(
+                status = %status,
+                body = %log_safe_response_body(&body),
+                "public_get error"
+            );
             return Err(Error::Server {
                 status: status.as_u16(),
             });
@@ -299,13 +338,77 @@ impl CloudClient {
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            tracing::warn!(status = %status, body = %body, "public_post error");
+            tracing::warn!(
+                status = %status,
+                body = %log_safe_response_body(&body),
+                "public_post error"
+            );
             return Err(Error::Server {
                 status: status.as_u16(),
             });
         }
         Ok(resp.json().await?)
     }
+}
+
+pub(crate) fn log_safe_response_body(body: &str) -> String {
+    const MAX_LOG_BYTES: usize = 256;
+    if body.trim().is_empty() {
+        return "<empty>".to_string();
+    }
+
+    let redacted = match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(mut value) => {
+            redact_json_value(&mut value);
+            value.to_string()
+        }
+        Err(_) => body.to_string(),
+    };
+
+    truncate_log_value(&redacted, MAX_LOG_BYTES)
+}
+
+fn redact_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map.iter_mut() {
+                if is_sensitive_log_key(key) {
+                    *value = serde_json::Value::String("<redacted>".to_string());
+                } else {
+                    redact_json_value(value);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_json_value(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_sensitive_log_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.contains("token")
+        || key.contains("secret")
+        || key.contains("password")
+        || key.contains("authorization")
+        || key == "code"
+        || key.ends_with("_code")
+        || key == "url"
+        || key.ends_with("_url")
+}
+
+fn truncate_log_value(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...<truncated>", &value[..end])
 }
 
 #[cfg(test)]
@@ -367,6 +470,25 @@ mod tests {
             }
             other => panic!("expected InsufficientBalance, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn log_safe_response_body_redacts_tokens_and_urls() {
+        let body = serde_json::json!({
+            "error": "bad",
+            "access_token": "secret-access",
+            "refresh_token": "secret-refresh",
+            "verification_url": "https://bluey.dev/link?token=secret",
+            "nested": { "device_code": "device-secret" }
+        })
+        .to_string();
+
+        let safe = log_safe_response_body(&body);
+        assert!(!safe.contains("secret-access"));
+        assert!(!safe.contains("secret-refresh"));
+        assert!(!safe.contains("device-secret"));
+        assert!(!safe.contains("https://bluey.dev/link"));
+        assert!(safe.contains("<redacted>"));
     }
 
     #[tokio::test]

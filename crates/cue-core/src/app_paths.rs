@@ -47,14 +47,38 @@ impl AppPaths {
     }
 
     pub fn ensure(&self) -> Result<()> {
-        fs::create_dir_all(&self.data_dir)
-            .with_context(|| format!("failed to create {}", self.data_dir.display()))?;
-        fs::create_dir_all(&self.config_dir)
-            .with_context(|| format!("failed to create {}", self.config_dir.display()))?;
-        fs::create_dir_all(&self.runtime_dir)
-            .with_context(|| format!("failed to create {}", self.runtime_dir.display()))?;
+        create_private_dir(&self.data_dir)?;
+        create_private_dir(&self.config_dir)?;
+        create_private_dir(&self.runtime_dir)?;
         Ok(())
     }
+}
+
+pub fn create_private_dir(path: &std::path::Path) -> Result<()> {
+    fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
+    // Permission tightening is best-effort: we cannot chmod a directory
+    // we do not own (e.g. /tmp, /var, a mounted volume). Callers that
+    // require a 0o700 invariant should verify it with metadata instead of
+    // relying on this helper.
+    let _ = set_private_dir_permissions(path);
+    Ok(())
+}
+
+pub fn set_private_dir_permissions(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to set private permissions on {}", path.display()))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+
+    Ok(())
 }
 
 fn path_override(name: &str) -> Option<PathBuf> {
@@ -74,5 +98,36 @@ fn product_or_legacy_dir(base: &std::path::Path) -> PathBuf {
         legacy
     } else {
         product
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_uses_private_directory_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base =
+            std::env::temp_dir().join(format!("bluey-app-paths-perms-{}", uuid::Uuid::new_v4()));
+        let paths = AppPaths {
+            data_dir: base.join("data"),
+            config_dir: base.join("config"),
+            runtime_dir: base.join("run"),
+            state_file: base.join("run/daemon-state.json"),
+            account_file: base.join("config/account.json"),
+            settings_file: base.join("config/settings.json"),
+        };
+
+        paths.ensure().expect("ensure paths");
+
+        for dir in [&paths.data_dir, &paths.config_dir, &paths.runtime_dir] {
+            let mode = fs::metadata(dir).expect("metadata").permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", dir.display());
+        }
+
+        let _ = fs::remove_dir_all(base);
     }
 }

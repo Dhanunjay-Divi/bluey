@@ -41,6 +41,10 @@ export interface InflightResponse {
   balance_cents_after?: number | null;
   provider?: string | null;
   model?: string | null;
+  cost_label?: string | null;
+  artifact_type?: string | null;
+  artifact_body?: string | null;
+  artifact_confidence?: number | null;
   /**
    * True if a `replace_body` chunk has fired for this entry. Used by the UI
    * to render a "refined" indicator distinguishing the deep answer from the
@@ -71,6 +75,10 @@ export interface CueResponseChunk {
   balance_cents_after?: number | null;
   provider?: string | null;
   model?: string | null;
+  cost_label?: string | null;
+  artifact_type?: string | null;
+  artifact_body?: string | null;
+  artifact_confidence?: number | null;
 }
 
 /**
@@ -115,6 +123,10 @@ export function applyChunk(
   const balance_cents_after = chunk.balance_cents_after ?? existing?.balance_cents_after;
   const provider = chunk.provider ?? existing?.provider;
   const model = chunk.model ?? existing?.model;
+  const cost_label = chunk.cost_label ?? existing?.cost_label;
+  const artifact_type = chunk.artifact_type ?? existing?.artifact_type;
+  const artifact_body = chunk.artifact_body ?? existing?.artifact_body;
+  const artifact_confidence = chunk.artifact_confidence ?? existing?.artifact_confidence;
 
   // Refined flag: sticky once set true.
   const refined = chunk.replace_body || existing?.refined || false;
@@ -128,6 +140,10 @@ export function applyChunk(
     balance_cents_after,
     provider,
     model,
+    cost_label,
+    artifact_type,
+    artifact_body,
+    artifact_confidence,
     refined,
   });
 

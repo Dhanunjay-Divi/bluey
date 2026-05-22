@@ -55,6 +55,16 @@ fn err(status: StatusCode, msg: &str) -> (StatusCode, Json<ApiError>) {
     )
 }
 
+fn allow_dev_auth_link_logs() -> bool {
+    matches!(
+        std::env::var("BLUEY_DEV_LOG_AUTH_LINKS")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 fn auth_response(
     state: &AppState,
     account: &Account,
@@ -391,12 +401,20 @@ pub async fn verify_email_start(
             tracing::info!(account_id = %account.id, email = %account.email, "email verification sent");
         }
         Ok(crate::mail::MailDelivery::NotConfigured) => {
-            tracing::info!(
-                account_id = %account.id,
-                email = %account.email,
-                verify_url = %verify_url,
-                "email verification (SMTP unconfigured; logging dev URL)"
-            );
+            if allow_dev_auth_link_logs() {
+                tracing::info!(
+                    account_id = %account.id,
+                    email = %account.email,
+                    verify_url = %verify_url,
+                    "email verification (SMTP unconfigured; dev link logging enabled)"
+                );
+            } else {
+                tracing::warn!(
+                    account_id = %account.id,
+                    email = %account.email,
+                    "email verification link created but SMTP is unconfigured; link suppressed from logs"
+                );
+            }
         }
         Err(error) => {
             tracing::warn!(account_id = %account.id, email = %account.email, %error, "email verification delivery failed");
@@ -480,12 +498,20 @@ pub async fn password_reset_start(
                     tracing::info!(account_id = %account.id, email = %account.email, "password reset sent");
                 }
                 Ok(crate::mail::MailDelivery::NotConfigured) => {
-                    tracing::info!(
-                        account_id = %account.id,
-                        email = %account.email,
-                        reset_url = %reset_url,
-                        "password reset (SMTP unconfigured; logging dev URL)"
-                    );
+                    if allow_dev_auth_link_logs() {
+                        tracing::info!(
+                            account_id = %account.id,
+                            email = %account.email,
+                            reset_url = %reset_url,
+                            "password reset (SMTP unconfigured; dev link logging enabled)"
+                        );
+                    } else {
+                        tracing::warn!(
+                            account_id = %account.id,
+                            email = %account.email,
+                            "password reset link created but SMTP is unconfigured; link suppressed from logs"
+                        );
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(account_id = %account.id, email = %account.email, %error, "password reset delivery failed");

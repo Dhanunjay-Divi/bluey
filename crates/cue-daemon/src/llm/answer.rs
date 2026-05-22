@@ -1,4 +1,4 @@
-use cue_llm::{LlmCostMetadata, LlmProvider, LlmRequest};
+use cue_llm::{LlmArtifactMetadata, LlmCostMetadata, LlmProvider, LlmRequest};
 use futures_util::StreamExt;
 
 use super::CueResponse;
@@ -37,6 +37,8 @@ impl AnswerLlm {
             request_id: None,
         };
         let mut cost: Option<LlmCostMetadata> = None;
+        let mut cost_label: Option<String> = None;
+        let mut artifact: Option<LlmArtifactMetadata> = None;
         let text = if llm.supports_streaming() {
             let mut stream = llm.complete_stream(&req).await?;
             let mut acc = String::new();
@@ -44,6 +46,12 @@ impl AnswerLlm {
                 let chunk = chunk?;
                 if chunk.cost.is_some() {
                     cost = chunk.cost.clone();
+                }
+                if chunk.cost_label.is_some() {
+                    cost_label = chunk.cost_label.clone();
+                }
+                if chunk.artifact.is_some() {
+                    artifact = chunk.artifact.clone();
                 }
                 // Emit DELTA (just the new text), not cumulative — the dashboard appends.
                 on_chunk(&chunk.text, chunk.finished);
@@ -56,12 +64,14 @@ impl AnswerLlm {
         } else {
             let resp = llm.complete(&req).await?;
             cost = resp.cost.clone();
+            cost_label = resp.cost_label.clone();
+            artifact = resp.artifact.clone();
             on_chunk(&resp.text, true);
             resp.text
         };
         Ok(
             CueResponse::new("answer", text, session_id, Some(question.to_string()))
-                .with_cost_metadata(cost.as_ref()),
+                .with_llm_metadata(cost.as_ref(), cost_label.as_deref(), artifact.as_ref()),
         )
     }
 }
@@ -70,7 +80,7 @@ impl AnswerLlm {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use cue_llm::{LlmCostMetadata, LlmError, LlmResponse};
+    use cue_llm::{LlmArtifactMetadata, LlmCostMetadata, LlmError, LlmResponse};
 
     struct FakeLlm;
 
@@ -84,6 +94,8 @@ mod tests {
             Ok(LlmResponse {
                 text: "The answer is 42.".into(),
                 cost: None,
+                cost_label: None,
+                artifact: None,
             })
         }
     }
@@ -106,6 +118,12 @@ mod tests {
                     cost_cents: 2,
                     balance_cents_after: Some(2998),
                     trial_seconds_remaining: Some(0),
+                }),
+                cost_label: Some("$0.02 · balance $29.98".into()),
+                artifact: Some(LlmArtifactMetadata {
+                    artifact_type: "code".into(),
+                    body: "CODE\n----\nfn answer() -> i32 { 42 }".into(),
+                    confidence: Some(0.96),
                 }),
             })
         }
@@ -133,5 +151,12 @@ mod tests {
         assert_eq!(resp.balance_cents_after, Some(2998));
         assert_eq!(resp.provider.as_deref(), Some("openai"));
         assert_eq!(resp.model.as_deref(), Some("gpt-4o-mini"));
+        assert_eq!(resp.cost_label.as_deref(), Some("$0.02 · balance $29.98"));
+        assert_eq!(resp.artifact_type.as_deref(), Some("code"));
+        assert!(resp
+            .artifact_body
+            .as_deref()
+            .is_some_and(|body| body.contains("fn answer")));
+        assert_eq!(resp.artifact_confidence, Some(0.96));
     }
 }

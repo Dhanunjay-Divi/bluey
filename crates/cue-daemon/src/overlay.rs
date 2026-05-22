@@ -119,15 +119,27 @@ pub enum OverlayVerifyError {
         binary: PathBuf,
         install_dir: PathBuf,
     },
-    // Future: HashMismatch { expected: String, actual: String }
+    #[error("overlay sha256 sidecar could not be read: {path}: {source}")]
+    HashSidecarReadFailed {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("overlay sha256 sidecar has no 64-character hash: {0}")]
+    HashSidecarInvalid(PathBuf),
+    #[error("overlay binary hash mismatch: binary={binary}, expected={expected}, actual={actual}")]
+    HashMismatch {
+        binary: PathBuf,
+        expected: String,
+        actual: String,
+    },
 }
 
 /// Verify that the overlay binary path is canonical and resides inside
 /// `install_dir`. This prevents symlink/traversal attacks that could trick
-/// the daemon into spawning an attacker-controlled binary.
+/// the daemon into spawning an attacker-controlled binary. If a sha256
+/// sidecar exists next to the helper, verify it too; release artifacts should
+/// ship sidecars, while local/dev builds can still run without one.
 ///
-/// Future enhancement: SHA-256 hash verification (placeholder structured
-/// so enabling it requires only a single flag + embedded hash constant).
 pub fn verify_overlay_binary(path: &Path, install_dir: &Path) -> Result<(), OverlayVerifyError> {
     if !path.is_absolute() {
         return Err(OverlayVerifyError::NotAbsolute(path.to_path_buf()));
@@ -144,7 +156,58 @@ pub fn verify_overlay_binary(path: &Path, install_dir: &Path) -> Result<(), Over
             install_dir: canonical_install,
         });
     }
+    verify_optional_sha256_sidecar(&canonical)?;
     Ok(())
+}
+
+fn verify_optional_sha256_sidecar(path: &Path) -> Result<(), OverlayVerifyError> {
+    let Some(sidecar) = sha256_sidecar_for(path) else {
+        return Ok(());
+    };
+    let expected = read_sha256_sidecar(&sidecar)?;
+    let actual =
+        sha256_file_hex(path).map_err(|source| OverlayVerifyError::HashSidecarReadFailed {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !actual.eq_ignore_ascii_case(&expected) {
+        return Err(OverlayVerifyError::HashMismatch {
+            binary: path.to_path_buf(),
+            expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn sha256_sidecar_for(path: &Path) -> Option<PathBuf> {
+    let mut candidates = vec![path.with_extension("sha256")];
+    if let Some(file_name) = path.file_name().and_then(|name| name.to_str()) {
+        candidates.push(path.with_file_name(format!("{file_name}.sha256")));
+    }
+    candidates.into_iter().find(|candidate| candidate.exists())
+}
+
+fn read_sha256_sidecar(path: &Path) -> Result<String, OverlayVerifyError> {
+    let raw = std::fs::read_to_string(path).map_err(|source| {
+        OverlayVerifyError::HashSidecarReadFailed {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+    raw.split_whitespace()
+        .find(|token| token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit()))
+        .map(|token| token.to_ascii_lowercase())
+        .ok_or_else(|| OverlayVerifyError::HashSidecarInvalid(path.to_path_buf()))
+}
+
+fn sha256_file_hex(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let bytes = std::fs::read(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Ok(hex::encode(hasher.finalize()))
 }
 
 // ─── Item 3: Session token generation ───────────────────────────────────────
@@ -736,6 +799,46 @@ mod tests {
         fs::write(&binary, b"fake").unwrap();
         let result = verify_overlay_binary(&binary, &dir);
         assert!(result.is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_overlay_binary_accepts_matching_sha256_sidecar() {
+        let dir =
+            std::env::temp_dir().join(format!("cue_test_verify_hash_{}", uuid::Uuid::new_v4()));
+        let _ = fs::create_dir_all(&dir);
+        let binary = dir.join("overlay");
+        fs::write(&binary, b"fake-overlay").unwrap();
+        let expected = sha256_file_hex(&binary).unwrap();
+        fs::write(
+            binary.with_file_name("overlay.sha256"),
+            format!("{expected}  overlay\n"),
+        )
+        .unwrap();
+
+        let result = verify_overlay_binary(&binary, &dir);
+        assert!(result.is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_overlay_binary_rejects_mismatched_sha256_sidecar() {
+        let dir =
+            std::env::temp_dir().join(format!("cue_test_verify_hash_bad_{}", uuid::Uuid::new_v4()));
+        let _ = fs::create_dir_all(&dir);
+        let binary = dir.join("overlay");
+        fs::write(&binary, b"fake-overlay").unwrap();
+        fs::write(
+            binary.with_file_name("overlay.sha256"),
+            format!("{}  overlay\n", "0".repeat(64)),
+        )
+        .unwrap();
+
+        let result = verify_overlay_binary(&binary, &dir);
+        assert!(matches!(
+            result,
+            Err(OverlayVerifyError::HashMismatch { .. })
+        ));
         let _ = fs::remove_dir_all(&dir);
     }
 

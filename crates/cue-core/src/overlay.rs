@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::CueCard;
+use crate::{CueCard, CueCardArtifact};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +73,8 @@ pub enum OverlayCommand {
         done: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cost_label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact: Option<CueCardArtifact>,
     },
     Shutdown,
 }

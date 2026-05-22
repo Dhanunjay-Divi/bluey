@@ -2,6 +2,7 @@ use std::env;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
@@ -349,6 +350,27 @@ enum AiCommands {
 enum CloudCommands {
     Status,
     Sync,
+    /// List cloud-synced sessions for this account.
+    Sessions {
+        #[arg(long, default_value_t = 20)]
+        limit: i64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a cloud-synced session bundle by id.
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Query account-scoped cloud RAG memory.
+    Rag {
+        query: Vec<String>,
+        #[arg(long, default_value_t = 8)]
+        limit: i64,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -623,14 +645,15 @@ pub async fn cli_main() -> Result<()> {
             let response = request(request_msg).await?;
             print_response(response)
         }
-        Commands::Cloud { command } => {
-            let request_msg = match command {
-                CloudCommands::Status => DaemonRequest::CloudStatus,
-                CloudCommands::Sync => DaemonRequest::CloudSyncNow,
-            };
-            let response = request(request_msg).await?;
-            print_response(response)
-        }
+        Commands::Cloud { command } => match command {
+            CloudCommands::Status => print_response(request(DaemonRequest::CloudStatus).await?),
+            CloudCommands::Sync => print_response(request(DaemonRequest::CloudSyncNow).await?),
+            CloudCommands::Sessions { limit, json } => print_cloud_sessions(limit, json).await,
+            CloudCommands::Show { id, json } => print_cloud_session(&id, json).await,
+            CloudCommands::Rag { query, limit, json } => {
+                print_cloud_rag(&query.join(" "), limit, json).await
+            }
+        },
         Commands::Providers => {
             print_provider_status();
             Ok(())
@@ -691,21 +714,13 @@ async fn cue_on(args: OnArgs) -> Result<()> {
         opacity: settings.overlay_opacity,
     })
     .await;
+    let account_ready = bluey_account_linked(&paths);
     // The native overlay orders the branded pill front when the child process
     // starts. Do not send OverlayShow here: in the current protocol it expands
     // the full feed, while `bluey on` should launch pill-first.
     let boot = request(DaemonRequest::OverlayBoot {
         title: "Bluey online".to_string(),
-        lines: vec![
-            "daemon link established".to_string(),
-            "new recording started".to_string(),
-            "click the pill for chat, files, and screen analysis".to_string(),
-            "restore the latest recording from the sidebar".to_string(),
-            "attach files with Attach".to_string(),
-            "screen context waits for Analyse consent".to_string(),
-            "audio transcripts appear as source-labeled cards".to_string(),
-            "answers appear as overlay cards".to_string(),
-        ],
+        lines: bluey_on_boot_lines(account_ready),
     })
     .await;
 
@@ -720,6 +735,33 @@ async fn cue_on(args: OnArgs) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn bluey_account_linked(paths: &AppPaths) -> bool {
+    cue_cloud_client::CloudClient::with_default_keyring()
+        .ok()
+        .and_then(|client| client.current_tokens())
+        .is_some()
+        || load_account(paths)
+            .ok()
+            .flatten()
+            .is_some_and(|account| account.token_configured())
+}
+
+fn bluey_on_boot_lines(account_ready: bool) -> Vec<String> {
+    let mut lines = vec![
+        "new recording started".to_string(),
+        "click the pill for chat, files, and screen analysis".to_string(),
+        "restore previous sessions from the sidebar".to_string(),
+        "attach files with Attach; Analyse asks before screen context".to_string(),
+        "transcripts stay source-labeled; answers stream into chat".to_string(),
+    ];
+    if account_ready {
+        lines.push("managed answers and balance tracking are ready".to_string());
+    } else {
+        lines.push("finish setup with: bluey login".to_string());
+    }
+    lines
 }
 
 async fn cue_off() -> Result<()> {
@@ -2248,12 +2290,133 @@ fn print_cloud_status(status: CloudSyncStatus) {
     }
 }
 
+async fn print_cloud_sessions(limit: i64, json: bool) -> Result<()> {
+    let Some(client) = cloud_client_or_message()? else {
+        println!("Not logged in. Run `bluey login` first.");
+        return Ok(());
+    };
+    let sessions = client
+        .list_cloud_sessions(Some(limit.clamp(1, 200)))
+        .await
+        .context("failed to list cloud sessions")?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&sessions)?);
+        return Ok(());
+    }
+    if sessions.sessions.is_empty() {
+        println!("No cloud sessions yet. Run `bluey cloud sync` after a session.");
+        return Ok(());
+    }
+    println!("Cloud sessions:");
+    for session in sessions.sessions {
+        println!(
+            "- {}  {}  {} transcript, {} answer(s), {} context",
+            short_id(&session.session_id),
+            session.status,
+            session.transcript_count,
+            session.response_count,
+            session.context_count
+        );
+        println!("  {}", session.title);
+    }
+    Ok(())
+}
+
+async fn print_cloud_session(id: &str, json: bool) -> Result<()> {
+    let Some(client) = cloud_client_or_message()? else {
+        println!("Not logged in. Run `bluey login` first.");
+        return Ok(());
+    };
+    let bundle = client
+        .load_cloud_session(id)
+        .await
+        .with_context(|| format!("failed to load cloud session {id}"))?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&bundle)?);
+        return Ok(());
+    }
+    println!("Session: {}", bundle.session.title);
+    println!("ID: {}", bundle.session.session_id);
+    println!("Status: {}", bundle.session.status);
+    println!(
+        "Stored: {} transcript, {} answer(s), {} context",
+        bundle.transcript_segments.len(),
+        bundle.cue_responses.len(),
+        bundle.context_artifacts.len()
+    );
+    if let Some(instructions) = bundle.session.answer_style.as_deref() {
+        println!("\nAnswer style:\n{instructions}");
+    }
+    if let Some(segment) = bundle.transcript_segments.last() {
+        println!(
+            "\nLatest transcript:\n{}: {}",
+            segment.speaker, segment.text
+        );
+    }
+    if let Some(answer) = bundle.cue_responses.last() {
+        println!("\nLatest answer:\n{}", answer.text);
+    }
+    Ok(())
+}
+
+async fn print_cloud_rag(query: &str, limit: i64, json: bool) -> Result<()> {
+    let query = query.trim();
+    if query.is_empty() {
+        bail!("provide a RAG query, for example: bluey cloud rag architecture risk");
+    }
+    let Some(client) = cloud_client_or_message()? else {
+        println!("Not logged in. Run `bluey login` first.");
+        return Ok(());
+    };
+    let result = client
+        .query_rag(&cue_cloud_client::RagQueryRequest {
+            query: query.to_string(),
+            embedding: None,
+            top_k: Some(limit.clamp(1, 20)),
+        })
+        .await
+        .context("failed to query cloud RAG")?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    if result.matches.is_empty() {
+        println!("No cloud RAG matches yet.");
+        return Ok(());
+    }
+    for hit in result.matches {
+        println!(
+            "- {}:{}  score {:.3}  session {}",
+            hit.source_kind,
+            hit.chunk_index,
+            hit.score,
+            hit.session_id.as_deref().map(short_id).unwrap_or("global")
+        );
+        println!("  {}", compact_line(&hit.text, 180));
+    }
+    Ok(())
+}
+
 fn yes_no(value: bool) -> &'static str {
     if value {
         "yes"
     } else {
         "no"
     }
+}
+
+fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
+fn compact_line(text: &str, max_chars: usize) -> String {
+    let clean = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if clean.chars().count() <= max_chars {
+        return clean;
+    }
+    let mut out = clean.chars().take(max_chars).collect::<String>();
+    out.push_str("...");
+    out
 }
 
 fn print_provider_status() {
@@ -2314,19 +2477,78 @@ fn env_present(name: &str) -> bool {
         .is_some()
 }
 
-async fn bluey_usage_cmd() -> Result<()> {
-    let client = match cue_cloud_client::CloudClient::with_default_keyring() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("bluey: cloud client init failed: {e}");
-            eprintln!("Run `bluey login` first if you have not already.");
-            return Ok(());
-        }
+fn optional_cloud_client() -> Result<Option<cue_cloud_client::CloudClient>> {
+    let paths = AppPaths::discover()?;
+    let base_url = env::var("BLUEY_CLOUD_API_URL")
+        .or_else(|_| env::var("CUE_CLOUD_API_URL"))
+        .ok()
+        .or_else(|| {
+            load_account(&paths)
+                .ok()
+                .flatten()
+                .map(|account| account.api_url)
+        })
+        .unwrap_or_else(|| "https://api.bluey.dev".to_string());
+    let config = cue_cloud_client::client::ClientConfig {
+        base_url,
+        ..Default::default()
     };
+
+    if let Some(access) = cloud_access_token_from_env() {
+        let store = cue_cloud_client::tokens::MemoryStore::new();
+        cue_cloud_client::TokenStore::save(
+            &store,
+            &cue_cloud_client::Tokens {
+                access,
+                refresh: env::var("BLUEY_CLOUD_REFRESH_TOKEN")
+                    .or_else(|_| env::var("CUE_CLOUD_REFRESH_TOKEN"))
+                    .unwrap_or_default(),
+                email: env::var("BLUEY_USER_ID")
+                    .or_else(|_| env::var("CUE_USER_ID"))
+                    .unwrap_or_else(|_| "env-token".to_string()),
+            },
+        )?;
+        return cue_cloud_client::CloudClient::new(config, Arc::new(store))
+            .map(Some)
+            .map_err(Into::into);
+    }
+
+    let client = cue_cloud_client::CloudClient::new(
+        config,
+        Arc::new(cue_cloud_client::tokens::KeyringStore::new()),
+    )?;
     if client.current_tokens().is_none() {
+        Ok(None)
+    } else {
+        Ok(Some(client))
+    }
+}
+
+fn cloud_client_or_message() -> Result<Option<cue_cloud_client::CloudClient>> {
+    match optional_cloud_client() {
+        Ok(client) => Ok(client),
+        Err(error) => {
+            eprintln!("bluey: cloud client init failed: {error}");
+            eprintln!("Run `bluey login` first if you have not already.");
+            Ok(None)
+        }
+    }
+}
+
+fn cloud_access_token_from_env() -> Option<String> {
+    env::var("BLUEY_CLOUD_TOKEN")
+        .ok()
+        .or_else(|| env::var("BLUEY_API_TOKEN").ok())
+        .or_else(|| env::var("CUE_CLOUD_TOKEN").ok())
+        .or_else(|| env::var("CUE_API_TOKEN").ok())
+        .filter(|token| !token.trim().is_empty())
+}
+
+async fn bluey_usage_cmd() -> Result<()> {
+    let Some(client) = cloud_client_or_message()? else {
         eprintln!("bluey: not logged in. Run `bluey login` first.");
         return Ok(());
-    }
+    };
     if let Err(e) = crate::bluey_cmds::show_usage(&client).await {
         eprintln!("bluey: usage failed: {e}");
     }
@@ -2334,17 +2556,10 @@ async fn bluey_usage_cmd() -> Result<()> {
 }
 
 async fn bluey_credits_cmd() -> Result<()> {
-    let client = match cue_cloud_client::CloudClient::with_default_keyring() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("bluey: cloud client init failed: {e}");
-            return Ok(());
-        }
-    };
-    if client.current_tokens().is_none() {
+    let Some(client) = cloud_client_or_message()? else {
         eprintln!("bluey: not logged in. Run `bluey login` first.");
         return Ok(());
-    }
+    };
     if let Err(e) = crate::bluey_cmds::show_credits(&client).await {
         eprintln!("bluey: credits failed: {e}");
     }
@@ -2352,12 +2567,9 @@ async fn bluey_credits_cmd() -> Result<()> {
 }
 
 async fn bluey_logout_cmd() -> Result<()> {
-    let client = match cue_cloud_client::CloudClient::with_default_keyring() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("bluey: cloud client init failed: {e}");
-            return Ok(());
-        }
+    let Some(client) = cloud_client_or_message()? else {
+        println!("Bluey is already logged out.");
+        return Ok(());
     };
     if let Err(e) = crate::bluey_cmds::logout(&client).await {
         eprintln!("bluey: logout failed: {e}");
@@ -2366,17 +2578,10 @@ async fn bluey_logout_cmd() -> Result<()> {
 }
 
 async fn bluey_portal_cmd() -> Result<()> {
-    let client = match cue_cloud_client::CloudClient::with_default_keyring() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("bluey: cloud client init failed: {e}");
-            return Ok(());
-        }
-    };
-    if client.current_tokens().is_none() {
+    let Some(client) = cloud_client_or_message()? else {
         eprintln!("bluey: not logged in. Run `bluey login` first.");
         return Ok(());
-    }
+    };
     if let Err(e) = crate::bluey_cmds::portal(&client).await {
         eprintln!("bluey: portal failed: {e}");
     }
@@ -2384,17 +2589,10 @@ async fn bluey_portal_cmd() -> Result<()> {
 }
 
 async fn bluey_export_cmd() -> Result<()> {
-    let client = match cue_cloud_client::CloudClient::with_default_keyring() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("bluey: cloud client init failed: {e}");
-            return Ok(());
-        }
-    };
-    if client.current_tokens().is_none() {
+    let Some(client) = cloud_client_or_message()? else {
         eprintln!("bluey: not logged in. Run `bluey login` first.");
         return Ok(());
-    }
+    };
     if let Err(e) = crate::bluey_cmds::export_data(&client).await {
         eprintln!("bluey: export failed: {e}");
     }
@@ -2402,19 +2600,31 @@ async fn bluey_export_cmd() -> Result<()> {
 }
 
 async fn bluey_delete_account_cmd(force: bool) -> Result<()> {
-    let client = match cue_cloud_client::CloudClient::with_default_keyring() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("bluey: cloud client init failed: {e}");
-            return Ok(());
-        }
-    };
-    if client.current_tokens().is_none() {
+    let Some(client) = cloud_client_or_message()? else {
         eprintln!("bluey: not logged in. Run `bluey login` first.");
         return Ok(());
-    }
+    };
     if let Err(e) = crate::bluey_cmds::delete_account(&client, force).await {
         eprintln!("bluey: delete-account failed: {e}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bluey_on_boot_lines;
+
+    #[test]
+    fn bluey_on_boot_lines_prompt_login_when_unlinked() {
+        let lines = bluey_on_boot_lines(false);
+        assert!(lines.iter().any(|line| line.contains("bluey login")));
+        assert!(lines.iter().any(|line| line.contains("previous sessions")));
+    }
+
+    #[test]
+    fn bluey_on_boot_lines_confirm_managed_ready_when_linked() {
+        let lines = bluey_on_boot_lines(true);
+        assert!(lines.iter().any(|line| line.contains("managed answers")));
+        assert!(!lines.iter().any(|line| line.contains("bluey login")));
+    }
 }

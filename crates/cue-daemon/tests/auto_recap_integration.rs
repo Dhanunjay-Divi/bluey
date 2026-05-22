@@ -24,6 +24,8 @@ impl LlmProvider for MockLlm {
                 &req.user[..req.user.len().min(40)]
             ),
             cost: None,
+            cost_label: None,
+            artifact: None,
         })
     }
 }

@@ -13,7 +13,8 @@ use cue_cloud_client::{
 use futures_util::StreamExt;
 
 use crate::{
-    LlmChunk, LlmChunkStream, LlmCostMetadata, LlmError, LlmProvider, LlmRequest, LlmResponse,
+    LlmArtifactMetadata, LlmChunk, LlmChunkStream, LlmCostMetadata, LlmError, LlmProvider,
+    LlmRequest, LlmResponse,
 };
 
 /// Codex Stage 9a (S5 round-2 nit): make managed local lane
@@ -95,9 +96,12 @@ impl LlmProvider for BlueyManagedProvider {
             .await
             .map_err(map_err)?;
         let cost = cost_from_response(&resp);
+        let artifact = artifact_from_response(&resp);
         Ok(LlmResponse {
             text: resp.text,
             cost: Some(cost),
+            cost_label: resp.cost_label,
+            artifact,
         })
     }
 
@@ -198,16 +202,24 @@ fn parse_managed_sse_frame(frame: &str, chunks: &mut Vec<Result<LlmChunk, LlmErr
             text: String::new(),
             finished: true,
             cost: None,
+            cost_label: None,
+            artifact: None,
         }));
         return;
     }
     if event == "billing" {
         match serde_json::from_str::<CloudCompleteResponse>(&data) {
-            Ok(resp) => chunks.push(Ok(LlmChunk {
-                text: String::new(),
-                finished: true,
-                cost: Some(cost_from_response(&resp)),
-            })),
+            Ok(resp) => {
+                let artifact = artifact_from_response(&resp);
+                let cost_label = resp.cost_label.clone();
+                chunks.push(Ok(LlmChunk {
+                    text: String::new(),
+                    finished: true,
+                    cost: Some(cost_from_response(&resp)),
+                    cost_label,
+                    artifact,
+                }));
+            }
             Err(e) => chunks.push(Err(LlmError::Provider(format!(
                 "managed billing SSE parse error: {e}"
             )))),
@@ -227,6 +239,8 @@ fn parse_managed_sse_frame(frame: &str, chunks: &mut Vec<Result<LlmChunk, LlmErr
                     text: delta.to_string(),
                     finished: false,
                     cost: None,
+                    cost_label: None,
+                    artifact: None,
                 }));
             }
         }
@@ -246,6 +260,14 @@ fn cost_from_response(resp: &CloudCompleteResponse) -> LlmCostMetadata {
         balance_cents_after: Some(resp.balance_cents_after),
         trial_seconds_remaining: Some(resp.trial_seconds_remaining),
     }
+}
+
+fn artifact_from_response(resp: &CloudCompleteResponse) -> Option<LlmArtifactMetadata> {
+    Some(LlmArtifactMetadata {
+        artifact_type: resp.artifact_type.clone()?,
+        body: resp.artifact_body.clone()?,
+        confidence: resp.confidence,
+    })
 }
 
 fn map_err(e: CloudError) -> LlmError {
@@ -285,7 +307,7 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}\n\n",
             "data: {\"choices\":[{\"delta\":{\"content\":\"world\"}}]}\n\n",
             "event: billing\n",
-            "data: {\"text\":\"Hello world\",\"provider\":\"openai\",\"model\":\"gpt-4o-mini\",\"input_tokens\":12,\"output_tokens\":7,\"cost_cents\":3,\"balance_cents_after\":2997,\"trial_seconds_remaining\":0}\n\n",
+            "data: {\"text\":\"Hello world\",\"provider\":\"openai\",\"model\":\"gpt-4o-mini\",\"input_tokens\":12,\"output_tokens\":7,\"cost_cents\":3,\"balance_cents_after\":2997,\"trial_seconds_remaining\":0,\"cost_label\":\"$0.03 · balance $29.97\",\"artifact_type\":\"code\",\"artifact_body\":\"CODE\\n----\\nfn main() {}\",\"confidence\":0.95}\n\n",
             "data: [DONE]\n\n",
         )
         .to_string();
@@ -305,6 +327,14 @@ mod tests {
         assert_eq!(cost.balance_cents_after, Some(2997));
         assert_eq!(cost.provider, "openai");
         assert_eq!(cost.model, "gpt-4o-mini");
+        assert_eq!(
+            chunks[2].cost_label.as_deref(),
+            Some("$0.03 · balance $29.97")
+        );
+        let artifact = chunks[2].artifact.as_ref().expect("artifact metadata");
+        assert_eq!(artifact.artifact_type, "code");
+        assert!(artifact.body.contains("fn main"));
+        assert_eq!(artifact.confidence, Some(0.95));
     }
 
     #[test]

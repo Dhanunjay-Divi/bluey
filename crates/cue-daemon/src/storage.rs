@@ -14,8 +14,7 @@ pub struct MeetingStore {
 impl MeetingStore {
     pub fn new(paths: &AppPaths) -> Result<Self> {
         let archive_dir = paths.data_dir.join("meetings");
-        fs::create_dir_all(&archive_dir)
-            .with_context(|| format!("failed to create {}", archive_dir.display()))?;
+        cue_core::app_paths::create_private_dir(&archive_dir)?;
         Ok(Self {
             active_file: paths.data_dir.join("active-meeting.json"),
             archive_dir,
@@ -34,16 +33,13 @@ impl MeetingStore {
     }
 
     pub fn save_active(&self, meeting: &MeetingRecord) -> Result<()> {
-        let bytes = serde_json::to_vec_pretty(meeting)?;
-        fs::write(&self.active_file, bytes)
-            .with_context(|| format!("failed to write {}", self.active_file.display()))
+        write_private_json(&self.active_file, meeting)
     }
 
     pub fn archive(&self, meeting: &MeetingRecord) -> Result<PathBuf> {
         let filename = format!("{}-{}.json", meeting.started_at, meeting.id);
         let path = self.archive_dir.join(filename);
-        let bytes = serde_json::to_vec_pretty(meeting)?;
-        fs::write(&path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
+        write_private_json(&path, meeting)?;
         let _ = fs::remove_file(&self.active_file);
         Ok(path)
     }
@@ -139,8 +135,7 @@ impl MeetingStore {
             .with_context(|| format!("meeting {id} not found"))?;
         let mut meeting = self.read_meeting(&path)?;
         meeting.title = title.to_string();
-        let bytes = serde_json::to_vec_pretty(&meeting)?;
-        fs::write(&path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
+        write_private_json(&path, &meeting)?;
         Ok(meeting)
     }
 
@@ -172,5 +167,80 @@ impl MeetingStore {
         let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
         serde_json::from_slice(&bytes)
             .with_context(|| format!("failed to parse {}", path.display()))
+    }
+}
+
+fn write_private_json(path: &Path, meeting: &MeetingRecord) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(meeting)?;
+    fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
+    set_private_file_permissions(path)
+}
+
+fn set_private_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to set private permissions on {}", path.display()))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn meeting_store_writes_private_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "bluey-meeting-store-perms-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = AppPaths {
+            data_dir: base.join("data"),
+            config_dir: base.join("config"),
+            runtime_dir: base.join("run"),
+            state_file: base.join("run/daemon-state.json"),
+            account_file: base.join("config/account.json"),
+            settings_file: base.join("config/settings.json"),
+        };
+        paths.ensure().expect("ensure paths");
+        let store = MeetingStore::new(&paths).expect("store");
+        let meeting = MeetingRecord::new(Some("Security permissions".to_string()));
+
+        store.save_active(&meeting).expect("save active");
+        let active_mode = fs::metadata(&store.active_file)
+            .expect("active metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(active_mode, 0o600);
+
+        let archive_path = store.archive(&meeting).expect("archive");
+        let archive_mode = fs::metadata(&archive_path)
+            .expect("archive metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(archive_mode, 0o600);
+
+        let archive_dir_mode = fs::metadata(&store.archive_dir)
+            .expect("archive dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(archive_dir_mode, 0o700);
+
+        let _ = fs::remove_dir_all(base);
     }
 }

@@ -49,3 +49,11 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 url = "2.5"
 wiremock = "0.6"
 obfstr = "0.4"
+
+[profile.release]
+# Client hardening / distribution posture:
+# strip symbol tables and use thin LTO so shipped binaries expose less
+# incidental implementation detail. This is friction, not a security boundary.
+strip = "symbols"
+lto = "thin"
+codegen-units = 1

@@ -29,7 +29,7 @@ pub use audio::{
     AudioPipelineStatus, AudioSourceConfig, AudioSourceKind, AudioSourcePlan, AudioSourceState,
     AudioSourceStatus, AudioStreamFormat, SttSegmentMetadata,
 };
-pub use cards::{CardKind, CueCard};
+pub use cards::{CardArtifactType, CardKind, CueCard, CueCardArtifact};
 pub use cloud::{
     ArtifactUploadMetadata, CloudAuthState, CloudDataScope, CloudDeviceId, CloudEndpointConfig,
     CloudEnvironment, CloudObjectKind, CloudSyncState, CloudSyncStatus, DeletionRequest,

@@ -47,6 +47,14 @@ pub struct CompleteResponse {
     pub cost_cents: i64,
     pub balance_cents_after: i64,
     pub trial_seconds_remaining: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
 }
 
 #[derive(Serialize, Default)]
@@ -350,6 +358,7 @@ async fn complete_inner(
         tracing::warn!(error = %e, "failed to record usage event");
     }
 
+    let artifact = response_artifact(&comp.text);
     let response = CompleteResponse {
         text: comp.text,
         provider: comp.provider,
@@ -359,6 +368,12 @@ async fn complete_inner(
         cost_cents: customer_cost,
         balance_cents_after: balance_after,
         trial_seconds_remaining: trial_remaining,
+        artifact_type: artifact
+            .as_ref()
+            .map(|artifact| artifact.artifact_type.to_string()),
+        artifact_body: artifact.as_ref().map(|artifact| artifact.body.clone()),
+        cost_label: Some(router_cost_label(customer_cost, balance_after)),
+        confidence: artifact.as_ref().map(|artifact| artifact.confidence),
     };
 
     // 9. Cache the terminal response in the idempotency row so a retry
@@ -394,6 +409,218 @@ async fn complete_inner(
     }
 
     Ok(response)
+}
+
+struct ResponseArtifact {
+    artifact_type: &'static str,
+    body: String,
+    confidence: f32,
+}
+
+fn response_artifact(text: &str) -> Option<ResponseArtifact> {
+    let body = text.trim();
+    if body.is_empty() {
+        return None;
+    }
+
+    let lower = body.to_lowercase();
+    let code_blocks = extract_fenced_code_blocks(body);
+    if !code_blocks.is_empty() || has_code_shape(&lower) {
+        return Some(ResponseArtifact {
+            artifact_type: "code",
+            body: format_code_artifact(body, &code_blocks),
+            confidence: if code_blocks.is_empty() { 0.74 } else { 0.95 },
+        });
+    }
+    if keyword_count(
+        &lower,
+        &[
+            "system design",
+            "architecture",
+            "api",
+            "database",
+            "cache",
+            "queue",
+            "scale",
+            "latency",
+            "throughput",
+            "tradeoff",
+            "load balancer",
+            "microservice",
+        ],
+    ) >= 3
+    {
+        return Some(ResponseArtifact {
+            artifact_type: "system_design",
+            body: format_structured_artifact(body, "System Design"),
+            confidence: 0.88,
+        });
+    }
+    if lower.contains("screenshot")
+        || lower.contains("screen context")
+        || lower.contains("analyse screen")
+        || lower.contains("analyze screen")
+        || lower.contains("image shows")
+    {
+        return Some(ResponseArtifact {
+            artifact_type: "screen",
+            body: format_structured_artifact(body, "Screen Context"),
+            confidence: 0.86,
+        });
+    }
+    if lower.contains("attached document")
+        || lower.contains("pdf")
+        || lower.contains("resume")
+        || lower.contains("document context")
+    {
+        return Some(ResponseArtifact {
+            artifact_type: "document",
+            body: format_structured_artifact(body, "Document Context"),
+            confidence: 0.78,
+        });
+    }
+    if body.chars().count() > 950 && has_structured_shape(body) {
+        return Some(ResponseArtifact {
+            artifact_type: "structured",
+            body: format_structured_artifact(body, "Details"),
+            confidence: 0.70,
+        });
+    }
+
+    None
+}
+
+fn router_cost_label(cost_cents: i64, balance_cents_after: i64) -> String {
+    format!(
+        "${:.2} · balance ${:.2}",
+        cost_cents as f64 / 100.0,
+        balance_cents_after as f64 / 100.0
+    )
+}
+
+fn keyword_count(text: &str, keywords: &[&str]) -> usize {
+    keywords
+        .iter()
+        .filter(|keyword| text.contains(**keyword))
+        .count()
+}
+
+fn has_code_shape(lower: &str) -> bool {
+    keyword_count(
+        lower,
+        &[
+            "class solution",
+            "def ",
+            "function ",
+            "const ",
+            "let ",
+            "public ",
+            "private ",
+            "time complexity",
+            "space complexity",
+            "test case",
+            "edge case",
+            "sql",
+        ],
+    ) >= 2
+}
+
+fn extract_fenced_code_blocks(text: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current = Vec::new();
+    let mut in_fence = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            if in_fence {
+                let block = current.join("\n").trim().to_string();
+                if !block.is_empty() {
+                    blocks.push(block);
+                }
+                current.clear();
+            }
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            current.push(line);
+        }
+    }
+    blocks
+}
+
+fn strip_fenced_code(text: &str) -> String {
+    let mut lines = Vec::new();
+    let mut in_fence = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if !in_fence {
+            lines.push(line);
+        }
+    }
+    lines.join("\n")
+}
+
+fn format_code_artifact(body: &str, code_blocks: &[String]) -> String {
+    let notes = strip_fenced_code(body).trim().to_string();
+    let mut sections = Vec::new();
+    if !code_blocks.is_empty() {
+        sections.push(format!(
+            "CODE\n----\n{}",
+            code_blocks.join("\n\n// ---\n\n")
+        ));
+    }
+    if !notes.is_empty() {
+        sections.push(format!("NOTES\n-----\n{notes}"));
+    }
+    if sections.is_empty() {
+        body.to_string()
+    } else {
+        sections.join("\n\n")
+    }
+}
+
+fn format_structured_artifact(body: &str, fallback_heading: &str) -> String {
+    let clean = body.trim();
+    if clean.starts_with('#')
+        || clean
+            .to_lowercase()
+            .starts_with(&fallback_heading.to_lowercase())
+    {
+        clean.to_string()
+    } else {
+        format!(
+            "{fallback_heading}\n{}\n{clean}",
+            "-".repeat(fallback_heading.len())
+        )
+    }
+}
+
+fn has_structured_shape(text: &str) -> bool {
+    text.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("- ")
+                || trimmed.starts_with("* ")
+                || trimmed.starts_with('#')
+                || numbered_list_prefix(trimmed)
+        })
+        .count()
+        >= 3
+}
+
+fn numbered_list_prefix(line: &str) -> bool {
+    let mut chars = line.chars().peekable();
+    let mut saw_digit = false;
+    while matches!(chars.peek(), Some(ch) if ch.is_ascii_digit()) {
+        saw_digit = true;
+        chars.next();
+    }
+    saw_digit
+        && matches!(chars.next(), Some('.' | ')'))
+        && matches!(chars.next(), Some(ch) if ch.is_whitespace())
 }
 
 fn response_to_sse_events(response: CompleteResponse) -> Vec<Event> {
@@ -917,4 +1144,37 @@ pub async fn transcribe(
     }
 
     Ok(Json(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_artifact_detects_code() {
+        let artifact = response_artifact(
+            "Use this implementation.\n```python\ndef solve():\n    return 42\n```\nTime Complexity: O(1)",
+        )
+        .expect("code artifact");
+
+        assert_eq!(artifact.artifact_type, "code");
+        assert!(artifact.body.contains("CODE\n----"));
+        assert!(artifact.body.contains("def solve()"));
+    }
+
+    #[test]
+    fn response_artifact_detects_system_design() {
+        let artifact = response_artifact(
+            "For this system design, use an API gateway, database, cache, queue, and load balancer to reduce latency at scale.",
+        )
+        .expect("system design artifact");
+
+        assert_eq!(artifact.artifact_type, "system_design");
+        assert!(artifact.confidence > 0.8);
+    }
+
+    #[test]
+    fn router_cost_label_includes_balance() {
+        assert_eq!(router_cost_label(7, 2993), "$0.07 · balance $29.93");
+    }
 }

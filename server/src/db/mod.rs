@@ -14,6 +14,7 @@ pub mod auth_tokens;
 pub mod balance;
 pub mod idempotency;
 pub mod link_codes;
+pub mod sync;
 pub mod usage;
 
 pub type DbPool = Pool<SqliteConnectionManager>;
@@ -216,6 +217,127 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_auth_link_codes_account
         ON auth_link_codes(account_id);
     "#,
+    // 0012 — cloud session sync + RAG foundation.
+    //
+    // SQLite keeps the dev/alpha server simple. The schema intentionally
+    // mirrors a future Postgres + pgvector layout: tenant key first,
+    // stable client ids, JSON metadata, and embedding vectors stored as a
+    // serialized array until pgvector lands.
+    r#"
+    CREATE TABLE IF NOT EXISTS cloud_sessions (
+        account_id          TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        session_id          TEXT NOT NULL,
+        title               TEXT NOT NULL,
+        status              TEXT NOT NULL DEFAULT 'active',
+        created_at_ms       INTEGER NOT NULL,
+        updated_at_ms       INTEGER NOT NULL,
+        last_active_at_ms   INTEGER,
+        answer_style        TEXT,
+        metadata_json       TEXT NOT NULL DEFAULT '{}',
+        deleted_at_ms       INTEGER,
+        PRIMARY KEY (account_id, session_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_cloud_sessions_account_updated
+        ON cloud_sessions(account_id, updated_at_ms DESC);
+
+    CREATE TABLE IF NOT EXISTS cloud_transcript_segments (
+        account_id          TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        segment_id          TEXT NOT NULL,
+        session_id          TEXT NOT NULL,
+        speaker             TEXT NOT NULL,
+        source              TEXT NOT NULL,
+        text                TEXT NOT NULL,
+        start_ms            INTEGER,
+        end_ms              INTEGER,
+        ts_ms               INTEGER NOT NULL,
+        is_final            INTEGER NOT NULL DEFAULT 1,
+        metadata_json       TEXT NOT NULL DEFAULT '{}',
+        PRIMARY KEY (account_id, segment_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_cloud_transcript_session_ts
+        ON cloud_transcript_segments(account_id, session_id, ts_ms);
+
+    CREATE TABLE IF NOT EXISTS cloud_cue_responses (
+        account_id              TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        response_id             TEXT NOT NULL,
+        session_id              TEXT NOT NULL,
+        kind                    TEXT NOT NULL,
+        text                    TEXT NOT NULL,
+        source_text             TEXT,
+        ts_ms                   INTEGER NOT NULL,
+        provider                TEXT,
+        model                   TEXT,
+        lane                    TEXT,
+        task_type               TEXT,
+        cost_cents              INTEGER,
+        balance_cents_after     INTEGER,
+        cost_label              TEXT,
+        artifact_type           TEXT,
+        artifact_body           TEXT,
+        artifact_confidence     REAL,
+        metadata_json           TEXT NOT NULL DEFAULT '{}',
+        PRIMARY KEY (account_id, response_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_cloud_responses_session_ts
+        ON cloud_cue_responses(account_id, session_id, ts_ms);
+
+    CREATE TABLE IF NOT EXISTS cloud_context_artifacts (
+        account_id          TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        artifact_id         TEXT NOT NULL,
+        session_id          TEXT NOT NULL,
+        kind                TEXT NOT NULL,
+        title               TEXT NOT NULL,
+        note                TEXT,
+        source_uri          TEXT,
+        content_hash        TEXT,
+        text_preview        TEXT,
+        created_at_ms       INTEGER NOT NULL,
+        metadata_json       TEXT NOT NULL DEFAULT '{}',
+        PRIMARY KEY (account_id, artifact_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_cloud_context_session
+        ON cloud_context_artifacts(account_id, session_id);
+
+    CREATE TABLE IF NOT EXISTS cloud_rag_chunks (
+        account_id          TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        chunk_id            TEXT NOT NULL,
+        session_id          TEXT,
+        source_kind         TEXT NOT NULL,
+        source_id           TEXT NOT NULL,
+        chunk_index         INTEGER NOT NULL,
+        text                TEXT NOT NULL,
+        embedding_json      TEXT,
+        embedding_model     TEXT,
+        token_count         INTEGER,
+        content_hash        TEXT,
+        updated_at_ms       INTEGER NOT NULL,
+        metadata_json       TEXT NOT NULL DEFAULT '{}',
+        PRIMARY KEY (account_id, chunk_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_cloud_rag_account_source
+        ON cloud_rag_chunks(account_id, source_kind, source_id);
+    CREATE INDEX IF NOT EXISTS idx_cloud_rag_session
+        ON cloud_rag_chunks(account_id, session_id);
+
+    CREATE TABLE IF NOT EXISTS stt_sessions (
+        session_token       TEXT PRIMARY KEY,
+        account_id          TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        bluey_session_id    TEXT NOT NULL,
+        provider            TEXT NOT NULL,
+        model               TEXT NOT NULL,
+        source              TEXT NOT NULL,
+        mode                TEXT NOT NULL,
+        max_seconds         INTEGER NOT NULL,
+        created_at_ms       INTEGER NOT NULL,
+        expires_at_ms       INTEGER NOT NULL,
+        consumed_seconds    INTEGER NOT NULL DEFAULT 0,
+        started_at_ms       INTEGER,
+        ended_at_ms         INTEGER,
+        relay_close_reason  TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_stt_sessions_account_exp
+        ON stt_sessions(account_id, expires_at_ms);
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -224,6 +346,26 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
         conn.execute_batch(sql)
             .with_context(|| format!("migration {} failed", i + 1))?;
     }
+    ensure_column(&conn, "stt_sessions", "started_at_ms", "INTEGER")?;
+    ensure_column(&conn, "stt_sessions", "ended_at_ms", "INTEGER")?;
+    ensure_column(&conn, "stt_sessions", "relay_close_reason", "TEXT")?;
     tracing::info!(count = MIGRATIONS.len(), "migrations applied");
+    Ok(())
+}
+
+fn ensure_column(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let exists = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .filter_map(|row| row.ok())
+        .any(|name| name == column);
+    if !exists {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition};"))?;
+    }
     Ok(())
 }

@@ -35,6 +35,10 @@ pub struct LlmResponse {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<LlmCostMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<LlmArtifactMetadata>,
 }
 
 /// A single chunk from a streaming LLM completion.
@@ -43,6 +47,8 @@ pub struct LlmChunk {
     pub text: String,
     pub finished: bool,
     pub cost: Option<LlmCostMetadata>,
+    pub cost_label: Option<String>,
+    pub artifact: Option<LlmArtifactMetadata>,
 }
 
 /// Billing/provider metadata returned by managed Bluey requests.
@@ -59,6 +65,19 @@ pub struct LlmCostMetadata {
     pub cost_cents: i64,
     pub balance_cents_after: Option<i64>,
     pub trial_seconds_remaining: Option<i64>,
+}
+
+/// Structured artifact metadata returned by managed Bluey.
+///
+/// The server is the source of truth for these fields once requests route
+/// through bluey-server. Local/direct providers can leave this as `None`; the
+/// overlay may still infer a canvas shape as a fallback for non-managed paths.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LlmArtifactMetadata {
+    pub artifact_type: String,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
 }
 
 #[derive(Debug, Error)]
@@ -108,6 +127,8 @@ pub trait LlmProvider: Send + Sync {
                 text: resp.text,
                 finished: true,
                 cost: resp.cost,
+                cost_label: resp.cost_label,
+                artifact: resp.artifact,
             })
         })))
     }

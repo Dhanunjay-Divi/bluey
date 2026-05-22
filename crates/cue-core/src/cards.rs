@@ -16,6 +16,25 @@ pub enum CardKind {
     System,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CardArtifactType {
+    Code,
+    SystemDesign,
+    Screen,
+    Document,
+    Structured,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CueCardArtifact {
+    #[serde(rename = "artifact_type")]
+    pub artifact_type: CardArtifactType,
+    pub title: String,
+    pub body: String,
+    pub confidence: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CueCard {
     pub id: Uuid,
@@ -26,6 +45,8 @@ pub struct CueCard {
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<CueCardArtifact>,
 }
 
 impl CueCard {
@@ -38,6 +59,7 @@ impl CueCard {
             created_at: clock::now_epoch_ms_string(),
             source: None,
             cost_label: None,
+            artifact: None,
         }
     }
 
@@ -48,6 +70,11 @@ impl CueCard {
 
     pub fn with_cost_label(mut self, label: impl Into<String>) -> Self {
         self.cost_label = Some(label.into());
+        self
+    }
+
+    pub fn with_artifact(mut self, artifact: CueCardArtifact) -> Self {
+        self.artifact = Some(artifact);
         self
     }
 }

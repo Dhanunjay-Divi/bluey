@@ -70,12 +70,26 @@ private struct CueCard: Decodable {
     let createdAt: String?
     let source: String?
     let costLabel: String?
+    let artifact: OverlayArtifact?
 
     enum CodingKeys: String, CodingKey {
         case id, kind, title, body
         case createdAt = "created_at"
         case source
         case costLabel = "cost_label"
+        case artifact
+    }
+}
+
+private struct OverlayArtifact: Decodable {
+    let artifactType: String
+    let title: String
+    let body: String
+    let confidence: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case artifactType = "artifact_type"
+        case title, body, confidence
     }
 }
 
@@ -107,7 +121,7 @@ private enum OverlayCommand {
     case setContextItems([OverlayContextItem])
     case setSessions([OverlaySessionItem])
     case pushCard(CueCard)
-    case updateCard(id: String, body: String, done: Bool, costLabel: String?)
+    case updateCard(id: String, body: String, done: Bool, costLabel: String?, artifact: OverlayArtifact?)
     case shutdown
     case unknown(String)
 }
@@ -172,7 +186,12 @@ private func parseCommand(_ line: String) -> OverlayCommand {
         let body = obj["body"] as? String ?? ""
         let done = obj["done"] as? Bool ?? false
         let costLabel = obj["cost_label"] as? String
-        return .updateCard(id: id, body: body, done: done, costLabel: costLabel)
+        var artifact: OverlayArtifact?
+        if let artifactObj = obj["artifact"] as? [String: Any],
+           let artifactData = try? JSONSerialization.data(withJSONObject: artifactObj) {
+            artifact = try? JSONDecoder().decode(OverlayArtifact.self, from: artifactData)
+        }
+        return .updateCard(id: id, body: body, done: done, costLabel: costLabel, artifact: artifact)
     default:
         return .unknown(line)
     }
@@ -195,6 +214,13 @@ private func argumentFlag(_ name: String) -> Bool {
     CommandLine.arguments.contains(name)
 }
 
+private func envFlag(_ name: String) -> Bool {
+    let raw = ProcessInfo.processInfo.environment[name]?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .lowercased()
+    return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
+}
+
 private let sessionToken: String = ProcessInfo.processInfo
     .environment["BLUEY_OVERLAY_SESSION_TOKEN"]
     ?? argumentValue("--bluey-overlay-session-token")
@@ -208,13 +234,11 @@ private var ipcInputHandle: FileHandle?
 private var ipcOutputHandle: FileHandle = FileHandle.standardOutput
 
 private let captureVisibleForDebug: Bool = {
-    if argumentFlag("--bluey-overlay-capture-visible") {
-        return true
-    }
-    let raw = ProcessInfo.processInfo.environment["BLUEY_OVERLAY_CAPTURE_VISIBLE"]?
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-        .lowercased()
-    return raw == "1" || raw == "true" || raw == "yes" || raw == "on"
+    let devEnabled = argumentFlag("--bluey-dev-overlay") || envFlag("BLUEY_DEV_OVERLAY")
+    guard devEnabled else { return false }
+    return argumentFlag("--bluey-overlay-capture-visible")
+        || envFlag("BLUEY_OVERLAY_CAPTURE_VISIBLE")
+        || envFlag("BLUEY_HOST_OVERLAY_CAPTURE_VISIBLE")
 }()
 
 private func connectUnixSocket(path: String) -> Int32? {
@@ -352,8 +376,8 @@ private final class OverlayWindow: NSWindow {
         ]
         self.isMovableByWindowBackground = draggable
         self.hidesOnDeactivate = false
-        // Production keeps the overlay out of screen capture. UI review can
-        // opt in to capture-visible rendering with BLUEY_OVERLAY_CAPTURE_VISIBLE=1.
+        // Production keeps the overlay out of screen capture. Capture-visible
+        // QA is dev-gated and must never be enabled in customer launch paths.
         self.sharingType = captureVisibleForDebug ? .readOnly : .none
     }
 
@@ -550,12 +574,70 @@ private struct RenderedCard {
     var body: String
     var done: Bool
     var costLabel: String?
+    var artifact: OverlayArtifact?
+}
+
+private enum CanvasKind {
+    case code
+    case systemDesign
+    case screen
+    case document
+    case structured
+
+    static func fromArtifactType(_ value: String) -> CanvasKind {
+        switch value {
+        case "code": return .code
+        case "system_design": return .systemDesign
+        case "screen": return .screen
+        case "document": return .document
+        default: return .structured
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .code: return "Code canvas"
+        case .systemDesign: return "System design canvas"
+        case .screen: return "Screen analysis"
+        case .document: return "Document notes"
+        case .structured: return "Workspace"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .code: return "Code, tests, complexity"
+        case .systemDesign: return "Architecture, tradeoffs, scale"
+        case .screen: return "Screen context and answer"
+        case .document: return "Attached context notes"
+        case .structured: return "Structured workspace"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .code: return "curlybraces"
+        case .systemDesign: return "square.stack.3d.up"
+        case .screen: return "rectangle.and.text.magnifyingglass"
+        case .document: return "doc.text"
+        case .structured: return "sidebar.right"
+        }
+    }
+}
+
+private struct CanvasArtifact {
+    let kind: CanvasKind
+    let title: String
+    let subtitle: String
+    let content: String
+    let sourceCardId: String
 }
 
 private final class FeedView: NSView {
     private var cards: [RenderedCard] = []
     private let stack = NSStackView()
     private let scroll = NSScrollView()
+    private let emptyState = NSView()
     var onTranscript: ((RenderedCard) -> Void)?
 
     override init(frame frameRect: NSRect) {
@@ -577,6 +659,7 @@ private final class FeedView: NSView {
         scroll.documentView = stack
         scroll.translatesAutoresizingMaskIntoConstraints = false
         addSubview(scroll)
+        configureEmptyState()
         NSLayoutConstraint.activate([
             scroll.topAnchor.constraint(equalTo: topAnchor),
             scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -589,6 +672,7 @@ private final class FeedView: NSView {
 
     func push(_ card: RenderedCard) {
         cards.append(card)
+        emptyState.isHidden = true
         let view = makeCardView(card)
         stack.addArrangedSubview(view)
         view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
@@ -599,12 +683,16 @@ private final class FeedView: NSView {
         emitCardRendered(id: card.id)
     }
 
-    func update(id: String, body: String, done: Bool, costLabel: String?) {
-        guard let idx = cards.firstIndex(where: { $0.id == id }) else { return }
+    @discardableResult
+    func update(id: String, body: String, done: Bool, costLabel: String?, artifact: OverlayArtifact?) -> RenderedCard? {
+        guard let idx = cards.firstIndex(where: { $0.id == id }) else { return nil }
         cards[idx].body = body
         cards[idx].done = done
         if let costLabel {
             cards[idx].costLabel = costLabel
+        }
+        if let artifact {
+            cards[idx].artifact = artifact
         }
         // Replace the corresponding subview.
         let existing = stack.arrangedSubviews[idx]
@@ -617,11 +705,92 @@ private final class FeedView: NSView {
         if cards[idx].kind == "transcript" {
             onTranscript?(cards[idx])
         }
+        return cards[idx]
     }
 
     func clear() {
         cards.removeAll()
         for v in stack.arrangedSubviews { v.removeFromSuperview() }
+        emptyState.isHidden = false
+    }
+
+    private func configureEmptyState() {
+        emptyState.translatesAutoresizingMaskIntoConstraints = false
+        emptyState.wantsLayer = true
+        emptyState.layer?.backgroundColor = NSColor.clear.cgColor
+        addSubview(emptyState)
+
+        let badge = NSTextField(labelWithString: "READY")
+        badge.translatesAutoresizingMaskIntoConstraints = false
+        badge.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .bold)
+        badge.textColor = BlueyTheme.cyan
+
+        let title = NSTextField(labelWithString: "New recording")
+        title.translatesAutoresizingMaskIntoConstraints = false
+        title.font = NSFont.systemFont(ofSize: 22, weight: .bold)
+        title.textColor = BlueyTheme.text
+        title.alignment = .center
+
+        let subtitle = NSTextField(labelWithString: "Audio, files, screen context, and answers stay in this session.")
+        subtitle.translatesAutoresizingMaskIntoConstraints = false
+        subtitle.font = NSFont.systemFont(ofSize: 12.5, weight: .medium)
+        subtitle.textColor = BlueyTheme.textDim
+        subtitle.alignment = .center
+        subtitle.maximumNumberOfLines = 2
+        subtitle.lineBreakMode = .byWordWrapping
+
+        let chips = NSStackView()
+        chips.translatesAutoresizingMaskIntoConstraints = false
+        chips.orientation = .horizontal
+        chips.alignment = .centerY
+        chips.spacing = 8
+        for label in ["Audio", "Files", "Screen", "Canvas"] {
+            chips.addArrangedSubview(emptyChip(label))
+        }
+
+        emptyState.addSubview(badge)
+        emptyState.addSubview(title)
+        emptyState.addSubview(subtitle)
+        emptyState.addSubview(chips)
+
+        NSLayoutConstraint.activate([
+            emptyState.centerXAnchor.constraint(equalTo: centerXAnchor),
+            emptyState.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -12),
+            emptyState.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.76),
+
+            badge.topAnchor.constraint(equalTo: emptyState.topAnchor),
+            badge.centerXAnchor.constraint(equalTo: emptyState.centerXAnchor),
+
+            title.topAnchor.constraint(equalTo: badge.bottomAnchor, constant: 8),
+            title.leadingAnchor.constraint(equalTo: emptyState.leadingAnchor),
+            title.trailingAnchor.constraint(equalTo: emptyState.trailingAnchor),
+
+            subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 8),
+            subtitle.leadingAnchor.constraint(equalTo: emptyState.leadingAnchor),
+            subtitle.trailingAnchor.constraint(equalTo: emptyState.trailingAnchor),
+
+            chips.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 16),
+            chips.centerXAnchor.constraint(equalTo: emptyState.centerXAnchor),
+            chips.bottomAnchor.constraint(equalTo: emptyState.bottomAnchor),
+        ])
+    }
+
+    private func emptyChip(_ text: String) -> NSView {
+        let chip = NSTextField(labelWithString: text)
+        chip.translatesAutoresizingMaskIntoConstraints = false
+        chip.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+        chip.textColor = BlueyTheme.textDim
+        chip.alignment = .center
+        chip.wantsLayer = true
+        chip.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.035).cgColor
+        chip.layer?.cornerRadius = 10
+        chip.layer?.borderWidth = 1
+        chip.layer?.borderColor = BlueyTheme.hairline.cgColor
+        NSLayoutConstraint.activate([
+            chip.heightAnchor.constraint(equalToConstant: 24),
+            chip.widthAnchor.constraint(greaterThanOrEqualToConstant: 58),
+        ])
+        return chip
     }
 
     private func makeCardView(_ card: RenderedCard) -> NSView {
@@ -659,7 +828,8 @@ private final class FeedView: NSView {
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         titleLabel.lineBreakMode = .byTruncatingTail
 
-        let bodyText = card.body.isEmpty && !card.done ? "Thinking..." : card.body
+        let rawBody = card.body.isEmpty && !card.done ? "Thinking..." : card.body
+        let bodyText = chatBody(for: card, rawBody: rawBody)
         let bodyLabel = NSTextField(wrappingLabelWithString: bodyText)
         bodyLabel.font = bodyFont(for: card)
         bodyLabel.textColor = rightAligned ? NSColor.black : BlueyTheme.text
@@ -742,10 +912,70 @@ private final class FeedView: NSView {
     }
 
     private func bodyFont(for card: RenderedCard) -> NSFont {
-        if card.kind == "answer", card.body.contains("```") {
-            return NSFont.monospacedSystemFont(ofSize: 12.5, weight: .regular)
-        }
         return NSFont.systemFont(ofSize: 13.5, weight: .regular)
+    }
+
+    private func chatBody(for card: RenderedCard, rawBody: String) -> String {
+        guard card.kind == "answer" else { return rawBody }
+
+        if let artifact = card.artifact {
+            if artifact.artifactType == "code" {
+                let notes = stripFencedCode(from: rawBody)
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                return notes.isEmpty
+                    ? "I opened the code in the canvas."
+                    : notes + "\n\nCode opened in the canvas."
+            }
+            if rawBody.count > 1_100 {
+                let prefix = String(rawBody.prefix(720))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                return prefix + "\n\nFull \(artifact.title.lowercased()) opened in the canvas."
+            }
+        }
+
+        if rawBody.contains("```") {
+            let notes = stripFencedCode(from: rawBody)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if notes.isEmpty {
+                return "I opened the code in the canvas."
+            }
+            return notes + "\n\nCode opened in the canvas."
+        }
+
+        if rawBody.count > 1_100 && hasStructuredShape(rawBody) {
+            let prefix = String(rawBody.prefix(720))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return prefix + "\n\nFull structured version opened in the canvas."
+        }
+
+        return rawBody
+    }
+
+    private func stripFencedCode(from text: String) -> String {
+        var lines: [String] = []
+        var inFence = false
+        for line in text.components(separatedBy: .newlines) {
+            if line.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
+                inFence.toggle()
+                continue
+            }
+            if !inFence {
+                lines.append(line)
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func hasStructuredShape(_ text: String) -> Bool {
+        let lines = text.components(separatedBy: .newlines)
+        let structured = lines.filter { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            return trimmed.hasPrefix("- ")
+                || trimmed.hasPrefix("* ")
+                || trimmed.hasPrefix("#")
+                || trimmed.range(of: #"^\d+[\.\)]\s"#, options: .regularExpression) != nil
+        }
+        return structured.count >= 3
     }
 
     private func statusText(for card: RenderedCard) -> String {
@@ -782,15 +1012,151 @@ private final class FeedView: NSView {
     }
 }
 
+// MARK: - Canvas pane
+
+private final class CanvasPaneView: NSView {
+    private let header = NSView()
+    private let iconView = NSImageView()
+    private let titleLabel = NSTextField(labelWithString: "Workspace")
+    private let subtitleLabel = NSTextField(labelWithString: "Structured output appears here")
+    private let closeButton = NSButton(title: "", target: nil, action: nil)
+    private let scroll = NSScrollView()
+    private let textView = NSTextView()
+
+    var onCollapse: (() -> Void)?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor(red: 0.020, green: 0.024, blue: 0.031, alpha: 0.98).cgColor
+        layer?.cornerRadius = 16
+        layer?.borderWidth = 1
+        layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.22).cgColor
+
+        header.translatesAutoresizingMaskIntoConstraints = false
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        closeButton.translatesAutoresizingMaskIntoConstraints = false
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(header)
+        header.addSubview(iconView)
+        header.addSubview(titleLabel)
+        header.addSubview(subtitleLabel)
+        header.addSubview(closeButton)
+        addSubview(scroll)
+
+        iconView.imageScaling = .scaleProportionallyDown
+        iconView.contentTintColor = BlueyTheme.cyan
+
+        titleLabel.font = NSFont.systemFont(ofSize: 12.5, weight: .bold)
+        titleLabel.textColor = BlueyTheme.text
+        subtitleLabel.font = NSFont.systemFont(ofSize: 10.5, weight: .medium)
+        subtitleLabel.textColor = BlueyTheme.textDim
+        subtitleLabel.lineBreakMode = .byTruncatingTail
+
+        closeButton.isBordered = false
+        closeButton.wantsLayer = true
+        closeButton.layer?.cornerRadius = 12
+        closeButton.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.035).cgColor
+        closeButton.layer?.borderWidth = 1
+        closeButton.layer?.borderColor = BlueyTheme.hairline.cgColor
+        closeButton.contentTintColor = BlueyTheme.textDim
+        if let image = symbolImage("chevron.right") {
+            image.isTemplate = true
+            closeButton.image = image
+            closeButton.imagePosition = .imageOnly
+        } else {
+            closeButton.title = "<"
+        }
+        closeButton.toolTip = "Collapse canvas"
+        closeButton.target = self
+        closeButton.action = #selector(collapseClicked)
+
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.drawsBackground = false
+        textView.textColor = BlueyTheme.text
+        textView.font = NSFont.monospacedSystemFont(ofSize: 12.2, weight: .regular)
+        textView.textContainerInset = NSSize(width: 12, height: 12)
+        textView.isHorizontallyResizable = true
+        textView.isVerticallyResizable = true
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = false
+        textView.textContainer?.containerSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude)
+
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.borderType = .noBorder
+        scroll.documentView = textView
+        scroll.scrollerStyle = .overlay
+
+        NSLayoutConstraint.activate([
+            header.topAnchor.constraint(equalTo: topAnchor, constant: 12),
+            header.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            header.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
+            header.heightAnchor.constraint(equalToConstant: 48),
+
+            iconView.leadingAnchor.constraint(equalTo: header.leadingAnchor),
+            iconView.topAnchor.constraint(equalTo: header.topAnchor, constant: 3),
+            iconView.widthAnchor.constraint(equalToConstant: 22),
+            iconView.heightAnchor.constraint(equalToConstant: 22),
+
+            closeButton.trailingAnchor.constraint(equalTo: header.trailingAnchor),
+            closeButton.topAnchor.constraint(equalTo: header.topAnchor),
+            closeButton.widthAnchor.constraint(equalToConstant: 26),
+            closeButton.heightAnchor.constraint(equalToConstant: 26),
+
+            titleLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
+            titleLabel.topAnchor.constraint(equalTo: header.topAnchor),
+            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: closeButton.leadingAnchor, constant: -8),
+
+            subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            subtitleLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 3),
+            subtitleLabel.trailingAnchor.constraint(equalTo: header.trailingAnchor),
+
+            scroll.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 8),
+            scroll.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            scroll.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            scroll.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func render(_ artifact: CanvasArtifact) {
+        titleLabel.stringValue = artifact.title
+        subtitleLabel.stringValue = artifact.subtitle
+        if let image = symbolImage(artifact.kind.icon) {
+            image.isTemplate = true
+            iconView.image = image
+        }
+        textView.string = artifact.content
+        textView.scrollRangeToVisible(NSRange(location: 0, length: 0))
+    }
+
+    @objc private func collapseClicked() {
+        onCollapse?()
+    }
+}
+
 // MARK: - Expanded panel (feed + composer)
 
 private final class ExpandedPanelView: NSView {
     let feed: FeedView
+    let workspace: NSView
+    let canvasPane: CanvasPaneView
     let headerBar: NSView
     let titleLabel: NSTextField
     let statusLabel: NSTextField
     let modelMenu: NSPopUpButton
     let balanceLabel: NSTextField
+    let canvasToggleButton: NSButton
     let navButton: NSButton
     let newSessionButton: NSButton
     let sessionDrawer: NSView
@@ -813,22 +1179,40 @@ private final class ExpandedPanelView: NSView {
     let analyzeButton: NSButton
     let attachButton: NSButton
     let instructionsButton: NSButton
+    let opacityControl: NSView
+    let opacityLabel: NSTextField
+    let opacitySlider: NSSlider
+    let opacityValueLabel: NSTextField
+    let hideButton: NSButton
     let closeButton: NSButton
+    let closeConfirmOverlay: NSView
+    let closeConfirmPanel: NSView
+    let closeConfirmTitle: NSTextField
+    let closeConfirmBody: NSTextField
+    let closeConfirmCancelButton: NSButton
+    let closeConfirmTurnOffButton: NSButton
 
     var onClose: (() -> Void)?
+    var onOpacityChanged: ((Double) -> Void)?
     private var recordingActive = false
     private var transcriptSnippets: [String] = []
     private var sessionItems: [OverlaySessionItem] = []
     private var editingSessionId: String?
     private var renameField: NSTextField?
+    private var canvasWidthConstraint: NSLayoutConstraint?
+    private var latestCanvas: CanvasArtifact?
+    private var canvasOpen = false
 
     override init(frame frameRect: NSRect) {
         feed = FeedView(frame: .zero)
+        workspace = NSView()
+        canvasPane = CanvasPaneView(frame: .zero)
         headerBar = NSView()
         titleLabel = NSTextField(labelWithString: "Bluey")
         statusLabel = NSTextField(labelWithString: "New recording")
         modelMenu = NSPopUpButton(frame: .zero, pullsDown: false)
         balanceLabel = NSTextField(labelWithString: "Balance --")
+        canvasToggleButton = NSButton(title: "", target: nil, action: nil)
         navButton = NSButton(title: "", target: nil, action: nil)
         newSessionButton = NSButton(title: "", target: nil, action: nil)
         sessionDrawer = NSView()
@@ -841,17 +1225,28 @@ private final class ExpandedPanelView: NSView {
         answerStyleBox = NSTextField()
         answerStyleSaveButton = NSButton(title: "Save", target: nil, action: nil)
         transcriptStrip = NSView()
-        transcriptLabel = NSTextField(labelWithString: "Transcript will appear here while you listen")
+        transcriptLabel = NSTextField(labelWithString: "Live captions preview")
         attachmentStrip = NSScrollView()
         attachmentStack = NSStackView()
         composerBar = NSView()
         composer = NSTextField()
-        recordingButton = NSButton(title: "Listen", target: nil, action: nil)
+        recordingButton = NSButton(title: "Start Bluey", target: nil, action: nil)
         askButton = NSButton(title: "Answer", target: nil, action: nil)
-        analyzeButton = NSButton(title: "", target: nil, action: nil)
-        attachButton = NSButton(title: "", target: nil, action: nil)
-        instructionsButton = NSButton(title: "", target: nil, action: nil)
+        analyzeButton = NSButton(title: "Screen", target: nil, action: nil)
+        attachButton = NSButton(title: "Docs", target: nil, action: nil)
+        instructionsButton = NSButton(title: "Style", target: nil, action: nil)
+        opacityControl = NSView()
+        opacityLabel = NSTextField(labelWithString: "Opacity")
+        opacitySlider = NSSlider(value: 0.94, minValue: 0.50, maxValue: 1.0, target: nil, action: nil)
+        opacityValueLabel = NSTextField(labelWithString: "94%")
+        hideButton = NSButton(title: "", target: nil, action: nil)
         closeButton = NSButton(title: "x", target: nil, action: nil)
+        closeConfirmOverlay = NSView()
+        closeConfirmPanel = NSView()
+        closeConfirmTitle = NSTextField(labelWithString: "Turn Bluey off?")
+        closeConfirmBody = NSTextField(wrappingLabelWithString: "This closes Bluey completely. To start again, run: bluey on")
+        closeConfirmCancelButton = NSButton(title: "Cancel", target: nil, action: nil)
+        closeConfirmTurnOffButton = NSButton(title: "Turn Off", target: nil, action: nil)
 
         super.init(frame: frameRect)
 
@@ -864,6 +1259,7 @@ private final class ExpandedPanelView: NSView {
         configureHeader()
         configureContextRows()
         configureComposer()
+        configureCloseConfirm()
         styleDrawer()
         feed.onTranscript = { [weak self] card in
             self?.appendTranscriptSnippet(card)
@@ -875,6 +1271,7 @@ private final class ExpandedPanelView: NSView {
             statusLabel,
             modelMenu,
             balanceLabel,
+            canvasToggleButton,
             navButton,
             newSessionButton,
             sessionDrawer,
@@ -886,7 +1283,9 @@ private final class ExpandedPanelView: NSView {
             answerStyleLabel,
             answerStyleBox,
             answerStyleSaveButton,
+            workspace,
             feed,
+            canvasPane,
             transcriptStrip,
             transcriptLabel,
             attachmentStrip,
@@ -898,7 +1297,18 @@ private final class ExpandedPanelView: NSView {
             analyzeButton,
             attachButton,
             instructionsButton,
+            opacityControl,
+            opacityLabel,
+            opacitySlider,
+            opacityValueLabel,
+            hideButton,
             closeButton,
+            closeConfirmOverlay,
+            closeConfirmPanel,
+            closeConfirmTitle,
+            closeConfirmBody,
+            closeConfirmCancelButton,
+            closeConfirmTurnOffButton,
         ] {
             view.translatesAutoresizingMaskIntoConstraints = false
         }
@@ -906,10 +1316,14 @@ private final class ExpandedPanelView: NSView {
         headerBar.addSubview(navButton)
         headerBar.addSubview(newSessionButton)
         headerBar.addSubview(modelMenu)
+        headerBar.addSubview(canvasToggleButton)
         headerBar.addSubview(balanceLabel)
+        headerBar.addSubview(hideButton)
         headerBar.addSubview(closeButton)
         addSubview(headerBar)
-        addSubview(feed)
+        addSubview(workspace)
+        workspace.addSubview(feed)
+        workspace.addSubview(canvasPane)
         addSubview(sessionDrawer)
         sessionDrawer.addSubview(drawerTitleLabel)
         sessionDrawer.addSubview(drawerSubtitleLabel)
@@ -923,11 +1337,24 @@ private final class ExpandedPanelView: NSView {
         addSubview(attachmentStrip)
         addSubview(composerBar)
         composerBar.addSubview(recordingButton)
+        composerBar.addSubview(opacityControl)
+        opacityControl.addSubview(opacityLabel)
+        opacityControl.addSubview(opacitySlider)
+        opacityControl.addSubview(opacityValueLabel)
         composerBar.addSubview(composer)
         composerBar.addSubview(attachButton)
         composerBar.addSubview(instructionsButton)
         composerBar.addSubview(analyzeButton)
         composerBar.addSubview(askButton)
+        addSubview(closeConfirmOverlay)
+        closeConfirmOverlay.addSubview(closeConfirmPanel)
+        closeConfirmPanel.addSubview(closeConfirmTitle)
+        closeConfirmPanel.addSubview(closeConfirmBody)
+        closeConfirmPanel.addSubview(closeConfirmCancelButton)
+        closeConfirmPanel.addSubview(closeConfirmTurnOffButton)
+
+        let canvasWidth = canvasPane.widthAnchor.constraint(equalToConstant: 0)
+        canvasWidthConstraint = canvasWidth
 
         NSLayoutConstraint.activate([
             headerBar.topAnchor.constraint(equalTo: topAnchor, constant: 10),
@@ -955,16 +1382,38 @@ private final class ExpandedPanelView: NSView {
             closeButton.widthAnchor.constraint(equalToConstant: 26),
             closeButton.heightAnchor.constraint(equalToConstant: 26),
 
-            balanceLabel.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
-            balanceLabel.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -8),
-            balanceLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 86),
-            balanceLabel.heightAnchor.constraint(equalToConstant: 26),
-            modelMenu.trailingAnchor.constraint(lessThanOrEqualTo: balanceLabel.leadingAnchor, constant: -10),
+            hideButton.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
+            hideButton.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -6),
+            hideButton.widthAnchor.constraint(equalToConstant: 26),
+            hideButton.heightAnchor.constraint(equalToConstant: 26),
 
-            feed.topAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: 8),
-            feed.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            feed.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            feed.bottomAnchor.constraint(equalTo: transcriptStrip.topAnchor, constant: -8),
+            balanceLabel.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
+            balanceLabel.trailingAnchor.constraint(equalTo: hideButton.leadingAnchor, constant: -8),
+            balanceLabel.widthAnchor.constraint(equalToConstant: 108),
+            balanceLabel.heightAnchor.constraint(equalToConstant: 26),
+
+            canvasToggleButton.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
+            canvasToggleButton.trailingAnchor.constraint(equalTo: balanceLabel.leadingAnchor, constant: -8),
+            canvasToggleButton.widthAnchor.constraint(equalToConstant: 30),
+            canvasToggleButton.heightAnchor.constraint(equalToConstant: 30),
+
+            modelMenu.trailingAnchor.constraint(lessThanOrEqualTo: canvasToggleButton.leadingAnchor, constant: -10),
+
+            workspace.topAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: 8),
+            workspace.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            workspace.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            workspace.bottomAnchor.constraint(equalTo: transcriptStrip.topAnchor, constant: -8),
+
+            feed.topAnchor.constraint(equalTo: workspace.topAnchor),
+            feed.leadingAnchor.constraint(equalTo: workspace.leadingAnchor),
+            feed.bottomAnchor.constraint(equalTo: workspace.bottomAnchor),
+            feed.widthAnchor.constraint(greaterThanOrEqualToConstant: 260),
+
+            canvasPane.topAnchor.constraint(equalTo: workspace.topAnchor),
+            canvasPane.leadingAnchor.constraint(equalTo: feed.trailingAnchor, constant: 8),
+            canvasPane.trailingAnchor.constraint(equalTo: workspace.trailingAnchor),
+            canvasPane.bottomAnchor.constraint(equalTo: workspace.bottomAnchor),
+            canvasWidth,
 
             sessionDrawer.topAnchor.constraint(equalTo: feed.topAnchor, constant: 10),
             sessionDrawer.leadingAnchor.constraint(equalTo: feed.leadingAnchor, constant: 10),
@@ -1031,49 +1480,106 @@ private final class ExpandedPanelView: NSView {
             composerBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             composerBar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             composerBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
-            composerBar.heightAnchor.constraint(equalToConstant: 48),
+            composerBar.heightAnchor.constraint(equalToConstant: 58),
 
             recordingButton.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 8),
             recordingButton.centerYAnchor.constraint(equalTo: composerBar.centerYAnchor),
-            recordingButton.widthAnchor.constraint(equalToConstant: 76),
-            recordingButton.heightAnchor.constraint(equalToConstant: 32),
+            recordingButton.widthAnchor.constraint(equalToConstant: 108),
+            recordingButton.heightAnchor.constraint(equalToConstant: 38),
+
+            opacityControl.leadingAnchor.constraint(equalTo: recordingButton.trailingAnchor, constant: 8),
+            opacityControl.centerYAnchor.constraint(equalTo: composerBar.centerYAnchor),
+            opacityControl.widthAnchor.constraint(equalToConstant: 118),
+            opacityControl.heightAnchor.constraint(equalToConstant: 38),
+
+            opacityLabel.leadingAnchor.constraint(equalTo: opacityControl.leadingAnchor, constant: 10),
+            opacityLabel.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
+            opacityLabel.widthAnchor.constraint(equalToConstant: 24),
+
+            opacitySlider.leadingAnchor.constraint(equalTo: opacityLabel.trailingAnchor, constant: 6),
+            opacitySlider.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
+            opacitySlider.trailingAnchor.constraint(equalTo: opacityValueLabel.leadingAnchor, constant: -6),
+            opacitySlider.heightAnchor.constraint(equalToConstant: 20),
+
+            opacityValueLabel.trailingAnchor.constraint(equalTo: opacityControl.trailingAnchor, constant: -9),
+            opacityValueLabel.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
+            opacityValueLabel.widthAnchor.constraint(equalToConstant: 28),
 
             askButton.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -8),
             askButton.centerYAnchor.constraint(equalTo: composerBar.centerYAnchor),
-            askButton.widthAnchor.constraint(equalToConstant: 32),
-            askButton.heightAnchor.constraint(equalToConstant: 32),
+            askButton.widthAnchor.constraint(equalToConstant: 88),
+            askButton.heightAnchor.constraint(equalToConstant: 38),
 
             analyzeButton.trailingAnchor.constraint(equalTo: askButton.leadingAnchor, constant: -7),
             analyzeButton.centerYAnchor.constraint(equalTo: composerBar.centerYAnchor),
-            analyzeButton.widthAnchor.constraint(equalToConstant: 32),
-            analyzeButton.heightAnchor.constraint(equalToConstant: 32),
+            analyzeButton.widthAnchor.constraint(equalToConstant: 74),
+            analyzeButton.heightAnchor.constraint(equalToConstant: 38),
 
             attachButton.trailingAnchor.constraint(equalTo: analyzeButton.leadingAnchor, constant: -7),
             attachButton.centerYAnchor.constraint(equalTo: composerBar.centerYAnchor),
-            attachButton.widthAnchor.constraint(equalToConstant: 32),
-            attachButton.heightAnchor.constraint(equalToConstant: 32),
+            attachButton.widthAnchor.constraint(equalToConstant: 58),
+            attachButton.heightAnchor.constraint(equalToConstant: 38),
 
             instructionsButton.trailingAnchor.constraint(equalTo: attachButton.leadingAnchor, constant: -7),
             instructionsButton.centerYAnchor.constraint(equalTo: composerBar.centerYAnchor),
-            instructionsButton.widthAnchor.constraint(equalToConstant: 32),
-            instructionsButton.heightAnchor.constraint(equalToConstant: 32),
+            instructionsButton.widthAnchor.constraint(equalToConstant: 58),
+            instructionsButton.heightAnchor.constraint(equalToConstant: 38),
 
-            composer.leadingAnchor.constraint(equalTo: recordingButton.trailingAnchor, constant: 10),
+            composer.leadingAnchor.constraint(equalTo: opacityControl.trailingAnchor, constant: 10),
             composer.trailingAnchor.constraint(equalTo: instructionsButton.leadingAnchor, constant: -10),
             composer.centerYAnchor.constraint(equalTo: composerBar.centerYAnchor),
-            composer.heightAnchor.constraint(equalToConstant: 32),
+            composer.heightAnchor.constraint(equalToConstant: 38),
+            composer.widthAnchor.constraint(greaterThanOrEqualToConstant: 120),
+
+            closeConfirmOverlay.topAnchor.constraint(equalTo: topAnchor),
+            closeConfirmOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
+            closeConfirmOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
+            closeConfirmOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            closeConfirmPanel.centerXAnchor.constraint(equalTo: closeConfirmOverlay.centerXAnchor),
+            closeConfirmPanel.centerYAnchor.constraint(equalTo: closeConfirmOverlay.centerYAnchor),
+            closeConfirmPanel.widthAnchor.constraint(equalToConstant: 330),
+
+            closeConfirmTitle.topAnchor.constraint(equalTo: closeConfirmPanel.topAnchor, constant: 18),
+            closeConfirmTitle.leadingAnchor.constraint(equalTo: closeConfirmPanel.leadingAnchor, constant: 18),
+            closeConfirmTitle.trailingAnchor.constraint(equalTo: closeConfirmPanel.trailingAnchor, constant: -18),
+
+            closeConfirmBody.topAnchor.constraint(equalTo: closeConfirmTitle.bottomAnchor, constant: 8),
+            closeConfirmBody.leadingAnchor.constraint(equalTo: closeConfirmTitle.leadingAnchor),
+            closeConfirmBody.trailingAnchor.constraint(equalTo: closeConfirmTitle.trailingAnchor),
+
+            closeConfirmCancelButton.topAnchor.constraint(equalTo: closeConfirmBody.bottomAnchor, constant: 18),
+            closeConfirmCancelButton.leadingAnchor.constraint(equalTo: closeConfirmPanel.leadingAnchor, constant: 18),
+            closeConfirmCancelButton.bottomAnchor.constraint(equalTo: closeConfirmPanel.bottomAnchor, constant: -18),
+            closeConfirmCancelButton.widthAnchor.constraint(equalToConstant: 130),
+            closeConfirmCancelButton.heightAnchor.constraint(equalToConstant: 34),
+
+            closeConfirmTurnOffButton.topAnchor.constraint(equalTo: closeConfirmCancelButton.topAnchor),
+            closeConfirmTurnOffButton.leadingAnchor.constraint(equalTo: closeConfirmCancelButton.trailingAnchor, constant: 12),
+            closeConfirmTurnOffButton.trailingAnchor.constraint(equalTo: closeConfirmPanel.trailingAnchor, constant: -18),
+            closeConfirmTurnOffButton.heightAnchor.constraint(equalTo: closeConfirmCancelButton.heightAnchor),
         ])
 
         navButton.target = self
         navButton.action = #selector(toggleSessionsClicked)
+        canvasToggleButton.target = self
+        canvasToggleButton.action = #selector(toggleCanvasClicked)
         newSessionButton.target = self
         newSessionButton.action = #selector(newSessionClicked)
         latestSessionButton.target = self
         latestSessionButton.action = #selector(continueSessionClicked)
         answerStyleSaveButton.target = self
         answerStyleSaveButton.action = #selector(saveAnswerStyleClicked)
+        hideButton.target = self
+        hideButton.action = #selector(hideClicked)
         closeButton.target = self
         closeButton.action = #selector(closeClicked)
+        closeConfirmCancelButton.target = self
+        closeConfirmCancelButton.action = #selector(cancelCloseConfirmClicked)
+        closeConfirmTurnOffButton.target = self
+        closeConfirmTurnOffButton.action = #selector(confirmTurnOffClicked)
+        opacitySlider.target = self
+        opacitySlider.action = #selector(opacityChanged)
         composer.target = self
         composer.action = #selector(askClicked)
         recordingButton.target = self
@@ -1088,16 +1594,21 @@ private final class ExpandedPanelView: NSView {
         instructionsButton.action = #selector(instructionsClicked)
 
         sessionDrawer.isHidden = true
+        canvasPane.isHidden = true
+        canvasToggleButton.isHidden = true
+        canvasPane.onCollapse = { [weak self] in self?.setCanvasOpen(false) }
         styleHeaderIconButton(navButton, symbol: "sidebar.left", fallback: "[]")
+        styleHeaderIconButton(canvasToggleButton, symbol: "sidebar.right", fallback: "|")
         styleHeaderIconButton(newSessionButton, symbol: "square.and.pencil", fallback: "+")
         styleControlButton(latestSessionButton, symbol: "clock.arrow.circlepath", accent: false)
         styleControlButton(answerStyleSaveButton, symbol: "checkmark", accent: true)
         styleControlButton(recordingButton, symbol: "waveform", accent: false)
-        styleIconButton(instructionsButton, symbol: "text.badge.checkmark", fallback: "T")
-        styleIconButton(attachButton, symbol: "paperclip", fallback: "+")
-        styleIconButton(analyzeButton, symbol: "sparkle.magnifyingglass", fallback: "?")
-        styleIconButton(askButton, symbol: "arrow.up", fallback: "^", accent: true)
-        styleIconButton(closeButton, symbol: "xmark", fallback: "x")
+        styleControlButton(instructionsButton, symbol: "text.bubble", accent: false)
+        styleControlButton(attachButton, symbol: "paperclip", accent: false)
+        styleControlButton(analyzeButton, symbol: "sparkle.magnifyingglass", accent: false)
+        styleControlButton(askButton, symbol: "arrow.up.circle.fill", accent: true)
+        styleHeaderIconButton(hideButton, symbol: "eye.slash", fallback: "-")
+        styleHeaderIconButton(closeButton, symbol: "xmark", fallback: "x")
         configureTooltips()
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -1217,28 +1728,81 @@ private final class ExpandedPanelView: NSView {
 
     private func configureComposer() {
         composerBar.wantsLayer = true
-        composerBar.layer?.backgroundColor = NSColor(red: 0.030, green: 0.034, blue: 0.042, alpha: 0.98).cgColor
-        composerBar.layer?.cornerRadius = 20
+        composerBar.layer?.backgroundColor = NSColor(red: 0.026, green: 0.030, blue: 0.038, alpha: 0.98).cgColor
+        composerBar.layer?.cornerRadius = 24
         composerBar.layer?.borderWidth = 1
         composerBar.layer?.borderColor = BlueyTheme.hairline.cgColor
+
+        opacityControl.wantsLayer = true
+        opacityControl.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.055).cgColor
+        opacityControl.layer?.cornerRadius = 19
+        opacityControl.layer?.borderWidth = 1
+        opacityControl.layer?.borderColor = NSColor.white.withAlphaComponent(0.08).cgColor
+        opacityControl.toolTip = "Overlay opacity"
+        opacityLabel.stringValue = "%"
+        opacityLabel.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
+        opacityLabel.textColor = BlueyTheme.textDim
+        opacityLabel.alignment = .left
+        opacityValueLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
+        opacityValueLabel.textColor = BlueyTheme.textDim
+        opacityValueLabel.alignment = .right
+        opacitySlider.controlSize = .small
+        opacitySlider.wantsLayer = true
+        opacitySlider.toolTip = "Overlay opacity"
 
         composer.placeholderString = "Ask anything..."
         composer.font = NSFont.systemFont(ofSize: 14, weight: .medium)
         composer.isBezeled = false
-        composer.drawsBackground = false
+        composer.drawsBackground = true
+        composer.backgroundColor = NSColor.black.withAlphaComponent(0.22)
         composer.focusRingType = .none
         composer.textColor = BlueyTheme.text
+        composer.wantsLayer = true
+        composer.layer?.cornerRadius = 18
+        composer.layer?.masksToBounds = true
+        composer.layer?.borderWidth = 1
+        composer.layer?.borderColor = NSColor.white.withAlphaComponent(0.09).cgColor
         composer.placeholderAttributedString = NSAttributedString(
             string: "Ask anything...",
             attributes: [.foregroundColor: BlueyTheme.textDim])
+    }
+
+    private func configureCloseConfirm() {
+        closeConfirmOverlay.isHidden = true
+        closeConfirmOverlay.wantsLayer = true
+        closeConfirmOverlay.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.52).cgColor
+        closeConfirmOverlay.layer?.zPosition = 100
+
+        closeConfirmPanel.wantsLayer = true
+        closeConfirmPanel.layer?.backgroundColor = BlueyTheme.panelDeep.cgColor
+        closeConfirmPanel.layer?.cornerRadius = 18
+        closeConfirmPanel.layer?.borderWidth = 1
+        closeConfirmPanel.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.30).cgColor
+        closeConfirmPanel.layer?.shadowColor = NSColor.black.cgColor
+        closeConfirmPanel.layer?.shadowOpacity = 0.34
+        closeConfirmPanel.layer?.shadowRadius = 22
+        closeConfirmPanel.layer?.shadowOffset = .zero
+
+        closeConfirmTitle.font = NSFont.systemFont(ofSize: 16, weight: .bold)
+        closeConfirmTitle.textColor = BlueyTheme.text
+        closeConfirmBody.font = NSFont.systemFont(ofSize: 12.5, weight: .medium)
+        closeConfirmBody.textColor = BlueyTheme.textDim
+        closeConfirmBody.maximumNumberOfLines = 3
+
+        styleControlButton(closeConfirmCancelButton, symbol: "xmark", accent: false)
+        styleControlButton(closeConfirmTurnOffButton, symbol: "power", accent: true)
+        closeConfirmCancelButton.toolTip = "Keep Bluey running"
+        closeConfirmTurnOffButton.toolTip = "Turn Bluey off. Run bluey on to start again."
     }
 
     private func configureTooltips() {
         navButton.toolTip = "Show recordings"
         newSessionButton.toolTip = "Start a new recording"
         modelMenu.toolTip = "Choose routing lane"
+        canvasToggleButton.toolTip = "Open or collapse the canvas"
         balanceLabel.toolTip = "Remaining Bluey balance"
-        closeButton.toolTip = "Hide Bluey"
+        hideButton.toolTip = "Hide to pill"
+        closeButton.toolTip = "Turn Bluey off. Run bluey on to start again."
         recordingButton.toolTip = "Start or stop listening"
         instructionsButton.toolTip = "Set answer style"
         attachButton.toolTip = "Attach files"
@@ -1330,11 +1894,56 @@ private final class ExpandedPanelView: NSView {
         button.alignment = .center
     }
 
-    @objc private func closeClicked() { onClose?() }
+    @objc private func hideClicked() { onClose?() }
+
+    @objc private func closeClicked() {
+        closeConfirmOverlay.isHidden = false
+        closeConfirmOverlay.alphaValue = 0
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.12
+            closeConfirmOverlay.animator().alphaValue = 1
+        }
+    }
+
+    @objc private func cancelCloseConfirmClicked() {
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.10
+            closeConfirmOverlay.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            guard let self else { return }
+            self.closeConfirmOverlay.isHidden = true
+            self.closeConfirmOverlay.alphaValue = 1
+        })
+    }
+
+    @objc private func confirmTurnOffClicked() {
+        emitSimple("close_requested")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+            NSApp.terminate(nil)
+        }
+    }
+
+    @objc private func opacityChanged() {
+        applyOpacity(opacitySlider.doubleValue)
+    }
+
+    func applyOpacity(_ opacity: Double) {
+        let value = min(max(opacity, 0.50), 1.0)
+        if abs(opacitySlider.doubleValue - value) > 0.001 {
+            opacitySlider.doubleValue = value
+        }
+        opacityValueLabel.stringValue = "\(Int((value * 100.0).rounded()))%"
+        onOpacityChanged?(value)
+    }
 
     @objc private func toggleSessionsClicked() {
         sessionDrawer.isHidden.toggle()
         statusLabel.stringValue = sessionDrawer.isHidden ? statusLabel.stringValue : "Sessions"
+    }
+
+    @objc private func toggleCanvasClicked() {
+        guard latestCanvas != nil else { return }
+        setCanvasOpen(!canvasOpen)
     }
 
     @objc private func newSessionClicked() {
@@ -1361,7 +1970,7 @@ private final class ExpandedPanelView: NSView {
         if recordingActive {
             emitSimple("recording_stop_requested")
             recordingActive = false
-            recordingButton.title = "Listen"
+            recordingButton.title = "Start Bluey"
             statusLabel.stringValue = "Paused"
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
         } else {
@@ -1445,7 +2054,140 @@ private final class ExpandedPanelView: NSView {
         feed.clear()
         setContextItems([])
         transcriptSnippets.removeAll()
-        transcriptLabel.stringValue = "Transcript will appear here while you listen"
+        transcriptLabel.stringValue = "Live captions preview"
+        latestCanvas = nil
+        setCanvasOpen(false)
+        canvasToggleButton.isHidden = true
+    }
+
+    func pushCard(_ card: RenderedCard) {
+        feed.push(card)
+        routeCanvasIfNeeded(card)
+    }
+
+    func updateCard(id: String, body: String, done: Bool, costLabel: String?, artifact: OverlayArtifact?) {
+        guard let card = feed.update(id: id, body: body, done: done, costLabel: costLabel, artifact: artifact) else {
+            return
+        }
+        routeCanvasIfNeeded(card)
+    }
+
+    private func routeCanvasIfNeeded(_ card: RenderedCard) {
+        guard let artifact = makeCanvasArtifact(from: card) else { return }
+        latestCanvas = artifact
+        canvasPane.render(artifact)
+        canvasToggleButton.isHidden = false
+        if shouldAutoOpenCanvas(for: card, artifact: artifact) {
+            setCanvasOpen(true)
+        }
+    }
+
+    private func shouldAutoOpenCanvas(for card: RenderedCard, artifact: CanvasArtifact) -> Bool {
+        if card.artifact != nil { return true }
+        guard card.kind == "answer" else { return false }
+        switch artifact.kind {
+        case .code, .systemDesign, .screen:
+            return true
+        case .document, .structured:
+            return false
+        }
+    }
+
+    private func setCanvasOpen(_ open: Bool) {
+        canvasOpen = open
+        canvasPane.isHidden = !open
+        canvasWidthConstraint?.constant = open ? 310 : 0
+        canvasToggleButton.contentTintColor = open ? BlueyTheme.cyan : BlueyTheme.textDim
+        if open {
+            ensureRoomForCanvas()
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.16
+            self.layoutSubtreeIfNeeded()
+        }
+    }
+
+    private func ensureRoomForCanvas() {
+        guard let window else { return }
+        let targetWidth: CGFloat = 820
+        guard window.frame.width < targetWidth else { return }
+        let screen = window.screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        var frame = window.frame
+        frame.size.width = min(targetWidth, screen.width - 24)
+        frame.origin.x = min(max(screen.minX + 12, frame.origin.x), screen.maxX - frame.width - 12)
+        window.setFrame(frame, display: true, animate: true)
+    }
+
+    private func makeCanvasArtifact(from card: RenderedCard) -> CanvasArtifact? {
+        guard card.kind == "answer" || card.kind == "context" || card.kind == "system" else {
+            return nil
+        }
+        let body = card.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { return nil }
+
+        if let artifact = card.artifact {
+            let kind = CanvasKind.fromArtifactType(artifact.artifactType)
+            let confidence = artifact.confidence.map { "Confidence \(Int(($0 * 100).rounded()))%" }
+            return CanvasArtifact(
+                kind: kind,
+                title: artifact.title.isEmpty ? kind.title : artifact.title,
+                subtitle: confidence ?? kind.subtitle,
+                content: artifact.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? body
+                    : artifact.body,
+                sourceCardId: card.id)
+        }
+
+        let lower = body.lowercased()
+        let codeBlocks = extractCodeBlocks(from: body)
+        if !codeBlocks.isEmpty || looksLikeCode(lower) {
+            return CanvasArtifact(
+                kind: .code,
+                title: "Code canvas",
+                subtitle: "Code, tests, complexity, and implementation notes",
+                content: formatCodeCanvas(body: body, codeBlocks: codeBlocks),
+                sourceCardId: card.id)
+        }
+
+        if looksLikeSystemDesign(lower) {
+            return CanvasArtifact(
+                kind: .systemDesign,
+                title: "System design canvas",
+                subtitle: "Architecture, tradeoffs, APIs, data, and scale",
+                content: formatStructuredCanvas(body, fallbackHeading: "System Design"),
+                sourceCardId: card.id)
+        }
+
+        if looksLikeScreenAnalysis(lower) {
+            return CanvasArtifact(
+                kind: .screen,
+                title: "Screen analysis",
+                subtitle: "Detected context and answerable details",
+                content: formatStructuredCanvas(body, fallbackHeading: "Screen Context"),
+                sourceCardId: card.id)
+        }
+
+        if card.kind == "context" || looksLikeDocumentWork(lower) {
+            return CanvasArtifact(
+                kind: .document,
+                title: "Document notes",
+                subtitle: "Attached context distilled for this session",
+                content: formatStructuredCanvas(body, fallbackHeading: "Document Context"),
+                sourceCardId: card.id)
+        }
+
+        if body.count > 950 && hasStructuredShape(body) {
+            return CanvasArtifact(
+                kind: .structured,
+                title: "Workspace",
+                subtitle: "Long-form answer kept beside the chat",
+                content: formatStructuredCanvas(body, fallbackHeading: "Details"),
+                sourceCardId: card.id)
+        }
+
+        return nil
     }
 
     private func appendTranscriptSnippet(_ card: RenderedCard) {
@@ -1699,6 +2441,134 @@ private final class ExpandedPanelView: NSView {
         }
     }
 
+    private func extractCodeBlocks(from text: String) -> [String] {
+        var blocks: [String] = []
+        var current: [String] = []
+        var inFence = false
+
+        for line in text.components(separatedBy: .newlines) {
+            if line.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
+                if inFence {
+                    blocks.append(current.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines))
+                    current.removeAll()
+                }
+                inFence.toggle()
+                continue
+            }
+            if inFence {
+                current.append(line)
+            }
+        }
+
+        return blocks.filter { !$0.isEmpty }
+    }
+
+    private func looksLikeCode(_ lower: String) -> Bool {
+        let signals = [
+            "class solution",
+            "def ",
+            "function ",
+            "const ",
+            "let ",
+            "public ",
+            "private ",
+            "time complexity",
+            "space complexity",
+            "test case",
+            "edge case",
+            "sql",
+        ]
+        return signals.filter { lower.contains($0) }.count >= 2
+    }
+
+    private func looksLikeSystemDesign(_ lower: String) -> Bool {
+        let signals = [
+            "system design",
+            "architecture",
+            "api",
+            "database",
+            "cache",
+            "queue",
+            "scale",
+            "latency",
+            "throughput",
+            "tradeoff",
+            "shard",
+            "load balancer",
+            "microservice",
+            "event-driven",
+        ]
+        return signals.filter { lower.contains($0) }.count >= 3
+    }
+
+    private func looksLikeScreenAnalysis(_ lower: String) -> Bool {
+        lower.contains("screenshot")
+            || lower.contains("screen context")
+            || lower.contains("analyse screen")
+            || lower.contains("analyze screen")
+            || lower.contains("image shows")
+    }
+
+    private func looksLikeDocumentWork(_ lower: String) -> Bool {
+        lower.contains("attached document")
+            || lower.contains("pdf")
+            || lower.contains("resume")
+            || lower.contains("document context")
+            || lower.contains("source:")
+    }
+
+    private func hasStructuredShape(_ text: String) -> Bool {
+        let lines = text.components(separatedBy: .newlines)
+        let structured = lines.filter { line in
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            return trimmed.hasPrefix("- ")
+                || trimmed.hasPrefix("* ")
+                || trimmed.hasPrefix("#")
+                || trimmed.range(of: #"^\d+[\.\)]\s"#, options: .regularExpression) != nil
+        }
+        return structured.count >= 3
+    }
+
+    private func formatCodeCanvas(body: String, codeBlocks: [String]) -> String {
+        let notes = stripCodeFences(from: body)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        var sections: [String] = []
+
+        if !codeBlocks.isEmpty {
+            sections.append("CODE\n----\n" + codeBlocks.joined(separator: "\n\n// ---\n\n"))
+        }
+
+        if !notes.isEmpty {
+            sections.append("NOTES\n-----\n" + notes)
+        }
+
+        return sections.isEmpty ? body : sections.joined(separator: "\n\n")
+    }
+
+    private func stripCodeFences(from text: String) -> String {
+        var lines: [String] = []
+        var inFence = false
+        for line in text.components(separatedBy: .newlines) {
+            if line.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
+                inFence.toggle()
+                continue
+            }
+            if !inFence {
+                lines.append(line)
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func formatStructuredCanvas(_ body: String, fallbackHeading: String) -> String {
+        let clean = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return fallbackHeading }
+        if clean.hasPrefix("#") || clean.uppercased().hasPrefix(fallbackHeading.uppercased()) {
+            return clean
+        }
+        return "\(fallbackHeading)\n" + String(repeating: "-", count: fallbackHeading.count) + "\n" + clean
+    }
+
     private func selectedRoute() -> (provider: String?, model: String?, mode: String?) {
         switch modelMenu.indexOfSelectedItem {
         case 1:
@@ -1803,7 +2673,7 @@ private final class OverlayApp {
     private func ensureExpandedWindow() {
         guard expandedWindow == nil else { return }
         let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
-        let expandedSize = NSSize(width: 590, height: 510)
+        let expandedSize = NSSize(width: 720, height: 520)
         let pillFrame = pillWindow?.frame ?? NSRect(
             x: screen.midX - 66,
             y: screen.maxY - 60,
@@ -1818,6 +2688,11 @@ private final class OverlayApp {
         let view = ExpandedPanelView(frame: NSRect(origin: .zero, size: expandedSize))
         window.contentView = view
         view.onClose = { [weak self] in self?.collapse() }
+        view.onOpacityChanged = { [weak self] opacity in
+            let value = CGFloat(opacity)
+            self?.pillWindow?.alphaValue = value
+            self?.expandedWindow?.alphaValue = value
+        }
         expandedWindow = window
         expandedView = view
         if let pending = pendingBoot {
@@ -1843,7 +2718,7 @@ private final class OverlayApp {
             pillWindow?.fadeOutAndHide()
             expandedWindow?.fadeOutAndHide()
             RestoreToast.shared.show()
-            
+
         case .toggle:
             if expandedWindow?.isVisible == true { collapse() } else { expand() }
         case .clear:
@@ -1851,8 +2726,10 @@ private final class OverlayApp {
         case .boot(let title, let lines):
             pushBootCard(title: title, lines: lines)
         case .setOpacity(let o):
-            pillWindow.alphaValue = CGFloat(o)
-            expandedWindow?.alphaValue = CGFloat(o)
+            let value = min(max(o, 0.50), 1.0)
+            pillWindow.alphaValue = CGFloat(value)
+            expandedWindow?.alphaValue = CGFloat(value)
+            expandedView?.applyOpacity(value)
         case .setPosition(let pos):
             applyPosition(pos)
         case .setBalance(let label):
@@ -1864,12 +2741,13 @@ private final class OverlayApp {
             expandedView?.setSessions(sessions)
         case .pushCard(let card):
             ensureExpandedWindow()
-            expandedView?.feed.push(RenderedCard(
+            expandedView?.pushCard(RenderedCard(
                 id: card.id, kind: card.kind, title: card.title,
-                body: card.body, done: true, costLabel: card.costLabel))
-        case .updateCard(let id, let body, let done, let costLabel):
+                body: card.body, done: true, costLabel: card.costLabel,
+                artifact: card.artifact))
+        case .updateCard(let id, let body, let done, let costLabel, let artifact):
             ensureExpandedWindow()
-            expandedView?.feed.update(id: id, body: body, done: done, costLabel: costLabel)
+            expandedView?.updateCard(id: id, body: body, done: done, costLabel: costLabel, artifact: artifact)
         case .shutdown:
             NSApp.terminate(nil)
         case .unknown:
@@ -1889,8 +2767,9 @@ private final class OverlayApp {
             title: title,
             body: body,
             done: true,
-            costLabel: nil)
-        view.feed.push(card)
+            costLabel: nil,
+            artifact: nil)
+        view.pushCard(card)
         // Briefly flash the pill to indicate boot activity.
         pillView?.dotColor = NSColor.systemBlue
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in

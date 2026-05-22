@@ -3,3 +3,4 @@
 pub mod balance;
 
 pub mod meeting_detect;
+pub mod sync;

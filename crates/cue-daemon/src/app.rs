@@ -23,11 +23,12 @@ use cue_core::{
     analyze_segment, clock, generate_recap, load_account, local_answer, AiCapabilities,
     AiProviderId, AiProviderKind, AiRuntimeStatus, AnswerContext, AnswerContextKind, AudioBackend,
     AudioCaptureConfig, AudioChunkMetadata, AudioDeviceDescriptor, AudioDeviceRole,
-    AudioPipelineStatus, AudioSourceKind, CardKind, CloudEndpointConfig, CloudEnvironment,
-    CloudSyncState, CloudSyncStatus, ContextArtifact, ContextKind, ContextProcessingStatus,
-    ConversationTurn, CueCard, DaemonState, MeetingRecord, MeetingState, MemoryHit, OverlayCommand,
-    OverlayContextItem, OverlayEvent, OverlaySessionItem, PrivacyFlags, ProviderRoute,
-    ProviderSelector, ProviderStatus, RouteBudget, Speaker, TranscriptSegment,
+    AudioPipelineStatus, AudioSourceKind, CardArtifactType, CardKind, CloudEndpointConfig,
+    CloudEnvironment, CloudSyncState, CloudSyncStatus, ContextArtifact, ContextKind,
+    ContextProcessingStatus, ConversationTurn, CueCard, CueCardArtifact, DaemonState,
+    MeetingRecord, MeetingState, MemoryHit, OverlayCommand, OverlayContextItem, OverlayEvent,
+    OverlaySessionItem, PrivacyFlags, ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget,
+    Speaker, TranscriptSegment,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -119,6 +120,7 @@ impl OverlayAnswerStream {
                 body: self.body.clone(),
                 done,
                 cost_label,
+                artifact: answer_overlay_artifact(&self.body).filter(|_| done),
             },
         )
         .await;
@@ -171,6 +173,7 @@ async fn register_active_answer_card(
                     body: "Superseded by a newer Bluey answer.".to_string(),
                     done: true,
                     cost_label: None,
+                    artifact: None,
                 },
             )
             .await;
@@ -342,8 +345,15 @@ struct RealAudioRuntimeConfig {
     stt_api_key: String,
     stt_model: String,
     stt_provider_label: String,
+    stt_transport: RealSttTransport,
     chunk_duration_ms: u32,
     sources: Vec<RealAudioSource>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RealSttTransport {
+    OpenAiMultipart,
+    BlueyManagedRaw,
 }
 
 #[derive(Debug, Clone)]
@@ -1045,18 +1055,53 @@ async fn handle_request_inner(
             Ok(DaemonResponse::CloudStatus { status })
         }
         DaemonRequest::CloudSyncNow => {
-            let status = {
-                let mut cloud = daemon.cloud.lock().await;
-                *cloud = cloud_status_from_env(&daemon.paths);
-                if cloud.sync_state == CloudSyncState::Ready
-                    || cloud.sync_state == CloudSyncState::Degraded
-                {
-                    cloud.mark_degraded(
-                        "cloud sync client is scaffolded but not wired; no data was uploaded",
-                    );
+            let mut status = cloud_status_from_env(&daemon.paths);
+            if status.sync_state == CloudSyncState::Disabled {
+                *daemon.cloud.lock().await = status.clone();
+                return Ok(DaemonResponse::CloudStatus { status });
+            }
+            status.mark_syncing();
+            *daemon.cloud.lock().await = status.clone();
+
+            let status = match build_cloud_client(&daemon.paths) {
+                Ok(client) => {
+                    match crate::cloud::sync::sync_local_meetings(
+                        &daemon.store,
+                        &daemon.paths.data_dir,
+                        &client,
+                    )
+                    .await
+                    {
+                        Ok(summary) => {
+                            let mut synced = cloud_status_from_env(&daemon.paths);
+                            synced.mark_synced();
+                            if summary.total_records() == 0 {
+                                synced.last_error = Some(
+                                    "No local sessions were available to sync yet.".to_string(),
+                                );
+                            } else {
+                                info!(
+                                    batches = summary.batches,
+                                    records = summary.total_records(),
+                                    "cloud sync complete"
+                                );
+                            }
+                            synced
+                        }
+                        Err(error) => {
+                            let mut failed = cloud_status_from_env(&daemon.paths);
+                            failed.mark_failed(format!("{error:#}"));
+                            failed
+                        }
+                    }
                 }
-                cloud.clone()
+                Err(error) => {
+                    let mut failed = cloud_status_from_env(&daemon.paths);
+                    failed.mark_failed(format!("{error:#}"));
+                    failed
+                }
             };
+            *daemon.cloud.lock().await = status.clone();
             Ok(DaemonResponse::CloudStatus { status })
         }
         DaemonRequest::Recap => {
@@ -1114,7 +1159,7 @@ async fn send_overlay(daemon: &Arc<Daemon>, command: OverlayCommand) -> Result<(
 }
 
 fn maybe_spawn_balance_polling(daemon: &Arc<Daemon>) {
-    let Ok(client) = cue_cloud_client::CloudClient::with_default_keyring() else {
+    let Ok(client) = build_cloud_client(&daemon.paths) else {
         debug!("balance polling skipped; keyring unavailable");
         return;
     };
@@ -1496,7 +1541,7 @@ async fn start_audio_capture(
     let session_id = format!("audio-{}", clock::now_epoch_ms_string());
     let (stop_tx, stop_rx) = oneshot::channel();
 
-    let real_runtime = build_real_audio_runtime_config(&config).await?;
+    let real_runtime = build_real_audio_runtime_config(&daemon.paths, &config).await?;
     let status = if let Some(real_runtime) = real_runtime.clone() {
         let devices = real_runtime
             .sources
@@ -1577,15 +1622,12 @@ pub async fn build_mic_stt_provider() -> anyhow::Result<Box<dyn cue_core::stt::S
 }
 
 async fn build_real_audio_runtime_config(
+    paths: &AppPaths,
     config: &AudioCaptureConfig,
 ) -> Result<Option<RealAudioRuntimeConfig>> {
     if env_truthy_any(&["BLUEY_AUDIO_SIMULATED_ONLY", "CUE_AUDIO_SIMULATED_ONLY"]) {
         return Ok(None);
     }
-
-    let Some(stt_api_key) = env_first(&["BLUEY_STT_API_KEY", "OPENAI_API_KEY"]) else {
-        return Ok(None);
-    };
 
     let ffmpeg_path = find_ffmpeg();
     let native_audio_helper = find_native_audio_helper();
@@ -1603,16 +1645,50 @@ async fn build_real_audio_runtime_config(
         return Ok(None);
     }
 
-    let stt_endpoint = env_first(&[
-        "BLUEY_STT_API_URL",
-        "OPENAI_AUDIO_TRANSCRIPTIONS_URL",
-        "OPENAI_TRANSCRIPTIONS_URL",
-    ])
-    .unwrap_or_else(|| "https://api.openai.com/v1/audio/transcriptions".to_string());
-    let stt_model =
-        env_first(&["BLUEY_STT_MODEL", "OPENAI_STT_MODEL"]).unwrap_or_else(|| "whisper-1".into());
-    let stt_provider_label =
-        env_first(&["BLUEY_STT_PROVIDER"]).unwrap_or_else(|| format!("openai:{stt_model}"));
+    let explicit_stt_key = env_first(&["BLUEY_STT_API_KEY", "OPENAI_API_KEY"]);
+    let account = load_account(paths).ok().flatten();
+    let account_token = cloud_access_token_from_env().or_else(|| {
+        account
+            .as_ref()
+            .and_then(|account| account.access_token.clone())
+            .filter(|token| !token.trim().is_empty())
+    });
+    let account_api_url = env::var("BLUEY_CLOUD_API_URL")
+        .or_else(|_| env::var("CUE_CLOUD_API_URL"))
+        .ok()
+        .or_else(|| account.as_ref().map(|account| account.api_url.clone()));
+
+    let (stt_endpoint, stt_api_key, stt_model, stt_provider_label, stt_transport) =
+        if let Some(explicit_stt_key) = explicit_stt_key {
+            let stt_endpoint = env_first(&[
+                "BLUEY_STT_API_URL",
+                "OPENAI_AUDIO_TRANSCRIPTIONS_URL",
+                "OPENAI_TRANSCRIPTIONS_URL",
+            ])
+            .unwrap_or_else(|| "https://api.openai.com/v1/audio/transcriptions".to_string());
+            let stt_model = env_first(&["BLUEY_STT_MODEL", "OPENAI_STT_MODEL"])
+                .unwrap_or_else(|| "whisper-1".into());
+            let stt_provider_label =
+                env_first(&["BLUEY_STT_PROVIDER"]).unwrap_or_else(|| format!("openai:{stt_model}"));
+            (
+                stt_endpoint,
+                explicit_stt_key,
+                stt_model,
+                stt_provider_label,
+                RealSttTransport::OpenAiMultipart,
+            )
+        } else {
+            match (account_token, account_api_url) {
+                (Some(token), Some(api_url)) => (
+                    format!("{}/router/transcribe", api_url.trim_end_matches('/')),
+                    token,
+                    env_first(&["BLUEY_STT_MODEL"]).unwrap_or_else(|| "nova-3".into()),
+                    "bluey-managed:deepgram/nova-3".to_string(),
+                    RealSttTransport::BlueyManagedRaw,
+                ),
+                _ => return Ok(None),
+            }
+        };
     let chunk_duration_ms = real_stt_chunk_duration_ms(config.chunk_duration_ms);
 
     Ok(Some(RealAudioRuntimeConfig {
@@ -1621,6 +1697,7 @@ async fn build_real_audio_runtime_config(
         stt_api_key,
         stt_model,
         stt_provider_label,
+        stt_transport,
         chunk_duration_ms,
         sources,
     }))
@@ -1708,6 +1785,18 @@ fn env_first(names: &[&str]) -> Option<String> {
         .find_map(|name| env::var(name).ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn url_component(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![byte as char]
+            }
+            _ => format!("%{byte:02X}").chars().collect(),
+        })
+        .collect()
 }
 
 fn env_truthy_any(names: &[&str]) -> bool {
@@ -2416,7 +2505,14 @@ fn overlay_context_items(meeting: &MeetingRecord) -> Vec<OverlayContextItem> {
 }
 
 async fn fetch_current_balance_snapshot() -> Option<crate::cloud::balance::BalanceSnapshot> {
-    let client = match cue_cloud_client::CloudClient::with_default_keyring() {
+    let paths = match AppPaths::discover() {
+        Ok(paths) => paths,
+        Err(error) => {
+            debug!("balance lookup skipped; app paths unavailable: {error}");
+            return None;
+        }
+    };
+    let client = match build_cloud_client(&paths) {
         Ok(client) => client,
         Err(error) => {
             debug!("balance lookup skipped; keyring unavailable: {error}");
@@ -2449,6 +2545,47 @@ async fn fetch_current_balance_snapshot() -> Option<crate::cloud::balance::Balan
             None
         }
     }
+}
+
+fn build_cloud_client(paths: &AppPaths) -> Result<cue_cloud_client::CloudClient> {
+    let base_url = env::var("BLUEY_CLOUD_API_URL")
+        .or_else(|_| env::var("CUE_CLOUD_API_URL"))
+        .ok()
+        .or_else(|| {
+            load_account(paths)
+                .ok()
+                .flatten()
+                .map(|account| account.api_url)
+        })
+        .unwrap_or_else(|| "https://api.bluey.dev".to_string());
+
+    let config = cue_cloud_client::client::ClientConfig {
+        base_url,
+        ..Default::default()
+    };
+
+    if let Some(access) = cloud_access_token_from_env() {
+        let store = cue_cloud_client::tokens::MemoryStore::new();
+        cue_cloud_client::TokenStore::save(
+            &store,
+            &cue_cloud_client::Tokens {
+                access,
+                refresh: env::var("BLUEY_CLOUD_REFRESH_TOKEN")
+                    .or_else(|_| env::var("CUE_CLOUD_REFRESH_TOKEN"))
+                    .unwrap_or_default(),
+                email: env::var("BLUEY_USER_ID")
+                    .or_else(|_| env::var("CUE_USER_ID"))
+                    .unwrap_or_else(|_| "env-token".to_string()),
+            },
+        )?;
+        return cue_cloud_client::CloudClient::new(config, Arc::new(store)).map_err(Into::into);
+    }
+
+    cue_cloud_client::CloudClient::new(
+        config,
+        Arc::new(cue_cloud_client::tokens::KeyringStore::new()),
+    )
+    .map_err(Into::into)
 }
 
 fn format_balance_cents(cents: i64) -> String {
@@ -2683,27 +2820,55 @@ async fn transcribe_audio_file(
         return Ok(None);
     }
 
-    let file_name = chunk_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("bluey-audio.wav")
-        .to_string();
-    let file_part = reqwest::multipart::Part::bytes(audio)
-        .file_name(file_name)
-        .mime_str("audio/wav")
-        .context("failed to build audio multipart body")?;
-    let form = reqwest::multipart::Form::new()
-        .text("model", runtime.stt_model.clone())
-        .text("response_format", "json")
-        .part("file", file_part);
-
-    let response = client
-        .post(&runtime.stt_endpoint)
-        .bearer_auth(&runtime.stt_api_key)
-        .multipart(form)
-        .send()
-        .await
-        .with_context(|| format!("failed to call STT endpoint {}", runtime.stt_endpoint))?;
+    let response = match runtime.stt_transport {
+        RealSttTransport::OpenAiMultipart => {
+            let file_name = chunk_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("bluey-audio.wav")
+                .to_string();
+            let file_part = reqwest::multipart::Part::bytes(audio)
+                .file_name(file_name)
+                .mime_str("audio/wav")
+                .context("failed to build audio multipart body")?;
+            let form = reqwest::multipart::Form::new()
+                .text("model", runtime.stt_model.clone())
+                .text("response_format", "json")
+                .part("file", file_part);
+            client
+                .post(&runtime.stt_endpoint)
+                .bearer_auth(&runtime.stt_api_key)
+                .multipart(form)
+                .send()
+                .await
+        }
+        RealSttTransport::BlueyManagedRaw => {
+            let sep = if runtime.stt_endpoint.contains('?') {
+                '&'
+            } else {
+                '?'
+            };
+            let request_id = format!(
+                "audio-{}-{sequence}-{}",
+                source.default_label(),
+                clock::now_epoch_ms_string()
+            );
+            let url = format!(
+                "{}{sep}request_id={}&model={}",
+                runtime.stt_endpoint,
+                url_component(&request_id),
+                url_component(&runtime.stt_model)
+            );
+            client
+                .post(url)
+                .bearer_auth(&runtime.stt_api_key)
+                .header(reqwest::header::CONTENT_TYPE, "audio/wav")
+                .body(audio)
+                .send()
+                .await
+        }
+    }
+    .with_context(|| format!("failed to call STT endpoint {}", runtime.stt_endpoint))?;
     let status = response.status();
     let body = response
         .text()
@@ -3211,6 +3376,225 @@ fn answer_overlay_cost_label(metadata: &AnswerResponseMetadata) -> Option<String
     } else {
         Some(parts.join(" · "))
     }
+}
+
+fn answer_overlay_artifact(answer: &str) -> Option<CueCardArtifact> {
+    let body = answer.trim();
+    if body.is_empty() {
+        return None;
+    }
+
+    let lower = body.to_lowercase();
+    let code_blocks = extract_fenced_code_blocks(body);
+    if !code_blocks.is_empty() || looks_like_code_answer(&lower) {
+        let artifact_body = format_code_artifact(body, &code_blocks);
+        return Some(CueCardArtifact {
+            artifact_type: CardArtifactType::Code,
+            title: "Code canvas".to_string(),
+            body: artifact_body,
+            confidence: if code_blocks.is_empty() { 0.74 } else { 0.95 },
+        });
+    }
+
+    if looks_like_system_design_answer(&lower) {
+        return Some(CueCardArtifact {
+            artifact_type: CardArtifactType::SystemDesign,
+            title: "System design canvas".to_string(),
+            body: format_structured_artifact(body, "System Design"),
+            confidence: 0.88,
+        });
+    }
+
+    if looks_like_screen_answer(&lower) {
+        return Some(CueCardArtifact {
+            artifact_type: CardArtifactType::Screen,
+            title: "Screen analysis".to_string(),
+            body: format_structured_artifact(body, "Screen Context"),
+            confidence: 0.86,
+        });
+    }
+
+    if looks_like_document_answer(&lower) {
+        return Some(CueCardArtifact {
+            artifact_type: CardArtifactType::Document,
+            title: "Document notes".to_string(),
+            body: format_structured_artifact(body, "Document Context"),
+            confidence: 0.78,
+        });
+    }
+
+    if body.chars().count() > 950 && has_structured_answer_shape(body) {
+        return Some(CueCardArtifact {
+            artifact_type: CardArtifactType::Structured,
+            title: "Workspace".to_string(),
+            body: format_structured_artifact(body, "Details"),
+            confidence: 0.70,
+        });
+    }
+
+    None
+}
+
+fn extract_fenced_code_blocks(text: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut current = Vec::new();
+    let mut in_fence = false;
+
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            if in_fence {
+                let block = current.join("\n").trim().to_string();
+                if !block.is_empty() {
+                    blocks.push(block);
+                }
+                current.clear();
+            }
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            current.push(line);
+        }
+    }
+
+    blocks
+}
+
+fn strip_fenced_code(text: &str) -> String {
+    let mut lines = Vec::new();
+    let mut in_fence = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if !in_fence {
+            lines.push(line);
+        }
+    }
+    lines.join("\n")
+}
+
+fn format_code_artifact(body: &str, code_blocks: &[String]) -> String {
+    let notes = strip_fenced_code(body).trim().to_string();
+    let mut sections = Vec::new();
+    if !code_blocks.is_empty() {
+        sections.push(format!(
+            "CODE\n----\n{}",
+            code_blocks.join("\n\n// ---\n\n")
+        ));
+    }
+    if !notes.is_empty() {
+        sections.push(format!("NOTES\n-----\n{notes}"));
+    }
+    if sections.is_empty() {
+        body.to_string()
+    } else {
+        sections.join("\n\n")
+    }
+}
+
+fn format_structured_artifact(body: &str, fallback_heading: &str) -> String {
+    let clean = body.trim();
+    if clean.starts_with('#')
+        || clean
+            .to_lowercase()
+            .starts_with(&fallback_heading.to_lowercase())
+    {
+        clean.to_string()
+    } else {
+        format!(
+            "{fallback_heading}\n{}\n{clean}",
+            "-".repeat(fallback_heading.len())
+        )
+    }
+}
+
+fn looks_like_code_answer(lower: &str) -> bool {
+    const SIGNALS: &[&str] = &[
+        "class solution",
+        "def ",
+        "function ",
+        "const ",
+        "let ",
+        "public ",
+        "private ",
+        "time complexity",
+        "space complexity",
+        "test case",
+        "edge case",
+        "sql",
+    ];
+    SIGNALS
+        .iter()
+        .filter(|signal| lower.contains(**signal))
+        .count()
+        >= 2
+}
+
+fn looks_like_system_design_answer(lower: &str) -> bool {
+    const SIGNALS: &[&str] = &[
+        "system design",
+        "architecture",
+        "api",
+        "database",
+        "cache",
+        "queue",
+        "scale",
+        "latency",
+        "throughput",
+        "tradeoff",
+        "shard",
+        "load balancer",
+        "microservice",
+        "event-driven",
+    ];
+    SIGNALS
+        .iter()
+        .filter(|signal| lower.contains(**signal))
+        .count()
+        >= 3
+}
+
+fn looks_like_screen_answer(lower: &str) -> bool {
+    lower.contains("screenshot")
+        || lower.contains("screen context")
+        || lower.contains("analyse screen")
+        || lower.contains("analyze screen")
+        || lower.contains("image shows")
+}
+
+fn looks_like_document_answer(lower: &str) -> bool {
+    lower.contains("attached document")
+        || lower.contains("pdf")
+        || lower.contains("resume")
+        || lower.contains("document context")
+        || lower.contains("source:")
+}
+
+fn has_structured_answer_shape(text: &str) -> bool {
+    text.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("- ")
+                || trimmed.starts_with("* ")
+                || trimmed.starts_with('#')
+                || numbered_list_prefix(trimmed)
+        })
+        .count()
+        >= 3
+}
+
+fn numbered_list_prefix(line: &str) -> bool {
+    let mut chars = line.chars().peekable();
+    let mut saw_digit = false;
+    while matches!(chars.peek(), Some(ch) if ch.is_ascii_digit()) {
+        saw_digit = true;
+        chars.next();
+    }
+    saw_digit
+        && matches!(chars.next(), Some('.' | ')'))
+        && matches!(chars.next(), Some(ch) if ch.is_whitespace())
 }
 
 fn visible_question_for_source(question: &str, source: &str) -> (String, String) {
@@ -5103,7 +5487,7 @@ fn cloud_status_from_env(paths: &AppPaths) -> CloudSyncStatus {
             .as_ref()
             .is_some_and(|account| account.token_configured())
     {
-        let mut status = CloudSyncStatus::ready(
+        CloudSyncStatus::ready(
             endpoint,
             env::var("BLUEY_WORKSPACE_ID")
                 .or_else(|_| env::var("CUE_WORKSPACE_ID"))
@@ -5122,9 +5506,7 @@ fn cloud_status_from_env(paths: &AppPaths) -> CloudSyncStatus {
                 .ok()
                 .or_else(|| account.as_ref().map(|account| account.device_id.clone()))
                 .unwrap_or_else(|| "local-device".to_string()),
-        );
-        status.mark_degraded("cloud credentials are configured; sync client is not wired yet");
-        status
+        )
     } else {
         let message = if account.is_some() {
             "account is linked but no Bluey cloud token is stored yet"
@@ -5156,10 +5538,16 @@ fn cloud_environment_from_env() -> CloudEnvironment {
 }
 
 fn cloud_token_configured() -> bool {
-    env_configured("BLUEY_CLOUD_TOKEN")
-        || env_configured("BLUEY_API_TOKEN")
-        || env_configured("CUE_CLOUD_TOKEN")
-        || env_configured("CUE_API_TOKEN")
+    cloud_access_token_from_env().is_some()
+}
+
+fn cloud_access_token_from_env() -> Option<String> {
+    env::var("BLUEY_CLOUD_TOKEN")
+        .ok()
+        .or_else(|| env::var("BLUEY_API_TOKEN").ok())
+        .or_else(|| env::var("CUE_CLOUD_TOKEN").ok())
+        .or_else(|| env::var("CUE_API_TOKEN").ok())
+        .filter(|value| !value.trim().is_empty())
 }
 
 fn env_configured(name: &str) -> bool {
@@ -5540,6 +5928,7 @@ fn macos_overlay_open_app_command(
         .arg("--bluey-overlay-session-token")
         .arg(expected_token);
     if macos_overlay_capture_visible_for_debug() {
+        command.arg("--bluey-dev-overlay");
         command.arg("--bluey-overlay-capture-visible");
     }
     command
@@ -5570,14 +5959,18 @@ fn macos_overlay_app_bundle_for_binary(binary: &Path) -> Option<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn macos_overlay_capture_visible_for_debug() -> bool {
-    std::env::var("BLUEY_OVERLAY_CAPTURE_VISIBLE")
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    macos_overlay_capture_visible_allowed(
+        env_truthy_any(&["BLUEY_DEV_OVERLAY"]),
+        env_truthy_any(&[
+            "BLUEY_OVERLAY_CAPTURE_VISIBLE",
+            "BLUEY_HOST_OVERLAY_CAPTURE_VISIBLE",
+        ]),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn macos_overlay_capture_visible_allowed(dev_gate: bool, capture_requested: bool) -> bool {
+    dev_gate && capture_requested
 }
 
 fn spawn_overlay_reader<R>(
@@ -6595,6 +6988,10 @@ fn spawn_auto_recap(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
                         model: resp.model.as_deref(),
                         input_tokens: resp.input_tokens,
                         output_tokens: resp.output_tokens,
+                        cost_label: resp.cost_label.as_deref(),
+                        artifact_type: resp.artifact_type.as_deref(),
+                        artifact_body: resp.artifact_body.as_deref(),
+                        artifact_confidence: resp.artifact_confidence,
                     }) {
                         warn!(error = %e, "auto-recap: failed to persist");
                     } else {
@@ -6701,6 +7098,14 @@ mod tests {
     }
 
     #[test]
+    fn url_component_escapes_audio_request_ids() {
+        assert_eq!(
+            url_component("audio system/1 + model"),
+            "audio%20system%2F1%20%2B%20model"
+        );
+    }
+
+    #[test]
     fn overlay_auto_uses_managed_route_fallbacks() {
         let request = answer_request_from_overlay(
             "Solve this in Rust",
@@ -6803,6 +7208,44 @@ mod tests {
             answer_overlay_cost_label(&metadata),
             Some("123 in / 45 out · 812 ms".to_string())
         );
+    }
+
+    #[test]
+    fn answer_overlay_artifact_detects_fenced_code() {
+        let artifact = answer_overlay_artifact(
+            "Use a hash map.\n```rust\nfn solve() -> i32 { 42 }\n```\nTime Complexity: O(n)",
+        )
+        .expect("code artifact");
+
+        assert_eq!(artifact.artifact_type, CardArtifactType::Code);
+        assert!(artifact.body.contains("CODE\n----"));
+        assert!(artifact.body.contains("fn solve()"));
+        assert!(artifact.body.contains("NOTES\n-----"));
+    }
+
+    #[test]
+    fn answer_overlay_artifact_detects_system_design() {
+        let artifact = answer_overlay_artifact(
+            "For this system design, use an API gateway, cache, queue, database, and load balancer to improve latency and scale.",
+        )
+        .expect("system design artifact");
+
+        assert_eq!(artifact.artifact_type, CardArtifactType::SystemDesign);
+        assert!(artifact.confidence > 0.8);
+    }
+
+    #[test]
+    fn answer_overlay_artifact_ignores_short_chat() {
+        assert!(answer_overlay_artifact("Yes, that is the right next step.").is_none());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_overlay_capture_visible_requires_dev_gate() {
+        assert!(!macos_overlay_capture_visible_allowed(false, false));
+        assert!(!macos_overlay_capture_visible_allowed(false, true));
+        assert!(!macos_overlay_capture_visible_allowed(true, false));
+        assert!(macos_overlay_capture_visible_allowed(true, true));
     }
 
     #[test]
