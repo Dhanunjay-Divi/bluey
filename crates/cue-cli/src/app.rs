@@ -15,11 +15,11 @@ use clap::{Args, Parser, Subcommand};
 use cue_core::app_paths::AppPaths;
 use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
 use cue_core::{
-    load_account, load_settings, save_account, save_settings, AccountConfig, ActionItem,
-    AiProviderId, AiProviderKind, AiRuntimeStatus, AnswerRequest, AnswerResponse,
-    AudioPipelineStatus, CardKind, CloudSyncStatus, ContextArtifact, CueCard, CueSettings,
-    MeetingRecap, MeetingRecord, MemoryHit, OverlayPosition, ProviderRoute, ProviderSelector,
-    Speaker,
+    load_account, load_settings, new_trace_id, save_account, save_settings, trace_id_from_env,
+    AccountConfig, ActionItem, AiProviderId, AiProviderKind, AiRuntimeStatus, AnswerRequest,
+    AnswerResponse, AudioPipelineStatus, CardKind, CloudSyncStatus, ContextArtifact, CueCard,
+    CueSettings, MeetingRecap, MeetingRecord, MemoryHit, OverlayPosition, ProviderRoute,
+    ProviderSelector, Speaker, BLUEY_TRACE_ID_ENV,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -1836,8 +1836,11 @@ async fn start(args: StartArgs) -> Result<()> {
 
     if args.foreground {
         let daemon_args = daemon_launch_args(&args);
-        let status = Command::new(resolve_daemon_bin()?)
+        let mut command = Command::new(resolve_daemon_bin()?);
+        command
             .args(daemon_args)
+            .env(BLUEY_TRACE_ID_ENV, command_trace_id());
+        let status = command
             .status()
             .context("failed to run Bluey daemon in foreground")?;
         if !status.success() {
@@ -1849,6 +1852,7 @@ async fn start(args: StartArgs) -> Result<()> {
     let mut command = Command::new(resolve_daemon_bin()?);
     command.args(daemon_launch_args(&args));
     command
+        .env(BLUEY_TRACE_ID_ENV, command_trace_id())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -1945,7 +1949,7 @@ async fn request(message: DaemonRequest) -> Result<DaemonResponse> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
-    let line = serde_json::to_string(&message)?;
+    let line = serde_json::to_string(&message.with_trace_id(command_trace_id()))?;
     writer.write_all(line.as_bytes()).await?;
     writer.write_all(b"\n").await?;
     writer.flush().await?;
@@ -1956,6 +1960,12 @@ async fn request(message: DaemonRequest) -> Result<DaemonResponse> {
         bail!("daemon closed connection without a response");
     }
     Ok(serde_json::from_str(response.trim_end())?)
+}
+
+fn command_trace_id() -> String {
+    static TRACE_ID: once_cell::sync::Lazy<String> =
+        once_cell::sync::Lazy::new(|| trace_id_from_env().unwrap_or_else(new_trace_id));
+    TRACE_ID.clone()
 }
 
 fn env_value_any(primary: &str, legacy: &str) -> Option<String> {
@@ -2545,6 +2555,7 @@ fn optional_cloud_client() -> Result<Option<cue_cloud_client::CloudClient>> {
         .unwrap_or_else(|| "https://api.bluey.dev".to_string());
     let config = cue_cloud_client::client::ClientConfig {
         base_url,
+        trace_id: Some(command_trace_id()),
         ..Default::default()
     };
 

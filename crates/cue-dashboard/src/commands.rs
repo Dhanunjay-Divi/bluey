@@ -51,6 +51,14 @@ pub struct AccountMePayload {
 
 /// Send a request to the running daemon over TCP and return the response.
 async fn daemon_ipc(request: DaemonRequest) -> Result<DaemonResponse, String> {
+    let trace_id = dashboard_trace_id();
+    daemon_ipc_with_trace(request, &trace_id).await
+}
+
+async fn daemon_ipc_with_trace(
+    request: DaemonRequest,
+    trace_id: &str,
+) -> Result<DaemonResponse, String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
 
@@ -60,7 +68,8 @@ async fn daemon_ipc(request: DaemonRequest) -> Result<DaemonResponse, String> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
 
-    let line = serde_json::to_string(&request).map_err(|e| e.to_string())?;
+    let line = serde_json::to_string(&request.with_trace_id(trace_id.to_string()))
+        .map_err(|e| e.to_string())?;
     writer
         .write_all(line.as_bytes())
         .await
@@ -79,6 +88,16 @@ async fn daemon_ipc(request: DaemonRequest) -> Result<DaemonResponse, String> {
     serde_json::from_str(response.trim_end()).map_err(|e| e.to_string())
 }
 
+fn dashboard_trace_id() -> String {
+    cue_core::new_trace_id()
+}
+
+fn cloud_client_with_trace(trace_id: &str) -> Result<cue_cloud_client::CloudClient, String> {
+    cue_cloud_client::CloudClient::with_default_keyring()
+        .map(|client| client.with_trace_id(trace_id.to_string()))
+        .map_err(|e| format!("account keyring unavailable: {e}"))
+}
+
 #[tauri::command]
 pub fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
@@ -86,8 +105,8 @@ pub fn get_app_version() -> String {
 
 #[tauri::command]
 pub async fn get_balance_snapshot() -> Result<Option<BalanceSnapshotPayload>, String> {
-    let client = cue_cloud_client::CloudClient::with_default_keyring()
-        .map_err(|e| format!("balance keyring unavailable: {e}"))?;
+    let trace_id = dashboard_trace_id();
+    let client = cloud_client_with_trace(&trace_id)?;
     if client.current_tokens().is_none() {
         return Ok(None);
     }
@@ -110,8 +129,8 @@ pub async fn get_balance_snapshot() -> Result<Option<BalanceSnapshotPayload>, St
 
 #[tauri::command]
 pub async fn account_me() -> Result<Option<AccountMePayload>, String> {
-    let client = cue_cloud_client::CloudClient::with_default_keyring()
-        .map_err(|e| format!("account keyring unavailable: {e}"))?;
+    let trace_id = dashboard_trace_id();
+    let client = cloud_client_with_trace(&trace_id)?;
     if client.current_tokens().is_none() {
         return Ok(None);
     }
@@ -138,8 +157,8 @@ pub async fn billing_portal_url() -> Result<String, String> {
         portal_url: String,
     }
 
-    let client = cue_cloud_client::CloudClient::with_default_keyring()
-        .map_err(|e| format!("account keyring unavailable: {e}"))?;
+    let trace_id = dashboard_trace_id();
+    let client = cloud_client_with_trace(&trace_id)?;
     let resp: PortalResponse = client
         .auth_post("/billing/portal", &serde_json::json!({}))
         .await
@@ -164,8 +183,8 @@ pub async fn delete_account_now(db: State<'_, DbState>) -> Result<(), String> {
         deleted: bool,
     }
 
-    let client = cue_cloud_client::CloudClient::with_default_keyring()
-        .map_err(|e| format!("account keyring unavailable: {e}"))?;
+    let trace_id = dashboard_trace_id();
+    let client = cloud_client_with_trace(&trace_id)?;
     let ack: DeleteAck = client
         .auth_post("/account/delete", &serde_json::json!({}))
         .await
@@ -503,8 +522,9 @@ pub fn list_speakers(
 /// Sends the appropriate IPC request to the running daemon.
 #[tauri::command]
 pub async fn daemon_toggle_listening() -> Result<String, String> {
+    let trace_id = dashboard_trace_id();
     // Query daemon status to decide start vs stop.
-    let status = daemon_ipc(DaemonRequest::Status).await?;
+    let status = daemon_ipc_with_trace(DaemonRequest::Status, &trace_id).await?;
     let is_active = match &status {
         DaemonResponse::Status { state } => {
             matches!(state.meeting, cue_core::MeetingState::InMeeting { .. })
@@ -512,9 +532,9 @@ pub async fn daemon_toggle_listening() -> Result<String, String> {
         _ => false,
     };
     let resp = if is_active {
-        daemon_ipc(DaemonRequest::MeetingEnd).await?
+        daemon_ipc_with_trace(DaemonRequest::MeetingEnd, &trace_id).await?
     } else {
-        daemon_ipc(DaemonRequest::MeetingStart { title: None }).await?
+        daemon_ipc_with_trace(DaemonRequest::MeetingStart { title: None }, &trace_id).await?
     };
     match resp {
         DaemonResponse::Text { text } => Ok(text),
@@ -530,8 +550,9 @@ pub async fn daemon_toggle_listening() -> Result<String, String> {
 /// only streams while toggled on. Each press cycles the state.
 #[tauri::command]
 pub async fn daemon_set_push_to_talk(db: State<'_, DbState>) -> Result<String, String> {
+    let trace_id = dashboard_trace_id();
     // Toggle audio: if audio is active, stop it; otherwise start mic-only.
-    let status = daemon_ipc(DaemonRequest::AudioStatus).await?;
+    let status = daemon_ipc_with_trace(DaemonRequest::AudioStatus, &trace_id).await?;
     let is_active = match &status {
         DaemonResponse::AudioStatus { status } => {
             status.session_id.is_some()
@@ -543,14 +564,17 @@ pub async fn daemon_set_push_to_talk(db: State<'_, DbState>) -> Result<String, S
         _ => false,
     };
     let resp = if is_active {
-        daemon_ipc(DaemonRequest::AudioStop).await?
+        daemon_ipc_with_trace(DaemonRequest::AudioStop, &trace_id).await?
     } else {
         let mic_device_id = load_mic_device_from_settings(&db);
-        daemon_ipc(DaemonRequest::AudioStart {
-            enable_system: false,
-            enable_microphone: true,
-            mic_device_id,
-        })
+        daemon_ipc_with_trace(
+            DaemonRequest::AudioStart {
+                enable_system: false,
+                enable_microphone: true,
+                mic_device_id,
+            },
+            &trace_id,
+        )
         .await?
     };
     match resp {
@@ -1411,6 +1435,7 @@ pub async fn request_cue(
 ) -> Result<String, String> {
     use cue_daemon::llm::{ends_with_question, AnswerLlm, WhatToAnswerLlm};
 
+    let trace_id = dashboard_trace_id();
     let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
     let store = cue_daemon::storage::MeetingStore::new(&paths).map_err(|e| e.to_string())?;
     let meeting = store
@@ -1437,8 +1462,8 @@ pub async fn request_cue(
         return Err("no recent transcript to analyze".to_string());
     }
 
-    let llm =
-        build_llm_provider_from_env(&db).ok_or_else(|| "no LLM provider configured".to_string())?;
+    let llm = build_llm_provider_from_env(&db, &trace_id)
+        .ok_or_else(|| "no LLM provider configured".to_string())?;
 
     // Generate response_id up-front so chunks and final event share it.
     let response_id = Uuid::new_v4().to_string();
@@ -1457,7 +1482,7 @@ pub async fn request_cue(
     // through to the legacy AnswerLlm / WhatToAnswerLlm path — zero regression.
     {
         use cue_daemon::llm::{answer as answer_mod, suggest as suggest_mod};
-        let registry = ProviderRegistry::from_env_and_secrets(&db);
+        let registry = ProviderRegistry::from_env_and_secrets(&db, &trace_id);
         let classification = classify_only_for_router(&recent, true, false);
         let is_question = kind == "answer" && ends_with_question(&recent);
         let user_text = if is_question {
@@ -1605,6 +1630,7 @@ pub async fn auto_recap(
 ) -> Result<String, String> {
     use cue_daemon::llm::RecapLlm;
 
+    let trace_id = dashboard_trace_id();
     let paths = cue_core::app_paths::AppPaths::discover().map_err(|e| e.to_string())?;
     let store = cue_daemon::storage::MeetingStore::new(&paths).map_err(|e| e.to_string())?;
 
@@ -1625,7 +1651,7 @@ pub async fn auto_recap(
         return Err("empty transcript".to_string());
     }
 
-    let llm = match build_llm_provider_from_env(&db) {
+    let llm = match build_llm_provider_from_env(&db, &trace_id) {
         Some(p) => p,
         None => {
             tracing::warn!("auto-recap skipped: no LLM provider configured");
@@ -1713,7 +1739,7 @@ struct ProviderRegistry {
 }
 
 impl ProviderRegistry {
-    fn from_env_and_secrets(_db: &tauri::State<DbState>) -> Self {
+    fn from_env_and_secrets(_db: &tauri::State<DbState>, trace_id: &str) -> Self {
         use std::collections::HashMap;
         use std::sync::Arc;
 
@@ -1727,7 +1753,7 @@ impl ProviderRegistry {
         // Legacy BYOK direct providers (OpenAI/Anthropic from env or
         // keyring) are gated behind BLUEY_DEV_BYOK=1 so dev workflows
         // still work without surprising customers in production.
-        let managed_mode = match cue_cloud_client::CloudClient::with_default_keyring() {
+        let managed_mode = match cloud_client_with_trace(trace_id) {
             Ok(client) => client.current_tokens().is_some(),
             Err(_) => false,
         };
@@ -1738,7 +1764,7 @@ impl ProviderRegistry {
             // name (bluey-managed-{lane}) matches what
             // cue_router::ManagedPolicy emits, so the registry lookup
             // dispatches correctly.
-            if let Ok(client) = cue_cloud_client::CloudClient::with_default_keyring() {
+            if let Ok(client) = cloud_client_with_trace(trace_id) {
                 for lane in [
                     cue_llm::bluey_managed::ManagedLane::Instant,
                     cue_llm::bluey_managed::ManagedLane::Balanced,
@@ -1864,7 +1890,10 @@ impl cue_router::speculative::SpeculativeProvider for ProviderRegistry {
 /// BlueyManagedProvider bound to the Balanced lane as the legacy
 /// single-shot fallback. The speculative path (`try_speculative_
 /// dispatch`) picks per-lane providers separately.
-fn build_llm_provider_from_env(_db: &State<DbState>) -> Option<Box<dyn cue_llm::LlmProvider>> {
+fn build_llm_provider_from_env(
+    _db: &State<DbState>,
+    trace_id: &str,
+) -> Option<Box<dyn cue_llm::LlmProvider>> {
     // Managed mode first: Bluey account tokens take priority over BYOK
     // unless BLUEY_DEV_BYOK=1 explicitly opts in (matching the
     // ProviderRegistry policy).
@@ -1872,7 +1901,7 @@ fn build_llm_provider_from_env(_db: &State<DbState>) -> Option<Box<dyn cue_llm::
         .map(|v| v == "1")
         .unwrap_or(false);
     if !allow_byok {
-        if let Ok(client) = cue_cloud_client::CloudClient::with_default_keyring() {
+        if let Ok(client) = cloud_client_with_trace(trace_id) {
             if client.current_tokens().is_some() {
                 return Some(Box::new(cue_llm::bluey_managed::BlueyManagedProvider::new(
                     client,

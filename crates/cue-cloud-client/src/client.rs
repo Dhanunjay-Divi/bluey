@@ -93,7 +93,7 @@ impl CloudClient {
     }
 
     /// Return a copy of this client that attaches a fixed trace id to all
-    /// outgoing HTTP calls. Phase 5 will use this for UI/IPC-originated traces.
+    /// outgoing HTTP calls.
     pub fn with_trace_id(mut self, trace_id: impl Into<String>) -> Self {
         self.config.trace_id = sanitize_observability_id(&trace_id.into());
         self

@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActionItem, AiRuntimeStatus, AnswerRequest, AnswerResponse, AnswerStreamEvent,
-    AudioPipelineStatus, CloudSyncStatus, ContextArtifact, CueCard, DaemonState, MeetingRecap,
-    MemoryHit, OverlayPosition, Speaker,
+    sanitize_observability_id, ActionItem, AiRuntimeStatus, AnswerRequest, AnswerResponse,
+    AnswerStreamEvent, AudioPipelineStatus, CloudSyncStatus, ContextArtifact, CueCard, DaemonState,
+    MeetingRecap, MemoryHit, OverlayPosition, Speaker,
 };
 
 pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:57321";
@@ -11,6 +11,15 @@ pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:57321";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonRequest {
+    /// Backward-compatible trace envelope for UI/CLI -> daemon IPC.
+    ///
+    /// Older clients send the inner request directly. Newer clients wrap any
+    /// request in this variant so daemon-side logs and downstream cloud calls
+    /// can share the same trace id.
+    WithTrace {
+        trace_id: String,
+        request: Box<DaemonRequest>,
+    },
     Ping,
     Status,
     Shutdown,
@@ -81,6 +90,38 @@ pub enum DaemonRequest {
     ActionItems,
 }
 
+impl DaemonRequest {
+    pub fn with_trace_id(self, trace_id: impl Into<String>) -> Self {
+        let trace_id = trace_id.into();
+        if sanitize_observability_id(&trace_id).is_none() {
+            return self;
+        }
+        Self::WithTrace {
+            trace_id,
+            request: Box::new(self),
+        }
+    }
+
+    pub fn into_trace_parts(self) -> (Self, Option<String>) {
+        match self {
+            Self::WithTrace { trace_id, request } => {
+                let (request, inner_trace_id) = request.into_trace_parts();
+                let trace_id = sanitize_observability_id(&trace_id).or(inner_trace_id);
+                (request, trace_id)
+            }
+            request => (request, None),
+        }
+    }
+
+    pub fn is_shutdown(&self) -> bool {
+        match self {
+            Self::Shutdown => true,
+            Self::WithTrace { request, .. } => request.is_shutdown(),
+            _ => false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonResponse {
@@ -120,4 +161,38 @@ pub enum DaemonResponse {
     Error {
         message: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn with_trace_round_trips_and_unwraps() {
+        let request = DaemonRequest::Status.with_trace_id("trace-123");
+        let json = serde_json::to_string(&request).expect("serialize");
+        assert!(json.contains("\"type\":\"with_trace\""));
+        assert!(json.contains("\"trace_id\":\"trace-123\""));
+
+        let decoded: DaemonRequest = serde_json::from_str(&json).expect("decode");
+        let (inner, trace_id) = decoded.into_trace_parts();
+        assert_eq!(trace_id.as_deref(), Some("trace-123"));
+        assert!(matches!(inner, DaemonRequest::Status));
+    }
+
+    #[test]
+    fn invalid_trace_wrapper_falls_back_to_inner_trace() {
+        let request = DaemonRequest::WithTrace {
+            trace_id: "bad\ntrace".to_string(),
+            request: Box::new(DaemonRequest::Ping.with_trace_id("inner.trace")),
+        };
+        let (inner, trace_id) = request.into_trace_parts();
+        assert_eq!(trace_id.as_deref(), Some("inner.trace"));
+        assert!(matches!(inner, DaemonRequest::Ping));
+    }
+
+    #[test]
+    fn shutdown_is_detected_inside_trace_envelope() {
+        assert!(DaemonRequest::Shutdown.with_trace_id("trace").is_shutdown());
+    }
 }

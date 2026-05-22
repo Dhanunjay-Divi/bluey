@@ -20,15 +20,15 @@ use cue_core::app_paths::AppPaths;
 use cue_core::audio::SimulatedPcmChunk;
 use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
 use cue_core::{
-    analyze_segment, clock, generate_recap, load_account, local_answer, AiCapabilities,
-    AiProviderId, AiProviderKind, AiRuntimeStatus, AnswerContext, AnswerContextKind, AudioBackend,
-    AudioCaptureConfig, AudioChunkMetadata, AudioDeviceDescriptor, AudioDeviceRole,
-    AudioPipelineStatus, AudioSourceKind, CardArtifactType, CardKind, CloudEndpointConfig,
-    CloudEnvironment, CloudSyncState, CloudSyncStatus, ContextArtifact, ContextKind,
-    ContextProcessingStatus, ConversationTurn, CueCard, CueCardArtifact, DaemonState,
-    MeetingRecord, MeetingState, MemoryHit, OverlayCommand, OverlayContextItem, OverlayEvent,
-    OverlaySessionItem, PrivacyFlags, ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget,
-    Speaker, TranscriptSegment,
+    analyze_segment, clock, generate_recap, load_account, local_answer, new_trace_id,
+    sanitize_observability_id, trace_id_from_env, AiCapabilities, AiProviderId, AiProviderKind,
+    AiRuntimeStatus, AnswerContext, AnswerContextKind, AudioBackend, AudioCaptureConfig,
+    AudioChunkMetadata, AudioDeviceDescriptor, AudioDeviceRole, AudioPipelineStatus,
+    AudioSourceKind, CardArtifactType, CardKind, CloudEndpointConfig, CloudEnvironment,
+    CloudSyncState, CloudSyncStatus, ContextArtifact, ContextKind, ContextProcessingStatus,
+    ConversationTurn, CueCard, CueCardArtifact, DaemonState, MeetingRecord, MeetingState,
+    MemoryHit, OverlayCommand, OverlayContextItem, OverlayEvent, OverlaySessionItem, PrivacyFlags,
+    ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget, Speaker, TranscriptSegment,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -685,7 +685,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: TcpStream) -> Result<()> {
     }
 
     let request: DaemonRequest = serde_json::from_str(line.trim_end())?;
-    let shutdown = matches!(request, DaemonRequest::Shutdown);
+    let shutdown = request.is_shutdown();
     let response = handle_request(&daemon, request).await;
     let line = serde_json::to_string(&response)?;
     writer.write_all(line.as_bytes()).await?;
@@ -701,7 +701,12 @@ async fn handle_client(daemon: Arc<Daemon>, stream: TcpStream) -> Result<()> {
 }
 
 async fn handle_request(daemon: &Arc<Daemon>, request: DaemonRequest) -> DaemonResponse {
-    match handle_request_inner(daemon, request).await {
+    let (request, trace_id) = request.into_trace_parts();
+    let trace_id = trace_id
+        .or_else(trace_id_from_env)
+        .unwrap_or_else(new_trace_id);
+    debug!(trace_id = %trace_id, "daemon ipc request received");
+    match handle_request_inner(daemon, request, &trace_id).await {
         Ok(response) => response,
         Err(error) => DaemonResponse::Error {
             message: format!("{error:#}"),
@@ -712,8 +717,10 @@ async fn handle_request(daemon: &Arc<Daemon>, request: DaemonRequest) -> DaemonR
 async fn handle_request_inner(
     daemon: &Arc<Daemon>,
     request: DaemonRequest,
+    trace_id: &str,
 ) -> Result<DaemonResponse> {
     match request {
+        DaemonRequest::WithTrace { .. } => unreachable!("trace envelope should be stripped"),
         DaemonRequest::Ping => Ok(DaemonResponse::Pong),
         DaemonRequest::Status => Ok(DaemonResponse::Status {
             state: daemon.state.lock().await.clone(),
@@ -1041,7 +1048,7 @@ async fn handle_request_inner(
         }
         DaemonRequest::AudioStop => {
             let status = stop_audio_capture(daemon).await;
-            let _ = refresh_overlay_balance(daemon).await;
+            let _ = refresh_overlay_balance(daemon, Some(trace_id)).await;
             Ok(DaemonResponse::AudioStatus { status })
         }
         DaemonRequest::AiStatus => Ok(DaemonResponse::AiStatus {
@@ -1061,7 +1068,7 @@ async fn handle_request_inner(
             status.mark_syncing();
             *daemon.cloud.lock().await = status.clone();
 
-            let status = match build_cloud_client(&daemon.paths) {
+            let status = match build_cloud_client(&daemon.paths, Some(trace_id)) {
                 Ok(client) => {
                     match crate::cloud::sync::sync_local_meetings(
                         &daemon.store,
@@ -1157,7 +1164,7 @@ async fn send_overlay(daemon: &Arc<Daemon>, command: OverlayCommand) -> Result<(
 }
 
 fn maybe_spawn_balance_polling(daemon: &Arc<Daemon>) {
-    let Ok(client) = build_cloud_client(&daemon.paths) else {
+    let Ok(client) = build_cloud_client(&daemon.paths, None) else {
         debug!("balance polling skipped; keyring unavailable");
         return;
     };
@@ -1289,7 +1296,7 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             refresh_overlay_sessions(daemon).await;
             let daemon_balance = Arc::clone(daemon);
             tokio::spawn(async move {
-                let _ = refresh_overlay_balance(&daemon_balance).await;
+                let _ = refresh_overlay_balance(&daemon_balance, None).await;
             });
         }
         OverlayEvent::Shown => {
@@ -1408,7 +1415,7 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         }
         OverlayEvent::RecordingStartRequested => {
             let status = start_audio_capture(daemon, AudioCaptureConfig::dual_default()).await?;
-            let balance = refresh_overlay_balance(daemon).await;
+            let balance = refresh_overlay_balance(daemon, None).await;
             let balance_line = balance
                 .map(|label| format!("\nBalance: {label}."))
                 .unwrap_or_default();
@@ -1428,7 +1435,7 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         }
         OverlayEvent::RecordingStopRequested => {
             let status = stop_audio_capture(daemon).await;
-            let balance = refresh_overlay_balance(daemon).await;
+            let balance = refresh_overlay_balance(daemon, None).await;
             let balance_line = balance
                 .map(|label| format!("\nFinal balance: {label}."))
                 .unwrap_or_default();
@@ -2362,7 +2369,7 @@ async fn maybe_auto_stop_idle_audio(
         audio.updated_at = clock::now_epoch_ms_string();
     }
 
-    let balance = refresh_overlay_balance(daemon).await;
+    let balance = refresh_overlay_balance(daemon, None).await;
     let balance_line = balance
         .map(|label| format!("\nFinal balance: {label}."))
         .unwrap_or_else(|| {
@@ -2406,8 +2413,8 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
-async fn refresh_overlay_balance(daemon: &Arc<Daemon>) -> Option<String> {
-    let snapshot = fetch_current_balance_snapshot().await?;
+async fn refresh_overlay_balance(daemon: &Arc<Daemon>, trace_id: Option<&str>) -> Option<String> {
+    let snapshot = fetch_current_balance_snapshot(trace_id).await?;
     let label = format_balance_cents(snapshot.balance_cents);
     daemon.balance_watch.publish(snapshot);
     let _ = send_overlay(
@@ -2502,7 +2509,9 @@ fn overlay_context_items(meeting: &MeetingRecord) -> Vec<OverlayContextItem> {
         .collect()
 }
 
-async fn fetch_current_balance_snapshot() -> Option<crate::cloud::balance::BalanceSnapshot> {
+async fn fetch_current_balance_snapshot(
+    trace_id: Option<&str>,
+) -> Option<crate::cloud::balance::BalanceSnapshot> {
     let paths = match AppPaths::discover() {
         Ok(paths) => paths,
         Err(error) => {
@@ -2510,7 +2519,7 @@ async fn fetch_current_balance_snapshot() -> Option<crate::cloud::balance::Balan
             return None;
         }
     };
-    let client = match build_cloud_client(&paths) {
+    let client = match build_cloud_client(&paths, trace_id) {
         Ok(client) => client,
         Err(error) => {
             debug!("balance lookup skipped; keyring unavailable: {error}");
@@ -2545,7 +2554,10 @@ async fn fetch_current_balance_snapshot() -> Option<crate::cloud::balance::Balan
     }
 }
 
-fn build_cloud_client(paths: &AppPaths) -> Result<cue_cloud_client::CloudClient> {
+fn build_cloud_client(
+    paths: &AppPaths,
+    trace_id: Option<&str>,
+) -> Result<cue_cloud_client::CloudClient> {
     let base_url = env::var("BLUEY_CLOUD_API_URL")
         .or_else(|_| env::var("CUE_CLOUD_API_URL"))
         .ok()
@@ -2576,14 +2588,25 @@ fn build_cloud_client(paths: &AppPaths) -> Result<cue_cloud_client::CloudClient>
                     .unwrap_or_else(|_| "env-token".to_string()),
             },
         )?;
-        return cue_cloud_client::CloudClient::new(config, Arc::new(store)).map_err(Into::into);
+        let client = cue_cloud_client::CloudClient::new(config, Arc::new(store))?;
+        return Ok(cloud_client_with_optional_trace(client, trace_id));
     }
 
-    cue_cloud_client::CloudClient::new(
+    let client = cue_cloud_client::CloudClient::new(
         config,
         Arc::new(cue_cloud_client::tokens::KeyringStore::new()),
-    )
-    .map_err(Into::into)
+    )?;
+    Ok(cloud_client_with_optional_trace(client, trace_id))
+}
+
+fn cloud_client_with_optional_trace(
+    client: cue_cloud_client::CloudClient,
+    trace_id: Option<&str>,
+) -> cue_cloud_client::CloudClient {
+    trace_id
+        .and_then(sanitize_observability_id)
+        .map(|trace_id| client.clone().with_trace_id(trace_id))
+        .unwrap_or(client)
 }
 
 fn format_balance_cents(cents: i64) -> String {
@@ -7048,6 +7071,32 @@ mod tests {
         assert!(json.contains("data:image/png;base64,"));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cloud_client_with_optional_trace_attaches_sanitized_trace_id() {
+        let client = cue_cloud_client::CloudClient::new(
+            cue_cloud_client::client::ClientConfig::default(),
+            Arc::new(cue_cloud_client::tokens::MemoryStore::new()),
+        )
+        .expect("client");
+
+        let traced = cloud_client_with_optional_trace(client, Some("trace-123"));
+
+        assert_eq!(traced.config.trace_id.as_deref(), Some("trace-123"));
+    }
+
+    #[test]
+    fn cloud_client_with_optional_trace_rejects_invalid_trace_id() {
+        let client = cue_cloud_client::CloudClient::new(
+            cue_cloud_client::client::ClientConfig::default(),
+            Arc::new(cue_cloud_client::tokens::MemoryStore::new()),
+        )
+        .expect("client");
+
+        let traced = cloud_client_with_optional_trace(client, Some("bad\ntrace"));
+
+        assert_eq!(traced.config.trace_id, None);
     }
 
     #[test]

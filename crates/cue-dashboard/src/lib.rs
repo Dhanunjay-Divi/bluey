@@ -596,8 +596,9 @@ async fn handle_deep_link_url(url: String, app: tauri::AppHandle) {
         return;
     };
 
+    let trace_id = cue_core::new_trace_id();
     let client = match cue_cloud_client::CloudClient::with_default_keyring() {
-        Ok(c) => c,
+        Ok(c) => c.with_trace_id(trace_id),
         Err(e) => {
             tracing::warn!(error = %e, "cloud client init failed");
             let _ = app.emit(
