@@ -1328,6 +1328,8 @@ private final class ExpandedPanelView: NSView {
     let titleLabel: NSTextField
     let statusLabel: NSTextField
     let modelMenu: NSPopUpButton
+    let routeBadge: NSTextField
+    let knowledgeBadge: NSTextField
     let balanceLabel: NSTextField
     let canvasToggleButton: NSButton
     let navButton: NSButton
@@ -1342,6 +1344,8 @@ private final class ExpandedPanelView: NSView {
     let answerStyleBox: NSTextField
     let answerStyleSaveButton: NSButton
     let transcriptStrip: NSView
+    let transcriptActivityDot: NSView
+    let transcriptStateLabel: NSTextField
     let transcriptScroll: NSScrollView
     let transcriptLabel: NSTextField
     let attachmentStrip: NSScrollView
@@ -1390,6 +1394,8 @@ private final class ExpandedPanelView: NSView {
         titleLabel = NSTextField(labelWithString: "Bluey")
         statusLabel = NSTextField(labelWithString: "New recording")
         modelMenu = NSPopUpButton(frame: .zero, pullsDown: false)
+        routeBadge = NSTextField(labelWithString: "Auto · ready")
+        knowledgeBadge = NSTextField(labelWithString: "KB empty")
         balanceLabel = NSTextField(labelWithString: "Balance --")
         canvasToggleButton = NSButton(title: "", target: nil, action: nil)
         navButton = NSButton(title: "", target: nil, action: nil)
@@ -1404,6 +1410,8 @@ private final class ExpandedPanelView: NSView {
         answerStyleBox = NSTextField()
         answerStyleSaveButton = NSButton(title: "Save", target: nil, action: nil)
         transcriptStrip = NSView()
+        transcriptActivityDot = NSView()
+        transcriptStateLabel = NSTextField(labelWithString: "IDLE")
         transcriptScroll = NSScrollView()
         transcriptLabel = NSTextField(labelWithString: "Live captions preview")
         attachmentStrip = NSScrollView()
@@ -1454,6 +1462,8 @@ private final class ExpandedPanelView: NSView {
             titleLabel,
             statusLabel,
             modelMenu,
+            routeBadge,
+            knowledgeBadge,
             balanceLabel,
             canvasToggleButton,
             navButton,
@@ -1471,6 +1481,8 @@ private final class ExpandedPanelView: NSView {
             feed,
             canvasPane,
             transcriptStrip,
+            transcriptActivityDot,
+            transcriptStateLabel,
             transcriptScroll,
             transcriptLabel,
             attachmentStrip,
@@ -1506,6 +1518,8 @@ private final class ExpandedPanelView: NSView {
             navButton,
             newSessionButton,
             brandStack,
+            routeBadge,
+            knowledgeBadge,
             headerSpacer,
             canvasToggleButton,
             balanceLabel,
@@ -1514,7 +1528,6 @@ private final class ExpandedPanelView: NSView {
         ] {
             headerStack.addArrangedSubview(view)
         }
-        addSubview(headerBar)
         addSubview(workspace)
         workspace.addSubview(feed)
         workspace.addSubview(canvasPane)
@@ -1527,6 +1540,8 @@ private final class ExpandedPanelView: NSView {
         sessionDrawer.addSubview(answerStyleBox)
         sessionDrawer.addSubview(answerStyleSaveButton)
         addSubview(transcriptStrip)
+        transcriptStrip.addSubview(transcriptActivityDot)
+        transcriptStrip.addSubview(transcriptStateLabel)
         transcriptStrip.addSubview(transcriptScroll)
         transcriptScroll.documentView = transcriptLabel
         transcriptLabel.translatesAutoresizingMaskIntoConstraints = true
@@ -1544,6 +1559,7 @@ private final class ExpandedPanelView: NSView {
         composerBar.addSubview(modelMenu)
         composerBar.addSubview(analyzeButton)
         composerBar.addSubview(askButton)
+        addSubview(headerBar, positioned: .above, relativeTo: nil)
         addSubview(closeConfirmOverlay)
         closeConfirmOverlay.addSubview(closeConfirmPanel)
         closeConfirmPanel.addSubview(closeConfirmTitle)
@@ -1583,6 +1599,14 @@ private final class ExpandedPanelView: NSView {
 
             brandStack.widthAnchor.constraint(greaterThanOrEqualToConstant: 110),
             brandStack.widthAnchor.constraint(lessThanOrEqualToConstant: 162),
+
+            routeBadge.widthAnchor.constraint(greaterThanOrEqualToConstant: 96),
+            routeBadge.widthAnchor.constraint(lessThanOrEqualToConstant: 142),
+            routeBadge.heightAnchor.constraint(equalToConstant: 26),
+
+            knowledgeBadge.widthAnchor.constraint(greaterThanOrEqualToConstant: 94),
+            knowledgeBadge.widthAnchor.constraint(lessThanOrEqualToConstant: 136),
+            knowledgeBadge.heightAnchor.constraint(equalToConstant: 26),
 
             closeButton.widthAnchor.constraint(equalToConstant: 26),
             closeButton.heightAnchor.constraint(equalToConstant: 26),
@@ -1661,8 +1685,17 @@ private final class ExpandedPanelView: NSView {
             transcriptStrip.bottomAnchor.constraint(equalTo: attachmentStrip.topAnchor, constant: -6),
             transcriptStrip.heightAnchor.constraint(equalToConstant: 26),
 
+            transcriptActivityDot.leadingAnchor.constraint(equalTo: transcriptStrip.leadingAnchor, constant: 11),
+            transcriptActivityDot.centerYAnchor.constraint(equalTo: transcriptStrip.centerYAnchor),
+            transcriptActivityDot.widthAnchor.constraint(equalToConstant: 7),
+            transcriptActivityDot.heightAnchor.constraint(equalToConstant: 7),
+
+            transcriptStateLabel.leadingAnchor.constraint(equalTo: transcriptActivityDot.trailingAnchor, constant: 7),
+            transcriptStateLabel.centerYAnchor.constraint(equalTo: transcriptStrip.centerYAnchor),
+            transcriptStateLabel.widthAnchor.constraint(equalToConstant: 88),
+
             transcriptScroll.topAnchor.constraint(equalTo: transcriptStrip.topAnchor, constant: 2),
-            transcriptScroll.leadingAnchor.constraint(equalTo: transcriptStrip.leadingAnchor, constant: 10),
+            transcriptScroll.leadingAnchor.constraint(equalTo: transcriptStateLabel.trailingAnchor, constant: 8),
             transcriptScroll.trailingAnchor.constraint(equalTo: transcriptStrip.trailingAnchor, constant: -10),
             transcriptScroll.bottomAnchor.constraint(equalTo: transcriptStrip.bottomAnchor, constant: -2),
 
@@ -1821,6 +1854,8 @@ private final class ExpandedPanelView: NSView {
         styleHeaderIconButton(hideButton, symbol: "eye.slash", fallback: "-")
         styleHeaderIconButton(closeButton, symbol: "xmark", fallback: "x")
         configureTooltips()
+        setContextItems([])
+        setTranscriptState("IDLE", active: false)
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -1878,6 +1913,12 @@ private final class ExpandedPanelView: NSView {
         modelMenu.setContentHuggingPriority(.defaultLow, for: .horizontal)
         modelMenu.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        styleHeaderBadge(routeBadge, textColor: BlueyTheme.cyan)
+        routeBadge.toolTip = "Auto Router classification and selected lane"
+
+        styleHeaderBadge(knowledgeBadge, textColor: BlueyTheme.text)
+        knowledgeBadge.toolTip = "Knowledge base status for attached documents"
+
         balanceLabel.font = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .bold)
         balanceLabel.textColor = BlueyTheme.text
         balanceLabel.alignment = .center
@@ -1898,6 +1939,19 @@ private final class ExpandedPanelView: NSView {
         transcriptStrip.layer?.cornerRadius = 13
         transcriptStrip.layer?.borderWidth = 1
         transcriptStrip.layer?.borderColor = BlueyTheme.hairline.cgColor
+
+        transcriptActivityDot.wantsLayer = true
+        transcriptActivityDot.layer?.cornerRadius = 3.5
+        transcriptActivityDot.layer?.backgroundColor = BlueyTheme.textDim.withAlphaComponent(0.55).cgColor
+        transcriptActivityDot.layer?.shadowColor = BlueyTheme.cyan.cgColor
+        transcriptActivityDot.layer?.shadowOpacity = 0
+        transcriptActivityDot.layer?.shadowRadius = 7
+        transcriptActivityDot.layer?.shadowOffset = .zero
+
+        transcriptStateLabel.font = NSFont.monospacedSystemFont(ofSize: 9.5, weight: .bold)
+        transcriptStateLabel.textColor = BlueyTheme.textDim
+        transcriptStateLabel.alignment = .left
+        transcriptStateLabel.lineBreakMode = .byTruncatingTail
 
         transcriptScroll.drawsBackground = false
         transcriptScroll.hasVerticalScroller = false
@@ -2102,6 +2156,21 @@ private final class ExpandedPanelView: NSView {
         button.alignment = .center
     }
 
+    private func styleHeaderBadge(_ label: NSTextField, textColor: NSColor) {
+        label.font = NSFont.systemFont(ofSize: 11.3, weight: .bold)
+        label.textColor = textColor
+        label.alignment = .center
+        label.lineBreakMode = .byTruncatingMiddle
+        label.maximumNumberOfLines = 1
+        label.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        label.wantsLayer = true
+        label.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.052).cgColor
+        label.layer?.cornerRadius = 13
+        label.layer?.borderWidth = 1
+        label.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.16).cgColor
+    }
+
     private func styleHeaderIconButton(_ button: NSButton, symbol: String, fallback: String) {
         button.title = fallback
         button.isBordered = false
@@ -2245,12 +2314,16 @@ private final class ExpandedPanelView: NSView {
             recordingActive = false
             recordingButton.title = "Listen"
             statusLabel.stringValue = "Paused"
+            composer.placeholder = "Ask anything..."
+            setTranscriptState("PAUSED", active: false)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
         } else {
             emitSimple("recording_start_requested")
             recordingActive = true
             recordingButton.title = "Stop"
             statusLabel.stringValue = "Listening"
+            composer.placeholder = "Listening... type a follow-up anytime"
+            setTranscriptState("LISTENING", active: true)
             styleControlButton(recordingButton, symbol: "stop.fill", accent: true)
         }
     }
@@ -2262,14 +2335,19 @@ private final class ExpandedPanelView: NSView {
             : raw
         composer.clearText()
         let route = selectedRoute()
+        updateRouteBadge(for: q, selectedRoute: route)
         emitAsk(question: q, provider: route.provider, model: route.model, mode: route.mode)
     }
 
     @objc private func analyzeClicked() {
+        routeBadge.stringValue = "Vision · deep"
+        statusLabel.stringValue = "Reading screen"
         emitSimple("analyze_screen_requested")
     }
 
     @objc private func attachClicked() {
+        setKnowledgeBadge("KB loading", accent: BlueyTheme.warning)
+        showKnowledgePlaceholder("Indexing selected files...")
         emitSimple("attach_requested")
     }
 
@@ -2283,14 +2361,108 @@ private final class ExpandedPanelView: NSView {
         balanceLabel.stringValue = clean.isEmpty ? "Balance --" : clean
     }
 
+    private func setKnowledgeBadge(_ text: String, accent: NSColor) {
+        knowledgeBadge.stringValue = text
+        knowledgeBadge.textColor = accent
+        knowledgeBadge.layer?.borderColor = accent.withAlphaComponent(0.30).cgColor
+        knowledgeBadge.layer?.backgroundColor = accent.withAlphaComponent(0.08).cgColor
+    }
+
+    private func showKnowledgePlaceholder(_ text: String) {
+        for view in attachmentStack.arrangedSubviews {
+            attachmentStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        attachmentStrip.isHidden = false
+
+        let chip = NSTextField(labelWithString: text)
+        chip.translatesAutoresizingMaskIntoConstraints = false
+        chip.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+        chip.textColor = BlueyTheme.textDim
+        chip.alignment = .center
+        chip.lineBreakMode = .byTruncatingTail
+        chip.wantsLayer = true
+        chip.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.035).cgColor
+        chip.layer?.cornerRadius = 12
+        chip.layer?.borderWidth = 1
+        chip.layer?.borderColor = BlueyTheme.hairline.cgColor
+        attachmentStack.addArrangedSubview(chip)
+        NSLayoutConstraint.activate([
+            chip.heightAnchor.constraint(equalToConstant: 28),
+            chip.widthAnchor.constraint(greaterThanOrEqualToConstant: 210),
+        ])
+    }
+
+    private func setTranscriptState(_ text: String, active: Bool) {
+        transcriptStateLabel.stringValue = text
+        transcriptStateLabel.textColor = active ? BlueyTheme.green : BlueyTheme.textDim
+        transcriptActivityDot.layer?.backgroundColor = (active ? BlueyTheme.green : BlueyTheme.textDim.withAlphaComponent(0.55)).cgColor
+        transcriptActivityDot.layer?.shadowOpacity = active ? 0.45 : 0
+        transcriptStrip.layer?.borderColor = (active ? BlueyTheme.green.withAlphaComponent(0.26) : BlueyTheme.hairline).cgColor
+    }
+
+    private func updateRouteBadge(
+        for question: String,
+        selectedRoute: (provider: String?, model: String?, mode: String?)
+    ) {
+        let manual = (selectedRoute.provider ?? "auto").lowercased() != "auto"
+        if manual {
+            switch selectedRoute.model ?? selectedRoute.provider ?? "Manual" {
+            case let value where value.contains("mini"):
+                routeBadge.stringValue = "Instant · manual"
+            case let value where value.contains("sonnet"):
+                routeBadge.stringValue = "Deep · manual"
+            default:
+                routeBadge.stringValue = "Manual lane"
+            }
+            routeBadge.textColor = BlueyTheme.text
+            return
+        }
+
+        let lower = question.lowercased()
+        let words = lower.split { $0.isWhitespace || $0.isNewline }.count
+        let vision = lower.contains("screen") || lower.contains("screenshot") || lower.contains("image")
+        let code = looksLikeCode(lower) || lower.contains("leetcode") || lower.contains("debug")
+        let design = looksLikeSystemDesign(lower) || lower.contains("architecture")
+        let hard = words > 80 || design || lower.contains("tradeoff") || lower.contains("scale")
+        let label: String
+        if vision {
+            label = "Vision · deep"
+        } else if hard {
+            label = "Auto · hard"
+        } else if code {
+            label = "Auto · medium"
+        } else {
+            label = "Auto · easy"
+        }
+        routeBadge.stringValue = label
+        routeBadge.textColor = hard || vision ? BlueyTheme.warning : BlueyTheme.cyan
+    }
+
+    private func routeBadgeText(for artifact: OverlayArtifact) -> String {
+        switch artifact.artifactType {
+        case "code": return "Code · canvas"
+        case "system_design": return "Design · canvas"
+        case "screen": return "Vision · canvas"
+        case "document": return "Docs · canvas"
+        default: return "Auto · canvas"
+        }
+    }
+
     func setContextItems(_ items: [OverlayContextItem]) {
         for view in attachmentStack.arrangedSubviews {
             attachmentStack.removeArrangedSubview(view)
             view.removeFromSuperview()
         }
 
-        attachmentStrip.isHidden = items.isEmpty
-        guard !items.isEmpty else { return }
+        attachmentStrip.isHidden = false
+        guard !items.isEmpty else {
+            setKnowledgeBadge("KB empty", accent: BlueyTheme.textDim)
+            showKnowledgePlaceholder("Knowledge base empty · attach docs")
+            return
+        }
+
+        setKnowledgeBadge("KB \(items.count) loaded", accent: BlueyTheme.green)
 
         for item in items {
             attachmentStack.addArrangedSubview(makeAttachmentChip(item))
@@ -2328,6 +2500,8 @@ private final class ExpandedPanelView: NSView {
         setContextItems([])
         transcriptSnippets.removeAll()
         updateTranscriptStripText("Live captions preview", scrollToEnd: false)
+        setTranscriptState("IDLE", active: false)
+        routeBadge.stringValue = "Auto · ready"
         latestCanvas = nil
         setCanvasOpen(false)
         canvasToggleButton.isHidden = true
@@ -2341,6 +2515,11 @@ private final class ExpandedPanelView: NSView {
     func updateCard(id: String, body: String, done: Bool, costLabel: String?, artifact: OverlayArtifact?) {
         guard let card = feed.update(id: id, body: body, done: done, costLabel: costLabel, artifact: artifact) else {
             return
+        }
+        if let artifact {
+            routeBadge.stringValue = routeBadgeText(for: artifact)
+        } else if !done {
+            statusLabel.stringValue = "Answer streaming"
         }
         routeCanvasIfNeeded(card)
     }
@@ -2508,6 +2687,7 @@ private final class ExpandedPanelView: NSView {
         if transcriptSnippets.count > 6 {
             transcriptSnippets.removeFirst(transcriptSnippets.count - 6)
         }
+        setTranscriptState(recordingActive ? "TRANSCRIBING" : "CAPTURED", active: recordingActive)
         updateTranscriptStripText(transcriptSnippets.joined(separator: "   "), scrollToEnd: true)
     }
 
@@ -2570,6 +2750,7 @@ private final class ExpandedPanelView: NSView {
         kind.translatesAutoresizingMaskIntoConstraints = false
         kind.font = NSFont.monospacedSystemFont(ofSize: 8.5, weight: .bold)
         kind.textColor = BlueyTheme.textDim
+        kind.stringValue = "LOADED · \(item.kind.uppercased())"
 
         chip.addSubview(icon)
         chip.addSubview(title)

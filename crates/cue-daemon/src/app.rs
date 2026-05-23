@@ -4009,6 +4009,7 @@ Human-speak contract:
 - Do not invent personal experience, shipped work, metrics, or ownership that is not in the question or session context.
 - No assistant preamble such as \"Sure\", \"Here is\", \"As an AI\", or \"You can say\".
 - Do not sound like a polished memo: avoid source labels, repeated headings, and long markdown checklists in the chat answer.
+- Include a concise rationale when it helps the user defend the answer, but do not expose hidden chain-of-thought.
 - If the topic needs depth, keep the chat answer speakable and put deeper code/design/detail in the structured sections or artifact.";
 
 fn provider_messages(payload: &ProviderRequestPayload) -> Result<Vec<ChatMessage>> {
@@ -4018,7 +4019,7 @@ fn provider_messages(payload: &ProviderRequestPayload) -> Result<Vec<ChatMessage
     system.push_str("\n\n");
     system.push_str(HUMAN_SPEAK_CONTRACT);
     system.push_str(
-        "\n\nOutput format:\n- Stream a clear, readable answer with short line breaks.\n- Put the direct, speakable answer first as one natural paragraph whenever possible.\n- Do not turn normal chat answers into a markdown outline. Use headings only when the task truly needs structure or when an artifact/canvas will render the deeper detail.\n- Auto-detect the task type. For coding, debugging, algorithms, API, or configuration questions, use this shape after the talk track when useful: Approach, Code, Explanation, Complexity, Edge cases. Put code in fenced Markdown code blocks with a language tag when possible.\n- For system design questions, use Architecture, Data flow, Components, Scaling, Tradeoffs, and Risks / next steps after the talk track when useful.\n- For design/debug/product questions, use compact bullets with concrete next steps.\n- Avoid long paragraphs; make the overlay easy to scan while it streams.",
+        "\n\nOutput format:\n- Stream a clear, readable answer with short line breaks.\n- Put the direct, speakable answer first as one natural paragraph whenever possible.\n- Do not turn normal chat answers into a markdown outline. Use headings only when the task truly needs structure or when an artifact/canvas will render the deeper detail.\n- Auto-detect the task type. For coding, debugging, algorithms, API, or configuration questions, use this shape after the talk track when useful: Approach, Code, Explanation, Complexity, Edge cases. Put code in fenced Markdown code blocks with a language tag when possible.\n- For code follow-ups or requested changes, return the full updated implementation or full replacement snippet in the artifact/canvas body, not only a tiny line diff, unless the user explicitly asks for a patch.\n- For system design questions, use Architecture, Data flow, Components, Scaling, Tradeoffs, and Risks / next steps after the talk track when useful.\n- For system design follow-ups, return the updated whole architecture section in the artifact/canvas body so the canvas remains the current source of truth.\n- For design/debug/product questions, use compact bullets with concrete next steps.\n- Avoid long paragraphs; make the overlay easy to scan while it streams.",
     );
     if let Some(instructions) = payload
         .instructions
@@ -7173,9 +7174,12 @@ mod tests {
         assert!(system.contains("Do not invent personal experience"));
         assert!(system.contains("No assistant preamble"));
         assert!(system.contains("Do not sound like a polished memo"));
+        assert!(system.contains("concise rationale"));
         assert!(system.contains("Output format"));
         assert!(system.contains("direct, speakable answer first"));
         assert!(system.contains("Do not turn normal chat answers into a markdown outline"));
+        assert!(system.contains("full updated implementation"));
+        assert!(system.contains("updated whole architecture"));
         assert!(system.contains("Approach, Code, Explanation, Complexity, Edge cases"));
         assert!(system.contains("fenced Markdown code blocks"));
     }
