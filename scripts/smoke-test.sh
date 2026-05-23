@@ -9,6 +9,7 @@ export BLUEY_CONFIG_DIR="$SMOKE_ROOT/config"
 export BLUEY_RUNTIME_DIR="$SMOKE_ROOT/runtime"
 export BLUEY_DAEMON_ADDR="${BLUEY_DAEMON_ADDR:-127.0.0.1:57329}"
 export BLUEY_AUDIO_SIMULATED_ONLY=1
+export BLUEY_SKIP_SIGNIN_OPEN=1
 SMOKE_CONTEXT_FILE="$SMOKE_ROOT/context.rs"
 printf 'fn main() { println!("bluey context smoke"); }\n' >"$SMOKE_CONTEXT_FILE"
 

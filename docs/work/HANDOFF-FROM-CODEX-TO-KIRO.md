@@ -182,7 +182,8 @@ What changed:
   - `bluey cloud sessions`
   - `bluey cloud show <session_id>`
   - `bluey cloud rag <query>`
-- Existing account commands now use the account API URL saved by `bluey login`, not only the default production URL.
+- Existing account paths now use the account API URL saved by first `bluey on`
+  sign-in, not only the default production URL.
 - `POST /stt/session` establishes the safe contract: server checks balance/trial state and returns a Bluey-scoped session token/relay URL, never a static provider key.
 - `/stt/relay` requires the normal Bearer account token plus that session token, single-claims it for the same account, proxies WebSocket frames to Deepgram with the server-held key, records usage, and bills elapsed seconds.
 

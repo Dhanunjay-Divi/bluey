@@ -70,7 +70,7 @@ These expand to standard `tracing::event!` calls so `tracing_subscriber` JSON ou
 
 ### Entry points that mint a fresh trace_id:
 
-1. **CLI command start** (`bluey on`, `bluey login`, `bluey cloud sync`, etc.) — `cue-cli` mints UUIDv4, passes via env var `BLUEY_TRACE_ID` to subprocesses.
+1. **CLI command start** (`bluey on`, `bluey off`, hidden support commands, etc.) — `cue-cli` mints UUIDv4, passes via env var `BLUEY_TRACE_ID` to subprocesses.
 2. **Tauri invoke from UI** — `cue-dashboard` mints a trace_id per invoke and includes it in the IPC payload to the daemon.
 3. **F19 hotkey trigger / overlay button press** — daemon-internal start, daemon mints.
 4. **Inbound webhook** (Stripe, etc.) — server middleware mints from header or fresh.

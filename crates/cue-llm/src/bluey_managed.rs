@@ -274,7 +274,7 @@ fn map_err(e: CloudError) -> LlmError {
     match e {
         // Codex S5.2: managed billing failures terminal (no failover).
         CloudError::Unauthorized => {
-            LlmError::Billing("bluey account login required (run `bluey login`)".into())
+            LlmError::Billing("Bluey sign-in required; run `bluey on` to finish setup".into())
         }
         CloudError::TrialEnded => {
             LlmError::Billing("free trial complete; reload your account to continue".into())

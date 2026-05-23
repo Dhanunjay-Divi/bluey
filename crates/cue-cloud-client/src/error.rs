@@ -12,7 +12,7 @@ pub enum Error {
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// 401 — caller should prompt `bluey login`.
+    /// 401 — caller should prompt first-run sign-in from `bluey on`.
     #[error("unauthorized: token invalid or expired")]
     Unauthorized,
 

@@ -19,7 +19,8 @@ This is the master gate before public alpha. Every item must be ticked or explic
 - [x] Per-IP rate limiting on auth + `/router/complete` w/ XFF behind trusted proxy
 - [x] Daemon: BlueyManagedProvider + ManagedPolicy + LocalFallbackPolicy
 - [x] Daemon: BalanceWatch poll + Stage 19 cost label plumbing
-- [x] CLI: `bluey login` / `usage` / `credits` / `logout` / `portal` / `export` / `delete-account`
+- [x] CLI product entrypoint: `bluey on` / `bluey off`; `bluey on` opens sign-in when needed
+- [x] Support/admin CLI: usage / credits / logout / portal / export / delete-account
 - [x] Onboarding: deep-link wizard + tray Invisible toggle + F19 hotkey
 - [x] Disguise: 4-mode picker + tray submenu + auto-disguise heuristic + persisted prefs
 - [x] Pipeline at tip: fmt + clippy -D + tests + builds across cue + server

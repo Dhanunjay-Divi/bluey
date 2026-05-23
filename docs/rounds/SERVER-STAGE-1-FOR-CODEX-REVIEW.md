@@ -39,7 +39,7 @@ Tables:
 - `accounts` — id (uuid), email (unique), password_hash, balance_cents, trial_seconds_remaining, auto_topup_*, stripe_*
 - `credit_batches` — per-reload tracking for FIFO 1-year expiry
 - `refresh_tokens` — sha256-hashed refresh tokens, device_label, expires_at, revoked_at
-- `device_codes` — OAuth-style device flow (`bluey login`)
+- `device_codes` — OAuth-style device flow opened by first `bluey on`
 - `usage_events` — per-request metering (kind, task_type, lane, provider, model, tokens, latency, cost_to_bluey, cost_to_customer, was_speculative, was_fallback)
 - `stripe_webhook_events` — webhook idempotency
 
@@ -117,7 +117,7 @@ commit.
 Stub-only. Routes wired:
 - `POST /auth/{signup,login,refresh}` — standard email/password.
 - `POST /auth/device/{start,poll,approve}` — OAuth-style device
-  flow for `bluey login` from the daemon.
+  flow opened by first `bluey on` from the daemon.
 
 **Ask:**
 - Device flow is the one I'm less sure about. Targeting the same

@@ -101,7 +101,8 @@ Tests pass in isolation; production happy path is gated on:
 
 - A real Stripe test-mode webhook flow (round-2 fix added the PI normalization but has no unit-test seam).
 - A real `/router/complete` call with a full request lifecycle (idempotency reservation → upstream dispatch → deduct → trigger auto top-up → record usage event → mark complete).
-- A real `bluey login` → `bluey usage` → `bluey credits` flow against the deployed server.
+- A real first-`bluey on` sign-in → hidden support usage/credits flow against
+  the deployed server.
 
 These are integration-test territory. The cleanest path to that confidence is a wiremock-backed test harness (Stripe + OpenAI + Anthropic mocks) that exercises the full money path; that's its own stage.
 

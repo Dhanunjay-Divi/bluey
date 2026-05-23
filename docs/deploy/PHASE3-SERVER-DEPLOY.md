@@ -216,7 +216,7 @@ curl -I https://api-test.bluey.dev/health  # should 200 with Caddy serving cert
 ```bash
 # On uno, create a test account against the staging server:
 export BLUEY_CLOUD_API_URL=https://api-test.bluey.dev
-bluey login  # device-flow against staging
+bluey on  # opens sign-in against staging if no token is present
 
 # Verify endpoints:
 bluey usage   # returns balance (0 minus free trial)
@@ -252,8 +252,7 @@ sudo journalctl -u bluey-api -f | grep -i stripe
 
 ```bash
 # On uno:
-bluey login                           # against staging
-bluey on
+bluey on                              # starts session and opens sign-in against staging if needed
 # Click "Start Bluey", speak for ~30s, click Stop
 # Watch droplet logs:
 sudo journalctl -u bluey-api -f | grep -E "stt|/router/transcribe"
@@ -331,7 +330,7 @@ Cron contents:
 Phase 3 is GREEN when:
 
 - [ ] HTTPS to `https://api-test.bluey.dev/health` returns 200
-- [ ] `bluey login` against staging succeeds with magic-link or device flow
+- [ ] First `bluey on` against staging succeeds with magic-link or device flow
 - [ ] `bluey usage` shows the trial balance
 - [ ] An LLM completion via `/router/complete/stream` succeeds with cost metadata
 - [ ] A Deepgram STT relay session via `/stt/session` + `/stt/relay` records `consumed_seconds`

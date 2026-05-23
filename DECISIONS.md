@@ -142,13 +142,14 @@ managed mode. Rejected because:
   but are gated behind a `dev` feature OR `BLUEY_DEV_BYOK=1`.
 - A new `BlueyManagedProvider` becomes the production default. It
   speaks HTTPS to `bluey-server` and authenticates with the customer's
-  Bluey account token (stored in keyring after `bluey login`).
+  Bluey account token (stored in keyring after the first `bluey on` sign-in).
 - `cue-router::StaticPolicy` is renamed `LocalFallbackPolicy` and
   becomes the offline-mode fallback. The new default is
   `cue-router::ManagedPolicy` which delegates lane choice to
   `bluey-server`.
-- `bluey login` / `bluey logout` flows are added. v0.2 launch is
-  gated on these.
+- `bluey on` / `bluey off` are the customer-facing lifecycle commands.
+  The first `bluey on` opens sign-in if no account token is stored.
+  Support-only account commands remain hidden.
 - Per-use metering happens server-side; the daemon emits usage events
   to `bluey-server` after every cue request.
 

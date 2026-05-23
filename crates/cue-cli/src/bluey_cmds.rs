@@ -1,7 +1,7 @@
 //! Bluey CLI cloud-account commands: `bluey usage`, `bluey credits`.
 //!
 //! These talk to bluey-server via cue-cloud-client, using the auth
-//! token stored in keyring after `bluey login`. They print
+//! token stored in keyring after the first `bluey on` sign-in. They print
 //! customer-facing summaries to stdout matching the format documented
 //! in `docs/PRICING-MODEL.md` Section 4.3.
 

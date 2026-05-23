@@ -73,7 +73,7 @@ Test growth across the wave:
 
 | Codex blocker | Fix |
 |---|---|
-| S8.1 `bluey login` writes legacy AccountConfig but `bluey usage`/`credits` read keyring | After `save_account` succeeds, `cue_login` also calls `CloudClient::with_default_keyring().save_tokens(Tokens { access, refresh, email: user_id })`. Best-effort: keyring failure prints a clear warning but does not fail login. Single login command now feeds both code paths. |
+| S8.1 hidden legacy login writes AccountConfig but usage/credits read keyring | After `save_account` succeeds, `cue_login` also calls `CloudClient::with_default_keyring().save_tokens(Tokens { access, refresh, email: user_id })`. Best-effort: keyring failure prints a clear warning but does not fail login. The hidden support path now feeds both stores. |
 | S8.2 `bluey credits` over-promises | CLI help softened from "Show credit-batch expiration info" to "Show your current Bluey balance and 1-year credit-validity reminder. (Per-batch expiration listing is not yet available; coming in a future release.)" |
 
 ## Codex re-verification commands

@@ -6,7 +6,8 @@ Product direction: Bluey is a commercial managed-cloud product, not an open-sour
 
 Current shape:
 
-- `bluey` CLI: terminal-first lifecycle, account, session history, settings, and overlay commands.
+- `bluey` CLI: terminal-first lifecycle (`bluey on` / `bluey off`) plus
+  hidden support/admin commands for diagnostics and automation.
 - `bluey-daemon`: local background process and IPC server.
 - `cue-core`: shared protocol, cards, state, paths.
 - `native/macos/cue-overlay`: AppKit overlay sidecar, excluded from screen capture with `NSWindow.sharingType = .none`; compact pill-first startup, click-to-open feed/composer, tokenized IPC, attach/instructions/recap/ask events, and opacity controls.
@@ -51,16 +52,10 @@ To turn Bluey off:
 ./target/debug/bluey off
 ```
 
-Optional terminal product commands:
-
-```bash
-./target/debug/bluey login
-./target/debug/bluey account
-./target/debug/bluey sessions
-./target/debug/bluey settings
-```
-
-`bluey login` can use a Bluey browser login callback, `--token` for dev/non-browser login, or `--local --no-browser` for local-only testing. Normal live use still starts with `bluey on` and ends with `bluey off`.
+There is no separate customer login command. If Bluey has no stored account
+token, `bluey on` opens the browser sign-in flow and then continues the same
+session after the app receives the `bluey://` callback. Support/dev commands
+remain hidden for diagnostics and local test automation.
 
 That opens the overlay-first flow. Use the overlay buttons for normal setup:
 
@@ -89,7 +84,9 @@ The live feed is chronological and scrollable: system audio appears as `System t
 
 Bluey streams answers into the same response card: live OpenAI-compatible providers update the card as deltas arrive, while local fallback/non-streaming answers replay word by word. Coding answers render fenced code as a dedicated code pane beside the explanation when possible. Before each model call, Bluey compacts transcript, recent Q&A, documents, screenshots, and notes so the request stays inside the active model window.
 
-Development and support commands remain hidden from normal help. The visible terminal product surface is lifecycle, login/account, saved sessions, and settings.
+Development and support commands remain hidden from normal help. The visible
+terminal product surface is only `bluey on` and `bluey off`; account, billing,
+history, and settings live in the overlay/dashboard.
 
 The daemon listens on `127.0.0.1:57321` by default. Set `BLUEY_DAEMON_ADDR`, `BLUEY_DAEMON_BIN`, or `BLUEY_OVERLAY_BIN` to override local development paths. Set `BLUEY_DATA_DIR`, `BLUEY_CONFIG_DIR`, or `BLUEY_RUNTIME_DIR` to isolate local state during testing. The older `CUE_*` names still work as compatibility aliases.
 
@@ -107,12 +104,13 @@ No Electron and no Python runtime in the first native build. Saved sessions and 
 
 This build is testable with or without provider keys. The customer-visible loop is:
 
-- `bluey on --title "Name"` starts the overlay-first session.
+- `bluey on --title "Name"` starts the overlay-first session and opens sign-in
+  only when needed.
 - Use the larger bottom mic button to start/stop real chunked audio transcription when STT credentials are present; otherwise Bluey falls back to the labeled development simulator for local testing.
 - Use the bottom ask tray and send button to ask Bluey questions.
 - Use Analyse, Recap, paperclip, notepad, model picker, and mode picker from the overlay.
-- Use `bluey sessions` for saved local session history.
-- Use `bluey settings` for terminal-first defaults.
+- Use the overlay/dashboard for saved session history, answer style, settings,
+  balance, and account actions.
 - `bluey off` stops Bluey.
 
 The audio path feeds the same session engine either way: source-labeled transcript segment in, context-aware answer cards out.

@@ -157,9 +157,9 @@ fi
 echo
 say "Bluey installed."
 echo
-printf "  ${BOLD}Open Bluey from Applications${RESET}, or run from Spotlight.\n"
-printf "  Sign in: a browser tab will open. After signing in, the\n"
-printf "  Bluey app picks up your tokens automatically.\n"
+printf "  ${BOLD}Run:${RESET} bluey on\n"
+printf "  Bluey opens the browser sign-in flow only when your account\n"
+printf "  is not already linked. Use ${BOLD}bluey off${RESET} to stop it.\n"
 echo
 printf "  ${DIM}First launch will ask for Accessibility permission so\n"
 printf "  the F19 hotkey works. Grant it and you're ready.${RESET}\n"

@@ -239,7 +239,7 @@ StaticPolicy::defaults()  // hard-coded lane → provider, daemon
 // v0.2 production default (managed-only, what customers see):
 ManagedPolicy::from_bluey_account(token)
 //   - daemon authenticates with bluey-server using the customer's
-//     Bluey account token (stored in keyring after `bluey login`)
+//     Bluey account token (stored in keyring after the first `bluey on` sign-in)
 //   - bluey-server picks lane + provider + model
 //   - bluey-server uses Bluey-owned upstream API keys
 //   - bluey-server enforces tenant budget + rate limits
@@ -292,7 +292,8 @@ both know how to talk to the cloud service.
 ### Stage 3 — daemon talks to product server (this repo)
 
 - New `cue-cloud-client` crate.
-- `bluey login` / `bluey logout`.
+- `bluey on` opens sign-in when needed; `bluey off` stops the product.
+  Support-only account commands remain hidden.
 - `cue-daemon` calls cloud-client for auth + license + managed router
   dispatch.
 - Dev-mode BYOK remains gated for internal testing only (BYOK is NOT exposed in the production UI per DECISIONS.md no-BYOK decision).

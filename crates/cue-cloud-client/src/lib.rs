@@ -13,7 +13,7 @@
 //!   - All endpoints return strongly-typed Rust structs.
 //!   - 401 triggers automatic token refresh + one retry; subsequent 401
 //!     surfaces as `Error::Unauthorized` so the caller can prompt
-//!     `bluey login`.
+//!     first-run sign-in from `bluey on`.
 //!   - 402 (Payment Required) surfaces as `Error::InsufficientBalance`
 //!     so the daemon can show the "Add $30" banner.
 //!   - 429 (Rate Limited) surfaces with the Retry-After hint.

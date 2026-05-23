@@ -89,7 +89,7 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX IF NOT EXISTS idx_refresh_tokens_account ON refresh_tokens(account_id);
     "#,
-    // 0004 — device_codes: OAuth-style device flow (bluey login)
+    // 0004 — device_codes: OAuth-style device flow opened by first `bluey on`
     r#"
     CREATE TABLE IF NOT EXISTS device_codes (
         device_code      TEXT PRIMARY KEY,

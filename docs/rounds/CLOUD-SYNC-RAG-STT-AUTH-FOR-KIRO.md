@@ -60,7 +60,8 @@ Daemon:
   - lexical RAG chunks from transcript, context, summaries, instructions, and answers.
 - Sync batches are capped below the server request limit so long sessions split safely.
 - Cloud status no longer claims “sync client is not wired” once credentials exist.
-- Balance polling and sync now respect the account API URL saved by `bluey login`, not only the default production URL.
+- Balance polling and sync now respect the account API URL saved by first
+  `bluey on` sign-in, not only the default production URL.
 - Env-token mode still works via `BLUEY_CLOUD_TOKEN` / `BLUEY_API_TOKEN` / `CUE_CLOUD_TOKEN` / `CUE_API_TOKEN`.
 - The chunked real-audio path now defaults to managed `/router/transcribe` when the user is logged in and no explicit developer STT key is set, so customer builds do not need a desktop Deepgram/OpenAI STT key.
 
@@ -79,7 +80,7 @@ New customer path:
 
 1. User runs `bluey on`.
 2. Bluey records locally first.
-3. User signs in with `bluey login`.
+3. User runs `bluey on`; Bluey opens sign-in if needed.
 4. `bluey cloud sync` uploads local sessions and searchable RAG chunks.
 5. `bluey cloud sessions` lists previously synced sessions from any synced device.
 6. `bluey cloud show <id>` loads the server-side session bundle.

@@ -231,11 +231,13 @@ Made the most important controls visible where the user is already typing:
 
 Aligned Bluey with the terminal-first product direction borrowed from Pinky while keeping Bluey's overlay live surface:
 
-- Added visible terminal product commands: `bluey login`, `bluey account`, `bluey sessions`, and `bluey settings`.
+- Added terminal account/session/settings commands in this round. These were
+  later hidden from the customer help surface so `bluey on` / `bluey off`
+  remain the only normal commands.
 - Kept `bluey on` and `bluey off` as the normal live-session loop.
 - Added local account/settings JSON under Bluey's config directory with private file permissions on Unix.
 - Added browser-callback login plumbing compatible with Bluey/Pinky-style `/login?callback=...&state=...` flows.
-- Added dev/non-browser login through `bluey login --token ...` and local-only linking through `bluey login --local --no-browser`.
+- Added hidden dev/non-browser account linking for token and local-only tests.
 - Made daemon cloud status read saved Bluey account config in addition to environment variables.
 - Added local session history listing/detail output through `bluey sessions`.
 - Added terminal-first settings for answer style, model label, mode label, opacity, cloud sync preference, and retention.

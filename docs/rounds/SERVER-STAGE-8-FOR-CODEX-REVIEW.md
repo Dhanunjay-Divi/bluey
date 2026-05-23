@@ -43,9 +43,9 @@ expiration listing is a TODO until we add a server endpoint
 - Is the stub OK for v0.2 launch, or do you want the per-batch
   endpoint built before launch?
 
-### 3. CLI integration without breaking existing `bluey login`
+### 3. CLI integration without breaking the hidden legacy login path
 
-The existing `bluey login` command uses a separate (env var +
+The existing hidden login subcommand uses a separate (env var +
 AccountConfig) flow that pre-dates cue-cloud-client. I deliberately
 did NOT refactor it to use CloudClient because:
 - It would require migrating AccountConfig storage to keyring.
@@ -54,11 +54,11 @@ did NOT refactor it to use CloudClient because:
   CloudClient path to work.
 
 If a customer has the legacy AccountConfig but no keyring token,
-`bluey usage` correctly prints "Run `bluey login` first" because
+the usage command correctly tells them to run first `bluey on` because
 `CloudClient::current_tokens()` returns None.
 
 **Ask:**
-- Should I bridge the existing `bluey login` to also save to keyring
+- Should I bridge the existing hidden login subcommand to also save to keyring
   for cue-cloud-client compat? That would let one login command
   serve both flows. Or keep them separate until we deprecate the
   legacy flow at v0.2? My take: keep separate — legacy is for dev

@@ -66,31 +66,30 @@ metered per request.
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-## 2. `bluey login` (one-time)
+## 2. First `bluey on` sign-in
 
-OAuth-style device flow, mirrors Pinky:
+Customers should not need a separate terminal login command. The first
+`bluey on` starts the daemon, shows the pill, and opens the Bluey sign-in page
+when no usable token is stored.
 
 ```
-Daemon                                      bluey-server
-─────                                       ────────────
-POST /auth/device/start ──────────────────►
-                          ◄────────────── { device_code, user_code,
-                                            verification_uri }
+Customer terminal                         bluey.sh + Bluey.app
+─────────────────                         ───────────────────
+bluey on ────────────────────────────────► daemon starts + pill appears
+                                           browser opens /link
 
-Daemon prints to terminal:
-  Open https://bluey.sh/device, enter code: ABCD-1234
+(customer signs in in browser)
 
-(customer opens browser, signs in,
- enters code)
+/auth/link/mint ─────────────────────────► mints one-time device code
+bluey://link?code=... ◄────────────────── browser redirects to Bluey.app
 
-POST /auth/device/poll ───────────────────►
-  (every 5s)             ◄────────────── { access_token,
+Bluey.app / dashboard ───────────────────► POST /auth/link/exchange
+                          ◄────────────── { access_token,
                                             refresh_token,
-                                            expires_in,
                                             balance_cents,
                                             trial_seconds_remaining }
 
-  Daemon stores tokens in macOS keyring under "bluey_account".
+  Bluey stores tokens in the OS keyring.
   Daemon flips ProviderRegistry to ManagedProvider mode.
   Daemon shows balance + trial state in overlay top strip.
 ```

@@ -1,6 +1,9 @@
 # Session Flow
 
-Bluey should feel like an overlay-first, terminal-first product. `bluey on` and `bluey off` are the live-session commands. `bluey login`, `bluey account`, `bluey sessions`, and `bluey settings` cover account linking, saved history, and defaults without requiring a separate dashboard app.
+Bluey should feel like an overlay-first, terminal-first product. `bluey on`
+and `bluey off` are the customer-facing live-session commands. The first
+`bluey on` opens browser sign-in when needed; the overlay/dashboard handles
+account, history, answer style, and settings from there.
 
 ## Normal User Flow
 
@@ -49,16 +52,8 @@ Stop Bluey:
 bluey off
 ```
 
-Optional terminal surfaces:
-
-```bash
-bluey login
-bluey account
-bluey sessions
-bluey settings
-```
-
-`bluey login` can open the Bluey browser callback flow, save a dev token with `--token`, or link local-only mode with `--local --no-browser`.
+Support/dev terminal surfaces still exist behind the scenes for diagnostics,
+automation, and smoke tests, but they are not part of the paid customer flow.
 
 ## Answer Instructions
 

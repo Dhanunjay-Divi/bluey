@@ -51,7 +51,7 @@ bluey on
 - Daemon starts; logs go to stderr (no rotation yet — observability round)
 - Boot lines printed to terminal include:
   - "Listening for hotkey F19" (or similar)
-  - "Managed answers ready" if logged in, OR "run `bluey login`" if not
+  - "Managed answers ready" if already signed in, OR "finish sign-in in your browser" if not
   - Session-history affordance, attach/analyse consent, transcript/answer behavior copy
 - Native overlay pill appears in top-right of screen as a small Bluey-tinted dot/badge
 
@@ -123,7 +123,7 @@ In the composer, type a question (e.g. "Write a Python function that sorts a lis
 **Fail signals:**
 - Question hangs / no response → check daemon log for `/router/complete` or `/router/complete/stream` errors
 - 402 Payment Required → balance is exhausted; topup via `bluey portal`
-- 401 Unauthorized → re-login: `bluey login`
+- 401 Unauthorized → run `bluey on` again so Bluey can reopen sign-in if needed
 - Answer arrives but no canvas → either fallback heuristics aren't detecting code, OR the LlmArtifactMetadata is not threading through correctly; check daemon log
 
 ---

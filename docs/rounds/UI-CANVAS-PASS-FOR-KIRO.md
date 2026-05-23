@@ -150,7 +150,8 @@ Goal:
 
 - Finish the direct managed response contract: server-owned artifact metadata must travel through `cue-llm`, speculative routing, dashboard events, persistence, and the response UI.
 - Keep daemon/native-overlay heuristics only as fallback for direct/local/older responses.
-- Make the first `bluey on` boot card tell a fresh user whether managed answers are ready or they still need `bluey login`.
+- Make the first `bluey on` boot card tell a fresh user whether managed answers
+  are ready or browser sign-in is open.
 
 Implementation:
 
@@ -166,7 +167,7 @@ Implementation:
   - session-history affordance
   - attach/analyse consent affordance
   - transcript/answer behavior
-  - managed-ready status or `bluey login` setup prompt
+  - managed-ready status or browser sign-in setup prompt
 
 Verification added:
 

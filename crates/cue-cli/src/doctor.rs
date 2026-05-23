@@ -212,7 +212,7 @@ fn print_health_summary() {
     let issues: Vec<String> = {
         let mut v = Vec::new();
         if !logged_in {
-            v.push("not logged in (run `bluey login`)".to_string());
+            v.push("not signed in (run `bluey on`)".to_string());
         }
         if granted < total_perms {
             v.push(format!(
@@ -380,7 +380,7 @@ fn print_account_section() -> Result<()> {
         }
         None => {
             println!("  status        : logged out");
-            println!("  hint          : run `bluey login` to enable managed answers");
+            println!("  hint          : run `bluey on` to finish setup");
         }
     }
     Ok(())

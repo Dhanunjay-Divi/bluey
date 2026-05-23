@@ -6,7 +6,7 @@
 > `server/src/api/auth.rs`, `server/Cargo.toml`.
 
 Auth endpoints are now real. Daemon-side `cue-cloud-client` and
-`bluey login` flow come in Stage 3.
+first-`bluey on` sign-in flow come in Stage 3.
 
 ## What I verified locally
 

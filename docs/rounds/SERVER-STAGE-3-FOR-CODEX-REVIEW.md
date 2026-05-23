@@ -150,8 +150,8 @@ working on Stage 3a. Verify they match what you wrote.
 
 ## What's NOT in Stage 3
 
-- **CLI integration of cue-cloud-client.** The existing `bluey login`
-  command already has a separate (BLUEY_CLOUD_TOKEN-env-var + AccountConfig)
+- **CLI integration of cue-cloud-client.** The hidden legacy login
+  subcommand already has a separate (BLUEY_CLOUD_TOKEN-env-var + AccountConfig)
   flow. Wiring cue-cloud-client into that command without breaking
   existing dev usage is Stage 3c work — coming next.
 - **Real `/router/complete` proxy.** Server endpoint still 501.

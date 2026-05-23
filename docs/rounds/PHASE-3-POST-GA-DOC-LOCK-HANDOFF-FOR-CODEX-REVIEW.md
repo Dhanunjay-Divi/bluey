@@ -119,7 +119,7 @@ New supplementary docs:
   Commercial section reframed as REQUIRED for v0.2 per no-BYOK.
 - `FUTURE-IMPLEMENTATIONS.md` — R14.9 product server bumped from
   optional to BLOCKING for v0.2; new R14.10–R14.14 added:
-  - R14.10 `cue-cloud-client` crate + `bluey login` flow (3–4 days)
+  - R14.10 `cue-cloud-client` crate + first-`bluey on` sign-in flow (3–4 days)
   - R14.11 `BlueyManagedProvider` + `ManagedPolicy` (2–3 days)
   - R14.12 local-fallback mode + offline detection (2 days)
   - R14.13 prepaid wallet + per-use metering (5–7 days)

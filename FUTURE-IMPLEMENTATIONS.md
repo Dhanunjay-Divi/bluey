@@ -131,14 +131,14 @@ Kept here as a pointer for git-history-divers.
 
 **Status:** parked until R14.9 lands.
 **Approach:** new `cue-cloud-client` crate in this repo;
-`bluey login` / `bluey logout` flows; `cue-router::ManagedPolicy` impl
+first-`bluey on` sign-in plus `bluey off` lifecycle; `cue-router::ManagedPolicy` impl
 that asks bluey-server which lane to use; `cue-router::BlueyManagedProvider`
 dispatches over HTTPS to the product server.
 **Estimate:** 3–5 days.
 **Trigger to ship:** product server has a working stub
 `POST /router/complete` endpoint + an auth flow.
 
-### R14.10 — `cue-cloud-client` crate + `bluey login` flow (BLOCKING for v0.2)
+### R14.10 — `cue-cloud-client` crate + first-`bluey on` sign-in flow (BLOCKING for v0.2)
 
 **Status:** required for v0.2 launch. Daemon must authenticate with
 `bluey-server` instead of using BYOK keys.
@@ -150,10 +150,9 @@ dispatches over HTTPS to the product server.
   backoff on 5xx.
 - Token stored in keyring under `bluey_account` (separate namespace
   from the dev BYOK `llm_*` keys).
-- `bluey login` runs OAuth-style device flow: daemon prints a code,
-  user opens `https://bluey.dev/device` in a browser, enters the code,
-  daemon polls until token is issued.
-- `bluey logout` clears the keyring entry.
+- `bluey on` opens the browser/device flow when no token exists, receives
+  the `bluey://` callback, and stores the issued token.
+- Hidden support/logout paths can clear the keyring entry when needed.
 
 **Estimate:** 3–4 days code + tests.
 **Trigger to ship:** R14.9 server has working auth + token endpoints.

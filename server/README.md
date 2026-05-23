@@ -12,7 +12,7 @@ Lives in this repo at `server/` for now; will split to a separate
 ```
 GET  /admin/health           liveness
 POST /auth/{signup,login,refresh}      account auth
-POST /auth/device/{start,poll,approve} OAuth-style device flow for `bluey login`
+POST /auth/device/{start,poll,approve} OAuth-style device flow opened by first `bluey on`
 GET  /account/me                       license + plan + balance
 GET  /account/usage                    rolling-7-day mix + tier projection
 POST /router/complete                  managed LLM dispatch

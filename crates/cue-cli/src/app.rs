@@ -46,31 +46,42 @@ enum Commands {
     /// Turn Bluey off.
     Off,
     /// Sign in or link Bluey to a cloud account.
+    #[command(hide = true)]
     Login(LoginArgs),
     /// Show account and cloud link status.
+    #[command(hide = true)]
     Account,
     /// List or inspect saved local sessions.
+    #[command(hide = true)]
     Sessions(SessionsArgs),
     /// Show or update terminal-first Bluey settings.
+    #[command(hide = true)]
     Settings(SettingsArgs),
     /// Show your Bluey balance, last-7-days usage, and tier projection.
+    #[command(hide = true)]
     Usage,
     /// Show your current Bluey balance and 1-year credit-validity reminder.
     /// (Per-batch expiration listing is not yet available; coming in a
     /// future release.)
+    #[command(hide = true)]
     Credits,
     /// Log out of Bluey: clear keyring tokens.
+    #[command(hide = true)]
     Logout,
     /// Open the Stripe Customer Portal in your browser to manage card / cancel auto top-up / view invoices.
+    #[command(hide = true)]
     Portal,
     /// Export your Bluey account data as a JSON file (GDPR).
+    #[command(hide = true)]
     Export,
     /// Permanently delete your Bluey account (interactive confirmation; --force to skip prompt).
+    #[command(hide = true)]
     DeleteAccount {
         #[arg(long)]
         force: bool,
     },
     /// Print a redacted self-diagnosis snapshot for support tickets.
+    #[command(hide = true)]
     Doctor {
         /// Emit JSON instead of human-readable text. Schema version 1.
         /// Useful for support automation. Sensitive fields are still
@@ -79,11 +90,13 @@ enum Commands {
         json: bool,
     },
     /// Manage local Bluey logs.
+    #[command(hide = true)]
     Logs {
         #[command(subcommand)]
         command: LogsCommands,
     },
     /// Bundle bluey doctor + logs export into a single zip for support tickets.
+    #[command(hide = true)]
     Support {
         /// Disable redaction. By default the bundle strips bearer tokens,
         /// magic-link URLs, Stripe IDs, provider keys, emails, IPv4
@@ -795,18 +808,36 @@ async fn cue_on(args: OnArgs) -> Result<()> {
     })
     .await;
     let account_ready = bluey_account_linked(&paths);
+    let auth_state = if account_ready {
+        BlueyOnAuthState::Ready
+    } else {
+        open_signin_for_bluey_on()
+    };
     // The native overlay orders the branded pill front when the child process
     // starts. Do not send OverlayShow here: in the current protocol it expands
     // the full feed, while `bluey on` should launch pill-first.
     let boot = request(DaemonRequest::OverlayBoot {
         title: "Bluey online".to_string(),
-        lines: bluey_on_boot_lines(account_ready),
+        lines: bluey_on_boot_lines(&auth_state),
     })
     .await;
 
     match boot {
         Ok(DaemonResponse::Ok) => {
-            println!("Bluey is on.");
+            match auth_state {
+                BlueyOnAuthState::Ready => println!("Bluey is on."),
+                BlueyOnAuthState::SignInOpened => {
+                    println!("Bluey is on. Finish sign-in in the browser.")
+                }
+                BlueyOnAuthState::SignInSkipped => {
+                    println!("Bluey is on. Sign-in is skipped in this environment.")
+                }
+                BlueyOnAuthState::SignInFailed { url, reason } => {
+                    println!(
+                        "Bluey is on. Open {url} to finish sign-in. Browser open failed: {reason}"
+                    )
+                }
+            }
             Ok(())
         }
         Ok(other) => print_response(other),
@@ -815,6 +846,14 @@ async fn cue_on(args: OnArgs) -> Result<()> {
             Ok(())
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlueyOnAuthState {
+    Ready,
+    SignInOpened,
+    SignInSkipped,
+    SignInFailed { url: String, reason: String },
 }
 
 fn bluey_account_linked(paths: &AppPaths) -> bool {
@@ -828,7 +867,28 @@ fn bluey_account_linked(paths: &AppPaths) -> bool {
             .is_some_and(|account| account.token_configured())
 }
 
-fn bluey_on_boot_lines(account_ready: bool) -> Vec<String> {
+fn open_signin_for_bluey_on() -> BlueyOnAuthState {
+    if env_bool("BLUEY_SKIP_SIGNIN_OPEN").unwrap_or(false)
+        || env_bool("BLUEY_NO_BROWSER").unwrap_or(false)
+    {
+        return BlueyOnAuthState::SignInSkipped;
+    }
+
+    let url = bluey_signin_url();
+    match open_browser(&url) {
+        Ok(()) => BlueyOnAuthState::SignInOpened,
+        Err(error) => BlueyOnAuthState::SignInFailed {
+            url,
+            reason: error.to_string(),
+        },
+    }
+}
+
+fn bluey_signin_url() -> String {
+    env::var("BLUEY_SIGNIN_URL").unwrap_or_else(|_| "https://bluey.sh/link".to_string())
+}
+
+fn bluey_on_boot_lines(auth_state: &BlueyOnAuthState) -> Vec<String> {
     let mut lines = vec![
         "new recording started".to_string(),
         "click the pill for chat, files, and screen analysis".to_string(),
@@ -836,10 +896,19 @@ fn bluey_on_boot_lines(account_ready: bool) -> Vec<String> {
         "attach files with Attach; Analyse asks before screen context".to_string(),
         "transcripts stay source-labeled; answers stream into chat".to_string(),
     ];
-    if account_ready {
-        lines.push("managed answers and balance tracking are ready".to_string());
-    } else {
-        lines.push("finish setup with: bluey login".to_string());
+    match auth_state {
+        BlueyOnAuthState::Ready => {
+            lines.push("managed answers and balance tracking are ready".to_string());
+        }
+        BlueyOnAuthState::SignInOpened => {
+            lines.push("finish sign-in in your browser; Bluey stays ready".to_string());
+        }
+        BlueyOnAuthState::SignInSkipped => {
+            lines.push("sign-in skipped for this run; Bluey stays in local fallback".to_string());
+        }
+        BlueyOnAuthState::SignInFailed { url, .. } => {
+            lines.push(format!("finish sign-in in your browser: {url}"));
+        }
     }
     lines
 }
@@ -915,9 +984,8 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
     save_account(&paths, &account)?;
 
     // Codex Stage 8 S8.1 (round 3): save tokens to the cue-cloud-client
-    // keyring store whenever access_token exists so `bluey usage` and
-    // `bluey credits` (which read from keyring) can find them after
-    // any successful `bluey login` path. Token-only / env-token /
+    // keyring store whenever access_token exists so usage/billing surfaces
+    // can find them after any successful auth path. Token-only / env-token /
     // browser-without-refresh logins all produce access-only sessions;
     // cue-cloud-client treats refresh as optional/defaultable so an
     // empty string is safe. Best-effort: keyring failure prints a
@@ -934,14 +1002,14 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
                 }) {
                     eprintln!(
                         "warning: could not save tokens to keyring: {e}\n\
-                         (legacy AccountConfig path still works; `bluey usage` may report not-logged-in until keyring is available)"
+                         (legacy AccountConfig path still works; cloud status may report not-logged-in until keyring is available)"
                     );
                 }
             }
             Err(e) => {
                 eprintln!(
                     "warning: cloud client keyring unavailable: {e}\n\
-                     (legacy AccountConfig path still works; `bluey usage` may report not-logged-in until keyring is available)"
+                     (legacy AccountConfig path still works; cloud status may report not-logged-in until keyring is available)"
                 );
             }
         }
@@ -954,7 +1022,7 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
     if account.token_configured() {
         println!("Cloud token saved for this user profile.");
     } else {
-        println!("Local account linked. Add a token later with `bluey login --token ...` when the Bluey cloud endpoint is ready.");
+        println!("Local account linked. Run `bluey on` later to sign in when the Bluey cloud endpoint is ready.");
     }
     Ok(())
 }
@@ -982,7 +1050,7 @@ async fn print_account() -> Result<()> {
         }
         None => {
             println!("Account: local");
-            println!("Run `bluey login` to link Bluey to cloud later.");
+            println!("Run `bluey on` to sign in when you are ready.");
         }
     }
 
@@ -2382,7 +2450,7 @@ fn print_cloud_status(status: CloudSyncStatus) {
 
 async fn print_cloud_sessions(limit: i64, json: bool) -> Result<()> {
     let Some(client) = cloud_client_or_message()? else {
-        println!("Not logged in. Run `bluey login` first.");
+        println!("Not signed in. Run `bluey on` to finish setup.");
         return Ok(());
     };
     let sessions = client
@@ -2414,7 +2482,7 @@ async fn print_cloud_sessions(limit: i64, json: bool) -> Result<()> {
 
 async fn print_cloud_session(id: &str, json: bool) -> Result<()> {
     let Some(client) = cloud_client_or_message()? else {
-        println!("Not logged in. Run `bluey login` first.");
+        println!("Not signed in. Run `bluey on` to finish setup.");
         return Ok(());
     };
     let bundle = client
@@ -2455,7 +2523,7 @@ async fn print_cloud_rag(query: &str, limit: i64, json: bool) -> Result<()> {
         bail!("provide a RAG query, for example: bluey cloud rag architecture risk");
     }
     let Some(client) = cloud_client_or_message()? else {
-        println!("Not logged in. Run `bluey login` first.");
+        println!("Not signed in. Run `bluey on` to finish setup.");
         return Ok(());
     };
     let result = client
@@ -2567,6 +2635,15 @@ fn env_present(name: &str) -> bool {
         .is_some()
 }
 
+fn env_bool(name: &str) -> Option<bool> {
+    env::var(name).ok().map(|value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no" | ""
+        )
+    })
+}
+
 fn optional_cloud_client() -> Result<Option<cue_cloud_client::CloudClient>> {
     let paths = AppPaths::discover()?;
     let base_url = env::var("BLUEY_CLOUD_API_URL")
@@ -2620,7 +2697,7 @@ fn cloud_client_or_message() -> Result<Option<cue_cloud_client::CloudClient>> {
         Ok(client) => Ok(client),
         Err(error) => {
             eprintln!("bluey: cloud client init failed: {error}");
-            eprintln!("Run `bluey login` first if you have not already.");
+            eprintln!("Run `bluey on` to sign in if you have not already.");
             Ok(None)
         }
     }
@@ -2637,7 +2714,7 @@ fn cloud_access_token_from_env() -> Option<String> {
 
 async fn bluey_usage_cmd() -> Result<()> {
     let Some(client) = cloud_client_or_message()? else {
-        eprintln!("bluey: not logged in. Run `bluey login` first.");
+        eprintln!("bluey: not signed in. Run `bluey on` to finish setup.");
         return Ok(());
     };
     if let Err(e) = crate::bluey_cmds::show_usage(&client).await {
@@ -2648,7 +2725,7 @@ async fn bluey_usage_cmd() -> Result<()> {
 
 async fn bluey_credits_cmd() -> Result<()> {
     let Some(client) = cloud_client_or_message()? else {
-        eprintln!("bluey: not logged in. Run `bluey login` first.");
+        eprintln!("bluey: not signed in. Run `bluey on` to finish setup.");
         return Ok(());
     };
     if let Err(e) = crate::bluey_cmds::show_credits(&client).await {
@@ -2670,7 +2747,7 @@ async fn bluey_logout_cmd() -> Result<()> {
 
 async fn bluey_portal_cmd() -> Result<()> {
     let Some(client) = cloud_client_or_message()? else {
-        eprintln!("bluey: not logged in. Run `bluey login` first.");
+        eprintln!("bluey: not signed in. Run `bluey on` to finish setup.");
         return Ok(());
     };
     if let Err(e) = crate::bluey_cmds::portal(&client).await {
@@ -2681,7 +2758,7 @@ async fn bluey_portal_cmd() -> Result<()> {
 
 async fn bluey_export_cmd() -> Result<()> {
     let Some(client) = cloud_client_or_message()? else {
-        eprintln!("bluey: not logged in. Run `bluey login` first.");
+        eprintln!("bluey: not signed in. Run `bluey on` to finish setup.");
         return Ok(());
     };
     if let Err(e) = crate::bluey_cmds::export_data(&client).await {
@@ -2692,7 +2769,7 @@ async fn bluey_export_cmd() -> Result<()> {
 
 async fn bluey_delete_account_cmd(force: bool) -> Result<()> {
     let Some(client) = cloud_client_or_message()? else {
-        eprintln!("bluey: not logged in. Run `bluey login` first.");
+        eprintln!("bluey: not signed in. Run `bluey on` to finish setup.");
         return Ok(());
     };
     if let Err(e) = crate::bluey_cmds::delete_account(&client, force).await {
@@ -2703,19 +2780,32 @@ async fn bluey_delete_account_cmd(force: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::bluey_on_boot_lines;
+    use super::{bluey_on_boot_lines, BlueyOnAuthState};
 
     #[test]
-    fn bluey_on_boot_lines_prompt_login_when_unlinked() {
-        let lines = bluey_on_boot_lines(false);
-        assert!(lines.iter().any(|line| line.contains("bluey login")));
+    fn bluey_on_boot_lines_prompt_browser_signin_when_unlinked() {
+        let lines = bluey_on_boot_lines(&BlueyOnAuthState::SignInOpened);
+        assert!(lines.iter().any(|line| line.contains("browser")));
         assert!(lines.iter().any(|line| line.contains("previous sessions")));
     }
 
     #[test]
     fn bluey_on_boot_lines_confirm_managed_ready_when_linked() {
-        let lines = bluey_on_boot_lines(true);
+        let lines = bluey_on_boot_lines(&BlueyOnAuthState::Ready);
         assert!(lines.iter().any(|line| line.contains("managed answers")));
-        assert!(!lines.iter().any(|line| line.contains("bluey login")));
+        assert!(!lines
+            .iter()
+            .any(|line| line.contains("separate login command")));
+    }
+
+    #[test]
+    fn bluey_on_boot_lines_include_url_when_browser_open_fails() {
+        let lines = bluey_on_boot_lines(&BlueyOnAuthState::SignInFailed {
+            url: "https://bluey.sh/link".to_string(),
+            reason: "no browser".to_string(),
+        });
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("https://bluey.sh/link")));
     }
 }

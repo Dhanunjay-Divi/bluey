@@ -212,7 +212,7 @@ Before flipping DNS or announcing the product:
 - [ ] Backup script runs successfully via `sudo -u root /usr/local/sbin/backup-bluey-db.sh` and produces a file in `/var/backups/bluey-api/`.
 - [ ] Off-host backup destination receives the snapshot.
 - [ ] At least one full money-path smoke: signup → trial → reload via Stripe → cue dispatch → balance debited → cue response.
-- [ ] `bluey login` from a clean Mac with the production-signed app successfully completes the deep-link flow against the production server.
+- [ ] First `bluey on` from a clean Mac opens browser sign-in and successfully completes the deep-link flow against the production server.
 - [ ] systemd unit restarts cleanly on `systemctl restart bluey-api.service` (no orphan PIDs).
 - [ ] Caddy auto-TLS renewal log entries visible (`journalctl -u caddy --since "1 hour ago" | grep -i renew`).
 
