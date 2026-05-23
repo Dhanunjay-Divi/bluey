@@ -94,7 +94,12 @@ Below `escalation_threshold` (default 0.6), the `LayeredClassifier` defers to th
 
 ## Speculative mode
 
-Only fires when the policy returns the `Deep` lane AND `speculative_when_deep: true`. The router emits two streams concurrently:
+Normal product mode uses `speculative_when_deep: false`, so even Deep questions
+stream as one visible answer card from the selected lane. Parallel draft mode
+is retained for internal latency experiments only.
+
+When the policy returns the `Deep` lane AND `speculative_when_deep: true`, the
+router emits two streams concurrently:
 
 ```
 Caller stream:
@@ -103,7 +108,9 @@ Caller stream:
    t=2.4s  SpeculativeChunk::Final { text: "<full deep answer>" }          ← Deep done; replace card
 ```
 
-The dashboard / overlay treats `Final` as a card-body replacement (the existing `OverlayCommand::UpdateCard` already supports this). If the Deep lane errors, the user keeps the draft.
+The dashboard / overlay can treat `Final` as a card-body replacement. This is
+not the default customer UX because replacement can feel like the answer is
+changing under the user while they are speaking.
 
 **Cost guardrail:** the Instant lane is configured to the cheapest streaming option, so a wasted parallel call is bounded to a few cents per question even at scale.
 

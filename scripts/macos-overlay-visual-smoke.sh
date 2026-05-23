@@ -44,6 +44,12 @@ require_source "composerBarHeightConstraint?.constant = textHeight + 62"
 require_source "knowledgeBadge = NSTextField(labelWithString: \"KB empty\")"
 require_source "routeBadge = NSTextField(labelWithString: \"Auto · ready\")"
 require_source "addSubview(headerBar, positioned: .above, relativeTo: nil)"
+require_source "configureFixedChromeLayoutPriorities()"
+require_source "keepFixedChromeInBounds()"
+require_source "PillMetrics.centeredFrame"
+require_source "startExpandedPassthroughTracking()"
+require_source "pillWindow?.orderOut(nil)"
+require_source "fitExpandedFrameToVisibleScreen"
 require_source "setKnowledgeBadge(\"KB loading\""
 require_source "setTranscriptState(\"LISTENING\""
 require_source "updateRouteBadge(for: q"
@@ -84,7 +90,9 @@ for win in windows():
     if win.get("kCGWindowOwnerName") != "Bluey Overlay":
         continue
     bounds = win.get("kCGWindowBounds", {})
-    if int(bounds.get("Width", 0)) == 110 and int(bounds.get("Height", 0)) == 30:
+    width = int(round(bounds.get("Width", 0)))
+    height = int(round(bounds.get("Height", 0)))
+    if 132 <= width <= 152 and 38 <= height <= 48:
         pill = bounds
         break
 
@@ -151,7 +159,7 @@ min_width = int(os.environ["MIN_WIDTH"])
 max_width = int(os.environ["MAX_WIDTH"])
 
 for label, row in [("before", before), ("after", after)]:
-    if row["height"] != expected_height:
+    if abs(row["height"] - expected_height) > 1:
         raise AssertionError(f"{label}: expected height {expected_height}, got {row['height']}: {row}")
     if not (min_width <= row["width"] <= max_width):
         raise AssertionError(f"{label}: expected width {min_width}..{max_width}, got {row['width']}: {row}")

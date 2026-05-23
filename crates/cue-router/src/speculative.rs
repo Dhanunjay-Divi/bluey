@@ -481,10 +481,11 @@ mod tests {
             }
         }
         assert_eq!(draft_texts, vec!["draft-part-1", "draft-part-2"]);
-        assert_eq!(final_text.as_deref(), Some("DEEP_FINAL_ANSWER"));
-        // 1 stream call for instant draft + 1 complete call for deep.
-        assert_eq!(provider.stream_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(provider.completion_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(final_text.as_deref(), Some("draft-part-1draft-part-2"));
+        // Deep routes are streaming now, so speculation starts one stream for
+        // the instant draft and one stream for the deep final.
+        assert_eq!(provider.stream_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(provider.completion_calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -499,11 +500,8 @@ mod tests {
         let class = classification(LatencyLane::Deep);
         let stream = router.run(&class, req()).await.unwrap();
         let chunks: Vec<_> = stream.collect::<Vec<_>>().await;
-        // With speculation off, the Deep lane is run as a single non-streaming
-        // call wrapped as a single-chunk stream by the LlmProvider default.
-        // Actually the policy's deep route has stream:false, but we still call
-        // complete_stream() on the provider here, so the mock will yield from
-        // its streaming path. Either way: there should be NO Final chunk.
+        // With speculation off, the Deep lane streams as the single visible
+        // answer path. There should be NO replacement Final chunk.
         for c in &chunks {
             assert!(
                 !matches!(c, SpeculativeChunk::Final { .. }),
@@ -534,7 +532,7 @@ mod tests {
         // Regression: codex flagged that the previous run() impl returned `?`
         // on Instant provider failure, killing the Deep lane too. We must
         // surface the Deep answer even if the cheap draft is gone.
-        let deep = Arc::new(MockProvider::new(vec![], "DEEP_ANSWER"));
+        let deep = Arc::new(MockProvider::new(vec!["DEEP_ANSWER"], "DEEP_ANSWER"));
         let dispatch = Arc::new(InstantFailDispatch {
             deep_provider: deep.clone(),
         });

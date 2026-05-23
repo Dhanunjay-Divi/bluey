@@ -1312,9 +1312,10 @@ async fn try_speculative_dispatch(
     use futures::stream::StreamExt;
     use std::sync::Arc;
 
-    // Bluey Auto speculative dispatch: default-ON for v0.1 (user is internal
-    // tester, cost is BYOK, USP demos better with draft+final out of the box).
-    // Explicitly disable via BLUEY_SPECULATIVE_ROUTING=0 / false / off.
+    // Bluey Auto routing is default-ON: classify once, pick the best lane,
+    // and stream one visible answer card from that lane. Parallel
+    // cheap-draft + deep-final replacement remains dev-gated because it made
+    // the customer UI feel jumpy during live questions.
     let speculative_off = std::env::var("BLUEY_SPECULATIVE_ROUTING")
         .map(|v| {
             let v = v.trim();
@@ -1324,6 +1325,12 @@ async fn try_speculative_dispatch(
     if speculative_off || registry.is_empty() {
         return Ok(None);
     }
+    let parallel_drafts = std::env::var("BLUEY_PARALLEL_DRAFTS")
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
+        })
+        .unwrap_or(false);
 
     // Codex Stage 9 round-2 Blocker 2: lane-correct policy selection.
     // StaticPolicy emits openai/anthropic provider names; a managed
@@ -1336,9 +1343,9 @@ async fn try_speculative_dispatch(
         Arc::new(StaticPolicy::defaults())
     };
     let provider: Arc<dyn cue_router::speculative::SpeculativeProvider> = Arc::new(registry);
-    // speculative_when_deep is true so a Hard question gets draft + final in
-    // parallel. Easy/Medium runs single-lane (still streamed).
-    let router = SpeculativeRouter::new(policy, provider, true);
+    // Normal product mode is single visible stream from the selected lane.
+    // `BLUEY_PARALLEL_DRAFTS=1` is retained for latency experiments only.
+    let router = SpeculativeRouter::new(policy, provider, parallel_drafts);
 
     let req = cue_llm::LlmRequest {
         system: system_prompt.to_string(),
@@ -1427,9 +1434,6 @@ async fn try_speculative_dispatch(
                 if artifact.is_some() {
                     metadata.artifact = artifact.clone();
                 }
-                // Replace: emit a synthetic chunk that the UI's reducer will
-                // append to. The dashboard'''s responseReducer keeps the entry
-                // marked done after this. The card body is the FULL final text.
                 let _ = app.emit(
                     "cue_response_chunk",
                     CueResponseChunkPayload {
@@ -1576,13 +1580,12 @@ pub async fn request_cue(
     let router_meta = classify_for_router(&recent, true, false);
     let emitted_meta = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Speculative routing path. **Default ON** for v0.1 internal testing
-    // (per DECISIONS.md 2026-05-19). Disable explicitly with
-    // BLUEY_SPECULATIVE_ROUTING=0 / false / off.
-    // When ON, dispatches through cue-router::SpeculativeRouter and (for Hard /
-    // Deep questions) emits a streaming Draft from the Instant lane plus a
-    // Final from the Deep lane. When OFF or no providers configured, falls
-    // through to the legacy AnswerLlm / WhatToAnswerLlm path — zero regression.
+    // Bluey Auto path. **Default ON**: classify, route, and stream one visible
+    // answer from the selected lane. Disable explicitly with
+    // BLUEY_SPECULATIVE_ROUTING=0 / false / off. The older parallel
+    // draft+deep experiment is retained behind BLUEY_PARALLEL_DRAFTS=1 only.
+    // When routing is OFF or no providers are configured, fall through to the
+    // legacy AnswerLlm / WhatToAnswerLlm path — zero regression.
     {
         use cue_daemon::llm::{answer as answer_mod, suggest as suggest_mod};
         let registry = ProviderRegistry::from_env_and_secrets(&db, &trace_id);

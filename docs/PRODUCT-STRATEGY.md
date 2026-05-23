@@ -46,14 +46,16 @@ not be marketed as a finished SaaS until cloud auth/sync/RAG/billing are real.
 
 ## Bluey Auto Router (USP)
 
-Bluey Auto is the product differentiator: the user does not pick a model, and
-hard questions get a fast draft + a refined final answer in the same flow.
+Bluey Auto is the product differentiator: the user does not pick a model.
+Bluey classifies each request, chooses the right managed lane, and streams one
+visible answer card from that lane. The older draft+refine experiment remains
+dev-gated because visible replacement was confusing in live use.
 
 See `docs/AUTO-ROUTING-USP.md` for the architecture and lane mapping. The
 routing crate ships in `crates/cue-router/` with a local heuristic classifier
 (no network call), a routing policy that maps task type + difficulty + latency
-lane onto provider/model pairs, and a speculative router that can run an
-Instant draft and a Deep refinement in parallel.
+lane onto provider/model pairs, and a router that can optionally run an
+Instant draft and a Deep refinement in parallel for internal latency tests.
 
 The classifier covers six task types (general / code / system_design /
 meeting / writing / vision), three difficulty levels, three latency lanes

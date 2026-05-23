@@ -4,8 +4,8 @@
 // when BLUEY_OVERLAY_SOCKET is set, with stdin/stdout retained for test stubs
 // and manual protocol checks. Provides:
 //
-//   - A small top-center pill (collapsed default state), draggable, click to
-//     expand into the full feed.
+//   - A compact centered pill (collapsed default state), draggable, click to
+//     disappear into the full feed.
 //   - A full feed/composer panel (expanded state) that renders the daemon's
 //     CueCards, accepts Ask / Attach / Instructions / Recap input, and shows
 //     streaming response chunks via UpdateCard.
@@ -58,6 +58,7 @@ private enum ExpandedPanelMetrics {
     static let minCompactWidth: CGFloat = 680
     static let maxCanvasWidth: CGFloat = 960
     static let height: CGFloat = 520
+    static let minHeight: CGFloat = 460
     static let screenInset: CGFloat = 12
 
     static func fittingWidth(for screen: NSRect, preferred: CGFloat) -> CGFloat {
@@ -65,9 +66,41 @@ private enum ExpandedPanelMetrics {
         return min(preferred, available)
     }
 
+    static func fittingHeight(for screen: NSRect, preferred: CGFloat = height) -> CGFloat {
+        let available = max(minHeight, screen.height - screenInset * 2)
+        return min(preferred, available)
+    }
+
     static func fittingMinimumWidth(for screen: NSRect, targetWidth: CGFloat) -> CGFloat {
         let available = max(360, screen.width - screenInset * 2)
         return min(minCompactWidth, targetWidth, available)
+    }
+
+    static func fitExpandedFrameToVisibleScreen(_ frame: NSRect, visibleFrame: NSRect) -> NSRect {
+        var fitted = frame
+        let availableWidth = max(360, visibleFrame.width - screenInset * 2)
+        let availableHeight = max(minHeight, visibleFrame.height - screenInset * 2)
+        fitted.size.width = min(max(360, fitted.size.width), availableWidth)
+        fitted.size.height = min(max(minHeight, fitted.size.height), availableHeight)
+        fitted.origin.x = min(
+            max(visibleFrame.minX + screenInset, fitted.origin.x),
+            visibleFrame.maxX - fitted.size.width - screenInset)
+        fitted.origin.y = min(
+            max(visibleFrame.minY + screenInset, fitted.origin.y),
+            visibleFrame.maxY - fitted.size.height - screenInset)
+        return fitted
+    }
+}
+
+private enum PillMetrics {
+    static let size = NSSize(width: 142, height: 44)
+
+    static func centeredFrame(in visibleFrame: NSRect) -> NSRect {
+        NSRect(
+            x: visibleFrame.midX - size.width / 2,
+            y: visibleFrame.midY - size.height / 2,
+            width: size.width,
+            height: size.height)
     }
 }
 
@@ -546,13 +579,7 @@ private final class OverlayWindow: NSWindow {
         if let minimumFrameWidth, minimumFrameWidth <= screenMaxWidth {
             clamped.size.width = max(minimumFrameWidth, clamped.size.width)
         }
-        clamped.origin.x = min(
-            max(visibleFrame.minX + inset, clamped.origin.x),
-            visibleFrame.maxX - clamped.size.width - inset)
-        clamped.origin.y = min(
-            max(visibleFrame.minY + inset, clamped.origin.y),
-            visibleFrame.maxY - clamped.size.height - inset)
-        return clamped
+        return ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(clamped, visibleFrame: visibleFrame)
     }
 }
 
@@ -575,23 +602,10 @@ private final class PillView: NSView {
         }
     }
     private func updateTitleDisplay() {
-        let trimmed = balanceText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
-            titleField.stringValue = statusText
-            titleField.textColor = NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0)
-        } else {
-            // Compose "<status> · <balance>" but use orange tint when
-            // the daemon flagged it as low.
-            let isLow = trimmed.lowercased().hasSuffix("low")
-            let displayBalance = isLow
-                ? trimmed.replacingOccurrences(of: " low", with: "")
-                    .replacingOccurrences(of: " LOW", with: "")
-                : trimmed
-            titleField.stringValue = "\(statusText) · \(displayBalance)"
-            titleField.textColor = isLow
-                ? NSColor(red: 0.98, green: 0.74, blue: 0.34, alpha: 1.0)
-                : NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0)
-        }
+        // The collapsed pill is intentionally identity-only. Balance lives in
+        // the expanded header so the launcher stays compact and scannable.
+        titleField.stringValue = statusText
+        titleField.textColor = NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0)
     }
     func setBalanceLabel(_ label: String) {
         balanceText = label
@@ -616,27 +630,27 @@ private final class PillView: NSView {
         layer?.cornerRadius = frameRect.height / 2
         layer?.borderWidth = 0
         layer?.shadowColor = NSColor(red: 0.10, green: 0.70, blue: 0.96, alpha: 1.0).cgColor
-        layer?.shadowOpacity = 0.18
-        layer?.shadowRadius = 7
+        layer?.shadowOpacity = 0.24
+        layer?.shadowRadius = 11
         layer?.shadowOffset = .zero
 
         logoTile.wantsLayer = true
         logoTile.layer?.backgroundColor = NSColor(red: 0.025, green: 0.140, blue: 0.190, alpha: 1.0).cgColor
-        logoTile.layer?.cornerRadius = 6
+        logoTile.layer?.cornerRadius = 9
         logoTile.layer?.borderWidth = 1
         logoTile.layer?.borderColor = NSColor(red: 0.42, green: 0.92, blue: 1.0, alpha: 0.72).cgColor
         logoTile.layer?.shadowColor = NSColor(red: 0.15, green: 0.66, blue: 1.0, alpha: 1.0).cgColor
-        logoTile.layer?.shadowOpacity = 0.22
-        logoTile.layer?.shadowRadius = 5
+        logoTile.layer?.shadowOpacity = 0.32
+        logoTile.layer?.shadowRadius = 9
         logoTile.layer?.shadowOffset = .zero
         addSubview(logoTile)
 
-        logoGlyph.font = NSFont.monospacedSystemFont(ofSize: 9.5, weight: .bold)
+        logoGlyph.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .bold)
         logoGlyph.textColor = NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0)
         logoGlyph.alignment = .center
         logoTile.addSubview(logoGlyph)
 
-        titleField.font = NSFont.systemFont(ofSize: 12.5, weight: .semibold)
+        titleField.font = NSFont.systemFont(ofSize: 17, weight: .bold)
         titleField.textColor = NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0)
         titleField.alignment = .left
         addSubview(titleField)
@@ -656,19 +670,19 @@ private final class PillView: NSView {
         super.layout()
         layer?.cornerRadius = bounds.height / 2
 
-        let logoSide: CGFloat = 20
-        logoTile.frame = NSRect(x: 7, y: (bounds.height - logoSide) / 2, width: logoSide, height: logoSide)
-        logoTile.layer?.cornerRadius = 6
-        logoGlyph.frame = logoTile.bounds.insetBy(dx: 3, dy: 5)
+        let logoSide: CGFloat = 30
+        logoTile.frame = NSRect(x: 9, y: (bounds.height - logoSide) / 2, width: logoSide, height: logoSide)
+        logoTile.layer?.cornerRadius = 9
+        logoGlyph.frame = logoTile.bounds.insetBy(dx: 5, dy: 6)
 
-        titleField.frame = NSRect(x: 34, y: (bounds.height - 17) / 2 + 1, width: bounds.width - 50, height: 17)
+        titleField.frame = NSRect(x: 50, y: (bounds.height - 22) / 2 + 1, width: bounds.width - 72, height: 22)
 
         let labelWidth = ceil((titleField.stringValue as NSString).size(withAttributes: [
-            .font: titleField.font ?? NSFont.systemFont(ofSize: 12.5, weight: .semibold),
+            .font: titleField.font ?? NSFont.systemFont(ofSize: 17, weight: .bold),
         ]).width)
-        let dotSize: CGFloat = 6
-        let dotX = min(titleField.frame.minX + labelWidth + 4, bounds.width - dotSize - 9)
-        dotView.frame = NSRect(x: dotX, y: bounds.midY + 3, width: dotSize, height: dotSize)
+        let dotSize: CGFloat = 8
+        let dotX = min(titleField.frame.minX + labelWidth + 7, bounds.width - dotSize - 13)
+        dotView.frame = NSRect(x: dotX, y: bounds.midY + 5, width: dotSize, height: dotSize)
         dotView.layer?.cornerRadius = dotSize / 2
     }
 
@@ -1448,6 +1462,7 @@ private final class ExpandedPanelView: NSView {
         configureHeader()
         configureContextRows()
         configureComposer()
+        configureFixedChromeLayoutPriorities()
         configureCloseConfirm()
         styleDrawer()
         feed.onTranscript = { [weak self] card in
@@ -1861,7 +1876,68 @@ private final class ExpandedPanelView: NSView {
 
     override func layout() {
         super.layout()
+        keepFixedChromeInBounds()
         resizeTranscriptLabelToContent()
+    }
+
+    func isInteractiveAtScreenPoint(_ screenPoint: NSPoint) -> Bool {
+        guard let window else { return false }
+        let windowPoint = window.convertPoint(fromScreen: screenPoint)
+        let localPoint = convert(windowPoint, from: nil)
+        guard bounds.contains(localPoint) else { return false }
+
+        if !closeConfirmOverlay.isHidden {
+            return true
+        }
+        if headerBar.frame.contains(localPoint) || composerBar.frame.contains(localPoint) {
+            return true
+        }
+        if !sessionDrawer.isHidden && sessionDrawer.frame.contains(localPoint) {
+            return true
+        }
+        return false
+    }
+
+    /// The expanded overlay is a fixed-height tool surface. Header,
+    /// transcript, attachments, and composer are chrome; only the workspace
+    /// may compress/scroll as content grows.
+    private func configureFixedChromeLayoutPriorities() {
+        for chrome in [headerBar, transcriptStrip, attachmentStrip, composerBar] {
+            chrome.setContentHuggingPriority(.required, for: .vertical)
+            chrome.setContentCompressionResistancePriority(.required, for: .vertical)
+        }
+        workspace.setContentHuggingPriority(.defaultLow, for: .vertical)
+        workspace.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        feed.setContentHuggingPriority(.defaultLow, for: .vertical)
+        feed.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        canvasPane.setContentHuggingPriority(.defaultLow, for: .vertical)
+        canvasPane.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+    }
+
+    private func keepFixedChromeInBounds() {
+        // Defensive guard for AppKit/autolayout edge cases: if a dense feed,
+        // drawer, or growing composer ever tries to push the header out of the
+        // content rect, restore the fixed chrome frame immediately instead of
+        // letting the user lose navigation/model/balance controls.
+        guard bounds.height >= ExpandedPanelMetrics.minHeight else { return }
+        headerBar.isHidden = false
+        headerBar.layer?.zPosition = 1_000
+        headerStack.layer?.zPosition = 1_001
+        addSubview(headerBar, positioned: .above, relativeTo: nil)
+        headerBar.frame = NSRect(
+            x: 10,
+            y: bounds.height - 52,
+            width: max(0, bounds.width - 20),
+            height: 42)
+        headerStack.frame = headerBar.bounds.insetBy(dx: 9, dy: 4)
+        if composerBar.frame.minY < 0 || composerBar.frame.maxY > bounds.height {
+            let height = composerBarHeightConstraint?.constant ?? 108
+            composerBar.frame = NSRect(
+                x: 10,
+                y: 10,
+                width: max(0, bounds.width - 20),
+                height: height)
+        }
     }
 
     private func configureHeader() {
@@ -2270,7 +2346,7 @@ private final class ExpandedPanelView: NSView {
     }
 
     private func setComposerTextHeight(_ rawHeight: CGFloat) {
-        let textHeight = min(max(rawHeight, 46), 122)
+        let textHeight = min(max(rawHeight, 46), 96)
         guard abs((composerTextHeightConstraint?.constant ?? 0) - textHeight) > 0.5 else { return }
         composerTextHeightConstraint?.constant = textHeight
         composerBarHeightConstraint?.constant = textHeight + 62
@@ -2581,6 +2657,7 @@ private final class ExpandedPanelView: NSView {
         var frame = window.frame
         frame.size.width = clampedTargetWidth
         frame.origin.x = min(max(screen.minX + 12, frame.origin.x), screen.maxX - frame.width - 12)
+        frame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(frame, visibleFrame: screen)
         window.setFrame(frame, display: true, animate: true)
     }
 
@@ -2604,6 +2681,7 @@ private final class ExpandedPanelView: NSView {
         guard window.frame.width > compactWidth else { return }
         var frame = window.frame
         frame.size.width = compactWidth
+        frame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(frame, visibleFrame: screen)
         window.setFrame(frame, display: true, animate: true)
     }
 
@@ -3109,19 +3187,17 @@ private final class OverlayApp {
     private var expandedWindow: OverlayWindow?
     private var pillView: PillView!
     private var expandedView: ExpandedPanelView?
+    private var expandedPassthroughTimer: Timer?
 
     /// Pending boot card, if a Boot command arrived before windows materialised.
     private var pendingBoot: (title: String, lines: [String])?
 
     func start() {
-        // Pill window: compact, parked at the top-right by default.
-        let pillSize = NSSize(width: 110, height: 30)
+        // Pill window: compact launcher, centered by default.
+        let pillSize = PillMetrics.size
         let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
-        let pillOrigin = NSPoint(
-            x: screen.maxX - pillSize.width - 16,
-            y: screen.maxY - pillSize.height - 12)
         pillWindow = OverlayWindow(
-            contentRect: NSRect(origin: pillOrigin, size: pillSize),
+            contentRect: PillMetrics.centeredFrame(in: screen),
             draggable: true)
 
         pillView = PillView(frame: NSRect(origin: .zero, size: pillSize))
@@ -3143,10 +3219,12 @@ private final class OverlayApp {
         emitReady()
         emitLifecycle("started", detail: "capture_excluded=\(!captureVisibleForDebug)")
         startParentWatchdog()
+        startExpandedPassthroughTracking()
         startIpcLoop()
     }
 
     private func bringPillToFront() {
+        centerPillOnMainScreen()
         pillWindow.setIsVisible(true)
         pillWindow.orderFrontRegardless()
         pillWindow.makeKeyAndOrderFront(nil)
@@ -3155,6 +3233,13 @@ private final class OverlayApp {
         pillView.layoutSubtreeIfNeeded()
         pillView.displayIfNeeded()
         pillWindow.displayIfNeeded()
+    }
+
+    private func centerPillOnMainScreen() {
+        let screen = pillWindow.screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
+        pillWindow.setFrame(PillMetrics.centeredFrame(in: screen), display: true)
     }
 
     private func startParentWatchdog() {
@@ -3171,22 +3256,34 @@ private final class OverlayApp {
         }
     }
 
+    private func startExpandedPassthroughTracking() {
+        expandedPassthroughTimer?.invalidate()
+        expandedPassthroughTimer = Timer.scheduledTimer(withTimeInterval: 0.06, repeats: true) { [weak self] _ in
+            guard
+                let self,
+                let expandedWindow = self.expandedWindow,
+                expandedWindow.isVisible,
+                let expandedView = self.expandedView
+            else { return }
+
+            let mouse = NSEvent.mouseLocation
+            let insideWindow = expandedWindow.frame.contains(mouse)
+            let shouldAcceptMouse = insideWindow && expandedView.isInteractiveAtScreenPoint(mouse)
+            let shouldIgnoreMouse = insideWindow && !shouldAcceptMouse
+
+            if expandedWindow.ignoresMouseEvents != shouldIgnoreMouse {
+                expandedWindow.ignoresMouseEvents = shouldIgnoreMouse
+            }
+        }
+    }
+
     private func expand() {
         ensureExpandedWindow()
-        // Reposition expanded just below pill's current frame so the user's
-        // dragging is honoured.
         guard let expandedWindow else { return }
-        if let pillFrame = pillWindow?.frame {
-            let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
-            let inset: CGFloat = 12
-            var ef = expandedWindow.frame
-            ef.origin.x = pillFrame.maxX - ef.width
-            ef.origin.x = min(max(screen.minX + inset, ef.origin.x), screen.maxX - ef.width - inset)
-            ef.origin.y = pillFrame.minY - ef.height - 8
-            ef.origin.y = min(max(screen.minY + inset, ef.origin.y), screen.maxY - ef.height - inset)
-            expandedWindow.setFrame(ef, display: true)
-        }
+        pillWindow?.orderOut(nil)
+        expandedWindow.ignoresMouseEvents = false
         expandedWindow.orderFrontRegardless()
+        expandedWindow.makeKeyAndOrderFront(nil)
         emitSimple("shown")
         emitLifecycle("expanded")
     }
@@ -3197,31 +3294,32 @@ private final class OverlayApp {
         let expandedWidth = ExpandedPanelMetrics.fittingWidth(
             for: screen,
             preferred: ExpandedPanelMetrics.maxCompactWidth)
+        let expandedHeight = ExpandedPanelMetrics.fittingHeight(for: screen)
         let minimumWidth = ExpandedPanelMetrics.fittingMinimumWidth(for: screen, targetWidth: expandedWidth)
-        let expandedSize = NSSize(width: expandedWidth, height: ExpandedPanelMetrics.height)
-        let pillFrame = pillWindow?.frame ?? NSRect(
-            x: screen.midX - 66,
-            y: screen.maxY - 60,
-            width: 110,
-            height: 30)
-        let expandedOrigin = NSPoint(
-            x: screen.midX - expandedSize.width / 2,
-            y: pillFrame.minY - expandedSize.height - 8)
+        let expandedSize = NSSize(width: expandedWidth, height: expandedHeight)
+        let expandedFrame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(
+            NSRect(
+                x: screen.midX - expandedSize.width / 2,
+                y: screen.midY - expandedSize.height / 2,
+                width: expandedSize.width,
+                height: expandedSize.height),
+            visibleFrame: screen)
         let window = OverlayWindow(
-            contentRect: NSRect(origin: expandedOrigin, size: expandedSize),
-            draggable: false)
+            contentRect: expandedFrame,
+            draggable: true)
         window.minimumFrameWidth = minimumWidth
-        window.lockedFrameHeight = expandedSize.height
+        window.lockedFrameHeight = expandedFrame.height
         // The expanded surface must stay compact vertically; otherwise AppKit can
         // grow the borderless window to satisfy dense feed/composer constraints.
         // Width can still expand intentionally for the canvas panel.
         let maxExpandedWidth = expandedWidth
-        window.minSize = NSSize(width: minimumWidth, height: expandedSize.height)
-        window.maxSize = NSSize(width: maxExpandedWidth, height: expandedSize.height)
-        window.contentMinSize = NSSize(width: minimumWidth, height: expandedSize.height)
-        window.contentMaxSize = NSSize(width: maxExpandedWidth, height: expandedSize.height)
+        window.minSize = NSSize(width: minimumWidth, height: expandedFrame.height)
+        window.maxSize = NSSize(width: maxExpandedWidth, height: expandedFrame.height)
+        window.contentMinSize = NSSize(width: minimumWidth, height: expandedFrame.height)
+        window.contentMaxSize = NSSize(width: maxExpandedWidth, height: expandedFrame.height)
         window.maximumFrameWidth = maxExpandedWidth
-        let view = ExpandedPanelView(frame: NSRect(origin: .zero, size: expandedSize))
+        let view = ExpandedPanelView(frame: NSRect(origin: .zero, size: expandedFrame.size))
+        view.autoresizingMask = [.width, .height]
         window.contentView = view
         view.onClose = { [weak self] in self?.collapse() }
         view.onOpacityChanged = { [weak self] opacity in
@@ -3238,7 +3336,9 @@ private final class OverlayApp {
     }
 
     private func collapse() {
+        expandedWindow?.ignoresMouseEvents = false
         expandedWindow?.orderOut(nil)
+        bringPillToFront()
         emitSimple("hidden")
         emitLifecycle("collapsed")
     }
@@ -3309,11 +3409,7 @@ private final class OverlayApp {
             costLabel: nil,
             artifact: nil)
         view.pushCard(card)
-        // Briefly flash the pill to indicate boot activity.
-        pillView?.dotColor = NSColor.systemBlue
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-            self?.pillView?.dotColor = NSColor.systemGreen
-        }
+        pillView?.dotColor = NSColor.systemGreen
     }
 
     private func applyPosition(_ pos: String) {
@@ -3327,7 +3423,7 @@ private final class OverlayApp {
         case "bottom_left":  origin = NSPoint(x: screen.minX + inset,                  y: screen.minY + inset)
         case "bottom_right": origin = NSPoint(x: screen.maxX - pillSize.width - inset, y: screen.minY + inset)
         case "center":       origin = NSPoint(x: screen.midX - pillSize.width / 2,     y: screen.midY - pillSize.height / 2)
-        default:             origin = NSPoint(x: screen.midX - pillSize.width / 2,     y: screen.maxY - pillSize.height - inset)
+        default:             origin = PillMetrics.centeredFrame(in: screen).origin
         }
         pillWindow.setFrameOrigin(origin)
     }

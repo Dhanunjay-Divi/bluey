@@ -65,7 +65,7 @@ impl StaticPolicy {
                 model: "claude-3-7-sonnet-latest".to_string(),
                 max_tokens: Some(8192),
                 temperature: Some(0.2),
-                stream: false,
+                stream: true,
             },
             vision: ProviderRoute {
                 lane: ProviderLane::Vision,
@@ -218,7 +218,7 @@ impl RoutingPolicy for ManagedPolicy {
                 model: "managed".to_string(),
                 max_tokens: classification.difficulty_max_tokens(),
                 temperature: Some(0.2),
-                stream: false,
+                stream: true,
             };
         }
         let (lane, provider_name, temperature) = match classification.latency_lane {
@@ -232,7 +232,7 @@ impl RoutingPolicy for ManagedPolicy {
             model: "managed".to_string(),
             max_tokens: classification.difficulty_max_tokens(),
             temperature,
-            stream: false,
+            stream: true,
         }
     }
 }

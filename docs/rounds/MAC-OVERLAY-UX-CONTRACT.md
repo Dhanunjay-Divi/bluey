@@ -21,9 +21,10 @@ Bluey is an always-present AI work surface. The user should be able to:
 
 ### Pill
 
-- Compact top-right launcher.
-- Shows Bluey identity and status dot.
-- Click expands; drag moves.
+- Compact centered launcher.
+- Shows only Bluey identity and status dot.
+- Click hides the pill and opens the expanded window; drag moves while collapsed.
+- Hide in the expanded window closes the panel and returns to the centered pill.
 - No composer controls belong here.
 
 ### Header
@@ -31,6 +32,8 @@ Bluey is an always-present AI work surface. The user should be able to:
 - Persistent top row inside the expanded panel.
 - Owns app/session chrome: recordings drawer, new recording, Bluey/status, canvas toggle, balance, hide-to-pill, close/turn-off.
 - Does not own per-question controls.
+- Expanded window movement is owned by the chrome/header surface, not by the
+  host content band.
 
 ### Chat Feed
 
@@ -38,6 +41,9 @@ Bluey is an always-present AI work surface. The user should be able to:
 - User typed questions render on the right.
 - System/session cards may render left, but should not dominate the feed.
 - Transcript snippets must not become stacked chat cards during live listening.
+- The central workspace is pass-through-oriented so remote host control is not
+  blocked by decorative/non-control overlay area. Header, drawer, and composer
+  remain interactive.
 
 ### Transcript Strip
 
@@ -84,4 +90,7 @@ If the classifier is unsure, the backend should prefer a managed router/server c
 - Composer height stays dynamic but bounded.
 - Vague `Full access` / old `Start Bluey` labels cannot re-enter silently.
 - Expanded overlay stays fixed height during transcript updates.
-
+- Header, transcript strip, attachment strip, and composer are fixed chrome:
+  only the workspace may compress/scroll as live transcript and answers grow.
+- Expanded window frames are fitted to the visible screen before display so
+  the header/model/balance controls cannot be cropped off-screen.
