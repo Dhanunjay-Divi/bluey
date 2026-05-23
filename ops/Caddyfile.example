@@ -1,27 +1,31 @@
-# Caddyfile for bluey-server.
+# Caddyfile for bluey.sh.
 #
-# Replace `bluey.sh` with your domain. Caddy auto-provisions Let's Encrypt
-# certificates on first request. Reverse-proxies to the local bluey-api
-# systemd service on 127.0.0.1:8080.
+# One origin hosts both the customer web/install pages and the managed API.
+# API routes reverse-proxy to the local bluey-server systemd service on
+# 127.0.0.1:8080. Everything else is served from /var/www/bluey.
 
-bluey.sh {
+bluey.sh, www.bluey.sh {
     encode gzip zstd
 
-    # Health endpoint can be polled by external monitors; expose freely.
-    handle /admin/health {
-        reverse_proxy 127.0.0.1:8080
+    @bluey_api path /health /admin/* /auth/* /billing/* /pricing/* /router/* /stt/* /sync/* /rag/* /usage/* /account/me /account/usage /account/export /account/delete
+
+    handle @bluey_api {
+        reverse_proxy 127.0.0.1:8080 {
+            # Strip any client-provided X-Forwarded-* headers and write our own.
+            # rate_limit::client_key() trusts XFF only when the immediate peer
+            # IP is in BLUEY_TRUSTED_PROXIES. Caddy → bluey-server is loopback,
+            # so 127.0.0.1 must be in BLUEY_TRUSTED_PROXIES on the server side.
+            header_up -X-Forwarded-For
+            header_up X-Forwarded-For {client_ip}
+            header_up X-Forwarded-Proto {scheme}
+            header_up X-Forwarded-Host {host}
+        }
     }
 
-    # All other traffic.
-    reverse_proxy 127.0.0.1:8080 {
-        # Strip any client-provided X-Forwarded-* headers and write our own.
-        # rate_limit::client_key() trusts XFF only when the immediate peer
-        # IP is in BLUEY_TRUSTED_PROXIES. Caddy → bluey-server is loopback,
-        # so 127.0.0.1 must be in BLUEY_TRUSTED_PROXIES on the server side.
-        header_up -X-Forwarded-For
-        header_up X-Forwarded-For {client_ip}
-        header_up X-Forwarded-Proto {scheme}
-        header_up X-Forwarded-Host {host}
+    handle {
+        root * /var/www/bluey
+        try_files {path} {path}/ /index.html
+        file_server
     }
 
     # Hardening headers.
@@ -31,8 +35,9 @@ bluey.sh {
         X-Frame-Options "DENY"
         Referrer-Policy "strict-origin-when-cross-origin"
         Permissions-Policy "interest-cohort=()"
-        # CSP: server returns JSON only; no HTML to render scripts from.
-        Content-Security-Policy "default-src 'none'; frame-ancestors 'none'"
+        # web/index.html currently uses inline CSS/JS; tighten when the site
+        # moves to bundled static assets.
+        Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'"
     }
 
     # Standard log to syslog so journalctl shows access patterns.

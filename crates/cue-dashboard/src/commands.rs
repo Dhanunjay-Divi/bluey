@@ -256,7 +256,7 @@ fn truncate_log_field(value: &str, max_chars: usize) -> String {
 
 #[tauri::command]
 pub fn get_signin_url() -> String {
-    std::env::var("BLUEY_SIGNIN_URL").unwrap_or_else(|_| "https://bluey.dev/link".to_string())
+    std::env::var("BLUEY_SIGNIN_URL").unwrap_or_else(|_| "https://bluey.sh/link".to_string())
 }
 
 #[tauri::command]

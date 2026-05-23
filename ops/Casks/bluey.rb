@@ -5,10 +5,10 @@ cask "bluey" do
   # artifacts are published from the release workflow.
   sha256 :no_check
 
-  url "https://bluey.dev/releases/v#{version}/bluey-#{version}-darwin-#{arch}.tar.gz"
+  url "https://bluey.sh/releases/v#{version}/bluey-#{version}-darwin-#{arch}.tar.gz"
   name "Bluey"
   desc "Quiet AI copilot — listens, suggests answers, stays out of the way"
-  homepage "https://bluey.dev"
+  homepage "https://bluey.sh"
   depends_on arch: :arm64
 
   app "Bluey.app"

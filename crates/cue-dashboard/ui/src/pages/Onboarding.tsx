@@ -56,7 +56,7 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
     setError(null);
     setStep("authorizing");
     try {
-      // Daemon hits the bluey.dev/link landing page; the user signs in
+      // Daemon hits the bluey.sh/link landing page; the user signs in
       // there, the page mints a /auth/link/mint code, then redirects
       // to bluey://link?code=... — which the deep-link handler in
       // lib.rs catches and turns into the "deep_link_login" event we

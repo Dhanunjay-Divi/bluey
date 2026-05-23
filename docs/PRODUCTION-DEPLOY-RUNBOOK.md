@@ -8,7 +8,7 @@
 
 Before starting, you must already have:
 
-- [ ] A **domain** (e.g. `bluey.sh`) with DNS A/AAAA records pointed at the droplet's public IPv4/IPv6.
+- [ ] The **`bluey.sh` domain** with DNS A/AAAA records pointed at the droplet's public IPv4/IPv6.
 - [ ] A **DigitalOcean droplet** (or equivalent) running Ubuntu 24.04 with at least 2 GB RAM, 2 vCPU, 25 GB SSD. SSH key set up.
 - [ ] **Stripe live secret key** (`sk_live_...`) and **webhook signing secret** (`whsec_...`) from the Stripe dashboard. Keep these in a password manager — never commit.
 - [ ] **Upstream provider keys** (OpenAI, Anthropic, Deepgram) for the managed lanes.
@@ -50,7 +50,7 @@ Caddy auto-renews certificates from Let's Encrypt; no cron needed.
 
 ## 3. Drop in the Caddyfile
 
-Copy `ops/Caddyfile.example` from this repo to `/etc/caddy/Caddyfile`, edit the `bluey.sh` placeholder to your domain, then:
+Copy `ops/Caddyfile.example` from this repo to `/etc/caddy/Caddyfile`, then:
 
 ```bash
 caddy validate --config /etc/caddy/Caddyfile
@@ -93,9 +93,9 @@ DEEPGRAM_API_KEY=xxxxxxxx
 # SMTP for verify + reset emails
 BLUEY_SMTP_HOST=smtp.postmarkapp.com
 BLUEY_SMTP_PORT=587
-BLUEY_SMTP_USER=<postmark token>
-BLUEY_SMTP_PASS=<postmark token>
-BLUEY_SMTP_FROM=Bluey <noreply@bluey.dev>
+BLUEY_SMTP_USERNAME=<postmark token>
+BLUEY_SMTP_PASSWORD=<postmark token>
+BLUEY_SMTP_FROM=Bluey <noreply@bluey.sh>
 
 # Rate-limit XFF trust — when behind Caddy on the same host this is loopback.
 BLUEY_TRUSTED_PROXIES=127.0.0.1,::1
@@ -160,7 +160,7 @@ The script lives at `ops/backup-bluey-db.sh` in this repo. It uses SQLite's onli
 
 The server exposes `/admin/metrics` in Prometheus exposition format (admin-only). To scrape:
 
-1. Create an admin account: `curl -X POST https://bluey.sh/auth/signup ...`, then `UPDATE accounts SET is_admin=1 WHERE email='ops@bluey.dev';` directly in the DB (or a future `bluey ops promote` CLI).
+1. Create an admin account: `curl -X POST https://bluey.sh/auth/signup ...`, then `UPDATE accounts SET is_admin=1 WHERE email='ops@bluey.sh';` directly in the DB (or a future `bluey ops promote` CLI).
 2. Mint a long-lived bearer for monitoring; store in your Prometheus auth config.
 3. Scrape with `Authorization: Bearer ...` header.
 
@@ -233,4 +233,7 @@ RPO is 1 hour (cron interval). RTO is roughly the time to provision + restore = 
 - **Multi-host / load-balanced deployment.** Today's binary uses in-memory rate-limit state; horizontal scaling needs a Redis-backed limiter swap. Single-host is the supported v0.2 shape.
 - **Database replication.** SQLite + hourly backup is the v0.2 RPO. PostgreSQL migration is queued for v0.3 if multi-region matters.
 - **Auto-update server for the macOS app.** A separate distribution server (`R14.8` in `FUTURE-IMPLEMENTATIONS.md`) hosts the signed `.dmg` + `latest.json`.
-- **Live web app on `bluey.dev`.** That's a separate web codebase. See section 8 of `docs/HOW-IT-WORKS.md` for the contract.
+- **Full web app polish on `bluey.sh`.** The same origin should host landing,
+  install, link, reload, account, and docs pages. This repo includes the API
+  and static landing starter; production page polish can stay in a separate
+  web codebase as long as it publishes into `/var/www/bluey`.

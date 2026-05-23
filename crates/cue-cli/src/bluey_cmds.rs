@@ -168,7 +168,7 @@ pub async fn delete_account(client: &CloudClient, force: bool) -> Result<()> {
         println!("⚠  This will PERMANENTLY DELETE your Bluey account.");
         println!("   - All credit batches forfeited (1-year validity does NOT apply on delete).");
         println!("   - All usage history removed.");
-        println!("   - Refund eligibility check via support@bluey.dev BEFORE deletion if you have unused credits.");
+        println!("   - Refund eligibility check via support@bluey.sh BEFORE deletion if you have unused credits.");
         println!();
         println!("Type DELETE to confirm:");
         let mut input = String::new();

@@ -35,7 +35,7 @@ impl Default for ClientConfig {
     fn default() -> Self {
         Self {
             base_url: std::env::var("BLUEY_API_BASE_URL")
-                .unwrap_or_else(|_| "https://api.bluey.dev".into()),
+                .unwrap_or_else(|_| "https://bluey.sh".into()),
             user_agent: format!("bluey-cloud-client/{}", env!("CARGO_PKG_VERSION")),
             timeout: Duration::from_secs(60),
             trace_id: None,
@@ -481,7 +481,7 @@ mod tests {
                 "balance_cents": 18,
                 "estimated_cost_cents": 30,
                 "reason": "insufficient_balance",
-                "reload_url": "https://bluey.dev/reload"
+                "reload_url": "https://bluey.sh/reload"
             })))
             .mount(&server)
             .await;
@@ -522,7 +522,7 @@ mod tests {
             "error": "bad",
             "access_token": "secret-access",
             "refresh_token": "secret-refresh",
-            "verification_url": "https://bluey.dev/link?token=secret",
+            "verification_url": "https://bluey.sh/link?token=secret",
             "nested": { "device_code": "device-secret" }
         })
         .to_string();
@@ -531,7 +531,7 @@ mod tests {
         assert!(!safe.contains("secret-access"));
         assert!(!safe.contains("secret-refresh"));
         assert!(!safe.contains("device-secret"));
-        assert!(!safe.contains("https://bluey.dev/link"));
+        assert!(!safe.contains("https://bluey.sh/link"));
         assert!(safe.contains("<redacted>"));
     }
 
@@ -543,7 +543,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(402).set_body_json(serde_json::json!({
                 "balance_cents": 0,
                 "reason": "trial_ended",
-                "reload_url": "https://bluey.dev/reload"
+                "reload_url": "https://bluey.sh/reload"
             })))
             .mount(&server)
             .await;
@@ -640,7 +640,7 @@ mod tests {
                 "balance_cents": 1,
                 "needed_cents": 9,
                 "reason": "insufficient_balance",
-                "reload_url": "https://bluey.dev/reload"
+                "reload_url": "https://bluey.sh/reload"
             })))
             .mount(&server)
             .await;

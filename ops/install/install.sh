@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Bluey one-line installer.
 #
-# Usage: curl -fsSL https://bluey.dev/install.sh | bash
+# Usage: curl -fsSL https://bluey.sh/install.sh | bash
 #
 # This installer ships Bluey on macOS without requiring an Apple
 # Developer ID. We ad-hoc sign the bundle (recognised by Gatekeeper
@@ -15,7 +15,7 @@ set -euo pipefail
 
 # ── Configuration ────────────────────────────────────────────────────
 BLUEY_VERSION="${BLUEY_VERSION:-0.2.0}"
-DOWNLOAD_HOST="${BLUEY_DOWNLOAD_HOST:-https://bluey.dev}"
+DOWNLOAD_HOST="${BLUEY_DOWNLOAD_HOST:-https://bluey.sh}"
 INSTALL_DIR="${BLUEY_INSTALL_DIR:-/Applications}"
 CLI_DIR="${BLUEY_CLI_DIR:-/usr/local/bin}"
 

@@ -2,7 +2,8 @@
 
 > **Owner:** product + ops jointly
 > **Status:** living doc — tick as items complete
-> **Companion:** `docs/PRODUCTION-DEPLOY-RUNBOOK.md`
+> **Companion:** `docs/PRODUCTION-DEPLOY-RUNBOOK.md` and
+> `docs/deploy/BLUEY-SH-LAUNCH.md`
 
 This is the master gate before public alpha. Every item must be ticked or explicitly waived (with rationale) before announcing the product.
 
@@ -71,10 +72,10 @@ This is the master gate before public alpha. Every item must be ticked or explic
 ### Domains + DNS
 
 - [ ] **`bluey.sh`** registered, A/AAAA records pointed at the bluey-server droplet's public IP
-- [ ] **`bluey.dev`** registered, A/AAAA records pointed at the marketing site host
-- [ ] DNSSEC enabled on both
+- [ ] `www.bluey.sh` points at the same host (CNAME to `bluey.sh` or A/AAAA to the same IP)
+- [ ] DNSSEC enabled
 - [ ] CAA records restricting cert issuance to Let's Encrypt
-- [ ] Email DNS for `noreply@bluey.dev`: SPF, DKIM, DMARC records published
+- [ ] Email DNS for `noreply@bluey.sh`: SPF, DKIM, DMARC records published
 
 ### Server host
 
@@ -106,14 +107,16 @@ This is the master gate before public alpha. Every item must be ticked or explic
 
 - [ ] SMTP provider account live (Postmark / SendGrid / SES)
 - [ ] `BLUEY_SMTP_*` env vars set in `/etc/bluey-api/bluey-api.env`
-- [ ] Sender domain (`noreply@bluey.dev`) DKIM-signed and verified at provider
+- [ ] Sender domain (`noreply@bluey.sh`) DKIM-signed and verified at provider
 - [ ] Live test: `/auth/verify-email/start` → email arrives in <30s, link opens
 - [ ] Live test: `/auth/password-reset/start` → email arrives in <30s, link opens
-- [ ] Bounce handling configured (provider dashboard → forward to ops@bluey.dev)
+- [ ] Bounce handling configured (provider dashboard → forward to ops@bluey.sh)
 
-### Web pages on `bluey.dev`
+### Web pages on `bluey.sh`
 
-These are NOT in this repo (separate web codebase). Must exist before public alpha:
+These can be served from `/var/www/bluey` behind the same Caddy origin as the
+API. The static starter in `web/` is enough for early internal testing; these
+routes must exist before public alpha:
 
 - [ ] `/` — landing page with download button
 - [ ] `/link` — OAuth-style landing for the `bluey://` deep-link flow (signup/signin form, calls `/auth/link/mint` after auth, redirects browser to `bluey://link?code=...`)
@@ -131,11 +134,11 @@ installer ad-hoc signs the bundle and strips the quarantine bit so
 first-launch is clean. Two distribution paths, ship both:
 
 #### Path A: One-line installer (`curl ... | bash`)
-- [ ] `ops/install/install.sh` hosted at `https://bluey.dev/install.sh`
-- [ ] Release tarball hosted at `https://bluey.dev/releases/v0.2.0/bluey-0.2.0-darwin-arm64.tar.gz`
+- [ ] `ops/install/install.sh` hosted at `https://bluey.sh/install.sh`
+- [ ] Release tarball hosted at `https://bluey.sh/releases/v0.2.0/bluey-0.2.0-darwin-arm64.tar.gz`
 - [ ] Each release tarball contains top-level `Bluey.app` and `bin/bluey`
 - [ ] `SHA256SUMS.txt` hosted next to the tarballs, and `install.sh` verifies it
-- [ ] Smoke on a clean Mac: `curl -fsSL https://bluey.dev/install.sh | bash` finishes cleanly
+- [ ] Smoke on a clean Mac: `curl -fsSL https://bluey.sh/install.sh | bash` finishes cleanly
 - [ ] Bluey.app launches from /Applications without a Gatekeeper hard-block
 - [ ] `bluey://` URL scheme registers (verify `lsregister -dump | grep bluey`)
 - [ ] First-run onboarding deep-link flow works end-to-end
@@ -170,8 +173,8 @@ without breaking existing customers (the bundle id stays the same).
 
 ### Legal + compliance
 
-- [ ] Terms of Service published at `bluey.dev/docs/terms`
-- [ ] Privacy Policy published at `bluey.dev/docs/privacy`
+- [ ] Terms of Service published at `bluey.sh/docs/terms`
+- [ ] Privacy Policy published at `bluey.sh/docs/privacy`
 - [ ] Onboarding flow links to both before account creation
 - [ ] GDPR-compatible data export tested (`bluey export` produces a valid JSON bundle)
 - [ ] GDPR-compatible account deletion tested (`bluey delete-account --force` → all DB rows scrubbed including stripe_webhook_events)
@@ -254,7 +257,7 @@ phrase "production-ready," which has burned us before.
 
 - Stripe LIVE mode keys
 - Production SMTP
-- `bluey.dev` DNS + production droplet
+- `bluey.sh` DNS + production droplet
 - Marketing/legal/privacy pages
 - Monitoring (Carnaval-equivalent or external)
 - Signed release manifest (ed25519 over `latest.json`) for safe auto-update

@@ -147,7 +147,7 @@ surfaces:
 
 ### 4.1 Onboarding screen (after first $30 reload)
 
-Bluey dashboard at `https://bluey.dev/onboarding/welcome` shows:
+Bluey dashboard at `https://bluey.sh/onboarding/welcome` shows:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐

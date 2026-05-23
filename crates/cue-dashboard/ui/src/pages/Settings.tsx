@@ -128,7 +128,7 @@ function DisguiseCard() {
         <h3 className="font-semibold text-zinc-100">Disguise</h3>
         <p className="text-xs text-zinc-400 mt-1 leading-relaxed">
           How Bluey appears in your menu bar and to screen-shares.{" "}
-          <a href="https://bluey.dev/docs/disguise" target="_blank" rel="noreferrer"
+          <a href="https://bluey.sh/docs/disguise" target="_blank" rel="noreferrer"
             className="text-blue-400 hover:text-blue-300 underline">Why?</a>
         </p>
       </div>

@@ -42,7 +42,7 @@ metered per request.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ 1. Customer visits  https://bluey.dev/signup                     │
+│ 1. Customer visits  https://bluey.sh/signup                     │
 │    enters email + password                                       │
 │    bluey-server creates account, balance = $0.00, trial = 600s   │
 │                                                                  │
@@ -52,7 +52,7 @@ metered per request.
 │    Sees: "10 minutes free trial. After that, $30 minimum         │
 │           reload. We deduct as you use."                         │
 │    Copies install command:                                       │
-│       curl https://bluey.dev/install.sh | sh                     │
+│       curl https://bluey.sh/install.sh | sh                     │
 │                                                                  │
 │ 4. Install script (templated by bluey-server):                   │
 │    - downloads bluey-0.2.0-darwin-universal.tar.gz               │
@@ -78,7 +78,7 @@ POST /auth/device/start ──────────────────�
                                             verification_uri }
 
 Daemon prints to terminal:
-  Open https://bluey.dev/device, enter code: ABCD-1234
+  Open https://bluey.sh/device, enter code: ABCD-1234
 
 (customer opens browser, signs in,
  enters code)
@@ -232,7 +232,7 @@ bluey-server:
        balance_cents: 18,
        estimated_cost_cents: 30,
        reason: "insufficient_balance",
-       reload_url: "https://bluey.dev/reload"
+       reload_url: "https://bluey.sh/reload"
      }
 
 bluey-daemon:

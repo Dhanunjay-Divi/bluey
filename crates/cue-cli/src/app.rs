@@ -2578,7 +2578,7 @@ fn optional_cloud_client() -> Result<Option<cue_cloud_client::CloudClient>> {
                 .flatten()
                 .map(|account| account.api_url)
         })
-        .unwrap_or_else(|| "https://api.bluey.dev".to_string());
+        .unwrap_or_else(|| "https://bluey.sh".to_string());
     let config = cue_cloud_client::client::ClientConfig {
         base_url,
         trace_id: Some(command_trace_id()),

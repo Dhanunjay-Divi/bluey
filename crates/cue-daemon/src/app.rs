@@ -2579,7 +2579,7 @@ fn build_cloud_client(
                 .flatten()
                 .map(|account| account.api_url)
         })
-        .unwrap_or_else(|| "https://api.bluey.dev".to_string());
+        .unwrap_or_else(|| "https://bluey.sh".to_string());
 
     let config = cue_cloud_client::client::ClientConfig {
         base_url,

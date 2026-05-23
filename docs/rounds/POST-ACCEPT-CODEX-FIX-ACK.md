@@ -128,19 +128,19 @@ Per `docs/PRELAUNCH-CHECKLIST.md`:
 
 - [ ] Tag `v0.2.0` and trigger the release workflow
 - [ ] Publish `bluey-0.2.0-darwin-arm64.tar.gz` + `SHA256SUMS.txt`
-- [ ] Host `https://bluey.dev/install.sh`
+- [ ] Host `https://bluey.sh/install.sh`
 - [ ] Create `bluey-dev/homebrew-bluey` tap and publish `bluey.rb`
-- [ ] Clean-Mac smoke: `curl -fsSL https://bluey.dev/install.sh | bash`
+- [ ] Clean-Mac smoke: `curl -fsSL https://bluey.sh/install.sh | bash`
 - [ ] Clean-Mac smoke: `brew tap bluey-dev/bluey && brew install --cask bluey`
 - [ ] Real-Mac validation: app launch, tray icon, tray-menu focus,
       `bluey://` deep-link, F19 hotkey, overlay visibility, capture
       exclusion in Zoom/Teams/Meet
 - [ ] DigitalOcean droplet provisioned per `docs/PRODUCTION-DEPLOY-RUNBOOK.md`
       (Caddy, systemd, backups, SQLite migrations)
-- [ ] DNS for `bluey.dev` + `api.bluey.dev`
+- [ ] DNS for `bluey.sh` + `bluey.sh`
 - [ ] Stripe live mode keys + webhook endpoint
 - [ ] SMTP (transactional + magic-link)
-- [ ] Marketing/legal web pages on `bluey.dev`
+- [ ] Marketing/legal web pages on `bluey.sh`
 - [ ] Monitoring (Carnaval / equivalent)
 
 ---

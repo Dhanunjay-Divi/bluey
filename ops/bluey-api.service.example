@@ -1,6 +1,6 @@
 [Unit]
 Description=Bluey API server (managed bluey-server)
-Documentation=https://bluey.dev/docs/server
+Documentation=https://bluey.sh/docs/server
 After=network-online.target
 Wants=network-online.target
 
