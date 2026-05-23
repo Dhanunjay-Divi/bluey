@@ -1353,7 +1353,6 @@ private final class ExpandedPanelView: NSView {
     let askButton: NSButton
     let analyzeButton: NSButton
     let attachButton: NSButton
-    let accessButton: NSButton
     let instructionsButton: NSButton
     let opacityControl: NSView
     let opacityLabel: NSTextField
@@ -1412,11 +1411,10 @@ private final class ExpandedPanelView: NSView {
         composerBar = NSView()
         composerSurface = NSView()
         composer = ComposerTextView(frame: .zero, textContainer: nil)
-        recordingButton = NSButton(title: "Start Bluey", target: nil, action: nil)
+        recordingButton = NSButton(title: "Listen", target: nil, action: nil)
         askButton = NSButton(title: "", target: nil, action: nil)
         analyzeButton = NSButton(title: "Screen", target: nil, action: nil)
         attachButton = NSButton(title: "", target: nil, action: nil)
-        accessButton = NSButton(title: "Full access", target: nil, action: nil)
         instructionsButton = NSButton(title: "Style", target: nil, action: nil)
         opacityControl = NSView()
         opacityLabel = NSTextField(labelWithString: "Opacity")
@@ -1484,7 +1482,6 @@ private final class ExpandedPanelView: NSView {
             askButton,
             analyzeButton,
             attachButton,
-            accessButton,
             instructionsButton,
             opacityControl,
             opacityLabel,
@@ -1538,7 +1535,6 @@ private final class ExpandedPanelView: NSView {
         composerBar.addSubview(composerSurface)
         composerSurface.addSubview(composer)
         composerBar.addSubview(attachButton)
-        composerBar.addSubview(accessButton)
         composerBar.addSubview(instructionsButton)
         composerBar.addSubview(recordingButton)
         composerBar.addSubview(opacityControl)
@@ -1700,19 +1696,14 @@ private final class ExpandedPanelView: NSView {
             attachButton.widthAnchor.constraint(equalToConstant: 36),
             attachButton.heightAnchor.constraint(equalToConstant: 36),
 
-            accessButton.leadingAnchor.constraint(equalTo: attachButton.trailingAnchor, constant: 8),
-            accessButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            accessButton.widthAnchor.constraint(equalToConstant: 116),
-            accessButton.heightAnchor.constraint(equalToConstant: 36),
-
-            instructionsButton.leadingAnchor.constraint(equalTo: accessButton.trailingAnchor, constant: 8),
+            instructionsButton.leadingAnchor.constraint(equalTo: attachButton.trailingAnchor, constant: 8),
             instructionsButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            instructionsButton.widthAnchor.constraint(equalToConstant: 68),
+            instructionsButton.widthAnchor.constraint(equalToConstant: 86),
             instructionsButton.heightAnchor.constraint(equalToConstant: 36),
 
             recordingButton.leadingAnchor.constraint(equalTo: instructionsButton.trailingAnchor, constant: 8),
             recordingButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            recordingButton.widthAnchor.constraint(equalToConstant: 104),
+            recordingButton.widthAnchor.constraint(equalToConstant: 94),
             recordingButton.heightAnchor.constraint(equalToConstant: 36),
 
             opacityControl.leadingAnchor.constraint(equalTo: recordingButton.trailingAnchor, constant: 8),
@@ -1810,8 +1801,6 @@ private final class ExpandedPanelView: NSView {
         analyzeButton.action = #selector(analyzeClicked)
         attachButton.target = self
         attachButton.action = #selector(attachClicked)
-        accessButton.target = self
-        accessButton.action = #selector(instructionsClicked)
         instructionsButton.target = self
         instructionsButton.action = #selector(instructionsClicked)
 
@@ -1825,7 +1814,6 @@ private final class ExpandedPanelView: NSView {
         styleControlButton(latestSessionButton, symbol: "clock.arrow.circlepath", accent: false)
         styleControlButton(answerStyleSaveButton, symbol: "checkmark", accent: true)
         styleControlButton(recordingButton, symbol: "waveform", accent: false)
-        styleControlButton(accessButton, symbol: "shield", accent: false)
         styleControlButton(instructionsButton, symbol: "text.bubble", accent: false)
         styleIconButton(attachButton, symbol: "plus", fallback: "+")
         styleControlButton(analyzeButton, symbol: "sparkle.magnifyingglass", accent: false)
@@ -2032,7 +2020,6 @@ private final class ExpandedPanelView: NSView {
 
         for control in [
             recordingButton,
-            accessButton,
             opacityControl,
             instructionsButton,
             attachButton,
@@ -2081,8 +2068,7 @@ private final class ExpandedPanelView: NSView {
         hideButton.toolTip = "Hide to pill"
         closeButton.toolTip = "Turn Bluey off. Run bluey on to start again."
         recordingButton.toolTip = "Start or stop listening"
-        accessButton.toolTip = "Full access mode. Click to edit how Bluey should answer."
-        instructionsButton.toolTip = "Set answer style"
+        instructionsButton.toolTip = "How Bluey should answer"
         attachButton.toolTip = "Attach files"
         analyzeButton.toolTip = "Analyse screen"
         askButton.toolTip = "Send"
@@ -2257,7 +2243,7 @@ private final class ExpandedPanelView: NSView {
         if recordingActive {
             emitSimple("recording_stop_requested")
             recordingActive = false
-            recordingButton.title = "Start Bluey"
+            recordingButton.title = "Listen"
             statusLabel.stringValue = "Paused"
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
         } else {
