@@ -4001,12 +4001,24 @@ fn provider_api_key(config: &ProviderClientConfig) -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+const HUMAN_SPEAK_CONTRACT: &str = "\
+Human-speak contract:
+- Start with a short talk track the user could say naturally, not a meta answer about what to say.
+- Use first person for plans, tradeoffs, and explanations: \"I would...\", \"My approach is...\", \"The reason I prefer...\".
+- Prefer a natural spoken flow: acknowledge the question, give the core answer, then add the reason or example.
+- Do not invent personal experience, shipped work, metrics, or ownership that is not in the question or session context.
+- No assistant preamble such as \"Sure\", \"Here is\", \"As an AI\", or \"You can say\".
+- Do not sound like a polished memo: avoid source labels, repeated headings, and long markdown checklists in the chat answer.
+- If the topic needs depth, keep the chat answer speakable and put deeper code/design/detail in the structured sections or artifact.";
+
 fn provider_messages(payload: &ProviderRequestPayload) -> Result<Vec<ChatMessage>> {
     let mut system = String::from(
         "You are Bluey, a concise meeting and work copilot. Answer only from the supplied session context when possible. If context is thin, say what is missing and give the most useful next step.",
     );
+    system.push_str("\n\n");
+    system.push_str(HUMAN_SPEAK_CONTRACT);
     system.push_str(
-        "\n\nOutput format:\n- Stream a clear, readable answer with short sections and line breaks.\n- Put the direct answer first.\n- Auto-detect the task type. For coding, debugging, algorithms, API, or configuration questions, use this shape: Approach, Code, Explanation, Complexity, Edge cases. Put code in fenced Markdown code blocks with a language tag when possible.\n- For system design questions, use Architecture, Data flow, Components, Scaling, Tradeoffs, and Risks / next steps.\n- For design/debug/product questions, use compact bullets with concrete next steps.\n- Avoid long paragraphs; make the overlay easy to scan while it streams.",
+        "\n\nOutput format:\n- Stream a clear, readable answer with short line breaks.\n- Put the direct, speakable answer first as one natural paragraph whenever possible.\n- Do not turn normal chat answers into a markdown outline. Use headings only when the task truly needs structure or when an artifact/canvas will render the deeper detail.\n- Auto-detect the task type. For coding, debugging, algorithms, API, or configuration questions, use this shape after the talk track when useful: Approach, Code, Explanation, Complexity, Edge cases. Put code in fenced Markdown code blocks with a language tag when possible.\n- For system design questions, use Architecture, Data flow, Components, Scaling, Tradeoffs, and Risks / next steps after the talk track when useful.\n- For design/debug/product questions, use compact bullets with concrete next steps.\n- Avoid long paragraphs; make the overlay easy to scan while it streams.",
     );
     if let Some(instructions) = payload
         .instructions
@@ -7156,7 +7168,14 @@ mod tests {
             ChatMessageContent::Parts(_) => panic!("system message should be text"),
         };
 
+        assert!(system.contains("Human-speak contract"));
+        assert!(system.contains("first person"));
+        assert!(system.contains("Do not invent personal experience"));
+        assert!(system.contains("No assistant preamble"));
+        assert!(system.contains("Do not sound like a polished memo"));
         assert!(system.contains("Output format"));
+        assert!(system.contains("direct, speakable answer first"));
+        assert!(system.contains("Do not turn normal chat answers into a markdown outline"));
         assert!(system.contains("Approach, Code, Explanation, Complexity, Edge cases"));
         assert!(system.contains("fenced Markdown code blocks"));
     }
