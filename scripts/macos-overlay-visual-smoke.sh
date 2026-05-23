@@ -13,9 +13,36 @@ BLUEY_BIN="${BLUEY_BIN:-$ROOT/target/debug/bluey}"
 EXPECTED_HEIGHT="${BLUEY_EXPECTED_OVERLAY_HEIGHT:-520}"
 MIN_WIDTH="${BLUEY_MIN_OVERLAY_WIDTH:-680}"
 MAX_WIDTH="${BLUEY_MAX_OVERLAY_WIDTH:-960}"
+OVERLAY_SOURCE="$ROOT/native/macos/cue-overlay/Sources/cue-overlay/main.swift"
+
+require_source() {
+  local pattern="$1"
+  if ! grep -Fq -- "$pattern" "$OVERLAY_SOURCE"; then
+    echo "[visual-smoke] missing required UI contract marker: $pattern" >&2
+    exit 2
+  fi
+}
+
+reject_source() {
+  local pattern="$1"
+  if grep -Fq -- "$pattern" "$OVERLAY_SOURCE"; then
+    echo "[visual-smoke] rejected UI contract marker still present: $pattern" >&2
+    exit 2
+  fi
+}
 
 mkdir -p "$OUT_DIR"
 cd "$ROOT"
+
+echo "[visual-smoke] checking overlay UI contract"
+require_source "private final class ComposerTextView"
+require_source "recordingButton = NSButton(title: \"Listen\""
+require_source "styleIconButton(attachButton, symbol: \"plus\""
+require_source "styleControlButton(instructionsButton, symbol: \"text.bubble\""
+require_source "modelMenu.trailingAnchor.constraint(equalTo: analyzeButton.leadingAnchor"
+require_source "composerBarHeightConstraint?.constant = textHeight + 62"
+reject_source "Full access"
+reject_source "Start Bluey"
 
 echo "[visual-smoke] building debug CLI/daemon + macOS overlay"
 cargo build --bin bluey --bin bluey-daemon >/dev/null
