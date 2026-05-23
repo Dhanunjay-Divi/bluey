@@ -1238,6 +1238,7 @@ private final class ExpandedPanelView: NSView {
     let canvasPane: CanvasPaneView
     let headerBar: NSView
     let headerStack: NSStackView
+    let brandStack: NSStackView
     let headerSpacer: NSView
     let titleLabel: NSTextField
     let statusLabel: NSTextField
@@ -1296,6 +1297,7 @@ private final class ExpandedPanelView: NSView {
         canvasPane = CanvasPaneView(frame: .zero)
         headerBar = NSView()
         headerStack = NSStackView()
+        brandStack = NSStackView()
         headerSpacer = NSView()
         titleLabel = NSTextField(labelWithString: "Bluey")
         statusLabel = NSTextField(labelWithString: "New recording")
@@ -1358,6 +1360,7 @@ private final class ExpandedPanelView: NSView {
         for view in [
             headerBar,
             headerStack,
+            brandStack,
             headerSpacer,
             titleLabel,
             statusLabel,
@@ -1407,9 +1410,12 @@ private final class ExpandedPanelView: NSView {
         }
 
         headerBar.addSubview(headerStack)
+        brandStack.addArrangedSubview(titleLabel)
+        brandStack.addArrangedSubview(statusLabel)
         for view in [
             navButton,
             newSessionButton,
+            brandStack,
             modelMenu,
             headerSpacer,
             canvasToggleButton,
@@ -1467,18 +1473,21 @@ private final class ExpandedPanelView: NSView {
             headerBar.topAnchor.constraint(equalTo: topAnchor, constant: 10),
             headerBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             headerBar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            headerBar.heightAnchor.constraint(equalToConstant: 36),
+            headerBar.heightAnchor.constraint(equalToConstant: 42),
 
-            headerStack.leadingAnchor.constraint(equalTo: headerBar.leadingAnchor, constant: 8),
-            headerStack.trailingAnchor.constraint(equalTo: headerBar.trailingAnchor, constant: -8),
-            headerStack.topAnchor.constraint(equalTo: headerBar.topAnchor, constant: 3),
-            headerStack.bottomAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: -3),
+            headerStack.leadingAnchor.constraint(equalTo: headerBar.leadingAnchor, constant: 9),
+            headerStack.trailingAnchor.constraint(equalTo: headerBar.trailingAnchor, constant: -9),
+            headerStack.topAnchor.constraint(equalTo: headerBar.topAnchor, constant: 4),
+            headerStack.bottomAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: -4),
 
             navButton.widthAnchor.constraint(equalToConstant: 30),
             navButton.heightAnchor.constraint(equalToConstant: 30),
 
             newSessionButton.widthAnchor.constraint(equalToConstant: 30),
             newSessionButton.heightAnchor.constraint(equalToConstant: 30),
+
+            brandStack.widthAnchor.constraint(greaterThanOrEqualToConstant: 110),
+            brandStack.widthAnchor.constraint(lessThanOrEqualToConstant: 162),
 
             modelMenu.widthAnchor.constraint(greaterThanOrEqualToConstant: 118),
             modelMenu.widthAnchor.constraint(lessThanOrEqualToConstant: 152),
@@ -1719,34 +1728,48 @@ private final class ExpandedPanelView: NSView {
 
     private func configureHeader() {
         headerBar.wantsLayer = true
-        headerBar.layer?.backgroundColor = NSColor(red: 0.030, green: 0.034, blue: 0.042, alpha: 0.96).cgColor
-        headerBar.layer?.cornerRadius = 18
+        headerBar.layer?.backgroundColor = NSColor(red: 0.016, green: 0.019, blue: 0.025, alpha: 0.98).cgColor
+        headerBar.layer?.cornerRadius = 21
         headerBar.layer?.borderWidth = 1
-        headerBar.layer?.borderColor = BlueyTheme.hairline.cgColor
+        headerBar.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.20).cgColor
+        headerBar.layer?.shadowColor = NSColor.black.cgColor
+        headerBar.layer?.shadowOpacity = 0.24
+        headerBar.layer?.shadowRadius = 18
+        headerBar.layer?.shadowOffset = NSSize(width: 0, height: -6)
 
         headerStack.orientation = .horizontal
         headerStack.alignment = .centerY
         headerStack.distribution = .fill
-        headerStack.spacing = 6
+        headerStack.spacing = 7
         headerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         headerSpacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .bold)
+        brandStack.orientation = .vertical
+        brandStack.alignment = .leading
+        brandStack.distribution = .fill
+        brandStack.spacing = -1
+        brandStack.setContentHuggingPriority(.defaultHigh, for: .horizontal)
+        brandStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
+        titleLabel.font = NSFont.systemFont(ofSize: 13.5, weight: .bold)
         titleLabel.textColor = BlueyTheme.text
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.maximumNumberOfLines = 1
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         statusLabel.font = NSFont.systemFont(ofSize: 9.5, weight: .semibold)
         statusLabel.textColor = BlueyTheme.textDim
-
-        titleLabel.isHidden = true
-        statusLabel.isHidden = true
+        statusLabel.lineBreakMode = .byTruncatingTail
+        statusLabel.maximumNumberOfLines = 1
+        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         modelMenu.addItems(withTitles: ["Auto", "Instant", "Balanced", "Deep"])
         modelMenu.selectItem(at: 0)
         modelMenu.isBordered = false
         modelMenu.wantsLayer = true
-        modelMenu.layer?.backgroundColor = BlueyTheme.surfaceRaised.cgColor
-        modelMenu.layer?.cornerRadius = 14
+        modelMenu.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.075).cgColor
+        modelMenu.layer?.cornerRadius = 15
         modelMenu.layer?.borderWidth = 1
-        modelMenu.layer?.borderColor = BlueyTheme.hairline.cgColor
+        modelMenu.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
         modelMenu.font = NSFont.systemFont(ofSize: 12, weight: .bold)
         modelMenu.contentTintColor = BlueyTheme.text
         modelMenu.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -1760,10 +1783,10 @@ private final class ExpandedPanelView: NSView {
         balanceLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         balanceLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         balanceLabel.wantsLayer = true
-        balanceLabel.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.18).cgColor
+        balanceLabel.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.055).cgColor
         balanceLabel.layer?.cornerRadius = 14
         balanceLabel.layer?.borderWidth = 1
-        balanceLabel.layer?.borderColor = BlueyTheme.hairline.cgColor
+        balanceLabel.layer?.borderColor = NSColor.white.withAlphaComponent(0.10).cgColor
     }
 
     private func configureContextRows() {
@@ -1993,12 +2016,12 @@ private final class ExpandedPanelView: NSView {
         button.title = fallback
         button.isBordered = false
         button.wantsLayer = true
-        button.layer?.cornerRadius = 14
-        button.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.035).cgColor
+        button.layer?.cornerRadius = 15
+        button.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.070).cgColor
         button.layer?.borderWidth = 1
-        button.layer?.borderColor = NSColor.white.withAlphaComponent(0.08).cgColor
+        button.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
         button.font = NSFont.systemFont(ofSize: 12, weight: .bold)
-        button.contentTintColor = BlueyTheme.textDim
+        button.contentTintColor = BlueyTheme.text
         if let image = symbolImage(symbol) {
             image.isTemplate = true
             button.title = ""
