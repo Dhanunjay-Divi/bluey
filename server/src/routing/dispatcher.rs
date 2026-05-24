@@ -33,14 +33,39 @@ pub struct Completion {
 }
 
 /// Resolve the lane/task to a concrete provider+model.
-/// Mirrors `cue_router::policy::StaticPolicy::defaults`.
+///
+/// This returns the preferred route for compatibility with older callers.
+/// New managed paths should use `resolve_route_candidates()` so they can
+/// skip an exhausted provider without failing the customer request.
 pub fn resolve_route(lane: &str) -> (&'static str, &'static str) {
+    resolve_route_candidates(lane)
+        .into_iter()
+        .next()
+        .unwrap_or(("anthropic", "claude-3-5-sonnet-latest"))
+}
+
+/// Ordered fallback candidates for one lane.
+///
+/// The list is intentionally conservative: the first route preserves product
+/// quality, later routes preserve availability. Pricing and provider capacity
+/// are checked by the API layer before dispatch.
+pub fn resolve_route_candidates(lane: &str) -> Vec<(&'static str, &'static str)> {
     match lane {
-        "instant" => ("openai", "gpt-4o-mini"),
-        "deep" => ("anthropic", "claude-3-7-sonnet-latest"),
-        "vision" => ("openai", "gpt-4o"),
-        "local" => ("ollama", "llama3.1"),
-        _ => ("anthropic", "claude-3-5-sonnet-latest"), // balanced default
+        "instant" => vec![
+            ("openai", "gpt-4o-mini"),
+            ("anthropic", "claude-3-5-sonnet-latest"),
+        ],
+        "deep" => vec![
+            ("anthropic", "claude-3-7-sonnet-latest"),
+            ("openai", "gpt-4o"),
+            ("anthropic", "claude-3-5-sonnet-latest"),
+        ],
+        "vision" => vec![("openai", "gpt-4o")],
+        "local" => vec![("ollama", "llama3.1")],
+        _ => vec![
+            ("anthropic", "claude-3-5-sonnet-latest"),
+            ("openai", "gpt-4o-mini"),
+        ], // balanced default
     }
 }
 
@@ -510,6 +535,22 @@ mod tests {
         assert_eq!(
             resolve_route("???"),
             ("anthropic", "claude-3-5-sonnet-latest"),
+        );
+    }
+
+    #[test]
+    fn route_candidates_preserve_preferred_first() {
+        assert_eq!(
+            resolve_route_candidates("deep"),
+            vec![
+                ("anthropic", "claude-3-7-sonnet-latest"),
+                ("openai", "gpt-4o"),
+                ("anthropic", "claude-3-5-sonnet-latest")
+            ]
+        );
+        assert_eq!(
+            resolve_route_candidates("vision"),
+            vec![("openai", "gpt-4o")]
         );
     }
 }

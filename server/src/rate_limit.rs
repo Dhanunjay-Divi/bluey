@@ -1,9 +1,13 @@
 #![allow(clippy::doc_lazy_continuation)]
-//! Per-IP rate limiting for sensitive endpoints.
+//! Per-IP, per-account, and per-provider rate limiting.
 //!
 //! Codex Stage 11: brute-force protection on /auth/login + /auth/signup
-//! + /auth/refresh + /auth/device/poll. Uses the governor crate
-//! per-key keyed rate limiter with an in-memory state map.
+//! + /auth/refresh + /auth/device/poll. The managed-provider capacity layer
+//! adds account fairness and upstream-provider buckets so one busy customer
+//! or one exhausted provider cannot knock realtime calls offline for everyone.
+//! Uses the governor crate per-key keyed rate limiter with an in-memory state
+//! map. Multi-process deployments should swap this seam for Redis-backed
+//! buckets without changing the API handlers.
 //!
 //! Limits (per IP):
 //!
@@ -11,6 +15,9 @@
 //! - /auth/refresh: 30 per minute, burst 30
 //! - /auth/device/poll: 60 per minute, long-poll friendly
 //! - /router/complete: 120 per minute, tier-aware in v0.2.x
+//! - Account LLM: 60 per minute, burst 12
+//! - Account embed/STT chunks: 120 per minute, burst 30
+//! - Provider buckets: env-configurable safety valves per provider family
 //!
 //! Enforcement is best-effort: behind a load balancer the IP we see
 //! is the LB's, so v0.2.x will need to honor X-Forwarded-For when
@@ -81,6 +88,12 @@ impl Limiter {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapacityDenied {
+    pub retry_after_secs: u64,
+    pub reason: &'static str,
+}
+
 /// Bundle of all per-endpoint limiters. Stored on AppState.
 #[derive(Clone)]
 pub struct RateLimiters {
@@ -89,6 +102,22 @@ pub struct RateLimiters {
     pub auth_refresh: Limiter,
     pub auth_device_poll: Limiter,
     pub router_complete: Limiter,
+    pub router_embed: Limiter,
+    pub router_transcribe: Limiter,
+    /// Per-account fairness for managed LLM requests.
+    pub account_llm: Limiter,
+    /// Per-account fairness for embeddings/RAG writes.
+    pub account_embed: Limiter,
+    /// Per-account fairness for chunked STT requests.
+    pub account_stt: Limiter,
+    /// Provider-wide capacity bucket for OpenAI chat/vision requests.
+    pub provider_openai_llm: Limiter,
+    /// Provider-wide capacity bucket for Anthropic chat requests.
+    pub provider_anthropic_llm: Limiter,
+    /// Provider-wide capacity bucket for OpenAI embeddings.
+    pub provider_openai_embed: Limiter,
+    /// Provider-wide capacity bucket for Deepgram STT.
+    pub provider_deepgram_stt: Limiter,
 }
 
 impl Default for RateLimiters {
@@ -99,8 +128,144 @@ impl Default for RateLimiters {
             auth_refresh: Limiter::new(30, 30),
             auth_device_poll: Limiter::new(60, 60),
             router_complete: Limiter::new(120, 60),
+            router_embed: Limiter::new(240, 80),
+            router_transcribe: Limiter::new(240, 80),
+            account_llm: limiter_from_env("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN", 60, 12),
+            account_embed: limiter_from_env("BLUEY_LIMIT_ACCOUNT_EMBED_PER_MIN", 120, 30),
+            account_stt: limiter_from_env("BLUEY_LIMIT_ACCOUNT_STT_PER_MIN", 120, 30),
+            provider_openai_llm: limiter_from_env(
+                "BLUEY_LIMIT_PROVIDER_OPENAI_LLM_PER_MIN",
+                900,
+                180,
+            ),
+            provider_anthropic_llm: limiter_from_env(
+                "BLUEY_LIMIT_PROVIDER_ANTHROPIC_LLM_PER_MIN",
+                300,
+                60,
+            ),
+            provider_openai_embed: limiter_from_env(
+                "BLUEY_LIMIT_PROVIDER_OPENAI_EMBED_PER_MIN",
+                900,
+                180,
+            ),
+            provider_deepgram_stt: limiter_from_env(
+                "BLUEY_LIMIT_PROVIDER_DEEPGRAM_STT_PER_MIN",
+                600,
+                120,
+            ),
         }
     }
+}
+
+impl RateLimiters {
+    pub async fn check_account_llm(&self, account_id: &str) -> Result<(), CapacityDenied> {
+        self.account_llm
+            .check(account_id)
+            .await
+            .map_err(|retry_after_secs| CapacityDenied {
+                retry_after_secs,
+                reason: "account_llm_busy",
+            })
+    }
+
+    pub async fn check_account_embed(&self, account_id: &str) -> Result<(), CapacityDenied> {
+        self.account_embed
+            .check(account_id)
+            .await
+            .map_err(|retry_after_secs| CapacityDenied {
+                retry_after_secs,
+                reason: "account_embed_busy",
+            })
+    }
+
+    pub async fn check_account_stt(&self, account_id: &str) -> Result<(), CapacityDenied> {
+        self.account_stt
+            .check(account_id)
+            .await
+            .map_err(|retry_after_secs| CapacityDenied {
+                retry_after_secs,
+                reason: "account_stt_busy",
+            })
+    }
+
+    pub async fn check_provider_llm(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<(), CapacityDenied> {
+        let key = format!("{provider}:{model}");
+        match provider {
+            "openai" => {
+                self.provider_openai_llm
+                    .check(&key)
+                    .await
+                    .map_err(|retry| CapacityDenied {
+                        retry_after_secs: retry,
+                        reason: "provider_openai_llm_busy",
+                    })
+            }
+            "anthropic" => self
+                .provider_anthropic_llm
+                .check(&key)
+                .await
+                .map_err(|retry| CapacityDenied {
+                    retry_after_secs: retry,
+                    reason: "provider_anthropic_llm_busy",
+                }),
+            _ => Ok(()),
+        }
+    }
+
+    pub async fn check_provider_embed(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<(), CapacityDenied> {
+        let key = format!("{provider}:{model}");
+        match provider {
+            "openai" => self
+                .provider_openai_embed
+                .check(&key)
+                .await
+                .map_err(|retry| CapacityDenied {
+                    retry_after_secs: retry,
+                    reason: "provider_openai_embed_busy",
+                }),
+            _ => Ok(()),
+        }
+    }
+
+    pub async fn check_provider_stt(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Result<(), CapacityDenied> {
+        let key = format!("{provider}:{model}");
+        match provider {
+            "deepgram" => self
+                .provider_deepgram_stt
+                .check(&key)
+                .await
+                .map_err(|retry| CapacityDenied {
+                    retry_after_secs: retry,
+                    reason: "provider_deepgram_stt_busy",
+                }),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn limiter_from_env(name: &str, default_per_minute: u32, default_burst: u32) -> Limiter {
+    let per_minute = env_u32(name).unwrap_or(default_per_minute);
+    let burst = env_u32(&format!("{name}_BURST")).unwrap_or(default_burst);
+    Limiter::new(per_minute, burst)
+}
+
+fn env_u32(name: &str) -> Option<u32> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
 }
 
 /// Cached parse of `BLUEY_TRUSTED_PROXIES`. Read once at first
@@ -182,6 +347,8 @@ make_middleware!(limit_auth_signup, auth_signup);
 make_middleware!(limit_auth_refresh, auth_refresh);
 make_middleware!(limit_auth_device_poll, auth_device_poll);
 make_middleware!(limit_router_complete, router_complete);
+make_middleware!(limit_router_embed, router_embed);
+make_middleware!(limit_router_transcribe, router_transcribe);
 
 /// Test-only helper: expose `client_key()` so an integration test can
 /// hit a real `axum::serve(...)` path and assert the peer IP arrives
@@ -223,6 +390,37 @@ mod tests {
         l.check("ip3").await.unwrap();
         // ip3 exhausted; ip4 still has its own bucket.
         assert!(l.check("ip4").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn account_capacity_denial_has_reason() {
+        let limits = RateLimiters {
+            account_llm: Limiter::new(60, 1),
+            ..RateLimiters::default()
+        };
+        limits.check_account_llm("acct1").await.unwrap();
+        let denied = limits.check_account_llm("acct1").await.unwrap_err();
+        assert_eq!(denied.reason, "account_llm_busy");
+        assert!(denied.retry_after_secs >= 1);
+        assert!(limits.check_account_llm("acct2").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn provider_capacity_isolated_by_model() {
+        let limits = RateLimiters {
+            provider_openai_llm: Limiter::new(60, 1),
+            ..RateLimiters::default()
+        };
+        limits
+            .check_provider_llm("openai", "gpt-4o-mini")
+            .await
+            .unwrap();
+        let denied = limits
+            .check_provider_llm("openai", "gpt-4o-mini")
+            .await
+            .unwrap_err();
+        assert_eq!(denied.reason, "provider_openai_llm_busy");
+        assert!(limits.check_provider_llm("openai", "gpt-4o").await.is_ok());
     }
 
     #[test]

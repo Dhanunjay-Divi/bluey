@@ -128,6 +128,15 @@ Reliability:
 - Never block overlay rendering on cloud sync, embeddings, recap, or billing checks.
 - Stream partial answer cards, then finalize with citations.
 - Track health for audio, STT, provider routing, cloud sync, and capture permissions.
+- Enforce three layers of capacity before provider dispatch:
+  - Per-IP edge buckets for abuse protection.
+  - Per-account buckets for fairness during live calls.
+  - Per-provider/model buckets for OpenAI, Anthropic, Deepgram, and embeddings.
+- Return typed `429` responses with `retry_after_secs` when Bluey is busy, and
+  route LLM lanes through fallback candidates before surfacing an outage.
+- For multi-instance deployment, move the capacity buckets from in-process
+  governor state to Redis/shared counters so 1000+ active users respect one
+  global provider budget.
 
 ## Product Gaps To Prioritize
 

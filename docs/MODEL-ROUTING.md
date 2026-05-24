@@ -1,6 +1,6 @@
 # Bluey Model Routing
 
-Last updated: 2026-05-23
+Last updated: 2026-05-24
 
 This document is the source-of-truth snapshot for the model/provider routing
 currently implemented in the Bluey codebase. It is intentionally operational:
@@ -20,11 +20,51 @@ actual upstream models.
 | `deep` | Anthropic | `claude-3-7-sonnet-latest` | Hard coding, system design, long reasoning |
 | `vision` | OpenAI | `gpt-4o` | Analyse Screen, screenshots, image context |
 
+The server now resolves each lane to an ordered candidate list, not a single
+hard dependency. If the preferred provider is unavailable, over quota, or
+temporarily busy, Bluey tries the next candidate before returning an error.
+
+| Lane | Candidate order |
+| --- | --- |
+| `instant` | OpenAI `gpt-4o-mini` -> Anthropic `claude-3-5-sonnet-latest` |
+| `balanced` | Anthropic `claude-3-5-sonnet-latest` -> OpenAI `gpt-4o-mini` |
+| `deep` | Anthropic `claude-3-7-sonnet-latest` -> OpenAI `gpt-4o` -> Anthropic `claude-3-5-sonnet-latest` |
+| `vision` | OpenAI `gpt-4o` |
+
 Code references:
 
-- `server/src/routing/dispatcher.rs::resolve_route`
+- `server/src/routing/dispatcher.rs::resolve_route_candidates`
 - `crates/cue-router/src/policy.rs::ManagedPolicy`
 - `crates/cue-llm/src/bluey_managed.rs`
+
+## Capacity And Rate-Limit Policy
+
+Bluey protects realtime work at three layers:
+
+1. **HTTP edge per-IP buckets**: protects auth and router endpoints from abuse.
+2. **Authenticated per-account buckets**: prevents one customer from consuming
+   all server/provider capacity during a call.
+3. **Provider/model buckets**: keeps OpenAI, Anthropic, Deepgram, and embedding
+   calls inside configured capacity and lets LLM lanes fall back before failing.
+
+Default server knobs:
+
+| Env var | Default | Purpose |
+| --- | ---: | --- |
+| `BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN` | 60/min, burst 12 | Per-account managed answers |
+| `BLUEY_LIMIT_ACCOUNT_EMBED_PER_MIN` | 120/min, burst 30 | Per-account embeddings/RAG writes |
+| `BLUEY_LIMIT_ACCOUNT_STT_PER_MIN` | 120/min, burst 30 | Per-account chunked STT |
+| `BLUEY_LIMIT_PROVIDER_OPENAI_LLM_PER_MIN` | 900/min, burst 180 | OpenAI chat/vision capacity |
+| `BLUEY_LIMIT_PROVIDER_ANTHROPIC_LLM_PER_MIN` | 300/min, burst 60 | Anthropic chat capacity |
+| `BLUEY_LIMIT_PROVIDER_OPENAI_EMBED_PER_MIN` | 900/min, burst 180 | OpenAI embedding capacity |
+| `BLUEY_LIMIT_PROVIDER_DEEPGRAM_STT_PER_MIN` | 600/min, burst 120 | Deepgram STT capacity |
+
+Each provider env var also supports a `_BURST` suffix, for example
+`BLUEY_LIMIT_PROVIDER_OPENAI_LLM_PER_MIN_BURST=240`.
+
+Current implementation is in-process and safe for single-binary alpha. Once
+Bluey runs more than one server instance, move these buckets to Redis or another
+shared atomic counter so provider limits are enforced globally.
 
 ## Local/Developer Fallback Routing
 

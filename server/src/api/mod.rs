@@ -128,10 +128,21 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
                 ),
             ),
         )
-        .route("/router/embed", axum::routing::post(router::embed))
+        .route(
+            "/router/embed",
+            axum::routing::post(router::embed).route_layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::rate_limit::limit_router_embed,
+            )),
+        )
         .route(
             "/router/transcribe",
-            axum::routing::post(router::transcribe),
+            axum::routing::post(router::transcribe).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_router_transcribe,
+                ),
+            ),
         )
         .route("/stt/session", axum::routing::post(stt::create_session))
         .route("/stt/relay", axum::routing::get(stt::relay))

@@ -67,7 +67,61 @@ pub struct ApiError {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reload_url: Option<String>,
+}
+
+struct PricedRoute {
+    provider: &'static str,
+    model: &'static str,
+    pricing: &'static pricing::ModelPricing,
+    estimated_cost_cents: i64,
+}
+
+fn capacity_error(reason: &str, retry_after_secs: u64) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(ApiError {
+            error: "Bluey is handling a burst right now; retry shortly".into(),
+            reason: Some(reason.to_string()),
+            retry_after_secs: Some(retry_after_secs),
+            ..Default::default()
+        }),
+    )
+}
+
+fn release_and_capacity_error(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    request_id: &str,
+    reason: &str,
+    retry_after_secs: u64,
+) -> (StatusCode, Json<ApiError>) {
+    let _ = idempotency::release(pool, account_id, request_id);
+    capacity_error(reason, retry_after_secs)
+}
+
+fn priced_routes_for(
+    lane: &str,
+    estimated_input_tokens: i64,
+    max_output_tokens: i64,
+) -> Vec<PricedRoute> {
+    routing::resolve_route_candidates(lane)
+        .into_iter()
+        .filter_map(|(provider, model)| {
+            pricing::lookup(provider, model).map(|entry| PricedRoute {
+                provider,
+                model,
+                pricing: entry,
+                estimated_cost_cents: pricing::estimate_cost_ceiling(
+                    entry,
+                    estimated_input_tokens,
+                    max_output_tokens,
+                ),
+            })
+        })
+        .collect()
 }
 
 pub async fn complete(
@@ -178,26 +232,42 @@ async fn complete_inner(
         }
     }
 
-    // 2. Resolve lane → provider+model.
-    let (provider, model) = routing::resolve_route(&req.lane);
-    let pricing_entry = pricing::lookup(provider, model).ok_or_else(|| {
-        let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError {
-                error: format!("no pricing for {provider}/{model}"),
-                ..Default::default()
-            }),
-        )
-    })?;
+    if let Err(denied) = state.rate_limiters.check_account_llm(&account.id).await {
+        return Err(release_and_capacity_error(
+            &state.pool,
+            &account.id,
+            &req.request_id,
+            denied.reason,
+            denied.retry_after_secs,
+        ));
+    }
 
-    // 3. Estimate cost ceiling for the entry check.
+    // 2. Resolve lane → provider+model candidates. Entry balance check uses
+    // the maximum candidate estimate so provider failover cannot overrun a
+    // customer's hard-stop budget.
     let max_out = req.max_tokens.unwrap_or(2048) as i64;
     let est_in = req.estimated_input_tokens.unwrap_or_else(|| {
         // Crude fallback: ~4 chars/token
         ((req.system.len() + req.user.len()) as i64) / 4
     });
-    let est_cost = pricing::estimate_cost_ceiling(pricing_entry, est_in, max_out);
+    let routes = priced_routes_for(&req.lane, est_in, max_out);
+    if routes.is_empty() {
+        let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("no priced route for lane {}", req.lane),
+                ..Default::default()
+            }),
+        ));
+    }
+
+    // 3. Estimate cost ceiling for the entry check.
+    let est_cost = routes
+        .iter()
+        .map(|route| route.estimated_cost_cents)
+        .max()
+        .unwrap_or(1);
 
     let on_trial = account.trial_seconds_remaining > 0;
 
@@ -224,47 +294,100 @@ async fn complete_inner(
                     estimated_cost_cents: Some(est_cost),
                     reason: Some("insufficient_balance".into()),
                     reload_url: Some(format!("{}/reload", state.config.public_url)),
+                    ..Default::default()
                 }),
             ));
         }
     }
 
-    // 5. Dispatch to upstream provider. Pass the entry estimate so the
-    //    dispatcher can fall back to it if the upstream omits `usage`.
-    //    Codex S4.5.
+    // 5. Dispatch to upstream provider. Try candidate routes in order. Provider
+    //    capacity is checked before each attempt, so a provider 429/rate-limit
+    //    storm degrades to another route instead of failing the active call.
+    //    Pass the entry estimate so the dispatcher can fall back to it if the
+    //    upstream omits `usage`. Codex S4.5.
     let started = Instant::now();
-    let result = routing::complete(
-        &state.config.upstream,
-        provider,
-        model,
-        &req.system,
-        &req.user,
-        req.max_tokens,
-        req.temperature,
-        Some(est_in),
-    )
-    .await;
-    let elapsed = started.elapsed();
-    let elapsed_ms = elapsed.as_millis() as i64;
+    let mut last_error: Option<anyhow::Error> = None;
+    let mut last_capacity: Option<crate::rate_limit::CapacityDenied> = None;
+    let mut last_failure_was_capacity = false;
+    let mut selected_route_idx = 0usize;
+    let mut selected_route: Option<&PricedRoute> = None;
+    let mut selected_completion: Option<routing::Completion> = None;
 
-    let comp = match result {
-        Ok(c) => c,
-        Err(e) => {
-            // Codex S4.6: log raw upstream details, return sanitized
-            // message to the customer. We DO NOT mark the idempotency
-            // row as failed-terminal because a transient upstream error
-            // should be retryable with the same request_id (the
-            // alternative — making the customer mint a new id — is
-            // user-hostile for ephemeral 503s).
+    for (idx, route) in routes.iter().enumerate() {
+        if let Err(denied) = state
+            .rate_limiters
+            .check_provider_llm(route.provider, route.model)
+            .await
+        {
             tracing::warn!(
                 account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 request_id = %req.request_id,
-                provider = %provider,
-                model = %model,
-                error = %e,
-                "upstream dispatch failed"
+                provider = %route.provider,
+                model = %route.model,
+                retry_after_secs = denied.retry_after_secs,
+                reason = denied.reason,
+                "provider capacity busy; trying next route"
             );
+            last_capacity = Some(denied);
+            last_failure_was_capacity = true;
+            continue;
+        }
+
+        match routing::complete(
+            &state.config.upstream,
+            route.provider,
+            route.model,
+            &req.system,
+            &req.user,
+            req.max_tokens,
+            req.temperature,
+            Some(est_in),
+        )
+        .await
+        {
+            Ok(completion) => {
+                selected_route_idx = idx;
+                selected_route = Some(route);
+                selected_completion = Some(completion);
+                break;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    request_id = %req.request_id,
+                    provider = %route.provider,
+                    model = %route.model,
+                    error = %e,
+                    "upstream dispatch failed; trying next route"
+                );
+                last_error = Some(e);
+                last_failure_was_capacity = false;
+            }
+        }
+    }
+    let elapsed = started.elapsed();
+    let elapsed_ms = elapsed.as_millis() as i64;
+
+    let (selected_route, comp) = match (selected_route, selected_completion) {
+        (Some(route), Some(completion)) => (route, completion),
+        _ => {
             let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
+            if last_failure_was_capacity {
+                let denied = last_capacity.expect("capacity flag set with no capacity denial");
+                return Err(capacity_error(denied.reason, denied.retry_after_secs));
+            }
+            if let Some(e) = last_error {
+                // Codex S4.6: log raw upstream details, return sanitized
+                // message to the customer. We DO NOT mark the idempotency
+                // row as failed-terminal because a transient upstream error
+                // should be retryable with the same request_id.
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    request_id = %req.request_id,
+                    error = %e,
+                    "all upstream dispatch routes failed"
+                );
+            }
             return Err((
                 StatusCode::BAD_GATEWAY,
                 Json(ApiError {
@@ -277,8 +400,11 @@ async fn complete_inner(
     };
 
     // 6. Compute actual cost from real token counts.
-    let (bluey_cost, customer_cost) =
-        pricing::compute_cost(pricing_entry, comp.input_tokens, comp.output_tokens);
+    let (bluey_cost, customer_cost) = pricing::compute_cost(
+        selected_route.pricing,
+        comp.input_tokens,
+        comp.output_tokens,
+    );
 
     // 7. Charge: trial decrement OR balance deduction.
     let trial_remaining = if on_trial {
@@ -352,7 +478,7 @@ async fn complete_inner(
         cost_cents_to_bluey: bluey_cost,
         cost_cents_to_customer: customer_cost,
         was_speculative: false,
-        was_fallback: false,
+        was_fallback: selected_route_idx > 0,
     };
     if let Err(e) = crate::db::usage::record(&state.pool, &account.id, &event) {
         tracing::warn!(error = %e, "failed to record usage event");
@@ -750,6 +876,29 @@ pub async fn embed(
         )
     })?;
 
+    if let Err(denied) = state.rate_limiters.check_account_embed(&account.id).await {
+        return Err(release_and_capacity_error(
+            &state.pool,
+            &account.id,
+            &req.request_id,
+            denied.reason,
+            denied.retry_after_secs,
+        ));
+    }
+    if let Err(denied) = state
+        .rate_limiters
+        .check_provider_embed(provider, model)
+        .await
+    {
+        return Err(release_and_capacity_error(
+            &state.pool,
+            &account.id,
+            &req.request_id,
+            denied.reason,
+            denied.retry_after_secs,
+        ));
+    }
+
     // Entry check (skipped on trial).
     let on_trial = account.trial_seconds_remaining > 0;
     let est_in = (req.input.len() as i64) / 4;
@@ -776,6 +925,7 @@ pub async fn embed(
                     estimated_cost_cents: Some(est_cost),
                     reason: Some("insufficient_balance".into()),
                     reload_url: Some(format!("{}/reload", state.config.public_url)),
+                    ..Default::default()
                 }),
             ));
         }
@@ -1001,6 +1151,29 @@ pub async fn transcribe(
         )
     })?;
 
+    if let Err(denied) = state.rate_limiters.check_account_stt(&account.id).await {
+        return Err(release_and_capacity_error(
+            &state.pool,
+            &account.id,
+            &q.request_id,
+            denied.reason,
+            denied.retry_after_secs,
+        ));
+    }
+    if let Err(denied) = state
+        .rate_limiters
+        .check_provider_stt(provider, model)
+        .await
+    {
+        return Err(release_and_capacity_error(
+            &state.pool,
+            &account.id,
+            &q.request_id,
+            denied.reason,
+            denied.retry_after_secs,
+        ));
+    }
+
     let on_trial = account.trial_seconds_remaining > 0;
     // Estimate ~1s per ~16KB of audio (rough). Real cost from upstream metadata.
     let est_seconds = (body.len() as i64 / 16_000).max(1);
@@ -1027,6 +1200,7 @@ pub async fn transcribe(
                     estimated_cost_cents: Some(est_cost),
                     reason: Some("insufficient_balance".into()),
                     reload_url: Some(format!("{}/reload", state.config.public_url)),
+                    ..Default::default()
                 }),
             ));
         }

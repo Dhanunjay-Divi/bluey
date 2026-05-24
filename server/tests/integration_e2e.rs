@@ -167,6 +167,155 @@ async fn router_complete_idempotency_replay_returns_cached() {
 
 #[tokio::test]
 #[serial]
+async fn router_complete_falls_back_when_preferred_provider_429s() {
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "fallback@example.com", "longenoughpw").await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+        .expect(1)
+        .mount(&h.anthropic)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "fallback answer"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 3}
+        })))
+        .expect(1)
+        .mount(&h.openai)
+        .await;
+
+    let req = Request::post("/router/complete")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "request_id": "fallback-429-1",
+                "system": "you are helpful",
+                "user": "answer a normal technical question",
+                "lane": "balanced"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["text"], "fallback answer");
+    assert_eq!(v["provider"], "openai");
+    assert_eq!(v["model"], "gpt-4o-mini");
+}
+
+#[tokio::test]
+#[serial]
+async fn router_complete_reports_upstream_error_after_capacity_skip() {
+    std::env::set_var("BLUEY_LIMIT_PROVIDER_ANTHROPIC_LLM_PER_MIN", "60");
+    std::env::set_var("BLUEY_LIMIT_PROVIDER_ANTHROPIC_LLM_PER_MIN_BURST", "1");
+    let h = boot_harness().await;
+    std::env::remove_var("BLUEY_LIMIT_PROVIDER_ANTHROPIC_LLM_PER_MIN");
+    std::env::remove_var("BLUEY_LIMIT_PROVIDER_ANTHROPIC_LLM_PER_MIN_BURST");
+    let access = signup_and_login(&h, "fallback-capacity@example.com", "longenoughpw").await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "content": [{"type": "text", "text": "first anthropic ok"}],
+            "usage": {"input_tokens": 10, "output_tokens": 4}
+        })))
+        .expect(1)
+        .mount(&h.anthropic)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("temporary openai failure"))
+        .expect(1)
+        .mount(&h.openai)
+        .await;
+
+    for (request_id, expected_status) in [("capacity-skip-1", 200), ("capacity-skip-2", 502)] {
+        let req = Request::post("/router/complete")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {access}"))
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "request_id": request_id,
+                    "system": "you are helpful",
+                    "user": "answer a normal technical question",
+                    "lane": "balanced"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = h.router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), expected_status);
+        if expected_status == 502 {
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(v["error"], "upstream provider error; please retry");
+            assert!(v.get("retry_after_secs").is_none());
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn router_complete_enforces_account_burst_before_second_upstream_hit() {
+    std::env::set_var("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN", "60");
+    std::env::set_var("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN_BURST", "1");
+    let h = boot_harness().await;
+    std::env::remove_var("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN");
+    std::env::remove_var("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN_BURST");
+
+    let access = signup_and_login(&h, "burst@example.com", "longenoughpw").await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "first ok"}}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2}
+        })))
+        .expect(1)
+        .mount(&h.openai)
+        .await;
+
+    for (idx, expected_status) in [(1, 200), (2, 429)] {
+        let req = Request::post("/router/complete")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {access}"))
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "request_id": format!("burst-limit-{idx}"),
+                    "system": "",
+                    "user": "hi",
+                    "lane": "instant"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = h.router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), expected_status);
+        if idx == 2 {
+            let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(v["reason"], "account_llm_busy");
+            assert!(v["retry_after_secs"].as_u64().unwrap_or(0) >= 1);
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
 async fn billing_checkout_uses_mocked_stripe() {
     let h = boot_harness().await;
     let access = signup_and_login(&h, "stripe@example.com", "longenoughpw").await;
