@@ -3,8 +3,11 @@
 //!
 //! Codex Stage 11: brute-force protection on /auth/login + /auth/signup
 //! + /auth/refresh + /auth/device/poll. The managed-provider capacity layer
-//! adds account fairness and upstream-provider buckets so one busy customer
-//! or one exhausted provider cannot knock realtime calls offline for everyone.
+//! adds high-ceiling account safety buckets and upstream-provider buckets so
+//! a runaway client loop or one exhausted provider cannot knock realtime calls
+//! offline for everyone. Customer usage is governed by wallet balance and
+//! provider availability; account buckets are emergency guardrails, not plan
+//! limits.
 //! Uses the governor crate per-key keyed rate limiter with an in-memory state
 //! map. Multi-process deployments should swap this seam for Redis-backed
 //! buckets without changing the API handlers.
@@ -15,8 +18,9 @@
 //! - /auth/refresh: 30 per minute, burst 30
 //! - /auth/device/poll: 60 per minute, long-poll friendly
 //! - /router/complete: 120 per minute, tier-aware in v0.2.x
-//! - Account LLM: 60 per minute, burst 12
-//! - Account embed/STT chunks: 120 per minute, burst 30
+//! - Account LLM: 600 per minute, burst 120
+//! - Account embed chunks: 1200 per minute, burst 240
+//! - Account STT chunks: 1800 per minute, burst 600
 //! - Provider buckets: env-configurable safety valves per provider family
 //!
 //! Enforcement is best-effort: behind a load balancer the IP we see
@@ -104,11 +108,11 @@ pub struct RateLimiters {
     pub router_complete: Limiter,
     pub router_embed: Limiter,
     pub router_transcribe: Limiter,
-    /// Per-account fairness for managed LLM requests.
+    /// High-ceiling per-account runaway-loop guardrail for managed LLM requests.
     pub account_llm: Limiter,
-    /// Per-account fairness for embeddings/RAG writes.
+    /// High-ceiling per-account runaway-loop guardrail for embeddings/RAG writes.
     pub account_embed: Limiter,
-    /// Per-account fairness for chunked STT requests.
+    /// High-ceiling per-account runaway-loop guardrail for chunked STT requests.
     pub account_stt: Limiter,
     /// Provider-wide capacity bucket for OpenAI chat/vision requests.
     pub provider_openai_llm: Limiter,
@@ -130,9 +134,9 @@ impl Default for RateLimiters {
             router_complete: Limiter::new(120, 60),
             router_embed: Limiter::new(240, 80),
             router_transcribe: Limiter::new(240, 80),
-            account_llm: limiter_from_env("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN", 60, 12),
-            account_embed: limiter_from_env("BLUEY_LIMIT_ACCOUNT_EMBED_PER_MIN", 120, 30),
-            account_stt: limiter_from_env("BLUEY_LIMIT_ACCOUNT_STT_PER_MIN", 120, 30),
+            account_llm: limiter_from_env("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN", 600, 120),
+            account_embed: limiter_from_env("BLUEY_LIMIT_ACCOUNT_EMBED_PER_MIN", 1200, 240),
+            account_stt: limiter_from_env("BLUEY_LIMIT_ACCOUNT_STT_PER_MIN", 1800, 600),
             provider_openai_llm: limiter_from_env(
                 "BLUEY_LIMIT_PROVIDER_OPENAI_LLM_PER_MIN",
                 900,

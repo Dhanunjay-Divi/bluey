@@ -10,11 +10,13 @@ provider/API key can hit rate limits and make answers/STT unreliable.
 
 This pass adds the first production safety layer for managed Bluey cloud:
 customers do not hit provider keys directly, and server-side buckets protect
-both customer fairness and upstream provider capacity.
+against runaway clients while also protecting upstream provider capacity.
+Paid customer usage is governed by wallet balance and provider availability,
+not a low per-account quota.
 
 ## What Changed
 
-- Added per-account managed capacity buckets:
+- Added high-ceiling per-account emergency guardrail buckets:
   - LLM answers
   - embeddings/RAG writes
   - chunked STT
@@ -31,7 +33,7 @@ both customer fairness and upstream provider capacity.
   - `deep`: Anthropic 3.7 -> OpenAI 4o -> Anthropic 3.5
   - `vision`: OpenAI 4o
 - `/router/complete` now:
-  - checks account fairness after idempotency reservation,
+  - checks account runaway-loop guardrails after idempotency reservation,
   - checks provider/model capacity before each upstream attempt,
   - skips busy providers and tries the next candidate,
   - bills against the selected provider/model,
@@ -44,9 +46,9 @@ both customer fairness and upstream provider capacity.
 
 All limits are in-process for v0.2 alpha and configurable by env:
 
-- `BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN=60`, burst 12
-- `BLUEY_LIMIT_ACCOUNT_EMBED_PER_MIN=120`, burst 30
-- `BLUEY_LIMIT_ACCOUNT_STT_PER_MIN=120`, burst 30
+- `BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN=600`, burst 120
+- `BLUEY_LIMIT_ACCOUNT_EMBED_PER_MIN=1200`, burst 240
+- `BLUEY_LIMIT_ACCOUNT_STT_PER_MIN=1800`, burst 600
 - `BLUEY_LIMIT_PROVIDER_OPENAI_LLM_PER_MIN=900`, burst 180
 - `BLUEY_LIMIT_PROVIDER_ANTHROPIC_LLM_PER_MIN=300`, burst 60
 - `BLUEY_LIMIT_PROVIDER_OPENAI_EMBED_PER_MIN=900`, burst 180
@@ -83,6 +85,9 @@ Focus on:
 
 - Money path: entry check uses the max estimated cost across candidates, actual
   charge uses the selected provider's pricing.
+- Product semantics: per-account limits are emergency guardrails only. Paying
+  users should not hit them in normal realtime use; balance and provider
+  capacity are the real usage controls.
 - Idempotency: capacity rejections release the reservation so the client can
   retry with the same `request_id`.
 - Provider fallback: failing/busy preferred providers should not leak raw

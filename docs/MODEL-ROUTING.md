@@ -42,8 +42,10 @@ Code references:
 Bluey protects realtime work at three layers:
 
 1. **HTTP edge per-IP buckets**: protects auth and router endpoints from abuse.
-2. **Authenticated per-account buckets**: prevents one customer from consuming
-   all server/provider capacity during a call.
+2. **High-ceiling per-account safety buckets**: protects against runaway loops,
+   stolen tokens, and broken clients. These are deliberately set far above
+   normal realtime usage; customer usage is controlled by wallet balance and
+   provider availability, not by a low per-account quota.
 3. **Provider/model buckets**: keeps OpenAI, Anthropic, Deepgram, and embedding
    calls inside configured capacity and lets LLM lanes fall back before failing.
 
@@ -51,9 +53,9 @@ Default server knobs:
 
 | Env var | Default | Purpose |
 | --- | ---: | --- |
-| `BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN` | 60/min, burst 12 | Per-account managed answers |
-| `BLUEY_LIMIT_ACCOUNT_EMBED_PER_MIN` | 120/min, burst 30 | Per-account embeddings/RAG writes |
-| `BLUEY_LIMIT_ACCOUNT_STT_PER_MIN` | 120/min, burst 30 | Per-account chunked STT |
+| `BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN` | 600/min, burst 120 | Emergency per-account answer guardrail |
+| `BLUEY_LIMIT_ACCOUNT_EMBED_PER_MIN` | 1200/min, burst 240 | Emergency per-account embeddings/RAG guardrail |
+| `BLUEY_LIMIT_ACCOUNT_STT_PER_MIN` | 1800/min, burst 600 | Emergency per-account chunked STT guardrail |
 | `BLUEY_LIMIT_PROVIDER_OPENAI_LLM_PER_MIN` | 900/min, burst 180 | OpenAI chat/vision capacity |
 | `BLUEY_LIMIT_PROVIDER_ANTHROPIC_LLM_PER_MIN` | 300/min, burst 60 | Anthropic chat capacity |
 | `BLUEY_LIMIT_PROVIDER_OPENAI_EMBED_PER_MIN` | 900/min, burst 180 | OpenAI embedding capacity |
