@@ -27,6 +27,7 @@ not per-account throttling.
   - Anthropic chat
   - OpenAI embeddings
   - Deepgram STT
+  - OpenAI STT fallback
 - Added provider-approved key-pool selection:
   - `OPENAI_API_KEYS`, `ANTHROPIC_API_KEYS`, and `DEEPGRAM_API_KEYS` can hold
     comma-separated pools.
@@ -39,12 +40,20 @@ not per-account throttling.
     is fail-open to the local limiter so realtime work can continue during a
     Redis blip.
 - Added `/router/embed` and `/router/transcribe` edge rate-limit middleware.
+- Added server-side chunked STT cloud fallback:
+  - `/router/transcribe` tries Deepgram `nova-3` first.
+  - If Deepgram is busy/unavailable, it falls back to OpenAI
+    `gpt-4o-mini-transcribe`.
+  - Billing uses the selected provider/model and usage is marked
+    `was_fallback=true` when the OpenAI fallback serves the request.
 - Changed managed LLM routing from a single route to ordered fallback
   candidates:
   - `instant`: OpenAI -> Anthropic
   - `balanced`: Anthropic -> OpenAI
   - `deep`: Anthropic 3.7 -> OpenAI 4o -> Anthropic 3.5
   - `vision`: OpenAI 4o
+- Closed the stale managed `local` resolver edge. Local/Ollama fallback remains
+  daemon-only and cannot be priced or dispatched through `bluey-server`.
 - `/router/complete` now:
   - checks account runaway-loop guardrails only when explicitly enabled by env,
   - checks provider/model capacity before each upstream attempt,
@@ -63,6 +72,7 @@ Provider limits are in-process for v0.2 alpha and configurable by env:
 - `BLUEY_LIMIT_PROVIDER_ANTHROPIC_LLM_PER_MIN=300`, burst 60
 - `BLUEY_LIMIT_PROVIDER_OPENAI_EMBED_PER_MIN=900`, burst 180
 - `BLUEY_LIMIT_PROVIDER_DEEPGRAM_STT_PER_MIN=600`, burst 120
+- `BLUEY_LIMIT_PROVIDER_OPENAI_STT_PER_MIN=600`, burst 120
 
 Account guardrails default to **off**. Set these only during abuse response or
 runaway-client mitigation:
@@ -100,9 +110,6 @@ Every capacity env var supports `_BURST`.
 - Move provider-key health and capacity to a shared ledger before running
   multiple server instances, so every server sees the same provider budget and
   unhealthy key state.
-- Add server-side OpenAI transcription fallback for `/router/transcribe`.
-  Desktop streaming STT already has Deepgram -> OpenAI Realtime -> LocalWhisper,
-  but the chunked REST server endpoint is still Deepgram-only.
 - Add dashboard copy for typed 429 responses: "Bluey is busy, retrying in Ns"
   instead of a generic provider error.
 - Keep optional per-account guardrails operator-only. Do not turn them into

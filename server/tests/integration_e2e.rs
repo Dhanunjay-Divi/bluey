@@ -537,6 +537,46 @@ async fn router_transcribe_happy_path_with_mocked_deepgram() {
 
 #[tokio::test]
 #[serial]
+async fn router_transcribe_falls_back_to_openai_when_deepgram_fails() {
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "stt-fallback@example.com", "longenoughpw").await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/listen"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("deepgram busy"))
+        .expect(1)
+        .mount(&h.deepgram)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "text": "hello from openai fallback"
+        })))
+        .expect(1)
+        .mount(&h.openai)
+        .await;
+
+    let req = Request::post("/router/transcribe?request_id=test-stt-fallback-1")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "audio/wav")
+        .body(Body::from(vec![1u8; 32_000]))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["text"], "hello from openai fallback");
+    assert_eq!(v["provider"], "openai");
+    assert_eq!(v["model"], "gpt-4o-mini-transcribe");
+    assert_eq!(v["duration_seconds"], 2);
+}
+
+#[tokio::test]
+#[serial]
 async fn billing_portal_creates_session_via_mocked_stripe() {
     let h = boot_harness().await;
     let access = signup_and_login(&h, "portal@example.com", "longenoughpw").await;

@@ -60,6 +60,7 @@ Default server knobs:
 | `BLUEY_LIMIT_PROVIDER_ANTHROPIC_LLM_PER_MIN` | 300/min, burst 60 | Anthropic chat capacity |
 | `BLUEY_LIMIT_PROVIDER_OPENAI_EMBED_PER_MIN` | 900/min, burst 180 | OpenAI embedding capacity |
 | `BLUEY_LIMIT_PROVIDER_DEEPGRAM_STT_PER_MIN` | 600/min, burst 120 | Deepgram STT capacity |
+| `BLUEY_LIMIT_PROVIDER_OPENAI_STT_PER_MIN` | 600/min, burst 120 | OpenAI STT fallback capacity |
 | `BLUEY_LIMIT_ROUTER_COMPLETE_PER_MIN` | unset/disabled | Optional emergency per-IP answer edge guardrail |
 | `BLUEY_LIMIT_ROUTER_EMBED_PER_MIN` | unset/disabled | Optional emergency per-IP embed/RAG edge guardrail |
 | `BLUEY_LIMIT_ROUTER_TRANSCRIBE_PER_MIN` | unset/disabled | Optional emergency per-IP chunked STT edge guardrail |
@@ -90,11 +91,13 @@ single-server alpha. With Redis, provider limits are enforced globally across
 instances. The next capacity step is provider-key health scoring in the same
 shared ledger so every server avoids unhealthy keys.
 
-## Local/Developer Fallback Routing
+## Internal Developer/Offline Fallback Routing
 
 `StaticPolicy` / `LocalFallbackPolicy` is used for local development,
-BYOK-style testing, and offline fallback. Production customer accounts should
-prefer managed routing.
+BYOK-style testing, and emergency offline fallback. This is not a customer
+model picker and should not appear in the paid product UI. Logged-in production
+accounts use managed routing through `bluey-server`; local fallback is selected
+inside the daemon before a request reaches the cloud.
 
 | Lane | Provider | Model |
 | --- | --- | --- |
@@ -109,7 +112,8 @@ local lane is currently pinned to `llama3.1`.
 
 Direct BYOK providers are developer-gated by `BLUEY_DEV_BYOK=1` once managed
 tokens exist. Ollama can still be enabled through `BLUEY_OLLAMA_HOST` for local
-fallback.
+fallback. The managed server intentionally returns no route candidates for the
+`local` lane and `/router/complete` rejects `lane=local`.
 
 ## Speculative Routing
 
@@ -150,9 +154,13 @@ Environment gates:
 
 Important scope note: the streaming STT factory covers the continuous
 system-audio streaming path. The chunked REST transcription path uses
-`/router/transcribe`, which currently supports Deepgram only. A production
-server-side fallback from Deepgram to OpenAI transcription is the next clean
-STT hardening task.
+`/router/transcribe`, which now tries Deepgram first and falls back to OpenAI
+`gpt-4o-mini-transcribe` if Deepgram is busy or unavailable.
+
+LocalWhisper is a hidden reliability/dev fallback, not the primary paid STT
+experience. The paid path should prefer cloud STT quality and provider failover;
+local STT remains useful for offline demos, development, and graceful degradation
+if the customer explicitly accepts lower accuracy.
 
 Code references:
 
@@ -210,14 +218,12 @@ BLUEY_SMTP_FROM="Bluey <no-reply@bluey.sh>"
 | Codex runtime model | Not used by Bluey runtime. Codex is the development/review agent. |
 | Gemini | Not wired in managed routing. Candidate for future cheap vision/classifier fallback. |
 | Groq/Cerebras | Mentioned in older strategy/reference docs, not active in the current managed route map. |
-| Server-side OpenAI STT fallback | Not wired into `/router/transcribe` yet. Daemon streaming fallback exists. |
 
 ## Recommended Next Hardening
 
-1. Add OpenAI transcription fallback to server `/router/transcribe`.
-2. Add an admin-visible model-routing config endpoint so lane/model changes do
+1. Add an admin-visible model-routing config endpoint so lane/model changes do
    not require a redeploy.
-3. Add latency/cost telemetry by lane so we can tune Auto routing with real
+2. Add latency/cost telemetry by lane so we can tune Auto routing with real
    data.
-4. Add Gemini only after the first managed test pass, as a measured fallback
+3. Add Gemini only after the first managed test pass, as a measured fallback
    rather than another visible customer option.

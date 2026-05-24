@@ -18,6 +18,7 @@ fn override_url(default: &str, env_var: &str) -> String {
 }
 
 use anyhow::{anyhow, Context, Result};
+use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 
 use crate::config::UpstreamKeys;
@@ -38,6 +39,9 @@ pub struct Completion {
 /// New managed paths should use `resolve_route_candidates()` so they can
 /// skip an exhausted provider without failing the customer request.
 pub fn resolve_route(lane: &str) -> (&'static str, &'static str) {
+    if lane == "local" {
+        return ("unsupported", "local");
+    }
     resolve_route_candidates(lane)
         .into_iter()
         .next()
@@ -61,12 +65,23 @@ pub fn resolve_route_candidates(lane: &str) -> Vec<(&'static str, &'static str)>
             ("anthropic", "claude-3-5-sonnet-latest"),
         ],
         "vision" => vec![("openai", "gpt-4o")],
-        "local" => vec![("ollama", "llama3.1")],
+        // The managed cloud never dispatches local/on-device models. Local
+        // fallback is selected in the daemon before traffic reaches
+        // bluey-server.
+        "local" => vec![],
         _ => vec![
             ("anthropic", "claude-3-5-sonnet-latest"),
             ("openai", "gpt-4o-mini"),
         ], // balanced default
     }
+}
+
+/// Ordered fallback candidates for chunked server-side STT.
+pub fn resolve_transcribe_candidates(deepgram_model: Option<&str>) -> Vec<(&'static str, String)> {
+    vec![
+        ("deepgram", deepgram_model.unwrap_or("nova-3").to_string()),
+        ("openai", "gpt-4o-mini-transcribe".to_string()),
+    ]
 }
 
 /// Run a single non-streaming completion against the upstream provider.
@@ -418,6 +433,7 @@ pub async fn transcribe(
 ) -> Result<TranscribeCompletion> {
     match provider {
         "deepgram" => deepgram_transcribe(keys, model, audio_bytes, content_type).await,
+        "openai" => openai_transcribe(keys, model, audio_bytes, content_type).await,
         other => Err(anyhow!(
             "unsupported transcribe provider for managed dispatch: {other}"
         )),
@@ -457,6 +473,11 @@ struct DeepgramChannel {
 #[derive(Deserialize)]
 struct DeepgramAlternative {
     transcript: String,
+}
+
+#[derive(Deserialize)]
+struct OpenAiTranscribeResp {
+    text: String,
 }
 
 async fn deepgram_transcribe(
@@ -510,6 +531,65 @@ async fn deepgram_transcribe(
     })
 }
 
+async fn openai_transcribe(
+    keys: &UpstreamKeys,
+    model: &str,
+    audio_bytes: &[u8],
+    content_type: &str,
+) -> Result<TranscribeCompletion> {
+    let key = keys
+        .openai_key(&format!("transcribe:{model}:{}", audio_bytes.len()))
+        .ok_or_else(|| anyhow!("OPENAI_API_KEY(S) not configured on bluey-server"))?;
+    let file = Part::bytes(audio_bytes.to_vec())
+        .file_name(audio_filename(content_type))
+        .mime_str(content_type)
+        .context("openai transcribe mime")?;
+    let form = Form::new()
+        .text("model", model.to_string())
+        .part("file", file);
+    let resp = reqwest::Client::new()
+        .post(
+            override_url(
+                "https://api.openai.com/v1/audio/transcriptions",
+                "BLUEY_TEST_OPENAI_URL",
+            )
+            .as_str(),
+        )
+        .bearer_auth(key)
+        .multipart(form)
+        .send()
+        .await
+        .context("openai transcribe http")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("openai transcribe {status}: {body}"));
+    }
+    let parsed: OpenAiTranscribeResp = resp.json().await.context("openai transcribe json")?;
+    Ok(TranscribeCompletion {
+        text: parsed.text,
+        provider: "openai".to_string(),
+        model: model.to_string(),
+        duration_seconds: estimate_audio_seconds(audio_bytes),
+    })
+}
+
+fn estimate_audio_seconds(audio_bytes: &[u8]) -> i64 {
+    // Chunked REST STT receives mixed compressed/uncompressed formats. This is
+    // only used when a provider does not return duration metadata.
+    (audio_bytes.len() as i64 / 16_000).max(1)
+}
+
+fn audio_filename(content_type: &str) -> &'static str {
+    match content_type.split(';').next().unwrap_or("").trim() {
+        "audio/mpeg" | "audio/mp3" => "audio.mp3",
+        "audio/mp4" | "audio/x-m4a" => "audio.m4a",
+        "audio/webm" => "audio.webm",
+        "audio/ogg" => "audio.ogg",
+        _ => "audio.wav",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,7 +606,7 @@ mod tests {
             ("anthropic", "claude-3-7-sonnet-latest"),
         );
         assert_eq!(resolve_route("vision"), ("openai", "gpt-4o"));
-        assert_eq!(resolve_route("local"), ("ollama", "llama3.1"));
+        assert_eq!(resolve_route("local"), ("unsupported", "local"));
         // Unknown → balanced default.
         assert_eq!(
             resolve_route("???"),
@@ -547,6 +627,25 @@ mod tests {
         assert_eq!(
             resolve_route_candidates("vision"),
             vec![("openai", "gpt-4o")]
+        );
+        assert!(
+            resolve_route_candidates("local").is_empty(),
+            "managed cloud must not dispatch daemon-only local lanes"
+        );
+    }
+
+    #[test]
+    fn transcribe_candidates_prefer_deepgram_then_openai() {
+        assert_eq!(
+            resolve_transcribe_candidates(None),
+            vec![
+                ("deepgram", "nova-3".to_string()),
+                ("openai", "gpt-4o-mini-transcribe".to_string())
+            ]
+        );
+        assert_eq!(
+            resolve_transcribe_candidates(Some("nova-2"))[0],
+            ("deepgram", "nova-2".to_string())
         );
     }
 }

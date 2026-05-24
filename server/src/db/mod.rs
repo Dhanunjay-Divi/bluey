@@ -110,8 +110,8 @@ const MIGRATIONS: &[&str] = &[
         ts                    DATETIME NOT NULL DEFAULT (datetime('now')),
         kind                  TEXT NOT NULL,            -- llm | embed | stt | vision
         task_type             TEXT,                      -- general | code | system_design | meeting | writing | vision
-        lane                  TEXT,                      -- instant | balanced | deep | vision | local
-        provider              TEXT,                      -- openai | anthropic | ollama | deepgram
+        lane                  TEXT,                      -- instant | balanced | deep | vision
+        provider              TEXT,                      -- openai | anthropic | deepgram
         model                 TEXT,
         input_tokens          INTEGER NOT NULL DEFAULT 0,
         output_tokens         INTEGER NOT NULL DEFAULT 0,

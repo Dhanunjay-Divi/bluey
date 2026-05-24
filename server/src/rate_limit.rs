@@ -267,6 +267,8 @@ pub struct RateLimiters {
     pub provider_openai_embed: SharedLimiter,
     /// Provider-wide capacity bucket for Deepgram STT.
     pub provider_deepgram_stt: SharedLimiter,
+    /// Provider-wide capacity bucket for OpenAI STT fallback.
+    pub provider_openai_stt: SharedLimiter,
 }
 
 impl Default for RateLimiters {
@@ -331,6 +333,13 @@ impl Default for RateLimiters {
             provider_deepgram_stt: limiter_from_env(
                 "provider_deepgram_stt",
                 "BLUEY_LIMIT_PROVIDER_DEEPGRAM_STT_PER_MIN",
+                600,
+                120,
+                redis.clone(),
+            ),
+            provider_openai_stt: limiter_from_env(
+                "provider_openai_stt",
+                "BLUEY_LIMIT_PROVIDER_OPENAI_STT_PER_MIN",
                 600,
                 120,
                 redis,
@@ -440,6 +449,14 @@ impl RateLimiters {
                 .map_err(|retry| CapacityDenied {
                     retry_after_secs: retry,
                     reason: "provider_deepgram_stt_busy",
+                }),
+            "openai" => self
+                .provider_openai_stt
+                .check(&key)
+                .await
+                .map_err(|retry| CapacityDenied {
+                    retry_after_secs: retry,
+                    reason: "provider_openai_stt_busy",
                 }),
             _ => Ok(()),
         }

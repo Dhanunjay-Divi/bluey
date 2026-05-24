@@ -34,12 +34,16 @@ Not shipped in v0.1.0:
   writing / vision task types with confidence scoring; vision keywords
   narrowed so text-only "diagram" / "chart" do not misroute design
   questions to Vision.
-- StaticPolicy maps lanes to providers (Instant -> OpenAI gpt-4o-mini,
-  Balanced -> Anthropic claude-3-5-sonnet, Deep -> claude-3-7-sonnet,
-  Vision -> gpt-4o, Local -> Ollama llama3.1). Vision overrides latency.
+- StaticPolicy maps developer/offline lanes to providers (Instant -> OpenAI
+  gpt-4o-mini, Balanced -> Anthropic claude-3-5-sonnet, Deep ->
+  claude-3-7-sonnet, Vision -> gpt-4o). Its separate daemon-only fallback can
+  use Ollama for local development/offline testing. Vision overrides latency.
+- ManagedPolicy maps paid customer traffic to `bluey-managed-*` lanes. It never
+  emits a Local lane; local/Ollama fallback is daemon-only and is not exposed as
+  a paid customer model.
 - AutoRouter coordinator takes ClassifierInput + RouteOptions { local_only }
-  and returns a RoutedRequest. local_only forces Local lane regardless of
-  classification.
+  and returns a RoutedRequest. `local_only` is for developer/offline daemon
+  fallback, not managed cloud dispatch.
 - SpeculativeRouter honors ProviderRoute.stream and survives Instant-lane
   unavailability by emitting a non-fatal Error chunk and continuing Deep.
 - **Daemon wiring shipped**: `request_cue` classifies every prompt and
@@ -90,6 +94,9 @@ were updated alongside this change to match the default-ON behaviour.
 - STT provider chain supports Deepgram Nova-3 WebSocket, OpenAI Realtime
   transcription protocol, LocalWhisper, mock, and echo providers.
 - LocalWhisper is real on macOS through the SwiftWhisper/whisper.cpp helper.
+- LocalWhisper is hidden reliability/dev fallback only. Paid cloud sessions
+  should prefer Deepgram/OpenAI STT failover; do not advertise LocalWhisper as a
+  customer-facing model choice until quality and support posture are validated.
 - Windows whisper remains a stub and is not a supported release path.
 
 ### Answers And Context

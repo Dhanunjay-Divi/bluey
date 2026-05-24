@@ -79,6 +79,13 @@ struct PricedRoute {
     estimated_cost_cents: i64,
 }
 
+struct PricedTranscribeRoute {
+    provider: &'static str,
+    model: String,
+    pricing: &'static pricing::ModelPricing,
+    estimated_cost_cents: i64,
+}
+
 fn capacity_error(reason: &str, retry_after_secs: u64) -> (StatusCode, Json<ApiError>) {
     (
         StatusCode::TOO_MANY_REQUESTS,
@@ -119,6 +126,23 @@ fn priced_routes_for(
                     estimated_input_tokens,
                     max_output_tokens,
                 ),
+            })
+        })
+        .collect()
+}
+
+fn priced_transcribe_routes_for(
+    deepgram_model: Option<&str>,
+    estimated_seconds: i64,
+) -> Vec<PricedTranscribeRoute> {
+    routing::resolve_transcribe_candidates(deepgram_model)
+        .into_iter()
+        .filter_map(|(provider, model)| {
+            pricing::lookup(provider, &model).map(|entry| PricedTranscribeRoute {
+                provider,
+                model,
+                pricing: entry,
+                estimated_cost_cents: pricing::estimate_cost_ceiling(entry, estimated_seconds, 0),
             })
         })
         .collect()
@@ -1045,7 +1069,8 @@ pub async fn embed(
 #[derive(Deserialize)]
 pub struct TranscribeQuery {
     pub request_id: String,
-    /// Optional Deepgram model override. Defaults to nova-3.
+    /// Optional Deepgram model override. Defaults to nova-3. The managed server
+    /// still keeps OpenAI gpt-4o-mini-transcribe as the cloud fallback.
     #[serde(default)]
     pub model: Option<String>,
 }
@@ -1138,19 +1163,6 @@ pub async fn transcribe(
         }
     }
 
-    let provider = "deepgram";
-    let model = q.model.as_deref().unwrap_or("nova-3");
-    let pricing_entry = pricing::lookup(provider, model).ok_or_else(|| {
-        let _ = idempotency::mark_failed(&state.pool, &account.id, &q.request_id);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError {
-                error: format!("no pricing for {provider}/{model}"),
-                ..Default::default()
-            }),
-        )
-    })?;
-
     if let Err(denied) = state.rate_limiters.check_account_stt(&account.id).await {
         return Err(release_and_capacity_error(
             &state.pool,
@@ -1160,24 +1172,25 @@ pub async fn transcribe(
             denied.retry_after_secs,
         ));
     }
-    if let Err(denied) = state
-        .rate_limiters
-        .check_provider_stt(provider, model)
-        .await
-    {
-        return Err(release_and_capacity_error(
-            &state.pool,
-            &account.id,
-            &q.request_id,
-            denied.reason,
-            denied.retry_after_secs,
-        ));
-    }
-
     let on_trial = account.trial_seconds_remaining > 0;
     // Estimate ~1s per ~16KB of audio (rough). Real cost from upstream metadata.
     let est_seconds = (body.len() as i64 / 16_000).max(1);
-    let est_cost = pricing::estimate_cost_ceiling(pricing_entry, est_seconds, 0);
+    let routes = priced_transcribe_routes_for(q.model.as_deref(), est_seconds);
+    if routes.is_empty() {
+        let _ = idempotency::mark_failed(&state.pool, &account.id, &q.request_id);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "no priced transcribe route available".into(),
+                ..Default::default()
+            }),
+        ));
+    }
+    let est_cost = routes
+        .iter()
+        .map(|route| route.estimated_cost_cents)
+        .max()
+        .unwrap_or(1);
     if !on_trial {
         let can = balance::can_afford(&state.pool, &account.id, est_cost).map_err(|e| {
             let _ = idempotency::mark_failed(&state.pool, &account.id, &q.request_id);
@@ -1206,27 +1219,78 @@ pub async fn transcribe(
         }
     }
 
-    let result = routing::transcribe(
-        &state.config.upstream,
-        provider,
-        model,
-        &body,
-        &content_type,
-    )
-    .await;
+    let mut last_error: Option<anyhow::Error> = None;
+    let mut last_capacity: Option<crate::rate_limit::CapacityDenied> = None;
+    let mut last_failure_was_capacity = false;
+    let mut selected_route_idx = 0usize;
+    let mut selected_route: Option<&PricedTranscribeRoute> = None;
+    let mut selected_completion: Option<routing::TranscribeCompletion> = None;
 
-    let comp = match result {
-        Ok(c) => c,
-        Err(e) => {
+    for (idx, route) in routes.iter().enumerate() {
+        if let Err(denied) = state
+            .rate_limiters
+            .check_provider_stt(route.provider, &route.model)
+            .await
+        {
             tracing::warn!(
                 account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 request_id = %q.request_id,
-                provider = %provider,
-                model = %model,
-                error = %e,
-                "transcribe dispatch failed"
+                provider = %route.provider,
+                model = %route.model,
+                retry_after_secs = denied.retry_after_secs,
+                reason = denied.reason,
+                "provider STT capacity busy; trying next route"
             );
+            last_capacity = Some(denied);
+            last_failure_was_capacity = true;
+            continue;
+        }
+        match routing::transcribe(
+            &state.config.upstream,
+            route.provider,
+            &route.model,
+            &body,
+            &content_type,
+        )
+        .await
+        {
+            Ok(c) => {
+                selected_route_idx = idx;
+                selected_route = Some(route);
+                selected_completion = Some(c);
+                break;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    request_id = %q.request_id,
+                    provider = %route.provider,
+                    model = %route.model,
+                    error = %e,
+                    "transcribe dispatch failed; trying next route"
+                );
+                last_error = Some(e);
+                last_failure_was_capacity = false;
+            }
+        }
+    }
+
+    let (selected_route, comp) = match (selected_route, selected_completion) {
+        (Some(route), Some(completion)) => (route, completion),
+        _ => {
             let _ = idempotency::release(&state.pool, &account.id, &q.request_id);
+            if last_failure_was_capacity {
+                let denied = last_capacity.expect("capacity flag set with no capacity denial");
+                return Err(capacity_error(denied.reason, denied.retry_after_secs));
+            }
+            if let Some(e) = last_error {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    request_id = %q.request_id,
+                    error = %e,
+                    "all transcribe routes failed"
+                );
+            }
             return Err((
                 StatusCode::BAD_GATEWAY,
                 Json(ApiError {
@@ -1240,7 +1304,7 @@ pub async fn transcribe(
 
     // Cost billed against duration_seconds as input "tokens".
     let (bluey_cost, customer_cost) =
-        pricing::compute_cost(pricing_entry, comp.duration_seconds, 0);
+        pricing::compute_cost(selected_route.pricing, comp.duration_seconds, 0);
 
     if !on_trial {
         let ok = balance::deduct(&state.pool, &account.id, customer_cost).map_err(|e| {
@@ -1291,7 +1355,7 @@ pub async fn transcribe(
         cost_cents_to_bluey: bluey_cost,
         cost_cents_to_customer: customer_cost,
         was_speculative: false,
-        was_fallback: false,
+        was_fallback: selected_route_idx > 0,
     };
     if let Err(e) = crate::db::usage::record(&state.pool, &account.id, &event) {
         tracing::warn!(error = %e, "failed to record transcribe usage event");
@@ -1350,5 +1414,30 @@ mod tests {
     #[test]
     fn router_cost_label_includes_balance() {
         assert_eq!(router_cost_label(7, 2993), "$0.07 · balance $29.93");
+    }
+
+    #[test]
+    fn local_lane_has_no_managed_priced_routes() {
+        assert!(
+            priced_routes_for("local", 100, 100).is_empty(),
+            "local/Ollama fallback must stay daemon-only, not managed cloud"
+        );
+    }
+
+    #[test]
+    fn transcribe_priced_routes_include_cloud_fallback() {
+        let routes = priced_transcribe_routes_for(None, 60);
+        let names: Vec<_> = routes
+            .iter()
+            .map(|route| (route.provider, route.model.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("deepgram", "nova-3"),
+                ("openai", "gpt-4o-mini-transcribe")
+            ]
+        );
+        assert!(routes.iter().all(|route| route.estimated_cost_cents > 0));
     }
 }

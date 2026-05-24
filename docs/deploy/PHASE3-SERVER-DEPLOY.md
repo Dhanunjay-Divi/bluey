@@ -272,7 +272,7 @@ Endpoints to validate against staging:
 - `POST /auth/login` → access + refresh
 - `POST /router/complete` → OpenAI staging key
 - `POST /router/complete/stream` → OpenAI staging key (synthesized SSE)
-- `POST /router/transcribe` → Deepgram staging key
+- `POST /router/transcribe` → Deepgram staging key, OpenAI fallback key
 - `POST /sync/batch` → roundtrip
 - `POST /rag/query` → roundtrip
 - `POST /stt/session` + `WS /stt/relay` → Deepgram WS proxy

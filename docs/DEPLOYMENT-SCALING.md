@@ -132,7 +132,8 @@ Reliability:
   - Per-IP edge buckets for unauthenticated auth abuse protection; authenticated
     router edge buckets are disabled by default so shared NAT/VPN users are not
     punished for being active.
-  - Per-provider/model buckets for OpenAI, Anthropic, Deepgram, and embeddings.
+  - Per-provider/model buckets for OpenAI, Anthropic, Deepgram, OpenAI STT
+    fallback, and embeddings.
   - Optional per-account guardrails, disabled by default and used only for
     runaway loops, stolen tokens, or abuse response; paid usage itself is
     controlled by wallet balance and provider availability.

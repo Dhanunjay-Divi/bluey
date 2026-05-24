@@ -91,6 +91,16 @@ pub const PRICING: &[ModelPricing] = &[
         upstream_out_microcents_per_1m: 0,
         markup_percent: 150,
     },
+    ModelPricing {
+        // OpenAI gpt-4o-mini-transcribe: $0.003/minute = 0.3 cents/minute =
+        // 3_000 microcents/minute. With 1 minute = 60 seconds, microcents
+        // per 1M seconds = 3_000 * 1_000_000 / 60 = 50_000_000.
+        provider: "openai",
+        model: "gpt-4o-mini-transcribe",
+        upstream_in_microcents_per_1m: 50_000_000,
+        upstream_out_microcents_per_1m: 0,
+        markup_percent: 150,
+    },
 ];
 
 pub fn lookup(provider: &str, model: &str) -> Option<&'static ModelPricing> {
@@ -224,6 +234,15 @@ mod tests {
         // microcents per 1M seconds = 71.667 * 1_000_000 ≈ 71_666_667.
         let pricing = lookup("deepgram", "nova-3").unwrap();
         assert_eq!(pricing.upstream_in_microcents_per_1m, 71_666_667);
+    }
+
+    #[test]
+    fn openai_transcribe_pricing_dollar_per_minute_to_microcents_per_1m_seconds() {
+        // OpenAI gpt-4o-mini-transcribe: $0.003/minute = 0.3 cents/minute =
+        // 3_000 microcents/minute. Microcents per 1M seconds =
+        // 3_000 * 1_000_000 / 60 = 50_000_000.
+        let pricing = lookup("openai", "gpt-4o-mini-transcribe").unwrap();
+        assert_eq!(pricing.upstream_in_microcents_per_1m, 50_000_000);
     }
 
     #[test]

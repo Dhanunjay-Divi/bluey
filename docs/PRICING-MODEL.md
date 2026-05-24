@@ -73,6 +73,13 @@
 | Easy general | ~150 | ~150 | 0 | gpt-4o-mini Instant | in: $0.000023 + out: $0.000090 = **$0.000113** | $0.0003 (0.03¢) |
 | Medium general | ~400 | ~500 | 0 | claude-3-5-sonnet | in: $0.0012 + out: $0.0075 = **$0.0087** | $0.026 (2.6¢) |
 
+**STT pricing used by server meters:**
+
+| Provider/model | Upstream list price | Customer markup | Notes |
+|---|---:|---:|---|
+| Deepgram `nova-3` | $0.0043/min | 150% | Primary chunked `/router/transcribe` route |
+| OpenAI `gpt-4o-mini-transcribe` | $0.0030/min | 150% | Cloud fallback when Deepgram is busy/unavailable |
+
 **Raw-cost formula:**
 
 ```
