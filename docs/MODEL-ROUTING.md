@@ -41,7 +41,10 @@ Code references:
 
 Bluey protects realtime work at three layers:
 
-1. **HTTP edge per-IP buckets**: protects auth and router endpoints from abuse.
+1. **HTTP edge per-IP buckets**: protects unauthenticated auth endpoints from
+   abuse. Authenticated router edge buckets are disabled by default to avoid
+   punishing legitimate customers behind the same office/VPN/NAT; operators can
+   enable them during an incident with `BLUEY_LIMIT_ROUTER_*`.
 2. **Provider/model buckets**: keeps OpenAI, Anthropic, Deepgram, and embedding
    calls inside configured capacity and lets LLM lanes fall back before failing.
 3. **Optional per-account emergency guardrails**: disabled by default. Turn
@@ -57,6 +60,9 @@ Default server knobs:
 | `BLUEY_LIMIT_PROVIDER_ANTHROPIC_LLM_PER_MIN` | 300/min, burst 60 | Anthropic chat capacity |
 | `BLUEY_LIMIT_PROVIDER_OPENAI_EMBED_PER_MIN` | 900/min, burst 180 | OpenAI embedding capacity |
 | `BLUEY_LIMIT_PROVIDER_DEEPGRAM_STT_PER_MIN` | 600/min, burst 120 | Deepgram STT capacity |
+| `BLUEY_LIMIT_ROUTER_COMPLETE_PER_MIN` | unset/disabled | Optional emergency per-IP answer edge guardrail |
+| `BLUEY_LIMIT_ROUTER_EMBED_PER_MIN` | unset/disabled | Optional emergency per-IP embed/RAG edge guardrail |
+| `BLUEY_LIMIT_ROUTER_TRANSCRIBE_PER_MIN` | unset/disabled | Optional emergency per-IP chunked STT edge guardrail |
 | `BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN` | unset/disabled | Optional emergency per-account answer guardrail |
 | `BLUEY_LIMIT_ACCOUNT_EMBED_PER_MIN` | unset/disabled | Optional emergency per-account embeddings/RAG guardrail |
 | `BLUEY_LIMIT_ACCOUNT_STT_PER_MIN` | unset/disabled | Optional emergency per-account chunked STT guardrail |
@@ -70,10 +76,19 @@ key pools (`OPENAI_API_KEYS`, `ANTHROPIC_API_KEYS`, `DEEPGRAM_API_KEYS`). Bluey
 shards requests across the pool. This is for approved capacity across projects,
 regions, or enterprise allocations; do not use it for provider-limit evasion.
 
-Current implementation is in-process and safe for single-binary alpha. Once
-Bluey runs more than one server instance, move these buckets and provider-key
-health to Redis or another shared atomic ledger so provider limits are enforced
-globally and unhealthy keys are avoided by every server.
+Set `BLUEY_REDIS_URL` in production so capacity buckets are shared across every
+Bluey server instance. Optional knobs:
+
+| Env var | Default | Purpose |
+| --- | --- | --- |
+| `BLUEY_REDIS_URL` | unset/local only | Enables shared capacity ledger |
+| `BLUEY_REDIS_NAMESPACE` | `bluey` | Separates staging/prod Redis keys |
+| `BLUEY_RATE_LIMIT_REDIS_STRICT` | `false` | If true, Redis errors deny instead of falling back locally |
+
+Without Redis, buckets are in-process and suitable only for local/dev or a
+single-server alpha. With Redis, provider limits are enforced globally across
+instances. The next capacity step is provider-key health scoring in the same
+shared ledger so every server avoids unhealthy keys.
 
 ## Local/Developer Fallback Routing
 

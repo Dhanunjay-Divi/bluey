@@ -4,20 +4,22 @@
 //! Codex Stage 11: brute-force protection on /auth/login + /auth/signup
 //! + /auth/refresh + /auth/device/poll. The managed-provider capacity layer
 //! adds upstream-provider buckets so one exhausted provider cannot knock
-//! realtime calls offline for everyone. Customer usage is governed by wallet
-//! balance and provider availability. Per-account buckets are disabled by
-//! default and exist only as opt-in emergency guardrails for abuse incidents,
-//! stolen tokens, or runaway clients.
+//! realtime calls offline for everyone. With `BLUEY_REDIS_URL` set, these
+//! buckets are shared across every server instance. Customer usage is governed
+//! by wallet balance and provider availability. Per-account buckets are
+//! disabled by default and exist only as opt-in emergency guardrails for abuse
+//! incidents, stolen tokens, or runaway clients.
 //! Uses the governor crate per-key keyed rate limiter with an in-memory state
-//! map. Multi-process deployments should swap this seam for Redis-backed
-//! buckets without changing the API handlers.
+//! map. Multi-process deployments should set `BLUEY_REDIS_URL` so provider
+//! capacity is enforced globally.
 //!
 //! Limits (per IP):
 //!
 //! - /auth/login + /auth/signup: 5 per minute, burst 5
 //! - /auth/refresh: 30 per minute, burst 30
 //! - /auth/device/poll: 60 per minute, long-poll friendly
-//! - /router/complete: 120 per minute, tier-aware in v0.2.x
+//! - Authenticated router edge buckets: disabled by default; opt in via
+//!   BLUEY_LIMIT_ROUTER_*
 //! - Account buckets: disabled by default; opt in via BLUEY_LIMIT_ACCOUNT_*
 //! - Provider buckets: env-configurable safety valves per provider family
 //!
@@ -90,6 +92,151 @@ impl Limiter {
     }
 }
 
+const REDIS_TOKEN_BUCKET_LUA: &str = r#"
+local token_key = KEYS[1]
+local ts_key = KEYS[2]
+local rate = tonumber(ARGV[1])
+local capacity = tonumber(ARGV[2])
+local ttl = tonumber(ARGV[3])
+local now_parts = redis.call('TIME')
+local now = tonumber(now_parts[1]) + (tonumber(now_parts[2]) / 1000000)
+local tokens = tonumber(redis.call('GET', token_key))
+if tokens == nil then tokens = capacity end
+local last = tonumber(redis.call('GET', ts_key))
+if last == nil then last = now end
+local elapsed = now - last
+if elapsed < 0 then elapsed = 0 end
+tokens = math.min(capacity, tokens + (elapsed * rate))
+if tokens >= 1 then
+  tokens = tokens - 1
+  redis.call('SET', token_key, tokens, 'EX', ttl)
+  redis.call('SET', ts_key, now, 'EX', ttl)
+  return {1, 0}
+end
+local retry = math.ceil((1 - tokens) / rate)
+if retry < 1 then retry = 1 end
+redis.call('SET', token_key, tokens, 'EX', ttl)
+redis.call('SET', ts_key, now, 'EX', ttl)
+return {0, retry}
+"#;
+
+#[derive(Clone)]
+struct RedisCapacityConfig {
+    client: redis::Client,
+    namespace: Arc<str>,
+    strict: bool,
+}
+
+#[derive(Clone)]
+struct RedisLimiter {
+    config: RedisCapacityConfig,
+    name: Arc<str>,
+    per_minute: u32,
+    burst: u32,
+    ttl_secs: usize,
+}
+
+impl RedisLimiter {
+    fn new(config: RedisCapacityConfig, name: &str, per_minute: u32, burst: u32) -> Self {
+        let refill_secs = ((burst.max(1) as f64) / ((per_minute.max(1) as f64) / 60.0)).ceil();
+        let ttl_secs = refill_secs.max(120.0) as usize;
+        Self {
+            config,
+            name: Arc::from(name),
+            per_minute: per_minute.max(1),
+            burst: burst.max(1),
+            ttl_secs,
+        }
+    }
+
+    async fn check(&self, key: &str) -> anyhow::Result<Result<(), u64>> {
+        let redis_key = format!("{}:rate:{}:{}", self.config.namespace, self.name, key);
+        let token_key = format!("{redis_key}:tokens");
+        let ts_key = format!("{redis_key}:ts");
+        let rate_per_second = (self.per_minute as f64) / 60.0;
+        let mut conn = self
+            .config
+            .client
+            .get_multiplexed_async_connection()
+            .await?;
+        let result: Vec<i64> = redis::Script::new(REDIS_TOKEN_BUCKET_LUA)
+            .key(token_key)
+            .key(ts_key)
+            .arg(rate_per_second)
+            .arg(self.burst)
+            .arg(self.ttl_secs)
+            .invoke_async(&mut conn)
+            .await?;
+        let allowed = result.first().copied().unwrap_or(0) == 1;
+        let retry_after = result.get(1).copied().unwrap_or(1).max(1) as u64;
+        if allowed {
+            Ok(Ok(()))
+        } else {
+            Ok(Err(retry_after))
+        }
+    }
+}
+
+/// Capacity limiter used by route middleware and provider/account buckets.
+///
+/// When `BLUEY_REDIS_URL` is present this checks Redis first so all server
+/// instances share one budget. If Redis is temporarily unavailable, the default
+/// is to fall back to the local limiter to preserve realtime availability; set
+/// `BLUEY_RATE_LIMIT_REDIS_STRICT=1` to fail closed instead.
+#[derive(Clone)]
+pub struct SharedLimiter {
+    name: Arc<str>,
+    local: Option<Limiter>,
+    redis: Option<RedisLimiter>,
+}
+
+impl SharedLimiter {
+    fn new(name: &str, per_minute: u32, burst: u32, redis: Option<RedisCapacityConfig>) -> Self {
+        Self {
+            name: Arc::from(name),
+            local: Some(Limiter::new(per_minute, burst)),
+            redis: redis
+                .map(|config| RedisLimiter::new(config, name, per_minute.max(1), burst.max(1))),
+        }
+    }
+
+    fn disabled(name: &str) -> Self {
+        Self {
+            name: Arc::from(name),
+            local: None,
+            redis: None,
+        }
+    }
+
+    pub async fn check(&self, key: &str) -> Result<(), u64> {
+        let Some(local) = &self.local else {
+            return Ok(());
+        };
+        let Some(redis) = &self.redis else {
+            return local.check(key).await;
+        };
+        match redis.check(key).await {
+            Ok(result) => result,
+            Err(error) if redis.config.strict => {
+                tracing::error!(
+                    limiter = %self.name,
+                    error = %error,
+                    "redis capacity check failed; strict mode denying request",
+                );
+                Err(1)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    limiter = %self.name,
+                    error = %error,
+                    "redis capacity check failed; falling back to local limiter",
+                );
+                local.check(key).await
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapacityDenied {
     pub retry_after_secs: u64,
@@ -99,61 +246,94 @@ pub struct CapacityDenied {
 /// Bundle of all per-endpoint limiters. Stored on AppState.
 #[derive(Clone)]
 pub struct RateLimiters {
-    pub auth_login: Limiter,
-    pub auth_signup: Limiter,
-    pub auth_refresh: Limiter,
-    pub auth_device_poll: Limiter,
-    pub router_complete: Limiter,
-    pub router_embed: Limiter,
-    pub router_transcribe: Limiter,
+    pub auth_login: SharedLimiter,
+    pub auth_signup: SharedLimiter,
+    pub auth_refresh: SharedLimiter,
+    pub auth_device_poll: SharedLimiter,
+    pub router_complete: SharedLimiter,
+    pub router_embed: SharedLimiter,
+    pub router_transcribe: SharedLimiter,
     /// Optional per-account runaway-loop guardrail for managed LLM requests.
-    pub account_llm: Option<Limiter>,
+    pub account_llm: Option<SharedLimiter>,
     /// Optional per-account runaway-loop guardrail for embeddings/RAG writes.
-    pub account_embed: Option<Limiter>,
+    pub account_embed: Option<SharedLimiter>,
     /// Optional per-account runaway-loop guardrail for chunked STT requests.
-    pub account_stt: Option<Limiter>,
+    pub account_stt: Option<SharedLimiter>,
     /// Provider-wide capacity bucket for OpenAI chat/vision requests.
-    pub provider_openai_llm: Limiter,
+    pub provider_openai_llm: SharedLimiter,
     /// Provider-wide capacity bucket for Anthropic chat requests.
-    pub provider_anthropic_llm: Limiter,
+    pub provider_anthropic_llm: SharedLimiter,
     /// Provider-wide capacity bucket for OpenAI embeddings.
-    pub provider_openai_embed: Limiter,
+    pub provider_openai_embed: SharedLimiter,
     /// Provider-wide capacity bucket for Deepgram STT.
-    pub provider_deepgram_stt: Limiter,
+    pub provider_deepgram_stt: SharedLimiter,
 }
 
 impl Default for RateLimiters {
     fn default() -> Self {
+        let redis = redis_capacity_config_from_env();
         Self {
-            auth_login: Limiter::new(5, 5),
-            auth_signup: Limiter::new(5, 5),
-            auth_refresh: Limiter::new(30, 30),
-            auth_device_poll: Limiter::new(60, 60),
-            router_complete: Limiter::new(120, 60),
-            router_embed: Limiter::new(240, 80),
-            router_transcribe: Limiter::new(240, 80),
-            account_llm: optional_limiter_from_env("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN"),
-            account_embed: optional_limiter_from_env("BLUEY_LIMIT_ACCOUNT_EMBED_PER_MIN"),
-            account_stt: optional_limiter_from_env("BLUEY_LIMIT_ACCOUNT_STT_PER_MIN"),
+            auth_login: SharedLimiter::new("auth_login", 5, 5, redis.clone()),
+            auth_signup: SharedLimiter::new("auth_signup", 5, 5, redis.clone()),
+            auth_refresh: SharedLimiter::new("auth_refresh", 30, 30, redis.clone()),
+            auth_device_poll: SharedLimiter::new("auth_device_poll", 60, 60, redis.clone()),
+            router_complete: optional_route_limiter_from_env(
+                "router_complete",
+                "BLUEY_LIMIT_ROUTER_COMPLETE_PER_MIN",
+                redis.clone(),
+            ),
+            router_embed: optional_route_limiter_from_env(
+                "router_embed",
+                "BLUEY_LIMIT_ROUTER_EMBED_PER_MIN",
+                redis.clone(),
+            ),
+            router_transcribe: optional_route_limiter_from_env(
+                "router_transcribe",
+                "BLUEY_LIMIT_ROUTER_TRANSCRIBE_PER_MIN",
+                redis.clone(),
+            ),
+            account_llm: optional_limiter_from_env(
+                "account_llm",
+                "BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN",
+                redis.clone(),
+            ),
+            account_embed: optional_limiter_from_env(
+                "account_embed",
+                "BLUEY_LIMIT_ACCOUNT_EMBED_PER_MIN",
+                redis.clone(),
+            ),
+            account_stt: optional_limiter_from_env(
+                "account_stt",
+                "BLUEY_LIMIT_ACCOUNT_STT_PER_MIN",
+                redis.clone(),
+            ),
             provider_openai_llm: limiter_from_env(
+                "provider_openai_llm",
                 "BLUEY_LIMIT_PROVIDER_OPENAI_LLM_PER_MIN",
                 900,
                 180,
+                redis.clone(),
             ),
             provider_anthropic_llm: limiter_from_env(
+                "provider_anthropic_llm",
                 "BLUEY_LIMIT_PROVIDER_ANTHROPIC_LLM_PER_MIN",
                 300,
                 60,
+                redis.clone(),
             ),
             provider_openai_embed: limiter_from_env(
+                "provider_openai_embed",
                 "BLUEY_LIMIT_PROVIDER_OPENAI_EMBED_PER_MIN",
                 900,
                 180,
+                redis.clone(),
             ),
             provider_deepgram_stt: limiter_from_env(
+                "provider_deepgram_stt",
                 "BLUEY_LIMIT_PROVIDER_DEEPGRAM_STT_PER_MIN",
                 600,
                 120,
+                redis,
             ),
         }
     }
@@ -266,16 +446,38 @@ impl RateLimiters {
     }
 }
 
-fn limiter_from_env(name: &str, default_per_minute: u32, default_burst: u32) -> Limiter {
-    let per_minute = env_u32(name).unwrap_or(default_per_minute);
-    let burst = env_u32(&format!("{name}_BURST")).unwrap_or(default_burst);
-    Limiter::new(per_minute, burst)
+fn limiter_from_env(
+    limiter_name: &str,
+    env_name: &str,
+    default_per_minute: u32,
+    default_burst: u32,
+    redis: Option<RedisCapacityConfig>,
+) -> SharedLimiter {
+    let per_minute = env_u32(env_name).unwrap_or(default_per_minute);
+    let burst = env_u32(&format!("{env_name}_BURST")).unwrap_or(default_burst);
+    SharedLimiter::new(limiter_name, per_minute, burst, redis)
 }
 
-fn optional_limiter_from_env(name: &str) -> Option<Limiter> {
-    let per_minute = env_u32(name)?;
-    let burst = env_u32(&format!("{name}_BURST")).unwrap_or(per_minute);
-    Some(Limiter::new(per_minute, burst))
+fn optional_limiter_from_env(
+    limiter_name: &str,
+    env_name: &str,
+    redis: Option<RedisCapacityConfig>,
+) -> Option<SharedLimiter> {
+    let per_minute = env_u32(env_name)?;
+    let burst = env_u32(&format!("{env_name}_BURST")).unwrap_or(per_minute);
+    Some(SharedLimiter::new(limiter_name, per_minute, burst, redis))
+}
+
+fn optional_route_limiter_from_env(
+    limiter_name: &str,
+    env_name: &str,
+    redis: Option<RedisCapacityConfig>,
+) -> SharedLimiter {
+    let Some(per_minute) = env_u32(env_name) else {
+        return SharedLimiter::disabled(limiter_name);
+    };
+    let burst = env_u32(&format!("{env_name}_BURST")).unwrap_or(per_minute);
+    SharedLimiter::new(limiter_name, per_minute, burst, redis)
 }
 
 fn env_u32(name: &str) -> Option<u32> {
@@ -283,6 +485,37 @@ fn env_u32(name: &str) -> Option<u32> {
         .ok()
         .and_then(|value| value.trim().parse::<u32>().ok())
         .filter(|value| *value > 0)
+}
+
+fn redis_capacity_config_from_env() -> Option<RedisCapacityConfig> {
+    let url = std::env::var("BLUEY_REDIS_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())?;
+    match redis::Client::open(url.as_str()) {
+        Ok(client) => Some(RedisCapacityConfig {
+            client,
+            namespace: Arc::from(
+                std::env::var("BLUEY_REDIS_NAMESPACE")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| "bluey".to_string()),
+            ),
+            strict: env_bool("BLUEY_RATE_LIMIT_REDIS_STRICT").unwrap_or(false),
+        }),
+        Err(error) => {
+            tracing::error!(error = %error, "invalid BLUEY_REDIS_URL; using local rate limiters");
+            None
+        }
+    }
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    std::env::var(name).ok().map(|value| {
+        !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
 }
 
 /// Cached parse of `BLUEY_TRUSTED_PROXIES`. Read once at first
@@ -412,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn account_capacity_denial_has_reason() {
         let limits = RateLimiters {
-            account_llm: Some(Limiter::new(60, 1)),
+            account_llm: Some(SharedLimiter::new("test_account_llm", 60, 1, None)),
             ..RateLimiters::default()
         };
         limits.check_account_llm("acct1").await.unwrap();
@@ -433,9 +666,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_router_edge_capacity_disabled_by_default() {
+        let limits = RateLimiters::default();
+        for _ in 0..1_000 {
+            limits.router_complete.check("shared-nat-ip").await.unwrap();
+            limits.router_embed.check("shared-nat-ip").await.unwrap();
+            limits
+                .router_transcribe
+                .check("shared-nat-ip")
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn provider_capacity_isolated_by_model() {
         let limits = RateLimiters {
-            provider_openai_llm: Limiter::new(60, 1),
+            provider_openai_llm: SharedLimiter::new("test_provider_openai_llm", 60, 1, None),
             ..RateLimiters::default()
         };
         limits

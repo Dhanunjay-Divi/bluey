@@ -20,6 +20,8 @@ not per-account throttling.
   - LLM answers
   - embeddings/RAG writes
   - chunked STT
+- Changed authenticated router edge buckets to optional env-only guardrails, so
+  many paying users behind the same NAT/VPN do not get per-IP throttled.
 - Added provider/model buckets:
   - OpenAI chat/vision
   - Anthropic chat
@@ -30,6 +32,12 @@ not per-account throttling.
     comma-separated pools.
   - Requests shard deterministically across the configured pool.
   - Single-key env vars remain supported for local/staging.
+- Added Redis-backed shared capacity:
+  - `BLUEY_REDIS_URL` enables global buckets across server instances.
+  - `BLUEY_REDIS_NAMESPACE` separates staging/prod keys.
+  - `BLUEY_RATE_LIMIT_REDIS_STRICT=1` makes Redis failures fail closed; default
+    is fail-open to the local limiter so realtime work can continue during a
+    Redis blip.
 - Added `/router/embed` and `/router/transcribe` edge rate-limit middleware.
 - Changed managed LLM routing from a single route to ordered fallback
   candidates:
@@ -63,6 +71,13 @@ runaway-client mitigation:
 - `BLUEY_LIMIT_ACCOUNT_EMBED_PER_MIN`
 - `BLUEY_LIMIT_ACCOUNT_STT_PER_MIN`
 
+Authenticated router per-IP guardrails also default to **off**. Set these only
+during endpoint abuse incidents:
+
+- `BLUEY_LIMIT_ROUTER_COMPLETE_PER_MIN`
+- `BLUEY_LIMIT_ROUTER_EMBED_PER_MIN`
+- `BLUEY_LIMIT_ROUTER_TRANSCRIBE_PER_MIN`
+
 Every capacity env var supports `_BURST`.
 
 ## Tests Added
@@ -76,11 +91,12 @@ Every capacity env var supports `_BURST`.
   - Wiremock proves only one upstream provider call happened.
 - Unit coverage in `server/src/rate_limit.rs` for account and provider capacity
   reasons/isolation.
+- Unit coverage proving account and authenticated-router edge guardrails are
+  disabled by default.
 
 ## Known Follow-Ups
 
-- Replace in-process governor buckets with Redis/shared counters before running
-  multiple server instances.
+- Run production with `BLUEY_REDIS_URL` set before multiple server instances.
 - Move provider-key health and capacity to a shared ledger before running
   multiple server instances, so every server sees the same provider budget and
   unhealthy key state.
@@ -101,9 +117,12 @@ Focus on:
 - Product semantics: per-account limits are disabled by default. Paying users
   should not hit them in normal realtime use; balance and provider capacity are
   the real usage controls.
+- NAT/VPN semantics: authenticated router per-IP limits are disabled by default.
+  Provider capacity and wallet balance remain the active controls.
 - Idempotency: capacity rejections release the reservation so the client can
   retry with the same `request_id`.
 - Provider fallback: failing/busy preferred providers should not leak raw
   provider details to customers.
-- Scaling: the implementation is alpha-safe for one server process; Redis is
-  required for true multi-instance global limits.
+- Scaling: with `BLUEY_REDIS_URL`, provider capacity is global across multiple
+  server instances. Without Redis, the implementation is alpha-safe for one
+  server process only.

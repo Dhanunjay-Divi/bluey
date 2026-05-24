@@ -129,7 +129,9 @@ Reliability:
 - Stream partial answer cards, then finalize with citations.
 - Track health for audio, STT, provider routing, cloud sync, and capture permissions.
 - Enforce three layers of capacity before provider dispatch:
-  - Per-IP edge buckets for abuse protection.
+  - Per-IP edge buckets for unauthenticated auth abuse protection; authenticated
+    router edge buckets are disabled by default so shared NAT/VPN users are not
+    punished for being active.
   - Per-provider/model buckets for OpenAI, Anthropic, Deepgram, and embeddings.
   - Optional per-account guardrails, disabled by default and used only for
     runaway loops, stolen tokens, or abuse response; paid usage itself is
@@ -138,6 +140,9 @@ Reliability:
   early alpha, comma-separated key pools for approved multi-project or
   enterprise capacity, then a shared global capacity ledger when Bluey runs more
   than one server process.
+- Set `BLUEY_REDIS_URL` before running more than one `bluey-server`; Redis makes
+  provider capacity global across every instance. The local in-process fallback
+  is for dev/single-node resilience only.
 - Return typed `429` responses with `retry_after_secs` when Bluey is busy, and
   route LLM lanes through fallback candidates before surfacing an outage.
 - For multi-instance deployment, move the capacity buckets from in-process
