@@ -169,9 +169,8 @@ async fn openai_complete(
     fallback_input_tokens: Option<i64>,
 ) -> Result<Completion> {
     let key = keys
-        .openai_api_key
-        .as_ref()
-        .ok_or_else(|| anyhow!("OPENAI_API_KEY not configured on bluey-server"))?;
+        .openai_key(&format!("chat:{model}:{system}:{user}"))
+        .ok_or_else(|| anyhow!("OPENAI_API_KEY(S) not configured on bluey-server"))?;
     let req = OpenAiChatReq {
         model,
         messages: vec![
@@ -274,9 +273,8 @@ async fn anthropic_complete(
     fallback_input_tokens: Option<i64>,
 ) -> Result<Completion> {
     let key = keys
-        .anthropic_api_key
-        .as_ref()
-        .ok_or_else(|| anyhow!("ANTHROPIC_API_KEY not configured on bluey-server"))?;
+        .anthropic_key(&format!("chat:{model}:{system}:{user}"))
+        .ok_or_else(|| anyhow!("ANTHROPIC_API_KEY(S) not configured on bluey-server"))?;
     let req = AnthropicReq {
         model,
         max_tokens: max_tokens.unwrap_or(2048),
@@ -370,9 +368,8 @@ struct OpenAiEmbedData {
 
 async fn openai_embed(keys: &UpstreamKeys, model: &str, input: &str) -> Result<EmbedCompletion> {
     let key = keys
-        .openai_api_key
-        .as_ref()
-        .ok_or_else(|| anyhow!("OPENAI_API_KEY not configured on bluey-server"))?;
+        .openai_key(&format!("embed:{model}:{input}"))
+        .ok_or_else(|| anyhow!("OPENAI_API_KEY(S) not configured on bluey-server"))?;
     let req = OpenAiEmbedReq { model, input };
     let resp = reqwest::Client::new()
         .post(
@@ -469,9 +466,8 @@ async fn deepgram_transcribe(
     content_type: &str,
 ) -> Result<TranscribeCompletion> {
     let key = keys
-        .deepgram_api_key
-        .as_ref()
-        .ok_or_else(|| anyhow!("DEEPGRAM_API_KEY not configured on bluey-server"))?;
+        .deepgram_key(&format!("transcribe:{model}:{}", audio_bytes.len()))
+        .ok_or_else(|| anyhow!("DEEPGRAM_API_KEY(S) not configured on bluey-server"))?;
     // POST to /v1/listen?model=...&punctuate=true with the raw audio
     // bytes as the body. Deepgram accepts audio/wav, audio/mpeg, etc.
     let default_url = format!(

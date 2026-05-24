@@ -1,13 +1,13 @@
 #![allow(clippy::doc_lazy_continuation)]
-//! Per-IP, per-account, and per-provider rate limiting.
+//! Per-IP, optional per-account guardrail, and per-provider rate limiting.
 //!
 //! Codex Stage 11: brute-force protection on /auth/login + /auth/signup
 //! + /auth/refresh + /auth/device/poll. The managed-provider capacity layer
-//! adds high-ceiling account safety buckets and upstream-provider buckets so
-//! a runaway client loop or one exhausted provider cannot knock realtime calls
-//! offline for everyone. Customer usage is governed by wallet balance and
-//! provider availability; account buckets are emergency guardrails, not plan
-//! limits.
+//! adds upstream-provider buckets so one exhausted provider cannot knock
+//! realtime calls offline for everyone. Customer usage is governed by wallet
+//! balance and provider availability. Per-account buckets are disabled by
+//! default and exist only as opt-in emergency guardrails for abuse incidents,
+//! stolen tokens, or runaway clients.
 //! Uses the governor crate per-key keyed rate limiter with an in-memory state
 //! map. Multi-process deployments should swap this seam for Redis-backed
 //! buckets without changing the API handlers.
@@ -18,9 +18,7 @@
 //! - /auth/refresh: 30 per minute, burst 30
 //! - /auth/device/poll: 60 per minute, long-poll friendly
 //! - /router/complete: 120 per minute, tier-aware in v0.2.x
-//! - Account LLM: 600 per minute, burst 120
-//! - Account embed chunks: 1200 per minute, burst 240
-//! - Account STT chunks: 1800 per minute, burst 600
+//! - Account buckets: disabled by default; opt in via BLUEY_LIMIT_ACCOUNT_*
 //! - Provider buckets: env-configurable safety valves per provider family
 //!
 //! Enforcement is best-effort: behind a load balancer the IP we see
@@ -108,12 +106,12 @@ pub struct RateLimiters {
     pub router_complete: Limiter,
     pub router_embed: Limiter,
     pub router_transcribe: Limiter,
-    /// High-ceiling per-account runaway-loop guardrail for managed LLM requests.
-    pub account_llm: Limiter,
-    /// High-ceiling per-account runaway-loop guardrail for embeddings/RAG writes.
-    pub account_embed: Limiter,
-    /// High-ceiling per-account runaway-loop guardrail for chunked STT requests.
-    pub account_stt: Limiter,
+    /// Optional per-account runaway-loop guardrail for managed LLM requests.
+    pub account_llm: Option<Limiter>,
+    /// Optional per-account runaway-loop guardrail for embeddings/RAG writes.
+    pub account_embed: Option<Limiter>,
+    /// Optional per-account runaway-loop guardrail for chunked STT requests.
+    pub account_stt: Option<Limiter>,
     /// Provider-wide capacity bucket for OpenAI chat/vision requests.
     pub provider_openai_llm: Limiter,
     /// Provider-wide capacity bucket for Anthropic chat requests.
@@ -134,9 +132,9 @@ impl Default for RateLimiters {
             router_complete: Limiter::new(120, 60),
             router_embed: Limiter::new(240, 80),
             router_transcribe: Limiter::new(240, 80),
-            account_llm: limiter_from_env("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN", 600, 120),
-            account_embed: limiter_from_env("BLUEY_LIMIT_ACCOUNT_EMBED_PER_MIN", 1200, 240),
-            account_stt: limiter_from_env("BLUEY_LIMIT_ACCOUNT_STT_PER_MIN", 1800, 600),
+            account_llm: optional_limiter_from_env("BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN"),
+            account_embed: optional_limiter_from_env("BLUEY_LIMIT_ACCOUNT_EMBED_PER_MIN"),
+            account_stt: optional_limiter_from_env("BLUEY_LIMIT_ACCOUNT_STT_PER_MIN"),
             provider_openai_llm: limiter_from_env(
                 "BLUEY_LIMIT_PROVIDER_OPENAI_LLM_PER_MIN",
                 900,
@@ -163,7 +161,10 @@ impl Default for RateLimiters {
 
 impl RateLimiters {
     pub async fn check_account_llm(&self, account_id: &str) -> Result<(), CapacityDenied> {
-        self.account_llm
+        let Some(limiter) = &self.account_llm else {
+            return Ok(());
+        };
+        limiter
             .check(account_id)
             .await
             .map_err(|retry_after_secs| CapacityDenied {
@@ -173,7 +174,10 @@ impl RateLimiters {
     }
 
     pub async fn check_account_embed(&self, account_id: &str) -> Result<(), CapacityDenied> {
-        self.account_embed
+        let Some(limiter) = &self.account_embed else {
+            return Ok(());
+        };
+        limiter
             .check(account_id)
             .await
             .map_err(|retry_after_secs| CapacityDenied {
@@ -183,7 +187,10 @@ impl RateLimiters {
     }
 
     pub async fn check_account_stt(&self, account_id: &str) -> Result<(), CapacityDenied> {
-        self.account_stt
+        let Some(limiter) = &self.account_stt else {
+            return Ok(());
+        };
+        limiter
             .check(account_id)
             .await
             .map_err(|retry_after_secs| CapacityDenied {
@@ -263,6 +270,12 @@ fn limiter_from_env(name: &str, default_per_minute: u32, default_burst: u32) -> 
     let per_minute = env_u32(name).unwrap_or(default_per_minute);
     let burst = env_u32(&format!("{name}_BURST")).unwrap_or(default_burst);
     Limiter::new(per_minute, burst)
+}
+
+fn optional_limiter_from_env(name: &str) -> Option<Limiter> {
+    let per_minute = env_u32(name)?;
+    let burst = env_u32(&format!("{name}_BURST")).unwrap_or(per_minute);
+    Some(Limiter::new(per_minute, burst))
 }
 
 fn env_u32(name: &str) -> Option<u32> {
@@ -399,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn account_capacity_denial_has_reason() {
         let limits = RateLimiters {
-            account_llm: Limiter::new(60, 1),
+            account_llm: Some(Limiter::new(60, 1)),
             ..RateLimiters::default()
         };
         limits.check_account_llm("acct1").await.unwrap();
@@ -407,6 +420,16 @@ mod tests {
         assert_eq!(denied.reason, "account_llm_busy");
         assert!(denied.retry_after_secs >= 1);
         assert!(limits.check_account_llm("acct2").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn account_capacity_disabled_by_default() {
+        let limits = RateLimiters::default();
+        for _ in 0..1_000 {
+            limits.check_account_llm("paid-account").await.unwrap();
+            limits.check_account_embed("paid-account").await.unwrap();
+            limits.check_account_stt("paid-account").await.unwrap();
+        }
     }
 
     #[tokio::test]

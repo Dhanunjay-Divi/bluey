@@ -130,9 +130,14 @@ Reliability:
 - Track health for audio, STT, provider routing, cloud sync, and capture permissions.
 - Enforce three layers of capacity before provider dispatch:
   - Per-IP edge buckets for abuse protection.
-  - High-ceiling per-account guardrails only for runaway loops or stolen tokens;
-    paid usage itself is controlled by wallet balance and provider availability.
   - Per-provider/model buckets for OpenAI, Anthropic, Deepgram, and embeddings.
+  - Optional per-account guardrails, disabled by default and used only for
+    runaway loops, stolen tokens, or abuse response; paid usage itself is
+    controlled by wallet balance and provider availability.
+- Scale provider capacity with approved provider allocations: single keys for
+  early alpha, comma-separated key pools for approved multi-project or
+  enterprise capacity, then a shared global capacity ledger when Bluey runs more
+  than one server process.
 - Return typed `429` responses with `retry_after_secs` when Bluey is busy, and
   route LLM lanes through fallback candidates before surfacing an outage.
 - For multi-instance deployment, move the capacity buckets from in-process

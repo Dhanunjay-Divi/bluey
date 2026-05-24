@@ -42,31 +42,38 @@ Code references:
 Bluey protects realtime work at three layers:
 
 1. **HTTP edge per-IP buckets**: protects auth and router endpoints from abuse.
-2. **High-ceiling per-account safety buckets**: protects against runaway loops,
-   stolen tokens, and broken clients. These are deliberately set far above
-   normal realtime usage; customer usage is controlled by wallet balance and
-   provider availability, not by a low per-account quota.
-3. **Provider/model buckets**: keeps OpenAI, Anthropic, Deepgram, and embedding
+2. **Provider/model buckets**: keeps OpenAI, Anthropic, Deepgram, and embedding
    calls inside configured capacity and lets LLM lanes fall back before failing.
+3. **Optional per-account emergency guardrails**: disabled by default. Turn
+   them on only during abuse incidents, stolen-token response, or runaway-client
+   mitigation. Normal paid usage is controlled by wallet balance and provider
+   availability, not by per-account throttling.
 
 Default server knobs:
 
 | Env var | Default | Purpose |
 | --- | ---: | --- |
-| `BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN` | 600/min, burst 120 | Emergency per-account answer guardrail |
-| `BLUEY_LIMIT_ACCOUNT_EMBED_PER_MIN` | 1200/min, burst 240 | Emergency per-account embeddings/RAG guardrail |
-| `BLUEY_LIMIT_ACCOUNT_STT_PER_MIN` | 1800/min, burst 600 | Emergency per-account chunked STT guardrail |
 | `BLUEY_LIMIT_PROVIDER_OPENAI_LLM_PER_MIN` | 900/min, burst 180 | OpenAI chat/vision capacity |
 | `BLUEY_LIMIT_PROVIDER_ANTHROPIC_LLM_PER_MIN` | 300/min, burst 60 | Anthropic chat capacity |
 | `BLUEY_LIMIT_PROVIDER_OPENAI_EMBED_PER_MIN` | 900/min, burst 180 | OpenAI embedding capacity |
 | `BLUEY_LIMIT_PROVIDER_DEEPGRAM_STT_PER_MIN` | 600/min, burst 120 | Deepgram STT capacity |
+| `BLUEY_LIMIT_ACCOUNT_LLM_PER_MIN` | unset/disabled | Optional emergency per-account answer guardrail |
+| `BLUEY_LIMIT_ACCOUNT_EMBED_PER_MIN` | unset/disabled | Optional emergency per-account embeddings/RAG guardrail |
+| `BLUEY_LIMIT_ACCOUNT_STT_PER_MIN` | unset/disabled | Optional emergency per-account chunked STT guardrail |
 
-Each provider env var also supports a `_BURST` suffix, for example
+Each capacity env var also supports a `_BURST` suffix, for example
 `BLUEY_LIMIT_PROVIDER_OPENAI_LLM_PER_MIN_BURST=240`.
 
+Provider keys can be supplied either as single-key env vars (`OPENAI_API_KEY`,
+`ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`) or as comma-separated, provider-approved
+key pools (`OPENAI_API_KEYS`, `ANTHROPIC_API_KEYS`, `DEEPGRAM_API_KEYS`). Bluey
+shards requests across the pool. This is for approved capacity across projects,
+regions, or enterprise allocations; do not use it for provider-limit evasion.
+
 Current implementation is in-process and safe for single-binary alpha. Once
-Bluey runs more than one server instance, move these buckets to Redis or another
-shared atomic counter so provider limits are enforced globally.
+Bluey runs more than one server instance, move these buckets and provider-key
+health to Redis or another shared atomic ledger so provider limits are enforced
+globally and unhealthy keys are avoided by every server.
 
 ## Local/Developer Fallback Routing
 

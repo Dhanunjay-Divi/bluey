@@ -160,8 +160,8 @@ pub async fn relay(
     let deepgram_key = state
         .config
         .upstream
-        .deepgram_api_key
-        .clone()
+        .deepgram_key(&session.token)
+        .map(str::to_string)
         .ok_or_else(|| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
