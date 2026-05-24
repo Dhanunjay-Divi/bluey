@@ -51,9 +51,9 @@ bluey on
 - Daemon starts; logs go to stderr (no rotation yet — observability round)
 - Boot lines printed to terminal include:
   - "Listening for hotkey F19" (or similar)
-  - "Managed answers ready" if already signed in, OR "finish sign-in in your browser" if not
+  - "Managed answers ready" if already signed in, OR "sign in when ready" if not
   - Session-history affordance, attach/analyse consent, transcript/answer behavior copy
-- Native overlay pill appears in top-right of screen as a small Bluey-tinted dot/badge
+- Native overlay pill appears centered as a compact Bluey-tinted badge
 
 **Fail signals:**
 - "Failed to spawn overlay helper" → check `/tmp/bluey-internal-test/bin/cue-overlay` exists + is executable; `codesign -dv` should show ad-hoc sign
@@ -67,8 +67,8 @@ bluey on
 Click the pill or use the F19 hotkey.
 
 **Expect:**
-- Overlay expands to a 520px-tall panel that fits the visible screen
-  (up to ~820px wide without canvas; narrower screens must not crop chrome)
+- Overlay expands to an approximately 820x520 panel that fits the visible screen
+  and can be resized without cropping header/composer chrome
 - Top header shows: Bluey label, balance (e.g. "Bluey · $4.98" or "Sign in to start"), Hide (eye-slash) and Close (X) icons
 - Disguise menu accessible (click the Bluey icon header)
 - Empty state explains the session surface; not a blank debug panel
@@ -81,16 +81,16 @@ Click the pill or use the F19 hotkey.
 
 ---
 
-## Step 3 — Start Bluey / Stop session
+## Step 3 — Listen / Stop session
 
-In the expanded overlay, click "Start Bluey" (or the listening toggle).
+In the expanded overlay, click "Listen" (or the listening toggle).
 
 **Expect:**
 - Daemon starts capturing audio; overlay shows live transcript preview ("Live captions preview" strip)
 - Live transcription text scrolls as you speak
 - Transcript snippets stay inside the fixed bottom preview strip; they do not render as chat cards
-- Expanded overlay remains fixed at the Step 2 size while captions update
-- "Stop Bluey" button replaces "Start"
+- Expanded overlay remains at the user-selected size while captions update
+- "Stop" button replaces "Listen"
 - Session is created in `~/Library/Application Support/Bluey/active-meeting.json` (perms 0600)
 
 Click Stop. **Expect:**

@@ -49,6 +49,8 @@ require_source "keepFixedChromeInBounds()"
 require_source "PillMetrics.centeredFrame"
 require_source "startExpandedPassthroughTracking()"
 require_source "pillWindow?.orderOut(nil)"
+require_source "resizable: true"
+require_source "maximumFrameHeight"
 require_source "fitExpandedFrameToVisibleScreen"
 require_source "setKnowledgeBadge(\"KB loading\""
 require_source "setTranscriptState(\"LISTENING\""
@@ -92,7 +94,7 @@ for win in windows():
     bounds = win.get("kCGWindowBounds", {})
     width = int(round(bounds.get("Width", 0)))
     height = int(round(bounds.get("Height", 0)))
-    if 132 <= width <= 152 and 38 <= height <= 48:
+    if 108 <= width <= 126 and 30 <= height <= 38:
         pill = bounds
         break
 

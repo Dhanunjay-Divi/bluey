@@ -58,7 +58,7 @@ private enum ExpandedPanelMetrics {
     static let minCompactWidth: CGFloat = 680
     static let maxCanvasWidth: CGFloat = 960
     static let height: CGFloat = 520
-    static let minHeight: CGFloat = 460
+    static let minHeight: CGFloat = 440
     static let screenInset: CGFloat = 12
 
     static func fittingWidth(for screen: NSRect, preferred: CGFloat) -> CGFloat {
@@ -93,7 +93,7 @@ private enum ExpandedPanelMetrics {
 }
 
 private enum PillMetrics {
-    static let size = NSSize(width: 142, height: 44)
+    static let size = NSSize(width: 118, height: 34)
 
     static func centeredFrame(in visibleFrame: NSRect) -> NSRect {
         NSRect(
@@ -507,11 +507,17 @@ private final class OverlayWindow: NSWindow {
     var lockedFrameHeight: CGFloat?
     var minimumFrameWidth: CGFloat?
     var maximumFrameWidth: CGFloat?
+    var minimumFrameHeight: CGFloat?
+    var maximumFrameHeight: CGFloat?
 
-    init(contentRect: NSRect, draggable: Bool) {
+    init(contentRect: NSRect, draggable: Bool, resizable: Bool = false) {
+        var style: NSWindow.StyleMask = [.borderless]
+        if resizable {
+            style.insert(.resizable)
+        }
         super.init(
             contentRect: contentRect,
-            styleMask: [.borderless],
+            styleMask: style,
             backing: .buffered,
             defer: false
         )
@@ -545,9 +551,17 @@ private final class OverlayWindow: NSWindow {
     }
 
     override func setContentSize(_ size: NSSize) {
-        if lockedFrameHeight != nil || minimumFrameWidth != nil {
+        if clampingEnabled {
+            var requestedSize = size
+            if lockedFrameHeight == nil {
+                // AppKit may try to satisfy dense feed/composer constraints by
+                // growing the borderless window. Preserve the current height
+                // for content-size fitting while still allowing real user
+                // frame resizing through setFrame(_:display:).
+                requestedSize.height = frame.height
+            }
             super.setFrame(
-                clampedFrame(NSRect(origin: frame.origin, size: size)),
+                clampedFrame(NSRect(origin: frame.origin, size: requestedSize)),
                 display: true)
         } else {
             super.setContentSize(size)
@@ -564,9 +578,16 @@ private final class OverlayWindow: NSWindow {
         }
         if let lockedFrameHeight {
             clamped.size.height = lockedFrameHeight
+        } else {
+            if let minimumFrameHeight {
+                clamped.size.height = max(minimumFrameHeight, clamped.size.height)
+            }
+            if let maximumFrameHeight {
+                clamped.size.height = min(maximumFrameHeight, clamped.size.height)
+            }
         }
 
-        guard lockedFrameHeight != nil || minimumFrameWidth != nil || maximumFrameWidth != nil else {
+        guard clampingEnabled else {
             return clamped
         }
 
@@ -580,6 +601,14 @@ private final class OverlayWindow: NSWindow {
             clamped.size.width = max(minimumFrameWidth, clamped.size.width)
         }
         return ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(clamped, visibleFrame: visibleFrame)
+    }
+
+    private var clampingEnabled: Bool {
+        lockedFrameHeight != nil
+            || minimumFrameWidth != nil
+            || maximumFrameWidth != nil
+            || minimumFrameHeight != nil
+            || maximumFrameHeight != nil
     }
 }
 
@@ -630,27 +659,27 @@ private final class PillView: NSView {
         layer?.cornerRadius = frameRect.height / 2
         layer?.borderWidth = 0
         layer?.shadowColor = NSColor(red: 0.10, green: 0.70, blue: 0.96, alpha: 1.0).cgColor
-        layer?.shadowOpacity = 0.24
-        layer?.shadowRadius = 11
+        layer?.shadowOpacity = 0.18
+        layer?.shadowRadius = 8
         layer?.shadowOffset = .zero
 
         logoTile.wantsLayer = true
-        logoTile.layer?.backgroundColor = NSColor(red: 0.025, green: 0.140, blue: 0.190, alpha: 1.0).cgColor
-        logoTile.layer?.cornerRadius = 9
+        logoTile.layer?.backgroundColor = NSColor(red: 0.020, green: 0.120, blue: 0.160, alpha: 1.0).cgColor
+        logoTile.layer?.cornerRadius = 7
         logoTile.layer?.borderWidth = 1
-        logoTile.layer?.borderColor = NSColor(red: 0.42, green: 0.92, blue: 1.0, alpha: 0.72).cgColor
+        logoTile.layer?.borderColor = NSColor(red: 0.42, green: 0.92, blue: 1.0, alpha: 0.66).cgColor
         logoTile.layer?.shadowColor = NSColor(red: 0.15, green: 0.66, blue: 1.0, alpha: 1.0).cgColor
-        logoTile.layer?.shadowOpacity = 0.32
-        logoTile.layer?.shadowRadius = 9
+        logoTile.layer?.shadowOpacity = 0.24
+        logoTile.layer?.shadowRadius = 7
         logoTile.layer?.shadowOffset = .zero
         addSubview(logoTile)
 
-        logoGlyph.font = NSFont.monospacedSystemFont(ofSize: 13, weight: .bold)
+        logoGlyph.font = NSFont.monospacedSystemFont(ofSize: 11.5, weight: .bold)
         logoGlyph.textColor = NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0)
         logoGlyph.alignment = .center
         logoTile.addSubview(logoGlyph)
 
-        titleField.font = NSFont.systemFont(ofSize: 17, weight: .bold)
+        titleField.font = NSFont.systemFont(ofSize: 14.5, weight: .bold)
         titleField.textColor = NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0)
         titleField.alignment = .left
         addSubview(titleField)
@@ -670,51 +699,51 @@ private final class PillView: NSView {
         super.layout()
         layer?.cornerRadius = bounds.height / 2
 
-        let logoSide: CGFloat = 30
-        logoTile.frame = NSRect(x: 9, y: (bounds.height - logoSide) / 2, width: logoSide, height: logoSide)
-        logoTile.layer?.cornerRadius = 9
-        logoGlyph.frame = logoTile.bounds.insetBy(dx: 5, dy: 6)
+        let logoSide: CGFloat = 24
+        logoTile.frame = NSRect(x: 7, y: (bounds.height - logoSide) / 2, width: logoSide, height: logoSide)
+        logoTile.layer?.cornerRadius = 7
+        logoGlyph.frame = logoTile.bounds.insetBy(dx: 4, dy: 5)
 
-        titleField.frame = NSRect(x: 50, y: (bounds.height - 22) / 2 + 1, width: bounds.width - 72, height: 22)
+        titleField.frame = NSRect(x: 40, y: (bounds.height - 20) / 2 + 1, width: bounds.width - 58, height: 20)
 
         let labelWidth = ceil((titleField.stringValue as NSString).size(withAttributes: [
-            .font: titleField.font ?? NSFont.systemFont(ofSize: 17, weight: .bold),
+            .font: titleField.font ?? NSFont.systemFont(ofSize: 14.5, weight: .bold),
         ]).width)
-        let dotSize: CGFloat = 8
-        let dotX = min(titleField.frame.minX + labelWidth + 7, bounds.width - dotSize - 13)
-        dotView.frame = NSRect(x: dotX, y: bounds.midY + 5, width: dotSize, height: dotSize)
+        let dotSize: CGFloat = 7
+        let dotX = min(titleField.frame.minX + labelWidth + 5, bounds.width - dotSize - 9)
+        dotView.frame = NSRect(x: dotX, y: bounds.midY + 4, width: dotSize, height: dotSize)
         dotView.layer?.cornerRadius = dotSize / 2
     }
 
     override func draw(_ dirtyRect: NSRect) {
         NSGraphicsContext.saveGraphicsState()
 
-        let outer = bounds.insetBy(dx: 1, dy: 1)
+        let outer = bounds.insetBy(dx: 0.75, dy: 0.75)
         let radius = outer.height / 2
         let path = NSBezierPath(roundedRect: outer, xRadius: radius, yRadius: radius)
         let shadow = NSShadow()
-        shadow.shadowColor = NSColor.black.withAlphaComponent(0.38)
-        shadow.shadowBlurRadius = 9
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.32)
+        shadow.shadowBlurRadius = 7
         shadow.shadowOffset = .zero
         shadow.set()
 
         let bg = NSGradient(colors: [
-            NSColor(red: 0.012, green: 0.016, blue: 0.022, alpha: 0.97),
-            NSColor(red: 0.018, green: 0.038, blue: 0.046, alpha: 0.94),
-            NSColor(red: 0.011, green: 0.014, blue: 0.020, alpha: 0.98),
+            NSColor(red: 0.010, green: 0.014, blue: 0.020, alpha: 0.97),
+            NSColor(red: 0.016, green: 0.030, blue: 0.038, alpha: 0.94),
+            NSColor(red: 0.010, green: 0.013, blue: 0.018, alpha: 0.98),
         ])
         bg?.draw(in: path, angle: -12)
 
         NSGraphicsContext.restoreGraphicsState()
 
-        NSColor(red: 0.30, green: 0.78, blue: 0.96, alpha: 0.40).setStroke()
-        path.lineWidth = 1
+        NSColor(red: 0.30, green: 0.78, blue: 0.96, alpha: 0.34).setStroke()
+        path.lineWidth = 0.9
         path.stroke()
 
-        let inner = outer.insetBy(dx: 2, dy: 2)
+        let inner = outer.insetBy(dx: 1.5, dy: 1.5)
         let innerPath = NSBezierPath(roundedRect: inner, xRadius: inner.height / 2, yRadius: inner.height / 2)
-        NSColor.white.withAlphaComponent(0.055).setStroke()
-        innerPath.lineWidth = 1
+        NSColor.white.withAlphaComponent(0.045).setStroke()
+        innerPath.lineWidth = 0.7
         innerPath.stroke()
 
         let gloss = NSBezierPath(roundedRect: outer.insetBy(dx: 2, dy: 2), xRadius: radius - 2, yRadius: radius - 2)
@@ -1454,10 +1483,14 @@ private final class ExpandedPanelView: NSView {
         super.init(frame: frameRect)
 
         wantsLayer = true
-        layer?.backgroundColor = BlueyTheme.panelDeep.cgColor
-        layer?.cornerRadius = 22
+        layer?.backgroundColor = NSColor(red: 0.010, green: 0.012, blue: 0.016, alpha: 0.94).cgColor
+        layer?.cornerRadius = 24
         layer?.borderWidth = 1
-        layer?.borderColor = BlueyTheme.hairline.cgColor
+        layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.14).cgColor
+        layer?.shadowColor = NSColor.black.cgColor
+        layer?.shadowOpacity = 0.28
+        layer?.shadowRadius = 24
+        layer?.shadowOffset = .zero
 
         configureHeader()
         configureContextRows()
@@ -1898,7 +1931,7 @@ private final class ExpandedPanelView: NSView {
         return false
     }
 
-    /// The expanded overlay is a fixed-height tool surface. Header,
+    /// The expanded overlay is a bounded, resizable tool surface. Header,
     /// transcript, attachments, and composer are chrome; only the workspace
     /// may compress/scroll as content grows.
     private func configureFixedChromeLayoutPriorities() {
@@ -1942,13 +1975,13 @@ private final class ExpandedPanelView: NSView {
 
     private func configureHeader() {
         headerBar.wantsLayer = true
-        headerBar.layer?.backgroundColor = NSColor(red: 0.016, green: 0.019, blue: 0.025, alpha: 0.98).cgColor
+        headerBar.layer?.backgroundColor = NSColor(red: 0.018, green: 0.022, blue: 0.030, alpha: 0.92).cgColor
         headerBar.layer?.cornerRadius = 21
         headerBar.layer?.borderWidth = 1
-        headerBar.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.20).cgColor
+        headerBar.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.18).cgColor
         headerBar.layer?.shadowColor = NSColor.black.cgColor
-        headerBar.layer?.shadowOpacity = 0.24
-        headerBar.layer?.shadowRadius = 18
+        headerBar.layer?.shadowOpacity = 0.18
+        headerBar.layer?.shadowRadius = 14
         headerBar.layer?.shadowOffset = NSSize(width: 0, height: -6)
 
         headerStack.orientation = .horizontal
@@ -2116,16 +2149,20 @@ private final class ExpandedPanelView: NSView {
 
     private func configureComposer() {
         composerBar.wantsLayer = true
-        composerBar.layer?.backgroundColor = NSColor(red: 0.026, green: 0.030, blue: 0.038, alpha: 0.98).cgColor
+        composerBar.layer?.backgroundColor = NSColor(red: 0.014, green: 0.016, blue: 0.022, alpha: 0.94).cgColor
         composerBar.layer?.cornerRadius = 28
         composerBar.layer?.borderWidth = 1
-        composerBar.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.16).cgColor
+        composerBar.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.22).cgColor
+        composerBar.layer?.shadowColor = NSColor.black.cgColor
+        composerBar.layer?.shadowOpacity = 0.22
+        composerBar.layer?.shadowRadius = 18
+        composerBar.layer?.shadowOffset = .zero
 
         composerSurface.wantsLayer = true
-        composerSurface.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.055).cgColor
+        composerSurface.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.050).cgColor
         composerSurface.layer?.cornerRadius = 20
         composerSurface.layer?.borderWidth = 1
-        composerSurface.layer?.borderColor = NSColor.white.withAlphaComponent(0.10).cgColor
+        composerSurface.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
 
         opacityControl.wantsLayer = true
         opacityControl.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.055).cgColor
@@ -2212,9 +2249,9 @@ private final class ExpandedPanelView: NSView {
         button.layer?.cornerRadius = 16
         button.layer?.backgroundColor = accent
             ? NSColor(red: 0.07, green: 0.19, blue: 0.24, alpha: 0.98).cgColor
-            : BlueyTheme.surfaceRaised.cgColor
+            : NSColor.white.withAlphaComponent(0.070).cgColor
         button.layer?.borderWidth = 1
-        button.layer?.borderColor = (accent ? BlueyTheme.cyan.withAlphaComponent(0.55) : BlueyTheme.hairline).cgColor
+        button.layer?.borderColor = (accent ? BlueyTheme.cyan.withAlphaComponent(0.55) : NSColor.white.withAlphaComponent(0.12)).cgColor
         button.font = NSFont.systemFont(ofSize: 12, weight: .bold)
         button.attributedTitle = NSAttributedString(
             string: button.title,
@@ -2281,9 +2318,9 @@ private final class ExpandedPanelView: NSView {
         button.layer?.cornerRadius = 16
         button.layer?.backgroundColor = accent
             ? NSColor(red: 0.84, green: 0.92, blue: 0.96, alpha: 0.95).cgColor
-            : BlueyTheme.surfaceRaised.cgColor
+            : NSColor.white.withAlphaComponent(0.070).cgColor
         button.layer?.borderWidth = 1
-        button.layer?.borderColor = (accent ? NSColor.white.withAlphaComponent(0.18) : BlueyTheme.hairline).cgColor
+        button.layer?.borderColor = (accent ? NSColor.white.withAlphaComponent(0.18) : NSColor.white.withAlphaComponent(0.12)).cgColor
         button.font = NSFont.systemFont(ofSize: 12, weight: .bold)
         button.contentTintColor = accent ? NSColor.black.withAlphaComponent(0.82) : BlueyTheme.cyan
         if let image = symbolImage(symbol) {
@@ -2645,14 +2682,18 @@ private final class ExpandedPanelView: NSView {
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let clampedTargetWidth = ExpandedPanelMetrics.fittingWidth(for: screen, preferred: targetWidth)
         let minimumWidth = ExpandedPanelMetrics.fittingMinimumWidth(for: screen, targetWidth: clampedTargetWidth)
+        let maximumWidth = max(clampedTargetWidth, screen.width - ExpandedPanelMetrics.screenInset * 2)
+        let maximumHeight = max(ExpandedPanelMetrics.minHeight, screen.height - ExpandedPanelMetrics.screenInset * 2)
         if let overlayWindow = window as? OverlayWindow {
             overlayWindow.minimumFrameWidth = minimumWidth
-            overlayWindow.maximumFrameWidth = clampedTargetWidth
+            overlayWindow.maximumFrameWidth = maximumWidth
+            overlayWindow.minimumFrameHeight = ExpandedPanelMetrics.minHeight
+            overlayWindow.maximumFrameHeight = maximumHeight
         }
-        window.minSize = NSSize(width: minimumWidth, height: window.minSize.height)
-        window.contentMinSize = NSSize(width: minimumWidth, height: window.contentMinSize.height)
-        window.maxSize = NSSize(width: clampedTargetWidth, height: window.maxSize.height)
-        window.contentMaxSize = NSSize(width: clampedTargetWidth, height: window.contentMaxSize.height)
+        window.minSize = NSSize(width: minimumWidth, height: ExpandedPanelMetrics.minHeight)
+        window.contentMinSize = NSSize(width: minimumWidth, height: ExpandedPanelMetrics.minHeight)
+        window.maxSize = NSSize(width: maximumWidth, height: maximumHeight)
+        window.contentMaxSize = NSSize(width: maximumWidth, height: maximumHeight)
         guard window.frame.width < clampedTargetWidth else { return }
         var frame = window.frame
         frame.size.width = clampedTargetWidth
@@ -2670,19 +2711,18 @@ private final class ExpandedPanelView: NSView {
             for: screen,
             preferred: ExpandedPanelMetrics.maxCompactWidth)
         let minimumWidth = ExpandedPanelMetrics.fittingMinimumWidth(for: screen, targetWidth: compactWidth)
+        let maximumWidth = max(compactWidth, screen.width - ExpandedPanelMetrics.screenInset * 2)
+        let maximumHeight = max(ExpandedPanelMetrics.minHeight, screen.height - ExpandedPanelMetrics.screenInset * 2)
         if let overlayWindow = window as? OverlayWindow {
             overlayWindow.minimumFrameWidth = minimumWidth
-            overlayWindow.maximumFrameWidth = compactWidth
+            overlayWindow.maximumFrameWidth = maximumWidth
+            overlayWindow.minimumFrameHeight = ExpandedPanelMetrics.minHeight
+            overlayWindow.maximumFrameHeight = maximumHeight
         }
-        window.minSize = NSSize(width: minimumWidth, height: window.minSize.height)
-        window.contentMinSize = NSSize(width: minimumWidth, height: window.contentMinSize.height)
-        window.maxSize = NSSize(width: compactWidth, height: window.maxSize.height)
-        window.contentMaxSize = NSSize(width: compactWidth, height: window.contentMaxSize.height)
-        guard window.frame.width > compactWidth else { return }
-        var frame = window.frame
-        frame.size.width = compactWidth
-        frame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(frame, visibleFrame: screen)
-        window.setFrame(frame, display: true, animate: true)
+        window.minSize = NSSize(width: minimumWidth, height: ExpandedPanelMetrics.minHeight)
+        window.contentMinSize = NSSize(width: minimumWidth, height: ExpandedPanelMetrics.minHeight)
+        window.maxSize = NSSize(width: maximumWidth, height: maximumHeight)
+        window.contentMaxSize = NSSize(width: maximumWidth, height: maximumHeight)
     }
 
     private func makeCanvasArtifact(from card: RenderedCard) -> CanvasArtifact? {
@@ -3306,18 +3346,18 @@ private final class OverlayApp {
             visibleFrame: screen)
         let window = OverlayWindow(
             contentRect: expandedFrame,
-            draggable: true)
+            draggable: true,
+            resizable: true)
+        let maxExpandedWidth = max(minimumWidth, screen.width - ExpandedPanelMetrics.screenInset * 2)
+        let maxExpandedHeight = max(ExpandedPanelMetrics.minHeight, screen.height - ExpandedPanelMetrics.screenInset * 2)
         window.minimumFrameWidth = minimumWidth
-        window.lockedFrameHeight = expandedFrame.height
-        // The expanded surface must stay compact vertically; otherwise AppKit can
-        // grow the borderless window to satisfy dense feed/composer constraints.
-        // Width can still expand intentionally for the canvas panel.
-        let maxExpandedWidth = expandedWidth
-        window.minSize = NSSize(width: minimumWidth, height: expandedFrame.height)
-        window.maxSize = NSSize(width: maxExpandedWidth, height: expandedFrame.height)
-        window.contentMinSize = NSSize(width: minimumWidth, height: expandedFrame.height)
-        window.contentMaxSize = NSSize(width: maxExpandedWidth, height: expandedFrame.height)
         window.maximumFrameWidth = maxExpandedWidth
+        window.minimumFrameHeight = ExpandedPanelMetrics.minHeight
+        window.maximumFrameHeight = maxExpandedHeight
+        window.minSize = NSSize(width: minimumWidth, height: ExpandedPanelMetrics.minHeight)
+        window.maxSize = NSSize(width: maxExpandedWidth, height: maxExpandedHeight)
+        window.contentMinSize = NSSize(width: minimumWidth, height: ExpandedPanelMetrics.minHeight)
+        window.contentMaxSize = NSSize(width: maxExpandedWidth, height: maxExpandedHeight)
         let view = ExpandedPanelView(frame: NSRect(origin: .zero, size: expandedFrame.size))
         view.autoresizingMask = [.width, .height]
         window.contentView = view

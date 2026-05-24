@@ -811,7 +811,9 @@ async fn cue_on(args: OnArgs) -> Result<()> {
     let auth_state = if account_ready {
         BlueyOnAuthState::Ready
     } else {
-        open_signin_for_bluey_on()
+        BlueyOnAuthState::SignInAvailable {
+            url: bluey_signin_url(),
+        }
     };
     // The native overlay orders the branded pill front when the child process
     // starts. Do not send OverlayShow here: in the current protocol it expands
@@ -826,16 +828,8 @@ async fn cue_on(args: OnArgs) -> Result<()> {
         Ok(DaemonResponse::Ok) => {
             match auth_state {
                 BlueyOnAuthState::Ready => println!("Bluey is on."),
-                BlueyOnAuthState::SignInOpened => {
-                    println!("Bluey is on. Finish sign-in in the browser.")
-                }
-                BlueyOnAuthState::SignInSkipped => {
-                    println!("Bluey is on. Sign-in is skipped in this environment.")
-                }
-                BlueyOnAuthState::SignInFailed { url, reason } => {
-                    println!(
-                        "Bluey is on. Open {url} to finish sign-in. Browser open failed: {reason}"
-                    )
+                BlueyOnAuthState::SignInAvailable { url } => {
+                    println!("Bluey is on. Sign in when ready with `bluey login` or {url}.")
                 }
             }
             Ok(())
@@ -851,9 +845,7 @@ async fn cue_on(args: OnArgs) -> Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BlueyOnAuthState {
     Ready,
-    SignInOpened,
-    SignInSkipped,
-    SignInFailed { url: String, reason: String },
+    SignInAvailable { url: String },
 }
 
 fn bluey_account_linked(paths: &AppPaths) -> bool {
@@ -867,47 +859,22 @@ fn bluey_account_linked(paths: &AppPaths) -> bool {
             .is_some_and(|account| account.token_configured())
 }
 
-fn open_signin_for_bluey_on() -> BlueyOnAuthState {
-    if env_bool("BLUEY_SKIP_SIGNIN_OPEN").unwrap_or(false)
-        || env_bool("BLUEY_NO_BROWSER").unwrap_or(false)
-    {
-        return BlueyOnAuthState::SignInSkipped;
-    }
-
-    let url = bluey_signin_url();
-    match open_browser(&url) {
-        Ok(()) => BlueyOnAuthState::SignInOpened,
-        Err(error) => BlueyOnAuthState::SignInFailed {
-            url,
-            reason: error.to_string(),
-        },
-    }
-}
-
 fn bluey_signin_url() -> String {
     env::var("BLUEY_SIGNIN_URL").unwrap_or_else(|_| "https://bluey.sh/link".to_string())
 }
 
 fn bluey_on_boot_lines(auth_state: &BlueyOnAuthState) -> Vec<String> {
     let mut lines = vec![
-        "new recording started".to_string(),
-        "click the pill for chat, files, and screen analysis".to_string(),
-        "restore previous sessions from the sidebar".to_string(),
-        "attach files with Attach; Analyse asks before screen context".to_string(),
-        "transcripts stay source-labeled; answers stream into chat".to_string(),
+        "new recording ready".to_string(),
+        "use Listen, Docs, Screen, or Ask from the composer".to_string(),
+        "previous sessions live in the sidebar".to_string(),
     ];
     match auth_state {
         BlueyOnAuthState::Ready => {
             lines.push("managed answers and balance tracking are ready".to_string());
         }
-        BlueyOnAuthState::SignInOpened => {
-            lines.push("finish sign-in in your browser; Bluey stays ready".to_string());
-        }
-        BlueyOnAuthState::SignInSkipped => {
-            lines.push("sign-in skipped for this run; Bluey stays in local fallback".to_string());
-        }
-        BlueyOnAuthState::SignInFailed { url, .. } => {
-            lines.push(format!("finish sign-in in your browser: {url}"));
+        BlueyOnAuthState::SignInAvailable { url } => {
+            lines.push(format!("sign in when ready: bluey login or {url}"));
         }
     }
     lines
@@ -2635,15 +2602,6 @@ fn env_present(name: &str) -> bool {
         .is_some()
 }
 
-fn env_bool(name: &str) -> Option<bool> {
-    env::var(name).ok().map(|value| {
-        !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no" | ""
-        )
-    })
-}
-
 fn optional_cloud_client() -> Result<Option<cue_cloud_client::CloudClient>> {
     let paths = AppPaths::discover()?;
     let base_url = env::var("BLUEY_CLOUD_API_URL")
@@ -2783,9 +2741,11 @@ mod tests {
     use super::{bluey_on_boot_lines, BlueyOnAuthState};
 
     #[test]
-    fn bluey_on_boot_lines_prompt_browser_signin_when_unlinked() {
-        let lines = bluey_on_boot_lines(&BlueyOnAuthState::SignInOpened);
-        assert!(lines.iter().any(|line| line.contains("browser")));
+    fn bluey_on_boot_lines_offer_signin_without_forcing_browser_when_unlinked() {
+        let lines = bluey_on_boot_lines(&BlueyOnAuthState::SignInAvailable {
+            url: "https://bluey.sh/link".to_string(),
+        });
+        assert!(lines.iter().any(|line| line.contains("bluey login")));
         assert!(lines.iter().any(|line| line.contains("previous sessions")));
     }
 
@@ -2799,10 +2759,9 @@ mod tests {
     }
 
     #[test]
-    fn bluey_on_boot_lines_include_url_when_browser_open_fails() {
-        let lines = bluey_on_boot_lines(&BlueyOnAuthState::SignInFailed {
+    fn bluey_on_boot_lines_include_link_url_when_unlinked() {
+        let lines = bluey_on_boot_lines(&BlueyOnAuthState::SignInAvailable {
             url: "https://bluey.sh/link".to_string(),
-            reason: "no browser".to_string(),
         });
         assert!(lines
             .iter()
