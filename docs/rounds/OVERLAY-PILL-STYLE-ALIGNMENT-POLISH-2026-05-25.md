@@ -21,6 +21,7 @@ The macOS overlay looked too uneven for product testing:
 File changed:
 
 - `native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+- `crates/cue-daemon/src/app.rs`
 
 Changes:
 
@@ -44,6 +45,12 @@ Changes:
 - Kept live transcript bounded:
   - Smoke checked that transcript updates remain inside the horizontal strip
     while simulated audio emits many chunks.
+- Fixed file-picker affordance mismatch:
+  - macOS `choose file` now uses allowed UTIs plus explicit extensions for
+    readable text/code/PDF/DOC/DOCX/RTF/Markdown so unsupported media such as
+    `.mp4` is dimmed/unselectable by Finder.
+  - Windows OpenFileDialog no longer exposes an `All files` fallback that made
+    unsupported formats appear selectable.
 
 ## Manual Smoke Notes
 
@@ -64,6 +71,7 @@ Observed:
 - KB empty appears only in the header.
 - Attach click changes header to `KB loading` and shows one loading chip.
 - Listen creates simulated transcript chunks without growing the window.
+- Attach picker now highlights only readable Bluey context file types.
 
 After testing:
 
@@ -76,6 +84,8 @@ After testing:
 ```bash
 swift build -c release --package-path native/macos/cue-overlay
 bash native/macos/cue-overlay/build.sh
+cargo fmt --all --check
+cargo check -p cue-daemon
 git diff --check
 ```
 
