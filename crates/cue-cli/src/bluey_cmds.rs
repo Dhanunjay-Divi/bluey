@@ -127,7 +127,7 @@ pub async fn logout(client: &CloudClient) -> Result<()> {
     Ok(())
 }
 
-/// Codex Stage 16: bluey portal — open Stripe Customer Portal in browser.
+/// Codex Stage 16: bluey portal — open the provider-backed billing page in browser.
 pub async fn portal(client: &CloudClient) -> Result<()> {
     #[derive(serde::Deserialize)]
     struct PortalResponse {
@@ -137,7 +137,7 @@ pub async fn portal(client: &CloudClient) -> Result<()> {
         .auth_post("/billing/portal", &serde_json::json!({}))
         .await
         .context("/billing/portal")?;
-    println!("Opening Stripe Customer Portal:");
+    println!("Opening Bluey billing page:");
     println!("  {}", resp.portal_url);
     if let Err(e) = webbrowser::open(&resp.portal_url) {
         eprintln!("(could not open browser: {e}; copy the URL above)");

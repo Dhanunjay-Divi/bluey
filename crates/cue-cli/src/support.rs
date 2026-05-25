@@ -7,14 +7,16 @@
 //!
 //! Output zip layout:
 //!
+//! ```text
 //!     Bluey-support-YYYYMMDD.zip
-//!       manifest.json           — what's in the bundle + redaction state
-//!       doctor.json             — bluey doctor --json output
-//!       system-info.txt         — uname + sw_vers (macOS only)
+//!       manifest.json           - what's in the bundle + redaction state
+//!       doctor.json             - bluey doctor --json output
+//!       system-info.txt         - uname + sw_vers (macOS only)
 //!       logs/
 //!         daemon-log.YYYY-MM-DD.log  (redacted)
 //!         dashboard-log.YYYY-MM-DD.log  (redacted)
 //!         ...
+//! ```
 //!
 //! Phase 4 follow-up: the most-requested support-tooling feature.
 
@@ -108,7 +110,7 @@ pub fn bundle(args: SupportArgs) -> Result<()> {
         "generated_at_unix_ms": current_unix_ms(),
         "redacted": args.redact,
         "redaction_policy": if args.redact {
-            "tokens, magic-link URLs, Stripe IDs, OpenAI/Anthropic/Deepgram \
+            "tokens, magic-link URLs, billing IDs, OpenAI/Anthropic/Deepgram \
              keys, JWTs, device codes, emails, IPv4 addresses (last octet → 0/24), \
              /Users/<name>/ + /home/<name>/ paths"
         } else {

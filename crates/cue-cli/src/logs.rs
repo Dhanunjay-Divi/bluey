@@ -4,7 +4,7 @@
 //!
 //! Finds daemon/dashboard log files (when log rotation lands in Phase 2),
 //! pipes them through a regex-based redactor that strips bearer tokens,
-//! magic-link URLs, Stripe IDs, provider keys, emails, and full IP
+//! magic-link URLs, billing IDs, provider keys, emails, and full IP
 //! addresses, then bundles the result into a ZIP archive that a customer
 //! can attach to a support ticket without leaking secrets.
 //!
@@ -90,7 +90,7 @@ pub fn export(args: LogsExportArgs) -> Result<()> {
     );
     if args.redact {
         println!();
-        println!("Redacted: bearer tokens, magic-link URLs, Stripe IDs,");
+        println!("Redacted: bearer tokens, magic-link URLs, billing IDs,");
         println!("OpenAI/Anthropic/Deepgram keys, email addresses, and full");
         println!("IP addresses (replaced with /24 prefix). Account IDs and");
         println!("session IDs are PRESERVED so support can correlate.");

@@ -68,7 +68,7 @@ enum Commands {
     /// Log out of Bluey: clear keyring tokens.
     #[command(hide = true)]
     Logout,
-    /// Open the Stripe Customer Portal in your browser to manage card / cancel auto top-up / view invoices.
+    /// Open the Bluey billing page in your browser to manage credits and provider-backed billing.
     #[command(hide = true)]
     Portal,
     /// Export your Bluey account data as a JSON file (GDPR).
@@ -99,7 +99,7 @@ enum Commands {
     #[command(hide = true)]
     Support {
         /// Disable redaction. By default the bundle strips bearer tokens,
-        /// magic-link URLs, Stripe IDs, provider keys, emails, IPv4
+        /// magic-link URLs, billing IDs, provider keys, emails, IPv4
         /// addresses, and /Users/<name>/ paths.
         #[arg(long = "no-redact", default_value_t = false)]
         no_redact: bool,
@@ -288,7 +288,7 @@ enum LogsCommands {
     /// Bundle local Bluey logs into a redacted zip for support.
     Export {
         /// Disable redaction. By default the export strips bearer tokens,
-        /// magic-link URLs, Stripe IDs, provider keys, emails, and IPv4
+        /// magic-link URLs, billing IDs, provider keys, emails, and IPv4
         /// addresses. Use --no-redact only when you control where the zip
         /// is going.
         #[arg(long = "no-redact", default_value_t = false)]
