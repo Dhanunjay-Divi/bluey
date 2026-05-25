@@ -1,4 +1,4 @@
-# Phase 3: bluey-server Test Deploy + Stripe/Provider-Key Staging
+# Phase 3: bluey-server Test Deploy + Square/Provider-Key Staging
 
 > **Status:** durable doc; promoted from /tmp staging when the
 > Observability Round was at 5/6 phases done. Use this as the operator
@@ -7,7 +7,7 @@
 
 **Trigger:** Phase 2 (Mac smoke) all-green.
 **Owner:** operator (kiro can guide remotely).
-**Time budget:** ~90 minutes for deploy + ~30 minutes for Stripe/provider staging smoke.
+**Time budget:** ~90 minutes for deploy + ~30 minutes for Square/provider staging smoke.
 
 This is the FIRST production-shaped deploy of `bluey-server`. The host is a
 DigitalOcean droplet. Everything below is per
@@ -120,12 +120,13 @@ BLUEY_DB_MIGRATE=true
 BLUEY_JWT_SECRET=<generate via: openssl rand -hex 64>
 BLUEY_PUBLIC_URL=https://api-test.bluey.dev
 
-# ── Stripe TEST mode (use sk_test_* and whsec_test_*) ──────────
-BLUEY_STRIPE_SECRET_KEY=sk_test_xxxxxxxxxxxxxxxxxxxxxx
-BLUEY_STRIPE_WEBHOOK_SECRET=whsec_test_xxxxxxxxxxxxxxxxxxxxxx
-BLUEY_STRIPE_PRICE_TOPUP_5=price_1xxxxxxxxxxxxxxxxxx
-BLUEY_STRIPE_PRICE_TOPUP_10=price_1xxxxxxxxxxxxxxxxxx
-BLUEY_STRIPE_PRICE_TOPUP_25=price_1xxxxxxxxxxxxxxxxxx
+# ── Square SANDBOX mode ────────────────────────────────────────
+BLUEY_BILLING_PROVIDER=square
+SQUARE_ENVIRONMENT=sandbox
+SQUARE_SANDBOX_APPLICATION_ID=sandbox-sq0idb_xxxxxxxxx
+SQUARE_SANDBOX_ACCESS_TOKEN=EAAA_sandbox_xxxxxxxxx
+SQUARE_SANDBOX_LOCATION_ID=<Square sandbox location id>
+SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY=<Square sandbox webhook signature key>
 
 # ── Upstream provider keys (TEST/STAGING ACCOUNTS) ─────────────
 BLUEY_OPENAI_API_KEY=sk-test-xxxxxxxxxxxxxx
@@ -227,23 +228,17 @@ curl -X POST https://api-test.bluey.dev/auth/register \
 
 ---
 
-## 3.9 Stripe test-mode webhook smoke
+## 3.9 Square sandbox webhook smoke
 
 ```bash
-# Install Stripe CLI on uno if not already:
-brew install stripe/stripe-cli/stripe
-stripe login
-
-# Forward Stripe events to your staging server:
-stripe listen --forward-to https://api-test.bluey.dev/billing/webhook
-# Note the whsec_... it prints — set this as BLUEY_STRIPE_WEBHOOK_SECRET on droplet
-
-# In another terminal, trigger a test event:
-stripe trigger checkout.session.completed
+# Register this endpoint in the Square sandbox app dashboard:
+# https://api-test.bluey.dev/billing/square/webhook
+# Subscribe at minimum to order.updated, then paste the signature key
+# into SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY.
 
 # On droplet, watch logs:
-sudo journalctl -u bluey-api -f | grep -i stripe
-# Should see signature verify OK + balance topup applied
+sudo journalctl -u bluey-api -f | grep -i square
+# Complete a sandbox checkout and confirm balance crediting.
 ```
 
 ---
@@ -334,7 +329,7 @@ Phase 3 is GREEN when:
 - [ ] `bluey usage` shows the trial balance
 - [ ] An LLM completion via `/router/complete/stream` succeeds with cost metadata
 - [ ] A Deepgram STT relay session via `/stt/session` + `/stt/relay` records `consumed_seconds`
-- [ ] A Stripe `checkout.session.completed` test event topup applies to balance
+- [ ] A Square sandbox `order.updated` event applies reload credit to balance
 - [ ] `/sync/batch` round-trips: upload local data, list cloud sessions, get one back
 - [ ] `/rag/query` returns chunks
 - [ ] systemd restarts the server cleanly: `sudo systemctl restart bluey-api && sudo systemctl status bluey-api`
@@ -345,7 +340,7 @@ Phase 3 is GREEN when:
 ## What stays out of Phase 3
 
 - Production DNS for `bluey.dev` (use `api-test.bluey.dev` only)
-- Stripe LIVE mode keys (test mode only)
+- Square production keys (sandbox only in preprod)
 - Production SMTP (Mailhog or test smtp is fine for staging)
 - Carnaval / monitoring dashboards
 - Postgres migration (SQLite is fine for staging)

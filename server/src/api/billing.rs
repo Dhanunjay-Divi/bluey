@@ -1,4 +1,4 @@
-//! Stripe integration: Checkout Sessions + webhook handling.
+//! Billing integration: Stripe compatibility plus Square checkout.
 //!
 //! v0.2 scope:
 //!   - POST /billing/checkout: creates a Stripe Checkout Session for
@@ -23,10 +23,12 @@
 
 use anyhow::{anyhow, Context, Result};
 use axum::{extract::State, http::StatusCode, Extension, Json};
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
 use crate::auth::AuthedAccount;
+use crate::config::BillingProvider;
 use crate::db::balance;
 
 #[derive(Deserialize)]
@@ -100,6 +102,17 @@ pub async fn checkout(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Json(req): Json<CheckoutRequest>,
+) -> Result<Json<CheckoutResponse>, (StatusCode, Json<ApiError>)> {
+    match state.config.billing_provider() {
+        BillingProvider::Square => square_checkout(state, account, req).await,
+        BillingProvider::Stripe => stripe_checkout(state, account, req).await,
+    }
+}
+
+async fn stripe_checkout(
+    state: AppState,
+    account: crate::db::accounts::Account,
+    req: CheckoutRequest,
 ) -> Result<Json<CheckoutResponse>, (StatusCode, Json<ApiError>)> {
     let stripe_key = state.config.stripe_secret_key.as_ref().ok_or_else(|| {
         (
@@ -194,8 +207,171 @@ pub async fn checkout(
     Ok(Json(CheckoutResponse { checkout_url: url }))
 }
 
+fn square_api_url(config: &crate::config::SquareConfig, path: &str) -> String {
+    let base = std::env::var("BLUEY_TEST_SQUARE_URL")
+        .unwrap_or_else(|_| config.environment.api_base_url().to_string());
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
+fn square_missing(message: &str) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ApiError {
+            error: message.to_string(),
+        }),
+    )
+}
+
+fn build_square_payment_link_body(
+    public_url: &str,
+    location_id: &str,
+    account_id: &str,
+    customer_email: &str,
+    amount_cents: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "idempotency_key": format!("bluey-reload-{account_id}-{amount_cents}-{}", uuid::Uuid::new_v4()),
+        "order": {
+            "location_id": location_id,
+            "reference_id": format!("bluey_reload:{account_id}"),
+            "metadata": {
+                "bluey_account_id": account_id,
+                "bluey_amount_cents": amount_cents.to_string()
+            },
+            "line_items": [{
+                "name": "Bluey credits",
+                "quantity": "1",
+                "base_price_money": {
+                    "amount": amount_cents,
+                    "currency": "USD"
+                }
+            }]
+        },
+        "checkout_options": {
+            "redirect_url": format!("{}/account?reload=success", public_url),
+            "ask_for_shipping_address": false
+        },
+        "pre_populated_data": {
+            "buyer_email": customer_email
+        },
+        "payment_note": "Bluey credit reload"
+    })
+}
+
+fn log_safe_square_body(body: &serde_json::Value) -> serde_json::Value {
+    let mut safe = body.clone();
+    redact_stripe_json(&mut safe);
+    safe
+}
+
+async fn square_checkout(
+    state: AppState,
+    account: crate::db::accounts::Account,
+    req: CheckoutRequest,
+) -> Result<Json<CheckoutResponse>, (StatusCode, Json<ApiError>)> {
+    if req.amount_cents < MINIMUM_RELOAD_CENTS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: format!("minimum reload is ${}", MINIMUM_RELOAD_CENTS / 100),
+            }),
+        ));
+    }
+
+    let square = state.config.square_config();
+    let access_token = square
+        .access_token
+        .as_deref()
+        .ok_or_else(|| square_missing("Square billing not configured"))?;
+    let location_id = square
+        .location_id
+        .as_deref()
+        .ok_or_else(|| square_missing("Square location not configured"))?;
+
+    let body = build_square_payment_link_body(
+        &state.config.public_url,
+        location_id,
+        &account.id,
+        &account.email,
+        req.amount_cents,
+    );
+
+    let resp = reqwest::Client::new()
+        .post(square_api_url(&square, "/v2/online-checkout/payment-links"))
+        .bearer_auth(access_token)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "square checkout http failed");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError {
+                    error: "billing provider unavailable; please retry".into(),
+                }),
+            )
+        })?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        let safe_body = log_safe_square_body(&body);
+        tracing::warn!(square_status = %status, square_body = %safe_body, "square checkout error");
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ApiError {
+                error: "billing checkout failed; please retry".into(),
+            }),
+        ));
+    }
+
+    let url = body
+        .pointer("/payment_link/url")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            body.pointer("/payment_link/long_url")
+                .and_then(|v| v.as_str())
+        })
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError {
+                    error: "Square checkout response missing url".into(),
+                }),
+            )
+        })?
+        .to_string();
+
+    Ok(Json(CheckoutResponse { checkout_url: url }))
+}
+
 pub async fn webhook(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Result<StatusCode, StatusCode> {
+    if headers.contains_key("x-square-hmacsha256-signature")
+        || matches!(state.config.billing_provider(), BillingProvider::Square)
+    {
+        return square_webhook_impl(state, headers, body).await;
+    }
+    stripe_webhook_impl(state, headers, body).await
+}
+
+pub async fn square_webhook(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Result<StatusCode, StatusCode> {
+    square_webhook_impl(state, headers, body).await
+}
+
+async fn stripe_webhook_impl(
+    state: AppState,
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, StatusCode> {
@@ -258,6 +434,85 @@ pub async fn webhook(
         "UPDATE stripe_webhook_events SET processed_at = datetime('now') WHERE event_id = ?1",
         rusqlite::params![event_id],
     );
+
+    Ok(StatusCode::OK)
+}
+
+async fn square_webhook_impl(
+    state: AppState,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> Result<StatusCode, StatusCode> {
+    let square = state.config.square_config();
+    let webhook_secret = square
+        .webhook_signature_key
+        .as_deref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let notification_url = square
+        .webhook_notification_url
+        .as_deref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+
+    let sig_header = headers
+        .get("x-square-hmacsha256-signature")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
+
+    if let Err(e) = verify_square_signature(webhook_secret, notification_url, &body, sig_header) {
+        tracing::warn!(error = %e, "square webhook signature rejected");
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let event: serde_json::Value =
+        serde_json::from_str(&body).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let event_id = event
+        .get("event_id")
+        .or_else(|| event.get("id"))
+        .and_then(|v| v.as_str())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let event_type = event
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let stored_event_id = format!("square:{event_id}");
+
+    let conn = state
+        .pool
+        .get()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let already: Option<String> = conn
+        .query_row(
+            "SELECT processed_at FROM stripe_webhook_events WHERE event_id = ?1",
+            rusqlite::params![&stored_event_id],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .ok()
+        .flatten();
+    if already.is_some() {
+        return Ok(StatusCode::OK);
+    }
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO stripe_webhook_events (event_id, type, body) VALUES (?1, ?2, ?3)",
+        rusqlite::params![&stored_event_id, event_type, &body],
+    );
+    drop(conn);
+
+    if matches!(
+        event_type,
+        "order.updated" | "payment.updated" | "payment.created"
+    ) {
+        if let Err(e) = handle_square_payment_event(&state, &event).await {
+            tracing::error!(error = %e, event_id = %stored_event_id, "square webhook handler failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    if let Ok(conn) = state.pool.get() {
+        let _ = conn.execute(
+            "UPDATE stripe_webhook_events SET processed_at = datetime('now') WHERE event_id = ?1",
+            rusqlite::params![&stored_event_id],
+        );
+    }
 
     Ok(StatusCode::OK)
 }
@@ -418,6 +673,94 @@ async fn handle_checkout_completed(state: &AppState, event: &serde_json::Value) 
     Ok(())
 }
 
+async fn handle_square_payment_event(state: &AppState, event: &serde_json::Value) -> Result<()> {
+    let Some((account_id, amount_cents, payment_id)) = extract_square_credit(event)? else {
+        tracing::debug!("square webhook did not contain a completed Bluey reload");
+        return Ok(());
+    };
+
+    let charge_id = format!("square:{payment_id}");
+    let credited = balance::credit(&state.pool, &account_id, amount_cents, Some(&charge_id))
+        .context("credit account from Square")?;
+    if !credited {
+        tracing::info!(
+            account_id,
+            square_payment_id = %payment_id,
+            "Square payment already credited, no-op"
+        );
+    }
+    tracing::info!(
+        account_id,
+        amount_cents,
+        square_payment_id = %payment_id,
+        "credited from Square webhook"
+    );
+    Ok(())
+}
+
+fn extract_square_credit(event: &serde_json::Value) -> Result<Option<(String, i64, String)>> {
+    if let Some(order) = event.pointer("/data/object/order") {
+        let state = order.get("state").and_then(|v| v.as_str()).unwrap_or("");
+        if state != "COMPLETED" {
+            return Ok(None);
+        }
+        let account_id = order
+            .pointer("/metadata/bluey_account_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                order
+                    .get("reference_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.strip_prefix("bluey_reload:"))
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| anyhow!("Square order missing bluey account metadata"))?;
+        let amount_cents = order
+            .pointer("/metadata/bluey_amount_cents")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<i64>().ok())
+            .or_else(|| {
+                order
+                    .pointer("/total_money/amount")
+                    .and_then(|v| v.as_i64())
+            })
+            .ok_or_else(|| anyhow!("Square order missing amount"))?;
+        let payment_id = order
+            .pointer("/tenders/0/payment_id")
+            .and_then(|v| v.as_str())
+            .or_else(|| order.get("id").and_then(|v| v.as_str()))
+            .ok_or_else(|| anyhow!("Square order missing id/payment_id"))?
+            .to_string();
+        return Ok(Some((account_id, amount_cents, payment_id)));
+    }
+
+    if let Some(payment) = event.pointer("/data/object/payment") {
+        let status = payment.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if status != "COMPLETED" {
+            return Ok(None);
+        }
+        let account_id = payment
+            .get("reference_id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.strip_prefix("bluey_reload:"))
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("Square payment missing bluey reference_id"))?;
+        let amount_cents = payment
+            .pointer("/amount_money/amount")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| anyhow!("Square payment missing amount"))?;
+        let payment_id = payment
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("Square payment missing id"))?
+            .to_string();
+        return Ok(Some((account_id, amount_cents, payment_id)));
+    }
+
+    Ok(None)
+}
+
 /// Verify Stripe `t=...,v1=...` signature header against the body.
 /// Implements the standard scheme: signed_payload = "t.body",
 /// HMAC-SHA256 with the webhook secret, constant-time compared to v1.
@@ -483,6 +826,31 @@ fn verify_stripe_signature(secret: &str, sig_header: &str, body: &str) -> Result
     Ok(())
 }
 
+fn verify_square_signature(
+    signature_key: &str,
+    notification_url: &str,
+    body: &str,
+    signature_header: &str,
+) -> Result<()> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    use subtle::ConstantTimeEq;
+
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(signature_key.as_bytes())
+        .map_err(|e| anyhow!("hmac key: {e}"))?;
+    mac.update(notification_url.as_bytes());
+    mac.update(body.as_bytes());
+    let computed = mac.finalize().into_bytes();
+    let computed_b64 = base64::engine::general_purpose::STANDARD.encode(computed);
+
+    let expected = computed_b64.as_bytes();
+    let actual = signature_header.trim().as_bytes();
+    if actual.len() != expected.len() || !bool::from(actual.ct_eq(expected)) {
+        return Err(anyhow!("signature mismatch"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,6 +904,100 @@ mod tests {
     }
 
     #[test]
+    fn square_payment_link_body_carries_bluey_metadata() {
+        let body = build_square_payment_link_body(
+            "https://bluey.sh",
+            "LOC_TEST",
+            "acct-123",
+            "user@example.com",
+            3000,
+        );
+        assert_eq!(body.pointer("/order/location_id").unwrap(), "LOC_TEST");
+        assert_eq!(
+            body.pointer("/order/reference_id").unwrap(),
+            "bluey_reload:acct-123"
+        );
+        assert_eq!(
+            body.pointer("/order/metadata/bluey_account_id").unwrap(),
+            "acct-123"
+        );
+        assert_eq!(
+            body.pointer("/order/line_items/0/base_price_money/amount")
+                .unwrap(),
+            3000
+        );
+        assert_eq!(
+            body.pointer("/checkout_options/redirect_url").unwrap(),
+            "https://bluey.sh/account?reload=success"
+        );
+    }
+
+    #[test]
+    fn square_signature_verifies_with_correct_secret() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let secret = "sq-webhook-secret";
+        let url = "https://bluey.sh/billing/square/webhook";
+        let body = r#"{"event_id":"evt_square","type":"order.updated"}"#;
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(url.as_bytes());
+        mac.update(body.as_bytes());
+        let sig = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+
+        assert!(verify_square_signature(secret, url, body, &sig).is_ok());
+        assert!(verify_square_signature("wrong", url, body, &sig).is_err());
+    }
+
+    #[test]
+    fn square_order_extracts_credit_from_completed_order() {
+        let event = serde_json::json!({
+            "event_id": "evt1",
+            "type": "order.updated",
+            "data": {
+                "object": {
+                    "order": {
+                        "id": "order_1",
+                        "state": "COMPLETED",
+                        "reference_id": "bluey_reload:acct-123",
+                        "metadata": {
+                            "bluey_account_id": "acct-123",
+                            "bluey_amount_cents": "3000"
+                        },
+                        "total_money": {"amount": 3000, "currency": "USD"},
+                        "tenders": [{"payment_id": "payment_1"}]
+                    }
+                }
+            }
+        });
+
+        let extracted = extract_square_credit(&event).unwrap().unwrap();
+        assert_eq!(extracted.0, "acct-123");
+        assert_eq!(extracted.1, 3000);
+        assert_eq!(extracted.2, "payment_1");
+    }
+
+    #[test]
+    fn square_order_ignores_non_completed_order() {
+        let event = serde_json::json!({
+            "event_id": "evt1",
+            "type": "order.updated",
+            "data": {
+                "object": {
+                    "order": {
+                        "id": "order_1",
+                        "state": "OPEN",
+                        "reference_id": "bluey_reload:acct-123",
+                        "total_money": {"amount": 3000, "currency": "USD"}
+                    }
+                }
+            }
+        });
+
+        assert!(extract_square_credit(&event).unwrap().is_none());
+    }
+
+    #[test]
     fn signature_rejects_wrong_secret() {
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
@@ -584,6 +1046,21 @@ pub struct PortalResponse {
 pub async fn portal(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+) -> Result<Json<PortalResponse>, (StatusCode, Json<ApiError>)> {
+    if matches!(state.config.billing_provider(), BillingProvider::Square) {
+        // Square does not provide a Stripe-style hosted customer portal.
+        // Send customers to Bluey's account page where we can show
+        // reloads, receipts, and future card-management UX.
+        return Ok(Json(PortalResponse {
+            portal_url: format!("{}/account?billing=square", state.config.public_url),
+        }));
+    }
+    stripe_portal(state, account).await
+}
+
+async fn stripe_portal(
+    state: AppState,
+    account: crate::db::accounts::Account,
 ) -> Result<Json<PortalResponse>, (StatusCode, Json<ApiError>)> {
     let stripe_key = state.config.stripe_secret_key.as_ref().ok_or_else(|| {
         (

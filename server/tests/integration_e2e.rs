@@ -26,6 +26,7 @@ struct Harness {
     pub openai: MockServer,
     pub anthropic: MockServer,
     pub stripe: MockServer,
+    pub square: MockServer,
     pub deepgram: MockServer,
 }
 
@@ -33,6 +34,7 @@ async fn boot_harness() -> Harness {
     let openai = MockServer::start().await;
     let anthropic = MockServer::start().await;
     let stripe = MockServer::start().await;
+    let square = MockServer::start().await;
     let deepgram = MockServer::start().await;
 
     let path = std::env::temp_dir().join(format!("bluey-e2e-{}.db", uuid::Uuid::new_v4()));
@@ -63,6 +65,7 @@ async fn boot_harness() -> Harness {
     std::env::set_var("BLUEY_TEST_OPENAI_URL", openai.uri());
     std::env::set_var("BLUEY_TEST_ANTHROPIC_URL", anthropic.uri());
     std::env::set_var("BLUEY_TEST_STRIPE_URL", stripe.uri());
+    std::env::set_var("BLUEY_TEST_SQUARE_URL", square.uri());
     std::env::set_var("BLUEY_TEST_DEEPGRAM_URL", deepgram.uri());
 
     let router = bluey_server::api::build_router(pool.clone(), config);
@@ -73,6 +76,7 @@ async fn boot_harness() -> Harness {
         openai,
         anthropic,
         stripe,
+        square,
         deepgram,
     }
 }
@@ -615,6 +619,133 @@ async fn billing_portal_creates_session_via_mocked_stripe() {
         .as_str()
         .unwrap()
         .starts_with("https://billing.stripe.com/"));
+}
+
+#[tokio::test]
+#[serial]
+async fn billing_checkout_creates_square_payment_link_when_square_enabled() {
+    std::env::set_var("BLUEY_BILLING_PROVIDER", "square");
+    std::env::set_var("SQUARE_ENVIRONMENT", "sandbox");
+    std::env::set_var("SQUARE_SANDBOX_ACCESS_TOKEN", "sandbox-token");
+    std::env::set_var("SQUARE_SANDBOX_LOCATION_ID", "sandbox-location");
+
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "square-checkout@example.com", "longenoughpw").await;
+
+    Mock::given(method("POST"))
+        .and(path("/v2/online-checkout/payment-links"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "payment_link": {
+                "id": "LNK_TEST",
+                "url": "https://square.link/u/bluey-test"
+            }
+        })))
+        .expect(1)
+        .mount(&h.square)
+        .await;
+
+    let req = Request::post("/billing/checkout")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "amount_cents": 3000
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["checkout_url"], "https://square.link/u/bluey-test");
+
+    std::env::remove_var("BLUEY_BILLING_PROVIDER");
+    std::env::remove_var("SQUARE_ENVIRONMENT");
+    std::env::remove_var("SQUARE_SANDBOX_ACCESS_TOKEN");
+    std::env::remove_var("SQUARE_SANDBOX_LOCATION_ID");
+}
+
+#[tokio::test]
+#[serial]
+async fn billing_square_webhook_credits_completed_order() {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    std::env::set_var("BLUEY_BILLING_PROVIDER", "square");
+    std::env::set_var("SQUARE_ENVIRONMENT", "sandbox");
+    std::env::set_var("SQUARE_SANDBOX_ACCESS_TOKEN", "sandbox-token");
+    std::env::set_var("SQUARE_SANDBOX_LOCATION_ID", "sandbox-location");
+    std::env::set_var("SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY", "square-whsec");
+
+    let h = boot_harness().await;
+    let _access = signup_and_login(&h, "square-webhook@example.com", "longenoughpw").await;
+    let account_id: String = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT id FROM accounts WHERE email = ?1",
+            rusqlite::params!["square-webhook@example.com"],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    let body = serde_json::to_string(&json!({
+        "event_id": "evt_square_credit_1",
+        "type": "order.updated",
+        "data": {
+            "object": {
+                "order": {
+                    "id": "order_1",
+                    "state": "COMPLETED",
+                    "reference_id": format!("bluey_reload:{account_id}"),
+                    "metadata": {
+                        "bluey_account_id": account_id,
+                        "bluey_amount_cents": "3000"
+                    },
+                    "total_money": {"amount": 3000, "currency": "USD"},
+                    "tenders": [{"payment_id": "payment_square_1"}]
+                }
+            }
+        }
+    }))
+    .unwrap();
+
+    let url = "http://localhost:8080/billing/square/webhook";
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(b"square-whsec").unwrap();
+    mac.update(url.as_bytes());
+    mac.update(body.as_bytes());
+    let signature = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+
+    let req = Request::post("/billing/square/webhook")
+        .header("x-square-hmacsha256-signature", signature)
+        .header("content-type", "application/json")
+        .body(Body::from(body.clone()))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let balance: i64 = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT balance_cents FROM accounts WHERE email = ?1",
+            rusqlite::params!["square-webhook@example.com"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(balance, 3000);
+
+    std::env::remove_var("BLUEY_BILLING_PROVIDER");
+    std::env::remove_var("SQUARE_ENVIRONMENT");
+    std::env::remove_var("SQUARE_SANDBOX_ACCESS_TOKEN");
+    std::env::remove_var("SQUARE_SANDBOX_LOCATION_ID");
+    std::env::remove_var("SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY");
 }
 
 #[tokio::test]

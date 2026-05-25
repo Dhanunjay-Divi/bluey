@@ -24,6 +24,65 @@ pub struct Config {
     pub smtp: Option<SmtpConfig>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BillingProvider {
+    Stripe,
+    Square,
+}
+
+impl BillingProvider {
+    fn from_env_value(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "stripe" => Some(Self::Stripe),
+            "square" => Some(Self::Square),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SquareEnvironment {
+    #[default]
+    Sandbox,
+    Production,
+}
+
+impl SquareEnvironment {
+    pub fn api_base_url(self) -> &'static str {
+        match self {
+            Self::Sandbox => "https://connect.squareupsandbox.com",
+            Self::Production => "https://connect.squareup.com",
+        }
+    }
+
+    fn env_prefix(self) -> &'static str {
+        match self {
+            Self::Sandbox => "SQUARE_SANDBOX",
+            Self::Production => "SQUARE_PRODUCTION",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SquareConfig {
+    pub environment: SquareEnvironment,
+    pub application_id: Option<String>,
+    pub access_token: Option<String>,
+    pub location_id: Option<String>,
+    pub webhook_signature_key: Option<String>,
+    pub webhook_notification_url: Option<String>,
+}
+
+impl SquareConfig {
+    pub fn is_checkout_ready(&self) -> bool {
+        self.access_token.is_some() && self.location_id.is_some()
+    }
+
+    pub fn is_webhook_ready(&self) -> bool {
+        self.webhook_signature_key.is_some()
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct UpstreamKeys {
     /// Single key or comma-separated, provider-approved key pool.
@@ -126,6 +185,45 @@ impl Config {
             smtp,
         })
     }
+
+    pub fn billing_provider(&self) -> BillingProvider {
+        if let Some(provider) = std::env::var("BLUEY_BILLING_PROVIDER")
+            .ok()
+            .and_then(|v| BillingProvider::from_env_value(&v))
+        {
+            return provider;
+        }
+
+        let square = self.square_config();
+        if square.is_checkout_ready() {
+            return BillingProvider::Square;
+        }
+
+        BillingProvider::Stripe
+    }
+
+    pub fn square_config(&self) -> SquareConfig {
+        let environment = square_environment_from_env();
+        let prefix = environment.env_prefix();
+
+        SquareConfig {
+            environment,
+            application_id: env_any(&[
+                "SQUARE_APPLICATION_ID",
+                &format!("{prefix}_APPLICATION_ID"),
+            ]),
+            access_token: env_any(&["SQUARE_ACCESS_TOKEN", &format!("{prefix}_ACCESS_TOKEN")]),
+            location_id: env_any(&["SQUARE_LOCATION_ID", &format!("{prefix}_LOCATION_ID")]),
+            webhook_signature_key: env_any(&[
+                "SQUARE_WEBHOOK_SIGNATURE_KEY",
+                &format!("{prefix}_WEBHOOK_SIGNATURE_KEY"),
+            ]),
+            webhook_notification_url: std::env::var("SQUARE_WEBHOOK_NOTIFICATION_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| Some(format!("{}/billing/square/webhook", self.public_url))),
+        }
+    }
 }
 
 fn env_any(names: &[&str]) -> Option<String> {
@@ -141,6 +239,16 @@ fn env_bool(name: &str) -> Option<bool> {
             "0" | "false" | "off" | "no"
         )
     })
+}
+
+fn square_environment_from_env() -> SquareEnvironment {
+    let value = std::env::var("SQUARE_ENVIRONMENT")
+        .or_else(|_| std::env::var("BLUEY_ENVIRONMENT"))
+        .unwrap_or_else(|_| "sandbox".to_string());
+    match value.trim().to_ascii_lowercase().as_str() {
+        "prod" | "production" | "live" => SquareEnvironment::Production,
+        _ => SquareEnvironment::Sandbox,
+    }
 }
 
 fn select_key_from_pool<'a>(raw: Option<&'a str>, shard_key: &str) -> Option<&'a str> {
@@ -200,5 +308,43 @@ mod tests {
             seen.insert(keys.deepgram_key(&format!("request-{idx}")).unwrap());
         }
         assert!(seen.len() >= 2, "expected pool to use more than one key");
+    }
+
+    #[test]
+    fn square_config_uses_environment_specific_keys() {
+        std::env::set_var("SQUARE_ENVIRONMENT", "sandbox");
+        std::env::set_var("SQUARE_SANDBOX_ACCESS_TOKEN", "sandbox-token");
+        std::env::set_var("SQUARE_SANDBOX_LOCATION_ID", "sandbox-location");
+        std::env::set_var("SQUARE_PRODUCTION_ACCESS_TOKEN", "prod-token");
+        std::env::set_var("SQUARE_PRODUCTION_LOCATION_ID", "prod-location");
+
+        let cfg = Config {
+            port: 0,
+            db_path: PathBuf::from(":memory:"),
+            jwt_secret: "test_secret_at_least_32_chars_long_xx".to_string(),
+            public_url: "https://bluey.sh".to_string(),
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            upstream: UpstreamKeys::default(),
+            smtp: None,
+        };
+
+        let square = cfg.square_config();
+        assert_eq!(square.environment, SquareEnvironment::Sandbox);
+        assert_eq!(square.access_token.as_deref(), Some("sandbox-token"));
+        assert_eq!(square.location_id.as_deref(), Some("sandbox-location"));
+        assert_eq!(cfg.billing_provider(), BillingProvider::Square);
+
+        std::env::set_var("SQUARE_ENVIRONMENT", "production");
+        let square = cfg.square_config();
+        assert_eq!(square.environment, SquareEnvironment::Production);
+        assert_eq!(square.access_token.as_deref(), Some("prod-token"));
+        assert_eq!(square.location_id.as_deref(), Some("prod-location"));
+
+        std::env::remove_var("SQUARE_ENVIRONMENT");
+        std::env::remove_var("SQUARE_SANDBOX_ACCESS_TOKEN");
+        std::env::remove_var("SQUARE_SANDBOX_LOCATION_ID");
+        std::env::remove_var("SQUARE_PRODUCTION_ACCESS_TOKEN");
+        std::env::remove_var("SQUARE_PRODUCTION_LOCATION_ID");
     }
 }

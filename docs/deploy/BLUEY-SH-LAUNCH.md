@@ -34,12 +34,23 @@ Caddy routes the API paths to `bluey-server` and serves everything else from
 
 3. Secrets
    - `BLUEY_JWT_SECRET`: `openssl rand -hex 32`
-   - `STRIPE_SECRET_KEY`
-   - `STRIPE_WEBHOOK_SECRET`
+   - `BLUEY_BILLING_PROVIDER=square`
+   - `SQUARE_ENVIRONMENT=sandbox` for preprod, `production` for prod
+   - `SQUARE_SANDBOX_APPLICATION_ID`
+   - `SQUARE_SANDBOX_ACCESS_TOKEN`
+   - `SQUARE_SANDBOX_LOCATION_ID`
+   - `SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY`
+   - `SQUARE_PRODUCTION_APPLICATION_ID`
+   - `SQUARE_PRODUCTION_ACCESS_TOKEN`
+   - `SQUARE_PRODUCTION_LOCATION_ID`
+   - `SQUARE_PRODUCTION_WEBHOOK_SIGNATURE_KEY`
    - `OPENAI_API_KEY`
    - `ANTHROPIC_API_KEY`
    - `DEEPGRAM_API_KEY`
    - SMTP credentials for `noreply@bluey.sh`
+
+   See `docs/deploy/SQUARE-BILLING.md` for the exact Square sandbox/production
+   switching contract.
 
 4. Release artifacts
    - `/var/www/bluey/install.sh`
@@ -72,8 +83,8 @@ Use logged-in Chrome only for actions that require account dashboards:
 
 - Namecheap DNS
 - DigitalOcean droplet/networking
-- Stripe webhook/live-mode setup
+- Square webhook setup for `/billing/square/webhook`
 - SMTP provider domain verification
 
-Stop before paid creation, DNS publish, Stripe live changes, or API-key
+Stop before paid creation, DNS publish, Square production changes, or API-key
 creation unless the operator explicitly confirms that action.

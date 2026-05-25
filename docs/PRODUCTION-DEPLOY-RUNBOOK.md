@@ -10,7 +10,7 @@ Before starting, you must already have:
 
 - [ ] The **`bluey.sh` domain** with DNS A/AAAA records pointed at the droplet's public IPv4/IPv6.
 - [ ] A **DigitalOcean droplet** (or equivalent) running Ubuntu 24.04 with at least 2 GB RAM, 2 vCPU, 25 GB SSD. SSH key set up.
-- [ ] **Stripe live secret key** (`sk_live_...`) and **webhook signing secret** (`whsec_...`) from the Stripe dashboard. Keep these in a password manager — never commit.
+- [ ] **Square production + sandbox application credentials**, location IDs, and webhook signature keys from the Square dashboard. Keep these in a password manager — never commit.
 - [ ] **Upstream provider keys** (OpenAI, Anthropic, Deepgram) for the managed lanes.
 - [ ] **SMTP credentials** for transactional email (Postmark / SendGrid / SES).
 - [ ] A **64-character JWT secret** generated via `openssl rand -hex 32`.
@@ -81,9 +81,20 @@ BLUEY_DB_PATH=/opt/bluey-api/bluey.db
 BLUEY_JWT_SECRET=<openssl rand -hex 32 output>
 BLUEY_PUBLIC_URL=https://bluey.sh
 
-# Stripe LIVE mode
-STRIPE_SECRET_KEY=sk_live_xxxxxxxx
-STRIPE_WEBHOOK_SECRET=whsec_xxxxxxxx
+# Square billing. Preprod uses SQUARE_ENVIRONMENT=sandbox; prod uses production.
+BLUEY_BILLING_PROVIDER=square
+SQUARE_ENVIRONMENT=production
+SQUARE_PRODUCTION_APPLICATION_ID=sq0idp_xxxxxxxx
+SQUARE_PRODUCTION_ACCESS_TOKEN=EAAA_xxxxxxxx
+SQUARE_PRODUCTION_LOCATION_ID=<Square production location id>
+SQUARE_PRODUCTION_WEBHOOK_SIGNATURE_KEY=<Square production webhook signature key>
+
+# Optional: keep sandbox values on the host so a preprod env file can switch
+# by changing only SQUARE_ENVIRONMENT=sandbox.
+SQUARE_SANDBOX_APPLICATION_ID=sandbox-sq0idb_xxxxxxxx
+SQUARE_SANDBOX_ACCESS_TOKEN=EAAA_sandbox_xxxxxxxx
+SQUARE_SANDBOX_LOCATION_ID=<Square sandbox location id>
+SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY=<Square sandbox webhook signature key>
 
 # Upstream providers (Bluey owns these; customers pay Bluey)
 OPENAI_API_KEY=sk-xxxxxxxx
@@ -129,15 +140,15 @@ curl -fsS https://bluey.sh/pricing/tiers | jq .
 
 If both succeed, the server is reachable, TLS is live, and the public router responds.
 
-## 8. Configure Stripe webhook
+## 8. Configure Square webhook
 
-In the Stripe dashboard → Developers → Webhooks → Add endpoint:
+In the Square dashboard → Developer → Webhooks → Add subscription:
 
-- **URL:** `https://bluey.sh/billing/webhook`
-- **Events:** at minimum `checkout.session.completed` and `payment_intent.succeeded`.
-- After saving, copy the **Signing secret** and update `STRIPE_WEBHOOK_SECRET` in `/etc/bluey-api/bluey-api.env`. `systemctl restart bluey-api.service`.
+- **URL:** `https://bluey.sh/billing/square/webhook`
+- **Events:** at minimum `order.updated`.
+- After saving, copy the **Signature key** and update `SQUARE_PRODUCTION_WEBHOOK_SIGNATURE_KEY` in `/etc/bluey-api/bluey-api.env`. `systemctl restart bluey-api.service`.
 
-Run a Stripe test webhook from the dashboard; verify `journalctl -u bluey-api.service` shows it processed.
+Run a Square sandbox checkout and verify `journalctl -u bluey-api.service` shows the `order.updated` event processed and the account balance credited.
 
 ## 9. Backups
 
@@ -206,12 +217,12 @@ The rollout command copies the old binary to `/var/backups/bluey-api/bin/bluey-s
 Before flipping DNS or announcing the product:
 
 - [ ] `/admin/health` returns 200 over HTTPS with a valid TLS cert.
-- [ ] Stripe webhook fires successfully on a real test purchase (use Stripe test mode first; switch to live mode keys after verification).
+- [ ] Square webhook fires successfully on a sandbox purchase first, then on a real production purchase.
 - [ ] SMTP emails arrive in <30 seconds for both `/auth/verify-email/start` and `/auth/password-reset/start`.
 - [ ] `/admin/metrics` is reachable with a bearer + the metrics look sane (accounts >= 1, no in_progress > 0).
 - [ ] Backup script runs successfully via `sudo -u root /usr/local/sbin/backup-bluey-db.sh` and produces a file in `/var/backups/bluey-api/`.
 - [ ] Off-host backup destination receives the snapshot.
-- [ ] At least one full money-path smoke: signup → trial → reload via Stripe → cue dispatch → balance debited → cue response.
+- [ ] At least one full money-path smoke: signup → trial → reload via Square → cue dispatch → balance debited → cue response.
 - [ ] First `bluey on` from a clean Mac opens browser sign-in and successfully completes the deep-link flow against the production server.
 - [ ] systemd unit restarts cleanly on `systemctl restart bluey-api.service` (no orphan PIDs).
 - [ ] Caddy auto-TLS renewal log entries visible (`journalctl -u caddy --since "1 hour ago" | grep -i renew`).

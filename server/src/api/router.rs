@@ -1433,10 +1433,7 @@ mod tests {
             .collect();
         assert_eq!(
             names,
-            vec![
-                ("deepgram", "nova-3"),
-                ("openai", "gpt-4o-mini-transcribe")
-            ]
+            vec![("deepgram", "nova-3"), ("openai", "gpt-4o-mini-transcribe")]
         );
         assert!(routes.iter().all(|route| route.estimated_cost_cents > 0));
     }

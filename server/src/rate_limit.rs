@@ -450,14 +450,15 @@ impl RateLimiters {
                     retry_after_secs: retry,
                     reason: "provider_deepgram_stt_busy",
                 }),
-            "openai" => self
-                .provider_openai_stt
-                .check(&key)
-                .await
-                .map_err(|retry| CapacityDenied {
-                    retry_after_secs: retry,
-                    reason: "provider_openai_stt_busy",
-                }),
+            "openai" => {
+                self.provider_openai_stt
+                    .check(&key)
+                    .await
+                    .map_err(|retry| CapacityDenied {
+                        retry_after_secs: retry,
+                        reason: "provider_openai_stt_busy",
+                    })
+            }
             _ => Ok(()),
         }
     }

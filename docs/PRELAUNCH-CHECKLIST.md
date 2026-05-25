@@ -13,7 +13,7 @@ This is the master gate before public alpha. Every item must be ticked or explic
 - [x] Auth: signup / login / refresh / device flow / deep-link flow
 - [x] Auth: email-verify start+confirm with SMTP
 - [x] Auth: password-reset start+confirm with SMTP
-- [x] Billing: Stripe Checkout + webhook + Customer Portal + auto-topup
+- [x] Billing: Square Checkout + webhook crediting (Stripe compatibility path retained)
 - [x] GDPR: `/account/delete` (cascade + webhook scrub) + `/account/export`
 - [x] Admin: `/admin/customers`, `/admin/metrics`, `/admin/health`
 - [x] Per-IP rate limiting on auth + `/router/complete` w/ XFF behind trusted proxy
@@ -41,11 +41,11 @@ This is the master gate before public alpha. Every item must be ticked or explic
 - [x] Local file/directory permissions: 0700 dirs, 0600 files (best-effort on system-owned parents per B-1 fix)
 - [x] Release profile: `strip = "symbols"`, `lto = "thin"`, `codegen-units = 1`
 - [x] Overlay helper SHA-256 sidecar verification
-- [x] Stripe webhook multi-`v1` signature regression test + constant-time match
+- [x] Billing webhook signature regression tests + constant-time match
 - [x] Cloud-client log redaction: JSON-aware recursive redactor on tokens, secrets, codes, urls
 - [x] Auth verification/reset URLs gated behind `BLUEY_DEV_LOG_AUTH_LINKS=1`
 - [x] Deep-link parse failure suppresses raw `bluey://` URL
-- [x] Stripe upstream error redaction (url/client_secret/payment_method)
+- [x] Billing upstream error redaction (url/client_secret/payment_method/token)
 - [x] `docs/SECURITY-HARDENING.md` reflects managed-cloud auth model + honest "what we cannot make impossible" section
 - [x] No "unbacktraceable" / "undetectable" wording in customer-facing copy
 
@@ -93,16 +93,19 @@ This is the master gate before public alpha. Every item must be ticked or explic
 - [ ] **At least one** off-host backup destination configured (S3 or rsync target)
 - [ ] First backup completed successfully + checksum verified
 
-### Stripe
+### Square Billing
 
-- [ ] Stripe account in live mode
-- [ ] `STRIPE_SECRET_KEY` (sk_live_...) on the server matches the live account
-- [ ] Webhook endpoint registered: `https://bluey.sh/billing/webhook`
-- [ ] Webhook events subscribed: `checkout.session.completed` + `payment_intent.succeeded`
-- [ ] `STRIPE_WEBHOOK_SECRET` (whsec_...) on the server matches the registered webhook
-- [ ] Stripe live test: real $30 reload from a test card → balance credited within 30s
-- [ ] Stripe live test: auto-topup fires when balance drops below threshold + saved PaymentMethod
-- [ ] Stripe Customer Portal session URL works end-to-end (`POST /billing/portal` → portal opens → cancel auto-topup → confirmed disabled)
+- [ ] Square production application created and active
+- [ ] Square sandbox application created and active
+- [ ] `BLUEY_BILLING_PROVIDER=square` on the server
+- [ ] Preprod uses `SQUARE_ENVIRONMENT=sandbox`; production uses `SQUARE_ENVIRONMENT=production`
+- [ ] Matching `SQUARE_*_APPLICATION_ID`, `SQUARE_*_ACCESS_TOKEN`, and `SQUARE_*_LOCATION_ID` values set in `/etc/bluey-api/bluey-api.env`
+- [ ] Webhook endpoint registered: `https://bluey.sh/billing/square/webhook`
+- [ ] Webhook event subscribed: `order.updated`
+- [ ] Matching `SQUARE_*_WEBHOOK_SIGNATURE_KEY` set in `/etc/bluey-api/bluey-api.env`
+- [ ] Sandbox test: $30 reload through Square hosted checkout → balance credited within 30s
+- [ ] Production test: real $30 reload through Square hosted checkout → balance credited within 30s
+- [ ] Auto-topup/card-on-file is explicitly deferred until Square saved-card flow is wired; manual reload must be clear in `/account`
 
 ### SMTP
 
@@ -121,7 +124,7 @@ routes must exist before public alpha:
 
 - [ ] `/` — landing page with download button
 - [ ] `/link` — OAuth-style landing for the `bluey://` deep-link flow (signup/signin form, calls `/auth/link/mint` after auth, redirects browser to `bluey://link?code=...`)
-- [ ] `/reload` — Stripe Checkout redirect target (after pay → returns to `/account?reload=success`)
+- [ ] `/reload` — Square Checkout redirect target (after pay → returns to `/account?reload=success`)
 - [ ] `/account` — user-facing balance + usage + sign-out (calls `/account/me`, `/account/usage`, `/billing/portal`)
 - [ ] `/docs/disguise` — explainer page that the dashboard "Why?" link points at
 - [ ] `/docs/privacy` — privacy policy
@@ -202,7 +205,7 @@ curl -fsS https://bluey.sh/account/me -H "Authorization: Bearer $TOKEN" | jq '.t
 CHECKOUT_URL=$(curl -fsS -X POST https://bluey.sh/billing/checkout \
   -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
   -d '{"amount_cents":3000}' | jq -r .checkout_url)
-echo "Open $CHECKOUT_URL in browser, complete with Stripe test card 4242..."
+echo "Open $CHECKOUT_URL in browser, complete with Square sandbox card details..."
 read -p "Once paid, press Enter."
 
 # 4. Verify balance.
@@ -247,7 +250,7 @@ phrase "production-ready," which has burned us before.
   end-to-end trace_id, doctor probes, redactor zero-leak)
 - Real-Mac smoke (deploy track Phase 2) green on at least 2 macOS
   versions
-- Server staging deploy (deploy track Phase 3) green: Stripe test mode,
+- Server staging deploy (deploy track Phase 3) green: Square sandbox mode,
   test SMTP, test provider keys
 - All operator-side items below ticked OR explicitly deferred with
   rationale
@@ -256,7 +259,7 @@ phrase "production-ready," which has burned us before.
 
 ### C. Paying-customer shape
 
-- Stripe LIVE mode keys
+- Square production keys
 - Production SMTP
 - `bluey.sh` DNS + production droplet
 - Marketing/legal/privacy pages

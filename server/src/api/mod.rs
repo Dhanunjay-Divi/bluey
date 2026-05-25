@@ -81,6 +81,10 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
             ),
         )
         .route("/billing/webhook", axum::routing::post(billing::webhook))
+        .route(
+            "/billing/square/webhook",
+            axum::routing::post(billing::square_webhook),
+        )
         .route("/pricing/tiers", get(pricing::get_tiers))
         .route(
             "/auth/verify-email/confirm",
