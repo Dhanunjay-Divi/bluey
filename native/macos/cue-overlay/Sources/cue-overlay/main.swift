@@ -93,7 +93,7 @@ private enum ExpandedPanelMetrics {
 }
 
 private enum PillMetrics {
-    static let size = NSSize(width: 118, height: 34)
+    static let size = NSSize(width: 128, height: 38)
 
     static func centeredFrame(in visibleFrame: NSRect) -> NSRect {
         NSRect(
@@ -664,29 +664,29 @@ private final class PillView: NSView {
         layer?.shadowOffset = .zero
 
         logoTile.wantsLayer = true
-        logoTile.layer?.backgroundColor = NSColor(red: 0.020, green: 0.120, blue: 0.160, alpha: 1.0).cgColor
-        logoTile.layer?.cornerRadius = 7
+        logoTile.layer?.backgroundColor = NSColor(red: 0.014, green: 0.104, blue: 0.136, alpha: 1.0).cgColor
+        logoTile.layer?.cornerRadius = 9
         logoTile.layer?.borderWidth = 1
-        logoTile.layer?.borderColor = NSColor(red: 0.42, green: 0.92, blue: 1.0, alpha: 0.66).cgColor
+        logoTile.layer?.borderColor = NSColor(red: 0.38, green: 0.88, blue: 1.0, alpha: 0.70).cgColor
         logoTile.layer?.shadowColor = NSColor(red: 0.15, green: 0.66, blue: 1.0, alpha: 1.0).cgColor
-        logoTile.layer?.shadowOpacity = 0.24
-        logoTile.layer?.shadowRadius = 7
+        logoTile.layer?.shadowOpacity = 0.20
+        logoTile.layer?.shadowRadius = 8
         logoTile.layer?.shadowOffset = .zero
         addSubview(logoTile)
 
-        logoGlyph.font = NSFont.monospacedSystemFont(ofSize: 11.5, weight: .bold)
+        logoGlyph.font = NSFont.monospacedSystemFont(ofSize: 12.5, weight: .bold)
         logoGlyph.textColor = NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0)
         logoGlyph.alignment = .center
         logoTile.addSubview(logoGlyph)
 
-        titleField.font = NSFont.systemFont(ofSize: 14.5, weight: .bold)
+        titleField.font = NSFont.systemFont(ofSize: 15, weight: .bold)
         titleField.textColor = NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0)
         titleField.alignment = .left
         addSubview(titleField)
 
         dotView.wantsLayer = true
         dotView.layer?.backgroundColor = dotColor.cgColor
-        dotView.layer?.cornerRadius = 3
+        dotView.layer?.cornerRadius = 4
         dotView.layer?.shadowColor = dotColor.cgColor
         dotView.layer?.shadowOpacity = 0.62
         dotView.layer?.shadowRadius = 6
@@ -699,18 +699,18 @@ private final class PillView: NSView {
         super.layout()
         layer?.cornerRadius = bounds.height / 2
 
-        let logoSide: CGFloat = 24
-        logoTile.frame = NSRect(x: 7, y: (bounds.height - logoSide) / 2, width: logoSide, height: logoSide)
-        logoTile.layer?.cornerRadius = 7
-        logoGlyph.frame = logoTile.bounds.insetBy(dx: 4, dy: 5)
+        let logoSide: CGFloat = 29
+        logoTile.frame = NSRect(x: 6, y: (bounds.height - logoSide) / 2, width: logoSide, height: logoSide)
+        logoTile.layer?.cornerRadius = 9
+        logoGlyph.frame = logoTile.bounds.insetBy(dx: 4, dy: 6)
 
-        titleField.frame = NSRect(x: 40, y: (bounds.height - 20) / 2 + 1, width: bounds.width - 58, height: 20)
+        titleField.frame = NSRect(x: 47, y: (bounds.height - 21) / 2 + 1, width: bounds.width - 66, height: 21)
 
         let labelWidth = ceil((titleField.stringValue as NSString).size(withAttributes: [
-            .font: titleField.font ?? NSFont.systemFont(ofSize: 14.5, weight: .bold),
+            .font: titleField.font ?? NSFont.systemFont(ofSize: 15, weight: .bold),
         ]).width)
-        let dotSize: CGFloat = 7
-        let dotX = min(titleField.frame.minX + labelWidth + 5, bounds.width - dotSize - 9)
+        let dotSize: CGFloat = 8
+        let dotX = min(titleField.frame.minX + labelWidth + 4, bounds.width - dotSize - 8)
         dotView.frame = NSRect(x: dotX, y: bounds.midY + 4, width: dotSize, height: dotSize)
         dotView.layer?.cornerRadius = dotSize / 2
     }
@@ -718,31 +718,31 @@ private final class PillView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         NSGraphicsContext.saveGraphicsState()
 
-        let outer = bounds.insetBy(dx: 0.75, dy: 0.75)
+        let outer = bounds.insetBy(dx: 0.85, dy: 0.85)
         let radius = outer.height / 2
         let path = NSBezierPath(roundedRect: outer, xRadius: radius, yRadius: radius)
         let shadow = NSShadow()
-        shadow.shadowColor = NSColor.black.withAlphaComponent(0.32)
-        shadow.shadowBlurRadius = 7
+        shadow.shadowColor = NSColor.black.withAlphaComponent(0.34)
+        shadow.shadowBlurRadius = 9
         shadow.shadowOffset = .zero
         shadow.set()
 
         let bg = NSGradient(colors: [
-            NSColor(red: 0.010, green: 0.014, blue: 0.020, alpha: 0.97),
-            NSColor(red: 0.016, green: 0.030, blue: 0.038, alpha: 0.94),
-            NSColor(red: 0.010, green: 0.013, blue: 0.018, alpha: 0.98),
+            NSColor(red: 0.007, green: 0.011, blue: 0.017, alpha: 0.98),
+            NSColor(red: 0.014, green: 0.026, blue: 0.032, alpha: 0.95),
+            NSColor(red: 0.007, green: 0.010, blue: 0.015, alpha: 0.99),
         ])
         bg?.draw(in: path, angle: -12)
 
         NSGraphicsContext.restoreGraphicsState()
 
-        NSColor(red: 0.30, green: 0.78, blue: 0.96, alpha: 0.34).setStroke()
-        path.lineWidth = 0.9
+        NSColor(red: 0.26, green: 0.74, blue: 0.96, alpha: 0.38).setStroke()
+        path.lineWidth = 1.0
         path.stroke()
 
         let inner = outer.insetBy(dx: 1.5, dy: 1.5)
         let innerPath = NSBezierPath(roundedRect: inner, xRadius: inner.height / 2, yRadius: inner.height / 2)
-        NSColor.white.withAlphaComponent(0.045).setStroke()
+        NSColor.white.withAlphaComponent(0.050).setStroke()
         innerPath.lineWidth = 0.7
         innerPath.stroke()
 
@@ -1383,6 +1383,8 @@ private final class ExpandedPanelView: NSView {
     let latestSessionButton: NSButton
     let sessionScroll: NSScrollView
     let sessionStack: NSStackView
+    let answerStyleOverlay: NSView
+    let answerStylePanel: NSView
     let answerStyleLabel: NSTextField
     let answerStyleBox: NSTextField
     let answerStyleSaveButton: NSButton
@@ -1424,6 +1426,7 @@ private final class ExpandedPanelView: NSView {
     private var canvasWidthConstraint: NSLayoutConstraint?
     private var composerBarHeightConstraint: NSLayoutConstraint?
     private var composerTextHeightConstraint: NSLayoutConstraint?
+    private var attachmentStripHeightConstraint: NSLayoutConstraint?
     private var latestCanvas: CanvasArtifact?
     private var canvasOpen = false
     override init(frame frameRect: NSRect) {
@@ -1449,9 +1452,11 @@ private final class ExpandedPanelView: NSView {
         latestSessionButton = NSButton(title: "Continue latest", target: nil, action: nil)
         sessionScroll = NSScrollView()
         sessionStack = NSStackView()
+        answerStyleOverlay = NSView()
+        answerStylePanel = NSView()
         answerStyleLabel = NSTextField(labelWithString: "How Bluey should answer")
         answerStyleBox = NSTextField()
-        answerStyleSaveButton = NSButton(title: "Save", target: nil, action: nil)
+        answerStyleSaveButton = NSButton(title: "Save style", target: nil, action: nil)
         transcriptStrip = NSView()
         transcriptActivityDot = NSView()
         transcriptStateLabel = NSTextField(labelWithString: "IDLE")
@@ -1522,6 +1527,8 @@ private final class ExpandedPanelView: NSView {
             latestSessionButton,
             sessionScroll,
             sessionStack,
+            answerStyleOverlay,
+            answerStylePanel,
             answerStyleLabel,
             answerStyleBox,
             answerStyleSaveButton,
@@ -1584,9 +1591,11 @@ private final class ExpandedPanelView: NSView {
         sessionDrawer.addSubview(drawerSubtitleLabel)
         sessionDrawer.addSubview(latestSessionButton)
         sessionDrawer.addSubview(sessionScroll)
-        sessionDrawer.addSubview(answerStyleLabel)
-        sessionDrawer.addSubview(answerStyleBox)
-        sessionDrawer.addSubview(answerStyleSaveButton)
+        addSubview(answerStyleOverlay)
+        answerStyleOverlay.addSubview(answerStylePanel)
+        answerStylePanel.addSubview(answerStyleLabel)
+        answerStylePanel.addSubview(answerStyleBox)
+        answerStylePanel.addSubview(answerStyleSaveButton)
         addSubview(transcriptStrip)
         transcriptStrip.addSubview(transcriptActivityDot)
         transcriptStrip.addSubview(transcriptStateLabel)
@@ -1625,8 +1634,10 @@ private final class ExpandedPanelView: NSView {
         canvasWidthConstraint = canvasWidth
         let composerTextHeight = composerSurface.heightAnchor.constraint(equalToConstant: 46)
         let composerBarHeight = composerBar.heightAnchor.constraint(equalToConstant: 108)
+        let attachmentStripHeight = attachmentStrip.heightAnchor.constraint(equalToConstant: 0)
         composerTextHeightConstraint = composerTextHeight
         composerBarHeightConstraint = composerBarHeight
+        attachmentStripHeightConstraint = attachmentStripHeight
 
         NSLayoutConstraint.activate([
             headerBar.topAnchor.constraint(equalTo: topAnchor, constant: 10),
@@ -1706,7 +1717,7 @@ private final class ExpandedPanelView: NSView {
             sessionScroll.topAnchor.constraint(equalTo: latestSessionButton.bottomAnchor, constant: 10),
             sessionScroll.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 8),
             sessionScroll.trailingAnchor.constraint(equalTo: sessionDrawer.trailingAnchor, constant: -8),
-            sessionScroll.bottomAnchor.constraint(equalTo: answerStyleLabel.topAnchor, constant: -12),
+            sessionScroll.bottomAnchor.constraint(equalTo: sessionDrawer.bottomAnchor, constant: -12),
 
             sessionStack.leadingAnchor.constraint(equalTo: sessionScroll.contentView.leadingAnchor),
             sessionStack.topAnchor.constraint(equalTo: sessionScroll.contentView.topAnchor),
@@ -1714,19 +1725,29 @@ private final class ExpandedPanelView: NSView {
             sessionStack.bottomAnchor.constraint(lessThanOrEqualTo: sessionScroll.contentView.bottomAnchor),
             sessionStack.widthAnchor.constraint(equalTo: sessionScroll.widthAnchor),
 
-            answerStyleLabel.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 12),
-            answerStyleLabel.trailingAnchor.constraint(equalTo: sessionDrawer.trailingAnchor, constant: -12),
-            answerStyleLabel.bottomAnchor.constraint(equalTo: answerStyleBox.topAnchor, constant: -6),
+            answerStyleOverlay.topAnchor.constraint(equalTo: topAnchor),
+            answerStyleOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
+            answerStyleOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
+            answerStyleOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
 
-            answerStyleBox.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 12),
-            answerStyleBox.trailingAnchor.constraint(equalTo: sessionDrawer.trailingAnchor, constant: -12),
-            answerStyleBox.bottomAnchor.constraint(equalTo: answerStyleSaveButton.topAnchor, constant: -8),
-            answerStyleBox.heightAnchor.constraint(equalToConstant: 46),
+            answerStylePanel.centerXAnchor.constraint(equalTo: answerStyleOverlay.centerXAnchor),
+            answerStylePanel.centerYAnchor.constraint(equalTo: answerStyleOverlay.centerYAnchor),
+            answerStylePanel.widthAnchor.constraint(equalToConstant: 360),
 
-            answerStyleSaveButton.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 12),
-            answerStyleSaveButton.trailingAnchor.constraint(equalTo: sessionDrawer.trailingAnchor, constant: -12),
-            answerStyleSaveButton.bottomAnchor.constraint(equalTo: sessionDrawer.bottomAnchor, constant: -12),
-            answerStyleSaveButton.heightAnchor.constraint(equalToConstant: 30),
+            answerStyleLabel.topAnchor.constraint(equalTo: answerStylePanel.topAnchor, constant: 18),
+            answerStyleLabel.leadingAnchor.constraint(equalTo: answerStylePanel.leadingAnchor, constant: 18),
+            answerStyleLabel.trailingAnchor.constraint(equalTo: answerStylePanel.trailingAnchor, constant: -18),
+
+            answerStyleBox.topAnchor.constraint(equalTo: answerStyleLabel.bottomAnchor, constant: 12),
+            answerStyleBox.leadingAnchor.constraint(equalTo: answerStylePanel.leadingAnchor, constant: 18),
+            answerStyleBox.trailingAnchor.constraint(equalTo: answerStylePanel.trailingAnchor, constant: -18),
+            answerStyleBox.heightAnchor.constraint(equalToConstant: 48),
+
+            answerStyleSaveButton.topAnchor.constraint(equalTo: answerStyleBox.bottomAnchor, constant: 14),
+            answerStyleSaveButton.leadingAnchor.constraint(equalTo: answerStylePanel.leadingAnchor, constant: 18),
+            answerStyleSaveButton.trailingAnchor.constraint(equalTo: answerStylePanel.trailingAnchor, constant: -18),
+            answerStyleSaveButton.bottomAnchor.constraint(equalTo: answerStylePanel.bottomAnchor, constant: -18),
+            answerStyleSaveButton.heightAnchor.constraint(equalToConstant: 36),
 
             transcriptStrip.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             transcriptStrip.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
@@ -1750,7 +1771,7 @@ private final class ExpandedPanelView: NSView {
             attachmentStrip.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             attachmentStrip.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             attachmentStrip.bottomAnchor.constraint(equalTo: composerBar.topAnchor, constant: -6),
-            attachmentStrip.heightAnchor.constraint(equalToConstant: 34),
+            attachmentStripHeight,
 
             attachmentStack.leadingAnchor.constraint(equalTo: attachmentStrip.contentView.leadingAnchor),
             attachmentStack.topAnchor.constraint(equalTo: attachmentStrip.contentView.topAnchor),
@@ -1830,7 +1851,7 @@ private final class ExpandedPanelView: NSView {
 
             closeConfirmPanel.centerXAnchor.constraint(equalTo: closeConfirmOverlay.centerXAnchor),
             closeConfirmPanel.centerYAnchor.constraint(equalTo: closeConfirmOverlay.centerYAnchor),
-            closeConfirmPanel.widthAnchor.constraint(equalToConstant: 330),
+            closeConfirmPanel.widthAnchor.constraint(equalToConstant: 360),
 
             closeConfirmTitle.topAnchor.constraint(equalTo: closeConfirmPanel.topAnchor, constant: 18),
             closeConfirmTitle.leadingAnchor.constraint(equalTo: closeConfirmPanel.leadingAnchor, constant: 18),
@@ -1843,7 +1864,7 @@ private final class ExpandedPanelView: NSView {
             closeConfirmCancelButton.topAnchor.constraint(equalTo: closeConfirmBody.bottomAnchor, constant: 18),
             closeConfirmCancelButton.leadingAnchor.constraint(equalTo: closeConfirmPanel.leadingAnchor, constant: 18),
             closeConfirmCancelButton.bottomAnchor.constraint(equalTo: closeConfirmPanel.bottomAnchor, constant: -18),
-            closeConfirmCancelButton.widthAnchor.constraint(equalToConstant: 130),
+            closeConfirmCancelButton.widthAnchor.constraint(equalToConstant: 150),
             closeConfirmCancelButton.heightAnchor.constraint(equalToConstant: 34),
 
             closeConfirmTurnOffButton.topAnchor.constraint(equalTo: closeConfirmCancelButton.topAnchor),
@@ -1886,6 +1907,7 @@ private final class ExpandedPanelView: NSView {
         instructionsButton.action = #selector(instructionsClicked)
 
         sessionDrawer.isHidden = true
+        answerStyleOverlay.isHidden = true
         canvasPane.isHidden = true
         canvasToggleButton.isHidden = true
         canvasPane.onCollapse = { [weak self] in self?.setCanvasOpen(false) }
@@ -1920,6 +1942,9 @@ private final class ExpandedPanelView: NSView {
         guard bounds.contains(localPoint) else { return false }
 
         if !closeConfirmOverlay.isHidden {
+            return true
+        }
+        if !answerStyleOverlay.isHidden {
             return true
         }
         if headerBar.frame.contains(localPoint) || composerBar.frame.contains(localPoint) {
@@ -2109,6 +2134,21 @@ private final class ExpandedPanelView: NSView {
         sessionDrawer.layer?.shadowOffset = NSSize(width: 0, height: -8)
         sessionDrawer.layer?.zPosition = 10
 
+        answerStyleOverlay.isHidden = true
+        answerStyleOverlay.wantsLayer = true
+        answerStyleOverlay.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.44).cgColor
+        answerStyleOverlay.layer?.zPosition = 90
+
+        answerStylePanel.wantsLayer = true
+        answerStylePanel.layer?.backgroundColor = BlueyTheme.panelDeep.cgColor
+        answerStylePanel.layer?.cornerRadius = 18
+        answerStylePanel.layer?.borderWidth = 1
+        answerStylePanel.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.30).cgColor
+        answerStylePanel.layer?.shadowColor = NSColor.black.cgColor
+        answerStylePanel.layer?.shadowOpacity = 0.32
+        answerStylePanel.layer?.shadowRadius = 20
+        answerStylePanel.layer?.shadowOffset = .zero
+
         drawerTitleLabel.font = NSFont.systemFont(ofSize: 13, weight: .bold)
         drawerTitleLabel.textColor = BlueyTheme.text
         drawerSubtitleLabel.font = NSFont.systemFont(ofSize: 10.5, weight: .medium)
@@ -2131,12 +2171,15 @@ private final class ExpandedPanelView: NSView {
 
         answerStyleLabel.font = NSFont.systemFont(ofSize: 10.5, weight: .bold)
         answerStyleLabel.textColor = BlueyTheme.textDim
+        answerStyleLabel.alignment = .center
+        answerStyleLabel.stringValue = "Answer style"
         answerStyleBox.placeholderString = "Concise, structured, implementation-first..."
         answerStyleBox.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
         answerStyleBox.isBezeled = false
         answerStyleBox.drawsBackground = false
         answerStyleBox.focusRingType = .none
         answerStyleBox.textColor = BlueyTheme.text
+        answerStyleBox.alignment = .center
         answerStyleBox.placeholderAttributedString = NSAttributedString(
             string: "Concise, structured, implementation-first...",
             attributes: [.foregroundColor: BlueyTheme.textDim.withAlphaComponent(0.78)])
@@ -2216,8 +2259,10 @@ private final class ExpandedPanelView: NSView {
 
         closeConfirmTitle.font = NSFont.systemFont(ofSize: 16, weight: .bold)
         closeConfirmTitle.textColor = BlueyTheme.text
+        closeConfirmTitle.alignment = .center
         closeConfirmBody.font = NSFont.systemFont(ofSize: 12.5, weight: .medium)
         closeConfirmBody.textColor = BlueyTheme.textDim
+        closeConfirmBody.alignment = .center
         closeConfirmBody.maximumNumberOfLines = 3
 
         styleControlButton(closeConfirmCancelButton, symbol: "xmark", accent: false)
@@ -2265,6 +2310,7 @@ private final class ExpandedPanelView: NSView {
             button.image = image
         }
         button.imagePosition = .imageLeading
+        button.imageHugsTitle = true
         button.imageScaling = .scaleProportionallyDown
         button.alignment = .center
     }
@@ -2308,6 +2354,7 @@ private final class ExpandedPanelView: NSView {
                     .foregroundColor: BlueyTheme.textDim,
                 ])
         }
+        button.imageHugsTitle = true
         button.alignment = .center
     }
 
@@ -2337,6 +2384,7 @@ private final class ExpandedPanelView: NSView {
                     .foregroundColor: BlueyTheme.text,
                 ])
         }
+        button.imageHugsTitle = true
         button.alignment = .center
     }
 
@@ -2419,6 +2467,14 @@ private final class ExpandedPanelView: NSView {
         let text = answerStyleBox.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         emitInstructions(text: text)
         statusLabel.stringValue = text.isEmpty ? "Default style" : "Answer style saved"
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.10
+            answerStyleOverlay.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            guard let self else { return }
+            self.answerStyleOverlay.isHidden = true
+            self.answerStyleOverlay.alphaValue = 1
+        })
     }
 
     @objc private func recordingClicked() {
@@ -2465,7 +2521,12 @@ private final class ExpandedPanelView: NSView {
     }
 
     @objc private func instructionsClicked() {
-        sessionDrawer.isHidden = false
+        answerStyleOverlay.isHidden = false
+        answerStyleOverlay.alphaValue = 0
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.12
+            answerStyleOverlay.animator().alphaValue = 1
+        }
         window?.makeFirstResponder(answerStyleBox)
     }
 
@@ -2487,6 +2548,7 @@ private final class ExpandedPanelView: NSView {
             view.removeFromSuperview()
         }
         attachmentStrip.isHidden = false
+        attachmentStripHeightConstraint?.constant = 34
 
         let chip = NSTextField(labelWithString: text)
         chip.translatesAutoresizingMaskIntoConstraints = false
@@ -2504,6 +2566,7 @@ private final class ExpandedPanelView: NSView {
             chip.heightAnchor.constraint(equalToConstant: 28),
             chip.widthAnchor.constraint(greaterThanOrEqualToConstant: 210),
         ])
+        layoutSubtreeIfNeeded()
     }
 
     private func setTranscriptState(_ text: String, active: Bool) {
@@ -2571,15 +2634,19 @@ private final class ExpandedPanelView: NSView {
         attachmentStrip.isHidden = false
         guard !items.isEmpty else {
             setKnowledgeBadge("KB empty", accent: BlueyTheme.textDim)
-            showKnowledgePlaceholder("Knowledge base empty · attach docs")
+            attachmentStrip.isHidden = true
+            attachmentStripHeightConstraint?.constant = 0
+            layoutSubtreeIfNeeded()
             return
         }
 
         setKnowledgeBadge("KB \(items.count) loaded", accent: BlueyTheme.green)
+        attachmentStripHeightConstraint?.constant = 34
 
         for item in items {
             attachmentStack.addArrangedSubview(makeAttachmentChip(item))
         }
+        layoutSubtreeIfNeeded()
     }
 
     func setSessions(_ sessions: [OverlaySessionItem]) {
