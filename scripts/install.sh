@@ -96,6 +96,11 @@ if [[ -f "$target_tmp/bin/bluey-audio-macos" ]]; then chmod +x "$target_tmp/bin/
 if [[ -f "$target_tmp/bin/cue-audio-macos" ]]; then chmod +x "$target_tmp/bin/cue-audio-macos"; fi
 if [[ -f "$target_tmp/bin/cue-whisper" ]]; then chmod +x "$target_tmp/bin/cue-whisper"; fi
 if [[ -f "$target_tmp/bin/bluey-whisper-macos" ]]; then chmod +x "$target_tmp/bin/bluey-whisper-macos"; fi
+if [[ -f "$target_tmp/bin/bluey-file-picker-macos" ]]; then chmod +x "$target_tmp/bin/bluey-file-picker-macos"; fi
+if [[ -f "$target_tmp/bin/cue-file-picker-macos" ]]; then chmod +x "$target_tmp/bin/cue-file-picker-macos"; fi
+if [[ -f "$target_tmp/bin/BlueyFilePicker.app/Contents/MacOS/bluey-file-picker-macos" ]]; then
+  chmod +x "$target_tmp/bin/BlueyFilePicker.app/Contents/MacOS/bluey-file-picker-macos"
+fi
 
 rm -rf "$target"
 mv "$target_tmp" "$target"

@@ -6425,6 +6425,16 @@ async fn choose_context_files() -> Result<Vec<PathBuf>> {
 
 #[cfg(target_os = "macos")]
 fn choose_context_files_platform() -> Result<Vec<PathBuf>> {
+    if let Some(picker_app) = discover_macos_context_picker_app() {
+        match run_context_picker_app(&picker_app) {
+            Ok(paths) => return Ok(paths),
+            Err(error) => warn!(
+                picker = %picker_app.display(),
+                "native macOS context picker app failed, falling back to AppleScript: {error:#}"
+            ),
+        }
+    }
+
     let script = r#"
 try
   set allowedTypes to {"public.text", "public.source-code", "public.shell-script", "public.json", "public.yaml", "public.xml", "public.html", "public.css", "com.adobe.pdf", "com.microsoft.word.doc", "org.openxmlformats.wordprocessingml.document", "public.rtf", "net.daringfireball.markdown", "md", "markdown", "txt", "log", "csv", "tsv", "rst", "adoc", "rs", "swift", "c", "h", "cpp", "hpp", "js", "jsx", "ts", "tsx", "py", "go", "java", "kt", "kts", "cs", "rb", "php", "sql", "sh", "ps1", "toml", "yaml", "yml", "json", "html", "css", "scss", "pdf", "doc", "docx", "rtf"}
@@ -6448,6 +6458,71 @@ end try
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     Ok(stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .collect())
+}
+
+#[cfg(target_os = "macos")]
+fn discover_macos_context_picker_app() -> Option<PathBuf> {
+    if let Ok(value) = env::var("BLUEY_CONTEXT_PICKER_APP") {
+        let path = PathBuf::from(value);
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.extend([
+                dir.join("BlueyFilePicker.app"),
+                dir.join("bin/BlueyFilePicker.app"),
+            ]);
+        }
+    }
+    if let Ok(cwd) = env::current_dir() {
+        candidates.extend([
+            cwd.join("native/macos/cue-picker/.build/BlueyFilePicker.app"),
+            cwd.join("target/debug/BlueyFilePicker.app"),
+            cwd.join("target/release/BlueyFilePicker.app"),
+        ]);
+    }
+
+    candidates.into_iter().find(|path| path.is_dir())
+}
+
+#[cfg(target_os = "macos")]
+fn run_context_picker_app(picker_app: &Path) -> Result<Vec<PathBuf>> {
+    let output_path = env::temp_dir().join(format!(
+        "bluey-context-picker-{}-{}.txt",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    ));
+    let output = Command::new("open")
+        .arg("-W")
+        .arg("-n")
+        .arg(picker_app)
+        .arg("--args")
+        .arg("--output")
+        .arg(&output_path)
+        .output()
+        .with_context(|| format!("failed to launch {}", picker_app.display()))?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "{} exited with status {}",
+            picker_app.display(),
+            output.status
+        ));
+    }
+    let selected = std::fs::read_to_string(&output_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&output_path);
+    Ok(selected
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())

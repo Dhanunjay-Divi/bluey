@@ -22,6 +22,12 @@ File changed:
 
 - `native/macos/cue-overlay/Sources/cue-overlay/main.swift`
 - `crates/cue-daemon/src/app.rs`
+- `native/macos/cue-picker/*`
+- `scripts/build-macos.sh`
+- `scripts/build-macos-universal.sh`
+- `scripts/install.sh`
+- `scripts/smoke-test.sh`
+- `Makefile`
 
 Changes:
 
@@ -49,8 +55,24 @@ Changes:
   - macOS `choose file` now uses allowed UTIs plus explicit extensions for
     readable text/code/PDF/DOC/DOCX/RTF/Markdown so unsupported media such as
     `.mp4` is dimmed/unselectable by Finder.
+  - Added a dedicated macOS `bluey-file-picker-macos` helper backed by
+    `NSOpenPanel` + `NSOpenSavePanelDelegate`. The delegate explicitly disables
+    unsupported files instead of relying on AppleScript's inconsistent visual
+    filtering in Recents.
+  - The daemon discovers this helper next to the installed `bluey` binary,
+    under `target/{debug,release}`, or in `native/macos/cue-picker/.build`,
+    and only falls back to AppleScript if the helper is missing.
   - Windows OpenFileDialog no longer exposes an `All files` fallback that made
     unsupported formats appear selectable.
+- Clarified the conversation send model:
+  - `Listen`/transcription continuously captures session context and updates
+    the live transcript preview.
+  - Silence does not auto-send to the LLM. The idle timer only stops recording
+    after the configured no-transcript window to avoid STT spend.
+  - `Answer`/send is the explicit LLM boundary. The sent prompt appears as the
+    right-side user card, while the streamed Bluey response appears on the left.
+  - Raw transcript chunks stay in the live preview strip instead of becoming an
+    ever-growing stack of chat bubbles.
 
 ## Manual Smoke Notes
 
@@ -84,6 +106,7 @@ After testing:
 ```bash
 swift build -c release --package-path native/macos/cue-overlay
 bash native/macos/cue-overlay/build.sh
+bash native/macos/cue-picker/build.sh
 cargo fmt --all --check
 cargo check -p cue-daemon
 git diff --check

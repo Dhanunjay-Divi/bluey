@@ -8,6 +8,7 @@ cargo build --release
 bash native/macos/cue-overlay/build.sh >/dev/null
 bash native/macos/cue-audio/build.sh >/dev/null
 bash native/macos/cue-whisper/build.sh >/dev/null
+bash native/macos/cue-picker/build.sh >/dev/null
 
 ARCH="$(uname -m)"
 DIST="dist/bluey-macos-${ARCH}"
@@ -23,5 +24,8 @@ cp native/macos/cue-audio/.build/bluey-audio-macos "$DIST/bluey-audio-macos"
 cp native/macos/cue-audio/.build/cue-audio-macos "$DIST/cue-audio-macos"
 cp native/macos/cue-whisper/.build/cue-whisper "$DIST/cue-whisper"
 cp native/macos/cue-whisper/.build/bluey-whisper-macos "$DIST/bluey-whisper-macos"
+cp native/macos/cue-picker/.build/bluey-file-picker-macos "$DIST/bluey-file-picker-macos"
+cp native/macos/cue-picker/.build/cue-file-picker-macos "$DIST/cue-file-picker-macos"
+cp -R native/macos/cue-picker/.build/BlueyFilePicker.app "$DIST/BlueyFilePicker.app"
 
 echo "$DIST"

@@ -15,6 +15,7 @@ printf 'fn main() { println!("bluey context smoke"); }\n' >"$SMOKE_CONTEXT_FILE"
 
 bash native/macos/cue-overlay/build.sh >/dev/null
 bash native/macos/cue-audio/build.sh >/dev/null
+bash native/macos/cue-picker/build.sh >/dev/null
 cargo build >/dev/null
 
 ./target/debug/bluey stop >/dev/null 2>&1 || true

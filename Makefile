@@ -46,6 +46,9 @@ package-darwin-arm64: build-darwin-arm64 build-helpers-release
 	cp native/macos/cue-audio/.build/cue-audio-macos staging-arm64/bin/ 2>/dev/null || true
 	cp native/macos/cue-whisper/.build/cue-whisper staging-arm64/bin/ 2>/dev/null || true
 	cp native/macos/cue-whisper/.build/bluey-whisper-macos staging-arm64/bin/ 2>/dev/null || true
+	cp native/macos/cue-picker/.build/bluey-file-picker-macos staging-arm64/bin/ 2>/dev/null || true
+	cp native/macos/cue-picker/.build/cue-file-picker-macos staging-arm64/bin/ 2>/dev/null || true
+	cp -R native/macos/cue-picker/.build/BlueyFilePicker.app staging-arm64/bin/ 2>/dev/null || true
 	tar -czf dist/bluey-$(VERSION)-darwin-arm64.tar.gz -C staging-arm64 .
 	rm -rf staging-arm64
 
@@ -68,6 +71,8 @@ package-darwin-universal: build-darwin-universal
 	cp dist/bluey-macos-universal/bluey-overlay-macos staging-universal/bin/bluey-overlay-macos 2>/dev/null || true
 	cp dist/bluey-macos-universal/bluey-audio-macos staging-universal/bin/bluey-audio-macos 2>/dev/null || true
 	cp dist/bluey-macos-universal/bluey-whisper-macos staging-universal/bin/bluey-whisper-macos 2>/dev/null || true
+	cp dist/bluey-macos-universal/bluey-file-picker-macos staging-universal/bin/bluey-file-picker-macos 2>/dev/null || true
+	cp -R dist/bluey-macos-universal/BlueyFilePicker.app staging-universal/bin/ 2>/dev/null || true
 	tar -czf dist/bluey-$(VERSION)-darwin-universal.tar.gz -C staging-universal .
 	shasum -a 256 dist/bluey-$(VERSION)-darwin-universal.tar.gz \
 	  > dist/bluey-$(VERSION)-darwin-universal.tar.gz.sha256

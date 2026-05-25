@@ -8,9 +8,10 @@
 #   native/macos/cue-overlay/.build/{arm64,x86_64}-apple-macosx/release/cue-overlay
 #   native/macos/cue-audio/.build/{arm64,x86_64}-apple-macosx/release/cue-audio
 #   native/macos/cue-whisper/.build/{arm64,x86_64}-apple-macosx/release/CueWhisper
+#   native/macos/cue-picker/.build/{arm64,x86_64}-apple-macosx/release/cue-picker
 #
 # Output:
-#   dist/bluey-macos-universal/{bluey,bluey-daemon,bluey-overlay-macos,bluey-audio-macos,bluey-whisper-macos}
+#   dist/bluey-macos-universal/{bluey,bluey-daemon,bluey-overlay-macos,bluey-audio-macos,bluey-whisper-macos,bluey-file-picker-macos}
 
 set -euo pipefail
 
@@ -57,6 +58,20 @@ if [[ -f "$ARM_WHISPER" && -f "$X86_WHISPER" ]]; then
     lipo -create "$ARM_WHISPER" "$X86_WHISPER" -output "$OUT/bluey-whisper-macos"
 else
     echo "warn: whisper arch builds not both present; skipping whisper in universal" >&2
+fi
+
+# Swift context file picker.
+ARM_PICKER="native/macos/cue-picker/.build/arm64-apple-macosx/release/cue-picker"
+X86_PICKER="native/macos/cue-picker/.build/x86_64-apple-macosx/release/cue-picker"
+if [[ -f "$ARM_PICKER" && -f "$X86_PICKER" ]]; then
+    lipo -create "$ARM_PICKER" "$X86_PICKER" -output "$OUT/bluey-file-picker-macos"
+    APP_DIR="$OUT/BlueyFilePicker.app"
+    rm -rf "$APP_DIR"
+    mkdir -p "$APP_DIR/Contents/MacOS"
+    cp native/macos/cue-picker/.build/BlueyFilePicker.app/Contents/Info.plist "$APP_DIR/Contents/Info.plist"
+    cp "$OUT/bluey-file-picker-macos" "$APP_DIR/Contents/MacOS/bluey-file-picker-macos"
+else
+    echo "warn: picker arch builds not both present; skipping picker in universal" >&2
 fi
 
 # Verify.
