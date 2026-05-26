@@ -14,7 +14,7 @@ The new site is aimed at first-time users who need to understand, quickly:
 
 ## What Changed
 
-- New landing hero: "Bluey - Answers while you work."
+- New landing hero: "Bluey - Stay present, stay unseen."
 - New product mock showing transcript, routed answer, reasoning, canvas, docs, screen analysis, and composer controls.
 - New sections for answer flow, use cases, model routing, credits, and control/security.
 - Rebuilt `/account`, `/reload`, and `/link` page shell to match the new dark product language while preserving all existing backend-critical DOM IDs.
@@ -33,7 +33,7 @@ for (const match of html.matchAll(/<script>([\s\S]*?)<\/script>/g)) new Function
 console.log('html script ok');
 NODE
 
-curl -fsS http://127.0.0.1:8900/ | rg -n "Answers while you work|Bluey turns live context|No provider menu|curl -fsSL"
+curl -fsS http://127.0.0.1:8900/ | rg -n "Stay present, stay unseen|Bluey turns live context|No provider menu|curl -fsSL"
 curl -fsS http://127.0.0.1:8900/account | rg -n "Bluey account|Square checkout|What this unlocks"
 git diff --check
 ```
