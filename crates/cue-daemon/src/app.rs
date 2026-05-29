@@ -3138,6 +3138,22 @@ async fn handle_attach_paths(daemon: &Arc<Daemon>, paths: Vec<PathBuf>) -> Resul
 
     let mut attached = Vec::new();
     for path in paths {
+        if !is_supported_picker_context_file(&path) {
+            push_system_card(
+                daemon,
+                CardKind::Warning,
+                "File skipped",
+                format!(
+                    "{} is not a readable Bluey context file. Attach text, Markdown, code, PDF, DOC/DOCX, CSV/TSV, JSON/YAML/TOML, HTML/CSS, shell/SQL, or RTF.",
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("Selected file")
+                ),
+            )
+            .await;
+            continue;
+        }
+
         match build_context_artifact(
             path.display().to_string(),
             path.file_name()
@@ -6692,6 +6708,13 @@ fn classify_context_path(path: &Path) -> ContextKind {
     }
 }
 
+fn is_supported_picker_context_file(path: &Path) -> bool {
+    matches!(
+        classify_context_path(path),
+        ContextKind::Code | ContextKind::Document | ContextKind::Text
+    )
+}
+
 fn enrich_context_artifact(
     artifact: ContextArtifact,
     path: &Path,
@@ -7446,6 +7469,17 @@ mod tests {
     #[test]
     fn answer_overlay_artifact_ignores_short_chat() {
         assert!(answer_overlay_artifact("Yes, that is the right next step.").is_none());
+    }
+
+    #[test]
+    fn picker_context_filter_rejects_video_and_key_material() {
+        assert!(is_supported_picker_context_file(Path::new("plan.md")));
+        assert!(is_supported_picker_context_file(Path::new(
+            "architecture.pdf"
+        )));
+        assert!(is_supported_picker_context_file(Path::new("main.rs")));
+        assert!(!is_supported_picker_context_file(Path::new("clip.mp4")));
+        assert!(!is_supported_picker_context_file(Path::new("backup.p12")));
     }
 
     #[test]

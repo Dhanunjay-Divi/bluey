@@ -79,6 +79,10 @@ Click the pill or use the F19 hotkey.
 - Expanded panel is blank/grey → SwiftUI render fault; check overlay process for stderr/crash
 - Composer controls overlap or wrap → window-size or fixed-width regression
 
+**Regression guard:** the header must never be cropped. If the panel is close to
+an edge, it should reposition or shrink within the visible screen, not hide the
+model picker, balance, Hide, or Close controls.
+
 ---
 
 ## Step 3 — Listen / Stop session
@@ -104,6 +108,12 @@ Click Stop. **Expect:**
 - Overlay grows taller/wider while captions arrive → fixed-size/layout regression
 - Capture starts but no transcription → STT routing: if logged in, should be using managed `/router/transcribe`; check daemon log for `router/transcribe` HTTP errors
 - "STT not configured" with developer keys NOT set → confirm logged in (`bluey usage` should show balance)
+
+**Send behavior:** live captions are context, not automatic questions. Bluey
+should not auto-send an answer just because speech paused. The user sends by
+pressing Enter/Send or by clicking Answer/Screen. Future voice-auto-submit can
+be a separate explicit mode, but default live-call UX is "listen continuously,
+answer on command".
 
 ---
 
@@ -135,10 +145,16 @@ Click the "Attach" button in the composer. Select a small `.txt` or `.pdf`.
 **Expect:**
 - Attached file shows as a chip above the composer (horizontally scrollable if multiple)
 - Asking a question now uses the document as context; answer references the doc
+- The picker allows only readable context formats: text, Markdown, code, PDF,
+  DOC/DOCX, CSV/TSV, JSON/YAML/TOML, HTML/CSS, shell/SQL, and RTF.
+- Video/audio/keychain/certificate files such as `.mp4`, `.mov`, `.wav`, `.p12`
+  must be disabled by the native picker or skipped by the daemon with a visible
+  warning card.
 
 **Fail signals:**
 - "File picker doesn't open" → Tauri dialog plugin issue; check dashboard log
 - File attaches but answer doesn't reference it → context-bridge issue; verify the file content reaches the LLM request (check daemon `request_cue` logs)
+- Unsupported file appears as an attached chip → context validation regression
 
 ---
 

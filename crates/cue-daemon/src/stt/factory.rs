@@ -67,8 +67,8 @@ pub async fn build_stt_chain(
             model: env_value("BLUEY_DEEPGRAM_MODEL").unwrap_or_else(|| "nova-3".into()),
             language: env_value("BLUEY_DEEPGRAM_LANGUAGE"),
             smart_format: env_bool("BLUEY_DEEPGRAM_SMART_FORMAT").unwrap_or(true),
-            endpointing_ms: env_u32("BLUEY_DEEPGRAM_ENDPOINTING_MS").or(Some(300)),
-            utterance_end_ms: env_u32("BLUEY_DEEPGRAM_UTTERANCE_END_MS").or(Some(1_000)),
+            endpointing_ms: env_optional_u32("BLUEY_DEEPGRAM_ENDPOINTING_MS", Some(300)),
+            utterance_end_ms: env_optional_u32("BLUEY_DEEPGRAM_UTTERANCE_END_MS", Some(1_000)),
             vad_events: env_bool("BLUEY_DEEPGRAM_VAD_EVENTS").unwrap_or(true),
             ..Default::default()
         };
@@ -166,6 +166,50 @@ fn env_bool(name: &str) -> Option<bool> {
     })
 }
 
-fn env_u32(name: &str) -> Option<u32> {
-    env_value(name).and_then(|value| value.parse::<u32>().ok())
+fn env_optional_u32(name: &str, default: Option<u32>) -> Option<u32> {
+    optional_u32_from_value(env_value(name), default)
+}
+
+fn optional_u32_from_value(value: Option<String>, default: Option<u32>) -> Option<u32> {
+    match value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) if disables_optional_u32(&value) => None,
+        Some(value) => value.parse::<u32>().ok().or(default),
+        None => default,
+    }
+}
+
+fn disables_optional_u32(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "off" | "none" | "disabled" | "disable"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn optional_deepgram_millisecond_env_can_disable_endpointing() {
+        assert_eq!(
+            optional_u32_from_value(Some("off".to_string()), Some(300)),
+            None
+        );
+        assert_eq!(
+            optional_u32_from_value(Some("none".to_string()), Some(300)),
+            None
+        );
+        assert_eq!(
+            optional_u32_from_value(Some("450".to_string()), Some(300)),
+            Some(450)
+        );
+        assert_eq!(
+            optional_u32_from_value(Some("bad".to_string()), Some(300)),
+            Some(300)
+        );
+        assert_eq!(optional_u32_from_value(None, Some(300)), Some(300));
+    }
 }

@@ -1,16 +1,17 @@
 # Bluey Agent Handoff
 
-Last updated: 2026-05-25
+Last updated: 2026-05-29
 
 Start here when joining the Bluey repo.
 
 ## Read First
 
 1. `docs/rounds/END-TO-END-AGENT-CONTEXT-2026-05-25.md`
-2. `docs/MODEL-ROUTING.md`
-3. `docs/DEPLOYMENT-SCALING.md`
-4. `docs/PRODUCTION-READINESS.md`
-5. `docs/PRELAUNCH-CHECKLIST.md`
+2. `docs/rounds/END-TO-END-READINESS-PASS-2026-05-29.md`
+3. `docs/MODEL-ROUTING.md`
+4. `docs/DEPLOYMENT-SCALING.md`
+5. `docs/PRODUCTION-READINESS.md`
+6. `docs/PRELAUNCH-CHECKLIST.md`
 
 The first file is the complete current context: product flow, architecture,
 implemented state, provider routing, capacity policy, cloud/RAG/storage plan,
@@ -21,7 +22,7 @@ agent.
 
 - Branch: `feat/phase-3-round-12`
 - Code tip before this docs refresh:
-  `3c13ed7 feat(server): add cloud stt fallback routing`
+  `38d982b feat(audio): tune VAD and managed thinking budgets`
 - Product domain target: `bluey.sh`
 - Working tree warning: `bluey-dev.db` may appear as local untracked data. Do
   not stage it.
@@ -77,7 +78,9 @@ Implemented:
 - Redis shared ledger support through `BLUEY_REDIS_URL`.
 - Deepgram -> OpenAI fallback on `/router/transcribe`.
 
-Next capacity hardening: provider-key health scoring in Redis/shared ledger.
+Next capacity hardening: run the Redis/shared-ledger path under real load with
+approved provider key pools and verify `/admin/metrics` stays quiet for
+cooldowns/all-keys-cooling events.
 
 ## Debug Flag Warning
 
@@ -102,17 +105,18 @@ Use `docs/deploy/PHASE2-MAC-SMOKE.md` for visual/product smoke.
 
 ## Next Best Work
 
-1. Finish production-grade overlay UX: compact pill, uncropped/resizable panel,
-   scroll-contained transcript, ChatGPT-like composer, session drawer, attached
-   docs chips, style prompt, balance/cost labels, and canvas auto-open only for
-   artifacts.
-2. Run Mac smoke steps 4-10 with a real managed account/server path.
-3. Add Redis provider-key health scoring.
-4. Add server-owned model/routing config.
-5. Finish `bluey.sh` web/link/reload/account/docs pages.
-6. Stand up staging/prod infra with Stripe live, SMTP, Caddy/TLS, backups, and
+1. Run Mac smoke steps 1-10 with a real managed account/server path. Stop on the
+   first failure and attach screenshot + daemon log excerpt.
+2. Finish production-grade overlay UX nits found by smoke: compact pill,
+   uncropped/resizable panel, scroll-contained transcript, ChatGPT-like
+   composer, session drawer, attached-doc chips, style prompt, balance/cost
+   labels, and canvas auto-open only for artifacts.
+3. Add server-owned model/routing config so Gemini/newer OpenAI/newer Claude
+   candidates can be tested without rebuilding desktop customers.
+4. Finish `bluey.sh` web/link/reload/account/docs pages.
+5. Stand up staging/prod infra with live billing, SMTP, Caddy/TLS, backups, and
    monitoring.
-7. Complete Windows QA before claiming Windows support.
+6. Complete Windows QA before claiming Windows support.
 
 ## Review Cadence
 

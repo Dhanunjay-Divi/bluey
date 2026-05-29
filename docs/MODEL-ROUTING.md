@@ -247,6 +247,9 @@ BLUEY_DEEPGRAM_SMART_FORMAT=1
 
 The default goal is "fast but not twitchy": finalization should be quick after
 the user stops speaking, while quiet speech still gets through.
+For VAD experiments, `BLUEY_DEEPGRAM_ENDPOINTING_MS=off` and
+`BLUEY_DEEPGRAM_UTTERANCE_END_MS=off` explicitly remove those Deepgram query
+parameters so the local RMS/WebRTC gate can be measured by itself.
 
 ## Model Selection Recommendation
 
@@ -265,6 +268,48 @@ Decision: **have all providers behind the router, expose Auto/Balanced/Deep as
 simple UX concepts, and keep provider/model swaps server-side**. That lets us
 move capacity, pricing, and quality without forcing customers to understand
 provider names.
+
+### 2026-05-29 provider stance
+
+Do not hardcode the marketing site or overlay to one provider family. The
+server route table is the product control plane:
+
+- **Keep OpenAI** for fast mini answers, embeddings, current vision, and OpenAI
+  STT fallback.
+- **Keep Anthropic** for human-like technical/system-design answers and long
+  structured reasoning.
+- **Add Gemini only as a measured server-side candidate** after managed smoke:
+  likely first for vision and cheap/fast multimodal fallback, not as a visible
+  customer dropdown item.
+- **Keep Deepgram primary for live STT** and OpenAI Realtime/chunked
+  transcription as cloud fallback. LocalWhisper stays hidden/offline/dev.
+- **Do not expose Local** in paid UI. If cloud is unavailable, local fallback can
+  produce a degraded answer, but billing should reconcile once online only if
+  the cloud path actually ran.
+
+Why we are not switching every model name in code immediately:
+
+- The server already supports provider/model failover, key pools, and health
+  cooldowns. The remaining risk is product quality and cost, not just "newest
+  model wins".
+- Route changes must move with the pricing table, cost-label copy, and load
+  tests. Unknown model names are intentionally filtered out of priced routes.
+- OpenAI reasoning-era models are best wired through a Responses-style managed
+  path; the current managed OpenAI path still uses Chat Completions.
+- Claude newer-than-3.7 routes may need different thinking semantics than the
+  current manual `thinking` payload. Keep the current safe route until the API
+  request shape is verified by tests.
+
+Recommended next implementation after the managed smoke is an admin/server-owned
+route config table:
+
+```text
+lane -> ordered candidates -> pricing key -> health bucket -> feature flags
+```
+
+That lets us test "Gemini vision first", "Claude newest Sonnet for balanced",
+or "OpenAI newest reasoning model for deep" without rebuilding desktop
+customers.
 
 Important scope note: the streaming STT factory covers the continuous
 system-audio streaming path. The chunked REST transcription path uses
