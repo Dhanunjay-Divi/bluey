@@ -78,6 +78,17 @@ pub struct DeepgramConfig {
     pub language: Option<String>,
     /// Enable punctuation.
     pub punctuate: bool,
+    /// Enable Deepgram smart formatting for numbers, dates, and common
+    /// spoken forms. This is useful for answer prompts and screen notes.
+    pub smart_format: bool,
+    /// Deepgram endpointing silence window in milliseconds. `None` lets the
+    /// provider use its default; Bluey's default is tuned for live answers.
+    pub endpointing_ms: Option<u32>,
+    /// Emit utterance-end events after this much silence. Requires interim
+    /// results and VAD events to be useful.
+    pub utterance_end_ms: Option<u32>,
+    /// Ask Deepgram to emit VAD lifecycle events.
+    pub vad_events: bool,
     /// Enable speaker diarization (the `TranscriptEvent::SpeakerLabel` path).
     pub diarize: bool,
     /// Override the base URL (tests use `ws://localhost:…`).
@@ -92,6 +103,10 @@ impl Default for DeepgramConfig {
             interim_results: true,
             language: None,
             punctuate: true,
+            smart_format: true,
+            endpointing_ms: Some(300),
+            utterance_end_ms: Some(1_000),
+            vad_events: true,
             diarize: false,
             base_url: None,
         }
@@ -115,6 +130,12 @@ pub fn build_url(deepgram: &DeepgramConfig, stt: &SttConfig) -> Result<url::Url,
         if deepgram.punctuate {
             q.append_pair("punctuate", "true");
         }
+        if deepgram.smart_format {
+            q.append_pair("smart_format", "true");
+        }
+        if let Some(ms) = deepgram.endpointing_ms {
+            q.append_pair("endpointing", &ms.to_string());
+        }
         // Interim results: SttConfig.emit_partials wins (per-session) over
         // DeepgramConfig.interim_results (per-provider). If the session
         // explicitly disables partials, never request them; otherwise
@@ -122,6 +143,12 @@ pub fn build_url(deepgram: &DeepgramConfig, stt: &SttConfig) -> Result<url::Url,
         let want_interim = stt.emit_partials && deepgram.interim_results;
         if want_interim {
             q.append_pair("interim_results", "true");
+            if let Some(ms) = deepgram.utterance_end_ms {
+                q.append_pair("utterance_end_ms", &ms.to_string());
+            }
+            if deepgram.vad_events {
+                q.append_pair("vad_events", "true");
+            }
         }
         if deepgram.diarize {
             q.append_pair("diarize", "true");
@@ -648,7 +675,23 @@ mod tests {
         assert_eq!(q.get("sample_rate").map(String::as_str), Some("16000"));
         assert_eq!(q.get("channels").map(String::as_str), Some("1"));
         assert_eq!(q.get("punctuate").map(String::as_str), Some("true"));
+        assert_eq!(q.get("smart_format").map(String::as_str), Some("true"));
+        assert_eq!(q.get("endpointing").map(String::as_str), Some("300"));
         assert_eq!(q.get("interim_results").map(String::as_str), Some("true"));
+        assert_eq!(q.get("utterance_end_ms").map(String::as_str), Some("1000"));
+        assert_eq!(q.get("vad_events").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn url_builder_suppresses_utterance_events_when_partials_disabled() {
+        let (dc, mut sc) = cfg();
+        sc.emit_partials = false;
+        let url = build_url(&dc, &sc).unwrap();
+        let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(q.get("interim_results"), None);
+        assert_eq!(q.get("utterance_end_ms"), None);
+        assert_eq!(q.get("vad_events"), None);
+        assert_eq!(q.get("endpointing").map(String::as_str), Some("300"));
     }
 
     #[test]

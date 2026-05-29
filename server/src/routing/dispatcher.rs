@@ -80,6 +80,125 @@ pub struct Completion {
     pub output_tokens: i64,
 }
 
+/// Provider-neutral reasoning control. The server maps this to whichever
+/// upstream knob is safe for the selected provider/model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingMode {
+    Off,
+    Low,
+    Medium,
+    High,
+    Auto,
+}
+
+/// Per-request thinking budget. `max_tokens` is intentionally optional:
+/// some providers expose effort tiers, some expose token budgets, and some
+/// expose both on different API families.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThinkingBudget {
+    pub mode: ThinkingMode,
+    pub max_tokens: Option<u32>,
+}
+
+impl ThinkingBudget {
+    pub const fn off() -> Self {
+        Self {
+            mode: ThinkingMode::Off,
+            max_tokens: None,
+        }
+    }
+
+    fn is_enabled(self) -> bool {
+        !matches!(self.mode, ThinkingMode::Off)
+    }
+}
+
+/// Resolve a lane + optional client override into Bluey's server policy.
+pub fn resolve_thinking_budget(
+    lane: &str,
+    requested_effort: Option<&str>,
+    requested_tokens: Option<u32>,
+) -> ThinkingBudget {
+    let mut budget = default_thinking_budget(lane);
+
+    if let Some(env_effort) = env_lane_value(lane, "EFFORT") {
+        if let Some(mode) = parse_thinking_mode(&env_effort) {
+            budget.mode = mode;
+        }
+    }
+    if let Some(env_tokens) =
+        env_lane_value(lane, "TOKENS").and_then(|value| value.parse::<u32>().ok())
+    {
+        budget.max_tokens = Some(clamp_thinking_tokens(env_tokens));
+    }
+
+    if let Some(mode) = requested_effort.and_then(parse_thinking_mode) {
+        budget.mode = mode;
+    }
+    if let Some(tokens) = requested_tokens {
+        budget.max_tokens = Some(clamp_thinking_tokens(tokens));
+    }
+
+    if matches!(budget.mode, ThinkingMode::Off) {
+        budget.max_tokens = None;
+    }
+    budget
+}
+
+/// Max output token budget used for entry cost checks. Reasoning tokens count
+/// against provider output budgets, so deep thinking must reserve room.
+pub fn effective_max_output_tokens(requested: Option<u32>, thinking: ThinkingBudget) -> u32 {
+    let base = requested.unwrap_or(2048).max(256);
+    match (thinking.is_enabled(), thinking.max_tokens) {
+        (true, Some(tokens)) => base.max(tokens.saturating_add(1024)),
+        _ => base,
+    }
+}
+
+fn default_thinking_budget(lane: &str) -> ThinkingBudget {
+    match lane {
+        "deep" => ThinkingBudget {
+            mode: ThinkingMode::Medium,
+            max_tokens: Some(4_096),
+        },
+        // Keep fast lanes fast by default. Callers/operators can opt in via
+        // request fields or BLUEY_THINKING_* env vars.
+        _ => ThinkingBudget::off(),
+    }
+}
+
+fn parse_thinking_mode(value: &str) -> Option<ThinkingMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "0" | "false" => Some(ThinkingMode::Off),
+        "low" | "1" => Some(ThinkingMode::Low),
+        "medium" | "med" | "2" => Some(ThinkingMode::Medium),
+        "high" | "3" => Some(ThinkingMode::High),
+        "auto" | "dynamic" => Some(ThinkingMode::Auto),
+        _ => None,
+    }
+}
+
+fn env_lane_value(lane: &str, suffix: &str) -> Option<String> {
+    let lane = lane
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    std::env::var(format!("BLUEY_THINKING_{lane}_{suffix}"))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn clamp_thinking_tokens(tokens: u32) -> u32 {
+    tokens.clamp(1_024, 32_000)
+}
+
 /// Resolve the lane/task to a concrete provider+model.
 ///
 /// This returns the preferred route for compatibility with older callers.
@@ -141,6 +260,7 @@ pub async fn complete(
     user: &str,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
+    thinking: ThinkingBudget,
     // Codex S4.5: fallback estimate when upstream omits `usage`. The
     // server passes its entry-cost ceiling so we charge the best
     // available approximation rather than $0.
@@ -158,6 +278,7 @@ pub async fn complete(
                 user,
                 max_tokens,
                 temperature,
+                thinking,
                 fallback_input_tokens,
             )
             .await
@@ -173,6 +294,7 @@ pub async fn complete(
                 user,
                 max_tokens,
                 temperature,
+                thinking,
                 fallback_input_tokens,
             )
             .await
@@ -195,6 +317,7 @@ pub async fn complete_with_key(
     user: &str,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
+    thinking: ThinkingBudget,
     fallback_input_tokens: Option<i64>,
 ) -> Result<Completion> {
     match provider {
@@ -206,6 +329,7 @@ pub async fn complete_with_key(
                 user,
                 max_tokens,
                 temperature,
+                thinking,
                 fallback_input_tokens,
             )
             .await
@@ -218,6 +342,7 @@ pub async fn complete_with_key(
                 user,
                 max_tokens,
                 temperature,
+                thinking,
                 fallback_input_tokens,
             )
             .await
@@ -276,6 +401,7 @@ async fn openai_complete(
     user: &str,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
+    _thinking: ThinkingBudget,
     fallback_input_tokens: Option<i64>,
 ) -> Result<Completion> {
     let req = OpenAiChatReq {
@@ -342,6 +468,15 @@ struct AnthropicReq<'a> {
     messages: Vec<AnthropicMessage<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<AnthropicThinkingReq>,
+}
+
+#[derive(Serialize)]
+struct AnthropicThinkingReq {
+    #[serde(rename = "type")]
+    ty: &'static str,
+    budget_tokens: u32,
 }
 
 #[derive(Serialize)]
@@ -378,17 +513,26 @@ async fn anthropic_complete(
     user: &str,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
+    thinking: ThinkingBudget,
     fallback_input_tokens: Option<i64>,
 ) -> Result<Completion> {
+    let thinking_req = anthropic_thinking_for(model, thinking);
+    let effective_max_tokens = effective_max_output_tokens(max_tokens, thinking);
     let req = AnthropicReq {
         model,
-        max_tokens: max_tokens.unwrap_or(2048),
+        max_tokens: effective_max_tokens,
         system,
         messages: vec![AnthropicMessage {
             role: "user",
             content: user,
         }],
-        temperature,
+        // Anthropic rejects temperature together with extended thinking.
+        temperature: if thinking_req.is_some() {
+            None
+        } else {
+            temperature
+        },
+        thinking: thinking_req,
     };
     let resp = reqwest::Client::new()
         .post(
@@ -428,6 +572,33 @@ async fn anthropic_complete(
             .unwrap_or_else(|| fallback_input_tokens.unwrap_or(0)),
         output_tokens: parsed.usage.as_ref().map(|u| u.output_tokens).unwrap_or(0),
     })
+}
+
+fn anthropic_thinking_for(
+    model: &str,
+    thinking: ThinkingBudget,
+) -> Option<AnthropicThinkingReq> {
+    if !thinking.is_enabled() || !anthropic_supports_manual_thinking(model) {
+        return None;
+    }
+    let default_tokens = match thinking.mode {
+        ThinkingMode::Off => return None,
+        ThinkingMode::Low => 1_024,
+        ThinkingMode::Medium | ThinkingMode::Auto => 4_096,
+        ThinkingMode::High => 8_192,
+    };
+    Some(AnthropicThinkingReq {
+        ty: "enabled",
+        budget_tokens: thinking.max_tokens.unwrap_or(default_tokens),
+    })
+}
+
+fn anthropic_supports_manual_thinking(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    // Current production deep lane is Claude 3.7 Sonnet. Newer Claude 4.x
+    // models prefer adaptive thinking on Anthropic's side, so keep manual
+    // budget opt-in narrow until the route table moves to those APIs.
+    model.contains("claude-3-7")
 }
 
 /// Codex Stage 12: OpenAI embeddings via /v1/embeddings.
@@ -777,5 +948,38 @@ mod tests {
             resolve_transcribe_candidates(Some("nova-2"))[0],
             ("deepgram", "nova-2".to_string())
         );
+    }
+
+    #[test]
+    fn deep_lane_gets_default_thinking_budget() {
+        let budget = resolve_thinking_budget("deep", None, None);
+        assert_eq!(budget.mode, ThinkingMode::Medium);
+        assert_eq!(budget.max_tokens, Some(4096));
+        assert_eq!(effective_max_output_tokens(None, budget), 5120);
+    }
+
+    #[test]
+    fn instant_lane_defaults_to_no_thinking() {
+        let budget = resolve_thinking_budget("instant", None, None);
+        assert_eq!(budget, ThinkingBudget::off());
+        assert_eq!(effective_max_output_tokens(Some(512), budget), 512);
+    }
+
+    #[test]
+    fn request_can_override_thinking_budget() {
+        let budget = resolve_thinking_budget("balanced", Some("high"), Some(9000));
+        assert_eq!(budget.mode, ThinkingMode::High);
+        assert_eq!(budget.max_tokens, Some(9000));
+        assert_eq!(effective_max_output_tokens(Some(2048), budget), 10024);
+    }
+
+    #[test]
+    fn anthropic_manual_thinking_only_for_known_supported_models() {
+        let budget = resolve_thinking_budget("deep", None, None);
+        let enabled = anthropic_thinking_for("claude-3-7-sonnet-latest", budget).unwrap();
+        assert_eq!(enabled.ty, "enabled");
+        assert_eq!(enabled.budget_tokens, 4096);
+        assert!(anthropic_thinking_for("claude-3-5-sonnet-latest", budget).is_none());
+        assert!(anthropic_thinking_for("gpt-4o", budget).is_none());
     }
 }

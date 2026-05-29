@@ -32,6 +32,15 @@ pub struct CompleteRequest {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub temperature: Option<f32>,
+    /// Optional provider-neutral reasoning effort. Supported values:
+    /// off/low/medium/high/auto. Server policy still decides whether the
+    /// selected provider/model can safely apply it.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// Optional internal thinking token budget for provider families that
+    /// expose it. Clamped server-side.
+    #[serde(default)]
+    pub thinking_budget_tokens: Option<u32>,
     pub lane: String,
     #[serde(default)]
     pub estimated_input_tokens: Option<i64>,
@@ -273,7 +282,13 @@ async fn complete_inner(
     // 2. Resolve lane → provider+model candidates. Entry balance check uses
     // the maximum candidate estimate so provider failover cannot overrun a
     // customer's hard-stop budget.
-    let max_out = req.max_tokens.unwrap_or(2048) as i64;
+    let thinking = routing::resolve_thinking_budget(
+        &req.lane,
+        req.reasoning_effort.as_deref(),
+        req.thinking_budget_tokens,
+    );
+    let effective_max_out = routing::effective_max_output_tokens(req.max_tokens, thinking);
+    let max_out = i64::from(effective_max_out);
     let est_in = req.estimated_input_tokens.unwrap_or_else(|| {
         // Crude fallback: ~4 chars/token
         ((req.system.len() + req.user.len()) as i64) / 4
@@ -402,6 +417,7 @@ async fn complete_inner(
                 &req.user,
                 req.max_tokens,
                 req.temperature,
+                thinking,
                 Some(est_in),
             )
             .await

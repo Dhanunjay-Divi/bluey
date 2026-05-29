@@ -230,6 +230,8 @@ fn spawn_lane(
             user: request.user.clone(),
             max_tokens: route.max_tokens.or(request.max_tokens),
             temperature: route.temperature.or(request.temperature),
+            reasoning_effort: request.reasoning_effort.clone(),
+            thinking_budget_tokens: request.thinking_budget_tokens,
             request_id: lane_request_id,
         };
         // Honor route.stream: if the lane wants streaming, use complete_stream;
@@ -425,6 +427,8 @@ mod tests {
             user: "u".into(),
             max_tokens: None,
             temperature: None,
+            reasoning_effort: None,
+            thinking_budget_tokens: None,
             request_id: None,
         }
     }

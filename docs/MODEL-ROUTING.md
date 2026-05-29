@@ -20,6 +20,57 @@ actual upstream models.
 | `deep` | Anthropic | `claude-3-7-sonnet-latest` | Hard coding, system design, long reasoning |
 | `vision` | OpenAI | `gpt-4o` | Analyse Screen, screenshots, image context |
 
+## Thinking Budget Policy
+
+Bluey now carries provider-neutral thinking controls through the managed path:
+
+- Desktop/daemon request: `reasoning_effort` and `thinking_budget_tokens`
+- Cloud client: forwards those fields to `bluey-server`
+- Server dispatcher: maps them to provider-safe knobs only when the selected
+  model supports them
+
+Default policy:
+
+| Lane | Default thinking | Why |
+| --- | --- | --- |
+| `instant` | Off | Starts answers fastest; no hidden reasoning spend |
+| `balanced` | Off | Keeps normal work snappy unless caller/operator opts in |
+| `deep` | Medium, 4096 thinking tokens | Hard coding/system-design work benefits from explicit reasoning budget |
+| `vision` | Off | Screen analysis currently routes through OpenAI Chat Completions; provider-specific vision reasoning is future work |
+
+Server overrides:
+
+```bash
+BLUEY_THINKING_DEEP_EFFORT=high
+BLUEY_THINKING_DEEP_TOKENS=8192
+BLUEY_THINKING_BALANCED_EFFORT=low
+BLUEY_THINKING_BALANCED_TOKENS=2048
+```
+
+Request overrides use the same concepts:
+
+```json
+{
+  "reasoning_effort": "high",
+  "thinking_budget_tokens": 8192
+}
+```
+
+Provider mapping today:
+
+- Anthropic `claude-3-7-sonnet-latest` maps to `thinking:
+  {"type":"enabled","budget_tokens":...}` and reserves enough
+  `max_tokens` for both thinking and visible answer text.
+- OpenAI managed routes still use Chat Completions in this codebase, so
+  `reasoning_effort` is accepted but not sent upstream yet. Switching OpenAI
+  managed routes to the Responses API is the right future hook for explicit
+  OpenAI reasoning controls.
+- Gemini thinking controls are not wired today because Gemini is not in the
+  managed route table yet.
+
+This gives us the operational knob the user asked for without making every
+easy question slower or more expensive.
+
 The server now resolves each lane to an ordered candidate list, not a single
 hard dependency. If the preferred provider is unavailable, over quota, or
 temporarily busy, Bluey tries the next candidate before returning an error.
@@ -164,6 +215,56 @@ Environment gates:
 | LocalWhisper fallback | `BLUEY_STT_LOCAL_WHISPER=1` |
 | Force STT router wrapper | `BLUEY_STT_ROUTER=1` |
 | Dev mock STT | `BLUEY_USE_MOCK_STT=1` |
+
+### VAD And Endpointing
+
+Bluey has two speech-boundary layers:
+
+1. **Local VAD / silence gate**: production continuous system-audio STT now
+   runs a Send-safe RMS gate before `send_audio()`. It forwards speech and
+   short trailing silence, then drops sustained silence to cut STT bandwidth
+   and cost. The full WebRTC VAD stage remains in `cue-daemon::audio::vad`;
+   its native handle is not `Send`, so it should be used from a thread-owned
+   capture worker rather than a Tokio task.
+2. **Provider endpointing**: Deepgram streaming URLs request
+   `endpointing=300`, `utterance_end_ms=1000`, `vad_events=true`, and
+   `smart_format=true` by default. Provider endpointing is the second signal
+   for "speech ended" and is what lets realtime apps avoid waiting for large
+   silent chunks.
+
+Runtime tuning:
+
+```bash
+BLUEY_VAD_AGGRESSIVENESS=aggressive        # quality | low_bitrate | aggressive | very_aggressive
+BLUEY_VAD_RMS_THRESHOLD=0.02
+BLUEY_VAD_HANGOVER_MS=500
+
+BLUEY_DEEPGRAM_ENDPOINTING_MS=300
+BLUEY_DEEPGRAM_UTTERANCE_END_MS=1000
+BLUEY_DEEPGRAM_VAD_EVENTS=1
+BLUEY_DEEPGRAM_SMART_FORMAT=1
+```
+
+The default goal is "fast but not twitchy": finalization should be quick after
+the user stops speaking, while quiet speech still gets through.
+
+## Model Selection Recommendation
+
+The right customer UX is still **Auto**, not a wall of providers. Internally we
+should keep multiple providers and route by task:
+
+| Need | Best current strategy | Pros | Cons |
+| --- | --- | --- | --- |
+| Fast easy answer | OpenAI fast mini lane | Lowest latency, good first-token speed | Not ideal for deep reasoning |
+| Human-like technical answer | Anthropic Sonnet lane | Strong prose and reasoning style | Higher latency/cost than mini models |
+| Deep coding/system design | Anthropic deep lane with thinking budget | Better multi-step structure, safer tradeoff analysis | More output/thinking tokens, costlier |
+| Screen/image analysis | OpenAI vision lane today; evaluate Gemini vision later | Simple current integration | Gemini may be cheaper/better for some image workloads but is not wired |
+| Offline fallback | Local Whisper/Ollama hidden fallback | Helps demos and outage resilience | Not reliable enough as primary paid experience |
+
+Decision: **have all providers behind the router, expose Auto/Balanced/Deep as
+simple UX concepts, and keep provider/model swaps server-side**. That lets us
+move capacity, pricing, and quality without forcing customers to understand
+provider names.
 
 Important scope note: the streaming STT factory covers the continuous
 system-audio streaming path. The chunked REST transcription path uses

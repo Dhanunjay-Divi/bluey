@@ -131,6 +131,8 @@ mod tests {
             user: "hi".into(),
             max_tokens: None,
             temperature: None,
+            reasoning_effort: None,
+            thinking_budget_tokens: None,
             request_id: None,
         }
     }

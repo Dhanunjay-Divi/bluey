@@ -64,6 +64,12 @@ pub async fn build_stt_chain(
     } else if let Some(api_key) = env_stt_key() {
         let dg_cfg = super::deepgram::DeepgramConfig {
             api_key,
+            model: env_value("BLUEY_DEEPGRAM_MODEL").unwrap_or_else(|| "nova-3".into()),
+            language: env_value("BLUEY_DEEPGRAM_LANGUAGE"),
+            smart_format: env_bool("BLUEY_DEEPGRAM_SMART_FORMAT").unwrap_or(true),
+            endpointing_ms: env_u32("BLUEY_DEEPGRAM_ENDPOINTING_MS").or(Some(300)),
+            utterance_end_ms: env_u32("BLUEY_DEEPGRAM_UTTERANCE_END_MS").or(Some(1_000)),
+            vad_events: env_bool("BLUEY_DEEPGRAM_VAD_EVENTS").unwrap_or(true),
             ..Default::default()
         };
         match super::deepgram::DeepgramProvider::connect(dg_cfg, stt_cfg.clone(), source).await {
@@ -143,4 +149,23 @@ fn openai_key() -> Option<String> {
     std::env::var("OPENAI_API_KEY")
         .ok()
         .filter(|v| !v.is_empty())
+}
+
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    env_value(name).and_then(|value| match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    })
+}
+
+fn env_u32(name: &str) -> Option<u32> {
+    env_value(name).and_then(|value| value.parse::<u32>().ok())
 }

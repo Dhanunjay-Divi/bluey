@@ -87,6 +87,8 @@ impl LlmProvider for BlueyManagedProvider {
             user: req.user.clone(),
             max_tokens: req.max_tokens,
             temperature: req.temperature,
+            reasoning_effort: req.reasoning_effort.clone(),
+            thinking_budget_tokens: req.thinking_budget_tokens,
             lane: self.lane.as_str().to_string(),
             estimated_input_tokens: None,
         };
@@ -116,6 +118,8 @@ impl LlmProvider for BlueyManagedProvider {
             user: req.user.clone(),
             max_tokens: req.max_tokens,
             temperature: req.temperature,
+            reasoning_effort: req.reasoning_effort.clone(),
+            thinking_budget_tokens: req.thinking_budget_tokens,
             lane: self.lane.as_str().to_string(),
             estimated_input_tokens: None,
         };

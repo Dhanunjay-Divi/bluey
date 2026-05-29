@@ -13,6 +13,8 @@ use cue_core::pcm::{AudioChunk, SampleRate};
 use cue_core::vad::{FrameAction, VadAggressiveness, VadConfig};
 use webrtc_vad::{SampleRate as WebRtcSampleRate, Vad, VadMode};
 
+const DEFAULT_FRAME_MS: u32 = 20;
+
 /// Adaptive RMS silence gate. Classifies an audio chunk as speech, trailing
 /// silence (within hangover window), or drop (outside hangover window).
 ///
@@ -180,6 +182,59 @@ impl TwoStageVad {
     }
 }
 
+/// Runtime VAD config used by production capture loops.
+///
+/// Defaults are intentionally conservative: admit normal speech, forward a
+/// short trailing-silence tail so STT providers can finalize utterances, then
+/// drop sustained silence. Env overrides are for QA and field tuning only.
+pub fn config_from_env() -> VadConfig {
+    let default = VadConfig::default();
+    let env = |names: &[&str]| -> Option<String> {
+        names
+            .iter()
+            .find_map(|name| std::env::var(name).ok())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+
+    VadConfig {
+        aggressiveness: env(&["BLUEY_VAD_AGGRESSIVENESS", "CUE_VAD_AGGRESSIVENESS"])
+            .and_then(|value| parse_aggressiveness(&value))
+            .unwrap_or(default.aggressiveness),
+        rms_threshold_start: env(&["BLUEY_VAD_RMS_THRESHOLD", "CUE_VAD_RMS_THRESHOLD"])
+            .and_then(|value| value.parse::<f32>().ok())
+            .map(|value| value.clamp(0.001, 0.20))
+            .unwrap_or(default.rms_threshold_start),
+        silence_hangover_frames: env(&["BLUEY_VAD_HANGOVER_FRAMES", "CUE_VAD_HANGOVER_FRAMES"])
+            .and_then(|value| value.parse::<u32>().ok())
+            .map(|frames| frames.min(150))
+            .or_else(|| {
+                env(&["BLUEY_VAD_HANGOVER_MS", "CUE_VAD_HANGOVER_MS"])
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .map(ms_to_frames)
+            })
+            .unwrap_or(default.silence_hangover_frames),
+    }
+}
+
+fn parse_aggressiveness(value: &str) -> Option<VadAggressiveness> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "0" | "quality" => Some(VadAggressiveness::Quality),
+        "1" | "low_bitrate" | "low-bitrate" | "lowbitrate" => Some(VadAggressiveness::LowBitrate),
+        "2" | "aggressive" => Some(VadAggressiveness::Aggressive),
+        "3" | "very_aggressive" | "very-aggressive" | "veryaggressive" => {
+            Some(VadAggressiveness::VeryAggressive)
+        }
+        _ => None,
+    }
+}
+
+fn ms_to_frames(ms: u32) -> u32 {
+    ms.saturating_add(DEFAULT_FRAME_MS - 1)
+        .saturating_div(DEFAULT_FRAME_MS)
+        .min(150)
+}
+
 /// Normalized RMS in [0.0, 1.0]. Zero for empty input.
 fn normalized_rms(samples: &[i16]) -> f32 {
     if samples.is_empty() {
@@ -326,5 +381,27 @@ mod tests {
         // either Send or SendSilence is acceptable; just not Drop.
         let action = v.process(&loud);
         assert_ne!(action, FrameAction::Drop);
+    }
+
+    #[test]
+    fn parses_aggressiveness_env_values() {
+        assert_eq!(
+            parse_aggressiveness("very-aggressive"),
+            Some(VadAggressiveness::VeryAggressive)
+        );
+        assert_eq!(
+            parse_aggressiveness("low_bitrate"),
+            Some(VadAggressiveness::LowBitrate)
+        );
+        assert_eq!(parse_aggressiveness("wat"), None);
+    }
+
+    #[test]
+    fn converts_hangover_ms_to_20ms_frames() {
+        assert_eq!(ms_to_frames(0), 0);
+        assert_eq!(ms_to_frames(1), 1);
+        assert_eq!(ms_to_frames(500), 25);
+        assert_eq!(ms_to_frames(501), 26);
+        assert_eq!(ms_to_frames(10_000), 150);
     }
 }

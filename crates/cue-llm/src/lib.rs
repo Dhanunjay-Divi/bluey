@@ -20,6 +20,11 @@ pub struct LlmRequest {
     pub user: String,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    /// Provider-neutral reasoning effort requested by the caller. Managed
+    /// Bluey routes map this to safe provider-specific thinking controls.
+    pub reasoning_effort: Option<String>,
+    /// Optional thinking token budget for provider families that expose one.
+    pub thinking_budget_tokens: Option<u32>,
     /// Codex Stage 9b: stable logical request id. When present, the
     /// managed provider passes it through to bluey-server's idempotency
     /// layer so retries (network timeout, daemon-side retry) hit the

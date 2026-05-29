@@ -45,6 +45,8 @@ impl AnswerLlm {
             user: question.to_string(),
             max_tokens: Some(256),
             temperature: Some(0.3),
+            reasoning_effort: None,
+            thinking_budget_tokens: None,
             request_id: None,
         };
         let mut cost: Option<LlmCostMetadata> = None;

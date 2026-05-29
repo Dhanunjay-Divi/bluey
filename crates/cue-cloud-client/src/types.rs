@@ -79,6 +79,10 @@ pub struct CompleteRequest {
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget_tokens: Option<u32>,
     pub lane: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_input_tokens: Option<i64>,

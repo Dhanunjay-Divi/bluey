@@ -34,6 +34,8 @@ impl RecapLlm {
             user: transcript.to_string(),
             max_tokens: Some(1024),
             temperature: Some(0.2),
+            reasoning_effort: None,
+            thinking_budget_tokens: None,
             request_id: None,
         };
         let mut cost: Option<LlmCostMetadata> = None;

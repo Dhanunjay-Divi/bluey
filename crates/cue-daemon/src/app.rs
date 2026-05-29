@@ -35,7 +35,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::time::{sleep, Duration};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::storage::MeetingStore;
 
@@ -599,6 +599,16 @@ pub async fn run() -> Result<()> {
                     } else {
                         None
                     };
+                    let vad_config = crate::audio::vad::config_from_env();
+                    let mut vad = if stt_enabled {
+                        // WebRTC VAD's native handle is not Send, so the
+                        // async system-audio task uses the Send-safe RMS gate
+                        // and relies on provider endpointing for the second
+                        // speech-boundary signal.
+                        Some(crate::audio::vad::RmsGate::new(&vad_config))
+                    } else {
+                        None
+                    };
 
                     // Single-task select! loop: send audio AND drain events
                     // from the SAME provider instance.
@@ -609,6 +619,20 @@ pub async fn run() -> Result<()> {
                                     match chunk_opt {
                                         Some(chunk) => {
                                             debug!("[system audio chunk: {}ms]", chunk.duration_ms());
+                                            if let Some(vad) = vad.as_mut() {
+                                                let action = vad.process(&chunk);
+                                                if !action.should_forward() {
+                                                    trace!(
+                                                        vad_action = action.as_str(),
+                                                        "system audio VAD dropped silence frame"
+                                                    );
+                                                    continue;
+                                                }
+                                                trace!(
+                                                    vad_action = action.as_str(),
+                                                    "system audio VAD forwarded frame"
+                                                );
+                                            }
                                             if let Err(e) = provider.send_audio(&chunk).await {
                                                 warn!("system audio STT send failed: {e}");
                                             }

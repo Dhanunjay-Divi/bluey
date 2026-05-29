@@ -34,6 +34,8 @@ impl WhatToAnswerLlm {
             user: transcript.to_string(),
             max_tokens: Some(200),
             temperature: Some(0.5),
+            reasoning_effort: None,
+            thinking_budget_tokens: None,
             request_id: None,
         };
         let mut cost: Option<LlmCostMetadata> = None;

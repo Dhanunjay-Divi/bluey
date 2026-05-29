@@ -1352,6 +1352,8 @@ async fn try_speculative_dispatch(
         user: user_text.to_string(),
         max_tokens: None,
         temperature: None,
+        reasoning_effort: None,
+        thinking_budget_tokens: None,
         // Codex Stage 9b: thread the daemon's response_id as the
         // stable logical request id so retries / failover hit the
         // server idempotency cache instead of double-charging.
