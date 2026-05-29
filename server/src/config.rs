@@ -1,5 +1,6 @@
 //! Server-side configuration. Read from environment variables.
 
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -94,6 +95,12 @@ pub struct UpstreamKeys {
     pub ollama_base_url: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamKeyCandidate {
+    pub secret: String,
+    pub fingerprint: String,
+}
+
 impl UpstreamKeys {
     pub fn openai_key(&self, shard_key: &str) -> Option<&str> {
         select_key_from_pool(self.openai_api_key.as_deref(), shard_key)
@@ -105,6 +112,16 @@ impl UpstreamKeys {
 
     pub fn deepgram_key(&self, shard_key: &str) -> Option<&str> {
         select_key_from_pool(self.deepgram_api_key.as_deref(), shard_key)
+    }
+
+    pub fn key_candidates(&self, provider: &str, shard_key: &str) -> Vec<UpstreamKeyCandidate> {
+        let raw = match provider {
+            "openai" => self.openai_api_key.as_deref(),
+            "anthropic" => self.anthropic_api_key.as_deref(),
+            "deepgram" => self.deepgram_api_key.as_deref(),
+            _ => None,
+        };
+        key_candidates_from_pool(raw, shard_key)
     }
 }
 
@@ -265,6 +282,33 @@ fn select_key_from_pool<'a>(raw: Option<&'a str>, shard_key: &str) -> Option<&'a
     Some(keys[idx])
 }
 
+fn key_candidates_from_pool(raw: Option<&str>, shard_key: &str) -> Vec<UpstreamKeyCandidate> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    let keys = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return Vec::new();
+    }
+    let start = (stable_hash(shard_key) as usize) % keys.len();
+    (0..keys.len())
+        .map(|offset| keys[(start + offset) % keys.len()])
+        .map(|key| UpstreamKeyCandidate {
+            secret: key.to_string(),
+            fingerprint: key_fingerprint(key),
+        })
+        .collect()
+}
+
+fn key_fingerprint(key: &str) -> String {
+    let digest = Sha256::digest(key.as_bytes());
+    hex::encode(&digest[..8])
+}
+
 fn stable_hash(input: &str) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in input.as_bytes() {
@@ -308,6 +352,27 @@ mod tests {
             seen.insert(keys.deepgram_key(&format!("request-{idx}")).unwrap());
         }
         assert!(seen.len() >= 2, "expected pool to use more than one key");
+    }
+
+    #[test]
+    fn key_candidates_rotate_without_exposing_raw_key_as_fingerprint() {
+        let keys = UpstreamKeys {
+            openai_api_key: Some("sk-a,sk-b,sk-c".into()),
+            ..Default::default()
+        };
+        let candidates = keys.key_candidates("openai", "request-1");
+        assert_eq!(candidates.len(), 3);
+        let secrets = candidates
+            .iter()
+            .map(|candidate| candidate.secret.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(secrets.len(), 3);
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.fingerprint.len() == 16));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.fingerprint != candidate.secret));
     }
 
     #[test]

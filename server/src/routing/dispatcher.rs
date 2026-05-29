@@ -18,10 +18,57 @@ fn override_url(default: &str, env_var: &str) -> String {
 }
 
 use anyhow::{anyhow, Context, Result};
+use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::config::UpstreamKeys;
+
+#[derive(Debug, Error)]
+#[error("{provider} upstream http {status}")]
+pub struct UpstreamHttpError {
+    pub provider: String,
+    pub status: u16,
+    pub retry_after_secs: Option<u64>,
+}
+
+pub fn upstream_retry_after(error: &anyhow::Error) -> Option<u64> {
+    error
+        .downcast_ref::<UpstreamHttpError>()
+        .and_then(|error| error.retry_after_secs)
+}
+
+fn upstream_http_error(provider: &str, status: reqwest::StatusCode, headers: &HeaderMap) -> anyhow::Error {
+    anyhow!(UpstreamHttpError {
+        provider: provider.to_string(),
+        status: status.as_u16(),
+        retry_after_secs: retry_after_secs(status, headers),
+    })
+}
+
+fn retry_after_secs(status: reqwest::StatusCode, headers: &HeaderMap) -> Option<u64> {
+    let explicit = headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0);
+    if explicit.is_some() {
+        return explicit;
+    }
+    match status.as_u16() {
+        429 | 529 => Some(default_capacity_cooldown_secs()),
+        _ => None,
+    }
+}
+
+fn default_capacity_cooldown_secs() -> u64 {
+    std::env::var("BLUEY_PROVIDER_429_COOLDOWN_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(30)
+}
 
 /// Normalised completion response.
 #[derive(Debug)]
@@ -101,8 +148,11 @@ pub async fn complete(
 ) -> Result<Completion> {
     match provider {
         "openai" => {
+            let key = keys
+                .openai_key(&format!("chat:{model}:{system}:{user}"))
+                .ok_or_else(|| anyhow!("OPENAI_API_KEY(S) not configured on bluey-server"))?;
             openai_complete(
-                keys,
+                key,
                 model,
                 system,
                 user,
@@ -113,8 +163,11 @@ pub async fn complete(
             .await
         }
         "anthropic" => {
+            let key = keys
+                .anthropic_key(&format!("chat:{model}:{system}:{user}"))
+                .ok_or_else(|| anyhow!("ANTHROPIC_API_KEY(S) not configured on bluey-server"))?;
             anthropic_complete(
-                keys,
+                key,
                 model,
                 system,
                 user,
@@ -127,6 +180,48 @@ pub async fn complete(
         // Codex S4.4: explicit failure for unsupported providers
         // including `ollama` (which only the daemon's local fallback
         // path should run).
+        other => Err(anyhow!(
+            "unsupported provider for managed dispatch: {other}"
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_with_key(
+    api_key: &str,
+    provider: &str,
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    fallback_input_tokens: Option<i64>,
+) -> Result<Completion> {
+    match provider {
+        "openai" => {
+            openai_complete(
+                api_key,
+                model,
+                system,
+                user,
+                max_tokens,
+                temperature,
+                fallback_input_tokens,
+            )
+            .await
+        }
+        "anthropic" => {
+            anthropic_complete(
+                api_key,
+                model,
+                system,
+                user,
+                max_tokens,
+                temperature,
+                fallback_input_tokens,
+            )
+            .await
+        }
         other => Err(anyhow!(
             "unsupported provider for managed dispatch: {other}"
         )),
@@ -175,7 +270,7 @@ struct OpenAiUsage {
 
 #[allow(clippy::too_many_arguments)]
 async fn openai_complete(
-    keys: &UpstreamKeys,
+    key: &str,
     model: &str,
     system: &str,
     user: &str,
@@ -183,9 +278,6 @@ async fn openai_complete(
     temperature: Option<f32>,
     fallback_input_tokens: Option<i64>,
 ) -> Result<Completion> {
-    let key = keys
-        .openai_key(&format!("chat:{model}:{system}:{user}"))
-        .ok_or_else(|| anyhow!("OPENAI_API_KEY(S) not configured on bluey-server"))?;
     let req = OpenAiChatReq {
         model,
         messages: vec![
@@ -216,8 +308,9 @@ async fn openai_complete(
         .context("openai http")?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("openai {status}: {body}"));
+        let error = upstream_http_error("openai", status, resp.headers());
+        let _ = resp.text().await.unwrap_or_default();
+        return Err(error);
     }
     let parsed: OpenAiChatResp = resp.json().await.context("openai json")?;
     let text = parsed
@@ -279,7 +372,7 @@ struct AnthropicUsage {
 
 #[allow(clippy::too_many_arguments)]
 async fn anthropic_complete(
-    keys: &UpstreamKeys,
+    key: &str,
     model: &str,
     system: &str,
     user: &str,
@@ -287,9 +380,6 @@ async fn anthropic_complete(
     temperature: Option<f32>,
     fallback_input_tokens: Option<i64>,
 ) -> Result<Completion> {
-    let key = keys
-        .anthropic_key(&format!("chat:{model}:{system}:{user}"))
-        .ok_or_else(|| anyhow!("ANTHROPIC_API_KEY(S) not configured on bluey-server"))?;
     let req = AnthropicReq {
         model,
         max_tokens: max_tokens.unwrap_or(2048),
@@ -316,8 +406,9 @@ async fn anthropic_complete(
         .context("anthropic http")?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("anthropic {status}: {body}"));
+        let error = upstream_http_error("anthropic", status, resp.headers());
+        let _ = resp.text().await.unwrap_or_default();
+        return Err(error);
     }
     let parsed: AnthropicResp = resp.json().await.context("anthropic json")?;
     let text = parsed
@@ -347,7 +438,26 @@ pub async fn embed(
     input: &str,
 ) -> Result<EmbedCompletion> {
     match provider {
-        "openai" => openai_embed(keys, model, input).await,
+        "openai" => {
+            let key = keys
+                .openai_key(&format!("embed:{model}:{input}"))
+                .ok_or_else(|| anyhow!("OPENAI_API_KEY(S) not configured on bluey-server"))?;
+            openai_embed(key, model, input).await
+        }
+        other => Err(anyhow!(
+            "unsupported embedding provider for managed dispatch: {other}"
+        )),
+    }
+}
+
+pub async fn embed_with_key(
+    api_key: &str,
+    provider: &str,
+    model: &str,
+    input: &str,
+) -> Result<EmbedCompletion> {
+    match provider {
+        "openai" => openai_embed(api_key, model, input).await,
         other => Err(anyhow!(
             "unsupported embedding provider for managed dispatch: {other}"
         )),
@@ -381,10 +491,7 @@ struct OpenAiEmbedData {
     embedding: Vec<f32>,
 }
 
-async fn openai_embed(keys: &UpstreamKeys, model: &str, input: &str) -> Result<EmbedCompletion> {
-    let key = keys
-        .openai_key(&format!("embed:{model}:{input}"))
-        .ok_or_else(|| anyhow!("OPENAI_API_KEY(S) not configured on bluey-server"))?;
+async fn openai_embed(key: &str, model: &str, input: &str) -> Result<EmbedCompletion> {
     let req = OpenAiEmbedReq { model, input };
     let resp = reqwest::Client::new()
         .post(
@@ -401,8 +508,9 @@ async fn openai_embed(keys: &UpstreamKeys, model: &str, input: &str) -> Result<E
         .context("openai embed http")?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("openai embed {status}: {body}"));
+        let error = upstream_http_error("openai", status, resp.headers());
+        let _ = resp.text().await.unwrap_or_default();
+        return Err(error);
     }
     let parsed: OpenAiEmbedResp = resp.json().await.context("openai embed json")?;
     let vector = parsed
@@ -432,8 +540,34 @@ pub async fn transcribe(
     content_type: &str,
 ) -> Result<TranscribeCompletion> {
     match provider {
-        "deepgram" => deepgram_transcribe(keys, model, audio_bytes, content_type).await,
-        "openai" => openai_transcribe(keys, model, audio_bytes, content_type).await,
+        "deepgram" => {
+            let key = keys
+                .deepgram_key(&format!("transcribe:{model}:{}", audio_bytes.len()))
+                .ok_or_else(|| anyhow!("DEEPGRAM_API_KEY(S) not configured on bluey-server"))?;
+            deepgram_transcribe(key, model, audio_bytes, content_type).await
+        }
+        "openai" => {
+            let key = keys
+                .openai_key(&format!("transcribe:{model}:{}", audio_bytes.len()))
+                .ok_or_else(|| anyhow!("OPENAI_API_KEY(S) not configured on bluey-server"))?;
+            openai_transcribe(key, model, audio_bytes, content_type).await
+        }
+        other => Err(anyhow!(
+            "unsupported transcribe provider for managed dispatch: {other}"
+        )),
+    }
+}
+
+pub async fn transcribe_with_key(
+    api_key: &str,
+    provider: &str,
+    model: &str,
+    audio_bytes: &[u8],
+    content_type: &str,
+) -> Result<TranscribeCompletion> {
+    match provider {
+        "deepgram" => deepgram_transcribe(api_key, model, audio_bytes, content_type).await,
+        "openai" => openai_transcribe(api_key, model, audio_bytes, content_type).await,
         other => Err(anyhow!(
             "unsupported transcribe provider for managed dispatch: {other}"
         )),
@@ -481,14 +615,11 @@ struct OpenAiTranscribeResp {
 }
 
 async fn deepgram_transcribe(
-    keys: &UpstreamKeys,
+    key: &str,
     model: &str,
     audio_bytes: &[u8],
     content_type: &str,
 ) -> Result<TranscribeCompletion> {
-    let key = keys
-        .deepgram_key(&format!("transcribe:{model}:{}", audio_bytes.len()))
-        .ok_or_else(|| anyhow!("DEEPGRAM_API_KEY(S) not configured on bluey-server"))?;
     // POST to /v1/listen?model=...&punctuate=true with the raw audio
     // bytes as the body. Deepgram accepts audio/wav, audio/mpeg, etc.
     let default_url = format!(
@@ -505,8 +636,9 @@ async fn deepgram_transcribe(
         .context("deepgram transcribe http")?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("deepgram {status}: {body}"));
+        let error = upstream_http_error("deepgram", status, resp.headers());
+        let _ = resp.text().await.unwrap_or_default();
+        return Err(error);
     }
     let parsed: DeepgramResp = resp.json().await.context("deepgram json")?;
     let text = parsed
@@ -532,14 +664,11 @@ async fn deepgram_transcribe(
 }
 
 async fn openai_transcribe(
-    keys: &UpstreamKeys,
+    key: &str,
     model: &str,
     audio_bytes: &[u8],
     content_type: &str,
 ) -> Result<TranscribeCompletion> {
-    let key = keys
-        .openai_key(&format!("transcribe:{model}:{}", audio_bytes.len()))
-        .ok_or_else(|| anyhow!("OPENAI_API_KEY(S) not configured on bluey-server"))?;
     let file = Part::bytes(audio_bytes.to_vec())
         .file_name(audio_filename(content_type))
         .mime_str(content_type)
@@ -562,8 +691,9 @@ async fn openai_transcribe(
         .context("openai transcribe http")?;
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("openai transcribe {status}: {body}"));
+        let error = upstream_http_error("openai", status, resp.headers());
+        let _ = resp.text().await.unwrap_or_default();
+        return Err(error);
     }
     let parsed: OpenAiTranscribeResp = resp.json().await.context("openai transcribe json")?;
     Ok(TranscribeCompletion {

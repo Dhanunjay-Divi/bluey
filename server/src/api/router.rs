@@ -109,6 +109,10 @@ fn release_and_capacity_error(
     capacity_error(reason, retry_after_secs)
 }
 
+fn missing_provider_key_error(provider: &str) -> anyhow::Error {
+    anyhow::anyhow!("{provider} API key pool is not configured on bluey-server")
+}
+
 fn priced_routes_for(
     lane: &str,
     estimated_input_tokens: i64,
@@ -338,55 +342,121 @@ async fn complete_inner(
     let mut selected_completion: Option<routing::Completion> = None;
 
     for (idx, route) in routes.iter().enumerate() {
-        if let Err(denied) = state
-            .rate_limiters
-            .check_provider_llm(route.provider, route.model)
-            .await
-        {
-            tracing::warn!(
-                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                request_id = %req.request_id,
-                provider = %route.provider,
-                model = %route.model,
-                retry_after_secs = denied.retry_after_secs,
-                reason = denied.reason,
-                "provider capacity busy; trying next route"
-            );
-            last_capacity = Some(denied);
-            last_failure_was_capacity = true;
+        let key_candidates = state.config.upstream.key_candidates(
+            route.provider,
+            &format!("llm:{}:{}:{}", req.request_id, route.provider, route.model),
+        );
+        if key_candidates.is_empty() {
+            last_error = Some(missing_provider_key_error(route.provider));
+            last_failure_was_capacity = false;
             continue;
         }
 
-        match routing::complete(
-            &state.config.upstream,
-            route.provider,
-            route.model,
-            &req.system,
-            &req.user,
-            req.max_tokens,
-            req.temperature,
-            Some(est_in),
-        )
-        .await
-        {
-            Ok(completion) => {
-                selected_route_idx = idx;
-                selected_route = Some(route);
-                selected_completion = Some(completion);
-                break;
-            }
-            Err(e) => {
+        loop {
+            let selected_key = match state
+                .provider_health
+                .choose_key(route.provider, route.model, &key_candidates)
+                .await
+            {
+                Ok(key) => key,
+                Err(denied) => {
+                    tracing::warn!(
+                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                        request_id = %req.request_id,
+                        provider = %route.provider,
+                        model = %route.model,
+                        retry_after_secs = denied.retry_after_secs,
+                        reason = denied.reason,
+                        "provider key pool cooling down; trying next route"
+                    );
+                    last_capacity = Some(denied);
+                    last_failure_was_capacity = true;
+                    break;
+                }
+            };
+
+            if let Err(denied) = state
+                .rate_limiters
+                .check_provider_llm(route.provider, route.model)
+                .await
+            {
                 tracing::warn!(
                     account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                     request_id = %req.request_id,
                     provider = %route.provider,
                     model = %route.model,
-                    error = %e,
-                    "upstream dispatch failed; trying next route"
+                    retry_after_secs = denied.retry_after_secs,
+                    reason = denied.reason,
+                    "provider capacity busy; trying next route"
                 );
-                last_error = Some(e);
-                last_failure_was_capacity = false;
+                last_capacity = Some(denied);
+                last_failure_was_capacity = true;
+                break;
             }
+
+            match routing::complete_with_key(
+                &selected_key.secret,
+                route.provider,
+                route.model,
+                &req.system,
+                &req.user,
+                req.max_tokens,
+                req.temperature,
+                Some(est_in),
+            )
+            .await
+            {
+                Ok(completion) => {
+                    selected_route_idx = idx;
+                    selected_route = Some(route);
+                    selected_completion = Some(completion);
+                    break;
+                }
+                Err(e) => {
+                    if let Some(retry_after_secs) = routing::upstream_retry_after(&e) {
+                        let cooldown_secs = state
+                            .provider_health
+                            .record_cooldown(
+                                route.provider,
+                                route.model,
+                                &selected_key.fingerprint,
+                                retry_after_secs,
+                            )
+                            .await;
+                        tracing::warn!(
+                            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                            request_id = %req.request_id,
+                            provider = %route.provider,
+                            model = %route.model,
+                            key_fingerprint = %selected_key.fingerprint,
+                            retry_after_secs = cooldown_secs,
+                            error = %e,
+                            "upstream capacity response; cooled key and retrying route"
+                        );
+                        last_capacity = Some(crate::rate_limit::CapacityDenied {
+                            retry_after_secs: cooldown_secs,
+                            reason: "provider_key_cooling_down",
+                        });
+                        last_failure_was_capacity = true;
+                        continue;
+                    }
+                    tracing::warn!(
+                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                        request_id = %req.request_id,
+                        provider = %route.provider,
+                        model = %route.model,
+                        error = %e,
+                        "upstream dispatch failed; trying next route"
+                    );
+                    last_error = Some(e);
+                    last_failure_was_capacity = false;
+                    break;
+                }
+            }
+        }
+
+        if selected_completion.is_some() {
+            break;
         }
     }
     let elapsed = started.elapsed();
@@ -909,20 +979,6 @@ pub async fn embed(
             denied.retry_after_secs,
         ));
     }
-    if let Err(denied) = state
-        .rate_limiters
-        .check_provider_embed(provider, model)
-        .await
-    {
-        return Err(release_and_capacity_error(
-            &state.pool,
-            &account.id,
-            &req.request_id,
-            denied.reason,
-            denied.retry_after_secs,
-        ));
-    }
-
     // Entry check (skipped on trial).
     let on_trial = account.trial_seconds_remaining > 0;
     let est_in = (req.input.len() as i64) / 4;
@@ -955,29 +1011,97 @@ pub async fn embed(
         }
     }
 
-    // Dispatch.
-    let result = routing::embed(&state.config.upstream, provider, model, &req.input).await;
+    let key_candidates = state.config.upstream.key_candidates(
+        provider,
+        &format!("embed:{}:{provider}:{model}", req.request_id),
+    );
+    if key_candidates.is_empty() {
+        let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ApiError {
+                error: "upstream embed provider is not configured".into(),
+                reason: Some("upstream_not_configured".into()),
+                ..Default::default()
+            }),
+        ));
+    }
 
-    let comp = match result {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                request_id = %req.request_id,
-                provider = %provider,
-                model = %model,
-                error = %e,
-                "embed dispatch failed"
-            );
-            let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                Json(ApiError {
-                    error: "upstream embed error; please retry".into(),
-                    reason: Some("upstream_error".into()),
-                    ..Default::default()
-                }),
+    let comp = loop {
+        let selected_key = match state
+            .provider_health
+            .choose_key(provider, model, &key_candidates)
+            .await
+        {
+            Ok(key) => key,
+            Err(denied) => {
+                return Err(release_and_capacity_error(
+                    &state.pool,
+                    &account.id,
+                    &req.request_id,
+                    denied.reason,
+                    denied.retry_after_secs,
+                ));
+            }
+        };
+
+        if let Err(denied) = state
+            .rate_limiters
+            .check_provider_embed(provider, model)
+            .await
+        {
+            return Err(release_and_capacity_error(
+                &state.pool,
+                &account.id,
+                &req.request_id,
+                denied.reason,
+                denied.retry_after_secs,
             ));
+        }
+
+        match routing::embed_with_key(&selected_key.secret, provider, model, &req.input).await {
+            Ok(c) => break c,
+            Err(e) => {
+                if let Some(retry_after_secs) = routing::upstream_retry_after(&e) {
+                    let cooldown_secs = state
+                        .provider_health
+                        .record_cooldown(
+                            provider,
+                            model,
+                            &selected_key.fingerprint,
+                            retry_after_secs,
+                        )
+                        .await;
+                    tracing::warn!(
+                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                        request_id = %req.request_id,
+                        provider = %provider,
+                        model = %model,
+                        key_fingerprint = %selected_key.fingerprint,
+                        retry_after_secs = cooldown_secs,
+                        error = %e,
+                        "embed upstream capacity response; cooled key and retrying"
+                    );
+                    continue;
+                }
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    request_id = %req.request_id,
+                    provider = %provider,
+                    model = %model,
+                    error = %e,
+                    "embed dispatch failed"
+                );
+                let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    Json(ApiError {
+                        error: "upstream embed error; please retry".into(),
+                        reason: Some("upstream_error".into()),
+                        ..Default::default()
+                    }),
+                ));
+            }
         }
     };
 
@@ -1227,51 +1351,118 @@ pub async fn transcribe(
     let mut selected_completion: Option<routing::TranscribeCompletion> = None;
 
     for (idx, route) in routes.iter().enumerate() {
-        if let Err(denied) = state
-            .rate_limiters
-            .check_provider_stt(route.provider, &route.model)
-            .await
-        {
-            tracing::warn!(
-                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                request_id = %q.request_id,
-                provider = %route.provider,
-                model = %route.model,
-                retry_after_secs = denied.retry_after_secs,
-                reason = denied.reason,
-                "provider STT capacity busy; trying next route"
-            );
-            last_capacity = Some(denied);
-            last_failure_was_capacity = true;
+        let key_candidates = state.config.upstream.key_candidates(
+            route.provider,
+            &format!("stt:{}:{}:{}", q.request_id, route.provider, route.model),
+        );
+        if key_candidates.is_empty() {
+            last_error = Some(missing_provider_key_error(route.provider));
+            last_failure_was_capacity = false;
             continue;
         }
-        match routing::transcribe(
-            &state.config.upstream,
-            route.provider,
-            &route.model,
-            &body,
-            &content_type,
-        )
-        .await
-        {
-            Ok(c) => {
-                selected_route_idx = idx;
-                selected_route = Some(route);
-                selected_completion = Some(c);
-                break;
-            }
-            Err(e) => {
+
+        loop {
+            let selected_key = match state
+                .provider_health
+                .choose_key(route.provider, &route.model, &key_candidates)
+                .await
+            {
+                Ok(key) => key,
+                Err(denied) => {
+                    tracing::warn!(
+                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                        request_id = %q.request_id,
+                        provider = %route.provider,
+                        model = %route.model,
+                        retry_after_secs = denied.retry_after_secs,
+                        reason = denied.reason,
+                        "provider STT key pool cooling down; trying next route"
+                    );
+                    last_capacity = Some(denied);
+                    last_failure_was_capacity = true;
+                    break;
+                }
+            };
+
+            if let Err(denied) = state
+                .rate_limiters
+                .check_provider_stt(route.provider, &route.model)
+                .await
+            {
                 tracing::warn!(
                     account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                     request_id = %q.request_id,
                     provider = %route.provider,
                     model = %route.model,
-                    error = %e,
-                    "transcribe dispatch failed; trying next route"
+                    retry_after_secs = denied.retry_after_secs,
+                    reason = denied.reason,
+                    "provider STT capacity busy; trying next route"
                 );
-                last_error = Some(e);
-                last_failure_was_capacity = false;
+                last_capacity = Some(denied);
+                last_failure_was_capacity = true;
+                break;
             }
+
+            match routing::transcribe_with_key(
+                &selected_key.secret,
+                route.provider,
+                &route.model,
+                &body,
+                &content_type,
+            )
+            .await
+            {
+                Ok(c) => {
+                    selected_route_idx = idx;
+                    selected_route = Some(route);
+                    selected_completion = Some(c);
+                    break;
+                }
+                Err(e) => {
+                    if let Some(retry_after_secs) = routing::upstream_retry_after(&e) {
+                        let cooldown_secs = state
+                            .provider_health
+                            .record_cooldown(
+                                route.provider,
+                                &route.model,
+                                &selected_key.fingerprint,
+                                retry_after_secs,
+                            )
+                            .await;
+                        tracing::warn!(
+                            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                            request_id = %q.request_id,
+                            provider = %route.provider,
+                            model = %route.model,
+                            key_fingerprint = %selected_key.fingerprint,
+                            retry_after_secs = cooldown_secs,
+                            error = %e,
+                            "transcribe upstream capacity response; cooled key and retrying route"
+                        );
+                        last_capacity = Some(crate::rate_limit::CapacityDenied {
+                            retry_after_secs: cooldown_secs,
+                            reason: "provider_key_cooling_down",
+                        });
+                        last_failure_was_capacity = true;
+                        continue;
+                    }
+                    tracing::warn!(
+                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                        request_id = %q.request_id,
+                        provider = %route.provider,
+                        model = %route.model,
+                        error = %e,
+                        "transcribe dispatch failed; trying next route"
+                    );
+                    last_error = Some(e);
+                    last_failure_was_capacity = false;
+                    break;
+                }
+            }
+        }
+
+        if selected_completion.is_some() {
+            break;
         }
     }
 

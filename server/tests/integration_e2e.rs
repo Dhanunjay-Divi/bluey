@@ -11,7 +11,7 @@ use axum::http::Request;
 use serde_json::json;
 use serial_test::serial;
 use tower::ServiceExt;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use bluey_server::config::{Config, UpstreamKeys};
@@ -31,6 +31,16 @@ struct Harness {
 }
 
 async fn boot_harness() -> Harness {
+    boot_harness_with_upstream(UpstreamKeys {
+        openai_api_key: Some("sk-test-openai".to_string()),
+        anthropic_api_key: Some("sk-test-anthropic".to_string()),
+        deepgram_api_key: Some("dg-test".to_string()),
+        ollama_base_url: None,
+    })
+    .await
+}
+
+async fn boot_harness_with_upstream(upstream: UpstreamKeys) -> Harness {
     let openai = MockServer::start().await;
     let anthropic = MockServer::start().await;
     let stripe = MockServer::start().await;
@@ -49,12 +59,7 @@ async fn boot_harness() -> Harness {
         stripe_secret_key: Some("sk_test_e2e".to_string()),
         stripe_webhook_secret: Some("whsec_test_e2e".to_string()),
         smtp: None,
-        upstream: UpstreamKeys {
-            openai_api_key: Some("sk-test-openai".to_string()),
-            anthropic_api_key: Some("sk-test-anthropic".to_string()),
-            deepgram_api_key: Some("dg-test".to_string()),
-            ollama_base_url: None,
-        },
+        upstream,
     };
 
     // Override upstream URLs by env. The dispatcher reads from
@@ -212,6 +217,78 @@ async fn router_complete_falls_back_when_preferred_provider_429s() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["text"], "fallback answer");
+    assert_eq!(v["provider"], "openai");
+    assert_eq!(v["model"], "gpt-4o-mini");
+}
+
+#[tokio::test]
+#[serial]
+async fn router_complete_retries_next_openai_key_on_429_without_customer_wait() {
+    let upstream = UpstreamKeys {
+        openai_api_key: Some("sk-openai-a,sk-openai-b".to_string()),
+        anthropic_api_key: Some("sk-test-anthropic".to_string()),
+        deepgram_api_key: Some("dg-test".to_string()),
+        ollama_base_url: None,
+    };
+    let request_id = "openai-keypool-429-1";
+    let ordered_keys = upstream.key_candidates(
+        "openai",
+        &format!("llm:{request_id}:openai:gpt-4o-mini"),
+    );
+    assert_eq!(ordered_keys.len(), 2);
+
+    let h = boot_harness_with_upstream(upstream).await;
+    let access = signup_and_login(&h, "keypool@example.com", "longenoughpw").await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header(
+            "authorization",
+            format!("Bearer {}", ordered_keys[0].secret),
+        ))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "45")
+                .set_body_string("rate limited"),
+        )
+        .expect(1)
+        .mount(&h.openai)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(header(
+            "authorization",
+            format!("Bearer {}", ordered_keys[1].secret),
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "second key answered"}}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 3}
+        })))
+        .expect(1)
+        .mount(&h.openai)
+        .await;
+
+    let req = Request::post("/router/complete")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "request_id": request_id,
+                "system": "you are helpful",
+                "user": "answer quickly",
+                "lane": "instant"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["text"], "second key answered");
     assert_eq!(v["provider"], "openai");
     assert_eq!(v["model"], "gpt-4o-mini");
 }

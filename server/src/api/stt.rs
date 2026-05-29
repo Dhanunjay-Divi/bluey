@@ -551,6 +551,7 @@ mod tests {
                 smtp: None,
             }),
             rate_limiters: crate::rate_limit::RateLimiters::default(),
+            provider_health: crate::provider_health::ProviderHealth::default(),
         }
     }
 }

@@ -1,6 +1,6 @@
 # Bluey Model Routing
 
-Last updated: 2026-05-24
+Last updated: 2026-05-29
 
 This document is the source-of-truth snapshot for the model/provider routing
 currently implemented in the Bluey codebase. It is intentionally operational:
@@ -47,7 +47,10 @@ Bluey protects realtime work at three layers:
    enable them during an incident with `BLUEY_LIMIT_ROUTER_*`.
 2. **Provider/model buckets**: keeps OpenAI, Anthropic, Deepgram, and embedding
    calls inside configured capacity and lets LLM lanes fall back before failing.
-3. **Optional per-account emergency guardrails**: disabled by default. Turn
+3. **Provider/model/key health ledger**: if an upstream key returns a capacity
+   response such as HTTP 429, Bluey cools down that exact provider/model/key for
+   `Retry-After` and immediately tries the next approved key or route.
+4. **Optional per-account emergency guardrails**: disabled by default. Turn
    them on only during abuse incidents, stolen-token response, or runaway-client
    mitigation. Normal paid usage is controlled by wallet balance and provider
    availability, not by per-account throttling.
@@ -85,11 +88,21 @@ Bluey server instance. Optional knobs:
 | `BLUEY_REDIS_URL` | unset/local only | Enables shared capacity ledger |
 | `BLUEY_REDIS_NAMESPACE` | `bluey` | Separates staging/prod Redis keys |
 | `BLUEY_RATE_LIMIT_REDIS_STRICT` | `false` | If true, Redis errors deny instead of falling back locally |
+| `BLUEY_PROVIDER_429_COOLDOWN_SECS` | `30` | Fallback key cooldown when provider sends 429 without Retry-After |
+| `BLUEY_PROVIDER_MAX_COOLDOWN_SECS` | `300` | Caps provider-key cooldowns so one bad header cannot park capacity forever |
 
 Without Redis, buckets are in-process and suitable only for local/dev or a
 single-server alpha. With Redis, provider limits are enforced globally across
-instances. The next capacity step is provider-key health scoring in the same
-shared ledger so every server avoids unhealthy keys.
+instances. The provider-key health ledger uses the same Redis namespace when
+`BLUEY_REDIS_URL` is set; otherwise it falls back to a local in-process cooldown
+map. Redis failures do not block realtime calls by default because the local
+cooldown remains active and provider/model token buckets still protect the
+server.
+
+`/admin/metrics` exposes aggregate provider-health counters for cooldowns,
+all-keys-cooling events, and Redis ledger errors. Keep these low during load
+tests; a spike means Bluey needs more approved provider capacity or a route mix
+change.
 
 ## Internal Developer/Offline Fallback Routing
 

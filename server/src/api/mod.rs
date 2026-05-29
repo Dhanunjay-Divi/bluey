@@ -24,6 +24,8 @@ pub struct AppState {
     pub config: Arc<Config>,
     /// Codex Stage 11: per-IP rate limiters for sensitive endpoints.
     pub rate_limiters: crate::rate_limit::RateLimiters,
+    /// Provider/model/key cooldown ledger used to route around upstream 429s.
+    pub provider_health: crate::provider_health::ProviderHealth,
 }
 
 pub fn build_router(pool: DbPool, config: Config) -> Router {
@@ -31,6 +33,7 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         pool,
         config: Arc::new(config),
         rate_limiters: crate::rate_limit::RateLimiters::default(),
+        provider_health: crate::provider_health::ProviderHealth::default(),
     };
 
     // ---- Public (no auth) ---------------------------------------------------

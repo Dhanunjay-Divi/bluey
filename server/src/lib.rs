@@ -24,6 +24,7 @@ pub mod config;
 pub mod db;
 pub mod mail;
 pub mod pricing;
+pub mod provider_health;
 pub mod rate_limit;
 pub mod routing;
 

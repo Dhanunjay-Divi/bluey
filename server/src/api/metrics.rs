@@ -18,6 +18,9 @@
 //!   bluey_credit_batches_total        - all credit_batches rows
 //!   bluey_usage_events_24h            - usage_events in last 24h
 //!   bluey_stripe_webhook_processed    - rows with processed_at NOT NULL
+//!   bluey_provider_key_cooldowns_total - upstream key cooldown events
+//!   bluey_provider_key_all_cooling_total - all keys cooling for a route
+//!   bluey_provider_health_redis_errors_total - Redis health-ledger failures
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse};
 
@@ -74,6 +77,10 @@ pub async fn get_metrics(State(state): State<AppState>) -> impl IntoResponse {
         &conn,
         "SELECT COUNT(*) FROM stripe_webhook_events WHERE processed_at IS NOT NULL",
     );
+    let provider_health = state.provider_health.snapshot();
+    let provider_key_cooldowns = provider_health.cooldowns_total;
+    let provider_key_all_cooling = provider_health.all_keys_cooling_total;
+    let provider_health_redis_errors = provider_health.redis_errors_total;
 
     let body = format!(
         "# HELP bluey_accounts_total Total customer accounts.
@@ -106,6 +113,15 @@ pub async fn get_metrics(State(state): State<AppState>) -> impl IntoResponse {
          # HELP bluey_stripe_webhook_processed Stripe webhook events successfully processed.
          # TYPE bluey_stripe_webhook_processed counter
          bluey_stripe_webhook_processed {webhook_processed}
+         # HELP bluey_provider_key_cooldowns_total Provider/model/key cooldowns recorded after upstream capacity responses.
+         # TYPE bluey_provider_key_cooldowns_total counter
+         bluey_provider_key_cooldowns_total {provider_key_cooldowns}
+         # HELP bluey_provider_key_all_cooling_total Route attempts where every approved provider key was cooling down.
+         # TYPE bluey_provider_key_all_cooling_total counter
+         bluey_provider_key_all_cooling_total {provider_key_all_cooling}
+         # HELP bluey_provider_health_redis_errors_total Redis read/write errors in the provider-health ledger.
+         # TYPE bluey_provider_health_redis_errors_total counter
+         bluey_provider_health_redis_errors_total {provider_health_redis_errors}
 ",
     );
 
