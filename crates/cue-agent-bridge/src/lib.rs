@@ -20,11 +20,15 @@ use serde::{Deserialize, Serialize};
 pub mod capability;
 pub mod connectors;
 pub mod discover;
+pub mod drive;
 pub mod registry;
+pub mod sessions;
 
 pub use capability::compute_capability;
 pub use connectors::read_connectors;
 pub use discover::{discover_agents, discover_in_home, probe_sqlite_store};
+pub use drive::{drive, AnswerChunk, AnswerStream, Question};
+pub use sessions::{reader_for, SessionReader};
 
 /// A known (or generically detected) coding agent.
 ///
@@ -159,12 +163,8 @@ fn is_executable_path(path: &std::path::Path) -> bool {
     })
 }
 
-/// A uniform handle over one installed agent.
-///
-/// Slice 1 implements only the read-only methods. `ask()` (drive a new
-/// question and stream the answer) lands in **Slice 2** and is intentionally
-/// absent from this trait for now so the tree stays green without a stub that
-/// always errors.
+/// A uniform handle over one installed agent: discover, read context, and
+/// drive a new question.
 #[async_trait::async_trait]
 pub trait AgentSource: Send + Sync {
     /// Which agent this is.
@@ -184,8 +184,13 @@ pub trait AgentSource: Send + Sync {
     /// `max_turns`.
     fn read_session(&self, id: &str, max_turns: usize) -> anyhow::Result<Transcript>;
 
-    // NOTE: `async fn ask(&self, q: Question) -> Result<AnswerStream>` lands in
-    // Slice 2 (drive layer). Deliberately omitted here.
+    /// Drive a new question through this agent's headless CLI and stream the
+    /// answer. The default delegates to the data-driven [`drive`] runner for
+    /// this agent's [`AgentKind`]; agents whose [`Capability`] is not
+    /// [`Capability::Drive`] should be filtered by the caller first.
+    async fn ask(&self, question: Question) -> anyhow::Result<AnswerStream> {
+        drive(self.kind(), question).await
+    }
 }
 
 /// Errors surfaced by the bridge. Discovery itself never returns these (it is
