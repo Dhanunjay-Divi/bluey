@@ -14,6 +14,8 @@ not be marketed as a finished SaaS until cloud auth/sync/RAG/billing are real.
 - Live meeting intelligence for teams already using coding agents.
 - A bridge between live conversation and the work context that already exists
   in local repos, docs, tickets, and user-approved agent/MCP sessions.
+- Research-backed context intelligence: Bluey should measure what context it
+  has, explain what is missing, and guide users to safe/approved context sources.
 
 ## Privacy And Security Direction
 
@@ -76,6 +78,30 @@ Near-term implementation should start with local workspace/repo attachment and
 session RAG. Later rounds can add local coding-agent session discovery, MCP
 context bridges, team meeting context merge, and post-meeting pushbacks.
 
+## Context Intelligence Lab
+
+The research paper direction is part of the product. Bluey should not only
+capture context; it should understand and explain context coverage.
+
+Customer-facing feature:
+
+- Context coverage meter: audio, screen, docs, repo, page, memory, cloud, agent.
+- Missing-context prompts: "Attach project", "Read current page", "Connect
+  repo", "Analyse screen", or "Continue with limited context".
+- Source cards on answers: what was used, what was missing, and confidence.
+- Research-backed benchmarks that prove when screenshots are enough and when
+  structured context is required.
+
+Internal feature:
+
+- Controlled mock IDE/work-app lab for testing screenshot/OCR, selection,
+  clipboard, accessibility, local folder, repo index, and approved connector
+  context.
+- Reports that feed the public trust/research paper and product routing
+  decisions.
+
+See `docs/CONTEXT-INTELLIGENCE-LAB.md`.
+
 ## Commercial Features To Build
 
 - Authenticated cloud sync.
@@ -92,6 +118,8 @@ context bridges, team meeting context merge, and post-meeting pushbacks.
   prior decisions.
 - Team meeting memory that merges each participant's approved context without
   leaking private data across workspace boundaries.
+- Context coverage meter, missing-context prompts, source cards, and the
+  research-backed Context Intelligence Lab.
 
 ## Bluey Auto Router (USP)
 

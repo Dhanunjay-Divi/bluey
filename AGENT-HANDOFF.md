@@ -8,10 +8,11 @@ Start here when joining the Bluey repo.
 
 1. `docs/rounds/END-TO-END-AGENT-CONTEXT-2026-05-25.md`
 2. `docs/rounds/END-TO-END-READINESS-PASS-2026-05-29.md`
-3. `docs/MODEL-ROUTING.md`
-4. `docs/DEPLOYMENT-SCALING.md`
-5. `docs/PRODUCTION-READINESS.md`
-6. `docs/PRELAUNCH-CHECKLIST.md`
+3. `docs/CONTEXT-INTELLIGENCE-LAB.md`
+4. `docs/MODEL-ROUTING.md`
+5. `docs/DEPLOYMENT-SCALING.md`
+6. `docs/PRODUCTION-READINESS.md`
+7. `docs/PRELAUNCH-CHECKLIST.md`
 
 The first file is the complete current context: product flow, architecture,
 implemented state, provider routing, capacity policy, cloud/RAG/storage plan,
@@ -52,6 +53,10 @@ Strategic direction:
 - Long term: user-approved agent context bridge for Cursor, Claude Code, Codex,
   Kiro, Copilot/Gemini CLI-style workflows and MCP-style connectors. Do not
   build around hidden platform scraping or raw browser cookie capture.
+- Research-to-product loop: Context Intelligence Lab measures which sources
+  Bluey has, what is missing, and which safe user-approved source should be
+  attached next. This becomes both a product feature and the trust/research
+  paper.
 
 ## Current Architecture
 
@@ -128,10 +133,12 @@ Use `docs/deploy/PHASE2-MAC-SMOKE.md` for visual/product smoke.
    candidates can be tested without rebuilding desktop customers.
 4. Add the first local workspace/repo context bridge: attach folder, build file
    tree/summaries, index into RAG, and cite source files in meeting answers.
-5. Finish `bluey.sh` web/link/reload/account/docs pages.
-6. Stand up staging/prod infra with live billing, SMTP, Caddy/TLS, backups, and
+5. Add Context Intelligence v1: source coverage model, missing-context prompt,
+   and answer source cards.
+6. Finish `bluey.sh` web/link/reload/account/docs pages.
+7. Stand up staging/prod infra with live billing, SMTP, Caddy/TLS, backups, and
    monitoring.
-7. Complete Windows QA before claiming Windows support.
+8. Complete Windows QA before claiming Windows support.
 
 ## Review Cadence
 

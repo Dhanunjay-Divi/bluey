@@ -29,6 +29,10 @@
 - Provider cancellation/abort semantics for superseded answer requests.
 - Local workspace/repo attachment as a first-class context source, with file
   tree, summaries, search, and RAG feeding the live meeting/ask path.
+- Context coverage model for audio, screen, docs, repo, page, memory, and cloud
+  sources.
+- Missing-context prompts that guide the user to attach the right approved
+  source instead of guessing from weak screenshot context.
 
 ## Version 0.3: Platform Expansion
 
@@ -49,11 +53,15 @@
   context when a topic is mentioned in the live transcript.
 - Meeting intent detection for project names, branches, tickets, owners,
   customers, incidents, releases, and action items.
+- Source cards on answers: used sources, missing sources, freshness, and
+  confidence.
+- Research-backed context quality reports that compare screen-only answers
+  against structured workspace/repo/doc context.
 - Export and deletion jobs backed by the cloud policy model.
 - Retention, export, and deletion controls.
 - Billing and plan enforcement.
 
-## Version 0.5: Agent Context Bridge
+## Version 0.5: Agent Context Bridge And Context Intelligence Lab
 
 - Attach local coding-agent/workspace sessions where technically feasible:
   Cursor, Claude Code, Codex, Kiro, GitHub Copilot/Gemini CLI-style workflows.
@@ -65,6 +73,11 @@
   explicit workspace boundaries and audit logs.
 - Post-meeting pushbacks create or update Jira/GitHub/Notion-style artifacts
   through approved connectors or agent-owned tools.
+- Controlled mock IDE/work-app research harness for measuring context channels:
+  screenshot/OCR, selection, clipboard, accessibility, local folder, repo index,
+  browser-page text, and approved connectors.
+- Public research/trust paper derived from the harness, explaining Bluey's
+  consent-based context architecture and defensive recommendations.
 
 ## Reliability Principles
 

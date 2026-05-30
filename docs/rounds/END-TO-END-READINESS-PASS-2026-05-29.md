@@ -47,12 +47,19 @@ know their repos, docs, tickets, branches, and deployments. Bluey should bridge
 that context into live conversations instead of forcing people to tab through
 tools mid-meeting.
 
+The research-paper direction is now part of the product as Context
+Intelligence. Bluey should show what context it has, what is missing, and which
+approved source will improve the answer. The research harness proves those
+signals in controlled mock IDE/work-app environments and feeds the customer
+feature.
+
 Initial scope should stay consent-based:
 
 - local folder/repo attachment
 - approved docs and project files
 - visible screen/page context
 - cloud/team RAG
+- context coverage/source cards
 - later: local coding-agent session/MCP context bridges
 
 Do not make the product depend on hidden third-party scraping, raw browser
@@ -134,6 +141,9 @@ Do not put provider keys in the desktop. Production keys live on the server.
   current path.
 - Meeting agent-context bridge: local workspace/repo indexing first, then
   user-approved coding-agent/MCP session context and proactive meeting cards.
+- Context Intelligence Lab: coverage meter, missing-context prompts, source
+  cards, and controlled research harness for screen/workspace/connector context
+  quality.
 - Clean Windows QA: overlay parity, WASAPI audio, whisper.cpp, installer, and
   capture-exclusion verification.
 - Full cloud RAG on Postgres/pgvector/object storage; local SQLite remains the
