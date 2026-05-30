@@ -347,3 +347,10 @@ New IPC on `overlay_ipc.rs`: `SetAgents`, `SetAgentSessions`,
 | Drive selection | **Dynamic / data-driven.** No hardcoded "first agent". A per-agent command map (agent → command + flags + parser) is data; the runner drives whichever agent is attached. New agent = new table row, not new code. Claude Code used only as the first *test target* since it's installed. |
 | Fallback when no drivable agent | **Warn card only.** A `WARNING` card prompts the user to attach an agent. Bluey never answers from the user's context itself. Purest data residency. |
 | Session-read consent | **Global setting.** One toggle enables/disables reading other apps' session history for all agents. |
+| Daemon routing | **New provider route** (`AiProviderKind::Agent`). When an agent is attached, answers route through it via the existing `resolve_answer_route` / `OverlayAnswerStream` machinery — the agent is "just another provider", maximizing reuse. |
+| Agent CLI not ready | **Guide, never silently fall back.** Bluey does NOT auto-install anything. If the attached agent's CLI is missing or not logged in, show a card guiding the user to install / sign in (command or button). Their agent stays the source of truth — no silent Bluey-AI answer on their meeting context. |
+
+**Attach model:** Bluey detects which agent CLIs are present + authenticated. For
+a GUI app whose CLI isn't installed/logged-in, the attach UI guides the user to
+enable it (one-time, their choice). We never install or authenticate on their
+behalf.

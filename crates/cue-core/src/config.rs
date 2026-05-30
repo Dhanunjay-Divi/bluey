@@ -64,6 +64,16 @@ pub struct CueSettings {
     /// Codex Stage 24: persisted disguise mode (none / activity / terminal / settings).
     #[serde(default = "default_disguise_mode")]
     pub disguise_mode: String,
+
+    /// Agent bridge: global consent to read other agents' session history.
+    /// Off by default — reading a prior agent session requires opt-in.
+    #[serde(default)]
+    pub allow_agent_session_history: bool,
+    /// Agent bridge: the attached coding agent, as a snake_case [`AgentKind`]
+    /// label (e.g. "claude_code"). `None` means no agent is attached and
+    /// answers route through Bluey's normal providers.
+    #[serde(default)]
+    pub attached_agent: Option<String>,
 }
 
 impl Default for CueSettings {
@@ -81,6 +91,8 @@ impl Default for CueSettings {
             auto_disguise_prompted: false,
             auto_disguise_enabled: false,
             disguise_mode: "activity".to_string(),
+            allow_agent_session_history: false,
+            attached_agent: None,
         }
     }
 }
@@ -142,4 +154,42 @@ fn write_private_json<T: Serialize>(path: &std::path::Path, value: &T) -> Result
 
 fn default_disguise_mode() -> String {
     "activity".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_settings_without_agent_fields_still_load() {
+        // A config written before the agent-bridge fields existed must still
+        // deserialize, defaulting the new fields.
+        let legacy = r#"{
+            "default_model": "Bluey Auto",
+            "default_mode": "General",
+            "answer_style": null,
+            "overlay_opacity": 0.9,
+            "audio_system_enabled": true,
+            "audio_microphone_enabled": true,
+            "cloud_sync_enabled": false,
+            "retention_days": 30,
+            "updated_at": "0"
+        }"#;
+        let settings: CueSettings = serde_json::from_str(legacy).expect("legacy config loads");
+        assert!(!settings.allow_agent_session_history);
+        assert_eq!(settings.attached_agent, None);
+    }
+
+    #[test]
+    fn agent_fields_roundtrip_through_json() {
+        let settings = CueSettings {
+            allow_agent_session_history: true,
+            attached_agent: Some("claude_code".to_string()),
+            ..CueSettings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("serialize");
+        let parsed: CueSettings = serde_json::from_str(&json).expect("deserialize");
+        assert!(parsed.allow_agent_session_history);
+        assert_eq!(parsed.attached_agent.as_deref(), Some("claude_code"));
+    }
 }

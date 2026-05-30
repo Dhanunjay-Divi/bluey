@@ -11,6 +11,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use clap::Parser;
+use cue_agent_bridge::{AgentKind, AnswerChunk, Question as AgentQuestion};
 use cue_core::ai::{
     AnswerFinishReason, AnswerRequest, AnswerResponse, AnswerResponseMetadata, AnswerStreamEvent,
     CostEstimate, ProviderClientConfig, ProviderRequestPayload, RouteAttemptMetadata,
@@ -20,15 +21,16 @@ use cue_core::app_paths::AppPaths;
 use cue_core::audio::SimulatedPcmChunk;
 use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
 use cue_core::{
-    analyze_segment, clock, generate_recap, load_account, local_answer, new_trace_id,
-    sanitize_observability_id, trace_id_from_env, AiCapabilities, AiProviderId, AiProviderKind,
-    AiRuntimeStatus, AnswerContext, AnswerContextKind, AudioBackend, AudioCaptureConfig,
-    AudioChunkMetadata, AudioDeviceDescriptor, AudioDeviceRole, AudioPipelineStatus,
-    AudioSourceKind, CardArtifactType, CardKind, CloudEndpointConfig, CloudEnvironment,
-    CloudSyncState, CloudSyncStatus, ContextArtifact, ContextKind, ContextProcessingStatus,
-    ConversationTurn, CueCard, CueCardArtifact, DaemonState, MeetingRecord, MeetingState,
-    MemoryHit, OverlayCommand, OverlayContextItem, OverlayEvent, OverlaySessionItem, PrivacyFlags,
-    ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget, Speaker, TranscriptSegment,
+    analyze_segment, clock, generate_recap, load_account, load_settings, local_answer,
+    new_trace_id, sanitize_observability_id, trace_id_from_env, AiCapabilities, AiProviderId,
+    AiProviderKind, AiRuntimeStatus, AnswerContext, AnswerContextKind, AudioBackend,
+    AudioCaptureConfig, AudioChunkMetadata, AudioDeviceDescriptor, AudioDeviceRole,
+    AudioPipelineStatus, AudioSourceKind, CardArtifactType, CardKind, CloudEndpointConfig,
+    CloudEnvironment, CloudSyncState, CloudSyncStatus, ContextArtifact, ContextKind,
+    ContextProcessingStatus, ConversationTurn, CueCard, CueCardArtifact, DaemonState,
+    MeetingRecord, MeetingState, MemoryHit, OverlayCommand, OverlayContextItem, OverlayEvent,
+    OverlaySessionItem, PrivacyFlags, ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget,
+    Speaker, TranscriptSegment,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -141,6 +143,46 @@ fn streaming_word_chunks(text: &str) -> Vec<String> {
         chunks.push(current);
     }
     chunks
+}
+
+/// Parse the persisted `attached_agent` settings label (a snake_case
+/// [`AgentKind`], e.g. `"claude_code"`) into a concrete [`AgentKind`].
+///
+/// Pure and total: returns `None` for an absent, blank, or unrecognized
+/// label. Only registry agents are selectable for driving — a freeform
+/// `Other`/`Unknown` value is intentionally rejected so we never route a
+/// live answer to something we cannot drive.
+fn parse_attached_agent(label: Option<&str>) -> Option<AgentKind> {
+    let label = label.map(str::trim).filter(|value| !value.is_empty())?;
+    // `AgentKind` derives serde with `rename_all = "snake_case"`; round-trip
+    // the bare label through JSON to map it onto a known variant.
+    let quoted = serde_json::to_string(label).ok()?;
+    let kind: AgentKind = serde_json::from_str(&quoted).ok()?;
+    match kind {
+        AgentKind::Other(_) | AgentKind::Unknown => None,
+        kind => Some(kind),
+    }
+}
+
+/// Stable snake_case label for an [`AgentKind`], used as the agent provider's
+/// model id and in user-facing labels (display label, conversation turn).
+fn agent_model_label(kind: &AgentKind) -> String {
+    match serde_json::to_value(kind) {
+        Ok(serde_json::Value::String(label)) => label,
+        // `Other(label)` serializes as an object; fall back to its inner label.
+        _ => match kind {
+            AgentKind::Other(label) => label.clone(),
+            _ => "agent".to_string(),
+        },
+    }
+}
+
+/// Read the attached agent (if any) from on-disk settings. Fail-soft: a
+/// missing or unreadable settings file means "no agent attached", which keeps
+/// the normal provider route unchanged.
+fn attached_agent_kind(daemon: &Arc<Daemon>) -> Option<AgentKind> {
+    let settings = load_settings(&daemon.paths).ok()?;
+    parse_attached_agent(settings.attached_agent.as_deref())
 }
 
 fn next_answer_generation(daemon: &Arc<Daemon>) -> u64 {
@@ -3251,6 +3293,15 @@ async fn answer_with_provider_runtime(
     }
     let generation_id = next_answer_generation(daemon);
 
+    // Agent bridge (Slice 4): when the user has attached a coding agent, route
+    // the answer through it instead of Bluey's normal providers. A single
+    // Agent step replaces the route so `resolve_answer_route` dispatches to the
+    // agent driver. With no agent attached this block is a no-op and the
+    // existing provider route is used unchanged.
+    if let Some(kind) = attached_agent_kind(daemon) {
+        request.route = ProviderRoute::direct(ProviderSelector::agent(agent_model_label(&kind)));
+    }
+
     let (meeting_snapshot, answer_meeting) = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard.is_none() {
@@ -3771,6 +3822,29 @@ async fn resolve_answer_route(
             });
         }
 
+        if matches!(step.provider.provider_kind, AiProviderKind::Agent) {
+            let started_at = Instant::now();
+            let stream_ref = stream.as_mut().map(|stream| &mut **stream);
+            let outcome = answer_with_agent(
+                &step.provider,
+                &payload,
+                meeting,
+                stream_ref,
+                fallback_depth,
+            )
+            .await?;
+            let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            attempts.extend(outcome.attempts);
+            return Ok(AnswerRouteOutcome {
+                provider: step.provider.clone(),
+                answer: outcome.answer,
+                attempts,
+                latency_ms,
+                token_usage: None,
+                safety: outcome.safety,
+            });
+        }
+
         if let Some(message) = config.unavailable_message() {
             attempts.push(
                 RouteAttemptMetadata::started(step.provider.clone(), fallback_depth)
@@ -3819,6 +3893,202 @@ async fn resolve_answer_route(
         request.metadata.request_id,
         failures.join("; ")
     ))
+}
+
+/// The outcome of driving an attached agent: the rendered answer (real or
+/// guidance), the safety notice to attach, and a single attempt record.
+struct AgentRouteOutcome {
+    answer: String,
+    safety: SafetyOutcome,
+    attempts: Vec<RouteAttemptMetadata>,
+}
+
+/// Build the grounding [`AgentQuestion`] for the attached agent from the
+/// answer payload: the user's question plus a bounded transcript flattened
+/// from the request context. Pure string/struct assembly — no I/O.
+fn agent_question_from_payload(payload: &ProviderRequestPayload) -> AgentQuestion {
+    let mut turns = Vec::new();
+    if let Some(instructions) = payload
+        .instructions
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        turns.push(cue_agent_bridge::Turn {
+            role: cue_agent_bridge::Role::System,
+            text: instructions.clone(),
+        });
+    }
+    for context in &payload.context {
+        if context.content.trim().is_empty() {
+            continue;
+        }
+        let role = match context.kind {
+            AnswerContextKind::System => cue_agent_bridge::Role::System,
+            _ => cue_agent_bridge::Role::Other,
+        };
+        turns.push(cue_agent_bridge::Turn {
+            role,
+            text: context.content.clone(),
+        });
+    }
+    AgentQuestion {
+        prompt: payload.question.clone(),
+        context: (!turns.is_empty()).then_some(cue_agent_bridge::Transcript { turns }),
+        resume: None,
+    }
+}
+
+/// Drive the attached coding agent and stream its answer through the overlay.
+///
+/// Routing rule (PLAN §10): Bluey NEVER answers from the user's context with
+/// its own AI here. If the agent CLI is missing or not signed in, we surface a
+/// guidance WARNING card and resolve the answer to that same guidance text —
+/// we do not silently fall back to a Bluey provider.
+async fn answer_with_agent(
+    provider: &ProviderSelector,
+    payload: &ProviderRequestPayload,
+    _meeting: &MeetingRecord,
+    mut stream: Option<&mut OverlayAnswerStream>,
+    fallback_depth: usize,
+) -> Result<AgentRouteOutcome> {
+    let label = provider
+        .model
+        .as_ref()
+        .map(|model| model.as_str().to_string())
+        .unwrap_or_else(|| "agent".to_string());
+    let Some(kind) = parse_attached_agent(Some(&label)) else {
+        return Ok(agent_not_ready(
+            provider,
+            &mut stream,
+            fallback_depth,
+            &label,
+            "isn't a recognized agent",
+        )
+        .await);
+    };
+
+    let question = agent_question_from_payload(payload);
+    debug!(agent = %label, "driving attached agent for answer");
+
+    let answer_stream = match cue_agent_bridge::drive(kind.clone(), question).await {
+        Ok(answer_stream) => answer_stream,
+        Err(error) => {
+            // Spawn failure almost always means the CLI binary is missing.
+            debug!(agent = %label, error = %error, "agent drive failed to start");
+            return Ok(agent_not_ready(
+                provider,
+                &mut stream,
+                fallback_depth,
+                &label,
+                "isn't installed or signed in",
+            )
+            .await);
+        }
+    };
+
+    futures_util::pin_mut!(answer_stream);
+    let mut body = String::new();
+    let mut cost_usd: Option<f64> = None;
+    // Reset the placeholder body ("Thinking with agent...") so streamed deltas
+    // render on their own.
+    if let Some(stream) = stream.as_mut() {
+        stream.set_body(String::new(), false).await?;
+    }
+
+    while let Some(chunk) = futures_util::StreamExt::next(&mut answer_stream).await {
+        match chunk {
+            AnswerChunk::Started { .. } => {}
+            AnswerChunk::Delta(delta) => {
+                body.push_str(&delta);
+                if let Some(stream) = stream.as_mut() {
+                    stream.push_delta(&delta).await?;
+                }
+            }
+            AnswerChunk::Done { cost_usd: cost } => {
+                cost_usd = cost;
+            }
+            AnswerChunk::Error(message) => {
+                debug!(agent = %label, detail = %message, "agent reported a terminal error");
+                return Ok(agent_not_ready(
+                    provider,
+                    &mut stream,
+                    fallback_depth,
+                    &label,
+                    "couldn't answer (it may not be signed in)",
+                )
+                .await);
+            }
+        }
+    }
+
+    if body.trim().is_empty() {
+        return Ok(agent_not_ready(
+            provider,
+            &mut stream,
+            fallback_depth,
+            &label,
+            "returned no answer",
+        )
+        .await);
+    }
+
+    if let Some(stream) = stream.as_mut() {
+        let cost_label = match cost_usd {
+            Some(cost) => format!("${cost:.4} · {label}"),
+            None => format!("on your {label} plan"),
+        };
+        stream
+            .finish_with_cost_label(&body, Some(cost_label))
+            .await?;
+    }
+
+    let safety = SafetyOutcome::pass().with_notice(format!(
+        "answered by your attached agent ({label}); no Bluey provider call was made"
+    ));
+    Ok(AgentRouteOutcome {
+        answer: body,
+        safety,
+        attempts: vec![
+            RouteAttemptMetadata::started(provider.clone(), fallback_depth).succeeded(0),
+        ],
+    })
+}
+
+/// Push a guidance WARNING card and resolve the answer card to the same text.
+/// Used whenever the attached agent cannot answer live — never a silent
+/// fallback to Bluey's own AI.
+async fn agent_not_ready(
+    provider: &ProviderSelector,
+    stream: &mut Option<&mut OverlayAnswerStream>,
+    fallback_depth: usize,
+    label: &str,
+    reason: &str,
+) -> AgentRouteOutcome {
+    let body = format!(
+        "Your {label} CLI {reason}. Install it and sign in, then ask again — \
+Bluey answers live through your agent and never on your behalf."
+    );
+    if let Some(stream) = stream.as_mut() {
+        let _ = push_system_card(
+            &stream.daemon,
+            CardKind::Warning,
+            "Agent not ready",
+            body.clone(),
+        )
+        .await;
+        let _ = stream.finish(&body).await;
+    }
+    let safety = SafetyOutcome::pass().with_notice(format!(
+        "attached agent ({label}) not ready; guidance shown"
+    ));
+    AgentRouteOutcome {
+        answer: body,
+        safety,
+        attempts: vec![
+            RouteAttemptMetadata::started(provider.clone(), fallback_depth)
+                .failed(format!("agent not ready: {label} {reason}")),
+        ],
+    }
 }
 
 async fn call_chat_provider(
@@ -7578,5 +7848,94 @@ mod tests {
         assert!(context.contains("[Large doc from test]"));
         assert!(context.contains("[compacted]"));
         assert!(context.chars().count() < long_doc.chars().count());
+    }
+
+    #[test]
+    fn parse_attached_agent_maps_known_snake_case_labels() {
+        assert_eq!(
+            parse_attached_agent(Some("claude_code")),
+            Some(AgentKind::ClaudeCode)
+        );
+        assert_eq!(
+            parse_attached_agent(Some("cursor")),
+            Some(AgentKind::Cursor)
+        );
+        assert_eq!(
+            parse_attached_agent(Some(" codex ")),
+            Some(AgentKind::Codex)
+        );
+    }
+
+    #[test]
+    fn parse_attached_agent_rejects_absent_blank_and_unknown() {
+        assert_eq!(parse_attached_agent(None), None);
+        assert_eq!(parse_attached_agent(Some("")), None);
+        assert_eq!(parse_attached_agent(Some("   ")), None);
+        // Unrecognized labels and the inert/freeform variants are not drivable.
+        assert_eq!(parse_attached_agent(Some("not_a_real_agent")), None);
+        assert_eq!(parse_attached_agent(Some("unknown")), None);
+    }
+
+    #[test]
+    fn agent_model_label_roundtrips_known_kinds() {
+        assert_eq!(agent_model_label(&AgentKind::ClaudeCode), "claude_code");
+        assert_eq!(agent_model_label(&AgentKind::Cursor), "cursor");
+        assert_eq!(
+            agent_model_label(&AgentKind::Other("zed".to_string())),
+            "zed"
+        );
+    }
+
+    #[test]
+    fn attached_agent_label_survives_selector_roundtrip() {
+        // The selection path stores the label as the agent provider's model;
+        // it must round-trip back to the same kind for dispatch.
+        let label = agent_model_label(&AgentKind::ClaudeCode);
+        let selector = ProviderSelector::agent(label);
+        let model = selector.model.as_ref().map(|m| m.as_str().to_string());
+        assert_eq!(
+            parse_attached_agent(model.as_deref()),
+            Some(AgentKind::ClaudeCode)
+        );
+    }
+
+    #[test]
+    fn agent_question_from_payload_carries_prompt_and_context() {
+        let route = ProviderRoute::direct(ProviderSelector::agent("claude_code"));
+        let request = cue_core::ai::AnswerRequest::new("What did we decide?", route)
+            .with_instructions("Be concise")
+            .with_context(AnswerContext::transcript("Alice: ship it"));
+        let payload = ProviderRequestPayload::from_request(
+            &request,
+            ProviderSelector::agent("claude_code"),
+            None,
+            "claude_code",
+            RouteBudget::realtime(),
+        );
+
+        let question = agent_question_from_payload(&payload);
+        assert_eq!(question.prompt, "What did we decide?");
+        assert!(question.resume.is_none());
+        let transcript = question.context.expect("context present");
+        // System instruction + one transcript context turn.
+        assert_eq!(transcript.turns.len(), 2);
+        assert_eq!(transcript.turns[0].role, cue_agent_bridge::Role::System);
+        assert_eq!(transcript.turns[0].text, "Be concise");
+        assert_eq!(transcript.turns[1].text, "Alice: ship it");
+    }
+
+    #[test]
+    fn agent_question_from_payload_has_no_context_when_empty() {
+        let route = ProviderRoute::direct(ProviderSelector::agent("claude_code"));
+        let request = cue_core::ai::AnswerRequest::new("Hi", route);
+        let payload = ProviderRequestPayload::from_request(
+            &request,
+            ProviderSelector::agent("claude_code"),
+            None,
+            "claude_code",
+            RouteBudget::realtime(),
+        );
+        let question = agent_question_from_payload(&payload);
+        assert!(question.context.is_none());
     }
 }

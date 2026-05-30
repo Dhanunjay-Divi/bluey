@@ -26,6 +26,7 @@ cpal.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
+cue-agent-bridge = { path = "../cue-agent-bridge" }
 cue-core = { path = "../cue-core" }
 cue-llm = { path = "../cue-llm" }
 cue-rag = { path = "../cue-rag" }

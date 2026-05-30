@@ -102,6 +102,9 @@ pub enum AiProviderKind {
     Cohere,
     Deepgram,
     Local,
+    /// An attached coding agent (Claude Code, Cursor, …) driven via its own
+    /// CLI. Answers run on the user's agent, never on Bluey's own AI.
+    Agent,
     Custom,
 }
 
@@ -391,6 +394,10 @@ impl ProviderSelector {
 
     pub fn local(model: impl Into<AiModelId>) -> Self {
         Self::new("local", AiProviderKind::Local).with_model(model)
+    }
+
+    pub fn agent(model: impl Into<AiModelId>) -> Self {
+        Self::new("agent", AiProviderKind::Agent).with_model(model)
     }
 
     pub fn with_model(mut self, model: impl Into<AiModelId>) -> Self {
@@ -863,7 +870,10 @@ impl ProviderClientConfig {
     }
 
     pub fn missing_configuration_message(&self) -> Option<String> {
-        if matches!(self.provider.provider_kind, AiProviderKind::Local) {
+        if matches!(
+            self.provider.provider_kind,
+            AiProviderKind::Local | AiProviderKind::Agent
+        ) {
             return None;
         }
 
@@ -878,7 +888,10 @@ impl ProviderClientConfig {
     pub fn unavailable_message(&self) -> Option<String> {
         self.missing_configuration_message().or_else(|| {
             if self.live_requests_enabled
-                || matches!(self.provider.provider_kind, AiProviderKind::Local)
+                || matches!(
+                    self.provider.provider_kind,
+                    AiProviderKind::Local | AiProviderKind::Agent
+                )
             {
                 None
             } else {
@@ -1505,6 +1518,26 @@ mod tests {
         assert!(payload.stream);
         assert_eq!(payload.latency_timeout_ms, 4_000);
         assert_eq!(payload.max_output_tokens, Some(DEFAULT_MAX_OUTPUT_TOKENS));
+    }
+
+    #[test]
+    fn agent_provider_kind_serde_roundtrips() {
+        let json = serde_json::to_string(&AiProviderKind::Agent).expect("serialize");
+        assert_eq!(json, "\"agent\"");
+        let parsed: AiProviderKind = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, AiProviderKind::Agent);
+    }
+
+    #[test]
+    fn agent_selector_needs_no_http_credential() {
+        let config = ProviderClientConfig::new(
+            ProviderSelector::agent("claude_code"),
+            AiCapabilities::chat(),
+        )
+        .with_live_requests_enabled(true);
+        assert_eq!(config.missing_configuration_message(), None);
+        assert_eq!(config.unavailable_message(), None);
+        assert!(config.can_attempt_live_request());
     }
 
     #[test]

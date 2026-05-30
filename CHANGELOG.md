@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SessionReader` trait — JSONL (Claude/Codex), SQLite `state.vscdb` (Cursor/VS Code,
   read-only/immutable, bounded), JSON-files (VS Code/Copilot), and a deferred
   Antigravity protobuf stub. Normalizes to `Transcript`/`SessionRef`.
+- Agent bridge daemon wiring (Slice 4): new `AiProviderKind::Agent` provider route
+  so an attached coding agent answers through the existing
+  `resolve_answer_route`/`OverlayAnswerStream` machinery. Selection is driven by two
+  new `CueSettings` fields (`attached_agent`, `allow_agent_session_history`); when an
+  agent is attached, answers stream from it and the turn is recorded with an agent
+  provider label. If the agent CLI is missing or not signed in, Bluey shows a
+  guidance `Warning` card and never silently falls back to its own AI.
 - Master plan V3 (docs/reviews/CUE-BLUEY-V3-PLAN-COMPLETE.md)
 - Phase 0 foundation: workspace structure, Cargo workspace, crate scaffolding
 - Development workflow docs: CLAUDE.md, templates, CI, .codex agents + skills
