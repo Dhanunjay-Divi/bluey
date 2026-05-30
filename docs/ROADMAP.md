@@ -27,6 +27,8 @@
 - sqlite-vec or another ANN index for local RAG.
 - Attachment drawer and visible context management.
 - Provider cancellation/abort semantics for superseded answer requests.
+- Local workspace/repo attachment as a first-class context source, with file
+  tree, summaries, search, and RAG feeding the live meeting/ask path.
 
 ## Version 0.3: Platform Expansion
 
@@ -36,16 +38,33 @@
 - Linux build decision after audio/capture feasibility review.
 - Signed installers and auto-update only after the supported platform matrix is real.
 
-## Version 0.4: Commercial Cloud Memory
+## Version 0.4: Commercial Cloud Memory And Meeting Intelligence
 
 - Authenticated Bluey cloud account.
 - Secure cloud sync for meetings, artifacts, and recaps.
 - Cloud RAG index with tenant/workspace scoped retrieval.
 - Background recap and memory extraction.
 - Meeting history dashboard.
+- Proactive meeting cards that surface relevant repo/docs/ticket/PR/deploy
+  context when a topic is mentioned in the live transcript.
+- Meeting intent detection for project names, branches, tickets, owners,
+  customers, incidents, releases, and action items.
 - Export and deletion jobs backed by the cloud policy model.
 - Retention, export, and deletion controls.
 - Billing and plan enforcement.
+
+## Version 0.5: Agent Context Bridge
+
+- Attach local coding-agent/workspace sessions where technically feasible:
+  Cursor, Claude Code, Codex, Kiro, GitHub Copilot/Gemini CLI-style workflows.
+- Reuse user-approved local workspace context and MCP-style connectors instead
+  of rebuilding every integration from scratch.
+- Context-source router chooses between transcript, screen/page, local repo,
+  attached docs, session memory, and approved agent/connector context.
+- Team meeting mode merges multiple participants' approved context with
+  explicit workspace boundaries and audit logs.
+- Post-meeting pushbacks create or update Jira/GitHub/Notion-style artifacts
+  through approved connectors or agent-owned tools.
 
 ## Reliability Principles
 

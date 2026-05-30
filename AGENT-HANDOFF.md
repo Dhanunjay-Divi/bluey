@@ -29,7 +29,9 @@ agent.
 
 ## Product Direction
 
-Bluey is a managed desktop AI overlay for live work.
+Bluey is a managed desktop AI overlay for live work and meetings. The broader
+product thesis is a live meeting intelligence layer that brings approved
+coding-agent/workspace context into conversations, not an interview-only helper.
 
 Customer flow:
 
@@ -39,6 +41,17 @@ install -> bluey on -> link if needed -> compact pill -> expanded overlay
 ```
 
 The CLI is the launch/support surface. The overlay is the product surface.
+
+Strategic direction:
+
+- Near term: screen-native assistant for transcript, screen, docs, projects,
+  sessions, and managed answers.
+- Next product wedge: meeting intelligence for engineering teams. Bluey listens
+  to meetings and proactively surfaces relevant repo/docs/ticket/PR/deploy
+  context.
+- Long term: user-approved agent context bridge for Cursor, Claude Code, Codex,
+  Kiro, Copilot/Gemini CLI-style workflows and MCP-style connectors. Do not
+  build around hidden platform scraping or raw browser cookie capture.
 
 ## Current Architecture
 
@@ -113,10 +126,12 @@ Use `docs/deploy/PHASE2-MAC-SMOKE.md` for visual/product smoke.
    labels, and canvas auto-open only for artifacts.
 3. Add server-owned model/routing config so Gemini/newer OpenAI/newer Claude
    candidates can be tested without rebuilding desktop customers.
-4. Finish `bluey.sh` web/link/reload/account/docs pages.
-5. Stand up staging/prod infra with live billing, SMTP, Caddy/TLS, backups, and
+4. Add the first local workspace/repo context bridge: attach folder, build file
+   tree/summaries, index into RAG, and cite source files in meeting answers.
+5. Finish `bluey.sh` web/link/reload/account/docs pages.
+6. Stand up staging/prod infra with live billing, SMTP, Caddy/TLS, backups, and
    monitoring.
-6. Complete Windows QA before claiming Windows support.
+7. Complete Windows QA before claiming Windows support.
 
 ## Review Cadence
 

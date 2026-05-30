@@ -11,6 +11,9 @@ not be marketed as a finished SaaS until cloud auth/sync/RAG/billing are real.
 - Managed model/provider routing by default.
 - Enterprise-grade privacy, retention, deletion, and audit controls.
 - RAG memory across meetings, documents, screenshots, and user-provided context.
+- Live meeting intelligence for teams already using coding agents.
+- A bridge between live conversation and the work context that already exists
+  in local repos, docs, tickets, and user-approved agent/MCP sessions.
 
 ## Privacy And Security Direction
 
@@ -32,6 +35,46 @@ not be marketed as a finished SaaS until cloud auth/sync/RAG/billing are real.
   - screenshots and OCR/vision summaries
   - decisions and action items
   - answer-style/persona instructions
+- Meeting intelligence should combine:
+  - live system/mic transcript
+  - current screen/page context
+  - attached project folders and repos
+  - user-approved coding-agent session context where available
+  - team memory across prior meetings and artifacts
+
+## Meeting Agent Context Bridge
+
+The larger product thesis is not "interview assistant". Bluey should become the
+live layer between meetings and the coding agents people already use.
+
+Modern engineering teams run Cursor, Claude Code, Codex, Kiro, GitHub Copilot,
+Gemini CLI, and other agents that already know their repos, docs, tickets, and
+tooling through local workspaces and MCP-style connectors. During a meeting,
+that context usually disappears and people manually tab through Jira, Notion,
+GitHub, dashboards, and terminal sessions. Bluey's job is to bring that context
+into the conversation in real time.
+
+Target flow:
+
+```text
+before meeting: attach workspace / repo / agent session / approved connector
+during meeting: listen -> detect project/ticket/branch/topic -> surface context
+after meeting: decisions/actions -> push back through approved tools/connectors
+```
+
+Important boundaries:
+
+- Bluey should use what the user can see, select, attach, copy, or explicitly
+  authorize through folders, repos, OAuth/API connectors, or local agent
+  session bridges.
+- Bluey should not depend on hidden third-party platform scraping, stolen
+  cookies, or bypass flows.
+- Every proactive card should be explainable: screen, transcript, repo,
+  attached doc, session memory, or approved connector.
+
+Near-term implementation should start with local workspace/repo attachment and
+session RAG. Later rounds can add local coding-agent session discovery, MCP
+context bridges, team meeting context merge, and post-meeting pushbacks.
 
 ## Commercial Features To Build
 
@@ -43,6 +86,12 @@ not be marketed as a finished SaaS until cloud auth/sync/RAG/billing are real.
 - Managed model routing, fallbacks, and latency budgets.
 - Personas/modes for different meeting types.
 - Secure admin controls for retention and deletion.
+- Agent/workspace context bridge for Cursor, Claude Code, Codex, Kiro, GitHub
+  Copilot/Gemini CLI-style workflows where technically and ethically feasible.
+- Proactive meeting cards for tickets, PRs, docs, owners, deploys, risks, and
+  prior decisions.
+- Team meeting memory that merges each participant's approved context without
+  leaking private data across workspace boundaries.
 
 ## Bluey Auto Router (USP)
 

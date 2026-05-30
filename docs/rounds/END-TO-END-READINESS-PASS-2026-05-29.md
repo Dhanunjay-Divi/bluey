@@ -31,6 +31,33 @@ Rules:
   plan. Follow-ups should refine/replace the existing answer/canvas artifact
   instead of appending random duplicate cards.
 
+## Expanded Product Thesis
+
+Bluey is not limited to interview-style use. The product should become a live
+meeting intelligence layer for engineering and work teams:
+
+```text
+before meeting: attach workspace / repo / approved agent session
+during meeting: transcript -> intent detection -> relevant context card
+after meeting: decisions/actions -> approved connector or agent pushback
+```
+
+The key unlock is that users already run coding agents and workspace tools that
+know their repos, docs, tickets, branches, and deployments. Bluey should bridge
+that context into live conversations instead of forcing people to tab through
+tools mid-meeting.
+
+Initial scope should stay consent-based:
+
+- local folder/repo attachment
+- approved docs and project files
+- visible screen/page context
+- cloud/team RAG
+- later: local coding-agent session/MCP context bridges
+
+Do not make the product depend on hidden third-party scraping, raw browser
+cookies, or proctor/assessment bypasses.
+
 ## What This Pass Fixed
 
 - Unsupported picker selections are now rejected before attachment ingestion.
@@ -105,6 +132,8 @@ Do not put provider keys in the desktop. Production keys live on the server.
   desktop rebuild.
 - Gemini route adapter and pricing table entries after managed smoke proves the
   current path.
+- Meeting agent-context bridge: local workspace/repo indexing first, then
+  user-approved coding-agent/MCP session context and proactive meeting cards.
 - Clean Windows QA: overlay parity, WASAPI audio, whisper.cpp, installer, and
   capture-exclusion verification.
 - Full cloud RAG on Postgres/pgvector/object storage; local SQLite remains the
