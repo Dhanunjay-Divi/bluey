@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Fix button overlay UI (F4): a **Fix** button on agent answer cards (emits
+  `FixRequested`), a proposal card rendering DIAGNOSIS / REASONING / FIX with a
+  colorized diff block, and **Approve / Reject** buttons (id-matched, one-shot,
+  Approve disabled when the agent can't apply). Approve/Reject emit
+  `FixApprovalResponded`; states cover shown / approve-disabled / applying /
+  discarded. Reuses the overlay theme + card builders; `swift build` clean.
 - Fix button daemon flow (F3): the review-gated propose → approve → apply state
   machine. New `OverlayEvent::FixRequested` / `FixApprovalResponded` and
   `OverlayCommand::PushFixProposal`. On Fix, the daemon drives the attached agent

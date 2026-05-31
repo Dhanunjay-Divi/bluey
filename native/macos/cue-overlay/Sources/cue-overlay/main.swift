@@ -351,8 +351,22 @@ private enum OverlayCommand {
     case setAgents([AgentSummary])
     case setAgentSessions(kind: String, sessions: [AgentSessionSummary])
     case setAgentConnectors(kind: String, connectors: [AgentConnectorInfo])
+    case pushFixProposal(FixProposal)
     case shutdown
     case unknown(String)
+}
+
+/// A review-gated Fix proposal pushed by the daemon (Fix-button slice F4).
+/// Mirrors `OverlayCommand::PushFixProposal` in crates/cue-core/src/overlay.rs.
+/// `diff` is absent when the agent only proposed commands (no unified diff);
+/// `applySupported` is false for agents that cannot be driven to apply.
+private struct FixProposal {
+    let proposalId: String
+    let diagnosis: String
+    let reasoning: String
+    let fix: String
+    let diff: String?
+    let applySupported: Bool
 }
 
 private func parseCommand(_ line: String) -> OverlayCommand {
@@ -457,6 +471,23 @@ private func parseCommand(_ line: String) -> OverlayCommand {
             )
         }
         return .setAgentConnectors(kind: kind, connectors: connectors)
+    case "push_fix_proposal":
+        // Defensive decode: an unknown/missing proposal_id is unusable (the
+        // approve/reject echo is id-matched upstream), so drop the command
+        // rather than render an un-actionable card. The diff is optional and
+        // is omitted from the wire form when absent -> nil.
+        guard let proposalId = obj["proposal_id"] as? String, !proposalId.isEmpty else {
+            return .unknown(line)
+        }
+        let proposal = FixProposal(
+            proposalId: proposalId,
+            diagnosis: obj["diagnosis"] as? String ?? "",
+            reasoning: obj["reasoning"] as? String ?? "",
+            fix: obj["fix"] as? String ?? "",
+            diff: obj["diff"] as? String,
+            applySupported: obj["apply_supported"] as? Bool ?? false
+        )
+        return .pushFixProposal(proposal)
     default:
         return .unknown(line)
     }
@@ -653,6 +684,25 @@ private func emitAgentConnectorsRequested(kind: String) {
 
 private func emitConnectorReauthRequested(kind: String, name: String) {
     emitEvent(["type": "connector_reauth_requested", "kind": kind, "name": name])
+}
+
+// MARK: - Fix-button emit helpers (Slice F4)
+//
+// Mirror OverlayEvent::FixRequested / FixApprovalResponded. `card_id` is
+// omitted (not null) when nil so the daemon's `#[serde(default)]` applies.
+
+private func emitFixRequested(cardId: String?, question: String) {
+    var p: [String: Any] = ["type": "fix_requested", "question": question]
+    if let cardId, !cardId.isEmpty { p["card_id"] = cardId }
+    emitEvent(p)
+}
+
+private func emitFixApprovalResponded(proposalId: String, approved: Bool) {
+    emitEvent([
+        "type": "fix_approval_responded",
+        "proposal_id": proposalId,
+        "approved": approved,
+    ])
 }
 
 private func emitCardRendered(id: String) {
@@ -981,6 +1031,15 @@ private final class PillView: NSView {
 
 // MARK: - Card feed view
 
+/// The user's one-shot decision on a Fix proposal card (Slice F4). `pending`
+/// shows Approve/Reject; the terminal states disable both buttons so a proposal
+/// can never be double-submitted.
+private enum FixProposalState: Equatable {
+    case pending
+    case applying
+    case discarded
+}
+
 private struct RenderedCard {
     let id: String
     let kind: String
@@ -993,6 +1052,10 @@ private struct RenderedCard {
     /// When an answer card's source names a coding agent, the role badge and
     /// status reflect that agent instead of BLUEY (agent-bridge Slice 5b).
     var source: String?
+    /// Set only for kind == "fix_proposal" cards (Slice F4): the proposal
+    /// payload plus the user's pending/applying/discarded decision.
+    var fixProposal: FixProposal? = nil
+    var fixState: FixProposalState = .pending
 }
 
 private enum CanvasKind {
@@ -1057,6 +1120,14 @@ private final class FeedView: NSView {
     private let scroll = NSScrollView()
     private let emptyState = NSView()
     var onTranscript: ((RenderedCard) -> Void)?
+    /// Fired when the user taps **Fix** on an agent answer card (Slice F4).
+    /// Carries the source card id + its body text (the problem to fix).
+    var onFixRequested: ((_ cardId: String, _ question: String) -> Void)?
+    /// Interactive controls inside cards (Fix / Approve / Reject buttons). The
+    /// feed/workspace region is normally click-through; the panel consults
+    /// `hasInteractiveControl(at:)` so only these button frames capture the
+    /// mouse, leaving the rest of the feed transparent to the app underneath.
+    private let interactiveControls = NSHashTable<NSView>.weakObjects()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1087,6 +1158,30 @@ private final class FeedView: NSView {
         ])
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    /// Register a button so the panel's pass-through tracking treats its frame
+    /// as interactive. Enabled state is re-checked live at hit-test time, so a
+    /// disabled (already-submitted) button stops capturing the mouse.
+    private func registerInteractive(_ control: NSView) {
+        interactiveControls.add(control)
+    }
+
+    /// True when `point` (in FeedView coordinates) lands on an enabled card
+    /// button. Used by ExpandedPanelView.isInteractiveAtScreenPoint so card
+    /// affordances are clickable without making the whole feed opaque to mouse
+    /// events. Disabled buttons (terminal proposal states) return false.
+    func hasInteractiveControl(at point: NSPoint) -> Bool {
+        guard let hit = hitTest(point) else { return false }
+        var node: NSView? = hit
+        while let current = node {
+            if interactiveControls.contains(current) {
+                if let control = current as? NSControl { return control.isEnabled }
+                return true
+            }
+            node = current.superview
+        }
+        return false
+    }
 
     func push(_ card: RenderedCard) {
         if card.kind == "transcript" {
@@ -1127,8 +1222,26 @@ private final class FeedView: NSView {
 
     func clear() {
         cards.removeAll()
+        interactiveControls.removeAllObjects()
         for v in stack.arrangedSubviews { v.removeFromSuperview() }
         emptyState.isHidden = false
+    }
+
+    /// Transition a Fix proposal card to a terminal/transient state (Slice F4)
+    /// and rebuild just its subview so the buttons reflect the new state. The
+    /// proposal id doubles as the card id, so we match on it directly.
+    private func setFixState(proposalId: String, to state: FixProposalState) {
+        guard let idx = cards.firstIndex(where: {
+            $0.kind == "fix_proposal" && $0.id == proposalId
+        }) else { return }
+        guard case .pending = cards[idx].fixState else { return } // one-shot
+        cards[idx].fixState = state
+        let existing = stack.arrangedSubviews[idx]
+        stack.removeArrangedSubview(existing)
+        existing.removeFromSuperview()
+        let view = makeCardView(cards[idx])
+        stack.insertArrangedSubview(view, at: idx)
+        view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
     }
 
     private func configureEmptyState() {
@@ -1211,9 +1324,14 @@ private final class FeedView: NSView {
     }
 
     private func makeCardView(_ card: RenderedCard) -> NSView {
+        if card.kind == "fix_proposal", let proposal = card.fixProposal {
+            return makeFixProposalView(proposal, state: card.fixState)
+        }
         let accent = BlueyTheme.accent(for: card.kind)
         let rightAligned = isUserSide(card)
         let answerLike = card.kind == "answer"
+        // Agent answers (final, not streaming) get a compact Fix affordance.
+        let showFix = answerLike && card.done && agentLabel(from: card.source) != nil
         let row = NSView()
         row.translatesAutoresizingMaskIntoConstraints = false
 
@@ -1274,7 +1392,7 @@ private final class FeedView: NSView {
             trailing.priority = .defaultLow
         }
 
-        NSLayoutConstraint.activate([
+        var constraints: [NSLayoutConstraint] = [
             row.heightAnchor.constraint(greaterThanOrEqualTo: bubble.heightAnchor),
             bubble.topAnchor.constraint(equalTo: row.topAnchor),
             bubble.bottomAnchor.constraint(equalTo: row.bottomAnchor),
@@ -1296,9 +1414,360 @@ private final class FeedView: NSView {
             bodyLabel.topAnchor.constraint(equalTo: metaLabel.bottomAnchor, constant: 8),
             bodyLabel.leadingAnchor.constraint(equalTo: metaLabel.leadingAnchor),
             bodyLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
-            bodyLabel.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -12),
+        ]
+
+        if showFix {
+            // Compact cyan "Fix" affordance under an agent answer. Asks the
+            // attached agent to PROPOSE a fix for this answer (Slice F4).
+            let fixButton = NSButton(title: "Fix", target: self, action: #selector(fixButtonClicked(_:)))
+            fixButton.translatesAutoresizingMaskIntoConstraints = false
+            fixButton.identifier = NSUserInterfaceItemIdentifier(card.id)
+            fixButton.toolTip = "Ask your agent to propose a fix for this answer"
+            styleFixButton(fixButton)
+            bubble.addSubview(fixButton)
+            registerInteractive(fixButton)
+            constraints.append(contentsOf: [
+                fixButton.topAnchor.constraint(equalTo: bodyLabel.bottomAnchor, constant: 10),
+                fixButton.leadingAnchor.constraint(equalTo: metaLabel.leadingAnchor),
+                fixButton.heightAnchor.constraint(equalToConstant: 26),
+                fixButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 64),
+                fixButton.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -12),
+            ])
+        } else {
+            constraints.append(
+                bodyLabel.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -12))
+        }
+
+        NSLayoutConstraint.activate(constraints)
+        return row
+    }
+
+    /// Small cyan-accented pill used for the per-answer **Fix** button. Matches
+    /// the agent UI's compact-control look (Slice 5b) at a smaller scale.
+    private func styleFixButton(_ button: NSButton) {
+        button.isBordered = false
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 13
+        button.layer?.backgroundColor = BlueyTheme.cyanSoft.cgColor
+        button.layer?.borderWidth = 1
+        button.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.45).cgColor
+        button.font = NSFont.systemFont(ofSize: 11, weight: .bold)
+        button.contentTintColor = BlueyTheme.cyan
+        if let image = symbolImage("wrench.and.screwdriver") {
+            image.isTemplate = true
+            button.image = image
+            button.imagePosition = .imageLeading
+            button.imageHugsTitle = true
+            button.imageScaling = .scaleProportionallyDown
+        }
+        button.attributedTitle = NSAttributedString(
+            string: "Fix",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 11, weight: .bold),
+                .foregroundColor: BlueyTheme.cyan,
+            ])
+        button.alignment = .center
+    }
+
+    @objc private func fixButtonClicked(_ sender: NSButton) {
+        guard let cardId = sender.identifier?.rawValue,
+              let card = cards.first(where: { $0.id == cardId })
+        else { return }
+        onFixRequested?(cardId, card.body)
+    }
+
+    // MARK: Fix proposal card (Slice F4)
+
+    /// Render a review-gated Fix proposal: DIAGNOSIS / REASONING / FIX sections
+    /// (FIX shown as a monospace diff block when a unified diff is present) plus
+    /// Approve / Reject. Approve is disabled when the agent can't apply. The
+    /// `state` drives the terminal "Applying…" / "Discarded" presentation.
+    private func makeFixProposalView(_ proposal: FixProposal, state: FixProposalState) -> NSView {
+        let warn = BlueyTheme.warning
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        let bubble = NSView()
+        bubble.wantsLayer = true
+        bubble.layer?.backgroundColor = BlueyTheme.surface.cgColor
+        bubble.layer?.cornerRadius = 14
+        bubble.layer?.borderWidth = 1
+        // A distinct warning/amber accent sets the review-gated proposal apart
+        // from ordinary cyan answer cards.
+        bubble.layer?.borderColor = warn.withAlphaComponent(0.45).cgColor
+        bubble.layer?.shadowColor = NSColor.black.cgColor
+        bubble.layer?.shadowOpacity = 0.16
+        bubble.layer?.shadowRadius = 10
+        bubble.layer?.shadowOffset = NSSize(width: 0, height: -4)
+        bubble.translatesAutoresizingMaskIntoConstraints = false
+
+        let metaLabel = NSTextField(labelWithString: "PROPOSED FIX")
+        metaLabel.font = NSFont.systemFont(ofSize: 11, weight: .bold)
+        metaLabel.textColor = warn
+        metaLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let stateLabel = NSTextField(labelWithString: fixStateBadge(state))
+        stateLabel.font = NSFont.monospacedSystemFont(ofSize: 9.5, weight: .semibold)
+        stateLabel.textColor = BlueyTheme.textDim
+        stateLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        // Vertical content stack: the three labeled sections, then the diff (if
+        // any), then the action row.
+        let content = NSStackView()
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 10
+        content.translatesAutoresizingMaskIntoConstraints = false
+
+        // Each section/diff/action fills the content width so wrapping labels
+        // wrap at the bubble edge instead of taking intrinsic width.
+        func addFullWidth(_ view: NSView) {
+            content.addArrangedSubview(view)
+            view.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+        }
+
+        addFullWidth(makeFixSection(title: "DIAGNOSIS", body: proposal.diagnosis))
+        addFullWidth(makeFixSection(title: "REASONING", body: proposal.reasoning))
+
+        if let diff = proposal.diff, !diff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            addFullWidth(makeFixSectionHeader("FIX"))
+            addFullWidth(makeDiffBlock(diff))
+        } else {
+            addFullWidth(makeFixSection(title: "FIX", body: proposal.fix))
+        }
+
+        let actionRow = makeFixActionRow(proposal: proposal, state: state)
+        addFullWidth(actionRow)
+
+        row.addSubview(bubble)
+        bubble.addSubview(metaLabel)
+        bubble.addSubview(stateLabel)
+        bubble.addSubview(content)
+
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(greaterThanOrEqualTo: bubble.heightAnchor),
+            bubble.topAnchor.constraint(equalTo: row.topAnchor),
+            bubble.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+            bubble.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 8),
+            bubble.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -8),
+
+            metaLabel.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 12),
+            metaLabel.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 14),
+
+            stateLabel.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
+            stateLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
+            stateLabel.leadingAnchor.constraint(greaterThanOrEqualTo: metaLabel.trailingAnchor, constant: 8),
+
+            content.topAnchor.constraint(equalTo: metaLabel.bottomAnchor, constant: 10),
+            content.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 14),
+            content.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
+            content.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -14),
         ])
         return row
+    }
+
+    private func fixStateBadge(_ state: FixProposalState) -> String {
+        switch state {
+        case .pending:   return "awaiting review"
+        case .applying:  return "applying…"
+        case .discarded: return "discarded"
+        }
+    }
+
+    private func makeFixSectionHeader(_ title: String) -> NSView {
+        let label = NSTextField(labelWithString: title)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = NSFont.systemFont(ofSize: 10, weight: .heavy)
+        label.textColor = BlueyTheme.cyan
+        return label
+    }
+
+    private func makeFixSection(title: String, body: String) -> NSView {
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.alignment = .leading
+        container.spacing = 3
+        container.translatesAutoresizingMaskIntoConstraints = false
+
+        container.addArrangedSubview(makeFixSectionHeader(title))
+
+        let text = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        let bodyLabel = NSTextField(wrappingLabelWithString: text.isEmpty ? "—" : text)
+        bodyLabel.translatesAutoresizingMaskIntoConstraints = false
+        bodyLabel.font = NSFont.systemFont(ofSize: 12.5, weight: .regular)
+        bodyLabel.textColor = BlueyTheme.text
+        bodyLabel.preferredMaxLayoutWidth = 460
+        container.addArrangedSubview(bodyLabel)
+        bodyLabel.widthAnchor.constraint(equalTo: container.widthAnchor).isActive = true
+        return container
+    }
+
+    /// Monospace diff block. `+`/`-` lines are tinted green/red; hunk headers
+    /// (`@@`) cyan; everything else dim. Plain monospace if coloring fails.
+    private func makeDiffBlock(_ diff: String) -> NSView {
+        let panel = NSView()
+        panel.translatesAutoresizingMaskIntoConstraints = false
+        panel.wantsLayer = true
+        panel.layer?.backgroundColor = BlueyTheme.panelDeep.cgColor
+        panel.layer?.cornerRadius = 8
+        panel.layer?.borderWidth = 1
+        panel.layer?.borderColor = BlueyTheme.hairline.cgColor
+
+        let label = NSTextField(labelWithString: "")
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.attributedStringValue = attributedDiff(diff)
+        label.isEditable = false
+        label.isSelectable = true
+        label.drawsBackground = false
+        label.isBezeled = false
+        label.lineBreakMode = .byClipping
+        label.maximumNumberOfLines = 0
+        label.preferredMaxLayoutWidth = 440
+
+        panel.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.topAnchor.constraint(equalTo: panel.topAnchor, constant: 8),
+            label.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 10),
+            label.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -10),
+            label.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -8),
+        ])
+        return panel
+    }
+
+    private func attributedDiff(_ diff: String) -> NSAttributedString {
+        let mono = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        let result = NSMutableAttributedString()
+        let lines = diff.components(separatedBy: "\n")
+        for (idx, line) in lines.enumerated() {
+            let color: NSColor
+            if line.hasPrefix("+++") || line.hasPrefix("---") {
+                color = BlueyTheme.textDim
+            } else if line.hasPrefix("@@") {
+                color = BlueyTheme.cyan
+            } else if line.hasPrefix("+") {
+                color = BlueyTheme.green
+            } else if line.hasPrefix("-") {
+                color = NSColor(red: 1.0, green: 0.45, blue: 0.45, alpha: 1.0)
+            } else {
+                color = BlueyTheme.textDim
+            }
+            let suffix = idx == lines.count - 1 ? "" : "\n"
+            result.append(NSAttributedString(
+                string: line + suffix,
+                attributes: [.font: mono, .foregroundColor: color]))
+        }
+        return result
+    }
+
+    private func makeFixActionRow(proposal: FixProposal, state: FixProposalState) -> NSView {
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.alignment = .leading
+        container.spacing = 5
+        container.translatesAutoresizingMaskIntoConstraints = false
+
+        let buttonRow = NSStackView()
+        buttonRow.orientation = .horizontal
+        buttonRow.alignment = .centerY
+        buttonRow.spacing = 8
+        buttonRow.translatesAutoresizingMaskIntoConstraints = false
+
+        let pending = { if case .pending = state { return true }; return false }()
+        let approveEnabled = pending && proposal.applySupported
+
+        let approve = NSButton(title: "Approve", target: self, action: #selector(approveFixClicked(_:)))
+        approve.translatesAutoresizingMaskIntoConstraints = false
+        approve.identifier = NSUserInterfaceItemIdentifier(proposal.proposalId)
+        approve.isEnabled = approveEnabled
+        styleFixActionButton(approve, symbol: "checkmark", primary: true, enabled: approveEnabled)
+        buttonRow.addArrangedSubview(approve)
+        registerInteractive(approve)
+
+        let reject = NSButton(title: "Reject", target: self, action: #selector(rejectFixClicked(_:)))
+        reject.translatesAutoresizingMaskIntoConstraints = false
+        reject.identifier = NSUserInterfaceItemIdentifier(proposal.proposalId)
+        reject.isEnabled = pending
+        styleFixActionButton(reject, symbol: "xmark", primary: false, enabled: pending)
+        buttonRow.addArrangedSubview(reject)
+        registerInteractive(reject)
+
+        NSLayoutConstraint.activate([
+            approve.heightAnchor.constraint(equalToConstant: 30),
+            approve.widthAnchor.constraint(greaterThanOrEqualToConstant: 104),
+            reject.heightAnchor.constraint(equalToConstant: 30),
+            reject.widthAnchor.constraint(greaterThanOrEqualToConstant: 96),
+        ])
+
+        container.addArrangedSubview(buttonRow)
+
+        // Caption: explain a disabled Approve, or echo the terminal decision.
+        let captionText: String?
+        switch state {
+        case .pending:
+            captionText = proposal.applySupported
+                ? nil
+                : "This agent can't apply automatically"
+        case .applying:
+            captionText = "Applying… sent to your agent"
+        case .discarded:
+            captionText = "Discarded — nothing was applied"
+        }
+        if let captionText {
+            let caption = NSTextField(labelWithString: captionText)
+            caption.translatesAutoresizingMaskIntoConstraints = false
+            caption.font = NSFont.systemFont(ofSize: 10, weight: .medium)
+            caption.textColor = state == .applying ? BlueyTheme.cyan : BlueyTheme.textDim
+            caption.lineBreakMode = .byTruncatingTail
+            container.addArrangedSubview(caption)
+        }
+        return container
+    }
+
+    private func styleFixActionButton(_ button: NSButton, symbol: String, primary: Bool, enabled: Bool) {
+        button.isBordered = false
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 15
+        let baseFill: NSColor = primary
+            ? NSColor(red: 0.07, green: 0.19, blue: 0.24, alpha: 0.98)
+            : NSColor.white.withAlphaComponent(0.070)
+        let baseBorder: NSColor = primary
+            ? BlueyTheme.cyan.withAlphaComponent(0.55)
+            : NSColor.white.withAlphaComponent(0.12)
+        button.layer?.backgroundColor = baseFill.cgColor
+        button.layer?.borderWidth = 1
+        button.layer?.borderColor = baseBorder.cgColor
+        button.alphaValue = enabled ? 1.0 : 0.4
+        button.font = NSFont.systemFont(ofSize: 12, weight: .bold)
+        let titleColor: NSColor = primary ? BlueyTheme.text : BlueyTheme.textDim
+        button.attributedTitle = NSAttributedString(
+            string: button.title,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 12, weight: .bold),
+                .foregroundColor: titleColor,
+            ])
+        button.contentTintColor = primary ? BlueyTheme.cyan : BlueyTheme.textDim
+        if let image = symbolImage(symbol) {
+            image.isTemplate = true
+            button.image = image
+            button.imagePosition = .imageLeading
+            button.imageHugsTitle = true
+            button.imageScaling = .scaleProportionallyDown
+        }
+        button.alignment = .center
+    }
+
+    @objc private func approveFixClicked(_ sender: NSButton) {
+        guard sender.isEnabled, let proposalId = sender.identifier?.rawValue else { return }
+        // One-shot: flip to Applying (disables both buttons) before emitting so
+        // a fast double-click can't re-submit.
+        setFixState(proposalId: proposalId, to: .applying)
+        emitFixApprovalResponded(proposalId: proposalId, approved: true)
+    }
+
+    @objc private func rejectFixClicked(_ sender: NSButton) {
+        guard sender.isEnabled, let proposalId = sender.identifier?.rawValue else { return }
+        setFixState(proposalId: proposalId, to: .discarded)
+        emitFixApprovalResponded(proposalId: proposalId, approved: false)
     }
 
     private func kindLabel(_ card: RenderedCard) -> String {
@@ -1799,6 +2268,11 @@ private final class ExpandedPanelView: NSView {
         styleDrawer()
         feed.onTranscript = { [weak self] card in
             self?.appendTranscriptSnippet(card)
+        }
+        // Tapping Fix on an agent answer asks the daemon to drive a propose-only
+        // fix; nothing is applied until the proposal card is approved (Slice F4).
+        feed.onFixRequested = { cardId, question in
+            emitFixRequested(cardId: cardId, question: question)
         }
 
         for view in [
@@ -2392,6 +2866,13 @@ private final class ExpandedPanelView: NSView {
             return true
         }
         if !agentDrawer.isHidden && agentDrawer.frame.contains(localPoint) {
+            return true
+        }
+        // Card affordances (Fix / Approve / Reject) live inside the otherwise
+        // click-through feed: capture the mouse only over an enabled button so
+        // the rest of the feed stays transparent to the app underneath (F4).
+        let feedPoint = feed.convert(windowPoint, from: nil)
+        if feed.hasInteractiveControl(at: feedPoint) {
             return true
         }
         return false
@@ -3826,6 +4307,24 @@ private final class ExpandedPanelView: NSView {
         routeCanvasIfNeeded(card)
     }
 
+    /// Render a review-gated Fix proposal as a dedicated card in the feed
+    /// (Slice F4). Carries the proposal payload + a pending decision state; the
+    /// feed's Approve/Reject buttons echo back via emitFixApprovalResponded.
+    func pushFixProposal(_ proposal: FixProposal) {
+        let card = RenderedCard(
+            id: proposal.proposalId,
+            kind: "fix_proposal",
+            title: "Proposed fix",
+            body: "",
+            done: true,
+            costLabel: nil,
+            artifact: nil,
+            source: nil,
+            fixProposal: proposal,
+            fixState: .pending)
+        feed.push(card)
+    }
+
     func updateCard(id: String, body: String, done: Bool, costLabel: String?, artifact: OverlayArtifact?) {
         guard let card = feed.update(id: id, body: body, done: done, costLabel: costLabel, artifact: artifact) else {
             return
@@ -4637,6 +5136,9 @@ private final class OverlayApp {
             expandedView?.setAgentSessions(kind: kind, sessions: sessions)
         case .setAgentConnectors(let kind, let connectors):
             expandedView?.setAgentConnectors(kind: kind, connectors: connectors)
+        case .pushFixProposal(let proposal):
+            ensureExpandedWindow()
+            expandedView?.pushFixProposal(proposal)
         case .shutdown:
             emitLifecycle("shutdown")
             NSApp.terminate(nil)
