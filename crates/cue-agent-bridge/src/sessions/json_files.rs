@@ -58,28 +58,77 @@ impl SessionReader for JsonFilesReader {
     }
 }
 
-/// Enumerate `*.json` files for a store path (file or directory).
+/// Enumerate `*.json` chat-session files under a store path.
+///
+/// VS Code / Copilot store sessions at
+/// `…/User/workspaceStorage/<hash>/chatSessions/<id>.json`, so when `path` is
+/// the `workspaceStorage` root we must descend two levels: into each
+/// `<hash>/` workspace dir and its `chatSessions/` subdir. We also accept a
+/// path that already points directly at a `chatSessions/` dir or a single file,
+/// and any direct `*.json` children, so the reader works regardless of which
+/// level the store path names.
 fn enumerate_files(path: &Path) -> Vec<PathBuf> {
     if path.is_file() {
         return vec![path.to_path_buf()];
     }
     let mut files = Vec::new();
+    collect_json(path, &mut files);
+    // Descend into `<hash>/chatSessions/` (workspaceStorage layout).
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_file() && p.extension().is_some_and(|e| e == "json") {
-                files.push(p);
+            if !p.is_dir() {
+                continue;
+            }
+            // Either this IS a chatSessions dir, or it's a <hash> dir holding one.
+            if p.file_name().is_some_and(|n| n == "chatSessions") {
+                collect_json(&p, &mut files);
+            } else {
+                collect_json(&p.join("chatSessions"), &mut files);
             }
         }
     }
     files
 }
 
+/// Append every direct `*.json` child of `dir` to `out` (no recursion).
+fn collect_json(dir: &Path, out: &mut Vec<PathBuf>) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() && p.extension().is_some_and(|e| e == "json") {
+                out.push(p);
+            }
+        }
+    }
+}
+
+/// Resolve a session `id` back to its `*.json` file, searching the same
+/// locations [`enumerate_files`] scans.
 fn resolve_file(path: &Path, id: &str) -> PathBuf {
     if path.is_file() {
         return path.to_path_buf();
     }
-    path.join(format!("{id}.json"))
+    let target = format!("{id}.json");
+    let direct = path.join(&target);
+    if direct.is_file() {
+        return direct;
+    }
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let candidates = [p.join(&target), p.join("chatSessions").join(&target)];
+            for c in candidates {
+                if c.is_file() {
+                    return c;
+                }
+            }
+        }
+    }
+    direct
 }
 
 fn session_ref_for(file: &Path) -> Option<SessionRef> {
@@ -91,6 +140,7 @@ fn session_ref_for(file: &Path) -> Option<SessionRef> {
         id,
         title,
         updated_at,
+        project: None,
     })
 }
 

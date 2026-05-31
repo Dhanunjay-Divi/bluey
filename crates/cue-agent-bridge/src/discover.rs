@@ -435,20 +435,49 @@ fn vscdb_path(dir: &Path) -> PathBuf {
     join_glob(dir, "User/globalStorage/state.vscdb")
 }
 
-/// Look for a connector config file inside an agent's data dir. Checks the
-/// common names at the dir root and under a `User/` subdir.
+/// Look for a connector config file for an agent's data dir.
+///
+/// Candidates, in priority order:
+/// - a sibling `<dirname>.json` next to the data dir (Claude Code keeps its MCP
+///   servers in `~/.claude.json`, a sibling of the `~/.claude` data dir);
+/// - the common config names at the dir root and under a `User/` subdir.
+///
+/// A candidate that actually declares MCP servers wins over one that does not
+/// (so an empty `settings.json` never shadows a populated `~/.claude.json`).
 fn locate_connector_config(dir: &Path) -> Option<PathBuf> {
     const NAMES: &[&str] = &["mcp.json", "mcp_config.json", "settings.json"];
-    let bases = [dir.to_path_buf(), dir.join("User")];
-    for base in &bases {
-        for name in NAMES {
-            let candidate = base.join(name);
-            if path_exists(&candidate) {
-                return Some(candidate);
-            }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    // Sibling `<dirname>.json` (e.g. ~/.claude → ~/.claude.json).
+    if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+        if let Some(parent) = dir.parent() {
+            candidates.push(parent.join(format!("{name}.json")));
         }
     }
-    None
+    for base in [dir.to_path_buf(), dir.join("User")] {
+        for name in NAMES {
+            candidates.push(base.join(name));
+        }
+    }
+
+    let existing: Vec<PathBuf> = candidates.into_iter().filter(|c| path_exists(c)).collect();
+    // Prefer a config that actually declares MCP servers.
+    existing
+        .iter()
+        .find(|c| config_has_mcp_servers(c))
+        .or_else(|| existing.first())
+        .cloned()
+}
+
+/// Cheap check: does this JSON(C) config declare any MCP servers? Read-only,
+/// fail-soft — a missing/unreadable/malformed file simply returns `false`.
+fn config_has_mcp_servers(path: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    // Substring check is enough to rank candidates; the real parse happens in
+    // `connectors::read_connectors`. Matches `mcpServers` or `servers` keys.
+    raw.contains("\"mcpServers\"") || raw.contains("\"servers\"")
 }
 
 /// Look for a session store inside an agent's data dir, matching the registry's
@@ -457,7 +486,7 @@ fn locate_connector_config(dir: &Path) -> Option<PathBuf> {
 fn locate_session_store(dir: &Path, entry: &AgentEntry) -> Option<SessionStore> {
     let format = entry.session_format?;
     let path = match format {
-        SessionFormat::Jsonl => join_glob(dir, "projects"),
+        SessionFormat::Jsonl => join_glob(dir, entry.jsonl_subdir),
         SessionFormat::SqliteVscdb => vscdb_path(dir),
         SessionFormat::JsonFiles => join_glob(dir, "User/workspaceStorage"),
         SessionFormat::Protobuf => join_glob(dir, "conversations"),

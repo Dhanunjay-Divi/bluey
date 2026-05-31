@@ -36,6 +36,10 @@ pub struct AgentEntry {
     pub app_data_windows: &'static [&'static str],
     /// Session store format, when this agent has a local store.
     pub session_format: Option<SessionFormat>,
+    /// Subdirectory under the data dir holding the JSONL session store. Claude
+    /// uses `projects/<encoded-cwd>/*.jsonl`; Codex uses
+    /// `sessions/YYYY/MM/DD/rollout-*.jsonl`. Ignored for non-JSONL formats.
+    pub jsonl_subdir: &'static str,
     /// Drive command template: program + args, `{prompt}` substituted later.
     /// Stored as data only — never executed in Slice 1.
     pub drive_command: &'static [&'static str],
@@ -158,6 +162,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         data_dir_globs: &[".claude"],
         app_data_windows: &[],
         session_format: Some(SessionFormat::Jsonl),
+        jsonl_subdir: "projects",
         drive_command: &["claude", "-p", "{prompt}"],
         fix: FixProfile {
             propose_args: &["--permission-mode", "plan"],
@@ -174,6 +179,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         data_dir_globs: &[".cursor", "Library/Application Support/Cursor"],
         app_data_windows: &["Cursor"],
         session_format: Some(SessionFormat::SqliteVscdb),
+        jsonl_subdir: "projects",
         drive_command: &["cursor-agent", "-p", "{prompt}"],
         // NEVER `--plan`: Cursor's `--plan` flag is a known bug that writes
         // files. Propose = omit `--force` + rely on the prompt.
@@ -192,6 +198,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         data_dir_globs: &[".gemini/antigravity"],
         app_data_windows: &[],
         session_format: Some(SessionFormat::Protobuf),
+        jsonl_subdir: "projects",
         drive_command: &["gemini", "-p", "{prompt}"],
         // Antigravity drives through the `gemini` CLI, so it shares Gemini's
         // approval-mode flags.
@@ -210,6 +217,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         data_dir_globs: &["Library/Application Support/Code"],
         app_data_windows: &["Code"],
         session_format: Some(SessionFormat::JsonFiles),
+        jsonl_subdir: "projects",
         drive_command: &["copilot", "-p", "{prompt}"],
         // Copilot has no native propose flag; propose is prompt-only. Apply
         // needs `--allow-all-tools` (without it `-p` stalls).
@@ -228,6 +236,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         data_dir_globs: &[".gemini"],
         app_data_windows: &[],
         session_format: None,
+        jsonl_subdir: "projects",
         drive_command: &["gemini", "-p", "{prompt}"],
         fix: FixProfile {
             propose_args: &["--approval-mode", "plan"],
@@ -243,7 +252,8 @@ pub const REGISTRY: &[AgentEntry] = &[
         app_dirs_windows: &[],
         data_dir_globs: &[".codex"],
         app_data_windows: &[],
-        session_format: None,
+        session_format: Some(SessionFormat::Jsonl),
+        jsonl_subdir: "sessions",
         drive_command: &["codex", "exec", "{prompt}"],
         fix: FixProfile {
             propose_args: &["--sandbox", "read-only", "--ask-for-approval", "never"],
@@ -265,6 +275,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         data_dir_globs: &[".aider"],
         app_data_windows: &[],
         session_format: None,
+        jsonl_subdir: "projects",
         drive_command: &["aider", "--message", "{prompt}"],
         fix: FixProfile {
             propose_args: &["--dry-run"],
@@ -281,6 +292,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         data_dir_globs: &[".codeium/windsurf", "Library/Application Support/Windsurf"],
         app_data_windows: &["Windsurf"],
         session_format: Some(SessionFormat::SqliteVscdb),
+        jsonl_subdir: "projects",
         drive_command: &[],
         // No headless CLI to drive an apply — propose-capable only.
         fix: FixProfile {
@@ -298,6 +310,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         data_dir_globs: &["Library/Application Support/Code"],
         app_data_windows: &["Code"],
         session_format: Some(SessionFormat::JsonFiles),
+        jsonl_subdir: "projects",
         drive_command: &[],
         // No headless CLI to drive an apply — propose-capable only.
         fix: FixProfile {

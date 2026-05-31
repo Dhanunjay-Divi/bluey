@@ -86,6 +86,12 @@ pub struct SessionRef {
     pub title: Option<String>,
     /// Best-effort last-updated marker (RFC3339 or epoch string, per source).
     pub updated_at: String,
+    /// The project/workspace this session belongs to (a filesystem path), when
+    /// the store encodes it. Claude Code stores sessions under
+    /// `~/.claude/projects/<encoded-cwd>/`, so the cwd is recoverable; other
+    /// stores may leave this `None`.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// A normalized conversation, identical in shape across every agent format.

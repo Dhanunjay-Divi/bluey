@@ -42,7 +42,7 @@ impl SessionReader for JsonlReader {
     }
 
     fn read(&self, store: &SessionStore, id: &str, max_turns: usize) -> anyhow::Result<Transcript> {
-        let file = resolve_file(&store.path, id);
+        let file = resolve_file(&store.path, id, store);
         let mut turns = Vec::new();
         if max_turns == 0 {
             return Ok(Transcript { turns });
@@ -70,41 +70,131 @@ impl SessionReader for JsonlReader {
     }
 }
 
-/// Enumerate candidate `*.jsonl` files for a store path (file or directory).
+/// Enumerate candidate `*.jsonl` files for a store path.
+///
+/// Handles three layouts:
+/// - `path` is a single `*.jsonl` file → just that file.
+/// - `path` is a flat directory of `*.jsonl` files (Codex `…/YYYY/MM/DD/`).
+/// - `path` is a directory of **project subdirectories** each holding
+///   `*.jsonl` files (Claude `~/.claude/projects/<encoded-cwd>/<id>.jsonl`) →
+///   recurse one level into the subdirectories.
 fn enumerate_files(path: &Path) -> Vec<PathBuf> {
     if path.is_file() {
         return vec![path.to_path_buf()];
     }
+    // Recurse to a bounded depth so both layouts are covered:
+    //   Claude: `projects/<encoded-cwd>/*.jsonl`            (1 level)
+    //   Codex:  `sessions/YYYY/MM/DD/rollout-*.jsonl`       (3 levels)
+    const MAX_DEPTH: usize = 4;
     let mut files = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.is_file() && p.extension().is_some_and(|e| e == "jsonl") {
-                files.push(p);
-            }
-        }
-    }
+    collect_jsonl(path, MAX_DEPTH, &mut files);
     files
 }
 
-/// Resolve a session `id` (file stem) back to its `*.jsonl` path.
-fn resolve_file(path: &Path, id: &str) -> PathBuf {
+/// Append `*.jsonl` files at `dir` and recurse into subdirs up to `depth`.
+/// Read-only, fail-soft: an unreadable dir is skipped.
+fn collect_jsonl(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_file() {
+            if p.extension().is_some_and(|e| e == "jsonl") {
+                out.push(p);
+            }
+        } else if p.is_dir() && depth > 0 {
+            collect_jsonl(&p, depth - 1, out);
+        }
+    }
+}
+
+/// Resolve a session `id` (file stem) back to its `*.jsonl` path, searching the
+/// flat dir and one level of project subdirectories.
+fn resolve_file(path: &Path, id: &str, _store: &SessionStore) -> PathBuf {
     if path.is_file() {
         return path.to_path_buf();
     }
-    path.join(format!("{id}.jsonl"))
+    let flat = path.join(format!("{id}.jsonl"));
+    if flat.is_file() {
+        return flat;
+    }
+    // The id is a file stem; the file may be nested (Claude 1 level, Codex by
+    // date). Search the same enumerated set the listing uses.
+    enumerate_files(path)
+        .into_iter()
+        .find(|f| f.file_stem().is_some_and(|s| s.to_string_lossy() == id))
+        .unwrap_or(flat)
+}
+
+/// Decode a Claude-encoded project directory name back into a filesystem path.
+///
+/// Claude names each project dir by replacing path separators with `-` and
+/// prefixing a leading `-` (e.g. `-Users-ms-Developer-Bluey`). The encoding is
+/// lossy — a real directory named `Claude-Design` encodes the same as a nested
+/// `Claude/Design` — so we resolve it against the real filesystem: greedily
+/// keep joining `-`-separated tokens into the current path component, only
+/// descending when the longer component does not exist on disk. This recovers
+/// hyphenated folder names (`Claude-Design`, `Job-Scraper`) correctly when they
+/// exist, and falls back to the naive `-`→`/` split otherwise.
+fn decode_project_dir(dir_name: &str) -> Option<String> {
+    if !dir_name.starts_with('-') {
+        return None;
+    }
+    let tokens: Vec<&str> = dir_name[1..].split('-').collect();
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let mut path = std::path::PathBuf::from("/");
+    let mut component = String::new();
+    for (i, tok) in tokens.iter().enumerate() {
+        let candidate = if component.is_empty() {
+            (*tok).to_string()
+        } else {
+            format!("{component}-{tok}")
+        };
+        // Prefer extending the current component if the hyphenated form exists
+        // on disk; otherwise treat the `-` as a path separator.
+        let extended = path.join(&candidate);
+        let is_last = i + 1 == tokens.len();
+        if extended.exists() {
+            component = candidate;
+            if is_last {
+                path = extended;
+            }
+        } else if !component.is_empty() {
+            path.push(&component);
+            component = (*tok).to_string();
+            if is_last {
+                path.push(&component);
+            }
+        } else {
+            component = candidate;
+            if is_last {
+                path.push(&component);
+            }
+        }
+    }
+    Some(path.to_string_lossy().into_owned())
 }
 
 /// Build a [`SessionRef`] from a file: id = stem, updated_at = mtime epoch,
-/// title = first user-message snippet if cheaply available.
+/// title = first user-message snippet, project = decoded parent dir name.
 fn session_ref_for(file: &Path) -> Option<SessionRef> {
     let id = file.file_stem()?.to_string_lossy().into_owned();
     let updated_at = mtime_epoch_string(file);
     let title = first_user_snippet(file);
+    let project = file
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .and_then(|name| decode_project_dir(&name));
     Some(SessionRef {
         id,
         title,
         updated_at,
+        project,
     })
 }
 
@@ -270,6 +360,35 @@ mod tests {
         assert_eq!(refs[0].id, "sess-1");
         assert_eq!(refs[0].title.as_deref(), Some("What is the auth flow?"));
         assert!(refs[0].updated_at.parse::<u64>().is_ok());
+    }
+
+    #[test]
+    fn decode_project_recovers_hyphenated_dir_that_exists_on_disk() {
+        // Build a real folder tree:  <tmp>/My-Project  (hyphen is part of name)
+        let dir = tempfile::tempdir().expect("tempdir");
+        let base = dir.path();
+        let project = base.join("My-Project");
+        std::fs::create_dir_all(&project).expect("mkdir");
+
+        // Encode it the way Claude would: leading '-', separators → '-'.
+        let encoded = format!("-{}", base.join("My-Project").to_string_lossy()).replace('/', "-");
+        let decoded = decode_project_dir(&encoded).expect("decoded");
+        // The hyphen in "My-Project" must be preserved (folder exists on disk).
+        assert!(
+            decoded.ends_with("My-Project"),
+            "expected hyphen preserved, got {decoded}"
+        );
+        assert!(
+            !decoded.contains("My/Project"),
+            "hyphen wrongly split: {decoded}"
+        );
+    }
+
+    #[test]
+    fn decode_project_falls_back_to_naive_split_when_absent() {
+        // A path that does not exist → naive '-'→'/' split, never panics.
+        let decoded = decode_project_dir("-no-such-path-here-xyz").expect("decoded");
+        assert!(decoded.starts_with('/'));
     }
 
     #[test]

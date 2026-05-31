@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Agent session readers, corrected against real on-disk data (live testing
+  found the synthetic-fixture tests had masked these):
+  - **Cursor** (`vscdb`): listed sessions but read 0 turns/titles — now walks
+    `fullConversationHeadersOnly` → `bubbleId:` rows to recover ordered messages
+    and first-user titles (verified: full transcripts from a 220-session DB).
+  - **Copilot / VS Code** (`json_files`): found 0 sessions — now descends into
+    `workspaceStorage/<hash>/chatSessions/*.json`.
+  - **Codex**: session store wasn't discovered — registry now declares the JSONL
+    format + a per-agent `jsonl_subdir` (`sessions`), and the JSONL reader
+    recurses the date-nested `YYYY/MM/DD` layout.
+  - **Claude Code**: listed 98 of 259 sessions (one-level recursion) — now finds
+    all; added `SessionRef.project` decoded from the `~/.claude/projects/<cwd>`
+    dir name, resolving hyphenated folders against the real filesystem.
+  - **Claude MCP config**: read the empty `~/.claude/settings.json` — connector
+    discovery now also checks the sibling `~/.claude.json` and prefers whichever
+    config actually declares servers.
+  - **Antigravity** (`protobuf`): confirmed the `.pb` wire format is opaque with
+    no public schema; left as an honest enumerate-only stub (read returns a clear
+    deferral, never guesses).
+
 ### Added
 - Fix button overlay UI (F4): a **Fix** button on agent answer cards (emits
   `FixRequested`), a proposal card rendering DIAGNOSIS / REASONING / FIX with a

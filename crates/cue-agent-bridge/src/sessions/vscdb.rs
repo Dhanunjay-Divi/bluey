@@ -60,11 +60,15 @@ impl SessionReader for VscdbReader {
                 Ok(v) => v,
                 Err(_) => continue,
             };
+            // Title: the composer's own `title` if set (rare), else the first
+            // user message — looked up via the conversation headers, since the
+            // text lives on a separate `bubbleId:` row, not on the composer.
             let title = parsed
                 .get("title")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
-                .map(|s| snippet(s, TITLE_SNIPPET_CHARS));
+                .map(|s| snippet(s, TITLE_SNIPPET_CHARS))
+                .or_else(|| first_user_title(&conn, id, &parsed));
             let created = parsed.get("createdAt").and_then(Value::as_u64).unwrap_or(0);
             refs.push((
                 created,
@@ -72,6 +76,7 @@ impl SessionReader for VscdbReader {
                     id: id.to_string(),
                     title,
                     updated_at: created.to_string(),
+                    project: None,
                 },
             ));
         }
@@ -86,48 +91,107 @@ impl SessionReader for VscdbReader {
             return Ok(Transcript { turns });
         }
         let conn = open_readonly(store)?;
-        // Bubbles for this composer. LIKE on a literal prefix; bound the result.
-        let pattern = format!("bubbleId:{id}:%");
-        let mut stmt = conn
-            .prepare(
-                "SELECT key, value FROM cursorDiskKV \
-                 WHERE key LIKE ?1 ORDER BY key LIMIT ?2",
-            )
-            .map_err(|e| BridgeError::Session(e.to_string()))?;
 
-        // Fetch a few extra rows so textless bubbles don't starve max_turns,
-        // but keep a hard ceiling so a huge conversation is never slurped.
-        let fetch_cap = (max_turns.saturating_mul(4)).min(10_000) as i64;
-        let rows = stmt
-            .query_map(rusqlite::params![pattern, fetch_cap], |row| {
-                let key: String = row.get(0)?;
-                let value: String = row.get(1)?;
-                Ok((key, value))
-            })
-            .map_err(|e| BridgeError::Session(e.to_string()))?;
+        // Load the composer to get its ordered conversation manifest. The
+        // message text is NOT here — each header points at a separate
+        // `bubbleId:` row.
+        let composer = match load_composer(&conn, id) {
+            Some(c) => c,
+            None => return Ok(Transcript { turns }),
+        };
+        let headers = conversation_headers(&composer);
 
-        let mut staged: Vec<(SortKey, Turn)> = Vec::new();
-        for row in rows {
-            let (key, value) = match row {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let parsed: Value = match serde_json::from_str(&value) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            let Some(turn) = bubble_to_turn(&parsed) else {
+        for header in headers {
+            if turns.len() >= max_turns {
+                break;
+            }
+            let Some(bubble_id) = header.get("bubbleId").and_then(Value::as_str) else {
                 continue;
             };
-            staged.push((sort_key(&parsed, &key), turn));
-        }
-        // Order by an explicit message index when present, else by key.
-        staged.sort_by(|a, b| a.0.cmp(&b.0));
-        for (_, turn) in staged.into_iter().take(max_turns) {
+            let Some(bubble) = fetch_bubble(&conn, id, bubble_id) else {
+                continue;
+            };
+            // The bubble may carry its own role; fall back to the header `type`.
+            let mut turn = match bubble_to_turn(&bubble) {
+                Some(t) => t,
+                None => continue,
+            };
+            if bubble.get("role").is_none() && bubble.get("type").is_none() {
+                turn.role = header_role(header);
+            }
             turns.push(turn);
         }
         Ok(Transcript { turns })
     }
+}
+
+/// Load and parse a `composerData:<id>` row.
+fn load_composer(conn: &Connection, id: &str) -> Option<Value> {
+    let key = format!("composerData:{id}");
+    let value: String = conn
+        .query_row(
+            "SELECT value FROM cursorDiskKV WHERE key = ?1 LIMIT 1",
+            [key],
+            |row| row.get(0),
+        )
+        .ok()?;
+    serde_json::from_str(&value).ok()
+}
+
+/// The ordered `fullConversationHeadersOnly` list (each `{bubbleId, type}`).
+fn conversation_headers(composer: &Value) -> Vec<&Value> {
+    composer
+        .get("fullConversationHeadersOnly")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default()
+}
+
+/// Role from a header's numeric `type` (1 = user, 2 = assistant).
+fn header_role(header: &Value) -> Role {
+    match header.get("type").and_then(Value::as_u64) {
+        Some(1) => Role::User,
+        Some(2) => Role::Assistant,
+        _ => Role::Other,
+    }
+}
+
+/// Fetch and parse a single `bubbleId:<composer>:<bubble>` row.
+fn fetch_bubble(conn: &Connection, composer_id: &str, bubble_id: &str) -> Option<Value> {
+    let key = format!("bubbleId:{composer_id}:{bubble_id}");
+    let value: String = conn
+        .query_row(
+            "SELECT value FROM cursorDiskKV WHERE key = ?1 LIMIT 1",
+            [key],
+            |row| row.get(0),
+        )
+        .ok()?;
+    serde_json::from_str(&value).ok()
+}
+
+/// Best-effort title for a composer: the first user bubble's text, found by
+/// walking the conversation headers. Read-only, bounded to the first few
+/// headers so listing 220 sessions stays cheap.
+fn first_user_title(conn: &Connection, id: &str, composer: &Value) -> Option<String> {
+    const MAX_HEADER_SCAN: usize = 12;
+    for header in conversation_headers(composer)
+        .into_iter()
+        .take(MAX_HEADER_SCAN)
+    {
+        if header.get("type").and_then(Value::as_u64) != Some(1) {
+            continue;
+        }
+        let bubble_id = header.get("bubbleId").and_then(Value::as_str)?;
+        if let Some(bubble) = fetch_bubble(conn, id, bubble_id) {
+            if let Some(text) = bubble_text(&bubble) {
+                let text = text.trim();
+                if !text.is_empty() {
+                    return Some(snippet(text, TITLE_SNIPPET_CHARS));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Open the store read-only with `immutable=1` so a live/locked DB is never
@@ -142,23 +206,6 @@ fn open_readonly(store: &SessionStore) -> anyhow::Result<Connection> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
     .map_err(|_| BridgeError::Unreadable(store.path.clone()).into())
-}
-
-/// Sort key for ordering bubbles: prefer a numeric message index field, else
-/// fall back to the row key string (stable, deterministic).
-#[derive(PartialEq, Eq, PartialOrd, Ord)]
-enum SortKey {
-    Index(u64),
-    Key(String),
-}
-
-fn sort_key(parsed: &Value, key: &str) -> SortKey {
-    for field in ["messageIndex", "index", "ordinal", "bubbleIndex"] {
-        if let Some(n) = parsed.get(field).and_then(Value::as_u64) {
-            return SortKey::Index(n);
-        }
-    }
-    SortKey::Key(key.to_string())
 }
 
 /// Map a Cursor bubble JSON value to a normalized [`Turn`], or `None` if it
@@ -238,45 +285,40 @@ mod tests {
             ],
         )
         .unwrap();
+        // conv-new: the real Cursor shape — message text lives on separate
+        // `bubbleId:` rows, and the composer's `fullConversationHeadersOnly`
+        // is the ORDERED manifest of {bubbleId, type} (1=user, 2=assistant).
         conn.execute(
             "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
             rusqlite::params![
                 "composerData:conv-new",
-                r#"{"title":"Newer chat","createdAt":2000}"#
+                r#"{"title":"Newer chat","createdAt":2000,"fullConversationHeadersOnly":[{"bubbleId":"b1","type":1},{"bubbleId":"b2","type":2},{"bubbleId":"b3","type":2}]}"#
             ],
         )
         .unwrap();
-        // A composer row missing title/createdAt — must degrade, not panic.
+        // A composer row missing title/createdAt/headers — must degrade.
         conn.execute(
             "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
             rusqlite::params!["composerData:conv-bare", r#"{}"#],
         )
         .unwrap();
 
-        // Bubbles for conv-new, out of insertion order to exercise sorting.
+        // Bubbles for conv-new, inserted out of order — read() must honor the
+        // header order, not key/insertion order.
         conn.execute(
             "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
-            rusqlite::params![
-                "bubbleId:conv-new:b2",
-                r#"{"role":"assistant","text":"Sure, here","messageIndex":2}"#
-            ],
+            rusqlite::params!["bubbleId:conv-new:b2", r#"{"type":2,"text":"Sure, here"}"#],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
-            rusqlite::params![
-                "bubbleId:conv-new:b1",
-                r#"{"role":"user","text":"Question?","messageIndex":1}"#
-            ],
+            rusqlite::params!["bubbleId:conv-new:b1", r#"{"type":1,"text":"Question?"}"#],
         )
         .unwrap();
         // A bubble with no text — must be skipped.
         conn.execute(
             "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
-            rusqlite::params![
-                "bubbleId:conv-new:b3",
-                r#"{"role":"assistant","messageIndex":3}"#
-            ],
+            rusqlite::params!["bubbleId:conv-new:b3", r#"{"type":2}"#],
         )
         .unwrap();
     }

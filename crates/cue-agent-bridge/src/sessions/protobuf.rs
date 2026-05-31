@@ -34,6 +34,7 @@ impl SessionReader for ProtobufReader {
                     id,
                     title: None,
                     updated_at: mtime_epoch_string(&file),
+                    project: None,
                 })
             })
             .collect();
