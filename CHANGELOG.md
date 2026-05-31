@@ -28,6 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent is attached, answers stream from it and the turn is recorded with an agent
   provider label. If the agent CLI is missing or not signed in, Bluey shows a
   guidance `Warning` card and never silently falls back to its own AI.
+- Agent bridge IPC + discovery surface (Slice 5a): overlay-facing DTOs
+  (`AgentSummary`/`AgentConnectorInfo`/`AgentSessionSummary`), new `OverlayCommand`
+  (`SetAgents`/`SetAgentSessions`/`SetAgentConnectors`) and `OverlayEvent`
+  (`AgentListRequested`/`AgentAttachRequested`/`AgentDetachRequested`/
+  `AgentSessionsRequested`/`AgentConnectorsRequested`/`ConnectorReauthRequested`)
+  variants, and daemon handlers that discover agents, map them to summaries,
+  persist attach/detach to settings, and list sessions (gated on the
+  `allow_agent_session_history` consent toggle). Discovery/IO runs off the async
+  runtime; connector readiness reported without exposing secrets.
 - Master plan V3 (docs/reviews/CUE-BLUEY-V3-PLAN-COMPLETE.md)
 - Phase 0 foundation: workspace structure, Cargo workspace, crate scaffolding
 - Development workflow docs: CLAUDE.md, templates, CI, .codex agents + skills

@@ -11,7 +11,10 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use clap::Parser;
-use cue_agent_bridge::{AgentKind, AnswerChunk, Question as AgentQuestion};
+use cue_agent_bridge::{
+    discover_agents, read_connectors, reader_for, AgentKind, AnswerChunk, AuthTier, Capability,
+    DiscoveredAgent, Question as AgentQuestion,
+};
 use cue_core::ai::{
     AnswerFinishReason, AnswerRequest, AnswerResponse, AnswerResponseMetadata, AnswerStreamEvent,
     CostEstimate, ProviderClientConfig, ProviderRequestPayload, RouteAttemptMetadata,
@@ -22,15 +25,15 @@ use cue_core::audio::SimulatedPcmChunk;
 use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
 use cue_core::{
     analyze_segment, clock, generate_recap, load_account, load_settings, local_answer,
-    new_trace_id, sanitize_observability_id, trace_id_from_env, AiCapabilities, AiProviderId,
-    AiProviderKind, AiRuntimeStatus, AnswerContext, AnswerContextKind, AudioBackend,
-    AudioCaptureConfig, AudioChunkMetadata, AudioDeviceDescriptor, AudioDeviceRole,
-    AudioPipelineStatus, AudioSourceKind, CardArtifactType, CardKind, CloudEndpointConfig,
-    CloudEnvironment, CloudSyncState, CloudSyncStatus, ContextArtifact, ContextKind,
-    ContextProcessingStatus, ConversationTurn, CueCard, CueCardArtifact, DaemonState,
-    MeetingRecord, MeetingState, MemoryHit, OverlayCommand, OverlayContextItem, OverlayEvent,
-    OverlaySessionItem, PrivacyFlags, ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget,
-    Speaker, TranscriptSegment,
+    new_trace_id, sanitize_observability_id, save_settings, trace_id_from_env, AgentConnectorInfo,
+    AgentSessionSummary, AgentSummary, AiCapabilities, AiProviderId, AiProviderKind,
+    AiRuntimeStatus, AnswerContext, AnswerContextKind, AudioBackend, AudioCaptureConfig,
+    AudioChunkMetadata, AudioDeviceDescriptor, AudioDeviceRole, AudioPipelineStatus,
+    AudioSourceKind, CardArtifactType, CardKind, CloudEndpointConfig, CloudEnvironment,
+    CloudSyncState, CloudSyncStatus, ContextArtifact, ContextKind, ContextProcessingStatus,
+    ConversationTurn, CueCard, CueCardArtifact, DaemonState, MeetingRecord, MeetingState,
+    MemoryHit, OverlayCommand, OverlayContextItem, OverlayEvent, OverlaySessionItem, PrivacyFlags,
+    ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget, Speaker, TranscriptSegment,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -183,6 +186,73 @@ fn agent_model_label(kind: &AgentKind) -> String {
 fn attached_agent_kind(daemon: &Arc<Daemon>) -> Option<AgentKind> {
     let settings = load_settings(&daemon.paths).ok()?;
     parse_attached_agent(settings.attached_agent.as_deref())
+}
+
+/// Friendly, human-facing name for an [`AgentKind`], used in the discovery UI.
+fn agent_display_name(kind: &AgentKind) -> String {
+    match kind {
+        AgentKind::ClaudeCode => "Claude Code".to_string(),
+        AgentKind::Cursor => "Cursor".to_string(),
+        AgentKind::Antigravity => "Antigravity".to_string(),
+        AgentKind::Copilot => "GitHub Copilot".to_string(),
+        AgentKind::Gemini => "Gemini".to_string(),
+        AgentKind::Codex => "Codex".to_string(),
+        AgentKind::Aider => "Aider".to_string(),
+        AgentKind::Windsurf => "Windsurf".to_string(),
+        AgentKind::VsCodeFork => "VS Code".to_string(),
+        AgentKind::Other(label) => label.clone(),
+        AgentKind::Unknown => "Unknown agent".to_string(),
+    }
+}
+
+/// `snake_case` wire label for a [`Capability`], matching the UI DTO contract.
+fn capability_label(capability: Capability) -> String {
+    match capability {
+        Capability::Drive => "drive",
+        Capability::ReadOnly => "read_only",
+        Capability::NeedsTrust => "needs_trust",
+        Capability::NeedsReauth => "needs_reauth",
+        Capability::CloudBlocked => "cloud_blocked",
+    }
+    .to_string()
+}
+
+/// `snake_case` wire label for an [`AuthTier`].
+fn auth_tier_label(tier: AuthTier) -> String {
+    match tier {
+        AuthTier::EnvAuth => "env_auth",
+        AuthTier::HostedOauth => "hosted_oauth",
+        AuthTier::None_ => "none",
+    }
+    .to_string()
+}
+
+/// A connector is "ready" when it needs no re-login: env-auth or no auth.
+/// Hosted-OAuth connectors are not ready until a (future) re-auth flow runs.
+fn auth_tier_ready(tier: AuthTier) -> bool {
+    matches!(tier, AuthTier::EnvAuth | AuthTier::None_)
+}
+
+/// Pure mapping from a [`DiscoveredAgent`] (plus values the daemon resolved via
+/// filesystem IO) onto the wire [`AgentSummary`]. Kept free of IO so it is unit
+/// testable: the caller passes the connector counts, the optional session
+/// count, and the attached flag.
+fn agent_summary_from_discovered(
+    agent: &DiscoveredAgent,
+    connector_count: usize,
+    ready_connector_count: usize,
+    session_count: Option<usize>,
+    attached: bool,
+) -> AgentSummary {
+    AgentSummary {
+        kind: agent_model_label(&agent.kind),
+        display_name: agent_display_name(&agent.kind),
+        capability: capability_label(agent.capability),
+        connector_count,
+        ready_connector_count,
+        session_count,
+        attached,
+    }
 }
 
 fn next_answer_generation(daemon: &Arc<Daemon>) -> u64 {
@@ -1396,6 +1466,24 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             let _ui_state = reset_overlay_ui_state_on_scope_exit(&daemon.overlay_ui_state);
             handle_attach_paths(daemon, paths.into_iter().map(PathBuf::from).collect()).await?;
         }
+        OverlayEvent::AgentListRequested => {
+            refresh_overlay_agents(daemon).await;
+        }
+        OverlayEvent::AgentAttachRequested { kind, session_id } => {
+            handle_agent_attach(daemon, &kind, session_id.as_deref()).await;
+        }
+        OverlayEvent::AgentDetachRequested => {
+            handle_agent_detach(daemon).await;
+        }
+        OverlayEvent::AgentSessionsRequested { kind } => {
+            handle_agent_sessions_requested(daemon, &kind).await;
+        }
+        OverlayEvent::AgentConnectorsRequested { kind } => {
+            handle_agent_connectors_requested(daemon, &kind).await;
+        }
+        OverlayEvent::ConnectorReauthRequested { kind, name } => {
+            handle_connector_reauth_requested(daemon, &kind, &name).await;
+        }
         OverlayEvent::InstructionsRequested => {
             // Drive Idle -> InstructionsOpen while the daemon-owned prompt is
             // open. The guard resets on save, cancel, or error.
@@ -1556,6 +1644,269 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
     }
 
     Ok(())
+}
+
+/// Cap on how many recent agent sessions are listed for the picker. Listing is
+/// bounded so a multi-GB session store is never fully decoded.
+const AGENT_SESSION_LIST_CAP: usize = 40;
+
+/// Cap used when estimating a session count for the discovery summary. Smaller
+/// than the picker cap so the discovery list stays cheap; a store with more
+/// than this many sessions reports exactly the cap.
+const AGENT_SESSION_COUNT_CAP: usize = 20;
+
+/// Discover agents (filesystem IO, off the async runtime), map them to
+/// [`AgentSummary`] DTOs, and push the list to the overlay. Fail-soft: any
+/// discovery or read error degrades to an empty list with a debug log.
+async fn refresh_overlay_agents(daemon: &Arc<Daemon>) {
+    let settings = load_settings(&daemon.paths).unwrap_or_default();
+    let attached = settings.attached_agent.clone();
+    let allow_history = settings.allow_agent_session_history;
+
+    let agents =
+        tokio::task::spawn_blocking(move || build_agent_summaries(&attached, allow_history))
+            .await
+            .unwrap_or_else(|error| {
+                debug!("agent discovery task panicked: {error}");
+                Vec::new()
+            });
+
+    let _ = send_overlay(daemon, OverlayCommand::SetAgents { agents }).await;
+}
+
+/// Blocking core of [`refresh_overlay_agents`]: discover agents and map each to
+/// an [`AgentSummary`]. Runs on a blocking thread; never panics.
+fn build_agent_summaries(attached: &Option<String>, allow_history: bool) -> Vec<AgentSummary> {
+    discover_agents()
+        .iter()
+        .map(|agent| {
+            let label = agent_model_label(&agent.kind);
+            let (connector_count, ready_connector_count) = match &agent.connector_config_path {
+                Some(path) => {
+                    let connectors = read_connectors(path);
+                    let ready = connectors
+                        .iter()
+                        .filter(|c| auth_tier_ready(c.auth_tier))
+                        .count();
+                    (connectors.len(), ready)
+                }
+                None => (0, 0),
+            };
+            let session_count = if allow_history {
+                count_agent_sessions(agent)
+            } else {
+                None
+            };
+            let is_attached = attached.as_deref() == Some(label.as_str());
+            agent_summary_from_discovered(
+                agent,
+                connector_count,
+                ready_connector_count,
+                session_count,
+                is_attached,
+            )
+        })
+        .collect()
+}
+
+/// Best-effort recent-session count, bounded to [`AGENT_SESSION_COUNT_CAP`].
+/// Returns `None` when the agent has no session store or the read fails — the
+/// UI renders "unknown" rather than a wrong number.
+fn count_agent_sessions(agent: &DiscoveredAgent) -> Option<usize> {
+    let store = agent.session_store.as_ref()?;
+    match reader_for(store.format).list(store, AGENT_SESSION_COUNT_CAP) {
+        Ok(sessions) => Some(sessions.len()),
+        Err(error) => {
+            debug!(
+                agent = %agent_model_label(&agent.kind),
+                error = %error,
+                "agent session count read failed"
+            );
+            None
+        }
+    }
+}
+
+/// Attach `kind` as the active agent: validate, persist, and re-emit the list.
+/// `session_id` (a session to resume) is accepted but not yet persisted — that
+/// lands with the resume flow in a later slice.
+async fn handle_agent_attach(daemon: &Arc<Daemon>, kind: &str, session_id: Option<&str>) {
+    let Some(parsed) = parse_attached_agent(Some(kind)) else {
+        debug!(kind, "ignored attach request for unknown agent kind");
+        push_system_card(
+            daemon,
+            CardKind::Warning,
+            "Agent not recognized",
+            format!("\"{kind}\" is not a coding agent Bluey can attach."),
+        )
+        .await;
+        return;
+    };
+
+    // TODO(slice-resume): persist `session_id` so attach can resume a prior
+    // session. For now it is validated-in/ignored; only the agent is stored.
+    let _ = session_id;
+    let label = agent_model_label(&parsed);
+
+    if let Err(error) = persist_attached_agent(daemon, Some(label.clone())).await {
+        warn!("failed to persist attached agent: {error:#}");
+        push_system_card(
+            daemon,
+            CardKind::Warning,
+            "Could not attach agent",
+            format!("{error:#}"),
+        )
+        .await;
+        return;
+    }
+
+    refresh_overlay_agents(daemon).await;
+}
+
+/// Detach the active agent: clear the setting, persist, and re-emit the list.
+async fn handle_agent_detach(daemon: &Arc<Daemon>) {
+    if let Err(error) = persist_attached_agent(daemon, None).await {
+        warn!("failed to detach agent: {error:#}");
+        return;
+    }
+    refresh_overlay_agents(daemon).await;
+}
+
+/// Load settings, set `attached_agent`, `touch()`, and persist via the shared
+/// settings writer. Centralizes the read-modify-write so both attach and detach
+/// share one code path.
+async fn persist_attached_agent(daemon: &Arc<Daemon>, agent: Option<String>) -> Result<()> {
+    let mut settings = load_settings(&daemon.paths)?;
+    settings.attached_agent = agent;
+    settings.touch();
+    save_settings(&daemon.paths, &settings)
+}
+
+/// List one agent's prior sessions, gated on the session-history consent flag.
+/// When consent is off, an empty list is sent (the UI prompts the user to opt
+/// in). All store IO runs off the async runtime and is fail-soft.
+async fn handle_agent_sessions_requested(daemon: &Arc<Daemon>, kind: &str) {
+    let settings = load_settings(&daemon.paths).unwrap_or_default();
+    if !settings.allow_agent_session_history {
+        let _ = send_overlay(
+            daemon,
+            OverlayCommand::SetAgentSessions {
+                kind: kind.to_string(),
+                sessions: Vec::new(),
+            },
+        )
+        .await;
+        return;
+    }
+
+    let kind_owned = kind.to_string();
+    let sessions = tokio::task::spawn_blocking(move || list_agent_sessions(&kind_owned))
+        .await
+        .unwrap_or_else(|error| {
+            debug!("agent session list task panicked: {error}");
+            Vec::new()
+        });
+
+    let _ = send_overlay(
+        daemon,
+        OverlayCommand::SetAgentSessions {
+            kind: kind.to_string(),
+            sessions,
+        },
+    )
+    .await;
+}
+
+/// Blocking core of [`handle_agent_sessions_requested`]: find the agent and
+/// decode up to [`AGENT_SESSION_LIST_CAP`] session refs. Never panics; a
+/// missing agent / store or a read error yields an empty list.
+fn list_agent_sessions(kind: &str) -> Vec<AgentSessionSummary> {
+    let Some(agent) = find_discovered_agent(kind) else {
+        return Vec::new();
+    };
+    let Some(store) = agent.session_store.as_ref() else {
+        return Vec::new();
+    };
+    match reader_for(store.format).list(store, AGENT_SESSION_LIST_CAP) {
+        Ok(refs) => refs
+            .into_iter()
+            .map(|r| AgentSessionSummary {
+                id: r.id,
+                title: r.title,
+                updated_at: r.updated_at,
+            })
+            .collect(),
+        Err(error) => {
+            debug!(kind, error = %error, "agent session list read failed");
+            Vec::new()
+        }
+    }
+}
+
+/// Read one agent's inherited MCP connectors (shape + readiness only) and push
+/// them to the overlay. Connector config is not secret, so this is not gated on
+/// the session-history consent flag.
+async fn handle_agent_connectors_requested(daemon: &Arc<Daemon>, kind: &str) {
+    let kind_owned = kind.to_string();
+    let connectors = tokio::task::spawn_blocking(move || list_agent_connectors(&kind_owned))
+        .await
+        .unwrap_or_else(|error| {
+            debug!("agent connector list task panicked: {error}");
+            Vec::new()
+        });
+
+    let _ = send_overlay(
+        daemon,
+        OverlayCommand::SetAgentConnectors {
+            kind: kind.to_string(),
+            connectors,
+        },
+    )
+    .await;
+}
+
+/// Blocking core of [`handle_agent_connectors_requested`]: find the agent and
+/// read its connector config into [`AgentConnectorInfo`] DTOs (never secrets).
+fn list_agent_connectors(kind: &str) -> Vec<AgentConnectorInfo> {
+    let Some(agent) = find_discovered_agent(kind) else {
+        return Vec::new();
+    };
+    let Some(path) = agent.connector_config_path.as_ref() else {
+        return Vec::new();
+    };
+    read_connectors(path)
+        .into_iter()
+        .map(|c| AgentConnectorInfo {
+            name: c.name,
+            auth_tier: auth_tier_label(c.auth_tier),
+            ready: auth_tier_ready(c.auth_tier),
+        })
+        .collect()
+}
+
+/// Re-auth one hosted-OAuth connector. Real OAuth is future work; for now this
+/// logs and re-emits the connector list so the UI can refresh state.
+async fn handle_connector_reauth_requested(daemon: &Arc<Daemon>, kind: &str, name: &str) {
+    // TODO(slice-reauth): drive the actual per-connector OAuth re-login. The
+    // bridge does not yet expose a re-auth entry point, so we only log and
+    // refresh the connector view.
+    debug!(kind, connector = name, "connector re-auth requested (stub)");
+    push_system_card(
+        daemon,
+        CardKind::System,
+        "Re-auth not available yet",
+        format!("Re-authenticating \"{name}\" will be supported in a later update."),
+    )
+    .await;
+    handle_agent_connectors_requested(daemon, kind).await;
+}
+
+/// Discover agents and return the one whose label matches `kind`, if any.
+/// Blocking; call from inside `spawn_blocking`.
+fn find_discovered_agent(kind: &str) -> Option<DiscoveredAgent> {
+    discover_agents()
+        .into_iter()
+        .find(|agent| agent_model_label(&agent.kind) == kind)
 }
 
 async fn start_screen_capture(
@@ -7884,6 +8235,63 @@ mod tests {
             agent_model_label(&AgentKind::Other("zed".to_string())),
             "zed"
         );
+    }
+
+    #[test]
+    fn capability_and_auth_tier_labels_are_snake_case() {
+        assert_eq!(capability_label(Capability::Drive), "drive");
+        assert_eq!(capability_label(Capability::ReadOnly), "read_only");
+        assert_eq!(capability_label(Capability::NeedsTrust), "needs_trust");
+        assert_eq!(capability_label(Capability::NeedsReauth), "needs_reauth");
+        assert_eq!(capability_label(Capability::CloudBlocked), "cloud_blocked");
+
+        assert_eq!(auth_tier_label(AuthTier::EnvAuth), "env_auth");
+        assert_eq!(auth_tier_label(AuthTier::HostedOauth), "hosted_oauth");
+        assert_eq!(auth_tier_label(AuthTier::None_), "none");
+    }
+
+    #[test]
+    fn auth_tier_ready_only_for_env_auth_and_none() {
+        // Env-auth and no-auth connectors are usable as-is; hosted-OAuth needs
+        // a re-login first, so it is not counted as ready.
+        assert!(auth_tier_ready(AuthTier::EnvAuth));
+        assert!(auth_tier_ready(AuthTier::None_));
+        assert!(!auth_tier_ready(AuthTier::HostedOauth));
+    }
+
+    #[test]
+    fn agent_summary_maps_discovered_fields_and_attached_flag() {
+        let agent = DiscoveredAgent {
+            kind: AgentKind::ClaudeCode,
+            install_evidence: vec![std::path::PathBuf::from("claude")],
+            capability: Capability::Drive,
+            connector_config_path: None,
+            session_store: None,
+        };
+
+        let attached = agent_summary_from_discovered(&agent, 3, 2, Some(7), true);
+        assert_eq!(attached.kind, "claude_code");
+        assert_eq!(attached.display_name, "Claude Code");
+        assert_eq!(attached.capability, "drive");
+        assert_eq!(attached.connector_count, 3);
+        assert_eq!(attached.ready_connector_count, 2);
+        assert_eq!(attached.session_count, Some(7));
+        assert!(attached.attached);
+
+        // A different agent that is not the attached one reports attached=false
+        // and carries an unknown (None) session count.
+        let other = DiscoveredAgent {
+            kind: AgentKind::Cursor,
+            install_evidence: vec![],
+            capability: Capability::ReadOnly,
+            connector_config_path: None,
+            session_store: None,
+        };
+        let summary = agent_summary_from_discovered(&other, 0, 0, None, false);
+        assert_eq!(summary.kind, "cursor");
+        assert_eq!(summary.capability, "read_only");
+        assert_eq!(summary.session_count, None);
+        assert!(!summary.attached);
     }
 
     #[test]

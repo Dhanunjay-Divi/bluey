@@ -1,3 +1,4 @@
+pub mod agent_ui;
 pub mod ai;
 pub mod app_paths;
 pub mod audio;
@@ -19,6 +20,7 @@ pub mod pcm;
 pub mod stt;
 pub mod vad;
 
+pub use agent_ui::{AgentConnectorInfo, AgentSessionSummary, AgentSummary};
 pub use ai::{
     AiCapabilities, AiCapability, AiModelId, AiProviderId, AiProviderKind, AiRuntimeStatus,
     AnswerContext, AnswerContextKind, AnswerRequest, AnswerResponse, AnswerStreamEvent, CostBudget,

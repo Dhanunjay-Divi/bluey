@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::agent_ui::{AgentConnectorInfo, AgentSessionSummary, AgentSummary};
 use crate::{CueCard, CueCardArtifact};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -76,6 +77,20 @@ pub enum OverlayCommand {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         artifact: Option<CueCardArtifact>,
     },
+    /// Push the discovered-agent list to the UI (agent-bridge Slice 5a).
+    SetAgents {
+        agents: Vec<AgentSummary>,
+    },
+    /// Push one agent's prior sessions to the UI (gated on consent upstream).
+    SetAgentSessions {
+        kind: String,
+        sessions: Vec<AgentSessionSummary>,
+    },
+    /// Push one agent's inherited MCP connectors (shape + readiness only).
+    SetAgentConnectors {
+        kind: String,
+        connectors: Vec<AgentConnectorInfo>,
+    },
     Shutdown,
 }
 
@@ -101,6 +116,30 @@ pub enum OverlayEvent {
     AttachRequested,
     AttachFilesRequested {
         paths: Vec<String>,
+    },
+    /// UI asked for the current discovered-agent list (agent-bridge Slice 5a).
+    AgentListRequested,
+    /// UI attached an agent; `session_id` is an optional session to resume.
+    AgentAttachRequested {
+        kind: String,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    /// UI detached the currently attached agent.
+    AgentDetachRequested,
+    /// UI asked for one agent's prior sessions (gated on consent in the daemon).
+    AgentSessionsRequested {
+        kind: String,
+    },
+    /// UI asked for one agent's inherited MCP connectors.
+    AgentConnectorsRequested {
+        kind: String,
+    },
+    /// UI asked to re-authenticate one hosted-OAuth connector. For now this
+    /// only logs and re-emits guidance; the real OAuth flow is future work.
+    ConnectorReauthRequested {
+        kind: String,
+        name: String,
     },
     InstructionsRequested,
     InstructionsUpdated {
@@ -189,6 +228,106 @@ mod tests {
         assert_eq!(
             json,
             r#"{"type":"set_sessions","sessions":[{"id":"00000000-0000-0000-0000-000000000000","title":"System design prep","subtitle":"3 transcripts · 2 files","is_active":true}]}"#
+        );
+    }
+
+    #[test]
+    fn set_agents_serializes_with_type_tag() {
+        let json = serde_json::to_string(&OverlayCommand::SetAgents {
+            agents: vec![crate::agent_ui::AgentSummary {
+                kind: "claude_code".to_string(),
+                display_name: "Claude Code".to_string(),
+                capability: "drive".to_string(),
+                connector_count: 2,
+                ready_connector_count: 1,
+                session_count: Some(4),
+                attached: true,
+            }],
+        })
+        .expect("serialize set_agents command");
+
+        assert!(json.starts_with(r#"{"type":"set_agents","agents":[{"#));
+        assert!(json.contains(r#""kind":"claude_code""#));
+    }
+
+    #[test]
+    fn set_agent_sessions_roundtrips() {
+        let command = OverlayCommand::SetAgentSessions {
+            kind: "cursor".to_string(),
+            sessions: vec![crate::agent_ui::AgentSessionSummary {
+                id: "s1".to_string(),
+                title: Some("Refactor".to_string()),
+                updated_at: "1717000000".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&command).expect("serialize");
+        assert!(json.contains(r#""type":"set_agent_sessions""#));
+        assert!(json.contains(r#""kind":"cursor""#));
+    }
+
+    #[test]
+    fn set_agent_connectors_roundtrips() {
+        let command = OverlayCommand::SetAgentConnectors {
+            kind: "codex".to_string(),
+            connectors: vec![crate::agent_ui::AgentConnectorInfo {
+                name: "fs".to_string(),
+                auth_tier: "none".to_string(),
+                ready: true,
+            }],
+        };
+        let json = serde_json::to_string(&command).expect("serialize");
+        assert!(json.contains(r#""type":"set_agent_connectors""#));
+        assert!(json.contains(r#""name":"fs""#));
+    }
+
+    #[test]
+    fn agent_attach_event_deserializes_with_optional_session() {
+        let json = r#"{"type":"agent_attach_requested","kind":"claude_code"}"#;
+        let event: OverlayEvent = serde_json::from_str(json).expect("deserialize attach");
+        match event {
+            OverlayEvent::AgentAttachRequested { kind, session_id } => {
+                assert_eq!(kind, "claude_code");
+                assert_eq!(session_id, None);
+            }
+            other => panic!("expected agent_attach_requested, got {other:?}"),
+        }
+
+        let with_session = r#"{"type":"agent_attach_requested","kind":"cursor","session_id":"s9"}"#;
+        let event: OverlayEvent = serde_json::from_str(with_session).expect("deserialize");
+        match event {
+            OverlayEvent::AgentAttachRequested { kind, session_id } => {
+                assert_eq!(kind, "cursor");
+                assert_eq!(session_id.as_deref(), Some("s9"));
+            }
+            other => panic!("expected agent_attach_requested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_request_events_serialize_with_type_tag() {
+        let list = serde_json::to_string(&OverlayEvent::AgentListRequested).expect("serialize");
+        assert_eq!(list, r#"{"type":"agent_list_requested"}"#);
+
+        let detach = serde_json::to_string(&OverlayEvent::AgentDetachRequested).expect("serialize");
+        assert_eq!(detach, r#"{"type":"agent_detach_requested"}"#);
+
+        let sessions = serde_json::to_string(&OverlayEvent::AgentSessionsRequested {
+            kind: "gemini".to_string(),
+        })
+        .expect("serialize");
+        assert_eq!(
+            sessions,
+            r#"{"type":"agent_sessions_requested","kind":"gemini"}"#
+        );
+
+        let reauth = serde_json::to_string(&OverlayEvent::ConnectorReauthRequested {
+            kind: "cursor".to_string(),
+            name: "remote".to_string(),
+        })
+        .expect("serialize");
+        assert_eq!(
+            reauth,
+            r#"{"type":"connector_reauth_requested","kind":"cursor","name":"remote"}"#
         );
     }
 
