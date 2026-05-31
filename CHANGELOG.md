@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Agent bridge native overlay UI (Slice 5b): an "Attach Agent" drawer in the
+  macOS overlay — agent picker with capability chips, session picker
+  (continue-most-recent / fresh), connector sheet with per-connector readiness +
+  re-auth, attached-state header badge + pill glyph, and agent-answer card
+  relabeling (role badge shows the agent, "answered by your <agent>"). Decodes
+  `set_agents`/`set_agent_sessions`/`set_agent_connectors`, emits the agent
+  request events. Reuses existing theme/drawer/card builders; no new window.
+- Agent bridge session resume + agent-labeled answers: a new `attached_session`
+  setting persists the chosen session so an attached agent continues it
+  (`Question.resume`), and agent answers now carry an agent-labeled card source so
+  the overlay attributes them to the user's agent.
+- Windows agent discovery: discovery now resolves Windows base dirs
+  (`%APPDATA%`/`%LOCALAPPDATA%`/program dirs, `%USERPROFILE%`) and scans
+  Windows app-install + VS Code-family data locations, so `agent list` finds GUI
+  agents on Windows too (cfg-gated; macOS behavior unchanged).
+- `scripts/test-agent-bridge.sh`: one-command end-to-end smoke test (build →
+  start daemon → list/attach/connectors/sessions/ask/detach → stop), with safe
+  daemon start/stop and graceful handling when no drivable agent is installed.
 - `cue-agent-bridge` crate (Slice 1): read-only discovery of installed coding
   agents (GUI + CLI) via registry + generic VS Code-fork detector, JSONC-tolerant
   MCP connector reader with auth-tier classification, and the `AgentSource` trait
