@@ -23,7 +23,34 @@ use crate::{AgentKind, Transcript};
 
 pub mod cli;
 
-pub use cli::{drive, drive_with_options, DriveOptions};
+pub use cli::{drive, drive_with_mode, drive_with_options, DriveOptions};
+
+/// How a drive should treat the agent's write capability.
+///
+/// This is the entry point to the review-gated **Fix** lane (see
+/// `docs/work/PLAN-FIX-BUTTON.md`). The mode picks which extra args — if any —
+/// are appended from the agent's [`registry::FixProfile`], without the drive
+/// layer ever naming an agent:
+/// - [`Answer`](DriveMode::Answer): current behavior. No extra args; a plain
+///   question/answer.
+/// - [`ProposeFix`](DriveMode::ProposeFix): append the row's
+///   `propose_args` (read-only / plan). The agent proposes a fix but applies
+///   nothing.
+/// - [`ApplyFix`](DriveMode::ApplyFix): append the row's `apply_args` (write).
+///   Only valid for agents whose profile has `apply_supported = true`; used
+///   **only** after the user approves a proposal.
+///
+/// [`registry::FixProfile`]: crate::registry::FixProfile
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DriveMode {
+    /// Plain question → answer. No Fix-profile args appended (back-compat).
+    #[default]
+    Answer,
+    /// Propose-only: append the agent's read-only / plan args.
+    ProposeFix,
+    /// Apply: append the agent's write args. Post-approval only.
+    ApplyFix,
+}
 
 /// A question to put to an agent, plus optional grounding context and a native
 /// session id to resume.

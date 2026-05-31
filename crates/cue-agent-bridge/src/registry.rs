@@ -39,6 +39,39 @@ pub struct AgentEntry {
     /// Drive command template: program + args, `{prompt}` substituted later.
     /// Stored as data only — never executed in Slice 1.
     pub drive_command: &'static [&'static str],
+    /// Review-gated "Fix" profile: the extra args that switch this agent
+    /// between propose-only and apply (see [`FixProfile`]).
+    pub fix: FixProfile,
+}
+
+/// Per-agent profile for the review-gated **Fix** lane (see
+/// `docs/work/PLAN-FIX-BUTTON.md` §3). Pure data, `Copy`-friendly (only
+/// `&'static` slices and a `bool`), so registry rows stay `const`.
+///
+/// Two arg sets express the same agent in two safety postures:
+/// - [`propose_args`](FixProfile::propose_args) force **propose-only**
+///   (read-only / plan): the agent diagnoses and proposes a fix but applies
+///   nothing. Empty means the agent has no native propose flag and relies on
+///   prompt engineering plus simply *omitting* the apply args (e.g. Cursor,
+///   whose `--plan` flag is a known bug that writes files — never use it).
+/// - [`apply_args`](FixProfile::apply_args) **allow apply** (write). These are
+///   appended **only** after the user explicitly approves a proposal; the
+///   propose and answer paths never append them.
+///
+/// [`apply_supported`](FixProfile::apply_supported) is `false` for agents that
+/// can be read/proposed against but have no drivable apply path at all (e.g.
+/// Windsurf and generic VS Code have no headless CLI). For those, an apply
+/// request must be refused, never spawned.
+#[derive(Debug, Clone, Copy)]
+pub struct FixProfile {
+    /// Extra args that force PROPOSE-ONLY (read-only / plan). Empty = rely on
+    /// the prompt plus omitting the apply args.
+    pub propose_args: &'static [&'static str],
+    /// Extra args that ALLOW APPLY (write). Appended ONLY after user approval.
+    pub apply_args: &'static [&'static str],
+    /// `false` = this agent can propose but cannot be driven to apply at all
+    /// (no CLI). An apply request for such an agent must error, not spawn.
+    pub apply_supported: bool,
 }
 
 /// Prefix that marks a [`AgentEntry::data_dir_globs`] entry as a macOS-only
@@ -91,6 +124,26 @@ impl KindTag {
             KindTag::VsCode => AgentKind::VsCodeFork,
         }
     }
+
+    /// Inverse of [`to_agent_kind`](KindTag::to_agent_kind): map a runtime
+    /// [`AgentKind`] to its registry tag, when the kind names a known row.
+    /// `Other`/`Unknown` (and any future un-tagged kind) return `None`. This
+    /// lets the drive layer resolve a row generically by kind without ever
+    /// special-casing an agent by name.
+    pub fn from_agent_kind(kind: &AgentKind) -> Option<Self> {
+        match kind {
+            AgentKind::ClaudeCode => Some(KindTag::ClaudeCode),
+            AgentKind::Cursor => Some(KindTag::Cursor),
+            AgentKind::Antigravity => Some(KindTag::Antigravity),
+            AgentKind::Copilot => Some(KindTag::Copilot),
+            AgentKind::Gemini => Some(KindTag::Gemini),
+            AgentKind::Codex => Some(KindTag::Codex),
+            AgentKind::Aider => Some(KindTag::Aider),
+            AgentKind::Windsurf => Some(KindTag::Windsurf),
+            AgentKind::VsCodeFork => Some(KindTag::VsCode),
+            AgentKind::Other(_) | AgentKind::Unknown => None,
+        }
+    }
 }
 
 /// The known-agent table. Order is detection priority (earlier rows win on a
@@ -106,6 +159,11 @@ pub const REGISTRY: &[AgentEntry] = &[
         app_data_windows: &[],
         session_format: Some(SessionFormat::Jsonl),
         drive_command: &["claude", "-p", "{prompt}"],
+        fix: FixProfile {
+            propose_args: &["--permission-mode", "plan"],
+            apply_args: &["--permission-mode", "acceptEdits"],
+            apply_supported: true,
+        },
     },
     AgentEntry {
         kind_tag: KindTag::Cursor,
@@ -117,6 +175,13 @@ pub const REGISTRY: &[AgentEntry] = &[
         app_data_windows: &["Cursor"],
         session_format: Some(SessionFormat::SqliteVscdb),
         drive_command: &["cursor-agent", "-p", "{prompt}"],
+        // NEVER `--plan`: Cursor's `--plan` flag is a known bug that writes
+        // files. Propose = omit `--force` + rely on the prompt.
+        fix: FixProfile {
+            propose_args: &[],
+            apply_args: &["--force"],
+            apply_supported: true,
+        },
     },
     AgentEntry {
         kind_tag: KindTag::Antigravity,
@@ -128,6 +193,13 @@ pub const REGISTRY: &[AgentEntry] = &[
         app_data_windows: &[],
         session_format: Some(SessionFormat::Protobuf),
         drive_command: &["gemini", "-p", "{prompt}"],
+        // Antigravity drives through the `gemini` CLI, so it shares Gemini's
+        // approval-mode flags.
+        fix: FixProfile {
+            propose_args: &["--approval-mode", "plan"],
+            apply_args: &["--approval-mode", "yolo"],
+            apply_supported: true,
+        },
     },
     AgentEntry {
         kind_tag: KindTag::Copilot,
@@ -139,6 +211,13 @@ pub const REGISTRY: &[AgentEntry] = &[
         app_data_windows: &["Code"],
         session_format: Some(SessionFormat::JsonFiles),
         drive_command: &["copilot", "-p", "{prompt}"],
+        // Copilot has no native propose flag; propose is prompt-only. Apply
+        // needs `--allow-all-tools` (without it `-p` stalls).
+        fix: FixProfile {
+            propose_args: &[],
+            apply_args: &["--allow-all-tools"],
+            apply_supported: true,
+        },
     },
     AgentEntry {
         kind_tag: KindTag::Gemini,
@@ -150,6 +229,11 @@ pub const REGISTRY: &[AgentEntry] = &[
         app_data_windows: &[],
         session_format: None,
         drive_command: &["gemini", "-p", "{prompt}"],
+        fix: FixProfile {
+            propose_args: &["--approval-mode", "plan"],
+            apply_args: &["--approval-mode", "yolo"],
+            apply_supported: true,
+        },
     },
     AgentEntry {
         kind_tag: KindTag::Codex,
@@ -161,6 +245,16 @@ pub const REGISTRY: &[AgentEntry] = &[
         app_data_windows: &[],
         session_format: None,
         drive_command: &["codex", "exec", "{prompt}"],
+        fix: FixProfile {
+            propose_args: &["--sandbox", "read-only", "--ask-for-approval", "never"],
+            apply_args: &[
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "never",
+            ],
+            apply_supported: true,
+        },
     },
     AgentEntry {
         kind_tag: KindTag::Aider,
@@ -172,6 +266,11 @@ pub const REGISTRY: &[AgentEntry] = &[
         app_data_windows: &[],
         session_format: None,
         drive_command: &["aider", "--message", "{prompt}"],
+        fix: FixProfile {
+            propose_args: &["--dry-run"],
+            apply_args: &["--yes-always"],
+            apply_supported: true,
+        },
     },
     AgentEntry {
         kind_tag: KindTag::Windsurf,
@@ -183,6 +282,12 @@ pub const REGISTRY: &[AgentEntry] = &[
         app_data_windows: &["Windsurf"],
         session_format: Some(SessionFormat::SqliteVscdb),
         drive_command: &[],
+        // No headless CLI to drive an apply — propose-capable only.
+        fix: FixProfile {
+            propose_args: &[],
+            apply_args: &[],
+            apply_supported: false,
+        },
     },
     AgentEntry {
         kind_tag: KindTag::VsCode,
@@ -194,6 +299,12 @@ pub const REGISTRY: &[AgentEntry] = &[
         app_data_windows: &["Code"],
         session_format: Some(SessionFormat::JsonFiles),
         drive_command: &[],
+        // No headless CLI to drive an apply — propose-capable only.
+        fix: FixProfile {
+            propose_args: &[],
+            apply_args: &[],
+            apply_supported: false,
+        },
     },
 ];
 
@@ -204,6 +315,21 @@ pub fn all_binary_candidates() -> impl Iterator<Item = (&'static AgentEntry, &'s
     REGISTRY
         .iter()
         .flat_map(|e| e.binary_candidates.iter().map(move |b| (e, *b)))
+}
+
+/// Look up the registry row for a [`KindTag`]. Always `Some` for the const
+/// tags (every tag has exactly one row), but returned as `Option` so callers
+/// stay total without an `unwrap`.
+pub fn entry_for(kind: KindTag) -> Option<&'static AgentEntry> {
+    REGISTRY.iter().find(|e| e.kind_tag == kind)
+}
+
+/// Resolve the [`FixProfile`] for an agent's [`KindTag`], reading it straight
+/// off the registry row. Data-driven: the Fix lane reads this; it never names
+/// an agent. Returns `None` only if a tag has no row (impossible for the const
+/// table, but kept total).
+pub fn fix_profile_for(kind: KindTag) -> Option<&'static FixProfile> {
+    entry_for(kind).map(|e| &e.fix)
 }
 
 #[cfg(test)]
@@ -301,5 +427,223 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- FixProfile (Fix button, slice F1) ------------------------------
+
+    /// Parse a Fix arg list into ordered `(flag, value)` pairs. A token
+    /// starting with `-` opens a flag; an immediately following non-dash token
+    /// is its value. A dash token followed by another dash token (or EOL) is a
+    /// value-less flag (e.g. `--force`, `--dry-run`). Mirrors how the CLIs
+    /// these args target read their own flags.
+    fn arg_pairs(args: &[&'static str]) -> Vec<(&'static str, Option<&'static str>)> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < args.len() {
+            let tok = args[i];
+            if tok.starts_with('-') {
+                let val = args.get(i + 1).copied().filter(|n| !n.starts_with('-'));
+                i += if val.is_some() { 2 } else { 1 };
+                out.push((tok, val));
+            } else {
+                // A bare value with no preceding flag (none in current data);
+                // record it so a future stray token is still inspected.
+                out.push((tok, None));
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// The set of tokens that *grant write* when moving from propose to apply:
+    /// for each apply `(flag, value)`, the token is write-enabling when that
+    /// flag is absent from propose, or present with a different value. Returns
+    /// both the divergent flag and its value (when any). Posture-invariant
+    /// tokens shared by both lists (e.g. the flag name `--permission-mode`, or
+    /// Codex's `--ask-for-approval never`) are deliberately excluded.
+    fn write_enabling_tokens(
+        propose: &[(&'static str, Option<&'static str>)],
+        apply: &[(&'static str, Option<&'static str>)],
+    ) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        for (flag, apply_val) in apply {
+            let propose_entry = propose.iter().find(|(f, _)| f == flag);
+            let diverges = match propose_entry {
+                None => true,                                       // flag absent in propose
+                Some((_, propose_val)) => propose_val != apply_val, // value changed
+            };
+            if diverges {
+                // The value (if any) is the new write posture; the flag itself
+                // is also new when it was absent from propose.
+                if let Some(v) = apply_val {
+                    out.push(*v);
+                }
+                if propose_entry.is_none() {
+                    out.push(*flag);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn test_no_write_enabling_token_appears_in_propose() {
+        // Defense-in-depth, pair-aware: the tokens that switch an agent from
+        // read to write (Cursor `--force`, Codex `workspace-write`, Claude
+        // `acceptEdits`, …) must NEVER appear in the propose arg list. Tokens
+        // that are identical across both postures (a shared flag name, or
+        // Codex's invariant `--ask-for-approval never`) are not write-granting
+        // and are allowed to repeat.
+        for e in REGISTRY {
+            let propose = arg_pairs(e.fix.propose_args);
+            let apply = arg_pairs(e.fix.apply_args);
+            let write_tokens = write_enabling_tokens(&propose, &apply);
+            for tok in write_tokens {
+                assert!(
+                    !e.fix.propose_args.contains(&tok),
+                    "{}: write-enabling token {tok:?} leaked into propose_args",
+                    e.display_name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_writable_agents_actually_have_a_write_enabling_token() {
+        // The pair-diff is meaningful: every apply-capable agent must expose at
+        // least one write-enabling token, otherwise its apply posture is
+        // indistinguishable from propose and the gate is a no-op.
+        for e in REGISTRY {
+            if e.fix.apply_supported {
+                let propose = arg_pairs(e.fix.propose_args);
+                let apply = arg_pairs(e.fix.apply_args);
+                assert!(
+                    !write_enabling_tokens(&propose, &apply).is_empty(),
+                    "{}: apply posture has no write-enabling token over propose",
+                    e.display_name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_propose_and_apply_args_are_never_identical_for_writable_agents() {
+        // For an apply-capable agent the two postures must actually differ;
+        // identical arg sets would make the apply gate a no-op (a propose run
+        // would already carry write permission).
+        for e in REGISTRY {
+            if e.fix.apply_supported {
+                assert_ne!(
+                    e.fix.propose_args, e.fix.apply_args,
+                    "{}: propose and apply args are identical",
+                    e.display_name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cursor_never_uses_plan_flag() {
+        // Cursor's `--plan` is a known bug that writes files; it must never
+        // appear in either arg set (propose = omit --force + prompt only).
+        let cursor = row(KindTag::Cursor);
+        assert!(!cursor.fix.propose_args.contains(&"--plan"));
+        assert!(!cursor.fix.apply_args.contains(&"--plan"));
+    }
+
+    #[test]
+    fn test_no_row_carries_plan_flag_anywhere() {
+        // Stronger guard: the known-bad `--plan` flag belongs to no agent's
+        // Fix profile, so a future copy/paste can't reintroduce it.
+        for e in REGISTRY {
+            assert!(
+                !e.fix.propose_args.contains(&"--plan") && !e.fix.apply_args.contains(&"--plan"),
+                "{}: --plan must never appear in a Fix profile",
+                e.display_name
+            );
+        }
+    }
+
+    #[test]
+    fn test_cli_less_agents_cannot_apply() {
+        // Windsurf and VS Code have no headless CLI, so they can propose but
+        // not be driven to apply.
+        for kind in [KindTag::Windsurf, KindTag::VsCode] {
+            assert!(
+                !row(kind).fix.apply_supported,
+                "{kind:?} has no CLI and must have apply_supported = false"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cli_agents_support_apply() {
+        // Every agent with a non-empty drive command is apply-capable.
+        for e in REGISTRY {
+            if !e.drive_command.is_empty() {
+                assert!(
+                    e.fix.apply_supported,
+                    "{}: drivable agents should support apply",
+                    e.display_name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_apply_unsupported_rows_have_empty_apply_args() {
+        // An agent that cannot apply must not carry stray apply args.
+        for e in REGISTRY {
+            if !e.fix.apply_supported {
+                assert!(
+                    e.fix.apply_args.is_empty(),
+                    "{}: apply_supported=false but apply_args is non-empty",
+                    e.display_name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_claude_fix_profile_values() {
+        // Spot-check the exact data for one solid-propose agent.
+        let claude = row(KindTag::ClaudeCode).fix;
+        assert_eq!(claude.propose_args, &["--permission-mode", "plan"]);
+        assert_eq!(claude.apply_args, &["--permission-mode", "acceptEdits"]);
+        assert!(claude.apply_supported);
+    }
+
+    #[test]
+    fn test_from_agent_kind_round_trips_known_tags() {
+        // Every tag's owned kind maps back to the same tag (Antigravity and
+        // generic VS Code included).
+        for e in REGISTRY {
+            let kind = e.kind_tag.to_agent_kind();
+            assert_eq!(
+                KindTag::from_agent_kind(&kind),
+                Some(e.kind_tag),
+                "round-trip failed for {}",
+                e.display_name
+            );
+        }
+    }
+
+    #[test]
+    fn test_from_agent_kind_none_for_other_and_unknown() {
+        assert_eq!(KindTag::from_agent_kind(&AgentKind::Unknown), None);
+        assert_eq!(
+            KindTag::from_agent_kind(&AgentKind::Other("x".to_string())),
+            None
+        );
+    }
+
+    #[test]
+    fn test_fix_profile_for_resolves_off_the_row() {
+        // The lookup returns the same profile stored on the row.
+        let via_helper = fix_profile_for(KindTag::Codex).expect("profile");
+        let on_row = &row(KindTag::Codex).fix;
+        assert_eq!(via_helper.propose_args, on_row.propose_args);
+        assert_eq!(via_helper.apply_args, on_row.apply_args);
+        assert_eq!(via_helper.apply_supported, on_row.apply_supported);
     }
 }

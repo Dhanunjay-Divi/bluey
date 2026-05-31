@@ -21,6 +21,7 @@ pub mod capability;
 pub mod connectors;
 pub mod discover;
 pub mod drive;
+pub mod fix;
 pub mod registry;
 pub mod sessions;
 
@@ -28,6 +29,7 @@ pub use capability::compute_capability;
 pub use connectors::read_connectors;
 pub use discover::{discover_agents, discover_in_home, probe_sqlite_store};
 pub use drive::{drive, AnswerChunk, AnswerStream, Question};
+pub use fix::{fix_apply_prompt, fix_proposal_prompt, parse_fix_proposal, FixProposal};
 pub use sessions::{reader_for, SessionReader};
 
 /// A known (or generically detected) coding agent.

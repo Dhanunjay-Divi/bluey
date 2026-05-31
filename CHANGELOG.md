@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Fix button foundation (F1+F2): a data-driven `FixProfile` on each registry row
+  (per-agent propose-only vs apply args, `apply_supported`) plus a `DriveMode`
+  (Answer / ProposeFix / ApplyFix) so the drive layer forces propose-only or
+  apply purely from the table — no per-agent branches, apply args appended only
+  in ApplyFix and only for apply-capable agents (Cursor never uses the broken
+  `--plan`). Adds the fix-proposal / apply prompt templates (structured
+  DIAGNOSIS/REASONING/FIX, "apply nothing", "never push") and a fail-soft
+  `FixProposal` parser. Design: docs/work/PLAN-FIX-BUTTON.md.
 - Agent bridge native overlay UI (Slice 5b): an "Attach Agent" drawer in the
   macOS overlay — agent picker with capability chips, session picker
   (continue-most-recent / fresh), connector sheet with per-connector readiness +

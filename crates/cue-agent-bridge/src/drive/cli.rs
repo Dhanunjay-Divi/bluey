@@ -21,7 +21,8 @@ use async_stream::stream;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
-use super::{AnswerChunk, AnswerStream, Driver, Question};
+use super::{AnswerChunk, AnswerStream, DriveMode, Driver, Question};
+use crate::registry::{self, FixProfile};
 use crate::AgentKind;
 
 /// Default wall-clock timeout for a single drive. Configurable per call via
@@ -164,6 +165,9 @@ pub struct DriveOptions {
     pub timeout: Duration,
     /// Hard cap on total stdout bytes read.
     pub max_output_bytes: usize,
+    /// Write posture for this drive (see [`DriveMode`]). Defaults to
+    /// [`DriveMode::Answer`] so existing callers keep plain-answer behavior.
+    pub mode: DriveMode,
 }
 
 impl Default for DriveOptions {
@@ -171,6 +175,7 @@ impl Default for DriveOptions {
         Self {
             timeout: DEFAULT_TIMEOUT,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
+            mode: DriveMode::Answer,
         }
     }
 }
@@ -214,9 +219,84 @@ fn build_argv(spec: &DriveSpec, q: &Question) -> (String, Vec<String>) {
     (spec.binary.to_string(), args)
 }
 
+/// Resolve an agent's [`FixProfile`] from the registry, data-drivenly: a
+/// runtime [`AgentKind`] becomes a registry tag, then the profile is read off
+/// the row. Never names an agent inline. `None` when the kind has no registry
+/// row (e.g. `Other`/`Unknown`).
+fn fix_profile_for_agent(agent: &AgentKind) -> Option<&'static FixProfile> {
+    let tag = registry::KindTag::from_agent_kind(agent)?;
+    registry::fix_profile_for(tag)
+}
+
+/// Build the full argv for a drive, layering the [`DriveMode`] Fix-profile args
+/// on top of the base [`build_argv`] output. **Pure** (no I/O), so the
+/// mode→args wiring and the apply guard are unit-testable without spawning.
+///
+/// Append rules (read off the agent's [`FixProfile`], never by agent name):
+/// - [`DriveMode::Answer`] → base argv only;
+/// - [`DriveMode::ProposeFix`] → base argv + `propose_args`;
+/// - [`DriveMode::ApplyFix`] → base argv + `apply_args`, **but only** if the
+///   profile's `apply_supported` is `true`; otherwise an `Err` (the apply is
+///   refused, never spawned).
+///
+/// A missing profile (`Other`/`Unknown`) leaves a non-`Answer` mode with no
+/// extra args to append; since those kinds also have no drive spec they never
+/// reach here, but the function degrades to base argv rather than panicking.
+fn build_argv_with_mode(
+    spec: &DriveSpec,
+    agent: &AgentKind,
+    q: &Question,
+    mode: DriveMode,
+) -> Result<(String, Vec<String>)> {
+    let (program, mut args) = build_argv(spec, q);
+
+    let extra: &[&'static str] = match mode {
+        DriveMode::Answer => &[],
+        DriveMode::ProposeFix => fix_profile_for_agent(agent)
+            .map(|p| p.propose_args)
+            .unwrap_or(&[]),
+        DriveMode::ApplyFix => {
+            let profile = fix_profile_for_agent(agent);
+            match profile {
+                Some(p) if p.apply_supported => p.apply_args,
+                // Either no profile (unknown agent) or apply is unsupported:
+                // refuse rather than silently downgrading to a write-less run.
+                _ => anyhow::bail!("agent {agent:?} cannot apply fixes (no apply-capable CLI)"),
+            }
+        }
+    };
+
+    for tok in extra {
+        args.push((*tok).to_string());
+    }
+
+    Ok((program, args))
+}
+
 /// Drive an agent with default [`DriveOptions`]. See [`drive_with_options`].
 pub async fn drive(agent: AgentKind, question: Question) -> Result<AnswerStream> {
     drive_with_options(agent, question, DriveOptions::default()).await
+}
+
+/// Drive an agent in an explicit [`DriveMode`] with default limits.
+///
+/// `Answer` is identical to [`drive`]. `ProposeFix`/`ApplyFix` append the
+/// agent's Fix-profile args (read-only vs write); `ApplyFix` on an agent that
+/// cannot apply returns `Err` without spawning anything.
+pub async fn drive_with_mode(
+    agent: AgentKind,
+    question: Question,
+    mode: DriveMode,
+) -> Result<AnswerStream> {
+    drive_with_options(
+        agent,
+        question,
+        DriveOptions {
+            mode,
+            ..DriveOptions::default()
+        },
+    )
+    .await
 }
 
 /// Drive `agent` with explicit limits, returning a stream of [`AnswerChunk`]s.
@@ -237,7 +317,9 @@ pub async fn drive_with_options(
         }
     };
 
-    let (program, args) = build_argv(&spec, &question);
+    // Assemble argv with the requested mode. An unsupported ApplyFix returns
+    // `Err` here — before any subprocess is spawned (the apply gate).
+    let (program, args) = build_argv_with_mode(&spec, &agent, &question, opts.mode)?;
 
     // Log shape only — never the prompt text (it may carry meeting content).
     tracing::debug!(
@@ -245,6 +327,7 @@ pub async fn drive_with_options(
         argc = args.len(),
         prompt_len = question.prompt.len(),
         resuming = question.resume.is_some(),
+        mode = ?opts.mode,
         "driving agent CLI",
     );
 
@@ -650,6 +733,194 @@ mod tests {
         assert_eq!(prog, "codex");
         assert_eq!(args, vec!["exec", "resume", "--last"]);
         assert!(!args.iter().any(|a| a.contains("ignored")));
+    }
+
+    // ---- drive-mode → Fix-profile arg assembly (slice F1) ---------------
+
+    /// Grab the command-map spec for a local drive tag.
+    fn spec(tag: KindTag) -> &'static DriveSpec {
+        COMMAND_MAP
+            .iter()
+            .find(|s| s.kind_tag == tag)
+            .expect("command-map row")
+    }
+
+    #[test]
+    fn test_answer_mode_appends_no_fix_args() {
+        // Answer must be byte-for-byte the base argv — full back-compat.
+        let s = spec(KindTag::ClaudeCode);
+        let q = Question::new("why is the build red?");
+        let (_, base) = build_argv(s, &q);
+        let (_, with_mode) =
+            build_argv_with_mode(s, &AgentKind::ClaudeCode, &q, DriveMode::Answer).unwrap();
+        assert_eq!(base, with_mode);
+    }
+
+    #[test]
+    fn test_propose_mode_appends_propose_args_only() {
+        // Claude propose adds `--permission-mode plan` and nothing from apply.
+        let s = spec(KindTag::ClaudeCode);
+        let q = Question::new("propose a fix");
+        let (_, args) =
+            build_argv_with_mode(s, &AgentKind::ClaudeCode, &q, DriveMode::ProposeFix).unwrap();
+        let i = args
+            .iter()
+            .position(|a| a == "--permission-mode")
+            .expect("propose flag present");
+        assert_eq!(args[i + 1], "plan");
+        // The apply value must never leak into a propose run.
+        assert!(!args.iter().any(|a| a == "acceptEdits"));
+    }
+
+    #[test]
+    fn test_apply_mode_appends_apply_args() {
+        // Claude apply swaps the posture to `--permission-mode acceptEdits`.
+        let s = spec(KindTag::ClaudeCode);
+        let q = Question::new("apply the approved fix");
+        let (_, args) =
+            build_argv_with_mode(s, &AgentKind::ClaudeCode, &q, DriveMode::ApplyFix).unwrap();
+        let i = args
+            .iter()
+            .position(|a| a == "--permission-mode")
+            .expect("apply flag present");
+        assert_eq!(args[i + 1], "acceptEdits");
+        assert!(!args.iter().any(|a| a == "plan"));
+    }
+
+    #[test]
+    fn test_cursor_propose_omits_force_apply_adds_it() {
+        // Cursor propose appends nothing (omit --force); apply appends --force.
+        let s = spec(KindTag::Cursor);
+        let q = Question::new("fix it");
+        let (_, base) = build_argv(s, &q);
+
+        let (_, propose) =
+            build_argv_with_mode(s, &AgentKind::Cursor, &q, DriveMode::ProposeFix).unwrap();
+        assert_eq!(propose, base, "propose must not append any arg for Cursor");
+        assert!(!propose.iter().any(|a| a == "--force"));
+        assert!(!propose.iter().any(|a| a == "--plan"));
+
+        let (_, apply) =
+            build_argv_with_mode(s, &AgentKind::Cursor, &q, DriveMode::ApplyFix).unwrap();
+        assert!(apply.iter().any(|a| a == "--force"));
+        assert!(!apply.iter().any(|a| a == "--plan"));
+    }
+
+    #[test]
+    fn test_apply_args_appended_after_prompt_not_mixed_into_it() {
+        // The prompt stays a single argv entry; Fix args are appended after it.
+        let s = spec(KindTag::ClaudeCode);
+        let q = Question::new("the prompt");
+        let (_, args) =
+            build_argv_with_mode(s, &AgentKind::ClaudeCode, &q, DriveMode::ApplyFix).unwrap();
+        assert_eq!(args.iter().filter(|a| *a == "the prompt").count(), 1);
+        let prompt_idx = args.iter().position(|a| a == "the prompt").unwrap();
+        let flag_idx = args.iter().position(|a| a == "acceptEdits").unwrap();
+        assert!(
+            flag_idx > prompt_idx,
+            "apply args must come after the prompt"
+        );
+    }
+
+    #[test]
+    fn test_apply_on_codex_uses_workspace_write() {
+        // Codex apply must flip the sandbox to workspace-write (a write run),
+        // never read-only (the propose sandbox).
+        let s = spec(KindTag::Codex);
+        let q = Question::new("apply");
+        let (_, args) =
+            build_argv_with_mode(s, &AgentKind::Codex, &q, DriveMode::ApplyFix).unwrap();
+        assert!(args.iter().any(|a| a == "workspace-write"));
+        assert!(!args.iter().any(|a| a == "read-only"));
+    }
+
+    #[test]
+    fn test_antigravity_resolves_to_gemini_drive_but_own_fix_profile() {
+        // Antigravity drives via the gemini spec, yet its Fix profile resolves
+        // off the Antigravity registry row (same approval-mode values).
+        let s = spec(KindTag::Gemini);
+        let q = Question::new("propose");
+        let (_, args) =
+            build_argv_with_mode(s, &AgentKind::Antigravity, &q, DriveMode::ProposeFix).unwrap();
+        let i = args.iter().position(|a| a == "--approval-mode").unwrap();
+        assert_eq!(args[i + 1], "plan");
+    }
+
+    #[test]
+    fn test_propose_and_apply_argvs_differ_for_writable_agent() {
+        // Sanity: the two postures must not produce identical argv (otherwise
+        // the gate is a no-op for that agent).
+        let s = spec(KindTag::ClaudeCode);
+        let q = Question::new("x");
+        let (_, propose) =
+            build_argv_with_mode(s, &AgentKind::ClaudeCode, &q, DriveMode::ProposeFix).unwrap();
+        let (_, apply) =
+            build_argv_with_mode(s, &AgentKind::ClaudeCode, &q, DriveMode::ApplyFix).unwrap();
+        assert_ne!(propose, apply);
+    }
+
+    #[test]
+    fn test_apply_on_unsupported_agent_errors_in_arg_builder() {
+        // Windsurf/VS Code have apply_supported=false. Even handed a (borrowed)
+        // drive spec, the arg builder must refuse ApplyFix with an Err rather
+        // than producing argv — the apply gate, tested without spawning.
+        let s = spec(KindTag::ClaudeCode); // any spec; the guard keys off kind.
+        let q = Question::new("apply");
+        for kind in [AgentKind::Windsurf, AgentKind::VsCodeFork] {
+            let res = build_argv_with_mode(s, &kind, &q, DriveMode::ApplyFix);
+            assert!(res.is_err(), "{kind:?} ApplyFix should error");
+            let msg = res.unwrap_err().to_string();
+            assert!(msg.contains("cannot apply"), "unclear error: {msg}");
+        }
+    }
+
+    #[test]
+    fn test_propose_on_unsupported_agent_still_builds() {
+        // apply_supported=false blocks apply, NOT propose: a read-only propose
+        // run is fine (its profile has empty propose_args, so == base argv).
+        let s = spec(KindTag::ClaudeCode);
+        let q = Question::new("propose");
+        let (_, base) = build_argv(s, &q);
+        let (_, propose) =
+            build_argv_with_mode(s, &AgentKind::Windsurf, &q, DriveMode::ProposeFix).unwrap();
+        assert_eq!(propose, base);
+    }
+
+    #[test]
+    fn test_unknown_agent_apply_errors_unknown_agent_propose_ok() {
+        // No registry profile (Unknown): apply must error; propose degrades to
+        // base argv (no extra args), never panics.
+        let s = spec(KindTag::ClaudeCode);
+        let q = Question::new("x");
+        assert!(build_argv_with_mode(s, &AgentKind::Unknown, &q, DriveMode::ApplyFix).is_err());
+        let (_, base) = build_argv(s, &q);
+        let (_, propose) =
+            build_argv_with_mode(s, &AgentKind::Unknown, &q, DriveMode::ProposeFix).unwrap();
+        assert_eq!(propose, base);
+    }
+
+    #[tokio::test]
+    async fn test_drive_with_mode_apply_unsupported_agent_returns_err() {
+        // End-to-end through the public entry: an apply-incapable agent never
+        // spawns — it returns Err. (Windsurf also has no drive spec, so this
+        // is doubly guarded; either guard alone is sufficient.)
+        let res = drive_with_mode(
+            AgentKind::Windsurf,
+            Question::new("apply this"),
+            DriveMode::ApplyFix,
+        )
+        .await;
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_drive_with_mode_answer_matches_plain_drive_behavior() {
+        // Answer mode keeps the unsupported-agent error identical to drive():
+        // both bail on a no-CLI agent the same way (back-compat).
+        let plain = drive(AgentKind::Unknown, Question::new("hi")).await;
+        let answer =
+            drive_with_mode(AgentKind::Unknown, Question::new("hi"), DriveMode::Answer).await;
+        assert!(plain.is_err() && answer.is_err());
     }
 
     #[test]
