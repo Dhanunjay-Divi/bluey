@@ -167,6 +167,28 @@ fn parse_attached_agent(label: Option<&str>) -> Option<AgentKind> {
     }
 }
 
+/// Normalize an inbound resume `session_id` into a value safe to persist:
+/// trims surrounding whitespace and maps an absent or blank id to `None`, so a
+/// blank string is never stored as a "session to resume".
+fn normalize_resume_session(session_id: Option<String>) -> Option<String> {
+    session_id
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+/// Build the answer card's `source` string. The base form is
+/// `"{source} ({request_id})"`. When an agent answered, the agent's snake_case
+/// kind label is prepended (e.g. `"claude_code agent · overlay ask (id)"`) so
+/// the overlay's `agentLabel` detection relabels the card to the agent's badge
+/// (CLAUDE / CURSOR). With no agent attached the base form is returned
+/// unchanged, leaving Bluey-mediated answers badged BLUEY.
+fn answer_card_source(source: &str, request_id: uuid::Uuid, agent_label: Option<&str>) -> String {
+    match agent_label {
+        Some(label) => format!("{label} agent · {source} ({request_id})"),
+        None => format!("{source} ({request_id})"),
+    }
+}
+
 /// Stable snake_case label for an [`AgentKind`], used as the agent provider's
 /// model id and in user-facing labels (display label, conversation turn).
 fn agent_model_label(kind: &AgentKind) -> String {
@@ -178,14 +200,6 @@ fn agent_model_label(kind: &AgentKind) -> String {
             _ => "agent".to_string(),
         },
     }
-}
-
-/// Read the attached agent (if any) from on-disk settings. Fail-soft: a
-/// missing or unreadable settings file means "no agent attached", which keeps
-/// the normal provider route unchanged.
-fn attached_agent_kind(daemon: &Arc<Daemon>) -> Option<AgentKind> {
-    let settings = load_settings(&daemon.paths).ok()?;
-    parse_attached_agent(settings.attached_agent.as_deref())
 }
 
 /// Friendly, human-facing name for an [`AgentKind`], used in the discovery UI.
@@ -1280,16 +1294,14 @@ async fn handle_request_inner(
                     message: format!("\"{kind}\" is not a coding agent Bluey can attach"),
                 });
             };
-            // TODO(slice-resume): persist `session_id` so attach can resume a
-            // prior session. For now it is validated-in/ignored.
-            let _ = session_id;
             let label = agent_model_label(&parsed);
-            persist_attached_agent(daemon, Some(label)).await?;
+            let session = normalize_resume_session(session_id);
+            persist_attached_agent(daemon, Some(label), session).await?;
             let agents = discover_agent_summaries(daemon).await;
             Ok(DaemonResponse::Agents { agents })
         }
         DaemonRequest::AgentDetach => {
-            persist_attached_agent(daemon, None).await?;
+            persist_attached_agent(daemon, None, None).await?;
             Ok(DaemonResponse::Ok)
         }
         DaemonRequest::AgentSessions { kind } => {
@@ -1789,8 +1801,8 @@ fn count_agent_sessions(agent: &DiscoveredAgent) -> Option<usize> {
 }
 
 /// Attach `kind` as the active agent: validate, persist, and re-emit the list.
-/// `session_id` (a session to resume) is accepted but not yet persisted — that
-/// lands with the resume flow in a later slice.
+/// `session_id` (a session to resume) is normalized and persisted so the next
+/// answer continues that session via the agent's `--resume` flag.
 async fn handle_agent_attach(daemon: &Arc<Daemon>, kind: &str, session_id: Option<&str>) {
     let Some(parsed) = parse_attached_agent(Some(kind)) else {
         debug!(kind, "ignored attach request for unknown agent kind");
@@ -1804,12 +1816,10 @@ async fn handle_agent_attach(daemon: &Arc<Daemon>, kind: &str, session_id: Optio
         return;
     };
 
-    // TODO(slice-resume): persist `session_id` so attach can resume a prior
-    // session. For now it is validated-in/ignored; only the agent is stored.
-    let _ = session_id;
     let label = agent_model_label(&parsed);
+    let session = normalize_resume_session(session_id.map(str::to_string));
 
-    if let Err(error) = persist_attached_agent(daemon, Some(label.clone())).await {
+    if let Err(error) = persist_attached_agent(daemon, Some(label.clone()), session).await {
         warn!("failed to persist attached agent: {error:#}");
         push_system_card(
             daemon,
@@ -1824,21 +1834,28 @@ async fn handle_agent_attach(daemon: &Arc<Daemon>, kind: &str, session_id: Optio
     refresh_overlay_agents(daemon).await;
 }
 
-/// Detach the active agent: clear the setting, persist, and re-emit the list.
+/// Detach the active agent: clear the agent and any resume session, persist,
+/// and re-emit the list.
 async fn handle_agent_detach(daemon: &Arc<Daemon>) {
-    if let Err(error) = persist_attached_agent(daemon, None).await {
+    if let Err(error) = persist_attached_agent(daemon, None, None).await {
         warn!("failed to detach agent: {error:#}");
         return;
     }
     refresh_overlay_agents(daemon).await;
 }
 
-/// Load settings, set `attached_agent`, `touch()`, and persist via the shared
-/// settings writer. Centralizes the read-modify-write so both attach and detach
-/// share one code path.
-async fn persist_attached_agent(daemon: &Arc<Daemon>, agent: Option<String>) -> Result<()> {
+/// Load settings, set `attached_agent` plus the session to resume, `touch()`,
+/// and persist via the shared settings writer. Centralizes the read-modify-write
+/// so both attach and detach share one code path. Detach passes `None` for both
+/// so the resume session never outlives the agent it belonged to.
+async fn persist_attached_agent(
+    daemon: &Arc<Daemon>,
+    agent: Option<String>,
+    session: Option<String>,
+) -> Result<()> {
     let mut settings = load_settings(&daemon.paths)?;
     settings.attached_agent = agent;
+    settings.attached_session = session;
     settings.touch();
     save_settings(&daemon.paths, &settings)
 }
@@ -3710,8 +3727,20 @@ async fn answer_with_provider_runtime(
     // Agent step replaces the route so `resolve_answer_route` dispatches to the
     // agent driver. With no agent attached this block is a no-op and the
     // existing provider route is used unchanged.
-    if let Some(kind) = attached_agent_kind(daemon) {
-        request.route = ProviderRoute::direct(ProviderSelector::agent(agent_model_label(&kind)));
+    //
+    // Slice 5b: if the attach pinned a session to resume, carry it alongside so
+    // the agent driver replays into that session via `--resume`. Settings are
+    // read once here and the kind, the session, and the card-source label are
+    // all derived from it.
+    let mut resume_session: Option<String> = None;
+    let mut agent_source_label: Option<String> = None;
+    if let Ok(settings) = load_settings(&daemon.paths) {
+        if let Some(kind) = parse_attached_agent(settings.attached_agent.as_deref()) {
+            let label = agent_model_label(&kind);
+            request.route = ProviderRoute::direct(ProviderSelector::agent(label.clone()));
+            resume_session = normalize_resume_session(settings.attached_session);
+            agent_source_label = Some(label);
+        }
     }
 
     let (meeting_snapshot, answer_meeting) = {
@@ -3763,27 +3792,37 @@ async fn answer_with_provider_runtime(
     .await;
     write_state(daemon).await?;
 
-    let answer_card = CueCard::new(CardKind::Answer, "Bluey", "Thinking...")
-        .with_source(format!("{} ({})", source, request.metadata.request_id));
+    let answer_card =
+        CueCard::new(CardKind::Answer, "Bluey", "Thinking...").with_source(answer_card_source(
+            &source,
+            request.metadata.request_id,
+            agent_source_label.as_deref(),
+        ));
     let answer_card_id = answer_card.id;
     let _ = send_overlay(daemon, OverlayCommand::PushCard { card: answer_card }).await;
     register_active_answer_card(daemon, generation_id, answer_card_id).await;
     let mut overlay_stream =
         OverlayAnswerStream::new(Arc::clone(daemon), answer_card_id, generation_id);
 
-    let outcome =
-        match resolve_answer_route(&request, &answer_meeting, Some(&mut overlay_stream)).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                if is_answer_generation_current(daemon, generation_id) {
-                    let _ = overlay_stream
-                        .finish(&format!("Bluey could not generate an answer: {error:#}"))
-                        .await;
-                }
-                clear_active_answer_card(daemon, generation_id, answer_card_id).await;
-                return Err(error);
+    let outcome = match resolve_answer_route(
+        &request,
+        &answer_meeting,
+        resume_session.as_deref(),
+        Some(&mut overlay_stream),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if is_answer_generation_current(daemon, generation_id) {
+                let _ = overlay_stream
+                    .finish(&format!("Bluey could not generate an answer: {error:#}"))
+                    .await;
             }
-        };
+            clear_active_answer_card(daemon, generation_id, answer_card_id).await;
+            return Err(error);
+        }
+    };
     let safety = outcome.safety.clone();
     let metadata =
         AnswerResponseMetadata::new(request.metadata.request_id, outcome.provider.clone())
@@ -4159,6 +4198,7 @@ struct AnswerRouteOutcome {
 async fn resolve_answer_route(
     request: &AnswerRequest,
     meeting: &MeetingRecord,
+    resume_session: Option<&str>,
     mut stream: Option<&mut OverlayAnswerStream>,
 ) -> Result<AnswerRouteOutcome> {
     let mut attempts = Vec::new();
@@ -4241,6 +4281,7 @@ async fn resolve_answer_route(
                 &step.provider,
                 &payload,
                 meeting,
+                resume_session,
                 stream_ref,
                 fallback_depth,
             )
@@ -4317,8 +4358,13 @@ struct AgentRouteOutcome {
 
 /// Build the grounding [`AgentQuestion`] for the attached agent from the
 /// answer payload: the user's question plus a bounded transcript flattened
-/// from the request context. Pure string/struct assembly — no I/O.
-fn agent_question_from_payload(payload: &ProviderRequestPayload) -> AgentQuestion {
+/// from the request context. `resume` pins a prior session to continue (the
+/// agent driver maps it to `--resume`/`--continue`); `None` starts fresh.
+/// Pure string/struct assembly — no I/O.
+fn agent_question_from_payload(
+    payload: &ProviderRequestPayload,
+    resume: Option<&str>,
+) -> AgentQuestion {
     let mut turns = Vec::new();
     if let Some(instructions) = payload
         .instructions
@@ -4346,7 +4392,10 @@ fn agent_question_from_payload(payload: &ProviderRequestPayload) -> AgentQuestio
     AgentQuestion {
         prompt: payload.question.clone(),
         context: (!turns.is_empty()).then_some(cue_agent_bridge::Transcript { turns }),
-        resume: None,
+        resume: resume
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string),
     }
 }
 
@@ -4360,6 +4409,7 @@ async fn answer_with_agent(
     provider: &ProviderSelector,
     payload: &ProviderRequestPayload,
     _meeting: &MeetingRecord,
+    resume_session: Option<&str>,
     mut stream: Option<&mut OverlayAnswerStream>,
     fallback_depth: usize,
 ) -> Result<AgentRouteOutcome> {
@@ -4379,8 +4429,12 @@ async fn answer_with_agent(
         .await);
     };
 
-    let question = agent_question_from_payload(payload);
-    debug!(agent = %label, "driving attached agent for answer");
+    let question = agent_question_from_payload(payload, resume_session);
+    debug!(
+        agent = %label,
+        resuming = resume_session.is_some(),
+        "driving attached agent for answer"
+    );
 
     let answer_stream = match cue_agent_bridge::drive(kind.clone(), question).await {
         Ok(answer_stream) => answer_stream,
@@ -8382,7 +8436,7 @@ mod tests {
             RouteBudget::realtime(),
         );
 
-        let question = agent_question_from_payload(&payload);
+        let question = agent_question_from_payload(&payload, None);
         assert_eq!(question.prompt, "What did we decide?");
         assert!(question.resume.is_none());
         let transcript = question.context.expect("context present");
@@ -8404,7 +8458,53 @@ mod tests {
             "claude_code",
             RouteBudget::realtime(),
         );
-        let question = agent_question_from_payload(&payload);
+        let question = agent_question_from_payload(&payload, None);
         assert!(question.context.is_none());
+    }
+
+    #[test]
+    fn agent_question_from_payload_threads_resume_session() {
+        let route = ProviderRoute::direct(ProviderSelector::agent("claude_code"));
+        let request = cue_core::ai::AnswerRequest::new("Continue", route);
+        let payload = ProviderRequestPayload::from_request(
+            &request,
+            ProviderSelector::agent("claude_code"),
+            None,
+            "claude_code",
+            RouteBudget::realtime(),
+        );
+        // A real session id resumes; surrounding whitespace is trimmed.
+        let question = agent_question_from_payload(&payload, Some("  sess-7 "));
+        assert_eq!(question.resume.as_deref(), Some("sess-7"));
+        // A blank id never becomes a resume target.
+        let blank = agent_question_from_payload(&payload, Some("   "));
+        assert!(blank.resume.is_none());
+    }
+
+    #[test]
+    fn normalize_resume_session_trims_and_rejects_blank() {
+        assert_eq!(normalize_resume_session(None), None);
+        assert_eq!(normalize_resume_session(Some(String::new())), None);
+        assert_eq!(normalize_resume_session(Some("   ".to_string())), None);
+        assert_eq!(
+            normalize_resume_session(Some("  abc-1 ".to_string())).as_deref(),
+            Some("abc-1")
+        );
+    }
+
+    #[test]
+    fn answer_card_source_labels_agent_and_passes_overlay_detection() {
+        let id = uuid::Uuid::nil();
+        // No agent attached: base form, no agent signal.
+        let plain = answer_card_source("overlay ask", id, None);
+        assert_eq!(plain, format!("overlay ask ({id})"));
+        assert!(!plain.to_lowercase().contains("agent"));
+
+        // Agent attached: the snake_case kind label is present so the overlay's
+        // `agentLabel` detection relabels the card (here: CLAUDE).
+        let agentic = answer_card_source("overlay ask", id, Some("claude_code"));
+        assert!(agentic.contains("claude_code"));
+        assert!(agentic.to_lowercase().contains("agent"));
+        assert!(agentic.contains(&id.to_string()));
     }
 }

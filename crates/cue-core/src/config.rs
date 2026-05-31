@@ -74,6 +74,11 @@ pub struct CueSettings {
     /// answers route through Bluey's normal providers.
     #[serde(default)]
     pub attached_agent: Option<String>,
+    /// Agent bridge: the session id to resume on the attached agent, if the
+    /// user attached with a session to continue. `None` means start a fresh
+    /// session. Cleared on detach.
+    #[serde(default)]
+    pub attached_session: Option<String>,
 }
 
 impl Default for CueSettings {
@@ -93,6 +98,7 @@ impl Default for CueSettings {
             disguise_mode: "activity".to_string(),
             allow_agent_session_history: false,
             attached_agent: None,
+            attached_session: None,
         }
     }
 }
@@ -178,6 +184,7 @@ mod tests {
         let settings: CueSettings = serde_json::from_str(legacy).expect("legacy config loads");
         assert!(!settings.allow_agent_session_history);
         assert_eq!(settings.attached_agent, None);
+        assert_eq!(settings.attached_session, None);
     }
 
     #[test]
@@ -185,11 +192,35 @@ mod tests {
         let settings = CueSettings {
             allow_agent_session_history: true,
             attached_agent: Some("claude_code".to_string()),
+            attached_session: Some("sess-42".to_string()),
             ..CueSettings::default()
         };
         let json = serde_json::to_string(&settings).expect("serialize");
         let parsed: CueSettings = serde_json::from_str(&json).expect("deserialize");
         assert!(parsed.allow_agent_session_history);
         assert_eq!(parsed.attached_agent.as_deref(), Some("claude_code"));
+        assert_eq!(parsed.attached_session.as_deref(), Some("sess-42"));
+    }
+
+    #[test]
+    fn legacy_settings_with_agent_but_no_session_still_load() {
+        // A config written after `attached_agent` existed but before
+        // `attached_session` was added must still deserialize, defaulting the
+        // session to `None`.
+        let legacy = r#"{
+            "default_model": "Bluey Auto",
+            "default_mode": "General",
+            "answer_style": null,
+            "overlay_opacity": 0.9,
+            "audio_system_enabled": true,
+            "audio_microphone_enabled": true,
+            "cloud_sync_enabled": false,
+            "retention_days": 30,
+            "updated_at": "0",
+            "attached_agent": "claude_code"
+        }"#;
+        let settings: CueSettings = serde_json::from_str(legacy).expect("legacy config loads");
+        assert_eq!(settings.attached_agent.as_deref(), Some("claude_code"));
+        assert_eq!(settings.attached_session, None);
     }
 }

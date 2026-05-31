@@ -2129,7 +2129,7 @@ async fn agent_command(command: AgentCommands) -> Result<()> {
             let _ = agent_request_agents(request_msg).await?;
             println!("Attached {kind}.");
             if let Some(session) = session {
-                println!("Pinned session {session} (resume support lands later).");
+                println!("Resuming session {session} on the next answer.");
             }
             println!("`bluey ask` will now route answers through {kind}.");
             Ok(())

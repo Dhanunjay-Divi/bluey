@@ -6,6 +6,11 @@
 //! malformed or inaccessible path for one agent degrades that agent and the
 //! scan continues. Discovery never panics and never returns an error — the
 //! worst case is an empty `Vec`.
+//!
+//! Paths are resolved per-OS via `#[cfg(target_os = "...")]`: macOS scans
+//! `/Applications` + `~/Library/Application Support`, while Windows scans the
+//! program dirs + `%APPDATA%`/`%LOCALAPPDATA%`. All base directories come from
+//! environment variables (never hardcoded drive letters).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -14,25 +19,119 @@ use crate::capability::compute_capability;
 use crate::registry::{all_binary_candidates, AgentEntry, KindTag, REGISTRY};
 use crate::{AgentKind, Capability, DiscoveredAgent, SessionFormat, SessionStore};
 
-/// Resolve `$HOME` without adding a dependency. Returns `None` if unset.
+/// Resolve the user's home directory without adding a dependency. Prefers
+/// `HOME` (set on macOS/Linux and most Windows shells), falling back to
+/// `USERPROFILE` on Windows where `HOME` is frequently unset. Returns `None`
+/// if neither is set. Never panics.
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// Read an environment variable as a `PathBuf`, or `None` if it is unset.
+/// Fail-soft helper: a missing var degrades the source that needs it rather
+/// than panicking or hardcoding an absolute path. Used by the Windows base-dir
+/// resolution; referenced under `test` so the macOS CI can exercise it.
+#[cfg(any(target_os = "windows", test))]
+fn env_path(key: &str) -> Option<PathBuf> {
+    std::env::var_os(key).map(PathBuf::from)
+}
+
+/// Per-OS base directories used to locate installed agents. Only the home dir
+/// is meaningful on macOS; the Windows fields hold the roaming/local app-data
+/// and program directories that GUI agents install into and write data under.
+///
+/// Every field is `Option`/`Vec` because the backing env var may be unset —
+/// discovery degrades the affected source and continues.
+#[derive(Debug, Clone, Default)]
+struct BaseDirs {
+    /// `$HOME` / `%USERPROFILE%`. Root of dotfile CLI footprints on every OS.
+    home: Option<PathBuf>,
+    /// `%APPDATA%` (roaming). VS Code-family `User/globalStorage` lives here on
+    /// Windows. `None` on non-Windows.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    app_data: Option<PathBuf>,
+    /// `%LOCALAPPDATA%` (machine-local). Holds `Programs\<App>` per-user
+    /// installs and some local agent state. `None` on non-Windows.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    local_app_data: Option<PathBuf>,
+    /// Program install roots: `ProgramFiles`, `ProgramFiles(x86)`, and
+    /// `%LOCALAPPDATA%\Programs`. Empty on non-Windows.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    program_dirs: Vec<PathBuf>,
+}
+
+impl BaseDirs {
+    /// Resolve the base dirs for the current OS from the environment. macOS
+    /// only needs `home`; Windows additionally resolves the app-data and
+    /// program dirs. All resolution is fail-soft (missing var → `None`/skipped).
+    fn resolve() -> Self {
+        Self::for_platform(home_dir())
+    }
+
+    /// Build base dirs for an explicit `home`, resolving the Windows-only roots
+    /// from the environment. Shared by [`BaseDirs::resolve`] and the
+    /// home-rooted discovery entry point.
+    fn for_platform(home: Option<PathBuf>) -> Self {
+        #[cfg(target_os = "windows")]
+        {
+            let app_data = env_path("APPDATA");
+            let local_app_data = env_path("LOCALAPPDATA");
+            let program_dirs = windows_program_dirs(local_app_data.as_deref());
+            BaseDirs {
+                home,
+                app_data,
+                local_app_data,
+                program_dirs,
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            BaseDirs {
+                home,
+                ..BaseDirs::default()
+            }
+        }
+    }
+}
+
+/// Windows program-install roots, in scan order: `%ProgramFiles%`,
+/// `%ProgramFiles(x86)%`, then `%LOCALAPPDATA%\Programs` (where most Electron
+/// agents install per-user). Resolved purely from env vars and the supplied
+/// local-app-data dir — never hardcodes `C:\`. Missing vars are skipped.
+///
+/// Pure over its `local_app_data` argument so it is unit-testable on any OS.
+/// Compiled on Windows (where it is used) and under `test` (so the macOS CI can
+/// exercise the path logic), but not in macOS release builds.
+#[cfg(any(target_os = "windows", test))]
+fn windows_program_dirs(local_app_data: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(p) = env_path("ProgramFiles") {
+        dirs.push(p);
+    }
+    if let Some(p) = env_path("ProgramFiles(x86)") {
+        dirs.push(p);
+    }
+    if let Some(local) = local_app_data {
+        dirs.push(local.join("Programs"));
+    }
+    dirs
 }
 
 /// Discover every coding agent installed on this machine.
 ///
-/// Combines four passes — PATH binaries, app bundles, registry data-dirs, and a
+/// Combines four passes — PATH binaries, app installs, registry data-dirs, and a
 /// generic VS Code-fork sweep — then deduplicates so an agent found multiple
-/// ways becomes one entry with combined evidence.
+/// ways becomes one entry with combined evidence. Each disk-scanning pass runs
+/// the path set appropriate to the current OS (macOS app bundles vs Windows
+/// program/app-data dirs), gated at compile time.
 pub fn discover_agents() -> Vec<DiscoveredAgent> {
     let mut acc = Accumulator::default();
 
     scan_path_binaries(&mut acc);
-    if let Some(home) = home_dir() {
-        scan_app_bundles(&mut acc, &home);
-        scan_registry_data_dirs(&mut acc, &home);
-        scan_vscode_forks(&mut acc, &home);
-    }
+    let bases = BaseDirs::resolve();
+    scan_disk(&mut acc, &bases);
 
     acc.finish()
 }
@@ -40,12 +139,31 @@ pub fn discover_agents() -> Vec<DiscoveredAgent> {
 /// Discover agents rooted at an explicit `home` directory, skipping the `PATH`
 /// scan. Used by integration tests to run discovery against synthetic fixture
 /// trees without reading the real user's home or mutating global env.
+///
+/// The Windows-only app-data/program roots are still resolved from the
+/// environment (they live outside `home`); on macOS only the `home`-rooted
+/// scans run, so behavior against fixture trees is unchanged.
 pub fn discover_in_home(home: &Path) -> Vec<DiscoveredAgent> {
     let mut acc = Accumulator::default();
-    scan_app_bundles(&mut acc, home);
-    scan_registry_data_dirs(&mut acc, home);
-    scan_vscode_forks(&mut acc, home);
+    let bases = BaseDirs::for_platform(Some(home.to_path_buf()));
+    scan_disk(&mut acc, &bases);
     acc.finish()
+}
+
+/// Run every disk-scanning pass for the given base dirs. Centralizes the
+/// per-OS pass selection so both entry points stay in sync.
+fn scan_disk(acc: &mut Accumulator, bases: &BaseDirs) {
+    if let Some(home) = bases.home.as_deref() {
+        scan_app_bundles(acc, home);
+        scan_registry_data_dirs(acc, home);
+    }
+    scan_vscode_forks(acc, bases);
+
+    #[cfg(target_os = "windows")]
+    {
+        scan_windows_app_installs(acc, bases);
+        scan_windows_app_data(acc, bases);
+    }
 }
 
 /// Accumulates evidence keyed by a stable identity so duplicates merge.
@@ -135,6 +253,12 @@ fn find_on_path(dirs: &[PathBuf], name: &str) -> Option<PathBuf> {
 }
 
 /// Pass 2 — scan `/Applications` and `~/Applications` for known `.app` bundles.
+///
+/// macOS-only path shape: `.app` bundles and the `/Applications` roots do not
+/// exist on Windows (the Windows analog is [`scan_windows_app_installs`]). On
+/// non-Windows targets the original behavior is preserved unchanged, so Linux
+/// is unaffected.
+#[cfg(not(target_os = "windows"))]
 fn scan_app_bundles(acc: &mut Accumulator, home: &Path) {
     let roots = [PathBuf::from("/Applications"), home.join("Applications")];
     for entry in REGISTRY {
@@ -149,11 +273,30 @@ fn scan_app_bundles(acc: &mut Accumulator, home: &Path) {
     }
 }
 
+/// Windows has no `.app` bundles; app installs are handled by
+/// [`scan_windows_app_installs`]. This no-op keeps [`scan_disk`] uniform.
+#[cfg(target_os = "windows")]
+fn scan_app_bundles(_acc: &mut Accumulator, _home: &Path) {}
+
 /// Pass 3 — scan registry data-dir globs under `$HOME` for footprints.
+///
+/// On macOS every glob (dotfiles **and** `Library/Application Support/<App>`)
+/// is joined to `$HOME`, unchanged. On Windows only the HOME-relative dotfile
+/// globs apply here (`%USERPROFILE%\.claude`, …); the `Library/Application
+/// Support/<App>` rows are macOS-only and their Windows equivalent is scanned
+/// under `%APPDATA%` by [`scan_windows_app_data`].
 fn scan_registry_data_dirs(acc: &mut Accumulator, home: &Path) {
     for entry in REGISTRY {
-        for glob in entry.data_dir_globs {
-            let dir = home.join(glob);
+        #[cfg(target_os = "windows")]
+        let globs: Vec<&str> = entry.home_relative_globs().collect();
+        #[cfg(not(target_os = "windows"))]
+        let globs: Vec<&str> = entry.data_dir_globs.to_vec();
+
+        for glob in globs {
+            // Glob strings use `/` separators; split so each component is joined
+            // natively (`/` on Unix, `\` on Windows) — never a literal `/`
+            // baked into a Windows path.
+            let dir = join_glob(home, glob);
             if !path_exists(&dir) {
                 continue;
             }
@@ -169,32 +312,97 @@ fn scan_registry_data_dirs(acc: &mut Accumulator, home: &Path) {
     }
 }
 
-/// Pass 4 — generic VS Code-fork detector. Any directory under
-/// `~/Library/Application Support/*` that contains
-/// `User/globalStorage/state.vscdb` is treated as a VS Code-family agent, even
-/// if it is not a registry row, so unknown forks are discovered with no code
-/// change.
-fn scan_vscode_forks(acc: &mut Accumulator, home: &Path) {
-    let support = home.join("Library/Application Support");
-    let read = match std::fs::read_dir(&support) {
+/// Join a `/`-separated registry glob onto `base`, splitting on `/` so each
+/// segment is appended with the native separator. `Path::join` treats `/`
+/// literally inside a single component on Windows, so multi-segment globs like
+/// `.gemini/antigravity` must be split to resolve correctly there. Pure and
+/// OS-agnostic, so it is unit-testable on any platform.
+fn join_glob(base: &Path, glob: &str) -> PathBuf {
+    let mut out = base.to_path_buf();
+    for seg in glob.split('/').filter(|s| !s.is_empty()) {
+        out.push(seg);
+    }
+    out
+}
+
+/// Pass 4 — generic VS Code-fork detector. Any directory under a platform
+/// "support root" that contains `User/globalStorage/state.vscdb` is treated as
+/// a VS Code-family agent, even if it is not a registry row, so unknown forks
+/// are discovered with no code change.
+///
+/// Support roots are OS-specific: on macOS `~/Library/Application Support`; on
+/// Windows `%APPDATA%` and `%LOCALAPPDATA%` (forks roam under either). The
+/// per-directory detection logic is shared via [`scan_vscode_support_root`].
+fn scan_vscode_forks(acc: &mut Accumulator, bases: &BaseDirs) {
+    let known = known_vscode_dirs();
+    for root in vscode_support_roots(bases) {
+        scan_vscode_support_root(acc, &root, &known);
+    }
+}
+
+/// The directories whose immediate children are scanned for the VS Code-fork
+/// footprint, for the current OS. Missing roots (absent env var / no home) are
+/// simply not returned.
+fn vscode_support_roots(bases: &BaseDirs) -> Vec<PathBuf> {
+    #[cfg(target_os = "windows")]
+    {
+        // VS Code-family user data roams under %APPDATA%; some forks also keep
+        // a copy under %LOCALAPPDATA%. Scan both when present.
+        [bases.app_data.as_deref(), bases.local_app_data.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(Path::to_path_buf)
+            .collect()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        match bases.home.as_deref() {
+            Some(home) => vec![join_glob(home, "Library/Application Support")],
+            None => Vec::new(),
+        }
+    }
+}
+
+/// Registry dir-names that already map to a known kind, paired with that kind.
+/// On macOS these come from the `Library/Application Support/<App>` globs; on
+/// Windows from the `app_data_windows` names. Unknown dirs become
+/// `AgentKind::Other(name)`.
+fn known_vscode_dirs() -> Vec<(&'static str, KindTag)> {
+    #[cfg(target_os = "windows")]
+    {
+        REGISTRY
+            .iter()
+            .flat_map(|e| e.app_data_windows.iter().map(move |n| (*n, e.kind_tag)))
+            .collect()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        use crate::registry::MACOS_APP_SUPPORT_PREFIX;
+        REGISTRY
+            .iter()
+            .filter_map(|e| {
+                e.data_dir_globs
+                    .iter()
+                    .find_map(|g| g.strip_prefix(MACOS_APP_SUPPORT_PREFIX))
+                    .map(|name| (name, e.kind_tag))
+            })
+            .collect()
+    }
+}
+
+/// Enumerate one support `root`'s immediate children and record any that carry
+/// the VS Code-family footprint. Shared by every OS so the detection rule is
+/// identical regardless of where the root lives. Fail-soft: an unreadable root
+/// is skipped silently.
+fn scan_vscode_support_root(acc: &mut Accumulator, root: &Path, known: &[(&str, KindTag)]) {
+    let read = match std::fs::read_dir(root) {
         Ok(r) => r,
         Err(_) => return, // missing/unreadable → degrade silently, keep scanning
     };
 
-    // Names already covered by a registry data-dir glob → use that kind.
-    let known: Vec<(&str, KindTag)> = REGISTRY
-        .iter()
-        .filter_map(|e| {
-            e.data_dir_globs
-                .iter()
-                .find_map(|g| g.strip_prefix("Library/Application Support/"))
-                .map(|name| (name, e.kind_tag))
-        })
-        .collect();
-
     for child in read.flatten() {
         let dir = child.path();
-        let vscdb = dir.join("User/globalStorage/state.vscdb");
+        let vscdb = vscdb_path(&dir);
         // Require a genuine SQLite store (read-only probe), not just a
         // same-named file, so stray/corrupt files do not mint a fake agent.
         if !path_exists(&vscdb) || !probe_sqlite_store(&vscdb) {
@@ -221,6 +429,12 @@ fn scan_vscode_forks(acc: &mut Accumulator, home: &Path) {
     }
 }
 
+/// The VS Code-family session store path inside an app data dir:
+/// `<dir>/User/globalStorage/state.vscdb`, built with native separators.
+fn vscdb_path(dir: &Path) -> PathBuf {
+    join_glob(dir, "User/globalStorage/state.vscdb")
+}
+
 /// Look for a connector config file inside an agent's data dir. Checks the
 /// common names at the dir root and under a `User/` subdir.
 fn locate_connector_config(dir: &Path) -> Option<PathBuf> {
@@ -238,16 +452,91 @@ fn locate_connector_config(dir: &Path) -> Option<PathBuf> {
 }
 
 /// Look for a session store inside an agent's data dir, matching the registry's
-/// declared format for that agent.
+/// declared format for that agent. Multi-segment relative paths are joined with
+/// [`join_glob`] so they resolve natively on Windows as well as macOS.
 fn locate_session_store(dir: &Path, entry: &AgentEntry) -> Option<SessionStore> {
     let format = entry.session_format?;
     let path = match format {
-        SessionFormat::Jsonl => dir.join("projects"),
-        SessionFormat::SqliteVscdb => dir.join("User/globalStorage/state.vscdb"),
-        SessionFormat::JsonFiles => dir.join("User/workspaceStorage"),
-        SessionFormat::Protobuf => dir.join("conversations"),
+        SessionFormat::Jsonl => join_glob(dir, "projects"),
+        SessionFormat::SqliteVscdb => vscdb_path(dir),
+        SessionFormat::JsonFiles => join_glob(dir, "User/workspaceStorage"),
+        SessionFormat::Protobuf => join_glob(dir, "conversations"),
     };
     path_exists(&path).then_some(SessionStore { path, format })
+}
+
+/// Windows app-install candidate paths for one registry entry, given the
+/// program dirs to scan. For each `app_dirs_windows` name we emit both the
+/// install **directory** (`<programdir>\<App>`, how Electron apps install) and
+/// the bare `<programdir>\<name>.exe`. Pure over `program_dirs` so it is
+/// unit-testable on any OS; existence is checked by the caller.
+#[cfg(any(target_os = "windows", test))]
+fn windows_app_install_candidates(entry: &AgentEntry, program_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for dir in program_dirs {
+        for name in entry.app_dirs_windows {
+            out.push(dir.join(name));
+            out.push(dir.join(format!("{name}.exe")));
+        }
+    }
+    out
+}
+
+/// Windows `%APPDATA%`-rooted data-dir candidates for one registry entry, given
+/// the app-data base. Emits `<app_data>\<App>` for each `app_data_windows`
+/// name. Pure over `app_data` so it is unit-testable on any OS.
+#[cfg(any(target_os = "windows", test))]
+fn windows_app_data_candidates(entry: &AgentEntry, app_data: &Path) -> Vec<PathBuf> {
+    entry
+        .app_data_windows
+        .iter()
+        .map(|name| app_data.join(name))
+        .collect()
+}
+
+/// Windows-only Pass 2 — scan the program dirs (`ProgramFiles`,
+/// `ProgramFiles(x86)`, `%LOCALAPPDATA%\Programs`) for known agent install dirs
+/// and `.exe`s. Records any that exist as install evidence (no session/connector
+/// data — those come from the app-data pass).
+#[cfg(target_os = "windows")]
+fn scan_windows_app_installs(acc: &mut Accumulator, bases: &BaseDirs) {
+    if bases.program_dirs.is_empty() {
+        return;
+    }
+    for entry in REGISTRY {
+        for candidate in windows_app_install_candidates(entry, &bases.program_dirs) {
+            if path_exists(&candidate) {
+                acc.add(entry.kind_tag.to_agent_kind(), candidate, None, None);
+            }
+        }
+    }
+}
+
+/// Windows-only Pass 3b — scan `%APPDATA%\<App>` data dirs declared by the
+/// registry (`app_data_windows`) for footprints, mirroring the macOS
+/// `Library/Application Support/<App>` scan. Locates connector config and the
+/// declared session store, exactly like [`scan_registry_data_dirs`].
+#[cfg(target_os = "windows")]
+fn scan_windows_app_data(acc: &mut Accumulator, bases: &BaseDirs) {
+    let app_data = match bases.app_data.as_deref() {
+        Some(p) => p,
+        None => return,
+    };
+    for entry in REGISTRY {
+        for dir in windows_app_data_candidates(entry, app_data) {
+            if !path_exists(&dir) {
+                continue;
+            }
+            let connector_config = locate_connector_config(&dir);
+            let session_store = locate_session_store(&dir, entry);
+            acc.add(
+                entry.kind_tag.to_agent_kind(),
+                dir,
+                connector_config,
+                session_store,
+            );
+        }
+    }
 }
 
 /// Read-only existence check that never panics on permission errors.
@@ -344,5 +633,185 @@ mod tests {
     #[test]
     fn test_path_exists_handles_missing() {
         assert!(!path_exists(Path::new("/nonexistent/path/zzz/qqq")));
+    }
+
+    // ----- Cross-platform path logic (Windows pieces, tested on any OS) -----
+
+    fn entry(kind: KindTag) -> &'static AgentEntry {
+        REGISTRY
+            .iter()
+            .find(|e| e.kind_tag == kind)
+            .expect("registry row")
+    }
+
+    /// Build a minimal valid SQLite `state.vscdb` at `path` so the read-only
+    /// probe in fork detection succeeds. Synthetic — no real data.
+    fn build_synthetic_vscdb(path: &Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create vscdb parent");
+        }
+        let conn = rusqlite::Connection::open(path).expect("create synthetic vscdb");
+        conn.execute_batch(
+            "CREATE TABLE ItemTable (key TEXT, value BLOB);
+             INSERT INTO ItemTable VALUES ('synthetic', 'x');",
+        )
+        .expect("seed synthetic vscdb");
+    }
+
+    #[test]
+    fn test_join_glob_splits_segments_natively() {
+        let base = Path::new("/base");
+        let joined = join_glob(base, "User/globalStorage/state.vscdb");
+        // Equivalent to pushing each segment; no literal "/" component remains.
+        let expected: PathBuf = base.join("User").join("globalStorage").join("state.vscdb");
+        assert_eq!(joined, expected);
+        assert_eq!(joined.components().count(), expected.components().count());
+    }
+
+    #[test]
+    fn test_join_glob_ignores_empty_and_trailing_segments() {
+        assert_eq!(join_glob(Path::new("/b"), "x/"), Path::new("/b").join("x"));
+        assert_eq!(join_glob(Path::new("/b"), ""), Path::new("/b"));
+    }
+
+    #[test]
+    fn test_vscdb_path_is_user_globalstorage_state() {
+        let got = vscdb_path(Path::new("/data/Cursor"));
+        assert!(got.ends_with("User/globalStorage/state.vscdb"));
+        assert!(got.starts_with("/data/Cursor"));
+    }
+
+    #[test]
+    fn test_windows_program_dirs_appends_programs_under_local() {
+        // ProgramFiles* env vars are normally unset on the CI host, so the only
+        // deterministic entry comes from the injected local-app-data dir.
+        let local = PathBuf::from("/fake/Local");
+        let dirs = windows_program_dirs(Some(&local));
+        assert!(
+            dirs.contains(&local.join("Programs")),
+            "must include %LOCALAPPDATA%\\Programs"
+        );
+    }
+
+    #[test]
+    fn test_windows_program_dirs_skips_programs_when_local_absent() {
+        // With no local-app-data and (on CI) no ProgramFiles vars, the result
+        // contains no Programs dir — never a hardcoded C:\ path.
+        let dirs = windows_program_dirs(None);
+        assert!(
+            !dirs.iter().any(|d| d.ends_with("Programs")),
+            "no Programs dir without %LOCALAPPDATA%"
+        );
+    }
+
+    #[test]
+    fn test_windows_app_install_candidates_dir_and_exe() {
+        let program_dirs = vec![PathBuf::from("/Local/Programs")];
+        let got = windows_app_install_candidates(entry(KindTag::Cursor), &program_dirs);
+        // Cursor declares app_dirs_windows = ["cursor", "Cursor"] → 2 names × 2
+        // shapes (dir + .exe) = 4 candidates.
+        assert!(got.contains(&PathBuf::from("/Local/Programs/Cursor")));
+        assert!(got.contains(&PathBuf::from("/Local/Programs/Cursor.exe")));
+        assert!(got.contains(&PathBuf::from("/Local/Programs/cursor.exe")));
+        assert_eq!(got.len(), entry(KindTag::Cursor).app_dirs_windows.len() * 2);
+    }
+
+    #[test]
+    fn test_windows_app_install_candidates_empty_without_program_dirs() {
+        let got = windows_app_install_candidates(entry(KindTag::Cursor), &[]);
+        assert!(got.is_empty(), "no program dirs → no candidates");
+    }
+
+    #[test]
+    fn test_windows_app_data_candidates_join_appdata() {
+        let app_data = Path::new("/Roaming");
+        let got = windows_app_data_candidates(entry(KindTag::VsCode), app_data);
+        // VS Code declares app_data_windows = ["Code"].
+        assert_eq!(got, vec![PathBuf::from("/Roaming/Code")]);
+    }
+
+    #[test]
+    fn test_windows_app_data_candidates_empty_for_cli_only_agent() {
+        // Codex is a dotfile CLI with no %APPDATA% VS Code tree.
+        let got = windows_app_data_candidates(entry(KindTag::Codex), Path::new("/Roaming"));
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn test_base_dirs_for_platform_carries_home() {
+        let bases = BaseDirs::for_platform(Some(PathBuf::from("/home/me")));
+        assert_eq!(bases.home.as_deref(), Some(Path::new("/home/me")));
+    }
+
+    #[test]
+    fn test_fork_detector_handles_appdata_style_tree() {
+        // Simulate a Windows %APPDATA% layout: <root>/<App>/User/globalStorage/
+        // state.vscdb, with NO macOS "Library/Application Support" in the path.
+        // The shared support-root scanner must still detect it. This exercises
+        // the same code Windows runs, against a tree we can build on macOS.
+        let root = tempfile::tempdir().expect("tempdir");
+        let cursor = root.path().join("Cursor");
+        build_synthetic_vscdb(&cursor.join("User/globalStorage/state.vscdb"));
+        std::fs::write(
+            cursor.join("User/mcp.json"),
+            r#"{ "servers": { "x": { "command": "y" } } }"#,
+        )
+        .expect("write mcp");
+
+        // "Cursor" maps to a known kind on Windows (app_data_windows). On macOS
+        // the known set keys off Application-Support names, which also includes
+        // "Cursor", so either way this resolves to a registry kind, not Other.
+        let known: Vec<(&str, KindTag)> = vec![("Cursor", KindTag::Cursor)];
+        let mut acc = Accumulator::default();
+        scan_vscode_support_root(&mut acc, root.path(), &known);
+        let agents = acc.finish();
+
+        let cursor_agent = agents
+            .iter()
+            .find(|a| a.kind == AgentKind::Cursor)
+            .expect("appdata-style Cursor fork detected");
+        assert!(cursor_agent.session_store.is_some(), "records vscdb store");
+        assert!(
+            cursor_agent.connector_config_path.is_some(),
+            "records mcp.json under User/"
+        );
+        assert_eq!(cursor_agent.capability, Capability::ReadOnly);
+    }
+
+    #[test]
+    fn test_fork_detector_unknown_appdata_dir_is_other() {
+        // An unknown dir under a Windows-style root → Other(name), same rule as
+        // macOS.
+        let root = tempfile::tempdir().expect("tempdir");
+        let fork = root.path().join("MysteryWinFork");
+        build_synthetic_vscdb(&fork.join("User/globalStorage/state.vscdb"));
+
+        let mut acc = Accumulator::default();
+        scan_vscode_support_root(&mut acc, root.path(), &[]);
+        let agents = acc.finish();
+        assert!(
+            agents
+                .iter()
+                .any(|a| matches!(&a.kind, AgentKind::Other(n) if n == "MysteryWinFork")),
+            "unknown windows-style fork detected as Other"
+        );
+    }
+
+    #[test]
+    fn test_fork_detector_skips_corrupt_vscdb_in_appdata_tree() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let bad = root.path().join("BrokenWinFork");
+        let bad_db = bad.join("User/globalStorage/state.vscdb");
+        std::fs::create_dir_all(bad_db.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&bad_db, b"corrupt-not-sqlite").expect("write corrupt");
+
+        let mut acc = Accumulator::default();
+        scan_vscode_support_root(&mut acc, root.path(), &[]);
+        assert!(
+            !acc.finish()
+                .iter()
+                .any(|a| matches!(&a.kind, AgentKind::Other(n) if n == "BrokenWinFork")),
+            "corrupt vscdb must not mint a fake agent"
+        );
     }
 }
