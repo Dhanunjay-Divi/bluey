@@ -91,6 +91,23 @@ pub enum OverlayCommand {
         kind: String,
         connectors: Vec<AgentConnectorInfo>,
     },
+    /// Push a review-gated Fix proposal for the user to approve or reject
+    /// (Fix-button slice F3). The overlay renders the three sections plus the
+    /// optional diff and shows Approve/Reject. `proposal_id` is the id the
+    /// overlay must echo back in [`OverlayEvent::FixApprovalResponded`] — the
+    /// daemon only applies a fix whose id matches a still-pending proposal, so a
+    /// stale or unknown id can never trigger an apply. `apply_supported` is
+    /// `false` for agents that cannot be driven to apply (e.g. no CLI); the UI
+    /// disables Approve in that case.
+    PushFixProposal {
+        proposal_id: uuid::Uuid,
+        diagnosis: String,
+        reasoning: String,
+        fix: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff: Option<String>,
+        apply_supported: bool,
+    },
     Shutdown,
 }
 
@@ -140,6 +157,25 @@ pub enum OverlayEvent {
     ConnectorReauthRequested {
         kind: String,
         name: String,
+    },
+    /// UI clicked **Fix** on an agent answer (Fix-button slice F3). `question`
+    /// is the problem to fix (the answer/diagnosis text); `card_id` optionally
+    /// references the source card the Fix was launched from. The daemon drives
+    /// the attached agent in propose-only mode and replies with a
+    /// [`OverlayCommand::PushFixProposal`]; nothing is applied at this step.
+    FixRequested {
+        #[serde(default)]
+        card_id: Option<uuid::Uuid>,
+        question: String,
+    },
+    /// UI approved or rejected a pending Fix proposal. Carries the
+    /// `proposal_id` from the [`OverlayCommand::PushFixProposal`] it is
+    /// answering, so the daemon can id-match it against the still-pending
+    /// proposal (a stale, replayed, or unknown id is rejected and never
+    /// applied). Only `approved = true` against a live id drives an apply.
+    FixApprovalResponded {
+        proposal_id: uuid::Uuid,
+        approved: bool,
     },
     InstructionsRequested,
     InstructionsUpdated {
@@ -329,6 +365,90 @@ mod tests {
             reauth,
             r#"{"type":"connector_reauth_requested","kind":"cursor","name":"remote"}"#
         );
+    }
+
+    #[test]
+    fn push_fix_proposal_serializes_with_type_tag_and_skips_absent_diff() {
+        let id = uuid::Uuid::nil();
+        let command = OverlayCommand::PushFixProposal {
+            proposal_id: id,
+            diagnosis: "PORT is read before the env var is set".to_string(),
+            reasoning: "Reading it lazily fixes the ordering".to_string(),
+            fix: "cargo fmt".to_string(),
+            diff: None,
+            apply_supported: true,
+        };
+        let json = serde_json::to_string(&command).expect("serialize push_fix_proposal");
+        assert!(json.contains(r#""type":"push_fix_proposal""#));
+        assert!(json.contains(r#""proposal_id":"00000000-0000-0000-0000-000000000000""#));
+        assert!(json.contains(r#""apply_supported":true"#));
+        // Absent diff is omitted from the wire form.
+        assert!(!json.contains("diff"));
+    }
+
+    #[test]
+    fn push_fix_proposal_includes_diff_when_present() {
+        let command = OverlayCommand::PushFixProposal {
+            proposal_id: uuid::Uuid::nil(),
+            diagnosis: "d".to_string(),
+            reasoning: "r".to_string(),
+            fix: "f".to_string(),
+            diff: Some("--- a\n+++ b".to_string()),
+            apply_supported: false,
+        };
+        let json = serde_json::to_string(&command).expect("serialize");
+        assert!(json.contains(r#""diff":"--- a\n+++ b""#));
+        assert!(json.contains(r#""apply_supported":false"#));
+    }
+
+    #[test]
+    fn fix_requested_event_deserializes_with_optional_card_id() {
+        // card_id omitted -> None.
+        let json = r#"{"type":"fix_requested","question":"the build fails"}"#;
+        let event: OverlayEvent = serde_json::from_str(json).expect("deserialize fix_requested");
+        match event {
+            OverlayEvent::FixRequested { card_id, question } => {
+                assert_eq!(card_id, None);
+                assert_eq!(question, "the build fails");
+            }
+            other => panic!("expected fix_requested, got {other:?}"),
+        }
+
+        // card_id present -> Some.
+        let with_card = r#"{"type":"fix_requested","card_id":"00000000-0000-0000-0000-000000000000","question":"x"}"#;
+        let event: OverlayEvent = serde_json::from_str(with_card).expect("deserialize");
+        match event {
+            OverlayEvent::FixRequested { card_id, question } => {
+                assert_eq!(card_id, Some(uuid::Uuid::nil()));
+                assert_eq!(question, "x");
+            }
+            other => panic!("expected fix_requested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fix_approval_responded_event_roundtrips() {
+        let json = r#"{"type":"fix_approval_responded","proposal_id":"00000000-0000-0000-0000-000000000000","approved":true}"#;
+        let event: OverlayEvent = serde_json::from_str(json).expect("deserialize approval");
+        match event {
+            OverlayEvent::FixApprovalResponded {
+                proposal_id,
+                approved,
+            } => {
+                assert_eq!(proposal_id, uuid::Uuid::nil());
+                assert!(approved);
+            }
+            other => panic!("expected fix_approval_responded, got {other:?}"),
+        }
+
+        // Re-serialize the rejection form and confirm the tag + fields.
+        let reject = serde_json::to_string(&OverlayEvent::FixApprovalResponded {
+            proposal_id: uuid::Uuid::nil(),
+            approved: false,
+        })
+        .expect("serialize");
+        assert!(reject.contains(r#""type":"fix_approval_responded""#));
+        assert!(reject.contains(r#""approved":false"#));
     }
 
     #[test]

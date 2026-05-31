@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Fix button daemon flow (F3): the review-gated propose → approve → apply state
+  machine. New `OverlayEvent::FixRequested` / `FixApprovalResponded` and
+  `OverlayCommand::PushFixProposal`. On Fix, the daemon drives the attached agent
+  in ProposeFix mode, parses the structured proposal, and pushes a proposal card
+  (diagnosis / reasoning / diff + Approve-Reject) — applying nothing. Apply is
+  reachable only via an `approved=true` response carrying a server-minted,
+  unconsumed, unexpired proposal id for an apply-capable agent (remove-on-take +
+  TTL prevent replay/stale-apply); never pushes. Pending proposals are bounded.
 - Fix button foundation (F1+F2): a data-driven `FixProfile` on each registry row
   (per-agent propose-only vs apply args, `apply_supported`) plus a `DriveMode`
   (Answer / ProposeFix / ApplyFix) so the drive layer forces propose-only or

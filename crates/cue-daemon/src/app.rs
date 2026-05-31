@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -12,8 +13,12 @@ use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use clap::Parser;
 use cue_agent_bridge::{
-    discover_agents, read_connectors, reader_for, AgentKind, AnswerChunk, AuthTier, Capability,
-    DiscoveredAgent, Question as AgentQuestion,
+    discover_agents,
+    drive::{drive_with_mode, DriveMode},
+    fix::{extract_diff, fix_apply_prompt, fix_proposal_prompt, parse_fix_proposal, FixProposal},
+    read_connectors, reader_for,
+    registry::{fix_profile_for, KindTag},
+    AgentKind, AnswerChunk, AuthTier, Capability, DiscoveredAgent, Question as AgentQuestion,
 };
 use cue_core::ai::{
     AnswerFinishReason, AnswerRequest, AnswerResponse, AnswerResponseMetadata, AnswerStreamEvent,
@@ -174,6 +179,104 @@ fn normalize_resume_session(session_id: Option<String>) -> Option<String> {
     session_id
         .map(|id| id.trim().to_string())
         .filter(|id| !id.is_empty())
+}
+
+/// How long an un-approved Fix proposal stays valid. After this, the id is
+/// dropped and an Approve referencing it is rejected — so a stale plan the user
+/// walked away from can never be applied later.
+const FIX_PROPOSAL_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Hard cap on outstanding proposals, so a stuck/abusive UI cannot grow the map
+/// without bound. When full, the oldest entry is evicted to make room.
+const MAX_PENDING_FIXES: usize = 16;
+
+/// A Fix proposal awaiting the user's Approve/Reject decision.
+///
+/// Held in the daemon keyed by a server-minted `proposal_id`. The apply lane is
+/// reachable only by presenting that id back via
+/// [`OverlayEvent::FixApprovalResponded`]; an unknown or expired id is rejected
+/// (PLAN-FIX-BUTTON §6.1, §6.3 — no replay of a stale or edited plan), and the
+/// entry is removed the moment it is consumed (one-shot).
+struct PendingFix {
+    /// The parsed proposal as the agent returned it; pinned so apply uses the
+    /// exact approved content, not anything the UI could have altered.
+    proposal: FixProposal,
+    /// Which agent produced it (and must perform the apply).
+    agent: AgentKind,
+    /// When it was stored, for TTL expiry.
+    created_at: Instant,
+}
+
+impl PendingFix {
+    /// Has this proposal outlived [`FIX_PROPOSAL_TTL`] as of `now`?
+    fn is_expired(&self, now: Instant) -> bool {
+        now.duration_since(self.created_at) >= FIX_PROPOSAL_TTL
+    }
+}
+
+/// Drop every entry older than the TTL, then — if still at/over capacity —
+/// evict oldest-first until under [`MAX_PENDING_FIXES`]. Pure (operates on a
+/// borrowed map + an injected `now`) so it can be unit-tested without a clock.
+fn prune_pending_fixes(map: &mut HashMap<uuid::Uuid, PendingFix>, now: Instant) {
+    map.retain(|_, pending| !pending.is_expired(now));
+    while map.len() >= MAX_PENDING_FIXES {
+        // Find the oldest remaining entry and remove it. `min_by_key` over the
+        // creation instant gives a deterministic eviction order.
+        let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, pending)| pending.created_at)
+            .map(|(id, _)| *id)
+        else {
+            break;
+        };
+        map.remove(&oldest);
+    }
+}
+
+/// Take a still-valid pending fix out of `map` by id, or return `None` if the
+/// id is unknown or the entry has expired (expired entries are removed in
+/// passing). Removal-on-take makes approval one-shot: the same id can never
+/// drive a second apply, and a stale id never drives any.
+fn take_valid_pending_fix(
+    map: &mut HashMap<uuid::Uuid, PendingFix>,
+    proposal_id: &uuid::Uuid,
+    now: Instant,
+) -> Option<PendingFix> {
+    let pending = map.remove(proposal_id)?;
+    if pending.is_expired(now) {
+        return None;
+    }
+    Some(pending)
+}
+
+/// Whether `agent` can be driven to *apply* a fix, read straight off the
+/// registry's per-agent Fix profile (data-driven; no agent is named here).
+/// Agents with no registry row (`Other`/`Unknown`) and agents whose profile
+/// has `apply_supported = false` (e.g. no CLI) both return `false`.
+fn agent_apply_supported(agent: &AgentKind) -> bool {
+    KindTag::from_agent_kind(agent)
+        .and_then(fix_profile_for)
+        .map(|profile| profile.apply_supported)
+        .unwrap_or(false)
+}
+
+/// Build the [`OverlayCommand::PushFixProposal`] for a proposed fix: copies the
+/// three contract sections, extracts a renderable diff from the FIX section (if
+/// any), and stamps whether the producing agent can apply. Pure mapping, so the
+/// proposal-card payload is unit-testable without driving an agent.
+fn push_fix_proposal_command(
+    proposal_id: uuid::Uuid,
+    proposal: &FixProposal,
+    apply_supported: bool,
+) -> OverlayCommand {
+    OverlayCommand::PushFixProposal {
+        proposal_id,
+        diagnosis: proposal.diagnosis.clone(),
+        reasoning: proposal.reasoning.clone(),
+        fix: proposal.fix.clone(),
+        diff: extract_diff(&proposal.fix),
+        apply_supported,
+    }
 }
 
 /// Build the answer card's `source` string. The base form is
@@ -556,6 +659,10 @@ struct Daemon {
     balance_watch: crate::cloud::balance::BalanceWatch,
     answer_generation: AtomicU64,
     active_answer_card: Mutex<Option<(u64, uuid::Uuid)>>,
+    /// Outstanding Fix proposals awaiting Approve/Reject, keyed by a server-
+    /// minted proposal id. The apply lane is reachable only by echoing a live id
+    /// back (Fix-button slice F3); see [`PendingFix`] and [`take_valid_pending_fix`].
+    pending_fixes: Mutex<HashMap<uuid::Uuid, PendingFix>>,
     system_audio: Mutex<Option<crate::audio::system_capture::SystemAudioCapture>>,
     live_transcript_tx: broadcast::Sender<LiveTranscriptEvent>,
     rag: Option<Arc<crate::db::rag::RagPipeline>>,
@@ -666,6 +773,7 @@ pub async fn run() -> Result<()> {
         balance_watch,
         answer_generation: AtomicU64::new(0),
         active_answer_card: Mutex::new(None),
+        pending_fixes: Mutex::new(HashMap::new()),
         system_audio: Mutex::new(None),
         live_transcript_tx: broadcast::channel(64).0,
         rag: rag_pipeline,
@@ -1557,6 +1665,15 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         OverlayEvent::ConnectorReauthRequested { kind, name } => {
             handle_connector_reauth_requested(daemon, &kind, &name).await;
         }
+        OverlayEvent::FixRequested { card_id, question } => {
+            handle_fix_requested(daemon, card_id, &question).await;
+        }
+        OverlayEvent::FixApprovalResponded {
+            proposal_id,
+            approved,
+        } => {
+            handle_fix_approval(daemon, proposal_id, approved).await;
+        }
         OverlayEvent::InstructionsRequested => {
             // Drive Idle -> InstructionsOpen while the daemon-owned prompt is
             // open. The guard resets on save, cancel, or error.
@@ -1977,6 +2094,244 @@ async fn handle_connector_reauth_requested(daemon: &Arc<Daemon>, kind: &str, nam
     )
     .await;
     handle_agent_connectors_requested(daemon, kind).await;
+}
+
+/// Read the currently attached agent (and any session to resume) from settings.
+/// Returns `None` when nothing is attached or the stored label is not a
+/// drivable registry agent — the Fix lane never routes to an undrivable target.
+fn attached_agent_for_fix(daemon: &Arc<Daemon>) -> Option<(AgentKind, Option<String>)> {
+    let settings = load_settings(&daemon.paths).unwrap_or_default();
+    let agent = parse_attached_agent(settings.attached_agent.as_deref())?;
+    let resume = normalize_resume_session(settings.attached_session);
+    Some((agent, resume))
+}
+
+/// Drive `agent` in `mode` against `question`, accumulating the full streamed
+/// text. Returns `Ok(body)` on a clean run or `Err(reason)` for a spawn
+/// failure / terminal agent error / empty output — the caller turns the reason
+/// into a Warning card. Never applies anything itself; the mode + the prompt
+/// are what gate write access.
+async fn drive_and_collect(
+    agent: AgentKind,
+    question: AgentQuestion,
+    mode: DriveMode,
+) -> std::result::Result<String, String> {
+    let stream = drive_with_mode(agent, question, mode)
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+    futures_util::pin_mut!(stream);
+    let mut body = String::new();
+    while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+        match chunk {
+            AnswerChunk::Started { .. } | AnswerChunk::Done { .. } => {}
+            AnswerChunk::Delta(delta) => body.push_str(&delta),
+            AnswerChunk::Error(message) => return Err(message),
+        }
+    }
+    if body.trim().is_empty() {
+        return Err("the agent returned no output".to_string());
+    }
+    Ok(body)
+}
+
+/// Handle a **Fix** click: drive the attached agent in propose-only mode, parse
+/// the structured proposal, store it under a fresh id, and push the proposal
+/// card. Nothing is applied here (PLAN-FIX-BUTTON §4 steps 2–4). When no agent
+/// is attached, or the agent can't produce a structured proposal, a Warning
+/// card is shown and no proposal is stored — so there is nothing to approve.
+async fn handle_fix_requested(daemon: &Arc<Daemon>, _card_id: Option<uuid::Uuid>, question: &str) {
+    if question.trim().is_empty() {
+        push_system_card(
+            daemon,
+            CardKind::Warning,
+            "Nothing to fix",
+            "Fix needs a problem to work on. Ask the agent something first.",
+        )
+        .await;
+        return;
+    }
+
+    let Some((agent, resume)) = attached_agent_for_fix(daemon) else {
+        push_system_card(
+            daemon,
+            CardKind::Warning,
+            "Attach an agent to use Fix",
+            "Fix routes the repair through your own coding agent. Attach one, then try again.",
+        )
+        .await;
+        return;
+    };
+
+    // Propose works for any drivable agent; whether it can later *apply* is
+    // surfaced on the card so the UI can disable Approve up front.
+    let apply_supported = agent_apply_supported(&agent);
+
+    let prompt = fix_proposal_prompt(question);
+    let agent_question = AgentQuestion {
+        prompt,
+        context: None,
+        resume,
+    };
+    debug!(
+        agent = %agent_model_label(&agent),
+        apply_supported,
+        "driving attached agent to propose a fix"
+    );
+
+    let output = match drive_and_collect(agent.clone(), agent_question, DriveMode::ProposeFix).await
+    {
+        Ok(output) => output,
+        Err(reason) => {
+            // Surface a guidance hint for the common not-installed / not-signed-in
+            // failure without echoing the (possibly long) raw error.
+            debug!(detail = %reason, "fix proposal drive failed");
+            push_system_card(
+                daemon,
+                CardKind::Warning,
+                "Fix proposal failed",
+                "The agent couldn't propose a fix. Check that its CLI is installed and signed in, \
+then try again.",
+            )
+            .await;
+            return;
+        }
+    };
+
+    let proposal = match parse_fix_proposal(&output) {
+        Ok(proposal) => proposal,
+        Err(error) => {
+            debug!(detail = %error, "fix proposal did not match the structured contract");
+            push_system_card(
+                daemon,
+                CardKind::Warning,
+                "Couldn't read the fix proposal",
+                "The agent didn't return a structured fix proposal, so nothing was applied. \
+Try Fix again.",
+            )
+            .await;
+            return;
+        }
+    };
+
+    // Mint an id and store the proposal so a later Approve can be id-matched.
+    let proposal_id = uuid::Uuid::new_v4();
+    let now = Instant::now();
+    {
+        let mut pending = daemon.pending_fixes.lock().await;
+        prune_pending_fixes(&mut pending, now);
+        pending.insert(
+            proposal_id,
+            PendingFix {
+                proposal: proposal.clone(),
+                agent,
+                created_at: now,
+            },
+        );
+    }
+
+    let command = push_fix_proposal_command(proposal_id, &proposal, apply_supported);
+    let _ = send_overlay(daemon, command).await;
+}
+
+/// Handle an Approve/Reject for a Fix proposal. The id is matched against a
+/// still-pending, non-expired proposal; an unknown or stale id is rejected
+/// (PLAN-FIX-BUTTON §6.1, §6.3). Reject discards the entry. Approve re-checks
+/// apply-capability, then drives the agent in apply mode and streams the result
+/// into a card. Either way the entry is consumed once (one-shot).
+async fn handle_fix_approval(daemon: &Arc<Daemon>, proposal_id: uuid::Uuid, approved: bool) {
+    let now = Instant::now();
+    let pending = {
+        let mut map = daemon.pending_fixes.lock().await;
+        prune_pending_fixes(&mut map, now);
+        take_valid_pending_fix(&mut map, &proposal_id, now)
+    };
+
+    let Some(pending) = pending else {
+        // Unknown id, already-consumed id, or expired proposal: never apply.
+        push_system_card(
+            daemon,
+            CardKind::Warning,
+            "Fix no longer available",
+            "This fix proposal is no longer available. Run Fix again to get a fresh proposal.",
+        )
+        .await;
+        return;
+    };
+
+    if !approved {
+        push_system_card(
+            daemon,
+            CardKind::System,
+            "Fix discarded",
+            "The proposed fix was discarded. Nothing was changed.",
+        )
+        .await;
+        return;
+    }
+
+    // Re-check apply-capability at approve time (defense in depth — the card may
+    // be stale, or the attached agent could have changed).
+    if !agent_apply_supported(&pending.agent) {
+        push_system_card(
+            daemon,
+            CardKind::Warning,
+            "This agent can't apply fixes",
+            "This agent can propose fixes but can't apply them automatically. Apply it yourself \
+from the proposal.",
+        )
+        .await;
+        return;
+    }
+
+    // Push a status card and stream the apply result into it.
+    let card = CueCard::new(CardKind::System, "Applying fix…", "Working with the agent…")
+        .with_source("fix");
+    let card_id = card.id;
+    let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
+
+    let prompt = fix_apply_prompt(&pending.proposal);
+    let resume = attached_agent_for_fix(daemon).and_then(|(_, resume)| resume);
+    let agent_question = AgentQuestion {
+        prompt,
+        context: None,
+        resume,
+    };
+    debug!(
+        agent = %agent_model_label(&pending.agent),
+        "applying approved fix through the attached agent"
+    );
+
+    match drive_and_collect(pending.agent.clone(), agent_question, DriveMode::ApplyFix).await {
+        Ok(output) => {
+            let _ = send_overlay(
+                daemon,
+                OverlayCommand::UpdateCard {
+                    id: card_id,
+                    body: output,
+                    done: true,
+                    cost_label: None,
+                    artifact: None,
+                },
+            )
+            .await;
+        }
+        Err(reason) => {
+            debug!(detail = %reason, "fix apply drive failed");
+            let _ = send_overlay(
+                daemon,
+                OverlayCommand::UpdateCard {
+                    id: card_id,
+                    body: "The agent couldn't apply the fix. Nothing may have changed; \
+review your working tree."
+                        .to_string(),
+                    done: true,
+                    cost_label: None,
+                    artifact: None,
+                },
+            )
+            .await;
+        }
+    }
 }
 
 /// Discover agents and return the one whose label matches `kind`, if any.
@@ -8490,6 +8845,193 @@ mod tests {
             normalize_resume_session(Some("  abc-1 ".to_string())).as_deref(),
             Some("abc-1")
         );
+    }
+
+    fn sample_proposal() -> FixProposal {
+        FixProposal {
+            diagnosis: "PORT is read before the env var is set".to_string(),
+            reasoning: "Read it lazily to fix the ordering".to_string(),
+            fix: "Apply this:\n```diff\n--- a/x\n+++ b/x\n@@\n-1\n+2\n```".to_string(),
+            raw: String::new(),
+        }
+    }
+
+    fn insert_pending(
+        map: &mut HashMap<uuid::Uuid, PendingFix>,
+        agent: AgentKind,
+        created_at: Instant,
+    ) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        map.insert(
+            id,
+            PendingFix {
+                proposal: sample_proposal(),
+                agent,
+                created_at,
+            },
+        );
+        id
+    }
+
+    #[test]
+    fn take_valid_pending_fix_returns_and_removes_a_live_entry() {
+        let mut map = HashMap::new();
+        let now = Instant::now();
+        let id = insert_pending(&mut map, AgentKind::ClaudeCode, now);
+
+        let taken = take_valid_pending_fix(&mut map, &id, now).expect("live id resolves");
+        assert_eq!(taken.agent, AgentKind::ClaudeCode);
+        // One-shot: the entry is gone, so a second approval with the same id fails.
+        assert!(map.is_empty());
+        assert!(take_valid_pending_fix(&mut map, &id, now).is_none());
+    }
+
+    #[test]
+    fn take_valid_pending_fix_rejects_unknown_id() {
+        let mut map = HashMap::new();
+        let now = Instant::now();
+        let _present = insert_pending(&mut map, AgentKind::Codex, now);
+        // A different, never-issued id is rejected without disturbing the map.
+        let unknown = uuid::Uuid::new_v4();
+        assert!(take_valid_pending_fix(&mut map, &unknown, now).is_none());
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn take_valid_pending_fix_rejects_expired_id() {
+        let mut map = HashMap::new();
+        let created = Instant::now();
+        let id = insert_pending(&mut map, AgentKind::Aider, created);
+        // Simulate "now" past the TTL: the id is no longer applyable...
+        let later = created + FIX_PROPOSAL_TTL + Duration::from_secs(1);
+        assert!(take_valid_pending_fix(&mut map, &id, later).is_none());
+        // ...and the expired entry is removed in passing (no replay later).
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn prune_pending_fixes_drops_expired_entries() {
+        let mut map = HashMap::new();
+        let base = Instant::now();
+        let fresh = insert_pending(&mut map, AgentKind::ClaudeCode, base);
+        let stale = insert_pending(
+            &mut map,
+            AgentKind::Codex,
+            base - FIX_PROPOSAL_TTL - Duration::from_secs(1),
+        );
+        prune_pending_fixes(&mut map, base);
+        assert!(map.contains_key(&fresh));
+        assert!(!map.contains_key(&stale));
+    }
+
+    #[test]
+    fn prune_pending_fixes_evicts_oldest_when_over_capacity() {
+        let mut map = HashMap::new();
+        let base = Instant::now();
+        // Fill to capacity with staggered, non-expired timestamps (oldest first).
+        let mut ids = Vec::new();
+        for i in 0..MAX_PENDING_FIXES {
+            let created = base - Duration::from_secs((MAX_PENDING_FIXES - i) as u64);
+            ids.push(insert_pending(&mut map, AgentKind::ClaudeCode, created));
+        }
+        assert_eq!(map.len(), MAX_PENDING_FIXES);
+        // Pruning at capacity makes room for one more by evicting the oldest.
+        prune_pending_fixes(&mut map, base);
+        assert!(map.len() < MAX_PENDING_FIXES);
+        assert!(!map.contains_key(&ids[0]), "oldest entry should be evicted");
+    }
+
+    #[test]
+    fn agent_apply_supported_reads_the_registry_profile() {
+        // Claude Code is drivable + apply-capable per the registry.
+        assert!(agent_apply_supported(&AgentKind::ClaudeCode));
+        // Windsurf has no CLI -> apply_supported = false.
+        assert!(!agent_apply_supported(&AgentKind::Windsurf));
+        // Untagged kinds have no row, so they can't apply.
+        assert!(!agent_apply_supported(&AgentKind::Unknown));
+        assert!(!agent_apply_supported(&AgentKind::Other("x".to_string())));
+    }
+
+    #[test]
+    fn push_fix_proposal_command_carries_sections_diff_and_apply_flag() {
+        let id = uuid::Uuid::new_v4();
+        let proposal = sample_proposal();
+        let command = push_fix_proposal_command(id, &proposal, true);
+        match command {
+            OverlayCommand::PushFixProposal {
+                proposal_id,
+                diagnosis,
+                reasoning,
+                fix,
+                diff,
+                apply_supported,
+            } => {
+                assert_eq!(proposal_id, id);
+                assert_eq!(diagnosis, proposal.diagnosis);
+                assert_eq!(reasoning, proposal.reasoning);
+                assert_eq!(fix, proposal.fix);
+                assert!(apply_supported);
+                // The fenced ```diff block is extracted for the UI.
+                let diff = diff.expect("a diff block is present");
+                assert!(diff.starts_with("--- a/x"));
+                assert!(!diff.contains("```"));
+            }
+            other => panic!("expected push_fix_proposal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_fix_proposal_command_has_no_diff_for_commands_only_fix() {
+        let id = uuid::Uuid::new_v4();
+        let proposal = FixProposal {
+            diagnosis: "stale cache".to_string(),
+            reasoning: "rebuild".to_string(),
+            fix: "cargo clean\ncargo build".to_string(),
+            raw: String::new(),
+        };
+        let command = push_fix_proposal_command(id, &proposal, false);
+        match command {
+            OverlayCommand::PushFixProposal {
+                diff,
+                apply_supported,
+                ..
+            } => {
+                assert_eq!(diff, None);
+                assert!(!apply_supported);
+            }
+            other => panic!("expected push_fix_proposal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fix_events_are_accepted_by_production_validator() {
+        // The new Fix events must pass the overlay gate (default-allowed in any
+        // UI state) so they reach the handler.
+        let state = parking_lot::Mutex::new(cue_core::overlay_ipc::OverlayUiState::Idle);
+        let requested = validate_and_decode_overlay_line(
+            r#"{"type":"fix_requested","token":"tok","question":"the build fails"}"#,
+            "tok",
+            &state,
+        )
+        .expect("fix_requested should decode");
+        assert!(matches!(requested, OverlayEvent::FixRequested { .. }));
+
+        let responded = validate_and_decode_overlay_line(
+            r#"{"type":"fix_approval_responded","token":"tok","proposal_id":"00000000-0000-0000-0000-000000000000","approved":true}"#,
+            "tok",
+            &state,
+        )
+        .expect("fix_approval_responded should decode");
+        match responded {
+            OverlayEvent::FixApprovalResponded {
+                proposal_id,
+                approved,
+            } => {
+                assert_eq!(proposal_id, uuid::Uuid::nil());
+                assert!(approved);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[test]
