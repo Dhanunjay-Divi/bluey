@@ -37,6 +37,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   persist attach/detach to settings, and list sessions (gated on the
   `allow_agent_session_history` consent toggle). Discovery/IO runs off the async
   runtime; connector readiness reported without exposing secrets.
+- `bluey agent` CLI subcommand (list / attach / detach / sessions / connectors /
+  status) to discover, attach, and inspect coding agents from the terminal,
+  driving the daemon over new `DaemonRequest`/`DaemonResponse` agent variants.
+  `attach` persists the selection so `bluey ask` routes through the agent;
+  `sessions` honors the session-history consent gate. Lets the agent bridge be
+  tested end-to-end without the overlay UI.
 - Master plan V3 (docs/reviews/CUE-BLUEY-V3-PLAN-COMPLETE.md)
 - Phase 0 foundation: workspace structure, Cargo workspace, crate scaffolding
 - Development workflow docs: CLAUDE.md, templates, CI, .codex agents + skills

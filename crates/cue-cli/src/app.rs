@@ -16,10 +16,10 @@ use cue_core::app_paths::AppPaths;
 use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
 use cue_core::{
     load_account, load_settings, new_trace_id, save_account, save_settings, trace_id_from_env,
-    AccountConfig, ActionItem, AiProviderId, AiProviderKind, AiRuntimeStatus, AnswerRequest,
-    AnswerResponse, AudioPipelineStatus, CardKind, CloudSyncStatus, ContextArtifact, CueCard,
-    CueSettings, MeetingRecap, MeetingRecord, MemoryHit, OverlayPosition, ProviderRoute,
-    ProviderSelector, Speaker, BLUEY_TRACE_ID_ENV,
+    AccountConfig, ActionItem, AgentConnectorInfo, AgentSessionSummary, AgentSummary, AiProviderId,
+    AiProviderKind, AiRuntimeStatus, AnswerRequest, AnswerResponse, AudioPipelineStatus, CardKind,
+    CloudSyncStatus, ContextArtifact, CueCard, CueSettings, MeetingRecap, MeetingRecord, MemoryHit,
+    OverlayPosition, ProviderRoute, ProviderSelector, Speaker, BLUEY_TRACE_ID_ENV,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -178,6 +178,11 @@ enum Commands {
     Cloud {
         #[command(subcommand)]
         command: CloudCommands,
+    },
+    /// Discover, attach, and inspect coding agents that answer through Bluey.
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommands,
     },
     /// Show configured AI provider environment.
     #[command(hide = true)]
@@ -402,6 +407,34 @@ struct AudioStartArgs {
 
 #[derive(Debug, Subcommand)]
 enum AiCommands {
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentCommands {
+    /// List discovered coding agents and their attach state.
+    List,
+    /// Attach an agent so `bluey ask` routes answers through it.
+    Attach {
+        /// Agent kind, e.g. claude_code, cursor, codex.
+        kind: String,
+        /// Pin a prior session to resume (validated; resume lands later).
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Detach the active agent; answers use Bluey's normal providers.
+    Detach,
+    /// List a coding agent's prior sessions (needs session-history consent).
+    Sessions {
+        /// Agent kind, e.g. claude_code, cursor, codex.
+        kind: String,
+    },
+    /// List a coding agent's inherited MCP connectors (name/tier/ready only).
+    Connectors {
+        /// Agent kind, e.g. claude_code, cursor, codex.
+        kind: String,
+    },
+    /// Show which agent is currently attached.
     Status,
 }
 
@@ -747,6 +780,7 @@ pub async fn cli_main() -> Result<()> {
                 print_cloud_rag(&query.join(" "), limit, json).await
             }
         },
+        Commands::Agent { command } => agent_command(command).await,
         Commands::Providers => {
             print_provider_status();
             Ok(())
@@ -2079,6 +2113,169 @@ fn provider_selector(provider: &str, model: Option<&str>) -> ProviderSelector {
     }
 }
 
+async fn agent_command(command: AgentCommands) -> Result<()> {
+    match command {
+        AgentCommands::List => {
+            let agents = agent_request_agents(DaemonRequest::AgentList).await?;
+            print!("{}", render_agent_table(&agents));
+            Ok(())
+        }
+        AgentCommands::Attach { kind, session } => {
+            let request_msg = DaemonRequest::AgentAttach {
+                kind: kind.clone(),
+                session_id: session.clone(),
+            };
+            // A successful attach echoes the refreshed agent list back.
+            let _ = agent_request_agents(request_msg).await?;
+            println!("Attached {kind}.");
+            if let Some(session) = session {
+                println!("Pinned session {session} (resume support lands later).");
+            }
+            println!("`bluey ask` will now route answers through {kind}.");
+            Ok(())
+        }
+        AgentCommands::Detach => {
+            agent_request(DaemonRequest::AgentDetach).await?;
+            println!("Detached. Answers use Bluey's normal providers.");
+            Ok(())
+        }
+        AgentCommands::Sessions { kind } => {
+            match agent_request(DaemonRequest::AgentSessions { kind }).await? {
+                DaemonResponse::AgentSessions { sessions } => {
+                    print_agent_sessions(&sessions);
+                    Ok(())
+                }
+                DaemonResponse::Error { message } => bail!("daemon error: {message}"),
+                other => bail!("unexpected daemon response: {other:?}"),
+            }
+        }
+        AgentCommands::Connectors { kind } => {
+            match agent_request(DaemonRequest::AgentConnectors { kind }).await? {
+                DaemonResponse::AgentConnectors { connectors } => {
+                    print_agent_connectors(&connectors);
+                    Ok(())
+                }
+                DaemonResponse::Error { message } => bail!("daemon error: {message}"),
+                other => bail!("unexpected daemon response: {other:?}"),
+            }
+        }
+        AgentCommands::Status => {
+            let paths = AppPaths::discover()?;
+            let settings = load_settings(&paths)?;
+            match settings.attached_agent.as_deref() {
+                Some(kind) => {
+                    println!("Attached agent: {kind}");
+                    println!("`bluey ask` routes answers through it.");
+                }
+                None => {
+                    println!("No agent attached. Answers use Bluey's normal providers.");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Send an agent request and translate a missing-daemon connection failure into
+/// a friendly "run `bluey on`" message instead of a raw connect error.
+async fn agent_request(message: DaemonRequest) -> Result<DaemonResponse> {
+    request(message)
+        .await
+        .map_err(|error| anyhow!("Bluey isn't running - run `bluey on` first.\n  ({error:#})"))
+}
+
+/// Send a request expected to yield [`DaemonResponse::Agents`].
+async fn agent_request_agents(message: DaemonRequest) -> Result<Vec<AgentSummary>> {
+    match agent_request(message).await? {
+        DaemonResponse::Agents { agents } => Ok(agents),
+        DaemonResponse::Error { message } => bail!("daemon error: {message}"),
+        other => bail!("unexpected daemon response: {other:?}"),
+    }
+}
+
+/// Render the discovery table: KIND | CAPABILITY | CONNECTORS | SESSIONS, with a
+/// `*` marking the attached agent. Pure (no IO) so it can be unit-tested.
+fn render_agent_table(agents: &[AgentSummary]) -> String {
+    if agents.is_empty() {
+        return "No coding agents found.\n".to_string();
+    }
+
+    let kind_w = agents
+        .iter()
+        .map(|a| a.kind.len() + usize::from(a.attached))
+        .chain(std::iter::once("KIND".len()))
+        .max()
+        .unwrap_or(4);
+    let cap_w = agents
+        .iter()
+        .map(|a| a.capability.len())
+        .chain(std::iter::once("CAPABILITY".len()))
+        .max()
+        .unwrap_or(10);
+
+    let mut out = format!(
+        "{:<kind_w$}  {:<cap_w$}  {:>12}  {:>8}\n",
+        "KIND",
+        "CAPABILITY",
+        "CONNECTORS",
+        "SESSIONS",
+        kind_w = kind_w,
+        cap_w = cap_w,
+    );
+    for agent in agents {
+        let label = if agent.attached {
+            format!("{}*", agent.kind)
+        } else {
+            agent.kind.clone()
+        };
+        let connectors = format!("{}/{}", agent.ready_connector_count, agent.connector_count);
+        let sessions = agent
+            .session_count
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        out.push_str(&format!(
+            "{:<kind_w$}  {:<cap_w$}  {:>12}  {:>8}\n",
+            label,
+            agent.capability,
+            connectors,
+            sessions,
+            kind_w = kind_w,
+            cap_w = cap_w,
+        ));
+    }
+    out.push_str("\n* attached - `bluey ask` routes through it. CONNECTORS shows ready/total.\n");
+    out
+}
+
+fn print_agent_sessions(sessions: &[AgentSessionSummary]) {
+    if sessions.is_empty() {
+        println!("No sessions found.");
+        println!(
+            "If you expected sessions, enable allow_agent_session_history in settings to opt in."
+        );
+        return;
+    }
+    for session in sessions {
+        let title = session.title.as_deref().unwrap_or("(untitled)");
+        println!("{}  {}  {}", session.id, session.updated_at, title);
+    }
+}
+
+fn print_agent_connectors(connectors: &[AgentConnectorInfo]) {
+    if connectors.is_empty() {
+        println!("No connectors found.");
+        return;
+    }
+    for connector in connectors {
+        let ready = if connector.ready {
+            "ready"
+        } else {
+            "needs re-auth"
+        };
+        println!("{}  {}  {}", connector.name, connector.auth_tier, ready);
+    }
+}
+
 fn print_response(response: DaemonResponse) -> Result<()> {
     match response {
         DaemonResponse::Ok => println!("ok"),
@@ -2100,6 +2297,9 @@ fn print_response(response: DaemonResponse) -> Result<()> {
             print_answer_response(response, false, events.len())
         }
         DaemonResponse::CloudStatus { status } => print_cloud_status(status),
+        DaemonResponse::Agents { agents } => print!("{}", render_agent_table(&agents)),
+        DaemonResponse::AgentSessions { sessions } => print_agent_sessions(&sessions),
+        DaemonResponse::AgentConnectors { connectors } => print_agent_connectors(&connectors),
         DaemonResponse::Error { message } => {
             bail!("daemon error: {message}");
         }
@@ -2738,7 +2938,49 @@ async fn bluey_delete_account_cmd(force: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bluey_on_boot_lines, BlueyOnAuthState};
+    use super::{bluey_on_boot_lines, render_agent_table, BlueyOnAuthState};
+    use cue_core::AgentSummary;
+
+    fn sample_agent(kind: &str, attached: bool, sessions: Option<usize>) -> AgentSummary {
+        AgentSummary {
+            kind: kind.to_string(),
+            display_name: kind.to_string(),
+            capability: "drive".to_string(),
+            connector_count: 3,
+            ready_connector_count: 2,
+            session_count: sessions,
+            attached,
+        }
+    }
+
+    #[test]
+    fn render_agent_table_reports_empty_state() {
+        assert_eq!(render_agent_table(&[]), "No coding agents found.\n");
+    }
+
+    #[test]
+    fn render_agent_table_marks_attached_and_shows_ready_over_total() {
+        let table = render_agent_table(&[
+            sample_agent("claude_code", true, Some(5)),
+            sample_agent("cursor", false, None),
+        ]);
+        // Header columns present.
+        assert!(table.contains("KIND"));
+        assert!(table.contains("CAPABILITY"));
+        assert!(table.contains("CONNECTORS"));
+        assert!(table.contains("SESSIONS"));
+        // Attached agent carries the marker; unattached does not.
+        assert!(table.contains("claude_code*"));
+        assert!(table
+            .lines()
+            .any(|l| l.contains("cursor") && !l.contains('*')));
+        // Connectors render ready/total; unknown session count renders "-".
+        assert!(table.contains("2/3"));
+        assert!(table.contains('5'));
+        assert!(table
+            .lines()
+            .any(|l| l.contains("cursor") && l.contains('-')));
+    }
 
     #[test]
     fn bluey_on_boot_lines_offer_signin_without_forcing_browser_when_unlinked() {

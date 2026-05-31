@@ -1270,7 +1270,68 @@ async fn handle_request_inner(
                 items: meeting.map(|m| m.action_items).unwrap_or_default(),
             })
         }
+        DaemonRequest::AgentList => {
+            let agents = discover_agent_summaries(daemon).await;
+            Ok(DaemonResponse::Agents { agents })
+        }
+        DaemonRequest::AgentAttach { kind, session_id } => {
+            let Some(parsed) = parse_attached_agent(Some(&kind)) else {
+                return Ok(DaemonResponse::Error {
+                    message: format!("\"{kind}\" is not a coding agent Bluey can attach"),
+                });
+            };
+            // TODO(slice-resume): persist `session_id` so attach can resume a
+            // prior session. For now it is validated-in/ignored.
+            let _ = session_id;
+            let label = agent_model_label(&parsed);
+            persist_attached_agent(daemon, Some(label)).await?;
+            let agents = discover_agent_summaries(daemon).await;
+            Ok(DaemonResponse::Agents { agents })
+        }
+        DaemonRequest::AgentDetach => {
+            persist_attached_agent(daemon, None).await?;
+            Ok(DaemonResponse::Ok)
+        }
+        DaemonRequest::AgentSessions { kind } => {
+            let settings = load_settings(&daemon.paths).unwrap_or_default();
+            if !settings.allow_agent_session_history {
+                return Ok(DaemonResponse::AgentSessions {
+                    sessions: Vec::new(),
+                });
+            }
+            let sessions = tokio::task::spawn_blocking(move || list_agent_sessions(&kind))
+                .await
+                .unwrap_or_else(|error| {
+                    debug!("agent session list task panicked: {error}");
+                    Vec::new()
+                });
+            Ok(DaemonResponse::AgentSessions { sessions })
+        }
+        DaemonRequest::AgentConnectors { kind } => {
+            let connectors = tokio::task::spawn_blocking(move || list_agent_connectors(&kind))
+                .await
+                .unwrap_or_else(|error| {
+                    debug!("agent connector list task panicked: {error}");
+                    Vec::new()
+                });
+            Ok(DaemonResponse::AgentConnectors { connectors })
+        }
     }
+}
+
+/// Discover agents and map them to [`AgentSummary`] DTOs off the async runtime.
+/// Shared by the IPC `AgentList`/`AgentAttach` handlers; fail-soft to an empty
+/// list on a discovery panic.
+async fn discover_agent_summaries(daemon: &Arc<Daemon>) -> Vec<AgentSummary> {
+    let settings = load_settings(&daemon.paths).unwrap_or_default();
+    let attached = settings.attached_agent.clone();
+    let allow_history = settings.allow_agent_session_history;
+    tokio::task::spawn_blocking(move || build_agent_summaries(&attached, allow_history))
+        .await
+        .unwrap_or_else(|error| {
+            debug!("agent discovery task panicked: {error}");
+            Vec::new()
+        })
 }
 
 async fn send_overlay(daemon: &Arc<Daemon>, command: OverlayCommand) -> Result<()> {
