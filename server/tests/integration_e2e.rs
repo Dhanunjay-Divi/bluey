@@ -7,7 +7,7 @@
 #![cfg(test)]
 
 use axum::body::Body;
-use axum::http::Request;
+use axum::http::{Request, StatusCode};
 use serde_json::json;
 use serial_test::serial;
 use tower::ServiceExt;
@@ -462,6 +462,103 @@ async fn auth_link_mint_then_exchange_roundtrip() {
         .unwrap();
     let resp = h.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+#[serial]
+async fn auth_device_poll_is_single_use_after_approval() {
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "device-once@example.com", "longenoughpw").await;
+
+    let req = Request::post("/auth/device/start")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let started: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let device_code = started["device_code"].as_str().unwrap();
+    let user_code = started["user_code"].as_str().unwrap();
+
+    let req = Request::post("/auth/device/approve")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "user_code": user_code })).unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let poll_body = serde_json::to_vec(&json!({ "device_code": device_code })).unwrap();
+    let req = Request::post("/auth/device/poll")
+        .header("content-type", "application/json")
+        .body(Body::from(poll_body.clone()))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = Request::post("/auth/device/poll")
+        .header("content-type", "application/json")
+        .body(Body::from(poll_body))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+#[serial]
+async fn auth_device_approve_cannot_overwrite_approved_code() {
+    let h = boot_harness().await;
+    let first_access = signup_and_login(&h, "device-owner@example.com", "longenoughpw").await;
+    let second_access = signup_and_login(&h, "device-attacker@example.com", "longenoughpw").await;
+
+    let req = Request::post("/auth/device/start")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let started: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let device_code = started["device_code"].as_str().unwrap();
+    let user_code = started["user_code"].as_str().unwrap();
+
+    let approve_body = serde_json::to_vec(&json!({ "user_code": user_code })).unwrap();
+    let req = Request::post("/auth/device/approve")
+        .header("authorization", format!("Bearer {first_access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(approve_body.clone()))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = Request::post("/auth/device/approve")
+        .header("authorization", format!("Bearer {second_access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(approve_body))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let req = Request::post("/auth/device/poll")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "device_code": device_code })).unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let auth: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(auth["account"]["email"], "device-owner@example.com");
 }
 
 #[tokio::test]

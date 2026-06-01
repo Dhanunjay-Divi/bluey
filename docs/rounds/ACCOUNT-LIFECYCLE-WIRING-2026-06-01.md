@@ -17,6 +17,8 @@ Make the first customer path coherent from install to active paid use:
   - Opens `https://bluey.sh/link?user_code=XXXX-XXXX`.
   - Polls `POST /auth/device/poll` for up to 10 minutes.
   - Runs the polling client with an in-memory token store, then saves the returned access/refresh tokens through the existing keyring path. This keeps first login from depending on keyring availability before tokens exist.
+- Server device polling now consumes an approved device code before issuing tokens, so parallel retries cannot mint multiple token pairs from the same approval.
+- Server device approval now only applies to pending codes, so a second signed-in account cannot overwrite an already-approved code before the original CLI poll completes.
 - Server device-flow verification URI now points at `/link`, which is the product account page customers already see.
 - `web/index.html` now supports two browser-to-desktop handoff modes:
   - `/link?user_code=...`: approve a terminal/device login after sign-in or account creation.
@@ -57,6 +59,7 @@ Dashboard Sign in with browser
 - `cargo fmt --all --check`
 - `cargo check -p cue-cli -p cue-dashboard -p cue-cloud-client`
 - `cargo test -p cue-cli device_login_url -- --nocapture`
+- `cd server && cargo test auth_device_ --test integration_e2e`
 - `cd crates/cue-dashboard/ui && npm run build`
 
 ## Remaining Before Production Account Smoke

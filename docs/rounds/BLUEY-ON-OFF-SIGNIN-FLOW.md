@@ -12,10 +12,16 @@ bluey on
 bluey off
 ```
 
-There is no separate customer login subcommand. First `bluey on` starts the
-daemon/session and opens `https://bluey.sh/link` if no local Bluey account
-token is available. The browser/deep-link flow stores tokens in the OS keyring,
-after which later `bluey on` runs directly.
+Customer-facing launch is `bluey on` / `bluey off`. `bluey on` starts the
+daemon/session and keeps Bluey usable locally even when no cloud token exists.
+It does **not** force-open a browser; the overlay and terminal copy point users
+to sign in when they need managed cloud answers, billing, sync, or RAG.
+
+`bluey login` remains as a visible/supportable account-linking command for now
+because it is the safest terminal-only way to complete the server device flow:
+it opens `https://bluey.sh/link?user_code=...`, polls the server, and stores
+tokens in the OS keyring. Dashboard onboarding can also open `/link` and receive
+tokens through the `bluey://link?code=...` deep-link handoff.
 
 Support/dev commands still exist for diagnostics, automation, and non-browser
 testing, but they are hidden from normal CLI help.
@@ -24,14 +30,12 @@ testing, but they are hidden from normal CLI help.
 
 - `crates/cue-cli/src/app.rs`
   - `on` / `off` are the only visible commands in `bluey --help`.
-  - `login`, account, usage, credits, settings, support, doctor, logs, and
-    other support commands are hidden.
-  - `bluey on` checks keyring/legacy account config. If missing, it opens the
-    sign-in page.
-  - `BLUEY_SKIP_SIGNIN_OPEN=1` and `BLUEY_NO_BROWSER=1` keep tests/dev smoke
-    from opening a real browser.
-  - Boot-card copy reports managed-ready, browser-sign-in-open, skipped, or
-    browser-open-failed states.
+  - `bluey on` checks keyring/legacy account config. If missing, it starts
+    locally and prints/shows "sign in when ready" copy.
+  - `bluey login` is the explicit browser/device-code path. It uses an
+    in-memory token store while polling, then persists returned tokens to the
+    keyring.
+  - Boot-card copy reports managed-ready or sign-in-available states.
 - Smoke/install/docs now point users to first `bluey on` sign-in.
 
 ## Verification
@@ -50,8 +54,8 @@ Expected help output shows only `on`, `off`, and `help`.
 
 ## Kiro Review Notes
 
-- Treat the hidden login subcommand as a support/dev escape hatch only, not a product
-  flow.
+- Treat `bluey login` as the explicit terminal account-linking flow until the
+  dashboard deep-link flow has a live production smoke.
 - The server/device-code terminology can remain internal, but customer docs
   should always say first `bluey on` sign-in.
 - Smoke tests must keep `BLUEY_SKIP_SIGNIN_OPEN=1` unless they explicitly test

@@ -330,15 +330,24 @@ pub async fn device_poll(
         ));
     };
 
-    // Fetch account and issue tokens. Delete the device_code row to
-    // make it single-use.
+    // Consume the device code before issuing tokens. The conditional delete
+    // closes the retry race where two pollers select the same approved row
+    // before either one deletes it.
+    let deleted = conn
+        .execute(
+            "DELETE FROM device_codes
+             WHERE device_code = ?1 AND approved = 1 AND account_id = ?2",
+            rusqlite::params![&req.device_code, &account_id],
+        )
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
+    if deleted == 0 {
+        return Err(err(StatusCode::GONE, "device_code already consumed"));
+    }
+
+    // Fetch account and issue tokens.
     let account = Account::fetch_by_id(&state.pool, &account_id)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?
         .ok_or_else(|| err(StatusCode::INTERNAL_SERVER_ERROR, "account not found"))?;
-    let _ = conn.execute(
-        "DELETE FROM device_codes WHERE device_code = ?1",
-        rusqlite::params![&req.device_code],
-    );
     Ok(Json(auth_response(&state, &account)?))
 }
 
@@ -360,7 +369,7 @@ pub async fn device_approve(
     let n = conn
         .execute(
             "UPDATE device_codes SET approved = 1, account_id = ?1
-             WHERE user_code = ?2 AND expires_at > ?3",
+             WHERE user_code = ?2 AND expires_at > ?3 AND approved = 0",
             rusqlite::params![&account.id, &req.user_code, &now],
         )
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
