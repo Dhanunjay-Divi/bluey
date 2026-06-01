@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Agent MCP connectors now fire when Bluey drives a CLI in headless mode. Live
+  testing showed `gemini -p` blocks tool calls on an approval prompt that never
+  arrives non-interactively, so its MCP never ran. Added a data-driven
+  per-agent `answer_args` (Gemini/Antigravity → `--approval-mode yolo`; Claude
+  needs none); Answer-mode drives now append it. Verified live: a Gemini drive
+  through the bridge fired a perplexity MCP tool and returned real-time data.
 - Agent session readers, corrected against real on-disk data (live testing
   found the synthetic-fixture tests had masked these):
   - **Cursor** (`vscdb`): listed sessions but read 0 turns/titles — now walks

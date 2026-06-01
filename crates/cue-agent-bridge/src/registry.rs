@@ -43,6 +43,13 @@ pub struct AgentEntry {
     /// Drive command template: program + args, `{prompt}` substituted later.
     /// Stored as data only — never executed in Slice 1.
     pub drive_command: &'static [&'static str],
+    /// Extra args appended for a normal **answer** so the agent's own MCP
+    /// connectors actually fire in headless mode. Some CLIs (Gemini) block tool
+    /// calls on an approval prompt that never arrives non-interactively, so a
+    /// read-tolerant auto-approve flag is required for MCP to work; others
+    /// (Claude Code) load MCP in `-p` with no extra flag. These are answer-only
+    /// (read-intent) — the Fix lane uses [`FixProfile`] args instead.
+    pub answer_args: &'static [&'static str],
     /// Review-gated "Fix" profile: the extra args that switch this agent
     /// between propose-only and apply (see [`FixProfile`]).
     pub fix: FixProfile,
@@ -164,6 +171,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         session_format: Some(SessionFormat::Jsonl),
         jsonl_subdir: "projects",
         drive_command: &["claude", "-p", "{prompt}"],
+        answer_args: &[],
         fix: FixProfile {
             propose_args: &["--permission-mode", "plan"],
             apply_args: &["--permission-mode", "acceptEdits"],
@@ -181,6 +189,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         session_format: Some(SessionFormat::SqliteVscdb),
         jsonl_subdir: "projects",
         drive_command: &["cursor-agent", "-p", "{prompt}"],
+        answer_args: &[],
         // NEVER `--plan`: Cursor's `--plan` flag is a known bug that writes
         // files. Propose = omit `--force` + rely on the prompt.
         fix: FixProfile {
@@ -200,6 +209,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         session_format: Some(SessionFormat::Protobuf),
         jsonl_subdir: "projects",
         drive_command: &["gemini", "-p", "{prompt}"],
+        answer_args: &["--approval-mode", "yolo"],
         // Antigravity drives through the `gemini` CLI, so it shares Gemini's
         // approval-mode flags.
         fix: FixProfile {
@@ -219,6 +229,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         session_format: Some(SessionFormat::JsonFiles),
         jsonl_subdir: "projects",
         drive_command: &["copilot", "-p", "{prompt}"],
+        answer_args: &[],
         // Copilot has no native propose flag; propose is prompt-only. Apply
         // needs `--allow-all-tools` (without it `-p` stalls).
         fix: FixProfile {
@@ -238,6 +249,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         session_format: None,
         jsonl_subdir: "projects",
         drive_command: &["gemini", "-p", "{prompt}"],
+        answer_args: &["--approval-mode", "yolo"],
         fix: FixProfile {
             propose_args: &["--approval-mode", "plan"],
             apply_args: &["--approval-mode", "yolo"],
@@ -255,6 +267,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         session_format: Some(SessionFormat::Jsonl),
         jsonl_subdir: "sessions",
         drive_command: &["codex", "exec", "{prompt}"],
+        answer_args: &[],
         fix: FixProfile {
             propose_args: &["--sandbox", "read-only", "--ask-for-approval", "never"],
             apply_args: &[
@@ -277,6 +290,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         session_format: None,
         jsonl_subdir: "projects",
         drive_command: &["aider", "--message", "{prompt}"],
+        answer_args: &[],
         fix: FixProfile {
             propose_args: &["--dry-run"],
             apply_args: &["--yes-always"],
@@ -294,6 +308,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         session_format: Some(SessionFormat::SqliteVscdb),
         jsonl_subdir: "projects",
         drive_command: &[],
+        answer_args: &[],
         // No headless CLI to drive an apply — propose-capable only.
         fix: FixProfile {
             propose_args: &[],
@@ -312,6 +327,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         session_format: Some(SessionFormat::JsonFiles),
         jsonl_subdir: "projects",
         drive_command: &[],
+        answer_args: &[],
         // No headless CLI to drive an apply — propose-capable only.
         fix: FixProfile {
             propose_args: &[],

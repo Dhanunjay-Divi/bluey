@@ -228,6 +228,13 @@ fn fix_profile_for_agent(agent: &AgentKind) -> Option<&'static FixProfile> {
     registry::fix_profile_for(tag)
 }
 
+/// The agent's answer-mode args (so its own MCP connectors fire in headless
+/// mode), resolved off the registry table — never by agent name.
+fn answer_args_for_agent(agent: &AgentKind) -> Option<&'static [&'static str]> {
+    let tag = registry::KindTag::from_agent_kind(agent)?;
+    registry::entry_for(tag).map(|e| e.answer_args)
+}
+
 /// Build the full argv for a drive, layering the [`DriveMode`] Fix-profile args
 /// on top of the base [`build_argv`] output. **Pure** (no I/O), so the
 /// mode→args wiring and the apply guard are unit-testable without spawning.
@@ -251,7 +258,10 @@ fn build_argv_with_mode(
     let (program, mut args) = build_argv(spec, q);
 
     let extra: &[&'static str] = match mode {
-        DriveMode::Answer => &[],
+        // Answer mode appends the agent's `answer_args` so its own MCP
+        // connectors fire in headless mode (Gemini needs an auto-approve flag;
+        // Claude needs none).
+        DriveMode::Answer => answer_args_for_agent(agent).unwrap_or(&[]),
         DriveMode::ProposeFix => fix_profile_for_agent(agent)
             .map(|p| p.propose_args)
             .unwrap_or(&[]),
@@ -747,13 +757,28 @@ mod tests {
 
     #[test]
     fn test_answer_mode_appends_no_fix_args() {
-        // Answer must be byte-for-byte the base argv — full back-compat.
+        // Claude has empty answer_args, so Answer == base argv (back-compat).
         let s = spec(KindTag::ClaudeCode);
         let q = Question::new("why is the build red?");
         let (_, base) = build_argv(s, &q);
         let (_, with_mode) =
             build_argv_with_mode(s, &AgentKind::ClaudeCode, &q, DriveMode::Answer).unwrap();
         assert_eq!(base, with_mode);
+    }
+
+    #[test]
+    fn test_answer_mode_appends_answer_args_for_mcp() {
+        // Gemini needs an auto-approve flag in Answer mode so its MCP connectors
+        // fire headless. The flag must be present in Answer mode and must NOT be
+        // a Fix-profile arg (it's answer-only / read-intent).
+        let s = spec(KindTag::Gemini);
+        let q = Question::new("use a tool");
+        let (_, args) = build_argv_with_mode(s, &AgentKind::Gemini, &q, DriveMode::Answer).unwrap();
+        let i = args
+            .iter()
+            .position(|a| a == "--approval-mode")
+            .expect("answer_args approval flag present for Gemini");
+        assert_eq!(args[i + 1], "yolo");
     }
 
     #[test]
