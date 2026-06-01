@@ -7,9 +7,14 @@ The collapsed Bluey pill was still too large and behaved like a static logo. Whe
 ## Changes
 
 - Reduced the native macOS collapsed pill from `128x38` to `112x34`.
-- Added a compact state glyph inside the pill:
-  - Ready / paused: play glyph.
-  - Listening: pause glyph with green status.
+- Reworked the collapsed surface into a compact Bluey identity segment with an attached mini-control rail.
+- Added direct collapsed controls:
+  - Style opens the inline answer-style editor in the expanded panel.
+  - Play / pause toggles listening without opening the full panel.
+  - Power opens the full panel and shows the existing turn-off confirmation.
+- Added a compact state indicator:
+  - Ready / paused: play.
+  - Listening: pause with green status.
   - Connecting: amber activity glyph.
   - Failed: red warning glyph.
 - Kept the Bluey logo, label, and status dot, but tightened spacing so the dot sits close to the wordmark.
@@ -22,10 +27,9 @@ The collapsed Bluey pill was still too large and behaved like a static logo. Whe
 - `bluey on` starts with the compact pill centered by default.
 - Clicking the pill opens the full workspace.
 - Hiding/collapsing the workspace returns to the pill.
-- If Bluey is actively listening, the collapsed pill remains small but shows the listening state.
+- If Bluey is actively listening, the collapsed pill remains small but shows the listening state and exposes pause.
 - Passive daemon updates do not reopen the expanded overlay.
 
 ## Verification
 
 - `swift build -c release --package-path native/macos/cue-overlay` passes.
-

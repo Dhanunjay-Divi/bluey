@@ -94,7 +94,7 @@ private enum ExpandedPanelMetrics {
 }
 
 private enum PillMetrics {
-    static let size = NSSize(width: 112, height: 34)
+    static let size = NSSize(width: 174, height: 34)
 
     static func centeredFrame(in visibleFrame: NSRect) -> NSRect {
         NSRect(
@@ -680,21 +680,6 @@ private enum PillRunState: Equatable {
         }
     }
 
-    var compactMark: String {
-        switch self {
-        case .ready:
-            return "▶"
-        case .connecting:
-            return "~"
-        case .listening:
-            return "Ⅱ"
-        case .paused:
-            return "▶"
-        case .failed:
-            return "!"
-        }
-    }
-
     var symbolColor: NSColor {
         switch self {
         case .ready, .paused:
@@ -756,14 +741,19 @@ private final class PillView: NSView {
         }
     }
     var onClick: (() -> Void)?
+    var onRunToggle: (() -> Void)?
+    var onStyle: (() -> Void)?
+    var onEnd: (() -> Void)?
     private var runState: PillRunState = .ready
 
     private let logoTile = NSView()
     private let logoGlyph = NSTextField(labelWithString: ">_")
     private let titleField = NSTextField(labelWithString: "Bluey")
     private let dotView = NSView()
-    private let stateTile = NSView()
-    private let stateGlyph = NSTextField(labelWithString: "▶")
+    private let controlRail = NSView()
+    private let styleButton = NSButton(title: "", target: nil, action: nil)
+    private let runButton = NSButton(title: "", target: nil, action: nil)
+    private let endButton = NSButton(title: "", target: nil, action: nil)
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -806,17 +796,29 @@ private final class PillView: NSView {
         dotView.layer?.shadowOffset = .zero
         addSubview(dotView)
 
-        stateTile.wantsLayer = true
-        stateTile.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.045).cgColor
-        stateTile.layer?.cornerRadius = 7
-        stateTile.layer?.borderWidth = 1
-        stateTile.layer?.borderColor = NSColor.white.withAlphaComponent(0.10).cgColor
-        addSubview(stateTile)
+        controlRail.wantsLayer = true
+        controlRail.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.040).cgColor
+        controlRail.layer?.cornerRadius = 12
+        controlRail.layer?.borderWidth = 1
+        controlRail.layer?.borderColor = NSColor.white.withAlphaComponent(0.085).cgColor
+        addSubview(controlRail)
 
-        stateGlyph.font = NSFont.systemFont(ofSize: 10.5, weight: .heavy)
-        stateGlyph.textColor = runState.symbolColor
-        stateGlyph.alignment = .center
-        stateTile.addSubview(stateGlyph)
+        configureMiniButton(styleButton, symbol: "text.bubble", fallback: "S", tint: BlueyTheme.cyan)
+        configureRunButton()
+        configureMiniButton(endButton, symbol: "power", fallback: "×", tint: BlueyTheme.textDim)
+
+        styleButton.toolTip = "Answer style"
+        runButton.toolTip = "Start or pause listening"
+        endButton.toolTip = "Turn Bluey off"
+        styleButton.target = self
+        styleButton.action = #selector(styleClicked)
+        runButton.target = self
+        runButton.action = #selector(runClicked)
+        endButton.target = self
+        endButton.action = #selector(endClicked)
+        controlRail.addSubview(styleButton)
+        controlRail.addSubview(runButton)
+        controlRail.addSubview(endButton)
         updateRunStateDisplay()
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -830,13 +832,18 @@ private final class PillView: NSView {
         logoTile.layer?.cornerRadius = 8
         logoGlyph.frame = logoTile.bounds.insetBy(dx: 4, dy: 5)
 
-        let stateSide: CGFloat = 18
-        stateTile.frame = NSRect(
-            x: bounds.width - stateSide - 5,
-            y: (bounds.height - stateSide) / 2,
-            width: stateSide,
-            height: stateSide)
-        stateGlyph.frame = stateTile.bounds.insetBy(dx: 2, dy: 2)
+        let railWidth: CGFloat = 71
+        controlRail.frame = NSRect(
+            x: bounds.width - railWidth - 5,
+            y: (bounds.height - 24) / 2,
+            width: railWidth,
+            height: 24)
+        controlRail.layer?.cornerRadius = 12
+
+        let buttonSide: CGFloat = 20
+        styleButton.frame = NSRect(x: 3, y: 2, width: buttonSide, height: buttonSide)
+        runButton.frame = NSRect(x: 25.5, y: 2, width: buttonSide, height: buttonSide)
+        endButton.frame = NSRect(x: 48, y: 2, width: buttonSide, height: buttonSide)
 
         titleField.frame = NSRect(x: 41, y: (bounds.height - 20) / 2 + 1, width: 39, height: 20)
 
@@ -844,7 +851,7 @@ private final class PillView: NSView {
             .font: titleField.font ?? NSFont.systemFont(ofSize: 14.5, weight: .bold),
         ]).width)
         let dotSize: CGFloat = 7
-        let dotX = min(titleField.frame.minX + labelWidth + 4, stateTile.frame.minX - dotSize - 5)
+        let dotX = min(titleField.frame.minX + labelWidth + 4, controlRail.frame.minX - dotSize - 7)
         dotView.frame = NSRect(x: dotX, y: bounds.midY + 4.5, width: dotSize, height: dotSize)
         dotView.layer?.cornerRadius = dotSize / 2
     }
@@ -856,14 +863,55 @@ private final class PillView: NSView {
     }
 
     private func updateRunStateDisplay() {
-        stateGlyph.stringValue = runState.compactMark
-        stateGlyph.textColor = runState.symbolColor
-        stateTile.layer?.borderColor = runState.symbolColor.withAlphaComponent(0.22).cgColor
-        stateTile.layer?.backgroundColor = runState.symbolColor.withAlphaComponent(
-            runState == .listening ? 0.16 : 0.075).cgColor
+        configureRunButton()
+        runButton.layer?.backgroundColor = runState.symbolColor.withAlphaComponent(
+            runState == .listening ? 0.18 : 0.07).cgColor
+        runButton.layer?.borderColor = runState.symbolColor.withAlphaComponent(0.25).cgColor
         setAccessibilityLabel(runState.accessibilityLabel)
         needsLayout = true
     }
+
+    private func configureMiniButton(_ button: NSButton, symbol: String, fallback: String, tint: NSColor) {
+        button.isBordered = false
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 9
+        button.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.035).cgColor
+        button.layer?.borderWidth = 1
+        button.layer?.borderColor = NSColor.white.withAlphaComponent(0.08).cgColor
+        button.contentTintColor = tint
+        if let image = symbolImage(symbol) {
+            image.isTemplate = true
+            button.image = image
+            button.imagePosition = .imageOnly
+            button.title = ""
+        } else {
+            button.image = nil
+            button.attributedTitle = NSAttributedString(
+                string: fallback,
+                attributes: [
+                    .font: NSFont.systemFont(ofSize: 10.5, weight: .heavy),
+                    .foregroundColor: tint,
+                ])
+        }
+    }
+
+    private func configureRunButton() {
+        configureMiniButton(runButton, symbol: "", fallback: runState == .listening ? "Ⅱ" : "▶", tint: runState.symbolColor)
+        runButton.image = nil
+        runButton.attributedTitle = NSAttributedString(
+            string: runState == .listening ? "Ⅱ" : "▶",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: runState == .listening ? 11.5 : 10.0, weight: .heavy),
+                .foregroundColor: runState.symbolColor,
+            ])
+        runButton.alignment = .center
+    }
+
+    @objc private func runClicked() { onRunToggle?() }
+
+    @objc private func styleClicked() { onStyle?() }
+
+    @objc private func endClicked() { onEnd?() }
 
     override func draw(_ dirtyRect: NSRect) {
         NSGraphicsContext.saveGraphicsState()
@@ -2542,6 +2590,10 @@ private final class ExpandedPanelView: NSView {
     @objc private func hideClicked() { onClose?() }
 
     @objc private func closeClicked() {
+        showTurnOffConfirmation()
+    }
+
+    func showTurnOffConfirmation() {
         closeConfirmOverlay.isHidden = false
         closeConfirmOverlay.alphaValue = 0
         NSAnimationContext.runAnimationGroup { context in
@@ -2674,6 +2726,10 @@ private final class ExpandedPanelView: NSView {
     }
 
     @objc private func instructionsClicked() {
+        openAnswerStyleEditor()
+    }
+
+    func openAnswerStyleEditor() {
         answerStyleOverlay.isHidden = false
         answerStyleOverlay.alphaValue = 0
         NSAnimationContext.runAnimationGroup { context in
@@ -3521,6 +3577,9 @@ private final class OverlayApp {
         pillView.statusText = "Bluey"
         pillView.setRunState(currentRunState)
         pillView.onClick = { [weak self] in self?.expand() }
+        pillView.onRunToggle = { [weak self] in self?.toggleListeningFromPill() }
+        pillView.onStyle = { [weak self] in self?.expandAndOpenStyle() }
+        pillView.onEnd = { [weak self] in self?.expandAndConfirmTurnOff() }
 
         if captureVisibleForDebug {
             NSApp.activate(ignoringOtherApps: true)
@@ -3640,8 +3699,7 @@ private final class OverlayApp {
         window.contentView = view
         view.onClose = { [weak self] in self?.collapse() }
         view.onListeningStateChanged = { [weak self] state in
-            self?.currentRunState = state
-            self?.pillView?.setRunState(state)
+            self?.setRunState(state)
         }
         view.onOpacityChanged = { [weak self] opacity in
             let value = CGFloat(opacity)
@@ -3663,6 +3721,32 @@ private final class OverlayApp {
         bringPillToFront()
         emitSimple("hidden")
         emitLifecycle("collapsed")
+    }
+
+    private func setRunState(_ state: PillRunState) {
+        currentRunState = state
+        pillView?.setRunState(state)
+        expandedView?.setListeningState(state)
+    }
+
+    private func toggleListeningFromPill() {
+        if currentRunState == .listening || currentRunState == .connecting {
+            emitSimple("recording_stop_requested")
+            setRunState(.paused)
+        } else {
+            emitSimple("recording_start_requested")
+            setRunState(.listening)
+        }
+    }
+
+    private func expandAndOpenStyle() {
+        expand()
+        expandedView?.openAnswerStyleEditor()
+    }
+
+    private func expandAndConfirmTurnOff() {
+        expand()
+        expandedView?.showTurnOffConfirmation()
     }
 
     func handleCommand(_ cmd: OverlayCommand) {
@@ -3701,13 +3785,10 @@ private final class OverlayApp {
             expandedView?.setSessions(sessions)
         case .listeningStateChanged(let state):
             let runState = PillRunState(listeningState: state)
-            currentRunState = runState
-            pillView?.setRunState(runState)
-            expandedView?.setListeningState(runState)
+            setRunState(runState)
         case .transcriptPartial(let source, let text):
             let runState = PillRunState(listeningState: "listening")
-            currentRunState = runState
-            pillView?.setRunState(runState)
+            setRunState(runState)
             expandedView?.appendLiveTranscript(source: source, text: text, final: false)
         case .transcriptFinal(let source, let text):
             expandedView?.appendLiveTranscript(source: source, text: text, final: true)
