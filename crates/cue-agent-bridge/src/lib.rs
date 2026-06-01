@@ -23,6 +23,7 @@ pub mod connectors;
 pub mod discover;
 pub mod drive;
 pub mod fix;
+pub mod provision;
 pub mod registry;
 pub mod sessions;
 

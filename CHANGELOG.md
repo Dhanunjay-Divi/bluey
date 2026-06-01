@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Proactive provisioning (Phase A) — Bluey now installs a missing agent CLI so a
+  user with only the GUI becomes drivable, instead of degrading to read-only.
+  New `provision` module: vetted per-agent `InstallRecipe` (official npm/curl
+  sources only, shell-injection-guarded), a read-only **pre-flight diagnosis**,
+  and a **dynamic recovery** flow that handles the *class* of real-world install
+  obstructions (data-driven obstruction→remedy). First obstruction handled:
+  a broken symlink blocking `npm install` (`EEXIST`) — removed (consent-gated,
+  re-checked so a real file is never touched) then retried. Proven live on a real
+  machine: detected a broken `/usr/local/bin/codex` → deleted Homebrew cask,
+  cleared it, ran a real `npm install -g @openai/codex`, verified the binary, and
+  re-discovered Codex as `Drive` (was un-installable + un-runnable). Master plan:
+  docs/work/PLAN-PRODUCTION-VISION.md.
 - Adaptive Resolver core (self-healing session decoding, Track A1+A2): a
   schema-agnostic layer that re-derives where a message's text/role/order live
   when an agent changes its on-disk shape, so readers aren't pinned to one

@@ -58,6 +58,38 @@ pub struct AgentEntry {
     /// Review-gated "Fix" profile: the extra args that switch this agent
     /// between propose-only and apply (see [`FixProfile`]).
     pub fix: FixProfile,
+    /// How to PROACTIVELY install this agent's CLI when it's missing (so a user
+    /// with only the GUI app becomes drivable). `None` for agents with no known
+    /// official CLI installer. Recipes are vetted, official sources only — never
+    /// an arbitrary string — and are always run consent-gated + verified.
+    pub install: Option<InstallRecipe>,
+}
+
+/// A vetted recipe for installing an agent's CLI. Pure data; the runner in
+/// `provision.rs` executes it (consent-gated) and then verifies `verify_binary`
+/// appeared on `PATH`. Commands are official-source only (see
+/// `PLAN-PRODUCTION-VISION.md` §5 Phase A) — Bluey never runs an arbitrary
+/// install string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstallRecipe {
+    /// How the recipe is delivered.
+    pub method: InstallMethod,
+    /// The package/URL the method consumes (npm package name, or curl script
+    /// URL). e.g. `@openai/codex`, or `https://cursor.com/install`.
+    pub spec: &'static str,
+    /// The binary expected on `PATH` after a successful install — used to
+    /// VERIFY the install actually worked (never trust the installer's exit
+    /// code alone).
+    pub verify_binary: &'static str,
+}
+
+/// Delivery method for an [`InstallRecipe`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallMethod {
+    /// `npm install -g <spec>`. Requires Node/npm present.
+    NpmGlobal,
+    /// `curl -fsSL <spec> | bash` — official vendor install script.
+    CurlScript,
 }
 
 /// Per-agent profile for the review-gated **Fix** lane (see
@@ -178,6 +210,11 @@ pub const REGISTRY: &[AgentEntry] = &[
         drive_command: &["claude", "-p", "{prompt}"],
         answer_args: &[],
         mcp_allow_flag: None,
+        install: Some(InstallRecipe {
+            method: InstallMethod::CurlScript,
+            spec: "https://claude.ai/install.sh",
+            verify_binary: "claude",
+        }),
         fix: FixProfile {
             propose_args: &["--permission-mode", "plan"],
             apply_args: &["--permission-mode", "acceptEdits"],
@@ -204,6 +241,11 @@ pub const REGISTRY: &[AgentEntry] = &[
         mcp_allow_flag: None,
         // NEVER `--plan`: Cursor's `--plan` flag is a known bug that writes
         // files. Propose = omit `--force` + rely on the prompt.
+        install: Some(InstallRecipe {
+            method: InstallMethod::CurlScript,
+            spec: "https://cursor.com/install",
+            verify_binary: "cursor-agent",
+        }),
         fix: FixProfile {
             propose_args: &[],
             apply_args: &["--force"],
@@ -231,6 +273,11 @@ pub const REGISTRY: &[AgentEntry] = &[
         mcp_allow_flag: Some("--allowed-mcp-server-names"),
         // Antigravity drives through the `gemini` CLI, so it shares Gemini's
         // approval-mode flags.
+        install: Some(InstallRecipe {
+            method: InstallMethod::CurlScript,
+            spec: "https://antigravity.google/cli/install.sh",
+            verify_binary: "agy",
+        }),
         fix: FixProfile {
             propose_args: &["--approval-mode", "plan"],
             apply_args: &["--approval-mode", "yolo"],
@@ -260,6 +307,11 @@ pub const REGISTRY: &[AgentEntry] = &[
         mcp_allow_flag: None,
         // Copilot has no native propose flag; propose is prompt-only. Apply
         // needs `--allow-all-tools` (without it `-p` stalls).
+        install: Some(InstallRecipe {
+            method: InstallMethod::NpmGlobal,
+            spec: "@github/copilot",
+            verify_binary: "copilot",
+        }),
         fix: FixProfile {
             propose_args: &[],
             apply_args: &["--allow-all-tools"],
@@ -279,6 +331,11 @@ pub const REGISTRY: &[AgentEntry] = &[
         drive_command: &["gemini", "-p", "{prompt}"],
         answer_args: &[],
         mcp_allow_flag: Some("--allowed-mcp-server-names"),
+        install: Some(InstallRecipe {
+            method: InstallMethod::NpmGlobal,
+            spec: "@google/gemini-cli",
+            verify_binary: "gemini",
+        }),
         fix: FixProfile {
             propose_args: &["--approval-mode", "plan"],
             apply_args: &["--approval-mode", "yolo"],
@@ -303,6 +360,11 @@ pub const REGISTRY: &[AgentEntry] = &[
         // read-only MCP/tool side-effect behavior is NEEDS-LIVE-VERIFY.
         answer_args: &["--sandbox", "read-only", "--ask-for-approval", "never"],
         mcp_allow_flag: None,
+        install: Some(InstallRecipe {
+            method: InstallMethod::NpmGlobal,
+            spec: "@openai/codex",
+            verify_binary: "codex",
+        }),
         fix: FixProfile {
             propose_args: &["--sandbox", "read-only", "--ask-for-approval", "never"],
             apply_args: &[
@@ -327,6 +389,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         drive_command: &["aider", "--message", "{prompt}"],
         answer_args: &[],
         mcp_allow_flag: None,
+        install: None,
         fix: FixProfile {
             propose_args: &["--dry-run"],
             apply_args: &["--yes-always"],
@@ -347,6 +410,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         answer_args: &[],
         mcp_allow_flag: None,
         // No headless CLI to drive an apply — propose-capable only.
+        install: None,
         fix: FixProfile {
             propose_args: &[],
             apply_args: &[],
@@ -367,6 +431,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         answer_args: &[],
         mcp_allow_flag: None,
         // No headless CLI to drive an apply — propose-capable only.
+        install: None,
         fix: FixProfile {
             propose_args: &[],
             apply_args: &[],
