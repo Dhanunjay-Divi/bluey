@@ -628,7 +628,7 @@ private final class OverlayWindow: NSWindow {
 
 // MARK: - Pill view
 
-private enum PillRunState {
+private enum PillRunState: Equatable {
     case ready
     case connecting
     case listening
@@ -677,6 +677,21 @@ private enum PillRunState {
             return "play.fill"
         case .failed:
             return "exclamationmark"
+        }
+    }
+
+    var compactMark: String {
+        switch self {
+        case .ready:
+            return "▶"
+        case .connecting:
+            return "~"
+        case .listening:
+            return "Ⅱ"
+        case .paused:
+            return "▶"
+        case .failed:
+            return "!"
         }
     }
 
@@ -748,7 +763,7 @@ private final class PillView: NSView {
     private let titleField = NSTextField(labelWithString: "Bluey")
     private let dotView = NSView()
     private let stateTile = NSView()
-    private let stateGlyph = NSImageView()
+    private let stateGlyph = NSTextField(labelWithString: "▶")
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -798,8 +813,9 @@ private final class PillView: NSView {
         stateTile.layer?.borderColor = NSColor.white.withAlphaComponent(0.10).cgColor
         addSubview(stateTile)
 
-        stateGlyph.imageScaling = .scaleProportionallyDown
-        stateGlyph.contentTintColor = runState.symbolColor
+        stateGlyph.font = NSFont.systemFont(ofSize: 10.5, weight: .heavy)
+        stateGlyph.textColor = runState.symbolColor
+        stateGlyph.alignment = .center
         stateTile.addSubview(stateGlyph)
         updateRunStateDisplay()
     }
@@ -820,7 +836,7 @@ private final class PillView: NSView {
             y: (bounds.height - stateSide) / 2,
             width: stateSide,
             height: stateSide)
-        stateGlyph.frame = stateTile.bounds.insetBy(dx: 4, dy: 4)
+        stateGlyph.frame = stateTile.bounds.insetBy(dx: 2, dy: 2)
 
         titleField.frame = NSRect(x: 41, y: (bounds.height - 20) / 2 + 1, width: 39, height: 20)
 
@@ -840,10 +856,11 @@ private final class PillView: NSView {
     }
 
     private func updateRunStateDisplay() {
-        stateGlyph.image = symbolImage(runState.symbolName)
-        stateGlyph.contentTintColor = runState.symbolColor
+        stateGlyph.stringValue = runState.compactMark
+        stateGlyph.textColor = runState.symbolColor
         stateTile.layer?.borderColor = runState.symbolColor.withAlphaComponent(0.22).cgColor
-        stateTile.layer?.backgroundColor = runState.symbolColor.withAlphaComponent(0.075).cgColor
+        stateTile.layer?.backgroundColor = runState.symbolColor.withAlphaComponent(
+            runState == .listening ? 0.16 : 0.075).cgColor
         setAccessibilityLabel(runState.accessibilityLabel)
         needsLayout = true
     }
