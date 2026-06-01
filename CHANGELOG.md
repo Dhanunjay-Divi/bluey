@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Adaptive Resolver core (self-healing session decoding, Track A1+A2): a
+  schema-agnostic layer that re-derives where a message's text/role/order live
+  when an agent changes its on-disk shape, so readers aren't pinned to one
+  version's field names. Deterministic-first — a persisted recipe cache keyed by
+  a structure fingerprint, a heuristic shape-detector (longest-string field =
+  text, small-domain field = role, named/int values mapped), and a validation
+  gate that rejects incoherent recipes. Verified it adapts to Cursor, Claude,
+  AND an unseen made-up format with zero hardcoding. No AI yet — there's a
+  marked extension point (Track A3) where an AI fallback slots in, always behind
+  the same validation gate. Design: docs/work/PLAN-ADAPTIVE-RESOLVER.md.
+
+### Changed
+- Corrected the per-agent CLI drive command map against official 2025-2026 docs
+  (we had guessed wrong before): Cursor now uses `--output-format json` (a new
+  `CursorJson` parser captures the answer + session id) and `--resume=<id>`;
+  Codex uses `exec --json` (a new `CodexJsonl` parser) with the read-safe
+  `--sandbox read-only --ask-for-approval never`; Copilot's bogus `--continue`
+  resume is removed (it has none) and `-s` added; `agy` (Antigravity CLI) is now
+  a discovery candidate. Each change is annotated DOC-CONFIRMED vs
+  NEEDS-LIVE-VERIFY (Cursor/Copilot/Codex aren't installed here, so the commands
+  match docs but await a live run).
+
 ### Security
 - Hardened the connector secret guarantee. The stored HTTP connector URL now has
   its query string and fragment stripped (some MCP endpoints embed tokens as

@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub mod adaptive;
 pub mod capability;
 pub mod connectors;
 pub mod discover;
