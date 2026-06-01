@@ -283,7 +283,7 @@ pub async fn device_start(
     Ok(Json(DeviceStartResponse {
         device_code,
         user_code,
-        verification_uri: format!("{}/device", state.config.public_url),
+        verification_uri: format!("{}/link", state.config.public_url),
         expires_in: DEVICE_CODE_TTL_SECS,
         interval: DEVICE_POLL_INTERVAL_SECS,
     }))

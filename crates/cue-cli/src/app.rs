@@ -22,7 +22,7 @@ use cue_core::{
     ProviderSelector, Speaker, BLUEY_TRACE_ID_ENV,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration, Instant};
 
 #[derive(Debug, Parser)]
@@ -1117,94 +1117,52 @@ async fn browser_login(
     user_id: String,
     workspace_id: String,
 ) -> Result<AccountConfig> {
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let config = cue_cloud_client::client::ClientConfig {
+        base_url: api_url.to_string(),
+        trace_id: Some(command_trace_id()),
+        ..Default::default()
+    };
+    let client = cue_cloud_client::CloudClient::new(
+        config,
+        Arc::new(cue_cloud_client::tokens::KeyringStore::new()),
+    )
+    .context("failed to initialize Bluey cloud client")?;
+    let flow = cue_cloud_client::DeviceFlow::start(&client)
         .await
-        .context("failed to start local login callback listener")?;
-    let port = listener.local_addr()?.port();
-    let state = format!("bluey-{}-{}", std::process::id(), epoch_ms()?);
-    let callback = format!("http://127.0.0.1:{port}/callback");
-    let login_url = format!(
-        "{}/login?callback={}&state={}&product=bluey",
-        api_url.trim_end_matches('/'),
-        percent_encode(&callback),
-        percent_encode(&state)
-    );
+        .context("failed to start browser login")?;
+    let login_url = device_login_url(&flow.verification_uri, &flow.user_code);
 
-    println!("Opening browser login...");
+    println!("Opening Bluey sign-in...");
+    println!("Code: {}", flow.user_code);
     println!("{login_url}");
     let _ = open_browser(&login_url);
 
-    let token_result = tokio::time::timeout(Duration::from_secs(300), async {
-        loop {
-            let (stream, _) = listener.accept().await?;
-            if let Some(result) = handle_login_callback(stream, &state).await? {
-                return Ok::<_, anyhow::Error>(result);
-            }
-        }
+    let auth = tokio::time::timeout(Duration::from_secs(DEVICE_LOGIN_TIMEOUT_SECS), async {
+        flow.await_login(&client).await.map_err(anyhow::Error::from)
     })
     .await
-    .context("login timed out after 5 minutes")??;
+    .context("login timed out after 10 minutes")??;
 
     let mut account = AccountConfig::local();
     account.provider = "bluey".to_string();
     account.api_url = api_url.to_string();
-    account.user_id = user_id;
+    account.user_id = if user_id == "local-user" {
+        auth.account.email.clone()
+    } else {
+        user_id
+    };
     account.workspace_id = workspace_id;
-    account.access_token = Some(token_result.0);
-    account.refresh_token = token_result.1;
+    account.access_token = Some(auth.access_token);
+    account.refresh_token = Some(auth.refresh_token);
     Ok(account)
 }
 
-async fn handle_login_callback(
-    mut stream: TcpStream,
-    expected_state: &str,
-) -> Result<Option<(String, Option<String>)>> {
-    let mut reader = BufReader::new(&mut stream);
-    let mut first_line = String::new();
-    reader.read_line(&mut first_line).await?;
-    let path = first_line.split_whitespace().nth(1).unwrap_or_default();
-    let params = parse_query(path);
-    let token = params
-        .iter()
-        .find(|(key, _)| key == "token")
-        .map(|(_, value)| value.clone());
-    let refresh_token = params
-        .iter()
-        .find(|(key, _)| key == "refreshToken" || key == "refresh_token")
-        .map(|(_, value)| value.clone());
-    let state = params
-        .iter()
-        .find(|(key, _)| key == "state")
-        .map(|(_, value)| value.as_str())
-        .unwrap_or_default();
+const DEVICE_LOGIN_TIMEOUT_SECS: u64 = 600;
 
-    let (status, body, result) = if state != expected_state {
-        (
-            "403 Forbidden",
-            "Bluey login rejected: state mismatch.",
-            None,
-        )
-    } else if let Some(token) = token {
-        (
-            "200 OK",
-            "Bluey login complete. You can close this tab and return to the terminal.",
-            Some((token, refresh_token)),
-        )
-    } else {
-        (
-            "400 Bad Request",
-            "Bluey login failed: missing token.",
-            None,
-        )
-    };
-
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(response.as_bytes()).await?;
-    stream.flush().await?;
-    Ok(result)
+fn device_login_url(verification_uri: &str, user_code: &str) -> String {
+    let base = verification_uri.trim_end_matches('/');
+    let separator = if base.contains('?') { '&' } else { '?' };
+    format!("{base}{separator}user_code={user_code}")
 }
 
 fn read_pinky_api_from_auth() -> Option<String> {
@@ -1332,56 +1290,6 @@ fn open_browser(url: &str) -> Result<()> {
         .status()
         .context("failed to open browser")?;
     Ok(())
-}
-
-fn parse_query(path: &str) -> Vec<(String, String)> {
-    let Some((_, query)) = path.split_once('?') else {
-        return Vec::new();
-    };
-    query
-        .split('&')
-        .filter_map(|pair| {
-            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            Some((percent_decode(key)?, percent_decode(value)?))
-        })
-        .collect()
-}
-
-fn percent_encode(value: &str) -> String {
-    let mut output = String::new();
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                output.push(byte as char)
-            }
-            _ => output.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    output
-}
-
-fn percent_decode(value: &str) -> Option<String> {
-    let bytes = value.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'+' => {
-                output.push(b' ');
-                index += 1;
-            }
-            b'%' if index + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok()?;
-                output.push(u8::from_str_radix(hex, 16).ok()?);
-                index += 3;
-            }
-            byte => {
-                output.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8(output).ok()
 }
 
 #[cfg(target_os = "windows")]
@@ -2738,7 +2646,7 @@ async fn bluey_delete_account_cmd(force: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bluey_on_boot_lines, BlueyOnAuthState};
+    use super::{bluey_on_boot_lines, device_login_url, BlueyOnAuthState};
 
     #[test]
     fn bluey_on_boot_lines_offer_signin_without_forcing_browser_when_unlinked() {
@@ -2766,5 +2674,21 @@ mod tests {
         assert!(lines
             .iter()
             .any(|line| line.contains("https://bluey.sh/link")));
+    }
+
+    #[test]
+    fn device_login_url_appends_code_to_link_page() {
+        assert_eq!(
+            device_login_url("https://bluey.sh/link", "ABCD-EFGH"),
+            "https://bluey.sh/link?user_code=ABCD-EFGH"
+        );
+    }
+
+    #[test]
+    fn device_login_url_preserves_existing_query() {
+        assert_eq!(
+            device_login_url("https://bluey.sh/link?source=desktop", "ABCD-EFGH"),
+            "https://bluey.sh/link?source=desktop&user_code=ABCD-EFGH"
+        );
     }
 }

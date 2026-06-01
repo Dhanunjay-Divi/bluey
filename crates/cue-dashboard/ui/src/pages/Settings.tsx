@@ -43,9 +43,22 @@ export function Settings() {
 
 function AccountCard() {
   const [me, setMe] = useState<AccountMe | null>(null);
+  const [loaded, setLoaded] = useState(false);
   useEffect(() => {
-    invoke<AccountMe | null>("account_me").then(setMe).catch(() => {});
+    invoke<AccountMe | null>("account_me")
+      .then(setMe)
+      .catch(() => {})
+      .finally(() => setLoaded(true));
   }, []);
+
+  async function signIn() {
+    try {
+      const url = await invoke<string>("get_signin_url");
+      window.open(url, "_blank");
+    } catch (e) {
+      console.warn("get_signin_url failed", e);
+    }
+  }
 
   async function openPortal() {
     try {
@@ -85,10 +98,22 @@ function AccountCard() {
             )}
           </div>
         </div>
+      ) : loaded ? (
+        <div className="space-y-2">
+          <p className="text-sm text-zinc-400">
+            Sign in once in the browser. Bluey stores desktop tokens in the OS keychain.
+          </p>
+          <button
+            onClick={signIn}
+            className="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded-md bg-blue-500 hover:bg-blue-400 text-white"
+          >
+            Sign in or create account <ExternalLink className="h-3 w-3" />
+          </button>
+        </div>
       ) : (
-        <p className="text-sm text-zinc-500">Loading…</p>
+        <p className="text-sm text-zinc-500">Checking account…</p>
       )}
-      <div className="flex flex-wrap gap-2">
+      {me && <div className="flex flex-wrap gap-2">
         <button
           onClick={openPortal}
           className="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-100"
@@ -107,7 +132,7 @@ function AccountCard() {
         >
           Delete account <Trash2 className="h-3 w-3" />
         </button>
-      </div>
+      </div>}
     </div>
   );
 }

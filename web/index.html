@@ -924,6 +924,39 @@
       line-height: 1.45;
     }
 
+    .device-link-hint {
+      display: grid;
+      gap: 6px;
+      margin-bottom: 14px;
+      padding: 12px;
+      border: 1px solid rgba(114, 240, 255, .22);
+      border-radius: 14px;
+      background: rgba(114, 240, 255, .07);
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.4;
+    }
+
+    .device-link-hint[hidden] {
+      display: none;
+    }
+
+    .device-link-hint strong {
+      color: var(--cyan);
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      font-size: 11px;
+    }
+
+    .device-link-hint code {
+      padding: 2px 7px;
+      border: 1px solid rgba(255, 255, 255, .16);
+      border-radius: 999px;
+      color: var(--text);
+      background: rgba(0, 0, 0, .28);
+      font: 850 12px ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    }
+
     .account-preview-card {
       display: grid;
       gap: 12px;
@@ -1206,6 +1239,7 @@
           <aside class="account-card" id="accountAuthCard">
             <h2>Sign in</h2>
             <p>Use this account from the browser and from the Bluey desktop.</p>
+            <div class="device-link-hint" id="deviceLinkHint" hidden></div>
             <form class="account-form" id="accountForm">
               <label>
                 Email
@@ -1469,7 +1503,7 @@
   <script>
     const accountApp = document.getElementById('accountApp');
     const productSite = document.getElementById('productSite');
-    const accountRoutes = new Set(['/account', '/reload', '/link']);
+    const accountRoutes = new Set(['/account', '/reload', '/link', '/device']);
     const currentPath = window.location.pathname.replace(/\/+$/, '') || '/';
     const isAccountRoute = accountRoutes.has(currentPath);
 
@@ -1479,6 +1513,12 @@
 
     function accountToken() {
       return localStorage.getItem('bluey_access_token') || '';
+    }
+
+    function pendingDeviceCode() {
+      const params = new URLSearchParams(location.search);
+      const code = params.get('user_code') || params.get('device_code') || '';
+      return code.trim().toUpperCase();
     }
 
     function setAccountToken(auth) {
@@ -1512,6 +1552,55 @@
     function accountMessage(text, auth = false) {
       const el = document.getElementById(auth ? 'accountAuthMessage' : 'accountMessage');
       if (el) el.textContent = text || '';
+    }
+
+    function renderDeviceLinkHint() {
+      const code = pendingDeviceCode();
+      const el = document.getElementById('deviceLinkHint');
+      if (!el) return;
+      if (!code) {
+        el.hidden = true;
+        return;
+      }
+      el.hidden = false;
+      el.replaceChildren();
+      const title = document.createElement('strong');
+      title.textContent = 'Linking desktop Bluey';
+      const body = document.createElement('span');
+      body.append('Code ');
+      const codeEl = document.createElement('code');
+      codeEl.textContent = code;
+      body.append(codeEl, '. Sign in or create an account here; the app will connect automatically.');
+      el.append(title, body);
+    }
+
+    async function approvePendingDevice() {
+      const code = pendingDeviceCode();
+      if (!code || !accountToken()) return false;
+      const storageKey = `bluey_device_approved_${code}`;
+      if (sessionStorage.getItem(storageKey) === '1') return true;
+      accountMessage('Linking this browser account to the desktop app...');
+      await apiJson('/auth/device/approve', {
+        method: 'POST',
+        body: JSON.stringify({ user_code: code }),
+      });
+      sessionStorage.setItem(storageKey, '1');
+      accountMessage('Desktop linked. Return to Bluey; it will finish automatically.');
+      return true;
+    }
+
+    async function openDesktopDeepLinkIfNeeded() {
+      if (currentPath !== '/link' || pendingDeviceCode() || !accountToken()) return false;
+      if (sessionStorage.getItem('bluey_desktop_deep_link_started') === '1') return false;
+      accountMessage('Opening Bluey desktop...');
+      const link = await apiJson('/auth/link/mint', {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+      sessionStorage.setItem('bluey_desktop_deep_link_started', '1');
+      window.location.href = link.deep_link_url;
+      accountMessage('Bluey should open now. If it does not, make sure the desktop app is installed, then run bluey on.');
+      return true;
     }
 
     async function accountAuth(mode) {
@@ -1572,6 +1661,12 @@
       accountMessage(new URLSearchParams(location.search).get('reload') === 'success'
         ? 'Reload complete. If balance has not updated yet, Square is still delivering the webhook.'
         : '');
+      try {
+        const approved = await approvePendingDevice();
+        if (!approved) await openDesktopDeepLinkIfNeeded();
+      } catch (error) {
+        accountMessage(`Account signed in, but desktop handoff failed: ${error.message}`);
+      }
     }
 
     async function startReload() {
@@ -1591,6 +1686,7 @@
       if (!isAccountRoute) return;
       productSite.hidden = true;
       accountApp.hidden = false;
+      renderDeviceLinkHint();
 
       const params = new URLSearchParams(location.search);
       if (params.get('access_token')) {
