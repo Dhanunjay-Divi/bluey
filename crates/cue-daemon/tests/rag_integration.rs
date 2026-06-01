@@ -1,9 +1,11 @@
 //! Integration tests for the RAG pipeline.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use cue_core::{ContextArtifact, ContextKind};
+use cue_daemon::db::rag::RagPipeline;
 use cue_rag::{Chunk, Chunker, EmbeddingError, EmbeddingProvider, VectorStore};
 
 /// Mock embedder that returns deterministic embeddings based on text length.
@@ -229,4 +231,34 @@ async fn rag_live_indexing_smoke() {
     let results = store.query(&query_emb, 5, Some("live-session")).unwrap();
     assert!(!results.is_empty());
     assert_eq!(results[0].session_id, "live-session");
+}
+
+#[tokio::test]
+async fn rag_indexes_context_artifact_with_source_labels() {
+    let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder);
+    let pipeline = RagPipeline::new(PathBuf::from(":memory:"), embedder).unwrap();
+    let artifact = ContextArtifact::new(
+        ContextKind::Document,
+        "/Users/example/launch-plan.md",
+        "Launch plan",
+        Some("Added during the live session".to_string()),
+        Some(128),
+    )
+    .with_text_preview("The launch plan says revenue reporting depends on cache invalidation.");
+
+    pipeline
+        .index_context_artifact("session-docs", &artifact)
+        .await;
+
+    let hits = pipeline
+        .query("cache invalidation revenue", 5, Some("session-docs"))
+        .await
+        .unwrap();
+    assert!(!hits.is_empty());
+    assert_eq!(hits[0].session_id, "session-docs");
+    assert!(hits[0].chunk_text.contains("Attached context: Launch plan"));
+    assert!(hits[0]
+        .chunk_text
+        .contains("Source: /Users/example/launch-plan.md"));
+    assert!(hits[0].chunk_text.contains("cache invalidation"));
 }

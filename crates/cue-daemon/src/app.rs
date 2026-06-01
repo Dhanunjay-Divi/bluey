@@ -873,7 +873,7 @@ async fn handle_request_inner(
             text,
             is_final,
         } => {
-            let Some((meeting_snapshot, cards)) = ({
+            let Some((meeting_snapshot, cards, indexed_segment)) = ({
                 let mut meeting_guard = daemon.meeting.lock().await;
                 if meeting_guard.is_none() {
                     *meeting_guard = Some(MeetingRecord::new(Some("Ad hoc meeting".to_string())));
@@ -890,13 +890,20 @@ async fn handle_request_inner(
                     meeting.action_items.extend(analysis.action_items);
                     meeting.decisions.extend(analysis.decisions);
                     daemon.store.save_active(meeting)?;
-                    Some((meeting.clone(), analysis.cards))
+                    let indexed_segment = segment
+                        .is_final
+                        .then(|| (meeting.id.to_string(), segment.text.clone()));
+                    Some((meeting.clone(), analysis.cards, indexed_segment))
                 }
             }) else {
                 return Ok(DaemonResponse::Text {
                     text: format!("Skipped duplicate transcript segment from {speaker}."),
                 });
             };
+
+            if let Some((session_id, text)) = indexed_segment {
+                index_transcript_for_rag(daemon, session_id, text);
+            }
 
             update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
             let has_cards = !cards.is_empty();
@@ -924,17 +931,7 @@ async fn handle_request_inner(
         }
         DaemonRequest::ContextAdd { path, title, note } => {
             let artifact = build_context_artifact(path, title, note)?;
-            let meeting_snapshot = {
-                let mut meeting_guard = daemon.meeting.lock().await;
-                if meeting_guard.is_none() {
-                    *meeting_guard = Some(MeetingRecord::new(Some("Ad hoc meeting".to_string())));
-                }
-
-                let meeting = meeting_guard.as_mut().expect("meeting exists");
-                meeting.context.push(artifact.clone());
-                daemon.store.save_active(meeting)?;
-                meeting.clone()
-            };
+            let meeting_snapshot = attach_context_artifacts(daemon, vec![artifact.clone()]).await?;
 
             update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
             let card = CueCard::new(
@@ -3112,18 +3109,44 @@ async fn add_audio_transcript_segment(
         ts_ms,
     });
 
-    // Live RAG indexing on Final transcripts (fire-and-forget).
     if segment.is_final {
-        if let Some(rag) = daemon.rag.as_ref() {
-            let rag = Arc::clone(rag);
-            let sid = meeting_snapshot.id.to_string();
-            let t = text.to_string();
-            tokio::spawn(async move {
-                rag.index_transcript(&sid, &t).await;
-            });
-        }
+        index_transcript_for_rag(daemon, meeting_snapshot.id.to_string(), text.to_string());
     }
     Ok(())
+}
+
+fn index_transcript_for_rag(daemon: &Arc<Daemon>, session_id: String, text: String) {
+    let Some(rag) = daemon.rag.as_ref() else {
+        return;
+    };
+    if text.trim().is_empty() {
+        return;
+    }
+
+    let rag = Arc::clone(rag);
+    tokio::spawn(async move {
+        rag.index_transcript(&session_id, &text).await;
+    });
+}
+
+fn index_context_artifacts_for_rag(
+    daemon: &Arc<Daemon>,
+    session_id: String,
+    artifacts: Vec<ContextArtifact>,
+) {
+    let Some(rag) = daemon.rag.as_ref() else {
+        return;
+    };
+    if artifacts.is_empty() {
+        return;
+    }
+
+    let rag = Arc::clone(rag);
+    tokio::spawn(async move {
+        for artifact in artifacts {
+            rag.index_context_artifact(&session_id, &artifact).await;
+        }
+    });
 }
 
 async fn handle_attach_requested(daemon: &Arc<Daemon>) -> Result<()> {
@@ -3267,10 +3290,6 @@ async fn answer_with_provider_runtime(
             request.instructions.take(),
             meeting.answer_instructions.clone(),
         );
-        if request.context.is_empty() {
-            request.context = answer_context_from_meeting(meeting);
-        }
-
         let mut answer_meeting = meeting.clone();
         if let Some(instructions) = request
             .instructions
@@ -3282,6 +3301,11 @@ async fn answer_with_provider_runtime(
 
         (meeting.clone(), answer_meeting)
     };
+
+    if request.context.is_empty() {
+        request.context =
+            answer_context_for_question(daemon, &meeting_snapshot, &request.question).await;
+    }
 
     let (visible_question_title, visible_question) =
         visible_question_for_source(&request.question, &source);
@@ -4509,6 +4533,108 @@ fn provider_selector(provider: &str, model: Option<&str>) -> ProviderSelector {
     }
 }
 
+async fn answer_context_for_question(
+    daemon: &Arc<Daemon>,
+    meeting: &MeetingRecord,
+    question: &str,
+) -> Vec<AnswerContext> {
+    let mut context = answer_context_from_meeting(meeting);
+    context.extend(retrieved_memory_contexts(daemon, meeting, question).await);
+    context
+}
+
+async fn retrieved_memory_contexts(
+    daemon: &Arc<Daemon>,
+    meeting: &MeetingRecord,
+    question: &str,
+) -> Vec<AnswerContext> {
+    let Some(rag) = daemon.rag.as_ref() else {
+        return Vec::new();
+    };
+    if question.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let current_session_id = meeting.id.to_string();
+    let mut contexts = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    match rag.query(question, 4, Some(&current_session_id)).await {
+        Ok(hits) => {
+            for hit in hits {
+                if let Some(context) =
+                    rag_hit_to_answer_context(hit, &current_session_id, &mut seen)
+                {
+                    contexts.push(context);
+                }
+            }
+        }
+        Err(error) => {
+            debug!(
+                session_id = %current_session_id,
+                error = %error,
+                "local RAG current-session query failed"
+            );
+        }
+    }
+
+    match rag.query(question, 6, None).await {
+        Ok(hits) => {
+            for hit in hits {
+                if contexts.len() >= 8 {
+                    break;
+                }
+                if let Some(context) =
+                    rag_hit_to_answer_context(hit, &current_session_id, &mut seen)
+                {
+                    contexts.push(context);
+                }
+            }
+        }
+        Err(error) => {
+            debug!(
+                session_id = %current_session_id,
+                error = %error,
+                "local RAG global query failed"
+            );
+        }
+    }
+
+    contexts
+}
+
+fn rag_hit_to_answer_context(
+    hit: cue_rag::RagHit,
+    current_session_id: &str,
+    seen: &mut std::collections::HashSet<(String, String)>,
+) -> Option<AnswerContext> {
+    if hit.score < 0.18 || hit.chunk_text.trim().is_empty() {
+        return None;
+    }
+    let key = (hit.session_id.clone(), hit.chunk_text.clone());
+    if !seen.insert(key) {
+        return None;
+    }
+
+    let same_session = hit.session_id == current_session_id;
+    let title = if same_session {
+        "Relevant current-session memory"
+    } else {
+        "Relevant older Bluey memory"
+    };
+    let source = if same_session {
+        "local RAG · current session".to_string()
+    } else {
+        format!("local RAG · session {}", hit.session_id)
+    };
+    let content = format!("Relevance: {:.2}\n{}", hit.score, hit.chunk_text.trim());
+    Some(
+        AnswerContext::new(AnswerContextKind::MeetingMemory, content)
+            .with_title(title)
+            .with_source(source),
+    )
+}
+
 fn answer_context_from_meeting(meeting: &MeetingRecord) -> Vec<AnswerContext> {
     let mut context = Vec::new();
     let transcript = meeting.last_transcript_text(24);
@@ -4532,6 +4658,7 @@ fn answer_context_from_meeting(meeting: &MeetingRecord) -> Vec<AnswerContext> {
     for artifact in meeting
         .context
         .iter()
+        .rev()
         .filter(|artifact| {
             artifact.processing_status == ContextProcessingStatus::Ready
                 || artifact
@@ -4809,7 +4936,7 @@ async fn analyze_screen_with_screenshot_fallback(
         compact_snippet(&page_error_text, 260)
     );
     let mut request = vision_answer_request(&question, provider);
-    request.context = answer_context_from_meeting(&meeting_snapshot);
+    request.context = answer_context_for_question(daemon, &meeting_snapshot, &question).await;
     request.context.push(
         AnswerContext::new(
             AnswerContextKind::Screenshot,
@@ -5181,15 +5308,21 @@ async fn attach_context_artifacts(
     daemon: &Arc<Daemon>,
     artifacts: Vec<ContextArtifact>,
 ) -> Result<MeetingRecord> {
-    let mut meeting_guard = daemon.meeting.lock().await;
-    if meeting_guard.is_none() {
-        *meeting_guard = Some(MeetingRecord::new(Some("Ad hoc meeting".to_string())));
-    }
+    let indexed_artifacts = artifacts.clone();
+    let meeting_snapshot = {
+        let mut meeting_guard = daemon.meeting.lock().await;
+        if meeting_guard.is_none() {
+            *meeting_guard = Some(MeetingRecord::new(Some("Ad hoc meeting".to_string())));
+        }
 
-    let meeting = meeting_guard.as_mut().expect("meeting exists");
-    meeting.context.extend(artifacts);
-    daemon.store.save_active(meeting)?;
-    Ok(meeting.clone())
+        let meeting = meeting_guard.as_mut().expect("meeting exists");
+        meeting.context.extend(artifacts);
+        daemon.store.save_active(meeting)?;
+        meeting.clone()
+    };
+
+    index_context_artifacts_for_rag(daemon, meeting_snapshot.id.to_string(), indexed_artifacts);
+    Ok(meeting_snapshot)
 }
 
 async fn continue_session(

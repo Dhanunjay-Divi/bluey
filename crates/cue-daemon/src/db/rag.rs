@@ -7,6 +7,7 @@ use anyhow::Result;
 use tokio::sync::Mutex;
 use tracing::warn;
 
+use cue_core::{ContextArtifact, ContextProcessingStatus};
 use cue_rag::{Chunker, EmbeddingProvider, RagHit, VectorStore};
 
 /// Daemon-level RAG pipeline: chunker + embedder + vector store.
@@ -31,6 +32,46 @@ impl RagPipeline {
     /// Index a transcript segment. Chunks the text, embeds each chunk, and stores.
     /// Errors are logged but never propagated (fire-and-forget for live indexing).
     pub async fn index_transcript(&self, session_id: &str, text: &str) {
+        self.index_text(session_id, text).await;
+    }
+
+    /// Index a user-approved context artifact such as a document, page capture,
+    /// screenshot OCR/vision note, or source file preview.
+    ///
+    /// The vector store does not yet have separate source metadata columns, so
+    /// the indexed text is prefixed with a compact source header. That keeps
+    /// retrieved snippets self-explanatory in answer prompts and cloud sync.
+    pub async fn index_context_artifact(&self, session_id: &str, artifact: &ContextArtifact) {
+        if artifact.processing_status != ContextProcessingStatus::Ready {
+            return;
+        }
+        let Some(preview) = artifact
+            .text_preview
+            .as_deref()
+            .filter(|preview| !preview.trim().is_empty())
+        else {
+            return;
+        };
+
+        let mut text = format!(
+            "Attached context: {}\nKind: {}\nSource: {}",
+            artifact.title, artifact.kind, artifact.path
+        );
+        if let Some(note) = artifact
+            .note
+            .as_deref()
+            .filter(|note| !note.trim().is_empty())
+        {
+            text.push_str("\nNote: ");
+            text.push_str(note.trim());
+        }
+        text.push_str("\n\n");
+        text.push_str(preview.trim());
+
+        self.index_text(session_id, &text).await;
+    }
+
+    async fn index_text(&self, session_id: &str, text: &str) {
         let chunks = self.chunker.chunk(text);
         if chunks.is_empty() {
             return;

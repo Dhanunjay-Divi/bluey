@@ -220,6 +220,45 @@ Customer balance: $27.39 → $27.34
 canonical source of truth for the locked markup tiers.)
 ```
 
+## 5.5. Session memory, attachments, and RAG
+
+Bluey has two memory layers:
+
+1. **Immediate session context**: recent transcript, recent Q&A, latest
+   attached documents/screenshots/page captures, and the user's answer style.
+2. **Searchable memory**: source-labeled RAG chunks from final transcript
+   segments and ready context artifacts.
+
+When a user attaches something during a live session:
+
+```text
+Attach document / page / screenshot / source file
+  -> Bluey extracts readable text when possible
+  -> saves the artifact on the current session
+  -> indexes ready text into local RAG immediately
+  -> sync queue uploads artifact + RAG chunks to Bluey cloud
+```
+
+When the user asks a question later:
+
+```text
+Question
+  -> recent transcript + recent Q&A
+  -> latest attached artifacts first
+  -> top current-session RAG hits
+  -> top older-session RAG hits
+  -> provider prompt
+```
+
+Compaction only trims the provider prompt window. It does not delete the stored
+session, transcript, response, attachment, or RAG records. Older material can
+come back through retrieval when the question needs it.
+
+Local desktop memory is available first. Cloud sync already uploads the pieces;
+production cloud retrieval should use server-side embeddings + pgvector and
+return source cards so the overlay can show which file/session informed the
+answer.
+
 ## 6. Hard stop on $0 balance
 
 ```

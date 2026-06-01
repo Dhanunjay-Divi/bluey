@@ -1,6 +1,6 @@
 # Bluey Agent Handoff
 
-Last updated: 2026-05-29
+Last updated: 2026-06-01
 
 Start here when joining the Bluey repo.
 
@@ -13,6 +13,7 @@ Start here when joining the Bluey repo.
 5. `docs/DEPLOYMENT-SCALING.md`
 6. `docs/PRODUCTION-READINESS.md`
 7. `docs/PRELAUNCH-CHECKLIST.md`
+8. `docs/rounds/SESSION-KNOWLEDGE-RAG-2026-06-01.md`
 
 The first file is the complete current context: product flow, architecture,
 implemented state, provider routing, capacity policy, cloud/RAG/storage plan,
@@ -68,6 +69,35 @@ Strategic direction:
 - Storage target: local SQLite cache plus cloud Postgres/pgvector/object
   storage/Redis.
 - Provider keys are server-side only for production.
+
+## Current Session Knowledge Flow
+
+Implemented locally:
+
+- Final transcript segments are indexed into local RAG as they arrive.
+- User-approved context artifacts are indexed into local RAG when their
+  `text_preview` is ready. This includes CLI `bluey context add`, overlay
+  document attach, page capture, screenshot/OCR summaries, and source-file
+  previews that flow through `attach_context_artifacts`.
+- Attached artifacts are indexed with source labels in the chunk text:
+  title, kind, path, and optional note. That keeps retrieved snippets
+  self-explanatory even before richer source metadata columns exist.
+- Answer assembly uses bounded context:
+  - recent transcript turns,
+  - recent Q&A,
+  - latest attached artifacts first,
+  - top current-session RAG hits,
+  - top older-session local RAG hits.
+- Prompt compaction is only provider-window compaction. It does not delete the
+  raw local session, transcript, response, artifact, or RAG records.
+
+Already present but still needs production hardening:
+
+- Cloud sync uploads `context_artifacts` and `rag_chunks`.
+- The server has tenant-scoped sync/RAG query routes.
+- Next cloud step: server-side embedding/vector search with pgvector or
+  equivalent, then merge cloud RAG hits into managed answer generation with
+  source cards and deletion/retention guarantees.
 
 ## Current Model Routing
 
