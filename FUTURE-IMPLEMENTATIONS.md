@@ -109,7 +109,7 @@ Caddy + LetsEncrypt) but the language stays in the Bluey family.
 **Endpoints required for v0.2:**
 
 - `POST /auth/{signup,login,refresh,logout,reset}`
-- `POST /billing/{checkout,webhook}` (Stripe; test mode through
+- `POST /billing/{checkout,webhook}` (hosted billing provider; sandbox through
   Stage 3, live at Stage 4)
 - `GET  /account/me` (license + plan + usage summary)
 - `POST /router/complete` (managed LLM dispatch — this is the
@@ -200,16 +200,16 @@ just see errors).
 **Estimate:** 2 days code + tests.
 **Trigger to ship:** R14.11 ManagedProvider + LocalFallbackPolicy land.
 
-### R14.13 — Prepaid wallet + per-use metering + auto top-up (server side)
+### R14.13 — Account credits + per-use metering (server side)
 
 **Status:** required for v0.2 launch.
-**See:** `DECISIONS.md` 2026-05-19 prepaid-wallet entry,
+**See:** `DECISIONS.md` 2026-05-19 account-credit entry,
 `docs/HOW-IT-WORKS.md` Sections 0, 4-7.
 
 **Approach:**
 
 - Account schema gains `balance_cents`, `trial_seconds_remaining`,
-  `auto_topup_enabled`, `stripe_payment_method_id`.
+  and per-batch credit tracking with 12-month (365-day) expiry.
 - Per-model pricing table (input cents/1M tokens, output cents/1M
   tokens) with Bluey markup 100-200% over upstream provider cost.
 - `/router/complete` flow:
@@ -227,9 +227,9 @@ just see errors).
      response trailer.
 - Free trial: during trial, skip balance deduction; decrement
   `trial_seconds_remaining` by request duration.
-- Auto top-up: when balance < $5 (configurable), trigger Stripe
-  charge for $30 against saved PaymentMethod. On webhook success,
-  increment balance + push notification to daemon.
+- Reloads: hosted checkout credits the account through a verified webhook.
+  Saved-card auto-reload is a future feature and is not part of the live v0.2
+  customer promise.
 - Daemon polls `/account/me` every 30s OR receives WebSocket push to
   keep the live balance in the overlay top strip current.
 - Daemon emits the `RouterMeta` per-cue with `cost_cents` so the UI
@@ -237,11 +237,11 @@ just see errors).
 
 **Hard guarantees baked into the implementation:**
 1. Customer cannot rack up debt. Overruns are absorbed by Bluey.
-2. No surprise charges. Auto top-up is opt-out. Customer always sees
+2. No surprise charges. Customer explicitly reloads credits and always sees
    the balance.
 3. No silent failures. 402 is always accompanied by a clear reason.
 
-**Estimate:** 5-7 days code + tests + Stripe integration.
+**Estimate:** 5-7 days code + tests + billing integration.
 **Trigger to ship:** R14.9 server + R14.11 ManagedProvider land.
 
 ### R14.14 — Cost-label UX + tier visibility (daemon + dashboard)
@@ -268,17 +268,17 @@ usage dashboard and web onboarding screen.
 - Dashboard `/account/usage` page: rolling-7-day breakdown chart,
   tier comparison panel, "your $X.XX lasts ~N days" projection.
 - Onboarding screen `/onboarding/welcome` (after first reload):
-  static tier table from `PRICING-MODEL.md` + auto-top-up + credit
+  static tier table from `PRICING-MODEL.md` + manual reload + credit
   validity disclosure.
 
 **Estimate:** 3-4 days (UI work split across overlay, dashboard,
 CLI, plus the server-side aggregation endpoint).
-**Trigger to ship:** R14.13 wallet + R14.11 ManagedProvider land.
+**Trigger to ship:** R14.13 account credits + R14.11 ManagedProvider land.
 
-### Stripe live mode (Stage 4)
+### Billing-provider production mode (Stage 4)
 
 **Status:** parked until product server scaffold + Stage 3 daemon
-client are tested in Stripe test mode.
+client are tested against the billing sandbox.
 **Estimate:** 1 day flip + however long the first paying users take
 to find.
 **Trigger to ship:** dogfooding through Stage 3 confirms the

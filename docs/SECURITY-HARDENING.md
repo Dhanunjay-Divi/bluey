@@ -20,7 +20,7 @@ Anything that contradicts this document is either outdated or a bug.
 ### What we can protect strongly
 
 - Provider API keys.
-- Billing, wallet state, request pricing, and metering.
+- Billing, account-credit state, request pricing, and metering.
 - Account/session authorization.
 - Server-side routing policy.
 - Cloud transcript/RAG storage tenancy.
@@ -48,11 +48,11 @@ not security boundaries.
 
 | Adversary | What they can do | Bluey posture |
 |---|---|---|
-| Curious customer with the installed binary | inspect strings, disassemble, patch local checks | no provider keys in client; server validates account, wallet, routing, STT session, and usage |
+| Curious customer with the installed binary | inspect strings, disassemble, patch local checks | no provider keys in client; server validates account credits, routing, STT session, and usage |
 | Local malware in the user's account | read local DB/JSON, screen, process memory | OS keyring for auth tokens/API keys, private local file permissions, capture-excluded overlay, short-lived server tokens |
 | Co-process sending fake overlay events | attempt IPC injection | per-session overlay token, length caps, state-machine validation, install-dir binary verification |
 | Network attacker | observe or tamper with traffic | HTTPS/TLS via rustls; server-side auth; no static provider secrets on desktop |
-| Modified Bluey client | send malformed requests, replay tokens, claim fake usage | server owns billing, idempotency, wallet hard stops, request validation, STT relay token claim |
+| Modified Bluey client | send malformed requests, replay tokens, claim fake usage | server owns billing, idempotency, credit hard stops, request validation, STT relay token claim |
 | Compromised Bluey server | access managed transcripts/RAG/provider keys | out of client scope; requires server ops hardening, secret rotation, backups, audit trails, and least-privileged infra |
 
 ---

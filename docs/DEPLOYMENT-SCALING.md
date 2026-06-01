@@ -136,7 +136,7 @@ Reliability:
     fallback, and embeddings.
   - Optional per-account guardrails, disabled by default and used only for
     runaway loops, stolen tokens, or abuse response; paid usage itself is
-    controlled by wallet balance and provider availability.
+    controlled by account-credit balance and provider availability.
 - Scale provider capacity with approved provider allocations: single keys for
   early alpha, comma-separated key pools for approved multi-project or
   enterprise capacity, then a shared global capacity ledger when Bluey runs more

@@ -1,6 +1,6 @@
 # Bluey Pricing Model
 
-> **Source of truth for v0.2 pricing, markup, tiers, and where this
+> **Source of truth for v0.2 pricing, account credits, markup, tiers, and where this
 > info appears in the product UI.**
 >
 > Locked decisions live here; rationale + math live in the
@@ -15,10 +15,9 @@
 
 | Field | Value | Why |
 |---|---|---|
-| First reload | $30 (flat) | clean entry; covers a typical month |
-| Auto-reload trigger | balance < $5 | small enough to be invisible, large enough to avoid mid-stream cuts |
-| Auto-reload amount | $30 minimum, configurable higher | heavy users can set $50/$100 to reload less often |
-| Credit validity | **1 year from purchase** | per-batch, FIFO; balance carries forward across reloads as long as oldest batch < 365 days |
+| First reload | $30 (flat) | clean entry; covers a typical month for many users |
+| Reload model | manual hosted checkout in v0.2 | customer chooses when to add credits; saved-card auto-reload is deferred |
+| Credit validity | **up to 12 months (365 days) from purchase** | per-batch, FIFO; balance carries forward across reloads as long as oldest batch is unexpired |
 | Markup floor | **150%** | user direction 2026-05-19 |
 | Markup tier — Easy/Medium | 200% | absolute cents are tiny; small markup absurd |
 | Markup tier — Deep speculative | 150% | absolute cost is more visible to customer |
@@ -101,7 +100,7 @@ arithmetic without floats.
 
 ## 3. Three usage tiers (the product MUST show these to customers)
 
-These are realistic mixes used to project wallet duration. The product
+These are realistic mixes used to project credit duration. The product
 UI shows the customer their current rolling-7-day mix and tells them
 which tier they're in, so the $30 → time projection makes sense.
 
@@ -166,12 +165,11 @@ Bluey dashboard at `https://bluey.sh/onboarding/welcome` shows:
 │    ⚙️   Typical tech     ~1,380 cues   ~5 weeks                  │
 │    🔥  Heavy user        ~825 cues     ~10 days                 │
 │                                                                 │
-│  Auto top-up is ON (default). When your balance drops below $5, │
-│  we'll charge $30. You can change the amount or turn it off in  │
-│  Settings.                                                      │
+│  Reload when ready. Bluey is not a monthly subscription, and     │
+│  credits stop at zero so there is no surprise usage debt.        │
 │                                                                 │
-│  Credits stay active for 1 year. Unused balance after 365 days  │
-│  expires — we'll email you 30 days before that happens.         │
+│  Credits stay active for up to 12 months (365 days). Unused     │
+│  balance expires after that — we'll email you 30 days before.   │
 │                                                                 │
 │                          [   Got it   ]                         │
 └─────────────────────────────────────────────────────────────────┘
@@ -181,7 +179,7 @@ Bluey dashboard at `https://bluey.sh/onboarding/welcome` shows:
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  Balance:  $27.43           Auto top-up:  ON, $30 at <$5         │
+│  Balance:  $27.43           Reload: $30 minimum                  │
 │                                                                  │
 │  Your last 7 days:                                               │
 │    132 cues · $4.12 spent                                        │
@@ -204,7 +202,7 @@ Bluey dashboard at `https://bluey.sh/onboarding/welcome` shows:
 │  │ Heavy      ~825 cues / $30   ~10 days                        │
 │  └─────────────────────────────┘                                 │
 │                                                                  │
-│  [ Add $30 now ]  [ Change auto top-up settings ]                │
+│  [ Add $30 now ]  [ View credit batches ]                        │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -213,7 +211,7 @@ Bluey dashboard at `https://bluey.sh/onboarding/welcome` shows:
 ```
 $ bluey usage
 
-Balance         $27.43      (auto top-up: ON, $30 at <$5)
+Balance         $27.43      ($30 minimum reload)
 Last 7 days     132 cues, $4.12 spent
 Tier            Typical tech user
 Projection      $27.43 lasts ~32 days at your current rate
@@ -230,7 +228,7 @@ Per-cue cost (last 50):
   $0.046    Vision           (×2)
   ...
 
-Credits expire 1 year from purchase. Run `bluey credits` for
+Credits are valid for up to 12 months (365 days) from purchase. Run `bluey credits` for
 batch-by-batch expiration dates.
 ```
 
@@ -265,7 +263,7 @@ Per-request margin given the markup tiers:
 | Deep speculative (150% markup) | $0.020–$0.041 | 2.5× raw | ~60% |
 | Vision (150% markup) | $0.018 | 2.5× raw | ~60% |
 
-After Stripe processing fees (~3% per top-up) and cloud infra costs,
+After payment processing fees (~3% per reload) and cloud infra costs,
 the per-request margin floor stays above 55%. Healthy SaaS economics.
 
 ---
@@ -282,7 +280,8 @@ the per-request margin floor stays above 55%. Healthy SaaS economics.
 | **Bluey, heavy** | **~$60–90/mo equivalent** | same, more usage |
 
 Bluey lands in the standard SaaS pricing band for light/typical
-users and scales naturally for heavy users via the wallet model.
+users and scales naturally for heavy users through reloadable account credits,
+not a monthly subscription.
 
 ---
 
@@ -295,7 +294,7 @@ once we have real usage data.
 |---|---|---|
 | Cheaper for light users | Drop Easy markup to 100% | $30 lasts ~30% longer for light tier; margin drops to 50% |
 | More premium positioning | Raise Easy markup to 300% | $30 lasts 25% less; absolute cents still tiny ($0.0004) |
-| More predictable revenue | Add a $20/mo flat tier alongside wallet | classic SaaS funnel; complicates billing UI |
+| More predictable revenue | Optional monthly plan later | separate future product decision; not part of v0.2 credit model |
 | Encourage Hard usage | Drop Deep markup to 100% | speculative cost more attractive; margin still 50% |
 | Discourage Hard usage | Raise Deep markup to 200% | $30 lasts shorter for heavy users; pushes Easy/Medium |
 
@@ -303,12 +302,12 @@ once we have real usage data.
 
 ## 8. Implementation references
 
-- `FUTURE-IMPLEMENTATIONS.md::R14.13` — server-side wallet implementation.
+- `FUTURE-IMPLEMENTATIONS.md::R14.13` — server-side account-credit implementation.
 - `FUTURE-IMPLEMENTATIONS.md::R14.14` (NEW, see below) — daemon-side
   cost label + balance display + tier visibility UX.
 - `docs/HOW-IT-WORKS.md::Section 3` — overlay UI mockup including
   per-card cost label.
 - `docs/HOW-IT-WORKS.md::Section 4–7` — request flow, balance check,
   hard stop, mid-stream cut.
-- `DECISIONS.md` — the prepaid-wallet, no-BYOK, markup, and "always
+- `DECISIONS.md` — the account-credit, no-BYOK, markup, and "always
   visible" decisions.

@@ -54,7 +54,9 @@ Bluey settings should be driven by a single cloud profile plus local machine cap
   "limits": {
     "max_local_queue_mb": 512,
     "max_artifact_mb": 50,
-    "monthly_minutes_remaining": 1200
+    "credit_balance_cents": 2743,
+    "credit_expiry_days_remaining": 365,
+    "trial_seconds_remaining": 0
   }
 }
 ```

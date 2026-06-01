@@ -49,7 +49,7 @@ The CLI starts and supports the product. The overlay is the user experience.
   customer model choices.
 - `BLUEY_HOST_OVERLAY_CAPTURE_VISIBLE=1` is for local smoke testing only and
   must never ship enabled.
-- Paid users are constrained by wallet balance and provider capacity. Optional
+- Paid users are constrained by account-credit balance and provider capacity. Optional
   account throttles are emergency guardrails, not default product behavior.
 - Model changes require code, pricing, docs, and tests together.
 - New UI must not crop header/balance/model controls or grow the whole overlay

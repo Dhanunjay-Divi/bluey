@@ -8,6 +8,9 @@ Bluey sells non-transferable SaaS account credits for managed AI work. Do not
 market them as a cash wallet, stored-value card, gift card, financial product,
 or transferable balance.
 
+Credits are valid for up to 12 months (365 days) from purchase. The server
+spends the oldest unexpired credit batch first and stops managed usage at zero.
+
 ## Runtime Switch
 
 The same server binary supports sandbox and production:

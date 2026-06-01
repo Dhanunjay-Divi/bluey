@@ -43,11 +43,12 @@ See `docs/PRICING-MODEL.md` for the locked numbers + UI mockups.
 
 ---
 
-## 2026-05-19 — Prepaid wallet + auto top-up + 10-min free trial
+## 2026-05-19 — Account credits + manual reload + 10-min free trial
 
 **Source:** user direction.
-**Decision:** v0.2 monetization model is a **prepaid wallet** with
-**auto top-up** plus a **10-minute free trial** for new accounts.
+**Decision:** v0.2 monetization model is **prepaid account credits**
+with hosted reload checkout plus a **10-minute free trial** for new
+accounts. Bluey is not a monthly subscription by default.
 
 Specifics:
 
@@ -57,12 +58,15 @@ Specifics:
   deducting balance; trial seconds decrement by request duration.
 - After trial ends: customer must load $30 to continue. No partial
   reloads; minimum is $30.
+- Credits are non-transferable, have no cash value, and are valid for
+  up to 12 months (365 days) from purchase. The ledger spends the
+  oldest unexpired credit batch first.
 - Each request is metered server-side: `cost = input_tokens *
   markup_in + output_tokens * markup_out` with **100-200% markup
   over the upstream provider cost**.
-- Auto top-up: when balance drops below $5, bluey-server triggers a
-  $30 Stripe charge against the saved card. Customer can disable in
-  Settings (default ON).
+- Reloads: customers add credits through hosted checkout. Automatic
+  saved-card reload is deferred; do not describe it as live until the
+  Square saved-card flow is implemented and reviewed.
 - **Hard stop:** if balance is insufficient for the *estimated*
   cost of a request, server returns 402 Payment Required and
   daemon shows "Add $30 to continue" — no streaming starts. If
@@ -75,7 +79,7 @@ Specifics:
 (`docs/PRICING-MODEL.md`) are 200% on Easy/Medium / 150% on Deep
 speculative / 150% on Vision. Customer prices range from $0.0003
 (Easy) to $0.104 (System design speculative). The typical user
-(~50 cues/day mixed) burns ~$21/month and reloads the $30 wallet
+(~50 cues/day mixed) burns ~$21/month and reloads the $30 credit balance
 roughly once a month. Heavy users (~200 cues/day) reload 2-3 times
 per month. **Gross margin per request is ~67% on 200%-markup lanes
 and ~60% on 150%-markup lanes** (see `docs/PRICING-MODEL.md` Section 5
@@ -86,7 +90,7 @@ PRICING-MODEL.md table proves out per-lane.
 
 **What this changes for the codebase:**
 
-- Server-side: prepaid balance state in account record. Every
+- Server-side: prepaid credit balance state in account record. Every
   `/router/complete` does an entry check (balance >= estimated_cost)
   and a mid-stream check. Atomic deduction via SQL UPDATE on
   completion.
@@ -95,13 +99,13 @@ PRICING-MODEL.md table proves out per-lane.
   `RouterMeta`; just add `cost_cents` field).
 - Hard-stop UI: "balance_exhausted" event from server →
   daemon shows banner with reload button.
-- Auto top-up: Stripe SetupIntent at first $30 reload to save the
-  card, subsequent charges use saved PaymentMethod.
+- Reloads: hosted Square checkout credits the FIFO batch ledger by
+  webhook. Saved-card auto-reload remains a future feature.
 
 **Don't retry without new context:**
 - Don't allow debt. Customer overrun is on Bluey, not the customer.
-- Don't surprise-charge. Auto top-up is opt-out; customer always
-  sees the balance.
+- Don't surprise-charge. Customer explicitly reloads credits; customer
+  always sees the balance.
 - Don't hide cost. Per-card cost label is non-negotiable.
 
 See `docs/HOW-IT-WORKS.md` for the full v0.2 customer flow including
@@ -122,7 +126,7 @@ customers** in the product UI.
 customer is on a paid Bluey plan but momentarily disconnected, OR they
 explicitly toggle on a privacy-only mode, the daemon falls back to
 local whisper.cpp + local Ollama. The customer is still on a paid
-Bluey subscription; the inference cost just shifts to their hardware
+paid Bluey account; the inference cost just shifts to their hardware
 during the fallback window.
 **Earlier proposal (rejected):** BYOK as a default with an optional
 managed mode. Rejected because:

@@ -13,7 +13,8 @@ current macOS arm64 local-first release.
 - Production vision/OCR: screenshot and document understanding with source citations, thumbnails, processing status, and cloud parser fallback. Initial page/screenshot vision path exists.
 - Production audio/STT reliability: native capture, VAD, streaming STT, and fallback routing exist on macOS, but long-session stress, device hot-swap, clean-machine QA, and Windows parity remain.
 - Personas/modes: sales call, engineering design review, standup, customer support, interview prep for ethical personal practice, etc.
-- Billing and plans: subscription tiers, limits, trial, invoices.
+- Billing and credits: hosted reload flow, credit batches, expiry notices,
+  trial, invoices/receipts, and clear per-cue cost history.
 - Customer settings app: account, capture permissions, providers, workspace, retention, shortcuts, privacy. Terminal settings and developer dashboard exist.
 - Auto-update and signing: packaged macOS/Windows installers, codesigning, notarization. v0.1.0 is terminal-only macOS arm64 tarball + installer script.
 - Observability: crash reporting, local diagnostics, user-facing health status.

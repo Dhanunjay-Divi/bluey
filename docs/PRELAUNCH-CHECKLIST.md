@@ -106,7 +106,7 @@ This is the master gate before public alpha. Every item must be ticked or explic
 - [ ] Sandbox test: $30 reload through Square hosted checkout → balance credited within 30s
 - [ ] Production test: real $30 reload through Square hosted checkout → balance credited within 30s
 - [ ] Auto-topup/card-on-file is explicitly deferred until Square saved-card flow is wired; manual reload must be clear in `/account`
-- [ ] Customer-facing copy says account credits are non-transferable, have no cash value, and are not a stored-value/gift-card product
+- [x] Customer-facing copy says account credits are non-transferable, have no cash value, and are not a stored-value/gift-card product
 - [ ] Refund/support/privacy/terms pages are published before production payments
 - [ ] Square credentials rotated if any production credential was pasted into a non-secret channel during setup
 
@@ -130,8 +130,8 @@ routes must exist before public alpha:
 - [ ] `/reload` — Square Checkout redirect target (after pay → returns to `/account?reload=success`)
 - [ ] `/account` — user-facing balance + usage + sign-out (calls `/account/me`, `/account/usage`, `/billing/portal`)
 - [ ] `/docs/disguise` — explainer page that the dashboard "Why?" link points at
-- [ ] `/docs/privacy` — privacy policy
-- [ ] `/docs/terms` — terms of service
+- [x] `/docs/privacy` — alpha privacy policy
+- [x] `/docs/terms` — alpha terms of use
 - [ ] OG / favicon assets
 
 ### macOS app distribution (Pinky-style: NO Apple Developer ID required for v0.2 alpha)
@@ -180,9 +180,9 @@ without breaking existing customers (the bundle id stays the same).
 
 ### Legal + compliance
 
-- [ ] Terms of Service published at `bluey.sh/docs/terms`
-- [ ] Privacy Policy published at `bluey.sh/docs/privacy`
-- [ ] Onboarding flow links to both before account creation
+- [x] Terms of Use published at `bluey.sh/docs/terms` (alpha copy; final legal review still needed before broad launch)
+- [x] Privacy Policy published at `bluey.sh/docs/privacy` (alpha copy; final legal review still needed before broad launch)
+- [x] Account creation/sign-in surface links to both before account creation
 - [ ] GDPR-compatible data export tested (`bluey export` produces a valid JSON bundle)
 - [ ] GDPR-compatible account deletion tested (`bluey delete-account --force` → all DB rows scrubbed including stripe_webhook_events)
 - [ ] DPA template available for B2B customers who request one

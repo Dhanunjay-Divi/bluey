@@ -6,6 +6,12 @@ use rusqlite::params;
 
 use crate::db::DbPool;
 
+/// Reloaded account credits are valid for up to 12 months from purchase.
+///
+/// The implementation uses 365 days so every credit batch has a deterministic
+/// expiry timestamp and FIFO consumption can compare timestamps directly.
+pub const CREDIT_VALIDITY_DAYS: i64 = 365;
+
 /// Atomically deduct `cost_cents` from the account's balance AND from
 /// the oldest non-expired credit batch (FIFO consumption).
 ///
@@ -99,7 +105,7 @@ pub fn credit(
     }
 
     let batch_id = uuid::Uuid::new_v4().to_string();
-    let expires_at = (Utc::now() + Duration::days(365)).to_rfc3339();
+    let expires_at = (Utc::now() + Duration::days(CREDIT_VALIDITY_DAYS)).to_rfc3339();
 
     tx.execute(
         "INSERT INTO credit_batches
@@ -265,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn credit_extends_expiry_by_365_days() {
+    fn credit_extends_expiry_by_credit_validity_days() {
         let pool = temp_pool();
         let id = make_account(&pool, "expiry@example.com");
         credit(&pool, &id, 3000, None).unwrap();
@@ -279,7 +285,7 @@ mod tests {
             .unwrap();
         let parsed: chrono::DateTime<chrono::Utc> = expires_at.parse().unwrap();
         let days = (parsed - chrono::Utc::now()).num_days();
-        assert!((360..=366).contains(&days));
+        assert!(((CREDIT_VALIDITY_DAYS - 5)..=(CREDIT_VALIDITY_DAYS + 1)).contains(&days));
     }
 
     #[test]

@@ -103,7 +103,7 @@ Bluey protects realtime work at three layers:
    `Retry-After` and immediately tries the next approved key or route.
 4. **Optional per-account emergency guardrails**: disabled by default. Turn
    them on only during abuse incidents, stolen-token response, or runaway-client
-   mitigation. Normal paid usage is controlled by wallet balance and provider
+   mitigation. Normal paid usage is controlled by account-credit balance and provider
    availability, not by per-account throttling.
 
 Default server knobs:

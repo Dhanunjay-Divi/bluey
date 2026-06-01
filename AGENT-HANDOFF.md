@@ -86,7 +86,7 @@ route choice when the Screen/Analyze action already implies vision.
 ## Current Capacity Policy
 
 Bluey should not punish paying users for high usage. Normal usage is controlled
-by wallet balance and provider capacity, not arbitrary per-account throttles.
+by account-credit balance and provider capacity, not arbitrary per-account throttles.
 
 Implemented:
 

@@ -3,7 +3,7 @@
 > **End-to-end walkthrough of the v0.2 paid product.** This is the doc
 > a new engineer reads to understand what happens when a real
 > customer uses Bluey, from signup through their first cue request
-> through their first auto top-up.
+> through their first credit reload.
 >
 > v0.1 BYOK is dev-only (see `DECISIONS.md` 2026-05-19); v0.2 is
 > managed-only. This doc describes v0.2 unless explicitly marked
@@ -13,18 +13,19 @@
 
 ## 0. Pricing model (decided 2026-05-19)
 
-**Prepaid wallet with auto top-up.** Customer pays Bluey directly,
-metered per request.
+**Reloadable account credits.** Customer pays Bluey directly by loading
+non-transferable account credits, then Bluey meters each managed request.
+Bluey is not a monthly subscription by default.
 
 | Item | Value |
 |---|---|
 | Free trial | 10 minutes of active session time (mirrors Pinky's free model) |
-| Initial top-up | $30 USD |
-| Auto top-up trigger | balance drops below $5 (configurable per account) |
-| Auto top-up amount | $30 USD |
+| Initial reload | $30 USD |
+| Reload model | hosted checkout; manual reload in v0.2 |
 | Pricing basis | per request: input tokens + output tokens + model used |
 | Bluey markup over upstream cost | 100–200% (target gross margin) |
 | Hard stop on $0 balance | stream cut mid-response; UI shows "Add $30 to continue" |
+| Credit validity | up to 12 months (365 days) from purchase, FIFO oldest first |
 
 **Hard guarantees:**
 1. Customer cannot rack up debt. Server checks balance before each
@@ -33,7 +34,7 @@ metered per request.
 2. Customer always sees current balance at the top of the overlay
    (and a per-card cost label after each cue).
 3. Customer always sees what would have happened if Bluey were
-   broken — i.e. if the wallet hits zero, the UI tells them
+   broken — i.e. if the credit balance hits zero, the UI tells them
    exactly why and what to do about it.
 
 ---
@@ -247,22 +248,19 @@ bluey-daemon:
     ┌────────────────────────────────────────────────────┐
     │  💰 Balance: $0.18 — Bluey can't answer that one.  │
     │                                                    │
-    │  Add $30 to continue (auto top-up enabled by       │
-    │  default; turn off in Settings).                   │
+    │  Add $30 to continue.                              │
     │                                                    │
     │              [   Add $30 now   ]                   │
     └────────────────────────────────────────────────────┘
 
 Click "Add $30 now":
-  daemon → POST /billing/topup { amount_cents: 3000 }
-  bluey-server → Stripe charge using saved card
-  on Stripe webhook success → balance += 3000
+  daemon → opens https://bluey.sh/reload
+  bluey-server → Square-hosted checkout link
+  on Square webhook success → balance += 3000
   daemon polls /account/me, sees new balance, refreshes UI
 
-If auto-top-up is enabled (default ON):
-  the moment balance < $5, server triggers Stripe charge automatically.
-  customer sees a non-blocking notification:
-    "Auto top-up: charged $30, new balance $35.18".
+Saved-card automatic reload is deferred. Do not market it as available
+until Square saved-card support is implemented and reviewed.
 ```
 
 ## 7. Mid-stream cut (rare edge case)
@@ -332,7 +330,7 @@ If unreachable for >2 minutes (or user runs `bluey privacy-mode on`):
 
   LaneBadge in UI gains "OFFLINE" tag.
   No usage events emitted. No balance deductions.
-  Customer is still on a paid Bluey subscription;
+  Customer is still using a paid Bluey account;
   inference cost just shifts to their hardware.
 
 When connectivity returns: daemon polls /admin/health,
@@ -374,7 +372,7 @@ balance, tier projection. No hidden charges, no opaque billing.
 ## 11. Architecture cross-references
 
 - `ARCHITECTURE.md` — three-layer model, monetization plug-points.
-- `DECISIONS.md` — the no-BYOK + prepaid-wallet decisions and rationale.
+- `DECISIONS.md` — the no-BYOK + account-credit decisions and rationale.
 - `FUTURE-IMPLEMENTATIONS.md` R14.13 — per-use metering implementation
   detail.
 - `crates/cue-router/` — classifier + policy + speculative dispatch
@@ -391,7 +389,7 @@ balance, tier projection. No hidden charges, no opaque billing.
 | Per-card cost label | response header trailer with `actual_cost_cents` |
 | LaneBadge with provider/model | response trailer with `lane`, `provider`, `model` |
 | "Add $30" banner | 402 Payment Required from server with reason field |
-| Auto top-up notification | Stripe webhook → balance increment → daemon refresh |
+| Reload notification | Square webhook → balance increment → daemon refresh |
 | 10-min trial countdown | `trial_seconds_remaining` field in every response |
 | Hard stop with partial answer | mid-stream balance check → cut + truncated chunk + banner |
 | OFFLINE tag | daemon detects bluey-server unreachable, flips local-fallback |

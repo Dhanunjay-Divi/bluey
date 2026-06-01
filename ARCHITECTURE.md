@@ -86,8 +86,8 @@ actual model inference is in the cloud** — at the upstream provider
 customer's BYOK keys are NOT exposed in the production UI. Every paid
 inference goes through `bluey-server` so Bluey is the billing entity.
 **Local models (whisper.cpp, Ollama) exist as an offline / privacy
-fallback only** — the customer is still on a paid Bluey subscription
-during fallback; the cost just shifts to their hardware. See
+fallback only** — the customer is still using a paid Bluey account
+during fallback; the inference cost just shifts to their hardware. See
 `DECISIONS.md` for the rationale.
 
 **Practical implication for a customer's laptop:** modern Macs handle
@@ -204,8 +204,8 @@ provider keys with (or replaces them entirely with Bluey-managed keys).
 
 ```
 POST /auth/signup, /auth/login, /auth/refresh, /auth/reset
-POST /billing/checkout              (Stripe checkout session)
-POST /billing/webhook               (Stripe webhook handler)
+POST /billing/checkout              (hosted credit reload checkout)
+POST /billing/webhook               (billing-provider webhook handler)
 GET  /account/me                    (license + plan)
 POST /router/complete               (managed Auto Router endpoint)
 GET  /admin/customers               (Bluey-team only)
@@ -248,7 +248,7 @@ ManagedPolicy::from_bluey_account(token)
 // Local fallback (offline / privacy-only):
 LocalFallbackPolicy::default()  // routes all lanes to local Ollama
                                 // + local whisper.cpp; customer still
-                                // on paid Bluey subscription
+                                // using a paid Bluey account
 ```
 
 The `SpeculativeProvider` trait is the integration point. The dashboard's
@@ -282,11 +282,11 @@ both know how to talk to the cloud service.
 
 - New repo `bluey-server`, **Rust** (per 2026-05-19 lang decision).
 - All endpoints required for v0.2 paid launch (managed Auto Router
-  endpoint, auth, billing, license check). No more "scaffold + flip
+  endpoint, auth, account-credit billing, license check). No more "scaffold + flip
   later" — the no-BYOK decision (2026-05-19) makes Stage 2 the gating
   dependency for v0.2.
-- Stripe stays in test mode through Stage 3 dogfooding; flipped to live
-  at Stage 4.
+- Billing-provider sandbox stays enabled through Stage 3 dogfooding; production
+  credentials are flipped on at Stage 4.
 - **Time to land:** ~1–2 weeks dedicated work.
 
 ### Stage 3 — daemon talks to product server (this repo)
@@ -301,7 +301,7 @@ both know how to talk to the cloud service.
 
 ### Stage 4 — paid alpha launch
 
-- Flip Stripe to live mode.
+- Flip billing provider to production mode.
 - First paying customers.
 
 ### Stage 5 — public GA

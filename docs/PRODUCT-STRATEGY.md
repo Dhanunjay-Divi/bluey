@@ -6,7 +6,9 @@ not be marketed as a finished SaaS until cloud auth/sync/RAG/billing are real.
 
 ## Product Positioning
 
-- Paid subscription product.
+- Paid account-credit product: customers reload non-transferable Bluey credits,
+  spend them per managed request, and are not charged a monthly subscription by
+  default.
 - Managed cloud account and secure sync.
 - Managed model/provider routing by default.
 - Enterprise-grade privacy, retention, deletion, and audit controls.
@@ -106,7 +108,7 @@ See `docs/CONTEXT-INTELLIGENCE-LAB.md`.
 
 - Authenticated cloud sync.
 - Workspace/team accounts.
-- Billing and plan enforcement.
+- Credit reloads, per-use billing, hard-stop enforcement, and receipts.
 - Cloud RAG index.
 - Meeting history dashboard.
 - Managed model routing, fallbacks, and latency budgets.
