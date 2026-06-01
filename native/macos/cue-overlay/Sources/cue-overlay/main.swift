@@ -38,6 +38,7 @@ private enum BlueyTheme {
     static let hairline = NSColor.white.withAlphaComponent(0.08)
     static let green = NSColor(red: 0.42, green: 1.0, blue: 0.52, alpha: 1.0)
     static let warning = NSColor(red: 1.0, green: 0.72, blue: 0.28, alpha: 1.0)
+    static let danger = NSColor(red: 1.0, green: 0.38, blue: 0.44, alpha: 1.0)
 
     static func accent(for kind: String) -> NSColor {
         switch kind {
@@ -93,7 +94,7 @@ private enum ExpandedPanelMetrics {
 }
 
 private enum PillMetrics {
-    static let size = NSSize(width: 128, height: 38)
+    static let size = NSSize(width: 112, height: 34)
 
     static func centeredFrame(in visibleFrame: NSRect) -> NSRect {
         NSRect(
@@ -256,6 +257,9 @@ private enum OverlayCommand {
     case setBalance(String)
     case setContextItems([OverlayContextItem])
     case setSessions([OverlaySessionItem])
+    case listeningStateChanged(String)
+    case transcriptPartial(source: String, text: String)
+    case transcriptFinal(source: String, text: String)
     case pushCard(CueCard)
     case updateCard(id: String, body: String, done: Bool, costLabel: String?, artifact: OverlayArtifact?)
     case shutdown
@@ -311,6 +315,16 @@ private func parseCommand(_ line: String) -> OverlayCommand {
             )
         }.filter { !$0.id.isEmpty }
         return .setSessions(sessions)
+    case "listening_state_changed":
+        return .listeningStateChanged(obj["state"] as? String ?? "idle")
+    case "transcript_partial":
+        return .transcriptPartial(
+            source: obj["source"] as? String ?? "audio",
+            text: obj["text"] as? String ?? "")
+    case "transcript_final":
+        return .transcriptFinal(
+            source: obj["source"] as? String ?? "audio",
+            text: obj["text"] as? String ?? "")
     case "push_card":
         guard let cardObj = obj["card"] as? [String: Any],
               let cardData = try? JSONSerialization.data(withJSONObject: cardObj),
@@ -614,6 +628,87 @@ private final class OverlayWindow: NSWindow {
 
 // MARK: - Pill view
 
+private enum PillRunState {
+    case ready
+    case connecting
+    case listening
+    case paused
+    case failed
+
+    init(listeningState: String) {
+        switch listeningState.lowercased() {
+        case "connecting":
+            self = .connecting
+        case "listening":
+            self = .listening
+        case "paused":
+            self = .paused
+        case "failed":
+            self = .failed
+        default:
+            self = .ready
+        }
+    }
+
+    var dotColor: NSColor {
+        switch self {
+        case .ready:
+            return BlueyTheme.green
+        case .connecting:
+            return BlueyTheme.warning
+        case .listening:
+            return BlueyTheme.green
+        case .paused:
+            return BlueyTheme.textDim.withAlphaComponent(0.72)
+        case .failed:
+            return BlueyTheme.danger
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .ready:
+            return "play.fill"
+        case .connecting:
+            return "bolt.horizontal.fill"
+        case .listening:
+            return "pause.fill"
+        case .paused:
+            return "play.fill"
+        case .failed:
+            return "exclamationmark"
+        }
+    }
+
+    var symbolColor: NSColor {
+        switch self {
+        case .ready, .paused:
+            return BlueyTheme.text
+        case .connecting:
+            return BlueyTheme.warning
+        case .listening:
+            return BlueyTheme.green
+        case .failed:
+            return BlueyTheme.danger
+        }
+    }
+
+    var accessibilityLabel: String {
+        switch self {
+        case .ready:
+            return "Bluey ready"
+        case .connecting:
+            return "Bluey connecting"
+        case .listening:
+            return "Bluey listening"
+        case .paused:
+            return "Bluey paused"
+        case .failed:
+            return "Bluey needs attention"
+        }
+    }
+}
+
 private final class PillView: NSView {
     var statusText: String = "Bluey" {
         didSet {
@@ -646,11 +741,14 @@ private final class PillView: NSView {
         }
     }
     var onClick: (() -> Void)?
+    private var runState: PillRunState = .ready
 
     private let logoTile = NSView()
     private let logoGlyph = NSTextField(labelWithString: ">_")
     private let titleField = NSTextField(labelWithString: "Bluey")
     private let dotView = NSView()
+    private let stateTile = NSView()
+    private let stateGlyph = NSImageView()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -665,7 +763,7 @@ private final class PillView: NSView {
 
         logoTile.wantsLayer = true
         logoTile.layer?.backgroundColor = NSColor(red: 0.014, green: 0.104, blue: 0.136, alpha: 1.0).cgColor
-        logoTile.layer?.cornerRadius = 9
+        logoTile.layer?.cornerRadius = 8
         logoTile.layer?.borderWidth = 1
         logoTile.layer?.borderColor = NSColor(red: 0.38, green: 0.88, blue: 1.0, alpha: 0.70).cgColor
         logoTile.layer?.shadowColor = NSColor(red: 0.15, green: 0.66, blue: 1.0, alpha: 1.0).cgColor
@@ -674,12 +772,12 @@ private final class PillView: NSView {
         logoTile.layer?.shadowOffset = .zero
         addSubview(logoTile)
 
-        logoGlyph.font = NSFont.monospacedSystemFont(ofSize: 12.5, weight: .bold)
+        logoGlyph.font = NSFont.monospacedSystemFont(ofSize: 12.0, weight: .bold)
         logoGlyph.textColor = NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0)
         logoGlyph.alignment = .center
         logoTile.addSubview(logoGlyph)
 
-        titleField.font = NSFont.systemFont(ofSize: 15, weight: .bold)
+        titleField.font = NSFont.systemFont(ofSize: 14.5, weight: .bold)
         titleField.textColor = NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0)
         titleField.alignment = .left
         addSubview(titleField)
@@ -692,6 +790,18 @@ private final class PillView: NSView {
         dotView.layer?.shadowRadius = 6
         dotView.layer?.shadowOffset = .zero
         addSubview(dotView)
+
+        stateTile.wantsLayer = true
+        stateTile.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.045).cgColor
+        stateTile.layer?.cornerRadius = 7
+        stateTile.layer?.borderWidth = 1
+        stateTile.layer?.borderColor = NSColor.white.withAlphaComponent(0.10).cgColor
+        addSubview(stateTile)
+
+        stateGlyph.imageScaling = .scaleProportionallyDown
+        stateGlyph.contentTintColor = runState.symbolColor
+        stateTile.addSubview(stateGlyph)
+        updateRunStateDisplay()
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -699,20 +809,43 @@ private final class PillView: NSView {
         super.layout()
         layer?.cornerRadius = bounds.height / 2
 
-        let logoSide: CGFloat = 29
-        logoTile.frame = NSRect(x: 6, y: (bounds.height - logoSide) / 2, width: logoSide, height: logoSide)
-        logoTile.layer?.cornerRadius = 9
-        logoGlyph.frame = logoTile.bounds.insetBy(dx: 4, dy: 6)
+        let logoSide: CGFloat = 27
+        logoTile.frame = NSRect(x: 5, y: (bounds.height - logoSide) / 2, width: logoSide, height: logoSide)
+        logoTile.layer?.cornerRadius = 8
+        logoGlyph.frame = logoTile.bounds.insetBy(dx: 4, dy: 5)
 
-        titleField.frame = NSRect(x: 47, y: (bounds.height - 21) / 2 + 1, width: bounds.width - 66, height: 21)
+        let stateSide: CGFloat = 18
+        stateTile.frame = NSRect(
+            x: bounds.width - stateSide - 5,
+            y: (bounds.height - stateSide) / 2,
+            width: stateSide,
+            height: stateSide)
+        stateGlyph.frame = stateTile.bounds.insetBy(dx: 4, dy: 4)
+
+        titleField.frame = NSRect(x: 41, y: (bounds.height - 20) / 2 + 1, width: 39, height: 20)
 
         let labelWidth = ceil((titleField.stringValue as NSString).size(withAttributes: [
-            .font: titleField.font ?? NSFont.systemFont(ofSize: 15, weight: .bold),
+            .font: titleField.font ?? NSFont.systemFont(ofSize: 14.5, weight: .bold),
         ]).width)
-        let dotSize: CGFloat = 8
-        let dotX = min(titleField.frame.minX + labelWidth + 4, bounds.width - dotSize - 8)
-        dotView.frame = NSRect(x: dotX, y: bounds.midY + 4, width: dotSize, height: dotSize)
+        let dotSize: CGFloat = 7
+        let dotX = min(titleField.frame.minX + labelWidth + 4, stateTile.frame.minX - dotSize - 5)
+        dotView.frame = NSRect(x: dotX, y: bounds.midY + 4.5, width: dotSize, height: dotSize)
         dotView.layer?.cornerRadius = dotSize / 2
+    }
+
+    func setRunState(_ state: PillRunState) {
+        runState = state
+        dotColor = state.dotColor
+        updateRunStateDisplay()
+    }
+
+    private func updateRunStateDisplay() {
+        stateGlyph.image = symbolImage(runState.symbolName)
+        stateGlyph.contentTintColor = runState.symbolColor
+        stateTile.layer?.borderColor = runState.symbolColor.withAlphaComponent(0.22).cgColor
+        stateTile.layer?.backgroundColor = runState.symbolColor.withAlphaComponent(0.075).cgColor
+        setAccessibilityLabel(runState.accessibilityLabel)
+        needsLayout = true
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -1418,6 +1551,7 @@ private final class ExpandedPanelView: NSView {
 
     var onClose: (() -> Void)?
     var onOpacityChanged: ((Double) -> Void)?
+    var onListeningStateChanged: ((PillRunState) -> Void)?
     private var recordingActive = false
     private var transcriptSnippets: [String] = []
     private var sessionItems: [OverlaySessionItem] = []
@@ -2481,6 +2615,7 @@ private final class ExpandedPanelView: NSView {
         if recordingActive {
             emitSimple("recording_stop_requested")
             recordingActive = false
+            onListeningStateChanged?(.paused)
             recordingButton.title = "Listen"
             statusLabel.stringValue = "Paused"
             composer.placeholder = "Ask anything..."
@@ -2489,6 +2624,7 @@ private final class ExpandedPanelView: NSView {
         } else {
             emitSimple("recording_start_requested")
             recordingActive = true
+            onListeningStateChanged?(.listening)
             recordingButton.title = "Stop"
             statusLabel.stringValue = "Listening"
             composer.placeholder = "Listening... type a follow-up anytime"
@@ -2575,6 +2711,46 @@ private final class ExpandedPanelView: NSView {
         transcriptActivityDot.layer?.backgroundColor = (active ? BlueyTheme.green : BlueyTheme.textDim.withAlphaComponent(0.55)).cgColor
         transcriptActivityDot.layer?.shadowOpacity = active ? 0.45 : 0
         transcriptStrip.layer?.borderColor = (active ? BlueyTheme.green.withAlphaComponent(0.26) : BlueyTheme.hairline).cgColor
+    }
+
+    func setListeningState(_ state: PillRunState) {
+        switch state {
+        case .connecting:
+            recordingActive = false
+            recordingButton.title = "Listen"
+            statusLabel.stringValue = "Connecting"
+            composer.placeholder = "Connecting audio..."
+            setTranscriptState("CONNECTING", active: true)
+            styleControlButton(recordingButton, symbol: "waveform", accent: false)
+        case .listening:
+            recordingActive = true
+            recordingButton.title = "Stop"
+            statusLabel.stringValue = "Listening"
+            composer.placeholder = "Listening... type a follow-up anytime"
+            setTranscriptState("LISTENING", active: true)
+            styleControlButton(recordingButton, symbol: "stop.fill", accent: true)
+        case .paused:
+            recordingActive = false
+            recordingButton.title = "Listen"
+            statusLabel.stringValue = "Paused"
+            composer.placeholder = "Ask anything..."
+            setTranscriptState("PAUSED", active: false)
+            styleControlButton(recordingButton, symbol: "waveform", accent: false)
+        case .failed:
+            recordingActive = false
+            recordingButton.title = "Listen"
+            statusLabel.stringValue = "Audio needs attention"
+            composer.placeholder = "Ask anything..."
+            setTranscriptState("FAILED", active: false)
+            styleControlButton(recordingButton, symbol: "waveform", accent: false)
+        case .ready:
+            recordingActive = false
+            recordingButton.title = "Listen"
+            statusLabel.stringValue = "Ready"
+            composer.placeholder = "Ask anything..."
+            setTranscriptState("IDLE", active: false)
+            styleControlButton(recordingButton, symbol: "waveform", accent: false)
+        }
     }
 
     private func updateRouteBadge(
@@ -2873,6 +3049,21 @@ private final class ExpandedPanelView: NSView {
             transcriptSnippets.removeFirst(transcriptSnippets.count - 6)
         }
         setTranscriptState(recordingActive ? "TRANSCRIBING" : "CAPTURED", active: recordingActive)
+        updateTranscriptStripText(transcriptSnippets.joined(separator: "   "), scrollToEnd: true)
+    }
+
+    func appendLiveTranscript(source: String, text: String, final: Bool) {
+        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { return }
+        let cleanSource = source
+            .replacingOccurrences(of: "_", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let label = cleanSource.isEmpty ? "Audio" : cleanSource.capitalized
+        transcriptSnippets.append("\(label): \(body)")
+        if transcriptSnippets.count > 6 {
+            transcriptSnippets.removeFirst(transcriptSnippets.count - 6)
+        }
+        setTranscriptState(recordingActive ? "TRANSCRIBING" : (final ? "CAPTURED" : "HEARD"), active: recordingActive)
         updateTranscriptStripText(transcriptSnippets.joined(separator: "   "), scrollToEnd: true)
     }
 
@@ -3295,6 +3486,7 @@ private final class OverlayApp {
     private var pillView: PillView!
     private var expandedView: ExpandedPanelView?
     private var expandedPassthroughTimer: Timer?
+    private var currentRunState: PillRunState = .ready
 
     /// Pending boot card, if a Boot command arrived before windows materialised.
     private var pendingBoot: (title: String, lines: [String])?
@@ -3310,6 +3502,7 @@ private final class OverlayApp {
         pillView = PillView(frame: NSRect(origin: .zero, size: pillSize))
         pillWindow.contentView = pillView
         pillView.statusText = "Bluey"
+        pillView.setRunState(currentRunState)
         pillView.onClick = { [weak self] in self?.expand() }
 
         if captureVisibleForDebug {
@@ -3429,6 +3622,10 @@ private final class OverlayApp {
         view.autoresizingMask = [.width, .height]
         window.contentView = view
         view.onClose = { [weak self] in self?.collapse() }
+        view.onListeningStateChanged = { [weak self] state in
+            self?.currentRunState = state
+            self?.pillView?.setRunState(state)
+        }
         view.onOpacityChanged = { [weak self] opacity in
             let value = CGFloat(opacity)
             self?.pillWindow?.alphaValue = value
@@ -3436,6 +3633,7 @@ private final class OverlayApp {
         }
         expandedWindow = window
         expandedView = view
+        view.setListeningState(currentRunState)
         if let pending = pendingBoot {
             pushBootCard(title: pending.title, lines: pending.lines)
             pendingBoot = nil
@@ -3484,6 +3682,18 @@ private final class OverlayApp {
             expandedView?.setContextItems(items)
         case .setSessions(let sessions):
             expandedView?.setSessions(sessions)
+        case .listeningStateChanged(let state):
+            let runState = PillRunState(listeningState: state)
+            currentRunState = runState
+            pillView?.setRunState(runState)
+            expandedView?.setListeningState(runState)
+        case .transcriptPartial(let source, let text):
+            let runState = PillRunState(listeningState: "listening")
+            currentRunState = runState
+            pillView?.setRunState(runState)
+            expandedView?.appendLiveTranscript(source: source, text: text, final: false)
+        case .transcriptFinal(let source, let text):
+            expandedView?.appendLiveTranscript(source: source, text: text, final: true)
         case .pushCard(let card):
             ensureExpandedWindow()
             expandedView?.pushCard(RenderedCard(
