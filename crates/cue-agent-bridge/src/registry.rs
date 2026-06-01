@@ -286,14 +286,22 @@ pub const REGISTRY: &[AgentEntry] = &[
     },
     AgentEntry {
         kind_tag: KindTag::Copilot,
-        display_name: "GitHub Copilot",
+        // The STANDALONE GitHub Copilot CLI (`copilot`, GA Feb 2026) — its own
+        // binary + `~/.copilot/` store. This is NOT "Copilot inside VS Code":
+        // that extension's data lives in VS Code's own directory and belongs to
+        // the VS Code row. Pointing this row at VS Code's dir double-counted one
+        // install as two agents reading the same files; it now reads only the
+        // standalone CLI's store.
+        display_name: "GitHub Copilot CLI",
         binary_candidates: &["copilot"],
         app_bundles: &[],
         app_dirs_windows: &[],
-        data_dir_globs: &["Library/Application Support/Code"],
-        app_data_windows: &["Code"],
-        session_format: Some(SessionFormat::JsonFiles),
-        jsonl_subdir: "projects",
+        data_dir_globs: &[".copilot"],
+        app_data_windows: &[],
+        // The Copilot CLI stores sessions as `~/.copilot/session-state/<id>/
+        // events.jsonl` — JSONL, not VS Code's chatSessions JSON files.
+        session_format: Some(SessionFormat::Jsonl),
+        jsonl_subdir: "session-state",
         drive_command: &["copilot", "-p", "{prompt}"],
         answer_args: &[],
         // Copilot auto-denies tools headlessly unless allowed. Its scoped flag
@@ -475,7 +483,7 @@ mod tests {
             "Claude Code",
             "Cursor",
             "Antigravity",
-            "GitHub Copilot",
+            "GitHub Copilot CLI",
             "Gemini CLI",
             "Codex",
             "Aider",
