@@ -94,12 +94,15 @@ pub fn parse_connectors(raw: &str, source_label: &str) -> Vec<Connector> {
 fn classify_server(name: &str, spec: &serde_json::Value) -> Option<Connector> {
     let obj = spec.as_object()?;
 
-    // HTTP/SSE transport: presence of a `url` (or explicit http/sse type).
+    // HTTP/SSE transport: presence of a `url` (or explicit http/sse type). The
+    // URL is stored with its query string stripped — some MCP endpoints embed
+    // tokens/keys as query params (`?api_key=…`), and we must never surface a
+    // secret. A `headers` block (bearer tokens) is likewise never read.
     if let Some(url) = obj.get("url").and_then(|u| u.as_str()) {
         return Some(Connector {
             name: name.to_string(),
             transport: Transport::Http {
-                url: url.to_string(),
+                url: sanitize_url(url),
             },
             auth_tier: AuthTier::HostedOauth,
         });
@@ -141,6 +144,15 @@ fn classify_server(name: &str, spec: &serde_json::Value) -> Option<Connector> {
     }
 
     None
+}
+
+/// Return a URL with its query string and fragment removed, so a token embedded
+/// as a query param (`?api_key=…`, `?token=…`) can never be surfaced. Keeps
+/// scheme + host + path, which is enough to identify the endpoint. If the input
+/// has no `?`/`#`, it is returned unchanged.
+fn sanitize_url(url: &str) -> String {
+    let end = url.find(['?', '#']).unwrap_or(url.len());
+    url[..end].to_string()
 }
 
 /// Strip JSONC features that `serde_json` rejects: `//` line comments,
@@ -346,5 +358,53 @@ mod tests {
         let serialized = serde_json::to_string(&conns).unwrap();
         assert!(!serialized.contains("super-secret"));
         assert!(!serialized.contains("TOKEN"));
+    }
+
+    #[test]
+    fn test_sanitize_url_strips_query_and_fragment() {
+        assert_eq!(sanitize_url("https://h/mcp?api_key=abc"), "https://h/mcp");
+        assert_eq!(sanitize_url("https://h/mcp#frag"), "https://h/mcp");
+        assert_eq!(sanitize_url("https://h/mcp"), "https://h/mcp");
+    }
+
+    /// The hard secret guarantee: a hostile config carrying secrets in EVERY
+    /// place an MCP config can hide one (env values, a token in the URL query,
+    /// a bearer header) must never surface any of those values in a serialized
+    /// connector. Only names, commands, hosts, and tiers may appear.
+    #[test]
+    fn test_no_secret_of_any_kind_is_ever_serialized() {
+        let raw = r#"{ "mcpServers": {
+            "stdio_secret": {
+                "command": "tool",
+                "args": ["--flag"],
+                "env": { "API_KEY": "ENV_SECRET_VALUE" }
+            },
+            "http_query_secret": {
+                "url": "https://mcp.example.com/sse?token=URL_SECRET_VALUE&x=1"
+            },
+            "http_header_secret": {
+                "url": "https://mcp2.example.com/mcp",
+                "headers": { "Authorization": "Bearer HEADER_SECRET_VALUE" }
+            }
+        } }"#;
+        let conns = parse_connectors(raw, "fixture");
+        assert_eq!(conns.len(), 3, "all three connectors parsed");
+
+        let serialized = serde_json::to_string(&conns).unwrap();
+        for secret in [
+            "ENV_SECRET_VALUE",
+            "URL_SECRET_VALUE",
+            "HEADER_SECRET_VALUE",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "secret {secret:?} leaked into serialized connector: {serialized}"
+            );
+        }
+        // The non-secret host/path of the query URL survives (endpoint id).
+        assert!(serialized.contains("mcp.example.com/sse"));
+        // Auth tiers are reported (so the UI can prompt re-auth) without secrets.
+        assert!(conns.iter().any(|c| c.auth_tier == AuthTier::EnvAuth));
+        assert!(conns.iter().any(|c| c.auth_tier == AuthTier::HostedOauth));
     }
 }

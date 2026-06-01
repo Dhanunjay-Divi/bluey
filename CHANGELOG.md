@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Security
+- Hardened the connector secret guarantee. The stored HTTP connector URL now has
+  its query string and fragment stripped (some MCP endpoints embed tokens as
+  `?token=…`), and a `headers` block (bearer tokens) is never read. A new audit
+  test feeds a config carrying secrets in *every* hiding place — env values, a
+  URL query token, and a bearer header — and asserts none ever appear in a
+  serialized connector (only names, commands, hosts, and auth tiers do).
 - Headless answer drives no longer use a blanket auto-approve flag. The first
   MCP-enable attempt used Gemini's `--approval-mode yolo`, which auto-approves
   *all* tools — a live canary test proved it let a read-intent **answer write a
@@ -18,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file-write attempt was blocked.
 
 ### Fixed
+- Session reads no longer load whole files into memory. The JSONL reader (Claude
+  /Codex) and the per-session title lookup now stream line-by-line and stop at
+  the bound, instead of `read_to_string` on files that reach 10 MB+ (the title
+  lookup ran once per session during a list, so it could load every session's
+  file). A single oversized line is skipped via a 4 MiB cap. Verified live: 264
+  Claude sessions list + read correctly while streaming.
 - Agent MCP connectors now fire when Bluey drives a CLI in headless mode. Live
   testing showed `gemini -p` blocks tool calls on an approval prompt that never
   arrives non-interactively, so its MCP never ran. The drive layer now appends

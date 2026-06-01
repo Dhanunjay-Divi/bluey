@@ -12,6 +12,7 @@
 //! under it is one session (id = file stem). If `path` points directly at a
 //! `*.jsonl` file, that single file is the only session.
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -23,6 +24,11 @@ use crate::{Role, SessionRef, SessionStore, Transcript, Turn};
 pub struct JsonlReader;
 
 const TITLE_SNIPPET_CHARS: usize = 80;
+
+/// Cap on a single JSONL line we will parse. A normal turn is well under this;
+/// a line larger than this is treated as corrupt/oversized and skipped so a
+/// single pathological line can never blow up memory.
+const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 
 impl SessionReader for JsonlReader {
     fn list(&self, store: &SessionStore, limit: usize) -> anyhow::Result<Vec<SessionRef>> {
@@ -47,11 +53,17 @@ impl SessionReader for JsonlReader {
         if max_turns == 0 {
             return Ok(Transcript { turns });
         }
-        let contents = std::fs::read_to_string(&file)
-            .map_err(|_| crate::BridgeError::Unreadable(file.clone()))?;
-        for line in contents.lines() {
+        // Stream line-by-line and stop at `max_turns` — never load the whole
+        // file (sessions reach 10 MB+). A pathologically long single line is
+        // bounded by `MAX_LINE_BYTES` so a corrupt/huge line can't blow memory.
+        let handle =
+            std::fs::File::open(&file).map_err(|_| crate::BridgeError::Unreadable(file.clone()))?;
+        let reader = BufReader::new(handle);
+        for line in reader.lines() {
+            // An I/O error mid-file ends the read with what we have, fail-soft.
+            let Ok(line) = line else { break };
             let line = line.trim();
-            if line.is_empty() {
+            if line.is_empty() || line.len() > MAX_LINE_BYTES {
                 continue;
             }
             // Skip malformed lines; never abort the whole transcript.
@@ -199,12 +211,16 @@ fn session_ref_for(file: &Path) -> Option<SessionRef> {
 }
 
 /// Read just enough of a file to grab the first user message as a title.
-/// Bounded: stops at the first user turn, skips malformed lines.
+/// Streams line-by-line and stops at the first user turn — never loads the
+/// whole file (this runs once per session during `list`, so a whole-file read
+/// here would load every session's file just to title it).
 fn first_user_snippet(file: &Path) -> Option<String> {
-    let contents = std::fs::read_to_string(file).ok()?;
-    for line in contents.lines() {
+    let handle = std::fs::File::open(file).ok()?;
+    let reader = BufReader::new(handle);
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
         let line = line.trim();
-        if line.is_empty() {
+        if line.is_empty() || line.len() > MAX_LINE_BYTES {
             continue;
         }
         let value: Value = match serde_json::from_str(line) {
