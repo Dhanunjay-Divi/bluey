@@ -237,7 +237,7 @@ fn build_square_payment_link_body(
         "idempotency_key": format!("bluey-reload-{account_id}-{amount_cents}-{}", uuid::Uuid::new_v4()),
         "order": {
             "location_id": location_id,
-            "reference_id": format!("bluey_reload:{account_id}"),
+            "reference_id": square_reload_reference_id(account_id),
             "metadata": {
                 "bluey_account_id": account_id,
                 "bluey_amount_cents": amount_cents.to_string()
@@ -260,6 +260,35 @@ fn build_square_payment_link_body(
         },
         "payment_note": "Bluey credit reload"
     })
+}
+
+fn square_reload_reference_id(account_id: &str) -> String {
+    let compact = account_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(32)
+        .collect::<String>();
+    format!("br_{compact}")
+}
+
+fn square_account_id_from_reference(reference_id: &str) -> Option<String> {
+    if let Some(account_id) = reference_id.strip_prefix("bluey_reload:") {
+        return Some(account_id.to_string());
+    }
+
+    let compact = reference_id.strip_prefix("br_")?;
+    if compact.len() == 32 && compact.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(format!(
+            "{}-{}-{}-{}-{}",
+            &compact[0..8],
+            &compact[8..12],
+            &compact[12..16],
+            &compact[16..20],
+            &compact[20..32]
+        ));
+    }
+
+    None
 }
 
 fn log_safe_square_body(body: &serde_json::Value) -> serde_json::Value {
@@ -712,8 +741,7 @@ fn extract_square_credit(event: &serde_json::Value) -> Result<Option<(String, i6
                 order
                     .get("reference_id")
                     .and_then(|v| v.as_str())
-                    .and_then(|s| s.strip_prefix("bluey_reload:"))
-                    .map(str::to_string)
+                    .and_then(square_account_id_from_reference)
             })
             .ok_or_else(|| anyhow!("Square order missing bluey account metadata"))?;
         let amount_cents = order
@@ -743,8 +771,7 @@ fn extract_square_credit(event: &serde_json::Value) -> Result<Option<(String, i6
         let account_id = payment
             .get("reference_id")
             .and_then(|v| v.as_str())
-            .and_then(|s| s.strip_prefix("bluey_reload:"))
-            .map(str::to_string)
+            .and_then(square_account_id_from_reference)
             .ok_or_else(|| anyhow!("Square payment missing bluey reference_id"))?;
         let amount_cents = payment
             .pointer("/amount_money/amount")
@@ -913,10 +940,7 @@ mod tests {
             3000,
         );
         assert_eq!(body.pointer("/order/location_id").unwrap(), "LOC_TEST");
-        assert_eq!(
-            body.pointer("/order/reference_id").unwrap(),
-            "bluey_reload:acct-123"
-        );
+        assert_eq!(body.pointer("/order/reference_id").unwrap(), "br_acct123");
         assert_eq!(
             body.pointer("/order/metadata/bluey_account_id").unwrap(),
             "acct-123"
@@ -929,6 +953,18 @@ mod tests {
         assert_eq!(
             body.pointer("/checkout_options/redirect_url").unwrap(),
             "https://bluey.sh/account?reload=success"
+        );
+    }
+
+    #[test]
+    fn square_reference_id_stays_within_square_limit() {
+        let account_id = "833e66ac-0652-43c7-a55e-8d51d9ccc982";
+        let reference_id = square_reload_reference_id(account_id);
+        assert_eq!(reference_id, "br_833e66ac065243c7a55e8d51d9ccc982");
+        assert!(reference_id.len() <= 40);
+        assert_eq!(
+            square_account_id_from_reference(&reference_id).as_deref(),
+            Some(account_id)
         );
     }
 
@@ -995,6 +1031,29 @@ mod tests {
         });
 
         assert!(extract_square_credit(&event).unwrap().is_none());
+    }
+
+    #[test]
+    fn square_payment_extracts_credit_from_compact_reference() {
+        let event = serde_json::json!({
+            "event_id": "evt_payment",
+            "type": "payment.updated",
+            "data": {
+                "object": {
+                    "payment": {
+                        "id": "payment_1",
+                        "status": "COMPLETED",
+                        "reference_id": "br_833e66ac065243c7a55e8d51d9ccc982",
+                        "amount_money": {"amount": 3000, "currency": "USD"}
+                    }
+                }
+            }
+        });
+
+        let extracted = extract_square_credit(&event).unwrap().unwrap();
+        assert_eq!(extracted.0, "833e66ac-0652-43c7-a55e-8d51d9ccc982");
+        assert_eq!(extracted.1, 3000);
+        assert_eq!(extracted.2, "payment_1");
     }
 
     #[test]
