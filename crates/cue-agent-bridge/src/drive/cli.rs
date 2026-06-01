@@ -39,17 +39,34 @@ pub enum OutputParser {
     /// Claude Code `--output-format stream-json --verbose`: newline-delimited
     /// JSON events parsed incrementally into Started/Delta/Done.
     ClaudeStreamJson,
+    /// Cursor `cursor-agent --output-format json`: a **single** JSON object
+    /// emitted on success — `{"type":"result","subtype":"success","result":
+    /// "<text>","session_id":"<uuid>",...}`. Parsed into one Started (carrying
+    /// `session_id`), one Delta (`result`), and a Done. DOC-CONFIRMED shape
+    /// (https://cursor.com/docs/cli/reference/output-format).
+    CursorJson,
+    /// Codex `codex exec --json`: newline-delimited JSON events —
+    /// `{"type":"thread.started","thread_id":...}` (session id),
+    /// `{"type":"item.completed","item":{"type":"agent_message","text":...}}`
+    /// (answer text), `{"type":"turn.completed","usage":{...}}` (tokens).
+    /// Parsed incrementally into Started/Delta/Done. Flags DOC-CONFIRMED
+    /// (https://developers.openai.com/codex/noninteractive); exact event field
+    /// shapes NEEDS-LIVE-VERIFY. Fail-soft: a non-JSON line is treated as a
+    /// plain-text delta so the no-`--json` resume path still surfaces output.
+    CodexJsonl,
     /// Plain text on stdout: emit the whole captured output as one Delta, then
-    /// Done. Used by copilot / cursor-agent / gemini / codex.
+    /// Done. Used by copilot / gemini.
     PlainText,
 }
 
 /// One row of the per-agent command map: how to invoke an agent's CLI.
 ///
 /// Templates use the marker `{prompt}` for where the prompt argv entry goes and
-/// `{id}` for a resume session id. Markers are replaced as **whole argv
-/// entries** — never substituted into a larger string — so the prompt cannot
-/// leak into adjacent flags.
+/// `{id}` for a resume session id. `{prompt}` is only ever matched as a **whole
+/// argv entry** and never substituted into a larger string, so prompt content
+/// cannot leak into adjacent flags. `{id}` (a daemon-owned session UUID, not
+/// prompt text) may be embedded within a resume token — e.g. `--resume={id}` —
+/// so rows can use either the space form (`--resume {id}`) or the equals form.
 #[derive(Debug, Clone, Copy)]
 pub struct DriveSpec {
     /// The agent this row drives.
@@ -100,10 +117,10 @@ impl KindTag {
 /// | Agent | binary | one-shot args | resume args | parser |
 /// |---|---|---|---|---|
 /// | ClaudeCode | `claude` | `-p {prompt} --output-format stream-json --verbose` | `--resume {id}` | stream-json |
-/// | Copilot | `copilot` | `-p {prompt}` | `--continue` | plain text |
-/// | Cursor | `cursor-agent` | `-p {prompt}` | (none) | plain text |
+/// | Copilot | `copilot` | `-p {prompt} -s` | (none) | plain text |
+/// | Cursor | `cursor-agent` | `-p {prompt} --output-format json` | `--resume={id}` | cursor-json |
 /// | Gemini | `gemini` | `-p {prompt}` | (none) | plain text |
-/// | Codex | `codex` | `exec {prompt}` | `exec resume --last` | plain text |
+/// | Codex | `codex` | `exec --json {prompt}` | `exec resume --last --json` | codex-jsonl |
 pub const COMMAND_MAP: &[DriveSpec] = &[
     DriveSpec {
         kind_tag: KindTag::ClaudeCode,
@@ -121,16 +138,32 @@ pub const COMMAND_MAP: &[DriveSpec] = &[
     DriveSpec {
         kind_tag: KindTag::Copilot,
         binary: "copilot",
-        oneshot_args: &["-p", "{prompt}"],
-        resume_args: &["--continue"],
+        // `-s` (silent) suppresses stats/decoration so stdout is just the
+        // answer — DOC-CONFIRMED
+        // (https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference).
+        oneshot_args: &["-p", "{prompt}", "-s"],
+        // No documented resume/continue flag for the programmatic CLI
+        // (DOC-CONFIRMED absent — same reference page lists no --resume /
+        // --continue). Leave empty rather than passing an unsupported flag.
+        resume_args: &[],
+        // No JSON output flag is documented; stdout is plain text. DOC-CONFIRMED.
         parser: OutputParser::PlainText,
     },
     DriveSpec {
         kind_tag: KindTag::Cursor,
         binary: "cursor-agent",
-        oneshot_args: &["-p", "{prompt}"],
-        resume_args: &[],
-        parser: OutputParser::PlainText,
+        // `--output-format json` emits a single result object we parse with
+        // `CursorJson`. DOC-CONFIRMED
+        // (https://cursor.com/docs/cli/reference/output-format). NOTE: `-p` has
+        // access to write/shell tools; we deliberately omit `--force`, so in
+        // Answer/Propose mode Cursor proposes rather than applies edits.
+        oneshot_args: &["-p", "{prompt}", "--output-format", "json"],
+        // Resume uses the `--resume=<id>` equals form (the documented
+        // `--continue` is an alias for `--resume=-1`, confirming the equals
+        // syntax). DOC-CONFIRMED
+        // (https://cursor.com/docs/cli/reference/parameters).
+        resume_args: &["--resume={id}"],
+        parser: OutputParser::CursorJson,
     },
     DriveSpec {
         kind_tag: KindTag::Gemini,
@@ -142,12 +175,18 @@ pub const COMMAND_MAP: &[DriveSpec] = &[
     DriveSpec {
         kind_tag: KindTag::Codex,
         binary: "codex",
-        // Codex resume replaces `exec <prompt>` with `exec resume --last`,
-        // so the one-shot form is `exec {prompt}` and resume is handled by
-        // `build_argv` swapping the prompt entry for the resume args.
-        oneshot_args: &["exec", "{prompt}"],
-        resume_args: &["exec", "resume", "--last"],
-        parser: OutputParser::PlainText,
+        // `codex exec --json "<prompt>"` emits a JSONL event stream we parse
+        // with `CodexJsonl` (thread.started → session id, item.completed
+        // agent_message → answer, turn.completed.usage → tokens). Flags
+        // DOC-CONFIRMED (https://developers.openai.com/codex/noninteractive);
+        // exact event field shapes NEEDS-LIVE-VERIFY. Codex resume *replaces*
+        // `exec --json <prompt>` with `exec resume --last --json` — handled by
+        // `build_argv` swapping the prompt entry for the resume args. Whether
+        // `--json` is honored on the resume subcommand is NEEDS-LIVE-VERIFY;
+        // `CodexJsonl` falls back to plain text if it is not.
+        oneshot_args: &["exec", "--json", "{prompt}"],
+        resume_args: &["exec", "resume", "--last", "--json"],
+        parser: OutputParser::CodexJsonl,
     },
 ];
 
@@ -180,11 +219,19 @@ impl Default for DriveOptions {
     }
 }
 
-/// Build the full argv (binary + args) for a question, substituting the prompt
-/// and any resume id as **whole entries**.
+/// Build the full argv (binary + args) for a question.
 ///
-/// Returns `(program, args)`. The prompt is never concatenated into a flag, so
-/// shell metacharacters in the prompt are inert.
+/// The **prompt** marker `{prompt}` is only ever matched as a *whole* argv entry
+/// and substituted as its own entry, so prompt content (which may carry shell
+/// metacharacters) can never leak into an adjacent flag.
+///
+/// The **resume-id** marker `{id}` is substituted *within* a resume token, so a
+/// row can use either the whole-entry form (`"{id}"`, e.g. Claude's
+/// `--resume {id}`) or the embedded equals form (`"--resume={id}"`, e.g.
+/// Cursor). The id is a session UUID the daemon owns — never attacker-controlled
+/// prompt text — so embedding it is safe; the prompt is still kept separate.
+///
+/// Returns `(program, args)`.
 fn build_argv(spec: &DriveSpec, q: &Question) -> (String, Vec<String>) {
     let prompt = q.render_prompt();
     let resuming = q.resume.is_some();
@@ -208,11 +255,9 @@ fn build_argv(spec: &DriveSpec, q: &Question) -> (String, Vec<String>) {
     if resuming {
         let id = q.resume.as_deref().unwrap_or_default();
         for tok in spec.resume_args {
-            if *tok == "{id}" {
-                args.push(id.to_string());
-            } else {
-                args.push((*tok).to_string());
-            }
+            // Substitute the id within the token: handles both the whole-entry
+            // form (`{id}`) and the embedded equals form (`--resume={id}`).
+            args.push(tok.replace("{id}", id));
         }
     }
 
@@ -483,6 +528,16 @@ fn run_stream(
                                 yield chunk;
                             }
                         }
+                        OutputParser::CursorJson => {
+                            for chunk in state.push_cursor_line(&line) {
+                                yield chunk;
+                            }
+                        }
+                        OutputParser::CodexJsonl => {
+                            for chunk in state.push_codex_line(&line) {
+                                yield chunk;
+                            }
+                        }
                         OutputParser::PlainText => {
                             if !plain_buf.is_empty() {
                                 plain_buf.push('\n');
@@ -536,7 +591,9 @@ fn run_stream(
 
         // Successful exit: flush parser-specific terminal chunks.
         match parser {
-            OutputParser::ClaudeStreamJson => {
+            OutputParser::ClaudeStreamJson
+            | OutputParser::CursorJson
+            | OutputParser::CodexJsonl => {
                 for chunk in state.finish() {
                     yield chunk;
                 }
@@ -681,11 +738,164 @@ impl ParseState {
         out
     }
 
-    /// Terminal chunks after stdout EOF. If the CLI never emitted a `result`
-    /// event we still close the stream so consumers are not left hanging:
-    /// emit a `Started` if none was seen, then a `Done` with no cost.
+    /// Parse Cursor's `--output-format json` output: a **single** JSON object
+    /// emitted on success. We get one line; turn it into Started + Delta + Done
+    /// (or Started + Error when `is_error`).
+    ///
+    /// Object shape (DOC-CONFIRMED,
+    /// https://cursor.com/docs/cli/reference/output-format):
+    /// `{type:"result",subtype:"success",is_error,result,session_id,...}`.
+    ///
+    /// Non-`result` lines (the format documents only the single result object,
+    /// but a stray banner is possible) are ignored fail-soft.
+    fn push_cursor_line(&mut self, line: &str) -> Vec<AnswerChunk> {
+        debug_assert_eq!(self.parser, OutputParser::CursorJson);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        let v: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("result") {
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        if !self.started {
+            self.started = true;
+            self.session_id = v
+                .get("session_id")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string());
+            out.push(AnswerChunk::Started {
+                session_id: self.session_id.clone(),
+            });
+        }
+
+        let is_error = v.get("is_error").and_then(|b| b.as_bool()).unwrap_or(false);
+        if is_error {
+            let msg = v
+                .get("result")
+                .and_then(|r| r.as_str())
+                .unwrap_or("agent reported an error")
+                .to_string();
+            self.done = true;
+            out.push(AnswerChunk::Error(msg));
+        } else {
+            if let Some(text) = v.get("result").and_then(|r| r.as_str()) {
+                if !text.is_empty() {
+                    out.push(AnswerChunk::Delta(text.to_string()));
+                }
+            }
+            self.done = true;
+            // Cursor's result object carries timing, not a USD cost.
+            out.push(AnswerChunk::Done { cost_usd: None });
+        }
+        out
+    }
+
+    /// Parse one line of Codex `exec --json` output (NDJSON events). Event
+    /// shapes (flags DOC-CONFIRMED, field shapes NEEDS-LIVE-VERIFY,
+    /// https://developers.openai.com/codex/noninteractive):
+    /// - `{type:"thread.started",thread_id}` → `Started` (session id)
+    /// - `{type:"item.completed",item:{type:"agent_message",text}}` → `Delta`
+    /// - `{type:"turn.completed",usage:{...}}` → `Done` (usage is tokens, not
+    ///   USD, so no cost is reported)
+    /// - `{type:"error",message}` / `{type:"turn.failed",error:{message}}`
+    ///   → `Error`
+    ///
+    /// Fail-soft: a line that is not valid JSON is treated as a plain-text
+    /// delta, so the resume path (which may not honor `--json`) still surfaces
+    /// the agent's final message instead of swallowing it.
+    fn push_codex_line(&mut self, line: &str) -> Vec<AnswerChunk> {
+        debug_assert_eq!(self.parser, OutputParser::CodexJsonl);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return Vec::new();
+        }
+        let v: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            // Not JSON: emit as a literal delta (fail-soft, see doc comment),
+            // ensuring we Started first so consumers see ordering.
+            Err(_) => {
+                let mut out = Vec::new();
+                self.start_if_needed(&mut out);
+                out.push(AnswerChunk::Delta(line.to_string()));
+                return out;
+            }
+        };
+        let Some(ty) = v.get("type").and_then(|t| t.as_str()) else {
+            return Vec::new();
+        };
+
+        let mut out = Vec::new();
+        match ty {
+            "thread.started" => {
+                self.session_id = v
+                    .get("thread_id")
+                    .and_then(|s| s.as_str())
+                    .map(|s| s.to_string());
+                self.start_if_needed(&mut out);
+            }
+            "item.completed" | "item.updated" => {
+                self.start_if_needed(&mut out);
+                let item = v.get("item");
+                let is_msg = item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
+                    == Some("agent_message");
+                if is_msg {
+                    if let Some(text) = item.and_then(|i| i.get("text")).and_then(|t| t.as_str()) {
+                        if !text.is_empty() {
+                            out.push(AnswerChunk::Delta(text.to_string()));
+                        }
+                    }
+                }
+            }
+            "turn.completed" => {
+                self.start_if_needed(&mut out);
+                self.done = true;
+                // `usage` reports token counts, not a USD cost.
+                out.push(AnswerChunk::Done { cost_usd: None });
+            }
+            "error" | "turn.failed" => {
+                self.start_if_needed(&mut out);
+                let msg = v
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .or_else(|| {
+                        v.get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|m| m.as_str())
+                    })
+                    .unwrap_or("agent reported an error")
+                    .to_string();
+                self.done = true;
+                out.push(AnswerChunk::Error(msg));
+            }
+            _ => {}
+        }
+        out
+    }
+
+    /// Emit a `Started` (with the current session id) if one has not been sent,
+    /// flipping the `started` flag. Shared by the Codex parser's branches.
+    fn start_if_needed(&mut self, out: &mut Vec<AnswerChunk>) {
+        if !self.started {
+            self.started = true;
+            out.push(AnswerChunk::Started {
+                session_id: self.session_id.clone(),
+            });
+        }
+    }
+
+    /// Terminal chunks after stdout EOF, shared by every JSON parser
+    /// (`ClaudeStreamJson` / `CursorJson` / `CodexJsonl`). If the CLI never
+    /// emitted a terminal event we still close the stream so consumers are not
+    /// left hanging: emit a `Started` if none was seen, then a `Done` with no
+    /// cost.
     fn finish(&mut self) -> Vec<AnswerChunk> {
-        debug_assert_eq!(self.parser, OutputParser::ClaudeStreamJson);
+        debug_assert_ne!(self.parser, OutputParser::PlainText);
         let mut out = Vec::new();
         if !self.started {
             out.push(AnswerChunk::Started {
@@ -796,8 +1006,82 @@ mod tests {
         q.resume = Some("whatever".to_string());
         let (prog, args) = build_argv(spec, &q);
         assert_eq!(prog, "codex");
-        assert_eq!(args, vec!["exec", "resume", "--last"]);
+        // Resume swaps the whole `exec --json <prompt>` form for the resume
+        // subcommand, still carrying `--json` so the JSONL parser applies.
+        assert_eq!(args, vec!["exec", "resume", "--last", "--json"]);
         assert!(!args.iter().any(|a| a.contains("ignored")));
+    }
+
+    #[test]
+    fn test_build_argv_cursor_uses_json_output_format() {
+        // Cursor one-shot must request `--output-format json` so the single
+        // result object is emitted for the CursorJson parser.
+        let spec = spec(KindTag::Cursor);
+        let q = Question::new("hi");
+        let (prog, args) = build_argv(spec, &q);
+        assert_eq!(prog, "cursor-agent");
+        let i = args
+            .iter()
+            .position(|a| a == "--output-format")
+            .expect("output-format flag present");
+        assert_eq!(args[i + 1], "json");
+        assert_eq!(spec.parser, OutputParser::CursorJson);
+    }
+
+    #[test]
+    fn test_build_argv_cursor_resume_uses_equals_form() {
+        // Cursor resume is the `--resume=<id>` equals form (one argv entry).
+        let spec = spec(KindTag::Cursor);
+        let mut q = Question::new("follow up");
+        q.resume = Some("chat-77".to_string());
+        let (_, args) = build_argv(spec, &q);
+        assert!(
+            args.iter().any(|a| a == "--resume=chat-77"),
+            "expected --resume=chat-77 as a single entry, got {args:?}"
+        );
+        // The id is never a separate bare entry.
+        assert!(!args.iter().any(|a| a == "chat-77"));
+    }
+
+    #[test]
+    fn test_build_argv_copilot_has_silent_flag_and_no_resume() {
+        // Copilot one-shot carries `-s` (silent); resume is undocumented, so it
+        // appends nothing even when a resume id is set.
+        let spec = spec(KindTag::Copilot);
+        let mut q = Question::new("q");
+        let (_, oneshot) = build_argv(spec, &q);
+        assert!(oneshot.iter().any(|a| a == "-s"), "expected -s silent flag");
+
+        q.resume = Some("anything".to_string());
+        let (_, resumed) = build_argv(spec, &q);
+        // No resume flag exists, so resuming yields the same argv as one-shot.
+        assert_eq!(oneshot, resumed);
+        assert!(!resumed.iter().any(|a| a == "--continue"));
+        assert!(!resumed.iter().any(|a| a == "--resume"));
+        assert!(!resumed.iter().any(|a| a == "anything"));
+    }
+
+    #[test]
+    fn test_codex_answer_args_carry_read_only_sandbox() {
+        // Answer mode for Codex must append the read-only sandbox flags
+        // (reads allowed, writes blocked, no approval prompt) — off the
+        // registry, not by naming the agent.
+        let s = spec(KindTag::Codex);
+        let q = Question::new("what changed?");
+        let (_, args) =
+            build_argv_with_mode(s, &AgentKind::Codex, &q, DriveMode::Answer, &[]).unwrap();
+        let sb = args
+            .iter()
+            .position(|a| a == "--sandbox")
+            .expect("sandbox flag present in answer");
+        assert_eq!(args[sb + 1], "read-only");
+        let ap = args
+            .iter()
+            .position(|a| a == "--ask-for-approval")
+            .expect("ask-for-approval present in answer");
+        assert_eq!(args[ap + 1], "never");
+        // A read-only answer must never carry the write sandbox.
+        assert!(!args.iter().any(|a| a == "workspace-write"));
     }
 
     // ---- drive-mode → Fix-profile arg assembly (slice F1) ---------------
@@ -1145,6 +1429,153 @@ echo '{"type":"result","result":"rate limited","is_error":true}'
         assert_eq!(chunks.len(), 3);
     }
 
+    // ---- (b2) cursor single-object json parser --------------------------
+
+    #[tokio::test]
+    async fn test_cursor_json_single_object_started_delta_done() {
+        let dir = TempDir::new().unwrap();
+        // A fake `cursor-agent` that prints one result object on success.
+        let script = write_script(
+            &dir,
+            "cursor-agent",
+            "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"hi\",\"session_id\":\"x\"}'\n",
+        );
+        let chunks = collect(drive_fixture(
+            script,
+            vec![],
+            OutputParser::CursorJson,
+            DriveOptions::default(),
+        ))
+        .await;
+        assert_eq!(
+            chunks[0],
+            AnswerChunk::Started {
+                session_id: Some("x".to_string())
+            }
+        );
+        assert_eq!(chunks[1], AnswerChunk::Delta("hi".to_string()));
+        assert_eq!(chunks[2], AnswerChunk::Done { cost_usd: None });
+        assert_eq!(chunks.len(), 3);
+    }
+
+    #[test]
+    fn test_cursor_json_parser_unit() {
+        // Pure parse: one result object → Started(x) + Delta("hi") + Done.
+        let mut st = ParseState::new(OutputParser::CursorJson);
+        let line = r#"{"type":"result","subtype":"success","result":"hi","session_id":"x"}"#;
+        let out = st.push_cursor_line(line);
+        assert_eq!(
+            out,
+            vec![
+                AnswerChunk::Started {
+                    session_id: Some("x".to_string())
+                },
+                AnswerChunk::Delta("hi".to_string()),
+                AnswerChunk::Done { cost_usd: None },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cursor_json_is_error_emits_error() {
+        let dir = TempDir::new().unwrap();
+        let script = write_script(
+            &dir,
+            "cursor-agent",
+            "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"error\",\"is_error\":true,\"result\":\"nope\",\"session_id\":\"y\"}'\n",
+        );
+        let chunks = collect(drive_fixture(
+            script,
+            vec![],
+            OutputParser::CursorJson,
+            DriveOptions::default(),
+        ))
+        .await;
+        assert!(matches!(chunks[0], AnswerChunk::Started { .. }));
+        assert_eq!(chunks[1], AnswerChunk::Error("nope".to_string()));
+    }
+
+    // ---- (b3) codex jsonl event parser ----------------------------------
+
+    #[test]
+    fn test_codex_jsonl_parser_unit() {
+        // Stream: thread.started → Started(id), item.completed agent_message →
+        // Delta, turn.completed → Done.
+        let mut st = ParseState::new(OutputParser::CodexJsonl);
+        let mut out = Vec::new();
+        out.extend(st.push_codex_line(r#"{"type":"thread.started","thread_id":"0199a2"}"#));
+        out.extend(st.push_codex_line(
+            r#"{"type":"item.completed","item":{"id":"i3","type":"agent_message","text":"done"}}"#,
+        ));
+        out.extend(st.push_codex_line(
+            r#"{"type":"turn.completed","usage":{"input_tokens":24,"output_tokens":2}}"#,
+        ));
+        assert_eq!(
+            out,
+            vec![
+                AnswerChunk::Started {
+                    session_id: Some("0199a2".to_string())
+                },
+                AnswerChunk::Delta("done".to_string()),
+                AnswerChunk::Done { cost_usd: None },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_codex_jsonl_stream_parses_session_and_answer() {
+        let dir = TempDir::new().unwrap();
+        let script = write_script(
+            &dir,
+            "codex",
+            "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"thread.started\",\"thread_id\":\"sid-1\"}'\n\
+             printf '%s\\n' '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"hello\"}}'\n\
+             printf '%s\\n' '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'\n",
+        );
+        let chunks = collect(drive_fixture(
+            script,
+            vec![],
+            OutputParser::CodexJsonl,
+            DriveOptions::default(),
+        ))
+        .await;
+        assert_eq!(
+            chunks[0],
+            AnswerChunk::Started {
+                session_id: Some("sid-1".to_string())
+            }
+        );
+        assert_eq!(chunks[1], AnswerChunk::Delta("hello".to_string()));
+        assert_eq!(chunks[2], AnswerChunk::Done { cost_usd: None });
+        assert_eq!(chunks.len(), 3);
+    }
+
+    #[test]
+    fn test_codex_jsonl_fail_soft_plain_line_becomes_delta() {
+        // Resume path may not honor `--json`: a non-JSON line is surfaced as a
+        // plain-text Delta (after an implicit Started) rather than dropped.
+        let mut st = ParseState::new(OutputParser::CodexJsonl);
+        let out = st.push_codex_line("just the final answer");
+        assert_eq!(
+            out,
+            vec![
+                AnswerChunk::Started { session_id: None },
+                AnswerChunk::Delta("just the final answer".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_codex_jsonl_turn_failed_emits_error() {
+        let mut st = ParseState::new(OutputParser::CodexJsonl);
+        let _ = st.push_codex_line(r#"{"type":"thread.started","thread_id":"s"}"#);
+        let out = st.push_codex_line(r#"{"type":"turn.failed","error":{"message":"boom"}}"#);
+        assert_eq!(out, vec![AnswerChunk::Error("boom".to_string())]);
+    }
+
     // ---- (c) timeout kills child and emits Error ------------------------
 
     #[tokio::test]
@@ -1263,5 +1694,19 @@ echo '{"type":"result","result":"rate limited","is_error":true}'
                 "missing command-map row: {tag:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_command_map_parsers_match_corrections() {
+        // Lock in the per-agent parser choices from the doc-confirmed
+        // corrections so a future edit can't silently regress them.
+        assert_eq!(
+            spec(KindTag::ClaudeCode).parser,
+            OutputParser::ClaudeStreamJson
+        );
+        assert_eq!(spec(KindTag::Cursor).parser, OutputParser::CursorJson);
+        assert_eq!(spec(KindTag::Codex).parser, OutputParser::CodexJsonl);
+        assert_eq!(spec(KindTag::Copilot).parser, OutputParser::PlainText);
+        assert_eq!(spec(KindTag::Gemini).parser, OutputParser::PlainText);
     }
 }

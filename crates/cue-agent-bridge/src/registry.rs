@@ -196,6 +196,11 @@ pub const REGISTRY: &[AgentEntry] = &[
         jsonl_subdir: "projects",
         drive_command: &["cursor-agent", "-p", "{prompt}"],
         answer_args: &[],
+        // Cursor auto-loads `~/.cursor/mcp.json`; in `-p` mode without `--force`
+        // it proposes rather than applies, so MCP read-tools are not blanket
+        // auto-approved. No documented scoped allow-flag for headless read-tool
+        // trust exists, so we add none. NEEDS-LIVE-VERIFY (the trust-gate
+        // behavior for read-only MCP tools in `-p` mode is unconfirmed).
         mcp_allow_flag: None,
         // NEVER `--plan`: Cursor's `--plan` flag is a known bug that writes
         // files. Propose = omit `--force` + rely on the prompt.
@@ -208,7 +213,13 @@ pub const REGISTRY: &[AgentEntry] = &[
     AgentEntry {
         kind_tag: KindTag::Antigravity,
         display_name: "Antigravity",
-        binary_candidates: &["antigravity", "gemini"],
+        // `agy` is Antigravity 2.0's CLI (successor to gemini-cli); list it
+        // first so discovery prefers it when installed. It stores sessions as
+        // JSONL at
+        // `~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl`
+        // — wiring that session reader is a follow-up slice. NEEDS-LIVE-VERIFY
+        // (`agy` may not be installed; drive still falls back to `gemini`).
+        binary_candidates: &["agy", "antigravity", "gemini"],
         app_bundles: &["Antigravity.app"],
         app_dirs_windows: &["Antigravity"],
         data_dir_globs: &[".gemini/antigravity"],
@@ -238,6 +249,14 @@ pub const REGISTRY: &[AgentEntry] = &[
         jsonl_subdir: "projects",
         drive_command: &["copilot", "-p", "{prompt}"],
         answer_args: &[],
+        // Copilot auto-denies tools headlessly unless allowed. Its scoped flag
+        // is `--allow-tool='SERVER(tool)'` — it needs per-*tool* names, not bare
+        // server names, so the registry's "flag + server-name list" mechanism
+        // (which works for Gemini's `--allowed-mcp-server-names`) cannot drive
+        // it. We therefore set None here and do NOT use the blanket, unsafe
+        // `--allow-all-tools`. Per-tool scoping requires enumerating tool names.
+        // NEEDS-LIVE-VERIFY
+        // (https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/allowing-tools).
         mcp_allow_flag: None,
         // Copilot has no native propose flag; propose is prompt-only. Apply
         // needs `--allow-all-tools` (without it `-p` stalls).
@@ -277,7 +296,12 @@ pub const REGISTRY: &[AgentEntry] = &[
         session_format: Some(SessionFormat::Jsonl),
         jsonl_subdir: "sessions",
         drive_command: &["codex", "exec", "{prompt}"],
-        answer_args: &[],
+        // Answer mode runs Codex with the read-safe sandbox: reads are allowed,
+        // writes are blocked, and no approval prompt is raised (which would
+        // stall a headless run). Flags DOC-CONFIRMED
+        // (https://developers.openai.com/codex/cli/reference); the precise
+        // read-only MCP/tool side-effect behavior is NEEDS-LIVE-VERIFY.
+        answer_args: &["--sandbox", "read-only", "--ask-for-approval", "never"],
         mcp_allow_flag: None,
         fix: FixProfile {
             propose_args: &["--sandbox", "read-only", "--ask-for-approval", "never"],
