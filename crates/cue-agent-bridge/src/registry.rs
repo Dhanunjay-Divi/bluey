@@ -43,13 +43,18 @@ pub struct AgentEntry {
     /// Drive command template: program + args, `{prompt}` substituted later.
     /// Stored as data only — never executed in Slice 1.
     pub drive_command: &'static [&'static str],
-    /// Extra args appended for a normal **answer** so the agent's own MCP
-    /// connectors actually fire in headless mode. Some CLIs (Gemini) block tool
-    /// calls on an approval prompt that never arrives non-interactively, so a
-    /// read-tolerant auto-approve flag is required for MCP to work; others
-    /// (Claude Code) load MCP in `-p` with no extra flag. These are answer-only
-    /// (read-intent) — the Fix lane uses [`FixProfile`] args instead.
+    /// Extra static args appended for a normal **answer**. Kept minimal and
+    /// **read-safe** — never an "auto-approve everything" flag (that would let a
+    /// read-intent answer perform writes). Most agents need nothing here.
     pub answer_args: &'static [&'static str],
+    /// When set, the flag this agent uses to **auto-approve only named MCP
+    /// servers** in headless answer mode (e.g. Gemini's
+    /// `--allowed-mcp-server-names`). The drive layer reads the agent's own
+    /// configured MCP server names and appends them after this flag, so the
+    /// agent's MCP read-tools fire while file/shell writes still require an
+    /// approval that never arrives headless (and are therefore blocked). `None`
+    /// for agents that load MCP without a flag (Claude) or have no MCP.
+    pub mcp_allow_flag: Option<&'static str>,
     /// Review-gated "Fix" profile: the extra args that switch this agent
     /// between propose-only and apply (see [`FixProfile`]).
     pub fix: FixProfile,
@@ -172,6 +177,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         jsonl_subdir: "projects",
         drive_command: &["claude", "-p", "{prompt}"],
         answer_args: &[],
+        mcp_allow_flag: None,
         fix: FixProfile {
             propose_args: &["--permission-mode", "plan"],
             apply_args: &["--permission-mode", "acceptEdits"],
@@ -190,6 +196,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         jsonl_subdir: "projects",
         drive_command: &["cursor-agent", "-p", "{prompt}"],
         answer_args: &[],
+        mcp_allow_flag: None,
         // NEVER `--plan`: Cursor's `--plan` flag is a known bug that writes
         // files. Propose = omit `--force` + rely on the prompt.
         fix: FixProfile {
@@ -209,7 +216,8 @@ pub const REGISTRY: &[AgentEntry] = &[
         session_format: Some(SessionFormat::Protobuf),
         jsonl_subdir: "projects",
         drive_command: &["gemini", "-p", "{prompt}"],
-        answer_args: &["--approval-mode", "yolo"],
+        answer_args: &[],
+        mcp_allow_flag: Some("--allowed-mcp-server-names"),
         // Antigravity drives through the `gemini` CLI, so it shares Gemini's
         // approval-mode flags.
         fix: FixProfile {
@@ -230,6 +238,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         jsonl_subdir: "projects",
         drive_command: &["copilot", "-p", "{prompt}"],
         answer_args: &[],
+        mcp_allow_flag: None,
         // Copilot has no native propose flag; propose is prompt-only. Apply
         // needs `--allow-all-tools` (without it `-p` stalls).
         fix: FixProfile {
@@ -249,7 +258,8 @@ pub const REGISTRY: &[AgentEntry] = &[
         session_format: None,
         jsonl_subdir: "projects",
         drive_command: &["gemini", "-p", "{prompt}"],
-        answer_args: &["--approval-mode", "yolo"],
+        answer_args: &[],
+        mcp_allow_flag: Some("--allowed-mcp-server-names"),
         fix: FixProfile {
             propose_args: &["--approval-mode", "plan"],
             apply_args: &["--approval-mode", "yolo"],
@@ -268,6 +278,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         jsonl_subdir: "sessions",
         drive_command: &["codex", "exec", "{prompt}"],
         answer_args: &[],
+        mcp_allow_flag: None,
         fix: FixProfile {
             propose_args: &["--sandbox", "read-only", "--ask-for-approval", "never"],
             apply_args: &[
@@ -291,6 +302,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         jsonl_subdir: "projects",
         drive_command: &["aider", "--message", "{prompt}"],
         answer_args: &[],
+        mcp_allow_flag: None,
         fix: FixProfile {
             propose_args: &["--dry-run"],
             apply_args: &["--yes-always"],
@@ -309,6 +321,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         jsonl_subdir: "projects",
         drive_command: &[],
         answer_args: &[],
+        mcp_allow_flag: None,
         // No headless CLI to drive an apply — propose-capable only.
         fix: FixProfile {
             propose_args: &[],
@@ -328,6 +341,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         jsonl_subdir: "projects",
         drive_command: &[],
         answer_args: &[],
+        mcp_allow_flag: None,
         // No headless CLI to drive an apply — propose-capable only.
         fix: FixProfile {
             propose_args: &[],

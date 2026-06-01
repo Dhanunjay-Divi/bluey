@@ -7,13 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- Headless answer drives no longer use a blanket auto-approve flag. The first
+  MCP-enable attempt used Gemini's `--approval-mode yolo`, which auto-approves
+  *all* tools — a live canary test proved it let a read-intent **answer write a
+  file**. Replaced with a scoped `mcp_allow_flag` (`--allowed-mcp-server-names`)
+  that the drive layer fills with the agent's *own* configured MCP server names:
+  the agent's MCP read-tools fire while file/shell writes stay gated (blocked
+  headless). Verified live through the bridge: MCP fired (real-time data) AND a
+  file-write attempt was blocked.
+
 ### Fixed
 - Agent MCP connectors now fire when Bluey drives a CLI in headless mode. Live
   testing showed `gemini -p` blocks tool calls on an approval prompt that never
-  arrives non-interactively, so its MCP never ran. Added a data-driven
-  per-agent `answer_args` (Gemini/Antigravity → `--approval-mode yolo`; Claude
-  needs none); Answer-mode drives now append it. Verified live: a Gemini drive
-  through the bridge fired a perplexity MCP tool and returned real-time data.
+  arrives non-interactively, so its MCP never ran. The drive layer now appends
+  the scoped MCP allow-list (see Security above) for agents that need it;
+  Claude Code loads MCP in `-p` with no flag.
 - Agent session readers, corrected against real on-disk data (live testing
   found the synthetic-fixture tests had masked these):
   - **Cursor** (`vscdb`): listed sessions but read 0 turns/titles — now walks

@@ -228,11 +228,51 @@ fn fix_profile_for_agent(agent: &AgentKind) -> Option<&'static FixProfile> {
     registry::fix_profile_for(tag)
 }
 
-/// The agent's answer-mode args (so its own MCP connectors fire in headless
-/// mode), resolved off the registry table — never by agent name.
+/// The agent's static answer-mode args (read-safe extras), off the registry.
 fn answer_args_for_agent(agent: &AgentKind) -> Option<&'static [&'static str]> {
     let tag = registry::KindTag::from_agent_kind(agent)?;
     registry::entry_for(tag).map(|e| e.answer_args)
+}
+
+/// Resolve the **MCP allow-list args** for an answer drive: the agent's
+/// `mcp_allow_flag` followed by the names of its own configured MCP servers.
+///
+/// This auto-approves only the agent's MCP (read) tools in headless mode while
+/// leaving file/shell write tools gated (so a read-intent answer cannot write).
+/// Does filesystem I/O (reads the agent's connector config), so it lives here
+/// rather than in the pure argv builder. Returns an empty vec when the agent
+/// has no `mcp_allow_flag`, no config, or no configured servers — in which case
+/// no MCP auto-approval is added (safe default: nothing fires that would
+/// otherwise need approval).
+fn mcp_allow_args_for_agent(agent: &AgentKind) -> Vec<String> {
+    let Some(tag) = registry::KindTag::from_agent_kind(agent) else {
+        return Vec::new();
+    };
+    let Some(entry) = registry::entry_for(tag) else {
+        return Vec::new();
+    };
+    let Some(flag) = entry.mcp_allow_flag else {
+        return Vec::new();
+    };
+    // Find this agent's connector config among discovered agents, read the
+    // server names. Discovery is read-only and fail-soft.
+    let names: Vec<String> = crate::discover_agents()
+        .into_iter()
+        .find(|d| &d.kind == agent)
+        .and_then(|d| d.connector_config_path)
+        .map(|cfg| {
+            crate::read_connectors(&cfg)
+                .into_iter()
+                .map(|c| c.name)
+                .collect()
+        })
+        .unwrap_or_default();
+    if names.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![flag.to_string()];
+    out.extend(names);
+    out
 }
 
 /// Build the full argv for a drive, layering the [`DriveMode`] Fix-profile args
@@ -254,13 +294,13 @@ fn build_argv_with_mode(
     agent: &AgentKind,
     q: &Question,
     mode: DriveMode,
+    mcp_allow: &[String],
 ) -> Result<(String, Vec<String>)> {
     let (program, mut args) = build_argv(spec, q);
 
     let extra: &[&'static str] = match mode {
-        // Answer mode appends the agent's `answer_args` so its own MCP
-        // connectors fire in headless mode (Gemini needs an auto-approve flag;
-        // Claude needs none).
+        // Answer mode appends only read-safe static args. MCP auto-approval is
+        // handled by `mcp_allow` (scoped to named servers), not a blanket flag.
         DriveMode::Answer => answer_args_for_agent(agent).unwrap_or(&[]),
         DriveMode::ProposeFix => fix_profile_for_agent(agent)
             .map(|p| p.propose_args)
@@ -278,6 +318,12 @@ fn build_argv_with_mode(
 
     for tok in extra {
         args.push((*tok).to_string());
+    }
+    // Append the scoped MCP allow-list (Answer mode only — read intent).
+    if matches!(mode, DriveMode::Answer) {
+        for tok in mcp_allow {
+            args.push(tok.clone());
+        }
     }
 
     Ok((program, args))
@@ -327,9 +373,18 @@ pub async fn drive_with_options(
         }
     };
 
+    // For an answer, resolve the scoped MCP allow-list (the agent's own server
+    // names) so its read-tools fire headless while writes stay gated. Empty for
+    // non-answer modes or agents without an MCP allow flag.
+    let mcp_allow = if matches!(opts.mode, DriveMode::Answer) {
+        mcp_allow_args_for_agent(&agent)
+    } else {
+        Vec::new()
+    };
+
     // Assemble argv with the requested mode. An unsupported ApplyFix returns
     // `Err` here — before any subprocess is spawned (the apply gate).
-    let (program, args) = build_argv_with_mode(&spec, &agent, &question, opts.mode)?;
+    let (program, args) = build_argv_with_mode(&spec, &agent, &question, opts.mode, &mcp_allow)?;
 
     // Log shape only — never the prompt text (it may carry meeting content).
     tracing::debug!(
@@ -762,23 +817,50 @@ mod tests {
         let q = Question::new("why is the build red?");
         let (_, base) = build_argv(s, &q);
         let (_, with_mode) =
-            build_argv_with_mode(s, &AgentKind::ClaudeCode, &q, DriveMode::Answer).unwrap();
+            build_argv_with_mode(s, &AgentKind::ClaudeCode, &q, DriveMode::Answer, &[]).unwrap();
         assert_eq!(base, with_mode);
     }
 
     #[test]
-    fn test_answer_mode_appends_answer_args_for_mcp() {
-        // Gemini needs an auto-approve flag in Answer mode so its MCP connectors
-        // fire headless. The flag must be present in Answer mode and must NOT be
-        // a Fix-profile arg (it's answer-only / read-intent).
+    fn test_answer_mode_never_adds_blanket_auto_approve() {
+        // Safety: Answer mode must NOT carry a blanket auto-approve flag (yolo /
+        // auto_edit) that would let a read-intent answer perform writes.
         let s = spec(KindTag::Gemini);
         let q = Question::new("use a tool");
-        let (_, args) = build_argv_with_mode(s, &AgentKind::Gemini, &q, DriveMode::Answer).unwrap();
+        let (_, args) =
+            build_argv_with_mode(s, &AgentKind::Gemini, &q, DriveMode::Answer, &[]).unwrap();
+        assert!(
+            !args.iter().any(|a| a == "yolo"),
+            "no blanket yolo in answer"
+        );
+        assert!(
+            !args.iter().any(|a| a == "auto_edit"),
+            "no auto_edit in answer"
+        );
+    }
+
+    #[test]
+    fn test_answer_mode_appends_scoped_mcp_allow_list() {
+        // The scoped MCP allow-list (resolved from the agent's own server names)
+        // is appended in Answer mode only — this auto-approves named MCP read
+        // tools while leaving write tools gated.
+        let s = spec(KindTag::Gemini);
+        let q = Question::new("use a tool");
+        let allow = vec![
+            "--allowed-mcp-server-names".to_string(),
+            "perplexity".to_string(),
+        ];
+        let (_, args) =
+            build_argv_with_mode(s, &AgentKind::Gemini, &q, DriveMode::Answer, &allow).unwrap();
         let i = args
             .iter()
-            .position(|a| a == "--approval-mode")
-            .expect("answer_args approval flag present for Gemini");
-        assert_eq!(args[i + 1], "yolo");
+            .position(|a| a == "--allowed-mcp-server-names")
+            .expect("scoped mcp allow flag present");
+        assert_eq!(args[i + 1], "perplexity");
+        // And the scoped allow-list must NOT leak into a Fix run.
+        let (_, propose) =
+            build_argv_with_mode(s, &AgentKind::Gemini, &q, DriveMode::ProposeFix, &allow).unwrap();
+        assert!(!propose.iter().any(|a| a == "--allowed-mcp-server-names"));
     }
 
     #[test]
@@ -787,7 +869,8 @@ mod tests {
         let s = spec(KindTag::ClaudeCode);
         let q = Question::new("propose a fix");
         let (_, args) =
-            build_argv_with_mode(s, &AgentKind::ClaudeCode, &q, DriveMode::ProposeFix).unwrap();
+            build_argv_with_mode(s, &AgentKind::ClaudeCode, &q, DriveMode::ProposeFix, &[])
+                .unwrap();
         let i = args
             .iter()
             .position(|a| a == "--permission-mode")
@@ -803,7 +886,7 @@ mod tests {
         let s = spec(KindTag::ClaudeCode);
         let q = Question::new("apply the approved fix");
         let (_, args) =
-            build_argv_with_mode(s, &AgentKind::ClaudeCode, &q, DriveMode::ApplyFix).unwrap();
+            build_argv_with_mode(s, &AgentKind::ClaudeCode, &q, DriveMode::ApplyFix, &[]).unwrap();
         let i = args
             .iter()
             .position(|a| a == "--permission-mode")
@@ -820,13 +903,13 @@ mod tests {
         let (_, base) = build_argv(s, &q);
 
         let (_, propose) =
-            build_argv_with_mode(s, &AgentKind::Cursor, &q, DriveMode::ProposeFix).unwrap();
+            build_argv_with_mode(s, &AgentKind::Cursor, &q, DriveMode::ProposeFix, &[]).unwrap();
         assert_eq!(propose, base, "propose must not append any arg for Cursor");
         assert!(!propose.iter().any(|a| a == "--force"));
         assert!(!propose.iter().any(|a| a == "--plan"));
 
         let (_, apply) =
-            build_argv_with_mode(s, &AgentKind::Cursor, &q, DriveMode::ApplyFix).unwrap();
+            build_argv_with_mode(s, &AgentKind::Cursor, &q, DriveMode::ApplyFix, &[]).unwrap();
         assert!(apply.iter().any(|a| a == "--force"));
         assert!(!apply.iter().any(|a| a == "--plan"));
     }
@@ -837,7 +920,7 @@ mod tests {
         let s = spec(KindTag::ClaudeCode);
         let q = Question::new("the prompt");
         let (_, args) =
-            build_argv_with_mode(s, &AgentKind::ClaudeCode, &q, DriveMode::ApplyFix).unwrap();
+            build_argv_with_mode(s, &AgentKind::ClaudeCode, &q, DriveMode::ApplyFix, &[]).unwrap();
         assert_eq!(args.iter().filter(|a| *a == "the prompt").count(), 1);
         let prompt_idx = args.iter().position(|a| a == "the prompt").unwrap();
         let flag_idx = args.iter().position(|a| a == "acceptEdits").unwrap();
@@ -854,7 +937,7 @@ mod tests {
         let s = spec(KindTag::Codex);
         let q = Question::new("apply");
         let (_, args) =
-            build_argv_with_mode(s, &AgentKind::Codex, &q, DriveMode::ApplyFix).unwrap();
+            build_argv_with_mode(s, &AgentKind::Codex, &q, DriveMode::ApplyFix, &[]).unwrap();
         assert!(args.iter().any(|a| a == "workspace-write"));
         assert!(!args.iter().any(|a| a == "read-only"));
     }
@@ -866,7 +949,8 @@ mod tests {
         let s = spec(KindTag::Gemini);
         let q = Question::new("propose");
         let (_, args) =
-            build_argv_with_mode(s, &AgentKind::Antigravity, &q, DriveMode::ProposeFix).unwrap();
+            build_argv_with_mode(s, &AgentKind::Antigravity, &q, DriveMode::ProposeFix, &[])
+                .unwrap();
         let i = args.iter().position(|a| a == "--approval-mode").unwrap();
         assert_eq!(args[i + 1], "plan");
     }
@@ -878,9 +962,10 @@ mod tests {
         let s = spec(KindTag::ClaudeCode);
         let q = Question::new("x");
         let (_, propose) =
-            build_argv_with_mode(s, &AgentKind::ClaudeCode, &q, DriveMode::ProposeFix).unwrap();
+            build_argv_with_mode(s, &AgentKind::ClaudeCode, &q, DriveMode::ProposeFix, &[])
+                .unwrap();
         let (_, apply) =
-            build_argv_with_mode(s, &AgentKind::ClaudeCode, &q, DriveMode::ApplyFix).unwrap();
+            build_argv_with_mode(s, &AgentKind::ClaudeCode, &q, DriveMode::ApplyFix, &[]).unwrap();
         assert_ne!(propose, apply);
     }
 
@@ -892,7 +977,7 @@ mod tests {
         let s = spec(KindTag::ClaudeCode); // any spec; the guard keys off kind.
         let q = Question::new("apply");
         for kind in [AgentKind::Windsurf, AgentKind::VsCodeFork] {
-            let res = build_argv_with_mode(s, &kind, &q, DriveMode::ApplyFix);
+            let res = build_argv_with_mode(s, &kind, &q, DriveMode::ApplyFix, &[]);
             assert!(res.is_err(), "{kind:?} ApplyFix should error");
             let msg = res.unwrap_err().to_string();
             assert!(msg.contains("cannot apply"), "unclear error: {msg}");
@@ -907,7 +992,7 @@ mod tests {
         let q = Question::new("propose");
         let (_, base) = build_argv(s, &q);
         let (_, propose) =
-            build_argv_with_mode(s, &AgentKind::Windsurf, &q, DriveMode::ProposeFix).unwrap();
+            build_argv_with_mode(s, &AgentKind::Windsurf, &q, DriveMode::ProposeFix, &[]).unwrap();
         assert_eq!(propose, base);
     }
 
@@ -917,10 +1002,12 @@ mod tests {
         // base argv (no extra args), never panics.
         let s = spec(KindTag::ClaudeCode);
         let q = Question::new("x");
-        assert!(build_argv_with_mode(s, &AgentKind::Unknown, &q, DriveMode::ApplyFix).is_err());
+        assert!(
+            build_argv_with_mode(s, &AgentKind::Unknown, &q, DriveMode::ApplyFix, &[]).is_err()
+        );
         let (_, base) = build_argv(s, &q);
         let (_, propose) =
-            build_argv_with_mode(s, &AgentKind::Unknown, &q, DriveMode::ProposeFix).unwrap();
+            build_argv_with_mode(s, &AgentKind::Unknown, &q, DriveMode::ProposeFix, &[]).unwrap();
         assert_eq!(propose, base);
     }
 
