@@ -18,6 +18,7 @@ webbrowser = "1"
 cue-cloud-client = { path = "../cue-cloud-client" }
 anyhow.workspace = true
 clap.workspace = true
+cue-agent-bridge = { path = "../cue-agent-bridge" }
 cue-core = { path = "../cue-core" }
 libc.workspace = true
 serde.workspace = true

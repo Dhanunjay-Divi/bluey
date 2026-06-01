@@ -436,6 +436,10 @@ enum AgentCommands {
     },
     /// Show which agent is currently attached.
     Status,
+    /// Prove, per agent, what works on this machine (capability matrix).
+    /// Read-only: probes discovery/connectors/sessions/install/drive at the
+    /// highest honest level (live / fixture / skip) without driving or installing.
+    Prove,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2171,6 +2175,12 @@ async fn agent_command(command: AgentCommands) -> Result<()> {
                     println!("No agent attached. Answers use Bluey's normal providers.");
                 }
             }
+            Ok(())
+        }
+        AgentCommands::Prove => {
+            // Read-only local probe — no daemon needed.
+            let proofs = cue_agent_bridge::prove::prove_all();
+            print!("{}", cue_agent_bridge::prove::render_report(&proofs));
             Ok(())
         }
     }

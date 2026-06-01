@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `bluey agent prove` — a capability matrix that probes EVERY known agent on the
+  machine and reports, per agent, what genuinely works at the highest honest
+  level: LIVE (exercised against the real installed agent), FIXTURE (reserved
+  for real captured samples), or SKIP (with the concrete reason — e.g. "CLI not
+  on PATH (install it to drive)"). Read-only: it really lists sessions, reads
+  connectors, and checks install/drive readiness, but never installs or drives.
+  Turns "test against all applications" into one truthful report instead of
+  per-agent guesswork — never a fake pass. New `prove` module in cue-agent-bridge.
 - Proactive provisioning (Phase A) — Bluey now installs a missing agent CLI so a
   user with only the GUI becomes drivable, instead of degrading to read-only.
   New `provision` module: vetted per-agent `InstallRecipe` (official npm/curl
