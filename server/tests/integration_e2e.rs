@@ -808,6 +808,7 @@ async fn billing_checkout_creates_square_payment_link_when_square_enabled() {
 
     Mock::given(method("POST"))
         .and(path("/v2/online-checkout/payment-links"))
+        .and(header("Square-Version", "2025-04-16"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "payment_link": {
                 "id": "LNK_TEST",

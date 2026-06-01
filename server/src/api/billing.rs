@@ -48,6 +48,7 @@ pub struct ApiError {
 }
 
 const MINIMUM_RELOAD_CENTS: i64 = 3000;
+const SQUARE_API_VERSION: &str = "2025-04-16";
 
 fn stripe_api_url(path: &str) -> String {
     let base =
@@ -332,6 +333,7 @@ async fn square_checkout(
     let resp = reqwest::Client::new()
         .post(square_api_url(&square, "/v2/online-checkout/payment-links"))
         .bearer_auth(access_token)
+        .header("Square-Version", SQUARE_API_VERSION)
         .json(&body)
         .send()
         .await

@@ -101,11 +101,14 @@ This is the master gate before public alpha. Every item must be ticked or explic
 - [ ] Preprod uses `SQUARE_ENVIRONMENT=sandbox`; production uses `SQUARE_ENVIRONMENT=production`
 - [ ] Matching `SQUARE_*_APPLICATION_ID`, `SQUARE_*_ACCESS_TOKEN`, and `SQUARE_*_LOCATION_ID` values set in `/etc/bluey-api/bluey-api.env`
 - [ ] Webhook endpoint registered: `https://bluey.sh/billing/square/webhook`
-- [ ] Webhook event subscribed: `order.updated`
+- [ ] Webhook events subscribed: `order.updated`, `payment.updated`
 - [ ] Matching `SQUARE_*_WEBHOOK_SIGNATURE_KEY` set in `/etc/bluey-api/bluey-api.env`
 - [ ] Sandbox test: $30 reload through Square hosted checkout → balance credited within 30s
 - [ ] Production test: real $30 reload through Square hosted checkout → balance credited within 30s
 - [ ] Auto-topup/card-on-file is explicitly deferred until Square saved-card flow is wired; manual reload must be clear in `/account`
+- [ ] Customer-facing copy says account credits are non-transferable, have no cash value, and are not a stored-value/gift-card product
+- [ ] Refund/support/privacy/terms pages are published before production payments
+- [ ] Square credentials rotated if any production credential was pasted into a non-secret channel during setup
 
 ### SMTP
 

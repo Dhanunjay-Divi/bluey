@@ -4,6 +4,10 @@ Bluey supports Square as the primary billing provider for hosted credit reloads.
 Do not commit Square application IDs, access tokens, location IDs, or webhook
 signature keys. Keep them in `/etc/bluey-api/bluey-api.env` or a secret manager.
 
+Bluey sells non-transferable SaaS account credits for managed AI work. Do not
+market them as a cash wallet, stored-value card, gift card, financial product,
+or transferable balance.
+
 ## Runtime Switch
 
 The same server binary supports sandbox and production:
@@ -48,6 +52,7 @@ Subscribe to:
 
 ```text
 order.updated
+payment.updated
 ```
 
 Bluey validates `x-square-hmacsha256-signature` with the configured webhook
@@ -59,14 +64,25 @@ through the same FIFO credit-batch ledger used by the rest of Bluey.
 Implemented:
 
 - `/billing/checkout` creates a Square hosted payment link.
+- Outbound Square API calls pin `Square-Version: 2025-04-16`.
 - `/billing/square/webhook` verifies the Square signature and credits completed
-  reload orders.
+  reload orders/payment events.
 - Preprod/prod credential switching via `SQUARE_ENVIRONMENT`.
 - Integration tests for Square checkout and webhook crediting.
+
+Compliance notes:
+
+- Bluey uses Square-hosted checkout and does not collect, store, or proxy card
+  numbers, CVV, or card expiration data.
+- Bluey stores Square access tokens and webhook signature keys only in server
+  environment/secret storage.
+- Refund, support, privacy, and terms pages must be published before production
+  traffic.
+- Rotate Square credentials before production if they were ever pasted into a
+  chat, ticket, or other non-secret channel.
 
 Deferred:
 
 - Square saved-card auto top-up. Manual reload is the supported v0.2 path.
 - A Bluey-hosted billing page for card management. `/billing/portal` currently
   routes Square customers back to `/account?billing=square`.
-
