@@ -243,7 +243,7 @@ When the user asks a question later:
 
 ```text
 Question
-  -> recent transcript + recent Q&A
+  -> recent transcript (up to 32 turns / 8,000 chars) + recent Q&A
   -> latest attached artifacts first
   -> top current-session RAG hits
   -> top older-session RAG hits

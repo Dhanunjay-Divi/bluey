@@ -478,6 +478,8 @@ struct AudioRuntime {
 }
 
 const DEFAULT_AUDIO_IDLE_STOP_SECS: u64 = 5 * 60;
+const ANSWER_TRANSCRIPT_TURN_LIMIT: usize = 32;
+const ANSWER_TRANSCRIPT_CHAR_BUDGET: usize = 8_000;
 
 impl OverlayProcess {
     fn send(&mut self, command: &OverlayCommand) -> Result<()> {
@@ -4637,7 +4639,8 @@ fn rag_hit_to_answer_context(
 
 fn answer_context_from_meeting(meeting: &MeetingRecord) -> Vec<AnswerContext> {
     let mut context = Vec::new();
-    let transcript = meeting.last_transcript_text(24);
+    let transcript = meeting
+        .last_transcript_text_bounded(ANSWER_TRANSCRIPT_TURN_LIMIT, ANSWER_TRANSCRIPT_CHAR_BUDGET);
     if !transcript.trim().is_empty() {
         context.push(
             AnswerContext::transcript(transcript)

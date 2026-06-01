@@ -43,6 +43,9 @@ daemon now builds context from:
 
 RAG retrieval is bounded:
 
+- Live transcript: up to 32 latest transcript turns, capped at 8,000
+  characters. This is the default answer-window setting because dual-channel
+  calls produce many small turns, while long monologues need a hard prompt cap.
 - Current session: top 4 hits.
 - Global local memory: top 6 hits.
 - Total retrieved memory contexts: max 8.

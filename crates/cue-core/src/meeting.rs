@@ -291,6 +291,44 @@ impl MeetingRecord {
             .join("\n")
     }
 
+    pub fn last_transcript_text_bounded(&self, count: usize, max_chars: usize) -> String {
+        if count == 0 || max_chars == 0 {
+            return String::new();
+        }
+
+        let start = self.transcript.len().saturating_sub(count);
+        let mut selected = Vec::new();
+        let mut used_chars = 0usize;
+
+        for segment in self.transcript[start..].iter().rev() {
+            let line = format!("{}: {}", segment.speaker, segment.text.trim());
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let separator_chars = usize::from(!selected.is_empty());
+            let line_chars = line.chars().count();
+            if used_chars + separator_chars + line_chars <= max_chars {
+                selected.push(line);
+                used_chars += separator_chars + line_chars;
+                continue;
+            }
+
+            let remaining = max_chars.saturating_sub(used_chars + separator_chars);
+            if selected.is_empty() || remaining >= 96 {
+                let truncated =
+                    truncate_transcript_line_tail(segment.speaker, &segment.text, remaining);
+                if !truncated.trim().is_empty() {
+                    selected.push(truncated);
+                }
+            }
+            break;
+        }
+
+        selected.reverse();
+        selected.join("\n")
+    }
+
     pub fn push_conversation_turn(&mut self, turn: ConversationTurn) {
         self.conversation.push(turn);
         let excess = self.conversation.len().saturating_sub(80);
@@ -317,6 +355,30 @@ impl MeetingRecord {
             .collect::<Vec<_>>()
             .join("\n\n")
     }
+}
+
+fn truncate_transcript_line_tail(speaker: Speaker, text: &str, max_chars: usize) -> String {
+    let prefix = format!("{speaker}: ...");
+    let prefix_chars = prefix.chars().count();
+    if max_chars <= prefix_chars {
+        return tail_chars(&format!("{speaker}: {}", text.trim()), max_chars);
+    }
+
+    let tail_budget = max_chars - prefix_chars;
+    format!(
+        "{prefix}{}",
+        tail_chars(text.trim(), tail_budget).trim_start()
+    )
+}
+
+fn tail_chars(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let mut chars = text.chars().rev().take(max_chars).collect::<Vec<_>>();
+    chars.reverse();
+    chars.into_iter().collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -364,5 +426,37 @@ mod tests {
         assert!(text.contains("you: What is the plan?"));
         assert!(text.contains("bluey: Step two is to wire the provider route."));
         assert!(text.contains("provider: Bluey managed"));
+    }
+
+    #[test]
+    fn bounded_transcript_keeps_recent_turns_within_budget() {
+        let mut meeting = MeetingRecord::new(Some("Budget".to_string()));
+        for index in 0..8 {
+            meeting.transcript.push(TranscriptSegment::new(
+                Speaker::User,
+                format!("turn {index} with enough words to consume budget"),
+                true,
+            ));
+        }
+
+        let text = meeting.last_transcript_text_bounded(8, 120);
+        assert!(text.chars().count() <= 120);
+        assert!(!text.contains("turn 0"));
+        assert!(text.contains("turn 7"));
+    }
+
+    #[test]
+    fn bounded_transcript_truncates_single_long_latest_turn() {
+        let mut meeting = MeetingRecord::new(Some("Long".to_string()));
+        meeting.transcript.push(TranscriptSegment::new(
+            Speaker::System,
+            format!("{} important ending", "filler ".repeat(80)),
+            true,
+        ));
+
+        let text = meeting.last_transcript_text_bounded(4, 80);
+        assert!(text.chars().count() <= 80);
+        assert!(text.starts_with("system: ..."));
+        assert!(text.contains("important ending"));
     }
 }

@@ -83,7 +83,7 @@ Implemented locally:
   title, kind, path, and optional note. That keeps retrieved snippets
   self-explanatory even before richer source metadata columns exist.
 - Answer assembly uses bounded context:
-  - recent transcript turns,
+  - recent transcript turns: max 32 turns / 8,000 characters,
   - recent Q&A,
   - latest attached artifacts first,
   - top current-session RAG hits,
