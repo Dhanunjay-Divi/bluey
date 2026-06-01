@@ -9,7 +9,7 @@ The collapsed Bluey pill was still too large and behaved like a static logo. Whe
 - Reduced the native macOS collapsed pill from `128x38` to `112x34`.
 - Reworked the collapsed surface into a compact Bluey identity segment with an attached mini-control rail.
 - Added direct collapsed controls:
-  - Style opens the inline answer-style editor in the expanded panel.
+  - Ask opens the expanded panel and focuses the composer.
   - Play / pause toggles listening without opening the full panel.
   - Power opens the full panel and shows the existing turn-off confirmation.
 - Added a compact state indicator:

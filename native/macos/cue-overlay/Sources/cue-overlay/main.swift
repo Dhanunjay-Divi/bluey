@@ -742,7 +742,7 @@ private final class PillView: NSView {
     }
     var onClick: (() -> Void)?
     var onRunToggle: (() -> Void)?
-    var onStyle: (() -> Void)?
+    var onAsk: (() -> Void)?
     var onEnd: (() -> Void)?
     private var runState: PillRunState = .ready
 
@@ -803,11 +803,11 @@ private final class PillView: NSView {
         controlRail.layer?.borderColor = NSColor.white.withAlphaComponent(0.085).cgColor
         addSubview(controlRail)
 
-        configureMiniButton(styleButton, symbol: "text.bubble", fallback: "S", tint: BlueyTheme.cyan)
+        configureMiniButton(styleButton, symbol: "text.cursor", fallback: "?", tint: BlueyTheme.cyan)
         configureRunButton()
         configureMiniButton(endButton, symbol: "power", fallback: "×", tint: BlueyTheme.textDim)
 
-        styleButton.toolTip = "Answer style"
+        styleButton.toolTip = "Ask a question"
         runButton.toolTip = "Start or pause listening"
         endButton.toolTip = "Turn Bluey off"
         styleButton.target = self
@@ -909,7 +909,7 @@ private final class PillView: NSView {
 
     @objc private func runClicked() { onRunToggle?() }
 
-    @objc private func styleClicked() { onStyle?() }
+    @objc private func styleClicked() { onAsk?() }
 
     @objc private func endClicked() { onEnd?() }
 
@@ -2739,6 +2739,15 @@ private final class ExpandedPanelView: NSView {
         window?.makeFirstResponder(answerStyleBox)
     }
 
+    func focusComposerForQuestion() {
+        answerStyleOverlay.isHidden = true
+        closeConfirmOverlay.isHidden = true
+        composer.placeholder = recordingActive
+            ? "Ask while Bluey listens..."
+            : "Ask anything..."
+        window?.makeFirstResponder(composer)
+    }
+
     func setBalanceLabel(_ label: String) {
         let clean = label.trimmingCharacters(in: .whitespacesAndNewlines)
         balanceLabel.stringValue = clean.isEmpty ? "Balance --" : clean
@@ -3578,7 +3587,7 @@ private final class OverlayApp {
         pillView.setRunState(currentRunState)
         pillView.onClick = { [weak self] in self?.expand() }
         pillView.onRunToggle = { [weak self] in self?.toggleListeningFromPill() }
-        pillView.onStyle = { [weak self] in self?.expandAndOpenStyle() }
+        pillView.onAsk = { [weak self] in self?.expandAndFocusQuestion() }
         pillView.onEnd = { [weak self] in self?.expandAndConfirmTurnOff() }
 
         if captureVisibleForDebug {
@@ -3739,9 +3748,9 @@ private final class OverlayApp {
         }
     }
 
-    private func expandAndOpenStyle() {
+    private func expandAndFocusQuestion() {
         expand()
-        expandedView?.openAnswerStyleEditor()
+        expandedView?.focusComposerForQuestion()
     }
 
     private func expandAndConfirmTurnOff() {
