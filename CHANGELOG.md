@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connectors, and checks install/drive readiness, but never installs or drives.
   Turns "test against all applications" into one truthful report instead of
   per-agent guesswork — never a fake pass. New `prove` module in cue-agent-bridge.
+  Now also reports GUI vs CLI as **distinct surfaces with real versions**: the
+  GUI app version (from its bundle), the CLI version (by actually running
+  `--version`), which binary it drives via (e.g. Antigravity → gemini), and a
+  **present-but-broken** state (CLI on PATH but won't run — a dangling symlink /
+  bad install). `drivable` now requires the CLI to actually run, not just exist.
 - Proactive provisioning (Phase A) — Bluey now installs a missing agent CLI so a
   user with only the GUI becomes drivable, instead of degrading to read-only.
   New `provision` module: vetted per-agent `InstallRecipe` (official npm/curl

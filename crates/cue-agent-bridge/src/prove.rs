@@ -46,11 +46,32 @@ impl ProofLevel {
     }
 }
 
+/// GUI app and CLI are **distinct surfaces** — an agent can have one, both, or
+/// neither, at different versions. This separates them honestly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurfaceStatus {
+    /// The GUI app's version (from its bundle), if the app is installed.
+    pub gui_version: Option<String>,
+    /// The CLI binary's version (from `--version`), if the CLI is on PATH AND
+    /// actually runs. `None` if no CLI, or the CLI is present but won't run.
+    pub cli_version: Option<String>,
+    /// True if a CLI binary is on PATH but `--version` failed — a present but
+    /// **broken** CLI (e.g. a dangling symlink, a bad install). Distinct from
+    /// "no CLI at all".
+    pub cli_present_but_broken: bool,
+    /// The binary name we actually drive through (may differ from the agent —
+    /// e.g. Antigravity drives via `gemini`). `None` if not drivable.
+    pub drives_via: Option<String>,
+}
+
 /// The per-agent capability report.
 #[derive(Debug, Clone)]
 pub struct AgentProof {
     pub display_name: &'static str,
     pub kind: AgentKind,
+    /// GUI-vs-CLI surfaces + their versions (the thing a bare presence check
+    /// misses). See [`SurfaceStatus`].
+    pub surfaces: SurfaceStatus,
     /// Is the agent present at all (CLI binary or GUI/data footprint)?
     pub discovered: ProofLevel,
     /// Can we install its CLI if missing (is there a recipe + are prereqs met)?
@@ -59,7 +80,7 @@ pub struct AgentProof {
     pub connectors: ProofLevel,
     /// Can we read its session history?
     pub sessions: ProofLevel,
-    /// Can we drive it (CLI present on PATH)?
+    /// Can we drive it — CLI present on PATH AND it actually runs?
     pub drivable: ProofLevel,
 }
 
@@ -74,9 +95,112 @@ pub fn prove_all() -> Vec<AgentProof> {
         .collect()
 }
 
+/// Probe a CLI binary's version by actually running `<binary> --version`.
+/// Returns `Some(version)` if it runs and we can extract a version-ish token;
+/// `Some(raw)` trimmed if it runs but the format is unfamiliar; `None` if the
+/// binary is absent or fails to run. Bounded, read-only, never panics.
+///
+/// Real-world formats vary: `2.0.42 (Claude Code)`, bare `0.44.1`,
+/// `codex-cli 0.135.0` — so extraction is tolerant (first dotted-number token).
+fn probe_cli_version(binary: &str) -> Option<String> {
+    let output = std::process::Command::new(binary)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text.lines().next().unwrap_or("").trim();
+    if line.is_empty() {
+        return None;
+    }
+    // Extract the first token that looks like a version (digits + dots).
+    let version = line
+        .split_whitespace()
+        .find(|tok| {
+            let core = tok.trim_start_matches('v');
+            !core.is_empty()
+                && core.chars().next().is_some_and(|c| c.is_ascii_digit())
+                && core.contains('.')
+        })
+        .map(|t| t.trim_start_matches('v').to_string())
+        .unwrap_or_else(|| line.to_string());
+    Some(version)
+}
+
+/// Whether a binary name resolves on `PATH` (via `which`). Read-only.
+fn binary_on_path(binary: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(binary)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Read a macOS `.app` bundle's version from its `Info.plist`
+/// (`CFBundleShortVersionString`), if the bundle exists. Read-only; macOS-only
+/// path scheme (returns `None` elsewhere).
+fn gui_app_version(app_bundles: &[&str]) -> Option<String> {
+    for bundle in app_bundles {
+        let plist = format!("/Applications/{bundle}/Contents/Info.plist");
+        if !std::path::Path::new(&plist).exists() {
+            continue;
+        }
+        let info = format!("/Applications/{bundle}/Contents/Info");
+        if let Ok(out) = std::process::Command::new("defaults")
+            .args(["read", &info, "CFBundleShortVersionString"])
+            .output()
+        {
+            if out.status.success() {
+                let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Assess GUI-vs-CLI surfaces for an agent: the GUI app version (from its
+/// bundle), the CLI version (by actually running it), whether a present CLI is
+/// broken, and which binary we drive through.
+fn assess_surfaces(entry: &registry::AgentEntry) -> SurfaceStatus {
+    let gui_version = gui_app_version(entry.app_bundles);
+
+    // The agent's own CLI candidates (first that resolves is the drive binary).
+    let mut cli_version = None;
+    let mut cli_present_but_broken = false;
+    let mut drives_via = None;
+    for binary in entry.binary_candidates {
+        if binary_on_path(binary) {
+            match probe_cli_version(binary) {
+                Some(v) => {
+                    cli_version = Some(v);
+                    drives_via = Some((*binary).to_string());
+                    break;
+                }
+                None => {
+                    // On PATH but won't run → broken (e.g. dangling symlink).
+                    cli_present_but_broken = true;
+                }
+            }
+        }
+    }
+
+    SurfaceStatus {
+        gui_version,
+        cli_version,
+        cli_present_but_broken,
+        drives_via,
+    }
+}
+
 fn prove_one(entry: &registry::AgentEntry, discovered: &[DiscoveredAgent]) -> AgentProof {
     let kind = entry.kind_tag.to_agent_kind();
     let found = discovered.iter().find(|d| d.kind == kind);
+    let surfaces = assess_surfaces(entry);
 
     // Discovered?
     let discovered_lvl = match found {
@@ -132,16 +256,23 @@ fn prove_one(entry: &registry::AgentEntry, discovered: &[DiscoveredAgent]) -> Ag
         None => ProofLevel::Skipped("no session store on disk".to_string()),
     };
 
-    // Drivable — is a CLI binary actually on PATH? (real check, no spawn)
-    let drivable = if found.map(|d| d.has_cli_evidence()).unwrap_or(false) {
-        ProofLevel::Live("CLI binary on PATH (drive verified separately)".to_string())
-    } else {
-        ProofLevel::Skipped("no CLI on PATH (install it to drive)".to_string())
+    // Drivable — a CLI must be on PATH AND actually run (`--version` succeeded).
+    // This catches a present-but-broken CLI (dangling symlink / bad install)
+    // that a bare PATH check would wrongly call drivable.
+    let drivable = match (&surfaces.cli_version, &surfaces.drives_via) {
+        (Some(v), Some(bin)) => {
+            ProofLevel::Live(format!("{bin} v{v} runs (drive verified separately)"))
+        }
+        _ if surfaces.cli_present_but_broken => {
+            ProofLevel::Skipped("CLI on PATH but won't run — broken (reinstall to fix)".to_string())
+        }
+        _ => ProofLevel::Skipped("no working CLI on PATH (install it to drive)".to_string()),
     };
 
     AgentProof {
         display_name: entry.display_name,
         kind,
+        surfaces,
         discovered: discovered_lvl,
         installable,
         connectors,
@@ -158,6 +289,25 @@ pub fn render_report(proofs: &[AgentProof]) -> String {
     out.push('\n');
     for p in proofs {
         out.push_str(&format!("\n{} [{:?}]\n", p.display_name, p.kind));
+        // GUI-vs-CLI surfaces + versions (separate, honest).
+        let gui = p
+            .surfaces
+            .gui_version
+            .as_deref()
+            .map(|v| format!("GUI v{v}"))
+            .unwrap_or_else(|| "GUI —".to_string());
+        let cli = match (&p.surfaces.cli_version, p.surfaces.cli_present_but_broken) {
+            (Some(v), _) => format!("CLI v{v}"),
+            (None, true) => "CLI present-but-broken".to_string(),
+            (None, false) => "CLI —".to_string(),
+        };
+        let via = p
+            .surfaces
+            .drives_via
+            .as_deref()
+            .map(|b| format!(" (drives via {b})"))
+            .unwrap_or_default();
+        out.push_str(&format!("  surfaces    {gui} | {cli}{via}\n"));
         for (label, lvl) in [
             ("discovered ", &p.discovered),
             ("installable", &p.installable),
