@@ -16,7 +16,7 @@ Make the first customer path coherent from install to active paid use:
   - Starts `POST /auth/device/start`.
   - Opens `https://bluey.sh/link?user_code=XXXX-XXXX`.
   - Polls `POST /auth/device/poll` for up to 10 minutes.
-  - Saves the returned access/refresh tokens through the existing keyring path.
+  - Runs the polling client with an in-memory token store, then saves the returned access/refresh tokens through the existing keyring path. This keeps first login from depending on keyring availability before tokens exist.
 - Server device-flow verification URI now points at `/link`, which is the product account page customers already see.
 - `web/index.html` now supports two browser-to-desktop handoff modes:
   - `/link?user_code=...`: approve a terminal/device login after sign-in or account creation.

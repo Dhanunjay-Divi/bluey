@@ -1124,7 +1124,7 @@ async fn browser_login(
     };
     let client = cue_cloud_client::CloudClient::new(
         config,
-        Arc::new(cue_cloud_client::tokens::KeyringStore::new()),
+        Arc::new(cue_cloud_client::tokens::MemoryStore::new()),
     )
     .context("failed to initialize Bluey cloud client")?;
     let flow = cue_cloud_client::DeviceFlow::start(&client)
