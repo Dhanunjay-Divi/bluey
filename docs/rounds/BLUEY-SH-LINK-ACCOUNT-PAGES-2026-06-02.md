@@ -140,3 +140,16 @@ Second follow-up pass tightened the public page further after comparing against
 
 This is intentional. The public page should feel plain, fast, and easy to read;
 the product detail now lives in the account, docs, and desktop app surfaces.
+
+## Angular Wordmark Polish
+
+Third follow-up pass added an original angular `BLUEY` wordmark beside the logo
+in the shared brand header. The visual direction references sharp AI/security
+wordmarks, but the implementation is CSS-only and Bluey-specific rather than a
+copy of an external logo.
+
+- Applies to the public nav, account rail, and legal/auth header brand spots.
+- Keeps the existing terminal-logo icon as the product anchor.
+- Uses clipped letter spans so the mark stays lightweight and scales on mobile.
+- Verified against desktop and mobile screenshots plus route smoke for all
+  static web routes.

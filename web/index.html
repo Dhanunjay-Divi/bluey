@@ -124,6 +124,44 @@
       letter-spacing: 0;
     }
 
+    .brand-wordmark {
+      display: inline-flex;
+      align-items: baseline;
+      gap: .02em;
+      color: #f6fdff;
+      font-family: "Arial Black", "Avenir Next", "Segoe UI", sans-serif;
+      font-size: 25px;
+      font-weight: 950;
+      line-height: .78;
+      letter-spacing: 0;
+      text-transform: uppercase;
+      transform: skewX(-7deg);
+      text-shadow: 0 0 18px rgba(114, 240, 255, .22);
+    }
+
+    .brand-wordmark .wm-letter {
+      position: relative;
+      display: inline-block;
+      clip-path: polygon(0 0, 82% 0, 100% 22%, 100% 100%, 15% 100%, 0 80%);
+    }
+
+    .brand-wordmark .wm-letter:nth-child(2),
+    .brand-wordmark .wm-letter:nth-child(5) {
+      color: #dcf8ff;
+      clip-path: polygon(0 0, 100% 0, 88% 24%, 88% 100%, 0 100%);
+    }
+
+    .brand-wordmark .wm-letter:nth-child(4)::after {
+      content: "";
+      position: absolute;
+      right: .06em;
+      top: .12em;
+      width: .22em;
+      height: .2em;
+      background: #050708;
+      transform: skewX(22deg);
+    }
+
     .brand img {
       width: 42px;
       height: 42px;
@@ -1391,15 +1429,14 @@
     }
 
     .site .brand img {
-      width: 28px;
-      height: 28px;
+      width: 30px;
+      height: 30px;
       border-radius: 8px;
       box-shadow: none;
     }
 
     .site .brand {
       gap: 8px;
-      font-size: 17px;
       font-weight: 780;
     }
 
@@ -1729,7 +1766,7 @@
       <nav class="site-nav" style="width: 100%;">
         <a class="brand" href="/">
           <img src="assets/bluey-logo.svg" alt="">
-          <span>Bluey</span>
+          <span class="brand-wordmark" aria-label="Bluey"><span class="wm-letter">B</span><span class="wm-letter">L</span><span class="wm-letter">U</span><span class="wm-letter">E</span><span class="wm-letter">Y</span></span>
         </a>
         <div class="navlinks">
           <a href="/">Product</a>
@@ -1822,7 +1859,7 @@
       <aside class="account-rail" aria-label="Bluey account navigation">
         <a class="brand" href="/">
           <img src="assets/bluey-logo.svg" alt="">
-          <span>Bluey</span>
+          <span class="brand-wordmark" aria-label="Bluey"><span class="wm-letter">B</span><span class="wm-letter">L</span><span class="wm-letter">U</span><span class="wm-letter">E</span><span class="wm-letter">Y</span></span>
         </a>
         <div class="rail-command">
           <code>bluey on</code>
@@ -1980,7 +2017,7 @@
     <nav class="site-nav">
       <a class="brand" href="/">
         <img src="assets/bluey-logo.svg" alt="">
-        <span>Bluey</span>
+        <span class="brand-wordmark" aria-label="Bluey"><span class="wm-letter">B</span><span class="wm-letter">L</span><span class="wm-letter">U</span><span class="wm-letter">E</span><span class="wm-letter">Y</span></span>
       </a>
       <div class="navlinks">
         <a href="/docs/privacy">Privacy</a>
