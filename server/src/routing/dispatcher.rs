@@ -39,7 +39,11 @@ pub fn upstream_retry_after(error: &anyhow::Error) -> Option<u64> {
         .and_then(|error| error.retry_after_secs)
 }
 
-fn upstream_http_error(provider: &str, status: reqwest::StatusCode, headers: &HeaderMap) -> anyhow::Error {
+fn upstream_http_error(
+    provider: &str,
+    status: reqwest::StatusCode,
+    headers: &HeaderMap,
+) -> anyhow::Error {
     anyhow!(UpstreamHttpError {
         provider: provider.to_string(),
         status: status.as_u16(),
@@ -574,10 +578,7 @@ async fn anthropic_complete(
     })
 }
 
-fn anthropic_thinking_for(
-    model: &str,
-    thinking: ThinkingBudget,
-) -> Option<AnthropicThinkingReq> {
+fn anthropic_thinking_for(model: &str, thinking: ThinkingBudget) -> Option<AnthropicThinkingReq> {
     if !thinking.is_enabled() || !anthropic_supports_manual_thinking(model) {
         return None;
     }

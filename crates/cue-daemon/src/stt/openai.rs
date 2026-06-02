@@ -184,8 +184,6 @@ pub struct OpenAiRealtimeProvider {
     state: Arc<OpenAiState>,
     audio_tx: Option<UnboundedSender<Vec<u8>>>,
     events_rx: UnboundedReceiver<Result<TranscriptEvent, SttError>>,
-    #[allow(dead_code)]
-    source: AudioSource,
 }
 
 impl std::fmt::Debug for OpenAiRealtimeProvider {
@@ -199,7 +197,7 @@ impl std::fmt::Debug for OpenAiRealtimeProvider {
 impl OpenAiRealtimeProvider {
     /// Build from pre-existing channels (for tests).
     pub fn from_channels(
-        source: AudioSource,
+        _source: AudioSource,
         initial: ConnectionState,
         events_rx: UnboundedReceiver<Result<TranscriptEvent, SttError>>,
         audio_tx: UnboundedSender<Vec<u8>>,
@@ -210,7 +208,6 @@ impl OpenAiRealtimeProvider {
             state,
             audio_tx: Some(audio_tx),
             events_rx,
-            source,
         }
     }
 
@@ -243,7 +240,6 @@ impl OpenAiRealtimeProvider {
             state,
             audio_tx: Some(audio_tx),
             events_rx,
-            source,
         })
     }
 }

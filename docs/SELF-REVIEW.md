@@ -4,12 +4,12 @@
 
 No blocking issues found in the current macOS arm64 local-first build after smoke testing. The current build starts with `bluey on`, opens a compact native Bluey pill, expands into the overlay feed on click/show, starts or reuses a session, accepts typed and audio-derived transcript input, attaches readable user-selected context files, stores answer instructions, supports permissioned screenshot/page analysis, streams answer cards, detects questions/action items/decisions, returns recaps, archives sessions, and shuts down cleanly with `bluey off`. The macOS overlay is draggable, resizable, opacity-adjustable, capture-excluded, frame-persistent, click-through in the readable card area, and has a composer with model/mode selection.
 
-The commercial path review is now explicit: `bluey on` is the intended user-facing flow, while CLI commands remain development, support, diagnostics, and smoke-test surfaces. The product still needs managed cloud auth/sync, server-side provider routing, cloud RAG, settings/onboarding, and dashboard surfaces before it should be positioned as production SaaS.
+The commercial path review is now explicit: `bluey on` is the intended user-facing flow, while CLI commands remain development, support, diagnostics, and smoke-test surfaces. The product now has managed auth/linking, server-side provider routing, cloud sync, and a first server-side RAG retrieval path for managed answers. Production SaaS readiness still depends on clean-machine smoke, hosted infra, payment/provider credentials, richer onboarding/settings, source cards, and cloud retention/export/delete verification.
 
 ## Known Risks
 
 - The daemon currently uses local TCP on `127.0.0.1:57321`; this is simple for development, but a polished release should move to Unix domain sockets on macOS/Linux and named pipes on Windows.
-- Local storage includes SQLite-backed sessions/search/export paths, but cloud sync and tenant-scoped RAG are not implemented yet.
+- Local storage includes SQLite-backed sessions/search/export paths. Cloud sync and tenant-scoped managed-answer RAG now exist, but pgvector/server-owned embeddings, source-card UI, and retention/export/delete coverage still need production validation.
 - The macOS overlay uses `NSWindow.sharingType = .none`, but it still needs clean-machine visual QA against Zoom/Meet/Teams and macOS screenshot/recording flows before strong public claims.
 - The Windows overlay now has drag/resize hit testing, opacity command handling, bottom Recap/Search Analyse Screen/ask/mic controls, top attach/style controls, and `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` in source. The Windows audio helper cross-compiles from macOS, but overlay/audio behavior still needs real Windows hardware QA.
 - The answer layer streams through live providers when configured and falls back deterministically only on explicit local/dev fallback routes. Provider-level cancellation for superseded upstream requests is still pending.
@@ -17,12 +17,12 @@ The commercial path review is now explicit: `bluey on` is the intended user-faci
 - Text/code/Markdown/page context attachments now store a bounded local preview. PDF and Word/RTF attachments attempt real text extraction and are rejected when they cannot be read. Analyse Screen now has a first screenshot-to-vision fallback when a vision route is configured; richer OCR/vision extraction with citations and queues is still needed.
 - Screenshot capture has macOS and Windows paths. Page capture has macOS browser scripting and Windows UI Automation paths, but browser coverage needs QA.
 - Periodic capture remains an explicit CLI/live support flow and records visible daemon state when used.
-- Local memory/RAG exists, but production RAG should move to authenticated cloud storage and tenant-scoped vector search.
+- Local memory/RAG exists, and synced cloud RAG now enriches managed `/router/complete` answers with account-scoped session/attachment snippets. Production RAG still needs server-owned embeddings/pgvector, citation/source cards, and stronger lifecycle tests.
 - Overlay file picker and answer-style prompts are implemented for macOS first; Windows remains source/parity work until supported.
 - `bluey audio ...`, `bluey ai status`, `bluey cloud ...`, `bluey providers`, `bluey memory search`, `bluey ask`, and `bluey run` are useful internal surfaces, but they are not the desired customer journey.
 - Product branding has moved to Bluey, but the source-tree crate names still use `cue-*` internally to avoid a risky full-module migration in the same round.
 - Production provider keys must be server-side. Any local provider key path should be treated as development-only to avoid confusing commercial setup and secret handling.
-- The cloud/RAG architecture is documented but not implemented: no authenticated sync, signed artifact upload, vector retrieval, deletion propagation, or cloud citation path exists yet.
+- The cloud/RAG architecture is partially implemented: authenticated sync, artifact upload, and managed-answer retrieval are wired. Remaining gaps are pgvector/vector scoring, deletion-propagation tests across all artifact/RAG tables, and a first-class cloud citation/source-card path.
 - Commercial UI is incomplete without settings/onboarding, health indicators, account/workspace controls, billing, export/deletion, and a web dashboard.
 
 ## Design Checks
@@ -55,10 +55,10 @@ The commercial path review is now explicit: `bluey on` is the intended user-faci
 ## Next Work
 
 - Move daily-use actions behind overlay/settings UI so `bluey on` remains the only customer-facing command.
-- Build auth/device registration, local token storage, and the first cloud sync queue.
+- Finish hosted auth/device registration validation, local token storage QA, and cloud sync smoke against staging/prod.
 - Clean-machine validate the macOS arm64 tarball, installer script, `bluey on`, and `bluey off`.
 - Harden audio/STT with long-session stress, sleep/wake, device hot-swap, permission repair, and Windows hardware QA.
 - Add provider cancellation, citations, and stronger answer metadata behind the existing answer request/response/event contract.
-- Add cloud artifact upload, OCR/vision extraction, embeddings, and tenant-scoped RAG retrieval.
+- Add server-owned embeddings/pgvector, richer OCR/vision extraction, source cards, and tenant-scoped RAG lifecycle tests.
 - Create settings/onboarding and web dashboard surfaces for account, permissions, workspace, billing, history, export, and deletion.
 - Add crash diagnostics, opt-in telemetry/support bundle export, and eventually signed desktop apps with auto-update.

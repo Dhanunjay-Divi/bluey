@@ -1951,10 +1951,6 @@ impl ProviderRegistry {
     fn is_empty(&self) -> bool {
         self.providers.is_empty()
     }
-    #[allow(dead_code)]
-    fn fallback(&self) -> Option<std::sync::Arc<dyn cue_llm::LlmProvider>> {
-        self.providers.values().next().cloned()
-    }
 }
 
 impl ProviderRegistry {

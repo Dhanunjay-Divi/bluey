@@ -27,8 +27,6 @@ use self::parser::parse_line;
 
 /// Local Whisper STT provider using a child-process helper binary.
 pub struct LocalWhisperProvider {
-    #[allow(dead_code)]
-    config: SttConfig,
     state: ConnectionState,
     event_rx: mpsc::UnboundedReceiver<Result<TranscriptEvent, SttError>>,
     stdin_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
@@ -48,7 +46,6 @@ impl LocalWhisperProvider {
         });
 
         Ok(Self {
-            config,
             state: ConnectionState::Connected,
             event_rx,
             stdin_tx: Some(stdin_tx),

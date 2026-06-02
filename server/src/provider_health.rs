@@ -7,8 +7,8 @@
 //! instead of making the customer wait.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
@@ -59,10 +59,7 @@ impl ProviderHealth {
     pub fn snapshot(&self) -> ProviderHealthSnapshot {
         ProviderHealthSnapshot {
             cooldowns_total: self.counters.cooldowns_total.load(Ordering::Relaxed),
-            all_keys_cooling_total: self
-                .counters
-                .all_keys_cooling_total
-                .load(Ordering::Relaxed),
+            all_keys_cooling_total: self.counters.all_keys_cooling_total.load(Ordering::Relaxed),
             redis_errors_total: self.counters.redis_errors_total.load(Ordering::Relaxed),
         }
     }
@@ -105,9 +102,7 @@ impl ProviderHealth {
         key_fingerprint: &str,
         retry_after_secs: u64,
     ) -> u64 {
-        let cooldown_secs = retry_after_secs
-            .max(1)
-            .min(self.max_cooldown_secs.max(1));
+        let cooldown_secs = retry_after_secs.max(1).min(self.max_cooldown_secs.max(1));
         let key = health_key(provider, model, key_fingerprint);
         let expires_at = Instant::now() + Duration::from_secs(cooldown_secs);
         self.local.lock().await.insert(key.clone(), expires_at);
@@ -250,7 +245,9 @@ mod tests {
         let health = ProviderHealth::default();
         let candidates = vec![candidate("key-a", "fp-a"), candidate("key-b", "fp-b")];
 
-        health.record_cooldown("openai", "gpt-4o-mini", "fp-a", 60).await;
+        health
+            .record_cooldown("openai", "gpt-4o-mini", "fp-a", 60)
+            .await;
 
         let selected = health
             .choose_key("openai", "gpt-4o-mini", &candidates)
@@ -264,8 +261,12 @@ mod tests {
         let health = ProviderHealth::default();
         let candidates = vec![candidate("key-a", "fp-a"), candidate("key-b", "fp-b")];
 
-        health.record_cooldown("openai", "gpt-4o-mini", "fp-a", 60).await;
-        health.record_cooldown("openai", "gpt-4o-mini", "fp-b", 30).await;
+        health
+            .record_cooldown("openai", "gpt-4o-mini", "fp-a", 60)
+            .await;
+        health
+            .record_cooldown("openai", "gpt-4o-mini", "fp-b", 30)
+            .await;
 
         let denied = health
             .choose_key("openai", "gpt-4o-mini", &candidates)

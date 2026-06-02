@@ -365,21 +365,17 @@ struct RealAudioSource {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 enum FfmpegAudioInput {
     NativeHelper {
         helper_path: PathBuf,
         source_arg: String,
     },
-    MacAvFoundation {
-        device_name: String,
-    },
-    WindowsDshow {
-        device_name: String,
-    },
-    WindowsWasapiLoopback {
-        device_name: String,
-    },
+    #[cfg(target_os = "macos")]
+    MacAvFoundation { device_name: String },
+    #[cfg(target_os = "windows")]
+    WindowsDshow { device_name: String },
+    #[cfg(target_os = "windows")]
+    WindowsWasapiLoopback { device_name: String },
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -2836,6 +2832,7 @@ fn wav_from_f32le_48k_mono_to_i16_16k(raw: &[u8]) -> Vec<u8> {
 fn append_ffmpeg_input_args(command: &mut TokioCommand, input: &FfmpegAudioInput) {
     match input {
         FfmpegAudioInput::NativeHelper { .. } => {}
+        #[cfg(target_os = "macos")]
         FfmpegAudioInput::MacAvFoundation { device_name } => {
             command
                 .arg("-f")
@@ -2843,6 +2840,7 @@ fn append_ffmpeg_input_args(command: &mut TokioCommand, input: &FfmpegAudioInput
                 .arg("-i")
                 .arg(format!(":{device_name}"));
         }
+        #[cfg(target_os = "windows")]
         FfmpegAudioInput::WindowsDshow { device_name } => {
             command
                 .arg("-f")
@@ -2850,6 +2848,7 @@ fn append_ffmpeg_input_args(command: &mut TokioCommand, input: &FfmpegAudioInput
                 .arg("-i")
                 .arg(format!("audio={device_name}"));
         }
+        #[cfg(target_os = "windows")]
         FfmpegAudioInput::WindowsWasapiLoopback { device_name } => {
             command
                 .arg("-f")

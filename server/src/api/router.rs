@@ -367,8 +367,12 @@ async fn complete_inner(
         ));
     }
 
-    let rag_matches =
-        completion_rag_matches(&state.pool, &account.id, req.session_id.as_deref(), &req.user);
+    let rag_matches = completion_rag_matches(
+        &state.pool,
+        &account.id,
+        req.session_id.as_deref(),
+        &req.user,
+    );
     let (provider_system, provider_user) =
         prompt_with_rag_context(&req.system, &req.user, &rag_matches);
 
@@ -1747,7 +1751,10 @@ mod tests {
             embedding_model: None,
         };
 
-        assert!(rag_completion_score(&current, Some("session-a")) > rag_completion_score(&older, Some("session-a")));
+        assert!(
+            rag_completion_score(&current, Some("session-a"))
+                > rag_completion_score(&older, Some("session-a"))
+        );
     }
 
     #[test]

@@ -332,11 +332,6 @@ pub struct DeepgramProvider {
     state: Arc<DeepgramState>,
     audio_tx: Option<UnboundedSender<Vec<u8>>>,
     events_rx: UnboundedReceiver<Result<TranscriptEvent, SttError>>,
-    /// Retained so future extensions (e.g. per-request re-tagging of the
-    /// source on emitted events) can access it without re-plumbing the
-    /// constructors. The supervisor task receives its own copy.
-    #[allow(dead_code)]
-    source: AudioSource,
 }
 
 impl std::fmt::Debug for DeepgramProvider {
@@ -352,7 +347,7 @@ impl DeepgramProvider {
     /// starting connection state. This is the seam unit tests use to drive
     /// the provider without opening a real WebSocket.
     pub fn from_channels(
-        source: AudioSource,
+        _source: AudioSource,
         initial: ConnectionState,
         events_rx: UnboundedReceiver<Result<TranscriptEvent, SttError>>,
         audio_tx: UnboundedSender<Vec<u8>>,
@@ -363,7 +358,6 @@ impl DeepgramProvider {
             state,
             audio_tx: Some(audio_tx),
             events_rx,
-            source,
         }
     }
 
@@ -403,7 +397,6 @@ impl DeepgramProvider {
             state,
             audio_tx: Some(audio_tx),
             events_rx,
-            source,
         })
     }
 

@@ -19,7 +19,6 @@ use bluey_server::db::{open_pool, run_migrations, DbPool};
 
 /// Test harness: starts wiremocks, builds an AppState pointed at them,
 /// returns the axum Router ready for ServiceExt::oneshot.
-#[allow(dead_code)]
 struct Harness {
     pub router: axum::Router,
     pub pool: DbPool,
@@ -231,10 +230,8 @@ async fn router_complete_retries_next_openai_key_on_429_without_customer_wait() 
         ollama_base_url: None,
     };
     let request_id = "openai-keypool-429-1";
-    let ordered_keys = upstream.key_candidates(
-        "openai",
-        &format!("llm:{request_id}:openai:gpt-4o-mini"),
-    );
+    let ordered_keys =
+        upstream.key_candidates("openai", &format!("llm:{request_id}:openai:gpt-4o-mini"));
     assert_eq!(ordered_keys.len(), 2);
 
     let h = boot_harness_with_upstream(upstream).await;
