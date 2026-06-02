@@ -59,8 +59,8 @@ Caddy routes the API paths to `bluey-server` and serves everything else from
 
 4. Release artifacts
    - `/var/www/bluey/install.sh`
-   - `/var/www/bluey/releases/v0.2.0/bluey-0.2.0-darwin-arm64.tar.gz`
-   - `/var/www/bluey/releases/v0.2.0/SHA256SUMS.txt`
+   - `/var/www/bluey/releases/v0.1.0/bluey-0.1.0-darwin-arm64.tar.gz`
+   - `/var/www/bluey/releases/v0.1.0/SHA256SUMS.txt`
    - static pages copied from `web/` or a separate polished web build
 
 ## First Deploy Order

@@ -137,23 +137,23 @@ routes must exist before public alpha:
 - [x] `/docs/terms` — alpha terms of use
 - [ ] OG / favicon assets
 
-### macOS app distribution (Pinky-style: NO Apple Developer ID required for v0.2 alpha)
+### macOS terminal distribution (Pinky-style: NO Apple Developer ID required for v0.2 alpha)
 
-We ship the `.app` bundle without a paid Apple Developer ID. The
-installer ad-hoc signs the bundle and strips the quarantine bit so
-first-launch is clean. Two distribution paths, ship both:
+The current alpha ships as a terminal bundle: `bluey`, `bluey-daemon`,
+and native helper binaries. The installer ad-hoc signs the helper
+binaries and strips quarantine. A `.app` bundle can be added later, but
+do not advertise it until a real `Bluey.app` artifact exists.
 
 #### Path A: One-line installer (`curl ... | bash`)
 - [ ] `ops/install/install.sh` hosted at `https://bluey.sh/install.sh`
-- [ ] Release tarball hosted at `https://bluey.sh/releases/v0.2.0/bluey-0.2.0-darwin-arm64.tar.gz`
-- [ ] Each release tarball contains top-level `Bluey.app` and `bin/bluey`
+- [ ] Release tarball hosted at `https://bluey.sh/releases/v0.1.0/bluey-0.1.0-darwin-arm64.tar.gz`
+- [ ] Each release tarball contains top-level `bin/bluey` plus helper binaries
 - [ ] `SHA256SUMS.txt` hosted next to the tarballs, and `install.sh` verifies it
 - [ ] Smoke on a clean Mac: `curl -fsSL https://bluey.sh/install.sh | bash` finishes cleanly
-- [ ] Bluey.app launches from /Applications without a Gatekeeper hard-block
-- [ ] `bluey://` URL scheme registers (verify `lsregister -dump | grep bluey`)
-- [ ] First-run onboarding deep-link flow works end-to-end
+- [ ] `bluey` CLI is on `$PATH` after install
 
 #### Path B: Homebrew cask (`brew install --cask bluey`)
+- [ ] Replace cask with a terminal formula or publish a real `.app` artifact before enabling this path
 - [ ] `bluey-dev/homebrew-bluey` GitHub repo created
 - [ ] `ops/Casks/bluey.rb` published in that tap
 - [ ] `brew tap bluey-dev/bluey` + `brew install --cask bluey` succeeds on a clean Mac
@@ -162,9 +162,10 @@ first-launch is clean. Two distribution paths, ship both:
 
 #### Optional (v1.0 GA polish, NOT v0.2 gate)
 
-Bluey is terminal-installed (`curl ... | bash` or `brew install --cask`).
+Bluey is terminal-installed (`curl ... | bash`; Homebrew waits for either
+a formula or a real `.app` artifact).
 Apple Developer ID + notarization are NOT required. The install script
-ad-hoc signs the bundle and clears quarantine, which is sufficient for
+ad-hoc signs the helper binaries and clears quarantine, which is sufficient for
 Gatekeeper to allow first launch. If a paid Developer ID becomes
 available later, the install path can be upgraded transparently
 without breaking existing customers (the bundle id stays the same).

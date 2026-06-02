@@ -3,20 +3,19 @@
 #
 # Usage: curl -fsSL https://bluey.sh/install.sh | bash
 #
-# This installer ships Bluey on macOS without requiring an Apple
-# Developer ID. We ad-hoc sign the bundle (recognised by Gatekeeper
-# as "self-signed") and remove the quarantine bit so first launch
-# does not hit the "can't verify developer" hard-block. Same pattern
-# Pinky uses.
+# This installer ships the current terminal-first Bluey bundle on macOS
+# without requiring an Apple Developer ID. It installs the CLI plus native
+# helper binaries, ad-hoc signs them, clears quarantine, and creates a
+# `bluey` command symlink when possible.
 #
 # Refuses to run on unsupported platforms.
 
 set -euo pipefail
 
 # ── Configuration ────────────────────────────────────────────────────
-BLUEY_VERSION="${BLUEY_VERSION:-0.2.0}"
+BLUEY_VERSION="${BLUEY_VERSION:-0.1.0}"
 DOWNLOAD_HOST="${BLUEY_DOWNLOAD_HOST:-https://bluey.sh}"
-INSTALL_DIR="${BLUEY_INSTALL_DIR:-/Applications}"
+INSTALL_ROOT="${BLUEY_INSTALL_ROOT:-$HOME/.bluey}"
 CLI_DIR="${BLUEY_CLI_DIR:-/usr/local/bin}"
 
 # ── Colors ──────────────────────────────────────────────────────────
@@ -93,64 +92,59 @@ if [ "${BLUEY_SKIP_CHECKSUM:-0}" != "1" ] && command -v shasum >/dev/null; then
 fi
 
 # ── Extract ──────────────────────────────────────────────────────────
-say "Installing to $INSTALL_DIR/Bluey.app..."
+say "Installing Bluey to $INSTALL_ROOT..."
 WORKDIR="$(mktemp -d -t bluey-install)"
 trap 'rm -rf "$WORKDIR" "$DOWNLOAD_TMP"' EXIT
 
 tar -xzf "$TARBALL" -C "$WORKDIR"
 
-if [ ! -d "$WORKDIR/Bluey.app" ]; then
-    fail "Tarball did not contain Bluey.app at the top level"
+if [ ! -x "$WORKDIR/bin/bluey" ]; then
+    fail "Tarball did not contain bin/bluey"
 fi
 
-# Replace any prior install.
-if [ -d "$INSTALL_DIR/Bluey.app" ]; then
-    say "Replacing existing $INSTALL_DIR/Bluey.app..."
-    rm -rf "$INSTALL_DIR/Bluey.app"
-fi
-mv "$WORKDIR/Bluey.app" "$INSTALL_DIR/Bluey.app"
-ok "Installed $INSTALL_DIR/Bluey.app"
+# Replace any prior terminal bundle.
+mkdir -p "$INSTALL_ROOT"
+rm -rf "$INSTALL_ROOT/bin"
+cp -R "$WORKDIR/bin" "$INSTALL_ROOT/bin"
+chmod +x "$INSTALL_ROOT/bin/"*
+ok "Installed helper bundle"
 
 # ── Ad-hoc sign ──────────────────────────────────────────────────────
-# Without this, Gatekeeper blocks first-launch entirely. With ad-hoc
-# signing the customer sees right-click→Open at most.
-say "Ad-hoc signing the bundle..."
-if codesign --force --deep --sign - "$INSTALL_DIR/Bluey.app" 2>/dev/null; then
+say "Ad-hoc signing native binaries..."
+signed_any=0
+for bin in "$INSTALL_ROOT"/bin/*; do
+    [ -f "$bin" ] || continue
+    [ -x "$bin" ] || continue
+    if codesign --force --sign - "$bin" 2>/dev/null; then
+        signed_any=1
+    fi
+done
+if [ "$signed_any" = "1" ]; then
     ok "Ad-hoc signed"
 else
-    warn "codesign failed — you may see a Gatekeeper prompt on first launch."
-    warn "Right-click Bluey.app → Open to bypass it once."
+    warn "codesign did not sign any helper binaries; continuing."
 fi
 
 # ── Remove quarantine ────────────────────────────────────────────────
-# Strip the com.apple.quarantine extended attribute so Gatekeeper
-# doesn't gate the first-launch warning at all.
-xattr -dr com.apple.quarantine "$INSTALL_DIR/Bluey.app" 2>/dev/null || true
+# Strip the com.apple.quarantine extended attribute if the tarball arrived
+# through a quarantined path.
+xattr -dr com.apple.quarantine "$INSTALL_ROOT/bin" 2>/dev/null || true
 ok "Quarantine attribute cleared"
 
-# ── Register URL scheme ──────────────────────────────────────────────
-# Forces Launch Services to pick up our bluey:// scheme registration
-# from Info.plist.
-LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
-if [ -x "$LSREGISTER" ]; then
-    "$LSREGISTER" -f "$INSTALL_DIR/Bluey.app" 2>/dev/null || true
-    ok "bluey:// URL scheme registered"
-fi
-
 # ── CLI symlink ──────────────────────────────────────────────────────
-CLI_SOURCE=""
-if [ -f "$INSTALL_DIR/Bluey.app/Contents/Resources/bluey-cli" ]; then
-    CLI_SOURCE="$INSTALL_DIR/Bluey.app/Contents/Resources/bluey-cli"
-elif [ -f "$WORKDIR/bin/bluey" ]; then
-    mkdir -p "$INSTALL_DIR/Bluey.app/Contents/Resources"
-    cp "$WORKDIR/bin/bluey" "$INSTALL_DIR/Bluey.app/Contents/Resources/bluey-cli"
-    chmod +x "$INSTALL_DIR/Bluey.app/Contents/Resources/bluey-cli"
-    CLI_SOURCE="$INSTALL_DIR/Bluey.app/Contents/Resources/bluey-cli"
-fi
-
-if [ -n "$CLI_SOURCE" ] && [ -d "$CLI_DIR" ] && [ -w "$CLI_DIR" ]; then
+CLI_SOURCE="$INSTALL_ROOT/bin/bluey"
+if [ -d "$CLI_DIR" ] && [ -w "$CLI_DIR" ]; then
     ln -sf "$CLI_SOURCE" "$CLI_DIR/bluey"
     ok "CLI symlink: $CLI_DIR/bluey"
+elif [ -d "$HOME/.local/bin" ] || mkdir -p "$HOME/.local/bin" 2>/dev/null; then
+    ln -sf "$CLI_SOURCE" "$HOME/.local/bin/bluey"
+    ok "CLI symlink: $HOME/.local/bin/bluey"
+    case ":$PATH:" in
+        *":$HOME/.local/bin:"*) ;;
+        *) warn "Add $HOME/.local/bin to PATH if the bluey command is not found." ;;
+    esac
+else
+    warn "Could not create a CLI symlink. Run $CLI_SOURCE directly."
 fi
 
 # ── Done ─────────────────────────────────────────────────────────────
