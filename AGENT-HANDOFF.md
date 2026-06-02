@@ -178,9 +178,11 @@ Use `docs/deploy/PHASE2-MAC-SMOKE.md` for visual/product smoke.
 Update 2026-06-02: the static `bluey.sh` route shell now exists in
 `web/index.html` for `/`, `/link`, `/login`, `/reload`, `/account`,
 `/verify-email`, `/password-reset`, `/docs/privacy`, `/docs/terms`, and
-`/docs/disguise`. The remaining web work is deployment, live account/payment
-smoke, hosted release artifacts, and any richer account/session UI beyond the
-alpha shell.
+`/docs/disguise`. `/account` also lists synced cloud sessions from
+`/sync/sessions` and can inspect a cloud session bundle. The remaining web work
+is deployment, live account/payment smoke, hosted release artifacts, and the
+desktop bridge that restores a cloud-only session into a local active
+`MeetingRecord` so users can continue it from the overlay.
 
 ## Review Cadence
 

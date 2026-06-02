@@ -1142,6 +1142,100 @@
       font-size: 14px;
     }
 
+    .dashboard-section {
+      display: grid;
+      gap: 12px;
+      border-top: 1px solid rgba(114, 240, 255, .10);
+      padding-top: 16px;
+    }
+
+    .section-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .section-head h3 {
+      margin: 0 0 4px;
+    }
+
+    .session-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .session-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 12px;
+      align-items: center;
+      border: 1px solid rgba(114, 240, 255, .11);
+      border-radius: 16px;
+      background: rgba(255, 255, 255, .032);
+      padding: 12px;
+    }
+
+    .session-title {
+      display: block;
+      color: var(--text);
+      font-size: 14px;
+      font-weight: 850;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .session-meta {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .session-detail {
+      border: 1px solid rgba(114, 240, 255, .14);
+      border-radius: 18px;
+      background: rgba(0, 0, 0, .20);
+      padding: 14px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .session-detail strong {
+      display: block;
+      color: var(--text);
+      font-size: 15px;
+      margin-bottom: 4px;
+    }
+
+    .session-detail pre {
+      max-height: 170px;
+      overflow: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      margin: 10px 0 0;
+      border: 1px solid rgba(114, 240, 255, .10);
+      border-radius: 13px;
+      background: rgba(255, 255, 255, .035);
+      padding: 10px;
+      color: #d8eaf1;
+      font: 680 12px/1.45 ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    }
+
+    .session-empty {
+      border: 1px dashed rgba(114, 240, 255, .18);
+      border-radius: 16px;
+      padding: 14px;
+      color: var(--muted);
+      background: rgba(255, 255, 255, .025);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
     @media (max-width: 1060px) {
       .hero,
       .feature-grid,
@@ -1238,6 +1332,7 @@
 
       .install-box,
       .dashboard-head,
+      .section-head,
       .reload-card,
       .footer-inner {
         align-items: flex-start;
@@ -1486,6 +1581,17 @@
 
             <div class="account-message" id="accountMessage"></div>
             <div class="usage-list" id="usageList"></div>
+            <section class="dashboard-section" aria-label="Synced sessions">
+              <div class="section-head">
+                <div>
+                  <h3>Synced sessions</h3>
+                  <p>Sessions uploaded by <code>bluey cloud sync</code>. Local sessions continue from the desktop sidebar; cloud restore into the active desktop session is the next bridge.</p>
+                </div>
+                <button class="account-button ghost" id="refreshSessionsButton" type="button">Refresh sessions</button>
+              </div>
+              <div class="session-list" id="cloudSessionsList"></div>
+              <div class="session-detail" id="cloudSessionDetail" hidden></div>
+            </section>
           </section>
         </section>
       </main>
@@ -1844,6 +1950,136 @@
       `).join('');
     }
 
+    function shortSessionId(id) {
+      const value = String(id || '');
+      return value.length > 8 ? value.slice(0, 8) : value || 'session';
+    }
+
+    function formatSessionTime(ms) {
+      const value = Number(ms || 0);
+      if (!value) return 'not synced yet';
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return 'unknown time';
+      return date.toLocaleString([], {
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+      });
+    }
+
+    function renderCloudSessions(payload) {
+      const list = document.getElementById('cloudSessionsList');
+      if (!list) return;
+      list.replaceChildren();
+      const sessions = Array.isArray(payload?.sessions) ? payload.sessions : [];
+      if (!sessions.length) {
+        const empty = document.createElement('div');
+        empty.className = 'session-empty';
+        empty.textContent = 'No synced cloud sessions yet. Run bluey cloud sync after a local session, then refresh.';
+        list.append(empty);
+        return;
+      }
+
+      for (const session of sessions) {
+        const row = document.createElement('article');
+        row.className = 'session-row';
+
+        const body = document.createElement('div');
+        const title = document.createElement('strong');
+        title.className = 'session-title';
+        title.textContent = session.title || `Session ${shortSessionId(session.session_id)}`;
+        const meta = document.createElement('span');
+        meta.className = 'session-meta';
+        meta.textContent = [
+          session.status || 'synced',
+          `${session.transcript_count || 0} transcript`,
+          `${session.response_count || 0} answer(s)`,
+          `${session.context_count || 0} context`,
+          formatSessionTime(session.updated_at_ms || session.last_active_at_ms),
+        ].join(' - ');
+        body.append(title, meta);
+
+        const button = document.createElement('button');
+        button.className = 'account-button ghost';
+        button.type = 'button';
+        button.dataset.sessionId = session.session_id || '';
+        button.textContent = 'View';
+        row.append(body, button);
+        list.append(row);
+      }
+    }
+
+    function setCloudSessionDetail(text) {
+      const detail = document.getElementById('cloudSessionDetail');
+      if (!detail) return;
+      detail.hidden = !text;
+      detail.replaceChildren();
+      if (!text) return;
+      const empty = document.createElement('span');
+      empty.textContent = text;
+      detail.append(empty);
+    }
+
+    function latestRecord(records) {
+      return Array.isArray(records) && records.length ? records[records.length - 1] : null;
+    }
+
+    function appendBundlePreview(detail, label, text) {
+      if (!text) return;
+      const pre = document.createElement('pre');
+      pre.textContent = `${label}\n${text}`;
+      detail.append(pre);
+    }
+
+    async function loadCloudSessions() {
+      const sessions = await apiJson('/sync/sessions?limit=8');
+      renderCloudSessions(sessions);
+      return sessions;
+    }
+
+    async function loadCloudSessionDetail(sessionId) {
+      if (!sessionId) return;
+      setCloudSessionDetail('Loading synced session...');
+      const bundle = await apiJson(`/sync/sessions/${encodeURIComponent(sessionId)}`);
+      const detail = document.getElementById('cloudSessionDetail');
+      if (!detail) return;
+      detail.hidden = false;
+      detail.replaceChildren();
+
+      const title = document.createElement('strong');
+      title.textContent = bundle.session?.title || `Session ${shortSessionId(sessionId)}`;
+      const meta = document.createElement('span');
+      meta.textContent = [
+        `${bundle.transcript_segments?.length || 0} transcript segment(s)`,
+        `${bundle.cue_responses?.length || 0} answer(s)`,
+        `${bundle.context_artifacts?.length || 0} context artifact(s)`,
+      ].join(' - ');
+      detail.append(title, meta);
+
+      if (bundle.session?.answer_style) {
+        appendBundlePreview(detail, 'Answer style', bundle.session.answer_style);
+      }
+      const transcript = latestRecord(bundle.transcript_segments);
+      if (transcript?.text) {
+        appendBundlePreview(detail, `Latest transcript (${transcript.speaker || 'speaker'})`, transcript.text);
+      }
+      const answer = latestRecord(bundle.cue_responses);
+      if (answer?.text) {
+        appendBundlePreview(detail, 'Latest answer', answer.text);
+      }
+      if (Array.isArray(bundle.context_artifacts) && bundle.context_artifacts.length) {
+        appendBundlePreview(
+          detail,
+          'Attached context',
+          bundle.context_artifacts
+            .slice(-5)
+            .map((artifact) => `${artifact.kind || 'context'}: ${artifact.title || artifact.artifact_id}`)
+            .join('\n')
+        );
+      }
+    }
+
     async function loadAccount() {
       if (currentPath === '/verify-email' || currentPath === '/password-reset') {
         renderRecoveryRoute();
@@ -1857,9 +2093,14 @@
       document.getElementById('accountSignOut').hidden = !authed;
       if (!authed) return;
       accountMessage('Loading account...');
-      const [me, usage] = await Promise.all([
+      const [me, usage, sessions] = await Promise.all([
         apiJson('/account/me'),
         apiJson('/account/usage'),
+        loadCloudSessions().catch((error) => {
+          renderCloudSessions({ sessions: [] });
+          setCloudSessionDetail(`Could not load synced sessions: ${error.message}`);
+          return null;
+        }),
       ]);
       document.getElementById('accountEmailLabel').textContent = me.email || 'Bluey account';
       document.getElementById('balanceValue').textContent = money(me.balance_cents);
@@ -1867,6 +2108,7 @@
         ? `${Math.round(me.trial_seconds_remaining / 60)} trial minutes remaining.`
         : 'Credits stop at zero; reload when ready.';
       renderUsage(usage);
+      if (sessions) setCloudSessionDetail('');
       accountMessage(new URLSearchParams(location.search).get('reload') === 'success'
         ? 'Reload complete. If balance has not updated yet, Square is still delivering the webhook.'
         : '');
@@ -1928,6 +2170,17 @@
       document.getElementById('accountSignOut').addEventListener('click', () => {
         clearAccountToken();
         loadAccount().catch((error) => accountMessage(error.message));
+      });
+      document.getElementById('refreshSessionsButton').addEventListener('click', () => {
+        setCloudSessionDetail('');
+        loadCloudSessions().catch((error) => setCloudSessionDetail(`Could not load synced sessions: ${error.message}`));
+      });
+      document.getElementById('cloudSessionsList').addEventListener('click', (event) => {
+        const button = event.target.closest('button[data-session-id]');
+        if (!button) return;
+        loadCloudSessionDetail(button.dataset.sessionId).catch((error) => {
+          setCloudSessionDetail(`Could not load synced session: ${error.message}`);
+        });
       });
       document.getElementById('passwordResetStartForm').addEventListener('submit', (event) => {
         event.preventDefault();
