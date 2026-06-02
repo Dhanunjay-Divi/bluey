@@ -1344,8 +1344,8 @@
       }
     }
 
-    /* Minimal public-site refresh. Keep account/policy routes functional, but
-       make the product page simple enough to understand at a glance. */
+    /* Pinky-style public-site refresh. Keep account/policy routes functional,
+       but make the product page simple enough to understand at a glance. */
     .ambient,
     .page-glass {
       display: none;
@@ -1353,180 +1353,372 @@
 
     .site {
       min-height: 100vh;
-      overflow: visible;
-      background:
-        radial-gradient(circle at 80% 0%, rgba(114, 240, 255, .08), transparent 34%),
-        linear-gradient(180deg, #07090b, #050607 58%, #030404);
+      min-height: 100dvh;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      overflow: hidden;
+      background: #050708;
+      color: #eef7fb;
     }
 
     .site .site-nav {
-      width: min(1040px, calc(100% - 40px));
-      padding: 20px 0;
+      width: 100%;
+      max-width: 1120px;
+      min-height: 0;
+      padding: 18px 34px;
     }
 
     .site .navlinks {
-      gap: 4px;
+      gap: 18px;
     }
 
     .site .navlinks a {
-      color: #aebbc4;
+      min-height: 0;
+      padding: 0;
+      border-radius: 0;
+      color: #8797a2;
       background: transparent;
+      font-size: 14px;
+      font-weight: 650;
     }
 
     .site .navlinks .nav-cta {
+      padding: 8px 15px;
+      border-radius: 8px;
       color: #061014;
-      background: #edf9fc;
+      background: #72f0ff;
       box-shadow: none;
+    }
+
+    .site .brand img {
+      width: 28px;
+      height: 28px;
+      border-radius: 8px;
+      box-shadow: none;
+    }
+
+    .site .brand {
+      gap: 8px;
+      font-size: 17px;
+      font-weight: 780;
     }
 
     .site .hero {
-      width: min(1040px, calc(100% - 40px));
-      min-height: auto;
-      grid-template-columns: minmax(0, 1fr) minmax(280px, 420px);
-      gap: clamp(28px, 7vw, 80px);
+      width: min(1040px, calc(100% - 48px));
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(340px, .94fr) minmax(360px, 1fr);
+      gap: clamp(34px, 6vw, 76px);
       align-items: center;
-      padding: clamp(64px, 11vw, 128px) 0 78px;
+      justify-self: center;
+      padding: 18px 0 24px;
     }
 
     .site .launch-pill {
-      margin-bottom: 24px;
-      background: rgba(255, 255, 255, .045);
-      border-color: rgba(255, 255, 255, .10);
+      min-height: 36px;
+      margin-bottom: 18px;
+      padding: 5px 11px 5px 5px;
+      background: rgba(114, 240, 255, .06);
+      border-color: rgba(114, 240, 255, .2);
       box-shadow: none;
+      color: #91a5af;
     }
 
     .site .hero-copy h1 {
-      max-width: 780px;
-      font-size: clamp(64px, 12vw, 132px);
-      line-height: .86;
+      max-width: 560px;
+      font-size: clamp(46px, 6.4vw, 72px);
+      line-height: .96;
+      letter-spacing: 0;
     }
 
     .site .hero-line {
-      max-width: 760px;
-      margin: 14px 0 22px;
+      max-width: 560px;
+      margin: 10px 0 18px;
       color: #72f0ff;
-      font-size: clamp(28px, 5vw, 58px);
-      line-height: 1;
+      font-size: clamp(30px, 5vw, 50px);
+      line-height: .98;
+      letter-spacing: 0;
     }
 
     .site .hero-copy p {
-      max-width: 640px;
-      color: #bac8cf;
-      font-size: 18px;
+      max-width: 470px;
+      color: #91a2ab;
+      font-size: 17px;
+      line-height: 1.62;
     }
 
-    .simple-panel {
-      border: 1px solid rgba(255, 255, 255, .10);
-      border-radius: 28px;
-      background: rgba(255, 255, 255, .045);
-      padding: 22px;
+    .hero-proof {
+      margin: 12px 0 0;
+      color: #dceff5;
+      font-size: 15px;
+      font-weight: 720;
     }
 
-    .simple-panel h2 {
-      margin: 0 0 12px;
-      font-size: 20px;
-    }
-
-    .simple-list {
+    .site .hero-actions {
+      max-width: 350px;
       display: grid;
+      grid-template-columns: 1fr 1fr;
       gap: 10px;
-      margin: 0;
-      padding: 0;
-      list-style: none;
+      margin-top: 24px;
     }
 
-    .simple-list li {
-      display: grid;
-      grid-template-columns: 32px minmax(0, 1fr);
-      gap: 12px;
-      align-items: start;
-      color: #b6c5cc;
-      line-height: 1.45;
-    }
-
-    .simple-list span {
-      width: 32px;
-      height: 32px;
-      display: grid;
-      place-items: center;
-      border-radius: 10px;
-      color: #081114;
-      background: #dff9ff;
-      font-weight: 900;
-    }
-
-    .site .band {
-      padding: 56px 20px;
-      background: transparent;
-      border-top: 1px solid rgba(255, 255, 255, .075);
-    }
-
-    .site .band-inner {
-      width: min(1040px, 100%);
-    }
-
-    .site .section-title {
-      max-width: 720px;
-      margin-bottom: 22px;
-    }
-
-    .site .section-title span {
-      color: #72f0ff;
-      letter-spacing: .10em;
-    }
-
-    .site .section-title h2 {
-      font-size: clamp(30px, 5vw, 54px);
-      line-height: 1.02;
-    }
-
-    .site .answer-flow,
-    .site .security-grid {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 12px;
-    }
-
-    .site .flow-card,
-    .site .security-card {
-      min-height: 0;
-      border-radius: 20px;
-      background: rgba(255, 255, 255, .04);
-      border: 1px solid rgba(255, 255, 255, .09);
-      padding: 18px;
-    }
-
-    .site .cta-band {
-      min-height: 0;
-      padding: 68px 20px;
-      background: transparent;
-    }
-
-    .site .cta-band h2 {
-      font-size: clamp(34px, 6vw, 64px);
-      line-height: 1;
-    }
-
-    .site .install-box {
-      background: rgba(255, 255, 255, .04);
-      border-color: rgba(255, 255, 255, .10);
+    .site .button {
+      min-height: 46px;
+      border-radius: 12px;
+      font-size: 14px;
       box-shadow: none;
     }
 
-    .site .footer {
-      background: #030404;
-      border-top: 1px solid rgba(255, 255, 255, .075);
+    .site .button.primary {
+      color: #041215;
+      background: linear-gradient(135deg, #72f0ff, #5ea7ff);
     }
 
-    @media (max-width: 860px) {
+    .site .hero-note {
+      margin-top: 14px;
+      color: #60717c;
+      font-size: 13px;
+    }
+
+    .quick-join {
+      max-width: 348px;
+      display: flex;
+      gap: 8px;
+      margin-top: 14px;
+    }
+
+    .quick-join input {
+      min-width: 0;
+      flex: 1;
+      border: 1px solid rgba(114, 240, 255, .18);
+      border-radius: 10px;
+      padding: 11px 13px;
+      color: #eef7fb;
+      background: #0a0d10;
+      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 13px;
+      outline: none;
+    }
+
+    .quick-join input:focus {
+      border-color: rgba(114, 240, 255, .48);
+    }
+
+    .quick-join button {
+      border: 1px solid rgba(114, 240, 255, .2);
+      border-radius: 10px;
+      padding: 0 14px;
+      color: #72f0ff;
+      background: rgba(114, 240, 255, .08);
+      font-weight: 760;
+      cursor: pointer;
+    }
+
+    .terminal-preview {
+      width: min(100%, 470px);
+      justify-self: end;
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, .08);
+      border-radius: 16px;
+      background: linear-gradient(180deg, #0e1216, #070909);
+      box-shadow: 0 24px 70px rgba(0, 0, 0, .42);
+    }
+
+    .terminal-bar {
+      display: flex;
+      gap: 7px;
+      padding: 12px 14px;
+      background: #11161a;
+      border-bottom: 1px solid rgba(255, 255, 255, .055);
+    }
+
+    .terminal-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+    }
+
+    .terminal-dot.red { background: #ff5f57; }
+    .terminal-dot.yellow { background: #febc2e; }
+    .terminal-dot.green { background: #28c840; }
+
+    .terminal-body {
+      height: 316px;
+      padding: 22px;
+      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.72;
+      color: #8a99a3;
+    }
+
+    .terminal-body .cmd {
+      color: #e9f7fb;
+    }
+
+    .terminal-body .blue {
+      color: #72f0ff;
+    }
+
+    .terminal-body .green {
+      color: #76f3a7;
+    }
+
+    .terminal-body .muted {
+      color: #53636d;
+    }
+
+    .site-strip {
+      width: min(1040px, calc(100% - 48px));
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+      justify-self: center;
+      padding: 0 0 22px;
+    }
+
+    .site-card {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-height: 58px;
+      padding: 12px 14px;
+      border: 1px solid rgba(255, 255, 255, .07);
+      border-radius: 12px;
+      color: #ddeaf0;
+      background: rgba(255, 255, 255, .028);
+      text-decoration: none;
+    }
+
+    .site-card span {
+      color: #72f0ff;
+      font-weight: 850;
+    }
+
+    .site-card small {
+      display: block;
+      margin-top: 2px;
+      color: #788993;
+    }
+
+    .site .footer {
+      width: 100%;
+      padding: 12px 34px 16px;
+      border-top: 1px solid rgba(255, 255, 255, .06);
+      background: #050708;
+    }
+
+    .site .footer-inner {
+      width: min(1040px, 100%);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      margin: 0 auto;
+      color: #778892;
+      font-size: 12px;
+    }
+
+    .site .footer a {
+      color: #9db0bb;
+      text-decoration: none;
+    }
+
+    .site .band,
+    .site .cta-band {
+      display: none;
+    }
+
+    @media (max-width: 900px) {
+      .site {
+        overflow: visible;
+      }
+
       .site .hero,
-      .site .answer-flow,
-      .site .security-grid {
+      .site-strip {
         grid-template-columns: 1fr;
       }
 
+      .terminal-preview {
+        justify-self: stretch;
+        width: 100%;
+      }
+    }
+
+    @media (max-width: 620px) {
+      .site .site-nav {
+        width: 100%;
+        max-width: 100%;
+        flex-direction: row;
+        align-items: center;
+        justify-content: space-between;
+        padding: 14px 20px;
+      }
+
+      .site .brand {
+        flex: 0 0 auto;
+      }
+
+      .site .navlinks {
+        display: none;
+      }
+
       .site .hero {
-        padding-top: 44px;
+        width: auto !important;
+        max-width: none !important;
+        margin: 0 32px 0 16px;
+        justify-self: stretch;
+        padding-top: 24px;
+      }
+
+      .site .hero-copy,
+      .site .hero-copy p,
+      .site .hero-line,
+      .site .hero-actions,
+      .quick-join {
+        width: 100%;
+        max-width: 340px;
+      }
+
+      .site .button {
+        width: 100%;
+      }
+
+      .site .hero-copy h1 {
+        font-size: clamp(52px, 18vw, 66px);
+      }
+
+      .site .hero-line {
+        max-width: 330px;
+        font-size: clamp(28px, 8vw, 32px);
+        line-height: 1.05;
+        overflow-wrap: normal;
+      }
+
+      .site .hero-copy p {
+        max-width: 100%;
+        overflow-wrap: normal;
+      }
+
+      .site .hero-actions,
+      .quick-join {
+        max-width: 100%;
+      }
+
+      .site .hero-actions {
+        grid-template-columns: 1fr;
+      }
+
+      .terminal-preview {
+        display: none;
+      }
+
+      .site-strip {
+        display: none;
+      }
+
+      .site .footer-inner {
+        flex-direction: column;
+        gap: 6px;
       }
     }
   </style>
@@ -1791,10 +1983,9 @@
         <span>Bluey</span>
       </a>
       <div class="navlinks">
-        <a href="#flow">How it works</a>
-        <a href="#pricing">Pricing</a>
+        <a href="/docs/privacy">Privacy</a>
         <a href="/account">Account</a>
-        <a class="nav-cta" href="#install">Install</a>
+        <a class="nav-cta" href="/install.sh">Download</a>
       </div>
     </nav>
 
@@ -1808,62 +1999,45 @@
         <h1>Bluey</h1>
         <div class="hero-line">Stay present, stay unseen.</div>
         <p>A small AI layer for live work. Start it from the terminal, attach the context you want, and get useful answers while your meeting, code, or document stays in front of you.</p>
+        <p class="hero-proof">One command opens the overlay. Your account handles credits, sync, and managed AI.</p>
         <div class="hero-actions">
-          <a class="button primary" href="#install">Install Bluey</a>
+          <a class="button primary" href="/install.sh">Install Bluey</a>
           <a class="button" href="/account">Open account</a>
         </div>
-        <div class="hero-note">No monthly subscription by default. Reload credits, run until zero, and keep local sessions recoverable.</div>
+        <form class="quick-join" action="/link" method="get">
+          <input name="user_code" type="text" placeholder="Device code" autocomplete="one-time-code" spellcheck="false">
+          <button type="submit">Link</button>
+        </form>
+        <div class="hero-note">Credits reload manually. No monthly subscription by default.</div>
       </div>
 
-      <aside class="simple-panel" aria-label="Bluey summary">
-        <h2>What Bluey does</h2>
-        <ul class="simple-list">
-          <li><span>1</span><div>Listens only when you start it, with source-labeled transcript for system and microphone audio.</div></li>
-          <li><span>2</span><div>Uses your typed prompt, transcript, attached files, and screen analysis as one clear context.</div></li>
-          <li><span>3</span><div>Routes the answer to the right managed model and saves the session for later.</div></li>
-        </ul>
+      <aside class="terminal-preview" aria-label="Bluey terminal preview">
+        <div class="terminal-bar">
+          <span class="terminal-dot red"></span>
+          <span class="terminal-dot yellow"></span>
+          <span class="terminal-dot green"></span>
+        </div>
+        <div class="terminal-body">
+          <div><span class="muted">~</span> <span class="cmd">bluey on</span></div>
+          <br>
+          <div><span class="blue">Bluey online</span></div>
+          <div>new recording ready</div>
+          <div>listen, attach docs, analyse screen</div>
+          <div>answers stream into the overlay</div>
+          <br>
+          <div><span class="green">Auto route:</span> instant -> deep -> vision</div>
+          <div><span class="green">Memory:</span> local + synced sessions</div>
+          <div><span class="green">Billing:</span> credits stop at zero</div>
+          <br>
+          <div><span class="muted">Run</span> <span class="cmd">bluey off</span> <span class="muted">to close.</span></div>
+        </div>
       </aside>
     </section>
 
-    <section class="band" id="flow">
-      <div class="band-inner">
-        <div class="section-title">
-          <span>Flow</span>
-          <h2>Simple enough to use in the middle of work.</h2>
-          <p>Run Bluey, start listening or type a question, attach files if needed, then continue from the saved session later.</p>
-        </div>
-        <div class="answer-flow">
-          <div class="flow-card"><strong>Listen or ask</strong><p>Use the overlay to start audio, type a question, or analyse the screen with confirmation.</p></div>
-          <div class="flow-card"><strong>Add context</strong><p>Attach readable documents and keep answer style instructions with the session.</p></div>
-          <div class="flow-card"><strong>Continue later</strong><p>Local sessions reopen from the desktop sidebar. Synced cloud sessions are visible in the account page.</p></div>
-        </div>
-      </div>
-    </section>
-
-    <section class="band" id="pricing">
-      <div class="band-inner">
-        <div class="section-title">
-          <span>Account</span>
-          <h2>Credits, sync, and usage in one place.</h2>
-          <p>The web account is intentionally small: sign in, reload credits, see usage, and inspect synced sessions.</p>
-        </div>
-        <div class="security-grid">
-          <div class="security-card"><b>$30 reload</b><p>Credits are valid for up to 12 months and stop at zero.</p></div>
-          <div class="security-card"><b>Managed routing</b><p>Users choose Auto. Bluey picks quick, balanced, deep, or vision lanes behind the scenes.</p></div>
-          <div class="security-card"><b>Session memory</b><p>Transcripts, responses, files, and style can sync for account-scoped RAG.</p></div>
-        </div>
-      </div>
-    </section>
-
-    <section class="cta-band" id="install">
-      <div>
-        <h2>Start with one command.</h2>
-        <p>Install Bluey, run the overlay, and connect your account when cloud answers are needed.</p>
-        <div class="install-box">
-          <code>curl -fsSL https://bluey.sh/install.sh | bash</code>
-          <a class="button primary" href="/install.sh">Download script</a>
-        </div>
-      </div>
+    <section class="site-strip" aria-label="Bluey highlights">
+      <a class="site-card" href="/account"><div><span>$30 reload</span><small>Credits last up to 12 months.</small></div></a>
+      <a class="site-card" href="/docs/disguise"><div><span>Low profile</span><small>Compact overlay, clear controls.</small></div></a>
+      <a class="site-card" href="/docs/privacy"><div><span>User context</span><small>Docs, screen, transcript, sessions.</small></div></a>
     </section>
 
     <footer class="footer">

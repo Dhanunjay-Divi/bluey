@@ -126,3 +126,17 @@ Follow-up pass simplified the public landing page into one calm product page:
 Removed the old animated canvas initializer and the heavy mock app preview from
 the public page. Account, login, link, recovery, policy, and session-browser
 routes still share the same static file and API contracts.
+
+## Pinky-Style Minimal Landing
+
+Second follow-up pass tightened the public page further after comparing against
+`https://pinky.sh/`:
+
+- Single-viewport layout: small nav, left hero, right terminal-style preview.
+- Removed the visible multi-section marketing stack from the public route.
+- Kept only two primary actions: install and account.
+- Added a tiny device-code link form and three compact proof cards.
+- Preserved the current Bluey blue/cyan identity and all account/legal routes.
+
+This is intentional. The public page should feel plain, fast, and easy to read;
+the product detail now lives in the account, docs, and desktop app surfaces.
