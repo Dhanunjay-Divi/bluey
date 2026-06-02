@@ -168,3 +168,13 @@ Bluey preview:
 
 The page is still intentionally one-screen and static, but it now communicates
 the actual Bluey experience instead of just showing `bluey on` in a terminal.
+
+## Lowercase Wordmark Pass
+
+Fifth follow-up pass changed the brand mark from uppercase `BLUEY` to lowercase
+`bluey` so it matches the product command language (`bluey on`).
+
+- Keeps the terminal-logo icon beside the wordmark.
+- Uses a Space-Grotesk-style lowercase CSS treatment with subtle angular cuts.
+- Applies to product, account, legal, and preview-pill brand locations.
+- Preserves the larger human-readable hero heading as `Bluey`.
