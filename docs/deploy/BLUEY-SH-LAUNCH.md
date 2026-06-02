@@ -2,6 +2,11 @@
 
 Canonical production origin: `https://bluey.sh`.
 
+Release golden rule: build once, store the artifact, deploy that exact
+artifact to preprod, smoke preprod, then promote the same stored artifact
+to prod. If anything changes after smoke, cut a new artifact and repeat
+preprod. Never rebuild on prod.
+
 For v0.2, do not split API onto `api.bluey.sh`. The desktop, installer,
 landing page, deep-link flow, billing redirects, and managed API all use the
 same origin:

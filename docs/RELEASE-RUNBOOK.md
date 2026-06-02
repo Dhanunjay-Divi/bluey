@@ -9,6 +9,10 @@ For the high-level lifecycle (environments, branches, promotion gates),
 read `docs/DELIVERY-LIFECYCLE.md` first. This doc is the concrete
 checklist.
 
+**Golden rule:** build the release artifact once, store it, deploy that
+same artifact to preprod, smoke preprod, then promote that exact stored
+artifact to prod. Never rebuild between preprod and prod.
+
 ---
 
 ## 0. Pre-flight
@@ -68,6 +72,9 @@ dist/bluey-X.Y.Z-darwin-universal.tar.gz.sha256
 ---
 
 ## 3. Smoke test the artifact
+
+Smoke the archive you will publish. Do not smoke a local `target/release`
+binary and then publish a different archive.
 
 ```bash
 tmp=$(mktemp -d)
@@ -141,6 +148,10 @@ git -P show --stat "$TAG" | head -20
 
 ## 6. Publish to distribution server (when one exists)
 
+This step publishes the already-built artifact. If a code/doc fix is
+needed after preprod smoke, stop here, create a new commit and release id,
+then rebuild a new artifact and restart preprod smoke from section 1.
+
 ```bash
 PUBLISH_HOST=<host> PUBLISH_PATH=/var/www/bluey \
   PUBLISH_DO=1 \
@@ -164,6 +175,9 @@ PUBLISH_HOST=<prod-host> PUBLISH_PATH=/var/www/bluey \
   PUBLISH_DO=1 \
   bash scripts/publish.sh
 ```
+
+That command must point prod at the same artifact/version that passed
+preprod smoke. It must not run a build on the prod host.
 
 ---
 

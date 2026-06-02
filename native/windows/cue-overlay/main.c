@@ -54,7 +54,7 @@ static HWND g_recap_button;
 static HWND g_note_button;
 static HWND g_theme_button;
 static HWND g_close_button;
-static wchar_t g_title[256] = L"Bluey";
+static wchar_t g_title[256] = L"bluey";
 static wchar_t g_body[2048] = L"Waiting for meeting intelligence...";
 static wchar_t g_kind[64] = L"system";
 static wchar_t g_source[256] = L"";
@@ -700,14 +700,14 @@ static DWORD WINAPI stdin_thread(LPVOID unused) {
             if (g_visible) collapse_to_pill(g_hwnd, true);
             else show_full_overlay(true);
         } else if (strcmp(msg_type, "clear") == 0) {
-            wcscpy_s(g_title, 256, L"Bluey");
+            wcscpy_s(g_title, 256, L"bluey");
             wcscpy_s(g_body, 2048, L"");
             wcscpy_s(g_kind, 64, L"system");
             wcscpy_s(g_source, 256, L"");
             wcscpy_s(g_card_id, 80, L"");
             InvalidateRect(g_hwnd, NULL, TRUE);
         } else if (strcmp(msg_type, "boot") == 0) {
-            wcscpy_s(g_title, 256, L"Bluey online");
+            wcscpy_s(g_title, 256, L"bluey online");
             wcscpy_s(g_body, 2048, L"> overlay link established\n> session memory loaded\n> context controls armed\n> ready");
             wcscpy_s(g_kind, 64, L"system");
             wcscpy_s(g_source, 256, L"");
@@ -1058,7 +1058,7 @@ static bool paint_with_d2d(HWND hwnd) {
         dot.radiusX = 5.0f;
         dot.radiusY = 5.0f;
         BLUEY_FILL_ELLIPSE(g_d2d_target, &dot, g_d2d_brush);
-        d2d_text(L"Bluey", g_fmt_pill, d2d_rectf(40.0f, 0.0f, (float)rect.right - 16.0f, (float)rect.bottom), g_light_theme ? 8 : 235, g_light_theme ? 22 : 245, g_light_theme ? 32 : 255, 1.0f);
+        d2d_text(L"bluey", g_fmt_pill, d2d_rectf(40.0f, 0.0f, (float)rect.right - 16.0f, (float)rect.bottom), g_light_theme ? 8 : 235, g_light_theme ? 22 : 245, g_light_theme ? 32 : 255, 1.0f);
     } else {
         int header_w = clamp_int((rect.right * 84) / 100, 520, 780);
         if (header_w > rect.right - 28) header_w = rect.right - 28;
@@ -1082,7 +1082,7 @@ static bool paint_with_d2d(HWND hwnd) {
         record_dot.radiusY = 4.5f;
         BLUEY_FILL_ELLIPSE(g_d2d_target, &record_dot, g_d2d_brush);
 
-        d2d_text(L"Bluey", g_fmt_brand, d2d_rectf((float)header_left + 50.0f, 10.0f, (float)header_left + 118.0f, 46.0f), g_light_theme ? 8 : 230, g_light_theme ? 22 : 240, g_light_theme ? 32 : 245, 1.0f);
+        d2d_text(L"bluey", g_fmt_brand, d2d_rectf((float)header_left + 50.0f, 10.0f, (float)header_left + 118.0f, 46.0f), g_light_theme ? 8 : 230, g_light_theme ? 22 : 240, g_light_theme ? 32 : 245, 1.0f);
 
         wchar_t card_label[32];
         current_card_label(card_label, 32);
@@ -1359,7 +1359,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
                 DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
             SelectObject(hdc, font);
             RECT pill_text = {40, 0, rect.right - 16, rect.bottom};
-            DrawTextW(hdc, L"Bluey", -1, &pill_text, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            DrawTextW(hdc, L"bluey", -1, &pill_text, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             DeleteObject(font);
             EndPaint(hwnd, &ps);
             return 0;
@@ -1419,7 +1419,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
 
         SelectObject(hdc, title_font);
         RECT brand_rect = {header_left + 50, 10, header_left + 118, 46};
-        DrawTextW(hdc, L"Bluey", -1, &brand_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        DrawTextW(hdc, L"bluey", -1, &brand_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
         wchar_t card_label[32];
         current_card_label(card_label, 32);

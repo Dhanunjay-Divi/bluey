@@ -105,6 +105,96 @@ private enum PillMetrics {
     }
 }
 
+private enum BlueyBrandAsset {
+    static let logoSvg = #"""
+<svg viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Bluey logo">
+  <defs>
+    <linearGradient id="shell" x1="12" y1="10" x2="86" y2="88" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#08121c"/>
+      <stop offset=".58" stop-color="#092236"/>
+      <stop offset="1" stop-color="#0f4059"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="24" y1="22" x2="76" y2="70" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0b1a28"/>
+      <stop offset="1" stop-color="#06101b"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="16" y1="15" x2="82" y2="83" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#85f7ff"/>
+      <stop offset=".5" stop-color="#2eb8db"/>
+      <stop offset="1" stop-color="#4b6fff"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="60" y1="20" x2="78" y2="38" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#91ffb0"/>
+      <stop offset="1" stop-color="#49e8ff"/>
+    </linearGradient>
+    <filter id="soft-glow" x="-30%" y="-30%" width="160%" height="160%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="0" stdDeviation="2.4" flood-color="#69ecff" flood-opacity=".46"/>
+      <feDropShadow dx="0" dy="12" stdDeviation="12" flood-color="#020811" flood-opacity=".48"/>
+    </filter>
+  </defs>
+  <rect x="7" y="7" width="82" height="82" rx="25" fill="url(#shell)"/>
+  <rect x="8.5" y="8.5" width="79" height="79" rx="23.5" fill="none" stroke="#71e9ff" stroke-opacity=".24"/>
+  <path d="M18 46c0-16 13-29 29-29h6c12 0 22 10 22 22v16c0 12-10 22-22 22H39c-12 0-21-9-21-21V46Z" fill="#07101a" opacity=".58"/>
+  <rect x="23" y="25" width="50" height="42" rx="12" fill="url(#glass)" stroke="url(#edge)" stroke-width="3.25" filter="url(#soft-glow)"/>
+  <path d="M33 39.5 41.25 48 33 56.5" fill="none" stroke="#f4fbff" stroke-width="5.2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M47.5 57.5h14" stroke="#bcefff" stroke-width="5.2" stroke-linecap="round"/>
+  <path d="M69 19.5 71.15 27 78.5 29.3 71.15 31.7 69 39.5 66.85 31.7 59.5 29.3 66.85 27Z" fill="url(#signal)"/>
+  <circle cx="74.5" cy="23.5" r="2.2" fill="#9dff9e"/>
+</svg>
+"""#
+
+    static let wordmarkSvg = #"""
+<svg viewBox="0 0 292 76" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="bluey">
+  <defs>
+    <linearGradient id="wordmark-fill" x1="2" y1="6" x2="290" y2="72" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#f8fdff"/>
+      <stop offset=".5" stop-color="#ddf8ff"/>
+      <stop offset="1" stop-color="#8df4ff"/>
+    </linearGradient>
+    <filter id="wordmark-glow" x="-8%" y="-30%" width="116%" height="160%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="0" stdDeviation="3" flood-color="#54dcff" flood-opacity=".22"/>
+    </filter>
+  </defs>
+  <g fill="url(#wordmark-fill)" fill-rule="evenodd" filter="url(#wordmark-glow)">
+    <path d="M5 8h13v24c5.4-6.7 12.2-10 20.6-10 16.3 0 27.4 11.6 27.4 27.2C66 65.1 54.5 75 38.7 75c-9 0-16.1-3.3-21.2-9.9L15.7 73H5V8Zm13 41.2c0 9.8 7 16.9 16.8 16.9 9.6 0 16.3-6.9 16.3-16.8 0-10.1-6.7-17.1-16.3-17.1C25 32.2 18 39.3 18 49.2Z"/>
+    <path d="M76 8h13v65H76V8Z"/>
+    <path d="M103 23h13v27.2c0 9.6 5.1 15.2 14.1 15.2 8.8 0 14.7-5.9 14.7-15.7V23h13v50h-10.7l-1.4-8.4C140.7 71.1 133.6 75 124.4 75 109.8 75 103 65.6 103 51.4V23Z"/>
+    <path d="M171 48.6C171 32.8 182.7 22 198.2 22 214.7 22 224 33.9 224 48.5c0 1.7-.1 3.4-.4 5H184.2c1.7 7.3 7.4 11.3 15.5 11.3 6.2 0 11.4-2 15.8-5.6l5.6 8.4C215.2 72.5 207.8 75 198.5 75 181.2 75 171 64.2 171 48.6Zm13.3-5.1h27.8c-1.2-7.4-6.2-11.9-13.8-11.9-7.3 0-12.4 4.6-14 11.9Z"/>
+    <path d="M232 23h14.2l13.2 31.9L273 23h13.8l-31.2 70H242l10.3-23.1L232 23Z"/>
+  </g>
+  <path d="M206 31.5h15.4l-7.2 8.4H206Z" fill="#07121b" opacity=".92"/>
+</svg>
+"""#
+
+    static func image(from svg: String) -> NSImage? {
+        NSImage(data: Data(svg.utf8))
+    }
+}
+
+private final class BlueyLogoView: NSImageView {
+    init() {
+        super.init(frame: .zero)
+        image = BlueyBrandAsset.image(from: BlueyBrandAsset.logoSvg)
+        imageScaling = .scaleProportionallyUpOrDown
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+}
+
+private final class BlueyWordmarkView: NSImageView {
+    init() {
+        super.init(frame: .zero)
+        image = BlueyBrandAsset.image(from: BlueyBrandAsset.wordmarkSvg)
+        imageScaling = .scaleProportionallyUpOrDown
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+}
+
 private func symbolImage(_ name: String) -> NSImage? {
     guard let image = NSImage(systemSymbolName: name, accessibilityDescription: nil) else {
         return nil
@@ -728,8 +818,7 @@ private final class PillView: NSView {
     private func updateTitleDisplay() {
         // The collapsed pill is intentionally identity-only. Balance lives in
         // the expanded header so the launcher stays compact and scannable.
-        titleField.stringValue = statusText
-        titleField.textColor = NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0)
+        setAccessibilityLabel(statusText)
     }
     func setBalanceLabel(_ label: String) {
         balanceText = label
@@ -746,9 +835,8 @@ private final class PillView: NSView {
     var onEnd: (() -> Void)?
     private var runState: PillRunState = .ready
 
-    private let logoTile = NSView()
-    private let logoGlyph = NSTextField(labelWithString: ">_")
-    private let titleField = NSTextField(labelWithString: "Bluey")
+    private let logoMark = BlueyLogoView()
+    private let wordmarkView = BlueyWordmarkView()
     private let dotView = NSView()
     private let controlRail = NSView()
     private let styleButton = NSButton(title: "", target: nil, action: nil)
@@ -766,26 +854,13 @@ private final class PillView: NSView {
         layer?.shadowRadius = 8
         layer?.shadowOffset = .zero
 
-        logoTile.wantsLayer = true
-        logoTile.layer?.backgroundColor = NSColor(red: 0.014, green: 0.104, blue: 0.136, alpha: 1.0).cgColor
-        logoTile.layer?.cornerRadius = 8
-        logoTile.layer?.borderWidth = 1
-        logoTile.layer?.borderColor = NSColor(red: 0.38, green: 0.88, blue: 1.0, alpha: 0.70).cgColor
-        logoTile.layer?.shadowColor = NSColor(red: 0.15, green: 0.66, blue: 1.0, alpha: 1.0).cgColor
-        logoTile.layer?.shadowOpacity = 0.20
-        logoTile.layer?.shadowRadius = 8
-        logoTile.layer?.shadowOffset = .zero
-        addSubview(logoTile)
-
-        logoGlyph.font = NSFont.monospacedSystemFont(ofSize: 12.0, weight: .bold)
-        logoGlyph.textColor = NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0)
-        logoGlyph.alignment = .center
-        logoTile.addSubview(logoGlyph)
-
-        titleField.font = NSFont.systemFont(ofSize: 14.5, weight: .bold)
-        titleField.textColor = NSColor(red: 0.92, green: 0.98, blue: 1.0, alpha: 1.0)
-        titleField.alignment = .left
-        addSubview(titleField)
+        logoMark.wantsLayer = true
+        logoMark.layer?.shadowColor = NSColor(red: 0.26, green: 0.84, blue: 1.0, alpha: 1.0).cgColor
+        logoMark.layer?.shadowOpacity = 0.22
+        logoMark.layer?.shadowRadius = 8
+        logoMark.layer?.shadowOffset = .zero
+        addSubview(logoMark)
+        addSubview(wordmarkView)
 
         dotView.wantsLayer = true
         dotView.layer?.backgroundColor = dotColor.cgColor
@@ -828,9 +903,7 @@ private final class PillView: NSView {
         layer?.cornerRadius = bounds.height / 2
 
         let logoSide: CGFloat = 27
-        logoTile.frame = NSRect(x: 5, y: (bounds.height - logoSide) / 2, width: logoSide, height: logoSide)
-        logoTile.layer?.cornerRadius = 8
-        logoGlyph.frame = logoTile.bounds.insetBy(dx: 4, dy: 5)
+        logoMark.frame = NSRect(x: 5, y: (bounds.height - logoSide) / 2, width: logoSide, height: logoSide)
 
         let railWidth: CGFloat = 71
         controlRail.frame = NSRect(
@@ -845,13 +918,9 @@ private final class PillView: NSView {
         runButton.frame = NSRect(x: 25.5, y: 2, width: buttonSide, height: buttonSide)
         endButton.frame = NSRect(x: 48, y: 2, width: buttonSide, height: buttonSide)
 
-        titleField.frame = NSRect(x: 41, y: (bounds.height - 20) / 2 + 1, width: 39, height: 20)
-
-        let labelWidth = ceil((titleField.stringValue as NSString).size(withAttributes: [
-            .font: titleField.font ?? NSFont.systemFont(ofSize: 14.5, weight: .bold),
-        ]).width)
+        wordmarkView.frame = NSRect(x: 39, y: (bounds.height - 15) / 2 + 0.5, width: 52, height: 15)
         let dotSize: CGFloat = 7
-        let dotX = min(titleField.frame.minX + labelWidth + 4, controlRail.frame.minX - dotSize - 7)
+        let dotX = min(wordmarkView.frame.maxX + 4, controlRail.frame.minX - dotSize - 7)
         dotView.frame = NSRect(x: dotX, y: bounds.midY + 4.5, width: dotSize, height: dotSize)
         dotView.layer?.cornerRadius = dotSize / 2
     }
@@ -1565,8 +1634,9 @@ private final class ExpandedPanelView: NSView {
     let headerBar: NSView
     let headerStack: NSStackView
     let brandStack: NSStackView
+    let headerLogo: BlueyLogoView
+    let headerWordmark: BlueyWordmarkView
     let headerSpacer: NSView
-    let titleLabel: NSTextField
     let statusLabel: NSTextField
     let modelMenu: NSPopUpButton
     let routeBadge: NSTextField
@@ -1635,8 +1705,9 @@ private final class ExpandedPanelView: NSView {
         headerBar = NSView()
         headerStack = NSStackView()
         brandStack = NSStackView()
+        headerLogo = BlueyLogoView()
+        headerWordmark = BlueyWordmarkView()
         headerSpacer = NSView()
-        titleLabel = NSTextField(labelWithString: "Bluey")
         statusLabel = NSTextField(labelWithString: "New recording")
         modelMenu = NSPopUpButton(frame: .zero, pullsDown: false)
         routeBadge = NSTextField(labelWithString: "Auto · ready")
@@ -1710,8 +1781,9 @@ private final class ExpandedPanelView: NSView {
             headerBar,
             headerStack,
             brandStack,
+            headerLogo,
+            headerWordmark,
             headerSpacer,
-            titleLabel,
             statusLabel,
             modelMenu,
             routeBadge,
@@ -1766,11 +1838,12 @@ private final class ExpandedPanelView: NSView {
         }
 
         headerBar.addSubview(headerStack)
-        brandStack.addArrangedSubview(titleLabel)
+        brandStack.addArrangedSubview(headerWordmark)
         brandStack.addArrangedSubview(statusLabel)
         for view in [
             navButton,
             newSessionButton,
+            headerLogo,
             brandStack,
             routeBadge,
             knowledgeBadge,
@@ -1855,8 +1928,14 @@ private final class ExpandedPanelView: NSView {
             newSessionButton.widthAnchor.constraint(equalToConstant: 30),
             newSessionButton.heightAnchor.constraint(equalToConstant: 30),
 
-            brandStack.widthAnchor.constraint(greaterThanOrEqualToConstant: 110),
-            brandStack.widthAnchor.constraint(lessThanOrEqualToConstant: 162),
+            headerLogo.widthAnchor.constraint(equalToConstant: 28),
+            headerLogo.heightAnchor.constraint(equalToConstant: 28),
+
+            headerWordmark.widthAnchor.constraint(equalToConstant: 58),
+            headerWordmark.heightAnchor.constraint(equalToConstant: 16),
+
+            brandStack.widthAnchor.constraint(greaterThanOrEqualToConstant: 72),
+            brandStack.widthAnchor.constraint(lessThanOrEqualToConstant: 128),
 
             routeBadge.widthAnchor.constraint(greaterThanOrEqualToConstant: 96),
             routeBadge.widthAnchor.constraint(lessThanOrEqualToConstant: 142),
@@ -2222,11 +2301,6 @@ private final class ExpandedPanelView: NSView {
         brandStack.setContentHuggingPriority(.defaultHigh, for: .horizontal)
         brandStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        titleLabel.font = NSFont.systemFont(ofSize: 13.5, weight: .bold)
-        titleLabel.textColor = BlueyTheme.text
-        titleLabel.lineBreakMode = .byTruncatingTail
-        titleLabel.maximumNumberOfLines = 1
-        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         statusLabel.font = NSFont.systemFont(ofSize: 9.5, weight: .semibold)
         statusLabel.textColor = BlueyTheme.textDim
         statusLabel.lineBreakMode = .byTruncatingTail

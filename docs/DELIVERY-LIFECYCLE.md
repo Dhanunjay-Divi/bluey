@@ -65,6 +65,11 @@ GitHub Release UI (when used) auto-populates.
 
 ## 4. Promotion rules
 
+Golden rule: **build once, deploy that exact stored artifact to preprod,
+smoke it, then promote the same artifact to prod.** Do not rebuild
+between preprod and prod, even for "tiny" fixes. A fix creates a new
+release id, a new stored artifact, and a fresh preprod smoke.
+
 The promote model is **append-only**: we never modify a previously
 published release directory. Each release lives at its own immutable
 path; promotion is just swapping the `latest` symlink.
@@ -79,10 +84,12 @@ make package-* →     publish.sh →            promote.sh
 
 **Promotion gates:**
 
-1. **dev → preprod**: full pipeline green on uno + codex chain review 🟢.
+1. **dev → preprod**: full pipeline green on uno + codex chain review 🟢,
+   then upload the single release artifact to the preprod release store.
 2. **preprod → prod**: at least one external smoke test passes (clean
    Mac install + `bluey on/off` end-to-end, or equivalent for whichever
-   platform).
+   platform), then promote the already-smoked preprod artifact by pointer
+   or symlink only.
 
 Promotion is explicit, not auto. Auto-promotion of unverified bits to
 prod is the kind of thing that ships outages.
