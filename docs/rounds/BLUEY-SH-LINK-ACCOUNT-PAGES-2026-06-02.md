@@ -153,3 +153,18 @@ copy of an external logo.
 - Uses clipped letter spans so the mark stays lightweight and scales on mobile.
 - Verified against desktop and mobile screenshots plus route smoke for all
   static web routes.
+
+## Product Preview Refresh
+
+Fourth follow-up pass replaced the terminal-only hero proof with a product-like
+Bluey preview:
+
+- Top preview pill with logo, angular wordmark, live dot, and balance.
+- Session card showing a right-aligned transcript bubble, left-aligned Bluey
+  answer, and a small auto-open canvas hint for system-design/code work.
+- Composer row showing attach/ask/send affordances without overloading the
+  public page.
+- Removed the old terminal-preview selectors from the static page CSS.
+
+The page is still intentionally one-screen and static, but it now communicates
+the actual Bluey experience instead of just showing `bluey on` in a terminal.
