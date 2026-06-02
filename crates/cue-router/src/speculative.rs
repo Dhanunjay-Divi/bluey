@@ -228,6 +228,7 @@ fn spawn_lane(
         let req = LlmRequest {
             system: request.system.clone(),
             user: request.user.clone(),
+            session_id: request.session_id.clone(),
             max_tokens: route.max_tokens.or(request.max_tokens),
             temperature: route.temperature.or(request.temperature),
             reasoning_effort: request.reasoning_effort.clone(),
@@ -425,6 +426,7 @@ mod tests {
         LlmRequest {
             system: "s".into(),
             user: "u".into(),
+            session_id: None,
             max_tokens: None,
             temperature: None,
             reasoning_effort: None,

@@ -250,14 +250,20 @@ Question
   -> provider prompt
 ```
 
+Logged-in managed requests also send the current `session_id` to
+`bluey-server`. The server queries tenant-scoped cloud RAG, boosts matches from
+the active session, and enriches the provider prompt with up to six
+user-approved snippets before dispatching to the managed model route. If cloud
+RAG has no matches, or if lookup fails, the answer still proceeds without
+retrieved cloud memory.
+
 Compaction only trims the provider prompt window. It does not delete the stored
 session, transcript, response, attachment, or RAG records. Older material can
 come back through retrieval when the question needs it.
 
-Local desktop memory is available first. Cloud sync already uploads the pieces;
-production cloud retrieval should use server-side embeddings + pgvector and
-return source cards so the overlay can show which file/session informed the
-answer.
+Local desktop memory is available first. Cloud retrieval is now in the managed
+answer path; production still needs server-side embeddings + pgvector and
+source cards so the overlay can show which file/session informed the answer.
 
 ## 6. Hard stop on $0 balance
 

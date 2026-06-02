@@ -91,13 +91,17 @@ Implemented locally:
 - Prompt compaction is only provider-window compaction. It does not delete the
   raw local session, transcript, response, artifact, or RAG records.
 
-Already present but still needs production hardening:
+Managed cloud path now present:
 
 - Cloud sync uploads `context_artifacts` and `rag_chunks`.
 - The server has tenant-scoped sync/RAG query routes.
+- Managed `/router/complete` accepts `session_id`, queries account-scoped cloud
+  RAG, boosts current-session hits, and silently enriches the upstream prompt
+  with up to 6 user-approved snippets. If RAG lookup fails, the paid answer
+  still proceeds without retrieved context.
 - Next cloud step: server-side embedding/vector search with pgvector or
-  equivalent, then merge cloud RAG hits into managed answer generation with
-  source cards and deletion/retention guarantees.
+  equivalent, first-class source cards in the overlay, and deletion/retention
+  guarantees that cover context artifacts plus RAG chunks.
 
 ## Current Model Routing
 

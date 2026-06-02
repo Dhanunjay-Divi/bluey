@@ -129,6 +129,7 @@ mod tests {
         LlmRequest {
             system: String::new(),
             user: "hi".into(),
+            session_id: None,
             max_tokens: None,
             temperature: None,
             reasoning_effort: None,

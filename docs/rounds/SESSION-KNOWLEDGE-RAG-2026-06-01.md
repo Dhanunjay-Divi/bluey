@@ -96,8 +96,13 @@ Cloud:
 
 - Sync already uploads sessions, transcript, responses, context artifacts, and
   RAG chunks.
-- Production still needs managed cloud retrieval in the answer path using
-  server-owned embeddings and a real vector index.
+- Managed `/router/complete` now accepts `session_id`, runs an account-scoped
+  cloud RAG lookup against synced chunks, boosts current-session matches, and
+  injects up to 6 relevant user-approved snippets into the provider prompt.
+- Cloud RAG lookup is best-effort: if it fails, Bluey logs the error and still
+  answers. A paid answer should not be blocked by memory retrieval.
+- Production still needs server-owned embeddings plus pgvector or equivalent
+  for semantic retrieval at scale.
 
 Compaction:
 
@@ -112,8 +117,8 @@ Compaction:
 - Should older-session retrieval be opt-in per user/workspace before cloud GA?
 - Should attachment indexing add UI states: `Added`, `Parsing`, `Indexed`,
   `Unavailable`?
-- Should managed answers merge local RAG and cloud RAG, or should cloud RAG
-  become authoritative once logged in?
+- Should managed answers eventually return first-class source cards separately
+  from artifact bodies?
 
 ## Verification
 
@@ -140,8 +145,7 @@ For production-grade cloud memory:
 
 1. Make server-side embeddings the source of truth for managed cloud RAG.
 2. Store embeddings in Postgres + pgvector for alpha scale.
-3. Add cloud RAG retrieval to `BlueyManagedProvider` / answer assembly.
-4. Return source cards to the overlay so users see which doc/session informed
+3. Return source cards to the overlay so users see which doc/session informed
    the answer.
-5. Add retention/export/delete tests that prove context artifacts and RAG
+4. Add retention/export/delete tests that prove context artifacts and RAG
    chunks are removed together.

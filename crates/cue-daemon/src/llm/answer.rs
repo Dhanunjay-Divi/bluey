@@ -43,6 +43,7 @@ impl AnswerLlm {
         let req = LlmRequest {
             system: SYSTEM_PROMPT.to_string(),
             user: question.to_string(),
+            session_id: Some(session_id.to_string()),
             max_tokens: Some(256),
             temperature: Some(0.3),
             reasoning_effort: None,

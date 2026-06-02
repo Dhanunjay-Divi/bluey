@@ -32,6 +32,7 @@ impl RecapLlm {
         let req = LlmRequest {
             system: SYSTEM_PROMPT.to_string(),
             user: transcript.to_string(),
+            session_id: Some(session_id.to_string()),
             max_tokens: Some(1024),
             temperature: Some(0.2),
             reasoning_effort: None,

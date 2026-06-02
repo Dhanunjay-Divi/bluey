@@ -1298,6 +1298,7 @@ fn classify_for_router(prompt: &str, has_transcript: bool, has_screenshot: bool)
 #[allow(clippy::too_many_arguments)]
 async fn try_speculative_dispatch(
     user_text: &str,
+    session_id: &str,
     system_prompt: &str,
     kind: &str,
     response_id: &str,
@@ -1350,6 +1351,7 @@ async fn try_speculative_dispatch(
     let req = cue_llm::LlmRequest {
         system: system_prompt.to_string(),
         user: user_text.to_string(),
+        session_id: Some(session_id.to_string()),
         max_tokens: None,
         temperature: None,
         reasoning_effort: None,
@@ -1611,6 +1613,7 @@ pub async fn request_cue(
         let kind_str = if is_question { "answer" } else { "suggestion" };
         if let Some((text, response_metadata)) = try_speculative_dispatch(
             &user_text,
+            &session_id,
             system_prompt,
             kind_str,
             &response_id,

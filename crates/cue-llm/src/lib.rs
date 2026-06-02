@@ -18,6 +18,9 @@ use thiserror::Error;
 pub struct LlmRequest {
     pub system: String,
     pub user: String,
+    /// Optional Bluey session id for managed/cloud paths that can retrieve
+    /// account-scoped session memory. Direct BYOK/local providers ignore it.
+    pub session_id: Option<String>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     /// Provider-neutral reasoning effort requested by the caller. Managed

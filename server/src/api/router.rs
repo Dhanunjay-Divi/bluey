@@ -14,7 +14,7 @@ use std::time::Instant;
 use super::AppState;
 use crate::auth::AuthedAccount;
 use crate::db::accounts::Account;
-use crate::db::{balance, idempotency, usage::UsageEvent};
+use crate::db::{balance, idempotency, sync, usage::UsageEvent};
 use crate::pricing;
 use crate::routing;
 
@@ -28,6 +28,8 @@ pub struct CompleteRequest {
     pub request_id: String,
     pub system: String,
     pub user: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
     #[serde(default)]
@@ -161,6 +163,92 @@ fn priced_transcribe_routes_for(
         .collect()
 }
 
+fn completion_rag_matches(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    session_id: Option<&str>,
+    query: &str,
+) -> Vec<sync::RagMatch> {
+    if query.trim().chars().count() < 8 {
+        return Vec::new();
+    }
+    let mut matches = match sync::query_rag(pool, account_id, query, None, 12) {
+        Ok(matches) => matches,
+        Err(e) => {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                error = %e,
+                "managed cloud RAG lookup failed; continuing without retrieved context"
+            );
+            return Vec::new();
+        }
+    };
+    matches.sort_by(|a, b| {
+        rag_completion_score(b, session_id).total_cmp(&rag_completion_score(a, session_id))
+    });
+    matches.truncate(6);
+    matches
+}
+
+fn rag_completion_score(hit: &sync::RagMatch, session_id: Option<&str>) -> f32 {
+    let current_session_boost = match (hit.session_id.as_deref(), session_id) {
+        (Some(hit_session), Some(current_session)) if hit_session == current_session => 0.18,
+        _ => 0.0,
+    };
+    hit.score + current_session_boost
+}
+
+fn prompt_with_rag_context(
+    system: &str,
+    user: &str,
+    matches: &[sync::RagMatch],
+) -> (String, String) {
+    if matches.is_empty() {
+        return (system.to_string(), user.to_string());
+    }
+
+    let mut context = String::from(
+        "Relevant Bluey knowledge base snippets from user-approved sessions and attachments:\n",
+    );
+    for (idx, hit) in matches.iter().enumerate() {
+        let label = rag_source_label(hit);
+        let snippet = truncate_chars(hit.text.trim(), 900);
+        context.push_str(&format!(
+            "\n[S{}] {} · score {:.2}\n{}\n",
+            idx + 1,
+            label,
+            hit.score,
+            snippet
+        ));
+    }
+
+    let system = format!(
+        "{system}\n\n{context}\nUse these snippets only when relevant. Prefer the live user question when it conflicts with older memory. Do not expose snippet ids or source labels unless the user asks for sources."
+    );
+    (system, user.to_string())
+}
+
+fn rag_source_label(hit: &sync::RagMatch) -> String {
+    let session = hit
+        .session_id
+        .as_deref()
+        .map(|session_id| format!("session {session_id}"))
+        .unwrap_or_else(|| "global memory".to_string());
+    format!(
+        "{} {} chunk {} ({session})",
+        hit.source_kind, hit.source_id, hit.chunk_index
+    )
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out = text.chars().take(max_chars).collect::<String>();
+    out.push_str("...");
+    out
+}
+
 pub async fn complete(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
@@ -279,6 +367,11 @@ async fn complete_inner(
         ));
     }
 
+    let rag_matches =
+        completion_rag_matches(&state.pool, &account.id, req.session_id.as_deref(), &req.user);
+    let (provider_system, provider_user) =
+        prompt_with_rag_context(&req.system, &req.user, &rag_matches);
+
     // 2. Resolve lane → provider+model candidates. Entry balance check uses
     // the maximum candidate estimate so provider failover cannot overrun a
     // customer's hard-stop budget.
@@ -291,7 +384,7 @@ async fn complete_inner(
     let max_out = i64::from(effective_max_out);
     let est_in = req.estimated_input_tokens.unwrap_or_else(|| {
         // Crude fallback: ~4 chars/token
-        ((req.system.len() + req.user.len()) as i64) / 4
+        ((provider_system.len() + provider_user.len()) as i64) / 4
     });
     let routes = priced_routes_for(&req.lane, est_in, max_out);
     if routes.is_empty() {
@@ -413,8 +506,8 @@ async fn complete_inner(
                 &selected_key.secret,
                 route.provider,
                 route.model,
-                &req.system,
-                &req.user,
+                &provider_system,
+                &provider_user,
                 req.max_tokens,
                 req.temperature,
                 thinking,
@@ -1629,6 +1722,57 @@ mod tests {
             priced_routes_for("local", 100, 100).is_empty(),
             "local/Ollama fallback must stay daemon-only, not managed cloud"
         );
+    }
+
+    #[test]
+    fn rag_completion_score_boosts_current_session() {
+        let current = sync::RagMatch {
+            chunk_id: "current".into(),
+            session_id: Some("session-a".into()),
+            source_kind: "transcript".into(),
+            source_id: "seg-1".into(),
+            chunk_index: 0,
+            text: "current session cache plan".into(),
+            score: 0.40,
+            embedding_model: None,
+        };
+        let older = sync::RagMatch {
+            chunk_id: "older".into(),
+            session_id: Some("session-b".into()),
+            source_kind: "context".into(),
+            source_id: "doc-1".into(),
+            chunk_index: 0,
+            text: "older cache plan".into(),
+            score: 0.50,
+            embedding_model: None,
+        };
+
+        assert!(rag_completion_score(&current, Some("session-a")) > rag_completion_score(&older, Some("session-a")));
+    }
+
+    #[test]
+    fn prompt_with_rag_context_adds_memory_without_changing_user_text() {
+        let matches = vec![sync::RagMatch {
+            chunk_id: "chunk-1".into(),
+            session_id: Some("session-a".into()),
+            source_kind: "attached_doc".into(),
+            source_id: "architecture.pdf".into(),
+            chunk_index: 2,
+            text: "Use write-through caching for the billing cache.".into(),
+            score: 0.73,
+            embedding_model: None,
+        }];
+
+        let (system, user) = prompt_with_rag_context(
+            "You are Bluey.",
+            "How should I describe the cache design?",
+            &matches,
+        );
+
+        assert_eq!(user, "How should I describe the cache design?");
+        assert!(system.contains("Relevant Bluey knowledge base snippets"));
+        assert!(system.contains("write-through caching"));
+        assert!(system.contains("Use these snippets only when relevant"));
     }
 
     #[test]

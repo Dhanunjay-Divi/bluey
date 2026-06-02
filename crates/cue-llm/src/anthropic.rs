@@ -267,6 +267,7 @@ mod tests {
         LlmRequest {
             system: "You are helpful.".into(),
             user: "Hello".into(),
+            session_id: None,
             max_tokens: Some(100),
             temperature: None,
             reasoning_effort: None,
