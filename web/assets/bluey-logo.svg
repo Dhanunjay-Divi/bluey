@@ -1,22 +1,37 @@
 <svg viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Bluey logo">
   <defs>
-    <linearGradient id="bluey-bg" x1="9" y1="10" x2="85" y2="88" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#091827"/>
-      <stop offset=".55" stop-color="#0D314C"/>
-      <stop offset="1" stop-color="#124D6B"/>
+    <linearGradient id="shell" x1="12" y1="10" x2="86" y2="88" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#08121c"/>
+      <stop offset=".58" stop-color="#092236"/>
+      <stop offset="1" stop-color="#0f4059"/>
     </linearGradient>
-    <linearGradient id="bluey-accent" x1="24" y1="26" x2="74" y2="70" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#7AF8FF"/>
-      <stop offset="1" stop-color="#5F7CFF"/>
+    <linearGradient id="glass" x1="24" y1="22" x2="76" y2="70" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0b1a28"/>
+      <stop offset="1" stop-color="#06101b"/>
     </linearGradient>
-    <filter id="bluey-glow" x="-30%" y="-30%" width="160%" height="160%" color-interpolation-filters="sRGB">
-      <feDropShadow dx="0" dy="0" stdDeviation="3" flood-color="#7AF8FF" flood-opacity=".68"/>
-      <feDropShadow dx="0" dy="10" stdDeviation="10" flood-color="#020A14" flood-opacity=".42"/>
+    <linearGradient id="edge" x1="16" y1="15" x2="82" y2="83" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#85f7ff"/>
+      <stop offset=".5" stop-color="#2eb8db"/>
+      <stop offset="1" stop-color="#4b6fff"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="60" y1="20" x2="78" y2="38" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#91ffb0"/>
+      <stop offset="1" stop-color="#49e8ff"/>
+    </linearGradient>
+    <filter id="soft-glow" x="-30%" y="-30%" width="160%" height="160%" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="0" stdDeviation="2.4" flood-color="#69ecff" flood-opacity=".46"/>
+      <feDropShadow dx="0" dy="12" stdDeviation="12" flood-color="#020811" flood-opacity=".48"/>
     </filter>
   </defs>
-  <rect x="8" y="8" width="80" height="80" rx="24" fill="url(#bluey-bg)"/>
-  <rect x="22" y="25" width="52" height="42" rx="12" fill="#06111F" stroke="#64E9FF" stroke-width="4" filter="url(#bluey-glow)"/>
-  <path d="M32 39l9 9-9 9" fill="none" stroke="#F5FDFF" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
-  <path d="M47 58h17" stroke="url(#bluey-accent)" stroke-width="6" stroke-linecap="round"/>
-  <path d="M69 22l2 7 7 2-7 2-2 7-2-7-7-2 7-2 2-7Z" fill="#8BFF9D"/>
+
+  <rect x="7" y="7" width="82" height="82" rx="25" fill="url(#shell)"/>
+  <rect x="8.5" y="8.5" width="79" height="79" rx="23.5" fill="none" stroke="#71e9ff" stroke-opacity=".24"/>
+  <path d="M18 46c0-16 13-29 29-29h6c12 0 22 10 22 22v16c0 12-10 22-22 22H39c-12 0-21-9-21-21V46Z" fill="#07101a" opacity=".58"/>
+
+  <rect x="23" y="25" width="50" height="42" rx="12" fill="url(#glass)" stroke="url(#edge)" stroke-width="3.25" filter="url(#soft-glow)"/>
+  <path d="M33 39.5 41.25 48 33 56.5" fill="none" stroke="#f4fbff" stroke-width="5.2" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M47.5 57.5h14" stroke="#bcefff" stroke-width="5.2" stroke-linecap="round"/>
+
+  <path d="M69 19.5 71.15 27 78.5 29.3 71.15 31.7 69 39.5 66.85 31.7 59.5 29.3 66.85 27Z" fill="url(#signal)"/>
+  <circle cx="74.5" cy="23.5" r="2.2" fill="#9dff9e"/>
 </svg>

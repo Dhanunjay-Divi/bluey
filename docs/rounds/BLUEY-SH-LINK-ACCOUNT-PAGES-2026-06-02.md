@@ -178,3 +178,16 @@ Fifth follow-up pass changed the brand mark from uppercase `BLUEY` to lowercase
 - Uses a Space-Grotesk-style lowercase CSS treatment with subtle angular cuts.
 - Applies to product, account, legal, and preview-pill brand locations.
 - Preserves the larger human-readable hero heading as `Bluey`.
+
+## Vector Brand Asset Pass
+
+Sixth follow-up pass moved the brand from CSS-styled text into production-ready
+SVG assets:
+
+- Refined `web/assets/bluey-logo.svg` with a tighter terminal mark, softer
+  glow, and a Bluey-specific command spark.
+- Added `web/assets/bluey-wordmark.svg` as the lowercase vector source of
+  truth for the `bluey` wordmark.
+- Replaced all public/account/legal/preview wordmark spans with the SVG asset.
+- Left the brand direction intact: terminal-native, compact, dark, cyan, and
+  aligned with the `bluey on` command.
