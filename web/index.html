@@ -1343,6 +1343,192 @@
         padding: 12px;
       }
     }
+
+    /* Minimal public-site refresh. Keep account/policy routes functional, but
+       make the product page simple enough to understand at a glance. */
+    .ambient,
+    .page-glass {
+      display: none;
+    }
+
+    .site {
+      min-height: 100vh;
+      overflow: visible;
+      background:
+        radial-gradient(circle at 80% 0%, rgba(114, 240, 255, .08), transparent 34%),
+        linear-gradient(180deg, #07090b, #050607 58%, #030404);
+    }
+
+    .site .site-nav {
+      width: min(1040px, calc(100% - 40px));
+      padding: 20px 0;
+    }
+
+    .site .navlinks {
+      gap: 4px;
+    }
+
+    .site .navlinks a {
+      color: #aebbc4;
+      background: transparent;
+    }
+
+    .site .navlinks .nav-cta {
+      color: #061014;
+      background: #edf9fc;
+      box-shadow: none;
+    }
+
+    .site .hero {
+      width: min(1040px, calc(100% - 40px));
+      min-height: auto;
+      grid-template-columns: minmax(0, 1fr) minmax(280px, 420px);
+      gap: clamp(28px, 7vw, 80px);
+      align-items: center;
+      padding: clamp(64px, 11vw, 128px) 0 78px;
+    }
+
+    .site .launch-pill {
+      margin-bottom: 24px;
+      background: rgba(255, 255, 255, .045);
+      border-color: rgba(255, 255, 255, .10);
+      box-shadow: none;
+    }
+
+    .site .hero-copy h1 {
+      max-width: 780px;
+      font-size: clamp(64px, 12vw, 132px);
+      line-height: .86;
+    }
+
+    .site .hero-line {
+      max-width: 760px;
+      margin: 14px 0 22px;
+      color: #72f0ff;
+      font-size: clamp(28px, 5vw, 58px);
+      line-height: 1;
+    }
+
+    .site .hero-copy p {
+      max-width: 640px;
+      color: #bac8cf;
+      font-size: 18px;
+    }
+
+    .simple-panel {
+      border: 1px solid rgba(255, 255, 255, .10);
+      border-radius: 28px;
+      background: rgba(255, 255, 255, .045);
+      padding: 22px;
+    }
+
+    .simple-panel h2 {
+      margin: 0 0 12px;
+      font-size: 20px;
+    }
+
+    .simple-list {
+      display: grid;
+      gap: 10px;
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    .simple-list li {
+      display: grid;
+      grid-template-columns: 32px minmax(0, 1fr);
+      gap: 12px;
+      align-items: start;
+      color: #b6c5cc;
+      line-height: 1.45;
+    }
+
+    .simple-list span {
+      width: 32px;
+      height: 32px;
+      display: grid;
+      place-items: center;
+      border-radius: 10px;
+      color: #081114;
+      background: #dff9ff;
+      font-weight: 900;
+    }
+
+    .site .band {
+      padding: 56px 20px;
+      background: transparent;
+      border-top: 1px solid rgba(255, 255, 255, .075);
+    }
+
+    .site .band-inner {
+      width: min(1040px, 100%);
+    }
+
+    .site .section-title {
+      max-width: 720px;
+      margin-bottom: 22px;
+    }
+
+    .site .section-title span {
+      color: #72f0ff;
+      letter-spacing: .10em;
+    }
+
+    .site .section-title h2 {
+      font-size: clamp(30px, 5vw, 54px);
+      line-height: 1.02;
+    }
+
+    .site .answer-flow,
+    .site .security-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .site .flow-card,
+    .site .security-card {
+      min-height: 0;
+      border-radius: 20px;
+      background: rgba(255, 255, 255, .04);
+      border: 1px solid rgba(255, 255, 255, .09);
+      padding: 18px;
+    }
+
+    .site .cta-band {
+      min-height: 0;
+      padding: 68px 20px;
+      background: transparent;
+    }
+
+    .site .cta-band h2 {
+      font-size: clamp(34px, 6vw, 64px);
+      line-height: 1;
+    }
+
+    .site .install-box {
+      background: rgba(255, 255, 255, .04);
+      border-color: rgba(255, 255, 255, .10);
+      box-shadow: none;
+    }
+
+    .site .footer {
+      background: #030404;
+      border-top: 1px solid rgba(255, 255, 255, .075);
+    }
+
+    @media (max-width: 860px) {
+      .site .hero,
+      .site .answer-flow,
+      .site .security-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .site .hero {
+        padding-top: 44px;
+      }
+    }
   </style>
 </head>
 <body>
@@ -1599,9 +1785,6 @@
   </section>
 
   <main class="site" id="productSite">
-    <canvas class="ambient" id="ambient" aria-hidden="true"></canvas>
-    <div class="page-glass"></div>
-
     <nav class="site-nav">
       <a class="brand" href="/">
         <img src="assets/bluey-logo.svg" alt="">
@@ -1609,10 +1792,9 @@
       </a>
       <div class="navlinks">
         <a href="#flow">How it works</a>
-        <a href="#routing">Routing</a>
         <a href="#pricing">Pricing</a>
         <a href="/account">Account</a>
-        <a class="nav-cta" href="#install">Get Bluey</a>
+        <a class="nav-cta" href="#install">Install</a>
       </div>
     </nav>
 
@@ -1621,106 +1803,39 @@
         <div class="launch-pill">
           <img src="assets/bluey-logo.svg" alt="">
           <code>bluey on</code>
-          <span>private answer layer</span>
+          <span>native macOS alpha</span>
         </div>
         <h1>Bluey</h1>
         <div class="hero-line">Stay present, stay unseen.</div>
-        <p>Bluey sits on your screen, listens when you ask it to, reads the context you attach, and streams useful answers without pulling you out of the moment.</p>
+        <p>A small AI layer for live work. Start it from the terminal, attach the context you want, and get useful answers while your meeting, code, or document stays in front of you.</p>
         <div class="hero-actions">
           <a class="button primary" href="#install">Install Bluey</a>
           <a class="button" href="/account">Open account</a>
         </div>
-        <div class="hero-note">Native macOS alpha today. Managed AI, STT, vision, account credits, and sync are wired through Bluey Cloud.</div>
+        <div class="hero-note">No monthly subscription by default. Reload credits, run until zero, and keep local sessions recoverable.</div>
       </div>
 
-      <div class="answer-visual" aria-label="Bluey product preview">
-        <div class="mini-pill">
-          <img src="assets/bluey-logo.svg" alt="">
-          <span>Bluey</span>
-          <span class="live-dot"></span>
-        </div>
-        <div class="visual-top">
-          <div class="model-chip">Auto -> Deep/System Design</div>
-          <div class="balance-chip">Balance $30.00</div>
-        </div>
-        <div class="chat-lane">
-          <div class="message user">
-            <small>Transcript / You</small>
-            <p>Walk me through a production AI architecture for three workflows with safety, latency, and testing.</p>
-          </div>
-          <div class="message bluey">
-            <small>Bluey response</small>
-            <p><strong>Start with a central orchestrator.</strong> Keep channels thin, route each workflow to a specialist lane, and make policy checks explicit before any agent calls tools.</p>
-          </div>
-          <div class="message bluey">
-            <small>Why this answer</small>
-            <p>Classified as deep system design from transcript length, architecture terms, and multi-workflow constraints. Canvas opened for structure.</p>
-          </div>
-        </div>
-        <div class="canvas-panel">
-          <div class="canvas-head">
-            <span>Canvas</span>
-            <span>Architecture</span>
-          </div>
-          <div class="canvas-body">
-            <div class="code-line"></div>
-            <div class="code-line"></div>
-            <div class="code-line"></div>
-            <div class="code-line"></div>
-          </div>
-        </div>
-        <div class="composer">
-          <div class="composer-button optional">+</div>
-          <div class="composer-input">Ask anything or let transcript fill in...</div>
-          <div class="composer-button optional">Docs</div>
-          <div class="composer-button optional">Screen</div>
-          <div class="composer-button send-button">↑</div>
-        </div>
-      </div>
+      <aside class="simple-panel" aria-label="Bluey summary">
+        <h2>What Bluey does</h2>
+        <ul class="simple-list">
+          <li><span>1</span><div>Listens only when you start it, with source-labeled transcript for system and microphone audio.</div></li>
+          <li><span>2</span><div>Uses your typed prompt, transcript, attached files, and screen analysis as one clear context.</div></li>
+          <li><span>3</span><div>Routes the answer to the right managed model and saves the session for later.</div></li>
+        </ul>
+      </aside>
     </section>
 
     <section class="band" id="flow">
       <div class="band-inner">
         <div class="section-title">
-          <span>Answer flow</span>
-          <h2>Bluey turns live context into a response you can use.</h2>
-          <p>Typed question, transcript, screen analysis, and attached files all become one clean request. The UI keeps the question on the right, the answer on the left, and opens canvas only when structure helps.</p>
+          <span>Flow</span>
+          <h2>Simple enough to use in the middle of work.</h2>
+          <p>Run Bluey, start listening or type a question, attach files if needed, then continue from the saved session later.</p>
         </div>
         <div class="answer-flow">
-          <div class="flow-card"><strong>1. Capture intent</strong><p>Start listening, type a question, attach docs, or analyse the screen. Bluey keeps source labels and waits for user action.</p></div>
-          <div class="flow-card"><strong>2. Route the task</strong><p>Quick prompts start fast. Coding, system design, documents, and vision move to stronger lanes automatically.</p></div>
-          <div class="flow-card"><strong>3. Stream the answer</strong><p>Answers appear line by line. When the output needs code, design, or structured edits, canvas opens beside chat.</p></div>
-        </div>
-      </div>
-    </section>
-
-    <section class="band">
-      <div class="band-inner">
-        <div class="section-title">
-          <span>What it helps with</span>
-          <h2>One overlay for calls, code, documents, and follow-ups.</h2>
-        </div>
-        <div class="feature-grid">
-          <div class="feature"><div class="mark">STT</div><b>Live calls</b><p>System and microphone transcript stay source-labeled so answers know who said what.</p></div>
-          <div class="feature"><div class="mark">DEV</div><b>Coding help</b><p>Code-style answers open canvas for implementation, complexity, tests, and follow-up changes.</p></div>
-          <div class="feature"><div class="mark">DOC</div><b>Document context</b><p>Attach readable files and turn them into session context and searchable account knowledge.</p></div>
-          <div class="feature"><div class="mark">VIS</div><b>Screen analysis</b><p>Analyse the current screen with consent, then route through vision and normal answer lanes.</p></div>
-        </div>
-      </div>
-    </section>
-
-    <section class="band" id="routing">
-      <div class="band-inner">
-        <div class="section-title">
-          <span>Managed routing</span>
-          <h2>No provider menu for the user. Bluey picks the lane.</h2>
-          <p>Users see Auto, not a wall of models. Internally Bluey routes across quick, balanced, deep, and vision paths based on task shape and attached context.</p>
-        </div>
-        <div class="route-grid">
-          <div class="route-card"><div class="mark">1</div><b>Instant</b><p>Short asks and quick clarifications start in the lowest-latency lane.</p></div>
-          <div class="route-card"><div class="mark">2</div><b>Balanced</b><p>General work and normal technical answers use the default managed lane.</p></div>
-          <div class="route-card"><div class="mark">3</div><b>Deep</b><p>Architecture, coding, reasoning, and long-form tasks get stronger planning.</p></div>
-          <div class="route-card"><div class="mark">4</div><b>Vision</b><p>Screen, image, and diagram asks include visual context and can still escalate.</p></div>
+          <div class="flow-card"><strong>Listen or ask</strong><p>Use the overlay to start audio, type a question, or analyse the screen with confirmation.</p></div>
+          <div class="flow-card"><strong>Add context</strong><p>Attach readable documents and keep answer style instructions with the session.</p></div>
+          <div class="flow-card"><strong>Continue later</strong><p>Local sessions reopen from the desktop sidebar. Synced cloud sessions are visible in the account page.</p></div>
         </div>
       </div>
     </section>
@@ -1728,30 +1843,14 @@
     <section class="band" id="pricing">
       <div class="band-inner">
         <div class="section-title">
-          <span>Credits</span>
-          <h2>Pay for the managed lanes you actually use.</h2>
-          <p>Bluey uses non-transferable account credits for managed AI work. Reload credits, run until zero, and avoid surprise usage. The account page shows balance, recent usage, and tier classification.</p>
+          <span>Account</span>
+          <h2>Credits, sync, and usage in one place.</h2>
+          <p>The web account is intentionally small: sign in, reload credits, see usage, and inspect synced sessions.</p>
         </div>
         <div class="security-grid">
-          <div class="security-card"><b>$30 reload</b><p>Minimum reload for alpha. Credits are valid for up to 12 months (365 days), stop at zero, and have no cash value.</p></div>
-          <div class="security-card"><b>Cost labels</b><p>Each managed response can show the lane and cost once billing events are recorded.</p></div>
-          <div class="security-card"><b>Capacity aware</b><p>Provider keys, capacity buckets, and Redis-backed health tracking are part of the managed server path.</p></div>
-          <div class="security-card"><b>Local fallback</b><p>Local models are availability fallback, not the customer-facing paid model menu.</p></div>
-        </div>
-      </div>
-    </section>
-
-    <section class="band">
-      <div class="band-inner">
-        <div class="section-title">
-          <span>Control</span>
-          <h2>Context should be obvious, permissioned, and recoverable.</h2>
-        </div>
-        <div class="security-grid">
-          <div class="security-card"><b>Visible controls</b><p>Listen, docs, screen, style, and answer actions live in the overlay composer.</p></div>
-          <div class="security-card"><b>Session history</b><p>Past sessions can be reopened, renamed, and continued instead of disappearing.</p></div>
-          <div class="security-card"><b>Knowledge base</b><p>Useful documents and transcripts can sync to cloud RAG for follow-up work.</p></div>
-          <div class="security-card"><b>Supportable logs</b><p>Trace IDs, redaction, and support bundles make real debugging possible.</p></div>
+          <div class="security-card"><b>$30 reload</b><p>Credits are valid for up to 12 months and stop at zero.</p></div>
+          <div class="security-card"><b>Managed routing</b><p>Users choose Auto. Bluey picks quick, balanced, deep, or vision lanes behind the scenes.</p></div>
+          <div class="security-card"><b>Session memory</b><p>Transcripts, responses, files, and style can sync for account-scoped RAG.</p></div>
         </div>
       </div>
     </section>
@@ -1770,7 +1869,7 @@
     <footer class="footer">
       <div class="footer-inner">
         <span>Bluey. Stay present, stay unseen.</span>
-        <span><a href="/docs/privacy">Privacy</a> · <a href="/docs/terms">Terms</a> · macOS alpha. Windows and Linux planned.</span>
+        <span><a href="/docs/privacy">Privacy</a> · <a href="/docs/terms">Terms</a> · <a href="/docs/disguise">Controls</a></span>
       </div>
     </footer>
   </main>
@@ -2231,51 +2330,7 @@
       }
     }
 
-    function initAmbient() {
-      const canvas = document.getElementById('ambient');
-      if (!canvas) return;
-      const ctx = canvas.getContext('2d');
-      let w = 0;
-      let h = 0;
-      let t = 0;
-
-      function resize() {
-        const ratio = window.devicePixelRatio || 1;
-        w = canvas.width = Math.floor(window.innerWidth * ratio);
-        h = canvas.height = Math.floor(window.innerHeight * ratio);
-        canvas.style.width = `${window.innerWidth}px`;
-        canvas.style.height = `${window.innerHeight}px`;
-      }
-
-      function draw() {
-        t += 0.004;
-        ctx.clearRect(0, 0, w, h);
-        ctx.fillStyle = '#020405';
-        ctx.fillRect(0, 0, w, h);
-        ctx.globalAlpha = .24;
-        for (let i = 0; i < 38; i += 1) {
-          const y = h * (.12 + i / 46);
-          ctx.beginPath();
-          for (let x = 0; x <= w; x += 24) {
-            const wave = Math.sin(x * .004 + i * .42 + t * 8) * 16 + Math.cos(x * .0018 + t * 4) * 8;
-            if (x === 0) ctx.moveTo(x, y + wave);
-            else ctx.lineTo(x, y + wave);
-          }
-          ctx.strokeStyle = i % 4 === 0 ? '#174a5a' : '#0d2630';
-          ctx.lineWidth = i % 4 === 0 ? 1.2 : .7;
-          ctx.stroke();
-        }
-        ctx.globalAlpha = 1;
-        requestAnimationFrame(draw);
-      }
-
-      window.addEventListener('resize', resize, { passive: true });
-      resize();
-      draw();
-    }
-
     initAccountApp();
-    initAmbient();
   </script>
 </body>
 </html>

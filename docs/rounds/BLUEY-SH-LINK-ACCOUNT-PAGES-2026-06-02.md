@@ -113,3 +113,16 @@ This is intentionally a simple static alpha surface. A future web app can add a
 proper account dashboard framework, usage charts, reload receipts, and
 server-rendered support pages without changing the API contract. The account
 page already has the first synced-session browser for alpha validation.
+
+## Minimal Web Refresh
+
+Follow-up pass simplified the public landing page into one calm product page:
+
+- Hero explains Bluey, the tagline, and the `bluey on` entry point.
+- Flow section explains listen/ask, add context, and continue later.
+- Account section explains credits, managed routing, and session memory.
+- Install section keeps the one-command setup.
+
+Removed the old animated canvas initializer and the heavy mock app preview from
+the public page. Account, login, link, recovery, policy, and session-browser
+routes still share the same static file and API contracts.
