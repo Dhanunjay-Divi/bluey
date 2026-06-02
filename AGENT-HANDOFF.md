@@ -1,6 +1,6 @@
 # Bluey Agent Handoff
 
-Last updated: 2026-06-01
+Last updated: 2026-06-02
 
 Start here when joining the Bluey repo.
 
@@ -169,10 +169,18 @@ Use `docs/deploy/PHASE2-MAC-SMOKE.md` for visual/product smoke.
    tree/summaries, index into RAG, and cite source files in meeting answers.
 5. Add Context Intelligence v1: source coverage model, missing-context prompt,
    and answer source cards.
-6. Finish `bluey.sh` web/link/reload/account/docs pages.
+6. Deploy `bluey.sh` static pages, host release artifacts, and run live
+   account/payment smoke against the managed server.
 7. Stand up staging/prod infra with live billing, SMTP, Caddy/TLS, backups, and
    monitoring.
 8. Complete Windows QA before claiming Windows support.
+
+Update 2026-06-02: the static `bluey.sh` route shell now exists in
+`web/index.html` for `/`, `/link`, `/login`, `/reload`, `/account`,
+`/verify-email`, `/password-reset`, `/docs/privacy`, `/docs/terms`, and
+`/docs/disguise`. The remaining web work is deployment, live account/payment
+smoke, hosted release artifacts, and any richer account/session UI beyond the
+alpha shell.
 
 ## Review Cadence
 

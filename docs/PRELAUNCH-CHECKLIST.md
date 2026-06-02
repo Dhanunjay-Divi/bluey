@@ -125,11 +125,14 @@ These can be served from `/var/www/bluey` behind the same Caddy origin as the
 API. The static starter in `web/` is enough for early internal testing; these
 routes must exist before public alpha:
 
-- [ ] `/` — landing page with download button
-- [ ] `/link` — OAuth-style landing for the `bluey://` deep-link flow (signup/signin form, calls `/auth/link/mint` after auth, redirects browser to `bluey://link?code=...`)
-- [ ] `/reload` — Square Checkout redirect target (after pay → returns to `/account?reload=success`)
-- [ ] `/account` — user-facing balance + usage + sign-out (calls `/account/me`, `/account/usage`, `/billing/portal`)
-- [ ] `/docs/disguise` — explainer page that the dashboard "Why?" link points at
+- [x] `/` — landing page with download button
+- [x] `/link` — OAuth-style landing for the `bluey://` deep-link flow (signup/signin form, calls `/auth/link/mint` after auth, redirects browser to `bluey://link?code=...`)
+- [x] `/login` — web sign-in alias for the same account shell
+- [x] `/reload` — Square Checkout redirect target (after pay → returns to `/account?reload=success`)
+- [x] `/account` — user-facing balance + usage + sign-out (calls `/account/me`, `/account/usage`, `/billing/checkout`)
+- [x] `/verify-email` — email verification token confirmation page
+- [x] `/password-reset` — password-reset request + token-confirmation page
+- [x] `/docs/disguise` — explainer page that the dashboard "Why?" link points at
 - [x] `/docs/privacy` — alpha privacy policy
 - [x] `/docs/terms` — alpha terms of use
 - [ ] OG / favicon assets

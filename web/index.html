@@ -1261,6 +1261,7 @@
         <div class="navlinks">
           <a href="/">Product</a>
           <a href="/account">Account</a>
+          <a href="/docs/disguise">Controls</a>
           <a href="/docs/privacy">Privacy</a>
           <a href="/docs/terms">Terms</a>
         </div>
@@ -1319,6 +1320,26 @@
 
         <h2>Changes</h2>
         <p>We may update these terms as Bluey moves from alpha to broader release. Material changes should be reflected on this page and in release notes.</p>
+      </article>
+
+      <article class="policy-card" id="disguisePolicy" hidden>
+        <div class="policy-updated">Product note for the macOS alpha</div>
+        <h1>Low-profile controls</h1>
+        <p>Bluey's desktop controls are designed to stay out of your way while you work. The overlay can hide back to a compact pill, use capture-excluded windows where the operating system supports it, and keep session controls close to the screen context you are using.</p>
+
+        <h2>What the controls do</h2>
+        <ul>
+          <li><strong>Pill:</strong> the compact Bluey launcher. Click it to open the current session window; drag it to move it.</li>
+          <li><strong>Hide:</strong> collapses the expanded window back to the pill. Bluey keeps running until you turn it off.</li>
+          <li><strong>Turn off:</strong> stops the daemon and closes the overlay. Run <code>bluey on</code> to start again.</li>
+          <li><strong>Capture-excluded windows:</strong> normal OS screen recording and screen-share APIs should not include the overlay. Privileged tools, managed devices, cameras, or custom capture systems may still observe the screen.</li>
+        </ul>
+
+        <h2>Responsible use</h2>
+        <p>Bluey is for user-approved work context: meetings, documents, code, research, and day-to-day productivity. Do not use it to access data you are not authorized to access or to bypass third-party rules. If a workflow requires consent, get consent before capturing or uploading context.</p>
+
+        <h2>Why this matters</h2>
+        <p>The product goal is calm focus, not deception. You should always know when Bluey is listening, what context is attached, and whether an answer used managed cloud AI, local fallback, screen analysis, or knowledge-base retrieval.</p>
       </article>
     </div>
   </section>
@@ -1382,12 +1403,12 @@
               </div>
             </form>
             <div class="account-message" id="accountAuthMessage"></div>
-            <div class="account-note">Hosted checkout opens in the browser. Desktop tokens are stored in the OS keychain. By continuing, use Bluey under the <a href="/docs/terms">Terms</a> and <a href="/docs/privacy">Privacy Policy</a>.</div>
+            <div class="account-note">Hosted checkout opens in the browser. Desktop tokens are stored in the OS keychain. <a href="/password-reset">Forgot password?</a> By continuing, use Bluey under the <a href="/docs/terms">Terms</a> and <a href="/docs/privacy">Privacy Policy</a>.</div>
           </aside>
 
           <section class="account-card account-preview-card" id="accountPreviewCard">
             <h2>What this unlocks</h2>
-          <p>The web account is the credits and control layer. The real experience stays in the overlay.</p>
+            <p>The web account is the credits and control layer. The real experience stays in the overlay.</p>
             <div class="preview-list">
               <div class="preview-item">
                 <div class="preview-icon">$</div>
@@ -1402,6 +1423,27 @@
                 <div><strong>Session knowledge</strong><span>Documents, transcripts, and screen context can become searchable account memory.</span></div>
               </div>
             </div>
+          </section>
+
+          <section class="account-card" id="accountRecoveryCard" hidden>
+            <h2 id="recoveryTitle">Account help</h2>
+            <p id="recoveryCopy">Recover or verify your Bluey account.</p>
+            <form class="account-form" id="passwordResetStartForm" hidden>
+              <label>
+                Email
+                <input id="resetEmail" type="email" autocomplete="email" placeholder="you@company.com">
+              </label>
+              <button class="account-button primary" type="submit">Send reset link</button>
+            </form>
+            <form class="account-form" id="passwordResetConfirmForm" hidden>
+              <label>
+                New password
+                <input id="resetPassword" type="password" autocomplete="new-password" placeholder="New password">
+              </label>
+              <button class="account-button primary" type="submit">Set password</button>
+            </form>
+            <div class="account-message" id="recoveryMessage"></div>
+            <div class="account-note"><a href="/link">Return to sign in</a></div>
           </section>
 
           <section class="account-card dashboard-card" id="accountDashboard" hidden>
@@ -1631,8 +1673,8 @@
     const policyApp = document.getElementById('policyApp');
     const accountApp = document.getElementById('accountApp');
     const productSite = document.getElementById('productSite');
-    const accountRoutes = new Set(['/account', '/reload', '/link', '/device']);
-    const policyRoutes = new Set(['/docs/privacy', '/docs/terms']);
+    const accountRoutes = new Set(['/account', '/reload', '/link', '/login', '/device', '/verify-email', '/password-reset']);
+    const policyRoutes = new Set(['/docs/privacy', '/docs/terms', '/docs/disguise']);
     const currentPath = window.location.pathname.replace(/\/+$/, '') || '/';
     const isAccountRoute = accountRoutes.has(currentPath);
     const isPolicyRoute = policyRoutes.has(currentPath);
@@ -1681,6 +1723,11 @@
 
     function accountMessage(text, auth = false) {
       const el = document.getElementById(auth ? 'accountAuthMessage' : 'accountMessage');
+      if (el) el.textContent = text || '';
+    }
+
+    function recoveryMessage(text) {
+      const el = document.getElementById('recoveryMessage');
       if (el) el.textContent = text || '';
     }
 
@@ -1750,6 +1797,33 @@
       await loadAccount();
     }
 
+    async function startPasswordReset(email) {
+      recoveryMessage('Sending reset email...');
+      await apiJson('/auth/password-reset/start', {
+        method: 'POST',
+        body: JSON.stringify({ email }),
+      });
+      recoveryMessage('If the account exists, a reset link has been sent.');
+    }
+
+    async function confirmPasswordReset(token, newPassword) {
+      recoveryMessage('Updating password...');
+      await apiJson('/auth/password-reset/confirm', {
+        method: 'POST',
+        body: JSON.stringify({ token, new_password: newPassword }),
+      });
+      recoveryMessage('Password updated. You can sign in now.');
+    }
+
+    async function confirmEmailVerification(token) {
+      recoveryMessage('Verifying email...');
+      await apiJson('/auth/verify-email/confirm', {
+        method: 'POST',
+        body: JSON.stringify({ token }),
+      });
+      recoveryMessage('Email verified. You can return to Bluey.');
+    }
+
     function renderUsage(usage) {
       document.getElementById('usageValue').textContent = `${usage.total_cues || 0}`;
       document.getElementById('usageHint').textContent = `${money(usage.total_cents_spent)} spent in ${usage.period_days || 7} days.`;
@@ -1771,10 +1845,15 @@
     }
 
     async function loadAccount() {
+      if (currentPath === '/verify-email' || currentPath === '/password-reset') {
+        renderRecoveryRoute();
+        return;
+      }
       const authed = Boolean(accountToken());
       document.getElementById('accountAuthCard').hidden = authed;
       document.getElementById('accountPreviewCard').hidden = authed;
       document.getElementById('accountDashboard').hidden = !authed;
+      document.getElementById('accountRecoveryCard').hidden = true;
       document.getElementById('accountSignOut').hidden = !authed;
       if (!authed) return;
       accountMessage('Loading account...');
@@ -1819,6 +1898,7 @@
         policyApp.hidden = false;
         document.getElementById('privacyPolicy').hidden = currentPath !== '/docs/privacy';
         document.getElementById('termsPolicy').hidden = currentPath !== '/docs/terms';
+        document.getElementById('disguisePolicy').hidden = currentPath !== '/docs/disguise';
         return;
       }
       if (!isAccountRoute) return;
@@ -1849,11 +1929,53 @@
         clearAccountToken();
         loadAccount().catch((error) => accountMessage(error.message));
       });
+      document.getElementById('passwordResetStartForm').addEventListener('submit', (event) => {
+        event.preventDefault();
+        const email = document.getElementById('resetEmail').value.trim();
+        if (!email) return recoveryMessage('Email is required.');
+        startPasswordReset(email).catch((error) => recoveryMessage(error.message));
+      });
+      document.getElementById('passwordResetConfirmForm').addEventListener('submit', (event) => {
+        event.preventDefault();
+        const token = new URLSearchParams(location.search).get('token') || '';
+        const password = document.getElementById('resetPassword').value;
+        if (!token) return recoveryMessage('Reset token is missing.');
+        if (!password) return recoveryMessage('New password is required.');
+        confirmPasswordReset(token, password).catch((error) => recoveryMessage(error.message));
+      });
       loadAccount().catch((error) => {
         clearAccountToken();
         accountMessage(error.message, true);
         loadAccount();
       });
+    }
+
+    function renderRecoveryRoute() {
+      document.getElementById('accountAuthCard').hidden = true;
+      document.getElementById('accountPreviewCard').hidden = true;
+      document.getElementById('accountDashboard').hidden = true;
+      document.getElementById('accountRecoveryCard').hidden = false;
+      document.getElementById('accountSignOut').hidden = true;
+
+      const params = new URLSearchParams(location.search);
+      const token = params.get('token') || '';
+      const isVerify = currentPath === '/verify-email';
+      document.getElementById('recoveryTitle').textContent = isVerify ? 'Verify email' : 'Reset password';
+      document.getElementById('recoveryCopy').textContent = isVerify
+        ? 'Bluey will verify this email token and return you to the account flow.'
+        : token
+          ? 'Choose a new password for this Bluey account.'
+          : 'Enter your account email and Bluey will send a password reset link.';
+      document.getElementById('passwordResetStartForm').hidden = isVerify || Boolean(token);
+      document.getElementById('passwordResetConfirmForm').hidden = isVerify || !token;
+
+      if (isVerify) {
+        if (!token) {
+          recoveryMessage('Verification token is missing.');
+        } else {
+          confirmEmailVerification(token).catch((error) => recoveryMessage(error.message));
+        }
+      }
     }
 
     function initAmbient() {
