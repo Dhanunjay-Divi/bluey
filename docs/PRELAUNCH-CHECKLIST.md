@@ -92,9 +92,9 @@ This is the master gate before public alpha. Every item must be ticked or explic
 - [x] `journalctl -u bluey-api.service --since "10 min ago"` shows no error-level logs
 - [x] Firewall/listeners: only 22, 80, 443 are publicly listening
 - [x] Backup script installed at `/usr/local/sbin/backup-bluey-db.sh`
-- [ ] Backup cron entry verified
+- [x] Backup cron entry verified
 - [ ] **At least one** off-host backup destination configured (S3 or rsync target)
-- [ ] First backup completed successfully + checksum verified
+- [x] First backup completed successfully + checksum verified
 
 ### Square Billing
 
@@ -139,7 +139,7 @@ routes must exist before public alpha:
 - [x] `/docs/disguise` — explainer page that the dashboard "Why?" link points at
 - [x] `/docs/privacy` — alpha privacy policy
 - [x] `/docs/terms` — alpha terms of use
-- [ ] OG / favicon assets
+- [x] OG / favicon assets
 
 ### macOS terminal distribution (Pinky-style: NO Apple Developer ID required for v0.2 alpha)
 
@@ -153,6 +153,7 @@ do not advertise it until a real `Bluey.app` artifact exists.
 - [x] Release tarball hosted at `https://bluey.sh/releases/v0.1.0/bluey-0.1.0-darwin-arm64.tar.gz`
 - [x] Each release tarball contains top-level `bin/bluey` plus helper binaries
 - [x] `SHA256SUMS.txt` hosted next to the tarballs, and `install.sh` verifies it
+- [x] Current-Mac temp-root installer smoke: download, checksum, ad-hoc sign, quarantine strip, CLI symlink, `bluey --version`
 - [ ] Smoke on a clean Mac: `curl -fsSL https://bluey.sh/install.sh | bash` finishes cleanly
 - [ ] `bluey` CLI is on `$PATH` after install
 

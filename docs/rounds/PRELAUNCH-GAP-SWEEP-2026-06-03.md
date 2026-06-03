@@ -24,6 +24,13 @@ operator checks.
 - Observability acceptance smoke passes all assertions.
 - `bluey doctor --json` reports actual local probe/log state.
 - `bluey logs export` produces a redacted support zip.
+- Backup cron is installed at `/etc/cron.d/bluey-api-backup`, and the first
+  hourly SQLite backup completed with a passing SHA-256 checksum.
+- Static site favicon, Apple touch icon, and OpenGraph/Twitter preview assets
+  are present in `web/assets/` and return 200 from `https://bluey.sh/assets/`.
+- Current-Mac temp-root installer smoke passes: download, SHA-256 verification,
+  helper install, ad-hoc signing, quarantine clearing, CLI symlink, and
+  `bluey --version`.
 
 ## Completed Fixes In This Sweep
 
@@ -41,6 +48,8 @@ operator checks.
 - Tightened the log-export leak check: search for concrete secret shapes rather
   than broad words like "key", which can appear in harmless diagnostics such as
   "no OpenAI API key configured".
+- Added social preview and app icon metadata to `web/index.html`.
+- Deployed the updated static site assets to `/var/www/bluey`.
 
 ## Still Pending
 
@@ -58,9 +67,10 @@ claim:
   checkout completion tests.
 - Square webhook registration and signature key should be confirmed in the
   Square dashboard before accepting real money.
-- Backup cron/off-host destination/restore verification are still pending.
+- Off-host backup destination and restore verification are still pending.
 - DNSSEC is not enabled.
-- Clean-Mac installer smoke is still pending.
+- Clean-Mac installer smoke is still pending. The current-Mac temp-root smoke
+  passed, but it does not replace a fresh-machine install.
 - Real managed Mac smoke steps 4-10 are pending until provider keys and a
   logged-in test account are available.
 
