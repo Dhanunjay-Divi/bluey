@@ -53,7 +53,23 @@ email forwarding UI only permits one mail mode. DKIM/SPF/DMARC are enough for
 send smoke; bounce/return-path handling can be revisited once forwarding is no
 longer needed.
 
-Once the Resend API deployment is live, run live smoke:
+## Live Smoke
+
+After deploying commit `94366e4`, both auth email endpoints returned `202` and
+the production server logged successful delivery handoff to Resend:
+
+```text
+POST /auth/verify-email/start    -> 202, "email verification sent"
+POST /auth/password-reset/start  -> 202, "password reset sent"
+```
+
+The smoke recipient used a Gmail plus-address owned by the operator:
+
+```text
+kooldhanunjay+bluey-smoke-1780521852@gmail.com
+```
+
+Final inbox/link verification is pending operator confirmation:
 
 ```bash
 POST /auth/verify-email/start

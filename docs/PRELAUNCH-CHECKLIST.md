@@ -114,9 +114,10 @@ This is the master gate before public alpha. Every item must be ticked or explic
 
 - [x] SMTP provider account selected (Resend)
 - [x] `BLUEY_SMTP_*` env vars set in `/etc/bluey-api/bluey-api.env`
-- [ ] Sender domain (`noreply@bluey.sh`) DKIM-signed and verified at provider
+- [x] Sender domain (`noreply@bluey.sh`) DKIM-signed and verified at provider
 - [ ] Live test: `/auth/verify-email/start` → email arrives in <30s, link opens
 - [ ] Live test: `/auth/password-reset/start` → email arrives in <30s, link opens
+- [x] Server-side smoke: verify/reset endpoints return `202` and log `sent`
 - [ ] Bounce handling configured (provider dashboard → forward to ops@bluey.sh)
 
 ### Web pages on `bluey.sh`

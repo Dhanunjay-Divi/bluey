@@ -76,7 +76,7 @@ operator-only blockers without exposing secrets.
 | Installer | PASS | Public installer works in temp install root. |
 | Managed AI answer | BLOCKED | Droplet does not yet have OpenAI/Anthropic provider keys. |
 | STT/transcribe | BLOCKED | Droplet does not yet have Deepgram keys. |
-| Verify/reset email | PARTIAL | Droplet has Resend SMTP settings. Resend DNS records are not visible yet from public DNS, so live delivery smoke waits on domain verification. |
+| Verify/reset email | PARTIAL | Droplet uses Resend HTTPS API mail. `/auth/verify-email/start` and `/auth/password-reset/start` returned `202` and logged `sent`; inbox/link confirmation is pending operator check. |
 
 ## Remaining Inputs Needed From User
 
