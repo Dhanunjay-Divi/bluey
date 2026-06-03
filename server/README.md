@@ -35,11 +35,11 @@ export BLUEY_PORT=8080
 export BLUEY_DB_PATH=./bluey-dev.db
 
 # Optional. If unset, verification/reset flows log dev URLs instead.
-export BLUEY_SMTP_HOST=smtp.example.com
+export BLUEY_SMTP_HOST=smtp.resend.com
 export BLUEY_SMTP_PORT=587
-export BLUEY_SMTP_USERNAME=apikey
+export BLUEY_SMTP_USERNAME=resend
 export BLUEY_SMTP_PASSWORD=...
-export BLUEY_SMTP_FROM="Bluey <no-reply@bluey.sh>"
+export BLUEY_SMTP_FROM="Bluey <hello@bluey.sh>"
 export BLUEY_SMTP_STARTTLS=true
 
 cargo run
@@ -49,7 +49,9 @@ curl http://127.0.0.1:8080/admin/health
 
 ## Status
 
-🟡 **v0.2 server loop in progress.** Auth, billing, managed routing,
-embedding, transcription, account export/delete, metrics, and transactional
-email scaffolding are now implemented. Streaming proxy, onboarding web UI,
-and production infrastructure still land in later stages.
+🟡 **v0.2 prelaunch.** Auth, Square billing, managed routing, streaming
+responses, embedding, transcription, cloud sync, account export/delete,
+metrics, web account pages, and Resend-backed transactional email are
+implemented and deployed on `bluey.sh`. Remaining launch gates are operational:
+managed provider keys, live inbox/link confirmation, Square hosted-checkout
+smoke, backups, and clean-Mac installer smoke.

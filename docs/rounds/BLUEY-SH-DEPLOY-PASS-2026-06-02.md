@@ -9,7 +9,7 @@ operator-only blockers without exposing secrets.
 ## Commit Deployed
 
 - Local branch: `feat/phase-3-round-12`
-- Server commit embedded in `/health`: `bcb6e5a`
+- Server commit embedded in `/health`: `94366e4`
 - Public server: `https://bluey.sh`
 - Droplet: `165.227.77.152`
 
@@ -28,7 +28,7 @@ operator-only blockers without exposing secrets.
    - Synced a minimal build tree instead of the full repo.
    - Excluded local DBs, target directories, reference repos, and other
      non-deployable artifacts.
-   - Built `bluey-server` on Linux with `BLUEY_GIT_COMMIT=bcb6e5a`.
+   - Built `bluey-server` on Linux with `BLUEY_GIT_COMMIT=94366e4`.
    - Backed up the old `/usr/local/bin/bluey-server` before replacement.
    - Restarted `bluey-api` cleanly.
 
@@ -67,7 +67,7 @@ operator-only blockers without exposing secrets.
 
 | Surface | Result | Notes |
 |---|---:|---|
-| `GET /health` | PASS | Returns `commit: a2f5a4c`. |
+| `GET /health` | PASS | Returns `commit: 94366e4`. |
 | Static web routes | PASS | All checked routes return 200. |
 | Signup | PASS | Throwaway account created successfully. |
 | Account read | PASS | `/account/me` returned account state. |

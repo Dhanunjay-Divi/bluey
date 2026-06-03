@@ -12,7 +12,8 @@ Before starting, you must already have:
 - [ ] A **DigitalOcean droplet** (or equivalent) running Ubuntu 24.04 with at least 2 GB RAM, 2 vCPU, 25 GB SSD. SSH key set up.
 - [ ] **Square production + sandbox application credentials**, location IDs, and webhook signature keys from the Square dashboard. Keep these in a password manager — never commit.
 - [ ] **Upstream provider keys** (OpenAI, Anthropic, Deepgram) for the managed lanes.
-- [ ] **SMTP credentials** for transactional email (Postmark / SendGrid / SES).
+- [ ] **Resend API key** for transactional email. Bluey uses the Resend HTTPS
+  API path because many cloud hosts block outbound SMTP ports.
 - [ ] A **64-character JWT secret** generated via `openssl rand -hex 32`.
 - [ ] (Optional) **Backup destination** — S3-compatible bucket or off-host SFTP target.
 
@@ -72,7 +73,8 @@ ssh root@<droplet> 'chmod 755 /usr/local/bin/bluey-server && chown root:root /us
 
 ## 5. Configure environment
 
-Create `/etc/bluey-api/bluey-api.env` with mode 0600 owned by `root:bluey`:
+Create `/etc/bluey-api/bluey-api.env` with mode 0640 owned by `root:bluey`.
+The service runs as the `bluey` group, so group-read is required:
 
 ```ini
 # Required
@@ -115,7 +117,7 @@ BLUEY_TRUSTED_PROXIES=127.0.0.1,::1
 ```
 
 ```bash
-chmod 0600 /etc/bluey-api/bluey-api.env
+chmod 0640 /etc/bluey-api/bluey-api.env
 chown root:bluey /etc/bluey-api/bluey-api.env
 ```
 

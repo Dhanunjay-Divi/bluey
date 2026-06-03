@@ -49,47 +49,50 @@ This is the master gate before public alpha. Every item must be ticked or explic
 - [x] `docs/SECURITY-HARDENING.md` reflects managed-cloud auth model + honest "what we cannot make impossible" section
 - [x] No "unbacktraceable" / "undetectable" wording in customer-facing copy
 
-### Observability Round (in progress)
+### Observability Round (complete)
 
 - [x] Phase 1: shared `cue-core::observability` (ObserveFields, account_id_hash_prefix, header constants, sanitize_observability_id) — codex `9cd66d4` 🟢 kiro
-- [x] Phase 4: `bluey doctor` + `bluey logs export --redact` — kiro `8b9c24a` 🟢 codex
+- [x] Phase 4: `bluey doctor` + `bluey logs export` redacted support bundle — kiro `8b9c24a` 🟢 codex
 - [x] Phase 4 followup: real macOS permission probes for doctor (Accessibility, Microphone, Screen Recording) — kiro `cef8b77`
 - [x] Phase 6: standard field migration sweep (21 account_id → account_id_hash, 10 email drops) — kiro `60ff7fd` 🟢 codex
 - [x] Phase 6 tooling: `analyze-tracing-calls.py --check-only` CI gate — kiro `98fe051`
-- [ ] Phase 2: daemon + dashboard log rotation (tracing-appender) — codex in flight
-- [ ] Phase 3: overlay lifecycle emits + frontend error capture — codex queued
-- [ ] Phase 5: trace propagation through Tauri invoke + IPC — codex queued
-- [ ] Phase 6 followup: rename `cue-daemon/src/app.rs:6996` `session = %session_id` → `session_id = %session_id` (deferred until codex Phase 2 commits)
+- [x] Phase 2: daemon + dashboard log rotation (tracing-appender) — codex `fdf3611`, 🟢 kiro
+- [x] Phase 3: overlay lifecycle emits + frontend error capture — codex `8bdb9fe`, 🟢 kiro
+- [x] Phase 5: trace propagation through Tauri invoke + IPC — codex `3187d6b`, 🟢 kiro
+- [x] Phase 6 followup: renamed `cue-daemon/src/app.rs:6996` `session = %session_id` → `session_id = %session_id`
 
 ### Observability acceptance gate
 
-- [ ] `python3 scripts/analyze-tracing-calls.py --check-only` exits 0 (no transitional / PII / alias findings)
-- [ ] One F19 question end-to-end: same `trace_id` appears in daemon, cloud-client, server, provider log lines
-- [ ] `bluey doctor` permissions section reports actual probe results (not generic guidance)
-- [ ] `bluey logs export --redact` produces a zip; `unzip + grep -i "key|secret|token"` returns ZERO matches in the redacted contents
+- [x] `python3 scripts/analyze-tracing-calls.py --check-only` exits 0 (no transitional / PII / alias findings)
+- [x] `scripts/observability-acceptance-smoke.sh` passes all assertions: dashboard command trace, server trace/request headers, daemon IPC trace, overlay/frontend regression tests
+- [ ] One real F19 question end-to-end: same `trace_id` appears in daemon, cloud-client, server, provider log lines
+- [x] `bluey doctor --json` permissions/log section reports actual probe results and Phase 2 log rotation state
+- [x] `bluey logs export` produces a redacted zip. Grep for concrete secret shapes (`sk-`, `EAAA`, `re_`, raw bearer values, magic links), not broad words like "key" that can appear in harmless diagnostics.
 
 ## Operational infrastructure
 
 ### Domains + DNS
 
-- [ ] **`bluey.sh`** registered, A/AAAA records pointed at the bluey-server droplet's public IP
-- [ ] `www.bluey.sh` points at the same host (CNAME to `bluey.sh` or A/AAAA to the same IP)
+- [x] **`bluey.sh`** registered, A/AAAA records pointed at the bluey-server droplet's public IP
+- [x] `www.bluey.sh` points at the same host (CNAME to `bluey.sh` or A/AAAA to the same IP)
 - [ ] DNSSEC enabled
-- [ ] CAA records restricting cert issuance to Let's Encrypt
-- [ ] Email DNS for `hello@bluey.sh`: SPF, DKIM, DMARC records published
+- [x] CAA records restricting cert issuance to Let's Encrypt
+- [x] Email DNS for `hello@bluey.sh`: DKIM, SPF, and DMARC TXT records published. `send.bluey.sh` MX is deferred while Namecheap email forwarding is active.
 
 ### Server host
 
-- [ ] DigitalOcean droplet provisioned per `docs/PRODUCTION-DEPLOY-RUNBOOK.md` §1
-- [ ] Caddy installed + Caddyfile from `ops/Caddyfile.example` deployed
-- [ ] `bluey-server` binary built `--release` and installed to `/usr/local/bin/`
-- [ ] `/etc/bluey-api/bluey-api.env` populated with all 14 required env vars (mode 0600)
-- [ ] systemd unit from `ops/bluey-api.service.example` installed + enabled
-- [ ] `/admin/health` returns 200 over HTTPS with valid TLS cert
-- [ ] `/pricing/tiers` returns the canonical tier numbers over HTTPS
-- [ ] `journalctl -u bluey-api.service --since "10 min ago"` shows no error-level logs
-- [ ] Firewall: only 22, 80, 443 open
-- [ ] Backup script installed at `/usr/local/sbin/backup-bluey-db.sh` + cron entry verified
+- [x] DigitalOcean droplet provisioned per `docs/PRODUCTION-DEPLOY-RUNBOOK.md` §1
+- [x] Caddy installed + Caddyfile from `ops/Caddyfile.example` deployed
+- [x] `bluey-server` binary built `--release` and installed to `/usr/local/bin/`
+- [x] `/etc/bluey-api/bluey-api.env` populated with core, Square, and Resend SMTP env vars (mode 0640, owner root, group bluey)
+- [ ] `/etc/bluey-api/bluey-api.env` populated with managed provider keys: `OPENAI_API_KEYS`, `ANTHROPIC_API_KEYS`, `DEEPGRAM_API_KEYS`
+- [x] systemd unit from `ops/bluey-api.service.example` installed + enabled
+- [x] `/admin/health` and `/health` return 200 over HTTPS with valid TLS cert
+- [x] `/pricing/tiers` returns the canonical tier numbers over HTTPS
+- [x] `journalctl -u bluey-api.service --since "10 min ago"` shows no error-level logs
+- [x] Firewall/listeners: only 22, 80, 443 are publicly listening
+- [x] Backup script installed at `/usr/local/sbin/backup-bluey-db.sh`
+- [ ] Backup cron entry verified
 - [ ] **At least one** off-host backup destination configured (S3 or rsync target)
 - [ ] First backup completed successfully + checksum verified
 
@@ -146,10 +149,10 @@ binaries and strips quarantine. A `.app` bundle can be added later, but
 do not advertise it until a real `Bluey.app` artifact exists.
 
 #### Path A: One-line installer (`curl ... | bash`)
-- [ ] `ops/install/install.sh` hosted at `https://bluey.sh/install.sh`
-- [ ] Release tarball hosted at `https://bluey.sh/releases/v0.1.0/bluey-0.1.0-darwin-arm64.tar.gz`
-- [ ] Each release tarball contains top-level `bin/bluey` plus helper binaries
-- [ ] `SHA256SUMS.txt` hosted next to the tarballs, and `install.sh` verifies it
+- [x] `ops/install/install.sh` hosted at `https://bluey.sh/install.sh`
+- [x] Release tarball hosted at `https://bluey.sh/releases/v0.1.0/bluey-0.1.0-darwin-arm64.tar.gz`
+- [x] Each release tarball contains top-level `bin/bluey` plus helper binaries
+- [x] `SHA256SUMS.txt` hosted next to the tarballs, and `install.sh` verifies it
 - [ ] Smoke on a clean Mac: `curl -fsSL https://bluey.sh/install.sh | bash` finishes cleanly
 - [ ] `bluey` CLI is on `$PATH` after install
 

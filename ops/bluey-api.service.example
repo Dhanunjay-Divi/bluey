@@ -10,8 +10,8 @@ User=bluey
 Group=bluey
 WorkingDirectory=/opt/bluey-api
 
-# Environment file holds JWT_SECRET, STRIPE keys, OPENAI/ANTHROPIC/DEEPGRAM
-# keys, BLUEY_TRUSTED_PROXIES, etc.
+# Environment file holds JWT secret, Square credentials, provider keys,
+# BLUEY_TRUSTED_PROXIES, etc.
 EnvironmentFile=/etc/bluey-api/bluey-api.env
 
 ExecStart=/usr/local/bin/bluey-server
