@@ -6,6 +6,8 @@ use lettre::{
     transport::smtp::authentication::Credentials,
     AsyncSmtpTransport, AsyncTransport, Tokio1Executor,
 };
+use serde_json::json;
+use std::time::Duration;
 
 use crate::{config::SmtpConfig, Config};
 
@@ -61,15 +63,66 @@ async fn send_transactional(
         .from
         .parse::<Mailbox>()
         .context("invalid BLUEY_SMTP_FROM mailbox")?;
-    let to = to.parse::<Mailbox>().context("invalid recipient mailbox")?;
+    let to_mailbox = to.parse::<Mailbox>().context("invalid recipient mailbox")?;
+    if uses_resend_api(smtp) {
+        return send_resend_api(smtp, to, subject, body).await;
+    }
+
     let message = Message::builder()
         .from(from)
-        .to(to)
+        .to(to_mailbox)
         .subject(subject)
         .body(body.to_string())
         .context("build email message")?;
 
     transport(smtp)?.send(message).await.context("send email")?;
+    Ok(MailDelivery::Sent)
+}
+
+fn uses_resend_api(smtp: &SmtpConfig) -> bool {
+    std::env::var("BLUEY_MAIL_TRANSPORT")
+        .map(|value| value.eq_ignore_ascii_case("resend"))
+        .unwrap_or_else(|_| smtp.host.eq_ignore_ascii_case("smtp.resend.com"))
+}
+
+async fn send_resend_api(
+    smtp: &SmtpConfig,
+    to: &str,
+    subject: &str,
+    body: &str,
+) -> anyhow::Result<MailDelivery> {
+    let api_key = smtp
+        .password
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .context("Resend API key missing from BLUEY_SMTP_PASSWORD")?;
+    let base_url = std::env::var("BLUEY_RESEND_API_BASE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "https://api.resend.com".to_string());
+    let url = format!("{}/emails", base_url.trim_end_matches('/'));
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .context("build Resend API client")?;
+    let response = client
+        .post(url)
+        .bearer_auth(api_key)
+        .json(&json!({
+            "from": smtp.from,
+            "to": [to],
+            "subject": subject,
+            "text": body,
+        }))
+        .send()
+        .await
+        .context("send Resend API email")?;
+
+    if !response.status().is_success() {
+        anyhow::bail!("Resend API email failed with status {}", response.status());
+    }
+
     Ok(MailDelivery::Sent)
 }
 
@@ -92,6 +145,11 @@ fn transport(smtp: &SmtpConfig) -> anyhow::Result<AsyncSmtpTransport<Tokio1Execu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use wiremock::{
+        matchers::{body_json, header, method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
 
     fn test_config() -> Config {
         Config {
@@ -125,5 +183,42 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(result, MailDelivery::NotConfigured);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn resend_api_transport_sends_email() {
+        let server = MockServer::start().await;
+        std::env::set_var("BLUEY_RESEND_API_BASE_URL", server.uri());
+
+        Mock::given(method("POST"))
+            .and(path("/emails"))
+            .and(header("Authorization", "Bearer test-resend-key"))
+            .and(body_json(json!({
+                "from": "Bluey <noreply@bluey.sh>",
+                "to": ["user@example.com"],
+                "subject": "Verify your Bluey email",
+                "text": "Welcome to Bluey.\n\nVerify this email address by opening this link:\n\nhttps://bluey.sh/verify\n\nIf you did not request this, you can ignore this email."
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"email-test"})))
+            .mount(&server)
+            .await;
+
+        let mut config = test_config();
+        config.smtp = Some(SmtpConfig {
+            host: "smtp.resend.com".to_string(),
+            port: 587,
+            username: Some("resend".to_string()),
+            password: Some("test-resend-key".to_string()),
+            from: "Bluey <noreply@bluey.sh>".to_string(),
+            starttls: true,
+        });
+
+        let result = send_email_verification(&config, "user@example.com", "https://bluey.sh/verify")
+            .await
+            .unwrap();
+        assert_eq!(result, MailDelivery::Sent);
+
+        std::env::remove_var("BLUEY_RESEND_API_BASE_URL");
     }
 }

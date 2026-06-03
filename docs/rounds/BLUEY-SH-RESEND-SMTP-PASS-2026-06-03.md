@@ -11,7 +11,11 @@
 
 No Resend API key or SMTP password is stored in this repository.
 
-## Runtime SMTP Shape
+## Runtime Mail Shape
+
+Bluey accepts the same `BLUEY_SMTP_*` env shape for all mail providers. For
+Resend specifically, `smtp.resend.com` is routed through Resend's HTTPS API in
+code because DigitalOcean blocks outbound SMTP ports from this droplet.
 
 ```text
 BLUEY_SMTP_HOST=smtp.resend.com
@@ -36,17 +40,20 @@ for the apex domain.
 
 ## Current Verification Status
 
-Public DNS does not yet return the Resend records:
+Public DNS now returns the DKIM, SPF, and DMARC TXT records:
 
 ```bash
 dig +short TXT resend._domainkey.bluey.sh
-dig +short MX send.bluey.sh
 dig +short TXT send.bluey.sh
 dig +short TXT _dmarc.bluey.sh
 ```
 
-This means verify/reset email should not be considered production-verified yet.
-Once DNS propagates and Resend marks the domain verified, run live smoke:
+The `send.bluey.sh` MX record is intentionally deferred because Namecheap's
+email forwarding UI only permits one mail mode. DKIM/SPF/DMARC are enough for
+send smoke; bounce/return-path handling can be revisited once forwarding is no
+longer needed.
+
+Once the Resend API deployment is live, run live smoke:
 
 ```bash
 POST /auth/verify-email/start
