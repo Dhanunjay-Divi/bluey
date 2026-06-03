@@ -76,7 +76,7 @@ This is the master gate before public alpha. Every item must be ticked or explic
 - [ ] `www.bluey.sh` points at the same host (CNAME to `bluey.sh` or A/AAAA to the same IP)
 - [ ] DNSSEC enabled
 - [ ] CAA records restricting cert issuance to Let's Encrypt
-- [ ] Email DNS for `noreply@bluey.sh`: SPF, DKIM, DMARC records published
+- [ ] Email DNS for `hello@bluey.sh`: SPF, DKIM, DMARC records published
 
 ### Server host
 
@@ -114,7 +114,7 @@ This is the master gate before public alpha. Every item must be ticked or explic
 
 - [x] SMTP provider account selected (Resend)
 - [x] `BLUEY_SMTP_*` env vars set in `/etc/bluey-api/bluey-api.env`
-- [x] Sender domain (`noreply@bluey.sh`) DKIM-signed and verified at provider
+- [x] Sender domain (`hello@bluey.sh`) DKIM-signed and verified at provider
 - [ ] Live test: `/auth/verify-email/start` → email arrives in <30s, link opens
 - [ ] Live test: `/auth/password-reset/start` → email arrives in <30s, link opens
 - [x] Server-side smoke: verify/reset endpoints return `202` and log `sent`

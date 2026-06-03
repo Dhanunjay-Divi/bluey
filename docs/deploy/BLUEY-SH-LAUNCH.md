@@ -29,7 +29,7 @@ Caddy routes the API paths to `bluey-server` and serves everything else from
      - optional `AAAA @ <droplet_ipv6>`
      - `CNAME www @`
      - CAA permitting Let's Encrypt
-     - SPF, DKIM, DMARC for `noreply@bluey.sh` after the email provider is chosen
+     - SPF, DKIM, DMARC for `hello@bluey.sh` after the email provider is chosen
 
 2. Server host
    - DigitalOcean Ubuntu 24.04 droplet
@@ -52,7 +52,7 @@ Caddy routes the API paths to `bluey-server` and serves everything else from
    - `OPENAI_API_KEY`
    - `ANTHROPIC_API_KEY`
    - `DEEPGRAM_API_KEY`
-   - SMTP credentials for `noreply@bluey.sh`
+   - SMTP credentials for `hello@bluey.sh`
 
    See `docs/deploy/SQUARE-BILLING.md` for the exact Square sandbox/production
    switching contract.

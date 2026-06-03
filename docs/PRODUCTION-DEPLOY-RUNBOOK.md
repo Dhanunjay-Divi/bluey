@@ -101,12 +101,14 @@ OPENAI_API_KEY=sk-xxxxxxxx
 ANTHROPIC_API_KEY=sk-ant-xxxxxxxx
 DEEPGRAM_API_KEY=xxxxxxxx
 
-# SMTP for verify + reset emails
-BLUEY_SMTP_HOST=smtp.postmarkapp.com
+# Transactional mail for verify + reset emails. Resend is sent over HTTPS
+# by bluey-server because many cloud hosts block outbound SMTP ports.
+BLUEY_SMTP_HOST=smtp.resend.com
 BLUEY_SMTP_PORT=587
-BLUEY_SMTP_USERNAME=<postmark token>
-BLUEY_SMTP_PASSWORD=<postmark token>
-BLUEY_SMTP_FROM=Bluey <noreply@bluey.sh>
+BLUEY_SMTP_USERNAME=resend
+BLUEY_SMTP_PASSWORD=<resend api key>
+BLUEY_SMTP_FROM=Bluey <hello@bluey.sh>
+BLUEY_SMTP_STARTTLS=true
 
 # Rate-limit XFF trust — when behind Caddy on the same host this is loopback.
 BLUEY_TRUSTED_PROXIES=127.0.0.1,::1

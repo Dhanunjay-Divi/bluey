@@ -8,6 +8,9 @@
   healthy.
 - Updated `ops/bluey-api.env.example` so future operators see the Resend SMTP
   shape instead of the older Postmark placeholder.
+- Switched the production sender identity from `noreply@bluey.sh` to
+  `hello@bluey.sh` so transactional mail is replyable and matches the product
+  support posture.
 
 No Resend API key or SMTP password is stored in this repository.
 
@@ -22,7 +25,7 @@ BLUEY_SMTP_HOST=smtp.resend.com
 BLUEY_SMTP_PORT=587
 BLUEY_SMTP_USERNAME=resend
 BLUEY_SMTP_PASSWORD=<resend-api-key>
-BLUEY_SMTP_FROM=Bluey <noreply@bluey.sh>
+BLUEY_SMTP_FROM=Bluey <hello@bluey.sh>
 BLUEY_SMTP_STARTTLS=true
 ```
 
@@ -63,10 +66,11 @@ POST /auth/verify-email/start    -> 202, "email verification sent"
 POST /auth/password-reset/start  -> 202, "password reset sent"
 ```
 
-The smoke recipient used a Gmail plus-address owned by the operator:
+The latest smoke used `hello@bluey.sh` as the sender and a Gmail plus-address
+owned by the operator:
 
 ```text
-kooldhanunjay+bluey-smoke-1780521852@gmail.com
+kooldhanunjay+bluey-hello-1780523708@gmail.com
 ```
 
 Final inbox/link verification is pending operator confirmation:

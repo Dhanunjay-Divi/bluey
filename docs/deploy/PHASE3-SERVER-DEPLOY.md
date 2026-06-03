@@ -135,7 +135,7 @@ BLUEY_DEEPGRAM_API_KEY=test_xxxxxxxxxxxxxx
 
 # ── SMTP (use Mailhog or test SMTP for staging) ─────────────────
 BLUEY_SMTP_URL=smtp://user:pass@smtp.test:587
-BLUEY_SMTP_FROM=no-reply@api-test.bluey.dev
+BLUEY_SMTP_FROM=hello@api-test.bluey.dev
 
 # ── Pricing markup (test values) ────────────────────────────────
 BLUEY_MARKUP_PCT=20
