@@ -67,7 +67,7 @@ operator-only blockers without exposing secrets.
 
 | Surface | Result | Notes |
 |---|---:|---|
-| `GET /health` | PASS | Returns `commit: bcb6e5a`. |
+| `GET /health` | PASS | Returns `commit: a2f5a4c`. |
 | Static web routes | PASS | All checked routes return 200. |
 | Signup | PASS | Throwaway account created successfully. |
 | Account read | PASS | `/account/me` returned account state. |
@@ -76,7 +76,7 @@ operator-only blockers without exposing secrets.
 | Installer | PASS | Public installer works in temp install root. |
 | Managed AI answer | BLOCKED | Droplet does not yet have OpenAI/Anthropic provider keys. |
 | STT/transcribe | BLOCKED | Droplet does not yet have Deepgram keys. |
-| Verify/reset email | BLOCKED | Droplet does not yet have SMTP settings. |
+| Verify/reset email | PARTIAL | Droplet has Resend SMTP settings. Resend DNS records are not visible yet from public DNS, so live delivery smoke waits on domain verification. |
 
 ## Remaining Inputs Needed From User
 
@@ -86,11 +86,6 @@ Add these to `/etc/bluey-api/bluey-api.env`, then restart `bluey-api`:
 OPENAI_API_KEYS=
 ANTHROPIC_API_KEYS=
 DEEPGRAM_API_KEYS=
-BLUEY_SMTP_HOST=
-BLUEY_SMTP_PORT=
-BLUEY_SMTP_USERNAME=
-BLUEY_SMTP_PASSWORD=
-BLUEY_SMTP_FROM=
 ```
 
 For production, rotate any provider or billing secrets that were pasted into
@@ -98,7 +93,7 @@ chat before real customer launch.
 
 ## Next Step
 
-After provider and SMTP env values are installed:
+After provider keys are installed and Resend DNS verifies:
 
 1. Restart `bluey-api`.
 2. Re-run managed smoke:
