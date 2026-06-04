@@ -820,7 +820,7 @@ async fn cue_on(args: OnArgs) -> Result<()> {
     // starts. Do not send OverlayShow here: in the current protocol it expands
     // the full feed, while `bluey on` should launch pill-first.
     let boot = request(DaemonRequest::OverlayBoot {
-        title: "Bluey online".to_string(),
+        title: bluey_on_boot_title(&auth_state).to_string(),
         lines: bluey_on_boot_lines(&auth_state),
     })
     .await;
@@ -898,20 +898,27 @@ fn env_flag(name: &str) -> bool {
 }
 
 fn bluey_on_boot_lines(auth_state: &BlueyOnAuthState) -> Vec<String> {
-    let mut lines = vec![
-        "new recording ready".to_string(),
-        "use Listen, Docs, Screen, or Ask from the composer".to_string(),
-        "previous sessions live in the sidebar".to_string(),
-    ];
     match auth_state {
-        BlueyOnAuthState::Ready => {
-            lines.push("managed answers and balance tracking are ready".to_string());
-        }
-        BlueyOnAuthState::SignInAvailable { url } => {
-            lines.push(format!("finish sign-in in your browser: {url}"));
-        }
+        BlueyOnAuthState::Ready => vec![
+            "new recording ready".to_string(),
+            "use Listen, Docs, Screen, or Ask from the composer".to_string(),
+            "previous sessions live in the sidebar".to_string(),
+            "managed answers and balance tracking are ready".to_string(),
+        ],
+        BlueyOnAuthState::SignInAvailable { url } => vec![
+            "sign in to continue your cloud session".to_string(),
+            "managed answers, balance, sync, and RAG unlock after login".to_string(),
+            "the local overlay can stay ready while you finish setup".to_string(),
+            format!("login_url: {url}"),
+        ],
     }
-    lines
+}
+
+fn bluey_on_boot_title(auth_state: &BlueyOnAuthState) -> &'static str {
+    match auth_state {
+        BlueyOnAuthState::Ready => "Bluey online",
+        BlueyOnAuthState::SignInAvailable { .. } => "Sign in to Bluey",
+    }
 }
 
 async fn cue_off() -> Result<()> {
@@ -2684,7 +2691,8 @@ async fn bluey_delete_account_cmd(force: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bluey_on_boot_lines, default_bluey_signin_url, device_login_url, BlueyOnAuthState,
+        bluey_on_boot_lines, bluey_on_boot_title, default_bluey_signin_url, device_login_url,
+        BlueyOnAuthState,
     };
 
     #[test]
@@ -2692,8 +2700,8 @@ mod tests {
         let lines = bluey_on_boot_lines(&BlueyOnAuthState::SignInAvailable {
             url: "https://bluey.sh/login".to_string(),
         });
-        assert!(lines.iter().any(|line| line.contains("browser")));
-        assert!(lines.iter().any(|line| line.contains("previous sessions")));
+        assert!(lines.iter().any(|line| line.contains("continue")));
+        assert!(lines.iter().any(|line| line.contains("cloud session")));
     }
 
     #[test]
@@ -2712,7 +2720,21 @@ mod tests {
         });
         assert!(lines
             .iter()
-            .any(|line| line.contains("https://bluey.sh/login")));
+            .any(|line| line == "login_url: https://bluey.sh/login"));
+    }
+
+    #[test]
+    fn bluey_on_boot_title_reflects_signed_out_state() {
+        assert_eq!(
+            bluey_on_boot_title(&BlueyOnAuthState::SignInAvailable {
+                url: "https://bluey.sh/login".to_string(),
+            }),
+            "Sign in to Bluey"
+        );
+        assert_eq!(
+            bluey_on_boot_title(&BlueyOnAuthState::Ready),
+            "Bluey online"
+        );
     }
 
     #[test]

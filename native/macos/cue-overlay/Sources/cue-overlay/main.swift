@@ -1120,6 +1120,7 @@ private final class FeedView: NSView {
     private let scroll = NSScrollView()
     private let emptyState = NSView()
     var onTranscript: ((RenderedCard) -> Void)?
+    var onOpenURL: ((URL) -> Void)?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1308,24 +1309,46 @@ private final class FeedView: NSView {
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         titleLabel.lineBreakMode = .byTruncatingTail
 
+        let signInURL = loginURL(from: card)
         let rawBody = card.body.isEmpty && !card.done ? "Thinking..." : card.body
-        let bodyText = chatBody(for: card, rawBody: rawBody)
+        let bodyText = signInURL == nil
+            ? chatBody(for: card, rawBody: rawBody)
+            : signInBody(from: rawBody)
         let bodyLabel = NSTextField(wrappingLabelWithString: bodyText)
         bodyLabel.font = bodyFont(for: card)
         bodyLabel.textColor = rightAligned ? NSColor.black : BlueyTheme.text
+        bodyLabel.alignment = signInURL == nil ? .left : .center
         bodyLabel.translatesAutoresizingMaskIntoConstraints = false
-        bodyLabel.preferredMaxLayoutWidth = rightAligned ? 360 : 480
+        bodyLabel.preferredMaxLayoutWidth = signInURL == nil ? (rightAligned ? 360 : 480) : 430
 
         let statusLabel = NSTextField(labelWithString: statusText(for: card))
         statusLabel.font = NSFont.monospacedSystemFont(ofSize: 9.5, weight: .semibold)
         statusLabel.textColor = rightAligned ? NSColor.black.withAlphaComponent(0.46) : BlueyTheme.textDim
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
 
+        let signInButton: NSButton? = signInURL.map { url in
+            let button = NSButton(title: "Sign in", target: self, action: #selector(openURLButtonClicked(_:)))
+            button.translatesAutoresizingMaskIntoConstraints = false
+            button.identifier = NSUserInterfaceItemIdentifier(url.absoluteString)
+            styleSignInButton(button)
+            return button
+        }
+        if signInURL != nil {
+            bubble.layer?.backgroundColor = NSColor(red: 0.020, green: 0.030, blue: 0.040, alpha: 0.98).cgColor
+            bubble.layer?.borderWidth = 1
+            bubble.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.30).cgColor
+            titleLabel.font = NSFont.systemFont(ofSize: 13.5, weight: .bold)
+            statusLabel.stringValue = "login"
+        }
+
         row.addSubview(bubble)
         bubble.addSubview(metaLabel)
         bubble.addSubview(titleLabel)
         bubble.addSubview(bodyLabel)
         bubble.addSubview(statusLabel)
+        if let signInButton {
+            bubble.addSubview(signInButton)
+        }
 
         let leading = bubble.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 8)
         let trailing = bubble.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -8)
@@ -1337,7 +1360,7 @@ private final class FeedView: NSView {
             trailing.priority = .defaultLow
         }
 
-        NSLayoutConstraint.activate([
+        var constraints: [NSLayoutConstraint] = [
             row.heightAnchor.constraint(greaterThanOrEqualTo: bubble.heightAnchor),
             bubble.topAnchor.constraint(equalTo: row.topAnchor),
             bubble.bottomAnchor.constraint(equalTo: row.bottomAnchor),
@@ -1359,9 +1382,54 @@ private final class FeedView: NSView {
             bodyLabel.topAnchor.constraint(equalTo: metaLabel.bottomAnchor, constant: 8),
             bodyLabel.leadingAnchor.constraint(equalTo: metaLabel.leadingAnchor),
             bodyLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
-            bodyLabel.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -12),
-        ])
+        ]
+        if let signInButton {
+            constraints.append(contentsOf: [
+                bodyLabel.bottomAnchor.constraint(equalTo: signInButton.topAnchor, constant: -12),
+                signInButton.centerXAnchor.constraint(equalTo: bubble.centerXAnchor),
+                signInButton.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -14),
+                signInButton.widthAnchor.constraint(equalToConstant: 132),
+                signInButton.heightAnchor.constraint(equalToConstant: 34),
+            ])
+        } else {
+            constraints.append(bodyLabel.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -12))
+        }
+        NSLayoutConstraint.activate(constraints)
         return row
+    }
+
+    private func styleSignInButton(_ button: NSButton) {
+        button.isBordered = false
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 17
+        button.layer?.backgroundColor = NSColor(red: 0.64, green: 0.93, blue: 1.0, alpha: 0.96).cgColor
+        button.layer?.borderWidth = 1
+        button.layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
+        button.font = NSFont.systemFont(ofSize: 12.5, weight: .bold)
+        button.attributedTitle = NSAttributedString(
+            string: "Sign in",
+            attributes: [
+                .font: button.font ?? NSFont.systemFont(ofSize: 12.5, weight: .bold),
+                .foregroundColor: NSColor.black.withAlphaComponent(0.86),
+            ])
+        button.contentTintColor = NSColor.black.withAlphaComponent(0.82)
+        if let image = symbolImage("arrow.up.right") {
+            image.isTemplate = true
+            button.image = image
+            button.imagePosition = .imageTrailing
+            button.imageScaling = .scaleProportionallyDown
+        }
+        button.imageHugsTitle = true
+        button.alignment = .center
+        button.toolTip = "Open Bluey login"
+    }
+
+    @objc private func openURLButtonClicked(_ sender: NSButton) {
+        guard
+            let raw = sender.identifier?.rawValue,
+            let url = URL(string: raw)
+        else { return }
+        onOpenURL?(url)
     }
 
     private func kindLabel(_ card: RenderedCard) -> String {
@@ -1460,6 +1528,7 @@ private final class FeedView: NSView {
 
     private func statusText(for card: RenderedCard) -> String {
         if !card.done { return "streaming..." }
+        if loginURL(from: card) != nil { return "login" }
         if let costLabel = card.costLabel, !costLabel.isEmpty { return costLabel }
         switch card.kind {
         case "answer":   return ""
@@ -1480,6 +1549,38 @@ private final class FeedView: NSView {
         case "system":      return "Bluey"
         default:            return "Update"
         }
+    }
+
+    private func signInBody(from text: String) -> String {
+        text.components(separatedBy: .newlines)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("login_url:") }
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func loginURL(from card: RenderedCard) -> URL? {
+        guard card.kind == "system" else { return nil }
+        for line in card.body.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let candidate: String
+            if trimmed.hasPrefix("login_url:") {
+                candidate = trimmed
+                    .replacingOccurrences(of: "login_url:", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if trimmed.hasPrefix("https://") || trimmed.hasPrefix("http://") {
+                candidate = trimmed
+            } else {
+                continue
+            }
+            if
+                let url = URL(string: candidate),
+                let scheme = url.scheme?.lowercased(),
+                ["http", "https"].contains(scheme)
+            {
+                return url
+            }
+        }
+        return nil
     }
 
     private func scrollToBottom() {
@@ -1775,6 +1876,9 @@ private final class ExpandedPanelView: NSView {
         styleDrawer()
         feed.onTranscript = { [weak self] card in
             self?.appendTranscriptSnippet(card)
+        }
+        feed.onOpenURL = { url in
+            NSWorkspace.shared.open(url)
         }
 
         for view in [
@@ -2825,6 +2929,18 @@ private final class ExpandedPanelView: NSView {
     func setBalanceLabel(_ label: String) {
         let clean = label.trimmingCharacters(in: .whitespacesAndNewlines)
         balanceLabel.stringValue = clean.isEmpty ? "Balance --" : clean
+    }
+
+    func showSignedOutLogin(url: URL?) {
+        statusLabel.stringValue = "Login needed"
+        routeBadge.stringValue = "Sign in"
+        routeBadge.textColor = BlueyTheme.warning
+        routeBadge.layer?.borderColor = BlueyTheme.warning.withAlphaComponent(0.28).cgColor
+        routeBadge.layer?.backgroundColor = BlueyTheme.warning.withAlphaComponent(0.08).cgColor
+        balanceLabel.stringValue = "Login"
+        setKnowledgeBadge("KB locked", accent: BlueyTheme.textDim)
+        composer.placeholder = url == nil ? "Sign in to use managed answers..." : "Sign in, then ask anything..."
+        statusLabel.toolTip = "Cloud answers, balance, sync, and RAG unlock after login"
     }
 
     private func setKnowledgeBadge(_ text: String, accent: NSColor) {
@@ -3897,6 +4013,7 @@ private final class OverlayApp {
             pendingBoot = (title, lines)
             return
         }
+        let signInURL = loginURL(from: lines)
         let body = lines.joined(separator: "\n")
         let card = RenderedCard(
             id: UUID().uuidString,
@@ -3906,8 +4023,38 @@ private final class OverlayApp {
             done: true,
             costLabel: nil,
             artifact: nil)
+        if signInURL != nil || title.localizedCaseInsensitiveContains("sign in") {
+            view.showSignedOutLogin(url: signInURL)
+            pillView?.dotColor = BlueyTheme.warning
+        }
         view.pushCard(card)
-        pillView?.dotColor = NSColor.systemGreen
+        if signInURL == nil {
+            pillView?.dotColor = NSColor.systemGreen
+        }
+    }
+
+    private func loginURL(from lines: [String]) -> URL? {
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let candidate: String
+            if trimmed.hasPrefix("login_url:") {
+                candidate = trimmed
+                    .replacingOccurrences(of: "login_url:", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if trimmed.hasPrefix("https://") || trimmed.hasPrefix("http://") {
+                candidate = trimmed
+            } else {
+                continue
+            }
+            if
+                let url = URL(string: candidate),
+                let scheme = url.scheme?.lowercased(),
+                ["http", "https"].contains(scheme)
+            {
+                return url
+            }
+        }
+        return nil
     }
 
     private func applyPosition(_ pos: String) {
