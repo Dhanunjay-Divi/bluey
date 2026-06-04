@@ -73,8 +73,28 @@ Then create a smoke account and run:
 - One short `/router/transcribe` request.
 - `bluey usage` or `/account/usage` to confirm costs appear.
 
+## 2026-06-04 Deployment Probe
+
+`f0ab9f0` was built on the Linux droplet and installed to `/usr/local/bin/bluey-server`.
+The server restarted cleanly and public health checks passed:
+
+- `https://bluey.sh/health` -> `200`
+- `https://bluey.sh/pricing/tiers` -> `200`
+
+Provider state after configuring the supplied keys:
+
+- Deepgram: `200` on project probe; Bluey `/router/transcribe` smoke returned `200` with provider `deepgram`, model `nova-3`, and a one-cent cost event.
+- OpenAI: provider probe returned `429 insufficient_quota`. This is a provider billing/quota issue, not a Bluey dispatch bug.
+- Anthropic: provider probe returned low-credit `400`. This is a provider billing/credits issue, not a Bluey dispatch bug.
+- Gemini: key was stored for future wiring, but Bluey does not have a Gemini server adapter yet. A direct Gemini probe also returned quota exhausted.
+
+Because all currently wired LLM providers are out of quota/credits, `/router/complete`
+correctly fails after provider failover. Real managed answers require funded OpenAI
+and/or Anthropic keys, or a future Gemini adapter plus a funded Gemini key.
+
 ## Operator Inputs Still Needed
 
+- Add provider billing/credits for OpenAI and Anthropic, then rerun the tiny `/router/complete` smoke.
 - Confirm provider-dashboard test budget alerts/caps are set to $10 where each provider supports them.
 - Confirm Square sandbox/prod location IDs and webhook signature keys are final.
 - Confirm off-host backup destination.
