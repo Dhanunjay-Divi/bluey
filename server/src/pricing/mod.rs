@@ -134,6 +134,15 @@ pub fn estimate_cost_ceiling(
     customer_cents + (customer_cents / 10).max(1)
 }
 
+pub fn estimate_bluey_cost_ceiling(
+    pricing: &ModelPricing,
+    input_tokens: i64,
+    max_output_tokens: i64,
+) -> i64 {
+    let (bluey_cents, _) = compute_cost(pricing, input_tokens, max_output_tokens);
+    bluey_cents + (bluey_cents / 10).max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +217,12 @@ mod tests {
         // Medium question: customer=4 cents. Ceiling = 4 + max(4/10, 1) = 4+1 = 5 cents.
         let p = lookup("anthropic", "claude-3-5-sonnet-latest").unwrap();
         assert_eq!(estimate_cost_ceiling(p, 800, 600), 5);
+    }
+
+    #[test]
+    fn bluey_ceiling_uses_upstream_cost_not_markup() {
+        let p = lookup("anthropic", "claude-3-5-sonnet-latest").unwrap();
+        assert_eq!(estimate_bluey_cost_ceiling(p, 800, 600), 3);
     }
 
     #[test]

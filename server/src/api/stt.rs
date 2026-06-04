@@ -100,6 +100,14 @@ pub async fn create_session(
     let balance = balance::current_balance(&state.pool, &account.id).map_err(internal)?;
     let billable_ceiling_seconds = (max_seconds - account.trial_seconds_remaining).max(0);
     let estimated_cost_cents = estimate_deepgram_cost_cents(&model, billable_ceiling_seconds)?;
+    let estimated_bluey_cost_cents =
+        estimate_deepgram_bluey_cost_cents(&model, billable_ceiling_seconds)?;
+    check_upstream_spend_guard(
+        &state,
+        &account.id,
+        estimated_bluey_cost_cents,
+        "stt_session",
+    )?;
     if billable_ceiling_seconds > 0 && balance < estimated_cost_cents {
         return Err((
             StatusCode::PAYMENT_REQUIRED,
@@ -214,6 +222,55 @@ fn estimate_deepgram_cost_cents(model: &str, seconds: i64) -> Result<i64, (Statu
     })?;
     let (_, customer_cents) = pricing::compute_cost(pricing, seconds, 0);
     Ok(customer_cents)
+}
+
+fn estimate_deepgram_bluey_cost_cents(
+    model: &str,
+    seconds: i64,
+) -> Result<i64, (StatusCode, String)> {
+    if seconds <= 0 {
+        return Ok(0);
+    }
+    let pricing = pricing::lookup("deepgram", model).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "unsupported Deepgram STT model".to_string(),
+        )
+    })?;
+    let (bluey_cents, _) = pricing::compute_cost(pricing, seconds, 0);
+    Ok(bluey_cents + (bluey_cents / 10).max(1))
+}
+
+fn check_upstream_spend_guard(
+    state: &AppState,
+    account_id: &str,
+    projected_bluey_cents: i64,
+    kind: &str,
+) -> Result<(), (StatusCode, String)> {
+    let Some(guard) = state.config.upstream_spend_guard else {
+        return Ok(());
+    };
+    if projected_bluey_cents <= 0 {
+        return Ok(());
+    }
+    let current = usage::bluey_spend_cents_in_window(&state.pool, guard.window_hours)
+        .map_err(internal)?;
+    if current.saturating_add(projected_bluey_cents) > guard.limit_cents {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+            kind,
+            current_bluey_cents = current,
+            projected_bluey_cents,
+            limit_bluey_cents = guard.limit_cents,
+            window_hours = guard.window_hours,
+            "upstream spend guard paused STT session creation"
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Bluey live-test budget is paused; operator action required".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn claim_relay_session(
@@ -529,6 +586,7 @@ mod tests {
     fn estimate_cost_uses_deepgram_pricing() {
         assert_eq!(estimate_deepgram_cost_cents("nova-3", 0).unwrap(), 0);
         assert!(estimate_deepgram_cost_cents("nova-3", 60).unwrap() > 0);
+        assert!(estimate_deepgram_bluey_cost_cents("nova-3", 60).unwrap() > 0);
     }
 
     fn temp_state() -> AppState {
@@ -548,6 +606,7 @@ mod tests {
                     deepgram_api_key: Some("dg-test".into()),
                     ..Default::default()
                 },
+                upstream_spend_guard: None,
                 smtp: None,
                 admin_emails: vec![],
             }),

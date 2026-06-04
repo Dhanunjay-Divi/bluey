@@ -14,7 +14,10 @@ use std::time::Instant;
 use super::AppState;
 use crate::auth::AuthedAccount;
 use crate::db::accounts::Account;
-use crate::db::{balance, idempotency, sync, usage::UsageEvent};
+use crate::db::{
+    balance, idempotency, sync,
+    usage::{self, UsageEvent},
+};
 use crate::pricing;
 use crate::routing;
 
@@ -92,6 +95,7 @@ struct PricedRoute {
     model: &'static str,
     pricing: &'static pricing::ModelPricing,
     estimated_cost_cents: i64,
+    estimated_bluey_cost_cents: i64,
 }
 
 struct PricedTranscribeRoute {
@@ -99,6 +103,7 @@ struct PricedTranscribeRoute {
     model: String,
     pricing: &'static pricing::ModelPricing,
     estimated_cost_cents: i64,
+    estimated_bluey_cost_cents: i64,
 }
 
 fn capacity_error(reason: &str, retry_after_secs: u64) -> (StatusCode, Json<ApiError>) {
@@ -122,6 +127,64 @@ fn release_and_capacity_error(
 ) -> (StatusCode, Json<ApiError>) {
     let _ = idempotency::release(pool, account_id, request_id);
     capacity_error(reason, retry_after_secs)
+}
+
+fn release_and_upstream_spend_guard_check(
+    state: &AppState,
+    account_id: &str,
+    request_id: &str,
+    projected_bluey_cents: i64,
+    kind: &str,
+) -> Option<(StatusCode, Json<ApiError>)> {
+    let guard = state.config.upstream_spend_guard?;
+    if projected_bluey_cents <= 0 {
+        return None;
+    }
+    let current = match usage::bluey_spend_cents_in_window(&state.pool, guard.window_hours) {
+        Ok(value) => value,
+        Err(e) => {
+            let _ = idempotency::release(&state.pool, account_id, request_id);
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                request_id = %request_id,
+                kind,
+                error = %e,
+                "upstream spend guard query failed"
+            );
+            return Some((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: "upstream spend guard unavailable".into(),
+                    reason: Some("upstream_spend_guard_unavailable".into()),
+                    ..Default::default()
+                }),
+            ));
+        }
+    };
+    let projected_total = current.saturating_add(projected_bluey_cents);
+    if projected_total > guard.limit_cents {
+        let _ = idempotency::release(&state.pool, account_id, request_id);
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+            request_id = %request_id,
+            kind,
+            current_bluey_cents = current,
+            projected_bluey_cents,
+            limit_bluey_cents = guard.limit_cents,
+            window_hours = guard.window_hours,
+            "upstream spend guard paused managed dispatch"
+        );
+        return Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError {
+                error: "Bluey live-test budget is paused; operator action required".into(),
+                reason: Some("upstream_spend_guard".into()),
+                retry_after_secs: Some(3600),
+                ..Default::default()
+            }),
+        ));
+    }
+    None
 }
 
 fn missing_provider_key_error(provider: &str) -> anyhow::Error {
@@ -202,6 +265,11 @@ fn priced_routes_for(
                     estimated_input_tokens,
                     max_output_tokens,
                 ),
+                estimated_bluey_cost_cents: pricing::estimate_bluey_cost_ceiling(
+                    entry,
+                    estimated_input_tokens,
+                    max_output_tokens,
+                ),
             })
         })
         .collect()
@@ -219,6 +287,11 @@ fn priced_transcribe_routes_for(
                 model,
                 pricing: entry,
                 estimated_cost_cents: pricing::estimate_cost_ceiling(entry, estimated_seconds, 0),
+                estimated_bluey_cost_cents: pricing::estimate_bluey_cost_ceiling(
+                    entry,
+                    estimated_seconds,
+                    0,
+                ),
             })
         })
         .collect()
@@ -478,6 +551,20 @@ async fn complete_inner(
         .map(|route| route.estimated_cost_cents)
         .max()
         .unwrap_or(1);
+    let est_bluey_cost = routes
+        .iter()
+        .map(|route| route.estimated_bluey_cost_cents)
+        .max()
+        .unwrap_or(1);
+    if let Some(err) = release_and_upstream_spend_guard_check(
+        &state,
+        &account.id,
+        &req.request_id,
+        est_bluey_cost,
+        "llm",
+    ) {
+        return Err(err);
+    }
 
     let on_trial = account.trial_seconds_remaining > 0;
 
@@ -1167,6 +1254,16 @@ pub async fn embed(
     let on_trial = account.trial_seconds_remaining > 0;
     let est_in = (req.input.len() as i64) / 4;
     let est_cost = pricing::estimate_cost_ceiling(pricing_entry, est_in, 0);
+    let est_bluey_cost = pricing::estimate_bluey_cost_ceiling(pricing_entry, est_in, 0);
+    if let Some(err) = release_and_upstream_spend_guard_check(
+        &state,
+        &account.id,
+        &req.request_id,
+        est_bluey_cost,
+        "embed",
+    ) {
+        return Err(err);
+    }
     if !on_trial {
         let can = balance::can_afford(&state.pool, &account.id, est_cost).map_err(|e| {
             let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
@@ -1499,6 +1596,20 @@ pub async fn transcribe(
         .map(|route| route.estimated_cost_cents)
         .max()
         .unwrap_or(1);
+    let est_bluey_cost = routes
+        .iter()
+        .map(|route| route.estimated_bluey_cost_cents)
+        .max()
+        .unwrap_or(1);
+    if let Some(err) = release_and_upstream_spend_guard_check(
+        &state,
+        &account.id,
+        &q.request_id,
+        est_bluey_cost,
+        "stt",
+    ) {
+        return Err(err);
+    }
     if !on_trial {
         let can = balance::can_afford(&state.pool, &account.id, est_cost).map_err(|e| {
             let _ = idempotency::mark_failed(&state.pool, &account.id, &q.request_id);

@@ -15,8 +15,9 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use bluey_server::auth;
-use bluey_server::config::{Config, UpstreamKeys};
+use bluey_server::config::{Config, UpstreamKeys, UpstreamSpendGuard};
 use bluey_server::db::accounts::Account;
+use bluey_server::db::usage::{self, UsageEvent};
 use bluey_server::db::{open_pool, run_migrations, DbPool};
 
 /// Test harness: starts wiremocks, builds an AppState pointed at them,
@@ -49,6 +50,14 @@ async fn boot_harness_with_upstream_and_admin_emails(
     upstream: UpstreamKeys,
     admin_emails: Vec<String>,
 ) -> Harness {
+    boot_harness_with_options(upstream, admin_emails, None).await
+}
+
+async fn boot_harness_with_options(
+    upstream: UpstreamKeys,
+    admin_emails: Vec<String>,
+    upstream_spend_guard: Option<UpstreamSpendGuard>,
+) -> Harness {
     let openai = MockServer::start().await;
     let anthropic = MockServer::start().await;
     let stripe = MockServer::start().await;
@@ -68,6 +77,7 @@ async fn boot_harness_with_upstream_and_admin_emails(
         stripe_webhook_secret: Some("whsec_test_e2e".to_string()),
         smtp: None,
         upstream,
+        upstream_spend_guard,
         admin_emails,
     };
 
@@ -92,6 +102,24 @@ async fn boot_harness_with_upstream_and_admin_emails(
         stripe,
         square,
         deepgram,
+    }
+}
+
+fn sample_usage(request_id: &str, bluey_cost_cents: i64) -> UsageEvent {
+    UsageEvent {
+        request_id: request_id.to_string(),
+        kind: "llm".to_string(),
+        task_type: None,
+        lane: Some("instant".to_string()),
+        provider: Some("openai".to_string()),
+        model: Some("gpt-4o-mini".to_string()),
+        input_tokens: 10,
+        output_tokens: 5,
+        latency_ms: 20,
+        cost_cents_to_bluey: bluey_cost_cents,
+        cost_cents_to_customer: bluey_cost_cents,
+        was_speculative: false,
+        was_fallback: false,
     }
 }
 
@@ -219,6 +247,61 @@ async fn router_complete_happy_path_with_mocked_openai() {
         .unwrap();
     let resp = h.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+#[serial]
+async fn router_complete_upstream_spend_guard_blocks_before_provider_hit() {
+    let h = boot_harness_with_options(
+        UpstreamKeys {
+            openai_api_key: Some("sk-test-openai".to_string()),
+            anthropic_api_key: Some("sk-test-anthropic".to_string()),
+            deepgram_api_key: Some("dg-test".to_string()),
+            ollama_base_url: None,
+        },
+        vec![],
+        Some(UpstreamSpendGuard {
+            limit_cents: 10,
+            window_hours: 24,
+        }),
+    )
+    .await;
+    let access = signup_and_login(&h, "budget@example.com", "longenoughpw").await;
+    let account = Account::fetch_by_email(&h.pool, "budget@example.com")
+        .unwrap()
+        .unwrap();
+    usage::record(&h.pool, &account.id, &sample_usage("spent", 10)).unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "should not happen"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        })))
+        .expect(0)
+        .mount(&h.openai)
+        .await;
+
+    let req = Request::post("/router/complete")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "request_id": "budget-guard",
+                "system": "you are helpful",
+                "user": "hello",
+                "lane": "instant"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["reason"], "upstream_spend_guard");
 }
 
 #[tokio::test]

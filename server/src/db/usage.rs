@@ -59,6 +59,27 @@ pub fn record(pool: &DbPool, account_id: &str, event: &UsageEvent) -> Result<boo
     Ok(inserted == 1)
 }
 
+pub fn bluey_spend_cents_in_window(pool: &DbPool, window_hours: i64) -> Result<i64> {
+    let conn = pool.get()?;
+    let total = if window_hours > 0 {
+        let window = format!("-{window_hours} hours");
+        conn.query_row(
+            "SELECT COALESCE(SUM(cost_cents_to_bluey), 0)
+               FROM usage_events
+              WHERE ts >= datetime('now', ?1)",
+            params![window],
+            |row| row.get(0),
+        )?
+    } else {
+        conn.query_row(
+            "SELECT COALESCE(SUM(cost_cents_to_bluey), 0) FROM usage_events",
+            [],
+            |row| row.get(0),
+        )?
+    };
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +147,28 @@ mod tests {
         b.kind = "embed".into();
         assert!(record(&pool, &id, &a).unwrap());
         assert!(record(&pool, &id, &b).unwrap());
+    }
+
+    #[test]
+    fn bluey_spend_cents_in_window_sums_recent_provider_cost() {
+        let pool = temp_pool();
+        let id = make_account(&pool);
+        let mut recent = sample_event("req-recent");
+        recent.cost_cents_to_bluey = 7;
+        let mut old = sample_event("req-old");
+        old.cost_cents_to_bluey = 11;
+
+        assert!(record(&pool, &id, &recent).unwrap());
+        assert!(record(&pool, &id, &old).unwrap());
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE usage_events SET ts = datetime('now', '-2 days') WHERE request_id = ?1",
+                params!["req-old"],
+            )
+            .unwrap();
+
+        assert_eq!(bluey_spend_cents_in_window(&pool, 24).unwrap(), 7);
+        assert_eq!(bluey_spend_cents_in_window(&pool, 0).unwrap(), 18);
     }
 }

@@ -20,6 +20,10 @@ pub struct Config {
     /// Upstream provider keys held by Bluey. The managed Auto Router endpoint
     /// uses these to dispatch LLM / embedding / vision / STT calls.
     pub upstream: UpstreamKeys,
+    /// Optional rolling upstream-spend guardrail for live testing. This is a
+    /// Bluey-side safety cap; provider dashboards should still have their own
+    /// hard billing limits where available.
+    pub upstream_spend_guard: Option<UpstreamSpendGuard>,
     /// Transactional email transport. Optional in dev; when unset the server
     /// logs local verification/reset URLs instead of sending mail.
     pub smtp: Option<SmtpConfig>,
@@ -98,6 +102,12 @@ pub struct UpstreamKeys {
     pub ollama_base_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpstreamSpendGuard {
+    pub limit_cents: i64,
+    pub window_hours: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamKeyCandidate {
     pub secret: String,
@@ -173,6 +183,7 @@ impl Config {
                 .ok()
                 .filter(|v| !v.is_empty()),
         };
+        let upstream_spend_guard = upstream_spend_guard_from_env();
 
         let smtp = std::env::var("BLUEY_SMTP_HOST")
             .ok()
@@ -203,6 +214,7 @@ impl Config {
             stripe_secret_key,
             stripe_webhook_secret,
             upstream,
+            upstream_spend_guard,
             smtp,
             admin_emails,
         })
@@ -251,6 +263,22 @@ impl Config {
                 .or_else(|| Some(format!("{}/billing/square/webhook", self.public_url))),
         }
     }
+}
+
+fn upstream_spend_guard_from_env() -> Option<UpstreamSpendGuard> {
+    let limit_cents = std::env::var("BLUEY_UPSTREAM_SPEND_LIMIT_CENTS")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value > 0)?;
+    let window_hours = std::env::var("BLUEY_UPSTREAM_SPEND_WINDOW_HOURS")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(24);
+    Some(UpstreamSpendGuard {
+        limit_cents,
+        window_hours,
+    })
 }
 
 fn env_any(names: &[&str]) -> Option<String> {
@@ -413,6 +441,7 @@ mod tests {
             stripe_secret_key: None,
             stripe_webhook_secret: None,
             upstream: UpstreamKeys::default(),
+            upstream_spend_guard: None,
             smtp: None,
             admin_emails: vec![],
         };
@@ -446,6 +475,7 @@ mod tests {
             stripe_secret_key: None,
             stripe_webhook_secret: None,
             upstream: UpstreamKeys::default(),
+            upstream_spend_guard: None,
             smtp: None,
             admin_emails: parse_email_list(Some(" Owner@Bluey.SH , bad,ops@bluey.sh ".into())),
         };
@@ -453,5 +483,20 @@ mod tests {
         assert!(cfg.is_admin_email("owner@bluey.sh"));
         assert!(cfg.is_admin_email(" OPS@BLUEY.SH "));
         assert!(!cfg.is_admin_email("user@bluey.sh"));
+    }
+
+    #[test]
+    fn upstream_spend_guard_reads_positive_limit_only() {
+        std::env::set_var("BLUEY_UPSTREAM_SPEND_LIMIT_CENTS", "1000");
+        std::env::set_var("BLUEY_UPSTREAM_SPEND_WINDOW_HOURS", "12");
+        let guard = upstream_spend_guard_from_env().unwrap();
+        assert_eq!(guard.limit_cents, 1000);
+        assert_eq!(guard.window_hours, 12);
+
+        std::env::set_var("BLUEY_UPSTREAM_SPEND_LIMIT_CENTS", "0");
+        assert!(upstream_spend_guard_from_env().is_none());
+
+        std::env::remove_var("BLUEY_UPSTREAM_SPEND_LIMIT_CENTS");
+        std::env::remove_var("BLUEY_UPSTREAM_SPEND_WINDOW_HOURS");
     }
 }

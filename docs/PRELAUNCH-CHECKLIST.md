@@ -85,7 +85,9 @@ This is the master gate before public alpha. Every item must be ticked or explic
 - [x] Caddy installed + Caddyfile from `ops/Caddyfile.example` deployed
 - [x] `bluey-server` binary built `--release` and installed to `/usr/local/bin/`
 - [x] `/etc/bluey-api/bluey-api.env` populated with core, Square, and Resend SMTP env vars (mode 0640, owner root, group bluey)
-- [ ] `/etc/bluey-api/bluey-api.env` populated with managed provider keys: `OPENAI_API_KEYS`, `ANTHROPIC_API_KEYS`, `DEEPGRAM_API_KEYS`
+- [ ] `/etc/bluey-api/bluey-api.env` populated with managed provider key pools: `OPENAI_API_KEYS`, `ANTHROPIC_API_KEYS`, `DEEPGRAM_API_KEYS`
+- [ ] Temporary live-test guard enabled: `BLUEY_UPSTREAM_SPEND_LIMIT_CENTS=1000`, `BLUEY_UPSTREAM_SPEND_WINDOW_HOURS=24`
+- [ ] Provider dashboards also have manual billing/cost alerts or caps where available. The Bluey-side guard is an app-level safety valve, not a provider-account hard cap.
 - [x] systemd unit from `ops/bluey-api.service.example` installed + enabled
 - [x] `/admin/health` and `/health` return 200 over HTTPS with valid TLS cert
 - [x] `/pricing/tiers` returns the canonical tier numbers over HTTPS

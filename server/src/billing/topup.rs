@@ -194,6 +194,7 @@ mod tests {
             stripe_secret_key: None,
             stripe_webhook_secret: None,
             upstream: crate::config::UpstreamKeys::default(),
+            upstream_spend_guard: None,
             smtp: None,
             admin_emails: vec![],
         })

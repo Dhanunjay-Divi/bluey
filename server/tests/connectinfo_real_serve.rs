@@ -38,6 +38,7 @@ async fn real_serve_path_installs_connect_info_and_rate_limit_sees_peer_ip() {
         stripe_webhook_secret: None,
         smtp: None,
         upstream: UpstreamKeys::default(),
+        upstream_spend_guard: None,
         admin_emails: vec![],
     };
 
