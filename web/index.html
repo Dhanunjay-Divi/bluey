@@ -144,7 +144,7 @@
       filter: drop-shadow(0 0 18px rgba(114, 240, 255, .18));
     }
 
-    .brand img {
+    .brand img:not(.brand-wordmark) {
       width: 42px;
       height: 42px;
       display: block;
@@ -2036,6 +2036,8 @@
     .brand-wordmark {
       width: 96px;
       height: auto;
+      background: transparent !important;
+      border: 0 !important;
       border-radius: 0 !important;
       box-shadow: none !important;
       filter: drop-shadow(0 0 14px rgba(114, 240, 255, .14));
