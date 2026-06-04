@@ -9,6 +9,26 @@
 
 ---
 
+## 2026-06-04 — Local preprod, GitHub prod, hard artifact prechecks
+
+**Source:** user direction.
+**Decision:** preprod release validation runs on owned local machines,
+not GitHub Actions. Use this Mac (`uno`) and the Windows bench over SSH
+for preprod builds, installs, smoke tests, and visual QA. GitHub Actions
+is reserved for production release packaging/publishing, where the
+extra CI minutes are worth the audit trail.
+**Promotion rule:** every release must precheck version, commit, artifact
+hash, helper sidecar hash, and release signature/manifest status before
+promotion. For the current unsigned/ad-hoc macOS alpha, this means
+`SHA256SUMS.txt` + helper SHA sidecars + ad-hoc `codesign` verification.
+When a signed release manifest is introduced, its signature becomes a
+mandatory promote gate too.
+**Don't retry without new context:** do not burn GitHub credits for
+preprod loops, do not rebuild between preprod and prod, and do not
+promote if any served version/hash/signature check disagrees.
+
+---
+
 ## 2026-05-19 — Pricing tiers visible in product UI
 
 **Source:** user direction.

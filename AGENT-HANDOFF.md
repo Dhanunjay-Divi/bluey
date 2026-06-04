@@ -139,6 +139,23 @@ cooldowns/all-keys-cooling events.
 `BLUEY_HOST_OVERLAY_CAPTURE_VISIBLE=1` is local smoke-test only. It must never be
 enabled in customer builds or production launch scripts.
 
+## Release Gate Rule
+
+Preprod is local. Use this Mac and the Windows bench for preprod build,
+install, visual smoke, and version/hash/signature checks. Do not spend
+GitHub Actions credits on preprod loops.
+
+GitHub Actions is for production packaging/publishing only. Before prod,
+precheck that every served/bundled surface matches the intended release
+id and commit: `bluey --version`, daemon version, overlay/helper sidecar
+hashes, release tarball SHA256, server `/health`, static web version,
+and release signature/manifest status. For current unsigned macOS alpha,
+ad-hoc `codesign` + SHA manifests are the required check; a future signed
+manifest becomes mandatory once introduced.
+
+Never rebuild between preprod and prod. If any version, hash, or
+signature check mismatches, stop and cut a new release id.
+
 ## Full Verification Gate
 
 ```bash

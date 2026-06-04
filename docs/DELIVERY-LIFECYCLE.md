@@ -3,7 +3,7 @@
 > **CI/CD pipeline, environments, promotion rules, rollback model.**
 > Mirrors Pinky's `DELIVERY-LIFECYCLE.md` shape but Bluey-only.
 >
-> Last updated: 2026-05-19, post v0.1.0 GA.
+> Last updated: 2026-06-04, release-credit policy update.
 
 ---
 
@@ -12,12 +12,12 @@
 | Environment | Where | Stack | Purpose |
 |---|---|---|---|
 | **dev** | uno (Apple Silicon) at `/Users/uno/Downloads/cue/` | full Bluey workspace | feature work, all builds + smoke runs here |
-| **preprod** (future) | distribution droplet preprod path | nginx + static **OR** bluey-server Rust binary | release candidates served before prod swap |
-| **prod** (future) | distribution droplet prod path | same as preprod | the customer-facing endpoint |
+| **preprod** | owned local machines: uno Mac + Windows bench over SSH/Tailscale when needed | local release artifacts, local installs, local smoke | release candidates validated without spending GitHub Actions credits |
+| **prod** | GitHub Actions + production host/artifact store | production release job, signed/hashed artifacts, Caddy/bluey-server/static pages | customer-facing endpoint and auditable release publication |
 
-**State 2026-05-19:** preprod and prod are not yet provisioned. v0.1.0 is
-distributed by manual file transfer from uno. R14.8 stands up the first
-real server.
+**State 2026-06-04:** preprod validation is intentionally local. Do not
+use GitHub Actions for preprod loops. Use GitHub Actions only for the
+production release job after the same artifact has passed local smoke.
 
 For Layer 3 (product server) the same triplet repeats — dev / preprod /
 prod — once R14.9 lands.
@@ -72,27 +72,42 @@ release id, a new stored artifact, and a fresh preprod smoke.
 
 The promote model is **append-only**: we never modify a previously
 published release directory. Each release lives at its own immutable
-path; promotion is just swapping the `latest` symlink.
+path; promotion is just swapping the `latest` symlink or publishing the
+already-smoked artifact.
 
 ```
-dev (uno)            preprod                 prod
-make package-* →     publish.sh →            promote.sh
-                     (PUBLISH_DO=1)          (admin gesture)
-                                             swap symlink to point
-                                             at the new version
+dev (uno)            local preprod benches       prod
+make package-* →     install/smoke same bits →   GitHub release job
+                     Mac + Windows as needed     publishes/promotes
+                                                 the smoked version
 ```
 
 **Promotion gates:**
 
-1. **dev → preprod**: full pipeline green on uno + codex chain review 🟢,
-   then upload the single release artifact to the preprod release store.
-2. **preprod → prod**: at least one external smoke test passes (clean
-   Mac install + `bluey on/off` end-to-end, or equivalent for whichever
-   platform), then promote the already-smoked preprod artifact by pointer
-   or symlink only.
+1. **dev → local preprod**: full pipeline green on uno + codex/Kiro
+   chain review 🟢, then install the single release artifact locally on
+   the owned Mac/Windows benches. No GitHub Actions preprod run.
+2. **local preprod → prod**: clean install smoke passes for every
+   claimed platform, then production GitHub Actions may package/publish
+   the already-smoked version. If production CI rebuilds, its output must
+   match the local release id/commit and pass the artifact checks below.
 
 Promotion is explicit, not auto. Auto-promotion of unverified bits to
 prod is the kind of thing that ships outages.
+
+**Mandatory version/hash/signature precheck before prod:**
+
+- CLI `bluey --version`, daemon `bluey-daemon --version`, overlay helper
+  version, server `/health` version, and static web version/release id
+  all match the intended release id and commit.
+- Release tarball SHA256 matches `SHA256SUMS.txt`.
+- Native helper SHA sidecars match the bundled helper binaries.
+- macOS helper binaries pass the current release-signature expectation:
+  ad-hoc `codesign --verify` for unsigned alpha; Developer ID/notarized
+  signature if that release line has moved to signing.
+- Signed release manifest verification passes when the manifest exists.
+- If any check disagrees, stop. Do not promote. Produce a new release id
+  and run local preprod again.
 
 ---
 
@@ -137,16 +152,20 @@ for R12+.
 
 ## 7. CI / CD
 
-**State 2026-05-19:** no CI yet. Everything runs locally on uno.
+**State 2026-06-04:** preprod stays local by policy. GitHub Actions is
+reserved for production packaging/publishing and should not be used for
+iterative preprod smoke, because that burns credits/minutes without
+adding useful confidence.
 
 When CI lands (`docs/GITHUB-ACTIONS-SETUP.md`, when written):
 
-- Pull request: full pipeline (fmt, clippy -D, build, test, npm, swift,
-  diff check).
-- Merge to main: same + tag check + release-notes generation.
-- Release tag (`v*`): build all artifacts + run installer smoke + push
-  to preprod via publish.sh.
-- Manual workflow_dispatch: promote preprod → prod.
+- Pull request: optional targeted checks only when a reviewer asks for
+  them; normal preprod loops stay local.
+- Merge to main: tag/release metadata checks.
+- Release tag (`v*`): production artifact packaging + manifest/hash
+  generation + publication.
+- Manual workflow_dispatch: production promote/publish of the exact
+  release id that passed local preprod smoke.
 
 Until CI exists, the dev-on-uno + codex-review path is the substitute.
 Treat any commit that hasn't been through that path as untested.
