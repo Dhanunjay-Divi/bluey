@@ -4,6 +4,27 @@
 
 Verify Bluey's upstream provider accounts without storing or printing secrets.
 
+This is an internal operator/developer smoke, not the customer flow.
+
+## Customer Flow Stays The Same
+
+Customers do not bring provider keys and do not export shell variables.
+
+The user flow remains:
+
+```bash
+bluey on
+```
+
+If the user is not signed in and asks for a managed cloud feature, Bluey opens
+the normal `bluey.sh` account/link flow. After that, the desktop talks to
+`bluey-server`, and `bluey-server` uses Bluey's managed provider key pool.
+
+Provider keys live only in server/preprod/prod environment configuration owned
+by Bluey operators. They are never entered into the desktop app by customers.
+
+## Operator Smoke
+
 The smoke runner is:
 
 ```bash
@@ -39,9 +60,9 @@ Current managed route shape:
 - Embeddings/RAG: OpenAI `text-embedding-3-small`
 - STT: Deepgram `nova-3`, fallback OpenAI `gpt-4o-mini-transcribe`
 
-## How To Run
+## How Operators Run It
 
-Export keys into the current terminal session only:
+Export keys into the current operator terminal session only:
 
 ```bash
 export OPENAI_API_KEYS='...'
