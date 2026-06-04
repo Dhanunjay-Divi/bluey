@@ -130,8 +130,8 @@ API. The static starter in `web/` is enough for early internal testing; these
 routes must exist before public alpha:
 
 - [x] `/` — landing page with download button
-- [x] `/link` — OAuth-style landing for the `bluey://` deep-link flow (signup/signin form, calls `/auth/link/mint` after auth, redirects browser to `bluey://link?code=...`)
-- [x] `/login` — web sign-in alias for the same account shell
+- [x] `/login` — customer-facing account/link landing. `bluey on` opens this automatically when the desktop is not linked; after sign-in it approves device codes or redirects to `bluey://link?code=...`.
+- [x] `/link` — backward-compatible alias for older desktop/browser links
 - [x] `/reload` — Square Checkout redirect target (after pay → returns to `/account?reload=success`)
 - [x] `/account` — user-facing balance + usage + sign-out (calls `/account/me`, `/account/usage`, `/billing/checkout`)
 - [x] `/verify-email` — email verification token confirmation page

@@ -815,6 +815,7 @@ async fn cue_on(args: OnArgs) -> Result<()> {
             url: bluey_signin_url(),
         }
     };
+    let signin_browser_opened = open_bluey_signin_if_needed(&auth_state);
     // The native overlay orders the branded pill front when the child process
     // starts. Do not send OverlayShow here: in the current protocol it expands
     // the full feed, while `bluey on` should launch pill-first.
@@ -829,7 +830,11 @@ async fn cue_on(args: OnArgs) -> Result<()> {
             match auth_state {
                 BlueyOnAuthState::Ready => println!("Bluey is on."),
                 BlueyOnAuthState::SignInAvailable { url } => {
-                    println!("Bluey is on. Sign in when ready with `bluey login` or {url}.")
+                    if signin_browser_opened {
+                        println!("Bluey is on. Opening {url} to finish sign-in.");
+                    } else {
+                        println!("Bluey is on. Open {url} to finish sign-in.");
+                    }
                 }
             }
             Ok(())
@@ -860,7 +865,36 @@ fn bluey_account_linked(paths: &AppPaths) -> bool {
 }
 
 fn bluey_signin_url() -> String {
-    env::var("BLUEY_SIGNIN_URL").unwrap_or_else(|_| "https://bluey.sh/link".to_string())
+    env::var("BLUEY_SIGNIN_URL").unwrap_or_else(|_| default_bluey_signin_url().to_string())
+}
+
+fn default_bluey_signin_url() -> &'static str {
+    "https://bluey.sh/login"
+}
+
+fn open_bluey_signin_if_needed(auth_state: &BlueyOnAuthState) -> bool {
+    let BlueyOnAuthState::SignInAvailable { url } = auth_state else {
+        return false;
+    };
+    if env_flag("BLUEY_SKIP_SIGNIN_OPEN") {
+        return false;
+    }
+    match open_browser(url) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!("warning: could not open browser sign-in automatically: {error:#}");
+            false
+        }
+    }
+}
+
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            matches!(value.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
 }
 
 fn bluey_on_boot_lines(auth_state: &BlueyOnAuthState) -> Vec<String> {
@@ -874,7 +908,7 @@ fn bluey_on_boot_lines(auth_state: &BlueyOnAuthState) -> Vec<String> {
             lines.push("managed answers and balance tracking are ready".to_string());
         }
         BlueyOnAuthState::SignInAvailable { url } => {
-            lines.push(format!("sign in when ready: bluey login or {url}"));
+            lines.push(format!("finish sign-in in your browser: {url}"));
         }
     }
     lines
@@ -1285,10 +1319,13 @@ fn open_browser(url: &str) -> Result<()> {
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     let mut command = Command::new("xdg-open");
 
-    command
+    let status = command
         .arg(url)
         .status()
         .context("failed to open browser")?;
+    if !status.success() {
+        bail!("browser opener exited with status {status}");
+    }
     Ok(())
 }
 
@@ -2646,14 +2683,16 @@ async fn bluey_delete_account_cmd(force: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bluey_on_boot_lines, device_login_url, BlueyOnAuthState};
+    use super::{
+        bluey_on_boot_lines, default_bluey_signin_url, device_login_url, BlueyOnAuthState,
+    };
 
     #[test]
-    fn bluey_on_boot_lines_offer_signin_without_forcing_browser_when_unlinked() {
+    fn bluey_on_boot_lines_offer_browser_signin_when_unlinked() {
         let lines = bluey_on_boot_lines(&BlueyOnAuthState::SignInAvailable {
-            url: "https://bluey.sh/link".to_string(),
+            url: "https://bluey.sh/login".to_string(),
         });
-        assert!(lines.iter().any(|line| line.contains("bluey login")));
+        assert!(lines.iter().any(|line| line.contains("browser")));
         assert!(lines.iter().any(|line| line.contains("previous sessions")));
     }
 
@@ -2669,26 +2708,31 @@ mod tests {
     #[test]
     fn bluey_on_boot_lines_include_link_url_when_unlinked() {
         let lines = bluey_on_boot_lines(&BlueyOnAuthState::SignInAvailable {
-            url: "https://bluey.sh/link".to_string(),
+            url: "https://bluey.sh/login".to_string(),
         });
         assert!(lines
             .iter()
-            .any(|line| line.contains("https://bluey.sh/link")));
+            .any(|line| line.contains("https://bluey.sh/login")));
     }
 
     #[test]
-    fn device_login_url_appends_code_to_link_page() {
+    fn bluey_signin_url_defaults_to_login_page() {
+        assert_eq!(default_bluey_signin_url(), "https://bluey.sh/login");
+    }
+
+    #[test]
+    fn device_login_url_appends_code_to_login_page() {
         assert_eq!(
-            device_login_url("https://bluey.sh/link", "ABCD-EFGH"),
-            "https://bluey.sh/link?user_code=ABCD-EFGH"
+            device_login_url("https://bluey.sh/login", "ABCD-EFGH"),
+            "https://bluey.sh/login?user_code=ABCD-EFGH"
         );
     }
 
     #[test]
     fn device_login_url_preserves_existing_query() {
         assert_eq!(
-            device_login_url("https://bluey.sh/link?source=desktop", "ABCD-EFGH"),
-            "https://bluey.sh/link?source=desktop&user_code=ABCD-EFGH"
+            device_login_url("https://bluey.sh/login?source=desktop", "ABCD-EFGH"),
+            "https://bluey.sh/login?source=desktop&user_code=ABCD-EFGH"
         );
     }
 }

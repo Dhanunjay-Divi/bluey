@@ -560,6 +560,10 @@ async fn auth_device_poll_is_single_use_after_approval() {
         .await
         .unwrap();
     let started: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        started["verification_uri"].as_str().unwrap(),
+        "http://localhost:8080/login"
+    );
     let device_code = started["device_code"].as_str().unwrap();
     let user_code = started["user_code"].as_str().unwrap();
 

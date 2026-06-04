@@ -11,8 +11,8 @@ For v0.2, do not split API onto `api.bluey.sh`. The desktop, installer,
 landing page, deep-link flow, billing redirects, and managed API all use the
 same origin:
 
-- Web/install/static pages: `/`, `/install.sh`, `/releases/*`, `/link`,
-  `/reload`, `/account`, `/docs/*`
+- Web/install/static pages: `/`, `/install.sh`, `/releases/*`, `/login`,
+  `/link` compatibility alias, `/reload`, `/account`, `/docs/*`
 - Managed API: `/auth/*`, `/router/*`, `/billing/*`, `/sync/*`, `/rag/*`,
   `/stt/*`, `/usage/*`, `/pricing/*`, `/admin/*`, `/health`
 

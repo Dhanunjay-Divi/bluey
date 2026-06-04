@@ -14,14 +14,16 @@ bluey off
 
 Customer-facing launch is `bluey on` / `bluey off`. `bluey on` starts the
 daemon/session and keeps Bluey usable locally even when no cloud token exists.
-It does **not** force-open a browser; the overlay and terminal copy point users
-to sign in when they need managed cloud answers, billing, sync, or RAG.
+If no cloud token is present, it opens `https://bluey.sh/login` automatically so
+the user can sign in or create an account without learning a separate command.
+Smoke tests can set `BLUEY_SKIP_SIGNIN_OPEN=1` to suppress browser launch.
 
 `bluey login` remains as a visible/supportable account-linking command for now
 because it is the safest terminal-only way to complete the server device flow:
-it opens `https://bluey.sh/link?user_code=...`, polls the server, and stores
-tokens in the OS keyring. Dashboard onboarding can also open `/link` and receive
-tokens through the `bluey://link?code=...` deep-link handoff.
+it opens `https://bluey.sh/login?user_code=...`, polls the server, and stores
+tokens in the OS keyring. Dashboard onboarding can also open `/login` and
+receive tokens through the `bluey://link?code=...` deep-link handoff. `/link`
+remains a compatibility alias for older links.
 
 Support/dev commands still exist for diagnostics, automation, and non-browser
 testing, but they are hidden from normal CLI help.
@@ -31,7 +33,8 @@ testing, but they are hidden from normal CLI help.
 - `crates/cue-cli/src/app.rs`
   - `on` / `off` are the only visible commands in `bluey --help`.
   - `bluey on` checks keyring/legacy account config. If missing, it starts
-    locally and prints/shows "sign in when ready" copy.
+    locally, opens `/login`, and prints the same fallback URL if the browser
+    opener fails.
   - `bluey login` is the explicit browser/device-code path. It uses an
     in-memory token store while polling, then persists returned tokens to the
     keyring.

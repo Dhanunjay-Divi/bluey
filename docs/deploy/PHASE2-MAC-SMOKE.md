@@ -51,7 +51,7 @@ bluey on
 - Daemon starts; logs go to stderr (no rotation yet — observability round)
 - Boot lines printed to terminal include:
   - "Listening for hotkey F19" (or similar)
-  - "Managed answers ready" if already signed in, OR "sign in when ready" if not
+  - "Managed answers ready" if already signed in, OR "finish sign-in in your browser" if not
   - Session-history affordance, attach/analyse consent, transcript/answer behavior copy
 - Native overlay pill appears centered as a compact Bluey-tinted badge
 

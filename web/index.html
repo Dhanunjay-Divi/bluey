@@ -2432,6 +2432,201 @@
         width: 100%;
       }
     }
+
+    /* June 4 login/account simplification: the account surface should feel
+       like a clean Pinky-style control page, not a second dashboard. Keep the
+       existing ids/JS contracts, but remove visual noise from the entry flow. */
+    .account-shell {
+      width: min(760px, calc(100% - 28px));
+      min-height: calc(100svh - 28px);
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      align-content: center;
+      margin: 0 auto;
+    }
+
+    .account-rail,
+    .account-preview-card {
+      display: none !important;
+    }
+
+    .account-main {
+      width: 100%;
+      border-radius: 24px;
+      border: 1px solid rgba(114, 240, 255, .16);
+      background:
+        linear-gradient(180deg, rgba(9, 14, 18, .94), rgba(3, 5, 7, .96)),
+        radial-gradient(circle at 80% 0%, rgba(114, 240, 255, .10), transparent 34%);
+      padding: 16px;
+      box-shadow: 0 30px 90px rgba(0, 0, 0, .42), inset 0 1px 0 rgba(255, 255, 255, .045);
+      overflow: visible;
+    }
+
+    .account-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      min-height: 42px;
+      margin-bottom: 12px;
+    }
+
+    .account-top-brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      color: #eefaff;
+      text-decoration: none;
+      font-weight: 930;
+    }
+
+    .account-top-brand img:not(.brand-wordmark) {
+      width: 36px;
+      height: 36px;
+      border-radius: 12px;
+      filter: drop-shadow(0 0 18px rgba(114, 240, 255, .18));
+    }
+
+    .account-top-brand .brand-wordmark {
+      width: 82px;
+    }
+
+    .account-top .status-row {
+      display: none;
+    }
+
+    .account-actions-row {
+      gap: 9px;
+    }
+
+    .account-link {
+      min-height: 34px;
+      border-radius: 999px;
+      color: #b6c8d0;
+      background: rgba(255, 255, 255, .035);
+      border-color: rgba(255, 255, 255, .07);
+    }
+
+    .account-hero {
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      box-shadow: none;
+      padding: 18px 6px 16px;
+      text-align: center;
+    }
+
+    .account-hero h1 {
+      margin: 0;
+      font-size: clamp(42px, 8vw, 76px);
+      line-height: .9;
+      letter-spacing: 0;
+    }
+
+    .account-hero p {
+      max-width: 560px;
+      margin: 14px auto 0;
+      color: #9aadb7;
+      font-size: 15px;
+      line-height: 1.55;
+    }
+
+    .account-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: 12px;
+    }
+
+    .account-card {
+      border-radius: 20px;
+      border-color: rgba(114, 240, 255, .14);
+      background: rgba(255, 255, 255, .035);
+      padding: 18px;
+    }
+
+    #accountAuthCard {
+      max-width: 520px;
+      justify-self: center;
+      width: 100%;
+    }
+
+    .account-card h2 {
+      font-size: 24px;
+      line-height: 1.08;
+    }
+
+    .account-form {
+      gap: 11px;
+    }
+
+    .account-form label {
+      color: #8fa2ad;
+      font-size: 11px;
+      letter-spacing: .04em;
+    }
+
+    .account-form input {
+      height: 48px;
+      border-radius: 15px;
+      color: #eefaff;
+      background: rgba(0, 0, 0, .24);
+      border-color: rgba(114, 240, 255, .13);
+      font-size: 14px;
+    }
+
+    .account-button {
+      min-height: 44px;
+      border-radius: 15px;
+      font-size: 14px;
+    }
+
+    .account-button.primary {
+      color: #061014;
+      background: linear-gradient(135deg, #72f0ff, #8cffc2);
+      border-color: transparent;
+    }
+
+    .account-note,
+    .account-message {
+      text-align: center;
+    }
+
+    .device-link-hint {
+      border-radius: 16px;
+      text-align: left;
+      background: rgba(114, 240, 255, .07);
+    }
+
+    .dashboard-card {
+      max-width: none;
+    }
+
+    @media (max-width: 620px) {
+      .account-shell {
+        width: calc(100% - 20px);
+        align-content: start;
+      }
+
+      .account-main {
+        padding: 12px;
+      }
+
+      .account-top {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .account-actions-row,
+      .account-card .account-actions-row {
+        width: 100%;
+        flex-direction: column;
+      }
+
+      .account-button,
+      .account-link {
+        width: 100%;
+      }
+    }
   </style>
 </head>
 <body>
@@ -2444,7 +2639,7 @@
         </a>
         <div class="navlinks">
           <a href="/">Product</a>
-          <a href="/account">Account</a>
+          <a href="/login">Login</a>
           <a href="/docs/disguise">Controls</a>
           <a href="/docs/privacy">Privacy</a>
           <a href="/docs/terms">Terms</a>
@@ -2552,6 +2747,10 @@
 
       <main class="account-main">
         <header class="account-top">
+          <a class="account-top-brand" href="/">
+            <img src="assets/bluey-logo.svg" alt="">
+            <img class="brand-wordmark" src="assets/bluey-wordmark.svg" alt="bluey">
+          </a>
           <div class="status-row">
             <span class="status-chip live">API online</span>
             <span class="status-chip">Square checkout</span>
@@ -2565,14 +2764,14 @@
         </header>
 
         <section class="account-hero">
-          <h1>Bluey account</h1>
-          <p>Sign in, reload credits, and review synced sessions. The desktop stays simple: run <code>bluey on</code>.</p>
+          <h1>Sign in to Bluey</h1>
+          <p>Run <code>bluey on</code>. If the desktop is not linked, this page connects your account and returns you to the overlay automatically.</p>
         </section>
 
         <section class="account-grid">
           <aside class="account-card" id="accountAuthCard">
-            <h2>Sign in</h2>
-            <p>One account for the browser and desktop.</p>
+            <h2>Account</h2>
+            <p>Sign in or create an account. Credits are used only when managed AI, STT, vision, embedding, or RAG runs.</p>
             <div class="device-link-hint" id="deviceLinkHint" hidden></div>
             <form class="account-form" id="accountForm">
               <label>
@@ -2629,7 +2828,7 @@
               <button class="account-button primary" type="submit">Set password</button>
             </form>
             <div class="account-message" id="recoveryMessage"></div>
-            <div class="account-note"><a href="/link">Return to sign in</a></div>
+            <div class="account-note"><a href="/login">Return to sign in</a></div>
           </section>
 
           <section class="account-card dashboard-card" id="accountDashboard" hidden>
@@ -2698,7 +2897,7 @@
         </a>
         <div class="navlinks">
           <a href="/">Product</a>
-          <a href="/account">Account</a>
+          <a href="/login">Login</a>
         </div>
       </nav>
 
@@ -2767,7 +2966,7 @@
         <img class="brand-wordmark" src="assets/bluey-wordmark.svg" alt="bluey">
       </a>
       <div class="navlinks">
-        <a href="/account">Account</a>
+        <a href="/login">Login</a>
         <a class="nav-cta" href="/download">Install</a>
       </div>
     </nav>
@@ -2785,9 +2984,9 @@
         <p class="hero-proof">Simple install. Simple account. No subscription by default.</p>
         <div class="hero-actions">
           <a class="button primary" href="/download">Install Bluey</a>
-          <a class="button" href="/account">Open account</a>
+          <a class="button" href="/login">Sign in</a>
         </div>
-        <form class="quick-join" action="/link" method="get">
+        <form class="quick-join" action="/login" method="get">
           <input name="user_code" type="text" placeholder="Device code" autocomplete="one-time-code" spellcheck="false">
           <button type="submit">Link</button>
         </form>
@@ -2841,7 +3040,7 @@
     </section>
 
     <section class="site-strip" aria-label="Bluey highlights">
-      <a class="site-card" href="/account"><div><span>Account</span><small>Sign in, reload, review usage.</small></div></a>
+      <a class="site-card" href="/login"><div><span>Login</span><small>Sign in, reload, review usage.</small></div></a>
       <a class="site-card" href="/download"><div><span>Install</span><small>Mac alpha now; Windows path next.</small></div></a>
       <a class="site-card" href="/docs/privacy"><div><span>Context</span><small>Files, transcript, screen, sessions.</small></div></a>
     </section>
@@ -2955,7 +3154,7 @@
     }
 
     async function openDesktopDeepLinkIfNeeded() {
-      if (currentPath !== '/link' || pendingDeviceCode() || !accountToken()) return false;
+      if (!['/login', '/link'].includes(currentPath) || pendingDeviceCode() || !accountToken()) return false;
       if (sessionStorage.getItem('bluey_desktop_deep_link_started') === '1') return false;
       accountMessage('Opening Bluey desktop...');
       const link = await apiJson('/auth/link/mint', {
