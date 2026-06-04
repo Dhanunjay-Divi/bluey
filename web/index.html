@@ -2029,6 +2029,404 @@
         gap: 6px;
       }
     }
+
+    /* Senior UX cleanup pass: remove accidental brand capsules, simplify the
+       account shell, and add an actual platform install page. */
+    .brand img.brand-wordmark,
+    .brand-wordmark {
+      width: 96px;
+      height: auto;
+      border-radius: 0 !important;
+      box-shadow: none !important;
+      filter: drop-shadow(0 0 14px rgba(114, 240, 255, .14));
+    }
+
+    .brand img:not(.brand-wordmark) {
+      flex: 0 0 auto;
+    }
+
+    .site .brand-wordmark,
+    .preview-pill .brand-wordmark,
+    .account-rail .brand-wordmark,
+    .policy-app .brand-wordmark,
+    .download-app .brand-wordmark {
+      width: 92px;
+      min-width: 0;
+    }
+
+    .quick-join {
+      width: min(390px, 100%);
+      grid-template-columns: minmax(0, 1fr) 70px;
+      gap: 7px;
+      margin-top: 14px;
+    }
+
+    .quick-join input {
+      height: 40px;
+      border-radius: 13px;
+      color: #eaf8fc;
+      background: rgba(4, 8, 11, .72);
+      border-color: rgba(114, 240, 255, .17);
+      font-size: 12px;
+    }
+
+    .quick-join button {
+      min-height: 40px;
+      border-radius: 13px;
+      color: #051014;
+      border: 0;
+      background: linear-gradient(135deg, #72f0ff, #8cffc2);
+      font-size: 13px;
+      font-weight: 900;
+    }
+
+    .product-preview {
+      border-radius: 24px;
+      padding: 12px;
+    }
+
+    .preview-pill {
+      min-height: 44px;
+      padding: 5px 9px 5px 6px;
+    }
+
+    .preview-pill .brand-wordmark {
+      display: none;
+    }
+
+    .preview-pill-title {
+      color: #f2fbff;
+      font-size: 16px;
+      font-weight: 900;
+      letter-spacing: 0;
+    }
+
+    .preview-balance {
+      min-height: 30px;
+      font-size: 11px;
+    }
+
+    .site .navlinks a[href="/docs/privacy"] {
+      display: none;
+    }
+
+    .download-app {
+      min-height: 100svh;
+      padding: 18px;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 80% 10%, rgba(114, 240, 255, .12), transparent 31%),
+        linear-gradient(180deg, #040708, #030405);
+    }
+
+    .download-shell {
+      width: min(1040px, 100%);
+      display: grid;
+      gap: 18px;
+      margin: 0 auto;
+    }
+
+    .download-hero,
+    .download-card,
+    .download-note {
+      border: 1px solid rgba(114, 240, 255, .13);
+      background: rgba(7, 11, 15, .82);
+      box-shadow: 0 24px 70px rgba(0, 0, 0, .30), inset 0 1px 0 rgba(255, 255, 255, .035);
+    }
+
+    .download-hero {
+      border-radius: 26px;
+      padding: clamp(24px, 5vw, 44px);
+    }
+
+    .download-hero h1 {
+      margin: 0;
+      font-size: clamp(42px, 7vw, 76px);
+      line-height: .9;
+      letter-spacing: 0;
+    }
+
+    .download-hero p {
+      max-width: 720px;
+      margin: 14px 0 0;
+      color: var(--muted);
+      font-size: 17px;
+      line-height: 1.55;
+    }
+
+    .platform-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+
+    .download-card {
+      min-height: 300px;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: 18px;
+      border-radius: 24px;
+      padding: 22px;
+    }
+
+    .download-card.disabled {
+      opacity: .66;
+    }
+
+    .download-card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+    }
+
+    .platform-name {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      color: #f2fbff;
+      font-size: 24px;
+      font-weight: 900;
+    }
+
+    .os-icon {
+      width: 50px;
+      height: 50px;
+      display: grid;
+      place-items: center;
+      border-radius: 17px;
+      color: #dff9ff;
+      border: 1px solid rgba(114, 240, 255, .18);
+      background: rgba(114, 240, 255, .08);
+    }
+
+    .os-icon svg {
+      width: 27px;
+      height: 27px;
+      display: block;
+    }
+
+    .availability {
+      min-height: 30px;
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 0 10px;
+      color: #051014;
+      background: #85ffd1;
+      font-size: 12px;
+      font-weight: 900;
+      white-space: nowrap;
+    }
+
+    .availability.soon {
+      color: #b8c9d1;
+      background: rgba(255, 255, 255, .055);
+      border: 1px solid rgba(255, 255, 255, .08);
+    }
+
+    .download-card p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+
+    .install-command {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 9px;
+      align-items: center;
+      border: 1px solid rgba(114, 240, 255, .13);
+      border-radius: 17px;
+      background: rgba(0, 0, 0, .32);
+      padding: 10px;
+    }
+
+    .install-command code {
+      min-width: 0;
+      color: #72f0ff;
+      font-size: 13px;
+      font-weight: 850;
+      overflow-wrap: anywhere;
+    }
+
+    .copy-command {
+      min-height: 38px;
+      border: 0;
+      border-radius: 12px;
+      color: #061014;
+      background: #dff8ff;
+      padding: 0 13px;
+      font-weight: 900;
+      cursor: pointer;
+    }
+
+    .download-note {
+      border-radius: 20px;
+      padding: 18px;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+
+    .download-note strong {
+      color: var(--text);
+    }
+
+    .page-footer-links {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      justify-content: center;
+      color: #8ea1ab;
+      font-size: 12px;
+    }
+
+    .page-footer-links a {
+      color: #a9bdc6;
+      text-decoration: none;
+    }
+
+    .account-app {
+      padding: 14px;
+    }
+
+    .account-shell {
+      width: min(1080px, 100%);
+      min-height: calc(100svh - 28px);
+      grid-template-columns: 214px minmax(0, 1fr);
+      gap: 12px;
+    }
+
+    .account-rail {
+      min-height: 0;
+      border-radius: 24px;
+      padding: 14px;
+    }
+
+    .account-rail .brand {
+      gap: 9px;
+    }
+
+    .account-rail .brand img:not(.brand-wordmark) {
+      width: 36px;
+      height: 36px;
+      border-radius: 12px;
+    }
+
+    .rail-command {
+      margin-top: 14px;
+      border-radius: 16px;
+      padding: 13px;
+    }
+
+    .rail-command span {
+      display: block;
+    }
+
+    .rail-list {
+      gap: 7px;
+      margin-top: 14px;
+    }
+
+    .rail-list span {
+      min-height: 35px;
+      border-radius: 12px;
+    }
+
+    .account-rail-footer {
+      display: grid;
+      gap: 8px;
+      margin-top: auto;
+      padding-top: 18px;
+      color: #7e929c;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .account-rail-footer a {
+      color: #9fb2bc;
+      text-decoration: none;
+    }
+
+    .account-main {
+      overflow: auto;
+      border-radius: 26px;
+      padding: 16px;
+    }
+
+    .account-top {
+      min-height: 42px;
+    }
+
+    .status-row {
+      gap: 8px;
+    }
+
+    .status-chip,
+    .account-link,
+    .pill-muted {
+      min-height: 32px;
+      padding: 0 11px;
+      font-size: 12px;
+    }
+
+    .account-hero {
+      padding: 24px;
+      border-radius: 22px;
+    }
+
+    .account-hero h1 {
+      font-size: clamp(36px, 5.2vw, 58px);
+    }
+
+    .account-grid {
+      grid-template-columns: minmax(280px, 380px) minmax(0, 1fr);
+    }
+
+    .account-card {
+      border-radius: 20px;
+      padding: 18px;
+    }
+
+    .account-form input {
+      height: 46px;
+      border-radius: 14px;
+    }
+
+    .account-button {
+      border-radius: 14px;
+    }
+
+    .account-note a {
+      color: #bad4dc;
+    }
+
+    @media (max-width: 920px) {
+      .platform-grid,
+      .account-shell,
+      .account-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .account-rail-footer {
+        margin-top: 14px;
+      }
+    }
+
+    @media (max-width: 620px) {
+      .download-app,
+      .account-app {
+        padding: 10px;
+      }
+
+      .install-command {
+        grid-template-columns: 1fr;
+      }
+
+      .copy-command {
+        width: 100%;
+      }
+    }
   </style>
 </head>
 <body>
@@ -2141,6 +2539,10 @@
           <span>Credits</span>
           <span>Sessions</span>
         </div>
+        <div class="account-rail-footer">
+          <span>Bluey Cloud uses credits only when managed AI, STT, vision, embedding, or RAG runs.</span>
+          <span><a href="/docs/privacy">Privacy</a> · <a href="/docs/terms">Terms</a> · <a href="/docs/disguise">Controls</a></span>
+        </div>
       </aside>
 
       <main class="account-main">
@@ -2152,7 +2554,7 @@
           </div>
           <div class="account-actions-row">
             <a class="account-link" href="/">Product</a>
-            <a class="account-link" href="/install.sh">Install</a>
+            <a class="account-link" href="/download">Install</a>
             <button class="account-button ghost" id="accountSignOut" type="button" hidden>Sign out</button>
           </div>
         </header>
@@ -2282,6 +2684,77 @@
     </div>
   </section>
 
+  <section class="download-app" id="downloadApp" hidden>
+    <div class="download-shell">
+      <nav class="site-nav" style="width: 100%;">
+        <a class="brand" href="/">
+          <img src="assets/bluey-logo.svg" alt="">
+          <img class="brand-wordmark" src="assets/bluey-wordmark.svg" alt="bluey">
+        </a>
+        <div class="navlinks">
+          <a href="/">Product</a>
+          <a href="/account">Account</a>
+        </div>
+      </nav>
+
+      <section class="download-hero">
+        <h1>Install Bluey</h1>
+        <p>Start the desktop answer layer from terminal. macOS is the current alpha path; Windows is shown here as the planned parity path so testers know what is next.</p>
+      </section>
+
+      <section class="platform-grid" aria-label="Bluey platform installers">
+        <article class="download-card">
+          <div class="download-card-head">
+            <div class="platform-name">
+              <span class="os-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none">
+                  <path d="M16.8 12.8c0-2 1.1-3.6 2.8-4.5-1-1.4-2.5-2.2-4.4-2.3-1.8-.2-3.5 1.1-4.4 1.1-.9 0-2.3-1.1-3.8-1.1-2 0-3.9 1.2-5 3-2.1 3.6-.5 8.9 1.5 11.8 1 1.4 2.2 3 3.7 2.9 1.5-.1 2.1-.9 3.9-.9s2.3.9 3.9.9c1.6 0 2.6-1.4 3.6-2.8 1.1-1.6 1.6-3.2 1.6-3.3-.1 0-3.2-1.2-3.2-4.6Z" fill="currentColor" opacity=".92"/>
+                  <path d="M14.5 3.8c.8-1 1.4-2.3 1.2-3.6-1.2.1-2.6.8-3.5 1.8-.8.9-1.5 2.3-1.3 3.6 1.3.1 2.7-.7 3.6-1.6Z" fill="currentColor"/>
+                </svg>
+              </span>
+              <span>macOS</span>
+            </div>
+            <span class="availability">Alpha ready</span>
+          </div>
+          <p>Apple Silicon macOS is the primary internal test build. The installer places the CLI and helper app, then you start with <code>bluey on</code>.</p>
+          <div class="install-command">
+            <code>curl -fsSL https://bluey.sh/install.sh | bash</code>
+            <button class="copy-command" type="button" data-copy="curl -fsSL https://bluey.sh/install.sh | bash">Copy</button>
+          </div>
+        </article>
+
+        <article class="download-card disabled">
+          <div class="download-card-head">
+            <div class="platform-name">
+              <span class="os-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none">
+                  <path d="M2 4.2 10.8 3v8.5H2V4.2Zm10.2-1.4L22 1.4v10.1h-9.8V2.8ZM2 12.8h8.8V21L2 19.8v-7Zm10.2 0H22v10.1l-9.8-1.4v-8.7Z" fill="currentColor"/>
+                </svg>
+              </span>
+              <span>Windows</span>
+            </div>
+            <span class="availability soon">Coming next</span>
+          </div>
+          <p>Windows helper code exists, but the public installer is not enabled until clean-machine audio, overlay, and model smoke tests pass.</p>
+          <div class="install-command">
+            <code>PowerShell installer pending</code>
+            <button class="copy-command" type="button" disabled>Soon</button>
+          </div>
+        </article>
+      </section>
+
+      <div class="download-note">
+        <strong>After install:</strong> run <code>bluey on</code>. If managed AI, credits, or cloud sync are needed, Bluey opens the browser account flow automatically.
+      </div>
+
+      <div class="page-footer-links">
+        <a href="/docs/privacy">Privacy</a>
+        <a href="/docs/terms">Terms</a>
+        <a href="/docs/disguise">Controls</a>
+      </div>
+    </div>
+  </section>
+
   <main class="site" id="productSite">
     <nav class="site-nav">
       <a class="brand" href="/">
@@ -2290,8 +2763,7 @@
       </a>
       <div class="navlinks">
         <a href="/account">Account</a>
-        <a href="/docs/privacy">Privacy</a>
-        <a class="nav-cta" href="/install.sh">Install</a>
+        <a class="nav-cta" href="/download">Install</a>
       </div>
     </nav>
 
@@ -2307,7 +2779,7 @@
         <p>A small AI command layer for live work. Start from terminal, sign in when needed, attach context, and get answers without leaving the screen you are on.</p>
         <p class="hero-proof">Simple install. Simple account. No subscription by default.</p>
         <div class="hero-actions">
-          <a class="button primary" href="/install.sh">Install Bluey</a>
+          <a class="button primary" href="/download">Install Bluey</a>
           <a class="button" href="/account">Open account</a>
         </div>
         <form class="quick-join" action="/link" method="get">
@@ -2321,7 +2793,7 @@
         <div class="preview-pill">
           <div class="preview-pill-left">
             <img src="assets/bluey-logo.svg" alt="">
-            <img class="brand-wordmark" src="assets/bluey-wordmark.svg" alt="bluey">
+            <span class="preview-pill-title">Bluey</span>
             <span class="preview-live"></span>
           </div>
           <span class="preview-balance">$28.42</span>
@@ -2365,7 +2837,7 @@
 
     <section class="site-strip" aria-label="Bluey highlights">
       <a class="site-card" href="/account"><div><span>Account</span><small>Sign in, reload, review usage.</small></div></a>
-      <a class="site-card" href="/install.sh"><div><span>Install</span><small>One terminal command for macOS alpha.</small></div></a>
+      <a class="site-card" href="/download"><div><span>Install</span><small>Mac alpha now; Windows path next.</small></div></a>
       <a class="site-card" href="/docs/privacy"><div><span>Context</span><small>Files, transcript, screen, sessions.</small></div></a>
     </section>
 
@@ -2380,12 +2852,15 @@
   <script>
     const policyApp = document.getElementById('policyApp');
     const accountApp = document.getElementById('accountApp');
+    const downloadApp = document.getElementById('downloadApp');
     const productSite = document.getElementById('productSite');
+    const downloadRoutes = new Set(['/download', '/install']);
     const accountRoutes = new Set(['/account', '/reload', '/link', '/login', '/device', '/verify-email', '/password-reset']);
     const policyRoutes = new Set(['/docs/privacy', '/docs/terms', '/docs/disguise']);
     const currentPath = window.location.pathname.replace(/\/+$/, '') || '/';
     const isAccountRoute = accountRoutes.has(currentPath);
     const isPolicyRoute = policyRoutes.has(currentPath);
+    const isDownloadRoute = downloadRoutes.has(currentPath);
 
     function money(cents) {
       return `$${(Number(cents || 0) / 100).toFixed(2)}`;
@@ -2739,15 +3214,24 @@
       if (isPolicyRoute) {
         productSite.hidden = true;
         accountApp.hidden = true;
+        downloadApp.hidden = true;
         policyApp.hidden = false;
         document.getElementById('privacyPolicy').hidden = currentPath !== '/docs/privacy';
         document.getElementById('termsPolicy').hidden = currentPath !== '/docs/terms';
         document.getElementById('disguisePolicy').hidden = currentPath !== '/docs/disguise';
         return;
       }
+      if (isDownloadRoute) {
+        productSite.hidden = true;
+        accountApp.hidden = true;
+        policyApp.hidden = true;
+        downloadApp.hidden = false;
+        return;
+      }
       if (!isAccountRoute) return;
       productSite.hidden = true;
       accountApp.hidden = false;
+      downloadApp.hidden = true;
       renderDeviceLinkHint();
 
       const params = new URLSearchParams(location.search);
@@ -2832,6 +3316,23 @@
         }
       }
     }
+
+    document.addEventListener('click', async (event) => {
+      const button = event.target.closest('[data-copy]');
+      if (!button) return;
+      const text = button.dataset.copy || '';
+      if (!text) return;
+      try {
+        await navigator.clipboard.writeText(text);
+        const old = button.textContent;
+        button.textContent = 'Copied';
+        setTimeout(() => {
+          button.textContent = old;
+        }, 1200);
+      } catch {
+        button.textContent = 'Copy failed';
+      }
+    });
 
     initAccountApp();
   </script>
