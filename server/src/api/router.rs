@@ -132,44 +132,47 @@ const MAX_COMPLETE_IMAGE_DATA_URLS: usize = 4;
 const MAX_COMPLETE_IMAGE_DATA_URL_BYTES: usize = 12 * 1024 * 1024;
 const ESTIMATED_TOKENS_PER_IMAGE: i64 = 1_500;
 
-fn validate_complete_images(image_data_urls: &[String]) -> Result<(), (StatusCode, Json<ApiError>)> {
+fn image_validation_error(
+    error: impl Into<String>,
+    reason: impl Into<String>,
+) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ApiError {
+            error: error.into(),
+            reason: Some(reason.into()),
+            ..Default::default()
+        }),
+    )
+}
+
+fn validate_complete_images(image_data_urls: &[String]) -> Result<(), ApiError> {
     if image_data_urls.len() > MAX_COMPLETE_IMAGE_DATA_URLS {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ApiError {
-                error: format!(
-                    "too many screen images; maximum is {MAX_COMPLETE_IMAGE_DATA_URLS}"
-                ),
-                reason: Some("too_many_images".into()),
-                ..Default::default()
-            }),
-        ));
+        return Err(ApiError {
+            error: format!("too many screen images; maximum is {MAX_COMPLETE_IMAGE_DATA_URLS}"),
+            reason: Some("too_many_images".into()),
+            ..Default::default()
+        });
     }
 
     for data_url in image_data_urls {
         if data_url.len() > MAX_COMPLETE_IMAGE_DATA_URL_BYTES {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(ApiError {
-                    error: "screen image is too large".into(),
-                    reason: Some("image_too_large".into()),
-                    ..Default::default()
-                }),
-            ));
+            return Err(ApiError {
+                error: "screen image is too large".into(),
+                reason: Some("image_too_large".into()),
+                ..Default::default()
+            });
         }
         let allowed = data_url.starts_with("data:image/png;base64,")
             || data_url.starts_with("data:image/jpeg;base64,")
             || data_url.starts_with("data:image/webp;base64,")
             || data_url.starts_with("data:image/gif;base64,");
         if !allowed {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(ApiError {
-                    error: "unsupported screen image payload".into(),
-                    reason: Some("unsupported_image_payload".into()),
-                    ..Default::default()
-                }),
-            ));
+            return Err(ApiError {
+                error: "unsupported screen image payload".into(),
+                reason: Some("unsupported_image_payload".into()),
+                ..Default::default()
+            });
         }
     }
 
@@ -353,7 +356,8 @@ async fn complete_inner(
         ));
     }
 
-    validate_complete_images(&req.image_data_urls)?;
+    validate_complete_images(&req.image_data_urls)
+        .map_err(|error| image_validation_error(error.error, error.reason.unwrap_or_default()))?;
 
     let effective_lane = if req.image_data_urls.is_empty() {
         req.lane.as_str()
@@ -1809,16 +1813,14 @@ mod tests {
     #[test]
     fn complete_image_validation_rejects_unsupported_payload() {
         let images = vec!["file:///tmp/screenshot.png".to_string()];
-        let (status, Json(error)) = validate_complete_images(&images).unwrap_err();
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error = validate_complete_images(&images).unwrap_err();
         assert_eq!(error.reason.as_deref(), Some("unsupported_image_payload"));
     }
 
     #[test]
     fn complete_image_validation_rejects_too_many_images() {
         let images = vec!["data:image/png;base64,aGVsbG8=".to_string(); 5];
-        let (status, Json(error)) = validate_complete_images(&images).unwrap_err();
-        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error = validate_complete_images(&images).unwrap_err();
         assert_eq!(error.reason.as_deref(), Some("too_many_images"));
     }
 

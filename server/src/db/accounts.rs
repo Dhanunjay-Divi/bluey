@@ -97,11 +97,20 @@ impl Account {
     }
 
     pub fn create(pool: &DbPool, email: &str, password_hash: &str) -> Result<Self> {
+        Self::create_with_admin(pool, email, password_hash, false)
+    }
+
+    pub fn create_with_admin(
+        pool: &DbPool,
+        email: &str,
+        password_hash: &str,
+        is_admin: bool,
+    ) -> Result<Self> {
         let id = uuid::Uuid::new_v4().to_string();
         let conn = pool.get()?;
         match conn.execute(
-            "INSERT INTO accounts (id, email, password_hash) VALUES (?1, ?2, ?3)",
-            params![id, email, password_hash],
+            "INSERT INTO accounts (id, email, password_hash, is_admin) VALUES (?1, ?2, ?3, ?4)",
+            params![id, email, password_hash, if is_admin { 1 } else { 0 }],
         ) {
             Ok(_) => {}
             Err(e) => {
@@ -130,10 +139,19 @@ impl Account {
             auto_topup_enabled: true,
             auto_topup_threshold_cents: 500,
             auto_topup_amount_cents: 3000,
-            is_admin: false,
+            is_admin,
             stripe_customer_id: None,
             stripe_payment_method_id: None,
         })
+    }
+
+    pub fn set_admin(pool: &DbPool, id: &str, is_admin: bool) -> Result<()> {
+        let conn = pool.get()?;
+        conn.execute(
+            "UPDATE accounts SET is_admin = ?2 WHERE id = ?1",
+            params![id, if is_admin { 1 } else { 0 }],
+        )?;
+        Ok(())
     }
 
     /// Look up password hash for login validation.

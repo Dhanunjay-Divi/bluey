@@ -161,6 +161,7 @@ mod tests {
             stripe_webhook_secret: None,
             upstream: crate::config::UpstreamKeys::default(),
             smtp: None,
+            admin_emails: vec![],
         }
     }
 
@@ -214,9 +215,10 @@ mod tests {
             starttls: true,
         });
 
-        let result = send_email_verification(&config, "user@example.com", "https://bluey.sh/verify")
-            .await
-            .unwrap();
+        let result =
+            send_email_verification(&config, "user@example.com", "https://bluey.sh/verify")
+                .await
+                .unwrap();
         assert_eq!(result, MailDelivery::Sent);
 
         std::env::remove_var("BLUEY_RESEND_API_BASE_URL");

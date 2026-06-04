@@ -15,6 +15,7 @@ pub struct AccountMe {
     pub auto_topup_enabled: bool,
     pub auto_topup_threshold_cents: i64,
     pub auto_topup_amount_cents: i64,
+    pub is_admin: bool,
 }
 
 pub async fn me(Extension(AuthedAccount(account)): Extension<AuthedAccount>) -> Json<AccountMe> {
@@ -26,6 +27,7 @@ pub async fn me(Extension(AuthedAccount(account)): Extension<AuthedAccount>) -> 
         auto_topup_enabled: account.auto_topup_enabled,
         auto_topup_threshold_cents: account.auto_topup_threshold_cents,
         auto_topup_amount_cents: account.auto_topup_amount_cents,
+        is_admin: account.is_admin,
     })
 }
 

@@ -38,6 +38,7 @@ async fn real_serve_path_installs_connect_info_and_rate_limit_sees_peer_ip() {
         stripe_webhook_secret: None,
         smtp: None,
         upstream: UpstreamKeys::default(),
+        admin_emails: vec![],
     };
 
     let app = build_router(pool.clone(), config.clone());

@@ -23,6 +23,9 @@ pub struct Config {
     /// Transactional email transport. Optional in dev; when unset the server
     /// logs local verification/reset URLs instead of sending mail.
     pub smtp: Option<SmtpConfig>,
+    /// Operator/admin accounts. Matching signup emails are created as admins;
+    /// matching existing accounts are promoted on next login.
+    pub admin_emails: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +193,7 @@ impl Config {
                     .unwrap_or_else(|_| "Bluey <no-reply@bluey.sh>".to_string()),
                 starttls: env_bool("BLUEY_SMTP_STARTTLS").unwrap_or(true),
             });
+        let admin_emails = parse_email_list(std::env::var("BLUEY_ADMIN_EMAILS").ok());
 
         Ok(Self {
             port,
@@ -200,7 +204,13 @@ impl Config {
             stripe_webhook_secret,
             upstream,
             smtp,
+            admin_emails,
         })
+    }
+
+    pub fn is_admin_email(&self, email: &str) -> bool {
+        let normalized = normalize_email(email);
+        self.admin_emails.iter().any(|admin| admin == &normalized)
     }
 
     pub fn billing_provider(&self) -> BillingProvider {
@@ -256,6 +266,18 @@ fn env_bool(name: &str) -> Option<bool> {
             "0" | "false" | "off" | "no"
         )
     })
+}
+
+fn normalize_email(email: &str) -> String {
+    email.trim().to_ascii_lowercase()
+}
+
+fn parse_email_list(raw: Option<String>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(normalize_email)
+        .filter(|email| email.contains('@'))
+        .collect()
 }
 
 fn square_environment_from_env() -> SquareEnvironment {
@@ -392,6 +414,7 @@ mod tests {
             stripe_webhook_secret: None,
             upstream: UpstreamKeys::default(),
             smtp: None,
+            admin_emails: vec![],
         };
 
         let square = cfg.square_config();
@@ -411,5 +434,24 @@ mod tests {
         std::env::remove_var("SQUARE_SANDBOX_LOCATION_ID");
         std::env::remove_var("SQUARE_PRODUCTION_ACCESS_TOKEN");
         std::env::remove_var("SQUARE_PRODUCTION_LOCATION_ID");
+    }
+
+    #[test]
+    fn admin_email_matching_is_normalized() {
+        let cfg = Config {
+            port: 0,
+            db_path: PathBuf::from(":memory:"),
+            jwt_secret: "test-secret-at-least-32-chars-long".to_string(),
+            public_url: "http://localhost".to_string(),
+            stripe_secret_key: None,
+            stripe_webhook_secret: None,
+            upstream: UpstreamKeys::default(),
+            smtp: None,
+            admin_emails: parse_email_list(Some(" Owner@Bluey.SH , bad,ops@bluey.sh ".into())),
+        };
+
+        assert!(cfg.is_admin_email("owner@bluey.sh"));
+        assert!(cfg.is_admin_email(" OPS@BLUEY.SH "));
+        assert!(!cfg.is_admin_email("user@bluey.sh"));
     }
 }

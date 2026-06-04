@@ -14,7 +14,9 @@ use tower::ServiceExt;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use bluey_server::auth;
 use bluey_server::config::{Config, UpstreamKeys};
+use bluey_server::db::accounts::Account;
 use bluey_server::db::{open_pool, run_migrations, DbPool};
 
 /// Test harness: starts wiremocks, builds an AppState pointed at them,
@@ -40,6 +42,13 @@ async fn boot_harness() -> Harness {
 }
 
 async fn boot_harness_with_upstream(upstream: UpstreamKeys) -> Harness {
+    boot_harness_with_upstream_and_admin_emails(upstream, vec![]).await
+}
+
+async fn boot_harness_with_upstream_and_admin_emails(
+    upstream: UpstreamKeys,
+    admin_emails: Vec<String>,
+) -> Harness {
     let openai = MockServer::start().await;
     let anthropic = MockServer::start().await;
     let stripe = MockServer::start().await;
@@ -59,6 +68,7 @@ async fn boot_harness_with_upstream(upstream: UpstreamKeys) -> Harness {
         stripe_webhook_secret: Some("whsec_test_e2e".to_string()),
         smtp: None,
         upstream,
+        admin_emails,
     };
 
     // Override upstream URLs by env. The dispatcher reads from
@@ -103,6 +113,79 @@ async fn signup_and_login(harness: &Harness, email: &str, password: &str) -> Str
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     v["access_token"].as_str().unwrap().to_string()
+}
+
+async fn login(harness: &Harness, email: &str, password: &str) -> serde_json::Value {
+    let req = Request::post("/auth/login")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "email": email,
+                "password": password
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = harness.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200, "login failed");
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+async fn assert_admin_customers_allowed(harness: &Harness, access: &str) {
+    let req = Request::get("/admin/customers")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = harness.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+#[serial]
+async fn configured_admin_email_signup_gets_admin_access() {
+    let h = boot_harness_with_upstream_and_admin_emails(
+        UpstreamKeys::default(),
+        vec!["owner@bluey.sh".to_string()],
+    )
+    .await;
+
+    let access = signup_and_login(&h, " Owner@Bluey.SH ", "longenoughpw").await;
+    assert_admin_customers_allowed(&h, &access).await;
+
+    let req = Request::get("/account/me")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let me: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(me["email"], "owner@bluey.sh");
+    assert_eq!(me["is_admin"], true);
+}
+
+#[tokio::test]
+#[serial]
+async fn configured_admin_email_login_promotes_existing_account() {
+    let h = boot_harness_with_upstream_and_admin_emails(
+        UpstreamKeys::default(),
+        vec!["late-admin@bluey.sh".to_string()],
+    )
+    .await;
+
+    let password_hash = auth::password::hash_password("longenoughpw").unwrap();
+    let account = Account::create(&h.pool, "late-admin@bluey.sh", &password_hash).unwrap();
+    assert!(!account.is_admin);
+
+    let auth = login(&h, "late-admin@bluey.sh", "longenoughpw").await;
+    assert_eq!(auth["account"]["is_admin"], true);
+    let access = auth["access_token"].as_str().unwrap();
+    assert_admin_customers_allowed(&h, access).await;
 }
 
 #[tokio::test]

@@ -39,6 +39,7 @@ pub struct AuthAccountSummary {
     pub email: String,
     pub balance_cents: i64,
     pub trial_seconds_remaining: i64,
+    pub is_admin: bool,
 }
 
 #[derive(Serialize)]
@@ -108,6 +109,7 @@ fn auth_response(
             email: account.email.clone(),
             balance_cents: account.balance_cents,
             trial_seconds_remaining: account.trial_seconds_remaining,
+            is_admin: account.is_admin,
         },
     })
 }
@@ -138,18 +140,20 @@ pub async fn signup(
     let password_hash = auth::password::hash_password(&req.password)
         .map_err(|e| err(StatusCode::BAD_REQUEST, &e.to_string()))?;
 
-    let account = Account::create(&state.pool, &email, &password_hash).map_err(|e| {
-        // Codex Stage 10 round-2 typed-error nit: downcast to the typed
-        // AccountCreateError::DuplicateEmail variant instead of
-        // string-matching the error message. Race-free 409 mapping.
-        if matches!(
-            e.downcast_ref::<crate::db::accounts::AccountCreateError>(),
-            Some(crate::db::accounts::AccountCreateError::DuplicateEmail)
-        ) {
-            return err(StatusCode::CONFLICT, "email already registered");
-        }
-        err(StatusCode::INTERNAL_SERVER_ERROR, &format!("create: {e}"))
-    })?;
+    let is_admin = state.config.is_admin_email(&email);
+    let account = Account::create_with_admin(&state.pool, &email, &password_hash, is_admin)
+        .map_err(|e| {
+            // Codex Stage 10 round-2 typed-error nit: downcast to the typed
+            // AccountCreateError::DuplicateEmail variant instead of
+            // string-matching the error message. Race-free 409 mapping.
+            if matches!(
+                e.downcast_ref::<crate::db::accounts::AccountCreateError>(),
+                Some(crate::db::accounts::AccountCreateError::DuplicateEmail)
+            ) {
+                return err(StatusCode::CONFLICT, "email already registered");
+            }
+            err(StatusCode::INTERNAL_SERVER_ERROR, &format!("create: {e}"))
+        })?;
 
     Ok(Json(auth_response(&state, &account)?))
 }
@@ -171,7 +175,7 @@ pub async fn login(
         return Err(err(StatusCode::UNAUTHORIZED, "invalid credentials"));
     }
 
-    let account = Account::fetch_by_email(&state.pool, &email)
+    let mut account = Account::fetch_by_email(&state.pool, &email)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?
         .ok_or_else(|| {
             err(
@@ -179,6 +183,11 @@ pub async fn login(
                 "account vanished after auth",
             )
         })?;
+    if state.config.is_admin_email(&email) && !account.is_admin {
+        Account::set_admin(&state.pool, &account.id, true)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
+        account.is_admin = true;
+    }
 
     Ok(Json(auth_response(&state, &account)?))
 }
@@ -678,6 +687,7 @@ pub async fn link_exchange(
             email: account.email,
             balance_cents: account.balance_cents,
             trial_seconds_remaining: account.trial_seconds_remaining,
+            is_admin: account.is_admin,
         },
     }))
 }

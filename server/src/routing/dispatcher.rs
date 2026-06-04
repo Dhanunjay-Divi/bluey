@@ -501,9 +501,13 @@ fn openai_user_content<'a>(
 
     let mut parts = Vec::with_capacity(image_data_urls.len() + 1);
     parts.push(OpenAiContentPart::Text { text: user });
-    parts.extend(image_data_urls.iter().map(|url| OpenAiContentPart::ImageUrl {
-        image_url: OpenAiImageUrl { url },
-    }));
+    parts.extend(
+        image_data_urls
+            .iter()
+            .map(|url| OpenAiContentPart::ImageUrl {
+                image_url: OpenAiImageUrl { url },
+            }),
+    );
     OpenAiMessageContent::Parts(parts)
 }
 
@@ -1039,10 +1043,9 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("image payloads are only supported by the OpenAI vision route")
-        );
+        assert!(err
+            .to_string()
+            .contains("image payloads are only supported by the OpenAI vision route"));
     }
 
     #[test]

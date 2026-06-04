@@ -549,6 +549,7 @@ mod tests {
                     ..Default::default()
                 },
                 smtp: None,
+                admin_emails: vec![],
             }),
             rate_limiters: crate::rate_limit::RateLimiters::default(),
             provider_health: crate::provider_health::ProviderHealth::default(),
