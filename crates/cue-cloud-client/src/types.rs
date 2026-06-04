@@ -88,6 +88,13 @@ pub struct CompleteRequest {
     pub lane: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_input_tokens: Option<i64>,
+    /// Data URLs for user-approved screenshot/screen-analysis context.
+    ///
+    /// Kept as strings here because the desktop/daemon already produces
+    /// provider-compatible data URLs. The server validates MIME, count, and
+    /// size before routing these to a vision lane.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_data_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -1360,6 +1360,7 @@ async fn try_speculative_dispatch(
         // stable logical request id so retries / failover hit the
         // server idempotency cache instead of double-charging.
         request_id: Some(response_id.to_string()),
+        image_data_urls: Vec::new(),
     };
 
     let stream = router

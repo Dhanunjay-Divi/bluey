@@ -275,6 +275,7 @@ mod tests {
             reasoning_effort: None,
             thinking_budget_tokens: None,
             request_id: None,
+            image_data_urls: Vec::new(),
         }
     }
 

@@ -269,6 +269,7 @@ pub async fn complete(
     // server passes its entry-cost ceiling so we charge the best
     // available approximation rather than $0.
     fallback_input_tokens: Option<i64>,
+    image_data_urls: &[String],
 ) -> Result<Completion> {
     match provider {
         "openai" => {
@@ -284,6 +285,7 @@ pub async fn complete(
                 temperature,
                 thinking,
                 fallback_input_tokens,
+                image_data_urls,
             )
             .await
         }
@@ -300,6 +302,7 @@ pub async fn complete(
                 temperature,
                 thinking,
                 fallback_input_tokens,
+                image_data_urls,
             )
             .await
         }
@@ -323,6 +326,7 @@ pub async fn complete_with_key(
     temperature: Option<f32>,
     thinking: ThinkingBudget,
     fallback_input_tokens: Option<i64>,
+    image_data_urls: &[String],
 ) -> Result<Completion> {
     match provider {
         "openai" => {
@@ -335,6 +339,7 @@ pub async fn complete_with_key(
                 temperature,
                 thinking,
                 fallback_input_tokens,
+                image_data_urls,
             )
             .await
         }
@@ -348,6 +353,7 @@ pub async fn complete_with_key(
                 temperature,
                 thinking,
                 fallback_input_tokens,
+                image_data_urls,
             )
             .await
         }
@@ -372,7 +378,28 @@ struct OpenAiChatReq<'a> {
 #[derive(Serialize)]
 struct OpenAiMessage<'a> {
     role: &'static str,
-    content: &'a str,
+    content: OpenAiMessageContent<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum OpenAiMessageContent<'a> {
+    Text(&'a str),
+    Parts(Vec<OpenAiContentPart<'a>>),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type")]
+enum OpenAiContentPart<'a> {
+    #[serde(rename = "text")]
+    Text { text: &'a str },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: OpenAiImageUrl<'a> },
+}
+
+#[derive(Serialize)]
+struct OpenAiImageUrl<'a> {
+    url: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -407,17 +434,19 @@ async fn openai_complete(
     temperature: Option<f32>,
     _thinking: ThinkingBudget,
     fallback_input_tokens: Option<i64>,
+    image_data_urls: &[String],
 ) -> Result<Completion> {
+    let user_content = openai_user_content(user, image_data_urls);
     let req = OpenAiChatReq {
         model,
         messages: vec![
             OpenAiMessage {
                 role: "system",
-                content: system,
+                content: OpenAiMessageContent::Text(system),
             },
             OpenAiMessage {
                 role: "user",
-                content: user,
+                content: user_content,
             },
         ],
         max_tokens,
@@ -460,6 +489,22 @@ async fn openai_complete(
         input_tokens,
         output_tokens,
     })
+}
+
+fn openai_user_content<'a>(
+    user: &'a str,
+    image_data_urls: &'a [String],
+) -> OpenAiMessageContent<'a> {
+    if image_data_urls.is_empty() {
+        return OpenAiMessageContent::Text(user);
+    }
+
+    let mut parts = Vec::with_capacity(image_data_urls.len() + 1);
+    parts.push(OpenAiContentPart::Text { text: user });
+    parts.extend(image_data_urls.iter().map(|url| OpenAiContentPart::ImageUrl {
+        image_url: OpenAiImageUrl { url },
+    }));
+    OpenAiMessageContent::Parts(parts)
 }
 
 // ─── Anthropic ───────────────────────────────────────────────────────────
@@ -519,7 +564,14 @@ async fn anthropic_complete(
     temperature: Option<f32>,
     thinking: ThinkingBudget,
     fallback_input_tokens: Option<i64>,
+    image_data_urls: &[String],
 ) -> Result<Completion> {
+    if !image_data_urls.is_empty() {
+        return Err(anyhow!(
+            "image payloads are only supported by the OpenAI vision route"
+        ));
+    }
+
     let thinking_req = anthropic_thinking_for(model, thinking);
     let effective_max_tokens = effective_max_output_tokens(max_tokens, thinking);
     let req = AnthropicReq {
@@ -948,6 +1000,48 @@ mod tests {
         assert_eq!(
             resolve_transcribe_candidates(Some("nova-2"))[0],
             ("deepgram", "nova-2".to_string())
+        );
+    }
+
+    #[test]
+    fn openai_user_content_serializes_image_parts() {
+        let images = vec!["data:image/png;base64,aGVsbG8=".to_string()];
+        let content = openai_user_content("What is on screen?", &images);
+        let value = serde_json::to_value(OpenAiMessage {
+            role: "user",
+            content,
+        })
+        .unwrap();
+
+        assert_eq!(value["role"], "user");
+        assert_eq!(value["content"][0]["type"], "text");
+        assert_eq!(value["content"][0]["text"], "What is on screen?");
+        assert_eq!(value["content"][1]["type"], "image_url");
+        assert_eq!(
+            value["content"][1]["image_url"]["url"],
+            "data:image/png;base64,aGVsbG8="
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_rejects_image_payloads() {
+        let images = vec!["data:image/png;base64,aGVsbG8=".to_string()];
+        let err = anthropic_complete(
+            "sk-test",
+            "claude-3-5-sonnet-latest",
+            "system",
+            "user",
+            None,
+            None,
+            ThinkingBudget::off(),
+            None,
+            &images,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("image payloads are only supported by the OpenAI vision route")
         );
     }
 

@@ -144,14 +144,14 @@ private enum BlueyBrandAsset {
 """#
 
     static let wordmarkSvg = #"""
-<svg viewBox="0 0 292 76" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="bluey">
+<svg viewBox="0 0 292 100" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="bluey">
   <defs>
-    <linearGradient id="wordmark-fill" x1="2" y1="6" x2="290" y2="72" gradientUnits="userSpaceOnUse">
+    <linearGradient id="wordmark-fill" x1="2" y1="6" x2="290" y2="94" gradientUnits="userSpaceOnUse">
       <stop stop-color="#f8fdff"/>
       <stop offset=".5" stop-color="#ddf8ff"/>
       <stop offset="1" stop-color="#8df4ff"/>
     </linearGradient>
-    <filter id="wordmark-glow" x="-8%" y="-30%" width="116%" height="160%" color-interpolation-filters="sRGB">
+    <filter id="wordmark-glow" x="-8%" y="-24%" width="116%" height="148%" color-interpolation-filters="sRGB">
       <feDropShadow dx="0" dy="0" stdDeviation="3" flood-color="#54dcff" flood-opacity=".22"/>
     </filter>
   </defs>
@@ -918,9 +918,9 @@ private final class PillView: NSView {
         runButton.frame = NSRect(x: 25.5, y: 2, width: buttonSide, height: buttonSide)
         endButton.frame = NSRect(x: 48, y: 2, width: buttonSide, height: buttonSide)
 
-        wordmarkView.frame = NSRect(x: 39, y: (bounds.height - 15) / 2 + 0.5, width: 52, height: 15)
+        wordmarkView.frame = NSRect(x: 39, y: (bounds.height - 19) / 2 + 1, width: 54, height: 19)
         let dotSize: CGFloat = 7
-        let dotX = min(wordmarkView.frame.maxX + 4, controlRail.frame.minX - dotSize - 7)
+        let dotX = min(wordmarkView.frame.maxX + 2, controlRail.frame.minX - dotSize - 7)
         dotView.frame = NSRect(x: dotX, y: bounds.midY + 4.5, width: dotSize, height: dotSize)
         dotView.layer?.cornerRadius = dotSize / 2
     }
@@ -1931,8 +1931,8 @@ private final class ExpandedPanelView: NSView {
             headerLogo.widthAnchor.constraint(equalToConstant: 28),
             headerLogo.heightAnchor.constraint(equalToConstant: 28),
 
-            headerWordmark.widthAnchor.constraint(equalToConstant: 58),
-            headerWordmark.heightAnchor.constraint(equalToConstant: 16),
+            headerWordmark.widthAnchor.constraint(equalToConstant: 62),
+            headerWordmark.heightAnchor.constraint(equalToConstant: 22),
 
             brandStack.widthAnchor.constraint(greaterThanOrEqualToConstant: 72),
             brandStack.widthAnchor.constraint(lessThanOrEqualToConstant: 128),

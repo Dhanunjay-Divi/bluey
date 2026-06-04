@@ -92,6 +92,7 @@ impl LlmProvider for BlueyManagedProvider {
             thinking_budget_tokens: req.thinking_budget_tokens,
             lane: self.lane.as_str().to_string(),
             estimated_input_tokens: None,
+            image_data_urls: req.image_data_urls.clone(),
         };
         let resp = self
             .client
@@ -124,6 +125,7 @@ impl LlmProvider for BlueyManagedProvider {
             thinking_budget_tokens: req.thinking_budget_tokens,
             lane: self.lane.as_str().to_string(),
             estimated_input_tokens: None,
+            image_data_urls: req.image_data_urls.clone(),
         };
         let response = self
             .client

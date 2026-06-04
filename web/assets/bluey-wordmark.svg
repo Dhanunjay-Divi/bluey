@@ -1,11 +1,11 @@
-<svg viewBox="0 0 292 76" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="bluey">
+<svg viewBox="0 0 292 100" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="bluey">
   <defs>
-    <linearGradient id="wordmark-fill" x1="2" y1="6" x2="290" y2="72" gradientUnits="userSpaceOnUse">
+    <linearGradient id="wordmark-fill" x1="2" y1="6" x2="290" y2="94" gradientUnits="userSpaceOnUse">
       <stop stop-color="#f8fdff"/>
       <stop offset=".5" stop-color="#ddf8ff"/>
       <stop offset="1" stop-color="#8df4ff"/>
     </linearGradient>
-    <filter id="wordmark-glow" x="-8%" y="-30%" width="116%" height="160%" color-interpolation-filters="sRGB">
+    <filter id="wordmark-glow" x="-8%" y="-24%" width="116%" height="148%" color-interpolation-filters="sRGB">
       <feDropShadow dx="0" dy="0" stdDeviation="3" flood-color="#54dcff" flood-opacity=".22"/>
     </filter>
   </defs>

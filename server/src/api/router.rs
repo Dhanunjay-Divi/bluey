@@ -46,6 +46,10 @@ pub struct CompleteRequest {
     pub lane: String,
     #[serde(default)]
     pub estimated_input_tokens: Option<i64>,
+    /// User-approved screenshot/screen-analysis images as provider-compatible
+    /// data URLs. Presence of any image forces the managed lane to `vision`.
+    #[serde(default)]
+    pub image_data_urls: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -122,6 +126,60 @@ fn release_and_capacity_error(
 
 fn missing_provider_key_error(provider: &str) -> anyhow::Error {
     anyhow::anyhow!("{provider} API key pool is not configured on bluey-server")
+}
+
+const MAX_COMPLETE_IMAGE_DATA_URLS: usize = 4;
+const MAX_COMPLETE_IMAGE_DATA_URL_BYTES: usize = 12 * 1024 * 1024;
+const ESTIMATED_TOKENS_PER_IMAGE: i64 = 1_500;
+
+fn validate_complete_images(image_data_urls: &[String]) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if image_data_urls.len() > MAX_COMPLETE_IMAGE_DATA_URLS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: format!(
+                    "too many screen images; maximum is {MAX_COMPLETE_IMAGE_DATA_URLS}"
+                ),
+                reason: Some("too_many_images".into()),
+                ..Default::default()
+            }),
+        ));
+    }
+
+    for data_url in image_data_urls {
+        if data_url.len() > MAX_COMPLETE_IMAGE_DATA_URL_BYTES {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "screen image is too large".into(),
+                    reason: Some("image_too_large".into()),
+                    ..Default::default()
+                }),
+            ));
+        }
+        let allowed = data_url.starts_with("data:image/png;base64,")
+            || data_url.starts_with("data:image/jpeg;base64,")
+            || data_url.starts_with("data:image/webp;base64,")
+            || data_url.starts_with("data:image/gif;base64,");
+        if !allowed {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "unsupported screen image payload".into(),
+                    reason: Some("unsupported_image_payload".into()),
+                    ..Default::default()
+                }),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn image_token_estimate(image_count: usize) -> i64 {
+    i64::try_from(image_count)
+        .unwrap_or(i64::MAX / ESTIMATED_TOKENS_PER_IMAGE)
+        .saturating_mul(ESTIMATED_TOKENS_PER_IMAGE)
 }
 
 fn priced_routes_for(
@@ -295,11 +353,19 @@ async fn complete_inner(
         ));
     }
 
+    validate_complete_images(&req.image_data_urls)?;
+
+    let effective_lane = if req.image_data_urls.is_empty() {
+        req.lane.as_str()
+    } else {
+        "vision"
+    };
+
     // Codex S4.4: managed dispatcher does not run local models.
     // The daemon's LocalFallbackPolicy must dispatch local-lane work
     // directly to on-device Ollama; the managed cloud path is not the
     // right home for it.
-    if req.lane == "local" {
+    if effective_lane == "local" {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ApiError {
@@ -380,7 +446,7 @@ async fn complete_inner(
     // the maximum candidate estimate so provider failover cannot overrun a
     // customer's hard-stop budget.
     let thinking = routing::resolve_thinking_budget(
-        &req.lane,
+        effective_lane,
         req.reasoning_effort.as_deref(),
         req.thinking_budget_tokens,
     );
@@ -389,14 +455,14 @@ async fn complete_inner(
     let est_in = req.estimated_input_tokens.unwrap_or_else(|| {
         // Crude fallback: ~4 chars/token
         ((provider_system.len() + provider_user.len()) as i64) / 4
-    });
-    let routes = priced_routes_for(&req.lane, est_in, max_out);
+    }) + image_token_estimate(req.image_data_urls.len());
+    let routes = priced_routes_for(effective_lane, est_in, max_out);
     if routes.is_empty() {
         let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiError {
-                error: format!("no priced route for lane {}", req.lane),
+                error: format!("no priced route for lane {effective_lane}"),
                 ..Default::default()
             }),
         ));
@@ -516,6 +582,7 @@ async fn complete_inner(
                 req.temperature,
                 thinking,
                 Some(est_in),
+                &req.image_data_urls,
             )
             .await
             {
@@ -1726,6 +1793,33 @@ mod tests {
             priced_routes_for("local", 100, 100).is_empty(),
             "local/Ollama fallback must stay daemon-only, not managed cloud"
         );
+    }
+
+    #[test]
+    fn complete_image_validation_accepts_supported_data_urls() {
+        let images = vec![
+            "data:image/png;base64,aGVsbG8=".to_string(),
+            "data:image/jpeg;base64,aGVsbG8=".to_string(),
+            "data:image/webp;base64,aGVsbG8=".to_string(),
+        ];
+        assert!(validate_complete_images(&images).is_ok());
+        assert_eq!(image_token_estimate(images.len()), 4_500);
+    }
+
+    #[test]
+    fn complete_image_validation_rejects_unsupported_payload() {
+        let images = vec!["file:///tmp/screenshot.png".to_string()];
+        let (status, Json(error)) = validate_complete_images(&images).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.reason.as_deref(), Some("unsupported_image_payload"));
+    }
+
+    #[test]
+    fn complete_image_validation_rejects_too_many_images() {
+        let images = vec!["data:image/png;base64,aGVsbG8=".to_string(); 5];
+        let (status, Json(error)) = validate_complete_images(&images).unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.reason.as_deref(), Some("too_many_images"));
     }
 
     #[test]

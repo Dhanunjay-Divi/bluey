@@ -49,6 +49,7 @@ impl AnswerLlm {
             reasoning_effort: None,
             thinking_budget_tokens: None,
             request_id: None,
+            image_data_urls: Vec::new(),
         };
         let mut cost: Option<LlmCostMetadata> = None;
         let mut cost_label: Option<String> = None;

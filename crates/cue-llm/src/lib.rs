@@ -36,6 +36,11 @@ pub struct LlmRequest {
     /// provider then mints a per-call UUID for safety inside one call's
     /// token-refresh retry window.
     pub request_id: Option<String>,
+    /// User-approved image/screenshot context for managed vision routes.
+    ///
+    /// These are provider-compatible `data:image/...;base64,...` URLs. Direct
+    /// text providers ignore this field unless they explicitly support vision.
+    pub image_data_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
