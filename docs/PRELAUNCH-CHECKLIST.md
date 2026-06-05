@@ -152,11 +152,11 @@ binaries and strips quarantine. A `.app` bundle can be added later, but
 do not advertise it until a real `Bluey.app` artifact exists.
 
 #### Path A: One-line installer (`curl ... | bash`)
-- [ ] `ops/install/install.sh` hosted as a real static file at `https://bluey.sh/install.sh`
-- [ ] `latest.json` hosted as real JSON at `https://bluey.sh/latest.json`
-- [ ] Release tarball hosted at `https://bluey.sh/releases/v0.1.0/bluey-0.1.0-darwin-arm64.tar.gz`
+- [x] `ops/install/install.sh` hosted as a real static file at `https://bluey.sh/install.sh`
+- [x] `latest.json` hosted as real JSON at `https://bluey.sh/latest.json`
+- [x] Release tarball hosted at `https://bluey.sh/releases/v0.1.0/bluey-0.1.0-darwin-arm64.tar.gz`
 - [x] Each release tarball contains top-level `bin/bluey` plus helper binaries
-- [ ] `SHA256SUMS.txt` hosted next to the tarballs, and `install.sh` verifies it
+- [x] `SHA256SUMS.txt` hosted next to the tarballs, and `install.sh` verifies it
 - [x] `bluey on` checks the release manifest, waits 5 seconds for Esc, and auto-updates installed builds
 - [x] Current-Mac temp-root installer smoke: download, checksum, ad-hoc sign, quarantine strip, CLI symlink, `bluey --version`
 - [ ] Smoke on a clean Mac: `curl -fsSL https://bluey.sh/install.sh | bash` finishes cleanly
