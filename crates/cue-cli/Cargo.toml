@@ -23,6 +23,7 @@ libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+reqwest.workspace = true
 regex = "1"
 once_cell = "1"
 zip = { version = "2", default-features = false, features = ["deflate"] }

@@ -127,12 +127,18 @@ mod tests {
 
     #[test]
     fn set_process_name_does_not_crash() {
+        let _guard = crate::tests::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let result = set_process_name("Test");
         assert!(result.is_ok());
     }
 
     #[test]
     fn set_process_name_long_name_truncates() {
+        let _guard = crate::tests::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let long_name = "A".repeat(1024);
         let result = set_process_name(&long_name);
         assert!(result.is_ok());

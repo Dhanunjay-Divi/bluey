@@ -50,6 +50,8 @@ package-darwin-arm64: build-darwin-arm64 build-helpers-release
 	cp native/macos/cue-picker/.build/cue-file-picker-macos staging-arm64/bin/ 2>/dev/null || true
 	cp -R native/macos/cue-picker/.build/BlueyFilePicker.app staging-arm64/bin/ 2>/dev/null || true
 	tar -czf dist/bluey-$(VERSION)-darwin-arm64.tar.gz -C staging-arm64 .
+	shasum -a 256 dist/bluey-$(VERSION)-darwin-arm64.tar.gz \
+	  > dist/bluey-$(VERSION)-darwin-arm64.tar.gz.sha256
 	rm -rf staging-arm64
 
 package-darwin-x86_64: build-darwin-x86_64

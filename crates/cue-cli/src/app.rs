@@ -65,6 +65,9 @@ enum Commands {
     /// future release.)
     #[command(hide = true)]
     Credits,
+    /// Check for and install a Bluey desktop update.
+    #[command(hide = true)]
+    Update(UpdateArgs),
     /// Log out of Bluey: clear keyring tokens.
     #[command(hide = true)]
     Logout,
@@ -218,6 +221,19 @@ struct OnArgs {
     /// Optional title for the fresh session that `bluey on` starts.
     #[arg(long)]
     title: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct UpdateArgs {
+    /// Only report whether an update is available.
+    #[arg(long)]
+    check_only: bool,
+    /// Install without the 5-second Esc countdown.
+    #[arg(long)]
+    yes: bool,
+    /// Allow update checks from local target/debug builds.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -541,6 +557,9 @@ pub async fn cli_main() -> Result<()> {
         Commands::Settings(args) => cue_settings(args),
         Commands::Usage => bluey_usage_cmd().await,
         Commands::Credits => bluey_credits_cmd().await,
+        Commands::Update(args) => {
+            crate::update::manual_update(args.check_only, args.yes, args.force).await
+        }
         Commands::Logout => bluey_logout_cmd().await,
         Commands::Portal => bluey_portal_cmd().await,
         Commands::Export => bluey_export_cmd().await,
@@ -776,6 +795,8 @@ async fn run(args: RunArgs) -> Result<()> {
 }
 
 async fn cue_on(args: OnArgs) -> Result<()> {
+    crate::update::maybe_update_before_on(args.title.as_deref()).await?;
+
     let paths = AppPaths::discover()?;
     let settings = load_settings(&paths)?;
     ensure_daemon_quiet(false).await?;

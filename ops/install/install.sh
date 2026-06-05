@@ -13,7 +13,7 @@
 set -euo pipefail
 
 # ── Configuration ────────────────────────────────────────────────────
-BLUEY_VERSION="${BLUEY_VERSION:-0.1.0}"
+BLUEY_VERSION="${BLUEY_VERSION:-latest}"
 DOWNLOAD_HOST="${BLUEY_DOWNLOAD_HOST:-https://bluey.sh}"
 INSTALL_ROOT="${BLUEY_INSTALL_ROOT:-$HOME/.bluey}"
 CLI_DIR="${BLUEY_CLI_DIR:-/usr/local/bin}"
@@ -58,6 +58,16 @@ if [ "$EUID" -eq 0 ]; then
 fi
 
 # ── Download ─────────────────────────────────────────────────────────
+if [ "$BLUEY_VERSION" = "latest" ]; then
+    say "Resolving latest Bluey release..."
+    LATEST_JSON="$(curl -fsSL --retry 3 "$DOWNLOAD_HOST/latest.json")" \
+        || fail "Could not fetch $DOWNLOAD_HOST/latest.json"
+    BLUEY_VERSION="$(printf "%s" "$LATEST_JSON" \
+        | sed -nE 's/.*"version"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' \
+        | head -1)"
+    [ -n "$BLUEY_VERSION" ] || fail "latest.json did not include a version"
+fi
+
 VERSION_TAG="$BLUEY_VERSION"
 VERSION_NUMBER="${BLUEY_VERSION#v}"
 case "$VERSION_TAG" in
@@ -66,12 +76,16 @@ case "$VERSION_TAG" in
     *)      VERSION_TAG="v$VERSION_NUMBER"; ARTIFACT="bluey-$VERSION_NUMBER-$PLATFORM.tar.gz" ;;
 esac
 
+if [ -n "${BLUEY_ARTIFACT_URL:-}" ]; then
+    ARTIFACT="$(basename "${BLUEY_ARTIFACT_URL%%\?*}")"
+fi
+
 say "Downloading Bluey ($VERSION_TAG, $PLATFORM)..."
 DOWNLOAD_TMP="$(mktemp -d -t bluey-download)"
 TARBALL="$DOWNLOAD_TMP/$ARTIFACT"
 trap 'rm -rf "$DOWNLOAD_TMP"' EXIT
 
-URL="$DOWNLOAD_HOST/releases/$VERSION_TAG/$ARTIFACT"
+URL="${BLUEY_ARTIFACT_URL:-$DOWNLOAD_HOST/releases/$VERSION_TAG/$ARTIFACT}"
 if ! curl -fsSL --retry 3 -o "$TARBALL" "$URL"; then
     fail "Download failed from $URL"
 fi
@@ -79,7 +93,11 @@ ok "Downloaded $(stat -f%z "$TARBALL" 2>/dev/null || stat -c%s "$TARBALL") bytes
 
 if [ "${BLUEY_SKIP_CHECKSUM:-0}" != "1" ] && command -v shasum >/dev/null; then
     CHECKSUMS="$DOWNLOAD_TMP/SHA256SUMS.txt"
-    if curl -fsSL --retry 3 -o "$CHECKSUMS" "$DOWNLOAD_HOST/releases/$VERSION_TAG/SHA256SUMS.txt"; then
+    if [ -n "${BLUEY_ARTIFACT_SHA256:-}" ]; then
+        printf "%s  %s\n" "$BLUEY_ARTIFACT_SHA256" "$ARTIFACT" > "$CHECKSUMS.one"
+        (cd "$(dirname "$CHECKSUMS")" && shasum -a 256 -c "$CHECKSUMS.one")
+        ok "Checksum verified"
+    elif curl -fsSL --retry 3 -o "$CHECKSUMS" "$DOWNLOAD_HOST/releases/$VERSION_TAG/SHA256SUMS.txt"; then
         if grep " $ARTIFACT\$" "$CHECKSUMS" > "$CHECKSUMS.one"; then
             (cd "$(dirname "$CHECKSUMS")" && shasum -a 256 -c "$CHECKSUMS.one")
             ok "Checksum verified"

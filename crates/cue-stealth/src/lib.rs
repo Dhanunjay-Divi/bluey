@@ -216,7 +216,7 @@ mod tests {
     /// across the cue-stealth crate test binary. Without this, parallel cargo
     /// test threads race on these vars and the env-checking test sometimes
     /// observes a value set by a different test.
-    pub(super) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn mode_from_str_round_trip() {
