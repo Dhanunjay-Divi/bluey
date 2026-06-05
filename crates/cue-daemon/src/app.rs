@@ -17,7 +17,7 @@ use cue_core::ai::{
     SafetyOutcome, TokenUsage,
 };
 use cue_core::app_paths::AppPaths;
-use cue_core::audio::SimulatedPcmChunk;
+use cue_core::audio::{AudioRuntimeMode, SimulatedPcmChunk};
 use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
 use cue_core::{
     analyze_segment, clock, generate_recap, load_account, local_answer, new_trace_id,
@@ -1443,9 +1443,8 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
                 CardKind::System,
                 "Recording on",
                 format!(
-                    "{} source(s), {:?} runtime. Auto-stop after {} with no transcript.{}",
-                    status.active_source_count(),
-                    status.runtime_mode,
+                    "{} Auto-stop after {} with no transcript.{}",
+                    recording_sources_label(&status),
                     format_duration(audio_idle_stop_timeout()),
                     balance_line
                 ),
@@ -2428,6 +2427,19 @@ fn audio_idle_stop_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+fn recording_sources_label(status: &AudioPipelineStatus) -> &'static str {
+    match status.runtime_mode {
+        AudioRuntimeMode::Native => "Bluey is listening to system audio and microphone.",
+        AudioRuntimeMode::SimulatedDevelopment => {
+            "Local preview audio is active. Real STT starts after permissions and provider setup."
+        }
+        AudioRuntimeMode::Idle => "Bluey is ready to listen.",
+        AudioRuntimeMode::Unavailable => {
+            "Audio is not available yet. Check permissions or provider setup."
+        }
+    }
+}
+
 fn format_duration(duration: Duration) -> String {
     let total = duration.as_secs();
     let minutes = total / 60;
@@ -3339,7 +3351,7 @@ async fn answer_with_provider_runtime(
             Err(error) => {
                 if is_answer_generation_current(daemon, generation_id) {
                     let _ = overlay_stream
-                        .finish(&format!("Bluey could not generate an answer: {error:#}"))
+                        .finish(&user_facing_answer_error(&error))
                         .await;
                 }
                 clear_active_answer_card(daemon, generation_id, answer_card_id).await;
@@ -3443,6 +3455,31 @@ async fn answer_with_provider_runtime(
     update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
     write_state(daemon).await?;
     Ok((response, events))
+}
+
+fn user_facing_answer_error(error: &anyhow::Error) -> String {
+    let raw = format!("{error:#}");
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("insufficient_quota")
+        || lower.contains("quota")
+        || lower.contains("credit balance")
+        || lower.contains("payment")
+        || lower.contains("billing")
+    {
+        return "Bluey is connected, but the managed AI provider needs billing/quota attention before it can answer. Check provider credits or try again after the account is funded.".to_string();
+    }
+    if lower.contains("unauthorized")
+        || lower.contains("forbidden")
+        || lower.contains("auth")
+        || lower.contains("api key")
+    {
+        return "Bluey needs provider authentication before it can answer. Check the server-side API key setup, then try again.".to_string();
+    }
+    if lower.contains("rate limit") || lower.contains("429") || lower.contains("too many requests")
+    {
+        return "Bluey hit provider capacity for this lane. Try again shortly; the router will use the next healthy lane when available.".to_string();
+    }
+    "Bluey could not complete that answer yet. Try again, or check the server logs for the detailed provider error.".to_string()
 }
 
 fn answer_overlay_cost_label(metadata: &AnswerResponseMetadata) -> Option<String> {

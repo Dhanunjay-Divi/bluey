@@ -26,6 +26,38 @@ import Foundation
 
 // MARK: - Visual system
 
+private func normalizedCardKind(_ kind: String) -> String {
+    kind
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .replacingOccurrences(of: "-", with: "_")
+        .lowercased()
+}
+
+private func displayTranscriptText(_ text: String) -> String {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    let prefix = "[dev audio:"
+    guard trimmed.hasPrefix(prefix), let close = trimmed.firstIndex(of: "]") else {
+        return trimmed
+    }
+
+    let sourceStart = trimmed.index(trimmed.startIndex, offsetBy: prefix.count)
+    let source = String(trimmed[sourceStart..<close])
+        .replacingOccurrences(of: "_", with: " ")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+        .capitalized
+    let restStart = trimmed.index(after: close)
+    let rest = trimmed[restStart...].trimmingCharacters(in: .whitespacesAndNewlines)
+    let marker = rest.hasPrefix("audio preview sample")
+        ? "audio preview sample"
+        : "simulated speech chunk"
+    guard rest.hasPrefix(marker) else { return trimmed }
+
+    let number = rest
+        .replacingOccurrences(of: marker, with: "")
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    return "\(source.isEmpty ? "Audio" : source) preview sample \(number)"
+}
+
 private enum BlueyTheme {
     static let cyan = NSColor(red: 0.35, green: 0.82, blue: 1.0, alpha: 1.0)
     static let cyanSoft = NSColor(red: 0.35, green: 0.82, blue: 1.0, alpha: 0.14)
@@ -41,7 +73,7 @@ private enum BlueyTheme {
     static let danger = NSColor(red: 1.0, green: 0.38, blue: 0.44, alpha: 1.0)
 
     static func accent(for kind: String) -> NSColor {
-        switch kind {
+        switch normalizedCardKind(kind) {
         case "answer": return cyan
         case "question": return NSColor(red: 0.58, green: 0.70, blue: 1.0, alpha: 1.0)
         case "transcript": return NSColor(red: 0.48, green: 1.0, blue: 0.72, alpha: 1.0)
@@ -1153,7 +1185,7 @@ private final class FeedView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     func push(_ card: RenderedCard) {
-        if card.kind == "transcript" {
+        if normalizedCardKind(card.kind) == "transcript" {
             onTranscript?(card)
             emitCardRendered(id: card.id)
             return
@@ -1275,9 +1307,10 @@ private final class FeedView: NSView {
     }
 
     private func makeCardView(_ card: RenderedCard) -> NSView {
-        let accent = BlueyTheme.accent(for: card.kind)
+        let kind = normalizedCardKind(card.kind)
+        let accent = BlueyTheme.accent(for: kind)
         let rightAligned = isUserSide(card)
-        let answerLike = card.kind == "answer"
+        let answerLike = kind == "answer"
         let row = NSView()
         row.translatesAutoresizingMaskIntoConstraints = false
 
@@ -1290,7 +1323,7 @@ private final class FeedView: NSView {
         bubble.layer?.borderWidth = answerLike ? 0 : 1
         bubble.layer?.borderColor = rightAligned
             ? NSColor.white.withAlphaComponent(0.20).cgColor
-            : accent.withAlphaComponent(card.kind == "answer" ? 0.24 : 0.14).cgColor
+            : accent.withAlphaComponent(answerLike ? 0.24 : 0.14).cgColor
         bubble.layer?.shadowColor = NSColor.black.cgColor
         bubble.layer?.shadowOpacity = answerLike ? 0 : 0.14
         bubble.layer?.shadowRadius = 10
@@ -1433,7 +1466,7 @@ private final class FeedView: NSView {
     }
 
     private func kindLabel(_ card: RenderedCard) -> String {
-        switch card.kind {
+        switch normalizedCardKind(card.kind) {
         case "answer":      return "BLUEY"
         case "question":    return "YOU"
         case "action_item": return "ACTION"
@@ -1447,7 +1480,7 @@ private final class FeedView: NSView {
     }
 
     private func displayTitle(for card: RenderedCard) -> String {
-        switch card.kind {
+        switch normalizedCardKind(card.kind) {
         case "answer", "question", "transcript":
             return ""
         default:
@@ -1456,7 +1489,8 @@ private final class FeedView: NSView {
     }
 
     private func isUserSide(_ card: RenderedCard) -> Bool {
-        card.kind == "question" || card.kind == "transcript"
+        let kind = normalizedCardKind(card.kind)
+        return kind == "question" || kind == "transcript"
     }
 
     private func bodyFont(for card: RenderedCard) -> NSFont {
@@ -1464,7 +1498,7 @@ private final class FeedView: NSView {
     }
 
     private func chatBody(for card: RenderedCard, rawBody: String) -> String {
-        guard card.kind == "answer" else { return rawBody }
+        guard normalizedCardKind(card.kind) == "answer" else { return rawBody }
 
         if let artifact = card.artifact {
             if artifact.artifactType == "code" {
@@ -1530,7 +1564,7 @@ private final class FeedView: NSView {
         if !card.done { return "streaming..." }
         if loginURL(from: card) != nil { return "login" }
         if let costLabel = card.costLabel, !costLabel.isEmpty { return costLabel }
-        switch card.kind {
+        switch normalizedCardKind(card.kind) {
         case "answer":   return ""
         case "question": return "sent"
         default:         return ""
@@ -1538,7 +1572,7 @@ private final class FeedView: NSView {
     }
 
     private func kindTitle(_ kind: String) -> String {
-        switch kind {
+        switch normalizedCardKind(kind) {
         case "answer":      return "Response"
         case "question":    return "Question"
         case "action_item": return "Action item"
@@ -1559,7 +1593,7 @@ private final class FeedView: NSView {
     }
 
     private func loginURL(from card: RenderedCard) -> URL? {
-        guard card.kind == "system" else { return nil }
+        guard normalizedCardKind(card.kind) == "system" else { return nil }
         for line in card.body.components(separatedBy: .newlines) {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             let candidate: String
@@ -2549,22 +2583,23 @@ private final class ExpandedPanelView: NSView {
         answerStyleLabel.font = NSFont.systemFont(ofSize: 10.5, weight: .bold)
         answerStyleLabel.textColor = BlueyTheme.textDim
         answerStyleLabel.alignment = .center
-        answerStyleLabel.stringValue = "Answer style"
-        answerStyleBox.placeholderString = "Concise, structured, implementation-first..."
+        answerStyleLabel.stringValue = "How Bluey should answer"
+        answerStyleBox.placeholderString = "Concise, natural, implementation-first..."
         answerStyleBox.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
         answerStyleBox.isBezeled = false
-        answerStyleBox.drawsBackground = false
+        answerStyleBox.drawsBackground = true
         answerStyleBox.focusRingType = .none
-        answerStyleBox.textColor = BlueyTheme.text
+        answerStyleBox.backgroundColor = NSColor.white.withAlphaComponent(0.92)
+        answerStyleBox.textColor = NSColor.black.withAlphaComponent(0.88)
         answerStyleBox.alignment = .center
         answerStyleBox.placeholderAttributedString = NSAttributedString(
-            string: "Concise, structured, implementation-first...",
-            attributes: [.foregroundColor: BlueyTheme.textDim.withAlphaComponent(0.78)])
+            string: "Concise, natural, implementation-first...",
+            attributes: [.foregroundColor: NSColor.black.withAlphaComponent(0.42)])
         answerStyleBox.wantsLayer = true
-        answerStyleBox.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.18).cgColor
+        answerStyleBox.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.92).cgColor
         answerStyleBox.layer?.cornerRadius = 10
         answerStyleBox.layer?.borderWidth = 1
-        answerStyleBox.layer?.borderColor = BlueyTheme.hairline.cgColor
+        answerStyleBox.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.24).cgColor
     }
 
     private func configureComposer() {
@@ -2660,7 +2695,7 @@ private final class ExpandedPanelView: NSView {
         instructionsButton.toolTip = "How Bluey should answer"
         attachButton.toolTip = "Attach files"
         analyzeButton.toolTip = "Analyse screen"
-        askButton.toolTip = "Send"
+        askButton.toolTip = "Answer"
         latestSessionButton.toolTip = "Continue the latest recording"
         answerStyleSaveButton.toolTip = "Save answer style for this session"
     }
@@ -2698,6 +2733,12 @@ private final class ExpandedPanelView: NSView {
         label.alignment = .center
         label.lineBreakMode = .byTruncatingMiddle
         label.maximumNumberOfLines = 1
+        if let cell = label.cell as? NSTextFieldCell {
+            cell.alignment = .center
+            cell.lineBreakMode = .byTruncatingMiddle
+            cell.usesSingleLineMode = true
+            cell.wraps = false
+        }
         label.setContentHuggingPriority(.defaultLow, for: .horizontal)
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.wantsLayer = true
@@ -3312,7 +3353,7 @@ private final class ExpandedPanelView: NSView {
 
     private func appendTranscriptSnippet(_ card: RenderedCard) {
         let title = card.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let body = card.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = displayTranscriptText(card.body)
         guard !body.isEmpty else { return }
 
         let label = title.isEmpty ? "Transcript" : title
@@ -3325,7 +3366,7 @@ private final class ExpandedPanelView: NSView {
     }
 
     func appendLiveTranscript(source: String, text: String, final: Bool) {
-        let body = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = displayTranscriptText(text)
         guard !body.isEmpty else { return }
         let cleanSource = source
             .replacingOccurrences(of: "_", with: " ")

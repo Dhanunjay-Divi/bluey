@@ -831,9 +831,9 @@ async fn cue_on(args: OnArgs) -> Result<()> {
                 BlueyOnAuthState::Ready => println!("Bluey is on."),
                 BlueyOnAuthState::SignInAvailable { url } => {
                     if signin_browser_opened {
-                        println!("Bluey is on. Opening {url} to finish sign-in.");
+                        println!("Bluey is on. Opening {url} so you can sign in.");
                     } else {
-                        println!("Bluey is on. Open {url} to finish sign-in.");
+                        println!("Bluey is on. Sign in from the Bluey window or open {url}.");
                     }
                 }
             }
@@ -901,14 +901,14 @@ fn bluey_on_boot_lines(auth_state: &BlueyOnAuthState) -> Vec<String> {
     match auth_state {
         BlueyOnAuthState::Ready => vec![
             "new recording ready".to_string(),
-            "use Listen, Docs, Screen, or Ask from the composer".to_string(),
+            "listen, attach docs, analyse screen, or ask from the composer".to_string(),
             "previous sessions live in the sidebar".to_string(),
-            "managed answers and balance tracking are ready".to_string(),
+            "answers stream into chat; canvas opens when useful".to_string(),
         ],
         BlueyOnAuthState::SignInAvailable { url } => vec![
-            "sign in to continue your cloud session".to_string(),
-            "managed answers, balance, sync, and RAG unlock after login".to_string(),
-            "the local overlay can stay ready while you finish setup".to_string(),
+            "sign in to continue".to_string(),
+            "cloud answers, balance, sync, and knowledge base unlock after login".to_string(),
+            "the pill stays ready while the browser opens".to_string(),
             format!("login_url: {url}"),
         ],
     }
@@ -2701,13 +2701,14 @@ mod tests {
             url: "https://bluey.sh/login".to_string(),
         });
         assert!(lines.iter().any(|line| line.contains("continue")));
-        assert!(lines.iter().any(|line| line.contains("cloud session")));
+        assert!(lines.iter().any(|line| line.contains("knowledge base")));
+        assert!(lines.iter().any(|line| line.contains("browser opens")));
     }
 
     #[test]
     fn bluey_on_boot_lines_confirm_managed_ready_when_linked() {
         let lines = bluey_on_boot_lines(&BlueyOnAuthState::Ready);
-        assert!(lines.iter().any(|line| line.contains("managed answers")));
+        assert!(lines.iter().any(|line| line.contains("answers stream")));
         assert!(!lines
             .iter()
             .any(|line| line.contains("separate login command")));

@@ -1127,7 +1127,7 @@ impl SimulatedPcmChunk {
         };
         SttSegmentMetadata::new(
             format!(
-                "[dev audio:{label}] simulated speech chunk {}",
+                "[dev audio:{label}] audio preview sample {}",
                 self.metadata.sequence
             ),
             self.metadata.time.start_ms,

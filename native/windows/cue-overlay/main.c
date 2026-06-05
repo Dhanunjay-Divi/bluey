@@ -576,7 +576,7 @@ static void layout_controls(void) {
     int input_y = bottom - 72;
     int chip_y = bottom - 30;
     int button_w = 72;
-    int send_w = 64;
+    int send_w = 78;
     int gap = 10;
 
     MoveWindow(g_record_button, composer_left + 12, input_y, button_w, row_h, TRUE);
@@ -611,7 +611,7 @@ static void create_controls(HWND hwnd) {
         WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
         0, 0, 100, 30, hwnd, (HMENU)ID_ASK_EDIT, GetModuleHandleW(NULL), NULL
     );
-    g_send_button = CreateWindowW(L"BUTTON", L"Send", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+    g_send_button = CreateWindowW(L"BUTTON", L"Answer", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
         0, 0, 60, 30, hwnd, (HMENU)ID_SEND_BUTTON, GetModuleHandleW(NULL), NULL);
     g_record_button = CreateWindowW(L"BUTTON", L"Mic", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
         0, 0, 60, 30, hwnd, (HMENU)ID_RECORD_BUTTON, GetModuleHandleW(NULL), NULL);
@@ -1184,7 +1184,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         }
         if (id == ID_HELP_BUTTON) {
             overlay_message_box(
-                L"Green dot: Bluey is connected.\nHelp: show this guide.\nSession: continue or start clean.\nAttach: add files or show attached docs.\nTheme: switch black/white background while keeping Bluey borders.\nStyle: answer rules.\nAnalyse Screen: search/read the active browser page or available screen context and generate an answer.\nRecap: summarize the active session from the bottom bar.\nQuit: stop Bluey completely. Hide/collapse behavior becomes a small Bluey button.\nMic: start/stop audio capture.\nMic dot: dim off, bright green recording.\nSend: ask Bluey.\nMiddle cards: readable but click-through.",
+                L"Green dot: Bluey is connected.\nHelp: show this guide.\nSession: continue or start clean.\nAttach: add files or show attached docs.\nTheme: switch black/white background while keeping Bluey borders.\nStyle: answer rules.\nAnalyse Screen: search/read the active browser page or available screen context and generate an answer.\nRecap: summarize the active session from the bottom bar.\nQuit: stop Bluey completely. Hide/collapse behavior becomes a small Bluey button.\nMic: start/stop audio capture.\nMic dot: dim off, bright green recording.\nAnswer: ask Bluey.\nMiddle cards: readable but click-through.",
                 L"Bluey controls",
                 MB_OK | MB_ICONINFORMATION
             );
