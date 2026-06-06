@@ -4743,49 +4743,131 @@
       box-shadow: 0 30px 90px rgba(0, 0, 0, .42), inset 0 1px 0 rgba(255, 255, 255, .035);
     }
 
-    .preview-pill {
-      min-height: 46px;
-      border-radius: 23px;
-      padding: 6px 8px;
+    .terminal-preview {
+      padding: 12px;
+      background:
+        radial-gradient(circle at 12% 0%, rgba(120, 239, 255, .16), transparent 28%),
+        linear-gradient(180deg, rgba(4, 10, 11, .92), rgba(1, 2, 3, .84));
     }
 
-    .preview-pill-left img {
-      width: 30px;
-      height: 30px;
-      border-radius: 9px;
-    }
-
-    .preview-pill-title,
-    .preview-balance {
-      font-size: 13px;
-    }
-
-    .preview-session {
-      margin-top: 10px;
+    .bluey-terminal {
+      min-height: 398px;
       border-radius: 24px;
+      overflow: hidden;
+      background:
+        radial-gradient(circle at 88% 8%, rgba(118, 255, 205, .08), transparent 28%),
+        linear-gradient(180deg, #080d0f 0%, #030506 100%);
+      border: 1px solid rgba(120, 239, 255, .18);
+      box-shadow:
+        0 30px 84px rgba(0, 0, 0, .46),
+        inset 0 1px 0 rgba(255, 255, 255, .05);
     }
 
-    .preview-chat {
-      min-height: 300px;
-      padding: 16px;
+    .bluey-terminal-bar {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      align-items: center;
       gap: 12px;
+      min-height: 52px;
+      padding: 0 15px;
+      border-bottom: 1px solid rgba(120, 239, 255, .10);
+      background: rgba(255, 255, 255, .028);
     }
 
-    .preview-msg,
-    .preview-canvas {
+    .bluey-terminal-dots {
+      display: inline-flex;
+      gap: 7px;
+      align-items: center;
+    }
+
+    .bluey-terminal-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      box-shadow: 0 0 16px currentColor;
+    }
+
+    .bluey-terminal-dot.red { color: #ff5f57; background: #ff5f57; }
+    .bluey-terminal-dot.yellow { color: #febc2e; background: #febc2e; }
+    .bluey-terminal-dot.green { color: #28c840; background: #28c840; }
+
+    .bluey-terminal-title,
+    .bluey-terminal-status {
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-size: 12px;
+      font-weight: 850;
+      letter-spacing: .02em;
+    }
+
+    .bluey-terminal-title {
+      color: #eaf8fb;
+    }
+
+    .bluey-terminal-status {
+      justify-self: end;
+      color: #79ffd1;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(121, 255, 209, .08);
+      border: 1px solid rgba(121, 255, 209, .18);
+    }
+
+    .bluey-terminal-code {
+      height: 346px;
+      overflow: hidden;
+      padding: 24px 26px 32px;
+      font-family: "SF Mono", Menlo, Consolas, monospace;
       font-size: 13px;
-      line-height: 1.38;
+      line-height: 1.78;
+      color: #a9bcc3;
+      text-wrap: pretty;
     }
 
-    .preview-composer {
-      min-height: 54px;
-      margin-top: 10px;
-      border-radius: 22px;
-      padding: 8px;
+    .bluey-terminal-code .prompt {
+      color: #5f7882;
     }
 
-    .preview-input {
-      font-size: 13px;
+    .bluey-terminal-code .cmd {
+      color: #f1fbff;
+      font-weight: 760;
+    }
+
+    .bluey-terminal-code .blue {
+      color: #65e8ff;
+      font-weight: 850;
+    }
+
+    .bluey-terminal-code .green {
+      color: #79ffd1;
+      font-weight: 850;
+    }
+
+    .bluey-terminal-code .dim {
+      color: #60757d;
+    }
+
+    .bluey-terminal-code .label {
+      color: #65e8ff;
+    }
+
+    .bluey-terminal-code .value {
+      color: #eef9fc;
+    }
+
+    .terminal-cursor {
+      display: inline-block;
+      width: 8px;
+      height: 16px;
+      margin-left: 3px;
+      vertical-align: -2px;
+      border-radius: 2px;
+      background: #65e8ff;
+      animation: bluey-terminal-blink 1s step-end infinite;
+    }
+
+    @keyframes bluey-terminal-blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0; }
     }
 
     .site-strip {
@@ -4965,8 +5047,14 @@
         display: block;
       }
 
-      .preview-session {
-        display: none;
+      .bluey-terminal {
+        min-height: 320px;
+      }
+
+      .bluey-terminal-code {
+        height: 268px;
+        padding: 20px;
+        font-size: 12px;
       }
 
       .site-strip {
@@ -5351,48 +5439,18 @@
         <div class="hero-note">Already installed? Run <code>bluey on</code>. If Bluey shows a link code, enter it here.</div>
       </div>
 
-      <aside class="product-preview" aria-label="Bluey product preview">
-        <div class="preview-pill">
-          <div class="preview-pill-left">
-            <img src="assets/bluey-logo.svg" alt="">
-            <span class="preview-pill-title">Bluey</span>
-            <span class="preview-live"></span>
-          </div>
-          <span class="preview-balance">Ready</span>
-        </div>
-
-        <div class="preview-session">
-          <div class="preview-session-head">
-            <strong>Current session</strong>
-            <span>Auto</span>
-          </div>
-          <div class="preview-chat">
-            <div class="preview-msg user">
-              <small>You</small>
-              How should I answer this clearly?
+      <aside class="product-preview terminal-preview" aria-label="Bluey terminal preview">
+        <div class="bluey-terminal">
+          <div class="bluey-terminal-bar">
+            <div class="bluey-terminal-dots" aria-hidden="true">
+              <span class="bluey-terminal-dot red"></span>
+              <span class="bluey-terminal-dot yellow"></span>
+              <span class="bluey-terminal-dot green"></span>
             </div>
-            <div class="preview-msg ai">
-              <small>Bluey</small>
-              Start with the direct answer, then add reasoning only where it helps.
-            </div>
-            <div class="preview-canvas">
-              <div class="preview-canvas-head">
-                <span>Canvas</span>
-                <span>system design</span>
-              </div>
-              <div class="preview-code" aria-hidden="true">
-                <span></span>
-                <span></span>
-                <span></span>
-              </div>
-            </div>
+            <span class="bluey-terminal-title">bluey — zsh</span>
+            <span class="bluey-terminal-status">ready</span>
           </div>
-        </div>
-
-        <div class="preview-composer">
-          <div class="preview-plus">+</div>
-          <div class="preview-input">Ask, attach docs, analyse screen...</div>
-          <div class="preview-send">↑</div>
+          <div class="bluey-terminal-code" id="blueyTerminal" aria-live="polite"></div>
         </div>
       </aside>
     </section>
@@ -5471,6 +5529,78 @@
     function clearAccountToken() {
       localStorage.removeItem('bluey_access_token');
       localStorage.removeItem('bluey_refresh_token');
+    }
+
+    function bootBlueyTerminal() {
+      const term = document.getElementById('blueyTerminal');
+      if (!term || term.dataset.booted === '1') return;
+      term.dataset.booted = '1';
+
+      const scenes = [
+        {
+          cmd: 'bluey on',
+          lines: [
+            { t: '', d: 180 },
+            { t: '<span class="blue">[bluey]</span> starting private command layer', d: 220 },
+            { t: '<span class="green">[ok]</span> overlay pill ready', d: 300 },
+            { t: '<span class="green">[ok]</span> new local session created', d: 300 },
+            { t: '<span class="dim">click the pill to ask, attach docs, or analyse screen</span>', d: 360 },
+          ],
+        },
+        {
+          cmd: 'bluey listen',
+          lines: [
+            { t: '', d: 160 },
+            { t: '<span class="label">system</span> <span class="value">source-labeled transcript</span>', d: 260 },
+            { t: '<span class="label">mic</span> <span class="value">source-labeled transcript</span>', d: 260 },
+            { t: '<span class="green">[ok]</span> auto-stop after silence to control cost', d: 300 },
+          ],
+        },
+        {
+          cmd: 'bluey ask "what is the plan?"',
+          lines: [
+            { t: '', d: 160 },
+            { t: '<span class="label">router</span> auto → quick draft, stronger final', d: 260 },
+            { t: '<span class="label">context</span> transcript + docs + screen', d: 260 },
+            { t: '<span class="green">[stream]</span> answer appears in the overlay', d: 320 },
+          ],
+        },
+      ];
+
+      const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+      const typeText = async (text, el) => {
+        for (let i = 0; i < text.length; i += 1) {
+          el.textContent += text[i];
+          await sleep(28 + Math.random() * 18);
+        }
+      };
+      const renderCommandLine = (cmd, cursor = false) => {
+        term.innerHTML = `<span class="prompt">$ </span><span class="cmd">${cmd}</span>${cursor ? '<span class="terminal-cursor"></span>' : ''}`;
+      };
+      const playScene = async (scene) => {
+        if (!term.isConnected) return;
+        term.innerHTML = '<span class="prompt">$ </span><span class="cmd" id="blueyTyping"></span><span class="terminal-cursor"></span>';
+        await sleep(280);
+        await typeText(scene.cmd, document.getElementById('blueyTyping'));
+        await sleep(260);
+        renderCommandLine(scene.cmd);
+        for (const line of scene.lines) {
+          await sleep(line.d);
+          term.innerHTML += `<br>${line.t}`;
+        }
+        await sleep(2100);
+        renderCommandLine(scene.cmd, true);
+        await sleep(350);
+      };
+
+      (async () => {
+        let index = 0;
+        while (term.isConnected) {
+          await playScene(scenes[index % scenes.length]);
+          index += 1;
+          await sleep(500);
+        }
+      })();
     }
 
     async function apiJson(path, options = {}) {
@@ -6013,6 +6143,7 @@
       }
     });
 
+    bootBlueyTerminal();
     initAccountApp();
   </script>
 </body>
