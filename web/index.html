@@ -5086,8 +5086,8 @@
           <img class="brand-wordmark" src="assets/bluey-wordmark.svg" alt="bluey">
         </a>
         <div class="rail-command">
-          <code>bluey on</code>
-          <span>Start Bluey from terminal. The account is here when cloud answers or reloads are needed.</span>
+          <code id="railCommandLabel">bluey on</code>
+          <span id="railCommandCopy">Start Bluey from terminal. Link this account only when cloud answers or reloads are needed.</span>
         </div>
         <div class="rail-list">
           <span>Account</span>
@@ -5496,11 +5496,27 @@
       if (el) el.textContent = text || '';
     }
 
+    function setRailCommand(authed, email = '') {
+      const label = document.getElementById('railCommandLabel');
+      const copy = document.getElementById('railCommandCopy');
+      if (!label || !copy) return;
+      if (authed) {
+        label.textContent = 'signed in';
+        copy.textContent = email
+          ? `${email} is linked for credits, sessions, and managed AI. Run bluey on to open the overlay.`
+          : 'Account ready for credits, sessions, and managed AI. Run bluey on to open the overlay.';
+      } else {
+        label.textContent = 'bluey on';
+        copy.textContent = 'Start Bluey from terminal. Link this account only when cloud answers or reloads are needed.';
+      }
+    }
+
     function setAccountChrome(authed) {
       const app = document.getElementById('accountApp');
       if (!app) return;
       app.classList.toggle('is-authed', Boolean(authed));
       app.classList.toggle('is-guest', !authed);
+      setRailCommand(authed);
 
       const title = app.querySelector('.account-hero h1');
       const copy = app.querySelector('.account-hero p');
@@ -5838,6 +5854,7 @@
         }),
       ]);
       document.getElementById('accountEmailLabel').textContent = me.email || 'Bluey account';
+      setRailCommand(true, me.email || '');
       document.getElementById('balanceValue').textContent = money(me.balance_cents);
       document.getElementById('balanceHint').textContent = me.trial_seconds_remaining > 0
         ? `${Math.round(me.trial_seconds_remaining / 60)} trial minutes remaining.`
