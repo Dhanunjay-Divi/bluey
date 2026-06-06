@@ -3,22 +3,22 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Bluey | Stay present, stay unseen</title>
-  <meta name="description" content="Bluey is a native AI answer layer for live work. Stay present, stay unseen: listen with consent, attach files, analyse screen context, and get routed answers from managed AI.">
+  <title>Bluey | AI chat where work happens</title>
+  <meta name="description" content="Bluey is a native AI chat layer for live work: meetings, code, docs, screen context, managed model routing, and answers without switching tabs.">
   <meta name="theme-color" content="#020405">
   <link rel="icon" type="image/svg+xml" href="assets/bluey-logo.svg">
   <link rel="icon" type="image/png" sizes="512x512" href="assets/favicon-512.png">
   <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
-  <meta property="og:title" content="Bluey | Stay present, stay unseen">
-  <meta property="og:description" content="A native AI answer layer for live work: audio, files, screen context, managed routing, and fast answers from one small overlay.">
+  <meta property="og:title" content="Bluey | AI chat where work happens">
+  <meta property="og:description" content="A native AI chat layer for live work: meetings, files, screen context, managed routing, and fast answers from one small overlay.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://bluey.sh/">
   <meta property="og:image" content="https://bluey.sh/assets/bluey-og.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Bluey | Stay present, stay unseen">
-  <meta name="twitter:description" content="A native AI answer layer for live work: audio, files, screen context, managed routing, and fast answers from one small overlay.">
+  <meta name="twitter:title" content="Bluey | AI chat where work happens">
+  <meta name="twitter:description" content="A native AI chat layer for live work: meetings, files, screen context, managed routing, and fast answers from one small overlay.">
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <style>
     * {
@@ -5070,6 +5070,526 @@
         font-size: clamp(44px, 13vw, 60px);
       }
     }
+
+    /* Bluey site refresh: a one-command entry point for the AI chat
+       product while preserving account/download/policy route contracts. */
+    #productSite.site {
+      display: block;
+      overflow: visible;
+      background:
+        radial-gradient(circle at 14% 8%, rgba(124, 255, 199, .13), transparent 26%),
+        radial-gradient(circle at 80% 10%, rgba(114, 240, 255, .18), transparent 32%),
+        linear-gradient(180deg, #020506 0%, #05090b 52%, #020304 100%);
+    }
+
+    #productSite.site::before {
+      opacity: .72;
+      background-image:
+        linear-gradient(rgba(114, 240, 255, .055) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(114, 240, 255, .04) 1px, transparent 1px);
+      background-size: 76px 76px;
+      mask-image: linear-gradient(to bottom, rgba(0, 0, 0, .72), transparent 76%);
+    }
+
+    #productSite .site-nav,
+    #productSite .hero,
+    #productSite .bluey-section,
+    #productSite .footer {
+      width: min(1160px, calc(100% - 44px));
+      margin-left: auto;
+      margin-right: auto;
+    }
+
+    #productSite .site-nav {
+      min-height: 72px;
+      padding: 18px 0 8px;
+    }
+
+    #productSite .navlinks a {
+      border: 1px solid transparent;
+    }
+
+    #productSite .navlinks a:hover {
+      border-color: rgba(114, 240, 255, .14);
+    }
+
+    #productSite .navlinks .nav-cta {
+      color: #021114;
+      background: linear-gradient(135deg, #bff8ff, #72f0ff 55%, #7cffc7);
+      box-shadow: 0 18px 48px rgba(114, 240, 255, .18);
+    }
+
+    #productSite .hero {
+      min-height: auto;
+      grid-template-columns: minmax(0, .9fr) minmax(390px, .72fr);
+      gap: clamp(34px, 6vw, 82px);
+      padding: clamp(52px, 9vh, 96px) 0 56px;
+    }
+
+    #productSite .hero-copy {
+      max-width: 650px;
+    }
+
+    #productSite .launch-pill {
+      border-color: rgba(124, 255, 199, .22);
+      background: rgba(124, 255, 199, .065);
+    }
+
+    #productSite .hero-copy h1 {
+      max-width: 690px;
+      font-size: clamp(72px, 10vw, 142px);
+      line-height: .8;
+      letter-spacing: -.045em;
+    }
+
+    #productSite .hero-line {
+      max-width: 680px;
+      color: #87f7ff;
+      font-size: clamp(32px, 4.7vw, 62px);
+      letter-spacing: -.035em;
+    }
+
+    #productSite .hero-copy p {
+      max-width: 620px;
+      color: #bad0d8;
+      font-size: clamp(17px, 1.35vw, 20px);
+    }
+
+    #productSite .hero-proof {
+      color: #edfaff !important;
+      font-size: 14px !important;
+    }
+
+    #productSite .hero-actions {
+      align-items: center;
+      margin-top: 28px;
+    }
+
+    #productSite .button.primary {
+      background: linear-gradient(135deg, #dffaff, #72f0ff 48%, #82ffd0);
+    }
+
+    #productSite .quick-join {
+      background: rgba(255, 255, 255, .035);
+      border: 1px solid rgba(114, 240, 255, .10);
+      padding: 6px;
+    }
+
+    .bluey-proof-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+      margin-top: 16px;
+    }
+
+    .bluey-proof-row span {
+      display: inline-flex;
+      align-items: center;
+      min-height: 30px;
+      border: 1px solid rgba(114, 240, 255, .13);
+      border-radius: 999px;
+      color: #a8c0c8;
+      background: rgba(255, 255, 255, .035);
+      padding: 0 11px;
+      font-size: 12px;
+      font-weight: 830;
+    }
+
+    .bluey-chat-preview {
+      position: relative;
+      display: grid;
+      gap: 14px;
+      padding: 14px;
+      border-radius: 30px;
+      border: 1px solid rgba(114, 240, 255, .16);
+      background:
+        radial-gradient(circle at 16% 0%, rgba(124, 255, 199, .12), transparent 30%),
+        linear-gradient(180deg, rgba(8, 16, 19, .94), rgba(2, 5, 7, .96));
+      box-shadow: 0 34px 100px rgba(0, 0, 0, .46), inset 0 1px 0 rgba(255, 255, 255, .05);
+    }
+
+    .bluey-chat-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 50px;
+      border: 1px solid rgba(114, 240, 255, .13);
+      border-radius: 999px;
+      background: rgba(0, 0, 0, .28);
+      padding: 6px 8px 6px 6px;
+    }
+
+    .bluey-chat-brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+      color: #f2fbff;
+      font-weight: 920;
+    }
+
+    .bluey-chat-brand img {
+      width: 36px;
+      height: 36px;
+      border-radius: 12px;
+    }
+
+    .bluey-live-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 32px;
+      border-radius: 999px;
+      color: #7dffd3;
+      background: rgba(125, 255, 211, .08);
+      border: 1px solid rgba(125, 255, 211, .18);
+      padding: 0 11px;
+      font-size: 12px;
+      font-weight: 880;
+      white-space: nowrap;
+    }
+
+    .bluey-live-chip::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: #7dffd3;
+      box-shadow: 0 0 16px rgba(125, 255, 211, .8);
+    }
+
+    .bluey-chat-window {
+      display: grid;
+      gap: 12px;
+      min-height: 430px;
+      border-radius: 25px;
+      border: 1px solid rgba(255, 255, 255, .07);
+      background:
+        linear-gradient(rgba(114, 240, 255, .035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(114, 240, 255, .026) 1px, transparent 1px),
+        rgba(3, 7, 9, .88);
+      background-size: 44px 44px;
+      padding: 18px;
+      overflow: hidden;
+    }
+
+    .bluey-message {
+      width: min(390px, 86%);
+      border-radius: 20px;
+      padding: 14px 15px;
+      border: 1px solid rgba(114, 240, 255, .12);
+      background: rgba(255, 255, 255, .045);
+      box-shadow: 0 18px 54px rgba(0, 0, 0, .20);
+    }
+
+    .bluey-message.user {
+      justify-self: end;
+      color: #061014;
+      background: #eefbff;
+      border-color: rgba(255, 255, 255, .72);
+    }
+
+    .bluey-message small {
+      display: block;
+      margin-bottom: 6px;
+      color: #70efff;
+      font: 900 10px ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    .bluey-message.user small {
+      color: #52656d;
+    }
+
+    .bluey-message p {
+      margin: 0;
+      color: inherit;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    .bluey-code-card {
+      width: min(360px, 88%);
+      border-radius: 20px;
+      border: 1px solid rgba(114, 240, 255, .15);
+      background: rgba(0, 0, 0, .34);
+      overflow: hidden;
+    }
+
+    .bluey-code-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      min-height: 38px;
+      border-bottom: 1px solid rgba(114, 240, 255, .10);
+      color: #dffaff;
+      padding: 0 13px;
+      font-size: 12px;
+      font-weight: 850;
+    }
+
+    .bluey-code-lines {
+      display: grid;
+      gap: 9px;
+      padding: 14px;
+    }
+
+    .bluey-code-lines span {
+      height: 9px;
+      border-radius: 999px;
+      background: linear-gradient(90deg, rgba(114, 240, 255, .82), rgba(124, 255, 199, .18));
+    }
+
+    .bluey-code-lines span:nth-child(2) { width: 76%; }
+    .bluey-code-lines span:nth-child(3) { width: 88%; }
+    .bluey-code-lines span:nth-child(4) { width: 58%; }
+
+    .bluey-composer-preview {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      border: 1px solid rgba(114, 240, 255, .15);
+      border-radius: 24px;
+      background: rgba(0, 0, 0, .30);
+      padding: 10px;
+    }
+
+    .bluey-composer-preview span {
+      color: #91aab2;
+      font-weight: 740;
+      font-size: 13px;
+    }
+
+    .bluey-icon-button {
+      width: 40px;
+      height: 40px;
+      display: grid;
+      place-items: center;
+      border-radius: 15px;
+      color: #dffaff;
+      border: 1px solid rgba(255, 255, 255, .08);
+      background: rgba(255, 255, 255, .05);
+      font-weight: 920;
+    }
+
+    .bluey-icon-button.send {
+      color: #061014;
+      background: linear-gradient(135deg, #dffaff, #82ffd0);
+    }
+
+    .bluey-section {
+      position: relative;
+      z-index: 1;
+      padding: 72px 0;
+      border-top: 1px solid rgba(114, 240, 255, .09);
+    }
+
+    .bluey-section-head {
+      max-width: 780px;
+      margin-bottom: 24px;
+    }
+
+    .bluey-kicker {
+      color: #72f0ff;
+      font: 900 12px ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+
+    .bluey-section h2 {
+      margin: 10px 0 0;
+      color: #f2fbff;
+      font-size: clamp(34px, 5vw, 64px);
+      line-height: .98;
+      letter-spacing: -.035em;
+    }
+
+    .bluey-section-head p {
+      margin: 14px 0 0;
+      color: #a9bec6;
+      font-size: 17px;
+      line-height: 1.55;
+    }
+
+    .bluey-card-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .bluey-card,
+    .bluey-price-card {
+      border: 1px solid rgba(114, 240, 255, .13);
+      border-radius: 24px;
+      background: rgba(255, 255, 255, .035);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .035);
+      padding: 22px;
+    }
+
+    .bluey-card b,
+    .bluey-price-card b {
+      display: block;
+      color: #effaff;
+      font-size: 19px;
+      line-height: 1.16;
+      margin-bottom: 10px;
+    }
+
+    .bluey-card p,
+    .bluey-price-card p,
+    .bluey-price-card li {
+      color: #a9bec6;
+      line-height: 1.55;
+      font-size: 14px;
+    }
+
+    .bluey-card p,
+    .bluey-price-card p {
+      margin: 0;
+    }
+
+    .bluey-card-mark {
+      width: 42px;
+      height: 42px;
+      display: grid;
+      place-items: center;
+      margin-bottom: 18px;
+      border-radius: 15px;
+      color: #061014;
+      background: linear-gradient(135deg, #72f0ff, #82ffd0);
+      font-weight: 950;
+    }
+
+    .bluey-price-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .bluey-price-card.featured {
+      border-color: rgba(124, 255, 199, .30);
+      background:
+        radial-gradient(circle at 80% 0%, rgba(124, 255, 199, .12), transparent 32%),
+        rgba(255, 255, 255, .045);
+    }
+
+    .bluey-price {
+      margin: 16px 0;
+      color: #72f0ff;
+      font-size: 38px;
+      line-height: 1;
+      font-weight: 950;
+    }
+
+    .bluey-price small {
+      color: #7e969f;
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .bluey-price-card ul {
+      display: grid;
+      gap: 9px;
+      margin: 16px 0 0;
+      padding-left: 18px;
+    }
+
+    .bluey-final-cta {
+      display: grid;
+      gap: 18px;
+      justify-items: center;
+      text-align: center;
+      padding: 86px 0 78px;
+    }
+
+    .bluey-final-cta h2 {
+      max-width: 800px;
+      margin: 0;
+      color: #f2fbff;
+      font-size: clamp(44px, 7vw, 86px);
+      line-height: .9;
+      letter-spacing: -.045em;
+    }
+
+    .bluey-final-cta p {
+      max-width: 620px;
+      margin: 0;
+      color: #adc2ca;
+      font-size: 17px;
+      line-height: 1.55;
+    }
+
+    #productSite .footer {
+      width: 100%;
+      padding: 24px 22px 32px;
+      background: rgba(0, 0, 0, .20);
+    }
+
+    @media (max-width: 980px) {
+      #productSite .hero,
+      .bluey-card-grid,
+      .bluey-price-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .bluey-chat-preview {
+        max-width: 620px;
+      }
+    }
+
+    @media (max-width: 680px) {
+      #productSite .site-nav,
+      #productSite .hero,
+      #productSite .bluey-section {
+        width: calc(100% - 28px);
+      }
+
+      #productSite .site-nav {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      #productSite .navlinks {
+        width: 100%;
+      }
+
+      #productSite .navlinks a {
+        flex: 1 1 auto;
+      }
+
+      #productSite .hero {
+        padding-top: 34px;
+      }
+
+      #productSite .hero-copy h1 {
+        font-size: clamp(62px, 19vw, 90px);
+      }
+
+      #productSite .hero-line {
+        font-size: clamp(30px, 10vw, 44px);
+      }
+
+      .bluey-proof-row {
+        display: none;
+      }
+
+      .bluey-chat-window {
+        min-height: 360px;
+        padding: 12px;
+      }
+
+      .bluey-message,
+      .bluey-code-card {
+        width: 100%;
+      }
+
+      .bluey-section {
+        padding: 52px 0;
+      }
+    }
   </style>
 </head>
 <body>
@@ -5412,6 +5932,8 @@
         <img class="brand-wordmark" src="assets/bluey-wordmark.svg" alt="bluey">
       </a>
       <div class="navlinks">
+        <a href="#how">How it works</a>
+        <a href="#pricing">Pricing</a>
         <a href="/login">Try Bluey</a>
         <a class="nav-cta" href="/download">Install</a>
       </div>
@@ -5422,72 +5944,194 @@
         <div class="launch-pill">
           <img src="assets/bluey-logo.svg" alt="">
           <code>bluey on</code>
-          <span>open the desktop overlay</span>
+          <span>AI chat that follows your live work</span>
         </div>
         <h1>Bluey</h1>
-        <div class="hero-line">Stay present, stay unseen.</div>
-        <p>A small desktop AI layer for live work. Listen, attach context, analyse the screen, and get answers without leaving the app you are already using.</p>
-        <p class="hero-proof">Run <code>bluey on</code>. Click the pill. Ask.</p>
+        <div class="hero-line">Ask without switching context.</div>
+        <p>Bluey is a native AI chat layer for meetings, research, code, docs, and screen work. It listens with consent, reads the context you attach, routes to the right model, and streams answers inside one tiny desktop pill.</p>
+        <p class="hero-proof">Run <code>bluey on</code>. Keep working. Ask when you need the answer.</p>
         <div class="hero-actions">
-          <a class="button primary" href="/download">Install Bluey</a>
-          <a class="button" href="/login">Try Bluey</a>
+          <a class="button primary" href="/download">Download Bluey</a>
+          <a class="button" href="/login">Create account</a>
         </div>
         <form class="quick-join" action="/login" method="get">
           <input name="user_code" type="text" placeholder="Desktop link code" autocomplete="one-time-code" spellcheck="false">
           <button type="submit">Link</button>
         </form>
         <div class="hero-note">Already installed? Run <code>bluey on</code>. If Bluey shows a link code, enter it here.</div>
+        <div class="bluey-proof-row" aria-label="Bluey capabilities">
+          <span>Native overlay</span>
+          <span>Model routing</span>
+          <span>Screen + file context</span>
+          <span>Credit-based cloud AI</span>
+        </div>
       </div>
 
-      <aside class="product-preview terminal-preview" aria-label="Bluey terminal preview">
-        <div class="bluey-terminal">
-          <div class="bluey-terminal-bar">
-            <div class="bluey-terminal-dots" aria-hidden="true">
-              <span class="bluey-terminal-dot red"></span>
-              <span class="bluey-terminal-dot yellow"></span>
-              <span class="bluey-terminal-dot green"></span>
-            </div>
-            <span class="bluey-terminal-title">bluey — zsh</span>
-            <span class="bluey-terminal-status">ready</span>
+      <aside class="bluey-chat-preview" aria-label="Bluey AI chat preview">
+        <div class="bluey-chat-top">
+          <div class="bluey-chat-brand">
+            <img src="assets/bluey-logo.svg" alt="">
+            <span>Bluey session</span>
           </div>
-          <div class="bluey-terminal-code" id="blueyTerminal" aria-live="polite"></div>
+          <span class="bluey-live-chip">listening</span>
+        </div>
+        <div class="bluey-chat-window">
+          <article class="bluey-message user">
+            <small>You</small>
+            <p>Summarize this call and draft the decision note before I tab away.</p>
+          </article>
+          <article class="bluey-message">
+            <small>Bluey</small>
+            <p><strong>Decision:</strong> ship the thinner onboarding flow first. Open risk is billing copy; I can turn this into a PRD or Slack update.</p>
+          </article>
+          <article class="bluey-code-card">
+            <div class="bluey-code-head">
+              <span>context pack</span>
+              <span>screen + docs</span>
+            </div>
+            <div class="bluey-code-lines" aria-hidden="true">
+              <span></span>
+              <span></span>
+              <span></span>
+              <span></span>
+            </div>
+          </article>
+          <div class="bluey-composer-preview">
+            <div class="bluey-icon-button">+</div>
+            <span>Ask about the current screen, transcript, or attached files...</span>
+            <div class="bluey-icon-button send">Go</div>
+          </div>
         </div>
       </aside>
     </section>
 
-    <section class="site-strip" aria-label="Bluey highlights">
-      <a class="site-card" href="/download"><div><span>Install</span><small>Run <code>bluey on</code> and the pill appears.</small></div></a>
-      <a class="site-card" href="/login"><div><span>Try</span><small>Sign in only when cloud answers or credits are needed.</small></div></a>
-      <a class="site-card" href="/docs/privacy"><div><span>Control</span><small>Attach files, screen, and transcripts only by choice.</small></div></a>
+    <section class="bluey-section" id="how" aria-label="How Bluey works">
+      <div class="bluey-section-head">
+        <span class="bluey-kicker">How it works</span>
+        <h2>One-command simplicity, built for AI chat.</h2>
+        <p>A tiny command starts the desktop layer. From there, Bluey keeps conversation, transcript, files, page text, screenshots, and model routing in one session so answers arrive where you are working.</p>
+      </div>
+      <div class="bluey-card-grid">
+        <article class="bluey-card">
+          <span class="bluey-card-mark">01</span>
+          <b>Open the pill</b>
+          <p>Run <code>bluey on</code>. The overlay stays compact until you need it, then expands into a focused chat composer.</p>
+        </article>
+        <article class="bluey-card">
+          <span class="bluey-card-mark">02</span>
+          <b>Add live context</b>
+          <p>Use transcript, visible screen, browser page text, attached files, or explicit rules. Bluey labels sources so you know what it used.</p>
+        </article>
+        <article class="bluey-card">
+          <span class="bluey-card-mark">03</span>
+          <b>Route the answer</b>
+          <p>Fast questions stay cheap. Code, vision, long context, and deep reasoning route to stronger lanes when they actually help.</p>
+        </article>
+      </div>
     </section>
 
-    <section class="flow-band" aria-label="How Bluey works">
-      <div class="flow-copy">
-        <span class="section-kicker">From install to answer</span>
-        <h2>One small pill, one focused session.</h2>
+    <section class="bluey-section" aria-label="Bluey use cases">
+      <div class="bluey-section-head">
+        <span class="bluey-kicker">Use cases</span>
+        <h2>Meetings, code, research, and operations in one answer layer.</h2>
+        <p>Bluey is not a generic chatbot tab. It is designed for the moments when the useful context is already on your machine.</p>
       </div>
-      <div class="flow-grid">
-        <article>
-          <span>01</span>
-          <h3>Open</h3>
-          <p>Start from terminal. Bluey opens a compact pill and creates a fresh local recording.</p>
+      <div class="bluey-card-grid">
+        <article class="bluey-card">
+          <span class="bluey-card-mark">M</span>
+          <b>Meeting copilot</b>
+          <p>Turn live transcript into decisions, objections, follow-ups, and clean recaps without leaving the call.</p>
         </article>
-        <article>
-          <span>02</span>
-          <h3>Add context</h3>
-          <p>Listen, attach docs, or analyse the visible screen. Context becomes searchable session memory.</p>
+        <article class="bluey-card">
+          <span class="bluey-card-mark">C</span>
+          <b>Code and docs</b>
+          <p>Attach files, ask about visible errors, draft fixes, and keep the answer beside the editor instead of another browser tab.</p>
         </article>
-        <article>
-          <span>03</span>
-          <h3>Answer</h3>
-          <p>Auto routing chooses quick, deep, code, or vision lanes and shows cost before the session gets noisy.</p>
+        <article class="bluey-card">
+          <span class="bluey-card-mark">O</span>
+          <b>Ops memory</b>
+          <p>Preserve session notes, account credits, model usage, and cloud RAG context for later follow-up.</p>
         </article>
+      </div>
+    </section>
+
+    <section class="bluey-section" id="pricing" aria-label="Bluey pricing">
+      <div class="bluey-section-head">
+        <span class="bluey-kicker">Pricing model</span>
+        <h2>Credit based, not mystery metering.</h2>
+        <p>Bluey is a managed AI product. Credits cover cloud models, STT, vision, embeddings, and RAG work. Start small and reload when the value is obvious.</p>
+      </div>
+      <div class="bluey-price-grid">
+        <article class="bluey-price-card">
+          <b>Starter reload</b>
+          <div class="bluey-price">$10 <small>credits</small></div>
+          <p>For testing the desktop flow, meetings, and lightweight chat sessions.</p>
+          <ul>
+            <li>Managed AI routing</li>
+            <li>Desktop link flow</li>
+            <li>Session history basics</li>
+          </ul>
+        </article>
+        <article class="bluey-price-card featured">
+          <b>Pro reload</b>
+          <div class="bluey-price">$30 <small>credits</small></div>
+          <p>The practical default for regular live work, code help, and screen/context analysis.</p>
+          <ul>
+            <li>Higher cloud usage headroom</li>
+            <li>Longer session context</li>
+            <li>Priority model lanes where available</li>
+          </ul>
+        </article>
+        <article class="bluey-price-card">
+          <b>Team path</b>
+          <div class="bluey-price">Custom</div>
+          <p>Workspace controls, shared memory, admin views, and production support once the team surface is ready.</p>
+          <ul>
+            <li>Workspace billing</li>
+            <li>Usage controls</li>
+            <li>Security review support</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section class="bluey-section" aria-label="Bluey safety and control">
+      <div class="bluey-section-head">
+        <span class="bluey-kicker">Control</span>
+        <h2>User-approved context only.</h2>
+        <p>Bluey should feel useful without being creepy: explicit attach flows, visible recording state, source labels, account controls, and clear privacy docs.</p>
+      </div>
+      <div class="bluey-card-grid">
+        <article class="bluey-card">
+          <span class="bluey-card-mark">OK</span>
+          <b>Visible state</b>
+          <p>The pill shows when the session is active. The feed labels mic/system transcript, page text, documents, and screen context.</p>
+        </article>
+        <article class="bluey-card">
+          <span class="bluey-card-mark">R</span>
+          <b>Exportable sessions</b>
+          <p>Session memory is designed to support account history, deletion, and reload controls instead of hidden one-off chats.</p>
+        </article>
+        <article class="bluey-card">
+          <span class="bluey-card-mark">$</span>
+          <b>Spend aware</b>
+          <p>Managed model work uses credit accounting so routing decisions stay visible and scalable.</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="bluey-final-cta" aria-label="Install Bluey">
+      <h2>Open Bluey where the work is already happening.</h2>
+      <p>Install the native app, run <code>bluey on</code>, link your account, and ask from the current screen, transcript, docs, or session memory.</p>
+      <div class="hero-actions">
+        <a class="button primary" href="/download">Install Bluey</a>
+        <a class="button" href="/login">Link account</a>
       </div>
     </section>
 
     <footer class="footer">
       <div class="footer-inner">
-        <span>Bluey. Stay present, stay unseen.</span>
+        <span>Bluey. Native AI chat for live work.</span>
         <span><a href="/docs/privacy">Privacy</a> · <a href="/docs/terms">Terms</a> · <a href="/docs/disguise">Controls</a></span>
       </div>
     </footer>
