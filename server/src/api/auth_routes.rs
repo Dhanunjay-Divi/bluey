@@ -355,39 +355,13 @@ pub async fn signup_confirm(
 }
 
 pub async fn signup(
-    State(state): State<AppState>,
-    Json(req): Json<SignupRequest>,
+    State(_state): State<AppState>,
+    Json(_req): Json<SignupRequest>,
 ) -> Result<Json<AuthResponse>, (StatusCode, Json<ApiError>)> {
-    let email = normalize_signup_email(&req.email)?;
-
-    // Reject duplicate email up-front (DB UNIQUE catches it too, but the
-    // user-facing error is friendlier).
-    if Account::fetch_by_email(&state.pool, &email)
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?
-        .is_some()
-    {
-        return Err(err(StatusCode::CONFLICT, "email already registered"));
-    }
-
-    let password_hash = auth::password::hash_password(&req.password)
-        .map_err(|e| err(StatusCode::BAD_REQUEST, &e.to_string()))?;
-
-    let is_admin = state.config.is_admin_email(&email);
-    let account = Account::create_with_admin(&state.pool, &email, &password_hash, is_admin)
-        .map_err(|e| {
-            // Codex Stage 10 round-2 typed-error nit: downcast to the typed
-            // AccountCreateError::DuplicateEmail variant instead of
-            // string-matching the error message. Race-free 409 mapping.
-            if matches!(
-                e.downcast_ref::<crate::db::accounts::AccountCreateError>(),
-                Some(crate::db::accounts::AccountCreateError::DuplicateEmail)
-            ) {
-                return err(StatusCode::CONFLICT, "email already registered");
-            }
-            err(StatusCode::INTERNAL_SERVER_ERROR, &format!("create: {e}"))
-        })?;
-
-    Ok(Json(auth_response(&state, &account)?))
+    Err(err(
+        StatusCode::GONE,
+        "use /auth/signup/start and /auth/signup/confirm",
+    ))
 }
 
 pub async fn login(

@@ -135,23 +135,11 @@ fn sample_usage(request_id: &str, bluey_cost_cents: i64) -> UsageEvent {
 }
 
 async fn signup_and_login(harness: &Harness, email: &str, password: &str) -> String {
-    let req = Request::post("/auth/signup")
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({
-                "email": email,
-                "password": password
-            }))
-            .unwrap(),
-        ))
-        .unwrap();
-    let resp = harness.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), 200, "signup failed");
-    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
-        .await
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    v["access_token"].as_str().unwrap().to_string()
+    let normalized_email = email.trim().to_lowercase();
+    let password_hash = auth::password::hash_password(password).unwrap();
+    Account::create(&harness.pool, &normalized_email, &password_hash).unwrap();
+    let auth = login(harness, &normalized_email, password).await;
+    auth["access_token"].as_str().unwrap().to_string()
 }
 
 async fn login(harness: &Harness, email: &str, password: &str) -> serde_json::Value {
@@ -197,20 +185,14 @@ fn extract_six_digit_code(text: &str) -> Option<String> {
     None
 }
 
-#[tokio::test]
-#[serial]
-async fn signup_otp_email_confirms_and_marks_email_verified() {
-    let h = boot_harness().await;
-
+async fn signup_with_otp(harness: &Harness, email: &str, password: &str) -> serde_json::Value {
     Mock::given(method("POST"))
         .and(path("/emails"))
         .and(header("Authorization", "Bearer test-resend-key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"email-otp"})))
-        .mount(&h.mail)
+        .mount(&harness.mail)
         .await;
 
-    let email = "otp-smoke@bluey.sh";
-    let password = "longenoughpw";
     let start = Request::post("/auth/signup/start")
         .header("content-type", "application/json")
         .body(Body::from(
@@ -221,13 +203,16 @@ async fn signup_otp_email_confirms_and_marks_email_verified() {
             .unwrap(),
         ))
         .unwrap();
-    let resp = h.router.clone().oneshot(start).await.unwrap();
+    let resp = harness.router.clone().oneshot(start).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    let requests = h.mail.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 1);
-    let mail_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-    assert_eq!(mail_body["to"][0], email);
+    let requests = harness.mail.received_requests().await.unwrap();
+    let mail_body: serde_json::Value =
+        serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+    assert_eq!(
+        mail_body["to"][0].as_str().unwrap(),
+        email.trim().to_lowercase()
+    );
     assert_eq!(mail_body["subject"], "Your Bluey verification code");
     let code = extract_six_digit_code(mail_body["text"].as_str().unwrap()).unwrap();
 
@@ -241,12 +226,22 @@ async fn signup_otp_email_confirms_and_marks_email_verified() {
             .unwrap(),
         ))
         .unwrap();
-    let resp = h.router.clone().oneshot(confirm).await.unwrap();
+    let resp = harness.router.clone().oneshot(confirm).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
         .await
         .unwrap();
-    let auth: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    serde_json::from_slice(&body).unwrap()
+}
+
+#[tokio::test]
+#[serial]
+async fn signup_otp_email_confirms_and_marks_email_verified() {
+    let h = boot_harness().await;
+
+    let email = "otp-smoke@bluey.sh";
+    let password = "longenoughpw";
+    let auth = signup_with_otp(&h, email, password).await;
     assert_eq!(auth["account"]["email"], email);
     assert!(auth["access_token"].as_str().unwrap().len() > 20);
 
@@ -270,8 +265,9 @@ async fn configured_admin_email_signup_gets_admin_access() {
     )
     .await;
 
-    let access = signup_and_login(&h, " Owner@Bluey.SH ", "longenoughpw").await;
-    assert_admin_customers_allowed(&h, &access).await;
+    let auth = signup_with_otp(&h, " Owner@Bluey.SH ", "longenoughpw").await;
+    let access = auth["access_token"].as_str().unwrap();
+    assert_admin_customers_allowed(&h, access).await;
 
     let req = Request::get("/account/me")
         .header("authorization", format!("Bearer {access}"))
@@ -285,6 +281,25 @@ async fn configured_admin_email_signup_gets_admin_access() {
     let me: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(me["email"], "owner@bluey.sh");
     assert_eq!(me["is_admin"], true);
+}
+
+#[tokio::test]
+#[serial]
+async fn legacy_signup_endpoint_is_retired() {
+    let h = boot_harness().await;
+
+    let req = Request::post("/auth/signup")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "email": "legacy-signup@bluey.sh",
+                "password": "longenoughpw"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::GONE);
 }
 
 #[tokio::test]
