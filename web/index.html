@@ -2782,9 +2782,14 @@
                 Password
                 <input id="accountPassword" type="password" autocomplete="current-password" placeholder="Password" required>
               </label>
+              <label id="signupOtpLabel" hidden>
+                Verification code
+                <input id="signupOtp" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" placeholder="6-digit code">
+              </label>
               <div class="account-actions-row">
                 <button class="account-button primary" type="submit">Sign in</button>
                 <button class="account-button" id="createAccountButton" type="button">Create account</button>
+                <button class="account-button primary" id="confirmSignupButton" type="button" hidden>Verify code</button>
               </div>
             </form>
             <div class="account-message" id="accountAuthMessage"></div>
@@ -3065,6 +3070,7 @@
     const isAccountRoute = accountRoutes.has(currentPath);
     const isPolicyRoute = policyRoutes.has(currentPath);
     const isDownloadRoute = downloadRoutes.has(currentPath);
+    let pendingSignupEmail = '';
 
     function money(cents) {
       return `$${(Number(cents || 0) / 100).toFixed(2)}`;
@@ -3111,6 +3117,19 @@
     function accountMessage(text, auth = false) {
       const el = document.getElementById(auth ? 'accountAuthMessage' : 'accountMessage');
       if (el) el.textContent = text || '';
+    }
+
+    function setSignupOtpMode(enabled, email = '') {
+      const label = document.getElementById('signupOtpLabel');
+      const otp = document.getElementById('signupOtp');
+      const confirm = document.getElementById('confirmSignupButton');
+      const create = document.getElementById('createAccountButton');
+      if (!label || !otp || !confirm || !create) return;
+      pendingSignupEmail = enabled ? email : '';
+      label.hidden = !enabled;
+      confirm.hidden = !enabled;
+      create.textContent = enabled ? 'Resend code' : 'Create account';
+      if (!enabled) otp.value = '';
     }
 
     function recoveryMessage(text) {
@@ -3180,6 +3199,41 @@
         body: JSON.stringify({ email, password }),
       });
       setAccountToken(auth);
+      accountMessage('', true);
+      await loadAccount();
+    }
+
+    async function startSignupOtp() {
+      const email = document.getElementById('accountEmail').value.trim();
+      const password = document.getElementById('accountPassword').value;
+      if (!email || !password) {
+        accountMessage('Email and password are required.', true);
+        return;
+      }
+      accountMessage('Sending verification code...', true);
+      const result = await apiJson('/auth/signup/start', {
+        method: 'POST',
+        body: JSON.stringify({ email, password }),
+      });
+      setSignupOtpMode(true, result.email || email);
+      accountMessage(`Code sent to ${result.email || email}. Enter it below to finish creating the account.`, true);
+      document.getElementById('signupOtp')?.focus();
+    }
+
+    async function confirmSignupOtp() {
+      const email = (pendingSignupEmail || document.getElementById('accountEmail').value).trim();
+      const otp = document.getElementById('signupOtp').value.trim();
+      if (!email || !otp) {
+        accountMessage('Enter the 6-digit verification code.', true);
+        return;
+      }
+      accountMessage('Verifying code...', true);
+      const auth = await apiJson('/auth/signup/confirm', {
+        method: 'POST',
+        body: JSON.stringify({ email, otp }),
+      });
+      setAccountToken(auth);
+      setSignupOtpMode(false);
       accountMessage('', true);
       await loadAccount();
     }
@@ -3452,7 +3506,10 @@
         accountAuth('login').catch((error) => accountMessage(error.message, true));
       });
       document.getElementById('createAccountButton').addEventListener('click', () => {
-        accountAuth('signup').catch((error) => accountMessage(error.message, true));
+        startSignupOtp().catch((error) => accountMessage(error.message, true));
+      });
+      document.getElementById('confirmSignupButton').addEventListener('click', () => {
+        confirmSignupOtp().catch((error) => accountMessage(error.message, true));
       });
       document.getElementById('reloadButton').addEventListener('click', () => {
         startReload();

@@ -33,6 +33,23 @@ pub async fn send_email_verification(
     .await
 }
 
+pub async fn send_signup_otp(
+    config: &Config,
+    to: &str,
+    code: &str,
+    expires_in_minutes: i64,
+) -> anyhow::Result<MailDelivery> {
+    send_transactional(
+        config,
+        to,
+        "Your Bluey verification code",
+        &format!(
+            "Welcome to Bluey.\n\nYour verification code is:\n\n{code}\n\nThis code expires in {expires_in_minutes} minutes. If you did not request this, you can ignore this email."
+        ),
+    )
+    .await
+}
+
 pub async fn send_password_reset(
     config: &Config,
     to: &str,
@@ -184,6 +201,14 @@ mod tests {
             send_password_reset(&test_config(), "user@example.com", "http://localhost/reset")
                 .await
                 .unwrap();
+        assert_eq!(result, MailDelivery::NotConfigured);
+    }
+
+    #[tokio::test]
+    async fn signup_otp_email_is_noop_when_smtp_unconfigured() {
+        let result = send_signup_otp(&test_config(), "user@example.com", "123456", 10)
+            .await
+            .unwrap();
         assert_eq!(result, MailDelivery::NotConfigured);
     }
 

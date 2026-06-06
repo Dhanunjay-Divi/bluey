@@ -53,6 +53,24 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
             ),
         )
         .route(
+            "/auth/signup/start",
+            axum::routing::post(auth_routes::signup_start).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_signup,
+                ),
+            ),
+        )
+        .route(
+            "/auth/signup/confirm",
+            axum::routing::post(auth_routes::signup_confirm).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_signup,
+                ),
+            ),
+        )
+        .route(
             "/auth/login",
             axum::routing::post(auth_routes::login).route_layer(
                 axum::middleware::from_fn_with_state(

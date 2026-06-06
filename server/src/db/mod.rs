@@ -338,6 +338,24 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_stt_sessions_account_exp
         ON stt_sessions(account_id, expires_at_ms);
     "#,
+    // 0013 — pending signup OTPs.
+    //
+    // Create-account now verifies email ownership before issuing account
+    // tokens. The pending row stores a bcrypt password hash and a server-keyed
+    // OTP hash for up to 10 minutes; successful confirmation creates the
+    // account and deletes the pending row.
+    r#"
+    CREATE TABLE IF NOT EXISTS signup_otps (
+        email           TEXT PRIMARY KEY,
+        otp_hash        TEXT NOT NULL,
+        password_hash   TEXT NOT NULL,
+        attempts        INTEGER NOT NULL DEFAULT 0,
+        created_at      DATETIME NOT NULL DEFAULT (datetime('now')),
+        expires_at      DATETIME NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_signup_otps_expires_at
+        ON signup_otps(expires_at);
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {

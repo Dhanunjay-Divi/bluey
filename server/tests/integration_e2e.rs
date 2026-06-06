@@ -15,7 +15,7 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use bluey_server::auth;
-use bluey_server::config::{Config, UpstreamKeys, UpstreamSpendGuard};
+use bluey_server::config::{Config, SmtpConfig, UpstreamKeys, UpstreamSpendGuard};
 use bluey_server::db::accounts::Account;
 use bluey_server::db::usage::{self, UsageEvent};
 use bluey_server::db::{open_pool, run_migrations, DbPool};
@@ -30,6 +30,7 @@ struct Harness {
     pub stripe: MockServer,
     pub square: MockServer,
     pub deepgram: MockServer,
+    pub mail: MockServer,
 }
 
 async fn boot_harness() -> Harness {
@@ -63,6 +64,7 @@ async fn boot_harness_with_options(
     let stripe = MockServer::start().await;
     let square = MockServer::start().await;
     let deepgram = MockServer::start().await;
+    let mail = MockServer::start().await;
 
     let path = std::env::temp_dir().join(format!("bluey-e2e-{}.db", uuid::Uuid::new_v4()));
     let pool = open_pool(&path).unwrap();
@@ -75,7 +77,14 @@ async fn boot_harness_with_options(
         public_url: "http://localhost:8080".to_string(),
         stripe_secret_key: Some("sk_test_e2e".to_string()),
         stripe_webhook_secret: Some("whsec_test_e2e".to_string()),
-        smtp: None,
+        smtp: Some(SmtpConfig {
+            host: "smtp.resend.com".to_string(),
+            port: 587,
+            username: Some("resend".to_string()),
+            password: Some("test-resend-key".to_string()),
+            from: "Bluey <hello@bluey.sh>".to_string(),
+            starttls: true,
+        }),
         upstream,
         upstream_spend_guard,
         admin_emails,
@@ -91,6 +100,7 @@ async fn boot_harness_with_options(
     std::env::set_var("BLUEY_TEST_STRIPE_URL", stripe.uri());
     std::env::set_var("BLUEY_TEST_SQUARE_URL", square.uri());
     std::env::set_var("BLUEY_TEST_DEEPGRAM_URL", deepgram.uri());
+    std::env::set_var("BLUEY_RESEND_API_BASE_URL", mail.uri());
 
     let router = bluey_server::api::build_router(pool.clone(), config);
 
@@ -102,6 +112,7 @@ async fn boot_harness_with_options(
         stripe,
         square,
         deepgram,
+        mail,
     }
 }
 
@@ -169,6 +180,85 @@ async fn assert_admin_customers_allowed(harness: &Harness, access: &str) {
         .unwrap();
     let resp = harness.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+fn extract_six_digit_code(text: &str) -> Option<String> {
+    let mut run = String::new();
+    for ch in text.chars() {
+        if ch.is_ascii_digit() {
+            run.push(ch);
+            if run.len() == 6 {
+                return Some(run);
+            }
+        } else {
+            run.clear();
+        }
+    }
+    None
+}
+
+#[tokio::test]
+#[serial]
+async fn signup_otp_email_confirms_and_marks_email_verified() {
+    let h = boot_harness().await;
+
+    Mock::given(method("POST"))
+        .and(path("/emails"))
+        .and(header("Authorization", "Bearer test-resend-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"email-otp"})))
+        .mount(&h.mail)
+        .await;
+
+    let email = "otp-smoke@bluey.sh";
+    let password = "longenoughpw";
+    let start = Request::post("/auth/signup/start")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "email": email,
+                "password": password
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(start).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let requests = h.mail.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let mail_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(mail_body["to"][0], email);
+    assert_eq!(mail_body["subject"], "Your Bluey verification code");
+    let code = extract_six_digit_code(mail_body["text"].as_str().unwrap()).unwrap();
+
+    let confirm = Request::post("/auth/signup/confirm")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "email": email,
+                "otp": code
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(confirm).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let auth: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(auth["account"]["email"], email);
+    assert!(auth["access_token"].as_str().unwrap().len() > 20);
+
+    let conn = h.pool.get().unwrap();
+    let verified_at: Option<String> = conn
+        .query_row(
+            "SELECT email_verified_at FROM accounts WHERE email = ?1",
+            rusqlite::params![email],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(verified_at.is_some());
 }
 
 #[tokio::test]
