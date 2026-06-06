@@ -5071,523 +5071,493 @@
       }
     }
 
-    /* Bluey site refresh: a one-command entry point for the AI chat
-       product while preserving account/download/policy route contracts. */
+    /* Pinky-style Bluey landing page. */
     #productSite.site {
-      display: block;
-      overflow: visible;
-      background:
-        radial-gradient(circle at 14% 8%, rgba(124, 255, 199, .13), transparent 26%),
-        radial-gradient(circle at 80% 10%, rgba(114, 240, 255, .18), transparent 32%),
-        linear-gradient(180deg, #020506 0%, #05090b 52%, #020304 100%);
+      min-height: 100vh;
+      min-height: 100dvh;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      overflow: hidden;
+      background: #050505;
+      color: #e0e0e0;
+      font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
     }
 
-    #productSite.site::before {
-      opacity: .72;
-      background-image:
-        linear-gradient(rgba(114, 240, 255, .055) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(114, 240, 255, .04) 1px, transparent 1px);
-      background-size: 76px 76px;
-      mask-image: linear-gradient(to bottom, rgba(0, 0, 0, .72), transparent 76%);
-    }
-
-    #productSite .site-nav,
-    #productSite .hero,
-    #productSite .bluey-section,
-    #productSite .footer {
-      width: min(1160px, calc(100% - 44px));
-      margin-left: auto;
-      margin-right: auto;
+    #productSite.site::before,
+    #productSite .hero::before,
+    #productSite .hero::after {
+      display: none;
     }
 
     #productSite .site-nav {
-      min-height: 72px;
-      padding: 18px 0 8px;
+      width: 100%;
+      min-height: auto;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      align-items: center;
+      justify-self: stretch;
+      padding: 1rem 2.5rem;
+      column-gap: 1.25rem;
+    }
+
+    #productSite .brand {
+      gap: .5rem;
+      font-size: 1.05rem;
+      font-weight: 600;
+      color: #e0e0e0;
+    }
+
+    #productSite .brand img:not(.brand-wordmark) {
+      width: 24px;
+      height: 24px;
+      border-radius: 6px;
+      box-shadow: none;
+    }
+
+    #productSite .brand-wordmark {
+      width: 68px;
+      filter: drop-shadow(0 0 10px rgba(114, 240, 255, .18));
+    }
+
+    #productSite .navlinks {
+      justify-self: end;
+      gap: 1.5rem;
     }
 
     #productSite .navlinks a {
-      border: 1px solid transparent;
+      min-height: auto;
+      padding: 0;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      color: #888;
+      font-size: .9rem;
+      font-weight: 500;
+      text-decoration: none;
+      transition: color .2s, background .2s;
     }
 
     #productSite .navlinks a:hover {
-      border-color: rgba(114, 240, 255, .14);
+      color: #e0e0e0;
     }
 
     #productSite .navlinks .nav-cta {
-      color: #021114;
-      background: linear-gradient(135deg, #bff8ff, #72f0ff 55%, #7cffc7);
-      box-shadow: 0 18px 48px rgba(114, 240, 255, .18);
+      padding: .45rem 1.2rem;
+      border-radius: 6px;
+      color: #061114;
+      background: #8beeff;
+      font-weight: 700;
+    }
+
+    #productSite .navlinks .nav-cta:hover {
+      color: #061114;
+      background: #6be6ff;
     }
 
     #productSite .hero {
+      width: 100%;
+      max-width: 1040px;
       min-height: auto;
-      grid-template-columns: minmax(0, .9fr) minmax(390px, .72fr);
-      gap: clamp(34px, 6vw, 82px);
-      padding: clamp(52px, 9vh, 96px) 0 56px;
+      display: grid;
+      grid-template-columns: minmax(360px, .92fr) minmax(380px, 1fr);
+      gap: 3.4rem;
+      align-items: center;
+      justify-self: center;
+      padding: 0 3rem;
     }
 
     #productSite .hero-copy {
-      max-width: 650px;
-    }
-
-    #productSite .launch-pill {
-      border-color: rgba(124, 255, 199, .22);
-      background: rgba(124, 255, 199, .065);
+      max-width: none;
     }
 
     #productSite .hero-copy h1 {
-      max-width: 690px;
-      font-size: clamp(72px, 10vw, 142px);
-      line-height: .8;
-      letter-spacing: -.045em;
+      max-width: none;
+      margin: 0 0 1.05rem;
+      color: #f4f7f8;
+      font-size: clamp(2.55rem, 4vw, 3.05rem);
+      font-weight: 740;
+      line-height: 1.07;
+      letter-spacing: -.04em;
+      text-wrap: balance;
     }
 
-    #productSite .hero-line {
-      max-width: 680px;
-      color: #87f7ff;
-      font-size: clamp(32px, 4.7vw, 62px);
-      letter-spacing: -.035em;
+    #productSite .hero-copy h1 .accent {
+      background: linear-gradient(135deg, #72f0ff, #7cffc7);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
     }
 
     #productSite .hero-copy p {
-      max-width: 620px;
-      color: #bad0d8;
-      font-size: clamp(17px, 1.35vw, 20px);
+      max-width: 430px;
+      color: #8d8d8d;
+      font-size: 1.03rem;
+      line-height: 1.58;
+    }
+
+    #productSite .hero-lede {
+      margin-bottom: .65rem;
     }
 
     #productSite .hero-proof {
-      color: #edfaff !important;
-      font-size: 14px !important;
+      color: #e7e7e7 !important;
+      font-size: 1.03rem !important;
+      font-weight: 650;
+      margin-bottom: 1.55rem;
+    }
+
+    #productSite .hero-proof span {
+      background: linear-gradient(135deg, #9df5ff, #8dffc8);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
     }
 
     #productSite .hero-actions {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(145px, 1fr));
+      gap: .7rem;
+      align-items: stretch;
+      max-width: 335px;
+      margin-top: 0;
+    }
+
+    #productSite .button {
+      width: 100%;
+      min-height: 46px;
+      display: inline-flex;
       align-items: center;
-      margin-top: 28px;
+      justify-content: center;
+      padding: .72rem 1.45rem;
+      border-radius: 12px;
+      border: 1px solid #333;
+      background: transparent;
+      color: #888;
+      box-shadow: 0 10px 28px rgba(114, 240, 255, .08);
+      font-size: .93rem;
+      font-weight: 700;
+      letter-spacing: -.01em;
+      text-decoration: none;
+      transition: transform .2s, border-color .2s, background .2s, box-shadow .2s, color .2s;
+    }
+
+    #productSite .button:hover {
+      color: #e0e0e0;
+      border-color: #555;
     }
 
     #productSite .button.primary {
-      background: linear-gradient(135deg, #dffaff, #72f0ff 48%, #82ffd0);
+      color: #061114;
+      border-color: rgba(255, 255, 255, .12);
+      background: linear-gradient(135deg, #bff8ff 0%, #72f0ff 52%, #7cffc7 100%);
+    }
+
+    #productSite .button.primary:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 13px 34px rgba(114, 240, 255, .20);
     }
 
     #productSite .quick-join {
-      background: rgba(255, 255, 255, .035);
-      border: 1px solid rgba(114, 240, 255, .10);
-      padding: 6px;
-    }
-
-    .bluey-proof-row {
+      width: 100%;
+      max-width: 320px;
       display: flex;
-      flex-wrap: wrap;
-      gap: 9px;
-      margin-top: 16px;
+      gap: .5rem;
+      margin-top: 1.2rem;
+      padding: 0;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
     }
 
-    .bluey-proof-row span {
-      display: inline-flex;
-      align-items: center;
-      min-height: 30px;
-      border: 1px solid rgba(114, 240, 255, .13);
-      border-radius: 999px;
-      color: #a8c0c8;
-      background: rgba(255, 255, 255, .035);
-      padding: 0 11px;
-      font-size: 12px;
-      font-weight: 830;
-    }
-
-    .bluey-chat-preview {
-      position: relative;
-      display: grid;
-      gap: 14px;
-      padding: 14px;
-      border-radius: 30px;
-      border: 1px solid rgba(114, 240, 255, .16);
-      background:
-        radial-gradient(circle at 16% 0%, rgba(124, 255, 199, .12), transparent 30%),
-        linear-gradient(180deg, rgba(8, 16, 19, .94), rgba(2, 5, 7, .96));
-      box-shadow: 0 34px 100px rgba(0, 0, 0, .46), inset 0 1px 0 rgba(255, 255, 255, .05);
-    }
-
-    .bluey-chat-top {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      min-height: 50px;
-      border: 1px solid rgba(114, 240, 255, .13);
-      border-radius: 999px;
-      background: rgba(0, 0, 0, .28);
-      padding: 6px 8px 6px 6px;
-    }
-
-    .bluey-chat-brand {
-      display: inline-flex;
-      align-items: center;
-      gap: 10px;
+    #productSite .quick-join input {
+      flex: 1;
+      width: auto;
       min-width: 0;
-      color: #f2fbff;
-      font-weight: 920;
+      height: auto;
+      min-height: auto;
+      padding: .6rem 1rem;
+      border: 1px solid rgba(114, 240, 255, .30);
+      border-radius: 8px;
+      background: #111;
+      color: #e0e0e0;
+      outline: none;
+      font-family: monospace;
+      font-size: 1rem;
+      letter-spacing: .15em;
+      text-transform: lowercase;
+      transition: border-color .3s, box-shadow .3s;
     }
 
-    .bluey-chat-brand img {
-      width: 36px;
-      height: 36px;
-      border-radius: 12px;
+    #productSite .quick-join input:focus {
+      border-color: #72f0ff;
+      box-shadow: 0 0 0 2px rgba(114, 240, 255, .16);
     }
 
-    .bluey-live-chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      min-height: 32px;
-      border-radius: 999px;
-      color: #7dffd3;
-      background: rgba(125, 255, 211, .08);
-      border: 1px solid rgba(125, 255, 211, .18);
-      padding: 0 11px;
-      font-size: 12px;
-      font-weight: 880;
-      white-space: nowrap;
+    #productSite .quick-join input::placeholder {
+      color: #444;
+      font-family: -apple-system, system-ui, sans-serif;
+      letter-spacing: normal;
     }
 
-    .bluey-live-chip::before {
-      content: "";
-      width: 8px;
-      height: 8px;
-      border-radius: 999px;
-      background: #7dffd3;
-      box-shadow: 0 0 16px rgba(125, 255, 211, .8);
+    #productSite .quick-join button {
+      width: auto;
+      flex: 0 0 auto;
+      height: auto;
+      min-height: auto;
+      padding: .6rem 1.2rem;
+      border: 1px solid rgba(114, 240, 255, .30);
+      border-radius: 8px;
+      background: rgba(114, 240, 255, .11);
+      color: #72f0ff;
+      font-size: .9rem;
+      cursor: pointer;
+      transition: all .2s;
     }
 
-    .bluey-chat-window {
-      display: grid;
-      gap: 12px;
-      min-height: 430px;
-      border-radius: 25px;
-      border: 1px solid rgba(255, 255, 255, .07);
-      background:
-        linear-gradient(rgba(114, 240, 255, .035) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(114, 240, 255, .026) 1px, transparent 1px),
-        rgba(3, 7, 9, .88);
-      background-size: 44px 44px;
-      padding: 18px;
-      overflow: hidden;
+    #productSite .quick-join button:hover {
+      border-color: #72f0ff;
+      background: rgba(114, 240, 255, .17);
+      color: #bff8ff;
     }
 
-    .bluey-message {
-      width: min(390px, 86%);
-      border-radius: 20px;
-      padding: 14px 15px;
-      border: 1px solid rgba(114, 240, 255, .12);
-      background: rgba(255, 255, 255, .045);
-      box-shadow: 0 18px 54px rgba(0, 0, 0, .20);
+    #productSite .hero-note {
+      max-width: none;
+      margin-top: .6rem;
+      color: #555;
+      font-size: .75rem;
     }
 
-    .bluey-message.user {
-      justify-self: end;
-      color: #061014;
-      background: #eefbff;
-      border-color: rgba(255, 255, 255, .72);
+    #productSite .hero-note + .hero-note {
+      margin-top: .25rem;
     }
 
-    .bluey-message small {
-      display: block;
-      margin-bottom: 6px;
-      color: #70efff;
-      font: 900 10px ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-      letter-spacing: .08em;
-      text-transform: uppercase;
-    }
-
-    .bluey-message.user small {
-      color: #52656d;
-    }
-
-    .bluey-message p {
-      margin: 0;
-      color: inherit;
-      font-size: 14px;
-      line-height: 1.5;
-    }
-
-    .bluey-code-card {
-      width: min(360px, 88%);
-      border-radius: 20px;
-      border: 1px solid rgba(114, 240, 255, .15);
-      background: rgba(0, 0, 0, .34);
-      overflow: hidden;
-    }
-
-    .bluey-code-head {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      min-height: 38px;
-      border-bottom: 1px solid rgba(114, 240, 255, .10);
-      color: #dffaff;
-      padding: 0 13px;
-      font-size: 12px;
-      font-weight: 850;
-    }
-
-    .bluey-code-lines {
-      display: grid;
-      gap: 9px;
-      padding: 14px;
-    }
-
-    .bluey-code-lines span {
-      height: 9px;
-      border-radius: 999px;
-      background: linear-gradient(90deg, rgba(114, 240, 255, .82), rgba(124, 255, 199, .18));
-    }
-
-    .bluey-code-lines span:nth-child(2) { width: 76%; }
-    .bluey-code-lines span:nth-child(3) { width: 88%; }
-    .bluey-code-lines span:nth-child(4) { width: 58%; }
-
-    .bluey-composer-preview {
-      display: grid;
-      grid-template-columns: auto minmax(0, 1fr) auto;
-      gap: 10px;
-      align-items: center;
-      border: 1px solid rgba(114, 240, 255, .15);
-      border-radius: 24px;
-      background: rgba(0, 0, 0, .30);
+    #productSite .product-preview {
+      width: min(100%, 500px);
+      justify-self: center;
+      align-self: center;
       padding: 10px;
+      border-radius: 30px;
+      background: rgba(4, 10, 12, .78);
+      box-shadow: 0 30px 90px rgba(0, 0, 0, .44), inset 0 1px 0 rgba(255, 255, 255, .04);
     }
 
-    .bluey-composer-preview span {
-      color: #91aab2;
-      font-weight: 740;
-      font-size: 13px;
-    }
-
-    .bluey-icon-button {
-      width: 40px;
-      height: 40px;
-      display: grid;
-      place-items: center;
-      border-radius: 15px;
-      color: #dffaff;
-      border: 1px solid rgba(255, 255, 255, .08);
-      background: rgba(255, 255, 255, .05);
-      font-weight: 920;
-    }
-
-    .bluey-icon-button.send {
-      color: #061014;
-      background: linear-gradient(135deg, #dffaff, #82ffd0);
-    }
-
-    .bluey-section {
-      position: relative;
-      z-index: 1;
-      padding: 72px 0;
-      border-top: 1px solid rgba(114, 240, 255, .09);
-    }
-
-    .bluey-section-head {
-      max-width: 780px;
-      margin-bottom: 24px;
-    }
-
-    .bluey-kicker {
-      color: #72f0ff;
-      font: 900 12px ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-      letter-spacing: .12em;
-      text-transform: uppercase;
-    }
-
-    .bluey-section h2 {
-      margin: 10px 0 0;
-      color: #f2fbff;
-      font-size: clamp(34px, 5vw, 64px);
-      line-height: .98;
-      letter-spacing: -.035em;
-    }
-
-    .bluey-section-head p {
-      margin: 14px 0 0;
-      color: #a9bec6;
-      font-size: 17px;
-      line-height: 1.55;
-    }
-
-    .bluey-card-grid {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 14px;
-    }
-
-    .bluey-card,
-    .bluey-price-card {
-      border: 1px solid rgba(114, 240, 255, .13);
-      border-radius: 24px;
-      background: rgba(255, 255, 255, .035);
-      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .035);
-      padding: 22px;
-    }
-
-    .bluey-card b,
-    .bluey-price-card b {
-      display: block;
-      color: #effaff;
-      font-size: 19px;
-      line-height: 1.16;
-      margin-bottom: 10px;
-    }
-
-    .bluey-card p,
-    .bluey-price-card p,
-    .bluey-price-card li {
-      color: #a9bec6;
-      line-height: 1.55;
-      font-size: 14px;
-    }
-
-    .bluey-card p,
-    .bluey-price-card p {
-      margin: 0;
-    }
-
-    .bluey-card-mark {
-      width: 42px;
-      height: 42px;
-      display: grid;
-      place-items: center;
-      margin-bottom: 18px;
-      border-radius: 15px;
-      color: #061014;
-      background: linear-gradient(135deg, #72f0ff, #82ffd0);
-      font-weight: 950;
-    }
-
-    .bluey-price-grid {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 14px;
-    }
-
-    .bluey-price-card.featured {
-      border-color: rgba(124, 255, 199, .30);
+    #productSite .terminal-preview {
+      padding: 12px;
       background:
-        radial-gradient(circle at 80% 0%, rgba(124, 255, 199, .12), transparent 32%),
-        rgba(255, 255, 255, .045);
+        radial-gradient(circle at 14% 0%, rgba(114, 240, 255, .18), transparent 30%),
+        linear-gradient(180deg, rgba(5, 14, 16, .94), rgba(2, 2, 4, .86));
     }
 
-    .bluey-price {
-      margin: 16px 0;
-      color: #72f0ff;
-      font-size: 38px;
-      line-height: 1;
-      font-weight: 950;
+    #productSite .bluey-terminal {
+      min-height: 398px;
+      border-color: rgba(114, 240, 255, .22);
+      background:
+        radial-gradient(circle at 88% 8%, rgba(124, 255, 199, .10), transparent 28%),
+        linear-gradient(180deg, #090d0f 0%, #030304 100%);
     }
 
-    .bluey-price small {
-      color: #7e969f;
-      font-size: 13px;
-      font-weight: 800;
+    #productSite .bluey-terminal-bar {
+      border-bottom-color: rgba(114, 240, 255, .12);
     }
 
-    .bluey-price-card ul {
-      display: grid;
-      gap: 9px;
-      margin: 16px 0 0;
-      padding-left: 18px;
-    }
-
-    .bluey-final-cta {
-      display: grid;
-      gap: 18px;
-      justify-items: center;
-      text-align: center;
-      padding: 86px 0 78px;
-    }
-
-    .bluey-final-cta h2 {
-      max-width: 800px;
-      margin: 0;
+    #productSite .bluey-terminal-title {
       color: #f2fbff;
-      font-size: clamp(44px, 7vw, 86px);
-      line-height: .9;
-      letter-spacing: -.045em;
     }
 
-    .bluey-final-cta p {
-      max-width: 620px;
-      margin: 0;
-      color: #adc2ca;
-      font-size: 17px;
-      line-height: 1.55;
+    #productSite .bluey-terminal-status {
+      color: #4ade80;
+      background: rgba(74, 222, 128, .08);
+      border-color: rgba(74, 222, 128, .2);
+    }
+
+    #productSite .bluey-terminal-code {
+      color: #a7b7bc;
+    }
+
+    #productSite .bluey-terminal-code .prompt {
+      color: #54737d;
+    }
+
+    #productSite .bluey-terminal-code .blue,
+    #productSite .bluey-terminal-code .label {
+      color: #72f0ff;
+    }
+
+    #productSite .terminal-cursor {
+      background: #72f0ff;
     }
 
     #productSite .footer {
-      width: 100%;
-      padding: 24px 22px 32px;
-      background: rgba(0, 0, 0, .20);
+      width: auto;
+      padding: 1.2rem 2.5rem .7rem;
+      border-top: 1px solid #111;
+      background: transparent;
     }
 
-    @media (max-width: 980px) {
-      #productSite .hero,
-      .bluey-card-grid,
-      .bluey-price-grid {
+    #productSite .pricing {
+      display: flex;
+      justify-content: center;
+      gap: 2rem;
+      align-items: center;
+    }
+
+    #productSite .plan {
+      display: flex;
+      align-items: center;
+      gap: .8rem;
+      padding: .6rem 1.5rem;
+      border: 1px solid #1a1a1a;
+      border-radius: 8px;
+      color: #e0e0e0;
+      text-decoration: none;
+      transition: border-color .2s;
+    }
+
+    #productSite .plan:hover {
+      border-color: #333;
+    }
+
+    #productSite .plan.featured {
+      border-color: rgba(114, 240, 255, .26);
+      background: rgba(114, 240, 255, .04);
+    }
+
+    #productSite .plan-name {
+      font-size: .9rem;
+      font-weight: 600;
+    }
+
+    #productSite .plan-price {
+      color: #72f0ff;
+      font-size: .85rem;
+      white-space: nowrap;
+    }
+
+    #productSite .plan-detail {
+      color: #555;
+      font-size: .75rem;
+    }
+
+    #productSite .plan-sep {
+      color: #222;
+      font-size: .8rem;
+    }
+
+    #productSite .footer-meta {
+      padding: .55rem 0 max(.65rem, env(safe-area-inset-bottom));
+      color: #c7cad1;
+      text-align: center;
+      font-size: .72rem;
+      line-height: 1.5;
+    }
+
+    #productSite .footer-meta a {
+      color: #eef1f7;
+      text-decoration: none;
+    }
+
+    #productSite .footer-meta a:hover {
+      color: #fff;
+    }
+
+    #productSite .footer-meta .email-link {
+      color: #8beeff;
+    }
+
+    #productSite .footer-meta .email-link:hover {
+      color: #c8fbff;
+    }
+
+    #productSite .footer-meta .muted-note {
+      color: #727781;
+    }
+
+    #productSite .footer-meta .dot {
+      color: #6f7480;
+      margin: 0 .4rem;
+    }
+
+    @media (max-width: 1120px) {
+      #productSite .hero {
         grid-template-columns: 1fr;
+        gap: 2rem;
+        text-align: center;
       }
 
-      .bluey-chat-preview {
-        max-width: 620px;
+      #productSite .hero-copy p {
+        max-width: 100%;
+      }
+
+      #productSite .hero-actions {
+        margin: 0 auto;
+      }
+
+      #productSite .quick-join {
+        max-width: 100%;
+        justify-content: center;
+      }
+
+      #productSite .product-preview {
+        max-width: 500px;
+        margin: 0 auto;
+      }
+
+      #productSite .bluey-terminal {
+        min-height: 340px;
+      }
+
+      #productSite .bluey-terminal-code {
+        height: 286px;
+        font-size: .72rem;
+      }
+
+      #productSite .pricing {
+        flex-wrap: wrap;
+        gap: 1rem;
       }
     }
 
-    @media (max-width: 680px) {
-      #productSite .site-nav,
-      #productSite .hero,
-      #productSite .bluey-section {
-        width: calc(100% - 28px);
+    @media (max-width: 720px) {
+      #productSite.site {
+        height: auto;
+        min-height: 100vh;
+        min-height: 100dvh;
       }
 
       #productSite .site-nav {
-        align-items: flex-start;
-        flex-direction: column;
-      }
-
-      #productSite .navlinks {
-        width: 100%;
-      }
-
-      #productSite .navlinks a {
-        flex: 1 1 auto;
+        padding: 1rem 1.5rem;
       }
 
       #productSite .hero {
-        padding-top: 34px;
+        padding: 1.5rem;
       }
 
       #productSite .hero-copy h1 {
-        font-size: clamp(62px, 19vw, 90px);
+        font-size: 2.2rem;
       }
 
-      #productSite .hero-line {
-        font-size: clamp(30px, 10vw, 44px);
+      #productSite .footer {
+        padding: 1rem 1.5rem;
       }
 
-      .bluey-proof-row {
+      #productSite .pricing {
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      #productSite .plan-sep {
+        display: none;
+      }
+    }
+
+    @media (max-width: 600px) {
+      #productSite .product-preview {
         display: none;
       }
 
-      .bluey-chat-window {
-        min-height: 360px;
-        padding: 12px;
-      }
-
-      .bluey-message,
-      .bluey-code-card {
-        width: 100%;
-      }
-
-      .bluey-section {
-        padding: 52px 0;
+      #productSite .hero-actions {
+        grid-template-columns: 1fr;
+        max-width: 100%;
       }
     }
   </style>
@@ -5932,207 +5902,72 @@
         <img class="brand-wordmark" src="assets/bluey-wordmark.svg" alt="bluey">
       </a>
       <div class="navlinks">
-        <a href="#how">How it works</a>
-        <a href="#pricing">Pricing</a>
-        <a href="/login">Try Bluey</a>
-        <a class="nav-cta" href="/download">Install</a>
+        <a href="/download">Download</a>
+        <a class="nav-cta" href="/login">Try Bluey</a>
       </div>
     </nav>
 
     <section class="hero">
       <div class="hero-copy">
-        <div class="launch-pill">
-          <img src="assets/bluey-logo.svg" alt="">
-          <code>bluey on</code>
-          <span>AI chat that follows your live work</span>
-        </div>
-        <h1>Bluey</h1>
-        <div class="hero-line">Stay present. Ask without switching context.</div>
-        <p>Bluey is a native AI chat layer for meetings, research, code, docs, and screen work. It listens with consent, reads the context you attach, routes to the right model, and streams answers inside one tiny desktop pill.</p>
-        <p class="hero-proof">Run <code>bluey on</code>. Keep working. Ask when you need the answer.</p>
+        <h1 aria-label="AI chat, out of the tab.">AI chat,<br><span class="accent">out of the tab.</span></h1>
+        <p class="hero-lede">Native AI chat for meetings, code, docs, research, and screen work from your terminal. Keep Bluey in the background and ask from the context already on your machine.</p>
+        <p class="hero-proof"><span>One pill is all you need.</span> Transcript, screen, files, memory, and routed cloud models without switching apps.</p>
         <div class="hero-actions">
-          <a class="button primary" href="/download">Install Bluey</a>
+          <a class="button primary" href="/download">Get Started</a>
           <a class="button" href="/login">Try Bluey</a>
         </div>
         <form class="quick-join" action="/login" method="get">
-          <input name="user_code" type="text" placeholder="Desktop link code" autocomplete="one-time-code" spellcheck="false">
+          <input name="user_code" type="text" placeholder="Link code" autocomplete="one-time-code" spellcheck="false">
           <button type="submit">Link</button>
         </form>
-        <div class="hero-note">Already installed? Run <code>bluey on</code>. If Bluey shows a link code, enter it here.</div>
-        <div class="bluey-proof-row" aria-label="Bluey capabilities">
-          <span>Native overlay</span>
-          <span>Model routing</span>
-          <span>Screen + file context</span>
-          <span>Credit-based cloud AI</span>
-        </div>
+        <div class="hero-note">managed AI routing &middot; visible context &middot; credit based</div>
+        <div class="hero-note">screen, transcript, files, and session memory by choice</div>
       </div>
 
-      <aside class="bluey-chat-preview" aria-label="Bluey AI chat preview">
-        <div class="bluey-chat-top">
-          <div class="bluey-chat-brand">
-            <img src="assets/bluey-logo.svg" alt="">
-            <span>Bluey session</span>
-          </div>
-          <span class="bluey-live-chip">listening</span>
-        </div>
-        <div class="bluey-chat-window">
-          <article class="bluey-message user">
-            <small>You</small>
-            <p>Summarize this call and draft the decision note before I tab away.</p>
-          </article>
-          <article class="bluey-message">
-            <small>Bluey</small>
-            <p><strong>Decision:</strong> ship the thinner onboarding flow first. Open risk is billing copy; I can turn this into a PRD or Slack update.</p>
-          </article>
-          <article class="bluey-code-card">
-            <div class="bluey-code-head">
-              <span>context pack</span>
-              <span>screen + docs</span>
+      <aside class="product-preview terminal-preview" aria-label="Bluey terminal preview">
+        <div class="bluey-terminal">
+          <div class="bluey-terminal-bar">
+            <div class="bluey-terminal-dots" aria-hidden="true">
+              <span class="bluey-terminal-dot red"></span>
+              <span class="bluey-terminal-dot yellow"></span>
+              <span class="bluey-terminal-dot green"></span>
             </div>
-            <div class="bluey-code-lines" aria-hidden="true">
-              <span></span>
-              <span></span>
-              <span></span>
-              <span></span>
-            </div>
-          </article>
-          <div class="bluey-composer-preview">
-            <div class="bluey-icon-button">+</div>
-            <span>Ask about the current screen, transcript, or attached files...</span>
-            <div class="bluey-icon-button send">Ask</div>
+            <span class="bluey-terminal-title">bluey - zsh</span>
+            <span class="bluey-terminal-status">ready</span>
           </div>
+          <div class="bluey-terminal-code" id="blueyTerminal" aria-live="polite"></div>
         </div>
       </aside>
     </section>
 
-    <section class="bluey-section" id="how" aria-label="How Bluey works">
-      <div class="bluey-section-head">
-        <span class="bluey-kicker">How it works</span>
-        <h2>One-command simplicity, built for AI chat.</h2>
-        <p>A tiny command starts the desktop layer. From there, Bluey keeps conversation, transcript, files, page text, screenshots, and model routing in one session so answers arrive where you are working.</p>
+    <footer class="footer" id="pricing">
+      <div class="pricing">
+        <a href="/login" class="plan">
+          <div>
+            <div class="plan-name">Trial</div>
+            <div class="plan-detail">10 minutes &middot; desktop link flow &middot; managed AI preview</div>
+          </div>
+          <div class="plan-price">Included</div>
+        </a>
+        <span class="plan-sep">&middot;</span>
+        <a href="/login" class="plan featured">
+          <div>
+            <div class="plan-name">Credits</div>
+            <div class="plan-detail">Cloud models &middot; STT &middot; vision &middot; embeddings &middot; RAG context</div>
+          </div>
+          <div class="plan-price">$30 reload</div>
+        </a>
+        <span class="plan-sep">&middot;</span>
+        <a href="/login" class="plan">
+          <div>
+            <div class="plan-name">Team</div>
+            <div class="plan-detail">Workspace controls &middot; shared memory &middot; admin support</div>
+          </div>
+          <div class="plan-price">Custom</div>
+        </a>
       </div>
-      <div class="bluey-card-grid">
-        <article class="bluey-card">
-          <span class="bluey-card-mark">01</span>
-          <b>Open the pill</b>
-          <p>Run <code>bluey on</code>. The overlay stays compact until you need it, then expands into a focused chat composer.</p>
-        </article>
-        <article class="bluey-card">
-          <span class="bluey-card-mark">02</span>
-          <b>Add live context</b>
-          <p>Use transcript, visible screen, browser page text, attached files, or explicit rules. Bluey labels sources so you know what it used.</p>
-        </article>
-        <article class="bluey-card">
-          <span class="bluey-card-mark">03</span>
-          <b>Route the answer</b>
-          <p>Fast questions stay cheap. Code, vision, long context, and deep reasoning route to stronger lanes when they actually help.</p>
-        </article>
-      </div>
-    </section>
-
-    <section class="bluey-section" aria-label="Bluey use cases">
-      <div class="bluey-section-head">
-        <span class="bluey-kicker">Use cases</span>
-        <h2>Meetings, code, research, and operations in one answer layer.</h2>
-        <p>Bluey is not a generic chatbot tab. It is designed for the moments when the useful context is already on your machine.</p>
-      </div>
-      <div class="bluey-card-grid">
-        <article class="bluey-card">
-          <span class="bluey-card-mark">M</span>
-          <b>Meeting copilot</b>
-          <p>Turn live transcript into decisions, objections, follow-ups, and clean recaps without leaving the call.</p>
-        </article>
-        <article class="bluey-card">
-          <span class="bluey-card-mark">C</span>
-          <b>Code and docs</b>
-          <p>Attach files, ask about visible errors, draft fixes, and keep the answer beside the editor instead of another browser tab.</p>
-        </article>
-        <article class="bluey-card">
-          <span class="bluey-card-mark">O</span>
-          <b>Ops memory</b>
-          <p>Preserve session notes, account credits, model usage, and cloud RAG context for later follow-up.</p>
-        </article>
-      </div>
-    </section>
-
-    <section class="bluey-section" id="pricing" aria-label="Bluey pricing">
-      <div class="bluey-section-head">
-        <span class="bluey-kicker">Pricing model</span>
-        <h2>Credit based, not mystery metering.</h2>
-        <p>Bluey is a managed AI product. Credits cover cloud models, STT, vision, embeddings, and RAG work. Start with trial time, then reload only when the value is obvious.</p>
-      </div>
-      <div class="bluey-price-grid">
-        <article class="bluey-price-card">
-          <b>Included trial</b>
-          <div class="bluey-price">10 <small>minutes</small></div>
-          <p>For testing the desktop flow, meetings, and lightweight chat before adding credits.</p>
-          <ul>
-            <li>Desktop AI routing preview</li>
-            <li>Desktop link flow</li>
-            <li>Session history basics</li>
-          </ul>
-        </article>
-        <article class="bluey-price-card featured">
-          <b>Credit reload</b>
-          <div class="bluey-price">$30 <small>credits</small></div>
-          <p>The default reload for regular live work, code help, and screen/context analysis.</p>
-          <ul>
-            <li>Higher cloud usage headroom</li>
-            <li>Longer session context</li>
-            <li>Priority model lanes where available</li>
-          </ul>
-        </article>
-        <article class="bluey-price-card">
-          <b>Team path</b>
-          <div class="bluey-price">Custom</div>
-          <p>Workspace controls, shared memory, admin views, and production support once the team surface is ready.</p>
-          <ul>
-            <li>Workspace billing</li>
-            <li>Usage controls</li>
-            <li>Security review support</li>
-          </ul>
-        </article>
-      </div>
-    </section>
-
-    <section class="bluey-section" aria-label="Bluey safety and control">
-      <div class="bluey-section-head">
-        <span class="bluey-kicker">Control</span>
-        <h2>User-approved context only.</h2>
-        <p>Bluey should feel useful without being creepy: explicit attach flows, visible recording state, source labels, account controls, and clear privacy docs.</p>
-      </div>
-      <div class="bluey-card-grid">
-        <article class="bluey-card">
-          <span class="bluey-card-mark">OK</span>
-          <b>Visible state</b>
-          <p>The pill shows when the session is active. The feed labels mic/system transcript, page text, documents, and screen context.</p>
-        </article>
-        <article class="bluey-card">
-          <span class="bluey-card-mark">R</span>
-          <b>Exportable sessions</b>
-          <p>Session memory is designed to support account history, deletion, and reload controls instead of hidden one-off chats.</p>
-        </article>
-        <article class="bluey-card">
-          <span class="bluey-card-mark">$</span>
-          <b>Spend aware</b>
-          <p>Managed model work uses credit accounting so routing decisions stay visible and scalable.</p>
-        </article>
-      </div>
-    </section>
-
-    <section class="bluey-final-cta" aria-label="Install Bluey">
-      <h2>Open Bluey where the work is already happening.</h2>
-      <p>Install the native app, run <code>bluey on</code>, link your account, and ask from the current screen, transcript, docs, or session memory.</p>
-      <div class="hero-actions">
-        <a class="button primary" href="/download">Install Bluey</a>
-        <a class="button" href="/login">Link account</a>
-      </div>
-    </section>
-
-    <footer class="footer">
-      <div class="footer-inner">
-        <span>Bluey. Native AI chat for live work.</span>
-        <span><a href="/docs/privacy">Privacy</a> · <a href="/docs/terms">Terms</a> · <a href="/docs/disguise">Controls</a></span>
+      <div class="footer-meta">
+        Reach us at <a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Built for live AI work</span><span class="dot">&middot;</span><a href="/docs/terms">Terms</a><span class="dot">&middot;</span><a href="/docs/privacy">Privacy</a><span class="dot">&middot;</span><a href="/docs/disguise">Controls</a>
       </div>
     </footer>
   </main>
