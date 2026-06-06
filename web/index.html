@@ -4552,6 +4552,436 @@
         font-size: clamp(52px, 16vw, 70px);
       }
     }
+
+    /* June 6 v3: Pinky-inspired simplification pass. Keep this after v2. */
+    [hidden] {
+      display: none !important;
+    }
+
+    .site,
+    .account-app,
+    .download-app,
+    .policy-app {
+      background:
+        radial-gradient(circle at 50% 0%, rgba(120, 239, 255, .13), transparent 32%),
+        linear-gradient(180deg, #020303 0%, #030606 48%, #010202 100%);
+    }
+
+    .site::after {
+      opacity: .55;
+      background:
+        radial-gradient(circle at 50% 22%, transparent 0%, rgba(2, 3, 3, .22) 46%, rgba(2, 3, 3, .86) 100%),
+        linear-gradient(90deg, rgba(2, 3, 3, .88), transparent 45%, rgba(2, 3, 3, .88));
+    }
+
+    .site .site-nav,
+    .download-app .site-nav,
+    .policy-app .site-nav {
+      width: min(1080px, calc(100% - 44px));
+      min-height: 64px;
+      padding: 16px 0 0;
+    }
+
+    .site .navlinks,
+    .download-app .navlinks,
+    .policy-app .navlinks {
+      gap: 8px;
+    }
+
+    .site .navlinks a,
+    .download-app .navlinks a,
+    .policy-app .navlinks a,
+    .account-link {
+      min-height: 38px;
+      padding: 0 15px;
+      font-size: 13px;
+      font-weight: 850;
+    }
+
+    .brand-wordmark,
+    .site .brand-wordmark,
+    .download-app .brand-wordmark,
+    .policy-app .brand-wordmark,
+    .account-top-brand .brand-wordmark,
+    .account-rail .brand-wordmark {
+      width: 82px;
+      filter: drop-shadow(0 0 10px rgba(120, 239, 255, .12));
+    }
+
+    .site .brand img:not(.brand-wordmark),
+    .download-app .brand img:not(.brand-wordmark),
+    .policy-app .brand img:not(.brand-wordmark),
+    .account-top-brand img:not(.brand-wordmark),
+    .account-rail .brand img:not(.brand-wordmark) {
+      width: 34px;
+      height: 34px;
+      border-radius: 11px;
+      box-shadow: 0 0 0 1px rgba(120, 239, 255, .17), 0 12px 34px rgba(0, 0, 0, .24);
+    }
+
+    .site .hero {
+      width: min(1080px, calc(100% - 44px));
+      min-height: calc(100svh - 88px);
+      display: grid;
+      grid-template-columns: minmax(0, .92fr) minmax(360px, .64fr);
+      gap: clamp(28px, 5vw, 70px);
+      align-items: center;
+      padding: clamp(34px, 6vh, 70px) 0 64px;
+    }
+
+    .site .hero::before {
+      right: 6%;
+      top: 50%;
+      width: min(520px, 44vw);
+      height: min(440px, 52vh);
+      border-radius: 36px;
+      opacity: .72;
+      background:
+        radial-gradient(circle at 72% 10%, rgba(130, 255, 209, .14), transparent 28%),
+        linear-gradient(135deg, rgba(120, 239, 255, .07), rgba(255, 255, 255, .015));
+      box-shadow: 0 44px 110px rgba(0, 0, 0, .48), inset 0 1px 0 rgba(255, 255, 255, .04);
+    }
+
+    .site .hero::after {
+      right: 21%;
+      top: 24%;
+      width: 230px;
+      height: 230px;
+      opacity: .5;
+    }
+
+    .site .hero-copy {
+      max-width: 600px;
+    }
+
+    .site .launch-pill {
+      min-height: 38px;
+      margin-bottom: 22px;
+      padding: 5px 13px 5px 5px;
+      border-radius: 999px;
+      font-size: 13px;
+    }
+
+    .site .launch-pill img {
+      width: 28px;
+      height: 28px;
+      border-radius: 9px;
+    }
+
+    .site .launch-pill code {
+      font-size: 12px;
+      padding: 5px 9px;
+    }
+
+    .site .hero-copy h1 {
+      font-size: clamp(86px, 12vw, 148px);
+      line-height: .78;
+      text-wrap: balance;
+    }
+
+    .site .hero-line {
+      margin: 14px 0 18px;
+      max-width: 590px;
+      font-size: clamp(34px, 5vw, 64px);
+      line-height: .92;
+    }
+
+    .site .hero-copy p {
+      max-width: 540px;
+      font-size: clamp(16px, 1.25vw, 19px);
+      line-height: 1.52;
+      color: #b7c8cf;
+    }
+
+    .hero-proof {
+      margin-top: 12px !important;
+      color: #dff7ff !important;
+      font-size: 13px !important;
+    }
+
+    .hero-actions {
+      margin-top: 24px;
+    }
+
+    .site .button {
+      min-height: 52px;
+      padding: 0 22px;
+      border-radius: 16px;
+      font-size: 15px;
+    }
+
+    .quick-join {
+      width: min(500px, 100%);
+      margin-top: 18px;
+      grid-template-columns: minmax(0, 1fr) 82px;
+      border-radius: 18px;
+      background: rgba(255, 255, 255, .026);
+    }
+
+    .quick-join input,
+    .quick-join button {
+      height: 48px;
+      min-height: 48px;
+    }
+
+    .hero-note {
+      margin-top: 12px;
+      font-size: 13px;
+      max-width: 490px;
+    }
+
+    .product-preview {
+      position: relative;
+      right: auto;
+      top: auto;
+      width: 100%;
+      transform: none;
+      padding: 10px;
+      border-radius: 30px;
+      align-self: center;
+      background: rgba(3, 7, 8, .76);
+      box-shadow: 0 30px 90px rgba(0, 0, 0, .42), inset 0 1px 0 rgba(255, 255, 255, .035);
+    }
+
+    .preview-pill {
+      min-height: 46px;
+      border-radius: 23px;
+      padding: 6px 8px;
+    }
+
+    .preview-pill-left img {
+      width: 30px;
+      height: 30px;
+      border-radius: 9px;
+    }
+
+    .preview-pill-title,
+    .preview-balance {
+      font-size: 13px;
+    }
+
+    .preview-session {
+      margin-top: 10px;
+      border-radius: 24px;
+    }
+
+    .preview-chat {
+      min-height: 300px;
+      padding: 16px;
+      gap: 12px;
+    }
+
+    .preview-msg,
+    .preview-canvas {
+      font-size: 13px;
+      line-height: 1.38;
+    }
+
+    .preview-composer {
+      min-height: 54px;
+      margin-top: 10px;
+      border-radius: 22px;
+      padding: 8px;
+    }
+
+    .preview-input {
+      font-size: 13px;
+    }
+
+    .site-strip {
+      width: min(1080px, calc(100% - 44px));
+      margin: -30px auto 0;
+      padding-bottom: 42px;
+      gap: 10px;
+    }
+
+    .site-card {
+      min-height: 68px;
+      padding: 15px 16px;
+      border-radius: 20px;
+      background: rgba(255, 255, 255, .03);
+    }
+
+    .site-card span {
+      font-size: 14px;
+    }
+
+    .site-card small {
+      font-size: 12px;
+    }
+
+    .site-strip,
+    .flow-band {
+      display: none;
+    }
+
+    .footer {
+      border-top: 1px solid rgba(120, 239, 255, .10);
+    }
+
+    .account-app.is-guest .account-shell {
+      width: min(880px, 100%);
+    }
+
+    .account-app.is-guest .account-main {
+      padding: 16px;
+      border-radius: 30px;
+      min-height: auto;
+    }
+
+    .account-app.is-guest .account-hero {
+      padding: 30px 24px 24px;
+      border-radius: 26px;
+      background: rgba(255, 255, 255, .035);
+    }
+
+    .account-app.is-guest .account-hero h1 {
+      font-size: clamp(54px, 8vw, 78px);
+    }
+
+    .account-app.is-guest .account-hero p {
+      max-width: 560px;
+      color: #b8c7ce;
+    }
+
+    .account-app.is-guest .account-grid {
+      grid-template-columns: minmax(0, 1fr);
+      max-width: 520px;
+      margin: 14px auto 0;
+    }
+
+    .account-app.is-guest .account-preview-card {
+      display: none !important;
+    }
+
+    .status-row {
+      display: none;
+    }
+
+    .account-card {
+      border-radius: 24px;
+      padding: 22px;
+    }
+
+    .account-card h2 {
+      font-size: 25px;
+    }
+
+    .account-card p {
+      font-size: 14px;
+      line-height: 1.48;
+    }
+
+    .account-form input {
+      height: 52px;
+      border-radius: 16px;
+      font-size: 16px;
+    }
+
+    .account-button {
+      min-height: 46px;
+      border-radius: 15px;
+      font-size: 14px;
+    }
+
+    .download-shell {
+      width: min(1040px, 100%);
+    }
+
+    .download-hero {
+      min-height: 220px;
+      border-radius: 30px;
+      padding: clamp(30px, 5vw, 52px);
+    }
+
+    .download-hero h1 {
+      font-size: clamp(58px, 9vw, 98px);
+    }
+
+    .download-hero p {
+      max-width: 610px;
+      font-size: 16px;
+    }
+
+    .download-card {
+      border-radius: 26px;
+      padding: 24px;
+    }
+
+    .platform-name span:last-child {
+      font-size: 22px;
+    }
+
+    .download-note {
+      border-radius: 22px;
+      background: rgba(255, 255, 255, .035);
+    }
+
+    @media (max-width: 1060px) {
+      .site .hero {
+        grid-template-columns: 1fr;
+        min-height: auto;
+      }
+
+      .product-preview {
+        max-width: 560px;
+      }
+
+      .site-strip {
+        margin-top: 0;
+      }
+    }
+
+    @media (max-width: 720px) {
+      .site .site-nav,
+      .download-app .site-nav,
+      .policy-app .site-nav,
+      .site .hero,
+      .site-strip {
+        width: calc(100% - 28px);
+      }
+
+      .site .site-nav {
+        align-items: center;
+      }
+
+      .site .navlinks a:not(.nav-cta) {
+        display: inline-flex;
+      }
+
+      .site .hero {
+        padding: 52px 0 34px;
+      }
+
+      .site .hero-copy h1 {
+        font-size: clamp(76px, 22vw, 104px);
+      }
+
+      .site .hero-line {
+        font-size: clamp(36px, 11vw, 54px);
+      }
+
+      .product-preview {
+        display: block;
+      }
+
+      .preview-session {
+        display: none;
+      }
+
+      .site-strip {
+        grid-template-columns: 1fr;
+        padding-bottom: 28px;
+      }
+
+      .account-top {
+        align-items: center;
+      }
+
+      .account-app.is-guest .account-hero h1 {
+        font-size: clamp(44px, 13vw, 60px);
+      }
+    }
   </style>
 </head>
 <body>
@@ -4564,7 +4994,7 @@
         </a>
         <div class="navlinks">
           <a href="/">Product</a>
-          <a href="/login">Try us</a>
+          <a href="/login">Try Bluey</a>
           <a href="/docs/disguise">Controls</a>
           <a href="/docs/privacy">Privacy</a>
           <a href="/docs/terms">Terms</a>
@@ -4677,9 +5107,7 @@
             <img class="brand-wordmark" src="assets/bluey-wordmark.svg" alt="bluey">
           </a>
           <div class="status-row">
-            <span class="status-chip live">API online</span>
-            <span class="status-chip">Square checkout</span>
-            <span class="status-chip">Managed AI</span>
+            <span class="status-chip live">Bluey Cloud</span>
           </div>
           <div class="account-actions-row">
             <a class="account-link" href="/">Product</a>
@@ -4689,14 +5117,14 @@
         </header>
 
         <section class="account-hero">
-          <h1>Sign in to Bluey</h1>
-          <p>Start the desktop with <strong>bluey on</strong>. If it is not linked, this page connects your account and returns you to the overlay automatically.</p>
+          <h1>Try Bluey</h1>
+          <p>Link your desktop, reload credits, and keep sessions synced. The real work still happens in the overlay.</p>
         </section>
 
         <section class="account-grid">
           <aside class="account-card" id="accountAuthCard">
             <h2>Account</h2>
-            <p>Sign in or create an account. Bluey uses credits only when managed AI, speech, vision, embedding, or RAG runs.</p>
+            <p>Sign in or create an account. If Bluey opened this page from the desktop, it links automatically after sign in.</p>
             <div class="device-link-hint" id="deviceLinkHint" hidden></div>
             <form class="account-form" id="accountForm">
               <label>
@@ -4722,8 +5150,8 @@
           </aside>
 
           <section class="account-card account-preview-card" id="accountPreviewCard">
-            <h2>What Bluey unlocks</h2>
-            <p>Your desktop stays light. Cloud credits unlock managed answers, screen analysis, STT, and synced session memory.</p>
+            <h2>What unlocks</h2>
+            <p>Credits power managed answers, screen analysis, live speech, and synced memory.</p>
             <div class="preview-list">
               <div class="preview-item">
                 <div class="preview-icon">$</div>
@@ -4827,13 +5255,13 @@
         </a>
         <div class="navlinks">
           <a href="/">Product</a>
-          <a href="/login">Try us</a>
+          <a href="/login">Try Bluey</a>
         </div>
       </nav>
 
       <section class="download-hero">
         <h1>Install Bluey</h1>
-        <p>Start the desktop answer layer from terminal. macOS is the current alpha path; Windows is shown here as the planned parity path so testers know what is next.</p>
+        <p>One command installs the CLI and helper app. Then run <strong>bluey on</strong>.</p>
       </section>
 
       <section class="platform-grid" aria-label="Bluey platform installers">
@@ -4850,7 +5278,7 @@
             </div>
             <span class="availability">Alpha ready</span>
           </div>
-          <p>Apple Silicon macOS is the primary internal test build. The installer places the CLI and helper app, then you start with <code>bluey on</code>.</p>
+          <p>Current alpha path for Apple Silicon Macs. Installs Bluey locally and links your account only when needed.</p>
           <div class="install-command">
             <code>curl -fsSL https://bluey.sh/install.sh | bash</code>
             <button class="copy-command" type="button" data-copy="curl -fsSL https://bluey.sh/install.sh | bash">Copy</button>
@@ -4869,7 +5297,7 @@
             </div>
             <span class="availability soon">Coming next</span>
           </div>
-          <p>Windows helper code exists, but the public installer is not enabled until clean-machine audio, overlay, and model smoke tests pass.</p>
+          <p>Windows parity is planned after clean-machine audio, overlay, and smoke tests pass.</p>
           <div class="install-command">
             <code>PowerShell installer pending</code>
             <button class="copy-command" type="button" disabled>Soon</button>
@@ -4896,7 +5324,7 @@
         <img class="brand-wordmark" src="assets/bluey-wordmark.svg" alt="bluey">
       </a>
       <div class="navlinks">
-        <a href="/login">Try us</a>
+        <a href="/login">Try Bluey</a>
         <a class="nav-cta" href="/download">Install</a>
       </div>
     </nav>
@@ -4906,21 +5334,21 @@
         <div class="launch-pill">
           <img src="assets/bluey-logo.svg" alt="">
           <code>bluey on</code>
-          <span>desktop answer layer</span>
+          <span>open the desktop overlay</span>
         </div>
         <h1>Bluey</h1>
         <div class="hero-line">Stay present, stay unseen.</div>
-        <p>A compact AI layer for live work. Listen, attach context, analyse the screen, and get routed answers without leaving the app you are already using.</p>
-        <p class="hero-proof">Terminal-first. Cloud-powered when needed. Local context stays under your control.</p>
+        <p>A small desktop AI layer for live work. Listen, attach context, analyse the screen, and get answers without leaving the app you are already using.</p>
+        <p class="hero-proof">Run <code>bluey on</code>. Click the pill. Ask.</p>
         <div class="hero-actions">
           <a class="button primary" href="/download">Install Bluey</a>
-          <a class="button" href="/login">Try us</a>
+          <a class="button" href="/login">Try Bluey</a>
         </div>
         <form class="quick-join" action="/login" method="get">
           <input name="user_code" type="text" placeholder="Desktop link code" autocomplete="one-time-code" spellcheck="false">
           <button type="submit">Link</button>
         </form>
-        <div class="hero-note">Already installed? Run <code>bluey on</code> and enter the desktop link code here if Bluey asks for one.</div>
+        <div class="hero-note">Already installed? Run <code>bluey on</code>. If Bluey shows a link code, enter it here.</div>
       </div>
 
       <aside class="product-preview" aria-label="Bluey product preview">
@@ -4971,7 +5399,7 @@
 
     <section class="site-strip" aria-label="Bluey highlights">
       <a class="site-card" href="/download"><div><span>Install</span><small>Run <code>bluey on</code> and the pill appears.</small></div></a>
-      <a class="site-card" href="/login"><div><span>Link</span><small>Sign in only when cloud answers or credits are needed.</small></div></a>
+      <a class="site-card" href="/login"><div><span>Try</span><small>Sign in only when cloud answers or credits are needed.</small></div></a>
       <a class="site-card" href="/docs/privacy"><div><span>Control</span><small>Attach files, screen, and transcripts only by choice.</small></div></a>
     </section>
 
@@ -5082,8 +5510,8 @@
         title.textContent = 'Bluey account';
         copy.innerHTML = 'Manage credits, synced sessions, and desktop linking. Bluey spends only when a managed cloud lane runs.';
       } else {
-        title.textContent = 'Sign in to Bluey';
-        copy.innerHTML = 'Start the desktop with <strong>bluey on</strong>. If it is not linked, this page connects your account and returns you to the overlay automatically.';
+        title.textContent = 'Try Bluey';
+        copy.innerHTML = 'Link your desktop, reload credits, and keep sessions synced. The real work still happens in the overlay.';
       }
     }
 
@@ -5394,7 +5822,7 @@
       const authed = Boolean(accountToken());
       setAccountChrome(authed);
       document.getElementById('accountAuthCard').hidden = authed;
-      document.getElementById('accountPreviewCard').hidden = authed;
+      document.getElementById('accountPreviewCard').hidden = true;
       document.getElementById('accountDashboard').hidden = !authed;
       document.getElementById('accountRecoveryCard').hidden = true;
       document.getElementById('accountSignOut').hidden = !authed;
