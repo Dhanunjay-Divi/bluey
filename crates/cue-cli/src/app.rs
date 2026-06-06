@@ -1959,19 +1959,39 @@ fn resolve_daemon_bin() -> Result<PathBuf> {
     }
 
     let exe = env::current_exe().context("failed to resolve current executable")?;
-    let bluey_sibling = exe.with_file_name(format!("bluey-daemon{}", env::consts::EXE_SUFFIX));
-    if bluey_sibling.exists() {
-        return Ok(bluey_sibling);
+    let mut roots = vec![exe.clone()];
+    if let Ok(real_exe) = exe.canonicalize() {
+        roots.push(real_exe);
+    }
+    if let Some(install_root) = env::var_os("BLUEY_INSTALL_ROOT") {
+        roots.push(PathBuf::from(install_root).join("bin").join("bluey"));
+    }
+    if let Some(home) = env::var_os("HOME") {
+        roots.push(PathBuf::from(home).join(".bluey/bin/bluey"));
     }
 
-    let sibling = exe.with_file_name(format!("cue-daemon{}", env::consts::EXE_SUFFIX));
-    if sibling.exists() {
-        return Ok(sibling);
+    if let Some(path) = resolve_daemon_bin_from_roots(roots) {
+        return Ok(path);
     }
 
     Err(anyhow!(
-        "could not find bluey-daemon next to bluey; build with `cargo build` or set BLUEY_DAEMON_BIN"
+        "could not find bluey-daemon in the Bluey install; reinstall with `curl -fsSL https://bluey.sh/install.sh | bash` or set BLUEY_DAEMON_BIN"
     ))
+}
+
+fn resolve_daemon_bin_from_roots(roots: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
+    for root in roots {
+        let bluey_sibling = root.with_file_name(format!("bluey-daemon{}", env::consts::EXE_SUFFIX));
+        if bluey_sibling.exists() {
+            return Some(bluey_sibling);
+        }
+
+        let sibling = root.with_file_name(format!("cue-daemon{}", env::consts::EXE_SUFFIX));
+        if sibling.exists() {
+            return Some(sibling);
+        }
+    }
+    None
 }
 
 async fn request(message: DaemonRequest) -> Result<DaemonResponse> {
@@ -2713,8 +2733,9 @@ async fn bluey_delete_account_cmd(force: bool) -> Result<()> {
 mod tests {
     use super::{
         bluey_on_boot_lines, bluey_on_boot_title, default_bluey_signin_url, device_login_url,
-        BlueyOnAuthState,
+        resolve_daemon_bin_from_roots, BlueyOnAuthState,
     };
+    use std::{fs, path::PathBuf};
 
     #[test]
     fn bluey_on_boot_lines_offer_browser_signin_when_unlinked() {
@@ -2778,5 +2799,31 @@ mod tests {
             device_login_url("https://bluey.sh/login?source=desktop", "ABCD-EFGH"),
             "https://bluey.sh/login?source=desktop&user_code=ABCD-EFGH"
         );
+    }
+
+    #[test]
+    fn resolve_daemon_bin_finds_installed_bluey_daemon_sibling() {
+        let base = std::env::temp_dir().join(format!(
+            "bluey-daemon-lookup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let bin_dir = base.join("bin");
+        fs::create_dir_all(&bin_dir).expect("create bin dir");
+
+        let bluey = bin_dir.join(format!("bluey{}", std::env::consts::EXE_SUFFIX));
+        let daemon = bin_dir.join(format!("bluey-daemon{}", std::env::consts::EXE_SUFFIX));
+        fs::write(&bluey, b"bluey").expect("write bluey");
+        fs::write(&daemon, b"bluey-daemon").expect("write daemon");
+
+        assert_eq!(
+            resolve_daemon_bin_from_roots(vec![PathBuf::from("/missing/bluey"), bluey]),
+            Some(daemon)
+        );
+
+        let _ = fs::remove_dir_all(base);
     }
 }

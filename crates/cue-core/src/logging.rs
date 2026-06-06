@@ -389,7 +389,7 @@ mod tests {
         assert_eq!(entries.len(), 1, "{entries:?}");
         let content = fs::read_to_string(&entries[0]).expect("read smoke log");
         assert!(content.contains("\"component\":\"cue-core-test\""));
-        assert!(content.contains("\"version\":\"0.1.0\""));
+        assert!(content.contains(&format!("\"version\":\"{}\"", env!("CARGO_PKG_VERSION"))));
         assert!(content.contains("\"platform\":"));
         assert!(content.contains("\"answer\":42"));
         assert!(content.contains("\"message\":\"phase two smoke\""));

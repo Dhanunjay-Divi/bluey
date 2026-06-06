@@ -151,11 +151,14 @@ ok "Quarantine attribute cleared"
 
 # ── CLI symlink ──────────────────────────────────────────────────────
 CLI_SOURCE="$INSTALL_ROOT/bin/bluey"
+DAEMON_SOURCE="$INSTALL_ROOT/bin/bluey-daemon"
 if [ -d "$CLI_DIR" ] && [ -w "$CLI_DIR" ]; then
     ln -sf "$CLI_SOURCE" "$CLI_DIR/bluey"
+    [ -x "$DAEMON_SOURCE" ] && ln -sf "$DAEMON_SOURCE" "$CLI_DIR/bluey-daemon"
     ok "CLI symlink: $CLI_DIR/bluey"
 elif [ -d "$HOME/.local/bin" ] || mkdir -p "$HOME/.local/bin" 2>/dev/null; then
     ln -sf "$CLI_SOURCE" "$HOME/.local/bin/bluey"
+    [ -x "$DAEMON_SOURCE" ] && ln -sf "$DAEMON_SOURCE" "$HOME/.local/bin/bluey-daemon"
     ok "CLI symlink: $HOME/.local/bin/bluey"
     case ":$PATH:" in
         *":$HOME/.local/bin:"*) ;;
