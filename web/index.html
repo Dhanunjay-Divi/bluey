@@ -3816,6 +3816,742 @@
         padding: 20px;
       }
     }
+
+    /* June 6 v2: complete customer-facing redesign. Keep this last. */
+    :root {
+      --v2-bg: #020303;
+      --v2-ink: #f4fbff;
+      --v2-muted: #a4b6bf;
+      --v2-soft: #6f818a;
+      --v2-cyan: #78efff;
+      --v2-mint: #82ffd1;
+      --v2-panel: rgba(7, 10, 12, .82);
+      --v2-panel-2: rgba(12, 16, 18, .72);
+      --v2-line: rgba(120, 239, 255, .18);
+      --v2-line-strong: rgba(120, 239, 255, .34);
+    }
+
+    body {
+      background: var(--v2-bg);
+      color: var(--v2-ink);
+    }
+
+    .site,
+    .account-app,
+    .download-app,
+    .policy-app {
+      background:
+        radial-gradient(circle at 74% 10%, rgba(120, 239, 255, .18), transparent 30%),
+        radial-gradient(circle at 10% 42%, rgba(130, 255, 209, .085), transparent 34%),
+        linear-gradient(140deg, #010202 0%, #071012 48%, #020303 100%);
+    }
+
+    .site::before,
+    .account-app::before,
+    .download-app::before,
+    .policy-app::before {
+      opacity: .32;
+      background:
+        linear-gradient(rgba(120, 239, 255, .05) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(120, 239, 255, .04) 1px, transparent 1px);
+      background-size: 92px 92px;
+      mask-image: radial-gradient(circle at 50% 22%, #000 0%, transparent 72%);
+    }
+
+    .site::after {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: .78;
+      background:
+        linear-gradient(90deg, rgba(2, 3, 3, .92) 0%, rgba(2, 3, 3, .12) 48%, rgba(2, 3, 3, .82) 100%),
+        linear-gradient(180deg, rgba(2, 3, 3, .18), rgba(2, 3, 3, .94) 92%);
+      z-index: 0;
+    }
+
+    .site .site-nav,
+    .download-app .site-nav,
+    .policy-app .site-nav {
+      width: min(1240px, calc(100% - 48px));
+      min-height: 72px;
+      padding: 18px 0 10px;
+    }
+
+    .site .brand img:not(.brand-wordmark),
+    .download-app .brand img:not(.brand-wordmark),
+    .policy-app .brand img:not(.brand-wordmark),
+    .account-top-brand img:not(.brand-wordmark),
+    .account-rail .brand img:not(.brand-wordmark) {
+      width: 36px;
+      height: 36px;
+      border-radius: 12px;
+      box-shadow: 0 0 0 1px rgba(120, 239, 255, .22), 0 0 30px rgba(120, 239, 255, .10);
+    }
+
+    .brand-wordmark,
+    .site .brand-wordmark,
+    .download-app .brand-wordmark,
+    .policy-app .brand-wordmark,
+    .account-top-brand .brand-wordmark,
+    .account-rail .brand-wordmark {
+      width: 94px;
+      filter: drop-shadow(0 0 16px rgba(120, 239, 255, .18));
+    }
+
+    .site .navlinks a,
+    .download-app .navlinks a,
+    .policy-app .navlinks a,
+    .account-link {
+      min-height: 40px;
+      padding: 0 16px;
+      border-radius: 999px;
+      color: #d8e8ef;
+      background: rgba(255, 255, 255, .042);
+      border: 1px solid rgba(255, 255, 255, .08);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .035);
+    }
+
+    .site .navlinks .nav-cta,
+    .download-app .navlinks .nav-cta,
+    .policy-app .navlinks .nav-cta {
+      color: #021113;
+      background: linear-gradient(135deg, #78efff, #82ffd1);
+      box-shadow: 0 16px 46px rgba(120, 239, 255, .18);
+    }
+
+    .site .hero {
+      width: min(1240px, calc(100% - 48px));
+      min-height: calc(100svh - 112px);
+      display: block;
+      margin: 0 auto;
+      padding: clamp(58px, 8vh, 112px) 0 108px;
+      position: relative;
+      isolation: isolate;
+    }
+
+    .site .hero::before {
+      content: "";
+      position: absolute;
+      right: -10vw;
+      top: 50%;
+      width: min(780px, 62vw);
+      height: min(620px, 68vh);
+      transform: translateY(-48%);
+      border-radius: 44px;
+      background:
+        radial-gradient(circle at 78% 18%, rgba(130, 255, 209, .20), transparent 24%),
+        linear-gradient(135deg, rgba(120, 239, 255, .12), rgba(255, 255, 255, .02));
+      border: 1px solid rgba(120, 239, 255, .14);
+      box-shadow: 0 70px 150px rgba(0, 0, 0, .54), inset 0 1px 0 rgba(255, 255, 255, .05);
+      z-index: -2;
+    }
+
+    .site .hero::after {
+      content: "";
+      position: absolute;
+      right: 7%;
+      top: 18%;
+      width: 360px;
+      height: 360px;
+      border-radius: 999px;
+      background: radial-gradient(circle, rgba(120, 239, 255, .18), transparent 62%);
+      filter: blur(18px);
+      z-index: -3;
+    }
+
+    .site .hero-copy {
+      max-width: 690px;
+      position: relative;
+      z-index: 2;
+    }
+
+    .site .launch-pill {
+      width: fit-content;
+      min-height: 40px;
+      padding: 6px 14px 6px 7px;
+      margin-bottom: 24px;
+      gap: 10px;
+      color: #ccdde4;
+      background: rgba(2, 4, 5, .68);
+      border-color: rgba(120, 239, 255, .20);
+      box-shadow: 0 16px 46px rgba(0, 0, 0, .24), inset 0 1px 0 rgba(255, 255, 255, .045);
+      backdrop-filter: blur(18px);
+    }
+
+    .site .launch-pill code {
+      color: var(--v2-cyan);
+      background: rgba(120, 239, 255, .10);
+      border-color: rgba(120, 239, 255, .16);
+      font-size: 12px;
+    }
+
+    .site .hero-copy h1 {
+      max-width: 780px;
+      margin: 0;
+      font-size: clamp(94px, 15vw, 190px);
+      line-height: .76;
+      font-weight: 960;
+      color: #f7fcff;
+      letter-spacing: 0;
+      text-shadow: 0 22px 80px rgba(120, 239, 255, .11);
+    }
+
+    .site .hero-line {
+      max-width: 760px;
+      margin: 18px 0 22px;
+      color: var(--v2-cyan);
+      font-size: clamp(42px, 6.9vw, 92px);
+      line-height: .86;
+      font-weight: 960;
+      text-wrap: balance;
+    }
+
+    .site .hero-copy p {
+      max-width: 660px;
+      color: #c1d0d7;
+      font-size: clamp(17px, 1.5vw, 21px);
+      line-height: 1.58;
+    }
+
+    .hero-proof {
+      color: #f3fbff !important;
+      font-size: 14px !important;
+      font-weight: 880;
+      opacity: .95;
+    }
+
+    .hero-actions {
+      gap: 12px;
+      margin-top: 28px;
+    }
+
+    .site .button {
+      min-height: 58px;
+      padding: 0 24px;
+      border-radius: 18px;
+      font-weight: 900;
+      letter-spacing: 0;
+      background: rgba(255, 255, 255, .055);
+      border-color: rgba(255, 255, 255, .10);
+    }
+
+    .site .button.primary {
+      color: #021113;
+      background: linear-gradient(135deg, #7defff 0%, #63aaff 52%, #86ffd2 100%);
+      box-shadow: 0 24px 70px rgba(99, 170, 255, .26);
+    }
+
+    .quick-join {
+      width: min(580px, 100%);
+      margin-top: 20px;
+      grid-template-columns: minmax(0, 1fr) 90px;
+      padding: 5px;
+      border-radius: 21px;
+      background: rgba(255, 255, 255, .035);
+      border: 1px solid rgba(120, 239, 255, .14);
+    }
+
+    .quick-join input {
+      height: 52px;
+      background: transparent;
+      border: 0;
+      color: #effaff;
+      padding: 0 14px;
+    }
+
+    .quick-join button {
+      min-height: 52px;
+      border-radius: 17px;
+      color: #031113;
+      background: linear-gradient(135deg, #82ffd1, #78efff);
+    }
+
+    .site .hero-note {
+      max-width: 560px;
+      color: #8799a1;
+    }
+
+    .product-preview {
+      position: absolute;
+      right: 0;
+      top: 50%;
+      width: min(500px, 42vw);
+      transform: translateY(-45%);
+      padding: 12px;
+      border-radius: 38px;
+      background: rgba(1, 4, 5, .72);
+      border: 1px solid rgba(120, 239, 255, .18);
+      box-shadow: 0 44px 130px rgba(0, 0, 0, .56), inset 0 1px 0 rgba(255, 255, 255, .045);
+      backdrop-filter: blur(24px);
+      z-index: 1;
+    }
+
+    .preview-pill {
+      min-height: 52px;
+      background: rgba(2, 5, 6, .94);
+      border-color: rgba(120, 239, 255, .16);
+    }
+
+    .preview-session {
+      background: rgba(2, 5, 6, .84);
+      border-color: rgba(255, 255, 255, .08);
+      overflow: hidden;
+    }
+
+    .preview-chat {
+      min-height: 360px;
+      justify-content: center;
+    }
+
+    .preview-msg.user {
+      margin-left: auto;
+      max-width: 82%;
+      border-radius: 22px 22px 8px 22px;
+    }
+
+    .preview-msg.ai {
+      max-width: 84%;
+      border-radius: 22px 22px 22px 8px;
+    }
+
+    .preview-canvas {
+      max-width: 88%;
+      margin-left: 0;
+    }
+
+    .preview-composer {
+      min-height: 62px;
+      border-radius: 24px;
+      background: rgba(1, 4, 5, .82);
+    }
+
+    .site-strip,
+    .flow-band {
+      width: min(1240px, calc(100% - 48px));
+      position: relative;
+      z-index: 1;
+    }
+
+    .site-strip {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin: -56px auto 0;
+      padding: 0 0 22px;
+    }
+
+    .site-card {
+      min-height: 86px;
+      border-radius: 26px;
+      padding: 19px 20px;
+      background: linear-gradient(180deg, rgba(255, 255, 255, .06), rgba(255, 255, 255, .026));
+      border: 1px solid rgba(120, 239, 255, .14);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .04);
+      transition: transform .18s ease, border-color .18s ease, background .18s ease;
+    }
+
+    .site-card:hover {
+      transform: translateY(-2px);
+      border-color: rgba(120, 239, 255, .30);
+      background: linear-gradient(180deg, rgba(120, 239, 255, .085), rgba(255, 255, 255, .03));
+    }
+
+    .site-card span {
+      font-size: 16px;
+      font-weight: 920;
+    }
+
+    .site-card small {
+      margin-top: 6px;
+      color: #92a5ae;
+    }
+
+    .flow-band {
+      display: grid;
+      grid-template-columns: minmax(260px, .72fr) minmax(0, 1.28fr);
+      gap: 28px;
+      align-items: start;
+      margin: 0 auto;
+      padding: 72px 0 88px;
+    }
+
+    .section-kicker {
+      color: var(--v2-cyan);
+      font-size: 12px;
+      font-weight: 940;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+
+    .flow-copy h2 {
+      max-width: 430px;
+      margin: 14px 0 0;
+      font-size: clamp(34px, 4.4vw, 58px);
+      line-height: .95;
+      letter-spacing: 0;
+    }
+
+    .flow-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .flow-grid article {
+      min-height: 220px;
+      padding: 22px;
+      border-radius: 28px;
+      background: rgba(255, 255, 255, .04);
+      border: 1px solid rgba(120, 239, 255, .13);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, .035);
+    }
+
+    .flow-grid article > span {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 42px;
+      height: 34px;
+      border-radius: 999px;
+      color: #041112;
+      background: linear-gradient(135deg, #82ffd1, #78efff);
+      font-size: 12px;
+      font-weight: 950;
+    }
+
+    .flow-grid h3 {
+      margin: 34px 0 10px;
+      font-size: 24px;
+    }
+
+    .flow-grid p {
+      margin: 0;
+      color: #9caeb6;
+      line-height: 1.5;
+    }
+
+    .footer {
+      background: rgba(2, 4, 5, .82);
+    }
+
+    .account-app,
+    .download-app,
+    .policy-app {
+      padding: 24px;
+    }
+
+    .account-shell,
+    .download-shell,
+    .policy-shell {
+      width: min(1180px, 100%);
+    }
+
+    .account-rail,
+    .account-main,
+    .download-hero,
+    .download-card,
+    .download-note,
+    .policy-card,
+    .account-card {
+      background: rgba(4, 8, 10, .76);
+      border-color: rgba(120, 239, 255, .15);
+      box-shadow: 0 34px 100px rgba(0, 0, 0, .42), inset 0 1px 0 rgba(255, 255, 255, .04);
+      backdrop-filter: blur(22px);
+    }
+
+    .account-app.is-guest .account-shell {
+      width: min(960px, 100%);
+    }
+
+    .account-app.is-guest .account-main {
+      padding: 18px;
+      border-radius: 34px;
+    }
+
+    .account-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .account-hero {
+      padding: 38px;
+      text-align: center;
+      background:
+        radial-gradient(circle at 70% 0%, rgba(120, 239, 255, .16), transparent 38%),
+        rgba(255, 255, 255, .045);
+    }
+
+    .account-hero h1 {
+      margin: 0 auto;
+      font-size: clamp(50px, 7vw, 90px);
+      line-height: .88;
+    }
+
+    .account-hero p {
+      margin-left: auto;
+      margin-right: auto;
+      font-size: 16px;
+      line-height: 1.55;
+    }
+
+    .account-app.is-guest .account-grid {
+      grid-template-columns: minmax(0, 430px) minmax(0, 1fr);
+      gap: 14px;
+    }
+
+    .account-card {
+      padding: 24px;
+      border-radius: 28px;
+    }
+
+    .account-form input {
+      height: 54px;
+      border-radius: 18px;
+      color: #f4fbff;
+      background: rgba(1, 3, 4, .68);
+      border: 1px solid rgba(120, 239, 255, .16);
+    }
+
+    .account-button {
+      min-height: 48px;
+      border-radius: 16px;
+      font-weight: 900;
+    }
+
+    .account-button.primary {
+      background: linear-gradient(135deg, #78efff, #82ffd1);
+      box-shadow: 0 18px 50px rgba(120, 239, 255, .18);
+    }
+
+    .preview-item {
+      border-radius: 20px;
+      background: rgba(255, 255, 255, .035);
+    }
+
+    .download-shell {
+      gap: 18px;
+    }
+
+    .download-hero {
+      min-height: 280px;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      padding: clamp(34px, 6vw, 64px);
+      background:
+        radial-gradient(circle at 80% 0%, rgba(120, 239, 255, .16), transparent 34%),
+        rgba(4, 8, 10, .76);
+    }
+
+    .download-hero h1 {
+      margin: 0;
+      font-size: clamp(66px, 10vw, 120px);
+      line-height: .82;
+    }
+
+    .download-hero p {
+      max-width: 760px;
+      color: #b6c7ce;
+      font-size: 17px;
+      line-height: 1.55;
+    }
+
+    .platform-grid {
+      gap: 14px;
+    }
+
+    .download-card {
+      border-radius: 30px;
+      padding: 26px;
+    }
+
+    .platform-name {
+      gap: 14px;
+    }
+
+    .platform-name span:last-child {
+      font-size: 24px;
+      font-weight: 940;
+    }
+
+    .os-icon {
+      border-radius: 17px;
+      background: rgba(120, 239, 255, .11);
+    }
+
+    .availability {
+      color: #031113;
+      background: #82ffd1;
+      border: 0;
+      font-weight: 920;
+    }
+
+    .availability.soon {
+      color: #9aabb3;
+      background: rgba(255, 255, 255, .06);
+    }
+
+    .install-command {
+      min-height: 64px;
+      border-radius: 20px;
+      background: rgba(1, 4, 5, .72);
+      border: 1px solid rgba(255, 255, 255, .08);
+    }
+
+    .copy-command {
+      min-height: 42px;
+      border-radius: 14px;
+    }
+
+    @media (max-width: 1060px) {
+      .product-preview {
+        position: relative;
+        right: auto;
+        top: auto;
+        width: min(560px, 100%);
+        margin-top: 44px;
+        transform: none;
+      }
+
+      .site .hero {
+        padding-bottom: 90px;
+      }
+
+      .site .hero::before {
+        inset: auto -18vw 4vh auto;
+        transform: none;
+        width: 76vw;
+        height: 48vh;
+      }
+
+      .site-strip,
+      .flow-band {
+        margin-top: 0;
+      }
+
+      .flow-band,
+      .flow-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .flow-grid article {
+        min-height: auto;
+      }
+
+      .flow-grid h3 {
+        margin-top: 22px;
+      }
+    }
+
+    @media (max-width: 720px) {
+      .site .site-nav,
+      .download-app .site-nav,
+      .policy-app .site-nav,
+      .site .hero,
+      .site-strip,
+      .flow-band {
+        width: calc(100% - 28px);
+      }
+
+      .site .site-nav {
+        align-items: flex-start;
+      }
+
+      .site .navlinks a:not(.nav-cta) {
+        display: none;
+      }
+
+      .site .hero {
+        min-height: auto;
+        padding: 70px 0 44px;
+      }
+
+      .site .hero-copy h1 {
+        font-size: clamp(74px, 24vw, 104px);
+      }
+
+      .site .hero-line {
+        font-size: clamp(42px, 13vw, 56px);
+      }
+
+      .site .launch-pill {
+        max-width: 100%;
+      }
+
+      .product-preview {
+        display: none;
+      }
+
+      .quick-join {
+        grid-template-columns: 1fr;
+        padding: 6px;
+      }
+
+      .site-strip {
+        grid-template-columns: 1fr;
+        padding-bottom: 10px;
+      }
+
+      .flow-band {
+        padding: 48px 0 58px;
+      }
+
+      .account-app,
+      .download-app,
+      .policy-app {
+        padding: 12px;
+      }
+
+      .account-app.is-guest .account-main,
+      .account-main {
+        padding: 12px;
+        border-radius: 28px;
+      }
+
+      .account-top {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .account-actions-row {
+        width: 100%;
+      }
+
+      .account-actions-row .account-button,
+      .account-actions-row .account-link {
+        flex: 1 1 auto;
+      }
+
+      .account-hero {
+        padding: 26px 20px;
+      }
+
+      .account-hero h1 {
+        font-size: clamp(46px, 15vw, 62px);
+      }
+
+      .account-app.is-guest .account-grid,
+      .platform-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .account-card,
+      .download-card {
+        padding: 20px;
+      }
+
+      .download-hero {
+        min-height: 230px;
+        padding: 28px 22px;
+      }
+
+      .download-hero h1 {
+        font-size: clamp(52px, 16vw, 70px);
+      }
+    }
   </style>
 </head>
 <body>
@@ -4170,12 +4906,12 @@
         <div class="launch-pill">
           <img src="assets/bluey-logo.svg" alt="">
           <code>bluey on</code>
-          <span>private answer layer</span>
+          <span>desktop answer layer</span>
         </div>
         <h1>Bluey</h1>
         <div class="hero-line">Stay present, stay unseen.</div>
-        <p>A quiet AI layer for live work. Start from terminal, attach context only when you choose, and get routed answers without leaving the screen you are on.</p>
-        <p class="hero-proof">One command to open. Credits only when managed cloud work runs.</p>
+        <p>A compact AI layer for live work. Listen, attach context, analyse the screen, and get routed answers without leaving the app you are already using.</p>
+        <p class="hero-proof">Terminal-first. Cloud-powered when needed. Local context stays under your control.</p>
         <div class="hero-actions">
           <a class="button primary" href="/download">Install Bluey</a>
           <a class="button" href="/login">Try us</a>
@@ -4199,17 +4935,17 @@
 
         <div class="preview-session">
           <div class="preview-session-head">
-            <strong>Live session</strong>
-            <span>Auto route</span>
+            <strong>Current session</strong>
+            <span>Auto</span>
           </div>
           <div class="preview-chat">
             <div class="preview-msg user">
               <small>You</small>
-              Walk me through the safest production design.
+              How should I answer this clearly?
             </div>
             <div class="preview-msg ai">
               <small>Bluey</small>
-              Start with a concise answer. Open canvas only when the work needs structure.
+              Start with the direct answer, then add reasoning only where it helps.
             </div>
             <div class="preview-canvas">
               <div class="preview-canvas-head">
@@ -4234,9 +4970,33 @@
     </section>
 
     <section class="site-strip" aria-label="Bluey highlights">
-      <a class="site-card" href="/login"><div><span>Try Bluey</span><small>Create an account or link the desktop.</small></div></a>
-      <a class="site-card" href="/download"><div><span>Install</span><small>Start with <code>bluey on</code> on macOS.</small></div></a>
-      <a class="site-card" href="/docs/privacy"><div><span>Context</span><small>Transcripts, files, screen, and synced sessions.</small></div></a>
+      <a class="site-card" href="/download"><div><span>Install</span><small>Run <code>bluey on</code> and the pill appears.</small></div></a>
+      <a class="site-card" href="/login"><div><span>Link</span><small>Sign in only when cloud answers or credits are needed.</small></div></a>
+      <a class="site-card" href="/docs/privacy"><div><span>Control</span><small>Attach files, screen, and transcripts only by choice.</small></div></a>
+    </section>
+
+    <section class="flow-band" aria-label="How Bluey works">
+      <div class="flow-copy">
+        <span class="section-kicker">From install to answer</span>
+        <h2>One small pill, one focused session.</h2>
+      </div>
+      <div class="flow-grid">
+        <article>
+          <span>01</span>
+          <h3>Open</h3>
+          <p>Start from terminal. Bluey opens a compact pill and creates a fresh local recording.</p>
+        </article>
+        <article>
+          <span>02</span>
+          <h3>Add context</h3>
+          <p>Listen, attach docs, or analyse the visible screen. Context becomes searchable session memory.</p>
+        </article>
+        <article>
+          <span>03</span>
+          <h3>Answer</h3>
+          <p>Auto routing chooses quick, deep, code, or vision lanes and shows cost before the session gets noisy.</p>
+        </article>
+      </div>
     </section>
 
     <footer class="footer">
