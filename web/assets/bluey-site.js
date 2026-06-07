@@ -1,3 +1,6 @@
+if (!window.__BLUEY_SITE_BOOTED__) {
+  window.__BLUEY_SITE_BOOTED__ = true;
+
     const policyApp = document.getElementById('policyApp');
     const accountApp = document.getElementById('accountApp');
     const downloadApp = document.getElementById('downloadApp');
@@ -5,7 +8,19 @@
     const downloadRoutes = new Set(['/download', '/install']);
     const accountRoutes = new Set(['/account', '/reload', '/link', '/login', '/device', '/verify-email', '/password-reset']);
     const policyRoutes = new Set(['/docs/privacy', '/docs/terms', '/docs/disguise']);
-    const currentPath = window.location.pathname.replace(/\/+$/, '') || '/';
+    function normalizeRoutePath(path) {
+      const value = String(path || '').trim();
+      if (!value || !value.startsWith('/')) return '';
+      const pathOnly = value.split('#')[0].split('?')[0];
+      return pathOnly.replace(/\/+$/, '') || '/';
+    }
+
+    const filePreviewRoute = window.location.protocol === 'file:'
+      ? normalizeRoutePath(new URLSearchParams(window.location.search).get('route'))
+      : '';
+    const currentPath = window.location.protocol === 'file:'
+      ? filePreviewRoute || '/'
+      : normalizeRoutePath(window.location.pathname) || '/';
     const isAccountRoute = accountRoutes.has(currentPath);
     const isPolicyRoute = policyRoutes.has(currentPath);
     const isDownloadRoute = downloadRoutes.has(currentPath);
@@ -37,6 +52,13 @@
       syncAccountNav();
     }
 
+    function signOut() {
+      clearAccountToken();
+      if (isAccountRoute) {
+        loadAccount().catch((error) => accountMessage(error.message));
+      }
+    }
+
     function syncAccountNav() {
       const authed = Boolean(accountToken());
       document.querySelectorAll('[data-guest-only]').forEach((el) => {
@@ -45,10 +67,36 @@
       document.querySelectorAll('[data-auth-only]').forEach((el) => {
         el.hidden = !authed;
       });
-      document.querySelectorAll('[data-account-icon]').forEach((el) => {
-        el.href = authed ? '/account' : '/login';
-        el.title = authed ? 'Account dashboard' : 'Login';
-        el.setAttribute('aria-label', authed ? 'Account dashboard' : 'Login');
+    }
+
+    function filePreviewHref(route) {
+      return `${window.location.pathname}?route=${encodeURIComponent(normalizeRoutePath(route) || '/')}`;
+    }
+
+    function initFilePreview() {
+      if (window.location.protocol !== 'file:') return;
+
+      document.querySelectorAll('img[src^="/assets/"]').forEach((img) => {
+        img.setAttribute('src', img.getAttribute('src').replace(/^\/assets\//, 'assets/'));
+      });
+      document.querySelectorAll('a[href^="/"]').forEach((link) => {
+        const href = link.getAttribute('href');
+        if (!href || href.startsWith('/assets/')) return;
+        link.setAttribute('href', filePreviewHref(href));
+      });
+      document.querySelectorAll('form[action^="/"]').forEach((form) => {
+        const action = normalizeRoutePath(form.getAttribute('action')) || '/';
+        form.setAttribute('action', window.location.pathname);
+        if (String(form.method || '').toLowerCase() !== 'get') return;
+        let routeInput = form.querySelector('input[name="route"][data-file-preview-route]');
+        if (!routeInput) {
+          routeInput = document.createElement('input');
+          routeInput.type = 'hidden';
+          routeInput.name = 'route';
+          routeInput.dataset.filePreviewRoute = '1';
+          form.prepend(routeInput);
+        }
+        routeInput.value = action;
       });
     }
 
@@ -594,10 +642,6 @@
       document.getElementById('reloadButton').addEventListener('click', () => {
         startReload();
       });
-      document.getElementById('accountSignOut').addEventListener('click', () => {
-        clearAccountToken();
-        loadAccount().catch((error) => accountMessage(error.message));
-      });
       document.getElementById('refreshSessionsButton').addEventListener('click', () => {
         setCloudSessionDetail('');
         loadCloudSessions().catch((error) => setCloudSessionDetail(`Could not load saved sessions: ${error.message}`));
@@ -696,6 +740,13 @@
     }
 
     document.addEventListener('click', async (event) => {
+      const signOutButton = event.target.closest('[data-sign-out]');
+      if (signOutButton) {
+        event.preventDefault();
+        signOut();
+        return;
+      }
+
       const button = event.target.closest('[data-copy]');
       if (!button) return;
       const text = button.dataset.copy || '';
@@ -712,7 +763,9 @@
       }
     });
 
+    initFilePreview();
     bootBlueyTerminal();
     syncAccountNav();
     initDownloadInstructions();
     initAccountApp();
+}

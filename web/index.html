@@ -20,12 +20,17 @@
   <meta name="twitter:title" content="Bluey | Stay Present, Stay Unseen">
   <meta name="twitter:description" content="Stay Present, stay unseen. Ask from meetings, files, your screen, and saved session context without switching apps.">
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
-  <link rel="stylesheet" href="/assets/bluey-site.css">
+  <link
+    rel="stylesheet"
+    href="/assets/bluey-site.css"
+    integrity="sha384-XXy+Nefh93ELaKWpcwPJG8Irmlsy239egNgAygDzmqbJ+XNVbYcEQyXScMs+ZP88"
+    crossorigin="anonymous"
+  >
 </head>
 <body>
   <section class="policy-app" id="policyApp" hidden>
     <div class="policy-shell">
-      <nav class="site-nav" style="width: 100%;">
+      <nav class="site-nav">
         <a class="brand" href="/">
           <img src="/assets/bluey-logo.svg" alt="">
           <img class="brand-wordmark" src="/assets/bluey-wordmark.svg" alt="bluey">
@@ -35,12 +40,7 @@
           <a href="/download">Download</a>
           <a class="nav-cta" href="/login" data-guest-only>Login</a>
           <a href="/account" data-auth-only hidden>Dashboard</a>
-          <a class="account-icon" href="/login" data-account-icon data-auth-only hidden aria-label="Login" title="Login">
-            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-              <path d="M12 12.2a4.2 4.2 0 1 0 0-8.4 4.2 4.2 0 0 0 0 8.4Z" stroke="currentColor" stroke-width="1.8"/>
-              <path d="M4.7 20.2c.8-3.6 3.4-5.7 7.3-5.7s6.5 2.1 7.3 5.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-            </svg>
-          </a>
+          <button class="nav-signout" type="button" data-auth-only data-sign-out hidden>Sign out</button>
           <a href="/docs/disguise">Controls</a>
           <a href="/docs/privacy">Privacy</a>
           <a href="/docs/terms">Terms</a>
@@ -178,13 +178,7 @@
           <a class="account-link" href="/download">Download</a>
           <a class="account-link nav-cta" href="/login" data-guest-only>Login</a>
           <a class="account-link" href="/account" data-auth-only hidden>Dashboard</a>
-          <a class="account-icon" href="/account" data-account-icon data-auth-only hidden aria-label="Account dashboard" title="Account dashboard">
-            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-              <path d="M12 12.2a4.2 4.2 0 1 0 0-8.4 4.2 4.2 0 0 0 0 8.4Z" stroke="currentColor" stroke-width="1.8"/>
-              <path d="M4.7 20.2c.8-3.6 3.4-5.7 7.3-5.7s6.5 2.1 7.3 5.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-            </svg>
-          </a>
-          <button class="account-link" id="accountSignOut" type="button" hidden>Sign out</button>
+          <button class="account-link" id="accountSignOut" type="button" data-sign-out hidden>Sign out</button>
         </div>
       </header>
 
@@ -298,7 +292,7 @@
                 <h3>Add credits</h3>
                 <p>$30 minimum. Credits stay valid for 365 days, and paid cloud requests stop at $0.</p>
               </div>
-              <div class="account-actions-row" style="justify-content: flex-end; align-items: center;">
+              <div class="account-actions-row reload-actions">
                 <div class="reload-price">$30</div>
                 <button class="account-button primary" id="reloadButton" type="button">Add credits</button>
               </div>
@@ -328,7 +322,7 @@
 
   <section class="download-app" id="downloadApp" hidden>
     <div class="download-shell">
-      <nav class="site-nav" style="width: 100%;">
+      <nav class="site-nav">
         <a class="brand" href="/">
           <img src="/assets/bluey-logo.svg" alt="">
           <img class="brand-wordmark" src="/assets/bluey-wordmark.svg" alt="bluey">
@@ -337,12 +331,7 @@
           <a href="/">Product</a>
           <a class="nav-cta" href="/login" data-guest-only>Login</a>
           <a href="/account" data-auth-only hidden>Dashboard</a>
-          <a class="account-icon" href="/login" data-account-icon data-auth-only hidden aria-label="Login" title="Login">
-            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-              <path d="M12 12.2a4.2 4.2 0 1 0 0-8.4 4.2 4.2 0 0 0 0 8.4Z" stroke="currentColor" stroke-width="1.8"/>
-              <path d="M4.7 20.2c.8-3.6 3.4-5.7 7.3-5.7s6.5 2.1 7.3 5.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-            </svg>
-          </a>
+          <button class="nav-signout" type="button" data-auth-only data-sign-out hidden>Sign out</button>
         </div>
       </nav>
 
@@ -490,12 +479,7 @@
         <a href="/download">Download</a>
         <a class="btn-nav" href="/login" data-guest-only>Login</a>
         <a href="/account" data-auth-only hidden>Dashboard</a>
-        <a class="account-icon" href="/login" data-account-icon data-auth-only hidden aria-label="Login" title="Login">
-          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <path d="M12 12.2a4.2 4.2 0 1 0 0-8.4 4.2 4.2 0 0 0 0 8.4Z" stroke="currentColor" stroke-width="1.8"/>
-            <path d="M4.7 20.2c.8-3.6 3.4-5.7 7.3-5.7s6.5 2.1 7.3 5.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-          </svg>
-        </a>
+        <button class="nav-signout" type="button" data-auth-only data-sign-out hidden>Sign out</button>
       </div>
     </nav>
 
@@ -566,6 +550,10 @@
     </footer>
   </main>
 
-  <script src="/assets/bluey-site.js"></script>
+  <script
+    src="/assets/bluey-site.js"
+    integrity="sha384-Cz6C5ufvzrujMxtnyIzrx4HA+HgBZ4cfg+lAy6vWQYN40ZPTyDqG+qrTnjOIr3Pl"
+    crossorigin="anonymous"
+  ></script>
 </body>
 </html>
