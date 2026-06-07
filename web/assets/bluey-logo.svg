@@ -15,8 +15,8 @@
       <stop offset="1" stop-color="#4b6fff"/>
     </linearGradient>
     <linearGradient id="signal" x1="60" y1="20" x2="78" y2="38" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#91ffb0"/>
-      <stop offset="1" stop-color="#49e8ff"/>
+      <stop stop-color="#8de9ff"/>
+      <stop offset="1" stop-color="#4f8dff"/>
     </linearGradient>
     <filter id="soft-glow" x="-30%" y="-30%" width="160%" height="160%" color-interpolation-filters="sRGB">
       <feDropShadow dx="0" dy="0" stdDeviation="2.4" flood-color="#69ecff" flood-opacity=".46"/>
@@ -33,5 +33,5 @@
   <path d="M47.5 57.5h14" stroke="#bcefff" stroke-width="5.2" stroke-linecap="round"/>
 
   <path d="M69 19.5 71.15 27 78.5 29.3 71.15 31.7 69 39.5 66.85 31.7 59.5 29.3 66.85 27Z" fill="url(#signal)"/>
-  <circle cx="74.5" cy="23.5" r="2.2" fill="#9dff9e"/>
+  <circle cx="74.5" cy="23.5" r="2.2" fill="#bfefff"/>
 </svg>

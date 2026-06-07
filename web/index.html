@@ -4,13 +4,13 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Bluey | Stay Present, Stay Unseen</title>
-  <meta name="description" content="Stay present, stay unseen. Ask Bluey from meetings, code, docs, screen context, files, and session memory from one small desktop layer.">
+  <meta name="description" content="Stay Present, stay unseen. Ask Bluey from meetings, code, docs, screen context, files, and session memory from one small desktop layer.">
   <meta name="theme-color" content="#020405">
   <link rel="icon" type="image/svg+xml" href="/assets/bluey-logo.svg">
   <link rel="icon" type="image/png" sizes="512x512" href="/assets/favicon-512.png">
   <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
   <meta property="og:title" content="Bluey | Stay Present, Stay Unseen">
-  <meta property="og:description" content="Stay present, stay unseen. Ask from meetings, files, screen context, managed routing, and session memory.">
+  <meta property="og:description" content="Stay Present, stay unseen. Ask from meetings, files, screen context, managed routing, and session memory.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://bluey.sh/">
   <meta property="og:image" content="https://bluey.sh/assets/bluey-og.png">
@@ -18,7 +18,7 @@
   <meta property="og:image:height" content="630">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Bluey | Stay Present, Stay Unseen">
-  <meta name="twitter:description" content="Stay present, stay unseen. Ask from meetings, files, screen context, managed routing, and session memory.">
+  <meta name="twitter:description" content="Stay Present, stay unseen. Ask from meetings, files, screen context, managed routing, and session memory.">
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <style>
     * {
@@ -5120,14 +5120,15 @@
       height: 24px;
       flex-shrink: 0;
       border-radius: 6px;
-      box-shadow: none;
+      background: rgba(99, 216, 255, .10);
+      box-shadow: 0 0 0 1px rgba(99, 216, 255, .36), 0 0 22px rgba(79, 141, 255, .34);
     }
 
     #productSite .brand-wordmark {
       display: block;
       width: 68px;
       height: auto;
-      filter: drop-shadow(0 0 10px rgba(114, 240, 255, .22));
+      filter: drop-shadow(0 0 8px rgba(99, 216, 255, .46)) drop-shadow(0 0 18px rgba(79, 141, 255, .30));
     }
 
     #productSite .nav-links {
@@ -5301,7 +5302,7 @@
 
     #productSite .hero-actions .btn {
       width: 100%;
-      box-shadow: 0 10px 28px rgba(114, 240, 255, .10);
+      box-shadow: 0 10px 28px rgba(99, 216, 255, .12);
     }
 
     #productSite .btn-primary {
@@ -5312,7 +5313,7 @@
 
     #productSite .btn-primary:hover {
       transform: translateY(-1px);
-      box-shadow: 0 13px 34px rgba(114, 240, 255, .20);
+      box-shadow: 0 13px 34px rgba(79, 141, 255, .24);
     }
 
     #productSite .btn-ghost {
@@ -5338,7 +5339,7 @@
       width: auto;
       min-width: 0;
       background: #111;
-      border: 1px solid rgba(114, 240, 255, .30);
+      border: 1px solid rgba(99, 216, 255, .30);
       color: #e0e0e0;
       border-radius: 8px;
       padding: .6rem 1rem;
@@ -5352,7 +5353,7 @@
 
     #productSite .join-bar input:focus {
       border-color: var(--bluey-accent);
-      box-shadow: 0 0 0 2px rgba(114, 240, 255, .16);
+      box-shadow: 0 0 0 2px rgba(99, 216, 255, .16);
     }
 
     #productSite .join-bar input::placeholder {
@@ -5364,9 +5365,9 @@
     #productSite .join-bar button {
       width: auto;
       flex: 0 0 auto;
-      background: rgba(114, 240, 255, .11);
+      background: rgba(99, 216, 255, .11);
       color: var(--bluey-accent);
-      border: 1px solid rgba(114, 240, 255, .30);
+      border: 1px solid rgba(99, 216, 255, .30);
       border-radius: 8px;
       padding: .6rem 1.2rem;
       font-size: .9rem;
@@ -5376,7 +5377,7 @@
 
     #productSite .join-bar button:hover {
       border-color: var(--bluey-accent);
-      background: rgba(114, 240, 255, .17);
+      background: rgba(79, 141, 255, .17);
       color: #bff8ff;
     }
 
@@ -5404,7 +5405,7 @@
     #productSite .terminal-preview {
       padding: 12px;
       background:
-        radial-gradient(circle at 14% 0%, rgba(114, 240, 255, .18), transparent 30%),
+        radial-gradient(circle at 14% 0%, rgba(99, 216, 255, .18), transparent 30%),
         linear-gradient(180deg, rgba(5, 14, 16, .94), rgba(2, 2, 4, .86));
     }
 
@@ -5412,12 +5413,12 @@
       min-height: 398px;
       border-color: var(--bluey-accent-soft);
       background:
-        radial-gradient(circle at 88% 8%, rgba(124, 255, 199, .10), transparent 28%),
+        radial-gradient(circle at 88% 8%, rgba(79, 141, 255, .14), transparent 28%),
         linear-gradient(180deg, #090d0f 0%, #030304 100%);
     }
 
     #productSite .bluey-terminal-bar {
-      border-bottom-color: rgba(114, 240, 255, .12);
+      border-bottom-color: rgba(99, 216, 255, .12);
     }
 
     #productSite .bluey-terminal-title {
@@ -5425,9 +5426,9 @@
     }
 
     #productSite .bluey-terminal-status {
-      color: #4ade80;
-      background: rgba(74, 222, 128, .08);
-      border-color: rgba(74, 222, 128, .2);
+      color: var(--bluey-accent);
+      background: rgba(99, 216, 255, .08);
+      border-color: rgba(99, 216, 255, .22);
     }
 
     #productSite .bluey-terminal-code {
@@ -5440,6 +5441,15 @@
 
     #productSite .bluey-terminal-code .blue,
     #productSite .bluey-terminal-code .label {
+      color: var(--bluey-accent);
+    }
+
+    #productSite .bluey-terminal-dot.green {
+      color: var(--bluey-accent);
+      background: var(--bluey-accent);
+    }
+
+    #productSite .bluey-terminal-code .green {
       color: var(--bluey-accent);
     }
 
@@ -5478,8 +5488,8 @@
     }
 
     #productSite .plan.featured {
-      border-color: rgba(114, 240, 255, .26);
-      background: rgba(114, 240, 255, .04);
+      border-color: rgba(99, 216, 255, .26);
+      background: rgba(79, 141, 255, .055);
     }
 
     #productSite .plan-name {
@@ -5488,7 +5498,7 @@
     }
 
     #productSite .plan-price {
-      color: #72f0ff;
+      color: var(--bluey-accent);
       font-size: .85rem;
       white-space: nowrap;
     }
@@ -5521,11 +5531,11 @@
     }
 
     #productSite .footer-meta .email-link {
-      color: #8beeff;
+      color: var(--bluey-accent);
     }
 
     #productSite .footer-meta .email-link:hover {
-      color: #c8fbff;
+      color: #dff7ff;
     }
 
     #productSite .footer-meta .muted-note {
@@ -5672,19 +5682,22 @@
 
     #downloadApp .brand img:not(.brand-wordmark),
     #policyApp .brand img:not(.brand-wordmark),
-    #accountApp .account-top-brand img:not(.brand-wordmark) {
+    #accountApp .account-top-brand img:not(.brand-wordmark),
+    #accountApp .account-rail .brand img:not(.brand-wordmark) {
       width: 24px;
       height: 24px;
       border-radius: 6px;
-      box-shadow: none;
+      background: rgba(99, 216, 255, .10);
+      box-shadow: 0 0 0 1px rgba(99, 216, 255, .36), 0 0 22px rgba(79, 141, 255, .34);
     }
 
     #downloadApp .brand-wordmark,
     #policyApp .brand-wordmark,
-    #accountApp .brand-wordmark {
+    #accountApp .brand-wordmark,
+    #accountApp .account-rail .brand-wordmark {
       width: 68px;
       height: auto;
-      filter: drop-shadow(0 0 10px rgba(114, 240, 255, .22));
+      filter: drop-shadow(0 0 8px rgba(99, 216, 255, .46)) drop-shadow(0 0 18px rgba(79, 141, 255, .30));
     }
 
     #downloadApp .navlinks,
@@ -6007,9 +6020,9 @@
       display: inline-flex;
       align-items: center;
       border-radius: 999px;
-      border: 1px solid rgba(114, 240, 255, .25);
+      border: 1px solid rgba(99, 216, 255, .25);
       color: var(--bluey-accent);
-      background: rgba(114, 240, 255, .08);
+      background: rgba(79, 141, 255, .08);
       padding: .2rem .6rem;
       font-size: .7rem;
       font-weight: 800;
@@ -6086,7 +6099,7 @@
     }
 
     #accountApp .usage-row:first-child {
-      border-color: rgba(114, 240, 255, .22);
+      border-color: rgba(99, 216, 255, .22);
     }
 
     #accountApp .dashboard-section {
@@ -6233,6 +6246,15 @@
     }
 
     #downloadApp .availability {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: auto;
+      min-width: 0;
+      padding: .2rem .55rem;
+      border: 1px solid rgba(99, 216, 255, .25);
+      border-radius: 999px;
+      background: rgba(99, 216, 255, .10);
       color: var(--bluey-accent);
       font-size: .7rem;
       font-weight: 800;
@@ -6241,6 +6263,8 @@
 
     #downloadApp .availability.soon {
       color: #888;
+      border-color: #222;
+      background: rgba(255, 255, 255, .03);
     }
 
     #downloadApp .download-card p {
@@ -6362,12 +6386,15 @@
     #downloadApp .page-footer-links,
     #policyApp .page-footer-links {
       display: flex;
+      align-items: center;
       justify-content: center;
-      gap: 1.5rem;
+      flex-wrap: wrap;
+      gap: 0;
       padding: .85rem 0 max(.65rem, env(safe-area-inset-bottom));
       color: #c7cad1;
       font-size: .72rem;
       line-height: 1.5;
+      text-align: center;
     }
 
     #downloadApp .page-footer-links a,
@@ -6379,6 +6406,27 @@
     #downloadApp .page-footer-links a:hover,
     #policyApp .page-footer-links a:hover {
       color: #fff;
+    }
+
+    #downloadApp .page-footer-links .email-link,
+    #policyApp .page-footer-links .email-link {
+      color: var(--bluey-accent);
+    }
+
+    #downloadApp .page-footer-links .email-link:hover,
+    #policyApp .page-footer-links .email-link:hover {
+      color: #dff7ff;
+    }
+
+    #downloadApp .page-footer-links .muted-note,
+    #policyApp .page-footer-links .muted-note {
+      color: #727781;
+    }
+
+    #downloadApp .page-footer-links .dot,
+    #policyApp .page-footer-links .dot {
+      color: #6f7480;
+      margin: 0 .4rem;
     }
 
     #policyApp .policy-shell {
@@ -6629,6 +6677,10 @@
         <h2>Why this matters</h2>
         <p>The product goal is calm focus, not deception. You should always know when Bluey is listening, what context is attached, and whether an answer used managed cloud AI, local fallback, screen analysis, or knowledge-base retrieval.</p>
       </article>
+
+      <div class="page-footer-links">
+        Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Stay Present, stay unseen</span><span class="dot">&middot;</span><a href="/docs/terms">Terms</a><span class="dot">&middot;</span><a href="/docs/privacy">Privacy</a><span class="dot">&middot;</span><a href="/docs/disguise">Controls</a>
+      </div>
     </div>
   </section>
 
@@ -6933,9 +6985,7 @@
       </div>
 
       <div class="page-footer-links">
-        <a href="/docs/privacy">Privacy</a>
-        <a href="/docs/terms">Terms</a>
-        <a href="/docs/disguise">Controls</a>
+        Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Stay Present, stay unseen</span><span class="dot">&middot;</span><a href="/docs/terms">Terms</a><span class="dot">&middot;</span><a href="/docs/privacy">Privacy</a><span class="dot">&middot;</span><a href="/docs/disguise">Controls</a>
       </div>
     </div>
   </section>
@@ -6962,7 +7012,7 @@
     <div class="main">
       <div class="content">
         <section class="hero">
-          <h1 aria-label="Stay present, stay unseen.">Stay present,<br><span class="accent">Stay unseen.</span></h1>
+          <h1 aria-label="Stay Present, stay unseen.">Stay Present,<br><span class="accent">stay unseen.</span></h1>
           <p class="hero-lede">Native AI chat for meetings, code, docs, research, and screen work from your terminal. Keep Bluey in the background and ask from the context already on your machine.</p>
           <p class="hero-proof"><span>One pill keeps the context together.</span> Ask with transcript, screen, files, memory, and routed cloud models without switching apps.</p>
           <div class="hero-actions">
@@ -7021,7 +7071,7 @@
         </a>
       </div>
       <div class="footer-meta">
-        Reach us at <a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Stay present, stay unseen</span><span class="dot">&middot;</span><a href="/docs/terms">Terms</a><span class="dot">&middot;</span><a href="/docs/privacy">Privacy</a><span class="dot">&middot;</span><a href="/docs/disguise">Controls</a>
+        Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Stay Present, stay unseen</span><span class="dot">&middot;</span><a href="/docs/terms">Terms</a><span class="dot">&middot;</span><a href="/docs/privacy">Privacy</a><span class="dot">&middot;</span><a href="/docs/disguise">Controls</a>
       </div>
     </footer>
   </main>
