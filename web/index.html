@@ -6350,6 +6350,26 @@
       margin: 0;
     }
 
+    #downloadApp .download-card-action {
+      margin-top: auto;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: .22rem .6rem;
+      border: 1px solid rgba(99, 216, 255, .22);
+      border-radius: 999px;
+      background: rgba(99, 216, 255, .08);
+      color: var(--bluey-accent);
+      font-size: .7rem;
+      font-weight: 800;
+    }
+
+    #downloadApp .download-card-action.soon {
+      border-color: #222;
+      background: rgba(255, 255, 255, .03);
+      color: #777;
+    }
+
     #downloadApp .install-command {
       width: 100%;
       position: relative;
@@ -7092,7 +7112,7 @@
       </section>
 
       <section class="platform-grid" aria-label="Bluey platform installers">
-        <article class="download-card" data-platform-card="mac" role="button" tabindex="0" aria-controls="macInstallInstructions" aria-expanded="false">
+        <article class="download-card" data-platform-card="mac" role="button" tabindex="0" aria-label="Show macOS terminal install instructions" aria-controls="macInstallInstructions" aria-expanded="false">
           <div class="download-card-head">
             <div class="platform-name">
               <span class="os-icon" aria-hidden="true">
@@ -7106,10 +7126,7 @@
             <span class="availability">Alpha ready</span>
           </div>
           <p>Current alpha path for Apple Silicon Macs. Installs Bluey locally and links your account only when needed.</p>
-          <div class="install-command">
-            <code>curl -fsSL https://bluey.sh/install.sh | bash</code>
-            <button class="copy-command" type="button" data-copy="curl -fsSL https://bluey.sh/install.sh | bash">Copy</button>
-          </div>
+          <span class="download-card-action">Show terminal steps</span>
         </article>
 
         <article class="download-card disabled" aria-disabled="true">
@@ -7125,10 +7142,7 @@
             <span class="availability soon">Roadmap</span>
           </div>
           <p>Planned after native audio, overlay parity, and clean Windows smoke tests pass.</p>
-          <div class="install-command">
-            <code>Windows installer roadmap</code>
-            <button class="copy-command" type="button" disabled>Planned</button>
-          </div>
+          <span class="download-card-action soon">Installer roadmap</span>
         </article>
 
         <article class="download-card disabled" aria-disabled="true">
@@ -7146,16 +7160,13 @@
             <span class="availability soon">Later</span>
           </div>
           <p>Planned after macOS alpha and Windows parity are stable enough for support.</p>
-          <div class="install-command">
-            <code>Linux installer roadmap</code>
-            <button class="copy-command" type="button" disabled>Planned</button>
-          </div>
+          <span class="download-card-action soon">Installer roadmap</span>
         </article>
       </section>
 
       <section class="platform-instructions" id="macInstallInstructions" data-platform-instructions="mac" hidden>
         <h2>macOS setup</h2>
-        <p>Install once from Terminal, then start Bluey with one command.</p>
+        <p>Install once from Terminal, then start Bluey with one command. This follows the same terminal-first flow as Pinky.</p>
         <div class="instruction-steps">
           <div class="instruction-step">
             <span class="instruction-num">1</span>
