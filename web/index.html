@@ -5713,6 +5713,8 @@
     #downloadApp .navlinks a,
     #policyApp .navlinks a,
     #accountApp .account-link {
+      display: inline-flex;
+      align-items: center;
       min-height: auto;
       padding: 0;
       border: 0;
@@ -6187,10 +6189,21 @@
     #downloadApp {
       display: flex;
       flex-direction: column;
+      padding: 0;
       overflow-x: hidden;
     }
 
-    #downloadApp .download-shell,
+    #downloadApp .download-shell {
+      width: 100%;
+      max-width: none;
+      min-height: 100vh;
+      min-height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      margin: 0;
+    }
+
     #policyApp .policy-shell {
       width: 100%;
       max-width: none;
@@ -6199,11 +6212,15 @@
 
     #downloadApp .download-hero {
       width: min(700px, 100%);
+      min-height: 0;
+      display: block;
       margin: 0 auto;
       padding: 1.2rem 2rem .55rem;
       border: 0;
+      border-radius: 0;
       background: transparent;
       box-shadow: none;
+      backdrop-filter: none;
       text-align: center;
     }
 
@@ -6232,9 +6249,11 @@
 
     #downloadApp .download-card {
       min-height: auto;
+      min-width: 0;
       display: flex;
       flex-direction: column;
       align-items: center;
+      justify-content: flex-start;
       gap: .5rem;
       padding: 1rem;
       border: 2px solid var(--bluey-line);
@@ -6256,6 +6275,7 @@
     }
 
     #downloadApp .download-card-head {
+      width: 100%;
       display: grid;
       gap: .45rem;
       justify-items: center;
@@ -6271,10 +6291,25 @@
       font-weight: 600;
     }
 
+    #downloadApp .platform-name span:last-child {
+      font-size: .96rem;
+      font-weight: 600;
+    }
+
     #downloadApp .os-icon {
       width: 36px;
       height: 36px;
+      display: block;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      box-shadow: none;
       color: #e0e0e0;
+    }
+
+    #downloadApp .os-icon svg {
+      width: 100%;
+      height: 100%;
     }
 
     #downloadApp .availability {
@@ -6284,10 +6319,10 @@
       width: auto;
       min-width: 0;
       padding: .2rem .55rem;
-      border: 1px solid rgba(99, 216, 255, .25);
+      border: 1px solid rgba(86, 242, 142, .32);
       border-radius: 999px;
-      background: rgba(99, 216, 255, .10);
-      color: var(--bluey-accent);
+      background: rgba(86, 242, 142, .10);
+      color: #56f28e;
       font-size: .7rem;
       font-weight: 800;
       text-transform: none;
@@ -6309,20 +6344,36 @@
     #downloadApp .install-command {
       width: 100%;
       position: relative;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: .55rem;
       margin-top: .35rem;
       border: 1px solid #1a1a1a;
       border-radius: 8px;
       background: #0a0a0a;
-      padding: .7rem;
+      padding: .65rem .7rem;
       text-align: left;
+      overflow: hidden;
     }
 
     #downloadApp .install-command code {
       display: block;
+      min-width: 0;
       color: #cfcfcf;
       font-size: .72rem;
       line-height: 1.45;
-      word-break: break-word;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      word-break: normal;
+    }
+
+    #downloadApp .install-command .copy-command {
+      margin-top: 0;
+      min-height: 32px;
+      padding: 0 .7rem;
+      white-space: nowrap;
     }
 
     #downloadApp .copy-command {
@@ -6386,9 +6437,14 @@
     #downloadApp .cmd .copy-command {
       flex: 0 0 auto;
       margin: 0;
+      min-height: auto;
+      padding: .18rem .55rem;
       background: transparent;
       border-color: transparent;
+      border-radius: 999px;
       color: #333;
+      font-size: .7rem;
+      line-height: 1.3;
       min-width: 64px;
     }
 
@@ -6427,6 +6483,10 @@
       font-size: .72rem;
       line-height: 1.5;
       text-align: center;
+    }
+
+    #downloadApp .page-footer-links {
+      margin-top: auto;
     }
 
     #downloadApp .page-footer-links a,
@@ -6511,7 +6571,6 @@
     }
 
     @media (max-width: 760px) {
-      #downloadApp .site-nav,
       #policyApp .site-nav,
       #accountApp .account-top {
         grid-template-columns: 1fr;
@@ -6549,8 +6608,6 @@
         text-align: center;
       }
 
-      #downloadApp .platform-grid,
-      #downloadApp .cmd-grid,
       #accountApp .account-kpis {
         grid-template-columns: 1fr;
       }
@@ -6569,10 +6626,10 @@
       }
 
       #downloadApp .cmd {
-        align-items: stretch;
-        flex-direction: column;
-        gap: .6rem;
-        padding: .8rem;
+        align-items: center;
+        flex-direction: row;
+        gap: .75rem;
+        padding: .55rem .7rem;
       }
 
       #downloadApp .cmd > div {
@@ -6585,11 +6642,11 @@
       }
 
       #downloadApp .cmd .copy-command {
-        width: 100%;
-        min-width: 0;
-        padding: .65rem;
-        background: linear-gradient(135deg, #e8fbff, var(--bluey-accent), var(--bluey-accent-2));
-        color: #061114;
+        width: auto;
+        min-width: 64px;
+        padding: .18rem .55rem;
+        background: transparent;
+        color: #333;
       }
 
       #accountApp .account-main,
@@ -6606,6 +6663,26 @@
       #accountApp .section-head {
         flex-direction: column;
         align-items: flex-start;
+      }
+    }
+
+    @media (max-width: 600px) {
+      #downloadApp .cmd-grid,
+      #downloadApp .platform-grid {
+        grid-template-columns: 1fr;
+      }
+
+      #downloadApp .install-command {
+        grid-template-columns: 1fr;
+      }
+
+      #downloadApp .install-command code {
+        white-space: normal;
+        overflow-wrap: anywhere;
+      }
+
+      #downloadApp .install-command .copy-command {
+        width: 100%;
       }
     }
   </style>
@@ -6916,8 +6993,8 @@
       </nav>
 
       <section class="download-hero">
-        <h1>Install Bluey</h1>
-        <p>One command installs the CLI and helper app. Then run <strong>bluey on</strong>.</p>
+        <h1>Download</h1>
+        <p>Pick your platform</p>
       </section>
 
       <section class="platform-grid" aria-label="Bluey platform installers">
