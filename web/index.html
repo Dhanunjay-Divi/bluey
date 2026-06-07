@@ -6264,9 +6264,18 @@
       transition: border-color .2s, transform .15s;
     }
 
+    #downloadApp .download-card:not(.disabled) {
+      cursor: pointer;
+    }
+
     #downloadApp .download-card:hover:not(.disabled) {
       border-color: #333;
       transform: translateY(-2px);
+    }
+
+    #downloadApp .download-card.active {
+      border-color: var(--bluey-accent);
+      box-shadow: 0 0 0 1px rgba(99, 216, 255, .12), 0 0 28px rgba(99, 216, 255, .08);
     }
 
     #downloadApp .download-card.disabled {
@@ -6391,6 +6400,86 @@
       width: min(700px, 100%);
       margin: 1.35rem auto 0;
       padding: 0 2rem;
+    }
+
+    #downloadApp .platform-instructions {
+      width: min(700px, calc(100% - 4rem));
+      margin: 1rem auto 0;
+      padding: 1rem;
+      border: 1px solid #222;
+      border-radius: 12px;
+      background: #111;
+      color: #aaa;
+      animation: blueyInstructionIn .22s ease-out;
+    }
+
+    #downloadApp .platform-instructions h2 {
+      margin: 0 0 .25rem;
+      color: #e0e0e0;
+      font-size: 1rem;
+    }
+
+    #downloadApp .platform-instructions > p {
+      margin: 0 0 .8rem;
+      color: #666;
+      font-size: .78rem;
+      line-height: 1.45;
+    }
+
+    #downloadApp .instruction-steps {
+      display: grid;
+      gap: .55rem;
+    }
+
+    #downloadApp .instruction-step {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: .75rem;
+      align-items: start;
+      padding: .75rem;
+      border: 1px solid #1a1a1a;
+      border-radius: 10px;
+      background: #0a0a0a;
+    }
+
+    #downloadApp .instruction-num {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #e8fbff, var(--bluey-accent), var(--bluey-accent-2));
+      color: #061114;
+      font-size: .72rem;
+      font-weight: 800;
+    }
+
+    #downloadApp .instruction-body p {
+      margin: 0 0 .45rem;
+      color: #ccc;
+      font-size: .8rem;
+      line-height: 1.45;
+    }
+
+    #downloadApp .instruction-help {
+      margin-top: .8rem;
+      color: #777;
+      font-size: .78rem;
+      line-height: 1.45;
+      text-align: center;
+    }
+
+    @keyframes blueyInstructionIn {
+      from {
+        opacity: 0;
+        transform: translateY(6px);
+      }
+
+      to {
+        opacity: 1;
+        transform: translateY(0);
+      }
     }
 
     #downloadApp .commands h2 {
@@ -6620,6 +6709,7 @@
       }
 
       #downloadApp .download-note,
+      #downloadApp .platform-instructions,
       #downloadApp .viewer-note,
       #policyApp .policy-card {
         width: calc(100% - 3rem);
@@ -6683,6 +6773,10 @@
 
       #downloadApp .install-command .copy-command {
         width: 100%;
+      }
+
+      #downloadApp .instruction-step {
+        grid-template-columns: 1fr;
       }
     }
   </style>
@@ -6998,7 +7092,7 @@
       </section>
 
       <section class="platform-grid" aria-label="Bluey platform installers">
-        <article class="download-card">
+        <article class="download-card" data-platform-card="mac" role="button" tabindex="0" aria-controls="macInstallInstructions" aria-expanded="false">
           <div class="download-card-head">
             <div class="platform-name">
               <span class="os-icon" aria-hidden="true">
@@ -7018,7 +7112,7 @@
           </div>
         </article>
 
-        <article class="download-card disabled">
+        <article class="download-card disabled" aria-disabled="true">
           <div class="download-card-head">
             <div class="platform-name">
               <span class="os-icon" aria-hidden="true">
@@ -7037,7 +7131,7 @@
           </div>
         </article>
 
-        <article class="download-card disabled">
+        <article class="download-card disabled" aria-disabled="true">
           <div class="download-card-head">
             <div class="platform-name">
               <span class="os-icon" aria-hidden="true">
@@ -7057,6 +7151,34 @@
             <button class="copy-command" type="button" disabled>Planned</button>
           </div>
         </article>
+      </section>
+
+      <section class="platform-instructions" id="macInstallInstructions" data-platform-instructions="mac" hidden>
+        <h2>macOS setup</h2>
+        <p>Install once from Terminal, then start Bluey with one command.</p>
+        <div class="instruction-steps">
+          <div class="instruction-step">
+            <span class="instruction-num">1</span>
+            <div class="instruction-body">
+              <p>Open <strong>Terminal</strong> and run:</p>
+              <div class="install-command">
+                <code>curl -fsSL https://bluey.sh/install.sh | bash</code>
+                <button class="copy-command" type="button" data-copy="curl -fsSL https://bluey.sh/install.sh | bash">Copy</button>
+              </div>
+            </div>
+          </div>
+          <div class="instruction-step">
+            <span class="instruction-num">2</span>
+            <div class="instruction-body">
+              <p>Then start Bluey:</p>
+              <div class="install-command">
+                <code>bluey on</code>
+                <button class="copy-command" type="button" data-copy="bluey on">Copy</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="instruction-help">If account linking, managed AI credits, or cloud sync are needed, Bluey opens the browser flow automatically.</div>
       </section>
 
       <div class="download-note">
@@ -7852,6 +7974,42 @@
       }
     }
 
+    function selectDownloadPlatform(platform) {
+      const cards = document.querySelectorAll('#downloadApp [data-platform-card]');
+      const panels = document.querySelectorAll('#downloadApp [data-platform-instructions]');
+      cards.forEach((card) => {
+        const selected = card.dataset.platformCard === platform;
+        card.classList.toggle('active', selected);
+        card.setAttribute('aria-expanded', selected ? 'true' : 'false');
+      });
+      panels.forEach((panel) => {
+        const selected = panel.dataset.platformInstructions === platform;
+        panel.hidden = !selected;
+        if (selected) panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      });
+    }
+
+    function initDownloadInstructions() {
+      document.querySelectorAll('#downloadApp [data-platform-card]').forEach((card) => {
+        if (card.dataset.instructionsReady === '1') return;
+        card.dataset.instructionsReady = '1';
+        const platform = card.dataset.platformCard;
+        const open = () => {
+          if (!platform || card.classList.contains('disabled')) return;
+          selectDownloadPlatform(platform);
+        };
+        card.addEventListener('click', (event) => {
+          if (event.target.closest('[data-copy]')) return;
+          open();
+        });
+        card.addEventListener('keydown', (event) => {
+          if (event.key !== 'Enter' && event.key !== ' ') return;
+          event.preventDefault();
+          open();
+        });
+      });
+    }
+
     document.addEventListener('click', async (event) => {
       const button = event.target.closest('[data-copy]');
       if (!button) return;
@@ -7871,6 +8029,7 @@
 
     bootBlueyTerminal();
     syncAccountNav();
+    initDownloadInstructions();
     initAccountApp();
   </script>
 </body>
