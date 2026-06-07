@@ -5081,9 +5081,9 @@
       background: #050505;
       color: #e0e0e0;
       font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
-      --bluey-accent: #72f0ff;
-      --bluey-accent-2: #7cffc7;
-      --bluey-accent-soft: rgba(114, 240, 255, .22);
+      --bluey-accent: #63d8ff;
+      --bluey-accent-2: #4f8dff;
+      --bluey-accent-soft: rgba(99, 216, 255, .22);
     }
 
     #productSite.page::before,
@@ -5161,6 +5161,48 @@
       color: #061114;
     }
 
+    #productSite [hidden],
+    #downloadApp [hidden],
+    #policyApp [hidden],
+    #accountApp [hidden] {
+      display: none !important;
+    }
+
+    #productSite .nav-links .account-icon,
+    #downloadApp .navlinks .account-icon,
+    #policyApp .navlinks .account-icon,
+    #accountApp .account-actions-row .account-icon {
+      width: 34px;
+      height: 34px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0;
+      border: 1px solid rgba(99, 216, 255, .24);
+      border-radius: 999px;
+      color: var(--bluey-accent);
+      background: rgba(99, 216, 255, .08);
+      box-shadow: 0 0 22px rgba(99, 216, 255, .10);
+    }
+
+    #productSite .nav-links .account-icon:hover,
+    #downloadApp .navlinks .account-icon:hover,
+    #policyApp .navlinks .account-icon:hover,
+    #accountApp .account-actions-row .account-icon:hover {
+      border-color: rgba(99, 216, 255, .55);
+      color: #dff7ff;
+      background: rgba(99, 216, 255, .14);
+    }
+
+    #productSite .nav-links .account-icon svg,
+    #downloadApp .navlinks .account-icon svg,
+    #policyApp .navlinks .account-icon svg,
+    #accountApp .account-actions-row .account-icon svg {
+      width: 17px;
+      height: 17px;
+      display: block;
+    }
+
     #productSite .main {
       display: flex;
       align-items: center;
@@ -5228,7 +5270,7 @@
     }
 
     #productSite .hero-proof span {
-      background: linear-gradient(135deg, #9df5ff, #92ffd0);
+      background: linear-gradient(135deg, #bcefff, var(--bluey-accent-2));
       -webkit-background-clip: text;
       -webkit-text-fill-color: transparent;
       background-clip: text;
@@ -5265,7 +5307,7 @@
     #productSite .btn-primary {
       color: #061114;
       border-color: rgba(255, 255, 255, .12);
-      background: linear-gradient(135deg, #dffaff 0%, var(--bluey-accent) 52%, var(--bluey-accent-2) 100%);
+      background: linear-gradient(135deg, #e8fbff 0%, var(--bluey-accent) 52%, var(--bluey-accent-2) 100%);
     }
 
     #productSite .btn-primary:hover {
@@ -5588,8 +5630,8 @@
       background: #050505;
       color: #e0e0e0;
       font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
-      --bluey-accent: #72f0ff;
-      --bluey-accent-2: #7cffc7;
+      --bluey-accent: #63d8ff;
+      --bluey-accent-2: #4f8dff;
       --bluey-line: #1a1a1a;
     }
 
@@ -5698,7 +5740,7 @@
     #downloadApp .copy-command {
       border-color: transparent;
       color: #061114;
-      background: linear-gradient(135deg, #dffaff, var(--bluey-accent), var(--bluey-accent-2));
+      background: linear-gradient(135deg, #e8fbff, var(--bluey-accent), var(--bluey-accent-2));
       font-weight: 700;
     }
 
@@ -6466,7 +6508,7 @@
         width: 100%;
         min-width: 0;
         padding: .65rem;
-        background: linear-gradient(135deg, #dffaff, var(--bluey-accent), var(--bluey-accent-2));
+        background: linear-gradient(135deg, #e8fbff, var(--bluey-accent), var(--bluey-accent-2));
         color: #061114;
       }
 
@@ -6498,7 +6540,15 @@
         </a>
         <div class="navlinks">
           <a href="/">Product</a>
-          <a href="/login">Try Bluey</a>
+          <a href="/download">Download</a>
+          <a href="/login" data-guest-only>Login</a>
+          <a href="/account" data-auth-only hidden>Dashboard</a>
+          <a class="account-icon" href="/login" data-account-icon aria-label="Login" title="Login">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M12 12.2a4.2 4.2 0 1 0 0-8.4 4.2 4.2 0 0 0 0 8.4Z" stroke="currentColor" stroke-width="1.8"/>
+              <path d="M4.7 20.2c.8-3.6 3.4-5.7 7.3-5.7s6.5 2.1 7.3 5.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+            </svg>
+          </a>
           <a href="/docs/disguise">Controls</a>
           <a href="/docs/privacy">Privacy</a>
           <a href="/docs/terms">Terms</a>
@@ -6615,7 +6665,14 @@
           </div>
           <div class="account-actions-row">
             <a class="account-link" href="/">Product</a>
-            <a class="account-link" href="/download">Install</a>
+            <a class="account-link" href="/download">Download</a>
+            <a class="account-link" href="/account" data-auth-only hidden>Dashboard</a>
+            <a class="account-icon" href="/account" data-account-icon data-auth-only hidden aria-label="Account dashboard" title="Account dashboard">
+              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M12 12.2a4.2 4.2 0 1 0 0-8.4 4.2 4.2 0 0 0 0 8.4Z" stroke="currentColor" stroke-width="1.8"/>
+                <path d="M4.7 20.2c.8-3.6 3.4-5.7 7.3-5.7s6.5 2.1 7.3 5.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+              </svg>
+            </a>
             <button class="account-button ghost" id="accountSignOut" type="button" hidden>Sign out</button>
           </div>
         </header>
@@ -6759,7 +6816,14 @@
         </a>
         <div class="navlinks">
           <a href="/">Product</a>
-          <a href="/login">Try Bluey</a>
+          <a href="/login" data-guest-only>Login</a>
+          <a href="/account" data-auth-only hidden>Dashboard</a>
+          <a class="account-icon" href="/login" data-account-icon aria-label="Login" title="Login">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M12 12.2a4.2 4.2 0 1 0 0-8.4 4.2 4.2 0 0 0 0 8.4Z" stroke="currentColor" stroke-width="1.8"/>
+              <path d="M4.7 20.2c.8-3.6 3.4-5.7 7.3-5.7s6.5 2.1 7.3 5.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+            </svg>
+          </a>
         </div>
       </nav>
 
@@ -6884,16 +6948,23 @@
       </a>
       <div class="nav-links">
         <a href="/download">Download</a>
-        <a class="btn-nav" href="/login">Try Bluey</a>
+        <a href="/login" data-guest-only>Login</a>
+        <a class="btn-nav" href="/account" data-auth-only hidden>Dashboard</a>
+        <a class="account-icon" href="/login" data-account-icon aria-label="Login" title="Login">
+          <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M12 12.2a4.2 4.2 0 1 0 0-8.4 4.2 4.2 0 0 0 0 8.4Z" stroke="currentColor" stroke-width="1.8"/>
+            <path d="M4.7 20.2c.8-3.6 3.4-5.7 7.3-5.7s6.5 2.1 7.3 5.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+          </svg>
+        </a>
       </div>
     </nav>
 
     <div class="main">
       <div class="content">
         <section class="hero">
-          <h1 aria-label="Stay present, stay unseen.">stay present,<br><span class="accent">stay unseen.</span></h1>
+          <h1 aria-label="Stay present, stay unseen.">Stay present,<br><span class="accent">Stay unseen.</span></h1>
           <p class="hero-lede">Native AI chat for meetings, code, docs, research, and screen work from your terminal. Keep Bluey in the background and ask from the context already on your machine.</p>
-          <p class="hero-proof"><span>One pill is all you need.</span> Transcript, screen, files, memory, and routed cloud models without switching apps.</p>
+          <p class="hero-proof"><span>One pill keeps the context together.</span> Ask with transcript, screen, files, memory, and routed cloud models without switching apps.</p>
           <div class="hero-actions">
             <a class="btn btn-primary" href="/download">Get Started</a>
             <a class="btn btn-ghost" href="/login">Try Bluey</a>
@@ -6986,11 +7057,28 @@
     function setAccountToken(auth) {
       localStorage.setItem('bluey_access_token', auth.access_token);
       localStorage.setItem('bluey_refresh_token', auth.refresh_token || '');
+      syncAccountNav();
     }
 
     function clearAccountToken() {
       localStorage.removeItem('bluey_access_token');
       localStorage.removeItem('bluey_refresh_token');
+      syncAccountNav();
+    }
+
+    function syncAccountNav() {
+      const authed = Boolean(accountToken());
+      document.querySelectorAll('[data-guest-only]').forEach((el) => {
+        el.hidden = authed;
+      });
+      document.querySelectorAll('[data-auth-only]').forEach((el) => {
+        el.hidden = !authed;
+      });
+      document.querySelectorAll('[data-account-icon]').forEach((el) => {
+        el.href = authed ? '/account' : '/login';
+        el.title = authed ? 'Account dashboard' : 'Login';
+        el.setAttribute('aria-label', authed ? 'Account dashboard' : 'Login');
+      });
     }
 
     function bootBlueyTerminal() {
@@ -7109,6 +7197,7 @@
       app.classList.toggle('is-authed', Boolean(authed));
       app.classList.toggle('is-guest', !authed);
       setRailCommand(authed);
+      syncAccountNav();
 
       const title = app.querySelector('.account-hero h1');
       const copy = app.querySelector('.account-hero p');
@@ -7606,6 +7695,7 @@
     });
 
     bootBlueyTerminal();
+    syncAccountNav();
     initAccountApp();
   </script>
 </body>
