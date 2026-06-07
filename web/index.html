@@ -5651,6 +5651,12 @@
       color: inherit;
     }
 
+    #accountApp,
+    #policyApp {
+      padding: 0;
+      overflow-x: hidden;
+    }
+
     #downloadApp .site-nav,
     #policyApp .site-nav,
     #accountApp .account-top {
@@ -5733,6 +5739,31 @@
       color: var(--bluey-accent);
     }
 
+    #downloadApp .navlinks .nav-cta,
+    #policyApp .navlinks .nav-cta,
+    #accountApp .account-actions-row .nav-cta {
+      min-height: 34px;
+      padding: 0 .95rem;
+      border: 0;
+      border-radius: 6px;
+      color: #061114;
+      background: var(--bluey-accent);
+      font-weight: 700;
+    }
+
+    #downloadApp .navlinks .nav-cta:hover,
+    #policyApp .navlinks .nav-cta:hover,
+    #accountApp .account-actions-row .nav-cta:hover {
+      color: #061114;
+      background: #8ff5ff;
+    }
+
+    #accountApp .account-actions-row button.account-link {
+      appearance: none;
+      cursor: pointer;
+      font-family: inherit;
+    }
+
     #accountApp .account-button,
     #downloadApp .copy-command {
       border: 1px solid #333;
@@ -5773,13 +5804,15 @@
       width: 100%;
       min-height: 100vh;
       min-height: 100dvh;
-      display: block;
+      display: flex;
+      flex-direction: column;
       margin: 0;
     }
 
     #accountApp .account-main {
       width: min(860px, 100%);
-      min-height: calc(100vh - 65px);
+      flex: 1 0 auto;
+      min-height: auto;
       margin: 0 auto;
       padding: 2rem 2rem 4rem;
       background: transparent;
@@ -5790,28 +5823,28 @@
     #accountApp.is-guest .account-main {
       width: 100%;
       max-width: 420px;
-      min-height: 100vh;
+      min-height: 0;
       display: flex;
       flex-direction: column;
       justify-content: center;
-      padding: 1.5rem;
+      padding: 2rem 1.5rem;
     }
 
     #accountApp.is-guest .account-top {
-      display: flex;
-      justify-content: center;
-      padding: 0 0 1.4rem;
-      border: 0;
-      background: transparent;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      justify-content: initial;
+      padding: 1rem 2.5rem;
+      border-bottom: 1px solid #111;
+      background: #050505;
     }
 
-    #accountApp.is-guest .status-row,
-    #accountApp.is-guest .account-top .account-actions-row {
+    #accountApp.is-guest .status-row {
       display: none;
     }
 
     #accountApp.is-guest .account-top-brand {
-      justify-content: center;
+      justify-content: flex-start;
     }
 
     #accountApp .account-hero {
@@ -6580,6 +6613,7 @@
       color: #d8d8d8;
     }
 
+    #accountApp .page-footer-links,
     #downloadApp .page-footer-links,
     #policyApp .page-footer-links {
       display: flex;
@@ -6594,40 +6628,46 @@
       text-align: center;
     }
 
-    #downloadApp .page-footer-links {
-      margin-top: auto;
-    }
-
+    #accountApp .page-footer-links a,
     #downloadApp .page-footer-links a,
     #policyApp .page-footer-links a {
       color: #eef1f7;
       text-decoration: none;
     }
 
+    #accountApp .page-footer-links a:hover,
     #downloadApp .page-footer-links a:hover,
     #policyApp .page-footer-links a:hover {
       color: #fff;
     }
 
+    #accountApp .page-footer-links .email-link,
     #downloadApp .page-footer-links .email-link,
     #policyApp .page-footer-links .email-link {
       color: var(--bluey-accent);
     }
 
+    #accountApp .page-footer-links .email-link:hover,
     #downloadApp .page-footer-links .email-link:hover,
     #policyApp .page-footer-links .email-link:hover {
       color: #dff7ff;
     }
 
+    #accountApp .page-footer-links .muted-note,
     #downloadApp .page-footer-links .muted-note,
     #policyApp .page-footer-links .muted-note {
       color: #727781;
     }
 
+    #accountApp .page-footer-links .dot,
     #downloadApp .page-footer-links .dot,
     #policyApp .page-footer-links .dot {
       color: #6f7480;
       margin: 0 .4rem;
+    }
+
+    #downloadApp .page-footer-links {
+      margin-top: auto;
     }
 
     #policyApp .policy-shell {
@@ -6799,6 +6839,118 @@
         grid-template-columns: 1fr;
       }
     }
+    /* Final account-route interaction guard. Older account/dashboard CSS
+       blocks intentionally remain for route compatibility, so the real app
+       navigation contract is pinned here: visible, scroll-safe, clickable. */
+    #accountApp .account-shell,
+    #accountApp .account-main,
+    #accountApp .account-top,
+    #accountApp .account-top * {
+      pointer-events: auto;
+    }
+
+    #accountApp .account-top {
+      position: sticky;
+      top: 0;
+      z-index: 80;
+      margin: 0;
+      width: 100%;
+      border: 0;
+      border-bottom: 1px solid #111;
+      border-radius: 0;
+      background: #050505;
+      box-shadow: none;
+      backdrop-filter: none;
+    }
+
+    #accountApp .account-top .account-actions-row {
+      position: relative;
+      z-index: 81;
+      display: flex !important;
+      align-items: center;
+      justify-content: flex-end;
+      width: auto;
+      flex-direction: row;
+      flex-wrap: wrap;
+      gap: .55rem;
+      pointer-events: auto;
+    }
+
+    #accountApp .account-top .account-link,
+    #accountApp .account-top .account-button,
+    #accountApp .account-top .account-icon {
+      width: auto;
+      pointer-events: auto;
+    }
+
+    #accountApp .account-top .account-link,
+    #accountApp .account-top #accountSignOut {
+      min-height: auto;
+      padding: 0;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      color: #888;
+    }
+
+    #accountApp .account-top .account-link:hover,
+    #accountApp .account-top #accountSignOut:hover {
+      color: #72f0ff;
+      background: transparent;
+    }
+
+    #accountApp .account-top .nav-cta {
+      min-height: 34px;
+      padding: 0 .95rem;
+      border: 0;
+      border-radius: 6px;
+      background: var(--bluey-accent);
+      color: #061114;
+      font-weight: 700;
+    }
+
+    #accountApp .account-top .nav-cta:hover {
+      color: #061114;
+      background: #8ff5ff;
+    }
+
+    #accountApp .account-top .account-icon {
+      width: 34px;
+      height: 34px;
+      padding: 0;
+    }
+
+    #accountApp.is-guest .account-top {
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      justify-content: stretch;
+      padding: 1rem 2.5rem;
+    }
+
+    #accountApp.is-guest .account-top .status-row,
+    #accountApp.is-guest .account-top .account-actions-row [data-auth-only],
+    #accountApp.is-guest .account-top .account-actions-row #accountSignOut {
+      display: none !important;
+    }
+
+    #accountApp.is-authed .account-top .account-actions-row [data-guest-only] {
+      display: none !important;
+    }
+
+    #accountApp.is-authed .account-top .status-row {
+      display: none;
+    }
+
+    @media (max-width: 760px) {
+      #accountApp .account-top {
+        width: 100%;
+        grid-template-columns: 1fr;
+        justify-items: center;
+      }
+
+      #accountApp .account-top .account-actions-row {
+        justify-content: center;
+      }
+    }
   </style>
 </head>
 <body>
@@ -6812,7 +6964,7 @@
         <div class="navlinks">
           <a href="/">Product</a>
           <a href="/download">Download</a>
-          <a href="/login" data-guest-only>Login</a>
+          <a class="nav-cta" href="/login" data-guest-only>Login</a>
           <a href="/account" data-auth-only hidden>Dashboard</a>
           <a class="account-icon" href="/login" data-account-icon data-auth-only hidden aria-label="Login" title="Login">
             <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -6929,29 +7081,30 @@
         </div>
       </aside>
 
-      <main class="account-main">
-        <header class="account-top">
-          <a class="account-top-brand" href="/">
-            <img src="/assets/bluey-logo.svg" alt="">
-            <img class="brand-wordmark" src="/assets/bluey-wordmark.svg" alt="bluey">
+      <header class="account-top">
+        <a class="account-top-brand" href="/">
+          <img src="/assets/bluey-logo.svg" alt="">
+          <img class="brand-wordmark" src="/assets/bluey-wordmark.svg" alt="bluey">
+        </a>
+        <div class="status-row">
+          <span class="status-chip live">Bluey Cloud</span>
+        </div>
+        <div class="account-actions-row">
+          <a class="account-link" href="/">Product</a>
+          <a class="account-link" href="/download">Download</a>
+          <a class="account-link nav-cta" href="/login" data-guest-only>Login</a>
+          <a class="account-link" href="/account" data-auth-only hidden>Dashboard</a>
+          <a class="account-icon" href="/account" data-account-icon data-auth-only hidden aria-label="Account dashboard" title="Account dashboard">
+            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M12 12.2a4.2 4.2 0 1 0 0-8.4 4.2 4.2 0 0 0 0 8.4Z" stroke="currentColor" stroke-width="1.8"/>
+              <path d="M4.7 20.2c.8-3.6 3.4-5.7 7.3-5.7s6.5 2.1 7.3 5.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+            </svg>
           </a>
-          <div class="status-row">
-            <span class="status-chip live">Bluey Cloud</span>
-          </div>
-          <div class="account-actions-row">
-            <a class="account-link" href="/">Product</a>
-            <a class="account-link" href="/download">Download</a>
-            <a class="account-link" href="/account" data-auth-only hidden>Dashboard</a>
-            <a class="account-icon" href="/account" data-account-icon data-auth-only hidden aria-label="Account dashboard" title="Account dashboard">
-              <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-                <path d="M12 12.2a4.2 4.2 0 1 0 0-8.4 4.2 4.2 0 0 0 0 8.4Z" stroke="currentColor" stroke-width="1.8"/>
-                <path d="M4.7 20.2c.8-3.6 3.4-5.7 7.3-5.7s6.5 2.1 7.3 5.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-              </svg>
-            </a>
-            <button class="account-button ghost" id="accountSignOut" type="button" hidden>Sign out</button>
-          </div>
-        </header>
+          <button class="account-link" id="accountSignOut" type="button" hidden>Sign out</button>
+        </div>
+      </header>
 
+      <main class="account-main">
         <section class="account-hero">
           <h1>Try Bluey</h1>
           <p>Start from Terminal, sign in when needed, and keep your work available from the overlay.</p>
@@ -7083,6 +7236,9 @@
           </section>
         </section>
       </main>
+      <div class="page-footer-links">
+        Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Stay Present, stay unseen</span><span class="dot">&middot;</span><a href="/docs/terms">Terms</a><span class="dot">&middot;</span><a href="/docs/privacy">Privacy</a><span class="dot">&middot;</span><a href="/docs/disguise">Controls</a>
+      </div>
     </div>
   </section>
 
@@ -7095,7 +7251,7 @@
         </a>
         <div class="navlinks">
           <a href="/">Product</a>
-          <a href="/login" data-guest-only>Login</a>
+          <a class="nav-cta" href="/login" data-guest-only>Login</a>
           <a href="/account" data-auth-only hidden>Dashboard</a>
           <a class="account-icon" href="/login" data-account-icon data-auth-only hidden aria-label="Login" title="Login">
             <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -7244,8 +7400,8 @@
       </a>
       <div class="nav-links">
         <a href="/download">Download</a>
-        <a href="/login" data-guest-only>Login</a>
-        <a class="btn-nav" href="/account" data-auth-only hidden>Dashboard</a>
+        <a class="btn-nav" href="/login" data-guest-only>Login</a>
+        <a href="/account" data-auth-only hidden>Dashboard</a>
         <a class="account-icon" href="/login" data-account-icon data-auth-only hidden aria-label="Login" title="Login">
           <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
             <path d="M12 12.2a4.2 4.2 0 1 0 0-8.4 4.2 4.2 0 0 0 0 8.4Z" stroke="currentColor" stroke-width="1.8"/>
