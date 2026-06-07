@@ -6916,7 +6916,7 @@
         </a>
         <div class="rail-command">
           <code id="railCommandLabel">bluey on</code>
-          <span id="railCommandCopy">Start Bluey from Terminal. Sign in only when you need cloud answers, billing, or saved sessions.</span>
+          <span id="railCommandCopy">Start Bluey from Terminal. Sign in only when you need cloud answers, credits, or saved sessions.</span>
         </div>
         <div class="rail-list">
           <span>Account</span>
@@ -6977,7 +6977,7 @@
               </label>
               <label class="terms-check" id="signupTermsLabel">
                 <input type="checkbox" id="signupTerms">
-                <span>I agree to the <a href="/docs/terms" target="_blank" rel="noopener noreferrer">Terms</a> &amp; <a href="/docs/privacy" target="_blank" rel="noopener noreferrer">Privacy</a>. Required only when creating a Bluey account.</span>
+                <span>For new accounts, I agree to the <a href="/docs/terms" target="_blank" rel="noopener noreferrer">Terms</a> &amp; <a href="/docs/privacy" target="_blank" rel="noopener noreferrer">Privacy</a>.</span>
               </label>
               <div class="account-actions-row">
                 <button class="account-button primary" type="submit">Sign in</button>
@@ -7033,7 +7033,7 @@
             <div class="dashboard-head">
               <div>
                 <h2 id="accountEmailLabel">Bluey account</h2>
-                <p>Credits cover cloud answers, speech transcription, screen analysis, and saved session history. Local desktop history stays available from the overlay.</p>
+                <p>Credits cover cloud answers, live speech, screen analysis, and saved sessions. Local desktop history stays available from the overlay.</p>
               </div>
               <span class="pill-muted" id="billingProviderLabel">Secure checkout</span>
             </div>
@@ -7059,7 +7059,7 @@
             <div class="reload-card">
               <div>
                 <h3>Add credits</h3>
-                <p>$30 minimum. Credits stay valid for 365 days, and paid cloud work stops at $0.</p>
+                <p>$30 minimum. Credits stay valid for 365 days, and paid cloud requests stop at $0.</p>
               </div>
               <div class="account-actions-row" style="justify-content: flex-end; align-items: center;">
                 <div class="reload-price">$30</div>
@@ -7123,9 +7123,9 @@
               </span>
               <span>macOS</span>
             </div>
-            <span class="availability">Alpha ready</span>
+            <span class="availability">Ready</span>
           </div>
-          <p>Current alpha path for Apple Silicon Macs. Installs Bluey locally and asks you to sign in only when needed.</p>
+          <p>Ready for Apple Silicon Macs. Install once, then sign in only when Bluey needs cloud help or credits.</p>
           <span class="download-card-action">Show terminal steps</span>
         </article>
 
@@ -7141,8 +7141,8 @@
             </div>
             <span class="availability soon">Roadmap</span>
           </div>
-          <p>Planned after native audio, overlay parity, and clean Windows smoke tests pass.</p>
-          <span class="download-card-action soon">Installer roadmap</span>
+          <p>Windows is next. We are polishing the desktop helper before opening the installer.</p>
+          <span class="download-card-action soon">Coming soon</span>
         </article>
 
         <article class="download-card disabled" aria-disabled="true">
@@ -7159,8 +7159,8 @@
             </div>
             <span class="availability soon">Later</span>
           </div>
-          <p>Planned after macOS alpha and Windows parity are stable enough for support.</p>
-          <span class="download-card-action soon">Installer roadmap</span>
+          <p>Linux follows after the desktop app is stable across Mac and Windows.</p>
+          <span class="download-card-action soon">Coming soon</span>
         </article>
       </section>
 
@@ -7295,7 +7295,7 @@
         <a href="/login" class="plan">
           <div>
             <div class="plan-name">Trial</div>
-            <div class="plan-detail">10 minutes &middot; desktop link flow &middot; cloud answer preview</div>
+            <div class="plan-detail">10 minutes &middot; no card needed &middot; cloud answer preview</div>
           </div>
           <div class="plan-price">Included</div>
         </a>
@@ -7311,7 +7311,7 @@
         <a href="/login" class="plan">
           <div>
             <div class="plan-name">Team</div>
-            <div class="plan-detail">Workspace controls &middot; shared context &middot; admin support</div>
+            <div class="plan-detail">Shared team setup &middot; pooled credits &middot; priority support</div>
           </div>
           <div class="plan-price">Custom</div>
         </a>
@@ -7391,7 +7391,7 @@
             { t: '<span class="green">[ok]</span> overlay pill ready', d: 300 },
             { t: '<span class="green">[ok]</span> private session ready', d: 300 },
             { t: '<span class="green">[ok]</span> running in background', d: 320 },
-            { t: '<span class="dim">Close this terminal. Bluey keeps running.</span>', d: 360 },
+            { t: '<span class="dim">Close this terminal. Bluey continues in the background.</span>', d: 360 },
           ],
         },
         {
@@ -7491,7 +7491,7 @@
           : 'Account ready for credits, saved sessions, and cloud answers. Run bluey on to open the overlay.';
       } else {
         label.textContent = 'bluey on';
-        copy.textContent = 'Start Bluey from Terminal. Sign in only when you need cloud answers, billing, or saved sessions.';
+        copy.textContent = 'Start Bluey from Terminal. Sign in only when you need cloud answers, credits, or saved sessions.';
       }
     }
 
@@ -7509,7 +7509,7 @@
 
       if (authed) {
         title.textContent = 'Bluey account';
-        copy.innerHTML = 'Manage credits, saved sessions, and desktop linking. Credits are used only when Bluey runs cloud work.';
+        copy.innerHTML = 'Manage credits, saved sessions, and your desktop connection. Credits are used only when Bluey uses cloud help.';
       } else {
         title.textContent = 'Try Bluey';
         copy.innerHTML = 'Start from Terminal, sign in when needed, and keep your work available from the overlay.';
@@ -7846,7 +7846,7 @@
       document.getElementById('balanceValue').textContent = money(me.balance_cents);
       document.getElementById('balanceHint').textContent = me.trial_seconds_remaining > 0
         ? `${Math.round(me.trial_seconds_remaining / 60)} trial minutes remaining.`
-        : 'Paid cloud work stops at $0. Add credits when ready.';
+        : 'Paid cloud requests stop at $0. Add credits when ready.';
       renderUsage(usage);
       if (sessions) setCloudSessionDetail('');
       accountMessage(new URLSearchParams(location.search).get('reload') === 'success'
