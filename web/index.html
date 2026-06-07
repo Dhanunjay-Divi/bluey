@@ -6,9 +6,9 @@
   <title>Bluey | AI Chat From Your Terminal</title>
   <meta name="description" content="AI chat, out of the tab. Ask from meetings, code, docs, screen context, files, and session memory from one small desktop layer.">
   <meta name="theme-color" content="#020405">
-  <link rel="icon" type="image/svg+xml" href="assets/bluey-logo.svg">
-  <link rel="icon" type="image/png" sizes="512x512" href="assets/favicon-512.png">
-  <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+  <link rel="icon" type="image/svg+xml" href="/assets/bluey-logo.svg">
+  <link rel="icon" type="image/png" sizes="512x512" href="/assets/favicon-512.png">
+  <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
   <meta property="og:title" content="Bluey | AI Chat From Your Terminal">
   <meta property="og:description" content="AI chat, out of the tab. Ask from meetings, files, screen context, managed routing, and session memory.">
   <meta property="og:type" content="website">
@@ -5578,6 +5578,860 @@
         max-width: 100%;
       }
     }
+
+    /* Pinky shell port for Bluey account, download, and docs routes. */
+    #accountApp,
+    #downloadApp,
+    #policyApp {
+      min-height: 100vh;
+      min-height: 100dvh;
+      background: #050505;
+      color: #e0e0e0;
+      font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
+      --bluey-accent: #72f0ff;
+      --bluey-accent-2: #7cffc7;
+      --bluey-line: #1a1a1a;
+    }
+
+    #accountApp a,
+    #downloadApp a,
+    #policyApp a {
+      color: inherit;
+    }
+
+    #downloadApp .site-nav,
+    #policyApp .site-nav,
+    #accountApp .account-top {
+      width: 100% !important;
+      min-height: auto;
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 1.25rem;
+      margin: 0;
+      padding: 1rem 2.5rem;
+      border-bottom: 1px solid #111;
+      background: #050505;
+    }
+
+    #downloadApp .brand,
+    #policyApp .brand,
+    #accountApp .account-top-brand {
+      display: flex;
+      align-items: center;
+      justify-self: start;
+      gap: .5rem;
+      color: #e0e0e0;
+      text-decoration: none;
+      font-size: 1.05rem;
+      font-weight: 600;
+      line-height: 1;
+    }
+
+    #downloadApp .brand img:not(.brand-wordmark),
+    #policyApp .brand img:not(.brand-wordmark),
+    #accountApp .account-top-brand img:not(.brand-wordmark) {
+      width: 24px;
+      height: 24px;
+      border-radius: 6px;
+      box-shadow: none;
+    }
+
+    #downloadApp .brand-wordmark,
+    #policyApp .brand-wordmark,
+    #accountApp .brand-wordmark {
+      width: 68px;
+      height: auto;
+      filter: drop-shadow(0 0 10px rgba(114, 240, 255, .22));
+    }
+
+    #downloadApp .navlinks,
+    #policyApp .navlinks,
+    #accountApp .account-actions-row {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+
+    #downloadApp .navlinks a,
+    #policyApp .navlinks a,
+    #accountApp .account-link {
+      min-height: auto;
+      padding: 0;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      color: #888;
+      text-decoration: none;
+      font-size: .9rem;
+      font-weight: 500;
+      transition: color .2s;
+    }
+
+    #downloadApp .navlinks a:hover,
+    #policyApp .navlinks a:hover,
+    #accountApp .account-link:hover {
+      color: var(--bluey-accent);
+    }
+
+    #accountApp .account-button,
+    #downloadApp .copy-command {
+      border: 1px solid #333;
+      border-radius: 8px;
+      background: transparent;
+      color: #ccc;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: .85rem;
+      transition: border-color .2s, color .2s, background .2s, opacity .2s;
+    }
+
+    #accountApp .account-button:hover,
+    #downloadApp .copy-command:hover:not(:disabled) {
+      border-color: var(--bluey-accent);
+      color: var(--bluey-accent);
+    }
+
+    #accountApp .account-button.primary,
+    #downloadApp .copy-command {
+      border-color: transparent;
+      color: #061114;
+      background: linear-gradient(135deg, #dffaff, var(--bluey-accent), var(--bluey-accent-2));
+      font-weight: 700;
+    }
+
+    #accountApp .account-button.ghost {
+      background: transparent;
+      color: #888;
+      border-color: #333;
+    }
+
+    #accountApp .account-rail {
+      display: none;
+    }
+
+    #accountApp .account-shell {
+      width: 100%;
+      min-height: 100vh;
+      min-height: 100dvh;
+      display: block;
+      margin: 0;
+    }
+
+    #accountApp .account-main {
+      width: min(860px, 100%);
+      min-height: calc(100vh - 65px);
+      margin: 0 auto;
+      padding: 2rem 2rem 4rem;
+      background: transparent;
+      border: 0;
+      box-shadow: none;
+    }
+
+    #accountApp.is-guest .account-main {
+      width: 100%;
+      max-width: 420px;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding: 1.5rem;
+    }
+
+    #accountApp.is-guest .account-top {
+      display: flex;
+      justify-content: center;
+      padding: 0 0 1.4rem;
+      border: 0;
+      background: transparent;
+    }
+
+    #accountApp.is-guest .status-row,
+    #accountApp.is-guest .account-top .account-actions-row {
+      display: none;
+    }
+
+    #accountApp.is-guest .account-top-brand {
+      justify-content: center;
+    }
+
+    #accountApp .account-hero {
+      padding: 0;
+      border: 0;
+      background: transparent;
+      text-align: center;
+      margin: 0 0 1.5rem;
+    }
+
+    #accountApp .account-hero h1 {
+      margin: 0 0 .4rem;
+      color: #f2f2f2;
+      font-size: 1.35rem;
+      line-height: 1.1;
+      letter-spacing: -.02em;
+    }
+
+    #accountApp .account-hero p {
+      max-width: none;
+      margin: 0 auto;
+      color: #888;
+      font-size: .9rem;
+      line-height: 1.55;
+    }
+
+    #accountApp.is-guest .account-grid {
+      display: block;
+      max-width: none;
+      margin: 0;
+    }
+
+    #accountApp.is-guest .account-card {
+      width: 100%;
+      max-width: 380px;
+      margin: 0 auto;
+      padding: 2.5rem;
+      border: 1px solid var(--bluey-line);
+      border-radius: 16px;
+      background: #0a0a0a;
+      box-shadow: none;
+    }
+
+    #accountApp.is-guest .account-card h2 {
+      color: #888;
+      text-align: center;
+      font-size: 1rem;
+      font-weight: 400;
+      margin-bottom: 1.5rem;
+    }
+
+    #accountApp.is-guest #accountAuthCard > p {
+      display: none;
+    }
+
+    #accountApp .account-form {
+      display: grid;
+      gap: .75rem;
+    }
+
+    #accountApp .account-form label {
+      color: #666;
+      font-size: .75rem;
+      font-weight: 700;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+
+    #accountApp .account-form input {
+      width: 100%;
+      margin-top: .35rem;
+      padding: .7rem 1rem;
+      border: 1px solid #222;
+      border-radius: 8px;
+      background: #111;
+      color: #e0e0e0;
+      font-size: .95rem;
+      outline: none;
+    }
+
+    #accountApp .account-form input:focus {
+      border-color: var(--bluey-accent);
+    }
+
+    #accountApp .account-form input:-webkit-autofill,
+    #accountApp .account-form input:-webkit-autofill:hover,
+    #accountApp .account-form input:-webkit-autofill:focus {
+      -webkit-box-shadow: 0 0 0 1000px #111 inset !important;
+      -webkit-text-fill-color: #e0e0e0 !important;
+      border-color: #222 !important;
+    }
+
+    #accountApp #accountAuthCard .account-actions-row {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: .65rem;
+      margin-top: .25rem;
+    }
+
+    #accountApp #accountAuthCard .account-button {
+      width: 100%;
+      min-height: 42px;
+      padding: .75rem;
+      justify-content: center;
+    }
+
+    #accountApp .account-note,
+    #accountApp .account-message {
+      color: #666;
+      text-align: center;
+      font-size: .85rem;
+      line-height: 1.45;
+      margin-top: 1rem;
+    }
+
+    #accountApp .account-note a {
+      color: var(--bluey-accent);
+      text-decoration: none;
+    }
+
+    #accountApp .account-note a:hover {
+      text-decoration: underline;
+    }
+
+    #accountApp.is-authed .account-main {
+      width: min(860px, 100%);
+      padding: 2rem 2rem 4rem;
+    }
+
+    #accountApp.is-authed .account-hero {
+      text-align: left;
+      margin: 0 0 1.5rem;
+    }
+
+    #accountApp.is-authed .account-hero h1 {
+      font-size: 1.65rem;
+      text-align: left;
+    }
+
+    #accountApp.is-authed .account-grid {
+      display: block;
+      max-width: none;
+      margin: 0;
+    }
+
+    #accountApp.is-authed .dashboard-card,
+    #accountApp .reload-card,
+    #accountApp .dashboard-section,
+    #accountApp .account-kpi,
+    #accountApp .usage-row,
+    #accountApp .session-row,
+    #accountApp .session-detail {
+      border: 1px solid var(--bluey-line);
+      border-radius: 12px;
+      background: #0a0a0a;
+      box-shadow: none;
+    }
+
+    #accountApp.is-authed .dashboard-card {
+      padding: 1.2rem 1.5rem;
+    }
+
+    #accountApp .dashboard-head,
+    #accountApp .section-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+
+    #accountApp .dashboard-head h2,
+    #accountApp .section-head h3,
+    #accountApp .reload-card h3 {
+      color: #f2f2f2;
+      font-size: 1.05rem;
+      margin: 0 0 .35rem;
+    }
+
+    #accountApp .dashboard-head p,
+    #accountApp .section-head p,
+    #accountApp .reload-card p {
+      color: #777;
+      font-size: .82rem;
+      line-height: 1.5;
+    }
+
+    #accountApp .pill-muted {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      border: 1px solid rgba(114, 240, 255, .25);
+      color: var(--bluey-accent);
+      background: rgba(114, 240, 255, .08);
+      padding: .2rem .6rem;
+      font-size: .7rem;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    #accountApp .account-kpis {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 1rem;
+      margin: 1rem 0;
+    }
+
+    #accountApp .account-kpi {
+      padding: 1rem;
+    }
+
+    #accountApp .account-kpi span {
+      display: block;
+      color: #666;
+      font-size: .72rem;
+      font-weight: 800;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    #accountApp .account-kpi strong {
+      display: block;
+      margin-top: .25rem;
+      color: #f2f2f2;
+      font-size: 1.3rem;
+      line-height: 1;
+    }
+
+    #accountApp .account-kpi em {
+      display: block;
+      margin-top: .45rem;
+      color: #666;
+      font-size: .75rem;
+      font-style: normal;
+      line-height: 1.35;
+    }
+
+    #accountApp .reload-card {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      padding: 1rem 1.1rem;
+      margin: 1rem 0;
+    }
+
+    #accountApp .reload-price {
+      color: var(--bluey-accent);
+      font-size: 1.1rem;
+      font-weight: 800;
+    }
+
+    #accountApp .usage-list {
+      display: grid;
+      gap: .5rem;
+      margin: 1rem 0;
+    }
+
+    #accountApp .usage-row,
+    #accountApp .session-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      gap: .75rem;
+      align-items: center;
+      padding: .7rem .85rem;
+      color: #aaa;
+      font-size: .85rem;
+    }
+
+    #accountApp .dashboard-section {
+      padding: 1rem;
+      margin-top: 1rem;
+    }
+
+    #accountApp .session-list {
+      display: grid;
+      gap: .5rem;
+    }
+
+    #accountApp .session-title {
+      display: block;
+      color: #e0e0e0;
+    }
+
+    #accountApp .session-meta {
+      display: block;
+      color: #666;
+      font-size: .75rem;
+      margin-top: .2rem;
+    }
+
+    #accountApp .session-empty {
+      color: #666;
+      text-align: center;
+      padding: 2rem;
+      font-size: .85rem;
+    }
+
+    #accountApp .session-detail {
+      display: grid;
+      gap: .5rem;
+      padding: 1rem;
+      margin-top: .75rem;
+      color: #aaa;
+      font-size: .85rem;
+    }
+
+    #accountApp .session-detail pre {
+      overflow-x: auto;
+      margin: .35rem 0 0;
+      padding: .75rem;
+      border: 1px solid #1a1a1a;
+      border-radius: 8px;
+      background: #050505;
+      color: #bbb;
+      font-size: .78rem;
+      white-space: pre-wrap;
+    }
+
+    #downloadApp {
+      display: flex;
+      flex-direction: column;
+      overflow-x: hidden;
+    }
+
+    #downloadApp .download-shell,
+    #policyApp .policy-shell {
+      width: 100%;
+      max-width: none;
+      margin: 0;
+    }
+
+    #downloadApp .download-hero {
+      width: min(700px, 100%);
+      margin: 0 auto;
+      padding: 1.2rem 2rem .55rem;
+      border: 0;
+      background: transparent;
+      box-shadow: none;
+      text-align: center;
+    }
+
+    #downloadApp .download-hero h1 {
+      margin: 0 0 .35rem;
+      color: #f2f2f2;
+      font-size: 1.65rem;
+      line-height: 1.15;
+    }
+
+    #downloadApp .download-hero p {
+      color: #666;
+      font-size: .9rem;
+      line-height: 1.5;
+      margin: 0;
+    }
+
+    #downloadApp .platform-grid {
+      width: min(700px, 100%);
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: .65rem;
+      margin: 0 auto;
+      padding: 0 2rem;
+    }
+
+    #downloadApp .download-card {
+      min-height: auto;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: .5rem;
+      padding: 1rem;
+      border: 2px solid var(--bluey-line);
+      border-radius: 12px;
+      background: #111;
+      text-align: center;
+      box-shadow: none;
+      transition: border-color .2s, transform .15s;
+    }
+
+    #downloadApp .download-card:hover:not(.disabled) {
+      border-color: #333;
+      transform: translateY(-2px);
+    }
+
+    #downloadApp .download-card.disabled {
+      opacity: .5;
+      cursor: default;
+    }
+
+    #downloadApp .download-card-head {
+      display: grid;
+      gap: .45rem;
+      justify-items: center;
+      min-height: 0;
+    }
+
+    #downloadApp .platform-name {
+      display: grid;
+      gap: .45rem;
+      justify-items: center;
+      color: #e0e0e0;
+      font-size: .96rem;
+      font-weight: 600;
+    }
+
+    #downloadApp .os-icon {
+      width: 36px;
+      height: 36px;
+      color: #e0e0e0;
+    }
+
+    #downloadApp .availability {
+      color: var(--bluey-accent);
+      font-size: .7rem;
+      font-weight: 800;
+      text-transform: none;
+    }
+
+    #downloadApp .availability.soon {
+      color: #888;
+    }
+
+    #downloadApp .download-card p {
+      color: #666;
+      font-size: .7rem;
+      line-height: 1.35;
+      margin: 0;
+    }
+
+    #downloadApp .install-command {
+      width: 100%;
+      position: relative;
+      margin-top: .35rem;
+      border: 1px solid #1a1a1a;
+      border-radius: 8px;
+      background: #0a0a0a;
+      padding: .7rem;
+      text-align: left;
+    }
+
+    #downloadApp .install-command code {
+      display: block;
+      color: #cfcfcf;
+      font-size: .72rem;
+      line-height: 1.45;
+      word-break: break-word;
+    }
+
+    #downloadApp .copy-command {
+      margin-top: .6rem;
+      padding: .35rem .7rem;
+      font-size: .75rem;
+    }
+
+    #downloadApp .copy-command:disabled {
+      opacity: .65;
+      cursor: default;
+    }
+
+    #downloadApp .commands {
+      width: min(700px, 100%);
+      margin: 1.35rem auto 0;
+      padding: 0 2rem;
+    }
+
+    #downloadApp .commands h2 {
+      color: #ccc;
+      font-size: 1.1rem;
+      margin-bottom: .75rem;
+    }
+
+    #downloadApp .cmd-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: .4rem;
+    }
+
+    #downloadApp .cmd {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: .75rem;
+      padding: .5rem .7rem;
+      border: 1px solid #1a1a1a;
+      border-radius: 8px;
+      background: #0a0a0a;
+      cursor: pointer;
+      transition: border-color .2s;
+    }
+
+    #downloadApp .cmd:hover {
+      border-color: #333;
+    }
+
+    #downloadApp .cmd code {
+      color: var(--bluey-accent);
+      font-size: .78rem;
+    }
+
+    #downloadApp .cmd span {
+      display: block;
+      color: #555;
+      font-size: .68rem;
+      margin-top: .1rem;
+    }
+
+    #downloadApp .cmd .copy-command {
+      flex: 0 0 auto;
+      margin: 0;
+      background: transparent;
+      border-color: transparent;
+      color: #333;
+      min-width: 64px;
+    }
+
+    #downloadApp .cmd:hover .copy-command {
+      color: #888;
+    }
+
+    #downloadApp .download-note,
+    #downloadApp .viewer-note {
+      width: min(700px, calc(100% - 4rem));
+      margin: 1rem auto 0;
+      padding: .85rem 1rem;
+      border: 1px solid #222;
+      border-radius: 8px;
+      background: #111;
+      color: #888;
+      text-align: center;
+      font-size: .82rem;
+      line-height: 1.45;
+    }
+
+    #downloadApp .download-note strong,
+    #downloadApp .viewer-note strong {
+      color: #d8d8d8;
+    }
+
+    #downloadApp .page-footer-links,
+    #policyApp .page-footer-links {
+      display: flex;
+      justify-content: center;
+      gap: 1.5rem;
+      padding: .85rem 0 max(.65rem, env(safe-area-inset-bottom));
+      color: #c7cad1;
+      font-size: .72rem;
+      line-height: 1.5;
+    }
+
+    #downloadApp .page-footer-links a,
+    #policyApp .page-footer-links a {
+      color: #eef1f7;
+      text-decoration: none;
+    }
+
+    #downloadApp .page-footer-links a:hover,
+    #policyApp .page-footer-links a:hover {
+      color: #fff;
+    }
+
+    #policyApp .policy-shell {
+      padding-bottom: 1rem;
+    }
+
+    #policyApp .policy-card {
+      width: min(860px, calc(100% - 4rem));
+      margin: 2rem auto 0;
+      padding: 2rem;
+      border: 1px solid var(--bluey-line);
+      border-radius: 12px;
+      background: #0a0a0a;
+      box-shadow: none;
+    }
+
+    #policyApp .policy-updated {
+      color: #666;
+      font-size: .78rem;
+      font-weight: 700;
+      margin-bottom: .7rem;
+    }
+
+    #policyApp .policy-card h1 {
+      margin: 0 0 1rem;
+      color: #f2f2f2;
+      font-size: 1.8rem;
+      line-height: 1.12;
+      letter-spacing: -.02em;
+    }
+
+    #policyApp .policy-card h2 {
+      margin: 1.6rem 0 .55rem;
+      color: var(--bluey-accent);
+      font-size: .9rem;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+
+    #policyApp .policy-card p,
+    #policyApp .policy-card li {
+      color: #aaa;
+      font-size: .9rem;
+      line-height: 1.65;
+    }
+
+    #policyApp .policy-card ul {
+      margin: .7rem 0 0;
+      padding-left: 1.2rem;
+    }
+
+    @media (max-width: 760px) {
+      #downloadApp .site-nav,
+      #policyApp .site-nav,
+      #accountApp .account-top {
+        padding: 1rem;
+        column-gap: .8rem;
+      }
+
+      #downloadApp .platform-grid,
+      #downloadApp .cmd-grid,
+      #accountApp .account-kpis {
+        grid-template-columns: 1fr;
+      }
+
+      #downloadApp .download-hero,
+      #downloadApp .platform-grid,
+      #downloadApp .commands {
+        padding-left: 1.5rem;
+        padding-right: 1.5rem;
+      }
+
+      #downloadApp .download-note,
+      #downloadApp .viewer-note,
+      #policyApp .policy-card {
+        width: calc(100% - 3rem);
+      }
+
+      #downloadApp .cmd {
+        align-items: stretch;
+        flex-direction: column;
+        gap: .6rem;
+        padding: .8rem;
+      }
+
+      #downloadApp .cmd > div {
+        min-width: 0;
+      }
+
+      #downloadApp .cmd span {
+        font-size: .72rem;
+        line-height: 1.35;
+      }
+
+      #downloadApp .cmd .copy-command {
+        width: 100%;
+        min-width: 0;
+        padding: .65rem;
+        background: linear-gradient(135deg, #dffaff, var(--bluey-accent), var(--bluey-accent-2));
+        color: #061114;
+      }
+
+      #accountApp .account-main,
+      #accountApp.is-authed .account-main {
+        padding: 1.5rem 1rem 3rem;
+      }
+
+      #accountApp.is-guest .account-card {
+        padding: 2rem;
+      }
+
+      #accountApp .reload-card,
+      #accountApp .dashboard-head,
+      #accountApp .section-head {
+        flex-direction: column;
+        align-items: flex-start;
+      }
+    }
   </style>
 </head>
 <body>
@@ -5585,8 +6439,8 @@
     <div class="policy-shell">
       <nav class="site-nav" style="width: 100%;">
         <a class="brand" href="/">
-          <img src="assets/bluey-logo.svg" alt="">
-          <img class="brand-wordmark" src="assets/bluey-wordmark.svg" alt="bluey">
+          <img src="/assets/bluey-logo.svg" alt="">
+          <img class="brand-wordmark" src="/assets/bluey-wordmark.svg" alt="bluey">
         </a>
         <div class="navlinks">
           <a href="/">Product</a>
@@ -5678,8 +6532,8 @@
     <div class="account-shell">
       <aside class="account-rail" aria-label="Bluey account navigation">
         <a class="brand" href="/">
-          <img src="assets/bluey-logo.svg" alt="">
-          <img class="brand-wordmark" src="assets/bluey-wordmark.svg" alt="bluey">
+          <img src="/assets/bluey-logo.svg" alt="">
+          <img class="brand-wordmark" src="/assets/bluey-wordmark.svg" alt="bluey">
         </a>
         <div class="rail-command">
           <code id="railCommandLabel">bluey on</code>
@@ -5699,8 +6553,8 @@
       <main class="account-main">
         <header class="account-top">
           <a class="account-top-brand" href="/">
-            <img src="assets/bluey-logo.svg" alt="">
-            <img class="brand-wordmark" src="assets/bluey-wordmark.svg" alt="bluey">
+            <img src="/assets/bluey-logo.svg" alt="">
+            <img class="brand-wordmark" src="/assets/bluey-wordmark.svg" alt="bluey">
           </a>
           <div class="status-row">
             <span class="status-chip live">Bluey Cloud</span>
@@ -5846,8 +6700,8 @@
     <div class="download-shell">
       <nav class="site-nav" style="width: 100%;">
         <a class="brand" href="/">
-          <img src="assets/bluey-logo.svg" alt="">
-          <img class="brand-wordmark" src="assets/bluey-wordmark.svg" alt="bluey">
+          <img src="/assets/bluey-logo.svg" alt="">
+          <img class="brand-wordmark" src="/assets/bluey-wordmark.svg" alt="bluey">
         </a>
         <div class="navlinks">
           <a href="/">Product</a>
@@ -5899,10 +6753,65 @@
             <button class="copy-command" type="button" disabled>Soon</button>
           </div>
         </article>
+
+        <article class="download-card disabled">
+          <div class="download-card-head">
+            <div class="platform-name">
+              <span class="os-icon" aria-hidden="true">
+                <svg viewBox="0 0 24 24" fill="none">
+                  <path d="M12 2.5c-2.3 0-4.2 2.5-4.2 5.6 0 1.8.6 3.3 1.4 4.4-.6.4-2.2 1.5-2.7 3-.6 1.8.4 3.2 2 3.2 1 0 1.8-.4 2.2-.9.4.6.8.9 1.3.9s.9-.3 1.3-.9c.5.5 1.2.9 2.2.9 1.6 0 2.6-1.4 2-3.2-.4-1.4-2.1-2.6-2.7-3 .8-1.1 1.4-2.6 1.4-4.4 0-3.1-1.9-5.6-4.2-5.6Z" fill="currentColor"/>
+                  <circle cx="10.6" cy="7.8" r=".8" fill="#050505"/>
+                  <circle cx="13.4" cy="7.8" r=".8" fill="#050505"/>
+                </svg>
+              </span>
+              <span>Linux</span>
+            </div>
+            <span class="availability soon">Coming soon</span>
+          </div>
+          <p>Linux support is planned after the macOS product path and Windows parity stabilize.</p>
+          <div class="install-command">
+            <code>Linux installer pending</code>
+            <button class="copy-command" type="button" disabled>Soon</button>
+          </div>
+        </article>
       </section>
 
       <div class="download-note">
         <strong>After install:</strong> run <code>bluey on</code>. If managed AI, credits, or cloud sync are needed, Bluey opens the browser account flow automatically.
+      </div>
+
+      <section class="commands" aria-label="Bluey commands">
+        <h2>Get Started</h2>
+        <div class="cmd-grid">
+          <div class="cmd">
+            <div><code>bluey on</code><span>Open the pill and link sign-in if needed</span></div>
+            <button class="copy-command" type="button" data-copy="bluey on">Copy</button>
+          </div>
+          <div class="cmd">
+            <div><code>bluey off</code><span>Stop the overlay and daemon</span></div>
+            <button class="copy-command" type="button" data-copy="bluey off">Copy</button>
+          </div>
+          <div class="cmd">
+            <div><code>bluey status</code><span>Show current session and account state</span></div>
+            <button class="copy-command" type="button" data-copy="bluey status">Copy</button>
+          </div>
+          <div class="cmd">
+            <div><code>bluey cloud sync</code><span>Sync local session snapshots to the account</span></div>
+            <button class="copy-command" type="button" data-copy="bluey cloud sync">Copy</button>
+          </div>
+          <div class="cmd">
+            <div><code>bluey ask</code><span>Ask from terminal when you do not need the overlay</span></div>
+            <button class="copy-command" type="button" data-copy="bluey ask">Copy</button>
+          </div>
+          <div class="cmd">
+            <div><code>bluey help</code><span>Show the full local command list</span></div>
+            <button class="copy-command" type="button" data-copy="bluey help">Copy</button>
+          </div>
+        </div>
+      </section>
+
+      <div class="viewer-note">
+        <strong>Bluey is terminal-first.</strong> Install once, run <code>bluey on</code>, then use the overlay to ask with screen, transcript, files, and session memory.
       </div>
 
       <div class="page-footer-links">
@@ -5916,8 +6825,8 @@
   <main class="page" id="productSite">
     <nav class="nav">
       <a class="logo" href="/">
-        <img src="assets/bluey-logo.svg" alt="">
-        <img class="brand-wordmark" src="assets/bluey-wordmark.svg" alt="bluey">
+        <img src="/assets/bluey-logo.svg" alt="">
+        <img class="brand-wordmark" src="/assets/bluey-wordmark.svg" alt="bluey">
       </a>
       <div class="nav-links">
         <a href="/download">Download</a>
