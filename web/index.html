@@ -3,22 +3,22 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Bluey | AI chat where work happens</title>
-  <meta name="description" content="Bluey is a native AI chat layer for live work: meetings, code, docs, screen context, managed model routing, and answers without switching tabs.">
+  <title>Bluey | AI Chat From Your Terminal</title>
+  <meta name="description" content="AI chat, out of the tab. Ask from meetings, code, docs, screen context, files, and session memory from one small desktop layer.">
   <meta name="theme-color" content="#020405">
   <link rel="icon" type="image/svg+xml" href="assets/bluey-logo.svg">
   <link rel="icon" type="image/png" sizes="512x512" href="assets/favicon-512.png">
   <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
-  <meta property="og:title" content="Bluey | AI chat where work happens">
-  <meta property="og:description" content="A native AI chat layer for live work: meetings, files, screen context, managed routing, and fast answers from one small overlay.">
+  <meta property="og:title" content="Bluey | AI Chat From Your Terminal">
+  <meta property="og:description" content="AI chat, out of the tab. Ask from meetings, files, screen context, managed routing, and session memory.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://bluey.sh/">
   <meta property="og:image" content="https://bluey.sh/assets/bluey-og.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Bluey | AI chat where work happens">
-  <meta name="twitter:description" content="A native AI chat layer for live work: meetings, files, screen context, managed routing, and fast answers from one small overlay.">
+  <meta name="twitter:title" content="Bluey | AI Chat From Your Terminal">
+  <meta name="twitter:description" content="AI chat, out of the tab. Ask from meetings, files, screen context, managed routing, and session memory.">
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <style>
     * {
@@ -5071,8 +5071,8 @@
       }
     }
 
-    /* Pinky-style Bluey landing page. */
-    #productSite.site {
+    /* Landing page forked from Pinky's compact terminal-first site. */
+    #productSite.page {
       min-height: 100vh;
       min-height: 100dvh;
       display: grid;
@@ -5081,114 +5081,135 @@
       background: #050505;
       color: #e0e0e0;
       font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
+      --bluey-accent: #72f0ff;
+      --bluey-accent-2: #7cffc7;
+      --bluey-accent-soft: rgba(114, 240, 255, .22);
     }
 
-    #productSite.site::before,
+    #productSite.page::before,
     #productSite .hero::before,
     #productSite .hero::after {
       display: none;
     }
 
-    #productSite .site-nav {
-      width: 100%;
-      min-height: auto;
+    #productSite .nav {
       display: grid;
       grid-template-columns: auto minmax(0, 1fr) auto;
       align-items: center;
-      justify-self: stretch;
       padding: 1rem 2.5rem;
       column-gap: 1.25rem;
     }
 
-    #productSite .brand {
+    #productSite .logo,
+    #productSite .logo:visited {
+      display: flex;
+      align-items: center;
       gap: .5rem;
+      justify-self: start;
+      flex-shrink: 0;
+      color: #e0e0e0;
+      text-decoration: none;
       font-size: 1.05rem;
       font-weight: 600;
-      color: #e0e0e0;
+      letter-spacing: -.01em;
+      line-height: 1;
     }
 
-    #productSite .brand img:not(.brand-wordmark) {
+    #productSite .logo img:not(.brand-wordmark) {
       width: 24px;
       height: 24px;
+      flex-shrink: 0;
       border-radius: 6px;
       box-shadow: none;
     }
 
     #productSite .brand-wordmark {
+      display: block;
       width: 68px;
-      filter: drop-shadow(0 0 10px rgba(114, 240, 255, .18));
+      height: auto;
+      filter: drop-shadow(0 0 10px rgba(114, 240, 255, .22));
     }
 
-    #productSite .navlinks {
+    #productSite .nav-links {
+      display: flex;
+      align-items: center;
       justify-self: end;
       gap: 1.5rem;
     }
 
-    #productSite .navlinks a {
-      min-height: auto;
-      padding: 0;
-      border: 0;
-      border-radius: 0;
-      background: transparent;
+    #productSite .nav-links a {
       color: #888;
-      font-size: .9rem;
-      font-weight: 500;
       text-decoration: none;
-      transition: color .2s, background .2s;
+      font-size: .9rem;
+      transition: color .2s;
     }
 
-    #productSite .navlinks a:hover {
+    #productSite .nav-links a:hover {
       color: #e0e0e0;
     }
 
-    #productSite .navlinks .nav-cta {
+    #productSite .nav-links .btn-nav {
+      background: var(--bluey-accent);
+      color: #061114;
       padding: .45rem 1.2rem;
       border-radius: 6px;
-      color: #061114;
-      background: #8beeff;
-      font-weight: 700;
+      font-weight: 600;
     }
 
-    #productSite .navlinks .nav-cta:hover {
+    #productSite .nav-links .btn-nav:hover {
+      background: #8ff5ff;
       color: #061114;
-      background: #6be6ff;
     }
 
-    #productSite .hero {
-      width: 100%;
-      max-width: 1040px;
-      min-height: auto;
-      display: grid;
-      grid-template-columns: minmax(360px, .92fr) minmax(380px, 1fr);
-      gap: 3.4rem;
+    #productSite .main {
+      display: flex;
       align-items: center;
-      justify-self: center;
+      justify-content: center;
       padding: 0 3rem;
     }
 
-    #productSite .hero-copy {
-      max-width: none;
+    #productSite .content {
+      display: grid;
+      grid-template-columns: minmax(360px, .92fr) minmax(380px, 1fr);
+      gap: 3.4rem;
+      max-width: 1040px;
+      width: 100%;
+      align-items: center;
+      position: relative;
     }
 
-    #productSite .hero-copy h1 {
+    #productSite .hero,
+    #productSite .product-preview {
+      position: relative;
+      z-index: 1;
+    }
+
+    #productSite .hero {
+      width: auto;
       max-width: none;
-      margin: 0 0 1.05rem;
+      min-height: 0;
+      display: block;
+      padding: 0;
+    }
+
+    #productSite .hero h1 {
       color: #f4f7f8;
       font-size: clamp(2.55rem, 4vw, 3.05rem);
       font-weight: 740;
       line-height: 1.07;
+      margin: 0 0 1.05rem;
       letter-spacing: -.04em;
       text-wrap: balance;
     }
 
-    #productSite .hero-copy h1 .accent {
-      background: linear-gradient(135deg, #72f0ff, #7cffc7);
+    #productSite .hero h1 .accent {
+      background: linear-gradient(135deg, var(--bluey-accent), var(--bluey-accent-2));
       -webkit-background-clip: text;
       -webkit-text-fill-color: transparent;
       background-clip: text;
     }
 
-    #productSite .hero-copy p {
+    #productSite .hero p {
       max-width: 430px;
       color: #8d8d8d;
       font-size: 1.03rem;
@@ -5207,7 +5228,7 @@
     }
 
     #productSite .hero-proof span {
-      background: linear-gradient(135deg, #9df5ff, #8dffc8);
+      background: linear-gradient(135deg, #9df5ff, #92ffd0);
       -webkit-background-clip: text;
       -webkit-text-fill-color: transparent;
       background-clip: text;
@@ -5222,100 +5243,97 @@
       margin-top: 0;
     }
 
-    #productSite .button {
-      width: 100%;
-      min-height: 46px;
+    #productSite .btn {
       display: inline-flex;
       align-items: center;
       justify-content: center;
+      min-height: 46px;
       padding: .72rem 1.45rem;
       border-radius: 12px;
-      border: 1px solid #333;
-      background: transparent;
-      color: #888;
-      box-shadow: 0 10px 28px rgba(114, 240, 255, .08);
       font-size: .93rem;
       font-weight: 700;
-      letter-spacing: -.01em;
       text-decoration: none;
+      letter-spacing: -.01em;
       transition: transform .2s, border-color .2s, background .2s, box-shadow .2s, color .2s;
     }
 
-    #productSite .button:hover {
-      color: #e0e0e0;
-      border-color: #555;
+    #productSite .hero-actions .btn {
+      width: 100%;
+      box-shadow: 0 10px 28px rgba(114, 240, 255, .10);
     }
 
-    #productSite .button.primary {
+    #productSite .btn-primary {
       color: #061114;
       border-color: rgba(255, 255, 255, .12);
-      background: linear-gradient(135deg, #bff8ff 0%, #72f0ff 52%, #7cffc7 100%);
+      background: linear-gradient(135deg, #dffaff 0%, var(--bluey-accent) 52%, var(--bluey-accent-2) 100%);
     }
 
-    #productSite .button.primary:hover {
+    #productSite .btn-primary:hover {
       transform: translateY(-1px);
       box-shadow: 0 13px 34px rgba(114, 240, 255, .20);
     }
 
-    #productSite .quick-join {
-      width: 100%;
-      max-width: 320px;
-      display: flex;
-      gap: .5rem;
-      margin-top: 1.2rem;
-      padding: 0;
-      border: 0;
-      border-radius: 0;
+    #productSite .btn-ghost {
+      color: #888;
+      border: 1px solid #333;
       background: transparent;
     }
 
-    #productSite .quick-join input {
+    #productSite .btn-ghost:hover {
+      color: #e0e0e0;
+      border-color: #555;
+    }
+
+    #productSite .join-bar {
+      display: flex;
+      gap: .5rem;
+      margin-top: 1.2rem;
+      max-width: 320px;
+    }
+
+    #productSite .join-bar input {
       flex: 1;
       width: auto;
       min-width: 0;
-      height: auto;
-      min-height: auto;
-      padding: .6rem 1rem;
-      border: 1px solid rgba(114, 240, 255, .30);
-      border-radius: 8px;
       background: #111;
+      border: 1px solid rgba(114, 240, 255, .30);
       color: #e0e0e0;
-      outline: none;
-      font-family: monospace;
+      border-radius: 8px;
+      padding: .6rem 1rem;
       font-size: 1rem;
+      font-family: monospace;
       letter-spacing: .15em;
       text-transform: lowercase;
+      outline: none;
       transition: border-color .3s, box-shadow .3s;
     }
 
-    #productSite .quick-join input:focus {
-      border-color: #72f0ff;
+    #productSite .join-bar input:focus {
+      border-color: var(--bluey-accent);
       box-shadow: 0 0 0 2px rgba(114, 240, 255, .16);
     }
 
-    #productSite .quick-join input::placeholder {
+    #productSite .join-bar input::placeholder {
       color: #444;
       font-family: -apple-system, system-ui, sans-serif;
       letter-spacing: normal;
     }
 
-    #productSite .quick-join button {
+    #productSite .join-bar button {
       width: auto;
       flex: 0 0 auto;
-      height: auto;
-      min-height: auto;
-      padding: .6rem 1.2rem;
+      background: rgba(114, 240, 255, .11);
+      color: var(--bluey-accent);
       border: 1px solid rgba(114, 240, 255, .30);
       border-radius: 8px;
-      background: rgba(114, 240, 255, .11);
-      color: #72f0ff;
+      padding: .6rem 1.2rem;
       font-size: .9rem;
       cursor: pointer;
       transition: all .2s;
     }
 
-    #productSite .quick-join button:hover {
-      border-color: #72f0ff;
+    #productSite .join-bar button:hover {
+      border-color: var(--bluey-accent);
       background: rgba(114, 240, 255, .17);
       color: #bff8ff;
     }
@@ -5350,7 +5368,7 @@
 
     #productSite .bluey-terminal {
       min-height: 398px;
-      border-color: rgba(114, 240, 255, .22);
+      border-color: var(--bluey-accent-soft);
       background:
         radial-gradient(circle at 88% 8%, rgba(124, 255, 199, .10), transparent 28%),
         linear-gradient(180deg, #090d0f 0%, #030304 100%);
@@ -5380,11 +5398,11 @@
 
     #productSite .bluey-terminal-code .blue,
     #productSite .bluey-terminal-code .label {
-      color: #72f0ff;
+      color: var(--bluey-accent);
     }
 
     #productSite .terminal-cursor {
-      background: #72f0ff;
+      background: var(--bluey-accent);
     }
 
     #productSite .footer {
@@ -5478,13 +5496,13 @@
     }
 
     @media (max-width: 1120px) {
-      #productSite .hero {
+      #productSite .content {
         grid-template-columns: 1fr;
         gap: 2rem;
         text-align: center;
       }
 
-      #productSite .hero-copy p {
+      #productSite .hero p {
         max-width: 100%;
       }
 
@@ -5492,7 +5510,7 @@
         margin: 0 auto;
       }
 
-      #productSite .quick-join {
+      #productSite .join-bar {
         max-width: 100%;
         justify-content: center;
       }
@@ -5518,21 +5536,21 @@
     }
 
     @media (max-width: 720px) {
-      #productSite.site {
+      #productSite.page {
         height: auto;
         min-height: 100vh;
         min-height: 100dvh;
       }
 
-      #productSite .site-nav {
+      #productSite .nav {
         padding: 1rem 1.5rem;
       }
 
-      #productSite .hero {
-        padding: 1.5rem;
+      #productSite .main {
+        padding: 0 1.5rem;
       }
 
-      #productSite .hero-copy h1 {
+      #productSite .hero h1 {
         font-size: 2.2rem;
       }
 
@@ -5895,50 +5913,52 @@
     </div>
   </section>
 
-  <main class="site" id="productSite">
-    <nav class="site-nav">
-      <a class="brand" href="/">
+  <main class="page" id="productSite">
+    <nav class="nav">
+      <a class="logo" href="/">
         <img src="assets/bluey-logo.svg" alt="">
         <img class="brand-wordmark" src="assets/bluey-wordmark.svg" alt="bluey">
       </a>
-      <div class="navlinks">
+      <div class="nav-links">
         <a href="/download">Download</a>
-        <a class="nav-cta" href="/login">Try Bluey</a>
+        <a class="btn-nav" href="/login">Try Bluey</a>
       </div>
     </nav>
 
-    <section class="hero">
-      <div class="hero-copy">
-        <h1 aria-label="AI chat, out of the tab.">AI chat,<br><span class="accent">out of the tab.</span></h1>
-        <p class="hero-lede">Native AI chat for meetings, code, docs, research, and screen work from your terminal. Keep Bluey in the background and ask from the context already on your machine.</p>
-        <p class="hero-proof"><span>One pill is all you need.</span> Transcript, screen, files, memory, and routed cloud models without switching apps.</p>
-        <div class="hero-actions">
-          <a class="button primary" href="/download">Get Started</a>
-          <a class="button" href="/login">Try Bluey</a>
-        </div>
-        <form class="quick-join" action="/login" method="get">
-          <input name="user_code" type="text" placeholder="Link code" autocomplete="one-time-code" spellcheck="false">
-          <button type="submit">Link</button>
-        </form>
-        <div class="hero-note">managed AI routing &middot; visible context &middot; credit based</div>
-        <div class="hero-note">screen, transcript, files, and session memory by choice</div>
-      </div>
-
-      <aside class="product-preview terminal-preview" aria-label="Bluey terminal preview">
-        <div class="bluey-terminal">
-          <div class="bluey-terminal-bar">
-            <div class="bluey-terminal-dots" aria-hidden="true">
-              <span class="bluey-terminal-dot red"></span>
-              <span class="bluey-terminal-dot yellow"></span>
-              <span class="bluey-terminal-dot green"></span>
-            </div>
-            <span class="bluey-terminal-title">bluey - zsh</span>
-            <span class="bluey-terminal-status">ready</span>
+    <div class="main">
+      <div class="content">
+        <section class="hero">
+          <h1 aria-label="AI chat, out of the tab.">AI chat,<br><span class="accent">out of the tab.</span></h1>
+          <p class="hero-lede">Native AI chat for meetings, code, docs, research, and screen work from your terminal. Keep Bluey in the background and ask from the context already on your machine.</p>
+          <p class="hero-proof"><span>One pill is all you need.</span> Transcript, screen, files, memory, and routed cloud models without switching apps.</p>
+          <div class="hero-actions">
+            <a class="btn btn-primary" href="/download">Get Started</a>
+            <a class="btn btn-ghost" href="/login">Try Bluey</a>
           </div>
-          <div class="bluey-terminal-code" id="blueyTerminal" aria-live="polite"></div>
-        </div>
-      </aside>
-    </section>
+          <form class="join-bar" action="/login" method="get">
+            <input name="user_code" type="text" placeholder="Link code" autocomplete="one-time-code" spellcheck="false">
+            <button type="submit">Link</button>
+          </form>
+          <div class="hero-note">managed AI routing &middot; visible context &middot; credit based</div>
+          <div class="hero-note">screen, transcript, files, and session memory by choice</div>
+        </section>
+
+        <aside class="product-preview terminal-preview" aria-label="Bluey terminal preview">
+          <div class="bluey-terminal">
+            <div class="bluey-terminal-bar">
+              <div class="bluey-terminal-dots" aria-hidden="true">
+                <span class="bluey-terminal-dot red"></span>
+                <span class="bluey-terminal-dot yellow"></span>
+                <span class="bluey-terminal-dot green"></span>
+              </div>
+              <span class="bluey-terminal-title">bluey - zsh</span>
+              <span class="bluey-terminal-status">ready</span>
+            </div>
+            <div class="bluey-terminal-code" id="blueyTerminal" aria-live="polite"></div>
+          </div>
+        </aside>
+      </div>
+    </div>
 
     <footer class="footer" id="pricing">
       <div class="pricing">
