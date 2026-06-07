@@ -5896,6 +5896,38 @@
       border-color: var(--bluey-accent);
     }
 
+    #accountApp .account-form .terms-check {
+      display: grid;
+      grid-template-columns: auto minmax(0, 1fr);
+      gap: .5rem;
+      align-items: flex-start;
+      margin: .15rem 0 .2rem;
+      color: #777;
+      font-size: .72rem;
+      font-weight: 500;
+      letter-spacing: 0;
+      line-height: 1.45;
+      text-transform: none;
+    }
+
+    #accountApp .account-form .terms-check input {
+      width: 13px;
+      height: 13px;
+      margin: .15rem 0 0;
+      padding: 0;
+      border-radius: 3px;
+      accent-color: var(--bluey-accent);
+    }
+
+    #accountApp .account-form .terms-check a {
+      color: var(--bluey-accent);
+      text-decoration: none;
+    }
+
+    #accountApp .account-form .terms-check a:hover {
+      text-decoration: underline;
+    }
+
     #accountApp .account-form input:-webkit-autofill,
     #accountApp .account-form input:-webkit-autofill:hover,
     #accountApp .account-form input:-webkit-autofill:focus {
@@ -6591,7 +6623,7 @@
           <a href="/download">Download</a>
           <a href="/login" data-guest-only>Login</a>
           <a href="/account" data-auth-only hidden>Dashboard</a>
-          <a class="account-icon" href="/login" data-account-icon aria-label="Login" title="Login">
+          <a class="account-icon" href="/login" data-account-icon data-auth-only hidden aria-label="Login" title="Login">
             <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
               <path d="M12 12.2a4.2 4.2 0 1 0 0-8.4 4.2 4.2 0 0 0 0 8.4Z" stroke="currentColor" stroke-width="1.8"/>
               <path d="M4.7 20.2c.8-3.6 3.4-5.7 7.3-5.7s6.5 2.1 7.3 5.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
@@ -6752,6 +6784,10 @@
                 Verification code
                 <input id="signupOtp" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" placeholder="6-digit code">
               </label>
+              <label class="terms-check" id="signupTermsLabel">
+                <input type="checkbox" id="signupTerms">
+                <span>I agree to the <a href="/docs/terms" target="_blank" rel="noopener noreferrer">Terms</a> &amp; <a href="/docs/privacy" target="_blank" rel="noopener noreferrer">Privacy</a>. Required only when creating a Bluey account.</span>
+              </label>
               <div class="account-actions-row">
                 <button class="account-button primary" type="submit">Sign in</button>
                 <button class="account-button" id="createAccountButton" type="button">Create account</button>
@@ -6870,7 +6906,7 @@
           <a href="/">Product</a>
           <a href="/login" data-guest-only>Login</a>
           <a href="/account" data-auth-only hidden>Dashboard</a>
-          <a class="account-icon" href="/login" data-account-icon aria-label="Login" title="Login">
+          <a class="account-icon" href="/login" data-account-icon data-auth-only hidden aria-label="Login" title="Login">
             <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
               <path d="M12 12.2a4.2 4.2 0 1 0 0-8.4 4.2 4.2 0 0 0 0 8.4Z" stroke="currentColor" stroke-width="1.8"/>
               <path d="M4.7 20.2c.8-3.6 3.4-5.7 7.3-5.7s6.5 2.1 7.3 5.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
@@ -7000,7 +7036,7 @@
         <a href="/download">Download</a>
         <a href="/login" data-guest-only>Login</a>
         <a class="btn-nav" href="/account" data-auth-only hidden>Dashboard</a>
-        <a class="account-icon" href="/login" data-account-icon aria-label="Login" title="Login">
+        <a class="account-icon" href="/login" data-account-icon data-auth-only hidden aria-label="Login" title="Login">
           <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
             <path d="M12 12.2a4.2 4.2 0 1 0 0-8.4 4.2 4.2 0 0 0 0 8.4Z" stroke="currentColor" stroke-width="1.8"/>
             <path d="M4.7 20.2c.8-3.6 3.4-5.7 7.3-5.7s6.5 2.1 7.3 5.7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
@@ -7227,6 +7263,14 @@
       if (el) el.textContent = text || '';
     }
 
+    function requireSignupTerms() {
+      const terms = document.getElementById('signupTerms');
+      if (!terms || terms.checked) return true;
+      accountMessage('Accept Terms and Privacy to create an account.', true);
+      terms.focus();
+      return false;
+    }
+
     function setRailCommand(authed, email = '') {
       const label = document.getElementById('railCommandLabel');
       const copy = document.getElementById('railCommandCopy');
@@ -7337,6 +7381,7 @@
         accountMessage('Email and password are required.', true);
         return;
       }
+      if (mode === 'signup' && !requireSignupTerms()) return;
       accountMessage(mode === 'signup' ? 'Creating account...' : 'Signing in...', true);
       const auth = await apiJson(`/auth/${mode === 'signup' ? 'signup' : 'login'}`, {
         method: 'POST',
@@ -7354,6 +7399,7 @@
         accountMessage('Email and password are required.', true);
         return;
       }
+      if (!requireSignupTerms()) return;
       accountMessage('Sending verification code...', true);
       const result = await apiJson('/auth/signup/start', {
         method: 'POST',
@@ -7371,6 +7417,7 @@
         accountMessage('Enter the 6-digit verification code.', true);
         return;
       }
+      if (!requireSignupTerms()) return;
       accountMessage('Verifying code...', true);
       const auth = await apiJson('/auth/signup/confirm', {
         method: 'POST',
