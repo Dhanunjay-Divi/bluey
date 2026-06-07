@@ -643,6 +643,7 @@ async fn handle_deep_link_url(url: String, app: tauri::AppHandle) {
                 return;
             }
             tracing::info!("deep-link login success");
+            notify_daemon_account_linked().await;
             let _ = app.emit(
                 "deep_link_login",
                 DeepLinkLoginResult {
@@ -663,6 +664,25 @@ async fn handle_deep_link_url(url: String, app: tauri::AppHandle) {
                 },
             );
         }
+    }
+}
+
+async fn notify_daemon_account_linked() {
+    let ready_lines = vec![
+        "account linked".to_string(),
+        "cloud answers, balance, sync, and saved sessions are ready".to_string(),
+        "ask from the composer or start listening".to_string(),
+    ];
+    if let Err(error) = commands::daemon_ipc(cue_core::ipc::DaemonRequest::OverlayBoot {
+        title: "Bluey online".to_string(),
+        lines: ready_lines,
+    })
+    .await
+    {
+        tracing::warn!(error = %error, "failed to notify daemon after deep-link login");
+    }
+    if let Err(error) = commands::daemon_ipc(cue_core::ipc::DaemonRequest::CloudStatus).await {
+        tracing::debug!(error = %error, "failed to refresh cloud status after deep-link login");
     }
 }
 

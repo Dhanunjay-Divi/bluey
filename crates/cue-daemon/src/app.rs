@@ -1076,6 +1076,7 @@ async fn handle_request_inner(
         DaemonRequest::CloudStatus => {
             let status = cloud_status_from_env(&daemon.paths);
             *daemon.cloud.lock().await = status.clone();
+            let _ = refresh_overlay_balance(daemon, Some(trace_id)).await;
             Ok(DaemonResponse::CloudStatus { status })
         }
         DaemonRequest::CloudSyncNow => {

@@ -2991,6 +2991,24 @@ private final class ExpandedPanelView: NSView {
         statusLabel.toolTip = "Cloud answers, balance, sync, and RAG unlock after login"
     }
 
+    func showSignedInReady() {
+        statusLabel.stringValue = recordingActive ? "Listening" : "Ready"
+        statusLabel.toolTip = nil
+        routeBadge.stringValue = "Auto · ready"
+        routeBadge.textColor = BlueyTheme.cyan
+        routeBadge.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.26).cgColor
+        routeBadge.layer?.backgroundColor = BlueyTheme.cyan.withAlphaComponent(0.075).cgColor
+        if balanceLabel.stringValue == "Login" {
+            balanceLabel.stringValue = "Balance --"
+        }
+        if knowledgeBadge.stringValue == "KB locked" {
+            setKnowledgeBadge("KB empty", accent: BlueyTheme.textDim)
+        }
+        composer.placeholder = recordingActive
+            ? "Listening... type a follow-up anytime"
+            : "Ask anything..."
+    }
+
     private func setKnowledgeBadge(_ text: String, accent: NSColor) {
         knowledgeBadge.stringValue = text
         knowledgeBadge.textColor = accent
@@ -4074,6 +4092,8 @@ private final class OverlayApp {
         if signInURL != nil || title.localizedCaseInsensitiveContains("sign in") {
             view.showSignedOutLogin(url: signInURL)
             pillView?.dotColor = BlueyTheme.warning
+        } else {
+            view.showSignedInReady()
         }
         view.pushCard(card)
         if signInURL == nil {

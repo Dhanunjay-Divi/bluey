@@ -62,7 +62,7 @@ pub struct FrontendErrorPayload {
 // ===== Daemon IPC helper =====
 
 /// Send a request to the running daemon over TCP and return the response.
-async fn daemon_ipc(request: DaemonRequest) -> Result<DaemonResponse, String> {
+pub(crate) async fn daemon_ipc(request: DaemonRequest) -> Result<DaemonResponse, String> {
     let trace_id = dashboard_trace_id();
     daemon_ipc_with_trace(request, &trace_id).await
 }

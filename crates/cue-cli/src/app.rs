@@ -836,7 +836,6 @@ async fn cue_on(args: OnArgs) -> Result<()> {
             url: bluey_signin_url(),
         }
     };
-    let signin_browser_opened = open_bluey_signin_if_needed(&auth_state);
     // The native overlay orders the branded pill front when the child process
     // starts. Do not send OverlayShow here: in the current protocol it expands
     // the full feed, while `bluey on` should launch pill-first.
@@ -851,11 +850,8 @@ async fn cue_on(args: OnArgs) -> Result<()> {
             match auth_state {
                 BlueyOnAuthState::Ready => println!("Bluey is on."),
                 BlueyOnAuthState::SignInAvailable { url } => {
-                    if signin_browser_opened {
-                        println!("Bluey is on. Opening {url} so you can sign in.");
-                    } else {
-                        println!("Bluey is on. Sign in from the Bluey window or open {url}.");
-                    }
+                    println!("Bluey is on. Click the pill to sign in when cloud help is needed, or run `bluey login`.");
+                    println!("Login: {url}");
                 }
             }
             Ok(())
@@ -893,31 +889,6 @@ fn default_bluey_signin_url() -> &'static str {
     "https://bluey.sh/login"
 }
 
-fn open_bluey_signin_if_needed(auth_state: &BlueyOnAuthState) -> bool {
-    let BlueyOnAuthState::SignInAvailable { url } = auth_state else {
-        return false;
-    };
-    if env_flag("BLUEY_SKIP_SIGNIN_OPEN") {
-        return false;
-    }
-    match open_browser(url) {
-        Ok(()) => true,
-        Err(error) => {
-            eprintln!("warning: could not open browser sign-in automatically: {error:#}");
-            false
-        }
-    }
-}
-
-fn env_flag(name: &str) -> bool {
-    env::var(name)
-        .map(|value| {
-            let value = value.trim().to_ascii_lowercase();
-            matches!(value.as_str(), "1" | "true" | "yes" | "on")
-        })
-        .unwrap_or(false)
-}
-
 fn bluey_on_boot_lines(auth_state: &BlueyOnAuthState) -> Vec<String> {
     match auth_state {
         BlueyOnAuthState::Ready => vec![
@@ -927,9 +898,9 @@ fn bluey_on_boot_lines(auth_state: &BlueyOnAuthState) -> Vec<String> {
             "answers stream into chat; canvas opens when useful".to_string(),
         ],
         BlueyOnAuthState::SignInAvailable { url } => vec![
-            "sign in to continue".to_string(),
-            "cloud answers, balance, sync, and knowledge base unlock after login".to_string(),
-            "the pill stays ready while the browser opens".to_string(),
+            "local recording is ready".to_string(),
+            "sign in from the Bluey window only when you want cloud answers, balance, sync, or knowledge base".to_string(),
+            "the pill stays visible; browser sign-in is not forced".to_string(),
             format!("login_url: {url}"),
         ],
     }
@@ -2742,9 +2713,9 @@ mod tests {
         let lines = bluey_on_boot_lines(&BlueyOnAuthState::SignInAvailable {
             url: "https://bluey.sh/login".to_string(),
         });
-        assert!(lines.iter().any(|line| line.contains("continue")));
+        assert!(lines.iter().any(|line| line.contains("local recording")));
         assert!(lines.iter().any(|line| line.contains("knowledge base")));
-        assert!(lines.iter().any(|line| line.contains("browser opens")));
+        assert!(lines.iter().any(|line| line.contains("not forced")));
     }
 
     #[test]
