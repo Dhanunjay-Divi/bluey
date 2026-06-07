@@ -178,23 +178,30 @@ private enum BlueyBrandAsset {
     static let wordmarkSvg = #"""
 <svg viewBox="0 0 292 100" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="bluey">
   <defs>
-    <linearGradient id="wordmark-fill" x1="2" y1="6" x2="290" y2="94" gradientUnits="userSpaceOnUse">
+    <linearGradient id="wordmark-fill" x1="0" y1="8" x2="292" y2="88" gradientUnits="userSpaceOnUse">
       <stop stop-color="#f8fdff"/>
-      <stop offset=".5" stop-color="#ddf8ff"/>
-      <stop offset="1" stop-color="#8df4ff"/>
+      <stop offset=".32" stop-color="#bdefff"/>
+      <stop offset=".68" stop-color="#63d8ff"/>
+      <stop offset="1" stop-color="#4f8dff"/>
     </linearGradient>
-    <filter id="wordmark-glow" x="-8%" y="-24%" width="116%" height="148%" color-interpolation-filters="sRGB">
-      <feDropShadow dx="0" dy="0" stdDeviation="3" flood-color="#54dcff" flood-opacity=".22"/>
+    <filter id="wordmark-glow" x="-16" y="-18" width="324" height="132" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="0" stdDeviation="3.5" flood-color="#63d8ff" flood-opacity=".30"/>
+      <feDropShadow dx="0" dy="10" stdDeviation="10" flood-color="#020811" flood-opacity=".55"/>
     </filter>
+    <mask id="wordmark-cut-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="292" height="100">
+      <rect width="292" height="100" fill="#fff"/>
+      <path d="M29.6 41.4h20.2l-7.2 7.5H22.2l7.4-7.5Z" fill="#000"/>
+      <path d="M185.4 43.2h27.8l-6.7 7.2h-28.2l7.1-7.2Z" fill="#000"/>
+      <path d="M252.5 53.4h21.2l-7.6 8.5h-21.4l7.8-8.5Z" fill="#000"/>
+    </mask>
   </defs>
-  <g fill="url(#wordmark-fill)" fill-rule="evenodd" filter="url(#wordmark-glow)">
+  <g fill="url(#wordmark-fill)" fill-rule="evenodd" filter="url(#wordmark-glow)" mask="url(#wordmark-cut-mask)">
     <path d="M5 8h13v24c5.4-6.7 12.2-10 20.6-10 16.3 0 27.4 11.6 27.4 27.2C66 65.1 54.5 75 38.7 75c-9 0-16.1-3.3-21.2-9.9L15.7 73H5V8Zm13 41.2c0 9.8 7 16.9 16.8 16.9 9.6 0 16.3-6.9 16.3-16.8 0-10.1-6.7-17.1-16.3-17.1C25 32.2 18 39.3 18 49.2Z"/>
     <path d="M76 8h13v65H76V8Z"/>
     <path d="M103 23h13v27.2c0 9.6 5.1 15.2 14.1 15.2 8.8 0 14.7-5.9 14.7-15.7V23h13v50h-10.7l-1.4-8.4C140.7 71.1 133.6 75 124.4 75 109.8 75 103 65.6 103 51.4V23Z"/>
     <path d="M171 48.6C171 32.8 182.7 22 198.2 22 214.7 22 224 33.9 224 48.5c0 1.7-.1 3.4-.4 5H184.2c1.7 7.3 7.4 11.3 15.5 11.3 6.2 0 11.4-2 15.8-5.6l5.6 8.4C215.2 72.5 207.8 75 198.5 75 181.2 75 171 64.2 171 48.6Zm13.3-5.1h27.8c-1.2-7.4-6.2-11.9-13.8-11.9-7.3 0-12.4 4.6-14 11.9Z"/>
     <path d="M232 23h14.2l13.2 31.9L273 23h13.8l-31.2 70H242l10.3-23.1L232 23Z"/>
   </g>
-  <path d="M206 31.5h15.4l-7.2 8.4H206Z" fill="#07121b" opacity=".92"/>
 </svg>
 """#
 
