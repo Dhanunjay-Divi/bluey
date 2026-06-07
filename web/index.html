@@ -5709,7 +5709,7 @@
     }
 
     #accountApp .account-rail {
-      display: none;
+      display: none !important;
     }
 
     #accountApp .account-shell {
@@ -5758,6 +5758,8 @@
     }
 
     #accountApp .account-hero {
+      display: block;
+      min-height: 0;
       padding: 0;
       border: 0;
       background: transparent;
@@ -5870,6 +5872,10 @@
       margin-top: 1rem;
     }
 
+    #accountApp .account-message:empty {
+      display: none;
+    }
+
     #accountApp .account-note a {
       color: var(--bluey-accent);
       text-decoration: none;
@@ -5880,13 +5886,19 @@
     }
 
     #accountApp.is-authed .account-main {
-      width: min(860px, 100%);
-      padding: 2rem 2rem 4rem;
+      width: min(940px, 100%);
+      padding: 1.5rem 2rem 4rem;
     }
 
     #accountApp.is-authed .account-hero {
+      display: grid;
+      grid-template-columns: minmax(0, 220px) minmax(0, 1fr);
+      align-items: end;
+      gap: 1rem;
+      min-height: 0;
+      padding: .75rem 0 .5rem;
       text-align: left;
-      margin: 0 0 1.5rem;
+      margin: 0 0 1.1rem;
     }
 
     #accountApp.is-authed .account-hero h1 {
@@ -5914,7 +5926,8 @@
     }
 
     #accountApp.is-authed .dashboard-card {
-      padding: 1.2rem 1.5rem;
+      display: block;
+      padding: 1.25rem;
     }
 
     #accountApp .dashboard-head,
@@ -5924,6 +5937,12 @@
       justify-content: space-between;
       gap: 1rem;
       margin-bottom: 1rem;
+    }
+
+    #accountApp .dashboard-head {
+      align-items: center;
+      padding-bottom: 1rem;
+      border-bottom: 1px solid #151515;
     }
 
     #accountApp .dashboard-head h2,
@@ -6022,6 +6041,10 @@
       padding: .7rem .85rem;
       color: #aaa;
       font-size: .85rem;
+    }
+
+    #accountApp .usage-row:first-child {
+      border-color: rgba(114, 240, 255, .22);
     }
 
     #accountApp .dashboard-section {
@@ -6369,8 +6392,39 @@
       #downloadApp .site-nav,
       #policyApp .site-nav,
       #accountApp .account-top {
+        grid-template-columns: 1fr;
+        justify-items: center;
         padding: 1rem;
         column-gap: .8rem;
+      }
+
+      #accountApp .account-top .account-actions-row {
+        width: 100%;
+        flex-direction: row;
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: .85rem;
+      }
+
+      #accountApp .account-top .account-actions-row .account-link,
+      #accountApp .account-top .account-actions-row .account-button {
+        width: auto;
+        min-height: 0;
+      }
+
+      #accountApp.is-authed .account-hero {
+        grid-template-columns: 1fr;
+        text-align: center;
+        padding: .4rem 0 1rem;
+      }
+
+      #accountApp.is-authed .account-hero h1 {
+        text-align: center;
+      }
+
+      #accountApp.is-authed .account-hero p {
+        max-width: 30rem;
+        text-align: center;
       }
 
       #downloadApp .platform-grid,
@@ -6745,12 +6799,12 @@
               </span>
               <span>Windows</span>
             </div>
-            <span class="availability soon">Coming next</span>
+            <span class="availability soon">Roadmap</span>
           </div>
-          <p>Windows parity is planned after clean-machine audio, overlay, and smoke tests pass.</p>
+          <p>Planned after native audio, overlay parity, and clean Windows smoke tests pass.</p>
           <div class="install-command">
-            <code>PowerShell installer pending</code>
-            <button class="copy-command" type="button" disabled>Soon</button>
+            <code>Windows installer roadmap</code>
+            <button class="copy-command" type="button" disabled>Planned</button>
           </div>
         </article>
 
@@ -6766,12 +6820,12 @@
               </span>
               <span>Linux</span>
             </div>
-            <span class="availability soon">Coming soon</span>
+            <span class="availability soon">Later</span>
           </div>
-          <p>Linux support is planned after the macOS product path and Windows parity stabilize.</p>
+          <p>Planned after macOS alpha and Windows parity are stable enough for support.</p>
           <div class="install-command">
-            <code>Linux installer pending</code>
-            <button class="copy-command" type="button" disabled>Soon</button>
+            <code>Linux installer roadmap</code>
+            <button class="copy-command" type="button" disabled>Planned</button>
           </div>
         </article>
       </section>
