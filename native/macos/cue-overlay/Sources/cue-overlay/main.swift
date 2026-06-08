@@ -109,6 +109,18 @@ private enum ExpandedPanelMetrics {
         return min(minCompactWidth, targetWidth, available)
     }
 
+    static func compactFrame(in visibleFrame: NSRect) -> NSRect {
+        let width = fittingWidth(for: visibleFrame, preferred: maxCompactWidth)
+        let height = fittingHeight(for: visibleFrame)
+        return fitExpandedFrameToVisibleScreen(
+            NSRect(
+                x: visibleFrame.midX - width / 2,
+                y: visibleFrame.midY - height / 2,
+                width: width,
+                height: height),
+            visibleFrame: visibleFrame)
+    }
+
     static func fitExpandedFrameToVisibleScreen(_ frame: NSRect, visibleFrame: NSRect) -> NSRect {
         var fitted = frame
         let availableWidth = max(360, visibleFrame.width - screenInset * 2)
@@ -3949,11 +3961,14 @@ private final class OverlayApp {
     private func expand() {
         ensureExpandedWindow()
         guard let expandedWindow else { return }
-        centerExpandedWindowOnActiveScreen()
+        placeExpandedWindowForOpen()
         pillWindow?.orderOut(nil)
         expandedWindow.ignoresMouseEvents = false
         expandedWindow.orderFrontRegardless()
         expandedWindow.makeKeyAndOrderFront(nil)
+        DispatchQueue.main.async { [weak self] in
+            self?.placeExpandedWindowForOpen()
+        }
         emitSimple("shown")
         emitLifecycle("expanded")
     }
@@ -3961,19 +3976,9 @@ private final class OverlayApp {
     private func ensureExpandedWindow() {
         guard expandedWindow == nil else { return }
         let screen = OverlayScreenPlacement.activeVisibleFrame()
-        let expandedWidth = ExpandedPanelMetrics.fittingWidth(
-            for: screen,
-            preferred: ExpandedPanelMetrics.maxCompactWidth)
-        let expandedHeight = ExpandedPanelMetrics.fittingHeight(for: screen)
+        let expandedFrame = ExpandedPanelMetrics.compactFrame(in: screen)
+        let expandedWidth = expandedFrame.width
         let minimumWidth = ExpandedPanelMetrics.fittingMinimumWidth(for: screen, targetWidth: expandedWidth)
-        let expandedSize = NSSize(width: expandedWidth, height: expandedHeight)
-        let expandedFrame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(
-            NSRect(
-                x: screen.midX - expandedSize.width / 2,
-                y: screen.midY - expandedSize.height / 2,
-                width: expandedSize.width,
-                height: expandedSize.height),
-            visibleFrame: screen)
         let window = OverlayWindow(
             contentRect: expandedFrame,
             draggable: true,
@@ -4010,15 +4015,10 @@ private final class OverlayApp {
         }
     }
 
-    private func centerExpandedWindowOnActiveScreen() {
+    private func placeExpandedWindowForOpen() {
         guard let expandedWindow else { return }
         let screen = OverlayScreenPlacement.activeVisibleFrame()
-        let currentSize = expandedWindow.frame.size
-        let centered = OverlayScreenPlacement.centeredFrame(size: currentSize, in: screen)
-        let fitted = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(
-            centered,
-            visibleFrame: screen)
-        expandedWindow.setFrame(fitted, display: true)
+        expandedWindow.setFrame(ExpandedPanelMetrics.compactFrame(in: screen), display: true)
     }
 
     private func collapse() {
