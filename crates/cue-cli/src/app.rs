@@ -1,6 +1,6 @@
 use std::env;
-use std::io::{self, Write};
-use std::path::PathBuf;
+use std::io::{self, ErrorKind, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -238,7 +238,7 @@ struct UpdateArgs {
 
 #[derive(Debug, Args)]
 struct LoginArgs {
-    /// Bluey API URL. Defaults to BLUEY_CLOUD_API_URL, CUE_CLOUD_API_URL, PINKY_API, or https://bluey.sh.
+    /// Bluey API URL. Defaults to BLUEY_CLOUD_API_URL, CUE_CLOUD_API_URL, or https://bluey.sh.
     #[arg(long)]
     api_url: Option<String>,
     /// Access token for non-browser/dev login. Prefer browser login for real accounts.
@@ -871,14 +871,14 @@ enum BlueyOnAuthState {
 }
 
 fn bluey_account_linked(paths: &AppPaths) -> bool {
-    cue_cloud_client::CloudClient::with_default_keyring()
+    load_account(paths)
         .ok()
-        .and_then(|client| client.current_tokens())
-        .is_some()
-        || load_account(paths)
+        .flatten()
+        .is_some_and(|account| account.token_configured())
+        || keyring_has_tokens_with_timeout(std::time::Duration::from_secs(1))
             .ok()
             .flatten()
-            .is_some_and(|account| account.token_configured())
+            .unwrap_or(false)
 }
 
 fn bluey_signin_url() -> String {
@@ -922,16 +922,9 @@ async fn cue_off() -> Result<()> {
         Ok(response) => print_response(response),
         Err(error) => {
             let paths = AppPaths::discover()?;
-            if paths.state_file.exists() {
-                tokio::fs::remove_file(&paths.state_file).await.with_context(|| {
-                    format!(
-                        "Bluey daemon was not reachable ({error:#}), and failed to remove stale state file {}",
-                        paths.state_file.display()
-                    )
-                })?;
-                println!("Bluey is off.");
-                return Ok(());
-            }
+            cleanup_stale_daemon(&paths, true)
+                .await
+                .with_context(|| format!("Bluey daemon was not reachable ({error:#})"))?;
             println!("Bluey is off.");
             Ok(())
         }
@@ -942,40 +935,27 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
     let paths = AppPaths::discover()?;
     paths.ensure()?;
 
-    let api_url = if args.local && args.api_url.is_none() {
-        "http://127.0.0.1:8787".to_string()
-    } else {
-        args.api_url
-            .clone()
-            .or_else(|| env::var("BLUEY_CLOUD_API_URL").ok())
-            .or_else(|| env::var("CUE_CLOUD_API_URL").ok())
-            .or_else(|| env::var("PINKY_API").ok())
-            .or_else(read_pinky_api_from_auth)
-            .unwrap_or_else(|| "https://bluey.sh".to_string())
-    };
+    let api_url = resolve_login_api_url(args.local, args.api_url.clone());
 
     let env_token = env::var("BLUEY_CLOUD_TOKEN")
         .ok()
         .or_else(|| env::var("BLUEY_API_TOKEN").ok())
         .or_else(|| env::var("CUE_CLOUD_TOKEN").ok())
-        .or_else(|| env::var("CUE_API_TOKEN").ok())
-        .or_else(|| env::var("PINKY_CUE_TOKEN").ok());
+        .or_else(|| env::var("CUE_API_TOKEN").ok());
     let token = args.token.or(env_token);
+    let refresh_token = args
+        .refresh_token
+        .or_else(|| env::var("BLUEY_CLOUD_REFRESH_TOKEN").ok())
+        .or_else(|| env::var("CUE_CLOUD_REFRESH_TOKEN").ok());
 
     let account = if args.local || args.no_browser || token.is_some() {
         let mut account = AccountConfig::local();
-        account.provider = if args.local {
-            "local".to_string()
-        } else if read_pinky_api_from_auth().is_some() {
-            "pinky".to_string()
-        } else {
-            "bluey".to_string()
-        };
+        account.provider = login_account_provider(args.local).to_string();
         account.api_url = api_url;
         account.user_id = args.user;
         account.workspace_id = args.workspace;
         account.access_token = token;
-        account.refresh_token = args.refresh_token;
+        account.refresh_token = refresh_token;
         account
     } else {
         browser_login(&api_url, args.user, args.workspace).await?
@@ -992,23 +972,23 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
     // warning but does not fail login.
     if let Some(access) = account.access_token.clone() {
         let refresh = account.refresh_token.clone().unwrap_or_default();
-        match cue_cloud_client::CloudClient::with_default_keyring() {
-            Ok(client) => {
-                let email = account.user_id.clone();
-                if let Err(e) = client.save_tokens(cue_cloud_client::Tokens {
-                    access,
-                    refresh,
-                    email,
-                }) {
-                    eprintln!(
-                        "warning: could not save tokens to keyring: {e}\n\
-                         (legacy AccountConfig path still works; cloud status may report not-logged-in until keyring is available)"
-                    );
-                }
+        let email = account.user_id.clone();
+        let tokens = cue_cloud_client::Tokens {
+            access,
+            refresh,
+            email,
+        };
+        match save_keyring_tokens_with_timeout(tokens) {
+            Ok(Some(())) => {}
+            Ok(None) => {
+                eprintln!(
+                    "warning: keyring token save timed out\n\
+                     (legacy AccountConfig path still works; cloud status may report not-logged-in until keyring is available)"
+                );
             }
             Err(e) => {
                 eprintln!(
-                    "warning: cloud client keyring unavailable: {e}\n\
+                    "warning: could not save tokens to keyring: {e}\n\
                      (legacy AccountConfig path still works; cloud status may report not-logged-in until keyring is available)"
                 );
             }
@@ -1192,23 +1172,81 @@ async fn browser_login(
 
 const DEVICE_LOGIN_TIMEOUT_SECS: u64 = 600;
 
+fn resolve_login_api_url(local: bool, explicit_api_url: Option<String>) -> String {
+    resolve_login_api_url_from(
+        local,
+        explicit_api_url,
+        env::var("BLUEY_CLOUD_API_URL").ok(),
+        env::var("CUE_CLOUD_API_URL").ok(),
+    )
+}
+
+fn resolve_login_api_url_from(
+    local: bool,
+    explicit_api_url: Option<String>,
+    bluey_api_url: Option<String>,
+    cue_api_url: Option<String>,
+) -> String {
+    if local && explicit_api_url.is_none() {
+        return "http://127.0.0.1:8787".to_string();
+    }
+    explicit_api_url
+        .or(bluey_api_url)
+        .or(cue_api_url)
+        .unwrap_or_else(|| "https://bluey.sh".to_string())
+}
+
+fn login_account_provider(local: bool) -> &'static str {
+    if local {
+        "local"
+    } else {
+        "bluey"
+    }
+}
+
+fn save_keyring_tokens_with_timeout(tokens: cue_cloud_client::Tokens) -> Result<Option<()>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<()> {
+            let client = cue_cloud_client::CloudClient::with_default_keyring()
+                .context("failed to open keyring token store")?;
+            client.save_tokens(tokens)?;
+            Ok(())
+        })();
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(result) => result.map(Some),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(anyhow!("keyring token save task ended without returning"))
+        }
+    }
+}
+
+fn keyring_has_tokens_with_timeout(timeout: std::time::Duration) -> Result<Option<bool>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<bool> {
+            let client = cue_cloud_client::CloudClient::with_default_keyring()
+                .context("failed to open keyring token store")?;
+            Ok(client.current_tokens().is_some())
+        })();
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result.map(Some),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(anyhow!("keyring token check task ended without returning"))
+        }
+    }
+}
+
 fn device_login_url(verification_uri: &str, user_code: &str) -> String {
     let base = verification_uri.trim_end_matches('/');
     let separator = if base.contains('?') { '&' } else { '?' };
     format!("{base}{separator}user_code={user_code}")
-}
-
-fn read_pinky_api_from_auth() -> Option<String> {
-    let home = env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))?;
-    let auth_path = home.join(".pinky").join("auth.json");
-    let bytes = std::fs::read(auth_path).ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    json.get("api")
-        .and_then(|value| value.as_str())
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_string)
 }
 
 fn load_local_meetings() -> Result<Vec<MeetingRecord>> {
@@ -1345,6 +1383,9 @@ async fn ensure_daemon_with_output(no_overlay: bool, quiet: bool) -> Result<()> 
     if request(DaemonRequest::Ping).await.is_ok() {
         return Ok(());
     }
+
+    let paths = AppPaths::discover()?;
+    cleanup_stale_daemon(&paths, quiet).await?;
 
     start(StartArgs {
         foreground: false,
@@ -1839,6 +1880,9 @@ async fn start(args: StartArgs) -> Result<()> {
         return Ok(());
     }
 
+    let paths = AppPaths::discover()?;
+    cleanup_stale_daemon(&paths, args.quiet).await?;
+
     if args.foreground {
         let daemon_args = daemon_launch_args(&args);
         let mut command = Command::new(resolve_daemon_bin()?);
@@ -1869,6 +1913,126 @@ async fn start(args: StartArgs) -> Result<()> {
         println!("Bluey daemon started with pid {}.", child.id());
     }
     Ok(())
+}
+
+async fn cleanup_stale_daemon(paths: &AppPaths, quiet: bool) -> Result<()> {
+    let state_pid = read_daemon_state_pid(&paths.state_file)?;
+    if let Some(pid) = state_pid {
+        terminate_pid(pid)?;
+    }
+
+    let daemon_bin = resolve_daemon_bin().ok();
+    let killed = terminate_matching_daemon_processes(daemon_bin.as_deref())?;
+
+    if paths.state_file.exists() {
+        tokio::fs::remove_file(&paths.state_file)
+            .await
+            .with_context(|| format!("failed to remove {}", paths.state_file.display()))?;
+    }
+
+    if !quiet && (state_pid.is_some() || killed > 0) {
+        eprintln!("Cleaned up stale Bluey daemon state.");
+    }
+    Ok(())
+}
+
+fn read_daemon_state_pid(state_file: &Path) -> Result<Option<u32>> {
+    let Ok(contents) = std::fs::read_to_string(state_file) else {
+        return Ok(None);
+    };
+    if contents.trim().is_empty() {
+        return Ok(None);
+    }
+    let json: serde_json::Value = match serde_json::from_str(&contents) {
+        Ok(json) => json,
+        Err(_) => return Ok(None),
+    };
+    Ok(json
+        .get("pid")
+        .and_then(|value| value.as_u64())
+        .and_then(|pid| u32::try_from(pid).ok()))
+}
+
+#[cfg(unix)]
+fn terminate_pid(pid: u32) -> Result<bool> {
+    if pid == 0 || pid == std::process::id() {
+        return Ok(false);
+    }
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(false);
+    }
+    Err(error).with_context(|| format!("failed to terminate stale Bluey daemon pid {pid}"))
+}
+
+#[cfg(not(unix))]
+fn terminate_pid(_pid: u32) -> Result<bool> {
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn terminate_matching_daemon_processes(daemon_bin: Option<&Path>) -> Result<usize> {
+    let expected = daemon_bin.and_then(|path| path.canonicalize().ok());
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,command="])
+        .output()
+        .context("failed to inspect running processes")?;
+    if !output.status.success() {
+        return Ok(0);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut killed = 0;
+    for line in stdout.lines() {
+        let trimmed = line.trim_start();
+        let Some(pid_end) = trimmed.find(char::is_whitespace) else {
+            continue;
+        };
+        let Ok(pid) = trimmed[..pid_end].trim().parse::<u32>() else {
+            continue;
+        };
+        if pid == std::process::id() {
+            continue;
+        }
+        let command = trimmed[pid_end..].trim_start();
+        let Some(exe) = command.split_whitespace().next() else {
+            continue;
+        };
+        if !is_daemon_executable_name(exe) {
+            continue;
+        }
+        if let Some(expected) = expected.as_ref() {
+            let Ok(actual) = Path::new(exe).canonicalize() else {
+                continue;
+            };
+            if actual != *expected {
+                continue;
+            }
+        }
+        if terminate_pid(pid)? {
+            killed += 1;
+        }
+    }
+    Ok(killed)
+}
+
+#[cfg(not(unix))]
+fn terminate_matching_daemon_processes(_daemon_bin: Option<&Path>) -> Result<usize> {
+    Ok(0)
+}
+
+fn is_daemon_executable_name(path: &str) -> bool {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            let name = name.trim_end_matches(env::consts::EXE_SUFFIX);
+            name == "bluey-daemon" || name == "cue-daemon"
+        })
 }
 
 async fn wait_for_daemon_ready(timeout: Duration) -> Result<()> {
@@ -2568,15 +2732,11 @@ fn env_present(name: &str) -> bool {
 
 fn optional_cloud_client() -> Result<Option<cue_cloud_client::CloudClient>> {
     let paths = AppPaths::discover()?;
+    let account = load_account(&paths).ok().flatten();
     let base_url = env::var("BLUEY_CLOUD_API_URL")
         .or_else(|_| env::var("CUE_CLOUD_API_URL"))
         .ok()
-        .or_else(|| {
-            load_account(&paths)
-                .ok()
-                .flatten()
-                .map(|account| account.api_url)
-        })
+        .or_else(|| account.as_ref().map(|account| account.api_url.clone()))
         .unwrap_or_else(|| "https://bluey.sh".to_string());
     let config = cue_cloud_client::client::ClientConfig {
         base_url,
@@ -2601,6 +2761,19 @@ fn optional_cloud_client() -> Result<Option<cue_cloud_client::CloudClient>> {
         return cue_cloud_client::CloudClient::new(config, Arc::new(store))
             .map(Some)
             .map_err(Into::into);
+    }
+
+    if let Some(account) = account {
+        if account
+            .access_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
+        {
+            let store = cue_cloud_client::AccountFileStore::new(paths.clone());
+            return cue_cloud_client::CloudClient::new(config, Arc::new(store))
+                .map(Some)
+                .map_err(Into::into);
+        }
     }
 
     let client = cue_cloud_client::CloudClient::new(
@@ -2657,14 +2830,54 @@ async fn bluey_credits_cmd() -> Result<()> {
 }
 
 async fn bluey_logout_cmd() -> Result<()> {
-    let Some(client) = cloud_client_or_message()? else {
+    let paths = AppPaths::discover()?;
+    let account_config_cleared = clear_local_account_config(&paths)?;
+
+    let had_keyring_tokens = match clear_keyring_tokens_with_timeout()? {
+        Some(had_tokens) => had_tokens,
+        None => {
+            eprintln!("bluey: keyring cleanup timed out; local account config was still cleared");
+            false
+        }
+    };
+
+    if !account_config_cleared && !had_keyring_tokens {
         println!("Bluey is already logged out.");
         return Ok(());
-    };
-    if let Err(e) = crate::bluey_cmds::logout(&client).await {
-        eprintln!("bluey: logout failed: {e}");
     }
+    println!("Bluey account logged out.");
     Ok(())
+}
+
+fn clear_keyring_tokens_with_timeout() -> Result<Option<bool>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<bool> {
+            let client = cue_cloud_client::CloudClient::with_default_keyring()
+                .context("failed to open keyring token store")?;
+            let had_keyring_tokens = client.current_tokens().is_some();
+            client.clear_tokens()?;
+            Ok(had_keyring_tokens)
+        })();
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(result) => result.map(Some),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(anyhow!("keyring cleanup task ended without returning"))
+        }
+    }
+}
+
+fn clear_local_account_config(paths: &AppPaths) -> Result<bool> {
+    match std::fs::remove_file(&paths.account_file) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to remove {}", paths.account_file.display()))
+        }
+    }
 }
 
 async fn bluey_portal_cmd() -> Result<()> {
@@ -2704,7 +2917,8 @@ async fn bluey_delete_account_cmd(force: bool) -> Result<()> {
 mod tests {
     use super::{
         bluey_on_boot_lines, bluey_on_boot_title, default_bluey_signin_url, device_login_url,
-        resolve_daemon_bin_from_roots, BlueyOnAuthState,
+        login_account_provider, resolve_daemon_bin_from_roots, resolve_login_api_url_from,
+        BlueyOnAuthState,
     };
     use std::{fs, path::PathBuf};
 
@@ -2754,6 +2968,50 @@ mod tests {
     #[test]
     fn bluey_signin_url_defaults_to_login_page() {
         assert_eq!(default_bluey_signin_url(), "https://bluey.sh/login");
+    }
+
+    #[test]
+    fn bluey_login_defaults_to_bluey_cloud() {
+        assert_eq!(
+            resolve_login_api_url_from(false, None, None, None),
+            "https://bluey.sh"
+        );
+        assert_eq!(login_account_provider(false), "bluey");
+    }
+
+    #[test]
+    fn bluey_login_local_mode_stays_local() {
+        assert_eq!(
+            resolve_login_api_url_from(true, None, None, None),
+            "http://127.0.0.1:8787"
+        );
+        assert_eq!(login_account_provider(true), "local");
+    }
+
+    #[test]
+    fn bluey_login_explicit_url_wins() {
+        assert_eq!(
+            resolve_login_api_url_from(
+                false,
+                Some("https://staging.bluey.sh".to_string()),
+                Some("https://ignored.bluey.sh".to_string()),
+                Some("https://ignored-cue.bluey.sh".to_string()),
+            ),
+            "https://staging.bluey.sh"
+        );
+    }
+
+    #[test]
+    fn bluey_login_env_prefers_bluey_over_legacy_cue() {
+        assert_eq!(
+            resolve_login_api_url_from(
+                false,
+                None,
+                Some("https://cloud.bluey.sh".to_string()),
+                Some("https://legacy-cue.example".to_string()),
+            ),
+            "https://cloud.bluey.sh"
+        );
     }
 
     #[test]

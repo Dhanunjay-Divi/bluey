@@ -27,6 +27,75 @@ pub trait TokenStore: Send + Sync {
     fn clear(&self) -> Result<()>;
 }
 
+/// Account-config-backed store for terminal installs where the OS keychain can
+/// block or be unavailable. It uses the same on-disk account profile that
+/// `bluey login` writes, so automatic refreshes survive across CLI invocations.
+#[derive(Clone)]
+pub struct AccountFileStore {
+    paths: cue_core::app_paths::AppPaths,
+}
+
+impl AccountFileStore {
+    pub fn new(paths: cue_core::app_paths::AppPaths) -> Self {
+        Self { paths }
+    }
+
+    fn load_account(&self) -> Result<Option<cue_core::AccountConfig>> {
+        cue_core::load_account(&self.paths).map_err(|error| Error::TokenStore(error.to_string()))
+    }
+
+    fn save_account(&self, account: &cue_core::AccountConfig) -> Result<()> {
+        cue_core::save_account(&self.paths, account)
+            .map_err(|error| Error::TokenStore(error.to_string()))
+    }
+}
+
+impl TokenStore for AccountFileStore {
+    fn save(&self, tokens: &Tokens) -> Result<()> {
+        let mut account = self.load_account()?.unwrap_or_else(|| {
+            let mut account = cue_core::AccountConfig::local();
+            account.provider = "bluey".to_string();
+            account.api_url = "https://bluey.sh".to_string();
+            account
+        });
+        account.provider = if account.provider == "local" {
+            "bluey".to_string()
+        } else {
+            account.provider
+        };
+        account.user_id = tokens.email.clone();
+        account.access_token = Some(tokens.access.clone());
+        account.refresh_token = (!tokens.refresh.trim().is_empty()).then(|| tokens.refresh.clone());
+        self.save_account(&account)
+    }
+
+    fn load(&self) -> Result<Option<Tokens>> {
+        let Some(account) = self.load_account()? else {
+            return Ok(None);
+        };
+        let Some(access) = account
+            .access_token
+            .filter(|token| !token.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Tokens {
+            access,
+            refresh: account.refresh_token.unwrap_or_default(),
+            email: account.user_id,
+        }))
+    }
+
+    fn clear(&self) -> Result<()> {
+        let Some(mut account) = self.load_account()? else {
+            return Ok(());
+        };
+        account.access_token = None;
+        account.refresh_token = None;
+        self.save_account(&account)
+    }
+}
+
 /// Production keyring-backed store.
 #[derive(Default)]
 pub struct KeyringStore;
@@ -122,5 +191,51 @@ mod tests {
         assert_eq!(loaded.email, "e@example.com");
         store.clear().unwrap();
         assert!(store.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn account_file_store_persists_refreshed_tokens() {
+        let base = std::env::temp_dir().join(format!(
+            "bluey-account-file-store-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let paths = cue_core::app_paths::AppPaths {
+            data_dir: base.join("data"),
+            config_dir: base.join("config"),
+            runtime_dir: base.join("run"),
+            state_file: base.join("run/daemon-state.json"),
+            account_file: base.join("config/account.json"),
+            settings_file: base.join("config/settings.json"),
+        };
+
+        let mut account = cue_core::AccountConfig::local();
+        account.provider = "bluey".into();
+        account.api_url = "https://bluey.sh".into();
+        account.user_id = "old@example.com".into();
+        account.access_token = Some("old-access".into());
+        account.refresh_token = Some("old-refresh".into());
+        cue_core::save_account(&paths, &account).unwrap();
+
+        let store = AccountFileStore::new(paths.clone());
+        store
+            .save(&Tokens {
+                access: "new-access".into(),
+                refresh: "new-refresh".into(),
+                email: "new@example.com".into(),
+            })
+            .unwrap();
+
+        let loaded = cue_core::load_account(&paths).unwrap().unwrap();
+        assert_eq!(loaded.provider, "bluey");
+        assert_eq!(loaded.api_url, "https://bluey.sh");
+        assert_eq!(loaded.user_id, "new@example.com");
+        assert_eq!(loaded.access_token.as_deref(), Some("new-access"));
+        assert_eq!(loaded.refresh_token.as_deref(), Some("new-refresh"));
+
+        let _ = std::fs::remove_dir_all(base);
     }
 }

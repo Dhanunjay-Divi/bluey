@@ -2602,15 +2602,11 @@ fn build_cloud_client(
     paths: &AppPaths,
     trace_id: Option<&str>,
 ) -> Result<cue_cloud_client::CloudClient> {
+    let account = load_account(paths).ok().flatten();
     let base_url = env::var("BLUEY_CLOUD_API_URL")
         .or_else(|_| env::var("CUE_CLOUD_API_URL"))
         .ok()
-        .or_else(|| {
-            load_account(paths)
-                .ok()
-                .flatten()
-                .map(|account| account.api_url)
-        })
+        .or_else(|| account.as_ref().map(|account| account.api_url.clone()))
         .unwrap_or_else(|| "https://bluey.sh".to_string());
 
     let config = cue_cloud_client::client::ClientConfig {
@@ -2634,6 +2630,18 @@ fn build_cloud_client(
         )?;
         let client = cue_cloud_client::CloudClient::new(config, Arc::new(store))?;
         return Ok(cloud_client_with_optional_trace(client, trace_id));
+    }
+
+    if let Some(account) = account {
+        if account
+            .access_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
+        {
+            let store = cue_cloud_client::AccountFileStore::new(paths.clone());
+            let client = cue_cloud_client::CloudClient::new(config, Arc::new(store))?;
+            return Ok(cloud_client_with_optional_trace(client, trace_id));
+        }
     }
 
     let client = cue_cloud_client::CloudClient::new(
