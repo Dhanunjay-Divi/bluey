@@ -1364,6 +1364,7 @@ private final class FeedView: NSView {
         let accent = BlueyTheme.accent(for: kind)
         let rightAligned = isUserSide(card)
         let answerLike = kind == "answer"
+        let signInLike = loginURL(from: card) != nil
         let row = NSView()
         row.translatesAutoresizingMaskIntoConstraints = false
 
@@ -1395,7 +1396,7 @@ private final class FeedView: NSView {
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         titleLabel.lineBreakMode = .byTruncatingTail
 
-        let signInURL = loginURL(from: card)
+        let signInURL = signInLike ? loginURL(from: card) : nil
         let rawBody = card.body.isEmpty && !card.done ? "Thinking..." : card.body
         let bodyText = signInURL == nil
             ? chatBody(for: card, rawBody: rawBody)
@@ -1413,7 +1414,7 @@ private final class FeedView: NSView {
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
 
         let signInButton: NSButton? = signInURL.map { url in
-            let button = NSButton(title: "Sign in", target: self, action: #selector(openURLButtonClicked(_:)))
+            let button = NSButton(title: "Open login", target: self, action: #selector(openURLButtonClicked(_:)))
             button.translatesAutoresizingMaskIntoConstraints = false
             button.identifier = NSUserInterfaceItemIdentifier(url.absoluteString)
             styleSignInButton(button)
@@ -1423,8 +1424,11 @@ private final class FeedView: NSView {
             bubble.layer?.backgroundColor = NSColor(red: 0.020, green: 0.030, blue: 0.040, alpha: 0.98).cgColor
             bubble.layer?.borderWidth = 1
             bubble.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.30).cgColor
-            titleLabel.font = NSFont.systemFont(ofSize: 13.5, weight: .bold)
-            statusLabel.stringValue = "login"
+            metaLabel.isHidden = true
+            statusLabel.isHidden = true
+            titleLabel.font = NSFont.systemFont(ofSize: 15.5, weight: .bold)
+            titleLabel.alignment = .center
+            bodyLabel.preferredMaxLayoutWidth = 360
         }
 
         row.addSubview(bubble)
@@ -1438,7 +1442,10 @@ private final class FeedView: NSView {
 
         let leading = bubble.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 8)
         let trailing = bubble.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -8)
-        if rightAligned {
+        if signInLike {
+            leading.priority = .defaultLow
+            trailing.priority = .defaultLow
+        } else if rightAligned {
             leading.priority = .defaultLow
             trailing.priority = .required
         } else {
@@ -1452,30 +1459,44 @@ private final class FeedView: NSView {
             bubble.bottomAnchor.constraint(equalTo: row.bottomAnchor),
             leading,
             trailing,
-            bubble.widthAnchor.constraint(lessThanOrEqualTo: row.widthAnchor, multiplier: answerLike ? 0.90 : (rightAligned ? 0.70 : 0.78)),
-            bubble.widthAnchor.constraint(greaterThanOrEqualToConstant: answerLike ? 240 : 170),
-
-            metaLabel.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 10),
-            metaLabel.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 14),
-
-            titleLabel.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
-            titleLabel.leadingAnchor.constraint(equalTo: metaLabel.trailingAnchor, constant: 8),
-            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: statusLabel.leadingAnchor, constant: -10),
-
-            statusLabel.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
-            statusLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
-
-            bodyLabel.topAnchor.constraint(equalTo: metaLabel.bottomAnchor, constant: 8),
-            bodyLabel.leadingAnchor.constraint(equalTo: metaLabel.leadingAnchor),
-            bodyLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
+            bubble.widthAnchor.constraint(lessThanOrEqualTo: row.widthAnchor, multiplier: signInLike ? 0.62 : (answerLike ? 0.90 : (rightAligned ? 0.70 : 0.78))),
+            bubble.widthAnchor.constraint(greaterThanOrEqualToConstant: signInLike ? 330 : (answerLike ? 240 : 170)),
         ]
+        if signInLike {
+            constraints.append(contentsOf: [
+                bubble.centerXAnchor.constraint(equalTo: row.centerXAnchor),
+                titleLabel.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 18),
+                titleLabel.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 18),
+                titleLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -18),
+
+                bodyLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 12),
+                bodyLabel.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 28),
+                bodyLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -28),
+            ])
+        } else {
+            constraints.append(contentsOf: [
+                metaLabel.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 10),
+                metaLabel.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 14),
+
+                titleLabel.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
+                titleLabel.leadingAnchor.constraint(equalTo: metaLabel.trailingAnchor, constant: 8),
+                titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: statusLabel.leadingAnchor, constant: -10),
+
+                statusLabel.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
+                statusLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
+
+                bodyLabel.topAnchor.constraint(equalTo: metaLabel.bottomAnchor, constant: 8),
+                bodyLabel.leadingAnchor.constraint(equalTo: metaLabel.leadingAnchor),
+                bodyLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
+            ])
+        }
         if let signInButton {
             constraints.append(contentsOf: [
                 bodyLabel.bottomAnchor.constraint(equalTo: signInButton.topAnchor, constant: -12),
                 signInButton.centerXAnchor.constraint(equalTo: bubble.centerXAnchor),
                 signInButton.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -14),
-                signInButton.widthAnchor.constraint(equalToConstant: 132),
-                signInButton.heightAnchor.constraint(equalToConstant: 34),
+                signInButton.widthAnchor.constraint(equalToConstant: 150),
+                signInButton.heightAnchor.constraint(equalToConstant: 38),
             ])
         } else {
             constraints.append(bodyLabel.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -12))
@@ -1493,7 +1514,7 @@ private final class FeedView: NSView {
         button.layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
         button.font = NSFont.systemFont(ofSize: 12.5, weight: .bold)
         button.attributedTitle = NSAttributedString(
-            string: "Sign in",
+            string: "Open login",
             attributes: [
                 .font: button.font ?? NSFont.systemFont(ofSize: 12.5, weight: .bold),
                 .foregroundColor: NSColor.black.withAlphaComponent(0.86),
@@ -1899,7 +1920,7 @@ private final class ExpandedPanelView: NSView {
         statusLabel = NSTextField(labelWithString: "New recording")
         modelMenu = NSPopUpButton(frame: .zero, pullsDown: false)
         routeBadge = NSTextField(labelWithString: "Auto · ready")
-        knowledgeBadge = NSTextField(labelWithString: "KB empty")
+        knowledgeBadge = NSTextField(labelWithString: "Docs empty")
         balanceLabel = NSTextField(labelWithString: "Balance --")
         canvasToggleButton = NSButton(title: "", target: nil, action: nil)
         navButton = NSButton(title: "", target: nil, action: nil)
@@ -1914,7 +1935,7 @@ private final class ExpandedPanelView: NSView {
         answerStylePanel = NSView()
         answerStyleLabel = NSTextField(labelWithString: "How Bluey should answer")
         answerStyleBox = NSTextField()
-        answerStyleSaveButton = NSButton(title: "Save style", target: nil, action: nil)
+        answerStyleSaveButton = NSButton(title: "Save", target: nil, action: nil)
         transcriptStrip = NSView()
         transcriptActivityDot = NSView()
         transcriptStateLabel = NSTextField(labelWithString: "IDLE")
@@ -1929,7 +1950,7 @@ private final class ExpandedPanelView: NSView {
         askButton = NSButton(title: "", target: nil, action: nil)
         analyzeButton = NSButton(title: "Screen", target: nil, action: nil)
         attachButton = NSButton(title: "", target: nil, action: nil)
-        instructionsButton = NSButton(title: "Style", target: nil, action: nil)
+        instructionsButton = NSButton(title: "Tone", target: nil, action: nil)
         opacityControl = NSView()
         opacityLabel = NSTextField(labelWithString: "Opacity")
         opacitySlider = NSSlider(value: 0.94, minValue: 0.50, maxValue: 1.0, target: nil, action: nil)
@@ -2515,7 +2536,7 @@ private final class ExpandedPanelView: NSView {
         routeBadge.toolTip = "Auto Router classification and selected lane"
 
         styleHeaderBadge(knowledgeBadge, textColor: BlueyTheme.text)
-        knowledgeBadge.toolTip = "Knowledge base status for attached documents"
+        knowledgeBadge.toolTip = "Attached document status"
 
         balanceLabel.font = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .bold)
         balanceLabel.textColor = BlueyTheme.text
@@ -2637,7 +2658,7 @@ private final class ExpandedPanelView: NSView {
         answerStyleLabel.textColor = BlueyTheme.textDim
         answerStyleLabel.alignment = .center
         answerStyleLabel.stringValue = "How Bluey should answer"
-        answerStyleBox.placeholderString = "Concise, natural, implementation-first..."
+        answerStyleBox.placeholderString = "Natural, concise, interview-ready..."
         answerStyleBox.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
         answerStyleBox.isBezeled = false
         answerStyleBox.drawsBackground = true
@@ -2646,7 +2667,7 @@ private final class ExpandedPanelView: NSView {
         answerStyleBox.textColor = NSColor.black.withAlphaComponent(0.88)
         answerStyleBox.alignment = .center
         answerStyleBox.placeholderAttributedString = NSAttributedString(
-            string: "Concise, natural, implementation-first...",
+            string: "Natural, concise, interview-ready...",
             attributes: [.foregroundColor: NSColor.black.withAlphaComponent(0.42)])
         answerStyleBox.wantsLayer = true
         answerStyleBox.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.92).cgColor
@@ -2992,7 +3013,7 @@ private final class ExpandedPanelView: NSView {
     }
 
     @objc private func attachClicked() {
-        setKnowledgeBadge("KB loading", accent: BlueyTheme.warning)
+        setKnowledgeBadge("Docs loading", accent: BlueyTheme.warning)
         showKnowledgePlaceholder("Indexing selected files...")
         emitSimple("attach_requested")
     }
@@ -3032,9 +3053,9 @@ private final class ExpandedPanelView: NSView {
         routeBadge.layer?.borderColor = BlueyTheme.warning.withAlphaComponent(0.28).cgColor
         routeBadge.layer?.backgroundColor = BlueyTheme.warning.withAlphaComponent(0.08).cgColor
         balanceLabel.stringValue = "Login"
-        setKnowledgeBadge("KB locked", accent: BlueyTheme.textDim)
+        setKnowledgeBadge("Docs locked", accent: BlueyTheme.textDim)
         composer.placeholder = url == nil ? "Sign in to use managed answers..." : "Sign in, then ask anything..."
-        statusLabel.toolTip = "Cloud answers, balance, sync, and RAG unlock after login"
+        statusLabel.toolTip = "Cloud answers, balance, sync, and documents unlock after login"
     }
 
     func showSignedInReady() {
@@ -3047,8 +3068,8 @@ private final class ExpandedPanelView: NSView {
         if balanceLabel.stringValue == "Login" {
             balanceLabel.stringValue = "Balance --"
         }
-        if knowledgeBadge.stringValue == "KB locked" {
-            setKnowledgeBadge("KB empty", accent: BlueyTheme.textDim)
+        if knowledgeBadge.stringValue == "Docs locked" {
+            setKnowledgeBadge("Docs empty", accent: BlueyTheme.textDim)
         }
         composer.placeholder = recordingActive
             ? "Listening... type a follow-up anytime"
@@ -3193,14 +3214,14 @@ private final class ExpandedPanelView: NSView {
 
         attachmentStrip.isHidden = false
         guard !items.isEmpty else {
-            setKnowledgeBadge("KB empty", accent: BlueyTheme.textDim)
+            setKnowledgeBadge("Docs empty", accent: BlueyTheme.textDim)
             attachmentStrip.isHidden = true
             attachmentStripHeightConstraint?.constant = 0
             layoutSubtreeIfNeeded()
             return
         }
 
-        setKnowledgeBadge("KB \(items.count) loaded", accent: BlueyTheme.green)
+        setKnowledgeBadge("Docs \(items.count) ready", accent: BlueyTheme.green)
         attachmentStripHeightConstraint?.constant = 34
 
         for item in items {

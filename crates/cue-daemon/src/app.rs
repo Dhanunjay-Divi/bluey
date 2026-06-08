@@ -6656,7 +6656,7 @@ fn choose_context_files_platform() -> Result<Vec<PathBuf>> {
     let script = r#"
 try
   set allowedTypes to {"public.text", "public.source-code", "public.shell-script", "public.json", "public.yaml", "public.xml", "public.html", "public.css", "com.adobe.pdf", "com.microsoft.word.doc", "org.openxmlformats.wordprocessingml.document", "public.rtf", "net.daringfireball.markdown", "md", "markdown", "txt", "log", "csv", "tsv", "rst", "adoc", "rs", "swift", "c", "h", "cpp", "hpp", "js", "jsx", "ts", "tsx", "py", "go", "java", "kt", "kts", "cs", "rb", "php", "sql", "sh", "ps1", "toml", "yaml", "yml", "json", "html", "css", "scss", "pdf", "doc", "docx", "rtf"}
-  set pickedFiles to choose file with prompt "Choose readable text, code, PDF, DOC, DOCX, or RTF files for this Bluey session" of type allowedTypes with multiple selections allowed
+  set pickedFiles to choose file with prompt "Choose readable text, code, PDF, DOC/DOCX, CSV/TSV, JSON/YAML/TOML, HTML/CSS, shell/SQL, or RTF files for this Bluey session. Video, audio, apps, and certificates are skipped." of type allowedTypes with multiple selections allowed
   set output to ""
   repeat with pickedFile in pickedFiles
     set output to output & POSIX path of pickedFile & linefeed

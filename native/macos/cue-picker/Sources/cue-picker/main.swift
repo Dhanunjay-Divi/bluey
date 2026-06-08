@@ -30,7 +30,7 @@ private final class ContextFilePanelDelegate: NSObject, NSOpenSavePanelDelegate 
                 code: 1,
                 userInfo: [
                     NSLocalizedDescriptionKey:
-                        "Bluey can attach readable text, code, PDF, DOC, DOCX, or RTF files only."
+                        "Bluey can attach readable text, code, PDF, DOC, DOCX, CSV/TSV, JSON/YAML/TOML, HTML/CSS, shell/SQL, or RTF files only."
                 ]
             )
         }
@@ -70,7 +70,7 @@ private final class PickerAppDelegate: NSObject, NSApplicationDelegate {
     private func runPanel() {
         let panel = NSOpenPanel()
         panel.title = "Attach files to Bluey"
-        panel.message = "Choose readable text, code, PDF, DOC, DOCX, or RTF files for this Bluey session"
+        panel.message = "Choose readable text, code, PDF, DOC/DOCX, CSV/TSV, JSON/YAML/TOML, HTML/CSS, shell/SQL, or RTF files. Video, audio, apps, and certificates are skipped."
         panel.prompt = "Attach"
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
