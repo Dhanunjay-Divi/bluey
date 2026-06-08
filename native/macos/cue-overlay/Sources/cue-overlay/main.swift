@@ -547,11 +547,15 @@ private var ipcInputHandle: FileHandle?
 private var ipcOutputHandle: FileHandle = FileHandle.standardOutput
 
 private let captureVisibleForDebug: Bool = {
+#if DEBUG
     let devEnabled = argumentFlag("--bluey-dev-overlay") || envFlag("BLUEY_DEV_OVERLAY")
     guard devEnabled else { return false }
     return argumentFlag("--bluey-overlay-capture-visible")
         || envFlag("BLUEY_OVERLAY_CAPTURE_VISIBLE")
         || envFlag("BLUEY_HOST_OVERLAY_CAPTURE_VISIBLE")
+#else
+    return false
+#endif
 }()
 
 private func connectUnixSocket(path: String) -> Int32? {

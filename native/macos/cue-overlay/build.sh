@@ -5,9 +5,10 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 cd "$SCRIPT_DIR"
-swift build -c release
+CONFIGURATION="${BLUEY_OVERLAY_SWIFT_CONFIGURATION:-release}"
+swift build -c "$CONFIGURATION"
 mkdir -p .build
-BIN="$(swift build -c release --show-bin-path)/cue-overlay"
+BIN="$(swift build -c "$CONFIGURATION" --show-bin-path)/cue-overlay"
 cp "$BIN" .build/bluey-overlay-macos
 cp "$BIN" .build/cue-overlay-macos
 
@@ -46,7 +47,12 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-for profile in debug release; do
+target_profiles=(debug release)
+if [[ "$CONFIGURATION" == "debug" ]]; then
+  target_profiles=(debug)
+fi
+
+for profile in "${target_profiles[@]}"; do
   target_dir="$ROOT/target/$profile"
   if [[ -d "$target_dir" ]]; then
     cp "$BIN" "$target_dir/bluey-overlay-macos"

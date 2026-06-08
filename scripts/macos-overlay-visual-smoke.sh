@@ -3,9 +3,9 @@ set -euo pipefail
 
 # Dev-only visual smoke for the native macOS overlay.
 #
-# This intentionally enables BLUEY_HOST_OVERLAY_CAPTURE_VISIBLE so the test can
-# screenshot the overlay. Production launch paths must never set that variable;
-# the daemon already gates it behind BLUEY_DEV_OVERLAY=1.
+# This intentionally builds a debug overlay and enables
+# BLUEY_HOST_OVERLAY_CAPTURE_VISIBLE so the test can screenshot the overlay.
+# Release overlay binaries ignore capture-visible QA flags at compile time.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${BLUEY_VISUAL_SMOKE_OUT:-/tmp/bluey-smoke-shots}"
@@ -60,7 +60,7 @@ reject_source "Start Bluey"
 
 echo "[visual-smoke] building debug CLI/daemon + macOS overlay"
 cargo build --bin bluey --bin bluey-daemon >/dev/null
-bash native/macos/cue-overlay/build.sh >/dev/null
+BLUEY_OVERLAY_SWIFT_CONFIGURATION=debug bash native/macos/cue-overlay/build.sh >/dev/null
 
 cleanup() {
   "$BLUEY_BIN" off >/dev/null 2>&1 || true
