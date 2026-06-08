@@ -43,7 +43,7 @@ require_source "modelMenu.trailingAnchor.constraint(equalTo: analyzeButton.leadi
 require_source "composerBarHeightConstraint?.constant = textHeight + 62"
 require_source "knowledgeBadge = NSTextField(labelWithString: \"Docs empty\")"
 require_source "routeBadge = NSTextField(labelWithString: \"Auto · ready\")"
-require_source "addSubview(headerBar, positioned: .above, relativeTo: nil)"
+require_source "addSubview(headerBar)"
 require_source "configureFixedChromeLayoutPriorities()"
 require_source "keepFixedChromeInBounds()"
 require_source "PillMetrics.centeredFrame"

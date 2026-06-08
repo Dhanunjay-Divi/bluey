@@ -11,6 +11,11 @@ This pass focused on the remaining product polish that could be completed locall
   - Removed the small corner "login" status text that made the card look misaligned.
   - Widened the card so the copy wraps cleanly.
   - Renamed the CTA to "Open login".
+  - The signed-out card now clears stale lifecycle cards so "Meeting started" / "Meeting ended" do not compete with the login state.
+  - Replaced internal "knowledge base" wording in the card with "documents".
+- Fixed expanded-header visibility:
+  - The top navigation/model/docs/balance controls are added as a normal late root subview instead of using the fragile `positioned: .above, relativeTo: nil` path.
+  - The defensive layout pass now preserves z-order only; it no longer fights Auto Layout by manually overwriting header frames.
 - Kept the existing chat layout contract:
   - Transcript and typed user/question cards stay on the right.
   - Bluey answer cards stay on the left.

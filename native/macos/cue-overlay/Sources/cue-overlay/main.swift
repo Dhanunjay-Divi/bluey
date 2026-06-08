@@ -1243,6 +1243,9 @@ private final class FeedView: NSView {
             emitCardRendered(id: card.id)
             return
         }
+        if loginURL(from: card) != nil {
+            removeAllCards()
+        }
         cards.append(card)
         emptyState.isHidden = true
         let view = makeCardView(card)
@@ -1275,9 +1278,16 @@ private final class FeedView: NSView {
     }
 
     func clear() {
-        cards.removeAll()
-        for v in stack.arrangedSubviews { v.removeFromSuperview() }
+        removeAllCards()
         emptyState.isHidden = false
+    }
+
+    private func removeAllCards() {
+        cards.removeAll()
+        for view in stack.arrangedSubviews {
+            stack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
     }
 
     private func configureEmptyState() {
@@ -1663,6 +1673,7 @@ private final class FeedView: NSView {
         text.components(separatedBy: .newlines)
             .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("login_url:") }
             .joined(separator: "\n")
+            .replacingOccurrences(of: "knowledge base", with: "documents")
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
@@ -2100,7 +2111,9 @@ private final class ExpandedPanelView: NSView {
         composerBar.addSubview(modelMenu)
         composerBar.addSubview(analyzeButton)
         composerBar.addSubview(askButton)
-        addSubview(headerBar, positioned: .above, relativeTo: nil)
+        // Add the header late in the root view so it paints above the scroll
+        // workspace. Full-screen modal overlays are added after this.
+        addSubview(headerBar)
         addSubview(closeConfirmOverlay)
         closeConfirmOverlay.addSubview(closeConfirmPanel)
         closeConfirmPanel.addSubview(closeConfirmTitle)
@@ -2463,21 +2476,19 @@ private final class ExpandedPanelView: NSView {
     }
 
     private func keepFixedChromeInBounds() {
-        // Defensive guard for AppKit/autolayout edge cases: if a dense feed,
-        // drawer, or growing composer ever tries to push the header out of the
-        // content rect, restore the fixed chrome frame immediately instead of
-        // letting the user lose navigation/model/balance controls.
+        // Defensive guard for AppKit/autolayout edge cases. Auto Layout owns
+        // the fixed chrome positions; this helper only keeps their stacking
+        // order stable so dense transcript/card content cannot visually cover
+        // navigation/model/balance controls.
         guard bounds.height >= ExpandedPanelMetrics.minHeight else { return }
         headerBar.isHidden = false
         headerBar.layer?.zPosition = 1_000
         headerStack.layer?.zPosition = 1_001
-        addSubview(headerBar, positioned: .above, relativeTo: nil)
-        headerBar.frame = NSRect(
-            x: 10,
-            y: bounds.height - 52,
-            width: max(0, bounds.width - 20),
-            height: 42)
-        headerStack.frame = headerBar.bounds.insetBy(dx: 9, dy: 4)
+        transcriptStrip.layer?.zPosition = 900
+        attachmentStrip.layer?.zPosition = 900
+        composerBar.layer?.zPosition = 1_000
+        headerBar.needsLayout = true
+        headerStack.needsLayout = true
         if composerBar.frame.minY < 0 || composerBar.frame.maxY > bounds.height {
             let height = composerBarHeightConstraint?.constant ?? 108
             composerBar.frame = NSRect(
