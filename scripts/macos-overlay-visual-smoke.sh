@@ -178,5 +178,57 @@ PY
 shot="$OUT_DIR/macos-overlay-visual-smoke.png"
 screencapture -x "$shot"
 echo "[visual-smoke] screenshot: $shot"
+export SHOT="$shot"
+python3 <<'PY'
+import json
+import os
+
+import Quartz
+from PIL import Image
+
+
+def expanded(rows):
+    candidates = [row for row in rows if row["height"] > 100]
+    if not candidates:
+        raise AssertionError("no expanded overlay window found")
+    return max(candidates, key=lambda row: row["width"] * row["height"])
+
+
+row = expanded(json.loads(os.environ["AFTER_JSON"]))
+image = Image.open(os.environ["SHOT"]).convert("RGB")
+display_bounds = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID())
+scale_x = image.width / max(1, display_bounds.size.width)
+scale_y = image.height / max(1, display_bounds.size.height)
+
+# CGWindow bounds are in display points while screencapture stores pixels on
+# Retina hosts. Keep a tiny tolerance by clamping the crop to the image.
+x = max(0, int(row["x"] * scale_x))
+y = max(0, int(row["y"] * scale_y))
+w = max(1, int(row["width"] * scale_x))
+header_box = (
+    min(image.width, x + 12),
+    min(image.height, y + 8),
+    min(image.width, x + w - 12),
+    min(image.height, y + 58),
+)
+if header_box[2] <= header_box[0] or header_box[3] <= header_box[1]:
+    raise AssertionError(f"invalid header crop: {header_box}, row={row}")
+
+pixels = list(image.crop(header_box).getdata())
+bright = sum(1 for r, g, b in pixels if r + g + b > 560)
+blue_accent = sum(1 for r, g, b in pixels if b > 80 and g > 80 and r < 130)
+yellow_accent = sum(1 for r, g, b in pixels if r > 140 and g > 105 and b < 90)
+
+if bright < 120 or blue_accent + yellow_accent < 35:
+    raise AssertionError(
+        "expanded overlay header appears missing or clipped: "
+        f"bright={bright} accent={blue_accent + yellow_accent} crop={header_box}"
+    )
+
+print(
+    "[visual-smoke] header visible: "
+    f"bright={bright} accent={blue_accent + yellow_accent}"
+)
+PY
 "$BLUEY_BIN" status
 echo "[visual-smoke] PASS"

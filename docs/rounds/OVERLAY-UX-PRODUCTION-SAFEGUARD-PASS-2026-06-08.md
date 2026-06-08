@@ -15,7 +15,8 @@ This pass focused on the remaining product polish that could be completed locall
   - Replaced internal "knowledge base" wording in the card with "documents".
 - Fixed expanded-header visibility:
   - The top navigation/model/docs/balance controls are added as a normal late root subview instead of using the fragile `positioned: .above, relativeTo: nil` path.
-  - The defensive layout pass now preserves z-order only; it no longer fights Auto Layout by manually overwriting header frames.
+  - The defensive layout pass now pins the header to the visible `NSWindow` frame height instead of trusting a sometimes-stale view `bounds.height`, which is what clipped the top controls in the Mac smoke.
+  - The visual smoke now inspects the screenshot crop for bright/accent header pixels so a missing eye/close/top bar fails the test instead of slipping through.
 - Kept the existing chat layout contract:
   - Transcript and typed user/question cards stay on the right.
   - Bluey answer cards stay on the left.
@@ -40,6 +41,7 @@ This pass focused on the remaining product polish that could be completed locall
 - Visual smoke screenshot confirmed:
   - Expanded overlay remains bounded at `820x520`.
   - Header stays visible.
+  - Header pixel assertion reports visible controls in the captured screenshot.
   - Login card is centered and readable.
   - Transcript strip scrolls horizontally instead of growing the window.
   - Bottom controls remain aligned.

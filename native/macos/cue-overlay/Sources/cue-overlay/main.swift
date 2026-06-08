@@ -2476,10 +2476,10 @@ private final class ExpandedPanelView: NSView {
     }
 
     private func keepFixedChromeInBounds() {
-        // Defensive guard for AppKit/autolayout edge cases. Auto Layout owns
-        // the fixed chrome positions; this helper only keeps their stacking
-        // order stable so dense transcript/card content cannot visually cover
-        // navigation/model/balance controls.
+        // Defensive guard for AppKit/autolayout edge cases. The window can
+        // report content bounds taller than the visible frame in some launch
+        // paths, so pin fixed chrome to the real visible height and keep its
+        // stacking order above dense transcript/card content.
         guard bounds.height >= ExpandedPanelMetrics.minHeight else { return }
         headerBar.isHidden = false
         headerBar.layer?.zPosition = 1_000
@@ -2487,8 +2487,13 @@ private final class ExpandedPanelView: NSView {
         transcriptStrip.layer?.zPosition = 900
         attachmentStrip.layer?.zPosition = 900
         composerBar.layer?.zPosition = 1_000
-        headerBar.needsLayout = true
-        headerStack.needsLayout = true
+        let visibleHeight = min(bounds.height, window?.frame.height ?? bounds.height)
+        headerBar.frame = NSRect(
+            x: 10,
+            y: max(10, visibleHeight - 52),
+            width: max(0, bounds.width - 20),
+            height: 42)
+        headerStack.frame = headerBar.bounds.insetBy(dx: 9, dy: 4)
         if composerBar.frame.minY < 0 || composerBar.frame.maxY > bounds.height {
             let height = composerBarHeightConstraint?.constant ?? 108
             composerBar.frame = NSRect(
