@@ -6013,7 +6013,12 @@ fn spawn_overlay(
     // Step 2: verify the binary path is canonical + inside the install dir.
     // The install dir is the parent of the daemon's own current_exe (Tauri+helpers
     // ship side-by-side). For dev builds we allow any path under the cwd.
-    let install_dir = if cfg!(debug_assertions) || crate::overlay::is_dev_overlay_enabled() {
+    let has_overlay_override = explicit.is_some()
+        || env::var_os("BLUEY_OVERLAY_BIN").is_some()
+        || env::var_os("CUE_OVERLAY_BIN").is_some();
+    let install_dir = if cfg!(debug_assertions)
+        || (crate::overlay::is_dev_overlay_enabled() && has_overlay_override)
+    {
         env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     } else {
         env::current_exe()

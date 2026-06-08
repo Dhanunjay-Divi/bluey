@@ -137,6 +137,28 @@ private enum PillMetrics {
     }
 }
 
+private enum OverlayScreenPlacement {
+    static let fallbackVisibleFrame = NSRect(x: 0, y: 0, width: 1920, height: 1080)
+
+    static func activeVisibleFrame() -> NSRect {
+        let mouse = NSEvent.mouseLocation
+        if let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) {
+            return screen.visibleFrame
+        }
+        return NSScreen.main?.visibleFrame
+            ?? NSScreen.screens.first?.visibleFrame
+            ?? fallbackVisibleFrame
+    }
+
+    static func centeredFrame(size: NSSize, in visibleFrame: NSRect) -> NSRect {
+        NSRect(
+            x: visibleFrame.midX - size.width / 2,
+            y: visibleFrame.midY - size.height / 2,
+            width: size.width,
+            height: size.height)
+    }
+}
+
 private enum BlueyBrandAsset {
     static let logoSvg = #"""
 <svg viewBox="0 0 96 96" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Bluey logo">
@@ -648,6 +670,7 @@ private func emitCardRendered(id: String) {
 /// the size passed at construction time.
 private final class OverlayWindow: NSWindow {
     var lockedFrameHeight: CGFloat?
+    var preserveProgrammaticFrameHeight = false
     var minimumFrameWidth: CGFloat?
     var maximumFrameWidth: CGFloat?
     var minimumFrameHeight: CGFloat?
@@ -722,6 +745,12 @@ private final class OverlayWindow: NSWindow {
         if let lockedFrameHeight {
             clamped.size.height = lockedFrameHeight
         } else {
+            if preserveProgrammaticFrameHeight,
+               frame.height > self.frame.height,
+               NSEvent.pressedMouseButtons == 0
+            {
+                clamped.size.height = self.frame.height
+            }
             if let minimumFrameHeight {
                 clamped.size.height = max(minimumFrameHeight, clamped.size.height)
             }
@@ -748,6 +777,7 @@ private final class OverlayWindow: NSWindow {
 
     private var clampingEnabled: Bool {
         lockedFrameHeight != nil
+            || preserveProgrammaticFrameHeight
             || minimumFrameWidth != nil
             || maximumFrameWidth != nil
             || minimumFrameHeight != nil
@@ -3832,7 +3862,7 @@ private final class OverlayApp {
     func start() {
         // Pill window: compact launcher, centered by default.
         let pillSize = PillMetrics.size
-        let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
+        let screen = OverlayScreenPlacement.activeVisibleFrame()
         pillWindow = OverlayWindow(
             contentRect: PillMetrics.centeredFrame(in: screen),
             draggable: true)
@@ -3877,9 +3907,7 @@ private final class OverlayApp {
     }
 
     private func centerPillOnMainScreen() {
-        let screen = pillWindow.screen?.visibleFrame
-            ?? NSScreen.main?.visibleFrame
-            ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
+        let screen = OverlayScreenPlacement.activeVisibleFrame()
         pillWindow.setFrame(PillMetrics.centeredFrame(in: screen), display: true)
     }
 
@@ -3921,6 +3949,7 @@ private final class OverlayApp {
     private func expand() {
         ensureExpandedWindow()
         guard let expandedWindow else { return }
+        centerExpandedWindowOnActiveScreen()
         pillWindow?.orderOut(nil)
         expandedWindow.ignoresMouseEvents = false
         expandedWindow.orderFrontRegardless()
@@ -3931,7 +3960,7 @@ private final class OverlayApp {
 
     private func ensureExpandedWindow() {
         guard expandedWindow == nil else { return }
-        let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1920, height: 1080)
+        let screen = OverlayScreenPlacement.activeVisibleFrame()
         let expandedWidth = ExpandedPanelMetrics.fittingWidth(
             for: screen,
             preferred: ExpandedPanelMetrics.maxCompactWidth)
@@ -3949,6 +3978,7 @@ private final class OverlayApp {
             contentRect: expandedFrame,
             draggable: true,
             resizable: true)
+        window.preserveProgrammaticFrameHeight = true
         let maxExpandedWidth = max(minimumWidth, screen.width - ExpandedPanelMetrics.screenInset * 2)
         let maxExpandedHeight = max(ExpandedPanelMetrics.minHeight, screen.height - ExpandedPanelMetrics.screenInset * 2)
         window.minimumFrameWidth = minimumWidth
@@ -3978,6 +4008,17 @@ private final class OverlayApp {
             pushBootCard(title: pending.title, lines: pending.lines)
             pendingBoot = nil
         }
+    }
+
+    private func centerExpandedWindowOnActiveScreen() {
+        guard let expandedWindow else { return }
+        let screen = OverlayScreenPlacement.activeVisibleFrame()
+        let currentSize = expandedWindow.frame.size
+        let centered = OverlayScreenPlacement.centeredFrame(size: currentSize, in: screen)
+        let fitted = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(
+            centered,
+            visibleFrame: screen)
+        expandedWindow.setFrame(fitted, display: true)
     }
 
     private func collapse() {
@@ -4126,7 +4167,7 @@ private final class OverlayApp {
     }
 
     private func applyPosition(_ pos: String) {
-        guard let screen = NSScreen.main?.visibleFrame else { return }
+        let screen = OverlayScreenPlacement.activeVisibleFrame()
         let pillSize = pillWindow.frame.size
         let inset: CGFloat = 12
         let origin: NSPoint

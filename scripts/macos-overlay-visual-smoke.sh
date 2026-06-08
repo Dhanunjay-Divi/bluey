@@ -89,12 +89,13 @@ def windows():
 
 pill = None
 for win in windows():
-    if win.get("kCGWindowOwnerName") != "Bluey Overlay":
+    owner = (win.get("kCGWindowOwnerName") or "").lower()
+    if owner not in ("bluey overlay", "bluey-overlay-macos"):
         continue
     bounds = win.get("kCGWindowBounds", {})
     width = int(round(bounds.get("Width", 0)))
     height = int(round(bounds.get("Height", 0)))
-    if 108 <= width <= 126 and 30 <= height <= 38:
+    if 160 <= width <= 190 and 30 <= height <= 38:
         pill = bounds
         break
 
@@ -117,7 +118,8 @@ import json
 import Quartz
 rows = []
 for win in Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID) or []:
-    if win.get("kCGWindowOwnerName") == "Bluey Overlay":
+    owner = (win.get("kCGWindowOwnerName") or "").lower()
+    if owner in ("bluey overlay", "bluey-overlay-macos"):
         b = win.get("kCGWindowBounds", {})
         rows.append({"width": int(round(b.get("Width", 0))), "height": int(round(b.get("Height", 0))), "x": int(round(b.get("X", 0))), "y": int(round(b.get("Y", 0))), "sharing": win.get("kCGWindowSharingState")})
 print(json.dumps(rows))
@@ -133,7 +135,8 @@ import json
 import Quartz
 rows = []
 for win in Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID) or []:
-    if win.get("kCGWindowOwnerName") == "Bluey Overlay":
+    owner = (win.get("kCGWindowOwnerName") or "").lower()
+    if owner in ("bluey overlay", "bluey-overlay-macos"):
         b = win.get("kCGWindowBounds", {})
         rows.append({"width": int(round(b.get("Width", 0))), "height": int(round(b.get("Height", 0))), "x": int(round(b.get("X", 0))), "y": int(round(b.get("Y", 0))), "sharing": win.get("kCGWindowSharingState")})
 print(json.dumps(rows))

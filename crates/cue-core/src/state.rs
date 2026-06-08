@@ -45,7 +45,7 @@ impl DaemonState {
             action_items: 0,
             decisions: 0,
             overlay_visible: false,
-            overlay_position: OverlayPosition::TopRight,
+            overlay_position: OverlayPosition::Center,
             overlay_opacity: 0.92,
             overlay_capture_excluded: None,
             screen_capture_active: false,

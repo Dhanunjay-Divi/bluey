@@ -14,7 +14,7 @@ pub enum OverlayPosition {
 
 impl Default for OverlayPosition {
     fn default() -> Self {
-        Self::TopRight
+        Self::Center
     }
 }
 
