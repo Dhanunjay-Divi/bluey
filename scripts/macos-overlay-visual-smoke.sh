@@ -87,28 +87,52 @@ def windows():
         Quartz.kCGNullWindowID,
     ) or []
 
-pill = None
-for win in windows():
-    owner = (win.get("kCGWindowOwnerName") or "").lower()
-    if owner not in ("bluey overlay", "bluey-overlay-macos"):
+def bluey_windows():
+    rows = []
+    for win in windows():
+        owner = (win.get("kCGWindowOwnerName") or "").lower()
+        if owner not in ("bluey overlay", "bluey-overlay-macos"):
+            continue
+        bounds = win.get("kCGWindowBounds", {})
+        rows.append(bounds)
+    return rows
+
+def expanded_window():
+    candidates = []
+    for bounds in bluey_windows():
+        width = int(round(bounds.get("Width", 0)))
+        height = int(round(bounds.get("Height", 0)))
+        if width > 400 and height > 100:
+            candidates.append(bounds)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda b: b.get("Width", 0) * b.get("Height", 0))
+
+def pill_window():
+    for bounds in bluey_windows():
+        width = int(round(bounds.get("Width", 0)))
+        height = int(round(bounds.get("Height", 0)))
+        if 160 <= width <= 190 and 30 <= height <= 38:
+            return bounds
+    return None
+
+for _ in range(10):
+    if expanded_window() is not None:
+        sys.exit(0)
+    pill = pill_window()
+    if pill is None:
+        time.sleep(0.2)
         continue
-    bounds = win.get("kCGWindowBounds", {})
-    width = int(round(bounds.get("Width", 0)))
-    height = int(round(bounds.get("Height", 0)))
-    if 160 <= width <= 190 and 30 <= height <= 38:
-        pill = bounds
-        break
+    x = pill["X"] + pill["Width"] / 2
+    y = pill["Y"] + pill["Height"] / 2
+    for typ in (Quartz.kCGEventMouseMoved, Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+        event = Quartz.CGEventCreateMouseEvent(None, typ, (x, y), Quartz.kCGMouseButtonLeft)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+        time.sleep(0.08)
+    time.sleep(0.35)
 
-if pill is None:
-    print("no Bluey pill window found", file=sys.stderr)
-    sys.exit(2)
-
-x = pill["X"] + pill["Width"] / 2
-y = pill["Y"] + pill["Height"] / 2
-for typ in (Quartz.kCGEventMouseMoved, Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
-    event = Quartz.CGEventCreateMouseEvent(None, typ, (x, y), Quartz.kCGMouseButtonLeft)
-    Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
-    time.sleep(0.08)
+print("Bluey pill did not expand after retrying", file=sys.stderr)
+sys.exit(2)
 PY
 
 sleep 0.8

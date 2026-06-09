@@ -2644,11 +2644,17 @@ fn build_cloud_client(
         }
     }
 
-    let client = cue_cloud_client::CloudClient::new(
-        config,
-        Arc::new(cue_cloud_client::tokens::KeyringStore::new()),
-    )?;
-    Ok(cloud_client_with_optional_trace(client, trace_id))
+    if env_truthy_any(&["BLUEY_LEGACY_KEYRING_FALLBACK"]) {
+        let client = cue_cloud_client::CloudClient::new(
+            config,
+            Arc::new(cue_cloud_client::tokens::KeyringStore::new()),
+        )?;
+        return Ok(cloud_client_with_optional_trace(client, trace_id));
+    }
+
+    Err(anyhow::anyhow!(
+        "Bluey cloud account is not linked; run `bluey login`"
+    ))
 }
 
 fn cloud_client_with_optional_trace(

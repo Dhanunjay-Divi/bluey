@@ -871,11 +871,16 @@ enum BlueyOnAuthState {
 }
 
 fn bluey_account_linked(paths: &AppPaths) -> bool {
-    load_account(paths)
+    if load_account(paths)
         .ok()
         .flatten()
         .is_some_and(|account| account.token_configured())
-        || keyring_has_tokens_with_timeout(std::time::Duration::from_secs(1))
+    {
+        return true;
+    }
+
+    legacy_keyring_fallback_enabled()
+        && keyring_has_tokens_with_timeout(std::time::Duration::from_secs(1))
             .ok()
             .flatten()
             .unwrap_or(false)
@@ -1202,6 +1207,22 @@ fn login_account_provider(local: bool) -> &'static str {
     } else {
         "bluey"
     }
+}
+
+fn legacy_keyring_fallback_enabled() -> bool {
+    truthy_env("BLUEY_LEGACY_KEYRING_FALLBACK")
+}
+
+fn truthy_env(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn save_keyring_tokens_with_timeout(tokens: cue_cloud_client::Tokens) -> Result<Option<()>> {
@@ -2776,15 +2797,17 @@ fn optional_cloud_client() -> Result<Option<cue_cloud_client::CloudClient>> {
         }
     }
 
-    let client = cue_cloud_client::CloudClient::new(
-        config,
-        Arc::new(cue_cloud_client::tokens::KeyringStore::new()),
-    )?;
-    if client.current_tokens().is_none() {
-        Ok(None)
-    } else {
-        Ok(Some(client))
+    if legacy_keyring_fallback_enabled() {
+        let client = cue_cloud_client::CloudClient::new(
+            config,
+            Arc::new(cue_cloud_client::tokens::KeyringStore::new()),
+        )?;
+        if client.current_tokens().is_some() {
+            return Ok(Some(client));
+        }
     }
+
+    Ok(None)
 }
 
 fn cloud_client_or_message() -> Result<Option<cue_cloud_client::CloudClient>> {

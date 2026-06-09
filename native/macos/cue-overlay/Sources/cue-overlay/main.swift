@@ -691,6 +691,13 @@ private final class OverlayWindow: NSWindow {
     var maximumFrameWidth: CGFloat?
     var minimumFrameHeight: CGFloat?
     var maximumFrameHeight: CGFloat?
+    var contentCornerRadius: CGFloat? {
+        didSet { applyContentCornerMask() }
+    }
+
+    override var contentView: NSView? {
+        didSet { applyContentCornerMask() }
+    }
 
     init(contentRect: NSRect, draggable: Bool, resizable: Bool = false) {
         var style: NSWindow.StyleMask = [.borderless]
@@ -723,6 +730,13 @@ private final class OverlayWindow: NSWindow {
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    private func applyContentCornerMask() {
+        guard let radius = contentCornerRadius, let contentView else { return }
+        contentView.wantsLayer = true
+        contentView.layer?.cornerRadius = radius
+        contentView.layer?.masksToBounds = true
+    }
 
     override func setFrame(_ frameRect: NSRect, display displayFlag: Bool) {
         super.setFrame(clampedFrame(frameRect), display: displayFlag)
@@ -798,6 +812,28 @@ private final class OverlayWindow: NSWindow {
             || maximumFrameWidth != nil
             || minimumFrameHeight != nil
             || maximumFrameHeight != nil
+    }
+}
+
+private final class ModalBlockerView: NSView {
+    var onEscape: (() -> Void)?
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, alphaValue > 0.01 else { return nil }
+        return super.hitTest(point) ?? self
+    }
+
+    override func mouseDown(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {}
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53 {
+            onEscape?()
+            return
+        }
+        super.keyDown(with: event)
     }
 }
 
@@ -1847,7 +1883,7 @@ private final class CanvasPaneView: NSView {
 
 // MARK: - Expanded panel (feed + composer)
 
-private final class ExpandedPanelView: NSView {
+private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     let feed: FeedView
     let workspace: NSView
     let canvasPane: CanvasPaneView
@@ -1942,7 +1978,7 @@ private final class ExpandedPanelView: NSView {
         latestSessionButton = NSButton(title: "Continue latest", target: nil, action: nil)
         sessionScroll = NSScrollView()
         sessionStack = NSStackView()
-        answerStyleOverlay = NSView()
+        answerStyleOverlay = ModalBlockerView()
         answerStylePanel = NSView()
         answerStyleLabel = NSTextField(labelWithString: "How Bluey should answer")
         answerStyleBox = NSTextField()
@@ -1968,7 +2004,7 @@ private final class ExpandedPanelView: NSView {
         opacityValueLabel = NSTextField(labelWithString: "94%")
         hideButton = NSButton(title: "", target: nil, action: nil)
         closeButton = NSButton(title: "x", target: nil, action: nil)
-        closeConfirmOverlay = NSView()
+        closeConfirmOverlay = ModalBlockerView()
         closeConfirmPanel = NSView()
         closeConfirmTitle = NSTextField(labelWithString: "Turn Bluey off?")
         closeConfirmBody = NSTextField(wrappingLabelWithString: "This closes Bluey completely. To start again, run: bluey on")
@@ -1977,9 +2013,17 @@ private final class ExpandedPanelView: NSView {
 
         super.init(frame: frameRect)
 
+        (answerStyleOverlay as? ModalBlockerView)?.onEscape = { [weak self] in
+            self?.dismissAnswerStyleEditor(animated: true)
+        }
+        (closeConfirmOverlay as? ModalBlockerView)?.onEscape = { [weak self] in
+            self?.dismissCloseConfirm(animated: true)
+        }
+
         wantsLayer = true
         layer?.backgroundColor = NSColor(red: 0.010, green: 0.012, blue: 0.016, alpha: 0.94).cgColor
         layer?.cornerRadius = 24
+        layer?.masksToBounds = true
         layer?.borderWidth = 1
         layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.14).cgColor
         layer?.shadowColor = NSColor.black.cgColor
@@ -2086,11 +2130,6 @@ private final class ExpandedPanelView: NSView {
         sessionDrawer.addSubview(drawerSubtitleLabel)
         sessionDrawer.addSubview(latestSessionButton)
         sessionDrawer.addSubview(sessionScroll)
-        addSubview(answerStyleOverlay)
-        answerStyleOverlay.addSubview(answerStylePanel)
-        answerStylePanel.addSubview(answerStyleLabel)
-        answerStylePanel.addSubview(answerStyleBox)
-        answerStylePanel.addSubview(answerStyleSaveButton)
         addSubview(transcriptStrip)
         transcriptStrip.addSubview(transcriptActivityDot)
         transcriptStrip.addSubview(transcriptStateLabel)
@@ -2114,6 +2153,11 @@ private final class ExpandedPanelView: NSView {
         // Add the header late in the root view so it paints above the scroll
         // workspace. Full-screen modal overlays are added after this.
         addSubview(headerBar)
+        addSubview(answerStyleOverlay)
+        answerStyleOverlay.addSubview(answerStylePanel)
+        answerStylePanel.addSubview(answerStyleLabel)
+        answerStylePanel.addSubview(answerStyleBox)
+        answerStylePanel.addSubview(answerStyleSaveButton)
         addSubview(closeConfirmOverlay)
         closeConfirmOverlay.addSubview(closeConfirmPanel)
         closeConfirmPanel.addSubview(closeConfirmTitle)
@@ -2386,6 +2430,7 @@ private final class ExpandedPanelView: NSView {
         latestSessionButton.action = #selector(continueSessionClicked)
         answerStyleSaveButton.target = self
         answerStyleSaveButton.action = #selector(saveAnswerStyleClicked)
+        answerStyleBox.delegate = self
         hideButton.target = self
         hideButton.action = #selector(hideClicked)
         closeButton.target = self
@@ -2436,6 +2481,22 @@ private final class ExpandedPanelView: NSView {
         super.layout()
         keepFixedChromeInBounds()
         resizeTranscriptLabelToContent()
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 53, dismissActiveOverlay() {
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        guard control === answerStyleBox else { return false }
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            dismissAnswerStyleEditor(animated: true)
+            return true
+        }
+        return false
     }
 
     func isInteractiveAtScreenPoint(_ screenPoint: NSPoint) -> Bool {
@@ -2903,8 +2964,11 @@ private final class ExpandedPanelView: NSView {
     }
 
     func showTurnOffConfirmation() {
+        dismissAnswerStyleEditor(animated: false)
         closeConfirmOverlay.isHidden = false
         closeConfirmOverlay.alphaValue = 0
+        updateBackgroundControlsEnabledForModalState()
+        window?.makeFirstResponder(closeConfirmOverlay)
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.12
             closeConfirmOverlay.animator().alphaValue = 1
@@ -2912,6 +2976,17 @@ private final class ExpandedPanelView: NSView {
     }
 
     @objc private func cancelCloseConfirmClicked() {
+        dismissCloseConfirm(animated: true)
+    }
+
+    private func dismissCloseConfirm(animated: Bool) {
+        guard !closeConfirmOverlay.isHidden else { return }
+        guard animated else {
+            closeConfirmOverlay.isHidden = true
+            closeConfirmOverlay.alphaValue = 1
+            updateBackgroundControlsEnabledForModalState()
+            return
+        }
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = 0.10
             closeConfirmOverlay.animator().alphaValue = 0
@@ -2919,6 +2994,7 @@ private final class ExpandedPanelView: NSView {
             guard let self else { return }
             self.closeConfirmOverlay.isHidden = true
             self.closeConfirmOverlay.alphaValue = 1
+            self.updateBackgroundControlsEnabledForModalState()
         })
     }
 
@@ -2979,6 +3055,30 @@ private final class ExpandedPanelView: NSView {
         let text = answerStyleBox.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         emitInstructions(text: text)
         statusLabel.stringValue = text.isEmpty ? "Default style" : "Answer style saved"
+        dismissAnswerStyleEditor(animated: true)
+    }
+
+    @discardableResult
+    private func dismissActiveOverlay() -> Bool {
+        if !closeConfirmOverlay.isHidden {
+            dismissCloseConfirm(animated: true)
+            return true
+        }
+        if !answerStyleOverlay.isHidden {
+            dismissAnswerStyleEditor(animated: true)
+            return true
+        }
+        return false
+    }
+
+    private func dismissAnswerStyleEditor(animated: Bool) {
+        guard !answerStyleOverlay.isHidden else { return }
+        guard animated else {
+            answerStyleOverlay.isHidden = true
+            answerStyleOverlay.alphaValue = 1
+            updateBackgroundControlsEnabledForModalState()
+            return
+        }
         NSAnimationContext.runAnimationGroup({ context in
             context.duration = 0.10
             answerStyleOverlay.animator().alphaValue = 0
@@ -2986,6 +3086,7 @@ private final class ExpandedPanelView: NSView {
             guard let self else { return }
             self.answerStyleOverlay.isHidden = true
             self.answerStyleOverlay.alphaValue = 1
+            self.updateBackgroundControlsEnabledForModalState()
         })
     }
 
@@ -3039,22 +3140,53 @@ private final class ExpandedPanelView: NSView {
     }
 
     func openAnswerStyleEditor() {
+        dismissCloseConfirm(animated: false)
         answerStyleOverlay.isHidden = false
         answerStyleOverlay.alphaValue = 0
+        updateBackgroundControlsEnabledForModalState()
+        window?.makeFirstResponder(answerStyleBox)
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.12
             answerStyleOverlay.animator().alphaValue = 1
         }
-        window?.makeFirstResponder(answerStyleBox)
     }
 
     func focusComposerForQuestion() {
-        answerStyleOverlay.isHidden = true
-        closeConfirmOverlay.isHidden = true
+        dismissAnswerStyleEditor(animated: false)
+        dismissCloseConfirm(animated: false)
         composer.placeholder = recordingActive
             ? "Ask while Bluey listens..."
             : "Ask anything..."
         window?.makeFirstResponder(composer)
+    }
+
+    private func updateBackgroundControlsEnabledForModalState() {
+        let hasModal = !answerStyleOverlay.isHidden || !closeConfirmOverlay.isHidden
+        setBackgroundControlsEnabled(!hasModal)
+    }
+
+    private func setBackgroundControlsEnabled(_ isEnabled: Bool) {
+        let controls: [NSControl] = [
+            navButton,
+            newSessionButton,
+            latestSessionButton,
+            canvasToggleButton,
+            modelMenu,
+            recordingButton,
+            askButton,
+            analyzeButton,
+            attachButton,
+            instructionsButton,
+            opacitySlider,
+            hideButton,
+            closeButton,
+        ]
+        for control in controls {
+            control.isEnabled = isEnabled
+            control.alphaValue = isEnabled ? 1.0 : 0.45
+        }
+        composer.isEditable = isEnabled
+        composer.alphaValue = isEnabled ? 1.0 : 0.55
     }
 
     func setBalanceLabel(_ label: String) {
@@ -3919,6 +4051,7 @@ private final class OverlayApp {
         pillWindow = OverlayWindow(
             contentRect: PillMetrics.centeredFrame(in: screen),
             draggable: true)
+        pillWindow.contentCornerRadius = pillSize.height / 2
 
         pillView = PillView(frame: NSRect(origin: .zero, size: pillSize))
         pillWindow.contentView = pillView
@@ -4024,6 +4157,7 @@ private final class OverlayApp {
             contentRect: expandedFrame,
             draggable: true,
             resizable: true)
+        window.contentCornerRadius = 26
         window.preserveProgrammaticFrameHeight = true
         let maxExpandedWidth = max(minimumWidth, screen.width - ExpandedPanelMetrics.screenInset * 2)
         let maxExpandedHeight = max(ExpandedPanelMetrics.minHeight, screen.height - ExpandedPanelMetrics.screenInset * 2)
