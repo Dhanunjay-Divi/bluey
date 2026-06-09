@@ -86,6 +86,33 @@ private enum BlueyTheme {
     }
 }
 
+private final class VerticallyCenteredTextFieldCell: NSTextFieldCell {
+    override func drawingRect(forBounds rect: NSRect) -> NSRect {
+        var drawingRect = super.drawingRect(forBounds: rect)
+        let textSize = cellSize(forBounds: rect)
+        drawingRect.origin.y = rect.origin.y + max(0, (rect.height - textSize.height) / 2)
+        drawingRect.size.height = min(rect.height, textSize.height)
+        return drawingRect
+    }
+}
+
+private func useCenteredSingleLineCell(_ label: NSTextField) {
+    let oldCell = label.cell as? NSTextFieldCell
+    let cell = VerticallyCenteredTextFieldCell(textCell: label.stringValue)
+    cell.font = label.font
+    cell.textColor = label.textColor
+    cell.alignment = label.alignment
+    cell.lineBreakMode = oldCell?.lineBreakMode ?? label.lineBreakMode
+    cell.usesSingleLineMode = true
+    cell.wraps = false
+    cell.isScrollable = false
+    label.cell = cell
+    label.isBezeled = false
+    label.drawsBackground = false
+    label.isEditable = false
+    label.isSelectable = false
+}
+
 private enum ExpandedPanelMetrics {
     static let maxCompactWidth: CGFloat = 820
     static let minCompactWidth: CGFloat = 680
@@ -1966,6 +1993,18 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var attachmentStripHeightConstraint: NSLayoutConstraint?
     private var latestCanvas: CanvasArtifact?
     private var canvasOpen = false
+    private struct ResizeEdges: OptionSet {
+        let rawValue: Int
+        static let left = ResizeEdges(rawValue: 1 << 0)
+        static let right = ResizeEdges(rawValue: 1 << 1)
+        static let top = ResizeEdges(rawValue: 1 << 2)
+        static let bottom = ResizeEdges(rawValue: 1 << 3)
+    }
+    private var activeResizeEdges: ResizeEdges = []
+    private var resizeStartMouse = NSPoint.zero
+    private var resizeStartFrame = NSRect.zero
+    private let resizeHitSize: CGFloat = 10
+
     override init(frame frameRect: NSRect) {
         feed = FeedView(frame: .zero)
         workspace = NSView()
@@ -2254,10 +2293,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             canvasPane.bottomAnchor.constraint(equalTo: workspace.bottomAnchor),
             canvasWidth,
 
-            sessionDrawer.topAnchor.constraint(equalTo: feed.topAnchor, constant: 10),
-            sessionDrawer.leadingAnchor.constraint(equalTo: feed.leadingAnchor, constant: 10),
-            sessionDrawer.widthAnchor.constraint(equalToConstant: 190),
-            sessionDrawer.bottomAnchor.constraint(equalTo: transcriptStrip.topAnchor, constant: -10),
+            sessionDrawer.topAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: 8),
+            sessionDrawer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            sessionDrawer.widthAnchor.constraint(equalToConstant: 248),
+            sessionDrawer.bottomAnchor.constraint(equalTo: composerBar.topAnchor, constant: -8),
 
             drawerTitleLabel.topAnchor.constraint(equalTo: sessionDrawer.topAnchor, constant: 14),
             drawerTitleLabel.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 14),
@@ -2289,7 +2328,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             answerStyleOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
 
             answerStylePanel.centerXAnchor.constraint(equalTo: centerXAnchor),
-            answerStylePanel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            answerStylePanel.centerYAnchor.constraint(equalTo: centerYAnchor, constant: 24),
             answerStylePanel.widthAnchor.constraint(equalToConstant: 360),
 
             answerStyleLabel.topAnchor.constraint(equalTo: answerStylePanel.topAnchor, constant: 18),
@@ -2408,7 +2447,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             closeConfirmOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
 
             closeConfirmPanel.centerXAnchor.constraint(equalTo: centerXAnchor),
-            closeConfirmPanel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            closeConfirmPanel.centerYAnchor.constraint(equalTo: centerYAnchor, constant: 24),
             closeConfirmPanel.widthAnchor.constraint(equalToConstant: 360),
 
             closeConfirmTitle.topAnchor.constraint(equalTo: closeConfirmPanel.topAnchor, constant: 18),
@@ -2511,6 +2550,65 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         super.keyDown(with: event)
     }
 
+    override func mouseDown(with event: NSEvent) {
+        let localPoint = convert(event.locationInWindow, from: nil)
+        let edges = resizeEdges(at: localPoint)
+        if !edges.isEmpty, let window {
+            activeResizeEdges = edges
+            resizeStartMouse = NSEvent.mouseLocation
+            resizeStartFrame = window.frame
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard !activeResizeEdges.isEmpty, let window else {
+            super.mouseDragged(with: event)
+            return
+        }
+        let currentMouse = NSEvent.mouseLocation
+        let deltaX = currentMouse.x - resizeStartMouse.x
+        let deltaY = currentMouse.y - resizeStartMouse.y
+        var frame = resizeStartFrame
+
+        if activeResizeEdges.contains(.left) {
+            frame.origin.x += deltaX
+            frame.size.width -= deltaX
+        }
+        if activeResizeEdges.contains(.right) {
+            frame.size.width += deltaX
+        }
+        if activeResizeEdges.contains(.bottom) {
+            frame.origin.y += deltaY
+            frame.size.height -= deltaY
+        }
+        if activeResizeEdges.contains(.top) {
+            frame.size.height += deltaY
+        }
+
+        frame = clampedResizeFrame(frame, from: resizeStartFrame, edges: activeResizeEdges, window: window)
+        let verticalResize = activeResizeEdges.contains(.top) || activeResizeEdges.contains(.bottom)
+        if let overlayWindow = window as? OverlayWindow, !verticalResize {
+            let topLeft = NSPoint(x: frame.minX, y: resizeStartFrame.maxY)
+            overlayWindow.lockedFrameHeight = resizeStartFrame.height
+            window.setFrame(frame, display: true)
+            window.setFrameTopLeftPoint(topLeft)
+            overlayWindow.lockedFrameHeight = nil
+        } else {
+            window.setFrame(frame, display: true)
+        }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if !activeResizeEdges.isEmpty {
+            (window as? OverlayWindow)?.lockedFrameHeight = nil
+            activeResizeEdges = []
+            return
+        }
+        super.mouseUp(with: event)
+    }
+
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
         guard control === answerStyleBox else { return false }
         if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
@@ -2532,6 +2630,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if !answerStyleOverlay.isHidden {
             return true
         }
+        if !resizeEdges(at: localPoint).isEmpty {
+            return true
+        }
         if headerBar.frame.contains(localPoint) || composerBar.frame.contains(localPoint) {
             return true
         }
@@ -2539,6 +2640,65 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return true
         }
         return false
+    }
+
+    private func resizeEdges(at point: NSPoint) -> ResizeEdges {
+        guard bounds.contains(point), closeConfirmOverlay.isHidden, answerStyleOverlay.isHidden else {
+            return []
+        }
+        var edges: ResizeEdges = []
+        if point.x <= resizeHitSize {
+            edges.insert(.left)
+        }
+        if point.x >= bounds.width - resizeHitSize {
+            edges.insert(.right)
+        }
+        if point.y <= resizeHitSize {
+            edges.insert(.bottom)
+        }
+        if point.y >= bounds.height - resizeHitSize {
+            edges.insert(.top)
+        }
+        return edges
+    }
+
+    private func clampedResizeFrame(
+        _ proposed: NSRect,
+        from start: NSRect,
+        edges: ResizeEdges,
+        window: NSWindow
+    ) -> NSRect {
+        var frame = proposed
+        let minWidth = max(window.minSize.width, 360)
+        let minHeight = max(window.minSize.height, ExpandedPanelMetrics.minHeight)
+        let maxWidth = window.maxSize.width > 0 ? window.maxSize.width : CGFloat.greatestFiniteMagnitude
+        let maxHeight = window.maxSize.height > 0 ? window.maxSize.height : CGFloat.greatestFiniteMagnitude
+
+        if frame.width < minWidth {
+            if edges.contains(.left) {
+                frame.origin.x = start.maxX - minWidth
+            }
+            frame.size.width = minWidth
+        } else if frame.width > maxWidth {
+            if edges.contains(.left) {
+                frame.origin.x = start.maxX - maxWidth
+            }
+            frame.size.width = maxWidth
+        }
+
+        if frame.height < minHeight {
+            if edges.contains(.bottom) {
+                frame.origin.y = start.maxY - minHeight
+            }
+            frame.size.height = minHeight
+        } else if frame.height > maxHeight {
+            if edges.contains(.bottom) {
+                frame.origin.y = start.maxY - maxHeight
+            }
+            frame.size.height = maxHeight
+        }
+
+        return frame
     }
 
     /// The expanded overlay is a bounded, resizable tool surface. Header,
@@ -2641,6 +2801,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         balanceLabel.alignment = .center
         balanceLabel.lineBreakMode = .byTruncatingMiddle
         balanceLabel.maximumNumberOfLines = 1
+        useCenteredSingleLineCell(balanceLabel)
         balanceLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         balanceLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         balanceLabel.wantsLayer = true
@@ -2715,12 +2876,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         sessionDrawer.layer?.shadowOpacity = 0.26
         sessionDrawer.layer?.shadowRadius = 18
         sessionDrawer.layer?.shadowOffset = NSSize(width: 0, height: -8)
-        sessionDrawer.layer?.zPosition = 10
+        sessionDrawer.layer?.zPosition = 920
 
         answerStyleOverlay.isHidden = true
         answerStyleOverlay.wantsLayer = true
         answerStyleOverlay.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.44).cgColor
-        answerStyleOverlay.layer?.zPosition = 90
+        answerStyleOverlay.layer?.zPosition = 2_000
 
         answerStylePanel.wantsLayer = true
         answerStylePanel.layer?.backgroundColor = BlueyTheme.panelDeep.cgColor
@@ -2761,17 +2922,18 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         answerStyleBox.isBezeled = false
         answerStyleBox.drawsBackground = true
         answerStyleBox.focusRingType = .none
-        answerStyleBox.backgroundColor = NSColor.white.withAlphaComponent(0.92)
-        answerStyleBox.textColor = NSColor.black.withAlphaComponent(0.88)
+        answerStyleBox.backgroundColor = NSColor.white.withAlphaComponent(0.98)
+        answerStyleBox.textColor = NSColor.black.withAlphaComponent(0.96)
         answerStyleBox.alignment = .center
         answerStyleBox.placeholderAttributedString = NSAttributedString(
             string: "Natural, concise, interview-ready...",
-            attributes: [.foregroundColor: NSColor.black.withAlphaComponent(0.42)])
+            attributes: [.foregroundColor: NSColor.black.withAlphaComponent(0.60)])
         answerStyleBox.wantsLayer = true
-        answerStyleBox.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.92).cgColor
+        answerStyleBox.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.98).cgColor
         answerStyleBox.layer?.cornerRadius = 10
         answerStyleBox.layer?.borderWidth = 1
         answerStyleBox.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.24).cgColor
+        answerStyleBox.layer?.masksToBounds = true
     }
 
     private func configureComposer() {
@@ -2829,7 +2991,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         closeConfirmOverlay.isHidden = true
         closeConfirmOverlay.wantsLayer = true
         closeConfirmOverlay.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.52).cgColor
-        closeConfirmOverlay.layer?.zPosition = 100
+        closeConfirmOverlay.layer?.zPosition = 2_100
 
         closeConfirmPanel.wantsLayer = true
         closeConfirmPanel.layer?.backgroundColor = BlueyTheme.panelDeep.cgColor
@@ -2911,6 +3073,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             cell.usesSingleLineMode = true
             cell.wraps = false
         }
+        useCenteredSingleLineCell(label)
         label.setContentHuggingPriority(.defaultLow, for: .horizontal)
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.wantsLayer = true
@@ -3059,10 +3222,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     @objc private func newSessionClicked() {
+        let preserveFrame = !canvasOpen
+        let previousFrame = preserveFrame ? window?.frame : nil
         resetSessionSurface()
         composer.clearText()
         statusLabel.stringValue = "New recording"
         sessionDrawer.isHidden = true
+        if let previousFrame {
+            layoutSubtreeIfNeeded()
+            window?.setFrame(previousFrame, display: true)
+        }
         emitSimple("session_new_requested")
     }
 
@@ -4177,7 +4346,7 @@ private final class OverlayApp {
         let window = OverlayWindow(
             contentRect: expandedFrame,
             draggable: true,
-            resizable: true)
+            resizable: false)
         window.contentCornerRadius = ExpandedPanelMetrics.cornerRadius
         window.preserveProgrammaticFrameHeight = true
         let maxExpandedWidth = max(minimumWidth, screen.width - ExpandedPanelMetrics.screenInset * 2)
