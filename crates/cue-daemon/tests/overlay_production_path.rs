@@ -189,6 +189,38 @@ fn attach_files_requested_accepted_when_attach_open() {
 }
 
 #[test]
+fn remove_context_requested_with_token_accepted() {
+    let state = idle_state();
+    let id = uuid::Uuid::new_v4();
+    let line = format!(r#"{{"type":"remove_context_requested","id":"{id}","token":"{TOK}"}}"#);
+    let result = validate_line(&line, TOK, state.as_ref());
+    assert!(
+        result.is_ok(),
+        "RemoveContextRequested must be accepted with a valid token, got {result:?}"
+    );
+    if let Ok(event) = result {
+        let dbg = format!("{event:?}");
+        assert!(
+            dbg.contains("RemoveContextRequested"),
+            "wrong variant: {dbg}"
+        );
+        assert!(dbg.contains(&id.to_string()), "id lost: {dbg}");
+    }
+}
+
+#[test]
+fn remove_context_requested_bad_uuid_rejected() {
+    let state = idle_state();
+    let line =
+        format!(r#"{{"type":"remove_context_requested","id":"not-a-uuid","token":"{TOK}"}}"#);
+    let result = validate_line(&line, TOK, state.as_ref());
+    assert!(
+        matches!(result, Err(OverlayLineReject::ParseError(_))),
+        "bad remove-context id must fail typed parsing, got {result:?}"
+    );
+}
+
+#[test]
 fn instructions_updated_accepted_when_idle_for_inline_overlay_textbox() {
     let state = idle_state();
     // legacy InstructionsUpdated uses `text` field

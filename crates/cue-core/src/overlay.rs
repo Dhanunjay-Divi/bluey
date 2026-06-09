@@ -102,6 +102,9 @@ pub enum OverlayEvent {
     AttachFilesRequested {
         paths: Vec<String>,
     },
+    RemoveContextRequested {
+        id: uuid::Uuid,
+    },
     InstructionsRequested,
     InstructionsUpdated {
         text: String,

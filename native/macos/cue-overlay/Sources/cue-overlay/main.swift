@@ -691,6 +691,10 @@ private func emitAttachFiles(paths: [String]) {
     emitEvent(["type": "attach_files_requested", "paths": paths])
 }
 
+private func emitRemoveContext(id: String) {
+    emitEvent(["type": "remove_context_requested", "id": id])
+}
+
 private func emitInstructions(text: String) {
     emitEvent(["type": "instructions_updated", "text": text])
 }
@@ -874,6 +878,14 @@ private final class ModalBlockerView: NSView {
         }
         super.keyDown(with: event)
     }
+}
+
+private final class CopyCardButton: NSButton {
+    var copyText = ""
+}
+
+private final class RemoveAttachmentButton: NSButton {
+    var contextId = ""
 }
 
 // MARK: - Pill view
@@ -1357,6 +1369,22 @@ private final class FeedView: NSView {
         emptyState.isHidden = false
     }
 
+    func hasCopyControl(atScreenPoint screenPoint: NSPoint) -> Bool {
+        guard let window else { return false }
+        let windowPoint = window.convertPoint(fromScreen: screenPoint)
+        let localPoint = convert(windowPoint, from: nil)
+        guard bounds.contains(localPoint) else { return false }
+
+        var hit: NSView? = hitTest(localPoint)
+        while let view = hit {
+            if view is CopyCardButton {
+                return true
+            }
+            hit = view.superview
+        }
+        return false
+    }
+
     private func removeAllCards() {
         cards.removeAll()
         for view in stack.arrangedSubviews {
@@ -1497,6 +1525,9 @@ private final class FeedView: NSView {
         statusLabel.font = NSFont.monospacedSystemFont(ofSize: 9.5, weight: .semibold)
         statusLabel.textColor = rightAligned ? NSColor.black.withAlphaComponent(0.46) : BlueyTheme.textDim
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        let copyButton = signInURL == nil
+            ? makeCopyCardButton(text: rawBody.isEmpty ? bodyText : rawBody, rightAligned: rightAligned)
+            : nil
 
         let signInButton: NSButton? = signInURL.map { url in
             let button = NSButton(title: "Open login", target: self, action: #selector(openURLButtonClicked(_:)))
@@ -1521,6 +1552,9 @@ private final class FeedView: NSView {
         bubble.addSubview(titleLabel)
         bubble.addSubview(bodyLabel)
         bubble.addSubview(statusLabel)
+        if let copyButton {
+            bubble.addSubview(copyButton)
+        }
         if let signInButton {
             bubble.addSubview(signInButton)
         }
@@ -1568,12 +1602,22 @@ private final class FeedView: NSView {
                 titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: statusLabel.leadingAnchor, constant: -10),
 
                 statusLabel.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
-                statusLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
 
                 bodyLabel.topAnchor.constraint(equalTo: metaLabel.bottomAnchor, constant: 8),
                 bodyLabel.leadingAnchor.constraint(equalTo: metaLabel.leadingAnchor),
                 bodyLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
             ])
+            if let copyButton {
+                constraints.append(contentsOf: [
+                    statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: copyButton.leadingAnchor, constant: -6),
+                    copyButton.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
+                    copyButton.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -10),
+                    copyButton.widthAnchor.constraint(equalToConstant: 22),
+                    copyButton.heightAnchor.constraint(equalToConstant: 22),
+                ])
+            } else {
+                constraints.append(statusLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14))
+            }
         }
         if let signInButton {
             constraints.append(contentsOf: [
@@ -1588,6 +1632,42 @@ private final class FeedView: NSView {
         }
         NSLayoutConstraint.activate(constraints)
         return row
+    }
+
+    private func makeCopyCardButton(text: String, rightAligned: Bool) -> CopyCardButton {
+        let button = CopyCardButton(title: "", target: self, action: #selector(copyCardClicked(_:)))
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.copyText = text
+        button.isBordered = false
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 10
+        button.layer?.backgroundColor = rightAligned
+            ? NSColor.black.withAlphaComponent(0.06).cgColor
+            : NSColor.white.withAlphaComponent(0.045).cgColor
+        button.layer?.borderWidth = 1
+        button.layer?.borderColor = rightAligned
+            ? NSColor.black.withAlphaComponent(0.10).cgColor
+            : BlueyTheme.hairline.cgColor
+        button.contentTintColor = rightAligned
+            ? NSColor.black.withAlphaComponent(0.56)
+            : BlueyTheme.textDim
+        if let image = symbolImage("doc.on.doc") {
+            image.isTemplate = true
+            button.image = image
+            button.imagePosition = .imageOnly
+            button.imageScaling = .scaleProportionallyDown
+        } else {
+            button.title = "Copy"
+        }
+        button.toolTip = "Copy this message"
+        return button
+    }
+
+    @objc private func copyCardClicked(_ sender: CopyCardButton) {
+        let text = sender.copyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
     }
 
     private func styleSignInButton(_ button: NSButton) {
@@ -2534,6 +2614,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         resizeTranscriptLabelToContent()
     }
 
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        guard closeConfirmOverlay.isHidden, answerStyleOverlay.isHidden else { return }
+        addCursorRect(NSRect(x: 0, y: 0, width: resizeHitSize, height: bounds.height), cursor: .resizeLeftRight)
+        addCursorRect(NSRect(x: bounds.width - resizeHitSize, y: 0, width: resizeHitSize, height: bounds.height), cursor: .resizeLeftRight)
+        addCursorRect(NSRect(x: 0, y: 0, width: bounds.width, height: resizeHitSize), cursor: .resizeUpDown)
+        addCursorRect(NSRect(x: 0, y: bounds.height - resizeHitSize, width: bounds.width, height: resizeHitSize), cursor: .resizeUpDown)
+    }
+
     private func applyShellChrome() {
         wantsLayer = true
         layer?.cornerRadius = ExpandedPanelMetrics.cornerRadius
@@ -2633,10 +2722,17 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if !resizeEdges(at: localPoint).isEmpty {
             return true
         }
-        if headerBar.frame.contains(localPoint) || composerBar.frame.contains(localPoint) {
+        if headerBar.frame.contains(localPoint)
+            || composerBar.frame.contains(localPoint)
+            || transcriptStrip.frame.contains(localPoint)
+            || (!attachmentStrip.isHidden && attachmentStrip.frame.contains(localPoint))
+        {
             return true
         }
         if !sessionDrawer.isHidden && sessionDrawer.frame.contains(localPoint) {
+            return true
+        }
+        if feed.hasCopyControl(atScreenPoint: screenPoint) {
             return true
         }
         return false
@@ -3325,6 +3421,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         emitSimple("attach_requested")
     }
 
+    @objc private func removeAttachmentClicked(_ sender: RemoveAttachmentButton) {
+        let id = sender.contextId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty else { return }
+        setKnowledgeBadge("Docs updating", accent: BlueyTheme.warning)
+        emitRemoveContext(id: id)
+    }
+
     @objc private func instructionsClicked() {
         openAnswerStyleEditor()
     }
@@ -3871,13 +3974,34 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         kind.textColor = BlueyTheme.textDim
         kind.stringValue = "LOADED · \(item.kind.uppercased())"
 
+        let remove = RemoveAttachmentButton(title: "", target: self, action: #selector(removeAttachmentClicked(_:)))
+        remove.translatesAutoresizingMaskIntoConstraints = false
+        remove.contextId = item.id
+        remove.isBordered = false
+        remove.wantsLayer = true
+        remove.layer?.cornerRadius = 9
+        remove.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.04).cgColor
+        remove.layer?.borderWidth = 1
+        remove.layer?.borderColor = BlueyTheme.hairline.cgColor
+        remove.contentTintColor = BlueyTheme.textDim
+        if let image = symbolImage("xmark") {
+            image.isTemplate = true
+            remove.image = image
+            remove.imagePosition = .imageOnly
+            remove.imageScaling = .scaleProportionallyDown
+        } else {
+            remove.title = "x"
+        }
+        remove.toolTip = "Remove this document"
+
         chip.addSubview(icon)
         chip.addSubview(title)
         chip.addSubview(kind)
+        chip.addSubview(remove)
         NSLayoutConstraint.activate([
             chip.heightAnchor.constraint(equalToConstant: 28),
-            chip.widthAnchor.constraint(lessThanOrEqualToConstant: 190),
-            chip.widthAnchor.constraint(greaterThanOrEqualToConstant: 112),
+            chip.widthAnchor.constraint(lessThanOrEqualToConstant: 214),
+            chip.widthAnchor.constraint(greaterThanOrEqualToConstant: 134),
 
             icon.leadingAnchor.constraint(equalTo: chip.leadingAnchor, constant: 8),
             icon.centerYAnchor.constraint(equalTo: chip.centerYAnchor),
@@ -3886,11 +4010,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
             title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 7),
             title.topAnchor.constraint(equalTo: chip.topAnchor, constant: 4),
-            title.trailingAnchor.constraint(equalTo: chip.trailingAnchor, constant: -8),
+            title.trailingAnchor.constraint(equalTo: remove.leadingAnchor, constant: -6),
 
             kind.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             kind.topAnchor.constraint(equalTo: title.bottomAnchor, constant: -1),
             kind.trailingAnchor.constraint(lessThanOrEqualTo: title.trailingAnchor),
+
+            remove.trailingAnchor.constraint(equalTo: chip.trailingAnchor, constant: -7),
+            remove.centerYAnchor.constraint(equalTo: chip.centerYAnchor),
+            remove.widthAnchor.constraint(equalToConstant: 18),
+            remove.heightAnchor.constraint(equalToConstant: 18),
         ])
         return chip
     }

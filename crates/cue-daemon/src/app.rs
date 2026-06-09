@@ -1350,6 +1350,9 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             let _ui_state = reset_overlay_ui_state_on_scope_exit(&daemon.overlay_ui_state);
             handle_attach_paths(daemon, paths.into_iter().map(PathBuf::from).collect()).await?;
         }
+        OverlayEvent::RemoveContextRequested { id } => {
+            handle_remove_context_requested(daemon, id).await?;
+        }
         OverlayEvent::InstructionsRequested => {
             // Drive Idle -> InstructionsOpen while the daemon-owned prompt is
             // open. The guard resets on save, cancel, or error.
@@ -3177,6 +3180,30 @@ fn index_context_artifacts_for_rag(
     });
 }
 
+fn reindex_meeting_for_rag(daemon: &Arc<Daemon>, meeting: MeetingRecord) {
+    let Some(rag) = daemon.rag.as_ref() else {
+        return;
+    };
+
+    let rag = Arc::clone(rag);
+    tokio::spawn(async move {
+        let session_id = meeting.id.to_string();
+        if let Err(error) = rag.delete_session(&session_id).await {
+            warn!("failed to clear RAG session before context removal reindex: {error}");
+            return;
+        }
+
+        for segment in meeting.transcript {
+            if segment.is_final && !segment.text.trim().is_empty() {
+                rag.index_transcript(&session_id, &segment.text).await;
+            }
+        }
+        for artifact in meeting.context {
+            rag.index_context_artifact(&session_id, &artifact).await;
+        }
+    });
+}
+
 async fn handle_attach_requested(daemon: &Arc<Daemon>) -> Result<()> {
     let paths = choose_context_files().await?;
     handle_attach_paths(daemon, paths).await
@@ -3238,6 +3265,41 @@ async fn handle_attach_paths(daemon: &Arc<Daemon>, paths: Vec<PathBuf>) -> Resul
         CardKind::Context,
         "Context attached",
         format!("{} file(s) added to this session.", attached.len()),
+    )
+    .await;
+    Ok(())
+}
+
+async fn handle_remove_context_requested(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<()> {
+    let Some((meeting_snapshot, removed_title)) = ({
+        let mut meeting_guard = daemon.meeting.lock().await;
+        let Some(meeting) = meeting_guard.as_mut() else {
+            return Ok(());
+        };
+
+        let Some(position) = meeting
+            .context
+            .iter()
+            .position(|artifact| artifact.id == id)
+        else {
+            return Ok(());
+        };
+        let removed = meeting.context.remove(position);
+        daemon.store.save_active(meeting)?;
+        Some((meeting.clone(), removed.title))
+    }) else {
+        return Ok(());
+    };
+
+    update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
+    refresh_overlay_context_items(daemon, &meeting_snapshot).await;
+    refresh_overlay_sessions(daemon).await;
+    reindex_meeting_for_rag(daemon, meeting_snapshot);
+    push_system_card(
+        daemon,
+        CardKind::Context,
+        "Context removed",
+        format!("{removed_title} removed from this session."),
     )
     .await;
     Ok(())
