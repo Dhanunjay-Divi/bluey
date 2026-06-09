@@ -2052,7 +2052,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         opacityControl = NSView()
         opacityLabel = NSTextField(labelWithString: "Opacity")
         opacitySlider = NSSlider(value: 0.94, minValue: 0.50, maxValue: 1.0, target: nil, action: nil)
-        opacityValueLabel = NSTextField(labelWithString: "94%")
+        opacityValueLabel = NSTextField(labelWithString: "94")
         hideButton = NSButton(title: "", target: nil, action: nil)
         closeButton = NSButton(title: "x", target: nil, action: nil)
         closeConfirmOverlay = ModalBlockerView()
@@ -2407,21 +2407,21 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
             opacityControl.leadingAnchor.constraint(equalTo: recordingButton.trailingAnchor, constant: 8),
             opacityControl.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            opacityControl.widthAnchor.constraint(equalToConstant: 96),
+            opacityControl.widthAnchor.constraint(equalToConstant: 154),
             opacityControl.heightAnchor.constraint(equalToConstant: 36),
 
-            opacityLabel.leadingAnchor.constraint(equalTo: opacityControl.leadingAnchor, constant: 10),
+            opacityLabel.leadingAnchor.constraint(equalTo: opacityControl.leadingAnchor, constant: 12),
             opacityLabel.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
-            opacityLabel.widthAnchor.constraint(equalToConstant: 18),
+            opacityLabel.widthAnchor.constraint(equalToConstant: 46),
 
-            opacitySlider.leadingAnchor.constraint(equalTo: opacityLabel.trailingAnchor, constant: 5),
+            opacitySlider.leadingAnchor.constraint(equalTo: opacityLabel.trailingAnchor, constant: 8),
             opacitySlider.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
-            opacitySlider.trailingAnchor.constraint(equalTo: opacityValueLabel.leadingAnchor, constant: -5),
+            opacitySlider.trailingAnchor.constraint(equalTo: opacityValueLabel.leadingAnchor, constant: -7),
             opacitySlider.heightAnchor.constraint(equalToConstant: 20),
 
-            opacityValueLabel.trailingAnchor.constraint(equalTo: opacityControl.trailingAnchor, constant: -8),
+            opacityValueLabel.trailingAnchor.constraint(equalTo: opacityControl.trailingAnchor, constant: -10),
             opacityValueLabel.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
-            opacityValueLabel.widthAnchor.constraint(equalToConstant: 28),
+            opacityValueLabel.widthAnchor.constraint(equalToConstant: 22),
 
             askButton.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -8),
             askButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
@@ -2954,16 +2954,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         composerSurface.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
 
         opacityControl.wantsLayer = true
-        opacityControl.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.055).cgColor
+        opacityControl.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.065).cgColor
         opacityControl.layer?.cornerRadius = 18
         opacityControl.layer?.borderWidth = 1
-        opacityControl.layer?.borderColor = NSColor.white.withAlphaComponent(0.08).cgColor
+        opacityControl.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.16).cgColor
         opacityControl.toolTip = "Overlay opacity"
-        opacityLabel.stringValue = "%"
-        opacityLabel.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
+        opacityLabel.stringValue = "Opacity"
+        opacityLabel.font = NSFont.systemFont(ofSize: 10.2, weight: .semibold)
         opacityLabel.textColor = BlueyTheme.textDim
         opacityLabel.alignment = .left
-        opacityValueLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
+        opacityValueLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 10.2, weight: .semibold)
         opacityValueLabel.textColor = BlueyTheme.textDim
         opacityValueLabel.alignment = .right
         opacitySlider.controlSize = .small
@@ -3115,14 +3115,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         button.title = fallback
         button.isBordered = false
         button.wantsLayer = true
-        button.layer?.cornerRadius = 16
+        button.layer?.cornerRadius = accent ? 20 : 16
         button.layer?.backgroundColor = accent
-            ? NSColor(red: 0.84, green: 0.92, blue: 0.96, alpha: 0.95).cgColor
+            ? NSColor(red: 0.07, green: 0.19, blue: 0.24, alpha: 0.98).cgColor
             : NSColor.white.withAlphaComponent(0.070).cgColor
         button.layer?.borderWidth = 1
-        button.layer?.borderColor = (accent ? NSColor.white.withAlphaComponent(0.18) : NSColor.white.withAlphaComponent(0.12)).cgColor
+        button.layer?.borderColor = (accent ? BlueyTheme.cyan.withAlphaComponent(0.58) : NSColor.white.withAlphaComponent(0.12)).cgColor
         button.font = NSFont.systemFont(ofSize: 12, weight: .bold)
-        button.contentTintColor = accent ? NSColor.black.withAlphaComponent(0.82) : BlueyTheme.cyan
+        button.contentTintColor = accent ? BlueyTheme.text : BlueyTheme.cyan
         if let image = symbolImage(symbol) {
             image.isTemplate = true
             button.title = ""
@@ -3198,7 +3198,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if abs(opacitySlider.doubleValue - value) > 0.001 {
             opacitySlider.doubleValue = value
         }
-        opacityValueLabel.stringValue = "\(Int((value * 100.0).rounded()))%"
+        opacityValueLabel.stringValue = "\(Int((value * 100.0).rounded()))"
         onOpacityChanged?(value)
     }
 
