@@ -68,7 +68,7 @@ enum Commands {
     /// Check for and install a Bluey desktop update.
     #[command(hide = true)]
     Update(UpdateArgs),
-    /// Log out of Bluey: clear keyring tokens.
+    /// Log out of Bluey: clear local account tokens.
     #[command(hide = true)]
     Logout,
     /// Open the Bluey billing page in your browser to manage credits and provider-backed billing.
@@ -968,34 +968,32 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
 
     save_account(&paths, &account)?;
 
-    // Codex Stage 8 S8.1 (round 3): save tokens to the cue-cloud-client
-    // keyring store whenever access_token exists so usage/billing surfaces
-    // can find them after any successful auth path. Token-only / env-token /
-    // browser-without-refresh logins all produce access-only sessions;
-    // cue-cloud-client treats refresh as optional/defaultable so an
-    // empty string is safe. Best-effort: keyring failure prints a
-    // warning but does not fail login.
-    if let Some(access) = account.access_token.clone() {
-        let refresh = account.refresh_token.clone().unwrap_or_default();
-        let email = account.user_id.clone();
-        let tokens = cue_cloud_client::Tokens {
-            access,
-            refresh,
-            email,
-        };
-        match save_keyring_tokens_with_timeout(tokens) {
-            Ok(Some(())) => {}
-            Ok(None) => {
-                eprintln!(
-                    "warning: keyring token save timed out\n\
-                     (legacy AccountConfig path still works; cloud status may report not-logged-in until keyring is available)"
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "warning: could not save tokens to keyring: {e}\n\
-                     (legacy AccountConfig path still works; cloud status may report not-logged-in until keyring is available)"
-                );
+    // Bluey stores desktop account tokens in the local account profile by
+    // default. The legacy Keychain bridge is opt-in because macOS can prompt
+    // during normal startup/polling, which is jarring for terminal installs.
+    if legacy_keyring_fallback_enabled() {
+        if let Some(access) = account.access_token.clone() {
+            let refresh = account.refresh_token.clone().unwrap_or_default();
+            let email = account.user_id.clone();
+            let tokens = cue_cloud_client::Tokens {
+                access,
+                refresh,
+                email,
+            };
+            match save_keyring_tokens_with_timeout(tokens) {
+                Ok(Some(())) => {}
+                Ok(None) => {
+                    eprintln!(
+                        "warning: legacy keyring token save timed out\n\
+                         (local account profile still works)"
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warning: could not save tokens to legacy keyring: {e}\n\
+                         (local account profile still works)"
+                    );
+                }
             }
         }
     }
@@ -2856,12 +2854,18 @@ async fn bluey_logout_cmd() -> Result<()> {
     let paths = AppPaths::discover()?;
     let account_config_cleared = clear_local_account_config(&paths)?;
 
-    let had_keyring_tokens = match clear_keyring_tokens_with_timeout()? {
-        Some(had_tokens) => had_tokens,
-        None => {
-            eprintln!("bluey: keyring cleanup timed out; local account config was still cleared");
-            false
+    let had_keyring_tokens = if legacy_keyring_fallback_enabled() {
+        match clear_keyring_tokens_with_timeout()? {
+            Some(had_tokens) => had_tokens,
+            None => {
+                eprintln!(
+                    "bluey: legacy keyring cleanup timed out; local account config was still cleared"
+                );
+                false
+            }
         }
+    } else {
+        false
     };
 
     if !account_config_cleared && !had_keyring_tokens {

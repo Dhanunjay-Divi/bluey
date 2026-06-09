@@ -2,7 +2,7 @@ mod commands;
 #[cfg(target_os = "macos")]
 mod macos;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use cue_daemon::db::Database;
 use tauri::{
@@ -553,7 +553,7 @@ struct DeepLinkLoginResult {
 }
 
 /// Handle an incoming bluey://link?code=... URL: exchange the one-time
-/// code for tokens, persist them in the keyring via CloudClient, and
+/// code for tokens, persist them in the local account store via CloudClient, and
 /// emit a "deep_link_login" event the dashboard subscribes to.
 async fn handle_deep_link_url(url: String, app: tauri::AppHandle) {
     use tauri::Emitter;
@@ -598,8 +598,8 @@ async fn handle_deep_link_url(url: String, app: tauri::AppHandle) {
     };
 
     let trace_id = cue_core::new_trace_id();
-    let client = match cue_cloud_client::CloudClient::with_default_keyring() {
-        Ok(c) => c.with_trace_id(trace_id),
+    let client = match dashboard_cloud_client_with_trace(&trace_id) {
+        Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %e, "cloud client init failed");
             let _ = app.emit(
@@ -637,7 +637,7 @@ async fn handle_deep_link_url(url: String, app: tauri::AppHandle) {
                     DeepLinkLoginResult {
                         success: false,
                         email: Some(resp.account.email),
-                        error: Some(format!("keyring: {e}")),
+                        error: Some(format!("account store: {e}")),
                     },
                 );
                 return;
@@ -665,6 +665,21 @@ async fn handle_deep_link_url(url: String, app: tauri::AppHandle) {
             );
         }
     }
+}
+
+fn dashboard_cloud_client_with_trace(
+    trace_id: &str,
+) -> Result<cue_cloud_client::CloudClient, cue_cloud_client::Error> {
+    let paths = cue_core::app_paths::AppPaths::discover()
+        .map_err(|error| cue_cloud_client::Error::TokenStore(error.to_string()))?;
+    let config = cue_cloud_client::client::ClientConfig {
+        trace_id: Some(trace_id.to_string()),
+        ..Default::default()
+    };
+    cue_cloud_client::CloudClient::new(
+        config,
+        Arc::new(cue_cloud_client::AccountFileStore::new(paths)),
+    )
 }
 
 async fn notify_daemon_account_linked() {

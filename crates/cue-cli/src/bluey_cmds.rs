@@ -1,7 +1,7 @@
 //! Bluey CLI cloud-account commands: `bluey usage`, `bluey credits`.
 //!
 //! These talk to bluey-server via cue-cloud-client, using the auth
-//! token stored in keyring after the first `bluey on` sign-in. They print
+//! token stored in the local account profile after sign-in. They print
 //! customer-facing summaries to stdout matching the format documented
 //! in `docs/PRICING-MODEL.md` Section 4.3.
 
@@ -116,14 +116,14 @@ async fn fetch_pricing_tiers(client: &CloudClient) -> Option<cue_cloud_client::P
     }
 }
 
-/// Codex Stage 16: bluey logout — clear the keyring tokens.
+/// Codex Stage 16: bluey logout — clear local account tokens.
 pub async fn logout(client: &CloudClient) -> Result<()> {
     if client.current_tokens().is_none() {
         println!("Already logged out.");
         return Ok(());
     }
     client.clear_tokens()?;
-    println!("Bluey account logged out (keyring cleared).");
+    println!("Bluey account logged out.");
     Ok(())
 }
 
@@ -190,7 +190,7 @@ pub async fn delete_account(client: &CloudClient, force: bool) -> Result<()> {
     if ack.deleted {
         let _ = client.clear_tokens();
         println!("Account deleted at {}.", ack.deleted_at);
-        println!("Local keyring tokens cleared.");
+        println!("Local account tokens cleared.");
     }
     Ok(())
 }

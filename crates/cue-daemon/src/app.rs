@@ -1185,7 +1185,7 @@ async fn send_overlay(daemon: &Arc<Daemon>, command: OverlayCommand) -> Result<(
 
 fn maybe_spawn_balance_polling(daemon: &Arc<Daemon>) {
     let Ok(client) = build_cloud_client(&daemon.paths, None) else {
-        debug!("balance polling skipped; keyring unavailable");
+        debug!("balance polling skipped; account store unavailable");
         return;
     };
     if client.current_tokens().is_none() {
@@ -2566,7 +2566,7 @@ async fn fetch_current_balance_snapshot(
     let client = match build_cloud_client(&paths, trace_id) {
         Ok(client) => client,
         Err(error) => {
-            debug!("balance lookup skipped; keyring unavailable: {error}");
+            debug!("balance lookup skipped; account store unavailable: {error}");
             return None;
         }
     };
@@ -7312,12 +7312,17 @@ async fn update_state_from_meeting(
 /// Initialize the RAG pipeline if an OpenAI API key is available.
 /// Returns None (with a log) if no key is configured — RAG is optional.
 fn init_rag_pipeline(paths: &AppPaths) -> Option<Arc<crate::db::rag::RagPipeline>> {
-    let api_key = match crate::secrets::load_api_key("openai") {
-        Ok(Some(key)) => key,
-        _ => {
-            info!("RAG pipeline disabled: no OpenAI API key configured");
-            return None;
-        }
+    let api_key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+        .or_else(|| {
+            env_truthy_any(&["BLUEY_DEV_BYOK"])
+                .then(|| crate::secrets::load_api_key("openai").ok().flatten())
+                .flatten()
+        });
+    let Some(api_key) = api_key else {
+        info!("RAG pipeline disabled: no OpenAI API key configured");
+        return None;
     };
     let embedder = Arc::new(cue_rag::embedder::OpenAiEmbedder::new(api_key));
     let store_path = paths.data_dir.join("rag_vectors.db");
@@ -7399,7 +7404,11 @@ fn build_recap_llm_from_env() -> Option<Box<dyn cue_llm::LlmProvider>> {
     let key = std::env::var("OPENAI_API_KEY")
         .ok()
         .filter(|k| !k.is_empty())
-        .or_else(|| crate::secrets::load_api_key("llm_openai").ok().flatten())?;
+        .or_else(|| {
+            env_truthy_any(&["BLUEY_DEV_BYOK"])
+                .then(|| crate::secrets::load_api_key("llm_openai").ok().flatten())
+                .flatten()
+        })?;
     Some(Box::new(cue_llm::openai::OpenAiProvider::new(key)))
 }
 

@@ -1,6 +1,6 @@
 //! Codex Stage 17: daemon-side balance polling.
 //!
-//! When a Bluey account token is in the keyring, this module spawns a
+//! When a Bluey account token is in the local account store, this module spawns a
 //! background task that polls `/account/me` every 30s and emits a
 //! `BalanceSnapshot` over a watch channel. The daemon bridges that
 //! snapshot to the native overlay with `SetBalance`, while the dashboard

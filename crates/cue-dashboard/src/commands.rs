@@ -1,7 +1,7 @@
 use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
 use cue_core::session::Session;
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
@@ -121,9 +121,37 @@ fn dashboard_trace_id() -> String {
 }
 
 fn cloud_client_with_trace(trace_id: &str) -> Result<cue_cloud_client::CloudClient, String> {
-    cue_cloud_client::CloudClient::with_default_keyring()
-        .map(|client| client.with_trace_id(trace_id.to_string()))
-        .map_err(|e| format!("account keyring unavailable: {e}"))
+    let paths = cue_core::app_paths::AppPaths::discover()
+        .map_err(|e| format!("account store unavailable: {e}"))?;
+    let config = cue_cloud_client::client::ClientConfig {
+        trace_id: Some(trace_id.to_string()),
+        ..Default::default()
+    };
+    let client = cue_cloud_client::CloudClient::new(
+        config.clone(),
+        Arc::new(cue_cloud_client::AccountFileStore::new(paths)),
+    )
+    .map_err(|e| format!("account store unavailable: {e}"))?;
+    if client.current_tokens().is_some() || !legacy_keyring_fallback_enabled() {
+        return Ok(client);
+    }
+
+    cue_cloud_client::CloudClient::new(
+        config,
+        Arc::new(cue_cloud_client::tokens::KeyringStore::new()),
+    )
+    .map_err(|e| format!("legacy account keyring unavailable: {e}"))
+}
+
+fn legacy_keyring_fallback_enabled() -> bool {
+    std::env::var("BLUEY_LEGACY_KEYRING_FALLBACK")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
 }
 
 #[tauri::command]
@@ -196,8 +224,8 @@ pub async fn billing_portal_url() -> Result<String, String> {
 
 #[tauri::command]
 pub fn sign_out(db: State<DbState>) -> Result<(), String> {
-    let client = cue_cloud_client::CloudClient::with_default_keyring()
-        .map_err(|e| format!("account keyring unavailable: {e}"))?;
+    let trace_id = dashboard_trace_id();
+    let client = cloud_client_with_trace(&trace_id)?;
     client
         .clear_tokens()
         .map_err(|e| format!("sign out failed: {e}"))?;
@@ -1840,7 +1868,7 @@ fn persist_cue_response(
 }
 
 /// Multi-provider registry: builds every LLM provider for which credentials
-/// are configured (env var or keyring) and exposes them by `LlmProvider::name()`.
+/// are configured (env var or opt-in saved dev secret) and exposes them by `LlmProvider::name()`.
 ///
 /// This is what the SpeculativeRouter dispatches against. If the chosen route
 /// targets a provider that is not in the registry, we fall back to whichever
@@ -1858,12 +1886,12 @@ impl ProviderRegistry {
         let mut providers: HashMap<String, Arc<dyn cue_llm::LlmProvider>> = HashMap::new();
 
         // Codex Stage 9a: managed-mode detection. If a Bluey account
-        // token is in the keyring, register BlueyManagedProvider for
+        // token is in the local account store, register BlueyManagedProvider for
         // every cloud lane; bluey-server will pick the actual upstream
         // provider+model. Customer pays Bluey; Bluey owns the API keys.
         //
         // Legacy BYOK direct providers (OpenAI/Anthropic from env or
-        // keyring) are gated behind BLUEY_DEV_BYOK=1 so dev workflows
+        // saved secrets) are gated behind BLUEY_DEV_BYOK=1 so dev workflows
         // still work without surprising customers in production.
         let managed_mode = match cloud_client_with_trace(trace_id) {
             Ok(client) => client.current_tokens().is_some(),
@@ -1871,7 +1899,7 @@ impl ProviderRegistry {
         };
 
         if managed_mode {
-            tracing::info!("ProviderRegistry: managed mode active (token in keyring)");
+            tracing::info!("ProviderRegistry: managed mode active (account token found)");
             // One BlueyManagedProvider per cloud lane. The provider
             // name (bluey-managed-{lane}) matches what
             // cue_router::ManagedPolicy emits, so the registry lookup
@@ -1891,18 +1919,20 @@ impl ProviderRegistry {
             }
         }
 
-        let allow_byok = std::env::var("BLUEY_DEV_BYOK")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-            || !managed_mode;
+        let allow_saved_byok = dev_byok_enabled();
+        let allow_byok = allow_saved_byok || !managed_mode;
 
         if allow_byok {
             if let Some(key) = std::env::var("OPENAI_API_KEY")
                 .ok()
                 .filter(|k| !k.is_empty())
                 .or_else(|| {
-                    cue_daemon::secrets::load_api_key("llm_openai")
-                        .ok()
+                    allow_saved_byok
+                        .then(|| {
+                            cue_daemon::secrets::load_api_key("llm_openai")
+                                .ok()
+                                .flatten()
+                        })
                         .flatten()
                 })
             {
@@ -1915,8 +1945,12 @@ impl ProviderRegistry {
                 .ok()
                 .filter(|k| !k.is_empty())
                 .or_else(|| {
-                    cue_daemon::secrets::load_api_key("llm_anthropic")
-                        .ok()
+                    allow_saved_byok
+                        .then(|| {
+                            cue_daemon::secrets::load_api_key("llm_anthropic")
+                                .ok()
+                                .flatten()
+                        })
                         .flatten()
                 })
             {
@@ -1993,7 +2027,7 @@ impl cue_router::speculative::SpeculativeProvider for ProviderRegistry {
 /// Build an LLM provider from environment variables or stored secrets.
 ///
 /// Codex Stage 9 round-2 Blocker 1: managed-mode customers (Bluey
-/// account token in keyring, no direct OPENAI_API_KEY) used to be
+/// account token in local account store, no direct OPENAI_API_KEY) used to be
 /// rejected here. We now check managed mode first and return a
 /// BlueyManagedProvider bound to the Balanced lane as the legacy
 /// single-shot fallback. The speculative path (`try_speculative_
@@ -2005,9 +2039,7 @@ fn build_llm_provider_from_env(
     // Managed mode first: Bluey account tokens take priority over BYOK
     // unless BLUEY_DEV_BYOK=1 explicitly opts in (matching the
     // ProviderRegistry policy).
-    let allow_byok = std::env::var("BLUEY_DEV_BYOK")
-        .map(|v| v == "1")
-        .unwrap_or(false);
+    let allow_byok = dev_byok_enabled();
     if !allow_byok {
         if let Ok(client) = cloud_client_with_trace(trace_id) {
             if client.current_tokens().is_some() {
@@ -2023,11 +2055,21 @@ fn build_llm_provider_from_env(
         .ok()
         .filter(|k| !k.is_empty())
         .or_else(|| {
-            cue_daemon::secrets::load_api_key("llm_openai")
-                .ok()
+            allow_byok
+                .then(|| {
+                    cue_daemon::secrets::load_api_key("llm_openai")
+                        .ok()
+                        .flatten()
+                })
                 .flatten()
         })?;
     Some(Box::new(cue_llm::openai::OpenAiProvider::new(openai_key)))
+}
+
+fn dev_byok_enabled() -> bool {
+    std::env::var("BLUEY_DEV_BYOK")
+        .ok()
+        .is_some_and(|value| value.trim() == "1")
 }
 
 // ─── R8 nit hardening tests (recheck rollout) ───────────────────────────────
