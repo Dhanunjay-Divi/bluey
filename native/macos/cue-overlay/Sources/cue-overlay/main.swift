@@ -92,7 +92,8 @@ private enum ExpandedPanelMetrics {
     static let maxCanvasWidth: CGFloat = 960
     static let height: CGFloat = 520
     static let minHeight: CGFloat = 440
-    static let screenInset: CGFloat = 12
+    static let screenInset: CGFloat = 32
+    static let cornerRadius: CGFloat = 28
 
     static func fittingWidth(for screen: NSRect, preferred: CGFloat) -> CGFloat {
         let available = max(360, screen.width - screenInset * 2)
@@ -736,6 +737,17 @@ private final class OverlayWindow: NSWindow {
         contentView.wantsLayer = true
         contentView.layer?.cornerRadius = radius
         contentView.layer?.masksToBounds = true
+        if #available(macOS 10.15, *) {
+            contentView.layer?.cornerCurve = .continuous
+        }
+        if let frameView = contentView.superview {
+            frameView.wantsLayer = true
+            frameView.layer?.cornerRadius = radius
+            frameView.layer?.masksToBounds = true
+            if #available(macOS 10.15, *) {
+                frameView.layer?.cornerCurve = .continuous
+            }
+        }
     }
 
     override func setFrame(_ frameRect: NSRect, display displayFlag: Bool) {
@@ -2020,9 +2032,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             self?.dismissCloseConfirm(animated: true)
         }
 
-        wantsLayer = true
+        applyShellChrome()
         layer?.backgroundColor = NSColor(red: 0.010, green: 0.012, blue: 0.016, alpha: 0.94).cgColor
-        layer?.cornerRadius = 24
         layer?.masksToBounds = true
         layer?.borderWidth = 1
         layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.14).cgColor
@@ -2277,8 +2288,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             answerStyleOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
             answerStyleOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
 
-            answerStylePanel.centerXAnchor.constraint(equalTo: answerStyleOverlay.centerXAnchor),
-            answerStylePanel.centerYAnchor.constraint(equalTo: answerStyleOverlay.centerYAnchor),
+            answerStylePanel.centerXAnchor.constraint(equalTo: centerXAnchor),
+            answerStylePanel.centerYAnchor.constraint(equalTo: centerYAnchor),
             answerStylePanel.widthAnchor.constraint(equalToConstant: 360),
 
             answerStyleLabel.topAnchor.constraint(equalTo: answerStylePanel.topAnchor, constant: 18),
@@ -2396,8 +2407,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             closeConfirmOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
             closeConfirmOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
 
-            closeConfirmPanel.centerXAnchor.constraint(equalTo: closeConfirmOverlay.centerXAnchor),
-            closeConfirmPanel.centerYAnchor.constraint(equalTo: closeConfirmOverlay.centerYAnchor),
+            closeConfirmPanel.centerXAnchor.constraint(equalTo: centerXAnchor),
+            closeConfirmPanel.centerYAnchor.constraint(equalTo: centerYAnchor),
             closeConfirmPanel.widthAnchor.constraint(equalToConstant: 360),
 
             closeConfirmTitle.topAnchor.constraint(equalTo: closeConfirmPanel.topAnchor, constant: 18),
@@ -2479,8 +2490,18 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     override func layout() {
         super.layout()
+        applyShellChrome()
         keepFixedChromeInBounds()
         resizeTranscriptLabelToContent()
+    }
+
+    private func applyShellChrome() {
+        wantsLayer = true
+        layer?.cornerRadius = ExpandedPanelMetrics.cornerRadius
+        layer?.masksToBounds = true
+        if #available(macOS 10.15, *) {
+            layer?.cornerCurve = .continuous
+        }
     }
 
     override func keyDown(with event: NSEvent) {
@@ -4157,7 +4178,7 @@ private final class OverlayApp {
             contentRect: expandedFrame,
             draggable: true,
             resizable: true)
-        window.contentCornerRadius = 26
+        window.contentCornerRadius = ExpandedPanelMetrics.cornerRadius
         window.preserveProgrammaticFrameHeight = true
         let maxExpandedWidth = max(minimumWidth, screen.width - ExpandedPanelMetrics.screenInset * 2)
         let maxExpandedHeight = max(ExpandedPanelMetrics.minHeight, screen.height - ExpandedPanelMetrics.screenInset * 2)
