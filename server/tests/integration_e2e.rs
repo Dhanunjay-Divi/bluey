@@ -18,7 +18,7 @@ use bluey_server::auth;
 use bluey_server::config::{Config, SmtpConfig, UpstreamKeys, UpstreamSpendGuard};
 use bluey_server::db::accounts::Account;
 use bluey_server::db::usage::{self, UsageEvent};
-use bluey_server::db::{open_pool, run_migrations, DbPool};
+use bluey_server::db::{idempotency, open_pool, run_migrations, DbPool};
 
 /// Test harness: starts wiremocks, builds an AppState pointed at them,
 /// returns the axum Router ready for ServiceExt::oneshot.
@@ -498,6 +498,56 @@ async fn router_complete_stream_proxies_openai_deltas_then_billing() {
     assert!(body.contains("\"input_tokens\":12"));
     assert!(body.contains("\"output_tokens\":4"));
     assert!(body.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+#[serial]
+async fn router_complete_stream_openai_error_frame_is_retryable() {
+    let h = boot_harness().await;
+    let email = "stream-openai-error@example.com";
+    let access = signup_and_login(&h, email, "longenoughpw").await;
+
+    let stream = concat!(
+        "data: {\"error\":{\"message\":\"provider overloaded\",\"type\":\"rate_limit_error\"}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(stream),
+        )
+        .expect(1)
+        .mount(&h.openai)
+        .await;
+
+    let req = Request::post("/router/complete/stream")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "request_id": "stream-openai-error-1",
+                "system": "you are helpful",
+                "user": "answer quickly",
+                "lane": "instant"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = axum::body::to_bytes(resp.into_body(), 128 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("event: error"));
+    assert!(body.contains("upstream_stream_error"));
+    assert!(!body.contains("event: billing"));
+
+    let account = Account::fetch_by_email(&h.pool, email).unwrap().unwrap();
+    let replay = idempotency::reserve(&h.pool, &account.id, "stream-openai-error-1").unwrap();
+    assert_eq!(replay, idempotency::ReserveOutcome::FreshReservation);
 }
 
 #[tokio::test]

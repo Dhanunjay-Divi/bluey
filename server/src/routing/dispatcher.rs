@@ -587,6 +587,14 @@ struct OpenAiStreamChunk {
     #[serde(default)]
     choices: Vec<OpenAiStreamChoice>,
     usage: Option<OpenAiUsage>,
+    error: Option<OpenAiStreamError>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiStreamError {
+    message: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -673,17 +681,8 @@ async fn openai_complete_stream(
                     seen_done = true;
                     continue;
                 }
-                let parsed: OpenAiStreamChunk = serde_json::from_str(data)
-                    .with_context(|| format!("openai stream json: {data}"))?;
-                if let Some(usage) = parsed.usage {
-                    final_usage = Some(usage);
-                }
-                for choice in parsed.choices {
-                    if let Some(content) = choice.delta.content {
-                        if !content.is_empty() {
-                            yield CompletionStreamEvent::Delta(content);
-                        }
-                    }
+                for delta in parse_openai_stream_chunk(data, &mut final_usage)? {
+                    yield CompletionStreamEvent::Delta(delta);
                 }
             }
         }
@@ -697,17 +696,8 @@ async fn openai_complete_stream(
                 seen_done = seen_done || data == "[DONE]";
                 continue;
             }
-            let parsed: OpenAiStreamChunk = serde_json::from_str(data)
-                .with_context(|| format!("openai stream json: {data}"))?;
-            if let Some(usage) = parsed.usage {
-                final_usage = Some(usage);
-            }
-            for choice in parsed.choices {
-                if let Some(content) = choice.delta.content {
-                    if !content.is_empty() {
-                        yield CompletionStreamEvent::Delta(content);
-                    }
-                }
+            for delta in parse_openai_stream_chunk(data, &mut final_usage)? {
+                yield CompletionStreamEvent::Delta(delta);
             }
         }
         let (input_tokens, output_tokens) = final_usage
@@ -725,6 +715,32 @@ async fn openai_complete_stream(
         model: model_string,
         events: Box::pin(stream),
     })
+}
+
+fn parse_openai_stream_chunk(
+    data: &str,
+    final_usage: &mut Option<OpenAiUsage>,
+) -> Result<Vec<String>> {
+    let parsed: OpenAiStreamChunk =
+        serde_json::from_str(data).with_context(|| format!("openai stream json: {data}"))?;
+    if let Some(error) = parsed.error {
+        return Err(anyhow!(
+            "openai stream error: {}",
+            error
+                .message
+                .or(error.kind)
+                .unwrap_or_else(|| "unknown upstream error".to_string())
+        ));
+    }
+    if let Some(usage) = parsed.usage {
+        *final_usage = Some(usage);
+    }
+    Ok(parsed
+        .choices
+        .into_iter()
+        .filter_map(|choice| choice.delta.content)
+        .filter(|content| !content.is_empty())
+        .collect())
 }
 
 fn openai_user_content<'a>(
@@ -880,6 +896,14 @@ struct AnthropicStreamPayload {
     delta: Option<AnthropicStreamDelta>,
     message: Option<AnthropicStreamMessage>,
     usage: Option<AnthropicStreamUsage>,
+    error: Option<AnthropicStreamError>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicStreamError {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    message: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1010,6 +1034,15 @@ fn parse_anthropic_stream_event(
     }
     let parsed: AnthropicStreamPayload =
         serde_json::from_str(data).with_context(|| format!("anthropic stream json: {data}"))?;
+    if event == "error" || parsed.kind == "error" {
+        return Err(anyhow!(
+            "anthropic stream error: {}",
+            parsed
+                .error
+                .and_then(|error| error.message.or(error.kind))
+                .unwrap_or_else(|| "unknown upstream error".to_string())
+        ));
+    }
     if event == "message_start" || parsed.kind == "message_start" {
         if let Some(usage) = parsed.message.and_then(|message| message.usage) {
             if let Some(value) = usage.input_tokens {
@@ -1504,6 +1537,36 @@ mod tests {
             value["content"][1]["image_url"]["url"],
             "data:image/png;base64,aGVsbG8="
         );
+    }
+
+    #[test]
+    fn openai_stream_error_frame_is_not_treated_as_empty_success() {
+        let mut usage = None;
+        let err = parse_openai_stream_chunk(
+            r#"{"error":{"message":"provider overloaded","type":"rate_limit_error"}}"#,
+            &mut usage,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("provider overloaded"));
+        assert!(usage.is_none());
+    }
+
+    #[test]
+    fn anthropic_stream_error_event_is_not_treated_as_empty_success() {
+        let mut input_tokens = None;
+        let mut output_tokens = None;
+        let err = parse_anthropic_stream_event(
+            "error",
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"provider busy"}}"#,
+            &mut input_tokens,
+            &mut output_tokens,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("provider busy"));
+        assert!(input_tokens.is_none());
+        assert!(output_tokens.is_none());
     }
 
     #[tokio::test]

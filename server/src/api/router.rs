@@ -25,6 +25,80 @@ use crate::routing;
 type RouterSseStream =
     Pin<Box<dyn futures_util::Stream<Item = Result<Event, Infallible>> + Send + 'static>>;
 
+struct StreamingIdempotencyGuard {
+    pool: crate::db::DbPool,
+    account_id: String,
+    request_id: String,
+    release_on_drop: bool,
+}
+
+impl StreamingIdempotencyGuard {
+    fn new(pool: crate::db::DbPool, account_id: String, request_id: String) -> Self {
+        Self {
+            pool,
+            account_id,
+            request_id,
+            release_on_drop: true,
+        }
+    }
+
+    fn release_now(&mut self) {
+        if !self.release_on_drop {
+            return;
+        }
+        if let Err(e) = idempotency::release(&self.pool, &self.account_id, &self.request_id) {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&self.account_id),
+                request_id = %self.request_id,
+                error = %e,
+                "failed to release streaming idempotency reservation"
+            );
+        }
+        self.release_on_drop = false;
+    }
+
+    fn mark_failed_now(&mut self) {
+        if !self.release_on_drop {
+            return;
+        }
+        if let Err(e) = idempotency::mark_failed(&self.pool, &self.account_id, &self.request_id) {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&self.account_id),
+                request_id = %self.request_id,
+                error = %e,
+                "failed to mark streaming idempotency reservation failed"
+            );
+        }
+        self.release_on_drop = false;
+    }
+
+    fn mark_complete_now(&mut self, response_json: &str) -> anyhow::Result<()> {
+        let result =
+            idempotency::mark_complete(&self.pool, &self.account_id, &self.request_id, response_json);
+        self.release_on_drop = false;
+        result
+    }
+
+    fn keep_in_progress_for_manual_reconciliation(&mut self) {
+        self.release_on_drop = false;
+    }
+}
+
+impl Drop for StreamingIdempotencyGuard {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            if let Err(e) = idempotency::release(&self.pool, &self.account_id, &self.request_id) {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&self.account_id),
+                    request_id = %self.request_id,
+                    error = %e,
+                    "failed to release dropped streaming idempotency reservation"
+                );
+            }
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct CompleteRequest {
     /// Client-supplied idempotency key. REQUIRED. Codex S4.1: a retry
@@ -745,6 +819,11 @@ async fn complete_stream_inner(
     };
 
     let event_stream = async_stream::stream! {
+        let mut idempotency_guard = StreamingIdempotencyGuard::new(
+            state.pool.clone(),
+            account.id.clone(),
+            req.request_id.clone(),
+        );
         let mut events = streaming.events;
         let mut text = String::new();
         let mut final_tokens: Option<(i64, i64)> = None;
@@ -767,7 +846,7 @@ async fn complete_stream_inner(
                     break;
                 }
                 Err(e) => {
-                    let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
+                    idempotency_guard.release_now();
                     tracing::warn!(
                         account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                         request_id = %req.request_id,
@@ -798,7 +877,7 @@ async fn complete_stream_inner(
             match balance::consume_trial_seconds(&state.pool, &account.id, elapsed_ms) {
                 Ok(value) => value,
                 Err(e) => {
-                    let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+                    idempotency_guard.mark_failed_now();
                     yield Ok(Event::default().event("error").data(
                         serde_json::json!({
                             "error": format!("trial: {e}"),
@@ -822,7 +901,7 @@ async fn complete_stream_inner(
                     account.trial_seconds_remaining
                 }
                 Err(e) => {
-                    let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+                    idempotency_guard.mark_failed_now();
                     yield Ok(Event::default().event("error").data(
                         serde_json::json!({
                             "error": format!("deduct: {e}"),
@@ -889,7 +968,7 @@ async fn complete_stream_inner(
 
         match serde_json::to_string(&response) {
             Ok(json) => {
-                if let Err(e) = idempotency::mark_complete(&state.pool, &account.id, &req.request_id, &json) {
+                if let Err(e) = idempotency_guard.mark_complete_now(&json) {
                     tracing::error!(
                         account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                         request_id = %req.request_id,
@@ -905,6 +984,7 @@ async fn complete_stream_inner(
                     error = %e,
                     "failed to serialize streaming response for idempotency cache; retry will return 409 — manual reconciliation required"
                 );
+                idempotency_guard.keep_in_progress_for_manual_reconciliation();
             }
         }
 
@@ -2377,6 +2457,61 @@ pub async fn transcribe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_pool() -> crate::db::DbPool {
+        let path =
+            std::env::temp_dir().join(format!("bluey-router-{}.db", uuid::Uuid::new_v4()));
+        let pool = crate::db::open_pool(&path).unwrap();
+        crate::db::run_migrations(&pool).unwrap();
+        pool
+    }
+
+    fn make_account(pool: &crate::db::DbPool, email: &str) -> String {
+        crate::db::accounts::Account::create(pool, email, "stub")
+            .unwrap()
+            .id
+    }
+
+    #[test]
+    fn streaming_idempotency_guard_releases_on_drop_before_billing() {
+        let pool = temp_pool();
+        let account_id = make_account(&pool, "stream-drop@example.com");
+        idempotency::reserve(&pool, &account_id, "stream-drop").unwrap();
+
+        {
+            let _guard = StreamingIdempotencyGuard::new(
+                pool.clone(),
+                account_id.clone(),
+                "stream-drop".into(),
+            );
+        }
+
+        assert_eq!(
+            idempotency::reserve(&pool, &account_id, "stream-drop").unwrap(),
+            idempotency::ReserveOutcome::FreshReservation
+        );
+    }
+
+    #[test]
+    fn streaming_idempotency_guard_can_preserve_in_progress_after_billing() {
+        let pool = temp_pool();
+        let account_id = make_account(&pool, "stream-reconcile@example.com");
+        idempotency::reserve(&pool, &account_id, "stream-reconcile").unwrap();
+
+        {
+            let mut guard = StreamingIdempotencyGuard::new(
+                pool.clone(),
+                account_id.clone(),
+                "stream-reconcile".into(),
+            );
+            guard.keep_in_progress_for_manual_reconciliation();
+        }
+
+        assert_eq!(
+            idempotency::reserve(&pool, &account_id, "stream-reconcile").unwrap(),
+            idempotency::ReserveOutcome::InProgress
+        );
+    }
 
     #[test]
     fn response_artifact_detects_code() {
