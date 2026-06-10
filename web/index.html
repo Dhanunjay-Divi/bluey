@@ -64,13 +64,13 @@
         <p>We use account and session data to authenticate you, answer requests, meter paid usage, save approved context, provide searchable history, show balance and cost labels, debug failures, prevent abuse, and support export or deletion requests.</p>
 
         <h2>AI Providers and Context</h2>
-        <p>When a request needs cloud help, Bluey sends only the context needed for that request: your prompt, selected transcript snippets, attached document text, screen-analysis output, saved session memory, and routing metadata such as task type and cost estimate. Speech transcription, image understanding, embedding, and answer generation may use separate providers. Local fallback runs on your machine and does not upload that local model work to Bluey Cloud.</p>
+        <p>When a request needs an AI model, Bluey sends only the context needed for that request: your prompt, selected transcript snippets, attached document text, screen-analysis output, saved session memory, and routing metadata such as task type and cost estimate. Speech transcription, image understanding, embedding, and answer generation may use separate providers.</p>
 
         <h2>Files, Sessions, and Memory</h2>
         <p>Documents you attach are parsed into readable text where supported and are tied to the active Bluey session. If you choose cloud sync or saved sessions, Bluey may store searchable session records so later questions can find the relevant transcript, file, screen note, or answer. You can keep using local sessions without cloud sync.</p>
 
         <h2>Your Controls</h2>
-        <p>Desktop capture starts only through visible user controls. You can stop listening, hide the overlay, attach or remove documents, export account data, delete your account, and clear local state. Local fallback may run on-device when Bluey Cloud is unavailable.</p>
+        <p>Desktop capture starts only through visible user controls. You can stop listening, hide the overlay, attach or remove documents, export account data, delete your account, and clear local state.</p>
 
         <h2>Retention</h2>
         <p>Account-credit batches remain in the ledger for accounting and expire up to 12 months (365 days) after purchase. Session, transcript, document, and saved-history retention follows account/workspace settings and the export/delete controls described in the product.</p>
@@ -92,7 +92,7 @@
 
         <h2>Account Credits</h2>
         <ul>
-          <li>Bluey is not a monthly subscription by default. You reload non-transferable account credits and spend them on cloud AI answers, speech transcription, screen analysis, searchable history, and related cloud work.</li>
+          <li>Bluey is not a monthly subscription by default. You reload non-transferable account credits and spend them on AI model requests, speech transcription, screen analysis, searchable history, and related cloud work.</li>
           <li>Credits have no cash value, are not a stored-value card or gift card, are not transferable, and cannot be used outside Bluey.</li>
           <li>Credits are valid for up to 12 months (365 days) from purchase. Bluey spends the oldest unexpired credit batch first and stops at zero so you do not accrue usage debt.</li>
           <li>Refund handling, payment disputes, taxes, and receipts follow the support and payment-provider process shown in your account page.</li>
@@ -111,7 +111,7 @@
         <p>Square or another checkout provider may process reloads, receipts, disputes, and payment methods. Bluey records enough checkout metadata to credit your account, prevent duplicate crediting, show usage, and support refunds or account deletion.</p>
 
         <h2>Service Availability</h2>
-        <p>Bluey is an alpha product. AI providers, speech transcription, billing providers, networks, and local OS permissions can fail or degrade. We work to fail clearly with logs, status, and local fallback where practical, but we do not guarantee uninterrupted service.</p>
+        <p>Bluey is an alpha product. AI providers, speech transcription, billing providers, networks, and local OS permissions can fail or degrade. We work to fail clearly with logs and status, but we do not guarantee uninterrupted service.</p>
 
         <h2>Changes</h2>
         <p>We may update these terms as Bluey moves from alpha to broader release. Material changes should be reflected on this page and in release notes.</p>
@@ -134,7 +134,7 @@
         <p>Bluey is for user-approved work context: meetings, documents, code, research, and day-to-day productivity. Do not use it to access data you are not authorized to access or to bypass third-party rules. If a workflow requires consent, get consent before capturing or uploading context.</p>
 
         <h2>Why this matters</h2>
-        <p>The product goal is calm focus, not deception. You should always know when Bluey is listening, what context is attached, and whether an answer used Bluey Cloud, local fallback, screen analysis, or saved context.</p>
+        <p>The product goal is calm focus, not deception. You should always know when Bluey is listening, what context is attached, and whether an answer used an AI model, screen analysis, or saved context.</p>
       </article>
 
       <div class="page-footer-links">
@@ -152,7 +152,7 @@
         </a>
         <div class="rail-command">
           <code id="railCommandLabel">bluey on</code>
-          <span id="railCommandCopy">Start Bluey from Terminal. Sign in only when you need cloud answers, credits, or saved sessions.</span>
+          <span id="railCommandCopy">Start Bluey from Terminal. Sign in when you want AI models, credits, or saved sessions.</span>
         </div>
         <div class="rail-list">
           <span>Dashboard</span>
@@ -160,7 +160,7 @@
           <span>Sessions</span>
         </div>
         <div class="account-rail-footer">
-          <span>Credits are used only for cloud answers, speech, screen analysis, and saved-session features.</span>
+          <span>Credits are used for AI models, speech, screen analysis, and saved-session features.</span>
           <span><a href="/docs/privacy">Privacy</a> · <a href="/docs/terms">Terms</a> · <a href="/docs/disguise">Controls</a></span>
         </div>
       </aside>
@@ -171,7 +171,7 @@
           <img class="brand-wordmark" src="/assets/bluey-wordmark.svg" alt="bluey">
         </a>
         <div class="status-row">
-          <span class="status-chip live">Bluey Cloud</span>
+          <span class="status-chip live">AI online</span>
         </div>
         <div class="account-actions-row">
           <a class="account-link" href="/">Product</a>
@@ -222,7 +222,7 @@
 
           <section class="account-card account-preview-card" id="accountPreviewCard">
             <h2>What unlocks</h2>
-            <p>Credits power cloud answers, screen analysis, live speech, and saved session history.</p>
+            <p>Credits power AI models, screen analysis, live speech, and saved session history.</p>
             <div class="preview-list">
               <div class="preview-item">
                 <div class="preview-icon">$</div>
@@ -230,7 +230,7 @@
               </div>
               <div class="preview-item">
                 <div class="preview-icon">AI</div>
-                <div><strong>Cloud answers</strong><span>Use stronger models when local help is not enough.</span></div>
+                <div><strong>AI models</strong><span>Bluey routes each request to the right model for the job.</span></div>
               </div>
               <div class="preview-item">
                 <div class="preview-icon">KB</div>
@@ -264,7 +264,7 @@
             <div class="dashboard-head">
               <div>
                 <h2 id="accountEmailLabel">Bluey account</h2>
-                <p>Credits cover cloud answers, live speech, screen analysis, and saved sessions. Local desktop history stays available from the overlay.</p>
+                <p>Credits cover AI models, live speech, screen analysis, and saved sessions. Desktop history stays available from the overlay.</p>
               </div>
               <span class="pill-muted" id="billingProviderLabel">Secure checkout</span>
             </div>
@@ -290,7 +290,7 @@
             <div class="reload-card">
               <div>
                 <h3>Add credits</h3>
-                <p>$30 minimum. Credits stay valid for 365 days, and paid cloud requests stop at $0.</p>
+                <p>$30 minimum. Credits stay valid for 365 days, and paid requests stop at $0.</p>
               </div>
               <div class="account-actions-row reload-actions">
                 <div class="reload-price">$30</div>
@@ -304,7 +304,7 @@
               <div class="section-head">
                 <div>
                   <h3>Saved sessions</h3>
-                  <p>Saved snapshots from <code>bluey cloud sync</code>. Your local sessions still live in the desktop app.</p>
+                  <p>Saved snapshots from Bluey sync. Desktop sessions still live in the app.</p>
                 </div>
                 <button class="account-button ghost" id="refreshSessionsButton" type="button">Refresh sessions</button>
               </div>
@@ -354,7 +354,7 @@
             </div>
             <span class="availability">Ready</span>
           </div>
-          <p>Ready for Apple Silicon Macs. Install once, then sign in only when Bluey needs cloud help or credits.</p>
+          <p>Ready for Apple Silicon Macs. Install once, then sign in only when Bluey needs AI models or credits.</p>
           <span class="download-card-action">Show terminal steps</span>
         </article>
 
@@ -453,7 +453,7 @@
             <button class="copy-command" type="button" data-copy="bluey ask">Copy</button>
           </div>
           <div class="cmd">
-            <div><code>bluey help</code><span>Show the full local command list</span></div>
+            <div><code>bluey help</code><span>Show the full command list</span></div>
             <button class="copy-command" type="button" data-copy="bluey help">Copy</button>
           </div>
         </div>
@@ -497,7 +497,7 @@
             <input name="user_code" type="text" placeholder="Link code" autocomplete="one-time-code" spellcheck="false">
             <button type="submit">Link</button>
           </form>
-          <div class="hero-note">local-first overlay &middot; cloud help when needed &middot; credits for paid work</div>
+          <div class="hero-note">native overlay &middot; AI models when needed &middot; credits for paid work</div>
           <div class="hero-note">screen, transcript, files, and saved session notes by choice</div>
         </section>
 
@@ -530,12 +530,12 @@
         <a href="/login" class="plan">
           <div>
             <div class="plan-name">Add credits</div>
-            <div class="plan-detail">Pay only when Bluey uses cloud answers, speech, screen analysis, or saved sessions.</div>
+            <div class="plan-detail">Pay only when Bluey uses AI models, speech, screen analysis, or saved sessions.</div>
           </div>
           <div class="plan-price">$30</div>
         </a>
       </div>
-      <p class="pricing-note">Teams are concierge for now. Reach us at <a href="mailto:hello@bluey.sh">hello@bluey.sh</a>.</p>
+      <p class="pricing-note">Teams are concierge for now.</p>
       <div class="footer-meta">
         Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Stay Present, stay unseen</span><span class="dot">&middot;</span><a href="/docs/terms">Terms</a><span class="dot">&middot;</span><a href="/docs/privacy">Privacy</a><span class="dot">&middot;</span><a href="/docs/disguise">Controls</a>
       </div>
