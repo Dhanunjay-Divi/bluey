@@ -25,6 +25,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     const isPolicyRoute = policyRoutes.has(currentPath);
     const isDownloadRoute = downloadRoutes.has(currentPath);
     let pendingSignupEmail = '';
+    let accountAuthMode = 'login';
 
     function money(cents) {
       return `$${(Number(cents || 0) / 100).toFixed(2)}`;
@@ -203,6 +204,33 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       return false;
     }
 
+    function setAccountAuthMode(mode) {
+      accountAuthMode = mode === 'signup' ? 'signup' : 'login';
+      const title = document.getElementById('accountAuthTitle');
+      const copy = document.getElementById('accountAuthCopy');
+      const terms = document.getElementById('signupTermsLabel');
+      const primary = document.getElementById('accountPrimaryButton');
+      const create = document.getElementById('createAccountButton');
+      const password = document.getElementById('accountPassword');
+      if (title) title.textContent = accountAuthMode === 'signup' ? 'Create account' : 'Sign in';
+      if (copy) {
+        copy.textContent = accountAuthMode === 'signup'
+          ? 'Create a Bluey account, verify your email, then the desktop links automatically.'
+          : 'Use your Bluey account. If the desktop opened this page, it links automatically after sign in.';
+      }
+      if (terms) terms.hidden = accountAuthMode !== 'signup';
+      if (primary) primary.textContent = accountAuthMode === 'signup' ? 'Send verification code' : 'Sign in';
+      if (create) create.textContent = accountAuthMode === 'signup' ? 'Sign in instead' : 'Create account';
+      if (password) {
+        password.autocomplete = accountAuthMode === 'signup' ? 'new-password' : 'current-password';
+        password.placeholder = accountAuthMode === 'signup' ? 'Create a password' : 'Password';
+      }
+      if (accountAuthMode !== 'signup') {
+        setSignupOtpMode(false);
+      }
+      accountMessage('', true);
+    }
+
     function setRailCommand(authed, email = '') {
       const label = document.getElementById('railCommandLabel');
       const copy = document.getElementById('railCommandCopy');
@@ -248,7 +276,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       pendingSignupEmail = enabled ? email : '';
       label.hidden = !enabled;
       confirm.hidden = !enabled;
-      create.textContent = enabled ? 'Resend code' : 'Create account';
+      create.textContent = enabled ? 'Resend code' : (accountAuthMode === 'signup' ? 'Sign in instead' : 'Create account');
       if (!enabled) otp.value = '';
     }
 
@@ -631,10 +659,23 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
       document.getElementById('accountForm').addEventListener('submit', (event) => {
         event.preventDefault();
-        accountAuth('login').catch((error) => accountMessage(error.message, true));
+        if (accountAuthMode === 'signup') {
+          startSignupOtp().catch((error) => accountMessage(error.message, true));
+        } else {
+          accountAuth('login').catch((error) => accountMessage(error.message, true));
+        }
       });
       document.getElementById('createAccountButton').addEventListener('click', () => {
-        startSignupOtp().catch((error) => accountMessage(error.message, true));
+        if (pendingSignupEmail) {
+          startSignupOtp().catch((error) => accountMessage(error.message, true));
+          return;
+        }
+        if (accountAuthMode === 'signup') {
+          setAccountAuthMode('login');
+        } else {
+          setAccountAuthMode('signup');
+          document.getElementById('accountEmail')?.focus();
+        }
       });
       document.getElementById('confirmSignupButton').addEventListener('click', () => {
         confirmSignupOtp().catch((error) => accountMessage(error.message, true));

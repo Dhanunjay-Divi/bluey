@@ -190,8 +190,8 @@
 
         <section class="account-grid">
           <aside class="account-card" id="accountAuthCard">
-            <h2>Sign in</h2>
-            <p>Sign in or create an account. If Bluey opened this page from the desktop, it links automatically after sign in.</p>
+            <h2 id="accountAuthTitle">Sign in</h2>
+            <p id="accountAuthCopy">Use your Bluey account. If the desktop opened this page, it links automatically after sign in.</p>
             <div class="device-link-hint" id="deviceLinkHint" hidden></div>
             <form class="account-form" id="accountForm">
               <label>
@@ -206,12 +206,12 @@
                 Verification code
                 <input id="signupOtp" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" placeholder="6-digit code">
               </label>
-              <label class="terms-check" id="signupTermsLabel">
+              <label class="terms-check" id="signupTermsLabel" hidden>
                 <input type="checkbox" id="signupTerms">
-                <span>For new accounts, I agree to the <a href="/docs/terms" target="_blank" rel="noopener noreferrer">Terms</a> &amp; <a href="/docs/privacy" target="_blank" rel="noopener noreferrer">Privacy</a>.</span>
+                <span>I agree to the <a href="/docs/terms" target="_blank" rel="noopener noreferrer">Terms</a> &amp; <a href="/docs/privacy" target="_blank" rel="noopener noreferrer">Privacy</a>.</span>
               </label>
               <div class="account-actions-row">
-                <button class="account-button primary" type="submit">Sign in</button>
+                <button class="account-button primary" id="accountPrimaryButton" type="submit">Sign in</button>
                 <button class="account-button" id="createAccountButton" type="button">Create account</button>
                 <button class="account-button primary" id="confirmSignupButton" type="button" hidden>Verify code</button>
               </div>
@@ -544,7 +544,7 @@
 
   <script
     src="/assets/bluey-site.js"
-    integrity="sha384-Cz6C5ufvzrujMxtnyIzrx4HA+HgBZ4cfg+lAy6vWQYN40ZPTyDqG+qrTnjOIr3Pl"
+    integrity="sha384-x6DJeMq+iwIXLdmCIyf9qgLNKbwcpmTCITWgoXrilgwL0/804r3VTy4jgYU1BEW0"
     crossorigin="anonymous"
   ></script>
 </body>

@@ -2,7 +2,7 @@
 
 [package]
 name = "bluey-server"
-version = "0.1.0"
+version = "0.1.5"
 edition = "2021"
 description = "Bluey product server: auth, billing, license, managed Auto Router endpoint, admin"
 license = "Proprietary"
