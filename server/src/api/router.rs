@@ -6,9 +6,10 @@ use axum::{
     response::sse::{Event, Sse},
     Extension, Json,
 };
-use futures_util::stream;
+use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
+use std::pin::Pin;
 use std::time::Instant;
 
 use super::AppState;
@@ -20,6 +21,9 @@ use crate::db::{
 };
 use crate::pricing;
 use crate::routing;
+
+type RouterSseStream =
+    Pin<Box<dyn futures_util::Stream<Item = Result<Event, Infallible>> + Send + 'static>>;
 
 #[derive(Deserialize)]
 pub struct CompleteRequest {
@@ -90,6 +94,7 @@ pub struct ApiError {
     pub reload_url: Option<String>,
 }
 
+#[derive(Clone, Copy)]
 struct PricedRoute {
     provider: &'static str,
     model: &'static str,
@@ -393,23 +398,522 @@ pub async fn complete(
 
 /// Streaming variant of `/router/complete`.
 ///
-/// The v0.2 managed billing invariant is "dispatch once, charge once, cache
-/// once". To preserve that invariant, this handler runs the same atomic
-/// `complete_inner` lifecycle and then emits the final answer as small
-/// OpenAI-compatible SSE deltas plus one `billing` event. Future stages can
-/// swap the internals to true upstream streaming as long as the same
-/// idempotency/deduction contract remains intact.
+/// This path performs the same entry checks/idempotency reservation as the
+/// non-streaming endpoint, then proxies provider deltas as they arrive. Billing,
+/// usage recording, and idempotency caching happen only after the upstream
+/// stream finishes, followed by one `billing` SSE event carrying the final
+/// `CompleteResponse`.
 pub async fn complete_stream(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Json(req): Json<CompleteRequest>,
 ) -> Result<
-    Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
+    Sse<RouterSseStream>,
     (StatusCode, Json<ApiError>),
 > {
-    let response = complete_inner(state, account, req).await?;
-    let events = response_to_sse_events(response);
-    Ok(Sse::new(stream::iter(events.into_iter().map(Ok))))
+    complete_stream_inner(state, account, req).await
+}
+
+async fn complete_stream_inner(
+    state: AppState,
+    account: Account,
+    req: CompleteRequest,
+) -> Result<
+    Sse<RouterSseStream>,
+    (StatusCode, Json<ApiError>),
+> {
+    if req.request_id.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "request_id is required and must be non-empty".into(),
+                reason: Some("missing_request_id".into()),
+                ..Default::default()
+            }),
+        ));
+    }
+
+    validate_complete_images(&req.image_data_urls)
+        .map_err(|error| image_validation_error(error.error, error.reason.unwrap_or_default()))?;
+
+    let effective_lane = if req.image_data_urls.is_empty() {
+        req.lane.as_str()
+    } else {
+        "vision"
+    };
+    if effective_lane == "local" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "local lane is daemon-only; managed cloud does not run local models".into(),
+                reason: Some("local_lane_unsupported".into()),
+                ..Default::default()
+            }),
+        ));
+    }
+
+    match idempotency::reserve(&state.pool, &account.id, &req.request_id).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("idempotency: {e}"),
+                ..Default::default()
+            }),
+        )
+    })? {
+        idempotency::ReserveOutcome::FreshReservation => {}
+        idempotency::ReserveOutcome::CachedComplete(json) => {
+            let cached: CompleteResponse = serde_json::from_str(&json).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiError {
+                        error: format!("idempotency cache decode: {e}"),
+                        ..Default::default()
+                    }),
+                )
+            })?;
+            let events = response_to_sse_events(cached);
+            return Ok(Sse::new(Box::pin(stream::iter(events.into_iter().map(Ok)))));
+        }
+        idempotency::ReserveOutcome::InProgress => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: "request already in progress; wait for original to complete".into(),
+                    reason: Some("request_in_progress".into()),
+                    ..Default::default()
+                }),
+            ));
+        }
+        idempotency::ReserveOutcome::CachedFailed => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: "previous attempt with this request_id failed; use a new request_id"
+                        .into(),
+                    reason: Some("request_failed_terminal".into()),
+                    ..Default::default()
+                }),
+            ));
+        }
+    }
+
+    if let Err(denied) = state.rate_limiters.check_account_llm(&account.id).await {
+        return Err(release_and_capacity_error(
+            &state.pool,
+            &account.id,
+            &req.request_id,
+            denied.reason,
+            denied.retry_after_secs,
+        ));
+    }
+
+    let rag_matches = completion_rag_matches(
+        &state.pool,
+        &account.id,
+        req.session_id.as_deref(),
+        &req.user,
+    );
+    let (provider_system, provider_user) =
+        prompt_with_rag_context(&req.system, &req.user, &rag_matches);
+
+    let thinking = routing::resolve_thinking_budget(
+        effective_lane,
+        req.reasoning_effort.as_deref(),
+        req.thinking_budget_tokens,
+    );
+    let effective_max_out = routing::effective_max_output_tokens(req.max_tokens, thinking);
+    let max_out = i64::from(effective_max_out);
+    let est_in = req.estimated_input_tokens.unwrap_or_else(|| {
+        ((provider_system.len() + provider_user.len()) as i64) / 4
+    }) + image_token_estimate(req.image_data_urls.len());
+    let routes = priced_routes_for(effective_lane, est_in, max_out);
+    if routes.is_empty() {
+        let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: format!("no priced route for lane {effective_lane}"),
+                ..Default::default()
+            }),
+        ));
+    }
+
+    let est_cost = routes
+        .iter()
+        .map(|route| route.estimated_cost_cents)
+        .max()
+        .unwrap_or(1);
+    let est_bluey_cost = routes
+        .iter()
+        .map(|route| route.estimated_bluey_cost_cents)
+        .max()
+        .unwrap_or(1);
+    if let Some(err) = release_and_upstream_spend_guard_check(
+        &state,
+        &account.id,
+        &req.request_id,
+        est_bluey_cost,
+        "llm_stream",
+    ) {
+        return Err(err);
+    }
+
+    let on_trial = account.trial_seconds_remaining > 0;
+    if !on_trial {
+        let can = balance::can_afford(&state.pool, &account.id, est_cost).map_err(|e| {
+            let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: format!("balance: {e}"),
+                    ..Default::default()
+                }),
+            )
+        })?;
+        if !can {
+            let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+            let bal = balance::current_balance(&state.pool, &account.id).unwrap_or(0);
+            return Err((
+                StatusCode::PAYMENT_REQUIRED,
+                Json(ApiError {
+                    error: "insufficient balance".into(),
+                    balance_cents: Some(bal),
+                    estimated_cost_cents: Some(est_cost),
+                    reason: Some("insufficient_balance".into()),
+                    reload_url: Some(format!("{}/reload", state.config.public_url)),
+                    ..Default::default()
+                }),
+            ));
+        }
+    }
+
+    let started = Instant::now();
+    let mut last_error: Option<anyhow::Error> = None;
+    let mut last_capacity: Option<crate::rate_limit::CapacityDenied> = None;
+    let mut last_failure_was_capacity = false;
+    let mut selected_route_idx = 0usize;
+    let mut selected_route: Option<PricedRoute> = None;
+    let mut selected_stream: Option<routing::StreamingCompletion> = None;
+
+    for (idx, route) in routes.iter().enumerate() {
+        let key_candidates = state.config.upstream.key_candidates(
+            route.provider,
+            &format!("llm-stream:{}:{}:{}", req.request_id, route.provider, route.model),
+        );
+        if key_candidates.is_empty() {
+            last_error = Some(missing_provider_key_error(route.provider));
+            last_failure_was_capacity = false;
+            continue;
+        }
+
+        loop {
+            let selected_key = match state
+                .provider_health
+                .choose_key(route.provider, route.model, &key_candidates)
+                .await
+            {
+                Ok(key) => key,
+                Err(denied) => {
+                    tracing::warn!(
+                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                        request_id = %req.request_id,
+                        provider = %route.provider,
+                        model = %route.model,
+                        retry_after_secs = denied.retry_after_secs,
+                        reason = denied.reason,
+                        "provider key pool cooling down; trying next streaming route"
+                    );
+                    last_capacity = Some(denied);
+                    last_failure_was_capacity = true;
+                    break;
+                }
+            };
+
+            if let Err(denied) = state
+                .rate_limiters
+                .check_provider_llm(route.provider, route.model)
+                .await
+            {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    request_id = %req.request_id,
+                    provider = %route.provider,
+                    model = %route.model,
+                    retry_after_secs = denied.retry_after_secs,
+                    reason = denied.reason,
+                    "provider capacity busy; trying next streaming route"
+                );
+                last_capacity = Some(denied);
+                last_failure_was_capacity = true;
+                break;
+            }
+
+            match routing::complete_stream_with_key(
+                &selected_key.secret,
+                route.provider,
+                route.model,
+                &provider_system,
+                &provider_user,
+                req.max_tokens,
+                req.temperature,
+                thinking,
+                Some(est_in),
+                &req.image_data_urls,
+            )
+            .await
+            {
+                Ok(streaming) => {
+                    selected_route_idx = idx;
+                    selected_route = Some(*route);
+                    selected_stream = Some(streaming);
+                    break;
+                }
+                Err(e) => {
+                    if let Some(retry_after_secs) = routing::upstream_retry_after(&e) {
+                        let cooldown_secs = state
+                            .provider_health
+                            .record_cooldown(
+                                route.provider,
+                                route.model,
+                                &selected_key.fingerprint,
+                                retry_after_secs,
+                            )
+                            .await;
+                        tracing::warn!(
+                            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                            request_id = %req.request_id,
+                            provider = %route.provider,
+                            model = %route.model,
+                            key_fingerprint = %selected_key.fingerprint,
+                            retry_after_secs = cooldown_secs,
+                            error = %e,
+                            "streaming upstream capacity response; cooled key and retrying route"
+                        );
+                        last_capacity = Some(crate::rate_limit::CapacityDenied {
+                            retry_after_secs: cooldown_secs,
+                            reason: "provider_key_cooling_down",
+                        });
+                        last_failure_was_capacity = true;
+                        continue;
+                    }
+                    tracing::warn!(
+                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                        request_id = %req.request_id,
+                        provider = %route.provider,
+                        model = %route.model,
+                        error = %e,
+                        "streaming upstream dispatch failed; trying next route"
+                    );
+                    last_error = Some(e);
+                    last_failure_was_capacity = false;
+                    break;
+                }
+            }
+        }
+
+        if selected_stream.is_some() {
+            break;
+        }
+    }
+
+    let (selected_route, streaming) = match (selected_route, selected_stream) {
+        (Some(route), Some(streaming)) => (route, streaming),
+        _ => {
+            let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
+            if last_failure_was_capacity {
+                let denied = last_capacity.expect("capacity flag set with no capacity denial");
+                return Err(capacity_error(denied.reason, denied.retry_after_secs));
+            }
+            if let Some(e) = last_error {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    request_id = %req.request_id,
+                    error = %e,
+                    "all streaming upstream dispatch routes failed"
+                );
+            }
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError {
+                    error: "upstream provider error; please retry".into(),
+                    reason: Some("upstream_error".into()),
+                    ..Default::default()
+                }),
+            ));
+        }
+    };
+
+    let event_stream = async_stream::stream! {
+        let mut events = streaming.events;
+        let mut text = String::new();
+        let mut final_tokens: Option<(i64, i64)> = None;
+
+        while let Some(event) = events.next().await {
+            match event {
+                Ok(routing::CompletionStreamEvent::Delta(delta)) => {
+                    text.push_str(&delta);
+                    yield Ok(Event::default().data(
+                        serde_json::json!({
+                            "choices": [
+                                { "delta": { "content": delta } }
+                            ]
+                        })
+                        .to_string(),
+                    ));
+                }
+                Ok(routing::CompletionStreamEvent::Done { input_tokens, output_tokens }) => {
+                    final_tokens = Some((input_tokens, output_tokens));
+                    break;
+                }
+                Err(e) => {
+                    let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
+                    tracing::warn!(
+                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                        request_id = %req.request_id,
+                        error = %e,
+                        "streaming upstream read failed; reservation released"
+                    );
+                    yield Ok(Event::default().event("error").data(
+                        serde_json::json!({
+                            "error": "upstream provider stream interrupted; please retry",
+                            "reason": "upstream_stream_error",
+                        })
+                        .to_string(),
+                    ));
+                    return;
+                }
+            }
+        }
+
+        let (input_tokens, output_tokens) = final_tokens.unwrap_or((est_in, 0));
+        let elapsed_ms = started.elapsed().as_millis() as i64;
+        let (bluey_cost, customer_cost) = pricing::compute_cost(
+            selected_route.pricing,
+            input_tokens,
+            output_tokens,
+        );
+
+        let trial_remaining = if on_trial {
+            match balance::consume_trial_seconds(&state.pool, &account.id, elapsed_ms) {
+                Ok(value) => value,
+                Err(e) => {
+                    let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+                    yield Ok(Event::default().event("error").data(
+                        serde_json::json!({
+                            "error": format!("trial: {e}"),
+                            "reason": "trial_update_failed",
+                        })
+                        .to_string(),
+                    ));
+                    return;
+                }
+            }
+        } else {
+            match balance::deduct(&state.pool, &account.id, customer_cost) {
+                Ok(ok) => {
+                    if !ok {
+                        tracing::warn!(
+                            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                            cost_cents = customer_cost,
+                            "streaming post-completion deduct failed; bluey absorbs overrun"
+                        );
+                    }
+                    account.trial_seconds_remaining
+                }
+                Err(e) => {
+                    let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+                    yield Ok(Event::default().event("error").data(
+                        serde_json::json!({
+                            "error": format!("deduct: {e}"),
+                            "reason": "deduct_failed",
+                        })
+                        .to_string(),
+                    ));
+                    return;
+                }
+            }
+        };
+
+        let balance_after = balance::current_balance(&state.pool, &account.id).unwrap_or(0);
+        if !on_trial {
+            crate::billing::topup::maybe_spawn(
+                state.pool.clone(),
+                state.config.clone(),
+                account.id.clone(),
+                balance_after,
+                account.auto_topup_enabled,
+                account.auto_topup_threshold_cents,
+                account.stripe_customer_id.clone(),
+                account.stripe_payment_method_id.clone(),
+                account.auto_topup_amount_cents,
+            );
+        }
+
+        let event = UsageEvent {
+            request_id: req.request_id.clone(),
+            kind: "llm".into(),
+            task_type: None,
+            lane: Some(req.lane.clone()),
+            provider: Some(streaming.provider.clone()),
+            model: Some(streaming.model.clone()),
+            input_tokens,
+            output_tokens,
+            latency_ms: elapsed_ms,
+            cost_cents_to_bluey: bluey_cost,
+            cost_cents_to_customer: customer_cost,
+            was_speculative: false,
+            was_fallback: selected_route_idx > 0,
+        };
+        if let Err(e) = usage::record(&state.pool, &account.id, &event) {
+            tracing::warn!(error = %e, "failed to record streaming usage event");
+        }
+
+        let artifact = response_artifact(&text);
+        let response = CompleteResponse {
+            text,
+            provider: streaming.provider,
+            model: streaming.model,
+            input_tokens,
+            output_tokens,
+            cost_cents: customer_cost,
+            balance_cents_after: balance_after,
+            trial_seconds_remaining: trial_remaining,
+            artifact_type: artifact
+                .as_ref()
+                .map(|artifact| artifact.artifact_type.to_string()),
+            artifact_body: artifact.as_ref().map(|artifact| artifact.body.clone()),
+            cost_label: Some(router_cost_label(customer_cost, balance_after)),
+            confidence: artifact.as_ref().map(|artifact| artifact.confidence),
+        };
+
+        match serde_json::to_string(&response) {
+            Ok(json) => {
+                if let Err(e) = idempotency::mark_complete(&state.pool, &account.id, &req.request_id, &json) {
+                    tracing::error!(
+                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                        request_id = %req.request_id,
+                        error = %e,
+                        "streaming idempotency::mark_complete failed AFTER customer billed; retry will return 409 — manual reconciliation required"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    request_id = %req.request_id,
+                    error = %e,
+                    "failed to serialize streaming response for idempotency cache; retry will return 409 — manual reconciliation required"
+                );
+            }
+        }
+
+        let billing = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+        yield Ok(Event::default().event("billing").data(billing));
+        yield Ok(Event::default().data("[DONE]"));
+    };
+
+    Ok(Sse::new(Box::pin(event_stream)))
 }
 
 async fn complete_inner(

@@ -17,10 +17,10 @@
 //! The Instant lane stays cheap so the wasted spend is bounded: instant
 //! provider + model are configured to the cheapest streaming option.
 //!
-//! `SpeculativeRouter` is structural. It does NOT yet wire to live providers;
-//! the integration with `cue_llm::LlmRouter` happens in the daemon layer that
-//! has access to the configured provider list. Tests exercise the streaming
-//! contract via mock providers.
+//! `SpeculativeRouter` is provider-agnostic. The daemon/dashboard command layer
+//! wires it to live providers through `cue_llm::LlmRouter` and
+//! `ProviderRegistry`; tests in this crate exercise the streaming contract via
+//! mock providers.
 
 use std::sync::Arc;
 
@@ -76,13 +76,11 @@ pub trait SpeculativeProvider: Send + Sync {
     async fn provider_for(&self, route: &ProviderRoute) -> Result<Arc<dyn LlmProvider>, LlmError>;
 }
 
-/// Speculative router. Configurable: callers decide whether speculation is
-/// active. As of v0.1 internal testing it is **default-ON** (controlled
-/// via the `BLUEY_SPECULATIVE_ROUTING` env var in the daemon dispatcher);
-/// the parallel-spend cost is acceptable while we are still refining the
-/// classifier confidence calibration. See
-/// `crates/cue-dashboard/src/commands.rs::try_speculative_dispatch` for
-/// the env-gating logic.
+/// Speculative router. Configurable: callers decide whether the router path and
+/// parallel draft lane are active. The product default uses Auto routing and one
+/// selected lane; draft+deep replacement is retained behind
+/// `BLUEY_PARALLEL_DRAFTS=1` for latency experiments so normal users see one
+/// stable answer card.
 pub struct SpeculativeRouter {
     policy: Arc<dyn RoutingPolicy>,
     provider: Arc<dyn SpeculativeProvider>,

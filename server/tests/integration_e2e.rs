@@ -123,7 +123,7 @@ fn sample_usage(request_id: &str, bluey_cost_cents: i64) -> UsageEvent {
         task_type: None,
         lane: Some("instant".to_string()),
         provider: Some("openai".to_string()),
-        model: Some("gpt-4o-mini".to_string()),
+        model: Some("gpt-5.4-mini".to_string()),
         input_tokens: 10,
         output_tokens: 5,
         latency_ms: 20,
@@ -446,6 +446,175 @@ async fn router_complete_idempotency_replay_returns_cached() {
 
 #[tokio::test]
 #[serial]
+async fn router_complete_stream_proxies_openai_deltas_then_billing() {
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "stream-openai@example.com", "longenoughpw").await;
+
+    let stream = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"stream\"}}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":4}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(stream),
+        )
+        .expect(1)
+        .mount(&h.openai)
+        .await;
+
+    let req = Request::post("/router/complete/stream")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "request_id": "stream-openai-1",
+                "system": "you are helpful",
+                "user": "answer quickly",
+                "lane": "instant"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = axum::body::to_bytes(resp.into_body(), 128 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+
+    let first_delta = body.find("Hello ").expect("missing first upstream delta");
+    let second_delta = body.find("stream").expect("missing second upstream delta");
+    let billing = body.find("event: billing").expect("missing billing event");
+    assert!(first_delta < billing, "delta must arrive before billing");
+    assert!(second_delta < billing, "delta must arrive before billing");
+    assert!(body.contains("\"text\":\"Hello stream\""));
+    assert!(body.contains("\"provider\":\"openai\""));
+    assert!(body.contains("\"model\":\"gpt-5.4-mini\""));
+    assert!(body.contains("\"input_tokens\":12"));
+    assert!(body.contains("\"output_tokens\":4"));
+    assert!(body.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+#[serial]
+async fn router_complete_stream_idempotency_replays_cached_stream_without_upstream() {
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "stream-idem@example.com", "longenoughpw").await;
+
+    let stream = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Cached \"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\"stream\"}}]}\n\n",
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":3}}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(stream),
+        )
+        .expect(1)
+        .mount(&h.openai)
+        .await;
+
+    for _ in 0..2 {
+        let req = Request::post("/router/complete/stream")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {access}"))
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "request_id": "stream-idem-1",
+                    "system": "you are helpful",
+                    "user": "answer quickly",
+                    "lane": "instant"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let resp = h.router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        let body = axum::body::to_bytes(resp.into_body(), 128 * 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Cached "));
+        assert!(body.contains("stream"));
+        assert!(body.contains("event: billing"));
+        assert!(body.contains("\"text\":\"Cached stream\""));
+        assert!(body.contains("data: [DONE]"));
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn router_complete_stream_proxies_anthropic_messages_sse() {
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "stream-anthropic@example.com", "longenoughpw").await;
+
+    let stream = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":20,\"output_tokens\":0}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Deep \"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"answer\"}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":6}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(stream),
+        )
+        .expect(1)
+        .mount(&h.anthropic)
+        .await;
+
+    let req = Request::post("/router/complete/stream")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "request_id": "stream-anthropic-1",
+                "system": "you are helpful",
+                "user": "answer a normal technical question",
+                "lane": "balanced"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = axum::body::to_bytes(resp.into_body(), 128 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+
+    let first_delta = body.find("Deep ").expect("missing first upstream delta");
+    let second_delta = body.find("answer").expect("missing second upstream delta");
+    let billing = body.find("event: billing").expect("missing billing event");
+    assert!(first_delta < billing, "delta must arrive before billing");
+    assert!(second_delta < billing, "delta must arrive before billing");
+    assert!(body.contains("\"text\":\"Deep answer\""));
+    assert!(body.contains("\"provider\":\"anthropic\""));
+    assert!(body.contains("\"model\":\"claude-sonnet-4-6\""));
+    assert!(body.contains("\"input_tokens\":20"));
+    assert!(body.contains("\"output_tokens\":6"));
+    assert!(body.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+#[serial]
 async fn router_complete_falls_back_when_preferred_provider_429s() {
     let h = boot_harness().await;
     let access = signup_and_login(&h, "fallback@example.com", "longenoughpw").await;
@@ -488,7 +657,7 @@ async fn router_complete_falls_back_when_preferred_provider_429s() {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["text"], "fallback answer");
     assert_eq!(v["provider"], "openai");
-    assert_eq!(v["model"], "gpt-4o-mini");
+    assert_eq!(v["model"], "gpt-5.4");
 }
 
 #[tokio::test]
@@ -502,7 +671,7 @@ async fn router_complete_retries_next_openai_key_on_429_without_customer_wait() 
     };
     let request_id = "openai-keypool-429-1";
     let ordered_keys =
-        upstream.key_candidates("openai", &format!("llm:{request_id}:openai:gpt-4o-mini"));
+        upstream.key_candidates("openai", &format!("llm:{request_id}:openai:gpt-5.4-mini"));
     assert_eq!(ordered_keys.len(), 2);
 
     let h = boot_harness_with_upstream(upstream).await;
@@ -558,7 +727,7 @@ async fn router_complete_retries_next_openai_key_on_429_without_customer_wait() 
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["text"], "second key answered");
     assert_eq!(v["provider"], "openai");
-    assert_eq!(v["model"], "gpt-4o-mini");
+    assert_eq!(v["model"], "gpt-5.4-mini");
 }
 
 #[tokio::test]
@@ -866,7 +1035,7 @@ async fn sync_batch_session_bundle_and_rag_roundtrip() {
             "text": "Use bounded queues, retries, and admission control.",
             "ts_ms": 1600,
             "provider": "bluey-managed-instant",
-            "model": "gpt-4o-mini",
+            "model": "gpt-5.4-mini",
             "cost_label": "$0.01 · balance $29.99"
         }],
         "context_artifacts": [{

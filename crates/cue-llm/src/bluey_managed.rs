@@ -135,16 +135,20 @@ impl LlmProvider for BlueyManagedProvider {
         let mut bytes = response.bytes_stream();
         let stream = async_stream::try_stream! {
             let mut buffer = String::new();
+            let mut pending_utf8 = Vec::new();
             while let Some(chunk) = bytes.next().await {
                 let chunk = chunk.map_err(|e| LlmError::Network(e.to_string()))?;
-                let part = std::str::from_utf8(&chunk)
-                    .map_err(|e| LlmError::Provider(format!("invalid managed SSE utf8: {e}")))?;
-                buffer.push_str(part);
-                for parsed in parse_managed_sse_chunks(&mut buffer) {
+                append_utf8_chunk(&chunk, &mut pending_utf8, &mut buffer)?;
+                for parsed in parse_managed_stream_chunks(&mut buffer) {
                     yield parsed?;
                 }
             }
-            for parsed in drain_managed_sse_tail(&mut buffer) {
+            if !pending_utf8.is_empty() {
+                let tail = std::str::from_utf8(&pending_utf8)
+                    .map_err(|e| LlmError::Provider(format!("incomplete managed stream utf8: {e}")))?;
+                buffer.push_str(tail);
+            }
+            for parsed in drain_managed_stream_tail(&mut buffer) {
                 yield parsed?;
             }
         };
@@ -152,21 +156,72 @@ impl LlmProvider for BlueyManagedProvider {
     }
 }
 
-fn parse_managed_sse_chunks(buffer: &mut String) -> Vec<Result<LlmChunk, LlmError>> {
+fn append_utf8_chunk(
+    bytes: &[u8],
+    pending_utf8: &mut Vec<u8>,
+    buffer: &mut String,
+) -> Result<(), LlmError> {
+    pending_utf8.extend_from_slice(bytes);
+    loop {
+        match std::str::from_utf8(pending_utf8) {
+            Ok(valid) => {
+                buffer.push_str(valid);
+                pending_utf8.clear();
+                return Ok(());
+            }
+            Err(err) => {
+                let valid_up_to = err.valid_up_to();
+                if valid_up_to > 0 {
+                    let valid = std::str::from_utf8(&pending_utf8[..valid_up_to])
+                        .expect("valid_up_to always marks utf8");
+                    buffer.push_str(valid);
+                    pending_utf8.drain(..valid_up_to);
+                    continue;
+                }
+                if err.error_len().is_some() {
+                    return Err(LlmError::Provider(format!(
+                        "invalid managed stream utf8: {err}"
+                    )));
+                }
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn parse_managed_stream_chunks(buffer: &mut String) -> Vec<Result<LlmChunk, LlmError>> {
     let mut chunks = Vec::new();
-    while let Some(frame) = take_sse_frame(buffer) {
-        parse_managed_sse_frame(&frame, &mut chunks);
+    loop {
+        if let Some(frame) = take_sse_frame(buffer) {
+            parse_managed_sse_frame(&frame, &mut chunks);
+            continue;
+        }
+        if let Some(record) = take_ndjson_record(buffer) {
+            parse_managed_ndjson_record(&record, &mut chunks);
+            continue;
+        }
+        break;
     }
     chunks
 }
 
-fn drain_managed_sse_tail(buffer: &mut String) -> Vec<Result<LlmChunk, LlmError>> {
+#[cfg(test)]
+fn parse_managed_sse_chunks(buffer: &mut String) -> Vec<Result<LlmChunk, LlmError>> {
+    parse_managed_stream_chunks(buffer)
+}
+
+fn drain_managed_stream_tail(buffer: &mut String) -> Vec<Result<LlmChunk, LlmError>> {
     let tail = std::mem::take(buffer);
     if tail.trim().is_empty() {
         return Vec::new();
     }
     let mut chunks = Vec::new();
-    parse_managed_sse_frame(&tail, &mut chunks);
+    let tail = tail.trim();
+    if looks_like_json_record(tail) || tail == "[DONE]" {
+        parse_managed_ndjson_record(tail, &mut chunks);
+    } else {
+        parse_managed_sse_frame(tail, &mut chunks);
+    }
     chunks
 }
 
@@ -190,6 +245,22 @@ fn take_sse_frame(buffer: &mut String) -> Option<String> {
     Some(frame)
 }
 
+fn take_ndjson_record(buffer: &mut String) -> Option<String> {
+    let (start, first) = buffer.char_indices().find(|(_, c)| !c.is_whitespace())?;
+    if !matches!(first, '{' | '[') {
+        return None;
+    }
+    let line_end = buffer[start..].find('\n')?;
+    let end = start + line_end;
+    let record = buffer[start..end].trim_end_matches('\r').to_string();
+    *buffer = buffer[end + 1..].to_string();
+    Some(record)
+}
+
+fn looks_like_json_record(value: &str) -> bool {
+    matches!(value.chars().next(), Some('{') | Some('['))
+}
+
 fn parse_managed_sse_frame(frame: &str, chunks: &mut Vec<Result<LlmChunk, LlmError>>) {
     let mut event = "message";
     let mut data_lines = Vec::new();
@@ -205,57 +276,315 @@ fn parse_managed_sse_frame(frame: &str, chunks: &mut Vec<Result<LlmChunk, LlmErr
         return;
     }
     let data = data_lines.join("\n");
+    parse_managed_payload(event, &data, chunks);
+}
+
+fn parse_managed_ndjson_record(record: &str, chunks: &mut Vec<Result<LlmChunk, LlmError>>) {
+    parse_managed_payload("message", record, chunks);
+}
+
+fn parse_managed_payload(event: &str, data: &str, chunks: &mut Vec<Result<LlmChunk, LlmError>>) {
+    let data = data.trim();
+    if data.is_empty() {
+        return;
+    }
     if data == "[DONE]" {
-        chunks.push(Ok(LlmChunk {
-            text: String::new(),
-            finished: true,
-            cost: None,
-            cost_label: None,
-            artifact: None,
-        }));
+        chunks.push(Ok(done_chunk()));
         return;
     }
-    if event == "billing" {
-        match serde_json::from_str::<CloudCompleteResponse>(&data) {
-            Ok(resp) => {
-                let artifact = artifact_from_response(&resp);
-                let cost_label = resp.cost_label.clone();
-                chunks.push(Ok(LlmChunk {
-                    text: String::new(),
-                    finished: true,
-                    cost: Some(cost_from_response(&resp)),
-                    cost_label,
-                    artifact,
-                }));
-            }
-            Err(e) => chunks.push(Err(LlmError::Provider(format!(
-                "managed billing SSE parse error: {e}"
-            )))),
-        }
-        return;
-    }
-    match serde_json::from_str::<serde_json::Value>(&data) {
-        Ok(parsed) => {
-            if let Some(delta) = parsed
-                .get("choices")
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("delta"))
-                .and_then(|d| d.get("content"))
-                .and_then(|c| c.as_str())
-            {
-                chunks.push(Ok(LlmChunk {
-                    text: delta.to_string(),
-                    finished: false,
-                    cost: None,
-                    cost_label: None,
-                    artifact: None,
-                }));
-            }
+    match serde_json::from_str::<serde_json::Value>(data) {
+        Ok(parsed) => parse_managed_json_event(event, &parsed, chunks),
+        Err(_) if is_plain_text_event(event) => {
+            chunks.push(Ok(text_chunk(data.to_string(), false)));
         }
         Err(e) => chunks.push(Err(LlmError::Provider(format!(
-            "managed SSE parse error: {e}"
+            "managed stream parse error: {e}"
         )))),
     }
+}
+
+fn parse_managed_json_event(
+    event: &str,
+    parsed: &serde_json::Value,
+    chunks: &mut Vec<Result<LlmChunk, LlmError>>,
+) {
+    if is_error_event(event, parsed) {
+        chunks.push(Err(LlmError::Provider(error_message_from_value(parsed))));
+        return;
+    }
+
+    let finalish = is_final_event(event, parsed);
+    if finalish {
+        chunks.push(Ok(final_chunk_from_value(event, parsed)));
+        return;
+    }
+
+    if let Some(delta) = extract_delta_text(parsed) {
+        chunks.push(Ok(text_chunk(delta, false)));
+        return;
+    }
+
+    if json_bool(parsed, &["finished", "done", "final"]) {
+        chunks.push(Ok(done_chunk()));
+    }
+}
+
+fn is_plain_text_event(event: &str) -> bool {
+    matches!(
+        event.trim().to_ascii_lowercase().as_str(),
+        "chunk" | "delta" | "text"
+    )
+}
+
+fn is_error_event(event: &str, value: &serde_json::Value) -> bool {
+    event.eq_ignore_ascii_case("error")
+        || stream_kind(value).as_deref() == Some("error")
+        || value.get("error").is_some()
+}
+
+fn is_final_event(event: &str, value: &serde_json::Value) -> bool {
+    let event = event.trim().to_ascii_lowercase();
+    matches!(
+        event.as_str(),
+        "billing" | "complete" | "completion" | "done" | "final" | "metadata"
+    ) || matches!(
+        stream_kind(value).as_deref(),
+        Some("billing" | "complete" | "completion" | "done" | "final" | "metadata")
+    ) || json_bool(value, &["finished", "done", "final"])
+        || looks_like_final_metadata(value)
+}
+
+fn stream_kind(value: &serde_json::Value) -> Option<String> {
+    for key in ["type", "event", "kind"] {
+        if let Some(kind) = value.get(key).and_then(|v| v.as_str()) {
+            return Some(kind.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+fn looks_like_final_metadata(value: &serde_json::Value) -> bool {
+    let has_billing_or_artifact = has_any_metadata_key(
+        value,
+        &[
+            "cost_cents",
+            "balance_cents_after",
+            "trial_seconds_remaining",
+            "cost_label",
+            "artifact_type",
+            "artifact_body",
+        ],
+    );
+    let has_provider_usage =
+        cost_metadata_from_value(value).is_some() && has_any_usage_metadata(value);
+    has_billing_or_artifact || has_provider_usage
+}
+
+fn final_chunk_from_value(event: &str, value: &serde_json::Value) -> LlmChunk {
+    if let Ok(resp) = serde_json::from_value::<CloudCompleteResponse>(value.clone()) {
+        let cost_label = resp.cost_label.clone();
+        return LlmChunk {
+            text: String::new(),
+            finished: true,
+            cost: Some(cost_from_response(&resp)),
+            cost_label,
+            artifact: artifact_from_response(&resp),
+        };
+    }
+
+    let metadata_only = event.eq_ignore_ascii_case("billing")
+        || event.eq_ignore_ascii_case("metadata")
+        || looks_like_final_metadata(value);
+    LlmChunk {
+        text: if metadata_only {
+            String::new()
+        } else {
+            extract_delta_text(value).unwrap_or_default()
+        },
+        finished: true,
+        cost: cost_metadata_from_value(value),
+        cost_label: find_string_in_sources(value, &["cost_label", "label"]),
+        artifact: artifact_from_value(value),
+    }
+}
+
+fn done_chunk() -> LlmChunk {
+    LlmChunk {
+        text: String::new(),
+        finished: true,
+        cost: None,
+        cost_label: None,
+        artifact: None,
+    }
+}
+
+fn text_chunk(text: String, finished: bool) -> LlmChunk {
+    LlmChunk {
+        text,
+        finished,
+        cost: None,
+        cost_label: None,
+        artifact: None,
+    }
+}
+
+fn extract_delta_text(value: &serde_json::Value) -> Option<String> {
+    value
+        .pointer("/choices/0/delta/content")
+        .and_then(|v| v.as_str())
+        .or_else(|| value.pointer("/delta/text").and_then(|v| v.as_str()))
+        .or_else(|| value.get("delta").and_then(|v| v.as_str()))
+        .or_else(|| value.get("text").and_then(|v| v.as_str()))
+        .or_else(|| value.get("content").and_then(|v| v.as_str()))
+        .or_else(|| value.get("chunk").and_then(|v| v.as_str()))
+        .map(ToOwned::to_owned)
+}
+
+fn cost_metadata_from_value(value: &serde_json::Value) -> Option<LlmCostMetadata> {
+    let provider = find_string_in_sources(value, &["provider"])?;
+    let model = find_string_in_sources(value, &["model"])?;
+    Some(LlmCostMetadata {
+        provider,
+        model,
+        input_tokens: find_i64_in_sources(value, &["input_tokens", "prompt_tokens"]).unwrap_or(0),
+        output_tokens: find_i64_in_sources(value, &["output_tokens", "completion_tokens"])
+            .unwrap_or(0),
+        cost_cents: find_i64_in_sources(value, &["cost_cents"]).unwrap_or(0),
+        balance_cents_after: find_i64_in_sources(value, &["balance_cents_after"]),
+        trial_seconds_remaining: find_i64_in_sources(value, &["trial_seconds_remaining"]),
+    })
+}
+
+fn artifact_from_value(value: &serde_json::Value) -> Option<LlmArtifactMetadata> {
+    if let (Some(artifact_type), Some(body)) = (
+        find_string_in_sources(value, &["artifact_type"]),
+        find_string_in_sources(value, &["artifact_body"]),
+    ) {
+        return Some(LlmArtifactMetadata {
+            artifact_type,
+            body,
+            confidence: find_f32_in_sources(value, &["confidence", "artifact_confidence"]),
+        });
+    }
+
+    for source in metadata_sources(value) {
+        if let Some(artifact) = source.get("artifact") {
+            let Some(artifact_type) = artifact.get("type").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(body) = artifact
+                .get("body")
+                .or_else(|| artifact.get("content"))
+                .and_then(|v| v.as_str())
+            else {
+                continue;
+            };
+            return Some(LlmArtifactMetadata {
+                artifact_type: artifact_type.to_string(),
+                body: body.to_string(),
+                confidence: artifact
+                    .get("confidence")
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32),
+            });
+        }
+    }
+    None
+}
+
+fn find_string_in_sources(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    for source in metadata_sources(value) {
+        for key in keys {
+            if let Some(found) = source.get(*key).and_then(|v| v.as_str()) {
+                return Some(found.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn find_i64_in_sources(value: &serde_json::Value, keys: &[&str]) -> Option<i64> {
+    for source in metadata_sources(value) {
+        for key in keys {
+            if let Some(found) = source.get(*key).and_then(|v| v.as_i64()) {
+                return Some(found);
+            }
+        }
+        if let Some(usage) = source.get("usage") {
+            for key in keys {
+                if let Some(found) = usage.get(*key).and_then(|v| v.as_i64()) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_f32_in_sources(value: &serde_json::Value, keys: &[&str]) -> Option<f32> {
+    for source in metadata_sources(value) {
+        for key in keys {
+            if let Some(found) = source.get(*key).and_then(|v| v.as_f64()) {
+                return Some(found as f32);
+            }
+        }
+    }
+    None
+}
+
+fn has_any_metadata_key(value: &serde_json::Value, keys: &[&str]) -> bool {
+    metadata_sources(value)
+        .into_iter()
+        .any(|source| keys.iter().any(|key| source.get(*key).is_some()))
+}
+
+fn has_any_usage_metadata(value: &serde_json::Value) -> bool {
+    metadata_sources(value).into_iter().any(|source| {
+        source.get("usage").is_some()
+            || [
+                "input_tokens",
+                "output_tokens",
+                "prompt_tokens",
+                "completion_tokens",
+            ]
+            .iter()
+            .any(|key| source.get(*key).is_some())
+    })
+}
+
+fn metadata_sources(value: &serde_json::Value) -> Vec<&serde_json::Value> {
+    let mut sources = vec![value];
+    for key in ["metadata", "billing", "final", "response", "result"] {
+        if let Some(source) = value.get(key) {
+            sources.push(source);
+        }
+    }
+    sources
+}
+
+fn json_bool(value: &serde_json::Value, keys: &[&str]) -> bool {
+    keys.iter()
+        .any(|key| value.get(*key).and_then(|v| v.as_bool()) == Some(true))
+}
+
+fn error_message_from_value(value: &serde_json::Value) -> String {
+    value
+        .get("error")
+        .and_then(|error| {
+            error.as_str().map(ToOwned::to_owned).or_else(|| {
+                error
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned)
+            })
+        })
+        .or_else(|| {
+            value
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| value.to_string())
 }
 
 fn cost_from_response(resp: &CloudCompleteResponse) -> LlmCostMetadata {
@@ -308,6 +637,12 @@ fn map_err(e: CloudError) -> LlmError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::LlmProvider;
+    use cue_cloud_client::{client::ClientConfig, tokens::MemoryStore, CloudClient, Tokens};
+    use futures_util::StreamExt;
+    use std::{sync::Arc, time::Duration};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn parses_managed_sse_deltas_and_billing_metadata() {
@@ -356,5 +691,126 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].text, "ok");
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn parses_ndjson_deltas_and_final_metadata() {
+        let mut buffer = concat!(
+            "{\"type\":\"chunk\",\"text\":\"Hello \"}\n",
+            "{\"delta\":{\"text\":\"world\"}}\n",
+            "{\"type\":\"final\",\"metadata\":{\"provider\":\"anthropic\",\"model\":\"claude-3-5-haiku\",\"usage\":{\"input_tokens\":4,\"output_tokens\":2},\"cost_cents\":1,\"balance_cents_after\":1999,\"trial_seconds_remaining\":0,\"cost_label\":\"$0.01\"},\"artifact\":{\"type\":\"markdown\",\"body\":\"# Done\",\"confidence\":0.8}}\n",
+        )
+        .to_string();
+
+        let chunks = parse_managed_stream_chunks(&mut buffer)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].text, "Hello ");
+        assert_eq!(chunks[1].text, "world");
+        assert!(chunks[2].finished);
+        assert_eq!(chunks[2].text, "");
+        let cost = chunks[2].cost.as_ref().unwrap();
+        assert_eq!(cost.provider, "anthropic");
+        assert_eq!(cost.model, "claude-3-5-haiku");
+        assert_eq!(cost.input_tokens, 4);
+        assert_eq!(cost.output_tokens, 2);
+        assert_eq!(cost.cost_cents, 1);
+        assert_eq!(cost.balance_cents_after, Some(1999));
+        assert_eq!(chunks[2].cost_label.as_deref(), Some("$0.01"));
+        let artifact = chunks[2].artifact.as_ref().unwrap();
+        assert_eq!(artifact.artifact_type, "markdown");
+        assert_eq!(artifact.body, "# Done");
+        assert_eq!(artifact.confidence, Some(0.8));
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn buffers_split_utf8_boundaries() {
+        let mut pending = Vec::new();
+        let mut buffer = String::new();
+        let bytes = "data: {\"text\":\"hi 👋\"}\n\n".as_bytes();
+        let split_at = bytes
+            .iter()
+            .position(|byte| *byte == 0xF0)
+            .expect("emoji first byte")
+            + 1;
+
+        append_utf8_chunk(&bytes[..split_at], &mut pending, &mut buffer).unwrap();
+        assert!(buffer.ends_with("hi "));
+        assert!(!pending.is_empty());
+        append_utf8_chunk(&bytes[split_at..], &mut pending, &mut buffer).unwrap();
+
+        let chunks = parse_managed_stream_chunks(&mut buffer)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(chunks[0].text, "hi 👋");
+    }
+
+    #[tokio::test]
+    async fn complete_stream_posts_to_managed_endpoint_and_parses_ndjson() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/router/complete/stream"))
+            .and(header("authorization", "Bearer access"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/x-ndjson")
+                    .set_body_string(concat!(
+                        "{\"type\":\"chunk\",\"text\":\"Hi \"}\n",
+                        "{\"type\":\"chunk\",\"text\":\"there\"}\n",
+                        "{\"type\":\"final\",\"metadata\":{\"provider\":\"openai\",\"model\":\"gpt-4o-mini\",\"input_tokens\":3,\"output_tokens\":2,\"cost_cents\":1,\"balance_cents_after\":499,\"trial_seconds_remaining\":0,\"cost_label\":\"$0.01\"}}\n",
+                    )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = CloudClient::new(
+            ClientConfig {
+                base_url: server.uri(),
+                user_agent: "test".into(),
+                timeout: Duration::from_secs(10),
+                trace_id: None,
+            },
+            Arc::new(MemoryStore::new()),
+        )
+        .unwrap();
+        client
+            .save_tokens(Tokens {
+                access: "access".into(),
+                refresh: "refresh".into(),
+                email: "e@example.com".into(),
+            })
+            .unwrap();
+        let provider = BlueyManagedProvider::new(client, ManagedLane::Instant);
+        let mut stream = provider
+            .complete_stream(&LlmRequest {
+                system: "system".into(),
+                user: "user".into(),
+                session_id: Some("sess-1".into()),
+                max_tokens: Some(10),
+                temperature: Some(0.2),
+                reasoning_effort: None,
+                thinking_budget_tokens: None,
+                request_id: Some("req-1".into()),
+                image_data_urls: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            chunks.push(chunk.unwrap());
+        }
+
+        assert_eq!(chunks[0].text, "Hi ");
+        assert_eq!(chunks[1].text, "there");
+        assert!(chunks[2].finished);
+        assert_eq!(chunks[2].cost.as_ref().unwrap().cost_cents, 1);
+        assert_eq!(chunks[2].cost_label.as_deref(), Some("$0.01"));
     }
 }

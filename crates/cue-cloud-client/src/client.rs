@@ -673,6 +673,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auth_post_stream_refreshes_on_401_before_returning_stream() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/router/complete/stream"))
+            .and(header("authorization", "Bearer old-access"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/auth/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "expires_in": 3600,
+                "account": {
+                    "id": "acct-1",
+                    "email": "e@example.com",
+                    "balance_cents": 100,
+                    "trial_seconds_remaining": 0
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/router/complete/stream"))
+            .and(header("authorization", "Bearer new-access"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/x-ndjson")
+                    .set_body_string("{\"type\":\"chunk\",\"text\":\"ok\"}\n"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = client_for(server.uri());
+        client
+            .save_tokens(Tokens {
+                access: "old-access".into(),
+                refresh: "old-refresh".into(),
+                email: "e@example.com".into(),
+            })
+            .unwrap();
+
+        let response = client
+            .auth_post_stream(
+                "/router/complete/stream",
+                &serde_json::json!({ "ok": true }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.text().await.unwrap(),
+            "{\"type\":\"chunk\",\"text\":\"ok\"}\n"
+        );
+        let refreshed = client.current_tokens().unwrap();
+        assert_eq!(refreshed.access, "new-access");
+        assert_eq!(refreshed.refresh, "new-refresh");
+    }
+
+    #[tokio::test]
     async fn auth_requests_send_trace_and_request_headers() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))

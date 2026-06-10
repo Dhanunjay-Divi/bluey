@@ -1,6 +1,6 @@
 # Bluey Model Routing
 
-Last updated: 2026-05-29
+Last updated: 2026-06-10
 
 This document is the source-of-truth snapshot for the model/provider routing
 currently implemented in the Bluey codebase. It is intentionally operational:
@@ -15,10 +15,10 @@ actual upstream models.
 
 | Bluey lane | Provider | Model | Primary use |
 | --- | --- | --- | --- |
-| `instant` | OpenAI | `gpt-4o-mini` | Easy questions, quick answers, optional cheap draft |
-| `balanced` | Anthropic | `claude-3-5-sonnet-latest` | Default technical/general answer |
-| `deep` | Anthropic | `claude-3-7-sonnet-latest` | Hard coding, system design, long reasoning |
-| `vision` | OpenAI | `gpt-4o` | Analyse Screen, screenshots, image context |
+| `instant` | OpenAI | `gpt-5.4-mini` | Easy questions, quick answers, optional cheap draft |
+| `balanced` | Anthropic | `claude-sonnet-4-6` | Default technical/general answer |
+| `deep` | Anthropic | `claude-sonnet-4-6` | Hard coding, system design, long reasoning with a larger thinking/output budget |
+| `vision` | OpenAI | `gpt-5.4` | Analyse Screen, screenshots, image context |
 
 ## Thinking Budget Policy
 
@@ -58,13 +58,16 @@ Request overrides use the same concepts:
 
 Provider mapping today:
 
-- Anthropic `claude-3-7-sonnet-latest` maps to `thinking:
+- Anthropic `claude-sonnet-4-6` maps to `thinking:
   {"type":"enabled","budget_tokens":...}` and reserves enough
-  `max_tokens` for both thinking and visible answer text.
+  `max_tokens` for both thinking and visible answer text. The Haiku fallback
+  also supports the same manual thinking payload when a caller explicitly asks
+  for thinking on that route.
 - OpenAI managed routes still use Chat Completions in this codebase, so
-  `reasoning_effort` is accepted but not sent upstream yet. Switching OpenAI
-  managed routes to the Responses API is the right future hook for explicit
-  OpenAI reasoning controls.
+  `reasoning_effort` is accepted but not sent upstream yet. The GPT-5.4 models
+  in the route table are Chat Completions compatible; switching OpenAI managed
+  routes to the Responses API is the right future hook for explicit OpenAI
+  reasoning controls.
 - Gemini thinking controls are not wired today because Gemini is not in the
   managed route table yet.
 
@@ -77,10 +80,14 @@ temporarily busy, Bluey tries the next candidate before returning an error.
 
 | Lane | Candidate order |
 | --- | --- |
-| `instant` | OpenAI `gpt-4o-mini` -> Anthropic `claude-3-5-sonnet-latest` |
-| `balanced` | Anthropic `claude-3-5-sonnet-latest` -> OpenAI `gpt-4o-mini` |
-| `deep` | Anthropic `claude-3-7-sonnet-latest` -> OpenAI `gpt-4o` -> Anthropic `claude-3-5-sonnet-latest` |
-| `vision` | OpenAI `gpt-4o` |
+| `instant` | OpenAI `gpt-5.4-mini` -> Anthropic `claude-haiku-4-5-20251001` |
+| `balanced` | Anthropic `claude-sonnet-4-6` -> OpenAI `gpt-5.4` |
+| `deep` | Anthropic `claude-sonnet-4-6` -> OpenAI `gpt-5.4` -> Anthropic `claude-haiku-4-5-20251001` |
+| `vision` | OpenAI `gpt-5.4` -> OpenAI `gpt-5.4-mini` |
+
+Every managed LLM candidate above has a matching entry in
+`server/src/pricing/mod.rs`; the dispatcher unit tests assert this so an
+unpriced model cannot silently become a paid route.
 
 Code references:
 
@@ -182,15 +189,23 @@ fallback. The managed server intentionally returns no route candidates for the
 ## Speculative Routing
 
 Bluey Auto classifies a task, picks a lane, and streams through the selected
-provider. Parallel cheap-draft plus deep-final replacement is available but
-currently opt-in through:
+provider. The normal product path is one stable answer card backed by true
+server-side provider streaming:
+
+```text
+desktop -> bluey-server -> OpenAI / Anthropic upstream stream -> overlay
+```
+
+Parallel cheap-draft plus deep-final replacement is implemented but remains
+opt-in through:
 
 ```bash
 BLUEY_PARALLEL_DRAFTS=1
 ```
 
-This keeps the default UX simple: one visible answer card that may stream and
-be updated in place, not random appended drafts.
+This keeps the default UX simple: one visible answer card that streams from the
+selected lane. When the draft+deep experiment is enabled, the final Deep answer
+replaces/refines the same card rather than appending a second random answer.
 
 To disable the auto router path for debugging:
 
@@ -258,10 +273,10 @@ should keep multiple providers and route by task:
 
 | Need | Best current strategy | Pros | Cons |
 | --- | --- | --- | --- |
-| Fast easy answer | OpenAI fast mini lane | Lowest latency, good first-token speed | Not ideal for deep reasoning |
-| Human-like technical answer | Anthropic Sonnet lane | Strong prose and reasoning style | Higher latency/cost than mini models |
-| Deep coding/system design | Anthropic deep lane with thinking budget | Better multi-step structure, safer tradeoff analysis | More output/thinking tokens, costlier |
-| Screen/image analysis | OpenAI vision lane today; evaluate Gemini vision later | Simple current integration | Gemini may be cheaper/better for some image workloads but is not wired |
+| Fast easy answer | OpenAI `gpt-5.4-mini` instant lane | Low latency with much stronger 2026-era baseline quality than the old 4o-mini route | Not ideal for deep reasoning |
+| Human-like technical answer | Anthropic `claude-sonnet-4-6` balanced lane | Strong prose, coding, and reasoning style | Higher latency/cost than fast mini models |
+| Deep coding/system design | Anthropic Sonnet lane with thinking budget, OpenAI `gpt-5.4` fallback | Better multi-step structure and safer tradeoff analysis | More output/thinking tokens, costlier |
+| Screen/image analysis | OpenAI `gpt-5.4` vision lane today; evaluate Gemini vision later | Strong current integration with text+image input through Chat Completions | Gemini may be cheaper/better for some image workloads but is not wired |
 | Offline fallback | Local Whisper/Ollama hidden fallback | Helps demos and outage resilience | Not reliable enough as primary paid experience |
 
 Decision: **have all providers behind the router, expose Auto/Balanced/Deep as
@@ -269,36 +284,49 @@ simple UX concepts, and keep provider/model swaps server-side**. That lets us
 move capacity, pricing, and quality without forcing customers to understand
 provider names.
 
-### 2026-05-29 provider stance
+Customer UI stays **Auto** because provider and model names are an operations
+control plane, not a customer workflow. The router can change candidate order,
+shift traffic away from a throttled model, and update pricing/health policy
+without making customers choose between vendor brands or learn which model
+currently handles screenshots, quick questions, or hard reasoning. The product
+can still expose simple intent controls like Auto, Balanced, and Deep; the
+provider menu should stay server-owned.
+
+### 2026-06-10 provider stance
 
 Do not hardcode the marketing site or overlay to one provider family. The
 server route table is the product control plane:
 
-- **Keep OpenAI** for fast mini answers, embeddings, current vision, and OpenAI
-  STT fallback.
+- **Keep OpenAI** for fast mini answers, accurate current vision, embeddings,
+  and OpenAI STT fallback. The current managed OpenAI path is Chat
+  Completions, so use Chat-compatible GPT-5.4 family models until the server
+  has a Responses API path for explicit reasoning controls.
 - **Keep Anthropic** for human-like technical/system-design answers and long
-  structured reasoning.
-- **Add Gemini only as a measured server-side candidate** after managed smoke:
-  likely first for vision and cheap/fast multimodal fallback, not as a visible
-  customer dropdown item.
+  structured reasoning. `claude-sonnet-4-6` is the conservative default because
+  it preserves the Messages API shape and supports manual extended thinking in
+  the current dispatcher.
+- **Add Gemini only as a measured server-side candidate** after managed smoke
+  and a real Gemini dispatcher exists: likely first for vision and cheap/fast
+  multimodal fallback, not as a visible customer dropdown item.
 - **Keep Deepgram primary for live STT** and OpenAI Realtime/chunked
   transcription as cloud fallback. LocalWhisper stays hidden/offline/dev.
 - **Do not expose Local** in paid UI. If cloud is unavailable, local fallback can
   produce a degraded answer, but billing should reconcile once online only if
   the cloud path actually ran.
 
-Why we are not switching every model name in code immediately:
+Why this is still conservative:
 
 - The server already supports provider/model failover, key pools, and health
   cooldowns. The remaining risk is product quality and cost, not just "newest
   model wins".
 - Route changes must move with the pricing table, cost-label copy, and load
   tests. Unknown model names are intentionally filtered out of priced routes.
-- OpenAI reasoning-era models are best wired through a Responses-style managed
-  path; the current managed OpenAI path still uses Chat Completions.
-- Claude newer-than-3.7 routes may need different thinking semantics than the
-  current manual `thinking` payload. Keep the current safe route until the API
-  request shape is verified by tests.
+- OpenAI reasoning-era controls are best wired through a Responses-style
+  managed path; the current managed OpenAI path still uses Chat Completions, so
+  the route table uses GPT-5.4 models that the current endpoint supports.
+- Anthropic Opus/Fable-class adaptive-thinking models may require request-shape
+  changes around effort and sampling parameters. Keep Sonnet 4.6 as the safe
+  Messages API route until those semantics are covered by dispatcher tests.
 
 Recommended next implementation after the managed smoke is an admin/server-owned
 route config table:
@@ -307,8 +335,8 @@ route config table:
 lane -> ordered candidates -> pricing key -> health bucket -> feature flags
 ```
 
-That lets us test "Gemini vision first", "Claude newest Sonnet for balanced",
-or "OpenAI newest reasoning model for deep" without rebuilding desktop
+That lets us test "Gemini vision first", "Claude Opus/Fable for deep", or
+"OpenAI newest reasoning model through Responses" without rebuilding desktop
 customers.
 
 Important scope note: the streaming STT factory covers the continuous

@@ -27,7 +27,7 @@ This is the master gate before public alpha. Every item must be ticked or explic
 
 ### Stage 25: managed streaming + cost metadata + cloud sync + STT auth (post-`9babb20`)
 
-- [x] Synthesized SSE on `/router/complete/stream` (true upstream streaming deferred to v0.2.x)
+- [x] True upstream streaming on `/router/complete/stream` (server proxies OpenAI / Anthropic streaming deltas before final billing metadata)
 - [x] Cost + artifact metadata threaded server → cue-llm → daemon → SQLite → overlay
 - [x] Native overlay UX: ChatGPT-style chat, side canvas, auto-routing artifact types, opacity capsule, hide/close split
 - [x] Server cloud-sync schema (migration 0012) + `/sync/batch`, `/sync/sessions`, `/rag/query`

@@ -2,13 +2,13 @@
 //!
 //! Source of truth lives here AND in `docs/PRICING-MODEL.md`. Any
 //! change to either must be reflected in both. Last reconciled
-//! 2026-05-19 against PRICING-MODEL.md.
+//! 2026-06-10 against PRICING-MODEL.md and MODEL-ROUTING.md.
 //!
 //! ## Unit semantics
 //!
 //! `upstream_in_microcents_per_1m` is the upstream provider's price
 //! in MICROCENTS per 1 million tokens. 1 cent = 10,000 microcents.
-//! So a list price of $3 per 1M tokens (Anthropic claude-3.5-sonnet)
+//! So a list price of $3 per 1M tokens (Anthropic Claude Sonnet)
 //! is 300 cents/1M = 3,000,000 microcents/1M.
 //!
 //! This integer-microcent representation lets us compute fractional
@@ -31,36 +31,36 @@ const MICROCENTS_PER_CENT: i64 = 10_000;
 
 pub const PRICING: &[ModelPricing] = &[
     ModelPricing {
-        // OpenAI gpt-4o-mini: $0.15/1M in, $0.60/1M out (list 2026-05).
+        // OpenAI gpt-5.4-mini: $0.75/1M in, $4.50/1M out (list 2026-06).
         provider: "openai",
-        model: "gpt-4o-mini",
-        upstream_in_microcents_per_1m: 150_000,
-        upstream_out_microcents_per_1m: 600_000,
+        model: "gpt-5.4-mini",
+        upstream_in_microcents_per_1m: 750_000,
+        upstream_out_microcents_per_1m: 4_500_000,
         markup_percent: 200,
     },
     ModelPricing {
-        // OpenAI gpt-4o (vision-capable): $2.50/1M in, $10/1M out.
+        // OpenAI gpt-5.4 (vision-capable): $2.50/1M in, $15/1M out.
         provider: "openai",
-        model: "gpt-4o",
+        model: "gpt-5.4",
         upstream_in_microcents_per_1m: 2_500_000,
-        upstream_out_microcents_per_1m: 10_000_000,
+        upstream_out_microcents_per_1m: 15_000_000,
         markup_percent: 150,
     },
     ModelPricing {
-        // Anthropic claude-3-5-sonnet: $3/1M in, $15/1M out.
+        // Anthropic Claude Sonnet 4.6: $3/1M in, $15/1M out.
         provider: "anthropic",
-        model: "claude-3-5-sonnet-latest",
+        model: "claude-sonnet-4-6",
         upstream_in_microcents_per_1m: 3_000_000,
         upstream_out_microcents_per_1m: 15_000_000,
         markup_percent: 200,
     },
     ModelPricing {
-        // Anthropic claude-3-7-sonnet: $3/1M in, $15/1M out.
+        // Anthropic Claude Haiku 4.5: $1/1M in, $5/1M out.
         provider: "anthropic",
-        model: "claude-3-7-sonnet-latest",
-        upstream_in_microcents_per_1m: 3_000_000,
-        upstream_out_microcents_per_1m: 15_000_000,
-        markup_percent: 150,
+        model: "claude-haiku-4-5-20251001",
+        upstream_in_microcents_per_1m: 1_000_000,
+        upstream_out_microcents_per_1m: 5_000_000,
+        markup_percent: 200,
     },
     ModelPricing {
         // Ollama (local fallback): no upstream cost, no markup.
@@ -149,19 +149,22 @@ mod tests {
 
     #[test]
     fn lookup_known_model() {
-        assert_eq!(lookup("openai", "gpt-4o-mini").unwrap().markup_percent, 200);
-        assert_eq!(lookup("openai", "gpt-4o").unwrap().markup_percent, 150);
         assert_eq!(
-            lookup("anthropic", "claude-3-5-sonnet-latest")
+            lookup("openai", "gpt-5.4-mini").unwrap().markup_percent,
+            200
+        );
+        assert_eq!(lookup("openai", "gpt-5.4").unwrap().markup_percent, 150);
+        assert_eq!(
+            lookup("anthropic", "claude-sonnet-4-6")
                 .unwrap()
                 .markup_percent,
             200
         );
         assert_eq!(
-            lookup("anthropic", "claude-3-7-sonnet-latest")
+            lookup("anthropic", "claude-haiku-4-5-20251001")
                 .unwrap()
                 .markup_percent,
-            150
+            200
         );
     }
 
@@ -172,14 +175,14 @@ mod tests {
 
     #[test]
     fn easy_question_under_one_cent() {
-        // 150 in / 100 out on gpt-4o-mini.
-        // raw: 150*150_000/1M + 100*600_000/1M = 22.5 + 60 = 82.5 microcents
-        // 200% markup: 247.5 microcents = 0.0248 cents → ceil 1 cent
-        let p = lookup("openai", "gpt-4o-mini").unwrap();
+        // 150 in / 100 out on gpt-5.4-mini.
+        // raw: 150*750_000/1M + 100*4_500_000/1M = 112.5 + 450 = 562.5 microcents
+        // 200% markup: 1687.5 microcents = 0.1688 cents → ceil 1 cent
+        let p = lookup("openai", "gpt-5.4-mini").unwrap();
         let (bluey, customer) = compute_cost(p, 150, 100);
-        assert_eq!(bluey, 1); // ceil 0.0083 cents → 1
-        assert_eq!(customer, 1); // ceil 0.0248 cents → 1
-                                 // Note: the 0.0003 cents headline number from PRICING-MODEL.md
+        assert_eq!(bluey, 1); // ceil 0.0563 cents → 1
+        assert_eq!(customer, 1); // ceil 0.1688 cents → 1
+                                 // Note: the fractional headline number from PRICING-MODEL.md
                                  // section 2 describes the *fractional* cost; the per-request
                                  // billing rounds up to 1 cent because that's the unit of currency.
                                  // For aggregation/reporting we use microcents internally.
@@ -187,11 +190,11 @@ mod tests {
 
     #[test]
     fn medium_code_q_charges_few_cents() {
-        // 800 in / 600 out on claude-3-5-sonnet
+        // 800 in / 600 out on claude-sonnet-4-6
         // raw: 800*3_000_000/1M + 600*15_000_000/1M = 2400 + 9000 = 11400 microcents
         // raw cents: 11400 / 10000 = 1.14 cents → ceil 2
         // 200% markup: 11400 * 3 / 1 = 34200 microcents = 3.42 cents → ceil 4
-        let p = lookup("anthropic", "claude-3-5-sonnet-latest").unwrap();
+        let p = lookup("anthropic", "claude-sonnet-4-6").unwrap();
         let (bluey, customer) = compute_cost(p, 800, 600);
         assert_eq!(bluey, 2);
         assert_eq!(customer, 4);
@@ -199,29 +202,29 @@ mod tests {
 
     #[test]
     fn deep_question_charges_tens_of_cents() {
-        // 1500 in / 1000 out on claude-3-7-sonnet
+        // 1500 in / 1000 out on claude-sonnet-4-6
         // raw: 1500*3M/1M + 1000*15M/1M = 4500 + 15000 = 19500 microcents = 1.95 cents → ceil 2
-        // 150% markup: 19500 * 2.5 = 48750 microcents = 4.875 cents → ceil 5
-        let p = lookup("anthropic", "claude-3-7-sonnet-latest").unwrap();
+        // 200% markup: 19500 * 3 = 58500 microcents = 5.85 cents → ceil 6
+        let p = lookup("anthropic", "claude-sonnet-4-6").unwrap();
         let (bluey, customer) = compute_cost(p, 1500, 1000);
         assert_eq!(bluey, 2);
-        assert_eq!(customer, 5);
+        assert_eq!(customer, 6);
     }
 
     #[test]
     fn ceiling_includes_safety_margin() {
         // Easy question: customer=1 cent. Ceiling = 1 + max(1/10, 1) = 1+1 = 2 cents.
-        let p = lookup("openai", "gpt-4o-mini").unwrap();
+        let p = lookup("openai", "gpt-5.4-mini").unwrap();
         assert_eq!(estimate_cost_ceiling(p, 150, 100), 2);
 
         // Medium question: customer=4 cents. Ceiling = 4 + max(4/10, 1) = 4+1 = 5 cents.
-        let p = lookup("anthropic", "claude-3-5-sonnet-latest").unwrap();
+        let p = lookup("anthropic", "claude-sonnet-4-6").unwrap();
         assert_eq!(estimate_cost_ceiling(p, 800, 600), 5);
     }
 
     #[test]
     fn bluey_ceiling_uses_upstream_cost_not_markup() {
-        let p = lookup("anthropic", "claude-3-5-sonnet-latest").unwrap();
+        let p = lookup("anthropic", "claude-sonnet-4-6").unwrap();
         assert_eq!(estimate_bluey_cost_ceiling(p, 800, 600), 3);
     }
 

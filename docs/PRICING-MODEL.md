@@ -7,7 +7,7 @@
 > per-decision sections. Cross-referenced from `DECISIONS.md`,
 > `docs/HOW-IT-WORKS.md`, `FUTURE-IMPLEMENTATIONS.md` R14.13.
 >
-> Last updated: 2026-05-19.
+> Last updated: 2026-06-10.
 
 ---
 
@@ -21,7 +21,7 @@
 | Markup floor | **150%** | user direction 2026-05-19 |
 | Markup tier — Easy/Medium | 200% | absolute cents are tiny; small markup absurd |
 | Markup tier — Deep speculative | 150% | absolute cost is more visible to customer |
-| Markup tier — Vision | 150% | gpt-4o vision pricing already high |
+| Markup tier — Vision | 150% | GPT-5.4 vision-capable route pricing already high |
 | Hard stop | balance < estimated cost → 402 | no debt, no surprise charges |
 | Mid-stream cut | running cost > balance → cut + Bluey eats overrun | customer never sees overrun deduction |
 | Free trial | 10 minutes of active session time | mirrors Pinky |
@@ -43,34 +43,32 @@
 > - The Light tier projection (~3,000 cues per $30) reflects the
 >   1¢ floor; under fractional-cent billing it would be ~10x higher.
 
-> **Provider price snapshot date:** 2026-05-19. List prices from
+> **Provider price snapshot date:** 2026-06-10. List prices from
 > `https://platform.openai.com/docs/pricing` and
 > `https://docs.anthropic.com/en/docs/about-claude/pricing`. Refresh
-> at every minor release. Models named here (`gpt-4o-mini`,
-> `claude-3-5-sonnet-latest`, `claude-3-7-sonnet-latest`) are
-> intentional placeholders pending the v0.2 launch model-selection
-> review; if any of these are deprecated by Anthropic / OpenAI by
-> launch, the substitute model is documented in DECISIONS.md and
-> the table is regenerated.
+> at every minor release. Managed LLM routes currently price
+> OpenAI `gpt-5.4-mini`, OpenAI `gpt-5.4`, Anthropic
+> `claude-sonnet-4-6`, and Anthropic `claude-haiku-4-5-20251001`.
+> Gemini is not priced here because the managed server has no Gemini
+> dispatcher yet.
 >
 > **Vision tokenization caveat:** "1 image" in the table below is a
-> simplification. OpenAI gpt-4o vision charges based on the
+> simplification. OpenAI GPT-5.4 vision input is billed as image/text
+> input tokens; exact image tokens vary with the provider's current
 > `detail` parameter and image dimensions: a 1280×720 screenshot at
 > auto detail decomposes into ~3-4 256×256 tiles (~85 tokens per
-> tile) plus a 85-token base. Real per-image cost ranges $0.0010 to
-> $0.0030 depending on size + detail. The PRICING table below uses
-> $0.018 as the typical cost for "what's on this screen" (~3 tiles,
-> auto detail) which empirically falls in that range.
+> tile) plus a 85-token base. Real per-image cost depends on size,
+> detail, and model input price.
 
 | Type | Input tokens | Output tokens | Image tokens | Provider/model | Bluey raw cost (input/output split) | Customer pays |
 |---|---|---|---|---|---|---|
-| Easy code | ~150 | ~100 | 0 | gpt-4o-mini Instant | in: $0.000023 + out: $0.000060 = **$0.000083** | $0.0003 (0.03¢) |
-| Medium code | ~800 | ~600 | 0 | claude-3-5-sonnet Balanced | in: $0.0024 + out: $0.0090 = **$0.0114** | $0.034 (3.4¢) |
-| Hard code (speculative) | ~1500 + ~1000 | ~500 + ~500 | 0 | gpt-4o-mini + claude-3-7 | Instant: $0.00053 + Deep: $0.0195 = **$0.020** | $0.050 (5¢) |
-| System design (speculative) | ~2000 + ~1200 | ~500 + ~2500 | 0 | gpt-4o-mini + claude-3-7 | Instant: $0.00060 + Deep: $0.0411 = **$0.042** | $0.104 (10.4¢) |
-| Vision | ~200 | ~300 | ~3 tiles | gpt-4o vision | image: ~$0.015 + in: $0.0005 + out: $0.0030 = **$0.0185** | $0.046 (4.6¢) |
-| Easy general | ~150 | ~150 | 0 | gpt-4o-mini Instant | in: $0.000023 + out: $0.000090 = **$0.000113** | $0.0003 (0.03¢) |
-| Medium general | ~400 | ~500 | 0 | claude-3-5-sonnet | in: $0.0012 + out: $0.0075 = **$0.0087** | $0.026 (2.6¢) |
+| Easy code | ~150 | ~100 | 0 | `gpt-5.4-mini` Instant | in: $0.000113 + out: $0.000450 = **$0.000563** | raw markup $0.0017; 1¢ minimum |
+| Medium code | ~800 | ~600 | 0 | `claude-sonnet-4-6` Balanced | in: $0.0024 + out: $0.0090 = **$0.0114** | raw markup $0.034; charged 4¢ |
+| Hard code (speculative) | ~1500 + ~1000 | ~500 + ~500 | 0 | `gpt-5.4-mini` + `claude-sonnet-4-6` | Instant: $0.0034 + Deep: $0.0105 = **$0.0139** | raw markup ~$0.042; charged by actual route(s) |
+| System design (speculative) | ~2000 + ~1200 | ~500 + ~2500 | 0 | `gpt-5.4-mini` + `claude-sonnet-4-6` | Instant: $0.0038 + Deep: $0.0411 = **$0.0449** | raw markup ~$0.135; charged by actual route(s) |
+| Vision | ~200 | ~300 | ~3 tiles | `gpt-5.4` vision | image+text in: ~$0.0014 + out: $0.0045 = **$0.0059** | raw markup ~$0.0146; charged 2¢ |
+| Easy general | ~150 | ~150 | 0 | `gpt-5.4-mini` Instant | in: $0.000113 + out: $0.000675 = **$0.000788** | raw markup $0.0024; 1¢ minimum |
+| Medium general | ~400 | ~500 | 0 | `claude-sonnet-4-6` | in: $0.0012 + out: $0.0075 = **$0.0087** | raw markup $0.026; charged 3¢ |
 
 **STT pricing used by server meters:**
 
