@@ -3186,22 +3186,52 @@ fn reindex_meeting_for_rag(daemon: &Arc<Daemon>, meeting: MeetingRecord) {
     };
 
     let rag = Arc::clone(rag);
-    tokio::spawn(async move {
-        let session_id = meeting.id.to_string();
-        if let Err(error) = rag.delete_session(&session_id).await {
-            warn!("failed to clear RAG session before context removal reindex: {error}");
-            return;
-        }
+    tokio::spawn(async move { rebuild_meeting_rag_index(rag, meeting, "session reindex").await });
+}
 
-        for segment in meeting.transcript {
-            if segment.is_final && !segment.text.trim().is_empty() {
-                rag.index_transcript(&session_id, &segment.text).await;
-            }
+async fn rebuild_meeting_rag_index(
+    rag: Arc<crate::db::rag::RagPipeline>,
+    meeting: MeetingRecord,
+    reason: &'static str,
+) {
+    let session_id = meeting.id.to_string();
+    if let Err(error) = rag.delete_session(&session_id).await {
+        warn!(session_id = %session_id, reason, error = %error, "failed to clear RAG session before rebuild");
+        return;
+    }
+
+    if let Some(summary) = meeting
+        .summary
+        .as_ref()
+        .filter(|summary| !summary.trim().is_empty())
+    {
+        rag.index_transcript(
+            &session_id,
+            &format!("Compacted session summary:\n{}", summary.trim()),
+        )
+        .await;
+    }
+
+    for turn in &meeting.conversation {
+        let question = turn.question.trim();
+        let answer = turn.answer.trim();
+        if !question.is_empty() || !answer.is_empty() {
+            rag.index_transcript(
+                &session_id,
+                &format!("Prior Bluey answer\nQuestion: {question}\nAnswer: {answer}"),
+            )
+            .await;
         }
-        for artifact in meeting.context {
-            rag.index_context_artifact(&session_id, &artifact).await;
+    }
+
+    for segment in &meeting.transcript {
+        if segment.is_final && !segment.text.trim().is_empty() {
+            rag.index_transcript(&session_id, &segment.text).await;
         }
-    });
+    }
+    for artifact in &meeting.context {
+        rag.index_context_artifact(&session_id, artifact).await;
+    }
 }
 
 async fn handle_attach_requested(daemon: &Arc<Daemon>) -> Result<()> {
@@ -4752,6 +4782,21 @@ fn rag_hit_to_answer_context(
 
 fn answer_context_from_meeting(meeting: &MeetingRecord) -> Vec<AnswerContext> {
     let mut context = Vec::new();
+    if let Some(summary) = meeting
+        .summary
+        .as_ref()
+        .filter(|summary| !summary.trim().is_empty())
+    {
+        context.push(
+            AnswerContext::new(
+                AnswerContextKind::MeetingMemory,
+                format!("Compacted summary:\n{}", summary.trim()),
+            )
+            .with_title(format!("{} summary", meeting.title))
+            .with_source("saved session summary"),
+        );
+    }
+
     let transcript = meeting
         .last_transcript_text_bounded(ANSWER_TRANSCRIPT_TURN_LIMIT, ANSWER_TRANSCRIPT_CHAR_BUDGET);
     if !transcript.trim().is_empty() {
@@ -5469,7 +5514,7 @@ async fn continue_session(
         }
     };
 
-    let (meeting, title, body) = match outcome {
+    let (meeting, title, body, should_warm_memory) = match outcome {
         ContinueOutcome::Active(meeting) => {
             let body = format!(
                 "Continuing {} with {} transcript segment(s) and {} context item(s).",
@@ -5477,7 +5522,7 @@ async fn continue_session(
                 meeting.transcript.len(),
                 meeting.context.len()
             );
-            (meeting, "Session continued", body)
+            (meeting, "Session continued", body, true)
         }
         ContinueOutcome::Restored(meeting) => {
             let body = format!(
@@ -5486,16 +5531,19 @@ async fn continue_session(
                 meeting.transcript.len(),
                 meeting.context.len()
             );
-            (meeting, "Session loaded", body)
+            (meeting, "Session loaded", body, true)
         }
         ContinueOutcome::Created(meeting) => {
             let body = format!(
                 "Started a new session from {source}. Attach docs/page context when needed."
             );
-            (meeting, "Session started", body)
+            (meeting, "Session started", body, false)
         }
     };
 
+    if should_warm_memory {
+        reindex_meeting_for_rag(daemon, meeting.clone());
+    }
     update_state_from_meeting(daemon, Some(&meeting)).await?;
     refresh_overlay_context_items(daemon, &meeting).await;
     refresh_overlay_sessions(daemon).await;
@@ -5532,6 +5580,7 @@ async fn open_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<Me
         *meeting_guard = Some(selected.clone());
     }
 
+    reindex_meeting_for_rag(daemon, selected.clone());
     update_state_from_meeting(daemon, Some(&selected)).await?;
     refresh_overlay_context_items(daemon, &selected).await;
     refresh_overlay_sessions(daemon).await;
@@ -7535,6 +7584,26 @@ mod tests {
         let traced = cloud_client_with_optional_trace(client, Some("bad\ntrace"));
 
         assert_eq!(traced.config.trace_id, None);
+    }
+
+    #[test]
+    fn answer_context_includes_compacted_session_summary() {
+        let mut meeting = MeetingRecord::new(Some("System design prep".to_string()));
+        meeting.summary = Some(
+            "We established the cache invalidation strategy and the user prefers concise tradeoffs."
+                .to_string(),
+        );
+
+        let context = answer_context_from_meeting(&meeting);
+
+        let summary = context
+            .iter()
+            .find(|item| item.source.as_deref() == Some("saved session summary"))
+            .expect("summary context");
+        assert_eq!(summary.kind, AnswerContextKind::MeetingMemory);
+        assert_eq!(summary.title.as_deref(), Some("System design prep summary"));
+        assert!(summary.content.contains("cache invalidation strategy"));
+        assert!(summary.content.contains("concise tradeoffs"));
     }
 
     #[test]
