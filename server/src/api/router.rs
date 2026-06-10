@@ -25,6 +25,12 @@ use crate::routing;
 type RouterSseStream =
     Pin<Box<dyn futures_util::Stream<Item = Result<Event, Infallible>> + Send + 'static>>;
 
+fn log_session_id(session_id: Option<&str>) -> &str {
+    session_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("none")
+}
+
 struct StreamingIdempotencyGuard {
     pool: crate::db::DbPool,
     account_id: String,
@@ -526,6 +532,21 @@ async fn complete_stream_inner(
         ));
     }
 
+    let account_id_hash = cue_core::account_id_hash_prefix(&account.id);
+    let session_id_log = log_session_id(req.session_id.as_deref()).to_string();
+    let lane_log = req.lane.clone();
+    let effective_lane_log = effective_lane.to_string();
+    tracing::info!(
+        account_id_hash = %account_id_hash,
+        request_id = %req.request_id,
+        session_id = %session_id_log,
+        lane = %lane_log,
+        effective_lane = %effective_lane_log,
+        streaming = true,
+        image_count = req.image_data_urls.len(),
+        "managed chat request accepted"
+    );
+
     match idempotency::reserve(&state.pool, &account.id, &req.request_id).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -535,7 +556,15 @@ async fn complete_stream_inner(
             }),
         )
     })? {
-        idempotency::ReserveOutcome::FreshReservation => {}
+        idempotency::ReserveOutcome::FreshReservation => {
+            tracing::debug!(
+                account_id_hash = %account_id_hash,
+                request_id = %req.request_id,
+                session_id = %session_id_log,
+                streaming = true,
+                "managed chat idempotency reserved"
+            );
+        }
         idempotency::ReserveOutcome::CachedComplete(json) => {
             let cached: CompleteResponse = serde_json::from_str(&json).map_err(|e| {
                 (
@@ -546,10 +575,24 @@ async fn complete_stream_inner(
                     }),
                 )
             })?;
+            tracing::info!(
+                account_id_hash = %account_id_hash,
+                request_id = %req.request_id,
+                session_id = %session_id_log,
+                streaming = true,
+                "managed chat idempotency replayed completed response"
+            );
             let events = response_to_sse_events(cached);
             return Ok(Sse::new(Box::pin(stream::iter(events.into_iter().map(Ok)))));
         }
         idempotency::ReserveOutcome::InProgress => {
+            tracing::warn!(
+                account_id_hash = %account_id_hash,
+                request_id = %req.request_id,
+                session_id = %session_id_log,
+                streaming = true,
+                "managed chat duplicate request still in progress"
+            );
             return Err((
                 StatusCode::CONFLICT,
                 Json(ApiError {
@@ -560,6 +603,13 @@ async fn complete_stream_inner(
             ));
         }
         idempotency::ReserveOutcome::CachedFailed => {
+            tracing::warn!(
+                account_id_hash = %account_id_hash,
+                request_id = %req.request_id,
+                session_id = %session_id_log,
+                streaming = true,
+                "managed chat duplicate request previously failed terminally"
+            );
             return Err((
                 StatusCode::CONFLICT,
                 Json(ApiError {
@@ -587,6 +637,14 @@ async fn complete_stream_inner(
         &account.id,
         req.session_id.as_deref(),
         &req.user,
+    );
+    tracing::debug!(
+        account_id_hash = %account_id_hash,
+        request_id = %req.request_id,
+        session_id = %session_id_log,
+        rag_match_count = rag_matches.len(),
+        streaming = true,
+        "managed chat memory context prepared"
     );
     let (provider_system, provider_user) =
         prompt_with_rag_context(&req.system, &req.user, &rag_matches);
@@ -740,6 +798,19 @@ async fn complete_stream_inner(
                 Ok(streaming) => {
                     selected_route_idx = idx;
                     selected_route = Some(*route);
+                    tracing::info!(
+                        account_id_hash = %account_id_hash,
+                        request_id = %req.request_id,
+                        session_id = %session_id_log,
+                        lane = %lane_log,
+                        effective_lane = %effective_lane_log,
+                        provider = %route.provider,
+                        model = %route.model,
+                        route_index = idx,
+                        was_fallback = idx > 0,
+                        streaming = true,
+                        "managed chat route selected"
+                    );
                     selected_stream = Some(streaming);
                     break;
                 }
@@ -944,9 +1015,58 @@ async fn complete_stream_inner(
             was_speculative: false,
             was_fallback: selected_route_idx > 0,
         };
-        if let Err(e) = usage::record(&state.pool, &account.id, &event) {
-            tracing::warn!(error = %e, "failed to record streaming usage event");
+        match usage::record(&state.pool, &account.id, &event) {
+            Ok(true) => tracing::info!(
+                account_id_hash = %account_id_hash,
+                request_id = %req.request_id,
+                session_id = %session_id_log,
+                provider = %streaming.provider,
+                model = %streaming.model,
+                cost_cents = customer_cost,
+                balance_cents_after = balance_after,
+                latency_ms = elapsed_ms,
+                streaming = true,
+                "managed chat usage event recorded"
+            ),
+            Ok(false) => tracing::warn!(
+                account_id_hash = %account_id_hash,
+                request_id = %req.request_id,
+                session_id = %session_id_log,
+                provider = %streaming.provider,
+                model = %streaming.model,
+                streaming = true,
+                "managed chat usage event deduplicated"
+            ),
+            Err(e) => tracing::warn!(
+                account_id_hash = %account_id_hash,
+                request_id = %req.request_id,
+                session_id = %session_id_log,
+                provider = %streaming.provider,
+                model = %streaming.model,
+                error = %e,
+                streaming = true,
+                "failed to record managed chat usage event"
+            ),
         }
+
+        tracing::info!(
+            account_id_hash = %account_id_hash,
+            request_id = %req.request_id,
+            session_id = %session_id_log,
+            lane = %lane_log,
+            effective_lane = %effective_lane_log,
+            provider = %streaming.provider,
+            model = %streaming.model,
+            input_tokens,
+            output_tokens,
+            cost_cents = customer_cost,
+            balance_cents_after = balance_after,
+            trial_seconds_remaining = trial_remaining,
+            latency_ms = elapsed_ms,
+            was_fallback = selected_route_idx > 0,
+            streaming = true,
+            "managed chat completed and billed"
+        );
 
         let artifact = response_artifact(&text);
         let response = CompleteResponse {
@@ -1037,6 +1157,21 @@ async fn complete_inner(
         ));
     }
 
+    let account_id_hash = cue_core::account_id_hash_prefix(&account.id);
+    let session_id_log = log_session_id(req.session_id.as_deref()).to_string();
+    let lane_log = req.lane.clone();
+    let effective_lane_log = effective_lane.to_string();
+    tracing::info!(
+        account_id_hash = %account_id_hash,
+        request_id = %req.request_id,
+        session_id = %session_id_log,
+        lane = %lane_log,
+        effective_lane = %effective_lane_log,
+        streaming = false,
+        image_count = req.image_data_urls.len(),
+        "managed chat request accepted"
+    );
+
     // 1. Idempotency check + reservation. Codex S4.1.
     match idempotency::reserve(&state.pool, &account.id, &req.request_id).map_err(|e| {
         (
@@ -1047,7 +1182,15 @@ async fn complete_inner(
             }),
         )
     })? {
-        idempotency::ReserveOutcome::FreshReservation => { /* fall through */ }
+        idempotency::ReserveOutcome::FreshReservation => {
+            tracing::debug!(
+                account_id_hash = %account_id_hash,
+                request_id = %req.request_id,
+                session_id = %session_id_log,
+                streaming = false,
+                "managed chat idempotency reserved"
+            );
+        }
         idempotency::ReserveOutcome::CachedComplete(json) => {
             // Replay: return the cached terminal response.
             let cached: CompleteResponse = serde_json::from_str(&json).map_err(|e| {
@@ -1059,9 +1202,23 @@ async fn complete_inner(
                     }),
                 )
             })?;
+            tracing::info!(
+                account_id_hash = %account_id_hash,
+                request_id = %req.request_id,
+                session_id = %session_id_log,
+                streaming = false,
+                "managed chat idempotency replayed completed response"
+            );
             return Ok(cached);
         }
         idempotency::ReserveOutcome::InProgress => {
+            tracing::warn!(
+                account_id_hash = %account_id_hash,
+                request_id = %req.request_id,
+                session_id = %session_id_log,
+                streaming = false,
+                "managed chat duplicate request still in progress"
+            );
             return Err((
                 StatusCode::CONFLICT,
                 Json(ApiError {
@@ -1072,6 +1229,13 @@ async fn complete_inner(
             ));
         }
         idempotency::ReserveOutcome::CachedFailed => {
+            tracing::warn!(
+                account_id_hash = %account_id_hash,
+                request_id = %req.request_id,
+                session_id = %session_id_log,
+                streaming = false,
+                "managed chat duplicate request previously failed terminally"
+            );
             return Err((
                 StatusCode::CONFLICT,
                 Json(ApiError {
@@ -1099,6 +1263,14 @@ async fn complete_inner(
         &account.id,
         req.session_id.as_deref(),
         &req.user,
+    );
+    tracing::debug!(
+        account_id_hash = %account_id_hash,
+        request_id = %req.request_id,
+        session_id = %session_id_log,
+        rag_match_count = rag_matches.len(),
+        streaming = false,
+        "managed chat memory context prepared"
     );
     let (provider_system, provider_user) =
         prompt_with_rag_context(&req.system, &req.user, &rag_matches);
@@ -1264,6 +1436,19 @@ async fn complete_inner(
                 Ok(completion) => {
                     selected_route_idx = idx;
                     selected_route = Some(route);
+                    tracing::info!(
+                        account_id_hash = %account_id_hash,
+                        request_id = %req.request_id,
+                        session_id = %session_id_log,
+                        lane = %lane_log,
+                        effective_lane = %effective_lane_log,
+                        provider = %route.provider,
+                        model = %route.model,
+                        route_index = idx,
+                        was_fallback = idx > 0,
+                        streaming = false,
+                        "managed chat route selected"
+                    );
                     selected_completion = Some(completion);
                     break;
                 }
@@ -1429,9 +1614,58 @@ async fn complete_inner(
         was_speculative: false,
         was_fallback: selected_route_idx > 0,
     };
-    if let Err(e) = crate::db::usage::record(&state.pool, &account.id, &event) {
-        tracing::warn!(error = %e, "failed to record usage event");
+    match crate::db::usage::record(&state.pool, &account.id, &event) {
+        Ok(true) => tracing::info!(
+            account_id_hash = %account_id_hash,
+            request_id = %req.request_id,
+            session_id = %session_id_log,
+            provider = %comp.provider,
+            model = %comp.model,
+            cost_cents = customer_cost,
+            balance_cents_after = balance_after,
+            latency_ms = elapsed_ms,
+            streaming = false,
+            "managed chat usage event recorded"
+        ),
+        Ok(false) => tracing::warn!(
+            account_id_hash = %account_id_hash,
+            request_id = %req.request_id,
+            session_id = %session_id_log,
+            provider = %comp.provider,
+            model = %comp.model,
+            streaming = false,
+            "managed chat usage event deduplicated"
+        ),
+        Err(e) => tracing::warn!(
+            account_id_hash = %account_id_hash,
+            request_id = %req.request_id,
+            session_id = %session_id_log,
+            provider = %comp.provider,
+            model = %comp.model,
+            error = %e,
+            streaming = false,
+            "failed to record managed chat usage event"
+        ),
     }
+
+    tracing::info!(
+        account_id_hash = %account_id_hash,
+        request_id = %req.request_id,
+        session_id = %session_id_log,
+        lane = %lane_log,
+        effective_lane = %effective_lane_log,
+        provider = %comp.provider,
+        model = %comp.model,
+        input_tokens = comp.input_tokens,
+        output_tokens = comp.output_tokens,
+        cost_cents = customer_cost,
+        balance_cents_after = balance_after,
+        trial_seconds_remaining = trial_remaining,
+        latency_ms = elapsed_ms,
+        was_fallback = selected_route_idx > 0,
+        streaming = false,
+        "managed chat completed and billed"
+    );
 
     let artifact = response_artifact(&comp.text);
     let response = CompleteResponse {

@@ -133,6 +133,14 @@ async fn stripe_checkout(
         ));
     }
 
+    let account_id_hash = cue_core::account_id_hash_prefix(&account.id);
+    tracing::info!(
+        account_id_hash = %account_id_hash,
+        billing_provider = "stripe",
+        amount_cents = req.amount_cents,
+        "billing checkout requested"
+    );
+
     // Build Stripe Checkout Session.
     // Form-urlencoded as Stripe's API requires.
     let success_url = format!("{}/account?reload=success", state.config.public_url);
@@ -172,7 +180,13 @@ async fn stripe_checkout(
         .map_err(|e| {
             // Codex Stage 6 S6.6: log raw upstream details, return
             // sanitized message to the customer.
-            tracing::warn!(error = %e, "stripe checkout http failed");
+            tracing::warn!(
+                account_id_hash = %account_id_hash,
+                billing_provider = "stripe",
+                amount_cents = req.amount_cents,
+                error = %e,
+                "stripe checkout http failed"
+            );
             (
                 StatusCode::BAD_GATEWAY,
                 Json(ApiError {
@@ -184,7 +198,14 @@ async fn stripe_checkout(
     let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
     if !status.is_success() {
         let safe_body = log_safe_stripe_body(&body);
-        tracing::warn!(stripe_status = %status, stripe_body = %safe_body, "stripe checkout error");
+        tracing::warn!(
+            account_id_hash = %account_id_hash,
+            billing_provider = "stripe",
+            amount_cents = req.amount_cents,
+            stripe_status = %status,
+            stripe_body = %safe_body,
+            "stripe checkout error"
+        );
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(ApiError {
@@ -204,6 +225,14 @@ async fn stripe_checkout(
             )
         })?
         .to_string();
+
+    tracing::info!(
+        account_id_hash = %account_id_hash,
+        billing_provider = "stripe",
+        amount_cents = req.amount_cents,
+        stripe_checkout_id = %body.get("id").and_then(|v| v.as_str()).unwrap_or("unknown"),
+        "billing checkout created"
+    );
 
     Ok(Json(CheckoutResponse { checkout_url: url }))
 }
@@ -322,6 +351,14 @@ async fn square_checkout(
         .as_deref()
         .ok_or_else(|| square_missing("Square location not configured"))?;
 
+    let account_id_hash = cue_core::account_id_hash_prefix(&account.id);
+    tracing::info!(
+        account_id_hash = %account_id_hash,
+        billing_provider = "square",
+        amount_cents = req.amount_cents,
+        "billing checkout requested"
+    );
+
     let body = build_square_payment_link_body(
         &state.config.public_url,
         location_id,
@@ -338,7 +375,13 @@ async fn square_checkout(
         .send()
         .await
         .map_err(|e| {
-            tracing::warn!(error = %e, "square checkout http failed");
+            tracing::warn!(
+                account_id_hash = %account_id_hash,
+                billing_provider = "square",
+                amount_cents = req.amount_cents,
+                error = %e,
+                "square checkout http failed"
+            );
             (
                 StatusCode::BAD_GATEWAY,
                 Json(ApiError {
@@ -351,7 +394,14 @@ async fn square_checkout(
     let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
     if !status.is_success() {
         let safe_body = log_safe_square_body(&body);
-        tracing::warn!(square_status = %status, square_body = %safe_body, "square checkout error");
+        tracing::warn!(
+            account_id_hash = %account_id_hash,
+            billing_provider = "square",
+            amount_cents = req.amount_cents,
+            square_status = %status,
+            square_body = %safe_body,
+            "square checkout error"
+        );
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(ApiError {
@@ -376,6 +426,17 @@ async fn square_checkout(
             )
         })?
         .to_string();
+
+    tracing::info!(
+        account_id_hash = %account_id_hash,
+        billing_provider = "square",
+        amount_cents = req.amount_cents,
+        square_payment_link_id = %body
+            .pointer("/payment_link/id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown"),
+        "billing checkout created"
+    );
 
     Ok(Json(CheckoutResponse { checkout_url: url }))
 }
@@ -629,6 +690,7 @@ async fn handle_checkout_completed(state: &AppState, event: &serde_json::Value) 
         })
         .ok_or_else(|| anyhow!("no account_id in session"))?
         .to_string();
+    let account_id_hash = cue_core::account_id_hash_prefix(&account_id);
     let amount_cents = session
         .pointer("/metadata/bluey_amount_cents")
         .and_then(|v| v.as_str())
@@ -663,14 +725,14 @@ async fn handle_checkout_completed(state: &AppState, event: &serde_json::Value) 
                 Ok(Some(pm)) => payment_method_id = Some(pm),
                 Ok(None) => {
                     tracing::warn!(
-                        account_id,
+                        account_id_hash = %account_id_hash,
                         payment_intent_id = pi_id,
                         "PaymentIntent retrieve returned no payment_method; auto top-up will rely on customer-default"
                     );
                 }
                 Err(e) => {
                     tracing::warn!(
-                        account_id,
+                        account_id_hash = %account_id_hash,
                         payment_intent_id = pi_id,
                         error = %e,
                         "PaymentIntent retrieve failed; will use customer-default at auto top-up time"
@@ -695,12 +757,18 @@ async fn handle_checkout_completed(state: &AppState, event: &serde_json::Value) 
 
     if !credited {
         tracing::info!(
-            account_id,
+            account_id_hash = %account_id_hash,
+            payment_intent_id = %payment_intent_id.as_deref().unwrap_or("unknown"),
             "checkout.session.completed: charge already credited, no-op"
         );
+    } else {
+        tracing::info!(
+            account_id_hash = %account_id_hash,
+            amount_cents,
+            payment_intent_id = %payment_intent_id.as_deref().unwrap_or("unknown"),
+            "credited from Stripe webhook"
+        );
     }
-
-    tracing::info!(account_id, amount_cents, "credited from Stripe webhook");
     Ok(())
 }
 
@@ -715,17 +783,18 @@ async fn handle_square_payment_event(state: &AppState, event: &serde_json::Value
         .context("credit account from Square")?;
     if !credited {
         tracing::info!(
-            account_id,
+            account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
             square_payment_id = %payment_id,
             "Square payment already credited, no-op"
         );
+    } else {
+        tracing::info!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
+            amount_cents,
+            square_payment_id = %payment_id,
+            "credited from Square webhook"
+        );
     }
-    tracing::info!(
-        account_id,
-        amount_cents,
-        square_payment_id = %payment_id,
-        "credited from Square webhook"
-    );
     Ok(())
 }
 
