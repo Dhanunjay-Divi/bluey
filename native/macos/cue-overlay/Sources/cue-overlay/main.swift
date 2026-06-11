@@ -2420,8 +2420,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         let canvasWidth = canvasPane.widthAnchor.constraint(equalToConstant: 0)
         canvasWidthConstraint = canvasWidth
-        let composerTextHeight = composerSurface.heightAnchor.constraint(equalToConstant: 46)
-        let composerBarHeight = composerBar.heightAnchor.constraint(equalToConstant: 108)
+        let composerTextHeight = composerSurface.heightAnchor.constraint(equalToConstant: 42)
+        let composerBarHeight = composerBar.heightAnchor.constraint(equalToConstant: 94)
         let attachmentStripHeight = attachmentStrip.heightAnchor.constraint(equalToConstant: 0)
         composerTextHeightConstraint = composerTextHeight
         composerBarHeightConstraint = composerBarHeight
@@ -2596,40 +2596,40 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             composerBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
             composerBarHeight,
 
-            composerSurface.topAnchor.constraint(equalTo: composerBar.topAnchor, constant: 10),
-            composerSurface.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 14),
-            composerSurface.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -14),
+            composerSurface.topAnchor.constraint(equalTo: composerBar.topAnchor, constant: 8),
+            composerSurface.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 12),
+            composerSurface.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -12),
             composerTextHeight,
 
-            composer.topAnchor.constraint(equalTo: composerSurface.topAnchor, constant: 3),
+            composer.topAnchor.constraint(equalTo: composerSurface.topAnchor, constant: 2),
             composer.leadingAnchor.constraint(equalTo: composerSurface.leadingAnchor, constant: 14),
             composer.trailingAnchor.constraint(equalTo: recordingButton.leadingAnchor, constant: -8),
-            composer.bottomAnchor.constraint(equalTo: composerSurface.bottomAnchor, constant: -3),
+            composer.bottomAnchor.constraint(equalTo: composerSurface.bottomAnchor, constant: -2),
 
             recordingButton.trailingAnchor.constraint(equalTo: askButton.leadingAnchor, constant: -6),
             recordingButton.centerYAnchor.constraint(equalTo: composerSurface.centerYAnchor),
-            recordingButton.widthAnchor.constraint(equalToConstant: 84),
-            recordingButton.heightAnchor.constraint(equalToConstant: 32),
+            recordingButton.widthAnchor.constraint(equalToConstant: 80),
+            recordingButton.heightAnchor.constraint(equalToConstant: 30),
 
             askButton.trailingAnchor.constraint(equalTo: composerSurface.trailingAnchor, constant: -7),
             askButton.centerYAnchor.constraint(equalTo: composerSurface.centerYAnchor),
-            askButton.widthAnchor.constraint(equalToConstant: 90),
-            askButton.heightAnchor.constraint(equalToConstant: 34),
+            askButton.widthAnchor.constraint(equalToConstant: 86),
+            askButton.heightAnchor.constraint(equalToConstant: 32),
 
-            attachButton.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 14),
-            attachButton.bottomAnchor.constraint(equalTo: composerBar.bottomAnchor, constant: -10),
-            attachButton.widthAnchor.constraint(equalToConstant: 36),
-            attachButton.heightAnchor.constraint(equalToConstant: 36),
+            attachButton.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 12),
+            attachButton.bottomAnchor.constraint(equalTo: composerBar.bottomAnchor, constant: -8),
+            attachButton.widthAnchor.constraint(equalToConstant: 32),
+            attachButton.heightAnchor.constraint(equalToConstant: 32),
 
             instructionsButton.leadingAnchor.constraint(equalTo: attachButton.trailingAnchor, constant: 8),
             instructionsButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            instructionsButton.widthAnchor.constraint(equalToConstant: 86),
-            instructionsButton.heightAnchor.constraint(equalToConstant: 36),
+            instructionsButton.widthAnchor.constraint(equalToConstant: 80),
+            instructionsButton.heightAnchor.constraint(equalToConstant: 32),
 
             opacityControl.leadingAnchor.constraint(equalTo: instructionsButton.trailingAnchor, constant: 8),
             opacityControl.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            opacityControl.widthAnchor.constraint(equalToConstant: 154),
-            opacityControl.heightAnchor.constraint(equalToConstant: 36),
+            opacityControl.widthAnchor.constraint(equalToConstant: 144),
+            opacityControl.heightAnchor.constraint(equalToConstant: 32),
 
             opacityLabel.leadingAnchor.constraint(equalTo: opacityControl.leadingAnchor, constant: 12),
             opacityLabel.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
@@ -2646,14 +2646,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
             analyzeButton.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -14),
             analyzeButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            analyzeButton.widthAnchor.constraint(equalToConstant: 88),
-            analyzeButton.heightAnchor.constraint(equalToConstant: 36),
+            analyzeButton.widthAnchor.constraint(equalToConstant: 84),
+            analyzeButton.heightAnchor.constraint(equalToConstant: 32),
 
             modelMenu.trailingAnchor.constraint(equalTo: analyzeButton.leadingAnchor, constant: -7),
             modelMenu.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
             modelMenu.widthAnchor.constraint(greaterThanOrEqualToConstant: 118),
             modelMenu.widthAnchor.constraint(lessThanOrEqualToConstant: 144),
-            modelMenu.heightAnchor.constraint(equalToConstant: 34),
+            modelMenu.heightAnchor.constraint(equalToConstant: 32),
 
             opacityControl.trailingAnchor.constraint(lessThanOrEqualTo: modelMenu.leadingAnchor, constant: -10),
 
@@ -3046,7 +3046,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             height: 42)
         headerStack.frame = headerBar.bounds.insetBy(dx: 9, dy: 4)
         if composerBar.frame.minY < 0 || composerBar.frame.maxY > bounds.height {
-            let height = composerBarHeightConstraint?.constant ?? 108
+            let height = composerBarHeightConstraint?.constant ?? 94
             composerBar.frame = NSRect(
                 x: 10,
                 y: 10,
@@ -3274,7 +3274,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func configureComposer() {
         composerBar.wantsLayer = true
         composerBar.layer?.backgroundColor = NSColor(red: 0.014, green: 0.016, blue: 0.022, alpha: 0.94).cgColor
-        composerBar.layer?.cornerRadius = 28
+        composerBar.layer?.cornerRadius = 24
         composerBar.layer?.borderWidth = 1
         composerBar.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.22).cgColor
         composerBar.layer?.shadowColor = NSColor.black.cgColor
@@ -3284,13 +3284,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         composerSurface.wantsLayer = true
         composerSurface.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.050).cgColor
-        composerSurface.layer?.cornerRadius = 20
+        composerSurface.layer?.cornerRadius = 18
         composerSurface.layer?.borderWidth = 1
         composerSurface.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
 
         opacityControl.wantsLayer = true
         opacityControl.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.065).cgColor
-        opacityControl.layer?.cornerRadius = 18
+        opacityControl.layer?.cornerRadius = 16
         opacityControl.layer?.borderWidth = 1
         opacityControl.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.16).cgColor
         opacityControl.toolTip = "Overlay opacity"
@@ -3567,10 +3567,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func setComposerTextHeight(_ rawHeight: CGFloat) {
-        let textHeight = min(max(rawHeight, 46), 96)
+        let textHeight = min(max(rawHeight, 42), 88)
         guard abs((composerTextHeightConstraint?.constant ?? 0) - textHeight) > 0.5 else { return }
         composerTextHeightConstraint?.constant = textHeight
-        composerBarHeightConstraint?.constant = textHeight + 62
+        composerBarHeightConstraint?.constant = textHeight + 52
         needsLayout = true
         layoutSubtreeIfNeeded()
     }
