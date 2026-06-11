@@ -2010,6 +2010,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     let feed: FeedView
     let workspace: NSView
     let canvasPane: CanvasPaneView
+    let toastView: NSView
+    let toastTitleLabel: NSTextField
+    let toastBodyLabel: NSTextField
     let headerBar: NSView
     let headerStack: NSStackView
     let brandStack: NSStackView
@@ -2076,6 +2079,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var composerBarHeightConstraint: NSLayoutConstraint?
     private var composerTextHeightConstraint: NSLayoutConstraint?
     private var attachmentStripHeightConstraint: NSLayoutConstraint?
+    private var toastHideWorkItem: DispatchWorkItem?
     private var latestCanvas: CanvasArtifact?
     private var canvasOpen = false
     private struct ResizeEdges: OptionSet {
@@ -2094,6 +2098,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         feed = FeedView(frame: .zero)
         workspace = NSView()
         canvasPane = CanvasPaneView(frame: .zero)
+        toastView = NSView()
+        toastTitleLabel = NSTextField(labelWithString: "")
+        toastBodyLabel = NSTextField(wrappingLabelWithString: "")
         headerBar = NSView()
         headerStack = NSStackView()
         brandStack = NSStackView()
@@ -2167,6 +2174,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         layer?.shadowOffset = .zero
 
         configureHeader()
+        configureSystemToast()
         configureContextRows()
         configureComposer()
         configureFixedChromeLayoutPriorities()
@@ -2208,6 +2216,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             workspace,
             feed,
             canvasPane,
+            toastView,
+            toastTitleLabel,
+            toastBodyLabel,
             transcriptStrip,
             transcriptActivityDot,
             transcriptStateLabel,
@@ -2260,6 +2271,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         addSubview(workspace)
         workspace.addSubview(feed)
         workspace.addSubview(canvasPane)
+        addSubview(toastView)
+        toastView.addSubview(toastTitleLabel)
+        toastView.addSubview(toastBodyLabel)
         addSubview(sessionDrawer)
         sessionDrawer.addSubview(drawerTitleLabel)
         sessionDrawer.addSubview(drawerSubtitleLabel)
@@ -2305,6 +2319,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         transcriptStrip.layer?.zPosition = 40
         attachmentStrip.layer?.zPosition = 40
         composerBar.layer?.zPosition = 50
+        toastView.layer?.zPosition = 70
 
         let canvasWidth = canvasPane.widthAnchor.constraint(equalToConstant: 0)
         canvasWidthConstraint = canvasWidth
@@ -2377,6 +2392,20 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             canvasPane.trailingAnchor.constraint(equalTo: workspace.trailingAnchor),
             canvasPane.bottomAnchor.constraint(equalTo: workspace.bottomAnchor),
             canvasWidth,
+
+            toastView.topAnchor.constraint(equalTo: workspace.topAnchor, constant: 14),
+            toastView.centerXAnchor.constraint(equalTo: centerXAnchor),
+            toastView.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.52),
+            toastView.widthAnchor.constraint(greaterThanOrEqualToConstant: 280),
+
+            toastTitleLabel.topAnchor.constraint(equalTo: toastView.topAnchor, constant: 12),
+            toastTitleLabel.leadingAnchor.constraint(equalTo: toastView.leadingAnchor, constant: 16),
+            toastTitleLabel.trailingAnchor.constraint(equalTo: toastView.trailingAnchor, constant: -16),
+
+            toastBodyLabel.topAnchor.constraint(equalTo: toastTitleLabel.bottomAnchor, constant: 5),
+            toastBodyLabel.leadingAnchor.constraint(equalTo: toastTitleLabel.leadingAnchor),
+            toastBodyLabel.trailingAnchor.constraint(equalTo: toastTitleLabel.trailingAnchor),
+            toastBodyLabel.bottomAnchor.constraint(equalTo: toastView.bottomAnchor, constant: -13),
 
             sessionDrawer.topAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: 8),
             sessionDrawer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
@@ -2910,6 +2939,32 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         balanceLabel.layer?.cornerRadius = 14
         balanceLabel.layer?.borderWidth = 1
         balanceLabel.layer?.borderColor = NSColor.white.withAlphaComponent(0.10).cgColor
+    }
+
+    private func configureSystemToast() {
+        toastView.wantsLayer = true
+        toastView.layer?.backgroundColor = NSColor(red: 0.018, green: 0.023, blue: 0.030, alpha: 0.96).cgColor
+        toastView.layer?.cornerRadius = 18
+        toastView.layer?.borderWidth = 1
+        toastView.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.28).cgColor
+        toastView.layer?.shadowColor = NSColor.black.cgColor
+        toastView.layer?.shadowOpacity = 0.24
+        toastView.layer?.shadowRadius = 18
+        toastView.layer?.shadowOffset = NSSize(width: 0, height: -8)
+        toastView.alphaValue = 0
+        toastView.isHidden = true
+
+        toastTitleLabel.font = NSFont.systemFont(ofSize: 13, weight: .bold)
+        toastTitleLabel.textColor = BlueyTheme.text
+        toastTitleLabel.alignment = .center
+        toastTitleLabel.maximumNumberOfLines = 1
+        toastTitleLabel.lineBreakMode = .byTruncatingTail
+
+        toastBodyLabel.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        toastBodyLabel.textColor = BlueyTheme.textDim
+        toastBodyLabel.alignment = .center
+        toastBodyLabel.maximumNumberOfLines = 3
+        toastBodyLabel.lineBreakMode = .byWordWrapping
     }
 
     private func configureContextRows() {
@@ -3730,6 +3785,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     func resetSessionSurface() {
         feed.clear()
+        hideSystemToast(immediately: true)
         setContextItems([])
         transcriptSnippets.removeAll()
         updateTranscriptStripText("Live captions preview", scrollToEnd: false)
@@ -3741,6 +3797,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func pushCard(_ card: RenderedCard) {
+        if shouldRenderAsToast(card) {
+            showSystemToast(for: card)
+            emitCardRendered(id: card.id)
+            return
+        }
         feed.push(card)
         routeCanvasIfNeeded(card)
     }
@@ -3755,6 +3816,95 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             statusLabel.stringValue = "Answer streaming"
         }
         routeCanvasIfNeeded(card)
+    }
+
+    private func shouldRenderAsToast(_ card: RenderedCard) -> Bool {
+        let kind = normalizedCardKind(card.kind)
+        guard (kind == "system" || kind == "warning"), actionableLoginURL(from: card) == nil else {
+            return false
+        }
+        let title = card.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if title.contains("recap") || title.contains("summary") {
+            return false
+        }
+        let plainBody = card.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        return plainBody.count <= 360
+    }
+
+    private func actionableLoginURL(from card: RenderedCard) -> URL? {
+        guard normalizedCardKind(card.kind) == "system" else { return nil }
+        for line in card.body.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let candidate: String
+            if trimmed.hasPrefix("login_url:") {
+                candidate = trimmed
+                    .replacingOccurrences(of: "login_url:", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if trimmed.hasPrefix("https://") || trimmed.hasPrefix("http://") {
+                candidate = trimmed
+            } else {
+                continue
+            }
+            if
+                let url = URL(string: candidate),
+                let scheme = url.scheme?.lowercased(),
+                ["http", "https"].contains(scheme)
+            {
+                return url
+            }
+        }
+        return nil
+    }
+
+    private func showSystemToast(for card: RenderedCard) {
+        toastHideWorkItem?.cancel()
+        let title = card.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body = systemToastBody(card.body)
+        toastTitleLabel.stringValue = title.isEmpty ? "Bluey" : title
+        toastBodyLabel.stringValue = body
+        statusLabel.stringValue = toastTitleLabel.stringValue
+
+        toastView.isHidden = false
+        toastView.animator().alphaValue = 1
+
+        let work = DispatchWorkItem { [weak self] in
+            self?.hideSystemToast(immediately: false)
+        }
+        toastHideWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0, execute: work)
+    }
+
+    private func hideSystemToast(immediately: Bool) {
+        toastHideWorkItem?.cancel()
+        toastHideWorkItem = nil
+        guard !toastView.isHidden else { return }
+        if immediately {
+            toastView.alphaValue = 0
+            toastView.isHidden = true
+            return
+        }
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.18
+            toastView.animator().alphaValue = 0
+        } completionHandler: { [weak self] in
+            self?.toastView.isHidden = true
+        }
+    }
+
+    private func systemToastBody(_ body: String) -> String {
+        var lines: [String] = []
+        for raw in body.components(separatedBy: .newlines) {
+            let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty, !line.hasPrefix("login_url:") else { continue }
+            lines.append(line)
+        }
+        let joined = lines.joined(separator: " · ")
+            .replacingOccurrences(of: "knowledge base", with: "documents")
+        if joined.count <= 190 {
+            return joined
+        }
+        let end = joined.index(joined.startIndex, offsetBy: 187)
+        return String(joined[..<end]) + "..."
     }
 
     private func routeCanvasIfNeeded(_ card: RenderedCard) {
