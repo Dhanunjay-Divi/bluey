@@ -1388,6 +1388,9 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         OverlayEvent::SessionRenameRequested { id, title } => {
             rename_meeting_session(daemon, id, &title).await?;
         }
+        OverlayEvent::SessionDeleteRequested { id } => {
+            delete_meeting_session(daemon, id).await?;
+        }
         OverlayEvent::SessionContinueRequested => {
             continue_session(daemon, "overlay session").await?;
         }
@@ -2506,11 +2509,24 @@ fn overlay_session_items(
         if !seen.insert(meeting.id) {
             continue;
         }
+        let is_active = Some(meeting.id) == active_id;
+        let has_content = !meeting.transcript.is_empty()
+            || !meeting.context.is_empty()
+            || !meeting.conversation.is_empty()
+            || meeting
+                .summary
+                .as_ref()
+                .is_some_and(|summary| !summary.trim().is_empty());
+        if !is_active && !has_content {
+            continue;
+        }
         let mut bits = Vec::new();
-        if Some(meeting.id) == active_id || meeting.ended_at.is_none() {
+        if is_active || meeting.ended_at.is_none() {
             bits.push("active".to_string());
         }
-        bits.push(format!("{} transcript", meeting.transcript.len()));
+        if !meeting.transcript.is_empty() {
+            bits.push(format!("{} transcript", meeting.transcript.len()));
+        }
         if !meeting.context.is_empty() {
             bits.push(format!(
                 "{} file{}",
@@ -2528,8 +2544,12 @@ fn overlay_session_items(
         items.push(OverlaySessionItem {
             id: meeting.id,
             title: meeting.title,
-            subtitle: bits.join(" · "),
-            is_active: Some(meeting.id) == active_id,
+            subtitle: if bits.is_empty() {
+                "saved recording".to_string()
+            } else {
+                bits.join(" · ")
+            },
+            is_active,
         });
     }
     Ok(items.into_iter().take(8).collect())
@@ -5626,6 +5646,50 @@ async fn rename_meeting_session(
     .await;
     write_state(daemon).await?;
     Ok(renamed)
+}
+
+async fn delete_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<()> {
+    let was_active = {
+        let mut meeting_guard = daemon.meeting.lock().await;
+        if meeting_guard
+            .as_ref()
+            .is_some_and(|meeting| meeting.id == id)
+        {
+            *meeting_guard = None;
+            true
+        } else {
+            false
+        }
+    };
+
+    let deleted = daemon.store.delete(id)?;
+    if !deleted {
+        anyhow::bail!("session {id} not found");
+    }
+
+    if let Some(rag) = daemon.rag.as_ref() {
+        let rag = Arc::clone(rag);
+        let session_id = id.to_string();
+        tokio::spawn(async move {
+            if let Err(error) = rag.delete_session(&session_id).await {
+                warn!(session_id = %session_id, error = %error, "failed to clear deleted session RAG index");
+            }
+        });
+    }
+
+    if was_active {
+        update_state_from_meeting(daemon, None).await?;
+        let _ = send_overlay(daemon, OverlayCommand::SetContextItems { items: vec![] }).await;
+    }
+    refresh_overlay_sessions(daemon).await;
+    push_system_card(
+        daemon,
+        CardKind::System,
+        "Session deleted",
+        "The saved recording was removed from this device.",
+    )
+    .await;
+    write_state(daemon).await
 }
 
 async fn start_new_session(

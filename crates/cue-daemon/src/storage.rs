@@ -139,6 +139,25 @@ impl MeetingStore {
         Ok(meeting)
     }
 
+    pub fn delete(&self, id: uuid::Uuid) -> Result<bool> {
+        let mut deleted = false;
+        if let Some(active) = self.load_active()? {
+            if active.id == id {
+                fs::remove_file(&self.active_file)
+                    .with_context(|| format!("failed to delete {}", self.active_file.display()))?;
+                deleted = true;
+            }
+        }
+
+        if let Some(path) = self.archive_path_for(id)? {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to delete {}", path.display()))?;
+            deleted = true;
+        }
+
+        Ok(deleted)
+    }
+
     fn archive_path_for(&self, id: uuid::Uuid) -> Result<Option<PathBuf>> {
         if !self.archive_dir.exists() {
             return Ok(None);
@@ -240,6 +259,40 @@ mod security_tests {
             .mode()
             & 0o777;
         assert_eq!(archive_dir_mode, 0o700);
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn meeting_store_deletes_active_and_archived_meetings() {
+        let base = std::env::temp_dir().join(format!(
+            "bluey-meeting-store-delete-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = AppPaths {
+            data_dir: base.join("data"),
+            config_dir: base.join("config"),
+            runtime_dir: base.join("run"),
+            state_file: base.join("run/daemon-state.json"),
+            account_file: base.join("config/account.json"),
+            settings_file: base.join("config/settings.json"),
+        };
+        paths.ensure().expect("ensure paths");
+        let store = MeetingStore::new(&paths).expect("store");
+
+        let active = MeetingRecord::new(Some("Active delete".to_string()));
+        store.save_active(&active).expect("save active");
+        assert!(store.delete(active.id).expect("delete active"));
+        assert!(store.load_active().expect("load active").is_none());
+
+        let archived = MeetingRecord::new(Some("Archived delete".to_string()));
+        let archive_path = store.archive(&archived).expect("archive");
+        assert!(archive_path.exists());
+        assert!(store.delete(archived.id).expect("delete archived"));
+        assert!(!archive_path.exists());
+        assert!(!store
+            .delete(uuid::Uuid::new_v4())
+            .expect("delete missing meeting"));
 
         let _ = fs::remove_dir_all(base);
     }

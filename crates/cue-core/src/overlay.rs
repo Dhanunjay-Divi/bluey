@@ -116,6 +116,9 @@ pub enum OverlayEvent {
         id: uuid::Uuid,
         title: String,
     },
+    SessionDeleteRequested {
+        id: uuid::Uuid,
+    },
     SessionContinueRequested,
     SessionNewRequested,
     ActivePageCaptureRequested,
@@ -207,6 +210,19 @@ mod tests {
         assert_eq!(
             json,
             r#"{"type":"lifecycle","stage":"started","status":"ok","detail":"capture_excluded=true"}"#
+        );
+    }
+
+    #[test]
+    fn session_delete_event_serializes() {
+        let json = serde_json::to_string(&OverlayEvent::SessionDeleteRequested {
+            id: uuid::Uuid::nil(),
+        })
+        .expect("serialize session delete event");
+
+        assert_eq!(
+            json,
+            r#"{"type":"session_delete_requested","id":"00000000-0000-0000-0000-000000000000"}"#
         );
     }
 }

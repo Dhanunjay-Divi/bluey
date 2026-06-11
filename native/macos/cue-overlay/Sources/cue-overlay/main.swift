@@ -707,6 +707,10 @@ private func emitSessionRename(id: String, title: String) {
     emitEvent(["type": "session_rename_requested", "id": id, "title": title])
 }
 
+private func emitSessionDelete(id: String) {
+    emitEvent(["type": "session_delete_requested", "id": id])
+}
+
 private func emitCardRendered(id: String) {
     emitEvent(["type": "card_rendered", "id": id])
 }
@@ -2066,6 +2070,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var transcriptSnippets: [String] = []
     private var sessionItems: [OverlaySessionItem] = []
     private var editingSessionId: String?
+    private var pendingDeleteSessionId: String?
     private var renameField: NSTextField?
     private var canvasWidthConstraint: NSLayoutConstraint?
     private var composerBarHeightConstraint: NSLayoutConstraint?
@@ -2125,7 +2130,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         composerSurface = NSView()
         composer = ComposerTextView(frame: .zero, textContainer: nil)
         recordingButton = NSButton(title: "Listen", target: nil, action: nil)
-        askButton = NSButton(title: "", target: nil, action: nil)
+        askButton = NSButton(title: "Answer", target: nil, action: nil)
         analyzeButton = NSButton(title: "Screen", target: nil, action: nil)
         attachButton = NSButton(title: "", target: nil, action: nil)
         instructionsButton = NSButton(title: "Tone", target: nil, action: nil)
@@ -2270,16 +2275,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         addSubview(composerBar)
         composerBar.addSubview(composerSurface)
         composerSurface.addSubview(composer)
+        composerSurface.addSubview(recordingButton)
+        composerSurface.addSubview(askButton)
         composerBar.addSubview(attachButton)
         composerBar.addSubview(instructionsButton)
-        composerBar.addSubview(recordingButton)
         composerBar.addSubview(opacityControl)
         opacityControl.addSubview(opacityLabel)
         opacityControl.addSubview(opacitySlider)
         opacityControl.addSubview(opacityValueLabel)
         composerBar.addSubview(modelMenu)
         composerBar.addSubview(analyzeButton)
-        composerBar.addSubview(askButton)
         // Add the header late in the root view so it paints above the scroll
         // workspace. Full-screen modal overlays are added after this.
         addSubview(headerBar)
@@ -2375,7 +2380,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
             sessionDrawer.topAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: 8),
             sessionDrawer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            sessionDrawer.widthAnchor.constraint(equalToConstant: 248),
+            sessionDrawer.widthAnchor.constraint(equalTo: widthAnchor, multiplier: 0.46),
             sessionDrawer.bottomAnchor.constraint(equalTo: composerBar.topAnchor, constant: -8),
 
             drawerTitleLabel.topAnchor.constraint(equalTo: sessionDrawer.topAnchor, constant: 14),
@@ -2467,8 +2472,18 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
             composer.topAnchor.constraint(equalTo: composerSurface.topAnchor, constant: 3),
             composer.leadingAnchor.constraint(equalTo: composerSurface.leadingAnchor, constant: 14),
-            composer.trailingAnchor.constraint(equalTo: composerSurface.trailingAnchor, constant: -14),
+            composer.trailingAnchor.constraint(equalTo: recordingButton.leadingAnchor, constant: -8),
             composer.bottomAnchor.constraint(equalTo: composerSurface.bottomAnchor, constant: -3),
+
+            recordingButton.trailingAnchor.constraint(equalTo: askButton.leadingAnchor, constant: -6),
+            recordingButton.centerYAnchor.constraint(equalTo: composerSurface.centerYAnchor),
+            recordingButton.widthAnchor.constraint(equalToConstant: 84),
+            recordingButton.heightAnchor.constraint(equalToConstant: 32),
+
+            askButton.trailingAnchor.constraint(equalTo: composerSurface.trailingAnchor, constant: -7),
+            askButton.centerYAnchor.constraint(equalTo: composerSurface.centerYAnchor),
+            askButton.widthAnchor.constraint(equalToConstant: 90),
+            askButton.heightAnchor.constraint(equalToConstant: 34),
 
             attachButton.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 14),
             attachButton.bottomAnchor.constraint(equalTo: composerBar.bottomAnchor, constant: -10),
@@ -2480,12 +2495,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             instructionsButton.widthAnchor.constraint(equalToConstant: 86),
             instructionsButton.heightAnchor.constraint(equalToConstant: 36),
 
-            recordingButton.leadingAnchor.constraint(equalTo: instructionsButton.trailingAnchor, constant: 8),
-            recordingButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            recordingButton.widthAnchor.constraint(equalToConstant: 94),
-            recordingButton.heightAnchor.constraint(equalToConstant: 36),
-
-            opacityControl.leadingAnchor.constraint(equalTo: recordingButton.trailingAnchor, constant: 8),
+            opacityControl.leadingAnchor.constraint(equalTo: instructionsButton.trailingAnchor, constant: 8),
             opacityControl.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
             opacityControl.widthAnchor.constraint(equalToConstant: 154),
             opacityControl.heightAnchor.constraint(equalToConstant: 36),
@@ -2503,12 +2513,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             opacityValueLabel.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
             opacityValueLabel.widthAnchor.constraint(equalToConstant: 22),
 
-            askButton.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -8),
-            askButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            askButton.widthAnchor.constraint(equalToConstant: 40),
-            askButton.heightAnchor.constraint(equalToConstant: 40),
-
-            analyzeButton.trailingAnchor.constraint(equalTo: askButton.leadingAnchor, constant: -7),
+            analyzeButton.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -14),
             analyzeButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
             analyzeButton.widthAnchor.constraint(equalToConstant: 88),
             analyzeButton.heightAnchor.constraint(equalToConstant: 36),
@@ -2598,7 +2603,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         styleControlButton(instructionsButton, symbol: "text.bubble", accent: false)
         styleIconButton(attachButton, symbol: "plus", fallback: "+")
         styleControlButton(analyzeButton, symbol: "sparkle.magnifyingglass", accent: false)
-        styleIconButton(askButton, symbol: "arrow.up", fallback: "↑", accent: true)
+        styleControlButton(askButton, symbol: "arrow.up", accent: true)
         styleHeaderIconButton(hideButton, symbol: "eye.slash", fallback: "-")
         styleHeaderIconButton(closeButton, symbol: "xmark", fallback: "x")
         configureTooltips()
@@ -3244,6 +3249,18 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func showTurnOffConfirmation() {
+        pendingDeleteSessionId = nil
+        closeConfirmTitle.stringValue = "Turn Bluey off?"
+        closeConfirmBody.stringValue = "This closes Bluey completely. To start again, run: bluey on"
+        closeConfirmTurnOffButton.title = "Turn Off"
+        closeConfirmTurnOffButton.target = self
+        closeConfirmTurnOffButton.action = #selector(confirmTurnOffClicked)
+        closeConfirmTurnOffButton.toolTip = "Turn Bluey off. Run bluey on to start again."
+        styleControlButton(closeConfirmTurnOffButton, symbol: "power", accent: true)
+        presentConfirmationOverlay()
+    }
+
+    private func presentConfirmationOverlay() {
         dismissAnswerStyleEditor(animated: false)
         closeConfirmOverlay.isHidden = false
         closeConfirmOverlay.alphaValue = 0
@@ -3256,6 +3273,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     @objc private func cancelCloseConfirmClicked() {
+        pendingDeleteSessionId = nil
         dismissCloseConfirm(animated: true)
     }
 
@@ -3283,6 +3301,19 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
             NSApp.terminate(nil)
         }
+    }
+
+    @objc private func confirmDeleteSessionClicked() {
+        guard let id = pendingDeleteSessionId else { return }
+        if let index = sessionItems.firstIndex(where: { $0.id == id }) {
+            sessionItems.remove(at: index)
+            setSessions(sessionItems)
+        }
+        editingSessionId = nil
+        pendingDeleteSessionId = nil
+        dismissCloseConfirm(animated: true)
+        statusLabel.stringValue = "Session deleted"
+        emitSessionDelete(id: id)
     }
 
     @objc private func opacityChanged() {
@@ -3680,7 +3711,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
 
         if sessions.isEmpty {
-            let empty = NSTextField(wrappingLabelWithString: "No saved recordings yet.")
+            let empty = NSTextField(wrappingLabelWithString: "No saved recordings on this device yet.")
             empty.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
             empty.textColor = BlueyTheme.textDim
             empty.alignment = .center
@@ -4063,6 +4094,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         rename.isBordered = false
         rename.tag = sessionIndex(session.id)
         rename.contentTintColor = BlueyTheme.cyan
+        rename.toolTip = "Rename recording"
         if let image = symbolImage("pencil") {
             image.isTemplate = true
             rename.image = image
@@ -4073,10 +4105,27 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             rename.font = NSFont.systemFont(ofSize: 9, weight: .bold)
         }
 
+        let delete = NSButton(title: "", target: self, action: #selector(deleteSessionClicked(_:)))
+        delete.translatesAutoresizingMaskIntoConstraints = false
+        delete.isBordered = false
+        delete.tag = sessionIndex(session.id)
+        delete.contentTintColor = BlueyTheme.warning
+        delete.toolTip = "Delete recording"
+        if let image = symbolImage("trash") {
+            image.isTemplate = true
+            delete.image = image
+            delete.imagePosition = .imageOnly
+            delete.imageScaling = .scaleProportionallyDown
+        } else {
+            delete.title = "Del"
+            delete.font = NSFont.systemFont(ofSize: 9, weight: .bold)
+        }
+
         row.addSubview(openButton)
         row.addSubview(title)
         row.addSubview(subtitle)
         row.addSubview(rename)
+        row.addSubview(delete)
         NSLayoutConstraint.activate([
             row.heightAnchor.constraint(equalToConstant: 52),
 
@@ -4093,10 +4142,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 2),
             subtitle.trailingAnchor.constraint(equalTo: title.trailingAnchor),
 
-            rename.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -6),
             rename.centerYAnchor.constraint(equalTo: row.centerYAnchor),
             rename.widthAnchor.constraint(equalToConstant: 28),
             rename.heightAnchor.constraint(equalToConstant: 28),
+
+            delete.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -6),
+            delete.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            delete.widthAnchor.constraint(equalToConstant: 28),
+            delete.heightAnchor.constraint(equalToConstant: 28),
+
+            rename.trailingAnchor.constraint(equalTo: delete.leadingAnchor, constant: -2),
         ])
         return row
     }
@@ -4170,6 +4225,20 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let session = sessionItems[sender.tag]
         editingSessionId = session.id
         setSessions(sessionItems)
+    }
+
+    @objc private func deleteSessionClicked(_ sender: NSButton) {
+        guard sender.tag >= 0, sender.tag < sessionItems.count else { return }
+        let session = sessionItems[sender.tag]
+        pendingDeleteSessionId = session.id
+        closeConfirmTitle.stringValue = "Delete recording?"
+        closeConfirmBody.stringValue = "Remove \"\(session.title)\" from this device. This cannot be undone."
+        closeConfirmTurnOffButton.title = "Delete"
+        closeConfirmTurnOffButton.target = self
+        closeConfirmTurnOffButton.action = #selector(confirmDeleteSessionClicked)
+        closeConfirmTurnOffButton.toolTip = "Delete this saved recording"
+        styleControlButton(closeConfirmTurnOffButton, symbol: "trash", accent: true)
+        presentConfirmationOverlay()
     }
 
     @objc private func saveInlineRenameClicked(_ sender: NSControl) {
