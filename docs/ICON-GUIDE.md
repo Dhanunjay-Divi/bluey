@@ -19,7 +19,7 @@ Bluey is meant to be usable from `bluey on` without memorizing terminal commands
 
 ## Bottom Tray
 
-- Mic: start or stop audio capture. On the v0.1.0 macOS path, Bluey captures system/microphone audio through bundled native helpers, applies VAD, and routes through configured STT providers including Deepgram, OpenAI Realtime, or LocalWhisper. Windows WASAPI source exists for the parity round but is not a shipped v0.1.0 path. Without a configured STT path, development mode can still emit labeled transcript cards. FFmpeg remains a fallback/dev path.
+- Mic: start or stop audio capture. On the v0.1.0 macOS path, Bluey captures system/microphone audio through bundled native helpers, applies VAD, and routes through managed STT providers: Deepgram Nova-3 first, then OpenAI transcription fallback. Windows WASAPI source exists for the parity round but is not a shipped v0.1.0 path. Mock transcript cards are allowed only when explicitly running local smoke tests with `BLUEY_AUDIO_SIMULATED_ONLY=1` or `CUE_AUDIO_SIMULATED_ONLY=1`; normal user Listen must use real audio or show a setup error. FFmpeg remains a fallback/dev path.
 - Mic dot: dim means off; bright green means recording.
 - Ask field: ask using transcript, screen context, documents, page context, and memory.
 - Send: submit the current question; if the field is empty, answer the latest clear question from the session context.

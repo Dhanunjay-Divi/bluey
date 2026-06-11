@@ -23,12 +23,13 @@ use cue_core::{
     analyze_segment, clock, generate_recap, load_account, local_answer, new_trace_id,
     sanitize_observability_id, trace_id_from_env, AiCapabilities, AiProviderId, AiProviderKind,
     AiRuntimeStatus, AnswerContext, AnswerContextKind, AudioBackend, AudioCaptureConfig,
-    AudioChunkMetadata, AudioDeviceDescriptor, AudioDeviceRole, AudioPipelineStatus,
-    AudioSourceKind, CardArtifactType, CardKind, CloudEndpointConfig, CloudEnvironment,
-    CloudSyncState, CloudSyncStatus, ContextArtifact, ContextKind, ContextProcessingStatus,
-    ConversationTurn, CueCard, CueCardArtifact, DaemonState, MeetingRecord, MeetingState,
-    MemoryHit, OverlayCommand, OverlayContextItem, OverlayEvent, OverlaySessionItem, PrivacyFlags,
-    ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget, Speaker, TranscriptSegment,
+    AudioCaptureStatus, AudioChunkMetadata, AudioDeviceDescriptor, AudioDeviceRole,
+    AudioPipelineStatus, AudioSourceKind, CardArtifactType, CardKind, CloudEndpointConfig,
+    CloudEnvironment, CloudSyncState, CloudSyncStatus, ContextArtifact, ContextKind,
+    ContextProcessingStatus, ConversationTurn, CueCard, CueCardArtifact, DaemonState,
+    MeetingRecord, MeetingState, MemoryHit, OverlayCommand, OverlayContextItem, OverlayEvent,
+    OverlaySessionItem, PrivacyFlags, ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget,
+    Speaker, TranscriptSegment,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -471,6 +472,13 @@ struct CaptureRuntime {
 struct AudioRuntime {
     stop: Option<oneshot::Sender<()>>,
     session_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum AudioRuntimeConfigResolution {
+    Real(RealAudioRuntimeConfig),
+    SimulatedRequested,
+    Unavailable(String),
 }
 
 const DEFAULT_AUDIO_IDLE_STOP_SECS: u64 = 5 * 60;
@@ -1440,23 +1448,35 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             stop_screen_capture(daemon, "overlay eye").await?;
         }
         OverlayEvent::RecordingStartRequested => {
-            let status = start_audio_capture(daemon, AudioCaptureConfig::dual_default()).await?;
-            let balance = refresh_overlay_balance(daemon, None).await;
-            let balance_line = balance
-                .map(|label| format!("\nBalance: {label}."))
-                .unwrap_or_default();
-            push_system_card(
-                daemon,
-                CardKind::System,
-                "Recording on",
-                format!(
-                    "{} Auto-stop after {} with no transcript.{}",
-                    recording_sources_label(&status),
-                    format_duration(audio_idle_stop_timeout()),
-                    balance_line
-                ),
-            )
-            .await;
+            match start_audio_capture(daemon, AudioCaptureConfig::dual_default()).await {
+                Ok(status) => {
+                    let balance = refresh_overlay_balance(daemon, None).await;
+                    let balance_line = balance
+                        .map(|label| format!("\nBalance: {label}."))
+                        .unwrap_or_default();
+                    push_system_card(
+                        daemon,
+                        CardKind::System,
+                        "Recording on",
+                        format!(
+                            "{} Auto-stop after {} with no transcript.{}",
+                            recording_sources_label(&status),
+                            format_duration(audio_idle_stop_timeout()),
+                            balance_line
+                        ),
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    push_system_card(
+                        daemon,
+                        CardKind::Warning,
+                        "Audio setup needed",
+                        format!("{error:#}"),
+                    )
+                    .await;
+                }
+            }
         }
         OverlayEvent::RecordingStopRequested => {
             let status = stop_audio_capture(daemon).await;
@@ -1583,8 +1603,8 @@ async fn start_audio_capture(
     let session_id = format!("audio-{}", clock::now_epoch_ms_string());
     let (stop_tx, stop_rx) = oneshot::channel();
 
-    let real_runtime = build_real_audio_runtime_config(&daemon.paths, &config).await?;
-    let status = if let Some(real_runtime) = real_runtime.clone() {
+    let runtime = build_real_audio_runtime_config(&daemon.paths, &config).await?;
+    let status = if let AudioRuntimeConfigResolution::Real(real_runtime) = runtime.clone() {
         let devices = real_runtime
             .sources
             .iter()
@@ -1607,8 +1627,19 @@ async fn start_audio_capture(
             real_runtime.stt_provider_label.clone(),
             real_audio_platform_note(&real_runtime),
         )
-    } else {
+    } else if matches!(runtime, AudioRuntimeConfigResolution::SimulatedRequested) {
         AudioPipelineStatus::simulated(session_id.clone(), config.clone())
+    } else {
+        let message = match runtime {
+            AudioRuntimeConfigResolution::Unavailable(message) => message,
+            AudioRuntimeConfigResolution::Real(_)
+            | AudioRuntimeConfigResolution::SimulatedRequested => {
+                "Audio capture is not available yet.".to_string()
+            }
+        };
+        let status = failed_audio_status(config, &message);
+        *daemon.audio.lock().await = status;
+        return Err(anyhow!(message));
     };
 
     {
@@ -1619,14 +1650,20 @@ async fn start_audio_capture(
     *daemon.audio.lock().await = status.clone();
 
     let daemon_for_loop = daemon.clone();
-    if let Some(real_runtime) = real_runtime {
-        tokio::spawn(async move {
-            real_audio_loop(daemon_for_loop, session_id, real_runtime, stop_rx).await;
-        });
-    } else {
-        tokio::spawn(async move {
-            audio_simulation_loop(daemon_for_loop, session_id, config, stop_rx).await;
-        });
+    match runtime {
+        AudioRuntimeConfigResolution::Real(real_runtime) => {
+            tokio::spawn(async move {
+                real_audio_loop(daemon_for_loop, session_id, real_runtime, stop_rx).await;
+            });
+        }
+        AudioRuntimeConfigResolution::SimulatedRequested => {
+            tokio::spawn(async move {
+                audio_simulation_loop(daemon_for_loop, session_id, config, stop_rx).await;
+            });
+        }
+        AudioRuntimeConfigResolution::Unavailable(_) => {
+            unreachable!("handled before runtime spawn")
+        }
     }
 
     Ok(status)
@@ -1666,15 +1703,17 @@ pub async fn build_mic_stt_provider() -> anyhow::Result<Box<dyn cue_core::stt::S
 async fn build_real_audio_runtime_config(
     paths: &AppPaths,
     config: &AudioCaptureConfig,
-) -> Result<Option<RealAudioRuntimeConfig>> {
-    if env_truthy_any(&["BLUEY_AUDIO_SIMULATED_ONLY", "CUE_AUDIO_SIMULATED_ONLY"]) {
-        return Ok(None);
+) -> Result<AudioRuntimeConfigResolution> {
+    if audio_simulation_requested() {
+        return Ok(AudioRuntimeConfigResolution::SimulatedRequested);
     }
 
     let ffmpeg_path = find_ffmpeg();
     let native_audio_helper = find_native_audio_helper();
     if ffmpeg_path.is_none() && native_audio_helper.is_none() {
-        return Ok(None);
+        return Ok(AudioRuntimeConfigResolution::Unavailable(
+            "Audio helper is missing. Reinstall Bluey from https://bluey.sh/download, then run bluey on again.".to_string(),
+        ));
     }
 
     let sources = resolve_real_audio_sources(
@@ -1684,10 +1723,12 @@ async fn build_real_audio_runtime_config(
     )
     .await?;
     if sources.is_empty() {
-        return Ok(None);
+        return Ok(AudioRuntimeConfigResolution::Unavailable(
+            "No usable system or microphone audio source was found. Check macOS Microphone and Screen Recording permissions, then try Listen again.".to_string(),
+        ));
     }
 
-    let explicit_stt_key = env_first(&["BLUEY_STT_API_KEY", "OPENAI_API_KEY"]);
+    let explicit_stt_api_key = env_first(&["BLUEY_STT_API_KEY", "OPENAI_API_KEY"]);
     let account = load_account(paths).ok().flatten();
     let account_token = cloud_access_token_from_env().or_else(|| {
         account
@@ -1700,40 +1741,47 @@ async fn build_real_audio_runtime_config(
         .ok()
         .or_else(|| account.as_ref().map(|account| account.api_url.clone()));
 
-    let (stt_endpoint, stt_api_key, stt_model, stt_provider_label, stt_transport) =
-        if let Some(explicit_stt_key) = explicit_stt_key {
-            let stt_endpoint = env_first(&[
-                "BLUEY_STT_API_URL",
-                "OPENAI_AUDIO_TRANSCRIPTIONS_URL",
-                "OPENAI_TRANSCRIPTIONS_URL",
-            ])
-            .unwrap_or_else(|| "https://api.openai.com/v1/audio/transcriptions".to_string());
-            let stt_model = env_first(&["BLUEY_STT_MODEL", "OPENAI_STT_MODEL"])
-                .unwrap_or_else(|| "whisper-1".into());
-            let stt_provider_label =
-                env_first(&["BLUEY_STT_PROVIDER"]).unwrap_or_else(|| format!("openai:{stt_model}"));
-            (
-                stt_endpoint,
-                explicit_stt_key,
-                stt_model,
-                stt_provider_label,
-                RealSttTransport::OpenAiMultipart,
-            )
-        } else {
-            match (account_token, account_api_url) {
-                (Some(token), Some(api_url)) => (
-                    format!("{}/router/transcribe", api_url.trim_end_matches('/')),
-                    token,
-                    env_first(&["BLUEY_STT_MODEL"]).unwrap_or_else(|| "nova-3".into()),
-                    "bluey-managed:deepgram/nova-3".to_string(),
-                    RealSttTransport::BlueyManagedRaw,
-                ),
-                _ => return Ok(None),
+    let (stt_endpoint, stt_api_key, stt_model, stt_provider_label, stt_transport) = if let Some(
+        explicit_stt_key,
+    ) =
+        explicit_stt_api_key
+    {
+        let stt_endpoint = env_first(&[
+            "BLUEY_STT_API_URL",
+            "OPENAI_AUDIO_TRANSCRIPTIONS_URL",
+            "OPENAI_TRANSCRIPTIONS_URL",
+        ])
+        .unwrap_or_else(|| "https://api.openai.com/v1/audio/transcriptions".to_string());
+        let stt_model = env_first(&["BLUEY_STT_MODEL", "OPENAI_STT_MODEL"])
+            .unwrap_or_else(|| "whisper-1".into());
+        let stt_provider_label =
+            env_first(&["BLUEY_STT_PROVIDER"]).unwrap_or_else(|| format!("openai:{stt_model}"));
+        (
+            stt_endpoint,
+            explicit_stt_key,
+            stt_model,
+            stt_provider_label,
+            RealSttTransport::OpenAiMultipart,
+        )
+    } else {
+        match (account_token, account_api_url) {
+            (Some(token), Some(api_url)) => (
+                format!("{}/router/transcribe", api_url.trim_end_matches('/')),
+                token,
+                env_first(&["BLUEY_STT_MODEL"]).unwrap_or_else(|| "nova-3".into()),
+                "bluey-managed:deepgram/nova-3".to_string(),
+                RealSttTransport::BlueyManagedRaw,
+            ),
+            _ => {
+                return Ok(AudioRuntimeConfigResolution::Unavailable(
+                    "Sign in to Bluey before using cloud speech-to-text. Local recording is ready, but Listen needs a linked account to transcribe real audio.".to_string(),
+                ))
             }
-        };
+        }
+    };
     let chunk_duration_ms = real_stt_chunk_duration_ms(config.chunk_duration_ms);
 
-    Ok(Some(RealAudioRuntimeConfig {
+    Ok(AudioRuntimeConfigResolution::Real(RealAudioRuntimeConfig {
         ffmpeg_path,
         stt_endpoint,
         stt_api_key,
@@ -1743,6 +1791,20 @@ async fn build_real_audio_runtime_config(
         chunk_duration_ms,
         sources,
     }))
+}
+
+fn failed_audio_status(config: AudioCaptureConfig, message: &str) -> AudioPipelineStatus {
+    let mut status = AudioPipelineStatus::planned(config);
+    status.capture = AudioCaptureStatus::failed(message);
+    status.runtime_mode = AudioRuntimeMode::Unavailable;
+    status.backend_ready = false;
+    status.note = Some(message.to_string());
+    status.updated_at = clock::now_epoch_ms_string();
+    status
+}
+
+fn audio_simulation_requested() -> bool {
+    env_truthy_any(&["BLUEY_AUDIO_SIMULATED_ONLY", "CUE_AUDIO_SIMULATED_ONLY"])
 }
 
 fn find_ffmpeg() -> Option<PathBuf> {
@@ -7730,6 +7792,34 @@ mod tests {
         assert_eq!(
             url_component("audio system/1 + model"),
             "audio%20system%2F1%20%2B%20model"
+        );
+    }
+
+    #[test]
+    fn failed_audio_status_does_not_mark_backend_ready() {
+        let status = failed_audio_status(
+            AudioCaptureConfig::dual_default(),
+            "Sign in before using speech-to-text.",
+        );
+
+        assert_eq!(status.runtime_mode, AudioRuntimeMode::Unavailable);
+        assert!(!status.backend_ready);
+        assert_eq!(status.stt_provider, None);
+        assert!(status.session_id.is_none());
+        assert_eq!(status.capture.state, cue_core::AudioCaptureState::Failed);
+        assert_eq!(
+            status.capture.last_error.as_deref(),
+            Some("Sign in before using speech-to-text.")
+        );
+    }
+
+    #[test]
+    fn recording_label_never_describes_unavailable_audio_as_preview() {
+        let status = failed_audio_status(AudioCaptureConfig::dual_default(), "missing setup");
+
+        assert_eq!(
+            recording_sources_label(&status),
+            "Audio is not available yet. Check permissions or provider setup."
         );
     }
 
