@@ -153,7 +153,7 @@ private enum ExpandedPanelMetrics {
 }
 
 private enum PillMetrics {
-    static let size = NSSize(width: 174, height: 34)
+    static let size = NSSize(width: 158, height: 32)
 
     static func centeredFrame(in visibleFrame: NSRect) -> NSRect {
         NSRect(
@@ -1066,10 +1066,10 @@ private final class PillView: NSView {
         super.layout()
         layer?.cornerRadius = bounds.height / 2
 
-        let logoSide: CGFloat = 27
+        let logoSide: CGFloat = 25
         logoMark.frame = NSRect(x: 5, y: (bounds.height - logoSide) / 2, width: logoSide, height: logoSide)
 
-        let railWidth: CGFloat = 71
+        let railWidth: CGFloat = 65
         controlRail.frame = NSRect(
             x: bounds.width - railWidth - 5,
             y: (bounds.height - 24) / 2,
@@ -1079,10 +1079,10 @@ private final class PillView: NSView {
 
         let buttonSide: CGFloat = 20
         styleButton.frame = NSRect(x: 3, y: 2, width: buttonSide, height: buttonSide)
-        runButton.frame = NSRect(x: 25.5, y: 2, width: buttonSide, height: buttonSide)
-        endButton.frame = NSRect(x: 48, y: 2, width: buttonSide, height: buttonSide)
+        runButton.frame = NSRect(x: 23.5, y: 2, width: buttonSide, height: buttonSide)
+        endButton.frame = NSRect(x: 42, y: 2, width: buttonSide, height: buttonSide)
 
-        wordmarkView.frame = NSRect(x: 39, y: (bounds.height - 19) / 2 + 1, width: 54, height: 19)
+        wordmarkView.frame = NSRect(x: 36, y: (bounds.height - 18) / 2 + 1, width: 50, height: 18)
         let dotSize: CGFloat = 7
         let dotX = min(wordmarkView.frame.maxX + 2, controlRail.frame.minX - dotSize - 7)
         dotView.frame = NSRect(x: dotX, y: bounds.midY + 4.5, width: dotSize, height: dotSize)
@@ -2112,6 +2112,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     let sessionDrawer: NSView
     let drawerTitleLabel: NSTextField
     let drawerSubtitleLabel: NSTextField
+    let drawerCloseButton: NSButton
     let latestSessionButton: NSButton
     let sessionScroll: NSScrollView
     let sessionStack: NSStackView
@@ -2162,6 +2163,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var composerTextHeightConstraint: NSLayoutConstraint?
     private var attachmentStripHeightConstraint: NSLayoutConstraint?
     private var toastHideWorkItem: DispatchWorkItem?
+    private var knowledgeIndexTimer: Timer?
+    private var knowledgeIndexFrame = 0
+    private let knowledgeIndexFrames = [
+        "Indexing · ● 101",
+        "Indexing · ● 010",
+        "Indexing · ● 111",
+        "Indexing · ● 001",
+    ]
     private var latestCanvas: CanvasArtifact?
     private var canvasOpen = false
     private var canvasFullWindow = false
@@ -2203,6 +2212,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         sessionDrawer = NSView()
         drawerTitleLabel = NSTextField(labelWithString: "Recordings")
         drawerSubtitleLabel = NSTextField(labelWithString: "Click to continue. Pencil to rename.")
+        drawerCloseButton = NSButton(title: "", target: nil, action: nil)
         latestSessionButton = NSButton(title: "Continue latest", target: nil, action: nil)
         sessionScroll = NSScrollView()
         sessionStack = NSStackView()
@@ -2290,6 +2300,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             sessionDrawer,
             drawerTitleLabel,
             drawerSubtitleLabel,
+            drawerCloseButton,
             latestSessionButton,
             sessionScroll,
             sessionStack,
@@ -2362,6 +2373,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         addSubview(sessionDrawer)
         sessionDrawer.addSubview(drawerTitleLabel)
         sessionDrawer.addSubview(drawerSubtitleLabel)
+        sessionDrawer.addSubview(drawerCloseButton)
         sessionDrawer.addSubview(latestSessionButton)
         sessionDrawer.addSubview(sessionScroll)
         addSubview(transcriptStrip)
@@ -2441,13 +2453,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             brandStack.widthAnchor.constraint(greaterThanOrEqualToConstant: 72),
             brandStack.widthAnchor.constraint(lessThanOrEqualToConstant: 128),
 
-            routeBadge.widthAnchor.constraint(greaterThanOrEqualToConstant: 96),
-            routeBadge.widthAnchor.constraint(lessThanOrEqualToConstant: 142),
-            routeBadge.heightAnchor.constraint(equalToConstant: 26),
+            routeBadge.widthAnchor.constraint(greaterThanOrEqualToConstant: 86),
+            routeBadge.widthAnchor.constraint(lessThanOrEqualToConstant: 126),
+            routeBadge.heightAnchor.constraint(equalToConstant: 24),
 
-            knowledgeBadge.widthAnchor.constraint(greaterThanOrEqualToConstant: 94),
-            knowledgeBadge.widthAnchor.constraint(lessThanOrEqualToConstant: 136),
-            knowledgeBadge.heightAnchor.constraint(equalToConstant: 26),
+            knowledgeBadge.widthAnchor.constraint(greaterThanOrEqualToConstant: 86),
+            knowledgeBadge.widthAnchor.constraint(lessThanOrEqualToConstant: 126),
+            knowledgeBadge.heightAnchor.constraint(equalToConstant: 24),
 
             closeButton.widthAnchor.constraint(equalToConstant: 26),
             closeButton.heightAnchor.constraint(equalToConstant: 26),
@@ -2455,9 +2467,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             hideButton.widthAnchor.constraint(equalToConstant: 26),
             hideButton.heightAnchor.constraint(equalToConstant: 26),
 
-            balanceLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 84),
-            balanceLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 116),
-            balanceLabel.heightAnchor.constraint(equalToConstant: 26),
+            balanceLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 76),
+            balanceLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 106),
+            balanceLabel.heightAnchor.constraint(equalToConstant: 24),
 
             canvasToggleButton.widthAnchor.constraint(equalToConstant: 30),
             canvasToggleButton.heightAnchor.constraint(equalToConstant: 30),
@@ -2492,14 +2504,19 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             toastBodyLabel.trailingAnchor.constraint(equalTo: toastTitleLabel.trailingAnchor),
             toastBodyLabel.bottomAnchor.constraint(equalTo: toastView.bottomAnchor, constant: -13),
 
-            sessionDrawer.topAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: 8),
+            sessionDrawer.topAnchor.constraint(equalTo: topAnchor, constant: 10),
             sessionDrawer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            sessionDrawer.widthAnchor.constraint(equalTo: widthAnchor, multiplier: 0.46),
-            sessionDrawer.bottomAnchor.constraint(equalTo: composerBar.topAnchor, constant: -8),
+            sessionDrawer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            sessionDrawer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
 
             drawerTitleLabel.topAnchor.constraint(equalTo: sessionDrawer.topAnchor, constant: 14),
             drawerTitleLabel.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 14),
-            drawerTitleLabel.trailingAnchor.constraint(equalTo: sessionDrawer.trailingAnchor, constant: -14),
+            drawerTitleLabel.trailingAnchor.constraint(equalTo: drawerCloseButton.leadingAnchor, constant: -10),
+
+            drawerCloseButton.topAnchor.constraint(equalTo: sessionDrawer.topAnchor, constant: 10),
+            drawerCloseButton.trailingAnchor.constraint(equalTo: sessionDrawer.trailingAnchor, constant: -10),
+            drawerCloseButton.widthAnchor.constraint(equalToConstant: 30),
+            drawerCloseButton.heightAnchor.constraint(equalToConstant: 30),
 
             drawerSubtitleLabel.topAnchor.constraint(equalTo: drawerTitleLabel.bottomAnchor, constant: 4),
             drawerSubtitleLabel.leadingAnchor.constraint(equalTo: drawerTitleLabel.leadingAnchor),
@@ -2671,6 +2688,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         navButton.target = self
         navButton.action = #selector(toggleSessionsClicked)
+        drawerCloseButton.target = self
+        drawerCloseButton.action = #selector(closeSessionsClicked)
         canvasToggleButton.target = self
         canvasToggleButton.action = #selector(toggleCanvasClicked)
         newSessionButton.target = self
@@ -2711,6 +2730,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         canvasPane.onToggleFullWindow = { [weak self] in self?.toggleCanvasFullWindow() }
         canvasPane.setFullWindow(false)
         styleHeaderIconButton(navButton, symbol: "sidebar.left", fallback: "[]")
+        styleHeaderIconButton(drawerCloseButton, symbol: "xmark", fallback: "x")
         styleHeaderIconButton(canvasToggleButton, symbol: "sidebar.right", fallback: "|")
         styleHeaderIconButton(newSessionButton, symbol: "square.and.pencil", fallback: "+")
         styleControlButton(latestSessionButton, symbol: "clock.arrow.circlepath", accent: false)
@@ -2896,6 +2916,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
         if !answerStyleOverlay.isHidden {
             return true
+        }
+        if !sessionDrawer.isHidden {
+            let drawerPoint = sessionDrawer.convert(localPoint, from: self)
+            return sessionDrawer.bounds.contains(drawerPoint)
         }
         if !resizeEdges(at: localPoint).isEmpty {
             return true
@@ -3187,7 +3211,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         sessionDrawer.layer?.shadowOpacity = 0.26
         sessionDrawer.layer?.shadowRadius = 18
         sessionDrawer.layer?.shadowOffset = NSSize(width: 0, height: -8)
-        sessionDrawer.layer?.zPosition = 920
+        sessionDrawer.layer?.zPosition = 1_500
 
         answerStyleOverlay.isHidden = true
         answerStyleOverlay.wantsLayer = true
@@ -3204,7 +3228,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         answerStylePanel.layer?.shadowRadius = 20
         answerStylePanel.layer?.shadowOffset = .zero
 
-        drawerTitleLabel.font = NSFont.systemFont(ofSize: 13, weight: .bold)
+        drawerTitleLabel.font = NSFont.systemFont(ofSize: 14, weight: .bold)
         drawerTitleLabel.textColor = BlueyTheme.text
         drawerSubtitleLabel.font = NSFont.systemFont(ofSize: 10.5, weight: .medium)
         drawerSubtitleLabel.textColor = BlueyTheme.textDim
@@ -3330,6 +3354,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func configureTooltips() {
         navButton.toolTip = "Show recordings"
+        drawerCloseButton.toolTip = "Close recordings"
         newSessionButton.toolTip = "Start a new recording"
         modelMenu.toolTip = "Choose routing lane"
         canvasToggleButton.toolTip = "Open or collapse the canvas"
@@ -3373,7 +3398,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func styleHeaderBadge(_ label: NSTextField, textColor: NSColor) {
-        label.font = NSFont.systemFont(ofSize: 11.3, weight: .bold)
+        label.font = NSFont.systemFont(ofSize: 10.6, weight: .bold)
         label.textColor = textColor
         label.alignment = .center
         label.lineBreakMode = .byTruncatingMiddle
@@ -3389,7 +3414,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.wantsLayer = true
         label.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.052).cgColor
-        label.layer?.cornerRadius = 13
+        label.layer?.cornerRadius = 12
         label.layer?.borderWidth = 1
         label.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.16).cgColor
     }
@@ -3555,9 +3580,23 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         statusLabel.stringValue = sessionDrawer.isHidden ? statusLabel.stringValue : "Sessions"
     }
 
+    @objc private func closeSessionsClicked() {
+        sessionDrawer.isHidden = true
+    }
+
     @objc private func toggleCanvasClicked() {
         guard latestCanvas != nil else { return }
-        setCanvasOpen(!canvasOpen)
+        if canvasOpen {
+            setCanvasOpen(false)
+        } else {
+            if let window {
+                preCanvasFullWindowFrame = window.frame
+            }
+            setCanvasOpen(true)
+            if !canvasFullWindow {
+                expandCanvasWindow()
+            }
+        }
     }
 
     private func toggleCanvasFullWindow() {
@@ -3770,10 +3809,44 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func setKnowledgeBadge(_ text: String, accent: NSColor) {
+        if text.localizedCaseInsensitiveContains("loading")
+            || text.localizedCaseInsensitiveContains("updating")
+            || text.localizedCaseInsensitiveContains("indexing")
+        {
+            startKnowledgeIndexing()
+            return
+        }
+        stopKnowledgeIndexing()
         knowledgeBadge.stringValue = text
         knowledgeBadge.textColor = accent
         knowledgeBadge.layer?.borderColor = accent.withAlphaComponent(0.30).cgColor
         knowledgeBadge.layer?.backgroundColor = accent.withAlphaComponent(0.08).cgColor
+    }
+
+    private func startKnowledgeIndexing() {
+        knowledgeIndexTimer?.invalidate()
+        knowledgeIndexFrame = 0
+        applyKnowledgeIndexFrame()
+        knowledgeIndexTimer = Timer.scheduledTimer(withTimeInterval: 0.42, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.knowledgeIndexFrame = (self.knowledgeIndexFrame + 1) % self.knowledgeIndexFrames.count
+            self.applyKnowledgeIndexFrame()
+        }
+    }
+
+    private func applyKnowledgeIndexFrame() {
+        let frame = knowledgeIndexFrames[knowledgeIndexFrame % knowledgeIndexFrames.count]
+        knowledgeBadge.stringValue = frame
+        knowledgeBadge.textColor = BlueyTheme.green
+        knowledgeBadge.layer?.borderColor = BlueyTheme.green.withAlphaComponent(0.36).cgColor
+        knowledgeBadge.layer?.backgroundColor = BlueyTheme.green.withAlphaComponent(0.075).cgColor
+        knowledgeBadge.toolTip = "Indexing attached documents"
+    }
+
+    private func stopKnowledgeIndexing() {
+        knowledgeIndexTimer?.invalidate()
+        knowledgeIndexTimer = nil
+        knowledgeBadge.toolTip = "Attached document status"
     }
 
     private func showKnowledgePlaceholder(_ text: String) {
@@ -4128,7 +4201,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func expandCanvasWindow() {
         guard let window else { return }
-        preCanvasFullWindowFrame = window.frame
+        if preCanvasFullWindowFrame == nil {
+            preCanvasFullWindowFrame = window.frame
+        }
         canvasFullWindow = true
         canvasPane.setFullWindow(true)
 

@@ -49,7 +49,10 @@ require_source "knowledgeBadge = NSTextField(labelWithString: \"Docs empty\")"
 require_source "routeBadge = NSTextField(labelWithString: \"Auto · ready\")"
 require_source "composerSurface.addSubview(recordingButton)"
 require_source "composerSurface.addSubview(askButton)"
-require_source "sessionDrawer.widthAnchor.constraint(equalTo: widthAnchor, multiplier: 0.46)"
+require_source "drawerCloseButton = NSButton(title: \"\", target: nil, action: nil)"
+require_source "sessionDrawer.topAnchor.constraint(equalTo: topAnchor, constant: 10)"
+require_source "sessionDrawer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10)"
+require_source "sessionDrawer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10)"
 require_source "emitEvent([\"type\": \"session_delete_requested\""
 require_source "NSButton(title: \"\", target: self, action: #selector(deleteSessionClicked(_:)))"
 require_source "addSubview(headerBar)"
@@ -70,8 +73,12 @@ require_source "resizable: false"
 require_source "maximumFrameHeight"
 require_source "fitExpandedFrameToVisibleScreen"
 require_source "setKnowledgeBadge(\"Docs loading\""
+require_source "private let knowledgeIndexFrames = ["
+require_source "Indexing · ● 101"
+require_source "startKnowledgeIndexing"
 require_source "setTranscriptState(\"LISTENING\""
 require_source "updateRouteBadge(for: q"
+require_source "preCanvasFullWindowFrame = window.frame"
 reject_source "Full access"
 reject_source "Start Bluey"
 reject_source "opacityLabel.stringValue = \"%\""
@@ -132,7 +139,7 @@ def pill_window():
     for bounds in bluey_windows():
         width = int(round(bounds.get("Width", 0)))
         height = int(round(bounds.get("Height", 0)))
-        if 160 <= width <= 190 and 30 <= height <= 38:
+        if 150 <= width <= 180 and 30 <= height <= 36:
             return bounds
     return None
 
