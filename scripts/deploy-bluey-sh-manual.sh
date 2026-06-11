@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Manual Bluey.sh deploy from a local or cloud machine.
+#
+# This is intentionally not tied to GitHub Actions. It keeps the static web
+# deploy and release-artifact deploy separate so a web rsync cannot delete
+# installer manifests or immutable release directories.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+PUBLISH_HOST="${PUBLISH_HOST:-root@165.227.77.152}"
+PUBLISH_PATH="${PUBLISH_PATH:-/var/www/bluey}"
+
+echo "[manual-deploy] host=$PUBLISH_HOST path=$PUBLISH_PATH"
+
+echo "[manual-deploy] syncing static web"
+rsync -av --delete \
+    --exclude '.DS_Store' \
+    --exclude '._*' \
+    --exclude '/backups/***' \
+    --exclude '/releases/***' \
+    --exclude '/install.sh' \
+    --exclude '/latest.json' \
+    --exclude 'index.html.bak-*' \
+    --exclude 'latest.json.bak-*' \
+    web/ "$PUBLISH_HOST:$PUBLISH_PATH/"
+
+echo "[manual-deploy] publishing install manifest + current release artifact"
+PUBLISH_DO=1 \
+PUBLISH_HOST="$PUBLISH_HOST" \
+PUBLISH_PATH="$PUBLISH_PATH" \
+scripts/publish-bluey-release.sh
+
+echo "[manual-deploy] live checks"
+curl -fsS "https://bluey.sh/health" >/dev/null
+curl -fsS "https://bluey.sh/latest.json" >/dev/null
+curl -fsS "https://bluey.sh/install.sh" >/dev/null
+
+echo "[manual-deploy] done"
