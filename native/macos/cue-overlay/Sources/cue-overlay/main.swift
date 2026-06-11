@@ -69,6 +69,10 @@ private enum BlueyTheme {
     }
 }
 
+private func blueyMaterialAlpha(_ base: CGFloat, opacity: CGFloat, floor: CGFloat = 0.02) -> CGFloat {
+    min(1.0, max(floor, base * min(max(opacity, 0.50), 1.0)))
+}
+
 private final class VerticallyCenteredTextFieldCell: NSTextFieldCell {
     override func drawingRect(forBounds rect: NSRect) -> NSRect {
         var drawingRect = super.drawingRect(forBounds: rect)
@@ -1001,6 +1005,7 @@ private final class PillView: NSView {
     private let styleButton = NSButton(title: "", target: nil, action: nil)
     private let runButton = NSButton(title: "", target: nil, action: nil)
     private let endButton = NSButton(title: "", target: nil, action: nil)
+    private var backgroundOpacity: CGFloat = 0.94
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1031,10 +1036,10 @@ private final class PillView: NSView {
         addSubview(dotView)
 
         controlRail.wantsLayer = true
-        controlRail.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.040).cgColor
+        controlRail.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.040)).cgColor
         controlRail.layer?.cornerRadius = 12
         controlRail.layer?.borderWidth = 1
-        controlRail.layer?.borderColor = NSColor.white.withAlphaComponent(0.085).cgColor
+        controlRail.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.085)).cgColor
         addSubview(controlRail)
 
         configureMiniButton(styleButton, symbol: "text.cursor", fallback: "?", tint: BlueyTheme.cyan)
@@ -1093,8 +1098,8 @@ private final class PillView: NSView {
     private func updateRunStateDisplay() {
         configureRunButton()
         runButton.layer?.backgroundColor = runState.symbolColor.withAlphaComponent(
-            runState == .listening ? 0.18 : 0.07).cgColor
-        runButton.layer?.borderColor = runState.symbolColor.withAlphaComponent(0.25).cgColor
+            materialAlpha(runState == .listening ? 0.18 : 0.07)).cgColor
+        runButton.layer?.borderColor = runState.symbolColor.withAlphaComponent(materialAlpha(0.25)).cgColor
         setAccessibilityLabel(runState.accessibilityLabel)
         needsLayout = true
     }
@@ -1103,9 +1108,9 @@ private final class PillView: NSView {
         button.isBordered = false
         button.wantsLayer = true
         button.layer?.cornerRadius = 9
-        button.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.035).cgColor
+        button.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.035)).cgColor
         button.layer?.borderWidth = 1
-        button.layer?.borderColor = NSColor.white.withAlphaComponent(0.08).cgColor
+        button.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.08)).cgColor
         button.contentTintColor = tint
         if let image = symbolImage(symbol) {
             image.isTemplate = true
@@ -1135,6 +1140,20 @@ private final class PillView: NSView {
         runButton.alignment = .center
     }
 
+    private func materialAlpha(_ base: CGFloat, floor: CGFloat = 0.0) -> CGFloat {
+        blueyMaterialAlpha(base, opacity: backgroundOpacity, floor: floor)
+    }
+
+    func applyBackgroundOpacity(_ opacity: Double) {
+        backgroundOpacity = min(max(CGFloat(opacity), 0.50), 1.0)
+        controlRail.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.040)).cgColor
+        controlRail.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.085)).cgColor
+        configureMiniButton(styleButton, symbol: "text.cursor", fallback: "?", tint: BlueyTheme.cyan)
+        configureMiniButton(endButton, symbol: "power", fallback: "×", tint: BlueyTheme.textDim)
+        updateRunStateDisplay()
+        needsDisplay = true
+    }
+
     @objc private func runClicked() { onRunToggle?() }
 
     @objc private func styleClicked() { onAsk?() }
@@ -1148,33 +1167,33 @@ private final class PillView: NSView {
         let radius = outer.height / 2
         let path = NSBezierPath(roundedRect: outer, xRadius: radius, yRadius: radius)
         let shadow = NSShadow()
-        shadow.shadowColor = NSColor.black.withAlphaComponent(0.34)
+        shadow.shadowColor = NSColor.black.withAlphaComponent(materialAlpha(0.34, floor: 0.10))
         shadow.shadowBlurRadius = 9
         shadow.shadowOffset = .zero
         shadow.set()
 
         let bg = NSGradient(colors: [
-            NSColor(red: 0.007, green: 0.011, blue: 0.017, alpha: 0.98),
-            NSColor(red: 0.014, green: 0.026, blue: 0.032, alpha: 0.95),
-            NSColor(red: 0.007, green: 0.010, blue: 0.015, alpha: 0.99),
+            NSColor(red: 0.007, green: 0.011, blue: 0.017, alpha: materialAlpha(0.98)),
+            NSColor(red: 0.014, green: 0.026, blue: 0.032, alpha: materialAlpha(0.95)),
+            NSColor(red: 0.007, green: 0.010, blue: 0.015, alpha: materialAlpha(0.99)),
         ])
         bg?.draw(in: path, angle: -12)
 
         NSGraphicsContext.restoreGraphicsState()
 
-        NSColor(red: 0.26, green: 0.74, blue: 0.96, alpha: 0.38).setStroke()
+        NSColor(red: 0.26, green: 0.74, blue: 0.96, alpha: materialAlpha(0.38)).setStroke()
         path.lineWidth = 1.0
         path.stroke()
 
         let inner = outer.insetBy(dx: 1.5, dy: 1.5)
         let innerPath = NSBezierPath(roundedRect: inner, xRadius: inner.height / 2, yRadius: inner.height / 2)
-        NSColor.white.withAlphaComponent(0.050).setStroke()
+        NSColor.white.withAlphaComponent(materialAlpha(0.050)).setStroke()
         innerPath.lineWidth = 0.7
         innerPath.stroke()
 
         let gloss = NSBezierPath(roundedRect: outer.insetBy(dx: 2, dy: 2), xRadius: radius - 2, yRadius: radius - 2)
         NSGradient(colors: [
-            NSColor.white.withAlphaComponent(0.08),
+            NSColor.white.withAlphaComponent(materialAlpha(0.08)),
             NSColor.white.withAlphaComponent(0.00),
         ])?.draw(in: gloss, angle: 90)
     }
@@ -1370,6 +1389,12 @@ private final class FeedView: NSView {
             hit = view.superview
         }
         return false
+    }
+
+    func applyBackgroundOpacity(_ opacity: CGFloat) {
+        layer?.backgroundColor = BlueyTheme.panel
+            .withAlphaComponent(blueyMaterialAlpha(0.95, opacity: opacity))
+            .cgColor
     }
 
     private func removeAllCards() {
@@ -1971,6 +1996,15 @@ private final class CanvasPaneView: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    func applyBackgroundOpacity(_ opacity: CGFloat) {
+        layer?.backgroundColor = NSColor(
+            red: 0.020,
+            green: 0.024,
+            blue: 0.031,
+            alpha: blueyMaterialAlpha(0.98, opacity: opacity)
+        ).cgColor
+    }
+
     func render(_ artifact: CanvasArtifact) {
         titleLabel.stringValue = artifact.title
         subtitleLabel.stringValue = artifact.subtitle
@@ -2076,6 +2110,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var resizeStartMouse = NSPoint.zero
     private var resizeStartFrame = NSRect.zero
     private let resizeHitSize: CGFloat = 10
+    private var backgroundOpacity: CGFloat = 0.94
 
     override init(frame frameRect: NSRect) {
         feed = FeedView(frame: .zero)
@@ -2621,6 +2656,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         configureTooltips()
         setContextItems([])
         setTranscriptState("IDLE", active: false)
+        applyOpacity(opacitySlider.doubleValue)
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -2647,6 +2683,59 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if #available(macOS 10.15, *) {
             layer?.cornerCurve = .continuous
         }
+    }
+
+    private func materialAlpha(_ base: CGFloat, floor: CGFloat = 0.0) -> CGFloat {
+        blueyMaterialAlpha(base, opacity: backgroundOpacity, floor: floor)
+    }
+
+    private func refreshBackgroundChrome() {
+        layer?.backgroundColor = NSColor(
+            red: 0.010,
+            green: 0.012,
+            blue: 0.016,
+            alpha: backgroundOpacity
+        ).cgColor
+        headerBar.layer?.backgroundColor = NSColor(
+            red: 0.018,
+            green: 0.022,
+            blue: 0.030,
+            alpha: materialAlpha(0.92)
+        ).cgColor
+        modelMenu.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.075)).cgColor
+        modelMenu.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.12)).cgColor
+        balanceLabel.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.055)).cgColor
+        balanceLabel.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.10)).cgColor
+        toastView.layer?.backgroundColor = NSColor(
+            red: 0.018,
+            green: 0.023,
+            blue: 0.030,
+            alpha: materialAlpha(0.96)
+        ).cgColor
+        transcriptStrip.layer?.backgroundColor = NSColor.black.withAlphaComponent(materialAlpha(0.16)).cgColor
+        sessionDrawer.layer?.backgroundColor = NSColor(
+            red: 0.035,
+            green: 0.040,
+            blue: 0.050,
+            alpha: materialAlpha(0.98)
+        ).cgColor
+        answerStylePanel.layer?.backgroundColor = BlueyTheme.panelDeep
+            .withAlphaComponent(materialAlpha(0.97))
+            .cgColor
+        composerBar.layer?.backgroundColor = NSColor(
+            red: 0.014,
+            green: 0.016,
+            blue: 0.022,
+            alpha: materialAlpha(0.94)
+        ).cgColor
+        composerSurface.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.050)).cgColor
+        composerSurface.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.12)).cgColor
+        opacityControl.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.065)).cgColor
+        closeConfirmPanel.layer?.backgroundColor = BlueyTheme.panelDeep
+            .withAlphaComponent(materialAlpha(0.97))
+            .cgColor
+        feed.applyBackgroundOpacity(backgroundOpacity)
+        canvasPane.applyBackgroundOpacity(backgroundOpacity)
     }
 
     override func keyDown(with event: NSEvent) {
@@ -3360,10 +3449,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     func applyOpacity(_ opacity: Double) {
         let value = min(max(opacity, 0.50), 1.0)
+        backgroundOpacity = CGFloat(value)
         if abs(opacitySlider.doubleValue - value) > 0.001 {
             opacitySlider.doubleValue = value
         }
         opacityValueLabel.stringValue = "\(Int((value * 100.0).rounded()))"
+        refreshBackgroundChrome()
         onOpacityChanged?(value)
     }
 
@@ -4561,6 +4652,7 @@ private final class OverlayApp {
     private var expandedView: ExpandedPanelView?
     private var expandedPassthroughTimer: Timer?
     private var currentRunState: PillRunState = .ready
+    private var overlayOpacity = 0.94
 
     /// Pending boot card, if a Boot command arrived before windows materialised.
     private var pendingBoot: (title: String, lines: [String])?
@@ -4578,6 +4670,7 @@ private final class OverlayApp {
         pillWindow.contentView = pillView
         pillView.statusText = "Bluey"
         pillView.setRunState(currentRunState)
+        pillView.applyBackgroundOpacity(overlayOpacity)
         pillView.onClick = { [weak self] in self?.expand() }
         pillView.onRunToggle = { [weak self] in self?.toggleListeningFromPill() }
         pillView.onAsk = { [weak self] in self?.expandAndFocusQuestion() }
@@ -4698,13 +4791,13 @@ private final class OverlayApp {
             self?.setRunState(state)
         }
         view.onOpacityChanged = { [weak self] opacity in
-            let value = CGFloat(opacity)
-            self?.pillWindow?.alphaValue = value
-            self?.expandedWindow?.alphaValue = value
+            self?.overlayOpacity = opacity
+            self?.pillView?.applyBackgroundOpacity(opacity)
         }
         expandedWindow = window
         expandedView = view
         view.setListeningState(currentRunState)
+        view.applyOpacity(overlayOpacity)
         if let pending = pendingBoot {
             pushBootCard(title: pending.title, lines: pending.lines)
             pendingBoot = nil
@@ -4773,8 +4866,8 @@ private final class OverlayApp {
             pushBootCard(title: title, lines: lines)
         case .setOpacity(let o):
             let value = min(max(o, 0.50), 1.0)
-            pillWindow.alphaValue = CGFloat(value)
-            expandedWindow?.alphaValue = CGFloat(value)
+            overlayOpacity = value
+            pillView?.applyBackgroundOpacity(value)
             expandedView?.applyOpacity(value)
         case .setPosition(let pos):
             applyPosition(pos)
