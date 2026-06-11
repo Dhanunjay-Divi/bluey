@@ -1886,11 +1886,16 @@ private final class CanvasPaneView: NSView {
     private let iconView = NSImageView()
     private let titleLabel = NSTextField(labelWithString: "Workspace")
     private let subtitleLabel = NSTextField(labelWithString: "Structured output appears here")
+    private let fullWindowButton = NSButton(title: "", target: nil, action: nil)
+    private let copyButton = NSButton(title: "", target: nil, action: nil)
     private let closeButton = NSButton(title: "", target: nil, action: nil)
     private let scroll = NSScrollView()
     private let textView = NSTextView()
+    private var currentText = ""
+    private var fullWindow = false
 
     var onCollapse: (() -> Void)?
+    var onToggleFullWindow: (() -> Void)?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1904,6 +1909,8 @@ private final class CanvasPaneView: NSView {
         iconView.translatesAutoresizingMaskIntoConstraints = false
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        fullWindowButton.translatesAutoresizingMaskIntoConstraints = false
+        copyButton.translatesAutoresizingMaskIntoConstraints = false
         closeButton.translatesAutoresizingMaskIntoConstraints = false
         scroll.translatesAutoresizingMaskIntoConstraints = false
 
@@ -1911,6 +1918,8 @@ private final class CanvasPaneView: NSView {
         header.addSubview(iconView)
         header.addSubview(titleLabel)
         header.addSubview(subtitleLabel)
+        header.addSubview(fullWindowButton)
+        header.addSubview(copyButton)
         header.addSubview(closeButton)
         addSubview(scroll)
 
@@ -1923,20 +1932,17 @@ private final class CanvasPaneView: NSView {
         subtitleLabel.textColor = BlueyTheme.textDim
         subtitleLabel.lineBreakMode = .byTruncatingTail
 
-        closeButton.isBordered = false
-        closeButton.wantsLayer = true
-        closeButton.layer?.cornerRadius = 12
-        closeButton.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.035).cgColor
-        closeButton.layer?.borderWidth = 1
-        closeButton.layer?.borderColor = BlueyTheme.hairline.cgColor
-        closeButton.contentTintColor = BlueyTheme.textDim
-        if let image = symbolImage("chevron.right") {
-            image.isTemplate = true
-            closeButton.image = image
-            closeButton.imagePosition = .imageOnly
-        } else {
-            closeButton.title = "<"
-        }
+        styleCanvasHeaderButton(copyButton, symbol: "doc.on.doc", fallback: "C")
+        copyButton.toolTip = "Copy canvas"
+        copyButton.target = self
+        copyButton.action = #selector(copyClicked)
+
+        styleCanvasHeaderButton(fullWindowButton, symbol: "arrow.up.left.and.arrow.down.right", fallback: "[]")
+        fullWindowButton.toolTip = "Expand canvas"
+        fullWindowButton.target = self
+        fullWindowButton.action = #selector(fullWindowClicked)
+
+        styleCanvasHeaderButton(closeButton, symbol: "chevron.right", fallback: "<")
         closeButton.toolTip = "Collapse canvas"
         closeButton.target = self
         closeButton.action = #selector(collapseClicked)
@@ -1979,9 +1985,19 @@ private final class CanvasPaneView: NSView {
             closeButton.widthAnchor.constraint(equalToConstant: 26),
             closeButton.heightAnchor.constraint(equalToConstant: 26),
 
+            copyButton.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -6),
+            copyButton.topAnchor.constraint(equalTo: header.topAnchor),
+            copyButton.widthAnchor.constraint(equalToConstant: 26),
+            copyButton.heightAnchor.constraint(equalToConstant: 26),
+
+            fullWindowButton.trailingAnchor.constraint(equalTo: copyButton.leadingAnchor, constant: -6),
+            fullWindowButton.topAnchor.constraint(equalTo: header.topAnchor),
+            fullWindowButton.widthAnchor.constraint(equalToConstant: 26),
+            fullWindowButton.heightAnchor.constraint(equalToConstant: 26),
+
             titleLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
             titleLabel.topAnchor.constraint(equalTo: header.topAnchor),
-            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: closeButton.leadingAnchor, constant: -8),
+            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: fullWindowButton.leadingAnchor, constant: -8),
 
             subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             subtitleLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 3),
@@ -2008,12 +2024,61 @@ private final class CanvasPaneView: NSView {
     func render(_ artifact: CanvasArtifact) {
         titleLabel.stringValue = artifact.title
         subtitleLabel.stringValue = artifact.subtitle
+        currentText = artifact.content
         if let image = symbolImage(artifact.kind.icon) {
             image.isTemplate = true
             iconView.image = image
         }
         textView.string = artifact.content
         textView.scrollRangeToVisible(NSRange(location: 0, length: 0))
+    }
+
+    func setFullWindow(_ value: Bool) {
+        fullWindow = value
+        let symbol = value
+            ? "arrow.down.right.and.arrow.up.left"
+            : "arrow.up.left.and.arrow.down.right"
+        styleCanvasHeaderButton(fullWindowButton, symbol: symbol, fallback: value ? "><" : "[]")
+        fullWindowButton.toolTip = value ? "Restore canvas size" : "Expand canvas"
+    }
+
+    private func styleCanvasHeaderButton(_ button: NSButton, symbol: String, fallback: String) {
+        button.title = ""
+        button.isBordered = false
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 12
+        button.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.040).cgColor
+        button.layer?.borderWidth = 1
+        button.layer?.borderColor = BlueyTheme.hairline.cgColor
+        button.contentTintColor = BlueyTheme.textDim
+        button.font = NSFont.systemFont(ofSize: 10.5, weight: .bold)
+        if let image = symbolImage(symbol) {
+            image.isTemplate = true
+            button.image = image
+            button.imagePosition = .imageOnly
+            button.imageScaling = .scaleProportionallyDown
+        } else {
+            button.image = nil
+            button.attributedTitle = NSAttributedString(
+                string: fallback,
+                attributes: [
+                    .font: button.font ?? NSFont.systemFont(ofSize: 10.5, weight: .bold),
+                    .foregroundColor: BlueyTheme.textDim,
+                ])
+        }
+        button.imageHugsTitle = true
+        button.alignment = .center
+    }
+
+    @objc private func copyClicked() {
+        let text = currentText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    @objc private func fullWindowClicked() {
+        onToggleFullWindow?()
     }
 
     @objc private func collapseClicked() {
@@ -2099,6 +2164,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var toastHideWorkItem: DispatchWorkItem?
     private var latestCanvas: CanvasArtifact?
     private var canvasOpen = false
+    private var canvasFullWindow = false
+    private var preCanvasFullWindowFrame: NSRect?
     private struct ResizeEdges: OptionSet {
         let rawValue: Int
         static let left = ResizeEdges(rawValue: 1 << 0)
@@ -2641,6 +2708,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         canvasPane.isHidden = true
         canvasToggleButton.isHidden = true
         canvasPane.onCollapse = { [weak self] in self?.setCanvasOpen(false) }
+        canvasPane.onToggleFullWindow = { [weak self] in self?.toggleCanvasFullWindow() }
+        canvasPane.setFullWindow(false)
         styleHeaderIconButton(navButton, symbol: "sidebar.left", fallback: "[]")
         styleHeaderIconButton(canvasToggleButton, symbol: "sidebar.right", fallback: "|")
         styleHeaderIconButton(newSessionButton, symbol: "square.and.pencil", fallback: "+")
@@ -2664,6 +2733,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         super.layout()
         applyShellChrome()
         keepFixedChromeInBounds()
+        if canvasOpen {
+            updateCanvasWidth()
+        }
         resizeTranscriptLabelToContent()
     }
 
@@ -2828,18 +2900,29 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if !resizeEdges(at: localPoint).isEmpty {
             return true
         }
-        if headerBar.frame.contains(localPoint)
-            || composerBar.frame.contains(localPoint)
-            || transcriptStrip.frame.contains(localPoint)
-            || (!attachmentStrip.isHidden && attachmentStrip.frame.contains(localPoint))
-        {
-            return true
-        }
-        if !sessionDrawer.isHidden && sessionDrawer.frame.contains(localPoint) {
-            return true
-        }
-        if feed.hasCopyControl(atScreenPoint: screenPoint) {
-            return true
+        return hasInteractiveView(at: localPoint)
+            || feed.hasCopyControl(atScreenPoint: screenPoint)
+    }
+
+    private func hasInteractiveView(at localPoint: NSPoint) -> Bool {
+        var hit: NSView? = hitTest(localPoint)
+        while let view = hit {
+            if view === self || view === workspace || view === headerBar || view === composerBar {
+                hit = view.superview
+                continue
+            }
+            if view is NSButton
+                || view is NSPopUpButton
+                || view is NSSlider
+                || view is NSScroller
+                || view is NSTextView
+            {
+                return true
+            }
+            if let textField = view as? NSTextField, textField.isEditable {
+                return true
+            }
+            hit = view.superview
         }
         return false
     }
@@ -3477,6 +3560,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         setCanvasOpen(!canvasOpen)
     }
 
+    private func toggleCanvasFullWindow() {
+        guard canvasOpen, window != nil else { return }
+        if canvasFullWindow {
+            restoreCanvasWindow()
+        } else {
+            expandCanvasWindow()
+        }
+    }
+
     @objc private func newSessionClicked() {
         let preserveFrame = !canvasOpen
         let previousFrame = preserveFrame ? window?.frame : nil
@@ -4003,9 +4095,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func setCanvasOpen(_ open: Bool) {
+        if !open, canvasFullWindow {
+            restoreCanvasWindow()
+        }
         canvasOpen = open
         canvasPane.isHidden = !open
-        canvasWidthConstraint?.constant = open ? 310 : 0
+        updateCanvasWidth()
         canvasToggleButton.contentTintColor = open ? BlueyTheme.cyan : BlueyTheme.textDim
         if open {
             ensureRoomForCanvas()
@@ -4015,6 +4110,73 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.16
             self.layoutSubtreeIfNeeded()
+        }
+    }
+
+    private func updateCanvasWidth() {
+        guard canvasOpen else {
+            canvasWidthConstraint?.constant = 0
+            return
+        }
+        let available = max(0, bounds.width)
+        if canvasFullWindow {
+            canvasWidthConstraint?.constant = min(max(380, available * 0.44), 560)
+        } else {
+            canvasWidthConstraint?.constant = 310
+        }
+    }
+
+    private func expandCanvasWindow() {
+        guard let window else { return }
+        preCanvasFullWindowFrame = window.frame
+        canvasFullWindow = true
+        canvasPane.setFullWindow(true)
+
+        let screen = window.screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let maxWidth = max(360, screen.width - ExpandedPanelMetrics.screenInset * 2)
+        let maxHeight = max(ExpandedPanelMetrics.minHeight, screen.height - ExpandedPanelMetrics.screenInset * 2)
+        if let overlayWindow = window as? OverlayWindow {
+            overlayWindow.minimumFrameWidth = min(ExpandedPanelMetrics.minCompactWidth, maxWidth)
+            overlayWindow.maximumFrameWidth = maxWidth
+            overlayWindow.minimumFrameHeight = ExpandedPanelMetrics.minHeight
+            overlayWindow.maximumFrameHeight = maxHeight
+        }
+        window.minSize = NSSize(width: min(ExpandedPanelMetrics.minCompactWidth, maxWidth), height: ExpandedPanelMetrics.minHeight)
+        window.contentMinSize = window.minSize
+        window.maxSize = NSSize(width: maxWidth, height: maxHeight)
+        window.contentMaxSize = window.maxSize
+        var frame = NSRect(
+            x: screen.midX - maxWidth / 2,
+            y: screen.midY - maxHeight / 2,
+            width: maxWidth,
+            height: maxHeight)
+        frame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(frame, visibleFrame: screen)
+        updateCanvasWidth()
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.16
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            window.animator().setFrame(frame, display: true)
+            self.layoutSubtreeIfNeeded()
+        }
+    }
+
+    private func restoreCanvasWindow() {
+        guard let window else { return }
+        canvasFullWindow = false
+        canvasPane.setFullWindow(false)
+        let targetFrame = preCanvasFullWindowFrame
+        preCanvasFullWindowFrame = nil
+        restoreCompactWidth()
+        updateCanvasWidth()
+        if let targetFrame {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.16
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                window.animator().setFrame(targetFrame, display: true)
+                self.layoutSubtreeIfNeeded()
+            }
         }
     }
 
