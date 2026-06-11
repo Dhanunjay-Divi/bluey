@@ -1936,9 +1936,6 @@ async fn start(args: StartArgs) -> Result<()> {
 
 async fn cleanup_stale_daemon(paths: &AppPaths, quiet: bool) -> Result<()> {
     let state_pid = read_daemon_state_pid(&paths.state_file)?;
-    if let Some(pid) = state_pid {
-        terminate_pid(pid)?;
-    }
 
     let daemon_bin = resolve_daemon_bin().ok();
     let killed = terminate_matching_daemon_processes(daemon_bin.as_deref())?;
@@ -2852,7 +2849,9 @@ async fn bluey_credits_cmd() -> Result<()> {
 
 async fn bluey_logout_cmd() -> Result<()> {
     let paths = AppPaths::discover()?;
-    let account_config_cleared = clear_local_account_config(&paths)?;
+    let account_store = cue_cloud_client::AccountFileStore::new(paths.clone());
+    let had_account_tokens = cue_cloud_client::TokenStore::load(&account_store)?.is_some();
+    cue_cloud_client::TokenStore::clear(&account_store)?;
 
     let had_keyring_tokens = if legacy_keyring_fallback_enabled() {
         match clear_keyring_tokens_with_timeout()? {
@@ -2868,7 +2867,7 @@ async fn bluey_logout_cmd() -> Result<()> {
         false
     };
 
-    if !account_config_cleared && !had_keyring_tokens {
+    if !had_account_tokens && !had_keyring_tokens {
         println!("Bluey is already logged out.");
         return Ok(());
     }
@@ -2893,16 +2892,6 @@ fn clear_keyring_tokens_with_timeout() -> Result<Option<bool>> {
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             Err(anyhow!("keyring cleanup task ended without returning"))
-        }
-    }
-}
-
-fn clear_local_account_config(paths: &AppPaths) -> Result<bool> {
-    match std::fs::remove_file(&paths.account_file) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
-        Err(error) => {
-            Err(error).with_context(|| format!("failed to remove {}", paths.account_file.display()))
         }
     }
 }

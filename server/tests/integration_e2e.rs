@@ -552,6 +552,54 @@ async fn router_complete_stream_openai_error_frame_is_retryable() {
 
 #[tokio::test]
 #[serial]
+async fn router_complete_stream_openai_truncated_after_delta_is_not_billed_or_released() {
+    let h = boot_harness().await;
+    let email = "stream-openai-truncated@example.com";
+    let access = signup_and_login(&h, email, "longenoughpw").await;
+
+    let stream = "data: {\"choices\":[{\"delta\":{\"content\":\"Partial answer\"}}]}\n\n";
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(stream),
+        )
+        .expect(1)
+        .mount(&h.openai)
+        .await;
+
+    let req = Request::post("/router/complete/stream")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "request_id": "stream-openai-truncated-1",
+                "system": "you are helpful",
+                "user": "answer quickly",
+                "lane": "instant"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = axum::body::to_bytes(resp.into_body(), 128 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("Partial answer"));
+    assert!(body.contains("event: error"));
+    assert!(body.contains("upstream_stream_error"));
+    assert!(!body.contains("event: billing"));
+
+    let account = Account::fetch_by_email(&h.pool, email).unwrap().unwrap();
+    let replay = idempotency::reserve(&h.pool, &account.id, "stream-openai-truncated-1").unwrap();
+    assert_eq!(replay, idempotency::ReserveOutcome::CachedFailed);
+}
+
+#[tokio::test]
+#[serial]
 async fn router_complete_stream_idempotency_replays_cached_stream_without_upstream() {
     let h = boot_harness().await;
     let access = signup_and_login(&h, "stream-idem@example.com", "longenoughpw").await;
@@ -661,6 +709,60 @@ async fn router_complete_stream_proxies_anthropic_messages_sse() {
     assert!(body.contains("\"input_tokens\":20"));
     assert!(body.contains("\"output_tokens\":6"));
     assert!(body.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+#[serial]
+async fn router_complete_stream_anthropic_truncated_after_delta_is_not_billed_or_released() {
+    let h = boot_harness().await;
+    let email = "stream-anthropic-truncated@example.com";
+    let access = signup_and_login(&h, email, "longenoughpw").await;
+
+    let stream = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":20,\"output_tokens\":0}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Partial deep answer\"}}\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(stream),
+        )
+        .expect(1)
+        .mount(&h.anthropic)
+        .await;
+
+    let req = Request::post("/router/complete/stream")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "request_id": "stream-anthropic-truncated-1",
+                "system": "you are helpful",
+                "user": "answer a normal technical question",
+                "lane": "balanced"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body = axum::body::to_bytes(resp.into_body(), 128 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("Partial deep answer"));
+    assert!(body.contains("event: error"));
+    assert!(body.contains("upstream_stream_error"));
+    assert!(!body.contains("event: billing"));
+
+    let account = Account::fetch_by_email(&h.pool, email).unwrap().unwrap();
+    let replay =
+        idempotency::reserve(&h.pool, &account.id, "stream-anthropic-truncated-1").unwrap();
+    assert_eq!(replay, idempotency::ReserveOutcome::CachedFailed);
 }
 
 #[tokio::test]
@@ -1416,7 +1518,7 @@ async fn billing_square_webhook_credits_completed_order() {
 
 #[tokio::test]
 #[serial]
-async fn billing_square_webhook_accepts_production_signature_while_checkout_is_sandbox() {
+async fn billing_square_webhook_rejects_production_signature_while_checkout_is_sandbox() {
     use base64::Engine;
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
@@ -1480,7 +1582,7 @@ async fn billing_square_webhook_accepts_production_signature_while_checkout_is_s
         .body(Body::from(body))
         .unwrap();
     let resp = h.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.status(), 401);
 
     let balance: i64 = h
         .pool
@@ -1492,7 +1594,7 @@ async fn billing_square_webhook_accepts_production_signature_while_checkout_is_s
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(balance, 1500);
+    assert_eq!(balance, 0);
 
     std::env::remove_var("BLUEY_BILLING_PROVIDER");
     std::env::remove_var("SQUARE_ENVIRONMENT");

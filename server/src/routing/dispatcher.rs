@@ -452,6 +452,8 @@ struct OpenAiChatReq<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
@@ -462,6 +464,14 @@ struct OpenAiChatReq<'a> {
 #[derive(Serialize)]
 struct OpenAiStreamOptions {
     include_usage: bool,
+}
+
+fn openai_token_limit_fields(model: &str, max_tokens: Option<u32>) -> (Option<u32>, Option<u32>) {
+    if model.to_ascii_lowercase().starts_with("gpt-5") {
+        (None, max_tokens)
+    } else {
+        (max_tokens, None)
+    }
 }
 
 #[derive(Serialize)]
@@ -526,6 +536,7 @@ async fn openai_complete(
     image_data_urls: &[String],
 ) -> Result<Completion> {
     let user_content = openai_user_content(user, image_data_urls);
+    let (max_tokens, max_completion_tokens) = openai_token_limit_fields(model, max_tokens);
     let req = OpenAiChatReq {
         model,
         messages: vec![
@@ -539,6 +550,7 @@ async fn openai_complete(
             },
         ],
         max_tokens,
+        max_completion_tokens,
         temperature,
         stream: None,
         stream_options: None,
@@ -616,10 +628,11 @@ async fn openai_complete_stream(
     max_tokens: Option<u32>,
     temperature: Option<f32>,
     _thinking: ThinkingBudget,
-    fallback_input_tokens: Option<i64>,
+    _fallback_input_tokens: Option<i64>,
     image_data_urls: &[String],
 ) -> Result<StreamingCompletion> {
     let user_content = openai_user_content(user, image_data_urls);
+    let (max_tokens, max_completion_tokens) = openai_token_limit_fields(model, max_tokens);
     let req = OpenAiChatReq {
         model,
         messages: vec![
@@ -633,6 +646,7 @@ async fn openai_complete_stream(
             },
         ],
         max_tokens,
+        max_completion_tokens,
         temperature,
         stream: Some(true),
         stream_options: Some(OpenAiStreamOptions {
@@ -662,7 +676,6 @@ async fn openai_complete_stream(
     let provider = "openai".to_string();
     let model_string = model.to_string();
     let mut bytes = resp.bytes_stream();
-    let fallback_input = fallback_input_tokens.unwrap_or(0);
     let stream = async_stream::try_stream! {
         let mut buffer = String::new();
         let mut pending_utf8 = Vec::new();
@@ -700,10 +713,12 @@ async fn openai_complete_stream(
                 yield CompletionStreamEvent::Delta(delta);
             }
         }
-        let (input_tokens, output_tokens) = final_usage
-            .map(|usage| (usage.prompt_tokens, usage.completion_tokens))
-            .unwrap_or((fallback_input, 0));
-        let _ = seen_done;
+        if !seen_done {
+            Err::<(), anyhow::Error>(anyhow!("openai stream ended before [DONE]"))?;
+        }
+        let usage = final_usage
+            .ok_or_else(|| anyhow!("openai stream ended before final usage"))?;
+        let (input_tokens, output_tokens) = (usage.prompt_tokens, usage.completion_tokens);
         yield CompletionStreamEvent::Done {
             input_tokens,
             output_tokens,
@@ -990,12 +1005,13 @@ async fn anthropic_complete_stream(
         let mut pending_utf8 = Vec::new();
         let mut input_tokens: Option<i64> = None;
         let mut output_tokens: Option<i64> = None;
+        let mut seen_stop = false;
 
         while let Some(chunk) = bytes.next().await {
             let chunk = chunk.context("anthropic stream read")?;
             append_utf8_chunk(&chunk, &mut pending_utf8, &mut buffer)?;
             while let Some((event, data)) = take_sse_event(&mut buffer) {
-                if let Some(delta) = parse_anthropic_stream_event(&event, &data, &mut input_tokens, &mut output_tokens)? {
+                if let Some(delta) = parse_anthropic_stream_event(&event, &data, &mut input_tokens, &mut output_tokens, &mut seen_stop)? {
                     yield CompletionStreamEvent::Delta(delta);
                 }
             }
@@ -1005,13 +1021,20 @@ async fn anthropic_complete_stream(
             buffer.push_str(tail);
         }
         while let Some((event, data)) = take_sse_event(&mut buffer) {
-            if let Some(delta) = parse_anthropic_stream_event(&event, &data, &mut input_tokens, &mut output_tokens)? {
+            if let Some(delta) = parse_anthropic_stream_event(&event, &data, &mut input_tokens, &mut output_tokens, &mut seen_stop)? {
                 yield CompletionStreamEvent::Delta(delta);
             }
         }
+        if !seen_stop {
+            Err::<(), anyhow::Error>(anyhow!(
+                "anthropic stream ended before message_stop"
+            ))?;
+        }
+        let output_tokens = output_tokens
+            .ok_or_else(|| anyhow!("anthropic stream ended before final usage"))?;
         yield CompletionStreamEvent::Done {
             input_tokens: input_tokens.unwrap_or(fallback_input),
-            output_tokens: output_tokens.unwrap_or(0),
+            output_tokens,
         };
     };
 
@@ -1027,6 +1050,7 @@ fn parse_anthropic_stream_event(
     data: &str,
     input_tokens: &mut Option<i64>,
     output_tokens: &mut Option<i64>,
+    seen_stop: &mut bool,
 ) -> Result<Option<String>> {
     let data = data.trim();
     if data.is_empty() || data == "[DONE]" {
@@ -1062,6 +1086,9 @@ fn parse_anthropic_stream_event(
                 *output_tokens = Some(value);
             }
         }
+    }
+    if event == "message_stop" || parsed.kind == "message_stop" {
+        *seen_stop = true;
     }
     if event == "content_block_delta" || parsed.kind == "content_block_delta" {
         if let Some(delta) = parsed.delta {
@@ -1556,17 +1583,20 @@ mod tests {
     fn anthropic_stream_error_event_is_not_treated_as_empty_success() {
         let mut input_tokens = None;
         let mut output_tokens = None;
+        let mut seen_stop = false;
         let err = parse_anthropic_stream_event(
             "error",
             r#"{"type":"error","error":{"type":"overloaded_error","message":"provider busy"}}"#,
             &mut input_tokens,
             &mut output_tokens,
+            &mut seen_stop,
         )
         .unwrap_err();
 
         assert!(err.to_string().contains("provider busy"));
         assert!(input_tokens.is_none());
         assert!(output_tokens.is_none());
+        assert!(!seen_stop);
     }
 
     #[tokio::test]

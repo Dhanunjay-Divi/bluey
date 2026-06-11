@@ -287,10 +287,15 @@ impl Config {
         let mut configs = Vec::new();
         for environment in ordered {
             let prefix = environment.env_prefix();
-            let key = generic_key.clone().or_else(|| {
-                std::env::var(format!("{prefix}_WEBHOOK_SIGNATURE_KEY"))
-                    .ok()
-                    .filter(|v| !v.trim().is_empty())
+            let environment_key = std::env::var(format!("{prefix}_WEBHOOK_SIGNATURE_KEY"))
+                .ok()
+                .filter(|v| !v.trim().is_empty());
+            let key = environment_key.or_else(|| {
+                if environment == configured {
+                    generic_key.clone()
+                } else {
+                    None
+                }
             });
             if let Some(webhook_signature_key) = key {
                 if configs
@@ -505,11 +510,27 @@ mod tests {
         assert_eq!(square.access_token.as_deref(), Some("prod-token"));
         assert_eq!(square.location_id.as_deref(), Some("prod-location"));
 
+        std::env::set_var("SQUARE_WEBHOOK_NOTIFICATION_URL", "https://bluey.sh/billing/square/webhook");
+        std::env::set_var("SQUARE_WEBHOOK_SIGNATURE_KEY", "generic-whsec");
+        std::env::set_var("SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY", "sandbox-whsec");
+        std::env::set_var("SQUARE_PRODUCTION_WEBHOOK_SIGNATURE_KEY", "prod-whsec");
+        std::env::set_var("SQUARE_ENVIRONMENT", "sandbox");
+        let webhook_configs = cfg.square_webhook_signature_configs();
+        assert_eq!(webhook_configs.len(), 2);
+        assert_eq!(webhook_configs[0].environment, SquareEnvironment::Sandbox);
+        assert_eq!(webhook_configs[0].webhook_signature_key, "sandbox-whsec");
+        assert_eq!(webhook_configs[1].environment, SquareEnvironment::Production);
+        assert_eq!(webhook_configs[1].webhook_signature_key, "prod-whsec");
+
         std::env::remove_var("SQUARE_ENVIRONMENT");
         std::env::remove_var("SQUARE_SANDBOX_ACCESS_TOKEN");
         std::env::remove_var("SQUARE_SANDBOX_LOCATION_ID");
         std::env::remove_var("SQUARE_PRODUCTION_ACCESS_TOKEN");
         std::env::remove_var("SQUARE_PRODUCTION_LOCATION_ID");
+        std::env::remove_var("SQUARE_WEBHOOK_NOTIFICATION_URL");
+        std::env::remove_var("SQUARE_WEBHOOK_SIGNATURE_KEY");
+        std::env::remove_var("SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY");
+        std::env::remove_var("SQUARE_PRODUCTION_WEBHOOK_SIGNATURE_KEY");
     }
 
     #[test]

@@ -123,10 +123,17 @@ fn dashboard_trace_id() -> String {
 fn cloud_client_with_trace(trace_id: &str) -> Result<cue_cloud_client::CloudClient, String> {
     let paths = cue_core::app_paths::AppPaths::discover()
         .map_err(|e| format!("account store unavailable: {e}"))?;
-    let config = cue_cloud_client::client::ClientConfig {
+    let account =
+        cue_core::load_account(&paths).map_err(|e| format!("account profile unavailable: {e}"))?;
+    let mut config = cue_cloud_client::client::ClientConfig {
         trace_id: Some(trace_id.to_string()),
         ..Default::default()
     };
+    if let Some(account) = account.as_ref() {
+        if !account.api_url.trim().is_empty() {
+            config.base_url = account.api_url.clone();
+        }
+    }
     let client = cue_cloud_client::CloudClient::new(
         config.clone(),
         Arc::new(cue_cloud_client::AccountFileStore::new(paths)),
@@ -152,6 +159,17 @@ fn legacy_keyring_fallback_enabled() -> bool {
                 "1" | "true" | "yes" | "on"
             )
         })
+}
+
+fn clear_legacy_keyring_tokens_if_enabled() -> Result<(), String> {
+    if !legacy_keyring_fallback_enabled() {
+        return Ok(());
+    }
+    let client = cue_cloud_client::CloudClient::with_default_keyring()
+        .map_err(|e| format!("legacy account keyring unavailable: {e}"))?;
+    client
+        .clear_tokens()
+        .map_err(|e| format!("legacy sign out failed: {e}"))
 }
 
 #[tauri::command]
@@ -229,6 +247,7 @@ pub fn sign_out(db: State<DbState>) -> Result<(), String> {
     client
         .clear_tokens()
         .map_err(|e| format!("sign out failed: {e}"))?;
+    clear_legacy_keyring_tokens_if_enabled()?;
     mark_onboarding_incomplete(db)
 }
 
@@ -249,6 +268,7 @@ pub async fn delete_account_now(db: State<'_, DbState>) -> Result<(), String> {
         client
             .clear_tokens()
             .map_err(|e| format!("account deleted, but local sign out failed: {e}"))?;
+        clear_legacy_keyring_tokens_if_enabled()?;
         mark_onboarding_incomplete(db)?;
     }
     Ok(())

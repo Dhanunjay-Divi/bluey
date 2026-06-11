@@ -35,7 +35,14 @@ struct StreamingIdempotencyGuard {
     pool: crate::db::DbPool,
     account_id: String,
     request_id: String,
-    release_on_drop: bool,
+    drop_action: StreamingDropAction,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamingDropAction {
+    Release,
+    KeepInProgress,
+    None,
 }
 
 impl StreamingIdempotencyGuard {
@@ -44,12 +51,12 @@ impl StreamingIdempotencyGuard {
             pool,
             account_id,
             request_id,
-            release_on_drop: true,
+            drop_action: StreamingDropAction::Release,
         }
     }
 
     fn release_now(&mut self) {
-        if !self.release_on_drop {
+        if self.drop_action != StreamingDropAction::Release {
             return;
         }
         if let Err(e) = idempotency::release(&self.pool, &self.account_id, &self.request_id) {
@@ -60,11 +67,11 @@ impl StreamingIdempotencyGuard {
                 "failed to release streaming idempotency reservation"
             );
         }
-        self.release_on_drop = false;
+        self.drop_action = StreamingDropAction::None;
     }
 
     fn mark_failed_now(&mut self) {
-        if !self.release_on_drop {
+        if self.drop_action == StreamingDropAction::None {
             return;
         }
         if let Err(e) = idempotency::mark_failed(&self.pool, &self.account_id, &self.request_id) {
@@ -75,32 +82,42 @@ impl StreamingIdempotencyGuard {
                 "failed to mark streaming idempotency reservation failed"
             );
         }
-        self.release_on_drop = false;
+        self.drop_action = StreamingDropAction::None;
     }
 
     fn mark_complete_now(&mut self, response_json: &str) -> anyhow::Result<()> {
         let result =
             idempotency::mark_complete(&self.pool, &self.account_id, &self.request_id, response_json);
-        self.release_on_drop = false;
+        self.drop_action = StreamingDropAction::None;
         result
     }
 
     fn keep_in_progress_for_manual_reconciliation(&mut self) {
-        self.release_on_drop = false;
+        if self.drop_action != StreamingDropAction::None {
+            self.drop_action = StreamingDropAction::KeepInProgress;
+        }
     }
 }
 
 impl Drop for StreamingIdempotencyGuard {
     fn drop(&mut self) {
-        if self.release_on_drop {
-            if let Err(e) = idempotency::release(&self.pool, &self.account_id, &self.request_id) {
-                tracing::warn!(
-                    account_id_hash = %cue_core::account_id_hash_prefix(&self.account_id),
-                    request_id = %self.request_id,
-                    error = %e,
-                    "failed to release dropped streaming idempotency reservation"
-                );
+        match self.drop_action {
+            StreamingDropAction::Release => {
+                if let Err(e) = idempotency::release(&self.pool, &self.account_id, &self.request_id) {
+                    tracing::warn!(
+                        account_id_hash = %cue_core::account_id_hash_prefix(&self.account_id),
+                        request_id = %self.request_id,
+                        error = %e,
+                        "failed to release dropped streaming idempotency reservation"
+                    );
+                }
             }
+            StreamingDropAction::KeepInProgress => tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&self.account_id),
+                request_id = %self.request_id,
+                "streaming response was dropped after deltas were delivered; reservation kept in progress for reconciliation"
+            ),
+            StreamingDropAction::None => {}
         }
     }
 }
@@ -889,20 +906,26 @@ async fn complete_stream_inner(
         }
     };
 
+    let idempotency_guard = StreamingIdempotencyGuard::new(
+        state.pool.clone(),
+        account.id.clone(),
+        req.request_id.clone(),
+    );
     let event_stream = async_stream::stream! {
-        let mut idempotency_guard = StreamingIdempotencyGuard::new(
-            state.pool.clone(),
-            account.id.clone(),
-            req.request_id.clone(),
-        );
+        let mut idempotency_guard = idempotency_guard;
         let mut events = streaming.events;
         let mut text = String::new();
         let mut final_tokens: Option<(i64, i64)> = None;
+        let mut delivered_delta = false;
 
         while let Some(event) = events.next().await {
             match event {
                 Ok(routing::CompletionStreamEvent::Delta(delta)) => {
                     text.push_str(&delta);
+                    if !delivered_delta {
+                        delivered_delta = true;
+                        idempotency_guard.keep_in_progress_for_manual_reconciliation();
+                    }
                     yield Ok(Event::default().data(
                         serde_json::json!({
                             "choices": [
@@ -917,12 +940,17 @@ async fn complete_stream_inner(
                     break;
                 }
                 Err(e) => {
-                    idempotency_guard.release_now();
+                    if delivered_delta {
+                        idempotency_guard.mark_failed_now();
+                    } else {
+                        idempotency_guard.release_now();
+                    }
                     tracing::warn!(
                         account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                         request_id = %req.request_id,
                         error = %e,
-                        "streaming upstream read failed; reservation released"
+                        delivered_delta,
+                        "streaming upstream read failed"
                     );
                     yield Ok(Event::default().event("error").data(
                         serde_json::json!({
@@ -936,7 +964,27 @@ async fn complete_stream_inner(
             }
         }
 
-        let (input_tokens, output_tokens) = final_tokens.unwrap_or((est_in, 0));
+        let Some((input_tokens, output_tokens)) = final_tokens else {
+            if delivered_delta {
+                idempotency_guard.mark_failed_now();
+            } else {
+                idempotency_guard.release_now();
+            }
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                request_id = %req.request_id,
+                delivered_delta,
+                "streaming provider ended without a terminal billing event"
+            );
+            yield Ok(Event::default().event("error").data(
+                serde_json::json!({
+                    "error": "upstream provider stream ended before completion; please retry",
+                    "reason": "upstream_stream_incomplete",
+                })
+                .to_string(),
+            ));
+            return;
+        };
         let elapsed_ms = started.elapsed().as_millis() as i64;
         let (bluey_cost, customer_cost) = pricing::compute_cost(
             selected_route.pricing,

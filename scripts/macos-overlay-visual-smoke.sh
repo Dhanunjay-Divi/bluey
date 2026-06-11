@@ -235,8 +235,8 @@ python3 <<'PY'
 import json
 import os
 
+import AppKit
 import Quartz
-from PIL import Image
 
 
 def expanded(rows):
@@ -247,10 +247,18 @@ def expanded(rows):
 
 
 row = expanded(json.loads(os.environ["AFTER_JSON"]))
-image = Image.open(os.environ["SHOT"]).convert("RGB")
+image = AppKit.NSImage.alloc().initWithContentsOfFile_(os.environ["SHOT"])
+if image is None:
+    raise AssertionError(f"failed to read screenshot: {os.environ['SHOT']}")
+rep = AppKit.NSBitmapImageRep.imageRepWithData_(image.TIFFRepresentation())
+if rep is None:
+    raise AssertionError(f"failed to decode screenshot bitmap: {os.environ['SHOT']}")
+rgb_space = AppKit.NSColorSpace.genericRGBColorSpace()
 display_bounds = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID())
-scale_x = image.width / max(1, display_bounds.size.width)
-scale_y = image.height / max(1, display_bounds.size.height)
+image_width = int(rep.pixelsWide())
+image_height = int(rep.pixelsHigh())
+scale_x = image_width / max(1, display_bounds.size.width)
+scale_y = image_height / max(1, display_bounds.size.height)
 
 # CGWindow bounds are in display points while screencapture stores pixels on
 # Retina hosts. Keep a tiny tolerance by clamping the crop to the image.
@@ -258,18 +266,34 @@ x = max(0, int(row["x"] * scale_x))
 y = max(0, int(row["y"] * scale_y))
 w = max(1, int(row["width"] * scale_x))
 header_box = (
-    min(image.width, x + 12),
-    min(image.height, y + 8),
-    min(image.width, x + w - 12),
-    min(image.height, y + 58),
+    min(image_width, x + 12),
+    min(image_height, y + 8),
+    min(image_width, x + w - 12),
+    min(image_height, y + 58),
 )
 if header_box[2] <= header_box[0] or header_box[3] <= header_box[1]:
     raise AssertionError(f"invalid header crop: {header_box}, row={row}")
 
-pixels = list(image.crop(header_box).getdata())
-bright = sum(1 for r, g, b in pixels if r + g + b > 560)
-blue_accent = sum(1 for r, g, b in pixels if b > 80 and g > 80 and r < 130)
-yellow_accent = sum(1 for r, g, b in pixels if r > 140 and g > 105 and b < 90)
+bright = 0
+blue_accent = 0
+yellow_accent = 0
+for py in range(header_box[1], header_box[3]):
+    for px in range(header_box[0], header_box[2]):
+        color = rep.colorAtX_y_(px, py)
+        if color is None:
+            continue
+        color = color.colorUsingColorSpace_(rgb_space)
+        if color is None:
+            continue
+        r = int(color.redComponent() * 255)
+        g = int(color.greenComponent() * 255)
+        b = int(color.blueComponent() * 255)
+        if r + g + b > 560:
+            bright += 1
+        if b > 80 and g > 80 and r < 130:
+            blue_accent += 1
+        if r > 140 and g > 105 and b < 90:
+            yellow_accent += 1
 
 if bright < 120 or blue_accent + yellow_accent < 35:
     raise AssertionError(

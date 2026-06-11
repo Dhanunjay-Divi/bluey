@@ -426,17 +426,32 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         : 'Projection appears after usage.';
       const list = document.getElementById('usageList');
       const rows = usage.mix || [];
+      list.replaceChildren();
       if (!rows.length) {
-        list.innerHTML = '<div class="usage-row"><span>No paid requests yet</span><span>Ready</span><span>$0.00</span></div>';
+        const row = document.createElement('div');
+        row.className = 'usage-row';
+        ['No paid requests yet', 'Ready', '$0.00'].forEach((label) => {
+          const item = document.createElement('span');
+          item.textContent = label;
+          row.appendChild(item);
+        });
+        list.appendChild(row);
         return;
       }
-      list.innerHTML = rows.map((entry) => `
-        <div class="usage-row">
-          <span>${entry.task_type || 'general'}</span>
-          <span>${entry.count || 0} cue${entry.count === 1 ? '' : 's'}</span>
-          <span>${money(entry.cost_cents)}</span>
-        </div>
-      `).join('');
+      rows.forEach((entry) => {
+        const row = document.createElement('div');
+        row.className = 'usage-row';
+        [
+          entry.task_type || 'general',
+          `${entry.count || 0} cue${entry.count === 1 ? '' : 's'}`,
+          money(entry.cost_cents),
+        ].forEach((label) => {
+          const item = document.createElement('span');
+          item.textContent = label;
+          row.appendChild(item);
+        });
+        list.appendChild(row);
+      });
     }
 
     function shortSessionId(id) {

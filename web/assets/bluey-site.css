@@ -572,7 +572,8 @@
       min-height: 100dvh;
       display: grid;
       grid-template-rows: auto 1fr auto;
-      overflow: hidden;
+      overflow-x: hidden;
+      overflow-y: auto;
       background: #050505;
       color: #e0e0e0;
       font-family: -apple-system, system-ui, "Segoe UI", sans-serif;

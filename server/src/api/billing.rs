@@ -556,7 +556,7 @@ async fn square_webhook_impl(
         .ok()
         .map(|_| config.environment)
     });
-    if matched_environment.is_none() {
+    let Some(matched_environment) = matched_environment else {
         let configured_environments = signature_configs
             .iter()
             .map(|config| format!("{:?}", config.environment))
@@ -565,6 +565,15 @@ async fn square_webhook_impl(
         tracing::warn!(
             configured_environments = %configured_environments,
             "square webhook signature rejected"
+        );
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    let active_environment = state.config.square_config().environment;
+    if matched_environment != active_environment {
+        tracing::warn!(
+            square_environment = ?matched_environment,
+            active_square_environment = ?active_environment,
+            "square webhook environment rejected for active billing ledger"
         );
         return Err(StatusCode::UNAUTHORIZED);
     }
