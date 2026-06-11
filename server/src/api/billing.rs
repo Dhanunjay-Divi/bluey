@@ -535,23 +535,37 @@ async fn square_webhook_impl(
     headers: axum::http::HeaderMap,
     body: String,
 ) -> Result<StatusCode, StatusCode> {
-    let square = state.config.square_config();
-    let webhook_secret = square
-        .webhook_signature_key
-        .as_deref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let notification_url = square
-        .webhook_notification_url
-        .as_deref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let signature_configs = state.config.square_webhook_signature_configs();
+    if signature_configs.is_empty() {
+        tracing::warn!("square webhook signature rejected: no webhook signing key configured");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
 
     let sig_header = headers
         .get("x-square-hmacsha256-signature")
         .and_then(|v| v.to_str().ok())
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    if let Err(e) = verify_square_signature(webhook_secret, notification_url, &body, sig_header) {
-        tracing::warn!(error = %e, "square webhook signature rejected");
+    let matched_environment = signature_configs.iter().find_map(|config| {
+        verify_square_signature(
+            &config.webhook_signature_key,
+            &config.webhook_notification_url,
+            &body,
+            sig_header,
+        )
+        .ok()
+        .map(|_| config.environment)
+    });
+    if matched_environment.is_none() {
+        let configured_environments = signature_configs
+            .iter()
+            .map(|config| format!("{:?}", config.environment))
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::warn!(
+            configured_environments = %configured_environments,
+            "square webhook signature rejected"
+        );
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -567,6 +581,12 @@ async fn square_webhook_impl(
         .and_then(|v| v.as_str())
         .ok_or(StatusCode::BAD_REQUEST)?;
     let stored_event_id = format!("square:{event_id}");
+    tracing::info!(
+        square_environment = ?matched_environment,
+        event_id = %stored_event_id,
+        event_type,
+        "square webhook signature accepted"
+    );
 
     let conn = state
         .pool

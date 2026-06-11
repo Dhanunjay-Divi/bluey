@@ -81,6 +81,13 @@ pub struct SquareConfig {
     pub webhook_notification_url: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SquareWebhookSignatureConfig {
+    pub environment: SquareEnvironment,
+    pub webhook_signature_key: String,
+    pub webhook_notification_url: String,
+}
+
 impl SquareConfig {
     pub fn is_checkout_ready(&self) -> bool {
         self.access_token.is_some() && self.location_id.is_some()
@@ -262,6 +269,46 @@ impl Config {
                 .filter(|v| !v.trim().is_empty())
                 .or_else(|| Some(format!("{}/billing/square/webhook", self.public_url))),
         }
+    }
+
+    pub fn square_webhook_signature_configs(&self) -> Vec<SquareWebhookSignatureConfig> {
+        let notification_url = std::env::var("SQUARE_WEBHOOK_NOTIFICATION_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| format!("{}/billing/square/webhook", self.public_url));
+        let configured = square_environment_from_env();
+        let ordered = match configured {
+            SquareEnvironment::Sandbox => [SquareEnvironment::Sandbox, SquareEnvironment::Production],
+            SquareEnvironment::Production => [SquareEnvironment::Production, SquareEnvironment::Sandbox],
+        };
+        let generic_key = std::env::var("SQUARE_WEBHOOK_SIGNATURE_KEY")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let mut configs = Vec::new();
+        for environment in ordered {
+            let prefix = environment.env_prefix();
+            let key = generic_key.clone().or_else(|| {
+                std::env::var(format!("{prefix}_WEBHOOK_SIGNATURE_KEY"))
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+            });
+            if let Some(webhook_signature_key) = key {
+                if configs
+                    .iter()
+                    .any(|config: &SquareWebhookSignatureConfig| {
+                        config.webhook_signature_key == webhook_signature_key
+                    })
+                {
+                    continue;
+                }
+                configs.push(SquareWebhookSignatureConfig {
+                    environment,
+                    webhook_signature_key,
+                    webhook_notification_url: notification_url.clone(),
+                });
+            }
+        }
+        configs
     }
 }
 

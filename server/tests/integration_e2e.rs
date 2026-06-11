@@ -1416,6 +1416,95 @@ async fn billing_square_webhook_credits_completed_order() {
 
 #[tokio::test]
 #[serial]
+async fn billing_square_webhook_accepts_production_signature_while_checkout_is_sandbox() {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let url = "http://localhost:8080/billing/square/webhook";
+    std::env::set_var("BLUEY_BILLING_PROVIDER", "square");
+    std::env::set_var("SQUARE_ENVIRONMENT", "sandbox");
+    std::env::set_var("SQUARE_WEBHOOK_NOTIFICATION_URL", url);
+    std::env::set_var("SQUARE_SANDBOX_ACCESS_TOKEN", "sandbox-token");
+    std::env::set_var("SQUARE_SANDBOX_LOCATION_ID", "sandbox-location");
+    std::env::set_var("SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY", "sandbox-square-whsec");
+    std::env::set_var("SQUARE_PRODUCTION_WEBHOOK_SIGNATURE_KEY", "prod-square-whsec");
+
+    let h = boot_harness().await;
+    let _access = signup_and_login(
+        &h,
+        "square-prod-webhook@example.com",
+        "longenoughpw",
+    )
+    .await;
+    let account_id: String = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT id FROM accounts WHERE email = ?1",
+            rusqlite::params!["square-prod-webhook@example.com"],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    let body = serde_json::to_string(&json!({
+        "event_id": "evt_square_prod_credit_1",
+        "type": "order.updated",
+        "data": {
+            "object": {
+                "order": {
+                    "id": "order_prod_1",
+                    "state": "COMPLETED",
+                    "reference_id": format!("bluey_reload:{account_id}"),
+                    "metadata": {
+                        "bluey_account_id": account_id,
+                        "bluey_amount_cents": "1500"
+                    },
+                    "total_money": {"amount": 1500, "currency": "USD"},
+                    "tenders": [{"payment_id": "payment_square_prod_1"}]
+                }
+            }
+        }
+    }))
+    .unwrap();
+
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(b"prod-square-whsec").unwrap();
+    mac.update(url.as_bytes());
+    mac.update(body.as_bytes());
+    let signature = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+
+    let req = Request::post("/billing/square/webhook")
+        .header("x-square-hmacsha256-signature", signature)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let balance: i64 = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT balance_cents FROM accounts WHERE email = ?1",
+            rusqlite::params!["square-prod-webhook@example.com"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(balance, 1500);
+
+    std::env::remove_var("BLUEY_BILLING_PROVIDER");
+    std::env::remove_var("SQUARE_ENVIRONMENT");
+    std::env::remove_var("SQUARE_WEBHOOK_NOTIFICATION_URL");
+    std::env::remove_var("SQUARE_SANDBOX_ACCESS_TOKEN");
+    std::env::remove_var("SQUARE_SANDBOX_LOCATION_ID");
+    std::env::remove_var("SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY");
+    std::env::remove_var("SQUARE_PRODUCTION_WEBHOOK_SIGNATURE_KEY");
+}
+
+#[tokio::test]
+#[serial]
 async fn billing_portal_400s_without_stripe_customer() {
     let h = boot_harness().await;
     let access = signup_and_login(&h, "no-cus@example.com", "longenoughpw").await;
