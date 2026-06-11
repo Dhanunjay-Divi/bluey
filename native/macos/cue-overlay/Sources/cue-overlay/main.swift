@@ -35,27 +35,10 @@ private func normalizedCardKind(_ kind: String) -> String {
 
 private func displayTranscriptText(_ text: String) -> String {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-    let prefix = "[dev audio:"
-    guard trimmed.hasPrefix(prefix), let close = trimmed.firstIndex(of: "]") else {
-        return trimmed
+    if trimmed.hasPrefix("[dev audio:") {
+        return ""
     }
-
-    let sourceStart = trimmed.index(trimmed.startIndex, offsetBy: prefix.count)
-    let source = String(trimmed[sourceStart..<close])
-        .replacingOccurrences(of: "_", with: " ")
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-        .capitalized
-    let restStart = trimmed.index(after: close)
-    let rest = trimmed[restStart...].trimmingCharacters(in: .whitespacesAndNewlines)
-    let marker = rest.hasPrefix("audio preview sample")
-        ? "audio preview sample"
-        : "simulated speech chunk"
-    guard rest.hasPrefix(marker) else { return trimmed }
-
-    let number = rest
-        .replacingOccurrences(of: marker, with: "")
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-    return "\(source.isEmpty ? "Audio" : source) preview sample \(number)"
+    return trimmed
 }
 
 private enum BlueyTheme {

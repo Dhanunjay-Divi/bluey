@@ -86,7 +86,6 @@ cleanup
 echo "[visual-smoke] launching Bluey in dev capture-visible mode"
 BLUEY_DEV_OVERLAY=1 \
 BLUEY_HOST_OVERLAY_CAPTURE_VISIBLE=1 \
-BLUEY_AUDIO_SIMULATED_ONLY=1 \
 "$BLUEY_BIN" on >/tmp/bluey-overlay-visual-smoke.on.log 2>&1
 sleep 1.2
 
@@ -164,8 +163,8 @@ print(json.dumps(rows))
 PY
 )"
 
-echo "[visual-smoke] starting simulated audio"
-"$BLUEY_BIN" audio start >/tmp/bluey-overlay-visual-smoke.audio.log 2>&1 || true
+echo "[visual-smoke] checking idle overlay bounds without mock audio"
+"$BLUEY_BIN" audio status >/tmp/bluey-overlay-visual-smoke.audio.log 2>&1 || true
 sleep 4
 
 after_json="$(python3 <<'PY'

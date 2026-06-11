@@ -17,7 +17,7 @@ use cue_core::ai::{
     SafetyOutcome, TokenUsage,
 };
 use cue_core::app_paths::AppPaths;
-use cue_core::audio::{AudioRuntimeMode, SimulatedPcmChunk};
+use cue_core::audio::AudioRuntimeMode;
 use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
 use cue_core::{
     analyze_segment, clock, generate_recap, load_account, local_answer, new_trace_id,
@@ -477,7 +477,6 @@ struct AudioRuntime {
 #[derive(Debug, Clone)]
 enum AudioRuntimeConfigResolution {
     Real(RealAudioRuntimeConfig),
-    SimulatedRequested,
     Unavailable(String),
 }
 
@@ -1627,13 +1626,10 @@ async fn start_audio_capture(
             real_runtime.stt_provider_label.clone(),
             real_audio_platform_note(&real_runtime),
         )
-    } else if matches!(runtime, AudioRuntimeConfigResolution::SimulatedRequested) {
-        AudioPipelineStatus::simulated(session_id.clone(), config.clone())
     } else {
         let message = match runtime {
             AudioRuntimeConfigResolution::Unavailable(message) => message,
-            AudioRuntimeConfigResolution::Real(_)
-            | AudioRuntimeConfigResolution::SimulatedRequested => {
+            AudioRuntimeConfigResolution::Real(_) => {
                 "Audio capture is not available yet.".to_string()
             }
         };
@@ -1654,11 +1650,6 @@ async fn start_audio_capture(
         AudioRuntimeConfigResolution::Real(real_runtime) => {
             tokio::spawn(async move {
                 real_audio_loop(daemon_for_loop, session_id, real_runtime, stop_rx).await;
-            });
-        }
-        AudioRuntimeConfigResolution::SimulatedRequested => {
-            tokio::spawn(async move {
-                audio_simulation_loop(daemon_for_loop, session_id, config, stop_rx).await;
             });
         }
         AudioRuntimeConfigResolution::Unavailable(_) => {
@@ -1704,10 +1695,6 @@ async fn build_real_audio_runtime_config(
     paths: &AppPaths,
     config: &AudioCaptureConfig,
 ) -> Result<AudioRuntimeConfigResolution> {
-    if audio_simulation_requested() {
-        return Ok(AudioRuntimeConfigResolution::SimulatedRequested);
-    }
-
     let ffmpeg_path = find_ffmpeg();
     let native_audio_helper = find_native_audio_helper();
     if ffmpeg_path.is_none() && native_audio_helper.is_none() {
@@ -1801,10 +1788,6 @@ fn failed_audio_status(config: AudioCaptureConfig, message: &str) -> AudioPipeli
     status.note = Some(message.to_string());
     status.updated_at = clock::now_epoch_ms_string();
     status
-}
-
-fn audio_simulation_requested() -> bool {
-    env_truthy_any(&["BLUEY_AUDIO_SIMULATED_ONLY", "CUE_AUDIO_SIMULATED_ONLY"])
 }
 
 fn find_ffmpeg() -> Option<PathBuf> {
@@ -3089,64 +3072,6 @@ async fn stop_audio_capture(daemon: &Arc<Daemon>) -> AudioPipelineStatus {
     let status = audio.clone().stopped();
     *audio = status.clone();
     status
-}
-
-async fn audio_simulation_loop(
-    daemon: Arc<Daemon>,
-    session_id: String,
-    config: AudioCaptureConfig,
-    mut stop_rx: oneshot::Receiver<()>,
-) {
-    let sources = config.enabled_sources();
-    let mut system_sequence = 0_u64;
-    let mut microphone_sequence = 0_u64;
-
-    loop {
-        for source in &sources {
-            let sequence = match source {
-                AudioSourceKind::System => {
-                    system_sequence = system_sequence.saturating_add(1);
-                    system_sequence
-                }
-                AudioSourceKind::Microphone => {
-                    microphone_sequence = microphone_sequence.saturating_add(1);
-                    microphone_sequence
-                }
-            };
-            let stream_id = format!("{}-dev", source.default_label());
-            let chunk = SimulatedPcmChunk::new(
-                *source,
-                stream_id,
-                sequence,
-                config.chunk_duration_ms,
-                config.target_format,
-            );
-
-            {
-                let mut audio = daemon.audio.lock().await;
-                if audio.session_id.as_deref() != Some(session_id.as_str()) {
-                    return;
-                }
-                audio.record_chunk(&chunk.metadata);
-            }
-
-            let segment = chunk.transcript_segment();
-            if let Err(error) = add_audio_transcript_segment(&daemon, &segment).await {
-                warn!("simulated audio transcript emission failed: {error:#}");
-                let mut audio = daemon.audio.lock().await;
-                audio.capture.last_error = Some(format!("{error:#}"));
-                audio.note = Some("Simulated audio runtime hit a transcript error.".to_string());
-                return;
-            }
-
-            daemon.audio.lock().await.record_stt_segment();
-        }
-
-        tokio::select! {
-            _ = &mut stop_rx => return,
-            _ = sleep(Duration::from_millis(config.chunk_duration_ms as u64)) => {}
-        }
-    }
 }
 
 async fn add_audio_transcript_segment(
