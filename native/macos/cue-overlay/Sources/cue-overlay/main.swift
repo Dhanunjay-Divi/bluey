@@ -297,6 +297,8 @@ private final class ComposerTextView: NSTextView {
     var onSubmit: (() -> Void)?
     var onMeasuredHeight: ((CGFloat) -> Void)?
 
+    override var acceptsFirstResponder: Bool { true }
+
     override init(frame frameRect: NSRect, textContainer container: NSTextContainer?) {
         super.init(frame: frameRect, textContainer: container)
         drawsBackground = false
@@ -344,15 +346,22 @@ private final class ComposerTextView: NSTextView {
     }
 
     override func keyDown(with event: NSEvent) {
-        let isReturn = event.keyCode == 36 || event.keyCode == 76
-        let wantsNewline = event.modifierFlags.contains(.shift)
-            || event.modifierFlags.contains(.option)
-            || event.modifierFlags.contains(.control)
-        if isReturn && !wantsNewline {
-            onSubmit?()
+        let chars = event.charactersIgnoringModifiers ?? ""
+        let isReturn = event.keyCode == 36 || event.keyCode == 76 || chars == "\r" || chars == "\n"
+        if isReturn {
+            if event.modifierFlags.contains(.shift) {
+                insertNewline(nil)
+            } else {
+                onSubmit?()
+            }
             return
         }
         super.keyDown(with: event)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        super.mouseDown(with: event)
     }
 
     func clearText() {
@@ -372,6 +381,19 @@ private final class ComposerTextView: NSTextView {
         let used = manager.usedRect(for: container)
         let measured = ceil(used.height + textContainerInset.height * 2 + 6)
         onMeasuredHeight?(measured)
+    }
+}
+
+private final class ComposerSurfaceView: NSView {
+    weak var composer: ComposerTextView?
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        if let composer {
+            window?.makeFirstResponder(composer)
+        }
+        super.mouseDown(with: event)
     }
 }
 
@@ -2261,7 +2283,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         attachmentStrip = NSScrollView()
         attachmentStack = NSStackView()
         composerBar = NSView()
-        composerSurface = NSView()
+        composerSurface = ComposerSurfaceView()
         composer = ComposerTextView(frame: .zero, textContainer: nil)
         recordingButton = NSButton(title: "Listen", target: nil, action: nil)
         askButton = NSButton(title: "Answer", target: nil, action: nil)
@@ -2743,6 +2765,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         opacitySlider.action = #selector(opacityChanged)
         composer.onSubmit = { [weak self] in self?.askClicked() }
         composer.onMeasuredHeight = { [weak self] height in self?.setComposerTextHeight(height) }
+        (composerSurface as? ComposerSurfaceView)?.composer = composer
         recordingButton.target = self
         recordingButton.action = #selector(recordingClicked)
         askButton.target = self
@@ -2974,6 +2997,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             knowledgeBadge,
             transcriptStrip,
             attachmentStrip,
+            composerSurface,
             composer,
             recordingButton,
             askButton,
@@ -3778,6 +3802,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let route = selectedRoute()
         updateRouteBadge(for: q, selectedRoute: route)
         emitAsk(question: q, provider: route.provider, model: route.model, mode: route.mode)
+        window?.makeFirstResponder(composer)
     }
 
     @objc private func analyzeClicked() {
