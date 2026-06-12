@@ -1938,7 +1938,7 @@ async fn cleanup_stale_daemon(paths: &AppPaths, quiet: bool) -> Result<()> {
     let state_pid = read_daemon_state_pid(&paths.state_file)?;
 
     let daemon_bin = resolve_daemon_bin().ok();
-    let killed = terminate_matching_daemon_processes(daemon_bin.as_deref())?;
+    let killed = terminate_recorded_daemon_process(state_pid, daemon_bin.as_deref())?;
 
     if paths.state_file.exists() {
         tokio::fs::remove_file(&paths.state_file)
@@ -1991,54 +1991,53 @@ fn terminate_pid(_pid: u32) -> Result<bool> {
 }
 
 #[cfg(unix)]
-fn terminate_matching_daemon_processes(daemon_bin: Option<&Path>) -> Result<usize> {
-    let expected = daemon_bin.and_then(|path| path.canonicalize().ok());
+fn terminate_recorded_daemon_process(
+    state_pid: Option<u32>,
+    daemon_bin: Option<&Path>,
+) -> Result<usize> {
+    let Some(pid) = state_pid else {
+        return Ok(0);
+    };
     let output = Command::new("ps")
-        .args(["-axo", "pid=,command="])
+        .args(["-p", &pid.to_string(), "-o", "command="])
         .output()
-        .context("failed to inspect running processes")?;
+        .context("failed to inspect stale daemon process")?;
     if !output.status.success() {
         return Ok(0);
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut killed = 0;
-    for line in stdout.lines() {
-        let trimmed = line.trim_start();
-        let Some(pid_end) = trimmed.find(char::is_whitespace) else {
-            continue;
-        };
-        let Ok(pid) = trimmed[..pid_end].trim().parse::<u32>() else {
-            continue;
-        };
-        if pid == std::process::id() {
-            continue;
-        }
-        let command = trimmed[pid_end..].trim_start();
-        let Some(exe) = command.split_whitespace().next() else {
-            continue;
-        };
-        if !is_daemon_executable_name(exe) {
-            continue;
-        }
-        if let Some(expected) = expected.as_ref() {
-            let Ok(actual) = Path::new(exe).canonicalize() else {
-                continue;
-            };
-            if actual != *expected {
-                continue;
-            }
-        }
-        if terminate_pid(pid)? {
-            killed += 1;
-        }
+    let command = String::from_utf8_lossy(&output.stdout);
+    if !recorded_daemon_command_matches(command.trim(), daemon_bin) {
+        return Ok(0);
     }
-    Ok(killed)
+
+    terminate_pid(pid).map(usize::from)
 }
 
 #[cfg(not(unix))]
-fn terminate_matching_daemon_processes(_daemon_bin: Option<&Path>) -> Result<usize> {
+fn terminate_recorded_daemon_process(
+    _state_pid: Option<u32>,
+    _daemon_bin: Option<&Path>,
+) -> Result<usize> {
     Ok(0)
+}
+
+#[cfg(unix)]
+fn recorded_daemon_command_matches(command: &str, daemon_bin: Option<&Path>) -> bool {
+    let expected = daemon_bin.and_then(|path| path.canonicalize().ok());
+    let Some(exe) = command.split_whitespace().next() else {
+        return false;
+    };
+    if !is_daemon_executable_name(exe) {
+        return false;
+    }
+    if let Some(expected) = expected.as_ref() {
+        let Ok(actual) = Path::new(exe).canonicalize() else {
+            return false;
+        };
+        return actual == *expected;
+    }
+    true
 }
 
 fn is_daemon_executable_name(path: &str) -> bool {
@@ -3068,6 +3067,44 @@ mod tests {
             resolve_daemon_bin_from_roots(vec![PathBuf::from("/missing/bluey"), bluey]),
             Some(daemon)
         );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_daemon_command_rejects_reused_non_daemon_pid() {
+        assert!(!super::recorded_daemon_command_matches(
+            "/bin/sleep 999",
+            None,
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_daemon_command_requires_expected_binary_when_known() {
+        let base = std::env::temp_dir().join(format!(
+            "bluey-stale-daemon-command-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).expect("create temp dir");
+        let expected = base.join("bluey-daemon");
+        let other = base.join("bluey-daemon-other");
+        fs::write(&expected, b"daemon").expect("write expected daemon");
+        fs::write(&other, b"daemon").expect("write other daemon");
+
+        assert!(super::recorded_daemon_command_matches(
+            &format!("{} --foreground", expected.display()),
+            Some(&expected),
+        ));
+        assert!(!super::recorded_daemon_command_matches(
+            &format!("{} --foreground", other.display()),
+            Some(&expected),
+        ));
 
         let _ = fs::remove_dir_all(base);
     }

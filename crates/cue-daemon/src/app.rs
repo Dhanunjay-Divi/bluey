@@ -431,6 +431,7 @@ struct Daemon {
     system_audio: Mutex<Option<crate::audio::system_capture::SystemAudioCapture>>,
     live_transcript_tx: broadcast::Sender<LiveTranscriptEvent>,
     rag: Option<Arc<crate::db::rag::RagPipeline>>,
+    rag_index_lock: Arc<Mutex<()>>,
     /// Per-session token issued at boot. Native overlay must echo this in
     /// every event; mismatched / missing token -> event dropped.
     overlay_session_token: String,
@@ -549,6 +550,7 @@ pub async fn run() -> Result<()> {
         system_audio: Mutex::new(None),
         live_transcript_tx: broadcast::channel(64).0,
         rag: rag_pipeline,
+        rag_index_lock: Arc::new(Mutex::new(())),
         overlay_session_token: crate::overlay::generate_session_token()
             .context("failed to generate overlay session token")?,
         overlay_ui_state: std::sync::Arc::new(parking_lot::Mutex::new(
@@ -3080,6 +3082,12 @@ async fn add_audio_transcript_segment(
     daemon: &Arc<Daemon>,
     segment: &cue_core::audio::SttSegmentMetadata,
 ) -> Result<()> {
+    let audio_session_id = daemon.audio.lock().await.session_id.clone();
+    if audio_session_id.is_none() {
+        debug!("dropping late audio transcript segment after capture stopped");
+        return Ok(());
+    }
+
     let speaker = match segment.source {
         Some(AudioSourceKind::System) => Speaker::System,
         Some(AudioSourceKind::Microphone) => Speaker::User,
@@ -3164,7 +3172,9 @@ fn index_transcript_for_rag(daemon: &Arc<Daemon>, session_id: String, text: Stri
     }
 
     let rag = Arc::clone(rag);
+    let rag_index_lock = Arc::clone(&daemon.rag_index_lock);
     tokio::spawn(async move {
+        let _guard = rag_index_lock.lock().await;
         rag.index_transcript(&session_id, &text).await;
     });
 }
@@ -3182,7 +3192,9 @@ fn index_context_artifacts_for_rag(
     }
 
     let rag = Arc::clone(rag);
+    let rag_index_lock = Arc::clone(&daemon.rag_index_lock);
     tokio::spawn(async move {
+        let _guard = rag_index_lock.lock().await;
         for artifact in artifacts {
             rag.index_context_artifact(&session_id, &artifact).await;
         }
@@ -3195,14 +3207,19 @@ fn reindex_meeting_for_rag(daemon: &Arc<Daemon>, meeting: MeetingRecord) {
     };
 
     let rag = Arc::clone(rag);
-    tokio::spawn(async move { rebuild_meeting_rag_index(rag, meeting, "session reindex").await });
+    let rag_index_lock = Arc::clone(&daemon.rag_index_lock);
+    tokio::spawn(async move {
+        rebuild_meeting_rag_index(rag, rag_index_lock, meeting, "session reindex").await
+    });
 }
 
 async fn rebuild_meeting_rag_index(
     rag: Arc<crate::db::rag::RagPipeline>,
+    rag_index_lock: Arc<Mutex<()>>,
     meeting: MeetingRecord,
     reason: &'static str,
 ) {
+    let _guard = rag_index_lock.lock().await;
     let session_id = meeting.id.to_string();
     if let Err(error) = rag.delete_session(&session_id).await {
         warn!(session_id = %session_id, reason, error = %error, "failed to clear RAG session before rebuild");
@@ -5638,6 +5655,16 @@ async fn rename_meeting_session(
 }
 
 async fn delete_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<()> {
+    let is_active = {
+        let meeting_guard = daemon.meeting.lock().await;
+        meeting_guard
+            .as_ref()
+            .is_some_and(|meeting| meeting.id == id)
+    };
+    if is_active {
+        let _ = stop_audio_capture(daemon).await;
+    }
+
     let was_active = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard
@@ -5658,8 +5685,10 @@ async fn delete_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<
 
     if let Some(rag) = daemon.rag.as_ref() {
         let rag = Arc::clone(rag);
+        let rag_index_lock = Arc::clone(&daemon.rag_index_lock);
         let session_id = id.to_string();
         tokio::spawn(async move {
+            let _guard = rag_index_lock.lock().await;
             if let Err(error) = rag.delete_session(&session_id).await {
                 warn!(session_id = %session_id, error = %error, "failed to clear deleted session RAG index");
             }

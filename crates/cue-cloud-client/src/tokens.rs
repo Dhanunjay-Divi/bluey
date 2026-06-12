@@ -238,4 +238,48 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(base);
     }
+
+    #[test]
+    fn account_file_store_clear_preserves_account_profile() {
+        let base = std::env::temp_dir().join(format!(
+            "bluey-account-file-clear-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let paths = cue_core::app_paths::AppPaths {
+            data_dir: base.join("data"),
+            config_dir: base.join("config"),
+            runtime_dir: base.join("run"),
+            state_file: base.join("run/daemon-state.json"),
+            account_file: base.join("config/account.json"),
+            settings_file: base.join("config/settings.json"),
+        };
+
+        let mut account = cue_core::AccountConfig::local();
+        account.provider = "bluey".into();
+        account.api_url = "https://staging.bluey.sh".into();
+        account.user_id = "user@example.com".into();
+        account.workspace_id = "workspace-1".into();
+        account.device_id = "device-1".into();
+        account.access_token = Some("access".into());
+        account.refresh_token = Some("refresh".into());
+        cue_core::save_account(&paths, &account).unwrap();
+
+        let store = AccountFileStore::new(paths.clone());
+        store.clear().unwrap();
+
+        let loaded = cue_core::load_account(&paths).unwrap().unwrap();
+        assert_eq!(loaded.provider, "bluey");
+        assert_eq!(loaded.api_url, "https://staging.bluey.sh");
+        assert_eq!(loaded.user_id, "user@example.com");
+        assert_eq!(loaded.workspace_id, "workspace-1");
+        assert_eq!(loaded.device_id, "device-1");
+        assert!(loaded.access_token.is_none());
+        assert!(loaded.refresh_token.is_none());
+
+        let _ = std::fs::remove_dir_all(base);
+    }
 }
