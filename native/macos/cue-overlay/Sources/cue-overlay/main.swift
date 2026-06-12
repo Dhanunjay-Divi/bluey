@@ -352,6 +352,8 @@ private final class ComposerTextView: NSTextView {
             if event.modifierFlags.contains(.shift) {
                 insertNewline(nil)
             } else {
+                // Enter and Command+Enter both submit. Shift+Enter keeps a
+                // multiline thought inside the composer.
                 onSubmit?()
             }
             return
@@ -2286,7 +2288,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         composerSurface = ComposerSurfaceView()
         composer = ComposerTextView(frame: .zero, textContainer: nil)
         recordingButton = NSButton(title: "Listen", target: nil, action: nil)
-        askButton = NSButton(title: "Answer", target: nil, action: nil)
+        askButton = NSButton(title: "Answer ⌘↵", target: nil, action: nil)
         analyzeButton = NSButton(title: "Screen", target: nil, action: nil)
         attachButton = NSButton(title: "", target: nil, action: nil)
         instructionsButton = NSButton(title: "Tone", target: nil, action: nil)
@@ -2667,7 +2669,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
             askButton.trailingAnchor.constraint(equalTo: composerSurface.trailingAnchor, constant: -7),
             askButton.centerYAnchor.constraint(equalTo: composerSurface.centerYAnchor),
-            askButton.widthAnchor.constraint(equalToConstant: 86),
+            askButton.widthAnchor.constraint(equalToConstant: 106),
             askButton.heightAnchor.constraint(equalToConstant: 32),
 
             attachButton.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 12),
@@ -3475,7 +3477,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         instructionsButton.toolTip = "How Bluey should answer"
         attachButton.toolTip = "Attach files"
         analyzeButton.toolTip = "Analyse screen"
-        askButton.toolTip = "Answer"
+        askButton.toolTip = "Answer with Enter or Command+Enter. Shift+Enter adds a new line."
         latestSessionButton.toolTip = "Continue the latest recording"
         answerStyleSaveButton.toolTip = "Save answer style for this session"
     }
