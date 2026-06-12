@@ -2162,6 +2162,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     let routeBadge: NSTextField
     let knowledgeBadge: NSTextField
     let balanceLabel: NSTextField
+    let fullSizeButton: NSButton
     let canvasToggleButton: NSButton
     let navButton: NSButton
     let newSessionButton: NSButton
@@ -2231,6 +2232,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var canvasOpen = false
     private var canvasFullWindow = false
     private var preCanvasFullWindowFrame: NSRect?
+    private var windowFullSize = false
+    private var preWindowFullSizeFrame: NSRect?
     private struct ResizeEdges: OptionSet {
         let rawValue: Int
         static let left = ResizeEdges(rawValue: 1 << 0)
@@ -2262,6 +2265,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         routeBadge = NSTextField(labelWithString: "● Ready")
         knowledgeBadge = NSTextField(labelWithString: "Docs empty")
         balanceLabel = NSTextField(labelWithString: "Balance --")
+        fullSizeButton = NSButton(title: "", target: nil, action: nil)
         canvasToggleButton = NSButton(title: "", target: nil, action: nil)
         navButton = NSButton(title: "", target: nil, action: nil)
         newSessionButton = NSButton(title: "", target: nil, action: nil)
@@ -2350,6 +2354,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             routeBadge,
             knowledgeBadge,
             balanceLabel,
+            fullSizeButton,
             canvasToggleButton,
             navButton,
             newSessionButton,
@@ -2415,6 +2420,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             headerSpacer,
             canvasToggleButton,
             balanceLabel,
+            fullSizeButton,
             hideButton,
             closeButton,
         ] {
@@ -2522,6 +2528,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
             hideButton.widthAnchor.constraint(equalToConstant: 26),
             hideButton.heightAnchor.constraint(equalToConstant: 26),
+
+            fullSizeButton.widthAnchor.constraint(equalToConstant: 26),
+            fullSizeButton.heightAnchor.constraint(equalToConstant: 26),
 
             balanceLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 76),
             balanceLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 106),
@@ -2757,6 +2766,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         answerStyleBox.delegate = self
         hideButton.target = self
         hideButton.action = #selector(hideClicked)
+        fullSizeButton.target = self
+        fullSizeButton.action = #selector(fullSizeClicked)
         closeButton.target = self
         closeButton.action = #selector(closeClicked)
         closeConfirmCancelButton.target = self
@@ -2799,6 +2810,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         styleControlButton(askButton, symbol: "arrow.up", accent: true)
         styleHeaderIconButton(hideButton, symbol: "eye.slash", fallback: "-")
         styleHeaderIconButton(closeButton, symbol: "xmark", fallback: "x")
+        updateFullSizeButtonChrome()
         configureTooltips()
         setContextItems([])
         setTranscriptState("IDLE", active: false)
@@ -2993,6 +3005,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             newSessionButton,
             canvasToggleButton,
             balanceLabel,
+            fullSizeButton,
             hideButton,
             closeButton,
             routeBadge,
@@ -3471,6 +3484,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         modelMenu.toolTip = "Choose routing lane"
         canvasToggleButton.toolTip = "Open or collapse the canvas"
         balanceLabel.toolTip = "Remaining Bluey balance"
+        fullSizeButton.toolTip = windowFullSize ? "Restore Bluey size" : "Make Bluey full size"
         hideButton.toolTip = "Hide to pill"
         closeButton.toolTip = "Turn Bluey off. Run bluey on to start again."
         recordingButton.toolTip = "Start or stop listening"
@@ -3593,6 +3607,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     @objc private func closeClicked() {
         showTurnOffConfirmation()
+    }
+
+    @objc private func fullSizeClicked() {
+        toggleWindowFullSize()
     }
 
     func showTurnOffConfirmation() {
@@ -3863,6 +3881,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             latestSessionButton,
             canvasToggleButton,
             modelMenu,
+            fullSizeButton,
             recordingButton,
             askButton,
             analyzeButton,
@@ -4294,13 +4313,91 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
     }
 
+    private func toggleWindowFullSize() {
+        guard window != nil else { return }
+        if windowFullSize {
+            restoreWindowFromFullSize()
+        } else {
+            expandWindowFullSize()
+        }
+    }
+
+    private func updateFullSizeButtonChrome() {
+        let symbol = windowFullSize
+            ? "arrow.down.right.and.arrow.up.left"
+            : "arrow.up.left.and.arrow.down.right"
+        let fallback = windowFullSize ? "↙" : "↗"
+        styleHeaderIconButton(fullSizeButton, symbol: symbol, fallback: fallback)
+        fullSizeButton.toolTip = windowFullSize ? "Restore Bluey size" : "Make Bluey full size"
+    }
+
+    private func expandWindowFullSize() {
+        guard let window else { return }
+        if preWindowFullSizeFrame == nil {
+            preWindowFullSizeFrame = window.frame
+        }
+        windowFullSize = true
+        updateFullSizeButtonChrome()
+
+        let screen = window.screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let maxWidth = max(ExpandedPanelMetrics.minCompactWidth, screen.width - ExpandedPanelMetrics.screenInset * 2)
+        let maxHeight = max(ExpandedPanelMetrics.minHeight, screen.height - ExpandedPanelMetrics.screenInset * 2)
+        if let overlayWindow = window as? OverlayWindow {
+            overlayWindow.minimumFrameWidth = min(ExpandedPanelMetrics.minCompactWidth, maxWidth)
+            overlayWindow.maximumFrameWidth = maxWidth
+            overlayWindow.minimumFrameHeight = ExpandedPanelMetrics.minHeight
+            overlayWindow.maximumFrameHeight = maxHeight
+        }
+        window.minSize = NSSize(width: min(ExpandedPanelMetrics.minCompactWidth, maxWidth), height: ExpandedPanelMetrics.minHeight)
+        window.contentMinSize = window.minSize
+        window.maxSize = NSSize(width: maxWidth, height: maxHeight)
+        window.contentMaxSize = window.maxSize
+
+        var frame = NSRect(
+            x: screen.midX - maxWidth / 2,
+            y: screen.midY - maxHeight / 2,
+            width: maxWidth,
+            height: maxHeight)
+        frame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(frame, visibleFrame: screen)
+        updateCanvasWidth()
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.16
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            window.animator().setFrame(frame, display: true)
+            self.layoutSubtreeIfNeeded()
+        }
+    }
+
+    private func restoreWindowFromFullSize() {
+        guard let window else { return }
+        windowFullSize = false
+        let targetFrame = preWindowFullSizeFrame
+        preWindowFullSizeFrame = nil
+        restoreCompactWidth()
+        updateCanvasWidth()
+        updateFullSizeButtonChrome()
+        guard let targetFrame else { return }
+        let screen = window.screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let fittedFrame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(targetFrame, visibleFrame: screen)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.16
+            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            window.animator().setFrame(fittedFrame, display: true)
+            self.layoutSubtreeIfNeeded()
+        }
+    }
+
     private func updateCanvasWidth() {
         guard canvasOpen else {
             canvasWidthConstraint?.constant = 0
             return
         }
         let available = max(0, bounds.width)
-        if canvasFullWindow {
+        if canvasFullWindow || windowFullSize {
             canvasWidthConstraint?.constant = min(max(380, available * 0.44), 560)
         } else {
             canvasWidthConstraint?.constant = 310

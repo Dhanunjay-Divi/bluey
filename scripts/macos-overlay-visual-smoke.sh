@@ -68,6 +68,8 @@ require_source "private let fullWindowButton = NSButton(title: \"\", target: nil
 require_source "private let copyButton = NSButton(title: \"\", target: nil, action: nil)"
 require_source "fullWindowButton.toolTip = \"Expand canvas\""
 require_source "copyButton.toolTip = \"Copy canvas\""
+require_source "fullSizeButton.toolTip = windowFullSize ? \"Restore Bluey size\" : \"Make Bluey full size\""
+require_source "fullSizeButton.action = #selector(fullSizeClicked)"
 require_source "private func hasInteractiveView(at localPoint: NSPoint) -> Bool"
 require_source "setFrameTopLeftPoint"
 require_source "resizable: false"
