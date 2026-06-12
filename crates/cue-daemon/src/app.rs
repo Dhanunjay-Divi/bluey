@@ -19,6 +19,7 @@ use cue_core::ai::{
 use cue_core::app_paths::AppPaths;
 use cue_core::audio::AudioRuntimeMode;
 use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
+use cue_core::overlay_ipc::ListeningState;
 use cue_core::{
     analyze_segment, clock, generate_recap, load_account, local_answer, new_trace_id,
     sanitize_observability_id, trace_id_from_env, AiCapabilities, AiProviderId, AiProviderKind,
@@ -1231,6 +1232,10 @@ async fn push_overlay_balance_snapshot(
     let _ = send_overlay(daemon, OverlayCommand::SetBalance { label }).await;
 }
 
+async fn set_overlay_listening_state(daemon: &Arc<Daemon>, state: ListeningState) {
+    let _ = send_overlay(daemon, OverlayCommand::ListeningStateChanged { state }).await;
+}
+
 async fn ensure_overlay_ready(
     daemon: &Arc<Daemon>,
     overlay: &mut Option<OverlayProcess>,
@@ -1447,8 +1452,10 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             stop_screen_capture(daemon, "overlay eye").await?;
         }
         OverlayEvent::RecordingStartRequested => {
+            set_overlay_listening_state(daemon, ListeningState::Connecting).await;
             match start_audio_capture(daemon, AudioCaptureConfig::dual_default()).await {
                 Ok(status) => {
+                    set_overlay_listening_state(daemon, ListeningState::Listening).await;
                     let balance = refresh_overlay_balance(daemon, None).await;
                     let balance_line = balance
                         .map(|label| format!("\nBalance: {label}."))
@@ -1467,6 +1474,7 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
                     .await;
                 }
                 Err(error) => {
+                    set_overlay_listening_state(daemon, ListeningState::Failed).await;
                     push_system_card(
                         daemon,
                         CardKind::Warning,
@@ -1479,6 +1487,7 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         }
         OverlayEvent::RecordingStopRequested => {
             let status = stop_audio_capture(daemon).await;
+            set_overlay_listening_state(daemon, ListeningState::Paused).await;
             let balance = refresh_overlay_balance(daemon, None).await;
             let balance_line = balance
                 .map(|label| format!("\nFinal balance: {label}."))

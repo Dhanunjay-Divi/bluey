@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{CueCard, CueCardArtifact};
+use crate::{overlay_ipc::ListeningState, CueCard, CueCardArtifact};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -62,6 +62,9 @@ pub enum OverlayCommand {
     },
     SetSessions {
         sessions: Vec<OverlaySessionItem>,
+    },
+    ListeningStateChanged {
+        state: ListeningState,
     },
     PushCard {
         card: CueCard,
@@ -195,6 +198,19 @@ mod tests {
         assert_eq!(
             json,
             r#"{"type":"set_sessions","sessions":[{"id":"00000000-0000-0000-0000-000000000000","title":"System design prep","subtitle":"3 transcripts · 2 files","is_active":true}]}"#
+        );
+    }
+
+    #[test]
+    fn listening_state_serializes_as_overlay_command() {
+        let json = serde_json::to_string(&OverlayCommand::ListeningStateChanged {
+            state: ListeningState::Listening,
+        })
+        .expect("serialize overlay listening state command");
+
+        assert_eq!(
+            json,
+            r#"{"type":"listening_state_changed","state":"listening"}"#
         );
     }
 

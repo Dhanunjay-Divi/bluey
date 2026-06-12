@@ -2203,7 +2203,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         headerSpacer = NSView()
         statusLabel = NSTextField(labelWithString: "New recording")
         modelMenu = NSPopUpButton(frame: .zero, pullsDown: false)
-        routeBadge = NSTextField(labelWithString: "Auto · ready")
+        routeBadge = NSTextField(labelWithString: "● Ready")
         knowledgeBadge = NSTextField(labelWithString: "Docs empty")
         balanceLabel = NSTextField(labelWithString: "Balance --")
         canvasToggleButton = NSButton(title: "", target: nil, action: nil)
@@ -2762,10 +2762,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     override func resetCursorRects() {
         super.resetCursorRects()
         guard closeConfirmOverlay.isHidden, answerStyleOverlay.isHidden else { return }
-        addCursorRect(NSRect(x: 0, y: 0, width: resizeHitSize, height: bounds.height), cursor: .resizeLeftRight)
         addCursorRect(NSRect(x: bounds.width - resizeHitSize, y: 0, width: resizeHitSize, height: bounds.height), cursor: .resizeLeftRight)
         addCursorRect(NSRect(x: 0, y: 0, width: bounds.width, height: resizeHitSize), cursor: .resizeUpDown)
-        addCursorRect(NSRect(x: 0, y: bounds.height - resizeHitSize, width: bounds.width, height: resizeHitSize), cursor: .resizeUpDown)
     }
 
     private func applyShellChrome() {
@@ -2924,8 +2922,40 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if !resizeEdges(at: localPoint).isEmpty {
             return true
         }
+        if hitsExplicitInteractiveChrome(at: localPoint) {
+            return true
+        }
         return hasInteractiveView(at: localPoint)
             || feed.hasCopyControl(atScreenPoint: screenPoint)
+    }
+
+    private func hitsExplicitInteractiveChrome(at localPoint: NSPoint) -> Bool {
+        let controls: [NSView] = [
+            navButton,
+            newSessionButton,
+            canvasToggleButton,
+            balanceLabel,
+            hideButton,
+            closeButton,
+            routeBadge,
+            knowledgeBadge,
+            transcriptStrip,
+            attachmentStrip,
+            composer,
+            recordingButton,
+            askButton,
+            attachButton,
+            instructionsButton,
+            opacityControl,
+            opacitySlider,
+            modelMenu,
+            analyzeButton,
+        ]
+        return controls.contains { view in
+            guard !view.isHidden, view.alphaValue > 0.01 else { return false }
+            let rect = view.convert(view.bounds, to: self).insetBy(dx: -8, dy: -8)
+            return rect.contains(localPoint)
+        }
     }
 
     private func hasInteractiveView(at localPoint: NSPoint) -> Bool {
@@ -2952,23 +2982,46 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func resizeEdges(at point: NSPoint) -> ResizeEdges {
-        guard bounds.contains(point), closeConfirmOverlay.isHidden, answerStyleOverlay.isHidden else {
+        guard bounds.contains(point),
+              closeConfirmOverlay.isHidden,
+              answerStyleOverlay.isHidden,
+              canStartResize(at: point)
+        else {
             return []
         }
         var edges: ResizeEdges = []
-        if point.x <= resizeHitSize {
-            edges.insert(.left)
-        }
         if point.x >= bounds.width - resizeHitSize {
             edges.insert(.right)
         }
         if point.y <= resizeHitSize {
             edges.insert(.bottom)
         }
-        if point.y >= bounds.height - resizeHitSize {
-            edges.insert(.top)
-        }
         return edges
+    }
+
+    private func canStartResize(at point: NSPoint) -> Bool {
+        if headerBar.frame.insetBy(dx: -4, dy: -4).contains(point) {
+            return false
+        }
+        if composerBar.frame.insetBy(dx: -4, dy: -4).contains(point) {
+            return false
+        }
+        if transcriptStrip.frame.insetBy(dx: -4, dy: -4).contains(point) {
+            return false
+        }
+        if !sessionDrawer.isHidden {
+            let drawerPoint = sessionDrawer.convert(point, from: self)
+            if sessionDrawer.bounds.contains(drawerPoint) {
+                return false
+            }
+        }
+        if !canvasPane.isHidden {
+            let canvasPoint = canvasPane.convert(point, from: self)
+            if canvasPane.bounds.contains(canvasPoint) {
+                return false
+            }
+        }
+        return point.x >= bounds.width - resizeHitSize || point.y <= resizeHitSize
     }
 
     private func clampedResizeFrame(
@@ -3099,7 +3152,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         modelMenu.setContentHuggingPriority(.defaultLow, for: .horizontal)
         modelMenu.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        styleHeaderBadge(routeBadge, textColor: BlueyTheme.cyan)
+        styleHeaderBadge(routeBadge, textColor: BlueyTheme.green)
         routeBadge.toolTip = "Auto Router classification and selected lane"
 
         styleHeaderBadge(knowledgeBadge, textColor: BlueyTheme.text)
@@ -3589,13 +3642,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if canvasOpen {
             setCanvasOpen(false)
         } else {
-            if let window {
-                preCanvasFullWindowFrame = window.frame
-            }
             setCanvasOpen(true)
-            if !canvasFullWindow {
-                expandCanvasWindow()
-            }
         }
     }
 
@@ -3679,13 +3726,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
         } else {
             emitSimple("recording_start_requested")
-            recordingActive = true
-            onListeningStateChanged?(.listening)
-            recordingButton.title = "Stop"
-            statusLabel.stringValue = "Listening"
-            composer.placeholder = "Listening... type a follow-up anytime"
-            setTranscriptState("LISTENING", active: true)
-            styleControlButton(recordingButton, symbol: "stop.fill", accent: true)
+            recordingActive = false
+            onListeningStateChanged?(.connecting)
+            recordingButton.title = "Starting"
+            statusLabel.stringValue = "Starting audio"
+            composer.placeholder = "Starting audio..."
+            setTranscriptState("STARTING", active: true)
+            styleControlButton(recordingButton, symbol: "waveform", accent: false)
         }
     }
 
@@ -3793,10 +3840,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     func showSignedInReady() {
         statusLabel.stringValue = recordingActive ? "Listening" : "Ready"
         statusLabel.toolTip = nil
-        routeBadge.stringValue = "Auto · ready"
-        routeBadge.textColor = BlueyTheme.cyan
-        routeBadge.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.26).cgColor
-        routeBadge.layer?.backgroundColor = BlueyTheme.cyan.withAlphaComponent(0.075).cgColor
+        routeBadge.stringValue = "● Ready"
+        routeBadge.textColor = BlueyTheme.green
+        routeBadge.layer?.borderColor = BlueyTheme.green.withAlphaComponent(0.30).cgColor
+        routeBadge.layer?.backgroundColor = BlueyTheme.green.withAlphaComponent(0.075).cgColor
         if balanceLabel.stringValue == "Login" {
             balanceLabel.stringValue = "Balance --"
         }
@@ -3888,7 +3935,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         switch state {
         case .connecting:
             recordingActive = false
-            recordingButton.title = "Listen"
+            recordingButton.title = "Starting"
             statusLabel.stringValue = "Connecting"
             composer.placeholder = "Connecting audio..."
             setTranscriptState("CONNECTING", active: true)
@@ -3964,11 +4011,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func routeBadgeText(for artifact: OverlayArtifact) -> String {
         switch artifact.artifactType {
-        case "code": return "Code · canvas"
-        case "system_design": return "Design · canvas"
-        case "screen": return "Vision · canvas"
-        case "document": return "Docs · canvas"
-        default: return "Auto · canvas"
+        case "code": return "Code"
+        case "system_design": return "Design"
+        case "screen": return "Vision"
+        case "document": return "Docs"
+        default: return "Auto"
         }
     }
 
@@ -4029,7 +4076,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         transcriptSnippets.removeAll()
         updateTranscriptStripText("Live captions preview", scrollToEnd: false)
         setTranscriptState("IDLE", active: false)
-        routeBadge.stringValue = "Auto · ready"
+        routeBadge.stringValue = "● Ready"
+        routeBadge.textColor = BlueyTheme.green
         latestCanvas = nil
         setCanvasOpen(false)
         canvasToggleButton.isHidden = true
