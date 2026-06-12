@@ -40,18 +40,18 @@ private func parseArgs() -> Args {
 private final class PCM16Writer {
     private let handle = FileHandle.standardOutput
     private let lock = NSLock()
-    private let ratio: Double = 16_000.0 / 48_000.0
     private var carry: Double = 0.0
 
-    func write48kFloat(_ pointer: UnsafePointer<Float>, frameCount: Int) {
-        guard frameCount > 0 else { return }
+    func writeMonoFloat(_ samples: [Float], sourceSampleRate: Double) {
+        guard !samples.isEmpty, sourceSampleRate > 0 else { return }
         lock.lock()
         var output = Data()
-        output.reserveCapacity(frameCount * 2 / 3)
-        for i in 0..<frameCount {
+        output.reserveCapacity(samples.count * 2)
+        let ratio = 16_000.0 / sourceSampleRate
+        for sample in samples {
             carry += ratio
             while carry >= 1.0 {
-                let clamped = max(-1.0, min(1.0, pointer[i]))
+                let clamped = max(-1.0, min(1.0, sample.isFinite ? sample : 0.0))
                 var sample = Int16(clamped * 32767.0)
                 withUnsafeBytes(of: &sample) { output.append(contentsOf: $0) }
                 carry -= 1.0
@@ -61,25 +61,77 @@ private final class PCM16Writer {
         lock.unlock()
     }
 
-    func writePlanar48kFloat(_ bufferList: UnsafeMutableAudioBufferListPointer, frameCount: Int) {
+    func write48kFloat(_ pointer: UnsafePointer<Float>, frameCount: Int) {
         guard frameCount > 0 else { return }
-        if bufferList.count == 1,
-           let data = bufferList[0].mData?.assumingMemoryBound(to: Float.self) {
-            write48kFloat(data, frameCount: frameCount)
-            return
-        }
+        writeMonoFloat(Array(UnsafeBufferPointer(start: pointer, count: frameCount)), sourceSampleRate: 48_000)
+    }
+
+    func writePCM(
+        _ bufferList: UnsafeMutableAudioBufferListPointer,
+        frameCount: Int,
+        format: AudioStreamBasicDescription
+    ) {
+        guard frameCount > 0 else { return }
+        let channelCount = max(Int(format.mChannelsPerFrame), 1)
+        let sourceSampleRate = format.mSampleRate > 0 ? format.mSampleRate : 48_000
+        let flags = format.mFormatFlags
+        let isFloat = (flags & kAudioFormatFlagIsFloat) != 0
+        let isSignedInt = (flags & kAudioFormatFlagIsSignedInteger) != 0
+        let isNonInterleaved = (flags & kAudioFormatFlagIsNonInterleaved) != 0
+
         var mono = [Float](repeating: 0, count: frameCount)
-        for audioBuffer in bufferList {
-            guard let data = audioBuffer.mData?.assumingMemoryBound(to: Float.self) else { continue }
-            for index in 0..<frameCount {
-                mono[index] += data[index] / Float(max(bufferList.count, 1))
+        var channelsMixed = 0
+
+        if isFloat && format.mBitsPerChannel == 32 {
+            if isNonInterleaved || bufferList.count > 1 {
+                let buffersToRead = min(bufferList.count, channelCount)
+                for bufferIndex in 0..<buffersToRead {
+                    guard let data = bufferList[bufferIndex].mData?.assumingMemoryBound(to: Float.self) else { continue }
+                    for frame in 0..<frameCount {
+                        mono[frame] += data[frame]
+                    }
+                    channelsMixed += 1
+                }
+            } else if let data = bufferList.first?.mData?.assumingMemoryBound(to: Float.self) {
+                for frame in 0..<frameCount {
+                    var sum: Float = 0
+                    for channel in 0..<channelCount {
+                        sum += data[frame * channelCount + channel]
+                    }
+                    mono[frame] = sum
+                }
+                channelsMixed = channelCount
+            }
+        } else if isSignedInt && format.mBitsPerChannel == 16 {
+            if isNonInterleaved || bufferList.count > 1 {
+                let buffersToRead = min(bufferList.count, channelCount)
+                for bufferIndex in 0..<buffersToRead {
+                    guard let data = bufferList[bufferIndex].mData?.assumingMemoryBound(to: Int16.self) else { continue }
+                    for frame in 0..<frameCount {
+                        mono[frame] += Float(data[frame]) / 32768.0
+                    }
+                    channelsMixed += 1
+                }
+            } else if let data = bufferList.first?.mData?.assumingMemoryBound(to: Int16.self) {
+                for frame in 0..<frameCount {
+                    var sum: Float = 0
+                    for channel in 0..<channelCount {
+                        sum += Float(data[frame * channelCount + channel]) / 32768.0
+                    }
+                    mono[frame] = sum
+                }
+                channelsMixed = channelCount
             }
         }
-        mono.withUnsafeBufferPointer { pointer in
-            if let base = pointer.baseAddress {
-                write48kFloat(base, frameCount: frameCount)
+
+        guard channelsMixed > 0 else { return }
+        if channelsMixed > 1 {
+            let divisor = Float(channelsMixed)
+            for index in mono.indices {
+                mono[index] /= divisor
             }
         }
+        writeMonoFloat(mono, sourceSampleRate: sourceSampleRate)
     }
 }
 
@@ -144,9 +196,16 @@ private final class SystemAudioCapture: NSObject, SCStreamOutput {
             blockBufferOut: &blockBuffer
         )
         guard status == noErr else { return }
-        writer.writePlanar48kFloat(
+        let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer)
+        guard
+            let streamDescription = formatDescription.flatMap({
+                CMAudioFormatDescriptionGetStreamBasicDescription($0)
+            })?.pointee
+        else { return }
+        writer.writePCM(
             UnsafeMutableAudioBufferListPointer(&audioBufferList),
-            frameCount: sampleBuffer.numSamples
+            frameCount: sampleBuffer.numSamples,
+            format: streamDescription
         )
         _ = blockBuffer
     }

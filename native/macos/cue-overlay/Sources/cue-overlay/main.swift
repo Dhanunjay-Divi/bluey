@@ -871,6 +871,38 @@ private final class ModalBlockerView: NSView {
     }
 }
 
+private final class HeaderDragView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, alphaValue > 0.01, bounds.contains(point) else { return nil }
+        guard let hit = super.hitTest(point) else { return self }
+        if hit === self { return self }
+        return preservesHeaderHit(for: hit) ? hit : self
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.performDrag(with: event)
+    }
+
+    private func preservesHeaderHit(for view: NSView) -> Bool {
+        var current: NSView? = view
+        while let candidate = current, candidate !== self {
+            if candidate is NSButton
+                || candidate is NSPopUpButton
+                || candidate is NSSlider
+                || candidate is NSScroller
+                || candidate is NSTextView
+            {
+                return true
+            }
+            if let textField = candidate as? NSTextField, textField.isEditable {
+                return true
+            }
+            current = candidate.superview
+        }
+        return false
+    }
+}
+
 private final class CopyCardButton: NSButton {
     var copyText = ""
 }
@@ -2095,7 +2127,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     let toastView: NSView
     let toastTitleLabel: NSTextField
     let toastBodyLabel: NSTextField
-    let headerBar: NSView
+    let headerBar: HeaderDragView
     let headerStack: NSStackView
     let brandStack: NSStackView
     let headerLogo: BlueyLogoView
@@ -2195,7 +2227,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         toastView = NSView()
         toastTitleLabel = NSTextField(labelWithString: "")
         toastBodyLabel = NSTextField(wrappingLabelWithString: "")
-        headerBar = NSView()
+        headerBar = HeaderDragView()
         headerStack = NSStackView()
         brandStack = NSStackView()
         headerLogo = BlueyLogoView()
@@ -2931,6 +2963,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func hitsExplicitInteractiveChrome(at localPoint: NSPoint) -> Bool {
         let controls: [NSView] = [
+            headerBar,
             navButton,
             newSessionButton,
             canvasToggleButton,
@@ -4444,7 +4477,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let cleanSource = source
             .replacingOccurrences(of: "_", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let label = cleanSource.isEmpty ? "Audio" : cleanSource.capitalized
+        let lowerSource = cleanSource.lowercased()
+        let label: String
+        if lowerSource.contains("microphone") || lowerSource.contains("mic") {
+            label = "Mic"
+        } else if lowerSource.contains("system") {
+            label = "System"
+        } else {
+            label = cleanSource.isEmpty ? "Audio" : cleanSource.capitalized
+        }
         transcriptSnippets.append("\(label): \(body)")
         if transcriptSnippets.count > 6 {
             transcriptSnippets.removeFirst(transcriptSnippets.count - 6)
@@ -4454,7 +4495,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func updateTranscriptStripText(_ text: String, scrollToEnd: Bool) {
-        transcriptLabel.stringValue = text
+        transcriptLabel.attributedStringValue = attributedTranscriptStripText(text)
         resizeTranscriptLabelToContent()
         guard scrollToEnd else {
             transcriptScroll.contentView.scroll(to: .zero)
@@ -4468,6 +4509,34 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             self.transcriptScroll.contentView.scroll(to: NSPoint(x: maxX, y: 0))
             self.transcriptScroll.reflectScrolledClipView(self.transcriptScroll.contentView)
         }
+    }
+
+    private func attributedTranscriptStripText(_ text: String) -> NSAttributedString {
+        let font = transcriptLabel.font ?? NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        let sourceFont = NSFont.systemFont(ofSize: 11.5, weight: .bold)
+        let attributed = NSMutableAttributedString(
+            string: text,
+            attributes: [
+                .font: font,
+                .foregroundColor: BlueyTheme.textDim,
+            ])
+        for label in ["Mic:", "System:"] {
+            var searchRange = NSRange(location: 0, length: attributed.length)
+            while true {
+                let found = (attributed.string as NSString).range(of: label, options: [], range: searchRange)
+                if found.location == NSNotFound { break }
+                attributed.addAttributes(
+                    [
+                        .font: sourceFont,
+                        .foregroundColor: BlueyTheme.green,
+                    ],
+                    range: found)
+                let nextLocation = found.location + found.length
+                if nextLocation >= attributed.length { break }
+                searchRange = NSRange(location: nextLocation, length: attributed.length - nextLocation)
+            }
+        }
+        return attributed
     }
 
     private func resizeTranscriptLabelToContent() {

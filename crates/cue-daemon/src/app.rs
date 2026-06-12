@@ -1906,8 +1906,8 @@ fn env_truthy_any(names: &[&str]) -> bool {
 fn real_stt_chunk_duration_ms(configured: u32) -> u32 {
     env_first(&["BLUEY_STT_CHUNK_MS", "CUE_STT_CHUNK_MS"])
         .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or_else(|| configured.max(3_000))
-        .clamp(1_000, 15_000)
+        .unwrap_or_else(|| configured.max(1_000))
+        .clamp(500, 15_000)
 }
 
 async fn resolve_real_audio_sources(
@@ -2896,23 +2896,16 @@ async fn capture_native_audio_chunk_to_file(
         ));
     }
 
-    let wav = wav_from_f32le_48k_mono_to_i16_16k(&output.stdout);
+    let wav = wav_from_i16le_16k_mono(&output.stdout);
     tokio::fs::write(chunk_path, wav)
         .await
         .with_context(|| format!("failed to write {}", chunk_path.display()))?;
     Ok(())
 }
 
-fn wav_from_f32le_48k_mono_to_i16_16k(raw: &[u8]) -> Vec<u8> {
-    let mut pcm = Vec::with_capacity(raw.len() / 6);
-    for (index, bytes) in raw.chunks_exact(4).enumerate() {
-        if index % 3 != 0 {
-            continue;
-        }
-        let sample = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]).clamp(-1.0, 1.0);
-        let sample_i16 = (sample * i16::MAX as f32) as i16;
-        pcm.extend_from_slice(&sample_i16.to_le_bytes());
-    }
+fn wav_from_i16le_16k_mono(raw: &[u8]) -> Vec<u8> {
+    let pcm_len = raw.len() - (raw.len() % 2);
+    let pcm = &raw[..pcm_len];
 
     let data_len = pcm.len() as u32;
     let mut wav = Vec::with_capacity(44 + pcm.len());
@@ -2929,7 +2922,7 @@ fn wav_from_f32le_48k_mono_to_i16_16k(raw: &[u8]) -> Vec<u8> {
     wav.extend_from_slice(&16_u16.to_le_bytes());
     wav.extend_from_slice(b"data");
     wav.extend_from_slice(&data_len.to_le_bytes());
-    wav.extend_from_slice(&pcm);
+    wav.extend_from_slice(pcm);
     wav
 }
 
@@ -7727,6 +7720,30 @@ mod tests {
             url_component("audio system/1 + model"),
             "audio%20system%2F1%20%2B%20model"
         );
+    }
+
+    #[test]
+    fn native_helper_pcm_is_wrapped_as_16k_i16_wav_without_resampling() {
+        let raw = [0x34, 0x12, 0x78, 0x56, 0xff];
+        let wav = wav_from_i16le_16k_mono(&raw);
+
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[12..16], b"fmt ");
+        assert_eq!(u16::from_le_bytes([wav[20], wav[21]]), 1);
+        assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 1);
+        assert_eq!(
+            u32::from_le_bytes([wav[24], wav[25], wav[26], wav[27]]),
+            16_000
+        );
+        assert_eq!(
+            u32::from_le_bytes([wav[28], wav[29], wav[30], wav[31]]),
+            32_000
+        );
+        assert_eq!(u16::from_le_bytes([wav[34], wav[35]]), 16);
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(u32::from_le_bytes([wav[40], wav[41], wav[42], wav[43]]), 4);
+        assert_eq!(&wav[44..], &[0x34, 0x12, 0x78, 0x56]);
     }
 
     #[test]
