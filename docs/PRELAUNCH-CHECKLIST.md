@@ -157,7 +157,7 @@ do not advertise it until a real `Bluey.app` artifact exists.
 - [x] Release tarball hosted at `https://bluey.sh/releases/v0.1.1/bluey-0.1.1-darwin-arm64.tar.gz`
 - [x] Each release tarball contains top-level `bin/bluey` plus helper binaries
 - [x] `SHA256SUMS.txt` hosted next to the tarballs, and `install.sh` verifies it
-- [x] `bluey on` checks the release manifest, waits 5 seconds for Esc, and auto-updates installed builds
+- [x] `bluey on` checks the signed release manifest and notifies when an update is available; silent install is disabled by default for alpha
 - [x] Current-Mac temp-root installer smoke: download, checksum, ad-hoc sign, quarantine strip, CLI symlink, `bluey --version`
 - [ ] Smoke on a clean Mac: `curl -fsSL https://bluey.sh/install.sh | bash` finishes cleanly
 - [ ] Smoke on a clean Mac: old installed Bluey updates itself on next `bluey on`
@@ -282,7 +282,7 @@ phrase "production-ready," which has burned us before.
 - `bluey.sh` DNS + production droplet
 - Marketing/legal/privacy pages
 - Monitoring (Carnaval-equivalent or external)
-- Signed release manifest (ed25519 over `latest.json`) for safe auto-update
+- Signed release manifest (Ed25519 over `latest.json`) for safe updates
 - Local DB encryption (SQLCipher / envelope) for malware-resistance polish
 - Dependency audit CI (`cargo deny` / `cargo audit`)
 - **Estimated: 4-6 weeks from current tip**

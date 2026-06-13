@@ -153,10 +153,26 @@ needed after preprod smoke, stop here, create a new commit and release id,
 then rebuild a new artifact and restart preprod smoke from section 1.
 
 ```bash
+BLUEY_RELEASE_SIGNING_KEY_FILE=/secure/off-repo/bluey-release-ed25519.pem \
 PUBLISH_HOST=<host> PUBLISH_PATH=/var/www/bluey \
   PUBLISH_DO=1 \
-  bash scripts/publish.sh
+  bash scripts/publish-bluey-release.sh
 ```
+
+The matching raw Ed25519 public key must be embedded in the CLI build:
+
+```bash
+export BLUEY_UPDATE_PUBKEY="$(
+  openssl pkey -in /secure/off-repo/bluey-release-ed25519.pem -pubout -outform DER \
+    | tail -c 32 | base64 | tr -d '\n'
+)"
+cargo build --release -p cue-cli --bin bluey
+```
+
+`latest.json.sig` is a detached signature over the exact bytes of
+`latest.json`. The signed manifest also pins `install.sh` and archive
+SHA256 values. Do not publish with `BLUEY_RELEASE_ALLOW_UNSIGNED=1`
+outside local release testing.
 
 Verify on the server:
 
@@ -171,9 +187,10 @@ point at the new release dir (atomic swap done by `publish.sh`).
 For preprod → prod promotion (after preprod soak):
 
 ```bash
+BLUEY_RELEASE_SIGNING_KEY_FILE=/secure/off-repo/bluey-release-ed25519.pem \
 PUBLISH_HOST=<prod-host> PUBLISH_PATH=/var/www/bluey \
   PUBLISH_DO=1 \
-  bash scripts/publish.sh
+  bash scripts/publish-bluey-release.sh
 ```
 
 That command must point prod at the same artifact/version that passed

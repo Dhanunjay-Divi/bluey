@@ -10,8 +10,11 @@ use std::time::Duration;
 use std::os::unix::process::CommandExt;
 
 use anyhow::{anyhow, bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use reqwest::Url;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 const DEFAULT_MANIFEST_URL: &str = "https://bluey.sh/latest.json";
 const DEFAULT_INSTALL_PATH: &str = "/install.sh";
@@ -21,7 +24,16 @@ const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 struct ReleaseManifest {
     version: String,
     #[serde(default)]
+    install: Option<InstallScriptArtifact>,
+    #[serde(default)]
     platforms: HashMap<String, PlatformArtifact>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct InstallScriptArtifact {
+    url: String,
+    #[serde(default)]
+    sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -38,9 +50,28 @@ struct UpdatePlan {
     version: String,
     manifest_origin: String,
     install_url: String,
+    install_sha256: Option<String>,
     artifact_url: String,
     artifact_sha256: Option<String>,
     artifact_size_bytes: Option<u64>,
+    manifest_trust: ManifestTrust,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManifestTrust {
+    Verified,
+    UnsignedAllowed(String),
+    Unverified(String),
+}
+
+impl ManifestTrust {
+    fn permits_install(&self) -> bool {
+        matches!(self, Self::Verified | Self::UnsignedAllowed(_))
+    }
+
+    fn is_verified(&self) -> bool {
+        matches!(self, Self::Verified)
+    }
 }
 
 pub async fn maybe_update_before_on(title: Option<&str>) -> Result<()> {
@@ -53,6 +84,18 @@ pub async fn maybe_update_before_on(title: Option<&str>) -> Result<()> {
 
     match check_for_update().await {
         Ok(Some(plan)) => {
+            if !env_flag("BLUEY_AUTO_UPDATE") {
+                print_update_available(&plan);
+                print_update_posture(&plan);
+                return Ok(());
+            }
+            if let Err(error) = ensure_update_installable(&plan) {
+                if env_flag("BLUEY_UPDATE_STRICT") {
+                    return Err(error);
+                }
+                eprintln!("warning: Bluey auto-update disabled: {error:#}");
+                return Ok(());
+            }
             if !confirm_or_auto_update(&plan, false) {
                 println!("Bluey update skipped for this launch.");
                 return Ok(());
@@ -92,10 +135,12 @@ pub async fn manual_update(check_only: bool, yes: bool, force: bool) -> Result<(
     match check_for_update().await? {
         Some(plan) if check_only => {
             print_update_available(&plan);
+            print_update_posture(&plan);
             Ok(())
         }
         Some(plan) => {
             print_update_available(&plan);
+            ensure_update_installable(&plan)?;
             if yes || confirm_or_auto_update(&plan, true) {
                 install_update(&plan).await?;
                 println!(
@@ -120,8 +165,6 @@ async fn check_for_update() -> Result<Option<UpdatePlan>> {
     let manifest_url = Url::parse(&manifest_url)
         .with_context(|| format!("invalid BLUEY_UPDATE_MANIFEST_URL: {manifest_url}"))?;
     let manifest_origin = manifest_origin(&manifest_url)?;
-    let install_url = env::var("BLUEY_UPDATE_INSTALL_URL")
-        .unwrap_or_else(|_| format!("{manifest_origin}{DEFAULT_INSTALL_PATH}"));
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -134,14 +177,32 @@ async fn check_for_update() -> Result<Option<UpdatePlan>> {
         .with_context(|| format!("failed to fetch update manifest from {manifest_url}"))?
         .error_for_status()
         .with_context(|| format!("update manifest returned an error: {manifest_url}"))?;
-    let manifest: ReleaseManifest = response
-        .json()
+    let manifest_bytes = response
+        .bytes()
         .await
+        .context("failed to read update manifest response")?;
+    let manifest_trust = verify_hosted_manifest(&client, &manifest_url, &manifest_bytes).await;
+    let manifest: ReleaseManifest = serde_json::from_slice(&manifest_bytes)
         .with_context(|| format!("update manifest was not valid JSON: {manifest_url}"))?;
 
     if !is_remote_newer(&manifest.version, CURRENT_VERSION) {
         return Ok(None);
     }
+
+    let install_override = env::var("BLUEY_UPDATE_INSTALL_URL").ok();
+    let install_from_manifest = manifest.install.as_ref();
+    let install_url = if let Some(url) = install_override.as_deref() {
+        url.to_string()
+    } else if let Some(install) = install_from_manifest {
+        resolve_artifact_url(&manifest_url, &install.url)
+            .with_context(|| format!("invalid installer URL: {}", install.url))?
+    } else {
+        format!("{manifest_origin}{DEFAULT_INSTALL_PATH}")
+    };
+    let install_sha256 = install_override
+        .is_none()
+        .then(|| install_from_manifest.and_then(|install| install.sha256.clone()))
+        .flatten();
 
     let (platform, artifact) = select_artifact(&manifest)
         .with_context(|| format!("no supported artifact for {}", current_platform()))?;
@@ -152,10 +213,111 @@ async fn check_for_update() -> Result<Option<UpdatePlan>> {
         version: manifest.version,
         manifest_origin,
         install_url,
+        install_sha256,
         artifact_url,
         artifact_sha256: artifact.sha256,
         artifact_size_bytes: artifact.size_bytes,
+        manifest_trust,
     }))
+}
+
+async fn verify_hosted_manifest(
+    client: &reqwest::Client,
+    manifest_url: &Url,
+    manifest_bytes: &[u8],
+) -> ManifestTrust {
+    let Some(pubkey) = embedded_update_pubkey() else {
+        return manifest_trust_from_error("build has no BLUEY_UPDATE_PUBKEY".to_string());
+    };
+    let signature_url = signature_url_for_manifest(manifest_url);
+    let signature_bytes = match client
+        .get(signature_url.clone())
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+    {
+        Ok(response) => match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return manifest_trust_from_error(format!(
+                    "failed to read signature {signature_url}: {error}"
+                ));
+            }
+        },
+        Err(error) => {
+            return manifest_trust_from_error(format!(
+                "failed to fetch signature {signature_url}: {error}"
+            ));
+        }
+    };
+
+    match verify_manifest_signature(manifest_bytes, signature_bytes.as_ref(), pubkey) {
+        Ok(()) => ManifestTrust::Verified,
+        Err(error) => manifest_trust_from_error(format!("{error:#}")),
+    }
+}
+
+fn embedded_update_pubkey() -> Option<&'static str> {
+    option_env!("BLUEY_UPDATE_PUBKEY").and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then_some(value)
+    })
+}
+
+fn manifest_trust_from_error(reason: String) -> ManifestTrust {
+    if env_flag("BLUEY_UPDATE_ALLOW_UNSIGNED") {
+        ManifestTrust::UnsignedAllowed(reason)
+    } else {
+        ManifestTrust::Unverified(reason)
+    }
+}
+
+fn signature_url_for_manifest(manifest_url: &Url) -> String {
+    let mut url = manifest_url.clone();
+    let path = url.path().trim_end_matches('/');
+    url.set_path(&format!("{path}.sig"));
+    url.to_string()
+}
+
+fn verify_manifest_signature(
+    manifest_bytes: &[u8],
+    signature_bytes: &[u8],
+    pubkey_b64: &str,
+) -> Result<()> {
+    let pubkey = BASE64_STANDARD
+        .decode(pubkey_b64.trim())
+        .context("release public key was not valid base64")?;
+    let pubkey: [u8; 32] = pubkey
+        .as_slice()
+        .try_into()
+        .map_err(|_| anyhow!("release public key must be 32 raw ed25519 bytes"))?;
+    let signature = decode_detached_signature(signature_bytes)?;
+
+    let verifying_key =
+        VerifyingKey::from_bytes(&pubkey).context("release public key was not valid ed25519")?;
+    let signature = Signature::from_bytes(&signature);
+    verifying_key
+        .verify(manifest_bytes, &signature)
+        .context("release manifest signature verification failed")?;
+    Ok(())
+}
+
+fn decode_detached_signature(signature_bytes: &[u8]) -> Result<[u8; 64]> {
+    if let Ok(text) = std::str::from_utf8(signature_bytes) {
+        let text = text.trim();
+        if !text.is_empty() {
+            if let Ok(decoded) = BASE64_STANDARD.decode(text) {
+                return decoded
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("release manifest signature must be 64 bytes"));
+            }
+        }
+    }
+
+    signature_bytes
+        .try_into()
+        .map_err(|_| anyhow!("release manifest signature must be base64 or 64 raw bytes"))
 }
 
 fn print_update_available(plan: &UpdatePlan) {
@@ -167,6 +329,43 @@ fn print_update_available(plan: &UpdatePlan) {
         "Bluey {} is available (current {CURRENT_VERSION}, {size}).",
         plan.version
     );
+}
+
+fn print_update_posture(plan: &UpdatePlan) {
+    match &plan.manifest_trust {
+        ManifestTrust::Verified => {
+            println!("Run `bluey update` to install when ready.");
+        }
+        ManifestTrust::UnsignedAllowed(reason) => {
+            println!("warning: unsigned update install is enabled for development ({reason}).");
+        }
+        ManifestTrust::Unverified(reason) => {
+            println!(
+                "Update install is disabled because the release manifest is not verified: {reason}"
+            );
+            println!(
+                "Release operators must publish latest.json.sig; BLUEY_UPDATE_ALLOW_UNSIGNED=1 is for local testing only."
+            );
+        }
+    }
+}
+
+fn ensure_update_installable(plan: &UpdatePlan) -> Result<()> {
+    if !plan.manifest_trust.permits_install() {
+        bail!(
+            "refusing to install unsigned Bluey update; publish latest.json.sig or set BLUEY_UPDATE_ALLOW_UNSIGNED=1 only for local testing"
+        );
+    }
+    if !plan.manifest_trust.is_verified() && !env_flag("BLUEY_UPDATE_ALLOW_UNSIGNED") {
+        bail!("refusing to install update without a verified release manifest");
+    }
+    if plan.install_sha256.is_none() && !env_flag("BLUEY_UPDATE_ALLOW_UNSIGNED") {
+        bail!("refusing to install update because latest.json does not pin install.sh sha256");
+    }
+    if plan.artifact_sha256.is_none() && !env_flag("BLUEY_UPDATE_ALLOW_UNSIGNED") {
+        bail!("refusing to install update because latest.json does not pin artifact sha256");
+    }
+    Ok(())
 }
 
 fn confirm_or_auto_update(plan: &UpdatePlan, manual: bool) -> bool {
@@ -184,7 +383,7 @@ fn confirm_or_auto_update(plan: &UpdatePlan, manual: bool) -> bool {
 }
 
 async fn install_update(plan: &UpdatePlan) -> Result<()> {
-    let script = download_install_script(&plan.install_url).await?;
+    let script = download_install_script(&plan.install_url, plan.install_sha256.as_deref()).await?;
     best_effort_stop_running_bluey();
 
     println!("Updating Bluey to {}...", plan.version);
@@ -211,7 +410,7 @@ async fn install_update(plan: &UpdatePlan) -> Result<()> {
     Ok(())
 }
 
-async fn download_install_script(url: &str) -> Result<PathBuf> {
+async fn download_install_script(url: &str, expected_sha256: Option<&str>) -> Result<PathBuf> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .user_agent(format!("bluey-cli/{CURRENT_VERSION}"))
@@ -227,9 +426,18 @@ async fn download_install_script(url: &str) -> Result<PathBuf> {
         .await
         .context("failed to read installer response")?;
 
+    if let Some(expected) = expected_sha256 {
+        let actual = sha256_hex(&bytes);
+        if !actual.eq_ignore_ascii_case(expected.trim()) {
+            bail!("installer sha256 mismatch: expected {expected}, got {actual}");
+        }
+    } else if !env_flag("BLUEY_UPDATE_ALLOW_UNSIGNED") {
+        bail!("installer sha256 missing from signed update manifest");
+    }
+
     let text = std::str::from_utf8(&bytes).context("installer was not UTF-8 shell text")?;
-    if !text.starts_with("#!/") || !text.contains("Bluey one-line installer") {
-        bail!("installer response did not look like Bluey's install.sh");
+    if !text.starts_with("#!/") {
+        bail!("installer response did not look like a shell script");
     }
 
     let path = env::temp_dir().join(format!(
@@ -239,6 +447,10 @@ async fn download_install_script(url: &str) -> Result<PathBuf> {
     ));
     fs::write(&path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(path)
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
 }
 
 fn best_effort_stop_running_bluey() {
@@ -447,6 +659,7 @@ fn wait_for_escape(timeout: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
 
     #[test]
     fn compare_versions_handles_v_prefix_and_patch() {
@@ -469,6 +682,7 @@ mod tests {
     fn selects_universal_fallback_for_arm64() {
         let mut manifest = ReleaseManifest {
             version: "9.9.9".to_string(),
+            install: None,
             platforms: HashMap::new(),
         };
         manifest.platforms.insert(
@@ -495,5 +709,83 @@ mod tests {
             Path::new("/tmp/project/not-target/debug/bluey"),
             "target"
         ));
+    }
+
+    #[test]
+    fn verifies_valid_release_manifest_signature() {
+        let manifest = br#"{"version":"9.9.9","platforms":{}}"#;
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let signature = signing_key.sign(manifest);
+        let signature_b64 = BASE64_STANDARD.encode(signature.to_bytes());
+        let pubkey_b64 = BASE64_STANDARD.encode(signing_key.verifying_key().to_bytes());
+
+        verify_manifest_signature(manifest, signature_b64.as_bytes(), &pubkey_b64).unwrap();
+    }
+
+    #[test]
+    fn rejects_tampered_release_manifest_signature() {
+        let manifest = br#"{"version":"9.9.9","platforms":{}}"#;
+        let tampered = br#"{"version":"9.9.10","platforms":{}}"#;
+        let signing_key = SigningKey::from_bytes(&[9_u8; 32]);
+        let signature = signing_key.sign(manifest);
+        let signature_b64 = BASE64_STANDARD.encode(signature.to_bytes());
+        let pubkey_b64 = BASE64_STANDARD.encode(signing_key.verifying_key().to_bytes());
+
+        assert!(
+            verify_manifest_signature(tampered, signature_b64.as_bytes(), &pubkey_b64).is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_missing_release_manifest_signature() {
+        assert!(decode_detached_signature(b"").is_err());
+    }
+
+    #[test]
+    fn unverified_manifest_is_not_installable_by_default() {
+        let plan = UpdatePlan {
+            version: "9.9.9".to_string(),
+            manifest_origin: "https://bluey.sh".to_string(),
+            install_url: "https://bluey.sh/install.sh".to_string(),
+            install_sha256: Some("abc".to_string()),
+            artifact_url: "https://bluey.sh/releases/v9.9.9/bluey.tgz".to_string(),
+            artifact_sha256: Some("def".to_string()),
+            artifact_size_bytes: Some(123),
+            manifest_trust: ManifestTrust::Unverified("missing signature".to_string()),
+        };
+
+        assert!(ensure_update_installable(&plan).is_err());
+    }
+
+    #[test]
+    fn verified_manifest_still_requires_installer_and_artifact_hashes() {
+        let mut plan = UpdatePlan {
+            version: "9.9.9".to_string(),
+            manifest_origin: "https://bluey.sh".to_string(),
+            install_url: "https://bluey.sh/install.sh".to_string(),
+            install_sha256: None,
+            artifact_url: "https://bluey.sh/releases/v9.9.9/bluey.tgz".to_string(),
+            artifact_sha256: Some("def".to_string()),
+            artifact_size_bytes: Some(123),
+            manifest_trust: ManifestTrust::Verified,
+        };
+        assert!(ensure_update_installable(&plan).is_err());
+
+        plan.install_sha256 = Some("abc".to_string());
+        plan.artifact_sha256 = None;
+        assert!(ensure_update_installable(&plan).is_err());
+
+        plan.artifact_sha256 = Some("def".to_string());
+        assert!(ensure_update_installable(&plan).is_ok());
+    }
+
+    #[test]
+    fn installer_sha256_matches_exact_downloaded_script_bytes() {
+        let bytes = b"#!/usr/bin/env bash\necho bluey\n";
+        assert_eq!(sha256_hex(bytes).len(), 64);
+        assert_ne!(
+            sha256_hex(bytes),
+            sha256_hex(b"#!/usr/bin/env bash\necho other\n")
+        );
     }
 }

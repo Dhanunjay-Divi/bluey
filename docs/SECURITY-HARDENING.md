@@ -2,8 +2,7 @@
 
 > Security posture, hard boundaries, client-protection strategy, and known gaps.
 >
-> Last updated: 2026-05-21, after managed cloud sync/RAG/STT auth and local
-> private-permission hardening.
+> Last updated: 2026-06-13, after signed update manifest hardening.
 
 This doc is intentionally blunt: code that runs on a customer's machine can be
 inspected, patched, dumped, and reverse engineered by a motivated local attacker.
@@ -25,7 +24,7 @@ Anything that contradicts this document is either outdated or a bug.
 - Server-side routing policy.
 - Cloud transcript/RAG storage tenancy.
 - Short-lived STT relay sessions.
-- Release/update integrity once manifest signing lands.
+- Release/update integrity with an Ed25519-signed manifest.
 
 ### What we cannot make impossible
 
@@ -110,7 +109,11 @@ not security boundaries.
 - Native overlay helper verification enforces canonical install-dir containment,
   and now verifies a colocated SHA-256 sidecar when one is present.
 - Operational install scripts ad-hoc sign macOS bundles and strip quarantine for the current Pinky-style alpha path.
-- This is not the same as signed release manifests. SHA256 over HTTPS protects against accidental corruption and simple mirror mistakes; it does not protect against a compromised release host.
+- This is not the same as Developer ID signing/notarization. The updater now
+  verifies `latest.json.sig` with an embedded Ed25519 public key before
+  trusting update metadata. The signed manifest pins both the release archive
+  SHA256 and `install.sh` SHA256, so a compromised static host cannot silently
+  swap updater inputs unless the release signing key is also compromised.
 
 ### Client-side friction
 
@@ -133,7 +136,7 @@ desktop-dependent.
 | Hardened auth: bcrypt, JWT validation, token invalidation | Present in `bluey-server`: bcrypt cost 12, JWT access/refresh split, hashed refresh tokens, atomic refresh consume/revoke paths |
 | Billing/replay/data access ownership gates | Present: managed router uses authenticated account, balance ledger, idempotency, account-scoped sync/RAG/export/delete |
 | SQL parameterization | Present across reviewed Rust/SQLite paths via `rusqlite::params!`; keep reviewing every new raw SQL call |
-| Host helper integrity SHA sidecars | Now partially present: overlay helper verifies sidecar if shipped; signed release manifest is still stronger and still P0 |
+| Host helper integrity SHA sidecars | Now partially present: overlay helper verifies sidecar if shipped; signed release manifest additionally protects published archives |
 | Debug capture-visible escape hatch blocked from shipping | Present: capture-visible overlay mode is gated behind dev overlay enablement |
 | Capture-excluded overlay | Present for normal macOS overlay paths; privileged capture/EDR can still see anything |
 | Preprod/prod separation | Operationally documented; must be validated during deployment |
@@ -158,11 +161,11 @@ reverse engineer".
 
 | Item | Why it matters | Direction |
 |---|---|---|
-| Signed release manifest | prevents compromised hosting from silently swapping binaries | ed25519-sign `latest.json` / archive hashes; embed public key in client installer/update check |
+| Signed release manifest | prevents compromised hosting from silently swapping binaries | Implemented for updater: Ed25519 detached signature over `latest.json`, embedded public key, archive + installer SHA256 pins |
 | Local DB encryption | protects local transcripts/RAG from casual file reads | SQLCipher or application-level envelope encryption using Keychain/DPAPI/Secret Service key |
 | Server-owned transcript/RAG source of truth | avoids relying on local cache for continuity | continue cloud sync; add dashboard cloud session restore |
 | Redaction audit | prevents secrets/tokens/transcripts leaking to logs | keep expanding tests around token/API-key/body logging; operational docs/logs/session links must be treated as private artifacts |
-| Updater verification | unsigned alpha install needs safe update story | `bluey check-update` should verify signed manifest before replacing binaries |
+| Updater verification | unsigned alpha install needs safe update story | Implemented: launch checks are notify-only by default; install requires verified manifest unless `BLUEY_UPDATE_ALLOW_UNSIGNED=1` is explicitly set for local testing |
 | Rate-limit and abuse visibility | production API needs operator signals | metrics, alerts, per-account/per-IP throttles, suspicious retry counters |
 
 ### P1 Hardening

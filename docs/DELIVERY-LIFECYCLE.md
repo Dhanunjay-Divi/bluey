@@ -3,7 +3,7 @@
 > **CI/CD pipeline, environments, promotion rules, rollback model.**
 > Mirrors Pinky's `DELIVERY-LIFECYCLE.md` shape but Bluey-only.
 >
-> Last updated: 2026-06-04, release-credit policy update.
+> Last updated: 2026-06-13, signed update manifest gate.
 
 ---
 
@@ -105,7 +105,12 @@ prod is the kind of thing that ships outages.
 - macOS helper binaries pass the current release-signature expectation:
   ad-hoc `codesign --verify` for unsigned alpha; Developer ID/notarized
   signature if that release line has moved to signing.
-- Signed release manifest verification passes when the manifest exists.
+- `latest.json` has a detached Ed25519 signature at `latest.json.sig`.
+  The CLI build embeds the matching raw public key via
+  `BLUEY_UPDATE_PUBKEY=<base64 raw 32-byte ed25519 public key>`. A
+  signed manifest pins both the platform artifact SHA256 and
+  `install.sh` SHA256; unsigned manifests are notify-only and cannot
+  install unless `BLUEY_UPDATE_ALLOW_UNSIGNED=1` is set for local testing.
 - If any check disagrees, stop. Do not promote. Produce a new release id
   and run local preprod again.
 
