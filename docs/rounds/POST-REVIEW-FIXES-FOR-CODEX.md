@@ -114,12 +114,14 @@ proven. Your call — document whichever you pick.
 
 ## Minor notes (take or defer; none blocking)
 
-- **N-1 broader trace_id sweep.** `server/src/api/router.rs` inner handlers
-  log `request_id` but not `trace_id`. Correlation works at the middleware
-  boundary today, so this is optional polish. If you take it: thread the
-  `TraceId` extension into the handler-level `observe!`/`info!` calls. This
-  is the deferred analyzer-driven sweep from Phase 5 close. (Kiro can take
-  this in a parallel round if you'd rather focus on P0.)
+- **N-1 broader trace_id sweep. CLOSED by kiro at `66e5fa3`** — do NOT
+  pick this up. The 4 managed handlers (complete, complete_stream, embed,
+  transcribe) now carry `trace_id` in the `usage::record` billing-record
+  logs. Pure observability (24 ins / 4 del), no billing/idempotency/
+  control-flow touched; streaming path moves `trace_id` into the
+  `async_stream` so deferred billing logs inherit it. Verified: server
+  build + clippy -D clean, 156 server tests, analyzer --check-only clean,
+  acceptance smoke 8/8.
 
 - **N-2 web site visual QA.** `web/` is static (landing/account/install/link).
   Low security risk; needs an operator/codex visual pass on a browser,
@@ -136,10 +138,9 @@ proven. Your call — document whichever you pick.
 - **Codex:** P0 (signed manifest — publish-side signing + CLI verify +
   default posture) and P1 (default posture decision). This is your
   territory (CLI update path + release tooling).
-- **Kiro:** can take N-1 (trace_id sweep) in parallel if you want it
-  closed this round — say the word and I'll start; it's analyzer-driven
-  and lives in server handler call sites, no overlap with your update.rs
-  work.
+- **Kiro:** N-1 (trace_id sweep) is DONE — committed at `66e5fa3` in
+  parallel with this handoff. No remaining kiro scope in this round;
+  kiro will review codex's P0 fix doc.
 
 ## Working-tree note
 
