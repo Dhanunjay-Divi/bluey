@@ -488,9 +488,12 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 pub async fn complete(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Extension(crate::api::middleware::request_id::TraceId(trace_id)): Extension<
+        crate::api::middleware::request_id::TraceId,
+    >,
     Json(req): Json<CompleteRequest>,
 ) -> Result<Json<CompleteResponse>, (StatusCode, Json<ApiError>)> {
-    Ok(Json(complete_inner(state, account, req).await?))
+    Ok(Json(complete_inner(state, account, req, trace_id).await?))
 }
 
 /// Streaming variant of `/router/complete`.
@@ -503,18 +506,22 @@ pub async fn complete(
 pub async fn complete_stream(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Extension(crate::api::middleware::request_id::TraceId(trace_id)): Extension<
+        crate::api::middleware::request_id::TraceId,
+    >,
     Json(req): Json<CompleteRequest>,
 ) -> Result<
     Sse<RouterSseStream>,
     (StatusCode, Json<ApiError>),
 > {
-    complete_stream_inner(state, account, req).await
+    complete_stream_inner(state, account, req, trace_id).await
 }
 
 async fn complete_stream_inner(
     state: AppState,
     account: Account,
     req: CompleteRequest,
+    trace_id: String,
 ) -> Result<
     Sse<RouterSseStream>,
     (StatusCode, Json<ApiError>),
@@ -1067,6 +1074,7 @@ async fn complete_stream_inner(
             Ok(true) => tracing::info!(
                 account_id_hash = %account_id_hash,
                 request_id = %req.request_id,
+                trace_id = %trace_id,
                 session_id = %session_id_log,
                 provider = %streaming.provider,
                 model = %streaming.model,
@@ -1079,6 +1087,7 @@ async fn complete_stream_inner(
             Ok(false) => tracing::warn!(
                 account_id_hash = %account_id_hash,
                 request_id = %req.request_id,
+                trace_id = %trace_id,
                 session_id = %session_id_log,
                 provider = %streaming.provider,
                 model = %streaming.model,
@@ -1088,6 +1097,7 @@ async fn complete_stream_inner(
             Err(e) => tracing::warn!(
                 account_id_hash = %account_id_hash,
                 request_id = %req.request_id,
+                trace_id = %trace_id,
                 session_id = %session_id_log,
                 provider = %streaming.provider,
                 model = %streaming.model,
@@ -1168,6 +1178,7 @@ async fn complete_inner(
     state: AppState,
     account: Account,
     req: CompleteRequest,
+    trace_id: String,
 ) -> Result<CompleteResponse, (StatusCode, Json<ApiError>)> {
     // 0. Validate request_id is non-empty.
     if req.request_id.trim().is_empty() {
@@ -1666,6 +1677,7 @@ async fn complete_inner(
         Ok(true) => tracing::info!(
             account_id_hash = %account_id_hash,
             request_id = %req.request_id,
+            trace_id = %trace_id,
             session_id = %session_id_log,
             provider = %comp.provider,
             model = %comp.model,
@@ -1678,6 +1690,7 @@ async fn complete_inner(
         Ok(false) => tracing::warn!(
             account_id_hash = %account_id_hash,
             request_id = %req.request_id,
+            trace_id = %trace_id,
             session_id = %session_id_log,
             provider = %comp.provider,
             model = %comp.model,
@@ -1687,6 +1700,7 @@ async fn complete_inner(
         Err(e) => tracing::warn!(
             account_id_hash = %account_id_hash,
             request_id = %req.request_id,
+            trace_id = %trace_id,
             session_id = %session_id_log,
             provider = %comp.provider,
             model = %comp.model,
@@ -2036,6 +2050,9 @@ pub struct EmbedResponse {
 pub async fn embed(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Extension(crate::api::middleware::request_id::TraceId(trace_id)): Extension<
+        crate::api::middleware::request_id::TraceId,
+    >,
     Json(req): Json<EmbedRequest>,
 ) -> Result<Json<EmbedResponse>, (StatusCode, Json<ApiError>)> {
     if req.request_id.trim().is_empty() {
@@ -2310,7 +2327,7 @@ pub async fn embed(
         was_fallback: false,
     };
     if let Err(e) = crate::db::usage::record(&state.pool, &account.id, &event) {
-        tracing::warn!(error = %e, "failed to record embed usage event");
+        tracing::warn!(trace_id = %trace_id, error = %e, "failed to record embed usage event");
     }
 
     let response = EmbedResponse {
@@ -2359,6 +2376,9 @@ pub struct TranscribeResponse {
 pub async fn transcribe(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Extension(crate::api::middleware::request_id::TraceId(trace_id)): Extension<
+        crate::api::middleware::request_id::TraceId,
+    >,
     axum::extract::Query(q): axum::extract::Query<TranscribeQuery>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
@@ -2710,7 +2730,7 @@ pub async fn transcribe(
         was_fallback: selected_route_idx > 0,
     };
     if let Err(e) = crate::db::usage::record(&state.pool, &account.id, &event) {
-        tracing::warn!(error = %e, "failed to record transcribe usage event");
+        tracing::warn!(trace_id = %trace_id, error = %e, "failed to record transcribe usage event");
     }
 
     let response = TranscribeResponse {
