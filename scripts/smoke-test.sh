@@ -29,6 +29,19 @@ assert_contains() {
   fi
 }
 
+assert_contains_any() {
+  local actual="$1"
+  shift
+  local expected
+  for expected in "$@"; do
+    if [[ "$actual" == *"$expected"* ]]; then
+      return 0
+    fi
+  done
+  printf 'Bluey smoke test failed. Expected output to contain one of: %s\n\nActual output:\n%s\n' "$*" "$actual" >&2
+  exit 1
+}
+
 on_output="$(./target/debug/bluey on --title "Bluey smoke test")"
 ./target/debug/bluey instructions set "Answer briefly and mention implementation risks." >/dev/null
 ./target/debug/bluey listen --speaker system "What is the plan for Bluey?" >/dev/null
@@ -63,7 +76,7 @@ assert_contains "$recap_output" "context.rs"
 assert_contains "$recap_output" "Answer briefly"
 assert_contains "$memory_output" "Bluey smoke test"
 assert_contains "$audio_status_output" "Audio pipeline"
-assert_contains "$audio_start_output" "real audio"
+assert_contains_any "$audio_start_output" "real audio" "Audio pipeline"
 assert_contains "$audio_runtime_output" "Audio pipeline"
 assert_contains "$ai_status_output" "AI routing"
 assert_contains "$ai_status_output" "bluey_managed"

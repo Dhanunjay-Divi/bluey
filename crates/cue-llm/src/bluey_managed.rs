@@ -136,11 +136,16 @@ impl LlmProvider for BlueyManagedProvider {
         let stream = async_stream::try_stream! {
             let mut buffer = String::new();
             let mut pending_utf8 = Vec::new();
+            let mut seen_billing_final = false;
             while let Some(chunk) = bytes.next().await {
                 let chunk = chunk.map_err(|e| LlmError::Network(e.to_string()))?;
                 append_utf8_chunk(&chunk, &mut pending_utf8, &mut buffer)?;
                 for parsed in parse_managed_stream_chunks(&mut buffer) {
-                    yield parsed?;
+                    let parsed = parsed?;
+                    if is_managed_billing_final(&parsed) {
+                        seen_billing_final = true;
+                    }
+                    yield parsed;
                 }
             }
             if !pending_utf8.is_empty() {
@@ -149,7 +154,16 @@ impl LlmProvider for BlueyManagedProvider {
                 buffer.push_str(tail);
             }
             for parsed in drain_managed_stream_tail(&mut buffer) {
-                yield parsed?;
+                let parsed = parsed?;
+                if is_managed_billing_final(&parsed) {
+                    seen_billing_final = true;
+                }
+                yield parsed;
+            }
+            if !seen_billing_final {
+                Err::<(), LlmError>(LlmError::Provider(
+                    "managed stream ended before final billing metadata".to_string(),
+                ))?;
             }
         };
         Ok(Box::pin(stream))
@@ -426,6 +440,10 @@ fn text_chunk(text: String, finished: bool) -> LlmChunk {
         cost_label: None,
         artifact: None,
     }
+}
+
+fn is_managed_billing_final(chunk: &LlmChunk) -> bool {
+    chunk.finished && chunk.cost.is_some()
 }
 
 fn extract_delta_text(value: &serde_json::Value) -> Option<String> {
@@ -812,5 +830,66 @@ mod tests {
         assert!(chunks[2].finished);
         assert_eq!(chunks[2].cost.as_ref().unwrap().cost_cents, 1);
         assert_eq!(chunks[2].cost_label.as_deref(), Some("$0.01"));
+    }
+
+    #[tokio::test]
+    async fn complete_stream_errors_when_managed_stream_ends_without_billing_final() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/router/complete/stream"))
+            .and(header("authorization", "Bearer access"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = CloudClient::new(
+            ClientConfig {
+                base_url: server.uri(),
+                user_agent: "test".into(),
+                timeout: Duration::from_secs(10),
+                trace_id: None,
+            },
+            Arc::new(MemoryStore::new()),
+        )
+        .unwrap();
+        client
+            .save_tokens(Tokens {
+                access: "access".into(),
+                refresh: "refresh".into(),
+                email: "e@example.com".into(),
+            })
+            .unwrap();
+        let provider = BlueyManagedProvider::new(client, ManagedLane::Instant);
+        let mut stream = provider
+            .complete_stream(&LlmRequest {
+                system: "system".into(),
+                user: "user".into(),
+                session_id: Some("sess-1".into()),
+                max_tokens: Some(10),
+                temperature: Some(0.2),
+                reasoning_effort: None,
+                thinking_budget_tokens: None,
+                request_id: Some("req-truncated".into()),
+                image_data_urls: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let first = stream.next().await.expect("first delta").unwrap();
+        assert_eq!(first.text, "partial");
+        let error = stream
+            .next()
+            .await
+            .expect("terminal stream error")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("final billing metadata"));
     }
 }

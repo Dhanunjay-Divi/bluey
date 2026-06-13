@@ -672,10 +672,17 @@ fn dashboard_cloud_client_with_trace(
 ) -> Result<cue_cloud_client::CloudClient, cue_cloud_client::Error> {
     let paths = cue_core::app_paths::AppPaths::discover()
         .map_err(|error| cue_cloud_client::Error::TokenStore(error.to_string()))?;
-    let config = cue_cloud_client::client::ClientConfig {
+    let account = cue_core::load_account(&paths)
+        .map_err(|error| cue_cloud_client::Error::TokenStore(error.to_string()))?;
+    let mut config = cue_cloud_client::client::ClientConfig {
         trace_id: Some(trace_id.to_string()),
         ..Default::default()
     };
+    if let Some(account) = account.as_ref() {
+        if !account.api_url.trim().is_empty() {
+            config.base_url = account.api_url.clone();
+        }
+    }
     cue_cloud_client::CloudClient::new(
         config,
         Arc::new(cue_cloud_client::AccountFileStore::new(paths)),

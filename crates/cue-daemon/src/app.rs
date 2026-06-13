@@ -652,7 +652,7 @@ pub async fn run() -> Result<()> {
                                     match event_opt {
                                         Some(Ok(event)) => {
                                             if let Some(segment) = transcript_event_to_stt_segment(&event) {
-                                                if let Err(e) = add_audio_transcript_segment(&daemon_sys, &segment).await {
+                                                if let Err(e) = add_audio_transcript_segment_allowing_session_start(&daemon_sys, &segment).await {
                                                     warn!("system audio STT drain: forward failed: {e:#}");
                                                 }
                                             }
@@ -3082,8 +3082,23 @@ async fn add_audio_transcript_segment(
     daemon: &Arc<Daemon>,
     segment: &cue_core::audio::SttSegmentMetadata,
 ) -> Result<()> {
+    add_audio_transcript_segment_inner(daemon, segment, false).await
+}
+
+async fn add_audio_transcript_segment_allowing_session_start(
+    daemon: &Arc<Daemon>,
+    segment: &cue_core::audio::SttSegmentMetadata,
+) -> Result<()> {
+    add_audio_transcript_segment_inner(daemon, segment, true).await
+}
+
+async fn add_audio_transcript_segment_inner(
+    daemon: &Arc<Daemon>,
+    segment: &cue_core::audio::SttSegmentMetadata,
+    allow_session_start: bool,
+) -> Result<()> {
     let audio_session_id = daemon.audio.lock().await.session_id.clone();
-    if audio_session_id.is_none() {
+    if audio_session_id.is_none() && !allow_session_start {
         debug!("dropping late audio transcript segment after capture stopped");
         return Ok(());
     }
@@ -5663,6 +5678,7 @@ async fn delete_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<
     };
     if is_active {
         let _ = stop_audio_capture(daemon).await;
+        let _ = stop_screen_capture(daemon, "session deleted").await;
     }
 
     let was_active = {
