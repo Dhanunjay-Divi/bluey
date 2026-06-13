@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::{mtime_epoch_string, snippet, SessionReader};
+use super::{mtime_epoch_string, SessionReader};
 use crate::{Role, SessionRef, SessionStore, Transcript, Turn};
 
 /// Decoder for Claude Code / Codex JSONL session files.
@@ -49,37 +49,46 @@ impl SessionReader for JsonlReader {
 
     fn read(&self, store: &SessionStore, id: &str, max_turns: usize) -> anyhow::Result<Transcript> {
         let file = resolve_file(&store.path, id, store);
-        let mut turns = Vec::new();
-        if max_turns == 0 {
-            return Ok(Transcript { turns });
-        }
-        // Stream line-by-line and stop at `max_turns` — never load the whole
-        // file (sessions reach 10 MB+). A pathologically long single line is
-        // bounded by `MAX_LINE_BYTES` so a corrupt/huge line can't blow memory.
-        let handle =
-            std::fs::File::open(&file).map_err(|_| crate::BridgeError::Unreadable(file.clone()))?;
-        let reader = BufReader::new(handle);
-        for line in reader.lines() {
-            // An I/O error mid-file ends the read with what we have, fail-soft.
-            let Ok(line) = line else { break };
-            let line = line.trim();
-            if line.is_empty() || line.len() > MAX_LINE_BYTES {
-                continue;
-            }
-            // Skip malformed lines; never abort the whole transcript.
-            let value: Value = match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if let Some(turn) = turn_from_value(&value) {
-                turns.push(turn);
-                if turns.len() >= max_turns {
-                    break;
-                }
-            }
-        }
-        Ok(Transcript { turns })
+        read_transcript_file(&file, max_turns)
     }
+}
+
+/// Stream a single Claude/Codex `*.jsonl` transcript file into a [`Transcript`],
+/// bounded to `max_turns`. Exposed `pub(crate)` so the Claude-app index reader
+/// can follow a `cliSessionId` into the shared `~/.claude/projects` store and
+/// reuse the exact same line-decoding (no divergent parsing). Fail-soft: an
+/// unreadable file errors; a malformed/oversized line is skipped, not fatal.
+pub(crate) fn read_transcript_file(file: &Path, max_turns: usize) -> anyhow::Result<Transcript> {
+    let mut turns = Vec::new();
+    if max_turns == 0 {
+        return Ok(Transcript { turns });
+    }
+    // Stream line-by-line and stop at `max_turns` — never load the whole
+    // file (sessions reach 10 MB+). A pathologically long single line is
+    // bounded by `MAX_LINE_BYTES` so a corrupt/huge line can't blow memory.
+    let handle = std::fs::File::open(file)
+        .map_err(|_| crate::BridgeError::Unreadable(file.to_path_buf()))?;
+    let reader = BufReader::new(handle);
+    for line in reader.lines() {
+        // An I/O error mid-file ends the read with what we have, fail-soft.
+        let Ok(line) = line else { break };
+        let line = line.trim();
+        if line.is_empty() || line.len() > MAX_LINE_BYTES {
+            continue;
+        }
+        // Skip malformed lines; never abort the whole transcript.
+        let value: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(turn) = turn_from_value(&value) {
+            turns.push(turn);
+            if turns.len() >= max_turns {
+                break;
+            }
+        }
+    }
+    Ok(Transcript { turns })
 }
 
 /// Enumerate candidate `*.jsonl` files for a store path.
@@ -132,11 +141,32 @@ fn resolve_file(path: &Path, id: &str, _store: &SessionStore) -> PathBuf {
         return flat;
     }
     // The id is a file stem; the file may be nested (Claude 1 level, Codex by
-    // date). Search the same enumerated set the listing uses.
+    // date). Match on the file stem OR — for brain transcripts whose stem is
+    // always "transcript" — on the derived session-dir id, mirroring how
+    // `session_ref_for` assigns the id.
     enumerate_files(path)
         .into_iter()
-        .find(|f| f.file_stem().is_some_and(|s| s.to_string_lossy() == id))
+        .find(|f| {
+            let stem = f.file_stem().map(|s| s.to_string_lossy().into_owned());
+            if stem.as_deref() == Some(id) {
+                return true;
+            }
+            stem.as_deref() == Some("transcript")
+                && session_id_from_brain_path(f).as_deref() == Some(id)
+        })
         .unwrap_or(flat)
+}
+
+/// For an Antigravity brain transcript at
+/// `…/brain/<session-id>/.system_generated/logs/transcript.jsonl`, return the
+/// `<session-id>` directory name (3 levels above the file). `None` if the path
+/// doesn't match that shape.
+fn session_id_from_brain_path(file: &Path) -> Option<String> {
+    // file → logs → .system_generated → <session-id>
+    let session_dir = file.parent()?.parent()?.parent()?;
+    session_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
 }
 
 /// Decode a Claude-encoded project directory name back into a filesystem path.
@@ -194,14 +224,27 @@ fn decode_project_dir(dir_name: &str) -> Option<String> {
 /// Build a [`SessionRef`] from a file: id = stem, updated_at = mtime epoch,
 /// title = first user-message snippet, project = decoded parent dir name.
 fn session_ref_for(file: &Path) -> Option<SessionRef> {
-    let id = file.file_stem()?.to_string_lossy().into_owned();
+    // Most layouts name the file by session id (`<id>.jsonl`). Some (Antigravity
+    // brain: `<id>/.system_generated/logs/transcript.jsonl`) name EVERY file
+    // `transcript.jsonl`, so the stem is useless — derive the id from the
+    // session directory instead.
+    let stem = file.file_stem()?.to_string_lossy().into_owned();
+    let id = if stem == "transcript" {
+        session_id_from_brain_path(file).unwrap_or(stem)
+    } else {
+        stem
+    };
     let updated_at = mtime_epoch_string(file);
-    let title = first_user_snippet(file);
     let project = file
         .parent()
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .and_then(|name| decode_project_dir(&name));
+    // Title: first real-topic user message → cleaned; else a project-based
+    // fallback so the row is never blank/unidentifiable (handles Codex rollouts
+    // and Claude sessions whose first turns are all boilerplate).
+    let title = super::clean_title(first_user_snippet(file), TITLE_SNIPPET_CHARS)
+        .or_else(|| super::fallback_label(project.as_deref(), &updated_at));
     Some(SessionRef {
         id,
         title,
@@ -210,13 +253,18 @@ fn session_ref_for(file: &Path) -> Option<SessionRef> {
     })
 }
 
-/// Read just enough of a file to grab the first user message as a title.
-/// Streams line-by-line and stops at the first user turn — never loads the
-/// whole file (this runs once per session during `list`, so a whole-file read
-/// here would load every session's file just to title it).
+/// Find the first user message that is a REAL topic (not boilerplate), to use
+/// as a title. Streams line-by-line and skips session-continuation banners,
+/// system prompts, and Bluey's own prompts ([`is_boilerplate_title`]), scanning
+/// a bounded number of turns before giving up. Never loads the whole file.
 fn first_user_snippet(file: &Path) -> Option<String> {
+    // Bound how many user turns we inspect — a real topic is near the top; if
+    // the first several are all boilerplate, fall back (project+date) rather
+    // than scanning a 10 MB file.
+    const MAX_USER_TURNS_SCANNED: usize = 8;
     let handle = std::fs::File::open(file).ok()?;
     let reader = BufReader::new(handle);
+    let mut user_turns_seen = 0;
     for line in reader.lines() {
         let Ok(line) = line else { break };
         let line = line.trim();
@@ -229,7 +277,13 @@ fn first_user_snippet(file: &Path) -> Option<String> {
         };
         if let Some(turn) = turn_from_value(&value) {
             if turn.role == Role::User && !turn.text.trim().is_empty() {
-                return Some(snippet(&turn.text, TITLE_SNIPPET_CHARS));
+                if !super::is_boilerplate_title(&turn.text) {
+                    return Some(turn.text); // raw; clean_title snippets it
+                }
+                user_turns_seen += 1;
+                if user_turns_seen >= MAX_USER_TURNS_SCANNED {
+                    break;
+                }
             }
         }
     }
@@ -241,11 +295,16 @@ fn first_user_snippet(file: &Path) -> Option<String> {
 /// Recognized shapes (first match wins):
 /// - Claude: `{"type":"user"|"assistant", "message":{"role":_, "content":_}}`
 /// - Generic: `{"role":_, "content":_}` or `{"role":_, "text":_}`
-/// - Codex rollout: `{"type":"message", "role":_, "content":_}`
+/// - Codex rollout: `{"type":"response_item", "payload":{"type":"message",
+///   "role":_, "content":[{"type":"input_text","text":_}]}}` — everything is
+///   wrapped in `payload`, with text in `input_text`/`output_text` blocks.
 ///
 /// Returns `None` for events with no usable role+text (tool calls, summaries,
 /// system metadata) so they are silently skipped.
 fn turn_from_value(value: &Value) -> Option<Turn> {
+    // Codex wraps the real event under `payload`; unwrap it first so the same
+    // role/content logic applies to Claude and Codex alike.
+    let value = value.get("payload").unwrap_or(value);
     // Prefer a nested `message` object (Claude), else the top level.
     let msg = value.get("message").unwrap_or(value);
 
@@ -257,6 +316,9 @@ fn turn_from_value(value: &Value) -> Option<Turn> {
         "user" => Role::User,
         "assistant" => Role::Assistant,
         "system" => Role::System,
+        // Antigravity brain-transcript dialect: USER_INPUT / MODEL_* / etc.
+        s if s.eq_ignore_ascii_case("user_input") => Role::User,
+        s if s.starts_with("MODEL") || s.starts_with("ASSISTANT") => Role::Assistant,
         _ => Role::Other,
     };
 

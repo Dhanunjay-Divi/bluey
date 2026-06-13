@@ -19,3 +19,6 @@ server/*.db
 server/*.db-journal
 server/*.db-shm
 server/*.db-wal
+
+# Local Claude Code session config and personal agent rules.
+.claude/

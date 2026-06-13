@@ -490,6 +490,10 @@ fn locate_session_store(dir: &Path, entry: &AgentEntry) -> Option<SessionStore> 
         SessionFormat::SqliteVscdb => vscdb_path(dir),
         SessionFormat::JsonFiles => join_glob(dir, "User/workspaceStorage"),
         SessionFormat::Protobuf => join_glob(dir, "conversations"),
+        // The Claude-app index lives at `<data_dir>/<subdir>` (the per-mode
+        // session-index folder); the reader walks `<account>/<workspace>/`
+        // beneath it. `jsonl_subdir` carries the subdir name for this row.
+        SessionFormat::ClaudeAppIndex => join_glob(dir, entry.jsonl_subdir),
     };
     path_exists(&path).then_some(SessionStore { path, format })
 }

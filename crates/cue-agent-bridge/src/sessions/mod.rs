@@ -22,6 +22,7 @@
 
 use crate::{SessionFormat, SessionRef, SessionStore, Transcript};
 
+pub mod claude_app;
 pub mod json_files;
 pub mod jsonl;
 pub mod protobuf;
@@ -48,6 +49,7 @@ pub fn reader_for(format: SessionFormat) -> Box<dyn SessionReader> {
         SessionFormat::SqliteVscdb => Box::new(vscdb::VscdbReader),
         SessionFormat::JsonFiles => Box::new(json_files::JsonFilesReader),
         SessionFormat::Protobuf => Box::new(protobuf::ProtobufReader),
+        SessionFormat::ClaudeAppIndex => Box::new(claude_app::ClaudeAppReader),
     }
 }
 
@@ -79,4 +81,99 @@ pub(crate) fn snippet(text: &str, max_chars: usize) -> String {
     let mut out: String = collapsed.chars().take(max_chars).collect();
     out.push('…');
     out
+}
+
+/// Whether a candidate first-message is **boilerplate**, not a real topic —
+/// shared by every reader so all agents reject the same junk titles. Catches
+/// session-continuation banners, system/agent prompts, and Bluey's own
+/// propose/apply/summary prompts that would otherwise become the "title".
+///
+/// Cross-agent by design: Claude, Codex, Cursor, VS Code all surface some of
+/// these, so the rule lives here, not per-reader.
+pub(crate) fn is_boilerplate_title(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return true;
+    }
+    let lower = t.to_lowercase();
+    const MARKERS: &[&str] = &[
+        "this session is being continued",
+        "continued from a previous conversation",
+        "you are proposing a fix",
+        "propose-only",
+        "===diagnosis===",
+        "one sentence: what is this session about", // Bluey's own summary prompt
+        "summarize what this",
+        "this is the gemini cli",
+        "<session_context>",
+        "<environment_context>", // Codex injects this as the first turn
+        "<cwd>",
+        "<user_instructions>",
+        "you are a ", // system role prompts ("You are a Rust architect…")
+        "system:",
+        "caveat: the messages below", // Claude Code system caveat banner
+    ];
+    MARKERS
+        .iter()
+        .any(|m| lower.starts_with(m) || lower.contains(m))
+}
+
+/// A meaningful fallback label when no real title is available — uses the
+/// project's last path segment (e.g. `…/Developer/Bluey` → "Bluey") so the row
+/// is identifiable instead of blank or a raw id/filename. Returns `None` only
+/// when there is no project to derive from (the caller then shows a short id).
+/// `_updated_at` is accepted for a future date suffix (no date lib in-tree yet).
+pub(crate) fn fallback_label(project: Option<&str>, _updated_at: &str) -> Option<String> {
+    let project = project?;
+    let leaf = project
+        .trim_end_matches('/')
+        .rsplit('/')
+        .find(|s| !s.is_empty())?;
+    if leaf.is_empty() {
+        None
+    } else {
+        Some(format!("{leaf} session"))
+    }
+}
+
+/// Pick a human title for a session: the candidate first-message if it is a
+/// real topic; else `None` so the caller falls back to project + date. Applied
+/// uniformly across readers.
+pub(crate) fn clean_title(candidate: Option<String>, max_chars: usize) -> Option<String> {
+    let text = strip_wrapper_tags(&candidate?);
+    if is_boilerplate_title(&text) {
+        return None;
+    }
+    let s = snippet(&text, max_chars);
+    if s.trim().is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Strip XML-ish wrapper tags some agents wrap user content in (e.g.
+/// Antigravity's `<USER_REQUEST>…</USER_REQUEST>`, Codex's `<user_instructions>`)
+/// so the title shows the actual message, not the tag. Generic — applies to any
+/// agent; leaves normal text (and inline `<` in code) intact by only removing
+/// whole `<TAG>`/`</TAG>` tokens.
+pub(crate) fn strip_wrapper_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '<' {
+            // Consume a tag only if it looks like <word ...> or </word> — a
+            // letter/slash right after '<'. Otherwise keep the '<' (e.g. `a < b`).
+            if matches!(chars.peek(), Some(n) if n.is_ascii_alphabetic() || *n == '/') {
+                for t in chars.by_ref() {
+                    if t == '>' {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }

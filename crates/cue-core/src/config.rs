@@ -79,6 +79,20 @@ pub struct CueSettings {
     /// session. Cleared on detach.
     #[serde(default)]
     pub attached_session: Option<String>,
+
+    /// Agent bridge: vendors for which the user has acknowledged the BYOT
+    /// billing disclosure. Each entry is a lowercase `vendor_short` string
+    /// from the cloud registry row (e.g. `"anthropic"`, `"codex_cloud"`).
+    /// The daemon refuses to mark a BYOT (`BillingModel::ApiCredits`) cloud
+    /// agent attached until its vendor appears in this list — that's how the
+    /// disclosure modal is unbypassable.
+    ///
+    /// Empty by default. Once a user acknowledges a vendor's disclosure, the
+    /// vendor stays in this list across daemon restarts so they aren't
+    /// re-prompted on every launch. Removed when the user detaches and
+    /// explicitly clears their stored credential.
+    #[serde(default)]
+    pub accepted_byot_vendors: Vec<String>,
 }
 
 impl Default for CueSettings {
@@ -99,6 +113,7 @@ impl Default for CueSettings {
             allow_agent_session_history: false,
             attached_agent: None,
             attached_session: None,
+            accepted_byot_vendors: Vec::new(),
         }
     }
 }

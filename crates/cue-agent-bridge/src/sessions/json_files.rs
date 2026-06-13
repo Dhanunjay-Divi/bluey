@@ -42,6 +42,22 @@ impl SessionReader for JsonFilesReader {
         if max_turns == 0 {
             return Ok(Transcript { turns });
         }
+        // JSON requires a full parse (no cheap streaming of the `requests`
+        // array), and these files reach hundreds of MB. Cap the parse so
+        // selecting a giant session never hangs — above the cap, surface one
+        // honest turn rather than spending many seconds parsing.
+        if std::fs::metadata(&file)
+            .map(|m| m.len() > MAX_READ_PARSE_BYTES)
+            .unwrap_or(false)
+        {
+            turns.push(Turn {
+                role: Role::System,
+                text: "This session is too large to load fully here. Open it in \
+                       the app, or ask a focused question."
+                    .to_string(),
+            });
+            return Ok(Transcript { turns });
+        }
         let contents = std::fs::read_to_string(&file)
             .map_err(|_| crate::BridgeError::Unreadable(file.clone()))?;
         let root: Value = serde_json::from_str(&contents)
@@ -134,8 +150,19 @@ fn resolve_file(path: &Path, id: &str) -> PathBuf {
 fn session_ref_for(file: &Path) -> Option<SessionRef> {
     let id = file.file_stem()?.to_string_lossy().into_owned();
     let updated_at = mtime_epoch_string(file);
-    // Title: a cheap parse for the first user message, best-effort only.
-    let title = first_user_snippet(file);
+
+    // Skip EMPTY sessions (VS Code/Copilot auto-create chat files with zero
+    // requests). A large file definitely has content (and we won't parse it
+    // for an emptiness check — too slow); a small file is cheap to check.
+    let size = std::fs::metadata(file).map(|m| m.len()).unwrap_or(0);
+    if size <= MAX_TITLE_PARSE_BYTES && !has_messages(file) {
+        return None;
+    }
+
+    // Title: cleaned first user message, or `None` (no readable topic). The
+    // reader stays agent-agnostic — a generic, registry-driven fallback label
+    // is applied by the caller, not hardcoded per reader.
+    let title = super::clean_title(first_user_snippet(file), TITLE_SNIPPET_CHARS);
     Some(SessionRef {
         id,
         title,
@@ -144,7 +171,40 @@ fn session_ref_for(file: &Path) -> Option<SessionRef> {
     })
 }
 
+/// Cheap check: does this (small) session file contain at least one message?
+/// Used to drop empty auto-created chat files from the listing.
+fn has_messages(file: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(file) else {
+        return false;
+    };
+    let Ok(root) = serde_json::from_str::<Value>(&contents) else {
+        return false;
+    };
+    !message_entries(&root).is_empty()
+}
+
+/// Max file size we will read+parse just to extract a title during `list`.
+/// VS Code chat-session JSON files can be **hundreds of MB** (observed: 141 MB),
+/// and `list` titles every session — parsing a giant file per row made listing
+/// take ~24s. Above this cap we skip the title (the row still lists, with no
+/// title); the full content is still readable on demand in `read`, bounded by
+/// `max_turns`.
+const MAX_TITLE_PARSE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Max file size we will fully parse on an explicit `read` (session selected).
+/// Reading is intentional so the cap is higher than the title cap, but still
+/// bounded — a 141 MB chat file would otherwise take many seconds to parse.
+const MAX_READ_PARSE_BYTES: u64 = 25 * 1024 * 1024;
+
 fn first_user_snippet(file: &Path) -> Option<String> {
+    // Skip titling oversized files — never parse a multi-hundred-MB JSON just
+    // for a title. Listing must stay fast.
+    let too_big = std::fs::metadata(file)
+        .map(|m| m.len() > MAX_TITLE_PARSE_BYTES)
+        .unwrap_or(true);
+    if too_big {
+        return None;
+    }
     let contents = std::fs::read_to_string(file).ok()?;
     let root: Value = serde_json::from_str(&contents).ok()?;
     for entry in message_entries(&root) {

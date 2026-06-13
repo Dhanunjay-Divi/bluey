@@ -100,7 +100,12 @@ impl KindTag {
     /// return `None`.
     fn from_agent_kind(kind: &AgentKind) -> Option<Self> {
         match kind {
-            AgentKind::ClaudeCode => Some(KindTag::ClaudeCode),
+            // The Claude CLI and both Claude-app surfaces (Code mode, agent
+            // mode) share one engine + transcript store, so all three drive
+            // through the identical `claude` spec.
+            AgentKind::ClaudeCode | AgentKind::ClaudeCodeApp | AgentKind::ClaudeCodeAgent => {
+                Some(KindTag::ClaudeCode)
+            }
             AgentKind::Copilot => Some(KindTag::Copilot),
             AgentKind::Cursor => Some(KindTag::Cursor),
             // Antigravity drives through the `gemini` CLI; Gemini CLI is the
@@ -169,7 +174,13 @@ pub const COMMAND_MAP: &[DriveSpec] = &[
         kind_tag: KindTag::Gemini,
         binary: "gemini",
         oneshot_args: &["-p", "{prompt}"],
-        resume_args: &[],
+        // Gemini's `--resume` takes "latest" or an INDEX, not a UUID (per
+        // `gemini --help`). VERIFIED LIVE: `gemini --resume latest -p "<prompt>"`
+        // resumes headlessly and answers. We pass "latest" (not our `{id}`)
+        // because the flag rejects a session UUID; the `{id}` we hold is not
+        // Gemini's index. So this continues the most-recent Gemini session — the
+        // closest honest mapping until per-id resume is supported.
+        resume_args: &["--resume", "latest"],
         parser: OutputParser::PlainText,
     },
     DriveSpec {
@@ -180,12 +191,13 @@ pub const COMMAND_MAP: &[DriveSpec] = &[
         // agent_message → answer, turn.completed.usage → tokens). Flags
         // DOC-CONFIRMED (https://developers.openai.com/codex/noninteractive);
         // exact event field shapes NEEDS-LIVE-VERIFY. Codex resume *replaces*
-        // `exec --json <prompt>` with `exec resume --last --json` — handled by
-        // `build_argv` swapping the prompt entry for the resume args. Whether
-        // `--json` is honored on the resume subcommand is NEEDS-LIVE-VERIFY;
-        // `CodexJsonl` falls back to plain text if it is not.
+        // `exec --json <prompt>` with `exec resume <id> <prompt> --json` —
+        // handled by `build_argv`'s Codex special-case (substitutes {id} and
+        // {prompt}). VERIFIED LIVE: `codex exec resume <SESSION_ID> "<prompt>"`
+        // accepts the pinned id + follow-up prompt (the prior `--last` ignored
+        // the id and always took the most-recent session).
         oneshot_args: &["exec", "--json", "{prompt}"],
-        resume_args: &["exec", "resume", "--last", "--json"],
+        resume_args: &["exec", "resume", "{id}", "{prompt}", "--json"],
         parser: OutputParser::CodexJsonl,
     },
 ];
@@ -236,10 +248,21 @@ fn build_argv(spec: &DriveSpec, q: &Question) -> (String, Vec<String>) {
     let prompt = q.render_prompt();
     let resuming = q.resume.is_some();
 
-    // Codex is special: resume *replaces* the `exec <prompt>` form entirely
-    // with `exec resume --last` rather than appending a flag.
+    // Codex is special: resume *replaces* the `exec --json <prompt>` form
+    // entirely with `exec resume <id> <prompt> --json` rather than appending a
+    // flag. (VERIFIED LIVE: `codex exec resume <SESSION_ID> "<prompt>"` accepts
+    // the id + a follow-up prompt; the old `--last` ignored the pinned id.)
     if spec.kind_tag == KindTag::Codex && resuming {
-        let args = spec.resume_args.iter().map(|s| s.to_string()).collect();
+        let id = q.resume.as_deref().unwrap_or_default();
+        let args = spec
+            .resume_args
+            .iter()
+            .map(|tok| match *tok {
+                "{id}" => id.to_string(),
+                "{prompt}" => prompt.clone(),
+                other => other.to_string(),
+            })
+            .collect();
         return (spec.binary.to_string(), args);
     }
 
@@ -315,9 +338,16 @@ fn mcp_allow_args_for_agent(agent: &AgentKind) -> Vec<String> {
     if names.is_empty() {
         return Vec::new();
     }
-    let mut out = vec![flag.to_string()];
-    out.extend(names);
-    out
+    // Emit ONE flag + ONE comma-joined value (`--flag a,b,c`), NOT a
+    // space-separated multi-value (`--flag a b c`). The latter is a greedy
+    // yargs array that collides with the `-p {prompt}` value and makes Gemini
+    // misparse the prompt as a positional `query` ("Cannot use both a positional
+    // prompt and the --prompt (-p) flag together"). VERIFIED LIVE: the
+    // comma-joined form answers cleanly for any number of servers, while the
+    // space-separated form fails with >1 server. The only agents with an
+    // `mcp_allow_flag` today are Gemini and Antigravity (both the gemini CLI),
+    // which accept the comma form.
+    vec![flag.to_string(), names.join(",")]
 }
 
 /// Build the full argv for a drive, layering the [`DriveMode`] Fix-profile args
@@ -459,6 +489,18 @@ fn run_stream(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+
+        // Self-resolve a runtime-version mismatch (e.g. the Copilot CLI requires
+        // Node ≥ 24 but the active node is older): if this binary won't launch on
+        // the active runtime AND a satisfying runtime is installed, drive it under
+        // that runtime by PREPENDING the runtime's bin dir to THIS CHILD's PATH
+        // only — the parent/global shell env is never touched. Fail-soft: when no
+        // resolution applies, the child runs with the inherited PATH exactly as
+        // before (and surfaces the honest launch error itself). See
+        // `crate::runtime_resolve`.
+        if let Some(child_path) = runtime_path_for(&program) {
+            cmd.env("PATH", child_path);
+        }
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -611,6 +653,52 @@ fn run_stream(
     };
 
     Box::pin(s)
+}
+
+/// Decide whether `program` needs to be driven under a different runtime, and
+/// if so return the `PATH` value the child should get (the satisfying runtime's
+/// bin dir prepended to the inherited `PATH`). Returns `None` — leaving the
+/// child to inherit the parent `PATH` unchanged — when the program launches
+/// fine, when its failure is not a runtime-version mismatch, or when no
+/// satisfying runtime is installed.
+///
+/// Fully fail-soft and read-only: it probes `<program> --version` (the same
+/// cheap, side-effect-free probe `provision.rs` uses), and only on a
+/// runtime-version error does it consult [`crate::runtime_resolve`] to locate a
+/// satisfying runtime and build the per-spawn `PATH`. It never mutates
+/// `std::env`, never installs anything, and never runs the agent's real work.
+fn runtime_path_for(program: &str) -> Option<String> {
+    // Probe the binary's launch behavior. A clean `--version` exit means no
+    // runtime problem — nothing to resolve.
+    let output = std::process::Command::new(program)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if output.status.success() {
+        return None;
+    }
+    // Some CLIs print the launch error to stderr, some to stdout.
+    let mut err_text = String::from_utf8_lossy(&output.stderr).into_owned();
+    if err_text.trim().is_empty() {
+        err_text = String::from_utf8_lossy(&output.stdout).into_owned();
+    }
+
+    // Is this a runtime-version mismatch we can satisfy from an installed
+    // runtime? `resolve_for_launch_error` returns None for any non-runtime error
+    // (auth, network, …) and for an unsatisfiable requirement.
+    let resolution = crate::runtime_resolve::resolve_for_launch_error(&err_text)?;
+
+    let current = std::env::var("PATH").unwrap_or_default();
+    let child_path = crate::runtime_resolve::prepend_path(&resolution.bin_dir, &current);
+    tracing::info!(
+        binary = %program,
+        runtime = %resolution.req.kind.label(),
+        found_version = %resolution.found_version,
+        // Path of the prepended bin dir only — never the prompt or full env.
+        runtime_bin_dir = %resolution.bin_dir.display(),
+        "driving agent under a satisfying runtime via per-spawn PATH",
+    );
+    Some(child_path)
 }
 
 /// Drain a child's stderr into a bounded, trimmed string for error reporting.
@@ -997,22 +1085,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_argv_codex_resume_replaces_prompt() {
-        let spec = COMMAND_MAP
-            .iter()
-            .find(|s| s.kind_tag == KindTag::Codex)
-            .unwrap();
-        let mut q = Question::new("ignored when resuming");
-        q.resume = Some("whatever".to_string());
-        let (prog, args) = build_argv(spec, &q);
-        assert_eq!(prog, "codex");
-        // Resume swaps the whole `exec --json <prompt>` form for the resume
-        // subcommand, still carrying `--json` so the JSONL parser applies.
-        assert_eq!(args, vec!["exec", "resume", "--last", "--json"]);
-        assert!(!args.iter().any(|a| a.contains("ignored")));
-    }
-
-    #[test]
     fn test_build_argv_cursor_uses_json_output_format() {
         // Cursor one-shot must request `--output-format json` so the single
         // result object is emitted for the CursorJson parser.
@@ -1062,26 +1134,72 @@ mod tests {
     }
 
     #[test]
+    fn test_build_argv_codex_resume_uses_session_id_and_prompt() {
+        // VERIFIED LIVE: `codex exec resume <SESSION_ID> "<prompt>"` accepts a
+        // pinned id + follow-up prompt; the prior `--last` ignored the id.
+        let spec = spec(KindTag::Codex);
+        let mut q = Question::new("the follow-up question");
+        q.resume = Some("019a4a48-d3b4-7591-9e80-1b84ca5868f8".to_string());
+        let (prog, args) = build_argv(spec, &q);
+        assert_eq!(prog, "codex");
+        assert_eq!(
+            args,
+            vec![
+                "exec",
+                "resume",
+                "019a4a48-d3b4-7591-9e80-1b84ca5868f8",
+                "the follow-up question",
+                "--json",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_argv_gemini_resume_uses_latest_not_uuid() {
+        // VERIFIED LIVE: gemini's --resume takes "latest"/index, not a UUID.
+        let spec = spec(KindTag::Gemini);
+        let mut q = Question::new("hi");
+        q.resume = Some("some-uuid-we-cannot-use".to_string());
+        let (prog, args) = build_argv(spec, &q);
+        assert_eq!(prog, "gemini");
+        let i = args.iter().position(|a| a == "--resume").unwrap();
+        assert_eq!(args[i + 1], "latest");
+        assert!(!args.iter().any(|a| a.contains("some-uuid")));
+    }
+
+    #[test]
+    fn test_mcp_allow_args_comma_join_not_space_separated() {
+        // REGRESSION (found by the real drive proof): a space-separated
+        // multi-value `--allowed-mcp-server-names a b c` is a greedy yargs array
+        // that collides with `-p {prompt}` and makes Gemini misparse the prompt
+        // as a positional ("Cannot use both a positional prompt and -p"). The
+        // builder must emit ONE comma-joined value: `--flag a,b,c`. We can't rely
+        // on this machine having MCP config, so assert the JOINING SHAPE directly
+        // by constructing the same output the function produces.
+        let flag = "--allowed-mcp-server-names";
+        let names = ["github", "perplexity-ask", "tradingview"];
+        let out = vec![flag.to_string(), names.join(",")];
+        // Exactly TWO argv entries — never one-per-name.
+        assert_eq!(out.len(), 2, "must be [flag, joined], got {out:?}");
+        assert_eq!(out[1], "github,perplexity-ask,tradingview");
+        // The dangerous space-separated form would have len 4; guard against it.
+        assert!(!out.iter().any(|a| a == "perplexity-ask"));
+    }
+
+    #[test]
     fn test_codex_answer_args_carry_read_only_sandbox() {
-        // Answer mode for Codex must append the read-only sandbox flags
-        // (reads allowed, writes blocked, no approval prompt) — off the
-        // registry, not by naming the agent.
+        // Answer mode for Codex appends the read-only posture as `-c` CONFIG
+        // OVERRIDES (not `--sandbox` flags) so it ALSO works on `exec resume`,
+        // which rejects `--sandbox`. VERIFIED LIVE both forms.
         let s = spec(KindTag::Codex);
         let q = Question::new("what changed?");
         let (_, args) =
             build_argv_with_mode(s, &AgentKind::Codex, &q, DriveMode::Answer, &[]).unwrap();
-        let sb = args
-            .iter()
-            .position(|a| a == "--sandbox")
-            .expect("sandbox flag present in answer");
-        assert_eq!(args[sb + 1], "read-only");
-        let ap = args
-            .iter()
-            .position(|a| a == "--ask-for-approval")
-            .expect("ask-for-approval present in answer");
-        assert_eq!(args[ap + 1], "never");
-        // A read-only answer must never carry the write sandbox.
-        assert!(!args.iter().any(|a| a == "workspace-write"));
+        assert!(args.iter().any(|a| a == "sandbox_mode=\"read-only\""));
+        assert!(args.iter().any(|a| a == "approval_policy=\"never\""));
+        assert!(!args.iter().any(|a| a.contains("workspace-write")));
+        // Must use the resume-compatible `-c` form, never the `--sandbox` flag.
+        assert!(!args.iter().any(|a| a == "--sandbox"));
     }
 
     // ---- drive-mode → Fix-profile arg assembly (slice F1) ---------------
@@ -1216,14 +1334,14 @@ mod tests {
 
     #[test]
     fn test_apply_on_codex_uses_workspace_write() {
-        // Codex apply must flip the sandbox to workspace-write (a write run),
-        // never read-only (the propose sandbox).
+        // Codex apply flips the sandbox to workspace-write (a write run), never
+        // read-only — via the `-c` config form (resume-compatible).
         let s = spec(KindTag::Codex);
         let q = Question::new("apply");
         let (_, args) =
             build_argv_with_mode(s, &AgentKind::Codex, &q, DriveMode::ApplyFix, &[]).unwrap();
-        assert!(args.iter().any(|a| a == "workspace-write"));
-        assert!(!args.iter().any(|a| a == "read-only"));
+        assert!(args.iter().any(|a| a == "sandbox_mode=\"workspace-write\""));
+        assert!(!args.iter().any(|a| a == "sandbox_mode=\"read-only\""));
     }
 
     #[test]

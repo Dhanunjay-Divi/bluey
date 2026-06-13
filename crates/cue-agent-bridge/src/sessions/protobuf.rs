@@ -30,6 +30,10 @@ impl SessionReader for ProtobufReader {
             .into_iter()
             .filter_map(|file| {
                 let id = file.file_stem()?.to_string_lossy().into_owned();
+                // Protobuf content is unreadable here, so no title — readers
+                // stay agent-agnostic and report only facts. A generic,
+                // registry-driven fallback label is applied by the caller
+                // (which knows the agent's display name), never hardcoded here.
                 Some(SessionRef {
                     id,
                     title: None,

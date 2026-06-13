@@ -36,8 +36,11 @@ impl SessionReader for VscdbReader {
             )
             .map_err(|e| BridgeError::Session(e.to_string()))?;
 
-        // Cap the scan so a giant store never streams unbounded rows.
-        let scan_cap = limit.saturating_mul(4).max(limit) as i64;
+        // Cursor auto-creates an empty composer for every chat panel opened —
+        // most are never used (e.g. ~190 of 220 on a real machine). We list
+        // only sessions with ACTUAL conversation content, so over-fetch wider
+        // (most rows will be empty and skipped) before truncating to `limit`.
+        let scan_cap = limit.saturating_mul(20).max(limit).min(5000) as i64;
         let rows = stmt
             .query_map([scan_cap], |row| {
                 let key: String = row.get(0)?;
@@ -60,6 +63,11 @@ impl SessionReader for VscdbReader {
                 Ok(v) => v,
                 Err(_) => continue,
             };
+            // Skip EMPTY sessions — an unused draft has no conversation headers.
+            // Only sessions the user actually had a conversation in are shown.
+            if conversation_headers(&parsed).is_empty() {
+                continue;
+            }
             // Title: the composer's own `title` if set (rare), else the first
             // user message — looked up via the conversation headers, since the
             // text lives on a separate `bubbleId:` row, not on the composer.
@@ -277,12 +285,19 @@ mod tests {
         .expect("create table");
 
         // Two composer conversations with differing createdAt for recency.
+        // conv-older: has content (a header) + an older createdAt, so it lists
+        // but sorts after conv-new.
         conn.execute(
             "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
             rusqlite::params![
                 "composerData:conv-older",
-                r#"{"title":"Older chat","createdAt":1000}"#
+                r#"{"title":"Older chat","createdAt":1000,"fullConversationHeadersOnly":[{"bubbleId":"o1","type":1}]}"#
             ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
+            rusqlite::params!["bubbleId:conv-older:o1", r#"{"type":1,"text":"older q"}"#],
         )
         .unwrap();
         // conv-new: the real Cursor shape — message text lives on separate
@@ -331,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn list_finds_composers_sorted_by_recency() {
+    fn list_shows_only_sessions_with_conversation_content() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("state.vscdb");
         make_db(&db);
@@ -339,13 +354,17 @@ mod tests {
         let reader = VscdbReader;
         let store = store_at(db);
         let refs = reader.list(&store, 10).expect("list");
-        // Three composer rows, newest first; bare row degrades to empty title.
-        assert_eq!(refs.len(), 3);
-        assert_eq!(refs[0].id, "conv-new");
+        // 3 composers in the fixture: conv-new + conv-older have conversation
+        // content (listed, newest first); conv-bare is an empty auto-created
+        // draft and is FILTERED OUT so users see only real sessions.
+        assert_eq!(refs.len(), 2, "empty draft (conv-bare) must be excluded");
+        assert_eq!(refs[0].id, "conv-new", "newest first");
         assert_eq!(refs[0].title.as_deref(), Some("Newer chat"));
         assert_eq!(refs[1].id, "conv-older");
-        let bare = refs.iter().find(|r| r.id == "conv-bare").expect("bare");
-        assert!(bare.title.is_none());
+        assert!(
+            !refs.iter().any(|r| r.id == "conv-bare"),
+            "empty session must not appear"
+        );
     }
 
     #[test]

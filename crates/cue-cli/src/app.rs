@@ -437,9 +437,81 @@ enum AgentCommands {
     /// Show which agent is currently attached.
     Status,
     /// Prove, per agent, what works on this machine (capability matrix).
-    /// Read-only: probes discovery/connectors/sessions/install/drive at the
-    /// highest honest level (live / fixture / skip) without driving or installing.
-    Prove,
+    /// Read-only by default: probes discovery/connectors/sessions/install/drive
+    /// at the highest honest level (live / fixture / skip) without driving or
+    /// installing. Pass `--drive` to ALSO run the real drive proof (actually
+    /// asks each agent a canary question — spends real model quota).
+    Prove(ProveArgs),
+    /// Proactively install a discovered agent's CLI when it's missing, using the
+    /// agent's vetted [`InstallRecipe`] (official source only). Shows the exact
+    /// command and asks for consent before running anything, then verifies the
+    /// binary appeared on PATH. This is the "proactive, not passive" path: a
+    /// user with only the GUI app (or nothing) becomes drivable.
+    Install(InstallArgs),
+    /// Trigger an agent's OWN login flow when its CLI is installed but not
+    /// signed in. Proposes the exact login command (e.g. `cursor-agent login`)
+    /// and, on consent, LAUNCHES it so the user completes the browser/device-
+    /// code flow in-product — instead of telling them to go type a command.
+    /// Bluey never handles credentials; the agent's own flow stores its token.
+    Login(AgentLoginArgs),
+    /// Resolve a MODEL-BLOCKED drive: when an agent is signed in and runs but
+    /// its configured model is not allowed for the account/plan (e.g. Codex's
+    /// "model is not supported when using Codex with a ChatGPT account"), Bluey
+    /// detects it, then PROPOSES either retrying with a fallback model the
+    /// account supports or connecting an API key (BYOT) — and, on consent, does
+    /// the work (re-drives with the fallback). Never just punts to "get a key".
+    ResolveModel(ResolveModelArgs),
+}
+
+#[derive(Debug, Args)]
+struct AgentLoginArgs {
+    /// Agent kind to log in, e.g. cursor, codex, claude_code.
+    kind: String,
+    /// Skip the consent prompt and launch the login immediately (for scripted
+    /// setups). The command is still the agent's own vetted login from the
+    /// registry; this only waives the interactive "proceed?" gate.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct ResolveModelArgs {
+    /// Agent kind to resolve, e.g. codex, claude_code.
+    kind: String,
+    /// Skip the consent prompt and apply the proposed fallback immediately (for
+    /// scripted setups). Only the model-swap retry is auto-approved; the BYOT
+    /// path is never auto-applied (it needs a credential the user must provide).
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct InstallArgs {
+    /// Agent kind to install, e.g. copilot, cursor, codex, gemini.
+    kind: String,
+    /// Skip the consent prompt and install immediately (for scripts/CI). The
+    /// recipe is still official-source-only; this only waives the interactive
+    /// "proceed?" gate.
+    #[arg(long)]
+    yes: bool,
+    /// Allow destructive remedies during recovery (e.g. removing a broken
+    /// symlink that blocks the install). Off by default: a destructive remedy
+    /// blocks with a report instead.
+    #[arg(long)]
+    allow_destructive: bool,
+}
+
+#[derive(Debug, Args)]
+struct ProveArgs {
+    /// ALSO run the real drive proof: send each drivable agent a canary question
+    /// through the production drive path and report whether it really answered.
+    /// This spends real model quota on your account for every agent that answers.
+    #[arg(long)]
+    drive: bool,
+    /// When combined with `--drive`, also attempt cloud vendors (they need a
+    /// stored credential; without one they are skipped, not failed).
+    #[arg(long)]
+    cloud: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2177,13 +2249,455 @@ async fn agent_command(command: AgentCommands) -> Result<()> {
             }
             Ok(())
         }
-        AgentCommands::Prove => {
+        AgentCommands::Prove(args) => {
             // Read-only local probe — no daemon needed.
             let proofs = cue_agent_bridge::prove::prove_all();
             print!("{}", cue_agent_bridge::prove::render_report(&proofs));
+
+            // Opt-in REAL drive proof: actually ask each agent the canary
+            // question and report whether it truly answered. Spends quota.
+            if args.drive {
+                println!();
+                eprintln!(
+                    "Running REAL drive proof — this asks each drivable agent a \
+question and spends real model quota.\n"
+                );
+                let drive_proofs = cue_agent_bridge::prove_drive::prove_drive_all(args.cloud).await;
+                print!(
+                    "{}",
+                    cue_agent_bridge::prove_drive::render_report(&drive_proofs)
+                );
+            }
+            Ok(())
+        }
+        AgentCommands::Install(args) => agent_install(&args).await,
+        AgentCommands::Login(args) => agent_login(&args).await,
+        AgentCommands::ResolveModel(args) => agent_resolve_model(&args).await,
+    }
+}
+
+/// Proactively install an agent's CLI via its vetted recipe — consent-gated.
+/// This is the "proactive, not passive" path: Bluey installs the missing CLI for
+/// the user instead of telling them to do it. Runs locally (no daemon).
+async fn agent_install(args: &InstallArgs) -> Result<()> {
+    use cue_agent_bridge::provision::{provision_with_recovery, InstallOutcome, RemedyConsent};
+
+    // Map the snake_case kind string onto a known AgentKind (serde round-trip,
+    // same approach the daemon uses), so a typo fails clearly rather than
+    // silently installing the wrong thing.
+    let quoted = serde_json::to_string(args.kind.trim())?;
+    let kind: cue_agent_bridge::AgentKind = serde_json::from_str(&quoted)
+        .map_err(|_| anyhow::anyhow!("unknown agent kind: {:?}", args.kind))?;
+
+    let Some(plan) = cue_agent_bridge::provision::plan_install(&kind) else {
+        bail!(
+            "no install recipe for {:?} — it has no known official CLI installer, \
+or is already a CLI-less agent",
+            args.kind
+        );
+    };
+
+    // Show the exact command and get consent before running anything.
+    println!("Bluey can install {} for you:", plan.recipe.verify_binary);
+    println!("    {}", plan.human_command);
+    if let Some(prereq) = plan.prerequisite {
+        println!("    (requires `{prereq}` on PATH)");
+    }
+    if !args.yes {
+        eprint!("\nProceed? [y/N] ");
+        use std::io::Write as _;
+        std::io::stderr().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Aborted — nothing was installed.");
+            return Ok(());
+        }
+    }
+
+    let consent = if args.allow_destructive {
+        RemedyConsent::AllowDestructive
+    } else {
+        RemedyConsent::SafeOnly
+    };
+
+    println!("Installing…");
+    match provision_with_recovery(&plan, consent) {
+        InstallOutcome::Installed { binary } => {
+            println!("✅ Installed — `{binary}` is on PATH and runs.");
+            println!("Next: sign in to the agent (e.g. `{binary} login`), then `bluey agent prove --drive`.");
+            Ok(())
+        }
+        InstallOutcome::InstalledButNotRunnable { binary, detail } => {
+            // Honest: on PATH but won't run (e.g. runtime-version mismatch).
+            // Not a hard failure — the binary IS installed — but it can't be
+            // driven yet, so we say so plainly with the real launch error.
+            println!("⚠️  `{binary}` installed (on PATH) but won't run yet:");
+            println!("    {detail}");
+
+            // Propose + approve: rather than punt ("go fix your runtime"), see if
+            // a satisfying runtime is already installed and offer to drive the
+            // agent under it (per-spawn PATH only — the global shell is never
+            // touched). The drive layer applies the same resolution automatically;
+            // here we surface it for consent and then PROVE it by driving the
+            // canary once.
+            if let Some(resolution) =
+                cue_agent_bridge::runtime_resolve::resolve_for_launch_error(&detail)
+            {
+                println!();
+                println!("Bluey can {}.", resolution.proposal_line(&binary));
+                let approved = if args.yes {
+                    true
+                } else {
+                    eprint!("Proceed? [y/N] ");
+                    use std::io::Write as _;
+                    std::io::stderr().flush().ok();
+                    let mut answer = String::new();
+                    std::io::stdin().read_line(&mut answer)?;
+                    matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
+                };
+                if !approved {
+                    println!(
+                        "Left as-is. Bluey will still drive {binary} under that runtime \
+on demand (per-spawn) when you ask."
+                    );
+                    return Ok(());
+                }
+                // Drive the canary through the production path, which now resolves
+                // the runtime per-spawn. This is "Bluey does the work": it proves
+                // the agent answers under the satisfying runtime.
+                println!("Verifying {binary} under that runtime…");
+                match cue_agent_bridge::prove_drive::drive_once(kind).await {
+                    cue_agent_bridge::prove_drive::DriveProof::Answered { answer, .. } => {
+                        println!("✅ {binary} now answers (under the located runtime): {answer:?}");
+                        println!(
+                            "Bluey drives it under that runtime per-spawn; your shell default \
+is unchanged."
+                        );
+                    }
+                    cue_agent_bridge::prove_drive::DriveProof::Failed { reason, .. } => {
+                        println!("⚠️  Still could not drive {binary}: {reason}");
+                    }
+                    cue_agent_bridge::prove_drive::DriveProof::Skipped { reason } => {
+                        println!("Skipped driving {binary}: {reason}");
+                    }
+                }
+            } else {
+                // No satisfying runtime installed — fall back to today's honest
+                // guidance rather than crash or hang.
+                println!(
+                    "It's a runtime/environment issue, not a failed install, and Bluey \
+couldn't find an installed runtime that satisfies it. Install the required \
+runtime (the message above says what it needs), then `bluey agent prove --drive`."
+                );
+            }
+            Ok(())
+        }
+        InstallOutcome::MissingPrerequisite { needed } => {
+            bail!("cannot install: required prerequisite `{needed}` is not on PATH")
+        }
+        InstallOutcome::VerificationFailed { binary, detail } => {
+            bail!("install ran but `{binary}` did not appear on PATH: {detail}")
+        }
+        InstallOutcome::InstallFailed { detail } => {
+            bail!("install command failed: {detail}")
+        }
+    }
+}
+
+/// Trigger an agent's OWN login flow — consent-gated. This is the auth analogue
+/// of [`agent_install`]: when an agent's CLI is installed but not signed in,
+/// Bluey PROPOSES the agent's own login command and, on approval, LAUNCHES it so
+/// the user completes the interactive browser/device-code flow in-product —
+/// instead of telling them to go type `cursor-agent login`. Bluey never reads or
+/// stores credentials; the agent's own flow stores its token. Runs locally (no
+/// daemon).
+async fn agent_login(args: &AgentLoginArgs) -> Result<()> {
+    use cue_agent_bridge::auth_resolve::{plan_login, run_login, LoginOutcome};
+
+    // Map the snake_case kind string onto a known AgentKind (serde round-trip,
+    // same approach `agent_install` uses), so a typo fails clearly.
+    let quoted = serde_json::to_string(args.kind.trim())?;
+    let kind: cue_agent_bridge::AgentKind = serde_json::from_str(&quoted)
+        .map_err(|_| anyhow::anyhow!("unknown agent kind: {:?}", args.kind))?;
+
+    let Some(plan) = plan_login(&kind) else {
+        bail!(
+            "no CLI login flow for {:?} — it authenticates another way \
+(e.g. an API-key env var or an interactive first run), so there's nothing for \
+Bluey to launch. Set its API key or sign in via its app, then \
+`bluey agent prove --drive`.",
+            args.kind
+        );
+    };
+
+    // Human display name from the registry row (data, not a hardcoded label);
+    // falls back to the kind's debug form for agents without a named row.
+    let display = cue_agent_bridge::registry::KindTag::from_agent_kind(&kind)
+        .and_then(cue_agent_bridge::registry::entry_for)
+        .map(|e| e.display_name.to_string())
+        .unwrap_or_else(|| format!("{kind:?}"));
+
+    // Propose the exact command and get consent before launching anything.
+    println!("Bluey can sign you in to {display} by running its own login flow:");
+    println!("    {}", plan.human_command);
+    if plan.supports_device_code() {
+        println!("    (will print a device code / URL — no browser needed)");
+    }
+    println!("Bluey only launches the agent's flow — it never sees your credentials.");
+    if !args.yes {
+        eprint!("\nProceed? [y/N] ");
+        use std::io::Write as _;
+        std::io::stderr().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+            println!("Aborted — no login was started.");
+            return Ok(());
+        }
+    }
+
+    println!(
+        "Launching `{}` — complete the sign-in when prompted…",
+        plan.human_command
+    );
+    // The login child is interactive and inherits this terminal's stdio; run the
+    // blocking spawn off the async runtime so we never block the reactor.
+    let outcome = tokio::task::spawn_blocking(move || run_login(&plan)).await?;
+    match outcome {
+        LoginOutcome::LoginFlowCompleted { binary } => {
+            println!("✅ `{binary}` login flow finished. Verify with `bluey agent prove --drive`.");
+            Ok(())
+        }
+        LoginOutcome::LoginFailed { detail } => {
+            bail!("login did not complete: {detail}")
+        }
+        LoginOutcome::CouldNotStart { detail } => {
+            bail!("could not start login: {detail}")
+        }
+        LoginOutcome::NoLoginCommand { detail } => {
+            bail!("nothing to launch: {detail}")
+        }
+    }
+}
+
+/// Resolve a MODEL-BLOCKED drive — consent-gated. This is the model-fallback
+/// analogue of [`agent_install`] / [`agent_login`]: when an agent is signed in
+/// and runs but its configured model is not allowed for the account/plan (the
+/// real Codex case: "The '<model>' model is not supported when using Codex with
+/// a ChatGPT account."), Bluey DETECTS it and PROPOSES either retrying with a
+/// fallback model the account supports or connecting an API key (BYOT). On
+/// approval of a fallback, Bluey DOES the work — it re-drives the canary with the
+/// fallback model and reports whether it answered. It never just punts to "go
+/// get an API key". Runs locally (no daemon).
+async fn agent_resolve_model(args: &ResolveModelArgs) -> Result<()> {
+    use cue_agent_bridge::model_resolve::{
+        classify_error, plan_resolution, ModelDiagnosis, ModelProposal,
+    };
+    use cue_agent_bridge::prove_drive::{drive_once, DriveProof};
+
+    // Map the snake_case kind string onto a known AgentKind (serde round-trip,
+    // same approach the sibling commands use), so a typo fails clearly.
+    let quoted = serde_json::to_string(args.kind.trim())?;
+    let kind: cue_agent_bridge::AgentKind = serde_json::from_str(&quoted)
+        .map_err(|_| anyhow::anyhow!("unknown agent kind: {:?}", args.kind))?;
+
+    // Human display name from the registry row (data, not a hardcoded label).
+    let display = cue_agent_bridge::registry::KindTag::from_agent_kind(&kind)
+        .and_then(cue_agent_bridge::registry::entry_for)
+        .map(|e| e.display_name.to_string())
+        .unwrap_or_else(|| format!("{kind:?}"));
+
+    // Drive the canary once through the production path to OBSERVE the real
+    // failure (this is detection from a real drive error, not a guess).
+    println!("Probing {display} with a canary question to see how it fails…");
+    let reason = match drive_once(kind.clone()).await {
+        DriveProof::Answered { answer, .. } => {
+            println!("✅ {display} already answers — no model block to resolve: {answer:?}");
+            return Ok(());
+        }
+        DriveProof::Skipped { reason } => {
+            println!("Skipped: {reason}");
+            return Ok(());
+        }
+        DriveProof::Failed { reason, .. } => reason,
+    };
+
+    // Classify the real failure. Only a MODEL block is ours to resolve; anything
+    // else we hand back honestly (the auth/runtime resolvers own those).
+    let blocked = match classify_error(&kind, &reason) {
+        ModelDiagnosis::ModelBlocked(b) => b,
+        ModelDiagnosis::NotAModelProblem => {
+            bail!(
+                "{display} did not fail with a model block, so there's nothing for the \
+model resolver to do. The real error was:\n    {reason}\n(If it's an auth or runtime \
+issue, try `bluey agent login {0}` or `bluey agent install {0}`.)",
+                args.kind
+            );
+        }
+    };
+
+    if let Some(m) = &blocked.blocked_model {
+        let why = blocked
+            .hint
+            .as_deref()
+            .map(|h| format!(" (blocked for your {h})"))
+            .unwrap_or_default();
+        println!("Detected a model block: `{m}` is not allowed{why}.");
+    } else {
+        println!("Detected a model block on {display}.");
+    }
+
+    // Propose a resolution and act on it. A fallback-model retry is appliable
+    // here; the BYOT path is surfaced (it needs a credential the user provides).
+    match plan_resolution(&blocked, &[]) {
+        ModelProposal::RetryWithModel {
+            fallback_model,
+            model_flag_args,
+            ..
+        } => {
+            println!(
+                "\nBluey can {}.",
+                plan_resolution(&blocked, &[]).proposal_line(&display)
+            );
+            let approved = if args.yes {
+                true
+            } else {
+                eprint!("Proceed? [y/N] ");
+                use std::io::Write as _;
+                std::io::stderr().flush().ok();
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                matches!(answer.trim().to_lowercase().as_str(), "y" | "yes")
+            };
+            if !approved {
+                println!(
+                    "Left as-is. Re-run `bluey agent resolve-model {}` any time.",
+                    args.kind
+                );
+                return Ok(());
+            }
+            // DO the work: re-drive the canary with the fallback model forced via
+            // the agent's own CLI + model flag (data-driven, from the registry).
+            println!("Retrying {display} with `{fallback_model}`…");
+            match redrive_with_model(&kind, &model_flag_args).await {
+                Ok(answer) => {
+                    println!("✅ {display} answered under `{fallback_model}`: {answer:?}");
+                    println!(
+                        "Bluey can drive it with `{fallback_model}` per-run; your \
+config.toml stays unchanged."
+                    );
+                    Ok(())
+                }
+                Err(e) => {
+                    // The fallback ALSO failed. Honest: re-classify and, if it's
+                    // another model block, surface the BYOT path as the next step.
+                    let next = format!("{e:#}");
+                    if matches!(
+                        classify_error(&kind, &next),
+                        ModelDiagnosis::ModelBlocked(_)
+                    ) {
+                        let byot = plan_resolution(&blocked, &all_fallback_models(&kind));
+                        println!("⚠️  `{fallback_model}` is also blocked for this account.");
+                        println!("Bluey can {}.", byot.proposal_line(&display));
+                        println!(
+                            "(All known fallback models are blocked — this account is \
+BYOT-only for {display}. Connect an OpenAI API key, e.g. `codex login --api-key`, \
+then re-run `bluey agent prove --drive`.)"
+                        );
+                        Ok(())
+                    } else {
+                        bail!("retry with `{fallback_model}` failed: {next}")
+                    }
+                }
+            }
+        }
+        ModelProposal::ConnectApiKey(byot) => {
+            // No fallback model applies — surface the BYOT proposal honestly.
+            println!(
+                "\nBluey can {}.",
+                ModelProposal::ConnectApiKey(byot.clone()).proposal_line(&display)
+            );
+            let env = byot
+                .api_key_env
+                .map(|e| format!(" Set it as {e} (or `codex login --api-key`)."))
+                .unwrap_or_default();
+            println!(
+                "No subscription model works for this account, so the path is BYOT: \
+provide an API key for {display} and Bluey will store it in your OS keychain \
+(service `bluey_cloud_{}`, key `{}`) and drive under it.{env}",
+                byot.keychain_vendor, byot.keychain_key
+            );
+            println!("Then verify with `bluey agent prove --drive`.");
             Ok(())
         }
     }
+}
+
+/// Re-drive an agent's canary with extra model-flag args appended, by spawning
+/// the agent's OWN drive command (from the registry) with the model override.
+/// This proves the fallback works WITHOUT modifying the shared drive layer.
+/// Returns the agent's answer text on success, or an error carrying the agent's
+/// failure output (so the caller can re-classify a still-blocked model).
+async fn redrive_with_model(
+    kind: &cue_agent_bridge::AgentKind,
+    model_flag_args: &[String],
+) -> Result<String> {
+    use tokio::process::Command;
+
+    let tag = cue_agent_bridge::registry::KindTag::from_agent_kind(kind)
+        .ok_or_else(|| anyhow!("no registry row for {kind:?}"))?;
+    let entry = cue_agent_bridge::registry::entry_for(tag)
+        .ok_or_else(|| anyhow!("no registry row for {kind:?}"))?;
+    let template = entry.drive_command;
+    let (program, rest) = template
+        .split_first()
+        .ok_or_else(|| anyhow!("{kind:?} has no drive command"))?;
+
+    // Build argv: the drive template with {prompt} substituted, then the model
+    // override appended. Codex needs `--skip-git-repo-check` to run outside a
+    // git repo; the registry template is the base, and we add the override.
+    const CANARY_PROMPT: &str = "Reply with exactly: BLUEY_OK";
+    let mut argv: Vec<String> = Vec::new();
+    for tok in rest {
+        if *tok == "{prompt}" {
+            argv.push(CANARY_PROMPT.to_string());
+        } else {
+            argv.push((*tok).to_string());
+        }
+    }
+    // Append the model override (e.g. `-m gpt-5.1-codex`).
+    argv.extend(model_flag_args.iter().cloned());
+
+    let out = Command::new(program)
+        .args(&argv)
+        .output()
+        .await
+        .map_err(|e| anyhow!("could not spawn `{program}`: {e}"))?;
+
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    if out.status.success() {
+        let body = stdout.trim();
+        if body.is_empty() {
+            // Some CLIs print the answer to stderr in non-JSON mode.
+            Ok(stderr.trim().to_string())
+        } else {
+            Ok(body.to_string())
+        }
+    } else {
+        // Carry BOTH streams so a model-block error in either is re-classifiable.
+        Err(anyhow!("{}", format!("{stdout}\n{stderr}").trim()))
+    }
+}
+
+/// All fallback model names for an agent (owned), for the "everything tried"
+/// BYOT decision.
+fn all_fallback_models(kind: &cue_agent_bridge::AgentKind) -> Vec<String> {
+    cue_agent_bridge::model_resolve::fallback_models_for(kind)
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Send an agent request and translate a missing-daemon connection failure into

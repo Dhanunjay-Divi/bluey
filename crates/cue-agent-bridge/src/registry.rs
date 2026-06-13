@@ -58,11 +58,74 @@ pub struct AgentEntry {
     /// Review-gated "Fix" profile: the extra args that switch this agent
     /// between propose-only and apply (see [`FixProfile`]).
     pub fix: FixProfile,
+    /// Ordered list of **fallback models** to try when a drive fails because the
+    /// agent's configured model is not allowed for the user's account/plan (the
+    /// "model-blocked" case — see [`crate::model_resolve`]). The model-fallback
+    /// resolver, on a `ModelBlocked` error, proposes retrying with the FIRST
+    /// entry here that isn't the already-blocked model, applied via
+    /// [`model_flag`](AgentEntry::model_flag).
+    ///
+    /// This is the **mechanism, expressed as data** — never an `if agent == …`
+    /// branch. The concrete model IDs are best-effort and shift over time
+    /// (OpenAI's per-plan allowlist in particular is in flux as of 2026-06), so
+    /// the values are documented as **NEEDS-LIVE-VERIFY**: the resolver tries
+    /// them in order and falls through to the BYOT (API-key) proposal when none
+    /// works. Empty for agents with no model flag or no known safe fallback
+    /// (the resolver then proposes BYOT or falls back to today's honest error).
+    pub fallback_models: &'static [&'static str],
+    /// The CLI flag this agent uses to **override the model for one run**, as a
+    /// token template ending in the model name. Codex accepts `-m <MODEL>`
+    /// (VERIFIED via `codex exec --help`: `-m, --model <MODEL>`); the `-c
+    /// model="X"` config-override form also works but `-m` is the simplest
+    /// single-token-pair. The resolver emits `[model_flag, <fallback>]` as two
+    /// argv entries. `None` for agents that don't take a per-run model flag, in
+    /// which case [`fallback_models`](AgentEntry::fallback_models) is unused and
+    /// the resolver goes straight to the BYOT proposal (or honest error).
+    pub model_flag: Option<&'static str>,
     /// How to PROACTIVELY install this agent's CLI when it's missing (so a user
     /// with only the GUI app becomes drivable). `None` for agents with no known
     /// official CLI installer. Recipes are vetted, official sources only — never
     /// an arbitrary string — and are always run consent-gated + verified.
     pub install: Option<InstallRecipe>,
+    /// The agent's OWN login invocation (program + args), as DATA — so the
+    /// auth/login resolver can TRIGGER it (consent-gated) when a drive error
+    /// shows the CLI is installed but not signed in, instead of telling the
+    /// user to type a command. Verified via `<bin> --help` on a real machine:
+    /// cursor-agent=`login`, codex=`login`, claude=`setup-token` (the long-lived
+    /// token flow; there is no `claude login` subcommand). `None` for agents
+    /// with no non-interactive CLI login (Gemini authenticates on first run /
+    /// via `GEMINI_API_KEY`; VS Code / Windsurf / Aider have no login CLI).
+    /// Read by [`crate::auth_resolve`]; never special-cased by name in logic.
+    pub login_command: Option<&'static [&'static str]>,
+    /// How to make this agent's login surface a device-code / printed URL
+    /// instead of popping a browser, as DATA — so the trigger works headlessly
+    /// (Bluey-as-overlay) without any per-agent `if` in the resolver. Verified
+    /// per CLI: cursor-agent reads a `NO_OPEN_BROWSER` env var; codex takes a
+    /// `--device-auth` flag; claude's `setup-token` is interactive with no
+    /// no-browser switch. [`LoginAuth::None`] for agents with no CLI login.
+    pub login_auth: LoginAuth,
+}
+
+/// How an agent's CLI login is made headless-friendly (device-code / printed
+/// URL instead of an opened browser) — pure data consumed by
+/// [`crate::auth_resolve::run_login`], so the trigger never hardcodes a
+/// per-agent env var or flag. Verified against the real CLIs (2026-06).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginAuth {
+    /// Set an environment variable to suppress the browser and print the
+    /// device-code/URL — e.g. cursor-agent's `NO_OPEN_BROWSER=1`.
+    NoBrowserEnv {
+        name: &'static str,
+        value: &'static str,
+    },
+    /// Append extra args to the login command for a device-code flow — e.g.
+    /// codex's `login --device-auth`.
+    DeviceCodeArgs(&'static [&'static str]),
+    /// Plain interactive login, no documented no-browser/device-code mode
+    /// (e.g. claude `setup-token`). The trigger runs the command as-is.
+    InteractiveOnly,
+    /// No CLI login flow at all (paired with `login_command: None`). Inert.
+    None,
 }
 
 /// A vetted recipe for installing an agent's CLI. Pure data; the runner in
@@ -145,14 +208,48 @@ impl AgentEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KindTag {
     ClaudeCode,
+    ClaudeCodeApp,
+    ClaudeCodeAgent,
     Cursor,
     Antigravity,
+    /// Cursor's cloud-hosted Background Agents. Distinct from `Cursor` (the
+    /// local IDE/CLI); routed through [`crate::cloud::cursor`].
+    CursorCloud,
+    /// GitHub Copilot Coding Agent (cloud-hosted, task-shaped). Distinct
+    /// from `Copilot` (the local standalone CLI); routed through
+    /// [`crate::cloud::copilot`].
+    CopilotCloud,
     Copilot,
     Gemini,
     Codex,
+    /// OpenAI's cloud-hosted Codex Cloud (task-shaped). Distinct from `Codex`
+    /// (the local CLI); routed through [`crate::cloud::codex_cloud`].
+    CodexCloud,
+    /// Anthropic's Claude Managed Agents (session-shaped, BYOT API key).
+    /// Distinct from `ClaudeCode` (the local CLI); routed through
+    /// [`crate::cloud::anthropic`]. The registry row carries the
+    /// `managed-agents-2026-04-01` beta header as DATA in the cloud-registry
+    /// table (`crate::cloud::registry::CLOUD_REGISTRY`).
+    AnthropicCloud,
     Aider,
     Windsurf,
     VsCode,
+    /// Google Antigravity (Cloud) — the Managed Agents surface of the Gemini
+    /// API (session/turn-shaped, BYOT Gemini API key). Distinct from the local
+    /// `Antigravity` (the bundled `agy`/`gemini` CLI); routed through
+    /// [`crate::cloud::antigravity_cloud`]. The registry row lives in the
+    /// cloud-registry table (`crate::cloud::registry::CLOUD_REGISTRY`); this tag
+    /// is the only thing in the local table. The cloud row carries the
+    /// `Api-Revision: 2026-05-20` header and the `x-goog-api-key` auth as DATA.
+    AntigravityCloud,
+    /// Google's Gemini Managed Agents — the generic cloud surface of the Gemini
+    /// API (turn-shaped, BYOT Gemini API key). Distinct from the local `Gemini`
+    /// (the `gemini` CLI); routed through [`crate::cloud::gemini_cloud`]. Shares
+    /// the Interactions API endpoint with the sibling `AntigravityCloud` row but
+    /// is a distinct vendor identity. The cloud row (in
+    /// `crate::cloud::registry::CLOUD_REGISTRY`) carries the
+    /// `Api-Revision: 2026-05-20` header and the `x-goog-api-key` auth as DATA.
+    GeminiCloud,
 }
 
 impl KindTag {
@@ -162,14 +259,22 @@ impl KindTag {
     pub fn to_agent_kind(self) -> AgentKind {
         match self {
             KindTag::ClaudeCode => AgentKind::ClaudeCode,
+            KindTag::ClaudeCodeApp => AgentKind::ClaudeCodeApp,
+            KindTag::ClaudeCodeAgent => AgentKind::ClaudeCodeAgent,
             KindTag::Cursor => AgentKind::Cursor,
             KindTag::Antigravity => AgentKind::Antigravity,
+            KindTag::CursorCloud => AgentKind::CursorCloud,
+            KindTag::CopilotCloud => AgentKind::CopilotCloud,
             KindTag::Copilot => AgentKind::Copilot,
             KindTag::Gemini => AgentKind::Gemini,
             KindTag::Codex => AgentKind::Codex,
+            KindTag::CodexCloud => AgentKind::CodexCloud,
+            KindTag::AnthropicCloud => AgentKind::AnthropicCloud,
             KindTag::Aider => AgentKind::Aider,
             KindTag::Windsurf => AgentKind::Windsurf,
             KindTag::VsCode => AgentKind::VsCodeFork,
+            KindTag::AntigravityCloud => AgentKind::AntigravityCloud,
+            KindTag::GeminiCloud => AgentKind::GeminiCloud,
         }
     }
 
@@ -181,14 +286,22 @@ impl KindTag {
     pub fn from_agent_kind(kind: &AgentKind) -> Option<Self> {
         match kind {
             AgentKind::ClaudeCode => Some(KindTag::ClaudeCode),
+            AgentKind::ClaudeCodeApp => Some(KindTag::ClaudeCodeApp),
+            AgentKind::ClaudeCodeAgent => Some(KindTag::ClaudeCodeAgent),
             AgentKind::Cursor => Some(KindTag::Cursor),
             AgentKind::Antigravity => Some(KindTag::Antigravity),
+            AgentKind::CursorCloud => Some(KindTag::CursorCloud),
+            AgentKind::CopilotCloud => Some(KindTag::CopilotCloud),
             AgentKind::Copilot => Some(KindTag::Copilot),
             AgentKind::Gemini => Some(KindTag::Gemini),
             AgentKind::Codex => Some(KindTag::Codex),
+            AgentKind::CodexCloud => Some(KindTag::CodexCloud),
+            AgentKind::AnthropicCloud => Some(KindTag::AnthropicCloud),
             AgentKind::Aider => Some(KindTag::Aider),
             AgentKind::Windsurf => Some(KindTag::Windsurf),
             AgentKind::VsCodeFork => Some(KindTag::VsCode),
+            AgentKind::AntigravityCloud => Some(KindTag::AntigravityCloud),
+            AgentKind::GeminiCloud => Some(KindTag::GeminiCloud),
             AgentKind::Other(_) | AgentKind::Unknown => None,
         }
     }
@@ -199,7 +312,19 @@ impl KindTag {
 pub const REGISTRY: &[AgentEntry] = &[
     AgentEntry {
         kind_tag: KindTag::ClaudeCode,
-        display_name: "Claude Code",
+        // No account/plan model-block has been observed for Claude Code, so no
+        // fallback ordering is asserted. Claude's CLI does accept `--model`, so
+        // the mechanism is wired (a future plan-gated model could populate the
+        // list) but the safe-fallback values stay empty until proven.
+        fallback_models: &[],
+        model_flag: Some("--model"),
+        // Claude's CLI login is `claude setup-token` (long-lived token; there is
+        // no `claude login` subcommand). Interactive, no no-browser switch.
+        login_command: Some(&["claude", "setup-token"]),
+        login_auth: LoginAuth::InteractiveOnly,
+        // "(CLI)" disambiguates the terminal Claude Code from the Claude app's
+        // "(App)" / "(Agent)" rows below, which share the same engine + store.
+        display_name: "Claude Code (CLI)",
         binary_candidates: &["claude"],
         app_bundles: &["Claude.app"],
         app_dirs_windows: &["Claude"],
@@ -221,8 +346,80 @@ pub const REGISTRY: &[AgentEntry] = &[
             apply_supported: true,
         },
     },
+    // The Claude desktop app's Code mode. Same engine + transcript store as the
+    // CLI above (driven by `claude`), but its sessions are indexed in the app's
+    // own store with rich pre-computed titles. `jsonl_subdir` names the app's
+    // session-index subdir under `Library/Application Support/Claude`; the
+    // ClaudeAppIndex reader follows each entry's `cliSessionId` into the shared
+    // `~/.claude/projects/*.jsonl` for the body.
+    AgentEntry {
+        kind_tag: KindTag::ClaudeCodeApp,
+        // Same `claude` engine as the CLI row — shares its (empty) fallback set.
+        fallback_models: &[],
+        model_flag: Some("--model"),
+        // Driven through the same `claude` CLI, so it shares its login command.
+        login_command: Some(&["claude", "setup-token"]),
+        login_auth: LoginAuth::InteractiveOnly,
+        display_name: "Claude Code (App)",
+        // No separate binary — driven through the same `claude` CLI.
+        binary_candidates: &["claude"],
+        app_bundles: &["Claude.app"],
+        app_dirs_windows: &["Claude"],
+        data_dir_globs: &["Library/Application Support/Claude"],
+        app_data_windows: &["Claude"],
+        session_format: Some(SessionFormat::ClaudeAppIndex),
+        jsonl_subdir: "claude-code-sessions",
+        drive_command: &["claude", "-p", "{prompt}"],
+        answer_args: &[],
+        mcp_allow_flag: None,
+        // Install handled by the CLI row; the app is GUI-installed out of band.
+        install: None,
+        fix: FixProfile {
+            propose_args: &["--permission-mode", "plan"],
+            apply_args: &["--permission-mode", "acceptEdits"],
+            apply_supported: true,
+        },
+    },
+    // The Claude desktop app's agent (cowork) mode — same engine/store, a
+    // different session-index subdir.
+    AgentEntry {
+        kind_tag: KindTag::ClaudeCodeAgent,
+        // Same `claude` engine as the CLI row — shares its (empty) fallback set.
+        fallback_models: &[],
+        model_flag: Some("--model"),
+        // Same `claude` CLI engine → same login command.
+        login_command: Some(&["claude", "setup-token"]),
+        login_auth: LoginAuth::InteractiveOnly,
+        display_name: "Claude Code (Agent)",
+        binary_candidates: &["claude"],
+        app_bundles: &["Claude.app"],
+        app_dirs_windows: &["Claude"],
+        data_dir_globs: &["Library/Application Support/Claude"],
+        app_data_windows: &["Claude"],
+        session_format: Some(SessionFormat::ClaudeAppIndex),
+        jsonl_subdir: "local-agent-mode-sessions",
+        drive_command: &["claude", "-p", "{prompt}"],
+        answer_args: &[],
+        mcp_allow_flag: None,
+        install: None,
+        fix: FixProfile {
+            propose_args: &["--permission-mode", "plan"],
+            apply_args: &["--permission-mode", "acceptEdits"],
+            apply_supported: true,
+        },
+    },
     AgentEntry {
         kind_tag: KindTag::Cursor,
+        // No account/plan model-block observed for Cursor; mechanism left inert.
+        fallback_models: &[],
+        model_flag: None,
+        // `cursor-agent login` opens a browser; `NO_OPEN_BROWSER` prints the
+        // device-code/URL instead (verified via `cursor-agent login --help`).
+        login_command: Some(&["cursor-agent", "login"]),
+        login_auth: LoginAuth::NoBrowserEnv {
+            name: "NO_OPEN_BROWSER",
+            value: "1",
+        },
         display_name: "Cursor",
         binary_candidates: &["cursor-agent", "cursor"],
         app_bundles: &["Cursor.app"],
@@ -254,20 +451,27 @@ pub const REGISTRY: &[AgentEntry] = &[
     },
     AgentEntry {
         kind_tag: KindTag::Antigravity,
+        // Drives through the `gemini` CLI; no model-block case observed.
+        fallback_models: &[],
+        model_flag: None,
+        // Drives through the `gemini` CLI, which has no non-interactive login
+        // subcommand (it authenticates on first run / via GEMINI_API_KEY).
+        login_command: None,
+        login_auth: LoginAuth::None,
         display_name: "Antigravity",
-        // `agy` is Antigravity 2.0's CLI (successor to gemini-cli); list it
-        // first so discovery prefers it when installed. It stores sessions as
-        // JSONL at
-        // `~/.gemini/antigravity-cli/brain/<id>/.system_generated/logs/transcript.jsonl`
-        // — wiring that session reader is a follow-up slice. NEEDS-LIVE-VERIFY
-        // (`agy` may not be installed; drive still falls back to `gemini`).
+        // Sessions are read from the `brain/<id>/.system_generated/logs/
+        // transcript.jsonl` files — these are READABLE JSONL (verified on a real
+        // machine), unlike the sibling `conversations/*.pb` protobuf which is
+        // encrypted. So we read the brain transcripts (JSONL), NOT the `.pb`.
+        // `agy` is Antigravity 2.0's CLI (successor to gemini-cli); listed first
+        // so discovery prefers it for driving when installed, else `gemini`.
         binary_candidates: &["agy", "antigravity", "gemini"],
         app_bundles: &["Antigravity.app"],
         app_dirs_windows: &["Antigravity"],
         data_dir_globs: &[".gemini/antigravity"],
         app_data_windows: &[],
-        session_format: Some(SessionFormat::Protobuf),
-        jsonl_subdir: "projects",
+        session_format: Some(SessionFormat::Jsonl),
+        jsonl_subdir: "brain",
         drive_command: &["gemini", "-p", "{prompt}"],
         answer_args: &[],
         mcp_allow_flag: Some("--allowed-mcp-server-names"),
@@ -286,6 +490,14 @@ pub const REGISTRY: &[AgentEntry] = &[
     },
     AgentEntry {
         kind_tag: KindTag::Copilot,
+        // No account/plan model-block observed for the Copilot CLI.
+        fallback_models: &[],
+        model_flag: None,
+        // The standalone `copilot` CLI has no `login` subcommand (verified via
+        // `copilot --help`): it authenticates via `GH_TOKEN`/`GITHUB_TOKEN` or an
+        // interactive in-REPL `/login`. No non-interactive CLI login to trigger.
+        login_command: None,
+        login_auth: LoginAuth::None,
         // The STANDALONE GitHub Copilot CLI (`copilot`, GA Feb 2026) — its own
         // binary + `~/.copilot/` store. This is NOT "Copilot inside VS Code":
         // that extension's data lives in VS Code's own directory and belongs to
@@ -328,6 +540,15 @@ pub const REGISTRY: &[AgentEntry] = &[
     },
     AgentEntry {
         kind_tag: KindTag::Gemini,
+        // No account/plan model-block observed for Gemini CLI (its capacity
+        // errors are 429 "no capacity", a transient class, not a plan block).
+        fallback_models: &[],
+        model_flag: Some("--model"),
+        // The `gemini` CLI has no `login`/`auth` subcommand (verified via
+        // `gemini --help`): it authenticates interactively on first launch or
+        // via `GEMINI_API_KEY`. Nothing non-interactive to trigger.
+        login_command: None,
+        login_auth: LoginAuth::None,
         display_name: "Gemini CLI",
         binary_candidates: &["gemini"],
         app_bundles: &[],
@@ -352,6 +573,30 @@ pub const REGISTRY: &[AgentEntry] = &[
     },
     AgentEntry {
         kind_tag: KindTag::Codex,
+        // Model-fallback ordering for the ChatGPT-account model-block (see
+        // `crate::model_resolve`). As of 2026-06-02 OpenAI restricts newer Codex
+        // models for ChatGPT-subscription accounts (they require an OpenAI API
+        // key); the real error is "The '<model>' model is not supported when
+        // using Codex with a ChatGPT account." The mechanism: on that error,
+        // retry with the first entry below that isn't the already-blocked model,
+        // via `model_flag` (`codex exec -m <MODEL>`).
+        //
+        // NEEDS-LIVE-VERIFY: the per-plan allowlist is in flux. On the test
+        // machine (ChatGPT-account auth, no API key) EVERY candidate below was
+        // ALSO blocked with the same error — i.e. the honest verdict for that
+        // account is BYOT-only (connect an OpenAI API key). These values are the
+        // best-effort ordering for accounts where at least one still works; the
+        // resolver tries them in order and, when none does, falls through to the
+        // BYOT (API-key) proposal. Ordered most-capable → most-available.
+        fallback_models: &["gpt-5.1-codex", "gpt-5-codex", "gpt-5.1", "o4-mini"],
+        // `codex exec` accepts `-m <MODEL>` (VERIFIED via `codex exec --help`:
+        // `-m, --model <MODEL>`). The `-c model="X"` config-override form also
+        // works on both `exec` and `exec resume`; `-m` is the simplest pair.
+        model_flag: Some("-m"),
+        // `codex login` opens a browser; `--device-auth` runs the headless
+        // device-code flow instead (verified via `codex login --help`).
+        login_command: Some(&["codex", "login"]),
+        login_auth: LoginAuth::DeviceCodeArgs(&["--device-auth"]),
         display_name: "Codex",
         binary_candidates: &["codex"],
         app_bundles: &[],
@@ -363,10 +608,17 @@ pub const REGISTRY: &[AgentEntry] = &[
         drive_command: &["codex", "exec", "{prompt}"],
         // Answer mode runs Codex with the read-safe sandbox: reads are allowed,
         // writes are blocked, and no approval prompt is raised (which would
-        // stall a headless run). Flags DOC-CONFIRMED
-        // (https://developers.openai.com/codex/cli/reference); the precise
-        // read-only MCP/tool side-effect behavior is NEEDS-LIVE-VERIFY.
-        answer_args: &["--sandbox", "read-only", "--ask-for-approval", "never"],
+        // stall a headless run). Expressed as `-c` CONFIG OVERRIDES, not the
+        // `--sandbox`/`--ask-for-approval` flags, because the `exec resume`
+        // subcommand does NOT accept those flags (VERIFIED LIVE: `exec resume`
+        // errors `unexpected argument '--sandbox'`), whereas `-c key=value` is
+        // accepted by BOTH `exec` and `exec resume`. Same posture, one form.
+        answer_args: &[
+            "-c",
+            "sandbox_mode=\"read-only\"",
+            "-c",
+            "approval_policy=\"never\"",
+        ],
         mcp_allow_flag: None,
         install: Some(InstallRecipe {
             method: InstallMethod::NpmGlobal,
@@ -374,18 +626,30 @@ pub const REGISTRY: &[AgentEntry] = &[
             verify_binary: "codex",
         }),
         fix: FixProfile {
-            propose_args: &["--sandbox", "read-only", "--ask-for-approval", "never"],
+            propose_args: &[
+                "-c",
+                "sandbox_mode=\"read-only\"",
+                "-c",
+                "approval_policy=\"never\"",
+            ],
             apply_args: &[
-                "--sandbox",
-                "workspace-write",
-                "--ask-for-approval",
-                "never",
+                "-c",
+                "sandbox_mode=\"workspace-write\"",
+                "-c",
+                "approval_policy=\"never\"",
             ],
             apply_supported: true,
         },
     },
     AgentEntry {
         kind_tag: KindTag::Aider,
+        // Aider is model-agnostic (BYO key already); no plan model-block class.
+        fallback_models: &[],
+        model_flag: Some("--model"),
+        // Aider authenticates via provider env vars (OPENAI_API_KEY, etc.), not
+        // a login subcommand. Nothing to trigger.
+        login_command: None,
+        login_auth: LoginAuth::None,
         display_name: "Aider",
         binary_candidates: &["aider"],
         app_bundles: &[],
@@ -406,6 +670,12 @@ pub const REGISTRY: &[AgentEntry] = &[
     },
     AgentEntry {
         kind_tag: KindTag::Windsurf,
+        // No headless CLI to drive, so no model flag / fallback applies.
+        fallback_models: &[],
+        model_flag: None,
+        // GUI-only auth (the IDE handles sign-in); no headless login CLI.
+        login_command: None,
+        login_auth: LoginAuth::None,
         display_name: "Windsurf",
         binary_candidates: &["windsurf"],
         app_bundles: &["Windsurf.app"],
@@ -427,6 +697,12 @@ pub const REGISTRY: &[AgentEntry] = &[
     },
     AgentEntry {
         kind_tag: KindTag::VsCode,
+        // No headless CLI to drive, so no model flag / fallback applies.
+        fallback_models: &[],
+        model_flag: None,
+        // GUI-only auth (the editor handles sign-in); no headless login CLI.
+        login_command: None,
+        login_auth: LoginAuth::None,
         display_name: "VS Code",
         binary_candidates: &["code"],
         app_bundles: &["Visual Studio Code.app"],
@@ -472,6 +748,25 @@ pub fn fix_profile_for(kind: KindTag) -> Option<&'static FixProfile> {
     entry_for(kind).map(|e| &e.fix)
 }
 
+/// The human display name for an [`AgentKind`], from the registry — the single
+/// source of truth. Generic: used to build session fallback labels etc. without
+/// hardcoding an agent name anywhere else. `Other(label)` returns its own label;
+/// `Unknown` and un-tagged kinds return `None`.
+pub fn display_name_for(kind: &AgentKind) -> Option<String> {
+    if let AgentKind::Other(label) = kind {
+        return Some(label.clone());
+    }
+    let tag = KindTag::from_agent_kind(kind)?;
+    // Try the local registry first (covers the LOCAL kinds: ClaudeCode,
+    // Cursor IDE, Copilot CLI, …). If absent, fall back to the CLOUD
+    // registry — cloud-only kinds (CursorCloud, …) live there.
+    entry_for(tag)
+        .map(|e| e.display_name.to_string())
+        .or_else(|| {
+            crate::cloud::registry::cloud_entry_for(tag).map(|e| e.display_name.to_string())
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,7 +775,9 @@ mod tests {
     fn test_registry_has_expected_agents() {
         let names: Vec<_> = REGISTRY.iter().map(|e| e.display_name).collect();
         for expected in [
-            "Claude Code",
+            "Claude Code (CLI)",
+            "Claude Code (App)",
+            "Claude Code (Agent)",
             "Cursor",
             "Antigravity",
             "GitHub Copilot CLI",
@@ -584,6 +881,20 @@ mod tests {
             if tok.starts_with('-') {
                 let val = args.get(i + 1).copied().filter(|n| !n.starts_with('-'));
                 i += if val.is_some() { 2 } else { 1 };
+                // A `-c key=value` config override is keyed by its CONFIG KEY,
+                // not the repeated `-c` flag — otherwise two `-c` pairs collide
+                // and the divergence check misfires (e.g. comparing apply's
+                // `approval_policy` against propose's `sandbox_mode`). Split the
+                // value into key + value so each config key is its own pair.
+                if tok == "-c" || tok == "--config" {
+                    if let Some(kv) = val {
+                        match kv.split_once('=') {
+                            Some((key, value)) => out.push((key, Some(value))),
+                            None => out.push((kv, None)),
+                        }
+                        continue;
+                    }
+                }
                 out.push((tok, val));
             } else {
                 // A bare value with no preceding flag (none in current data);

@@ -108,6 +108,46 @@ pub enum OverlayCommand {
         diff: Option<String>,
         apply_supported: bool,
     },
+    /// Push a BYOT (bring-your-own-token) billing-disclosure modal the user
+    /// MUST acknowledge before a cloud agent is marked attached. Emitted by
+    /// the daemon the first time the user attaches an agent whose registry
+    /// row's `billing_model` is BYOT/`api_credits` and whose `vendor_short`
+    /// is NOT yet in `accepted_byot_vendors` in settings.
+    ///
+    /// The UI renders `vendor` (display name), `billing_model` (e.g.
+    /// `"api_credits"`), and the row's full `consent_warning` (`disclosure`),
+    /// plus a Console URL the user can open to manage / revoke their key.
+    /// Acknowledgement is the `OverlayEvent::BillingDisclosureResponded`
+    /// event carrying the same `vendor_short`; the daemon refuses to attach
+    /// the agent until that event arrives, so the modal is unbypassable.
+    ///
+    /// Data-driven by design: every field comes off the cloud-registry row
+    /// (`crate::cloud::registry::CloudAgentEntry`). Adding a new BYOT vendor
+    /// = adding a row, not changing the disclosure code path.
+    PushBillingDisclosure {
+        /// Lowercase vendor short id (matches `vendor_short` in the cloud
+        /// registry row — e.g. `"anthropic"`, `"codex_cloud"`). The UI
+        /// echoes this back verbatim in the response event so the daemon
+        /// can match the consent to the right vendor.
+        vendor_short: String,
+        /// Human-facing display name (the registry row's `display_name`).
+        vendor_display_name: String,
+        /// Billing model label off [`crate::cloud::registry::BillingModel`]
+        /// (snake_case wire form — e.g. `"api_credits"`, `"subscription"`,
+        /// `"byot"`).
+        billing_model: String,
+        /// Verbatim disclosure copy from the registry row's
+        /// `consent_warning`. The UI MUST render this in full — it's the
+        /// legal disclosure (BYOT billing, ZDR ineligibility, …).
+        disclosure: String,
+        /// Pending agent attach to resume once the user accepts. The daemon
+        /// keeps the user's original `kind` + `session_id` here so accepting
+        /// the disclosure picks up the in-flight attach without a second
+        /// user gesture.
+        pending_kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pending_session_id: Option<String>,
+    },
     Shutdown,
 }
 
@@ -176,6 +216,25 @@ pub enum OverlayEvent {
     FixApprovalResponded {
         proposal_id: uuid::Uuid,
         approved: bool,
+    },
+    /// UI responded to a BYOT billing disclosure modal pushed by
+    /// [`OverlayCommand::PushBillingDisclosure`]. `accepted = true` means the
+    /// user agreed; the daemon adds `vendor_short` to
+    /// `accepted_byot_vendors` in settings and resumes the pending attach
+    /// (using the `pending_kind` / `pending_session_id` echoed back here).
+    /// `accepted = false` means the user declined; the daemon discards the
+    /// pending attach and pushes no overlay change.
+    BillingDisclosureResponded {
+        /// The same `vendor_short` the push carried. The daemon uses this to
+        /// (a) confirm the response matches a pending disclosure, and
+        /// (b) record acknowledgement in settings.
+        vendor_short: String,
+        accepted: bool,
+        /// Echoed from the original push so the daemon can resume the same
+        /// in-flight attach.
+        pending_kind: String,
+        #[serde(default)]
+        pending_session_id: Option<String>,
     },
     InstructionsRequested,
     InstructionsUpdated {

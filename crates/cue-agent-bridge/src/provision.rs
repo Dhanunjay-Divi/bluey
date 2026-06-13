@@ -47,8 +47,16 @@ pub struct InstallPlan {
 /// Outcome of running an [`InstallPlan`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallOutcome {
-    /// Installed and the expected binary is now on `PATH`.
+    /// Installed and the expected binary is now on `PATH` **and runs**.
     Installed { binary: String },
+    /// The binary installed and is on `PATH`, but it will not actually run in
+    /// this environment — e.g. a runtime-version mismatch (the GitHub Copilot
+    /// CLI requires Node ≥24; if the active node is older, `copilot` is present
+    /// but errors on launch). "On PATH" is NOT the same as "runnable", so this is
+    /// reported distinctly from [`Installed`] with the real launch error, rather
+    /// than falsely claiming success. The `detail` carries the runtime's own
+    /// message so the caller can guide the user (or auto-resolve the runtime).
+    InstalledButNotRunnable { binary: String, detail: String },
     /// The required prerequisite (e.g. `npm`) is missing — nothing was run.
     MissingPrerequisite { needed: &'static str },
     /// The installer ran but the binary did not appear on `PATH`.
@@ -206,6 +214,35 @@ fn binary_on_path(binary: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a binary on `PATH` actually **runs** — `Ok(())` if a `--version`
+/// probe exits 0, `Err(launch-error-text)` if it spawns but fails (e.g. a
+/// runtime-version mismatch like Copilot's "requires Node v24"). This is the
+/// difference between "installed" and "usable": a binary can be on `PATH` yet
+/// non-functional. We probe `--version` (cheap, side-effect-free for every CLI
+/// in the registry) and, on a non-zero exit, return the combined stderr+stdout
+/// tail so the caller sees the real reason. A binary that isn't even on PATH
+/// returns `Err` too (caller should check `binary_on_path` first for clarity).
+fn binary_runnable(binary: &str) -> Result<(), String> {
+    match Command::new(binary).arg("--version").output() {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => {
+            // Some CLIs print their launch error to stdout, some to stderr.
+            let mut msg = String::from_utf8_lossy(&o.stderr).into_owned();
+            if msg.trim().is_empty() {
+                msg = String::from_utf8_lossy(&o.stdout).into_owned();
+            }
+            let one_line: String = msg.split_whitespace().collect::<Vec<_>>().join(" ");
+            let tail: String = one_line.chars().take(240).collect();
+            Err(if tail.trim().is_empty() {
+                format!("`{binary} --version` exited non-zero")
+            } else {
+                tail
+            })
+        }
+        Err(e) => Err(format!("could not run `{binary}`: {e}")),
+    }
+}
+
 /// Run an approved [`InstallPlan`]: check the prerequisite, execute the vetted
 /// recipe, then VERIFY the expected binary appeared on `PATH`.
 ///
@@ -235,17 +272,22 @@ pub fn run_install(plan: &InstallPlan) -> InstallOutcome {
 
     match result {
         Ok(output) if output.status.success() => {
-            // Verify — never trust the exit code alone.
-            if binary_on_path(plan.recipe.verify_binary) {
-                InstallOutcome::Installed {
-                    binary: plan.recipe.verify_binary.to_string(),
-                }
-            } else {
+            // Verify — never trust the exit code alone. Two distinct checks:
+            // (1) is the binary on PATH? (2) does it actually RUN? A binary can
+            // pass (1) and fail (2) — e.g. Copilot on a too-old Node — so we
+            // report that case honestly instead of claiming "Installed".
+            let binary = plan.recipe.verify_binary.to_string();
+            if !binary_on_path(&binary) {
                 InstallOutcome::VerificationFailed {
-                    binary: plan.recipe.verify_binary.to_string(),
+                    binary,
                     detail: "install reported success but binary not on PATH \
                              (may need a new shell / PATH refresh)"
                         .to_string(),
+                }
+            } else {
+                match binary_runnable(&binary) {
+                    Ok(()) => InstallOutcome::Installed { binary },
+                    Err(detail) => InstallOutcome::InstalledButNotRunnable { binary, detail },
                 }
             }
         }
@@ -284,8 +326,12 @@ pub fn provision_with_recovery(plan: &InstallPlan, consent: RemedyConsent) -> In
     let pre = preflight(plan);
 
     if pre.already_installed {
-        return InstallOutcome::Installed {
-            binary: plan.recipe.verify_binary.to_string(),
+        // On PATH already — but confirm it actually RUNS before claiming success
+        // (the Copilot/old-Node case: present but non-functional).
+        let binary = plan.recipe.verify_binary.to_string();
+        return match binary_runnable(&binary) {
+            Ok(()) => InstallOutcome::Installed { binary },
+            Err(detail) => InstallOutcome::InstalledButNotRunnable { binary, detail },
         };
     }
     if let Some(needed) = pre.missing_prerequisite {
@@ -457,5 +503,41 @@ mod tests {
         // assert the consent enum gates correctly: SafeOnly must never be equal
         // to AllowDestructive, and the runner branches on it.
         assert_ne!(RemedyConsent::SafeOnly, RemedyConsent::AllowDestructive);
+    }
+
+    #[test]
+    fn binary_runnable_distinguishes_runs_from_fails() {
+        // A real, always-present binary that supports --version must report
+        // runnable. (`sh` exists on every supported platform; but it doesn't take
+        // --version cleanly, so use a binary that does. `true` always exits 0
+        // regardless of args, which is the safest cross-platform "runs" proxy.)
+        assert!(
+            binary_runnable("true").is_ok(),
+            "`true` should always run and exit 0"
+        );
+        // A binary that does not exist on PATH must report NOT runnable, with a
+        // reason — never a false positive.
+        let missing = binary_runnable("definitely-not-a-real-binary-xyz123");
+        assert!(missing.is_err(), "a nonexistent binary is not runnable");
+        assert!(
+            !missing.unwrap_err().is_empty(),
+            "the failure must carry a reason"
+        );
+    }
+
+    #[test]
+    fn installed_but_not_runnable_is_distinct_from_installed() {
+        // The whole point of the variant: "on PATH" != "usable". The two
+        // outcomes must be different values so callers can treat them
+        // differently (Installed = drive it; InstalledButNotRunnable = guide the
+        // user / resolve the runtime first).
+        let ok = InstallOutcome::Installed {
+            binary: "copilot".into(),
+        };
+        let runtime_blocked = InstallOutcome::InstalledButNotRunnable {
+            binary: "copilot".into(),
+            detail: "requires Node v24".into(),
+        };
+        assert_ne!(ok, runtime_blocked);
     }
 }
