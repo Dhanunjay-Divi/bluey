@@ -117,7 +117,7 @@ Result:
 
 ## 6. Explicitly Not Changed
 
-- No server handler trace-id sweep in this commit; Kiro offered to take N-1 in parallel.
+- No server handler trace-id sweep in this commit; Kiro closed N-1 separately in `66e5fa3`.
 - No UI/website changes.
 - No deployment to production or GitHub Actions usage.
 - `bluey-dev.db` remains local/untracked and untouched.
