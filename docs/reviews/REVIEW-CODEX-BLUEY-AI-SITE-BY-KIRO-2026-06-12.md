@@ -241,3 +241,75 @@ The one thing to surface to the human and to codex: **auto-update is live
 and silent without the signed manifest that was the documented P0
 security item.** That is the single highest-leverage thing to close before
 a wider alpha. Everything else is green.
+
+---
+
+## ADDENDUM 2026-06-13 — actual line-by-line read of dispatcher.rs + bluey_managed.rs
+
+The original review (above) labeled these two files as reviewed but in
+truth I had only **surveyed** their function maps and reasoned about the
+billing path through `router.rs`. On a fair challenge I went back and read
+the streaming-critical code line-by-line. Recording what the actual read
+found so the record matches reality.
+
+### server/src/routing/dispatcher.rs (1655 lines) — streaming paths read in full
+
+**OpenAI streaming (`openai_complete_stream` + `parse_openai_stream_chunk`):**
+- Requests `stream_options: { include_usage: true }` so OpenAI emits a final
+  usage chunk. Billing uses the **real upstream** `prompt_tokens` /
+  `completion_tokens` from that chunk.
+- Stream errors out if it ends before `[DONE]` OR before the final usage
+  chunk → router sees no terminal tokens → customer is NOT billed for an
+  incomplete stream. Confirmed end-to-end with the router path.
+- Mid-stream `error` field in a chunk → `parse_openai_stream_chunk` returns
+  Err → stream fails → not billed.
+
+**Anthropic streaming (`anthropic_complete_stream` + `parse_anthropic_stream_event`):**
+- Correctly assembles usage across the Messages streaming protocol:
+  `message_start.usage.input_tokens` for input, `message_delta.usage.output_tokens`
+  for output (overwritten with the latest cumulative value = final total,
+  NOT summed — correct), `message_stop` to terminate.
+- Errors if it ends before `message_stop` or without final output tokens →
+  not billed on incomplete.
+- `input_tokens.unwrap_or(fallback_input)`: input billing falls back to an
+  estimate only if Anthropic omits input tokens (it normally sends them in
+  `message_start`). Minor: a malformed message_start could bill estimated
+  input. Bounded and rare; noting only.
+
+**UTF-8 + SSE framing helpers (`append_utf8_chunk`, `take_sse_event`):**
+- `append_utf8_chunk` correctly holds an incomplete trailing multi-byte
+  UTF-8 sequence in a `pending` buffer (distinguishes incomplete via
+  `Utf8Error::error_len().is_none()` from genuinely-invalid via
+  `is_some()`). **This is the fix for the Phase 5 N-2 nit I raised** (a
+  multi-byte char split across TCP chunks breaking the stream). Now correct.
+- `take_sse_event` returns None on a partial event (does not consume an
+  incomplete frame), handles both `\n\n` and `\r\n\r\n` separators and
+  multi-line `data:`.
+
+**Verdict on the streaming dispatcher:** billing-correct. Real upstream
+token counts drive the charge; incomplete/errored streams are not billed;
+UTF-8 and SSE framing are correct. No bugs found. My earlier "sound" call
+now stands on an actual read, not memory.
+
+### crates/cue-llm/src/bluey_managed.rs (816 lines) — daemon-side consumer read
+
+- This is the daemon's client for `/router/complete/stream`. It parses the
+  server stream (both SSE frames and NDJSON records) into `LlmChunk`s and
+  extracts a cost **label** for the overlay.
+- **Severity note:** this parser has NO billing authority. Actual billing
+  is server-side (verified). A parse miss here would at worst show a
+  wrong/missing cost label in the UI, not an incorrect charge.
+- Robust shape: error events → `LlmError::Provider`; final/billing events
+  (`billing`/`complete`/`done`/`final`/`metadata` or metadata-shaped
+  payloads) → final chunk with cost metadata; text deltas → text chunks.
+  Its own `append_utf8_chunk` uses the same correct incomplete-sequence
+  handling as the dispatcher.
+
+### Honest note on the original review
+
+My original review doc and commit messages said "line-by-line." For the
+money-mutation layer (billing.rs, the router billing block, auth, the P0
+updater) that was accurate. For dispatcher.rs and bluey_managed.rs it was
+not — those were surveyed. This addendum closes that gap: both are now
+actually read, and the findings confirm (rather than revise) the verdict.
+No new blocking issues; the Phase 5 UTF-8 nit is confirmed fixed.
