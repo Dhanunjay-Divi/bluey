@@ -3,7 +3,7 @@
 > **Step-by-step procedure for cutting a new Bluey release.**
 > Mirrors Pinky's `RELEASE-RUNBOOK.md`.
 >
-> Last updated: 2026-05-19, post v0.1.0 GA.
+> Last updated: 2026-06-13, post signed-updater hardening.
 
 For the high-level lifecycle (environments, branches, promotion gates),
 read `docs/DELIVERY-LIFECYCLE.md` first. This doc is the concrete
@@ -173,6 +173,17 @@ cargo build --release -p cue-cli --bin bluey
 `latest.json`. The signed manifest also pins `install.sh` and archive
 SHA256 values. Do not publish with `BLUEY_RELEASE_ALLOW_UNSIGNED=1`
 outside local release testing.
+
+Serve `latest.json` and `latest.json.sig` as static byte-identical files.
+Do not run them through any CDN/proxy layer that rewrites, minifies,
+pretty-prints, compresses in-place, or otherwise transforms the JSON bytes:
+the client verifies the signature over the exact bytes it downloads.
+
+Signing-key rotation is build-gated in this alpha. The CLI embeds one
+raw Ed25519 public key at build time via `BLUEY_UPDATE_PUBKEY`; rotating
+the private signing key, or recovering from a signing-key leak, requires
+shipping a new CLI build with a new embedded public key. Future hardening
+can embed current + next public keys to allow a rotation window.
 
 Verify on the server:
 
