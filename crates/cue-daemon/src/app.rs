@@ -32,6 +32,7 @@ use cue_core::{
     OverlaySessionItem, PrivacyFlags, ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget,
     Speaker, TranscriptSegment,
 };
+use futures_util::future::join_all;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command as TokioCommand;
@@ -1072,11 +1073,20 @@ async fn handle_request_inner(
             if let Some(device_id) = mic_device_id {
                 config.microphone.device_id = Some(device_id);
             }
-            let status = start_audio_capture(daemon, config).await?;
+            set_overlay_listening_state(daemon, ListeningState::Connecting).await;
+            let status = match start_audio_capture(daemon, config).await {
+                Ok(status) => status,
+                Err(error) => {
+                    set_overlay_listening_state(daemon, ListeningState::Failed).await;
+                    return Err(error);
+                }
+            };
+            set_overlay_listening_state(daemon, ListeningState::Listening).await;
             Ok(DaemonResponse::AudioStatus { status })
         }
         DaemonRequest::AudioStop => {
             let status = stop_audio_capture(daemon).await;
+            set_overlay_listening_state(daemon, ListeningState::Paused).await;
             let _ = refresh_overlay_balance(daemon, Some(trace_id)).await;
             Ok(DaemonResponse::AudioStatus { status })
         }
@@ -2337,6 +2347,7 @@ async fn real_audio_loop(
     let mut last_transcript_at = Instant::now();
 
     loop {
+        let mut source_jobs = Vec::with_capacity(runtime.sources.len());
         for source in &runtime.sources {
             let sequence = match source.source {
                 AudioSourceKind::System => {
@@ -2349,15 +2360,26 @@ async fn real_audio_loop(
                 }
             };
 
-            let result = capture_transcribe_audio_chunk(
-                &daemon,
-                &session_id,
-                &runtime,
-                source,
-                sequence,
-                &client,
-            )
-            .await;
+            let daemon_ref = &daemon;
+            let session_id_ref = &session_id;
+            let runtime_ref = &runtime;
+            let client_ref = &client;
+            source_jobs.push(async move {
+                let source_kind = source.source;
+                let result = capture_transcribe_audio_chunk(
+                    daemon_ref,
+                    session_id_ref,
+                    runtime_ref,
+                    source,
+                    sequence,
+                    client_ref,
+                )
+                .await;
+                (source_kind, result)
+            });
+        }
+
+        for (source_kind, result) in join_all(source_jobs).await {
             match result {
                 Ok(Some(segment)) => {
                     last_transcript_at = Instant::now();
@@ -2381,9 +2403,9 @@ async fn real_audio_loop(
                         if audio.session_id.as_deref() != Some(session_id.as_str()) {
                             return;
                         }
-                        audio.record_drop(source.source, message.clone());
+                        audio.record_drop(source_kind, message.clone());
                         if is_permission {
-                            audio.capture.permission_denied_source = Some(source.source);
+                            audio.capture.permission_denied_source = Some(source_kind);
                         }
                     }
                     if !warned_stt_error {

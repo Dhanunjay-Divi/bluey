@@ -23,6 +23,7 @@
 import AppKit
 import Darwin
 import Foundation
+import QuartzCore
 
 // MARK: - Visual system
 
@@ -1045,6 +1046,7 @@ private final class PillView: NSView {
     var dotColor: NSColor = NSColor.systemGreen {
         didSet {
             dotView.layer?.backgroundColor = dotColor.cgColor
+            dotView.layer?.shadowColor = dotColor.cgColor
             needsDisplay = true
         }
     }
@@ -1156,8 +1158,42 @@ private final class PillView: NSView {
         runButton.layer?.backgroundColor = runState.symbolColor.withAlphaComponent(
             materialAlpha(runState == .listening ? 0.18 : 0.07)).cgColor
         runButton.layer?.borderColor = runState.symbolColor.withAlphaComponent(materialAlpha(0.25)).cgColor
+        runButton.layer?.shadowColor = runState.symbolColor.cgColor
+        runButton.layer?.shadowOpacity = runState == .listening ? 0.34 : 0
+        runButton.layer?.shadowRadius = runState == .listening ? 7 : 0
+        runButton.layer?.shadowOffset = .zero
+        updateRunPulseAnimation()
         setAccessibilityLabel(runState.accessibilityLabel)
         needsLayout = true
+    }
+
+    private func updateRunPulseAnimation() {
+        let isActive = runState == .listening || runState == .connecting
+        if isActive {
+            if dotView.layer?.animation(forKey: "bluey-dot-pulse") == nil {
+                let dotPulse = CABasicAnimation(keyPath: "opacity")
+                dotPulse.fromValue = 0.45
+                dotPulse.toValue = 1.0
+                dotPulse.duration = 0.58
+                dotPulse.autoreverses = true
+                dotPulse.repeatCount = .infinity
+                dotView.layer?.add(dotPulse, forKey: "bluey-dot-pulse")
+            }
+            if runButton.layer?.animation(forKey: "bluey-run-glow") == nil {
+                let glow = CABasicAnimation(keyPath: "shadowRadius")
+                glow.fromValue = 4
+                glow.toValue = 10
+                glow.duration = 0.64
+                glow.autoreverses = true
+                glow.repeatCount = .infinity
+                runButton.layer?.add(glow, forKey: "bluey-run-glow")
+            }
+        } else {
+            dotView.layer?.removeAnimation(forKey: "bluey-dot-pulse")
+            runButton.layer?.removeAnimation(forKey: "bluey-run-glow")
+            runButton.layer?.shadowOpacity = 0
+            runButton.layer?.shadowRadius = 0
+        }
     }
 
     private func configureMiniButton(_ button: NSButton, symbol: String, fallback: String, tint: NSColor) {
@@ -2222,6 +2258,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var toastHideWorkItem: DispatchWorkItem?
     private var knowledgeIndexTimer: Timer?
     private var knowledgeIndexFrame = 0
+    private var audioPulseTimer: Timer?
+    private var audioPulseFrame = 0
     private let knowledgeIndexFrames = [
         "Indexing · ● 101",
         "Indexing · ● 010",
@@ -2817,6 +2855,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         applyOpacity(opacitySlider.doubleValue)
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    deinit {
+        audioPulseTimer?.invalidate()
+        knowledgeIndexTimer?.invalidate()
+        toastHideWorkItem?.cancel()
+    }
 
     override func layout() {
         super.layout()
@@ -3799,8 +3843,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             recordingButton.title = "Listen"
             statusLabel.stringValue = "Paused"
             composer.placeholder = "Ask anything..."
-            setTranscriptState("PAUSED", active: false)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
+            setTranscriptState("PAUSED", active: false)
         } else {
             emitSimple("recording_start_requested")
             recordingActive = false
@@ -3808,8 +3852,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             recordingButton.title = "Starting"
             statusLabel.stringValue = "Starting audio"
             composer.placeholder = "Starting audio..."
-            setTranscriptState("STARTING", active: true)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
+            setTranscriptState("STARTING", active: true)
+            seedTranscriptPreviewIfEmpty("Starting mic + system audio...")
         }
     }
 
@@ -4008,6 +4053,62 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         transcriptActivityDot.layer?.backgroundColor = (active ? BlueyTheme.green : BlueyTheme.textDim.withAlphaComponent(0.55)).cgColor
         transcriptActivityDot.layer?.shadowOpacity = active ? 0.45 : 0
         transcriptStrip.layer?.borderColor = (active ? BlueyTheme.green.withAlphaComponent(0.26) : BlueyTheme.hairline).cgColor
+        setAudioPulseActive(active)
+    }
+
+    private func setAudioPulseActive(_ active: Bool) {
+        if active {
+            if audioPulseTimer == nil {
+                audioPulseFrame = 0
+                let timer = Timer(timeInterval: 0.34, repeats: true) { [weak self] _ in
+                    guard let self else { return }
+                    self.audioPulseFrame = (self.audioPulseFrame + 1) % 4
+                    self.applyAudioPulseFrame(active: true)
+                }
+                RunLoop.main.add(timer, forMode: .common)
+                audioPulseTimer = timer
+            }
+            applyAudioPulseFrame(active: true)
+        } else {
+            audioPulseTimer?.invalidate()
+            audioPulseTimer = nil
+            audioPulseFrame = 0
+            applyAudioPulseFrame(active: false)
+        }
+    }
+
+    private func applyAudioPulseFrame(active: Bool) {
+        guard active else {
+            transcriptStrip.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.16).cgColor
+            transcriptActivityDot.layer?.shadowOpacity = 0
+            transcriptActivityDot.layer?.shadowRadius = 7
+            recordingButton.layer?.shadowOpacity = 0
+            recordingButton.layer?.shadowRadius = 0
+            return
+        }
+
+        let phases: [CGFloat] = [0.00, 0.32, 0.68, 0.32]
+        let phase = phases[audioPulseFrame % phases.count]
+        let fill = 0.13 + (0.12 * phase)
+        let border = 0.36 + (0.28 * phase)
+        transcriptStrip.layer?.backgroundColor = BlueyTheme.green.withAlphaComponent(0.030 + (0.030 * phase)).cgColor
+        transcriptStrip.layer?.borderColor = BlueyTheme.green.withAlphaComponent(border).cgColor
+        transcriptActivityDot.layer?.backgroundColor = BlueyTheme.green.cgColor
+        transcriptActivityDot.layer?.shadowColor = BlueyTheme.green.cgColor
+        transcriptActivityDot.layer?.shadowOpacity = Float(0.50 + (0.32 * phase))
+        transcriptActivityDot.layer?.shadowRadius = 7 + (5 * phase)
+        recordingButton.layer?.backgroundColor = BlueyTheme.green.withAlphaComponent(fill).cgColor
+        recordingButton.layer?.borderColor = BlueyTheme.green.withAlphaComponent(border).cgColor
+        recordingButton.layer?.shadowColor = BlueyTheme.green.cgColor
+        recordingButton.layer?.shadowOpacity = Float(0.18 + (0.22 * phase))
+        recordingButton.layer?.shadowRadius = 7 + (6 * phase)
+        recordingButton.layer?.shadowOffset = .zero
+        recordingButton.contentTintColor = BlueyTheme.green
+    }
+
+    private func seedTranscriptPreviewIfEmpty(_ text: String) {
+        guard transcriptSnippets.isEmpty else { return }
+        updateTranscriptStripText(text, scrollToEnd: false)
     }
 
     func setListeningState(_ state: PillRunState) {
@@ -4017,37 +4118,53 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             recordingButton.title = "Starting"
             statusLabel.stringValue = "Connecting"
             composer.placeholder = "Connecting audio..."
-            setTranscriptState("CONNECTING", active: true)
+            updateAudioRouteBadge("● Starting", accent: BlueyTheme.green)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
+            setTranscriptState("STARTING", active: true)
+            seedTranscriptPreviewIfEmpty("Starting mic + system audio...")
         case .listening:
             recordingActive = true
             recordingButton.title = "Stop"
             statusLabel.stringValue = "Listening"
             composer.placeholder = "Listening... type a follow-up anytime"
-            setTranscriptState("LISTENING", active: true)
+            updateAudioRouteBadge("● Listening", accent: BlueyTheme.green)
             styleControlButton(recordingButton, symbol: "stop.fill", accent: true)
+            setTranscriptState("LISTENING", active: true)
+            seedTranscriptPreviewIfEmpty("Mic + System live. Captions appear here.")
         case .paused:
             recordingActive = false
             recordingButton.title = "Listen"
             statusLabel.stringValue = "Paused"
             composer.placeholder = "Ask anything..."
-            setTranscriptState("PAUSED", active: false)
+            updateAudioRouteBadge("● Paused", accent: BlueyTheme.textDim)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
+            setTranscriptState("PAUSED", active: false)
+            seedTranscriptPreviewIfEmpty("Live captions preview")
         case .failed:
             recordingActive = false
             recordingButton.title = "Listen"
             statusLabel.stringValue = "Audio needs attention"
             composer.placeholder = "Ask anything..."
-            setTranscriptState("FAILED", active: false)
+            updateAudioRouteBadge("● Audio", accent: BlueyTheme.warning)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
+            setTranscriptState("FAILED", active: false)
         case .ready:
             recordingActive = false
             recordingButton.title = "Listen"
             statusLabel.stringValue = "Ready"
             composer.placeholder = "Ask anything..."
-            setTranscriptState("IDLE", active: false)
+            updateAudioRouteBadge("● Ready", accent: BlueyTheme.green)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
+            setTranscriptState("IDLE", active: false)
+            seedTranscriptPreviewIfEmpty("Live captions preview")
         }
+    }
+
+    private func updateAudioRouteBadge(_ text: String, accent: NSColor) {
+        routeBadge.stringValue = text
+        routeBadge.textColor = accent
+        routeBadge.layer?.borderColor = accent.withAlphaComponent(0.30).cgColor
+        routeBadge.layer?.backgroundColor = accent.withAlphaComponent(0.075).cgColor
     }
 
     private func updateRouteBadge(
@@ -4597,7 +4714,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     func appendLiveTranscript(source: String, text: String, final: Bool) {
         let body = displayTranscriptText(text)
-        guard !body.isEmpty else { return }
         let cleanSource = source
             .replacingOccurrences(of: "_", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4610,12 +4726,27 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         } else {
             label = cleanSource.isEmpty ? "Audio" : cleanSource.capitalized
         }
+        guard !body.isEmpty else {
+            setTranscriptState(recordingActive ? "\(shortAudioLabel(label)) LIVE" : (final ? "CAPTURED" : "HEARD"), active: recordingActive)
+            return
+        }
         transcriptSnippets.append("\(label): \(body)")
         if transcriptSnippets.count > 6 {
             transcriptSnippets.removeFirst(transcriptSnippets.count - 6)
         }
-        setTranscriptState(recordingActive ? "TRANSCRIBING" : (final ? "CAPTURED" : "HEARD"), active: recordingActive)
+        setTranscriptState(recordingActive ? "\(shortAudioLabel(label)) LIVE" : (final ? "CAPTURED" : "HEARD"), active: recordingActive)
         updateTranscriptStripText(transcriptSnippets.joined(separator: "   "), scrollToEnd: true)
+    }
+
+    private func shortAudioLabel(_ label: String) -> String {
+        switch label.lowercased() {
+        case "mic":
+            return "MIC"
+        case "system":
+            return "SYS"
+        default:
+            return "AUDIO"
+        }
     }
 
     private func updateTranscriptStripText(_ text: String, scrollToEnd: Bool) {
