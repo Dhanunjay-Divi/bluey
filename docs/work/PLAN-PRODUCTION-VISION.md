@@ -261,6 +261,160 @@ real output shown. "It compiles" and "tests pass" are necessary, not sufficient.
 A proof harness (`examples/` throwaway or a `bluey agent prove` command) runs
 these against the real machine on demand.
 
+## 7.6 BUGS FOUND IN LIVE UI RUN (2026-06-01) — fix later, not now
+
+First real `bluey on` + visible-overlay run. The UI renders and every IPC round
+trip works (daemon log confirms it received AgentListRequested,
+AgentDetachRequested, AgentSessionsRequested{antigravity/claude_code/copilot}).
+Bugs surfaced — logged here, NOT yet fixed:
+
+- **B-UI-1 (perf):** agent picker sits on "Finding coding agents…" ~40s before
+  populating. Discovery runs filesystem + version-probe synchronously per call.
+  Fix: cache discovery / parallelize, show partial results, or a spinner with
+  progress. Functional but bad UX.
+- **B-UI-2 (silent consent gate):** clicking an agent fires
+  `AgentSessionsRequested` but session history is consent-gated OFF by default,
+  so the daemon returns an EMPTY list with no message. UI looks like "nothing
+  happened." Fix: when `allow_agent_session_history` is off, show "Session
+  history is off — enable it to see sessions" (or a consent prompt), not silence.
+- **B-UI-3 (window drift):** the expanded panel drifted partially off the left
+  screen edge during interaction. Fix: clamp the panel to visible screen bounds
+  (the brief's `fitExpandedFrameToVisibleScreen` may not cover all cases).
+- **B-UI-4 (no live-drive confirmation):** attaching Antigravity showed
+  "ANTIGRAVITY · 8/8 tools" in the header (correct), but there's no end-to-end
+  check that a *question* then actually routes through it in the running app
+  (we proved drive separately, not through the live overlay→daemon→agent path).
+- **B-UI-5 (session titles missing / wrong):** the Antigravity session picker
+  lists ~100 rows all reading "Untitled session / 1779546050" — no real titles
+  and an identical/wrong timestamp on every row. Antigravity protobuf is
+  unreadable (known), so there's no title; the duplicated timestamp is a
+  separate bug (mtime not read per-file, or a placeholder). Fix: real titles
+  where possible, real per-session timestamps, and a meaningful label for
+  unreadable-content stores ("Antigravity session · <date>") instead of a
+  repeated "Untitled session".
+- **B-UI-6 (long list breaks the UI):** ~100 session rows overflow the drawer —
+  no scroll containment / virtualization, the list spills over the panel. Fix:
+  scrollable, bounded, virtualized list (the design said top-40 + "load more";
+  the overlay isn't enforcing it).
+- **B-UI-7 (duplicate event spam):** selecting/hovering in the broken list fired
+  `AgentConnectorsRequested{antigravity}` FOUR times in ~0.5s (daemon log,
+  ts 1831328/1831500/1831668/1831834). A re-render loop or overlapping hit
+  targets in the overflowing list. Fix: debounce + fix the list hit-testing.
+- **B-ARCH-1 (dual code paths):** the CLI drives the daemon via
+  `DaemonRequest::AgentList/AgentSessions/...` while the overlay drives it via
+  `OverlayEvent::AgentListRequested/...` — TWO parallel handler paths for the
+  same operations, which can (and did) diverge. Confirmed via instrumentation:
+  CLI `bluey agent list/sessions` returns correct data through its path, but the
+  new overlay-path logs (`sending SetAgents` etc.) didn't fire for CLI calls.
+  Backend is CORRECT on both, but they should share one core to avoid drift +
+  give unified logging. (Instrumentation now added to the overlay path;
+  CLI path next.)
+- **B-UI-9 (session-row click is dead — CONFIRMED via log):** clicking a session
+  in the picker fires NO `agent_attach_requested` event — daemon log shows 0
+  `AgentAttachRequested` across a full run where the user clicked sessions
+  repeatedly. The Swift session-row click handler is not wired to emit attach
+  (or the overflowing list's hit-targets swallow the click — see B-UI-6). This
+  is why "click a session → goes blank, nothing happens." Backend is fine: the
+  same run logged `SetAgentSessions count=40` and `SetAgentConnectors count=7`
+  for Cursor — sessions ARE delivered; the click just never asks to attach.
+  Pinpointed root cause of the user's "selected something, nothing happened."
+- **B-UI-1 FIXED (perf):** root cause was NOT discovery (5ms) or version probes —
+  it was the JSON-files reader (`json_files.rs`) reading + fully JSON-parsing
+  multi-hundred-MB VS Code chat files (observed 141 MB) just to extract a title
+  during `list`. VS Code listing alone took 24s. Fixed: skip titling files over
+  2 MiB, and cap full-read at 25 MiB with an honest "too large to load here"
+  turn. VS Code listing 24s → 0.9ms; full list now sub-second. Verified live.
+- **B-UI-9 ROOT CAUSE FOUND (not a dead handler):** clicking a session row DOES
+  fire — `quickAttachClicked` → `beginAttachFlow`, which opens the **connector
+  confirmation sheet** and emits `AgentConnectorsRequested` (matches the log's
+  4× connector requests). Attach only fires after confirming IN that sheet. So
+  "click → nothing" = the **connector sheet isn't appearing/usable** (rendered
+  off-screen or hidden under the overflowing list — see B-UI-6). The fix is the
+  sheet's visibility/layout, NOT the click wiring. Needs the visible-overlay
+  see-it-fix-it loop to fix AppKit layout reliably.
+- **B-UI-8 (no action feedback — the big one):** selecting a session produced
+  NO attach, NO ask, and NO visible feedback — the user cannot tell whether it
+  worked, failed, or hung. Every agent action (select / attach / ask / drive /
+  fix) MUST show a clear state: in-progress (spinner) → success / failure /
+  empty, with a message. Silent no-ops are unacceptable. This is the #1 UX bug.
+- Carry-overs still open from §4: P2 (full app run — now partially done), P3
+  (UI visual QA — now started), P9 (meeting question-gate), P7 (cross-platform).
+
+## 7.7 HYBRID FLOW PROOF (2026-06-01) — engine works; naming is the blocker
+
+Ran a full real-machine hybrid proof. Results:
+- **Select session → "what is this about" → grounded answer:** ✅ works (real
+  Cursor session → accurate Claude summary).
+- **Hybrid vs direct routing:** ✅ correct — Antigravity `Drive` (has gemini CLI)
+  drives direct; Cursor `ReadOnly` (no cursor-agent) → "no CLI → would install:
+  curl https://cursor.com/install" (proactive-install path).
+- **Proactive install when a GUI agent lacks its CLI:** ✅ planned correctly.
+- **MCP tools (direct):** ✅ fired, returned live data.
+
+- **B-NAME-1 (THE usability blocker):** session "titles" are unhelpful, so a
+  user can't tell what to select:
+  - Claude: shows system/boilerplate ("This session is being continued…", "You
+    are proposing a fix…") and even leaked *our own test prompts* as titles —
+    the first-message-as-title grabs system/continuation text, not the topic.
+  - Codex: shows "session rollout-" (filename prefix) — useless.
+  - Cursor: untitled ones fall back to "session <id8>" — usable but not
+    descriptive.
+  Fix: title extraction must find the first *human/topic* line (skip system,
+  tool, "continued from", and propose/apply-prompt boilerplate), truncate
+  sensibly, and fall back to project+date, then short-id — NEVER bare "Untitled"
+  or raw filename. This is the #1 thing standing between "engine works" and
+  "a user can actually use the picker."
+
+## 7.8 CLAUDE 3-ROW SPLIT + DRIVE-CONTEXT ARCHITECTURE (2026-06-01)
+
+**Built + proven (the 3-row split).** The Claude desktop app embeds its own
+Claude Code engine (bundled `claude.app` v2.1.156, newer than the standalone CLI
+2.0.42) and keeps its own per-session index under
+`~/Library/Application Support/Claude/{claude-code-sessions,local-agent-mode-sessions}/<acct>/<ws>/local_*.json`.
+Each `local_*.json` is metadata only (rich `title`, `cwd`, `completedTurns`
+count, and a `cliSessionId`); the transcript itself lives in the SHARED
+`~/.claude/projects/<enc-cwd>/<cliSessionId>.jsonl` the CLI also uses.
+- New `SessionFormat::ClaudeAppIndex` + reader (`sessions/claude_app.rs`): a
+  **two-hop** read — parse the index for the title, follow `cliSessionId` into
+  the shared JSONL (reusing `jsonl::read_transcript_file`).
+- Three registry rows / kinds: `ClaudeCode` ("Claude Code (CLI)"),
+  `ClaudeCodeApp` ("Claude Code (App)"), `ClaudeCodeAgent` ("Claude Code (Agent)").
+  All drive via the same `claude` spec (`drive/cli.rs` maps all three →
+  `KindTag::ClaudeCode`).
+- **De-dup:** the CLI row excludes any session claimed by the app rows (by
+  `cliSessionId`), so a conversation appears once — under the App row (richer
+  title). Verified live: "Bluey repository setup" shows under `claude_code_app`,
+  not `claude_code`.
+- Status: detect ✅, read/titles ✅ (15 app sessions, real titles), attach ✅,
+  de-dup ✅, tests green (156 bridge + 212 daemon), fmt+clippy clean.
+
+**DRIVE-CONTEXT decision (the resume/"too long" problem).** Driving an attached
+session via native `--resume` hit "Prompt is too long" on the 14MB/139-turn
+"Bluey repository setup" session. Root cause (proven, sourced): native
+resume/continue ALWAYS reloads the full transcript; the interactive app survives
+huge sessions via **auto-compaction**, but an *already-over-limit* session can't
+be compacted by anyone (Anthropic issues #26317, #25620) — it fails in the
+user's own terminal too. This is NOT a Bluey bug and is RARE (only pathological
+sessions; normal sessions resume fine).
+
+**The escalation ladder (agent-agnostic — Claude/Cursor/Codex/Gemini):**
+1. **Native resume first.** Run the agent's own continue/resume. Works for ~all
+   sessions (the agent loads + auto-compacts itself). This IS the product: Bluey
+   runs the agent command the user would. → answer, done.
+2. **On a "too long"-class failure, fall back to a fresh session.** Start fresh
+   in the project dir — which gives **code + CLAUDE.md + all MCP connectors for
+   free** (context lives in the repo/config, NOT mostly in the chat history; a
+   fresh session is not a blank slate). Pass the small recent thread as context.
+3. **Deepest fallback (only if even fresh+context overflows): chunked compaction
+   via the USER'S agent.** Bluey *mechanically* slices the transcript into
+   window-sized chunks (no Bluey AI), feeds each chunk to the user's own agent
+   asking IT to roll a running summary, then continues from that summary.
+
+**Hard invariant:** Bluey's own AI NEVER summarizes/processes the user's data.
+Summarizing is always done by the user's attached agent; Bluey only slices text
+and orchestrates. Chunked compaction runs ONLY when the terminal genuinely can't
+continue — never on the common path.
+
 ## 8. The honest one-liner
 
 The **passive foundation is built and proven**. The gap to your full vision is:
