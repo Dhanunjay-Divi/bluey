@@ -1529,16 +1529,17 @@ async fn billing_square_webhook_rejects_production_signature_while_checkout_is_s
     std::env::set_var("SQUARE_WEBHOOK_NOTIFICATION_URL", url);
     std::env::set_var("SQUARE_SANDBOX_ACCESS_TOKEN", "sandbox-token");
     std::env::set_var("SQUARE_SANDBOX_LOCATION_ID", "sandbox-location");
-    std::env::set_var("SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY", "sandbox-square-whsec");
-    std::env::set_var("SQUARE_PRODUCTION_WEBHOOK_SIGNATURE_KEY", "prod-square-whsec");
+    std::env::set_var(
+        "SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY",
+        "sandbox-square-whsec",
+    );
+    std::env::set_var(
+        "SQUARE_PRODUCTION_WEBHOOK_SIGNATURE_KEY",
+        "prod-square-whsec",
+    );
 
     let h = boot_harness().await;
-    let _access = signup_and_login(
-        &h,
-        "square-prod-webhook@example.com",
-        "longenoughpw",
-    )
-    .await;
+    let _access = signup_and_login(&h, "square-prod-webhook@example.com", "longenoughpw").await;
     let account_id: String = h
         .pool
         .get()

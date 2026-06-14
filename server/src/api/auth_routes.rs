@@ -268,7 +268,10 @@ pub async fn signup_confirm(
     let email = normalize_signup_email(&req.email)?;
     let otp = req.otp.trim();
     if otp.len() != 6 || !otp.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(err(StatusCode::BAD_REQUEST, "verification code must be 6 digits"));
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "verification code must be 6 digits",
+        ));
     }
 
     let (stored_hash, password_hash, expires_at, attempts): (String, String, String, i64) = {

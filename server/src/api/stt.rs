@@ -253,8 +253,8 @@ fn check_upstream_spend_guard(
     if projected_bluey_cents <= 0 {
         return Ok(());
     }
-    let current = usage::bluey_spend_cents_in_window(&state.pool, guard.window_hours)
-        .map_err(internal)?;
+    let current =
+        usage::bluey_spend_cents_in_window(&state.pool, guard.window_hours).map_err(internal)?;
     if current.saturating_add(projected_bluey_cents) > guard.limit_cents {
         tracing::warn!(
             account_id_hash = %cue_core::account_id_hash_prefix(account_id),
