@@ -5340,17 +5340,18 @@ private final class OverlayApp {
             guard
                 let self,
                 let expandedWindow = self.expandedWindow,
-                expandedWindow.isVisible,
-                let expandedView = self.expandedView
+                expandedWindow.isVisible
             else { return }
 
-            let mouse = NSEvent.mouseLocation
-            let insideWindow = expandedWindow.frame.contains(mouse)
-            let shouldAcceptMouse = insideWindow && expandedView.isInteractiveAtScreenPoint(mouse)
-            let shouldIgnoreMouse = insideWindow && !shouldAcceptMouse
-
-            if expandedWindow.ignoresMouseEvents != shouldIgnoreMouse {
-                expandedWindow.ignoresMouseEvents = shouldIgnoreMouse
+            // The expanded panel is an interactive control surface. Earlier
+            // builds tried to make non-control regions pass clicks through by
+            // flipping the whole NSWindow's ignoresMouseEvents flag from a
+            // timer. In practice that made timing-sensitive controls feel
+            // broken: a click could arrive while the entire window was still
+            // ignoring events. Keep the expanded window clickable and reserve
+            // full click-through for the collapsed pill/hidden states.
+            if expandedWindow.ignoresMouseEvents {
+                expandedWindow.ignoresMouseEvents = false
             }
         }
     }

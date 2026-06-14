@@ -32,12 +32,15 @@ use cue_core::{
     OverlaySessionItem, PrivacyFlags, ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget,
     Speaker, TranscriptSegment,
 };
-use futures_util::future::join_all;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use futures_util::{future::join_all, SinkExt, StreamExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command as TokioCommand;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 use tokio::time::{sleep, Duration};
+use tokio_tungstenite::tungstenite::{
+    client::IntoClientRequest, http::HeaderValue, Message as WebSocketMessage,
+};
 use tracing::{debug, error, info, trace, warn};
 
 use crate::storage::MeetingStore;
@@ -357,6 +360,7 @@ struct RealAudioRuntimeConfig {
 enum RealSttTransport {
     OpenAiMultipart,
     BlueyManagedRaw,
+    BlueyManagedRelay,
 }
 
 #[derive(Debug, Clone)]
@@ -1773,13 +1777,26 @@ async fn build_real_audio_runtime_config(
         )
     } else {
         match (account_token, account_api_url) {
-            (Some(token), Some(api_url)) => (
-                format!("{}/router/transcribe", api_url.trim_end_matches('/')),
-                token,
-                env_first(&["BLUEY_STT_MODEL"]).unwrap_or_else(|| "nova-3".into()),
-                "bluey-managed:deepgram/nova-3".to_string(),
-                RealSttTransport::BlueyManagedRaw,
-            ),
+            (Some(token), Some(api_url)) => {
+                let stt_model = env_first(&["BLUEY_STT_MODEL"]).unwrap_or_else(|| "nova-3".into());
+                if env_truthy_any(&["BLUEY_STT_FORCE_CHUNKED", "BLUEY_MANAGED_STT_CHUNKED"]) {
+                    (
+                        format!("{}/router/transcribe", api_url.trim_end_matches('/')),
+                        token,
+                        stt_model.clone(),
+                        format!("bluey-managed:deepgram/{stt_model} chunked"),
+                        RealSttTransport::BlueyManagedRaw,
+                    )
+                } else {
+                    (
+                        api_url.trim_end_matches('/').to_string(),
+                        token,
+                        stt_model.clone(),
+                        format!("bluey-managed:deepgram/{stt_model} live"),
+                        RealSttTransport::BlueyManagedRelay,
+                    )
+                }
+            }
             _ => {
                 return Ok(AudioRuntimeConfigResolution::Unavailable(
                     "Sign in to Bluey before using cloud speech-to-text. Local recording is ready, but Listen needs a linked account to transcribe real audio.".to_string(),
@@ -2339,6 +2356,11 @@ async fn real_audio_loop(
     runtime: RealAudioRuntimeConfig,
     mut stop_rx: oneshot::Receiver<()>,
 ) {
+    if runtime.stt_transport == RealSttTransport::BlueyManagedRelay {
+        real_audio_relay_loop(daemon, session_id, runtime, stop_rx).await;
+        return;
+    }
+
     let client = reqwest::Client::new();
     let mut system_sequence = 0_u64;
     let mut microphone_sequence = 0_u64;
@@ -2451,6 +2473,323 @@ async fn real_audio_loop(
             }
         }
     }
+}
+
+async fn real_audio_relay_loop(
+    daemon: Arc<Daemon>,
+    session_id: String,
+    runtime: RealAudioRuntimeConfig,
+    mut stop_rx: oneshot::Receiver<()>,
+) {
+    let source_count = runtime.sources.len();
+    if source_count == 0 {
+        return;
+    }
+
+    let (relay_stop_tx, relay_stop_rx) = watch::channel(false);
+    let (done_tx, mut done_rx) = mpsc::channel::<()>(source_count);
+    let idle_timeout = audio_idle_stop_timeout();
+    let last_transcript_at = Arc::new(Mutex::new(Instant::now()));
+    let mut handles = Vec::with_capacity(source_count);
+
+    for source in runtime.sources.clone() {
+        let daemon_for_source = Arc::clone(&daemon);
+        let session_id_for_source = session_id.clone();
+        let runtime_for_source = runtime.clone();
+        let mut source_stop_rx = relay_stop_rx.clone();
+        let done_tx = done_tx.clone();
+        let last_transcript_at = Arc::clone(&last_transcript_at);
+        let source_kind = source.source;
+        handles.push(tokio::spawn(async move {
+            if let Err(error) = run_relay_audio_source(
+                Arc::clone(&daemon_for_source),
+                session_id_for_source.clone(),
+                runtime_for_source,
+                source,
+                &mut source_stop_rx,
+                last_transcript_at,
+            )
+            .await
+            {
+                let message = compact_snippet(&format!("{error:#}"), 260);
+                let is_permission = crate::audio::capture::is_permission_denied_message(&message)
+                    || crate::audio::system_capture::is_system_audio_permission_denied_message(
+                        &message,
+                    );
+                {
+                    let mut audio = daemon_for_source.audio.lock().await;
+                    if audio.session_id.as_deref() == Some(session_id_for_source.as_str()) {
+                        audio.record_drop(source_kind, message.clone());
+                        if is_permission {
+                            audio.capture.permission_denied_source = Some(source_kind);
+                        }
+                    }
+                }
+                push_system_card(
+                    &daemon_for_source,
+                    CardKind::Warning,
+                    if is_permission {
+                        "Audio permission denied"
+                    } else {
+                        "Live transcription needs attention"
+                    },
+                    message,
+                )
+                .await;
+            }
+            let _ = done_tx.send(()).await;
+        }));
+    }
+    drop(done_tx);
+
+    let mut completed_sources = 0_usize;
+    loop {
+        tokio::select! {
+            _ = &mut stop_rx => {
+                let _ = relay_stop_tx.send(true);
+                break;
+            }
+            Some(()) = done_rx.recv() => {
+                completed_sources = completed_sources.saturating_add(1);
+                if completed_sources >= source_count {
+                    break;
+                }
+            }
+            _ = sleep(Duration::from_secs(1)) => {
+                if daemon.audio.lock().await.session_id.as_deref() != Some(session_id.as_str()) {
+                    let _ = relay_stop_tx.send(true);
+                    break;
+                }
+                let last_transcript_at = *last_transcript_at.lock().await;
+                if maybe_auto_stop_idle_audio(&daemon, &session_id, last_transcript_at, idle_timeout).await {
+                    let _ = relay_stop_tx.send(true);
+                    break;
+                }
+            }
+        }
+    }
+
+    let _ = relay_stop_tx.send(true);
+    for handle in handles {
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+}
+
+async fn run_relay_audio_source(
+    daemon: Arc<Daemon>,
+    session_id: String,
+    runtime: RealAudioRuntimeConfig,
+    source: RealAudioSource,
+    stop_rx: &mut watch::Receiver<bool>,
+    last_transcript_at: Arc<Mutex<Instant>>,
+) -> Result<()> {
+    let (helper_path, source_arg) = match &source.ffmpeg_input {
+        FfmpegAudioInput::NativeHelper {
+            helper_path,
+            source_arg,
+        } => (helper_path.clone(), source_arg.clone()),
+        _ => {
+            return Err(anyhow!(
+                "live STT relay requires the native audio helper for {}",
+                source.source
+            ));
+        }
+    };
+
+    let cloud = build_cloud_client(&daemon.paths, None)
+        .with_context(|| format!("failed to create Bluey cloud client for {}", source.source))?;
+    let stt_session = cloud
+        .create_stt_session(&cue_cloud_client::SttSessionRequest {
+            session_id: session_id.clone(),
+            source: source.source.default_label().to_string(),
+            provider: Some("deepgram".to_string()),
+            model: Some(runtime.stt_model.clone()),
+            requested_seconds: Some(10 * 60),
+        })
+        .await
+        .with_context(|| format!("failed to create live STT session for {}", source.source))?;
+    let access_token = cloud
+        .current_tokens()
+        .context("Bluey account token unavailable after live STT session creation")?
+        .access;
+    let websocket_url = stt_relay_websocket_url(
+        stt_session
+            .websocket_url
+            .as_deref()
+            .context("Bluey STT session did not include a websocket URL")?,
+        &stt_session.session_token,
+    )?;
+    let mut request = websocket_url.into_client_request()?;
+    request.headers_mut().insert(
+        "Authorization",
+        HeaderValue::from_str(&format!("Bearer {access_token}"))?,
+    );
+
+    let (socket, _) = tokio_tungstenite::connect_async(request)
+        .await
+        .with_context(|| format!("failed to open live STT websocket for {}", source.source))?;
+    let (mut ws_tx, mut ws_rx) = socket.split();
+
+    let mut command = TokioCommand::new(&helper_path);
+    command
+        .arg("--source")
+        .arg(&source_arg)
+        .arg("--continuous")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed to start native live audio helper for {}",
+            source.source
+        )
+    })?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("native audio helper did not expose stdout")?;
+
+    let mut sequence = 0_u64;
+    let mut start_ms = 0_u64;
+    let mut buffer = vec![0_u8; 4096];
+    loop {
+        tokio::select! {
+            changed = stop_rx.changed() => {
+                if changed.is_err() || *stop_rx.borrow() {
+                    break;
+                }
+            }
+            read = stdout.read(&mut buffer) => {
+                let read = read.with_context(|| format!("failed to read live {} audio", source.source))?;
+                if read == 0 {
+                    break;
+                }
+                sequence = sequence.saturating_add(1);
+                let duration_ms = pcm16_16k_duration_ms(read);
+                let chunk = AudioChunkMetadata::new(
+                    source.source,
+                    source.stream_id.clone(),
+                    sequence,
+                    start_ms,
+                    duration_ms,
+                    cue_core::AudioStreamFormat::stt_mono(),
+                    read as u64,
+                );
+                start_ms = start_ms.saturating_add(duration_ms as u64);
+                {
+                    let mut audio = daemon.audio.lock().await;
+                    if audio.session_id.as_deref() != Some(session_id.as_str()) {
+                        break;
+                    }
+                    audio.record_chunk(&chunk);
+                }
+                ws_tx
+                    .send(WebSocketMessage::Binary(buffer[..read].to_vec()))
+                    .await
+                    .with_context(|| format!("failed to send live {} audio to Bluey STT relay", source.source))?;
+            }
+            message = ws_rx.next() => {
+                match message {
+                    Some(Ok(WebSocketMessage::Text(payload))) => {
+                        emit_deepgram_relay_payload(
+                            &daemon,
+                            &session_id,
+                            source.source,
+                            sequence,
+                            &payload,
+                            Arc::clone(&last_transcript_at),
+                        ).await?;
+                    }
+                    Some(Ok(WebSocketMessage::Binary(payload))) => {
+                        if let Ok(payload) = std::str::from_utf8(&payload) {
+                            emit_deepgram_relay_payload(
+                                &daemon,
+                                &session_id,
+                                source.source,
+                                sequence,
+                                payload,
+                                Arc::clone(&last_transcript_at),
+                            ).await?;
+                        }
+                    }
+                    Some(Ok(WebSocketMessage::Close(_))) | None => break,
+                    Some(Ok(WebSocketMessage::Ping(_))) | Some(Ok(WebSocketMessage::Pong(_))) | Some(Ok(WebSocketMessage::Frame(_))) => {}
+                    Some(Err(error)) => {
+                        return Err(anyhow!("live STT websocket failed for {}: {error}", source.source));
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = ws_tx.send(WebSocketMessage::Close(None)).await;
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    Ok(())
+}
+
+async fn emit_deepgram_relay_payload(
+    daemon: &Arc<Daemon>,
+    session_id: &str,
+    source: AudioSourceKind,
+    sequence: u64,
+    payload: &str,
+    last_transcript_at: Arc<Mutex<Instant>>,
+) -> Result<()> {
+    let pcm_source = pcm_source_for_audio_source(source);
+    let events = crate::stt::deepgram::parse_frame(payload, pcm_source)
+        .map_err(|error| anyhow!("Deepgram relay frame parse failed: {error}"))?;
+    for event in events {
+        let Some(segment) = transcript_event_to_stt_segment(&event) else {
+            continue;
+        };
+        let segment = segment
+            .with_provider_segment_id(format!("relay-{}-{sequence}", source.default_label()))
+            .with_source_sequence_range(sequence, sequence);
+        *last_transcript_at.lock().await = Instant::now();
+        if let Err(error) = add_audio_transcript_segment(daemon, &segment).await {
+            warn!("live relay transcript emission failed: {error:#}");
+        } else if segment.is_final {
+            daemon.audio.lock().await.record_stt_segment();
+        }
+        if daemon.audio.lock().await.session_id.as_deref() != Some(session_id) {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn stt_relay_websocket_url(endpoint: &str, session_token: &str) -> Result<String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() {
+        return Err(anyhow!("empty Bluey STT relay URL"));
+    }
+    let mut url = if let Some(rest) = endpoint.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = endpoint.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        endpoint.to_string()
+    };
+    let sep = if url.contains('?') { '&' } else { '?' };
+    url.push(sep);
+    url.push_str("session_token=");
+    url.push_str(&url_component(session_token));
+    Ok(url)
+}
+
+fn pcm_source_for_audio_source(source: AudioSourceKind) -> cue_core::pcm::AudioSource {
+    match source {
+        AudioSourceKind::System => cue_core::pcm::AudioSource::System,
+        AudioSourceKind::Microphone => cue_core::pcm::AudioSource::Microphone,
+    }
+}
+
+fn pcm16_16k_duration_ms(byte_len: usize) -> u32 {
+    let samples = (byte_len / 2) as u64;
+    ((samples.saturating_mul(1_000) / 16_000)
+        .max(1)
+        .min(u32::MAX as u64)) as u32
 }
 
 async fn maybe_auto_stop_idle_audio(
@@ -3042,6 +3381,11 @@ async fn transcribe_audio_file(
                 .body(audio)
                 .send()
                 .await
+        }
+        RealSttTransport::BlueyManagedRelay => {
+            return Err(anyhow!(
+                "live STT relay cannot transcribe a saved audio chunk"
+            ));
         }
     }
     .with_context(|| format!("failed to call STT endpoint {}", runtime.stt_endpoint))?;
@@ -6204,17 +6548,19 @@ fn transcript_event_to_stt_segment(
     use cue_core::pcm::AudioSource;
     use cue_core::stt::TranscriptEvent;
     match event {
-        TranscriptEvent::Final { text, source, .. } => {
+        TranscriptEvent::Final { text, source, .. }
+        | TranscriptEvent::Partial { text, source, .. } => {
             let kind = match source {
                 AudioSource::System => AudioSourceKind::System,
                 AudioSource::Microphone => AudioSourceKind::Microphone,
             };
-            let segment = cue_core::audio::SttSegmentMetadata::new(text.clone(), 0, 0, true)
+            let is_final = matches!(event, TranscriptEvent::Final { .. });
+            let segment = cue_core::audio::SttSegmentMetadata::new(text.clone(), 0, 0, is_final)
                 .with_source(kind)
                 .with_speaker_label(kind.default_label());
             Some(segment)
         }
-        TranscriptEvent::Partial { .. } | TranscriptEvent::SpeakerLabel { .. } => None,
+        TranscriptEvent::SpeakerLabel { .. } => None,
     }
 }
 
@@ -7787,6 +8133,31 @@ mod tests {
             url_component("audio system/1 + model"),
             "audio%20system%2F1%20%2B%20model"
         );
+    }
+
+    #[test]
+    fn stt_relay_websocket_url_converts_http_and_appends_token() {
+        let url =
+            stt_relay_websocket_url("https://bluey.sh/stt/relay", "tok /1").expect("websocket URL");
+
+        assert_eq!(url, "wss://bluey.sh/stt/relay?session_token=tok%20%2F1");
+    }
+
+    #[test]
+    fn stt_relay_websocket_url_preserves_existing_query() {
+        let url = stt_relay_websocket_url("http://127.0.0.1:8787/stt/relay?debug=1", "tok")
+            .expect("websocket URL");
+
+        assert_eq!(
+            url,
+            "ws://127.0.0.1:8787/stt/relay?debug=1&session_token=tok"
+        );
+    }
+
+    #[test]
+    fn pcm16_16k_duration_ms_tracks_byte_length() {
+        assert_eq!(pcm16_16k_duration_ms(3_200), 100);
+        assert_eq!(pcm16_16k_duration_ms(0), 1);
     }
 
     #[test]
