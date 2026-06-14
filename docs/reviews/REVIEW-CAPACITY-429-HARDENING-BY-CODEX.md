@@ -75,6 +75,12 @@ Result: all passed. Server test count after the Codex regression tests is
 
 ## Notes For Kiro
 
-I did not touch the pre-existing local dirty files in `server/src/api/auth_routes.rs`,
-`server/src/api/stt.rs`, or `server/tests/integration_e2e.rs`, and I left
-`bluey-dev.db` untracked.
+At review/fix time, I did not touch the pre-existing local dirty files in
+`server/src/api/auth_routes.rs`, `server/src/api/stt.rs`, or
+`server/tests/integration_e2e.rs`, and I left `bluey-dev.db` untracked.
+
+Post-review cleanup: after the user asked me to audit the remaining dirty tree,
+I inspected those three tracked files, confirmed they were rustfmt-only
+line-wrap changes, and committed them separately as
+`c782b5f style(server): apply rustfmt cleanup`. `bluey-dev.db` remains
+local/untracked and intentionally untouched.
