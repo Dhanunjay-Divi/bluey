@@ -647,6 +647,13 @@ fn map_err(e: CloudError) -> LlmError {
         CloudError::RateLimited { retry_after_secs } => {
             LlmError::Provider(format!("rate limited; retry in {retry_after_secs}s"))
         }
+        CloudError::CapacityBusy {
+            retry_after_secs,
+            reason,
+        } => LlmError::CapacityBusy {
+            retry_after_secs,
+            reason,
+        },
         CloudError::Server { status } => LlmError::Provider(format!("server error: {status}")),
         other => LlmError::Provider(other.to_string()),
     }
@@ -891,5 +898,24 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("final billing metadata"));
+    }
+
+    #[test]
+    fn maps_capacity_busy_to_typed_llm_error() {
+        let mapped = map_err(CloudError::CapacityBusy {
+            retry_after_secs: 17,
+            reason: "provider_key_cooling_down".into(),
+        });
+
+        match mapped {
+            LlmError::CapacityBusy {
+                retry_after_secs,
+                reason,
+            } => {
+                assert_eq!(retry_after_secs, 17);
+                assert_eq!(reason, "provider_key_cooling_down");
+            }
+            other => panic!("expected CapacityBusy, got {other:?}"),
+        }
     }
 }

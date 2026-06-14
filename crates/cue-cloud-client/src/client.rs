@@ -1,11 +1,12 @@
 //! HTTPS client for `bluey-server`. Handles auth-token attachment,
-//! 401-retry-with-refresh, 402 → InsufficientBalance, 429 → RateLimited.
+//! 401-retry-with-refresh, 402 → InsufficientBalance, 429 → RateLimited,
+//! capacity-busy API errors → CapacityBusy.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use reqwest::{header, Client, Method, Response, StatusCode};
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use cue_core::{
     new_request_id, sanitize_observability_id, trace_id_from_env, BLUEY_REQUEST_ID_HEADER,
@@ -61,14 +62,22 @@ fn retry_backoff(attempt: u32) -> std::time::Duration {
 
 /// Only retry explicitly-transient conditions on idempotent GETs.
 /// Network timeout/connect errors and gateway-class 5xx + 408.
-/// NOT: Unauthorized, InsufficientBalance, RateLimited, TrialEnded, 4xx,
-/// or Server 500/501 (ambiguous — may be a persistent bug).
+/// NOT: Unauthorized, InsufficientBalance, RateLimited, CapacityBusy,
+/// TrialEnded, 4xx, or Server 500/501 (ambiguous — may be a persistent bug).
 fn is_retryable_get_error(error: &Error) -> bool {
     match error {
         Error::Network(e) => e.is_timeout() || e.is_connect(),
         Error::Server { status } => matches!(status, 502 | 503 | 504 | 408),
         _ => false,
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ApiErrorBody {
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    retry_after_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -369,16 +378,23 @@ impl CloudClient {
                 })
             }
             StatusCode::TOO_MANY_REQUESTS => {
-                let retry_after_secs = resp
-                    .headers()
-                    .get(reqwest::header::RETRY_AFTER)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(60);
-                Err(Error::RateLimited { retry_after_secs })
+                let retry_after_secs = retry_after_header(&resp);
+                let body = resp.text().await.unwrap_or_default();
+                if let Some(error) = capacity_busy_error(&body, retry_after_secs) {
+                    return Err(error);
+                }
+                Err(Error::RateLimited {
+                    retry_after_secs: retry_after_secs.unwrap_or(60),
+                })
             }
             other => {
+                let retry_after_secs = retry_after_header(&resp);
                 let body = resp.text().await.unwrap_or_default();
+                if other == StatusCode::SERVICE_UNAVAILABLE {
+                    if let Some(error) = capacity_busy_error(&body, retry_after_secs) {
+                        return Err(error);
+                    }
+                }
                 tracing::warn!(
                     status = %other,
                     body = %log_safe_response_body(&body),
@@ -473,6 +489,45 @@ impl CloudClient {
         }
         Ok(resp.json().await?)
     }
+}
+
+fn retry_after_header(resp: &Response) -> Option<u64> {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+}
+
+fn capacity_busy_error(body: &str, header_retry_after_secs: Option<u64>) -> Option<Error> {
+    let parsed: ApiErrorBody = serde_json::from_str(body).ok()?;
+    let reason = parsed.reason.unwrap_or_default();
+    if !is_capacity_busy_reason(&reason) && parsed.retry_after_secs.is_none() {
+        return None;
+    }
+    Some(Error::CapacityBusy {
+        retry_after_secs: parsed
+            .retry_after_secs
+            .or(header_retry_after_secs)
+            .unwrap_or(60)
+            .max(1),
+        reason: if reason.trim().is_empty() {
+            "capacity_busy".to_string()
+        } else {
+            reason
+        },
+    })
+}
+
+fn is_capacity_busy_reason(reason: &str) -> bool {
+    matches!(
+        reason,
+        "provider_key_cooling_down"
+            | "provider_capacity"
+            | "upstream_spend_guard"
+            | "capacity_busy"
+    ) || reason.contains("capacity")
+        || reason.contains("cooling")
 }
 
 pub(crate) fn log_safe_response_body(body: &str) -> String {
@@ -572,6 +627,10 @@ mod tests {
         assert!(!is_retryable_get_error(&Error::Unauthorized));
         assert!(!is_retryable_get_error(&Error::RateLimited {
             retry_after_secs: 5
+        }));
+        assert!(!is_retryable_get_error(&Error::CapacityBusy {
+            retry_after_secs: 5,
+            reason: "provider_key_cooling_down".into(),
         }));
         assert!(!is_retryable_get_error(&Error::TrialEnded));
         assert!(!is_retryable_get_error(&Error::Other("x".into())));
@@ -757,6 +816,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parse_or_err_429_capacity_body_maps_to_capacity_busy() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/router/complete"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "error": "Bluey is handling a burst right now; retry shortly",
+                "reason": "provider_key_cooling_down",
+                "retry_after_secs": 17
+            })))
+            .mount(&server)
+            .await;
+        let client = client_for(server.uri());
+        client
+            .save_tokens(Tokens {
+                access: "a".into(),
+                refresh: "r".into(),
+                email: "e@example.com".into(),
+            })
+            .unwrap();
+        let r: Result<serde_json::Value> = client
+            .auth_post(
+                "/router/complete",
+                &serde_json::json!({
+                    "system": "x",
+                    "user": "y",
+                    "lane": "instant",
+                }),
+            )
+            .await;
+        match r {
+            Err(Error::CapacityBusy {
+                retry_after_secs,
+                reason,
+            }) => {
+                assert_eq!(retry_after_secs, 17);
+                assert_eq!(reason, "provider_key_cooling_down");
+            }
+            other => panic!("expected CapacityBusy, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_or_err_503_capacity_body_uses_retry_after_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/router/complete"))
+            .respond_with(
+                ResponseTemplate::new(503)
+                    .insert_header("retry-after", "23")
+                    .set_body_json(serde_json::json!({
+                        "error": "Bluey is handling a burst right now; retry shortly",
+                        "reason": "upstream_spend_guard"
+                    })),
+            )
+            .mount(&server)
+            .await;
+        let client = client_for(server.uri());
+        client
+            .save_tokens(Tokens {
+                access: "a".into(),
+                refresh: "r".into(),
+                email: "e@example.com".into(),
+            })
+            .unwrap();
+        let r: Result<serde_json::Value> = client
+            .auth_post(
+                "/router/complete",
+                &serde_json::json!({
+                    "system": "x",
+                    "user": "y",
+                    "lane": "instant",
+                }),
+            )
+            .await;
+        match r {
+            Err(Error::CapacityBusy {
+                retry_after_secs,
+                reason,
+            }) => {
+                assert_eq!(retry_after_secs, 23);
+                assert_eq!(reason, "upstream_spend_guard");
+            }
+            other => panic!("expected CapacityBusy, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn auth_post_stream_returns_raw_success_body() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -825,6 +971,45 @@ mod tests {
                 assert_eq!(needed_cents, 9);
             }
             other => panic!("expected InsufficientBalance, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_post_stream_maps_capacity_busy_before_streaming() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/router/complete/stream"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "error": "Bluey is handling a burst right now; retry shortly",
+                "reason": "provider_capacity",
+                "retry_after_secs": 31
+            })))
+            .mount(&server)
+            .await;
+        let client = client_for(server.uri());
+        client
+            .save_tokens(Tokens {
+                access: "a".into(),
+                refresh: "r".into(),
+                email: "e@example.com".into(),
+            })
+            .unwrap();
+
+        let result = client
+            .auth_post_stream(
+                "/router/complete/stream",
+                &serde_json::json!({ "ok": true }),
+            )
+            .await;
+        match result {
+            Err(Error::CapacityBusy {
+                retry_after_secs,
+                reason,
+            }) => {
+                assert_eq!(retry_after_secs, 31);
+                assert_eq!(reason, "provider_capacity");
+            }
+            other => panic!("expected CapacityBusy, got {other:?}"),
         }
     }
 

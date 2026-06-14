@@ -103,6 +103,11 @@ pub enum LlmError {
     Network(String),
     #[error("provider error: {0}")]
     Provider(String),
+    #[error("capacity busy: retry after {retry_after_secs}s ({reason})")]
+    CapacityBusy {
+        retry_after_secs: u64,
+        reason: String,
+    },
     /// Terminal billing failure from a managed provider. Codex Stage 5
     /// S5.2: managed-cloud auth/quota/balance failures must NOT trigger
     /// failover to a direct OpenAI/Anthropic provider that the daemon

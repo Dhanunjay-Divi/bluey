@@ -111,6 +111,13 @@ mod tests {
                 Err(LlmError::Quota(s)) => Err(LlmError::Quota(s.clone())),
                 Err(LlmError::Network(s)) => Err(LlmError::Network(s.clone())),
                 Err(LlmError::Provider(s)) => Err(LlmError::Provider(s.clone())),
+                Err(LlmError::CapacityBusy {
+                    retry_after_secs,
+                    reason,
+                }) => Err(LlmError::CapacityBusy {
+                    retry_after_secs: *retry_after_secs,
+                    reason: reason.clone(),
+                }),
                 Err(LlmError::Billing(s)) => Err(LlmError::Billing(s.clone())),
             }
         }
@@ -204,6 +211,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_no_failover_on_capacity_busy() {
+        let router = LlmRouter::new(vec![
+            Box::new(MockProvider {
+                name: "managed",
+                result: Err(LlmError::CapacityBusy {
+                    retry_after_secs: 15,
+                    reason: "provider_key_cooling_down".into(),
+                }),
+            }),
+            Box::new(MockProvider {
+                name: "direct",
+                result: Ok(llm_response("should never be reached")),
+            }),
+        ]);
+        let err = router.complete(&test_req()).await.unwrap_err();
+        match err {
+            LlmError::CapacityBusy {
+                retry_after_secs,
+                reason,
+            } => {
+                assert_eq!(retry_after_secs, 15);
+                assert_eq!(reason, "provider_key_cooling_down");
+            }
+            other => panic!("expected CapacityBusy, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_all_fail() {
         let router = LlmRouter::new(vec![
             Box::new(MockProvider {
@@ -280,6 +315,16 @@ mod tests {
     #[tokio::test]
     async fn billing_error_terminal_helpers() {
         let e = LlmError::Billing("test".into());
+        assert!(!e.should_failover());
+        assert!(!e.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn capacity_busy_terminal_helpers() {
+        let e = LlmError::CapacityBusy {
+            retry_after_secs: 30,
+            reason: "upstream_spend_guard".into(),
+        };
         assert!(!e.should_failover());
         assert!(!e.is_retryable());
     }

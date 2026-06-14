@@ -3989,11 +3989,37 @@ fn user_facing_answer_error(error: &anyhow::Error) -> String {
     {
         return "Bluey needs provider authentication before it can answer. Check the server-side API key setup, then try again.".to_string();
     }
+    if lower.contains("capacity busy")
+        || lower.contains("provider_key_cooling_down")
+        || lower.contains("provider_capacity")
+        || lower.contains("upstream_spend_guard")
+        || lower.contains("handling a burst")
+    {
+        let hint = retry_after_hint(&raw).unwrap_or_default();
+        return format!(
+            "Capacity busy. Bluey is waiting for provider capacity to recover before trying again.{hint}"
+        );
+    }
     if lower.contains("rate limit") || lower.contains("429") || lower.contains("too many requests")
     {
         return "Bluey hit provider capacity for this lane. Try again shortly; the router will use the next healthy lane when available.".to_string();
     }
     "Bluey could not complete that answer yet. Try again, or check the server logs for the detailed provider error.".to_string()
+}
+
+fn retry_after_hint(raw: &str) -> Option<String> {
+    let lower = raw.to_ascii_lowercase();
+    let after = lower.split("retry after ").nth(1)?;
+    let digits: String = after
+        .chars()
+        .skip_while(|ch| !ch.is_ascii_digit())
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        Some(format!(" Retry in about {digits}s."))
+    }
 }
 
 fn answer_overlay_cost_label(metadata: &AnswerResponseMetadata) -> Option<String> {

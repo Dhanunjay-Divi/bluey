@@ -29,6 +29,15 @@ pub enum Error {
     #[error("rate limited (retry after {retry_after_secs}s)")]
     RateLimited { retry_after_secs: u64 },
 
+    /// Provider/account capacity is temporarily exhausted. The server includes
+    /// a retry window so desktop surfaces can show one calm status instead of
+    /// repeatedly hammering the same cooling route.
+    #[error("capacity busy (retry after {retry_after_secs}s, reason={reason})")]
+    CapacityBusy {
+        retry_after_secs: u64,
+        reason: String,
+    },
+
     /// Trial ended (server returns 402 with reason="trial_ended").
     #[error("trial ended; first $30 reload required")]
     TrialEnded,
