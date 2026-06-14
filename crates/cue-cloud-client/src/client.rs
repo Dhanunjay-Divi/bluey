@@ -23,6 +23,54 @@ use crate::{
 };
 
 /// Configuration for the cloud client.
+/// Default max retries for idempotent GETs (total attempts = 1 + this).
+/// Override with BLUEY_CLOUD_GET_RETRIES.
+const DEFAULT_GET_RETRY_MAX: u32 = 2;
+/// Base backoff in milliseconds; doubles each attempt plus jitter.
+/// Override with BLUEY_CLOUD_RETRY_BASE_MS.
+const DEFAULT_RETRY_BASE_MS: u64 = 120;
+
+fn get_retry_max() -> u32 {
+    std::env::var("BLUEY_CLOUD_GET_RETRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_GET_RETRY_MAX)
+}
+
+fn retry_base_ms() -> u64 {
+    std::env::var("BLUEY_CLOUD_RETRY_BASE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(DEFAULT_RETRY_BASE_MS)
+}
+
+/// Exponential backoff with bounded jitter. attempt 0 -> ~base, 1 -> ~2x base.
+fn retry_backoff(attempt: u32) -> std::time::Duration {
+    let base = retry_base_ms();
+    let exp = base.saturating_mul(1u64 << attempt.min(4));
+    // Cheap dependency-free jitter in [0, base/2): derived from the
+    // monotonic-ish system nanos. Jitter only spreads retries; it does not
+    // need to be cryptographic.
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() as u64) % (base / 2 + 1))
+        .unwrap_or(0);
+    std::time::Duration::from_millis(exp.saturating_add(jitter))
+}
+
+/// Only retry explicitly-transient conditions on idempotent GETs.
+/// Network timeout/connect errors and gateway-class 5xx + 408.
+/// NOT: Unauthorized, InsufficientBalance, RateLimited, TrialEnded, 4xx,
+/// or Server 500/501 (ambiguous — may be a persistent bug).
+fn is_retryable_get_error(error: &Error) -> bool {
+    match error {
+        Error::Network(e) => e.is_timeout() || e.is_connect(),
+        Error::Server { status } => matches!(status, 502 | 503 | 504 | 408),
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     pub base_url: String,
@@ -130,8 +178,24 @@ impl CloudClient {
     }
 
     /// Authenticated GET. Auto-refresh on 401.
+    /// Authenticated GET with bounded retry-with-backoff on transient
+    /// failures. GETs are idempotent by HTTP semantics, so retrying a
+    /// balance/usage/session poll that hit a network blip or a 502/503/504
+    /// is safe and removes spurious failures + balance flicker. Auth (401)
+    /// refresh, 402, 429, and all 4xx are NOT retried here.
     pub async fn auth_get<Resp: DeserializeOwned>(&self, path: &str) -> Result<Resp> {
-        self.auth_request(Method::GET, path, None::<&()>).await
+        let max = get_retry_max();
+        let mut attempt: u32 = 0;
+        loop {
+            match self.auth_request(Method::GET, path, None::<&()>).await {
+                Ok(value) => return Ok(value),
+                Err(error) if attempt < max && is_retryable_get_error(&error) => {
+                    tokio::time::sleep(retry_backoff(attempt)).await;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Authenticated POST. Auto-refresh on 401.
@@ -341,7 +405,24 @@ impl CloudClient {
     /// (e.g. /pricing/tiers, /admin/health). No Authorization header
     /// attached. Suitable for endpoints in the bluey-server public
     /// router gate.
+    /// Unauthenticated GET with the same bounded transient retry as
+    /// `auth_get` (idempotent, safe to retry on network/gateway blips).
     pub async fn public_get<Resp: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Resp> {
+        let max = get_retry_max();
+        let mut attempt: u32 = 0;
+        loop {
+            match self.public_get_once(path).await {
+                Ok(value) => return Ok(value),
+                Err(error) if attempt < max && is_retryable_get_error(&error) => {
+                    tokio::time::sleep(retry_backoff(attempt)).await;
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn public_get_once<Resp: serde::de::DeserializeOwned>(&self, path: &str) -> Result<Resp> {
         let resp = self.request_builder(Method::GET, path).send().await?;
         let status = resp.status();
         if !status.is_success() {
@@ -470,6 +551,81 @@ mod tests {
         };
         let store = Arc::new(MemoryStore::new());
         CloudClient::new(config, store).unwrap()
+    }
+
+    #[test]
+    fn is_retryable_get_error_classifies_transient_only() {
+        // Gateway-class 5xx + 408 are transient -> retry.
+        for status in [502u16, 503, 504, 408] {
+            assert!(
+                is_retryable_get_error(&Error::Server { status }),
+                "status {status} should be retryable"
+            );
+        }
+        // Ambiguous / client / auth / billing errors are NOT retried.
+        for status in [400u16, 401, 403, 404, 409, 422, 500, 501] {
+            assert!(
+                !is_retryable_get_error(&Error::Server { status }),
+                "status {status} must not be retryable"
+            );
+        }
+        assert!(!is_retryable_get_error(&Error::Unauthorized));
+        assert!(!is_retryable_get_error(&Error::RateLimited {
+            retry_after_secs: 5
+        }));
+        assert!(!is_retryable_get_error(&Error::TrialEnded));
+        assert!(!is_retryable_get_error(&Error::Other("x".into())));
+    }
+
+    #[test]
+    fn retry_backoff_increases_and_is_bounded() {
+        let base = retry_base_ms();
+        let d0 = retry_backoff(0).as_millis() as u64;
+        let d1 = retry_backoff(1).as_millis() as u64;
+        // attempt 0 >= base; attempt 1 >= 2x base (jitter only adds).
+        assert!(d0 >= base, "d0={d0} base={base}");
+        assert!(d1 >= base * 2, "d1={d1} base={base}");
+        // Bounded: jitter is < base/2 above the exponential term.
+        assert!(d0 < base * 2, "d0={d0} should stay under 2x base");
+    }
+
+    #[tokio::test]
+    async fn public_get_retries_persistent_transient_then_gives_up() {
+        std::env::set_var("BLUEY_CLOUD_RETRY_BASE_MS", "1");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pricing/tiers"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let client = client_for(server.uri());
+        let result: Result<serde_json::Value> = client.public_get("/pricing/tiers").await;
+        std::env::remove_var("BLUEY_CLOUD_RETRY_BASE_MS");
+
+        assert!(matches!(result, Err(Error::Server { status: 503 })));
+        // 1 initial attempt + DEFAULT_GET_RETRY_MAX retries.
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(
+            received.len(),
+            (1 + DEFAULT_GET_RETRY_MAX) as usize,
+            "persistent 503 should be retried up to the bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_get_does_not_retry_client_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pricing/tiers"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let client = client_for(server.uri());
+        let result: Result<serde_json::Value> = client.public_get("/pricing/tiers").await;
+
+        assert!(matches!(result, Err(Error::Server { status: 404 })));
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1, "4xx must not be retried");
     }
 
     #[tokio::test]
