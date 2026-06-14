@@ -492,6 +492,14 @@ fn openai_token_limit_fields(model: &str, max_tokens: Option<u32>) -> (Option<u3
     }
 }
 
+fn openai_effective_token_limit_fields(
+    model: &str,
+    max_tokens: Option<u32>,
+    thinking: ThinkingBudget,
+) -> (Option<u32>, Option<u32>) {
+    openai_token_limit_fields(model, Some(effective_max_output_tokens(max_tokens, thinking)))
+}
+
 #[derive(Serialize)]
 struct OpenAiMessage<'a> {
     role: &'static str,
@@ -549,12 +557,13 @@ async fn openai_complete(
     user: &str,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
-    _thinking: ThinkingBudget,
+    thinking: ThinkingBudget,
     fallback_input_tokens: Option<i64>,
     image_data_urls: &[String],
 ) -> Result<Completion> {
     let user_content = openai_user_content(user, image_data_urls);
-    let (max_tokens, max_completion_tokens) = openai_token_limit_fields(model, max_tokens);
+    let (max_tokens, max_completion_tokens) =
+        openai_effective_token_limit_fields(model, max_tokens, thinking);
     let req = OpenAiChatReq {
         model,
         messages: vec![
@@ -645,12 +654,13 @@ async fn openai_complete_stream(
     user: &str,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
-    _thinking: ThinkingBudget,
+    thinking: ThinkingBudget,
     _fallback_input_tokens: Option<i64>,
     image_data_urls: &[String],
 ) -> Result<StreamingCompletion> {
     let user_content = openai_user_content(user, image_data_urls);
-    let (max_tokens, max_completion_tokens) = openai_token_limit_fields(model, max_tokens);
+    let (max_tokens, max_completion_tokens) =
+        openai_effective_token_limit_fields(model, max_tokens, thinking);
     let req = OpenAiChatReq {
         model,
         messages: vec![
@@ -1678,6 +1688,33 @@ mod tests {
         std::env::set_var("BLUEY_MAX_OUTPUT_TOKENS", "4096");
         assert_eq!(effective_max_output_tokens(Some(8000), off), 4096);
         std::env::remove_var("BLUEY_MAX_OUTPUT_TOKENS");
+    }
+
+    #[test]
+    fn openai_limit_fields_use_effective_output_budget() {
+        std::env::remove_var("BLUEY_MAX_OUTPUT_TOKENS");
+        let off = ThinkingBudget::off();
+
+        let (max_tokens, max_completion_tokens) =
+            openai_effective_token_limit_fields("gpt-5.4-mini", Some(8000), off);
+        assert_eq!(max_tokens, None);
+        assert_eq!(max_completion_tokens, Some(DEFAULT_MAX_OUTPUT_TOKENS));
+
+        let (max_tokens, max_completion_tokens) =
+            openai_effective_token_limit_fields("gpt-4o", Some(8000), off);
+        assert_eq!(max_tokens, Some(DEFAULT_MAX_OUTPUT_TOKENS));
+        assert_eq!(max_completion_tokens, None);
+    }
+
+    #[test]
+    fn openai_thinking_lanes_keep_larger_output_budget() {
+        std::env::remove_var("BLUEY_MAX_OUTPUT_TOKENS");
+        let budget = resolve_thinking_budget("deep", None, None);
+
+        let (max_tokens, max_completion_tokens) =
+            openai_effective_token_limit_fields("gpt-5.4", None, budget);
+        assert_eq!(max_tokens, None);
+        assert_eq!(max_completion_tokens, Some(5120));
     }
 
     #[test]
