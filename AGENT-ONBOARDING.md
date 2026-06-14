@@ -81,7 +81,9 @@ For a new round:
 1. Read the current handoff docs.
 2. Inspect current `git status` and recent commits.
 3. Implement a coherent slice.
-4. Add or update docs under `docs/rounds/` or `docs/reviews/`.
+4. Add the mandatory round docs: implementation/handoff in `docs/rounds/`
+   and review verdict in `docs/reviews/` once reviewed. Add an ack/close doc
+   when blockers, follow-ups, or self-merge close-out need durable tracking.
 5. Run verification.
 6. Commit with a conventional commit message.
 7. Tell the next agent exactly what to read and what to do next.

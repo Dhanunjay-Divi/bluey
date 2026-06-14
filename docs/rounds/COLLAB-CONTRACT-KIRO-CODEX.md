@@ -32,13 +32,16 @@ A *round* is a coherent batch that ships together. Examples:
 - Phase 4 of the Observability plan (`bluey doctor` + `bluey logs export --redact`) — needs a round
 - A 5-line typo fix — does NOT need a round
 
-When the change is round-shaped, follow the three-doc pattern:
+When the change is round-shaped, docs are mandatory. The implementer must
+write an implementation/handoff doc and the reviewer must write a review
+verdict doc. The ack/close doc is mandatory when the review returns blockers,
+follow-ups, or when a self-merge needs a durable close note.
 
 | Doc | Author | Path |
 |---|---|---|
-| Round handoff | Implementer | `docs/rounds/<TOPIC>-FOR-<REVIEWER>-REVIEW.md` |
+| Implementation / round handoff | Implementer | `docs/rounds/<TOPIC>-FOR-<REVIEWER>-REVIEW.md` |
 | Review verdict | Reviewer | `docs/reviews/REVIEW-<TOPIC>-BY-<REVIEWER>.md` |
-| Ack/close | Implementer | `docs/rounds/<TOPIC>-ACK.md` (only if blockers/nits required followup) |
+| Ack/close | Implementer | `docs/rounds/<TOPIC>-ACK.md` |
 
 Otherwise, a `feat(...)` / `fix(...)` commit with a clear body is enough.
 
@@ -208,7 +211,7 @@ This contract lives at `docs/rounds/COLLAB-CONTRACT-KIRO-CODEX.md`. Updates requ
 ## 14. TL;DR
 
 - Round, not commit, is the unit of review.
-- Three-doc pattern: handoff → verdict → ack.
+- Mandatory round docs: implementation/handoff → review verdict → ack when follow-up or close-out is needed.
 - Pipeline gate every commit. No exceptions.
 - Reviewer can self-implement small blockers; hands back larger ones.
 - Working-tree contract: whoever has uncommitted changes owns the tree.
