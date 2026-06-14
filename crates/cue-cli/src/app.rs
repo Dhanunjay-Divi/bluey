@@ -512,6 +512,17 @@ struct ProveArgs {
     /// stored credential; without one they are skipped, not failed).
     #[arg(long)]
     cloud: bool,
+    /// Run the full 5-STEP VALIDATION MATRIX (Detect · Sessions · Title · Ask ·
+    /// MCP) for one category of agents, SEQUENTIALLY. This is the "is it all
+    /// working?" scorecard. The Ask and MCP steps each spend real model quota on
+    /// your account, one agent at a time. Use `--category` to choose which set.
+    #[arg(long)]
+    matrix: bool,
+    /// Which agent category the `--matrix` scorecard runs: `cli` (local CLI
+    /// binaries), `gui` (the Claude desktop-app modes / GUI-bundle agents), or
+    /// `cloud` (cloud-hosted vendor rows). Defaults to `cli`.
+    #[arg(long, default_value = "cli")]
+    category: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -2267,6 +2278,30 @@ question and spends real model quota.\n"
                     "{}",
                     cue_agent_bridge::prove_drive::render_report(&drive_proofs)
                 );
+            }
+
+            // Opt-in FULL 5-STEP MATRIX scorecard for one category, run
+            // sequentially (one agent fully before the next). The Ask + MCP
+            // steps spend real model quota.
+            if args.matrix {
+                use cue_agent_bridge::prove_drive::{
+                    render_scorecard, validate_category, AgentCategory,
+                };
+                let category = AgentCategory::parse(&args.category).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "unknown --category {:?} (expected one of: cli, gui, cloud)",
+                        args.category
+                    )
+                })?;
+                println!();
+                eprintln!(
+                    "Running the 5-STEP VALIDATION MATRIX for the {} category — \
+this drives each agent SEQUENTIALLY and spends real model quota on the Ask \
+and MCP steps.\n",
+                    category.label()
+                );
+                let cards = validate_category(category).await;
+                print!("{}", render_scorecard(&cards));
             }
             Ok(())
         }

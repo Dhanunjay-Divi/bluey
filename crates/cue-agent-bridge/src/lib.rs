@@ -25,6 +25,7 @@ pub mod connectors;
 pub mod discover;
 pub mod drive;
 pub mod fix;
+pub mod mcp_probe;
 pub mod model_resolve;
 pub mod prove;
 pub mod prove_drive;
@@ -32,6 +33,7 @@ pub mod provision;
 pub mod registry;
 pub mod runtime_resolve;
 pub mod sessions;
+pub mod titler;
 
 pub use capability::compute_capability;
 pub use connectors::read_connectors;
