@@ -289,6 +289,23 @@ fn release_and_upstream_spend_guard_check(
     None
 }
 
+/// First-token deadline for managed streaming. A provider that accepts the
+/// request (2xx) but produces no first event within this budget is treated
+/// as a stalled candidate and the router falls back to the next route
+/// instead of hanging. An in-band error frame or an empty stream still
+/// counts as a response and is surfaced through the normal consume path.
+/// Override with BLUEY_STREAM_FIRST_TOKEN_TIMEOUT_MS.
+const DEFAULT_FIRST_TOKEN_TIMEOUT_MS: u64 = 6_000;
+
+fn first_token_deadline() -> std::time::Duration {
+    let ms = std::env::var("BLUEY_STREAM_FIRST_TOKEN_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(DEFAULT_FIRST_TOKEN_TIMEOUT_MS);
+    std::time::Duration::from_millis(ms)
+}
+
 fn missing_provider_key_error(provider: &str) -> anyhow::Error {
     anyhow::anyhow!("{provider} API key pool is not configured on bluey-server")
 }
@@ -751,6 +768,8 @@ async fn complete_stream_inner(
     let mut selected_route_idx = 0usize;
     let mut selected_route: Option<PricedRoute> = None;
     let mut selected_stream: Option<routing::StreamingCompletion> = None;
+    let mut selected_first_event: Option<anyhow::Result<routing::CompletionStreamEvent>> =
+        None;
 
     for (idx, route) in routes.iter().enumerate() {
         let key_candidates = state.config.upstream.key_candidates(
@@ -820,23 +839,58 @@ async fn complete_stream_inner(
             .await
             {
                 Ok(streaming) => {
-                    selected_route_idx = idx;
-                    selected_route = Some(*route);
-                    tracing::info!(
-                        account_id_hash = %account_id_hash,
-                        request_id = %req.request_id,
-                        session_id = %session_id_log,
-                        lane = %lane_log,
-                        effective_lane = %effective_lane_log,
-                        provider = %route.provider,
-                        model = %route.model,
-                        route_index = idx,
-                        was_fallback = idx > 0,
-                        streaming = true,
-                        "managed chat route selected"
-                    );
-                    selected_stream = Some(streaming);
-                    break;
+                    // B2: a 2xx connection is not yet a usable stream. Wait for
+                    // the first event under a deadline. Any response (delta,
+                    // terminal Done, in-band error, or empty stream) commits
+                    // this route and is replayed through the consume loop
+                    // unchanged. Only a stall (no event within the deadline)
+                    // falls back to the next route instead of hanging.
+                    let routing::StreamingCompletion {
+                        provider: stream_provider,
+                        model: stream_model,
+                        events: mut stream_events,
+                    } = streaming;
+                    match tokio::time::timeout(first_token_deadline(), stream_events.next())
+                        .await
+                    {
+                        Ok(first_event) => {
+                            selected_route_idx = idx;
+                            selected_route = Some(*route);
+                            tracing::info!(
+                                account_id_hash = %account_id_hash,
+                                request_id = %req.request_id,
+                                session_id = %session_id_log,
+                                lane = %lane_log,
+                                effective_lane = %effective_lane_log,
+                                provider = %route.provider,
+                                model = %route.model,
+                                route_index = idx,
+                                was_fallback = idx > 0,
+                                streaming = true,
+                                "managed chat route selected"
+                            );
+                            selected_first_event = first_event;
+                            selected_stream = Some(routing::StreamingCompletion {
+                                provider: stream_provider,
+                                model: stream_model,
+                                events: stream_events,
+                            });
+                            break;
+                        }
+                        Err(_elapsed) => {
+                            tracing::warn!(
+                                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                                request_id = %req.request_id,
+                                provider = %route.provider,
+                                model = %route.model,
+                                first_token_timeout_ms = first_token_deadline().as_millis() as u64,
+                                "streaming first-token deadline exceeded; trying next route"
+                            );
+                            last_error = Some(anyhow::anyhow!("first-token deadline exceeded"));
+                            last_failure_was_capacity = false;
+                            break;
+                        }
+                    }
                 }
                 Err(e) => {
                     if let Some(retry_after_secs) = routing::upstream_retry_after(&e) {
@@ -921,11 +975,19 @@ async fn complete_stream_inner(
     let event_stream = async_stream::stream! {
         let mut idempotency_guard = idempotency_guard;
         let mut events = streaming.events;
+        let mut pending_first = selected_first_event;
         let mut text = String::new();
         let mut final_tokens: Option<(i64, i64)> = None;
         let mut delivered_delta = false;
 
-        while let Some(event) = events.next().await {
+        loop {
+            // B2: replay the event prefetched during the first-token deadline
+            // check before resuming the live stream.
+            let event = match pending_first.take() {
+                Some(first) => Some(first),
+                None => events.next().await,
+            };
+            let Some(event) = event else { break };
             match event {
                 Ok(routing::CompletionStreamEvent::Delta(delta)) => {
                     text.push_str(&delta);
@@ -2772,6 +2834,29 @@ mod tests {
         crate::db::accounts::Account::create(pool, email, "stub")
             .unwrap()
             .id
+    }
+
+    #[test]
+    fn first_token_deadline_default_and_override() {
+        std::env::remove_var("BLUEY_STREAM_FIRST_TOKEN_TIMEOUT_MS");
+        assert_eq!(
+            first_token_deadline(),
+            std::time::Duration::from_millis(DEFAULT_FIRST_TOKEN_TIMEOUT_MS)
+        );
+        std::env::set_var("BLUEY_STREAM_FIRST_TOKEN_TIMEOUT_MS", "250");
+        assert_eq!(first_token_deadline(), std::time::Duration::from_millis(250));
+        // Zero / invalid falls back to the default.
+        std::env::set_var("BLUEY_STREAM_FIRST_TOKEN_TIMEOUT_MS", "0");
+        assert_eq!(
+            first_token_deadline(),
+            std::time::Duration::from_millis(DEFAULT_FIRST_TOKEN_TIMEOUT_MS)
+        );
+        std::env::set_var("BLUEY_STREAM_FIRST_TOKEN_TIMEOUT_MS", "notnum");
+        assert_eq!(
+            first_token_deadline(),
+            std::time::Duration::from_millis(DEFAULT_FIRST_TOKEN_TIMEOUT_MS)
+        );
+        std::env::remove_var("BLUEY_STREAM_FIRST_TOKEN_TIMEOUT_MS");
     }
 
     #[test]
