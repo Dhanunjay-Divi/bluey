@@ -118,6 +118,8 @@ private final class ComposerTextView: NSTextView {
     var onSubmit: (() -> Void)?
     var onMeasuredHeight: ((CGFloat) -> Void)?
 
+    override var acceptsFirstResponder: Bool { true }
+
     override init(frame frameRect: NSRect, textContainer container: NSTextContainer?) {
         super.init(frame: frameRect, textContainer: container)
         drawsBackground = false
@@ -165,15 +167,23 @@ private final class ComposerTextView: NSTextView {
     }
 
     override func keyDown(with event: NSEvent) {
-        let isReturn = event.keyCode == 36 || event.keyCode == 76
-        let wantsNewline = event.modifierFlags.contains(.shift)
-            || event.modifierFlags.contains(.option)
-            || event.modifierFlags.contains(.control)
-        if isReturn && !wantsNewline {
-            onSubmit?()
+        let chars = event.charactersIgnoringModifiers ?? ""
+        let isReturn = event.keyCode == 36 || event.keyCode == 76 || chars == "\r" || chars == "\n"
+        if isReturn {
+            if event.modifierFlags.contains(.shift) {
+                insertNewline(nil)
+            } else {
+                onSubmit?()
+            }
             return
         }
         super.keyDown(with: event)
+    }
+
+    // Clicking the text view must make it first responder so keystrokes land.
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        super.mouseDown(with: event)
     }
 
     func clearText() {
@@ -193,6 +203,21 @@ private final class ComposerTextView: NSTextView {
         let used = manager.usedRect(for: container)
         let measured = ceil(used.height + textContainerInset.height * 2 + 6)
         onMeasuredHeight?(measured)
+    }
+}
+
+/// The rounded background behind the composer. Clicking anywhere on it (not just
+/// the text glyphs) focuses the composer, so the whole bar reads as one input.
+private final class ComposerSurfaceView: NSView {
+    weak var composer: ComposerTextView?
+
+    override var acceptsFirstResponder: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        if let composer {
+            window?.makeFirstResponder(composer)
+        }
+        super.mouseDown(with: event)
     }
 }
 
@@ -2228,7 +2253,7 @@ private final class ExpandedPanelView: NSView {
         attachmentStrip = NSScrollView()
         attachmentStack = NSStackView()
         composerBar = NSView()
-        composerSurface = NSView()
+        composerSurface = ComposerSurfaceView()
         composer = ComposerTextView(frame: .zero, textContainer: nil)
         recordingButton = NSButton(title: "Listen", target: nil, action: nil)
         askButton = NSButton(title: "", target: nil, action: nil)
@@ -2787,6 +2812,8 @@ private final class ExpandedPanelView: NSView {
         opacitySlider.action = #selector(opacityChanged)
         composer.onSubmit = { [weak self] in self?.askClicked() }
         composer.onMeasuredHeight = { [weak self] height in self?.setComposerTextHeight(height) }
+        // Clicking the rounded surface (not just the glyphs) focuses the composer.
+        (composerSurface as? ComposerSurfaceView)?.composer = composer
         recordingButton.target = self
         recordingButton.action = #selector(recordingClicked)
         askButton.target = self
