@@ -160,9 +160,22 @@ pub const COMMAND_MAP: &[DriveSpec] = &[
         // `--output-format json` emits a single result object we parse with
         // `CursorJson`. DOC-CONFIRMED
         // (https://cursor.com/docs/cli/reference/output-format). NOTE: `-p` has
-        // access to write/shell tools; we deliberately omit `--force`, so in
-        // Answer/Propose mode Cursor proposes rather than applies edits.
-        oneshot_args: &["-p", "{prompt}", "--output-format", "json"],
+        // access to write/shell tools; we deliberately omit `--force`/`--yolo`,
+        // so in Answer/Propose mode Cursor proposes rather than applies edits.
+        //
+        // `--trust` grants WORKSPACE trust ("Trust the current workspace without
+        // prompting", per `cursor-agent --help`) — without it, `-p` in an
+        // untrusted directory stalls on the interactive "Workspace Trust
+        // Required" gate and never answers. It is SEPARATE from command/write
+        // approval: that is `-f/--force` ("Force allow commands unless explicitly
+        // denied") and its alias `--yolo` ("Run Everything"), which live ONLY in
+        // the apply profile (`fix.apply_args`). So `--trust` lets a read-only
+        // Answer proceed headless WITHOUT enabling auto-write/apply. VERIFIED
+        // LIVE: `cursor-agent --trust -p "reply with exactly: OK"
+        // --output-format json` answered "OK" in an untrusted repo dir
+        // (is_error:false, no edits applied); `--help` confirms `--trust` is
+        // workspace-trust, distinct from `-f/--force`/`--yolo`.
+        oneshot_args: &["-p", "{prompt}", "--trust", "--output-format", "json"],
         // Resume uses the `--resume=<id>` equals form (the documented
         // `--continue` is an alias for `--resume=-1`, confirming the equals
         // syntax). DOC-CONFIRMED
@@ -1098,6 +1111,28 @@ mod tests {
             .expect("output-format flag present");
         assert_eq!(args[i + 1], "json");
         assert_eq!(spec.parser, OutputParser::CursorJson);
+    }
+
+    #[test]
+    fn test_build_argv_cursor_carries_workspace_trust_not_write_flags() {
+        // REGRESSION (found by the real drive proof): without `--trust`,
+        // `cursor-agent -p` in an untrusted directory stalls on the interactive
+        // "Workspace Trust Required" gate and an Answer never returns. So the
+        // one-shot base must carry `--trust` (workspace trust). VERIFIED LIVE
+        // that this answers headless.
+        let spec = spec(KindTag::Cursor);
+        let q = Question::new("hi");
+        let (_, args) = build_argv(spec, &q);
+        assert!(
+            args.iter().any(|a| a == "--trust"),
+            "Cursor one-shot must carry --trust to answer headless, got {args:?}"
+        );
+        // SAFETY: `--trust` is workspace trust only. The write/command-approval
+        // flags (`-f`/`--force`/`--yolo`) must NOT be in the base argv — they
+        // belong solely to the apply profile, so a read-only Answer cannot write.
+        assert!(!args.iter().any(|a| a == "--force"));
+        assert!(!args.iter().any(|a| a == "-f"));
+        assert!(!args.iter().any(|a| a == "--yolo"));
     }
 
     #[test]

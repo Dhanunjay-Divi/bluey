@@ -319,6 +319,12 @@ fn turn_from_value(value: &Value) -> Option<Turn> {
         // Antigravity brain-transcript dialect: USER_INPUT / MODEL_* / etc.
         s if s.eq_ignore_ascii_case("user_input") => Role::User,
         s if s.starts_with("MODEL") || s.starts_with("ASSISTANT") => Role::Assistant,
+        // GitHub Copilot CLI dialect: dotted event types like "user.message" /
+        // "assistant.message". Match on the segment before the dot so the
+        // shared reader recognizes Copilot turns instead of dropping them to
+        // Role::Other (which left Copilot sessions untitleable).
+        s if s.split('.').next() == Some("user") => Role::User,
+        s if s.split('.').next() == Some("assistant") => Role::Assistant,
         _ => Role::Other,
     };
 
