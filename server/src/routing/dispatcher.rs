@@ -180,11 +180,29 @@ pub fn resolve_thinking_budget(
 
 /// Max output token budget used for entry cost checks. Reasoning tokens count
 /// against provider output budgets, so deep thinking must reserve room.
+/// Non-thinking output-token ceiling. Bounds per-request TPM reservation
+/// (fewer provider 429s under a token/min limit) and worst-case per-request
+/// cost. Thinking/deep lanes are exempt because their budget legitimately
+/// needs the room. Override with BLUEY_MAX_OUTPUT_TOKENS.
+const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 2048;
+
+fn non_thinking_output_ceiling() -> u32 {
+    std::env::var("BLUEY_MAX_OUTPUT_TOKENS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|t| *t >= 256)
+        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+}
+
 pub fn effective_max_output_tokens(requested: Option<u32>, thinking: ThinkingBudget) -> u32 {
     let base = requested.unwrap_or(2048).max(256);
     match (thinking.is_enabled(), thinking.max_tokens) {
+        // Thinking/deep lanes keep their (larger) computed budget.
         (true, Some(tokens)) => base.max(tokens.saturating_add(1024)),
-        _ => base,
+        (true, None) => base,
+        // Non-thinking lanes (instant/balanced): clamp to the ceiling so a
+        // client cannot reserve an unbounded output budget.
+        (false, _) => base.min(non_thinking_output_ceiling()),
     }
 }
 
@@ -1641,6 +1659,25 @@ mod tests {
         assert_eq!(budget.mode, ThinkingMode::High);
         assert_eq!(budget.max_tokens, Some(9000));
         assert_eq!(effective_max_output_tokens(Some(2048), budget), 10024);
+    }
+
+    #[test]
+    fn non_thinking_output_is_clamped_to_ceiling() {
+        std::env::remove_var("BLUEY_MAX_OUTPUT_TOKENS");
+        let off = ThinkingBudget::off();
+        // A large non-thinking request is clamped to the default ceiling.
+        assert_eq!(
+            effective_max_output_tokens(Some(8000), off),
+            DEFAULT_MAX_OUTPUT_TOKENS
+        );
+        // A small request is honored as-is.
+        assert_eq!(effective_max_output_tokens(Some(256), off), 256);
+        // Default (None) stays at the existing 2048 baseline.
+        assert_eq!(effective_max_output_tokens(None, off), 2048);
+        // Env override raises the ceiling.
+        std::env::set_var("BLUEY_MAX_OUTPUT_TOKENS", "4096");
+        assert_eq!(effective_max_output_tokens(Some(8000), off), 4096);
+        std::env::remove_var("BLUEY_MAX_OUTPUT_TOKENS");
     }
 
     #[test]
