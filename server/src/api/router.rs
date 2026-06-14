@@ -86,8 +86,12 @@ impl StreamingIdempotencyGuard {
     }
 
     fn mark_complete_now(&mut self, response_json: &str) -> anyhow::Result<()> {
-        let result =
-            idempotency::mark_complete(&self.pool, &self.account_id, &self.request_id, response_json);
+        let result = idempotency::mark_complete(
+            &self.pool,
+            &self.account_id,
+            &self.request_id,
+            response_json,
+        );
         self.drop_action = StreamingDropAction::None;
         result
     }
@@ -103,7 +107,8 @@ impl Drop for StreamingIdempotencyGuard {
     fn drop(&mut self) {
         match self.drop_action {
             StreamingDropAction::Release => {
-                if let Err(e) = idempotency::release(&self.pool, &self.account_id, &self.request_id) {
+                if let Err(e) = idempotency::release(&self.pool, &self.account_id, &self.request_id)
+                {
                     tracing::warn!(
                         account_id_hash = %cue_core::account_id_hash_prefix(&self.account_id),
                         request_id = %self.request_id,
@@ -296,6 +301,70 @@ fn release_and_upstream_spend_guard_check(
 /// counts as a response and is surfaced through the normal consume path.
 /// Override with BLUEY_STREAM_FIRST_TOKEN_TIMEOUT_MS.
 const DEFAULT_FIRST_TOKEN_TIMEOUT_MS: u64 = 6_000;
+
+/// Time budget for managed cloud RAG retrieval before answering. RAG
+/// enrichment is best-effort context, not correctness — it must never
+/// delay the first token by more than this. If the lexical/vector query
+/// over cloud_rag_chunks exceeds the budget the answer proceeds without
+/// retrieved context. Override with BLUEY_RAG_RETRIEVAL_BUDGET_MS.
+const DEFAULT_RAG_RETRIEVAL_BUDGET_MS: u64 = 300;
+
+fn rag_retrieval_budget() -> std::time::Duration {
+    let ms = std::env::var("BLUEY_RAG_RETRIEVAL_BUDGET_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(DEFAULT_RAG_RETRIEVAL_BUDGET_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Budgeted wrapper around `completion_rag_matches`. The underlying query is
+/// blocking SQLite, so it runs on the blocking pool; a `timeout` caps how
+/// long the request waits. On timeout/join failure the answer proceeds with
+/// no retrieved context (the blocking task is allowed to finish and its
+/// result dropped — it just no longer holds up the first token).
+async fn completion_rag_matches_budgeted(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    session_id: Option<&str>,
+    query: &str,
+) -> Vec<sync::RagMatch> {
+    if query.trim().chars().count() < 8 {
+        return Vec::new();
+    }
+    let budget = rag_retrieval_budget();
+    let pool = pool.clone();
+    let account_owned = account_id.to_string();
+    let session_owned = session_id.map(|s| s.to_string());
+    let query_owned = query.to_string();
+    let task = tokio::task::spawn_blocking(move || {
+        completion_rag_matches(
+            &pool,
+            &account_owned,
+            session_owned.as_deref(),
+            &query_owned,
+        )
+    });
+    match tokio::time::timeout(budget, task).await {
+        Ok(Ok(matches)) => matches,
+        Ok(Err(join_err)) => {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                error = %join_err,
+                "RAG retrieval task failed; continuing without retrieved context"
+            );
+            Vec::new()
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                budget_ms = budget.as_millis() as u64,
+                "RAG retrieval exceeded budget; continuing without retrieved context"
+            );
+            Vec::new()
+        }
+    }
+}
 
 fn first_token_deadline() -> std::time::Duration {
     let ms = std::env::var("BLUEY_STREAM_FIRST_TOKEN_TIMEOUT_MS")
@@ -527,10 +596,7 @@ pub async fn complete_stream(
         crate::api::middleware::request_id::TraceId,
     >,
     Json(req): Json<CompleteRequest>,
-) -> Result<
-    Sse<RouterSseStream>,
-    (StatusCode, Json<ApiError>),
-> {
+) -> Result<Sse<RouterSseStream>, (StatusCode, Json<ApiError>)> {
     complete_stream_inner(state, account, req, trace_id).await
 }
 
@@ -539,10 +605,7 @@ async fn complete_stream_inner(
     account: Account,
     req: CompleteRequest,
     trace_id: String,
-) -> Result<
-    Sse<RouterSseStream>,
-    (StatusCode, Json<ApiError>),
-> {
+) -> Result<Sse<RouterSseStream>, (StatusCode, Json<ApiError>)> {
     if req.request_id.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -673,12 +736,13 @@ async fn complete_stream_inner(
         ));
     }
 
-    let rag_matches = completion_rag_matches(
+    let rag_matches = completion_rag_matches_budgeted(
         &state.pool,
         &account.id,
         req.session_id.as_deref(),
         &req.user,
-    );
+    )
+    .await;
     tracing::debug!(
         account_id_hash = %account_id_hash,
         request_id = %req.request_id,
@@ -697,9 +761,10 @@ async fn complete_stream_inner(
     );
     let effective_max_out = routing::effective_max_output_tokens(req.max_tokens, thinking);
     let max_out = i64::from(effective_max_out);
-    let est_in = req.estimated_input_tokens.unwrap_or_else(|| {
-        ((provider_system.len() + provider_user.len()) as i64) / 4
-    }) + image_token_estimate(req.image_data_urls.len());
+    let est_in = req
+        .estimated_input_tokens
+        .unwrap_or_else(|| ((provider_system.len() + provider_user.len()) as i64) / 4)
+        + image_token_estimate(req.image_data_urls.len());
     let routes = priced_routes_for(effective_lane, est_in, max_out);
     if routes.is_empty() {
         let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
@@ -768,13 +833,15 @@ async fn complete_stream_inner(
     let mut selected_route_idx = 0usize;
     let mut selected_route: Option<PricedRoute> = None;
     let mut selected_stream: Option<routing::StreamingCompletion> = None;
-    let mut selected_first_event: Option<anyhow::Result<routing::CompletionStreamEvent>> =
-        None;
+    let mut selected_first_event: Option<anyhow::Result<routing::CompletionStreamEvent>> = None;
 
     for (idx, route) in routes.iter().enumerate() {
         let key_candidates = state.config.upstream.key_candidates(
             route.provider,
-            &format!("llm-stream:{}:{}:{}", req.request_id, route.provider, route.model),
+            &format!(
+                "llm-stream:{}:{}:{}",
+                req.request_id, route.provider, route.model
+            ),
         );
         if key_candidates.is_empty() {
             last_error = Some(missing_provider_key_error(route.provider));
@@ -850,9 +917,7 @@ async fn complete_stream_inner(
                         model: stream_model,
                         events: mut stream_events,
                     } = streaming;
-                    match tokio::time::timeout(first_token_deadline(), stream_events.next())
-                        .await
-                    {
+                    match tokio::time::timeout(first_token_deadline(), stream_events.next()).await {
                         Ok(first_event) => {
                             selected_route_idx = idx;
                             selected_route = Some(*route);
@@ -1379,12 +1444,13 @@ async fn complete_inner(
         ));
     }
 
-    let rag_matches = completion_rag_matches(
+    let rag_matches = completion_rag_matches_budgeted(
         &state.pool,
         &account.id,
         req.session_id.as_deref(),
         &req.user,
-    );
+    )
+    .await;
     tracing::debug!(
         account_id_hash = %account_id_hash,
         request_id = %req.request_id,
@@ -2823,8 +2889,7 @@ mod tests {
     use super::*;
 
     fn temp_pool() -> crate::db::DbPool {
-        let path =
-            std::env::temp_dir().join(format!("bluey-router-{}.db", uuid::Uuid::new_v4()));
+        let path = std::env::temp_dir().join(format!("bluey-router-{}.db", uuid::Uuid::new_v4()));
         let pool = crate::db::open_pool(&path).unwrap();
         crate::db::run_migrations(&pool).unwrap();
         pool
@@ -2837,6 +2902,23 @@ mod tests {
     }
 
     #[test]
+    fn rag_retrieval_budget_default_and_override() {
+        std::env::remove_var("BLUEY_RAG_RETRIEVAL_BUDGET_MS");
+        assert_eq!(
+            rag_retrieval_budget(),
+            std::time::Duration::from_millis(DEFAULT_RAG_RETRIEVAL_BUDGET_MS)
+        );
+        std::env::set_var("BLUEY_RAG_RETRIEVAL_BUDGET_MS", "50");
+        assert_eq!(rag_retrieval_budget(), std::time::Duration::from_millis(50));
+        std::env::set_var("BLUEY_RAG_RETRIEVAL_BUDGET_MS", "0");
+        assert_eq!(
+            rag_retrieval_budget(),
+            std::time::Duration::from_millis(DEFAULT_RAG_RETRIEVAL_BUDGET_MS)
+        );
+        std::env::remove_var("BLUEY_RAG_RETRIEVAL_BUDGET_MS");
+    }
+
+    #[test]
     fn first_token_deadline_default_and_override() {
         std::env::remove_var("BLUEY_STREAM_FIRST_TOKEN_TIMEOUT_MS");
         assert_eq!(
@@ -2844,7 +2926,10 @@ mod tests {
             std::time::Duration::from_millis(DEFAULT_FIRST_TOKEN_TIMEOUT_MS)
         );
         std::env::set_var("BLUEY_STREAM_FIRST_TOKEN_TIMEOUT_MS", "250");
-        assert_eq!(first_token_deadline(), std::time::Duration::from_millis(250));
+        assert_eq!(
+            first_token_deadline(),
+            std::time::Duration::from_millis(250)
+        );
         // Zero / invalid falls back to the default.
         std::env::set_var("BLUEY_STREAM_FIRST_TOKEN_TIMEOUT_MS", "0");
         assert_eq!(
