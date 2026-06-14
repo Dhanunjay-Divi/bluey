@@ -278,8 +278,12 @@ impl Config {
             .unwrap_or_else(|| format!("{}/billing/square/webhook", self.public_url));
         let configured = square_environment_from_env();
         let ordered = match configured {
-            SquareEnvironment::Sandbox => [SquareEnvironment::Sandbox, SquareEnvironment::Production],
-            SquareEnvironment::Production => [SquareEnvironment::Production, SquareEnvironment::Sandbox],
+            SquareEnvironment::Sandbox => {
+                [SquareEnvironment::Sandbox, SquareEnvironment::Production]
+            }
+            SquareEnvironment::Production => {
+                [SquareEnvironment::Production, SquareEnvironment::Sandbox]
+            }
         };
         let generic_key = std::env::var("SQUARE_WEBHOOK_SIGNATURE_KEY")
             .ok()
@@ -298,12 +302,9 @@ impl Config {
                 }
             });
             if let Some(webhook_signature_key) = key {
-                if configs
-                    .iter()
-                    .any(|config: &SquareWebhookSignatureConfig| {
-                        config.webhook_signature_key == webhook_signature_key
-                    })
-                {
+                if configs.iter().any(|config: &SquareWebhookSignatureConfig| {
+                    config.webhook_signature_key == webhook_signature_key
+                }) {
                     continue;
                 }
                 configs.push(SquareWebhookSignatureConfig {
@@ -396,14 +397,41 @@ fn key_candidates_from_pool(raw: Option<&str>, shard_key: &str) -> Vec<UpstreamK
     if keys.is_empty() {
         return Vec::new();
     }
-    let start = (stable_hash(shard_key) as usize) % keys.len();
-    (0..keys.len())
-        .map(|offset| keys[(start + offset) % keys.len()])
+    // Per-request seeded shuffle. A rotation would send every request whose
+    // start lands on a cooling key to the SAME next key (herd-onto-next
+    // during a cooldown). A full shuffle fans displaced load across all
+    // healthy keys. Deterministic per shard_key so a retry of the same
+    // request_id prefers the same key first.
+    shuffled_indices(keys.len(), stable_hash(shard_key))
+        .into_iter()
+        .map(|idx| keys[idx])
         .map(|key| UpstreamKeyCandidate {
             secret: key.to_string(),
             fingerprint: key_fingerprint(key),
         })
         .collect()
+}
+
+/// Deterministic Fisher-Yates shuffle of `0..n` seeded by `seed` (xorshift64).
+/// Same seed -> same permutation. Gives each request an independent ordering
+/// over the key pool without any shared/round-robin state.
+fn shuffled_indices(n: usize, seed: u64) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..n).collect();
+    if n <= 1 {
+        return order;
+    }
+    let mut state = seed ^ 0x9E37_79B9_7F4A_7C15;
+    if state == 0 {
+        state = 0xDEAD_BEEF;
+    }
+    for i in (1..n).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let j = (state % (i as u64 + 1)) as usize;
+        order.swap(i, j);
+    }
+    order
 }
 
 fn key_fingerprint(key: &str) -> String {
@@ -478,6 +506,47 @@ mod tests {
     }
 
     #[test]
+    fn shuffled_indices_is_a_deterministic_permutation() {
+        assert_eq!(shuffled_indices(5, 42), shuffled_indices(5, 42));
+        for n in [1usize, 2, 3, 8] {
+            let mut sorted = shuffled_indices(n, 0xABCD);
+            sorted.sort_unstable();
+            assert_eq!(
+                sorted,
+                (0..n).collect::<Vec<_>>(),
+                "n={n} not a permutation"
+            );
+        }
+        assert_ne!(shuffled_indices(4, 1), shuffled_indices(4, 2));
+    }
+
+    #[test]
+    fn key_candidates_fan_out_second_choice() {
+        let keys = UpstreamKeys {
+            openai_api_key: Some("sk-a,sk-b,sk-c,sk-d".into()),
+            ..Default::default()
+        };
+        let mut firsts = std::collections::BTreeSet::new();
+        let mut seconds_for_a = std::collections::BTreeSet::new();
+        for idx in 0..256 {
+            let cands = keys.key_candidates("openai", &format!("req-{idx}"));
+            assert_eq!(cands.len(), 4);
+            firsts.insert(cands[0].secret.clone());
+            if cands[0].secret == "sk-a" {
+                seconds_for_a.insert(cands[1].secret.clone());
+            }
+        }
+        assert!(
+            firsts.len() >= 3,
+            "first pick should spread across the pool"
+        );
+        assert!(
+            seconds_for_a.len() >= 2,
+            "second pick after sk-a should fan out, got {seconds_for_a:?}"
+        );
+    }
+
+    #[test]
     fn square_config_uses_environment_specific_keys() {
         std::env::set_var("SQUARE_ENVIRONMENT", "sandbox");
         std::env::set_var("SQUARE_SANDBOX_ACCESS_TOKEN", "sandbox-token");
@@ -510,7 +579,10 @@ mod tests {
         assert_eq!(square.access_token.as_deref(), Some("prod-token"));
         assert_eq!(square.location_id.as_deref(), Some("prod-location"));
 
-        std::env::set_var("SQUARE_WEBHOOK_NOTIFICATION_URL", "https://bluey.sh/billing/square/webhook");
+        std::env::set_var(
+            "SQUARE_WEBHOOK_NOTIFICATION_URL",
+            "https://bluey.sh/billing/square/webhook",
+        );
         std::env::set_var("SQUARE_WEBHOOK_SIGNATURE_KEY", "generic-whsec");
         std::env::set_var("SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY", "sandbox-whsec");
         std::env::set_var("SQUARE_PRODUCTION_WEBHOOK_SIGNATURE_KEY", "prod-whsec");
@@ -519,7 +591,10 @@ mod tests {
         assert_eq!(webhook_configs.len(), 2);
         assert_eq!(webhook_configs[0].environment, SquareEnvironment::Sandbox);
         assert_eq!(webhook_configs[0].webhook_signature_key, "sandbox-whsec");
-        assert_eq!(webhook_configs[1].environment, SquareEnvironment::Production);
+        assert_eq!(
+            webhook_configs[1].environment,
+            SquareEnvironment::Production
+        );
         assert_eq!(webhook_configs[1].webhook_signature_key, "prod-whsec");
 
         std::env::remove_var("SQUARE_ENVIRONMENT");
