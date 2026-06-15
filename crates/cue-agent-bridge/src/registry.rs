@@ -59,6 +59,18 @@ pub struct AgentEntry {
     /// [`McpAllowStyle`]). `None` only when `mcp_allow_flag` is `None`. Lets each
     /// CLI's allow-list syntax stay data, not a code branch.
     pub mcp_allow_style: Option<McpAllowStyle>,
+    /// How Bluey continues an existing conversation with this agent (see
+    /// [`ContinuationTier`]). `NativeResume` agents resume by id via the drive
+    /// spec; `Replay` agents continue by replaying the transcript Bluey read.
+    pub continuation: ContinuationTier,
+    /// For an agent that has NO drivable CLI of its own (`drive_command` empty)
+    /// but whose conversations CAN be continued through a SIBLING agent's CLI of
+    /// the same family: the kind to actually drive, replaying this agent's
+    /// transcript as context. The cross-surface bridge — e.g. **VS Code Copilot**
+    /// (the extension, no CLI) continues through the **Copilot CLI** (same GitHub
+    /// Copilot brand/account). `None` for agents driven by their own CLI or with
+    /// no sibling to bridge to. Read only on the Replay continuation path.
+    pub continuation_via: Option<KindTag>,
     /// Review-gated "Fix" profile: the extra args that switch this agent
     /// between propose-only and apply (see [`FixProfile`]).
     pub fix: FixProfile,
@@ -237,6 +249,27 @@ pub enum McpAllowStyle {
     CopilotAllowTool,
 }
 
+/// How Bluey **continues an existing conversation** with this agent — chosen per
+/// agent from what the agent's CLI actually exposes (web-verified; see
+/// `docs/vendors/SESSION-CONTINUATION-ARCHITECTURE.md`). Data, not a code branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationTier {
+    /// The agent's CLI can resume a SPECIFIC prior session by id, and that resume
+    /// reaches the same sessions Bluey reads. Bluey passes the session id via the
+    /// drive spec's `resume_args` and lets the VENDOR handle context compaction
+    /// server-side (free, seamless-infinite). Claude (`--resume <id>`, cwd-scoped),
+    /// Codex (`codex resume <id>`), Copilot (`--resume=<id>`).
+    NativeResume,
+    /// The agent's CLI has NO per-id resume that reaches Bluey's sessions, so
+    /// Bluey continues by REPLAYING the transcript it already read as context
+    /// (exactly what these apps do internally on a model switch — resend the
+    /// message list). Bluey caps/compacts the history to fit the window. Cursor
+    /// (no CLI resume), VS Code (no CLI), Gemini (`--resume` takes only
+    /// "latest"/index, not our id), Antigravity (sessions in its own store;
+    /// `agy --conversation` needed but not assumed installed → replay is robust).
+    Replay,
+}
+
 /// Prefix that marks a [`AgentEntry::data_dir_globs`] entry as a macOS-only
 /// Application-Support path. Globs without this prefix are HOME-relative
 /// dotfiles (`.claude`, `.cursor`, …) and resolve identically on every OS.
@@ -400,6 +433,8 @@ pub const REGISTRY: &[AgentEntry] = &[
         // own configured MCP servers — file/shell write tools stay gated.
         mcp_allow_flag: Some("--allowed-tools"),
         mcp_allow_style: Some(McpAllowStyle::ClaudeToolPattern),
+        continuation: ContinuationTier::NativeResume,
+        continuation_via: None,
         install: Some(InstallRecipe {
             method: InstallMethod::CurlScript,
             spec: "https://claude.ai/install.sh",
@@ -443,6 +478,8 @@ pub const REGISTRY: &[AgentEntry] = &[
         answer_args: &[],
         mcp_allow_flag: None,
         mcp_allow_style: None,
+        continuation: ContinuationTier::NativeResume,
+        continuation_via: None,
         // Install handled by the CLI row; the app is GUI-installed out of band.
         install: None,
         fix: FixProfile {
@@ -476,6 +513,8 @@ pub const REGISTRY: &[AgentEntry] = &[
         answer_args: &[],
         mcp_allow_flag: None,
         mcp_allow_style: None,
+        continuation: ContinuationTier::NativeResume,
+        continuation_via: None,
         install: None,
         fix: FixProfile {
             propose_args: &["--permission-mode", "plan"],
@@ -519,6 +558,8 @@ pub const REGISTRY: &[AgentEntry] = &[
         // behavior for read-only MCP tools in `-p` mode is unconfirmed).
         mcp_allow_flag: None,
         mcp_allow_style: None,
+        continuation: ContinuationTier::Replay,
+        continuation_via: None,
         // NEVER `--plan`: Cursor's `--plan` flag is a known bug that writes
         // files. Propose = omit `--force` + rely on the prompt.
         install: Some(InstallRecipe {
@@ -569,6 +610,8 @@ pub const REGISTRY: &[AgentEntry] = &[
         answer_args: &[],
         mcp_allow_flag: Some("--allowed-mcp-server-names"),
         mcp_allow_style: Some(McpAllowStyle::ServerNameCsv),
+        continuation: ContinuationTier::Replay,
+        continuation_via: None,
         // Antigravity drives through the `gemini` CLI, so it shares Gemini's
         // approval-mode flags.
         install: Some(InstallRecipe {
@@ -627,6 +670,8 @@ pub const REGISTRY: &[AgentEntry] = &[
         // instead of firing the connector (caught live by the MCP matrix).
         mcp_allow_flag: Some("--allow-tool"),
         mcp_allow_style: Some(McpAllowStyle::CopilotAllowTool),
+        continuation: ContinuationTier::NativeResume,
+        continuation_via: None,
         // Copilot has no native propose flag; propose is prompt-only. Apply
         // needs `--allow-all-tools` (without it `-p` stalls).
         install: Some(InstallRecipe {
@@ -673,6 +718,8 @@ pub const REGISTRY: &[AgentEntry] = &[
         answer_args: &[],
         mcp_allow_flag: Some("--allowed-mcp-server-names"),
         mcp_allow_style: Some(McpAllowStyle::ServerNameCsv),
+        continuation: ContinuationTier::Replay,
+        continuation_via: None,
         install: Some(InstallRecipe {
             method: InstallMethod::NpmGlobal,
             spec: "@google/gemini-cli",
@@ -760,6 +807,8 @@ pub const REGISTRY: &[AgentEntry] = &[
         ],
         mcp_allow_flag: None,
         mcp_allow_style: None,
+        continuation: ContinuationTier::NativeResume,
+        continuation_via: None,
         install: Some(InstallRecipe {
             method: InstallMethod::NpmGlobal,
             spec: "@openai/codex",
@@ -805,6 +854,8 @@ pub const REGISTRY: &[AgentEntry] = &[
         answer_args: &[],
         mcp_allow_flag: None,
         mcp_allow_style: None,
+        continuation: ContinuationTier::Replay,
+        continuation_via: None,
         install: None,
         fix: FixProfile {
             propose_args: &["--dry-run"],
@@ -835,6 +886,8 @@ pub const REGISTRY: &[AgentEntry] = &[
         answer_args: &[],
         mcp_allow_flag: None,
         mcp_allow_style: None,
+        continuation: ContinuationTier::Replay,
+        continuation_via: None,
         // No headless CLI to drive an apply — propose-capable only.
         install: None,
         fix: FixProfile {
@@ -866,6 +919,8 @@ pub const REGISTRY: &[AgentEntry] = &[
         answer_args: &[],
         mcp_allow_flag: None,
         mcp_allow_style: None,
+        continuation: ContinuationTier::Replay,
+        continuation_via: Some(KindTag::Copilot),
         // No headless CLI to drive an apply — propose-capable only.
         install: None,
         fix: FixProfile {

@@ -25,6 +25,14 @@ pub mod cli;
 
 pub use cli::{drive, drive_with_mode, drive_with_options, DriveOptions};
 
+/// Character budget for the full replayed prompt (prior history + the question),
+/// the **safety net** against "prompt too long" when continuing a conversation.
+/// ~4 chars/token, so this ≈ 120K tokens — comfortably under the smallest modern
+/// context window (200K) with headroom for the model's answer. The continuation
+/// orchestrator should summarize-and-shrink BEFORE relying on this; the cap only
+/// guarantees a long transcript is trimmed (recent kept) rather than overflowing.
+pub(crate) const DEFAULT_CONTEXT_CHAR_BUDGET: usize = 480_000;
+
 /// How a drive should treat the agent's write capability.
 ///
 /// This is the entry point to the review-gated **Fix** lane (see
@@ -64,6 +72,13 @@ pub struct Question {
     pub context: Option<Transcript>,
     /// Native session id to continue, when the agent supports `--resume`.
     pub resume: Option<String>,
+    /// Working directory to drive from, when known. **Required for correct
+    /// resume on cwd-scoped agents** (Claude resolves `--resume <id>` against
+    /// `~/.claude/projects/<encoded-cwd>/`, so resuming from the wrong directory
+    /// silently finds nothing). The daemon sets this to the session's recorded
+    /// project path. `None` → the child inherits the daemon's cwd (today's
+    /// behavior), which is fine for fresh, non-resumed drives.
+    pub cwd: Option<String>,
 }
 
 impl Question {
@@ -73,6 +88,7 @@ impl Question {
             prompt: prompt.into(),
             context: None,
             resume: None,
+            cwd: None,
         }
     }
 
@@ -83,29 +99,72 @@ impl Question {
     ///
     /// [`context`]: Question::context
     pub(crate) fn render_prompt(&self) -> String {
-        match &self.context {
-            None => self.prompt.clone(),
-            Some(t) if t.turns.is_empty() => self.prompt.clone(),
-            Some(t) => {
-                let mut out = String::new();
-                out.push_str("Context from a prior conversation:\n");
-                for turn in &t.turns {
-                    let role = match turn.role {
-                        crate::Role::User => "User",
-                        crate::Role::Assistant => "Assistant",
-                        crate::Role::System => "System",
-                        crate::Role::Other => "Note",
-                    };
-                    out.push_str(role);
-                    out.push_str(": ");
-                    out.push_str(&turn.text);
-                    out.push('\n');
-                }
-                out.push_str("\nQuestion:\n");
-                out.push_str(&self.prompt);
-                out
+        self.render_prompt_within(DEFAULT_CONTEXT_CHAR_BUDGET)
+    }
+
+    /// Like [`render_prompt`], but bounds the replayed history to `char_budget`
+    /// characters so a long prior conversation can never overflow the model's
+    /// context window ("prompt too long"). This is the **safety net**, mirroring
+    /// how the coding agents cap context: it keeps the MOST RECENT turns verbatim
+    /// (the "hot layer") and drops older ones, marking that older context was
+    /// trimmed. Higher-quality compaction (summarizing the dropped turns via a
+    /// drive through the user's own agent) happens BEFORE this, in the
+    /// continuation orchestrator, which replaces the old turns with a short
+    /// summary turn; this method then just bounds whatever it's given. Pure —
+    /// still assembled as a single argv entry, never through a shell.
+    ///
+    /// [`render_prompt`]: Question::render_prompt
+    pub(crate) fn render_prompt_within(&self, char_budget: usize) -> String {
+        let turns = match &self.context {
+            None => return self.prompt.clone(),
+            Some(t) if t.turns.is_empty() => return self.prompt.clone(),
+            Some(t) => &t.turns,
+        };
+
+        // Reserve room for the prompt + framing; the rest is the history budget.
+        let framing = "Context from a prior conversation:\n\nQuestion:\n";
+        let reserved = self.prompt.len() + framing.len();
+        let history_budget = char_budget.saturating_sub(reserved);
+
+        // Walk turns NEWEST-first, keeping as many recent ones as fit, then emit
+        // them in original order. This preserves recency (the hot layer) and
+        // trims the oldest when over budget.
+        let mut kept_rev: Vec<&crate::Turn> = Vec::new();
+        let mut used = 0usize;
+        let mut trimmed = false;
+        for turn in turns.iter().rev() {
+            // role label (~10) + ": " + text + newline
+            let cost = turn.text.len() + 12;
+            if used + cost > history_budget && !kept_rev.is_empty() {
+                trimmed = true;
+                break;
             }
+            used += cost;
+            kept_rev.push(turn);
         }
+        kept_rev.reverse();
+        let kept = kept_rev;
+
+        let mut out = String::new();
+        out.push_str("Context from a prior conversation:\n");
+        if trimmed {
+            out.push_str("[…earlier turns omitted to fit context…]\n");
+        }
+        for turn in kept {
+            let role = match turn.role {
+                crate::Role::User => "User",
+                crate::Role::Assistant => "Assistant",
+                crate::Role::System => "System",
+                crate::Role::Other => "Note",
+            };
+            out.push_str(role);
+            out.push_str(": ");
+            out.push_str(&turn.text);
+            out.push('\n');
+        }
+        out.push_str("\nQuestion:\n");
+        out.push_str(&self.prompt);
+        out
     }
 }
 
@@ -137,4 +196,66 @@ pub type AnswerStream = Pin<Box<dyn Stream<Item = AnswerChunk> + Send>>;
 pub trait Driver: Send + Sync {
     /// Run `question` against `agent` and return its streamed answer.
     async fn drive(&self, agent: AgentKind, question: Question) -> anyhow::Result<AnswerStream>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Role, Transcript, Turn};
+
+    fn q_with(turns: Vec<Turn>, prompt: &str) -> Question {
+        Question {
+            prompt: prompt.to_string(),
+            context: Some(Transcript { turns }),
+            resume: None,
+            cwd: None,
+        }
+    }
+
+    #[test]
+    fn render_prompt_within_replays_whole_under_budget() {
+        let turns = vec![
+            Turn {
+                role: Role::User,
+                text: "first question".into(),
+            },
+            Turn {
+                role: Role::Assistant,
+                text: "first answer".into(),
+            },
+        ];
+        let out = q_with(turns, "follow-up").render_prompt_within(10_000);
+        assert!(out.contains("first question"));
+        assert!(out.contains("first answer"));
+        assert!(out.contains("follow-up"));
+        // Nothing trimmed when it fits.
+        assert!(!out.contains("earlier turns omitted"));
+    }
+
+    #[test]
+    fn render_prompt_within_trims_oldest_keeps_recent_over_budget() {
+        // 10 turns of ~100 chars each; a tiny budget forces trimming.
+        let turns: Vec<Turn> = (0..10)
+            .map(|i| Turn {
+                role: Role::User,
+                text: format!("turn number {i} ").repeat(8),
+            })
+            .collect();
+        // Budget big enough for the prompt + a couple recent turns, not all 10.
+        let out = q_with(turns, "what next?").render_prompt_within(600);
+        assert!(
+            out.contains("earlier turns omitted"),
+            "older turns trimmed + marked"
+        );
+        // The MOST RECENT turn (9) is kept; an early one (0) is dropped.
+        assert!(out.contains("turn number 9"), "recent turn kept");
+        assert!(!out.contains("turn number 0"), "oldest turn dropped");
+        assert!(out.contains("what next?"));
+    }
+
+    #[test]
+    fn render_prompt_no_context_is_just_the_prompt() {
+        let q = Question::new("hello");
+        assert_eq!(q.render_prompt(), "hello");
+    }
 }
