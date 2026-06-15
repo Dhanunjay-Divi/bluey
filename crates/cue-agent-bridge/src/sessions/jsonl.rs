@@ -284,18 +284,23 @@ fn session_ref_for(file: &Path) -> Option<SessionRef> {
     let stem = file.file_stem()?.to_string_lossy().into_owned();
     let id = session_id_from_dir(file).unwrap_or(stem);
     let updated_at = mtime_epoch_string(file);
-    // Project resolution, in priority order. Claude's encoded-cwd dir name
-    // (`-Users-ms-…`) decodes directly. When that doesn't apply (the parent dir
-    // is a date / `chats` / a UUID for Codex/Gemini/Copilot), fall back to a
-    // format-specific extractor that reads the cwd the format DOES carry. Each
-    // is gated by a structural cue (not an agent name) and is read-only +
-    // fail-soft, so it degrades to `None` rather than erroring.
-    let project = file
-        .parent()
-        .and_then(|p| p.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .and_then(|name| decode_project_dir(&name))
-        .or_else(|| project_from_format(file));
+    // Project resolution, in priority order:
+    //   1. The cwd the FORMAT records (authoritative). Claude/Codex store the
+    //      real cwd INSIDE the transcript (`cwd` field / `session_meta.cwd`),
+    //      Gemini/Copilot via sidecars — these are exact, including spaces and
+    //      apostrophes that the dir-name encoding loses.
+    //   2. Else decode Claude's encoded-cwd dir name (`-Users-ms-…`). This is the
+    //      LOSSY fallback: `Staffing-Desk` can't be told apart from `Staffing/Desk`
+    //      (verified bug — cross-project Claude resume silently failed because the
+    //      decoded path didn't exist). So it's tried only when #1 yields nothing.
+    // Each extractor is gated by a structural cue (not an agent name), read-only,
+    // and fail-soft → `None` rather than erroring.
+    let project = project_from_format(file).or_else(|| {
+        file.parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .and_then(|name| decode_project_dir(&name))
+    });
     // Title priority:
     //   1. Claude's own stored title — `customTitle` (user-set) or `aiTitle`
     //      (Claude-generated). These are clean, human-readable titles that
@@ -319,6 +324,15 @@ fn session_ref_for(file: &Path) -> Option<SessionRef> {
 /// cues (file stem, parent-dir name, line-1 `type`) are structural, never an
 /// agent name. Read-only, bounded, fail-soft → `None` on any miss.
 fn project_from_format(file: &Path) -> Option<String> {
+    // Claude: each turn record carries a top-level `cwd` (the REAL project path,
+    // including spaces/apostrophes the dir-name encoding loses). Reading it here
+    // fixes cross-project resume — the lossy dir decode produced a wrong path
+    // that didn't exist, so `--resume` silently started fresh. Only accept it if
+    // the path EXISTS on disk (a moved/renamed project's stale cwd is no better
+    // than the decode; let the decode fall through then).
+    if let Some(cwd) = claude_record_cwd(file) {
+        return Some(cwd);
+    }
     // Codex: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, line 1 is
     // `{"type":"session_meta","payload":{"cwd":"…"}}`.
     if let Some(cwd) = codex_session_meta_cwd(file) {
@@ -333,6 +347,33 @@ fn project_from_format(file: &Path) -> Option<String> {
     // maps a real cwd path to that token; invert it.
     if let Some(cwd) = gemini_token_cwd(file) {
         return Some(cwd);
+    }
+    None
+}
+
+/// Claude: read the real project `cwd` from a turn record's top-level `cwd`
+/// field (Claude writes it on every turn). Scans a few early lines (the first
+/// may be a summary/meta line without `cwd`). Returns the path only if it EXISTS
+/// on disk — a stale cwd for a moved project is no improvement over the dir
+/// decode, so we let that fall through instead. Bounded + fail-soft.
+fn claude_record_cwd(file: &Path) -> Option<String> {
+    const SCAN_LINES: usize = 20;
+    let handle = std::fs::File::open(file).ok()?;
+    let reader = BufReader::new(handle);
+    for line in reader.lines().take(SCAN_LINES) {
+        let Ok(line) = line else { break };
+        let line = line.trim();
+        if line.is_empty() || !line.contains("\"cwd\"") || line.len() > MAX_LINE_BYTES {
+            continue;
+        }
+        let Ok(v): Result<Value, _> = serde_json::from_str(line) else {
+            continue;
+        };
+        if let Some(cwd) = v.get("cwd").and_then(Value::as_str) {
+            if !cwd.is_empty() && std::path::Path::new(cwd).is_dir() {
+                return Some(cwd.to_string());
+            }
+        }
     }
     None
 }

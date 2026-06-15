@@ -181,6 +181,48 @@ fn normalize_resume_session(session_id: Option<String>) -> Option<String> {
         .filter(|id| !id.is_empty())
 }
 
+/// Char budget over which a Replay-tier continuation summarizes older turns
+/// instead of replaying them whole. Below the drive layer's safety-net budget so
+/// the summary path engages BEFORE the net has to trim. ~4 chars/token.
+const CONTINUATION_SUMMARY_BUDGET: usize = 360_000;
+
+/// How many most-recent turns are always kept VERBATIM when compacting a long
+/// transcript for Replay-tier continuation (the "hot layer"); older turns are
+/// summarized. Mirrors the hierarchical-memory pattern the coding agents use.
+const CONTINUATION_HOT_TURNS: usize = 12;
+
+/// Split a transcript for Replay-tier compaction: returns `(older, recent)`
+/// where `recent` is the last [`CONTINUATION_HOT_TURNS`] turns and `older` is
+/// everything before. Pure — the caller summarizes `older` (via a drive through
+/// the user's own agent) and replays `[summary] + recent`. Returns `(&[], all)`
+/// when the transcript already fits within `CONTINUATION_HOT_TURNS`.
+fn split_for_compaction(
+    turns: &[cue_agent_bridge::Turn],
+) -> (&[cue_agent_bridge::Turn], &[cue_agent_bridge::Turn]) {
+    if turns.len() <= CONTINUATION_HOT_TURNS {
+        return (&[], turns);
+    }
+    let cut = turns.len() - CONTINUATION_HOT_TURNS;
+    (&turns[..cut], &turns[cut..])
+}
+
+/// Total character size of a transcript's turn text — the cheap proxy for
+/// "is this too big to replay whole" (~4 chars/token).
+fn transcript_chars(turns: &[cue_agent_bridge::Turn]) -> usize {
+    turns.iter().map(|t| t.text.len()).sum()
+}
+
+/// The prompt asked of the user's OWN agent to compress the older part of a long
+/// conversation (Bluey runs no AI of its own — the user's agent summarizes the
+/// user's conversation). Bounded output so the summary itself stays small.
+fn summarize_older_prompt(older_text: &str) -> String {
+    format!(
+        "Summarize the earlier part of our conversation below in at most 400 words. \
+Preserve key decisions, file names, code identifiers, and any open questions or \
+next steps. Output ONLY the summary, no preamble.\n\n----- earlier conversation -----\n{older_text}"
+    )
+}
+
 /// How long an un-approved Fix proposal stays valid. After this, the id is
 /// dropped and an Approve referencing it is rejected — so a stale plan the user
 /// walked away from can never be applied later.
@@ -2407,6 +2449,7 @@ async fn handle_fix_requested(daemon: &Arc<Daemon>, _card_id: Option<uuid::Uuid>
         prompt,
         context: None,
         resume,
+        cwd: None,
     };
     debug!(
         agent = %agent_model_label(&agent),
@@ -2531,6 +2574,7 @@ from the proposal.",
         prompt,
         context: None,
         resume,
+        cwd: None,
     };
     debug!(
         agent = %agent_model_label(&pending.agent),
@@ -4987,6 +5031,192 @@ fn agent_question_from_payload(
             .map(str::trim)
             .filter(|id| !id.is_empty())
             .map(str::to_string),
+        // cwd is resolved by the tier-aware continuation step (see
+        // `apply_continuation_tier`), not here — this stays pure string assembly.
+        cwd: None,
+    }
+}
+
+/// Upgrade a [`Question`] to **continue a specific prior session** with the
+/// attached agent, per the agent's [`ContinuationTier`] (see
+/// `docs/vendors/SESSION-CONTINUATION-ARCHITECTURE.md`). Called by the answer
+/// path when a session is pinned; a no-op when `session_id` is `None`.
+///
+/// - **NativeResume** (Claude/Codex/Copilot): set `resume = <id>` and `cwd =
+///   <session project>` so the agent's own `--resume` continues it (cwd is
+///   critical — Claude's resume is cwd-scoped) and the VENDOR compacts context.
+/// - **Replay** (Cursor/VsCode/Gemini/Antigravity): the agent can't resume by id,
+///   so LOAD the transcript and put it in `context`. If it's too big to replay
+///   whole, summarize the older turns via a drive through the USER's OWN agent
+///   (Bluey runs no AI) and replay `[summary] + recent`. Fail-soft: a failed
+///   summary falls back to the raw transcript (the drive layer's budget trims it).
+async fn apply_continuation_tier(
+    question: &mut AgentQuestion,
+    agent: &AgentKind,
+    session_id: Option<&str>,
+) {
+    let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return; // fresh question — nothing to continue
+    };
+    let Some(tag) = cue_agent_bridge::registry::KindTag::from_agent_kind(agent) else {
+        return;
+    };
+    let Some(entry) = cue_agent_bridge::registry::entry_for(tag) else {
+        return;
+    };
+
+    // Resolve the session's project (cwd) and — for Replay — its transcript.
+    let (project, transcript) =
+        resolve_session_for_continuation(agent, session_id, entry.continuation).await;
+
+    // Will the project dir actually be usable as a cwd? (exists + non-empty —
+    // mirrors the drive layer's guard). A missing/empty dir means a cwd-scoped
+    // native resume (Claude) would resolve against the WRONG directory and
+    // silently start fresh, losing all context.
+    let cwd_usable = project.as_deref().is_some_and(|p| {
+        let path = std::path::Path::new(p);
+        path.is_dir()
+            && std::fs::read_dir(path)
+                .map(|mut e| e.next().is_some())
+                .unwrap_or(false)
+    });
+    match entry.continuation {
+        cue_agent_bridge::registry::ContinuationTier::NativeResume if cwd_usable => {
+            // Normal native resume: drive in the project dir, resume by id, let
+            // the vendor handle context compaction.
+            question.cwd = project;
+            question.resume = Some(session_id.to_string());
+        }
+        cue_agent_bridge::registry::ContinuationTier::NativeResume => {
+            // Native resume but the project cwd is MISSING/EMPTY (e.g. a moved or
+            // un-synced folder). A cwd-scoped `--resume` (Claude) would resolve
+            // against the wrong directory and silently start fresh with NO
+            // context. So degrade to REPLAY: drop the resume id and the unusable
+            // cwd, and replay the transcript as context instead — the
+            // continuation still works, just without the vendor's native resume.
+            question.resume = None;
+            question.cwd = None;
+            if let Some(t) = transcript {
+                question.context = Some(maybe_compact(agent, t).await);
+            }
+        }
+        cue_agent_bridge::registry::ContinuationTier::Replay => {
+            // No native resume: replay the transcript as context. Never pass a
+            // resume id (the agent's --resume can't target it / would mis-fire).
+            // Set the project cwd ONLY if usable, so the agent operates in the
+            // right repo without crashing on a missing/empty folder.
+            question.resume = None;
+            if cwd_usable {
+                question.cwd = project;
+            }
+            if let Some(t) = transcript {
+                question.context = Some(maybe_compact(agent, t).await);
+            }
+        }
+    }
+}
+
+/// The kind to ACTUALLY drive for a (possibly cross-surface) continuation. When
+/// `replaying` and the agent declares a `continuation_via` sibling — i.e. it has
+/// no CLI of its own but its transcript can be continued through a sibling's CLI
+/// (VS Code Copilot → Copilot CLI) — return the sibling kind. Otherwise return
+/// the original kind unchanged. Pure registry lookup, data-driven.
+fn continuation_bridge_kind(kind: &AgentKind, replaying: bool) -> AgentKind {
+    if !replaying {
+        return kind.clone();
+    }
+    let via = cue_agent_bridge::registry::KindTag::from_agent_kind(kind)
+        .and_then(cue_agent_bridge::registry::entry_for)
+        .and_then(|e| e.continuation_via);
+    match via {
+        Some(tag) => tag.to_agent_kind(),
+        None => kind.clone(),
+    }
+}
+
+/// Find a session's project path, plus (for Replay tier) its full transcript.
+/// Read-only, fail-soft → `(None, None)` when the agent/store/session isn't found.
+async fn resolve_session_for_continuation(
+    agent: &AgentKind,
+    session_id: &str,
+    tier: cue_agent_bridge::registry::ContinuationTier,
+) -> (Option<String>, Option<cue_agent_bridge::Transcript>) {
+    let Some(discovered) = discover_agents().into_iter().find(|d| &d.kind == agent) else {
+        return (None, None);
+    };
+    let Some(store) = discovered.session_store.as_ref() else {
+        return (None, None);
+    };
+    let reader = reader_for(store.format);
+
+    // Project: from the session's SessionRef (the readers now populate it).
+    let project = reader
+        .list(store, AGENT_SESSION_LIST_CAP)
+        .ok()
+        .and_then(|refs| {
+            refs.into_iter()
+                .find(|r| r.id == session_id)
+                .and_then(|r| r.project)
+        });
+
+    // Transcript: always needed for Replay; for NativeResume it's a SAFETY NET
+    // used only if the project cwd turns out unusable (so a missed cwd-scoped
+    // resume still has context). Load it for both — it's a bounded read, far
+    // cheaper than the drive itself, and `apply_continuation_tier` only attaches
+    // it for NativeResume when actually needed. Whether the project is usable
+    // depends on the filesystem, which this resolver already touches.
+    let _ = tier; // both tiers load it now; kept for signature/back-compat
+    let transcript = reader
+        .read(store, session_id, CONTINUATION_READ_MAX_TURNS)
+        .ok();
+
+    (project, transcript)
+}
+
+/// Cap on turns loaded from a session being continued via Replay — bounded so a
+/// pathological transcript can't blow memory before compaction runs.
+const CONTINUATION_READ_MAX_TURNS: usize = 4_000;
+
+/// If a Replay transcript is too big to replay whole, summarize its older turns
+/// via a drive through the user's OWN agent and return `[summary] + recent`;
+/// otherwise return it unchanged. Fail-soft: a failed summary returns the raw
+/// transcript (the drive layer's char budget then trims it as the safety net).
+async fn maybe_compact(
+    agent: &AgentKind,
+    transcript: cue_agent_bridge::Transcript,
+) -> cue_agent_bridge::Transcript {
+    if transcript_chars(&transcript.turns) <= CONTINUATION_SUMMARY_BUDGET {
+        return transcript; // fits — replay whole, no extra drive
+    }
+    let (older, recent) = split_for_compaction(&transcript.turns);
+    if older.is_empty() {
+        return transcript;
+    }
+
+    // Flatten the older turns and ask the user's own agent to summarize them.
+    let older_text: String = older
+        .iter()
+        .map(|t| format!("{:?}: {}", t.role, t.text))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let summary_q = AgentQuestion {
+        prompt: summarize_older_prompt(&older_text),
+        context: None,
+        resume: None,
+        cwd: None,
+    };
+    match drive_and_collect(agent.clone(), summary_q, DriveMode::Answer).await {
+        Ok(summary) if !summary.trim().is_empty() => {
+            let mut turns = Vec::with_capacity(recent.len() + 1);
+            turns.push(cue_agent_bridge::Turn {
+                role: cue_agent_bridge::Role::System,
+                text: format!("Summary of the earlier conversation:\n{}", summary.trim()),
+            });
+            turns.extend(recent.iter().cloned());
+            cue_agent_bridge::Transcript { turns }
+        }
+        // Summary failed/empty → raw transcript; the drive budget trims it.
+        _ => transcript,
     }
 }
 
@@ -5042,7 +5272,16 @@ fn is_resume_recoverable_error(message: &str) -> bool {
         || m.contains("no session")
         || m.contains("invalid session")
         || (m.contains("session") && m.contains("not found"));
-    too_large || not_resumable
+    // Resume-incompatibility class: the persisted transcript references tools (or
+    // other state) that aren't available in Bluey's headless resume context, so
+    // the agent rejects replaying it as-is. Seen live: Claude returns
+    // `400 invalid_request_error: "Tool reference 'X' not found in available
+    // tools"` when resuming a session recorded with tools the headless CLI
+    // doesn't load. A fresh (non-resume) drive in the same project still answers,
+    // so this is recoverable the same way an overflow is.
+    let tool_incompatible = m.contains("not found in available tools")
+        || (m.contains("tool reference") && m.contains("not found"));
+    too_large || not_resumable || tool_incompatible
 }
 
 /// Run ONE drive attempt: spawn the agent, stream deltas live to the overlay,
@@ -5059,13 +5298,34 @@ async fn drive_answer_attempt(
     model_override: &[String],
     stream: &mut Option<&mut OverlayAnswerStream>,
 ) -> Result<DriveOutcome, DriveFailure> {
-    let question = agent_question_from_payload(payload, resume);
+    let mut question = agent_question_from_payload(payload, resume);
+    // When a prior session is pinned, continue it per the agent's tier:
+    // NativeResume → set resume id + the session's project as cwd (Claude's
+    // resume is cwd-scoped); Replay → load + (if huge) compact the transcript
+    // into context. No-op for a fresh question. Local agents only — cloud
+    // continuation is the cloud adapter's concern.
+    if !cue_agent_bridge::cloud::is_cloud_kind(kind) {
+        apply_continuation_tier(&mut question, kind, resume).await;
+    }
+
+    // Cross-surface continuation bridge: an agent with NO CLI of its own (e.g.
+    // VS Code Copilot, the extension) but a `continuation_via` sibling continues
+    // its conversation by REPLAYING its transcript through that sibling's CLI
+    // (the Copilot CLI — same GitHub Copilot account). Only when we actually
+    // loaded a transcript to replay (Replay continuation produced context);
+    // otherwise the kind is unchanged. Data-driven — never an `if agent == …`.
+    let drive_kind = continuation_bridge_kind(kind, question.context.is_some());
+
     debug!(
         agent = %label,
+        drive_via = ?drive_kind,
         resuming = resume.is_some(),
+        replay_context = question.context.is_some(),
+        cwd_set = question.cwd.is_some(),
         model_override = model_override.len(),
         "driving attached agent for answer"
     );
+    let kind = &drive_kind;
 
     // Pick the right driver by the agent's registry kind, not by name. Cloud
     // agents (Cursor Cloud, Copilot Cloud, …) have a row in
@@ -9496,6 +9756,77 @@ mod tests {
         );
     }
 
+    fn turn(text: &str) -> cue_agent_bridge::Turn {
+        cue_agent_bridge::Turn {
+            role: cue_agent_bridge::Role::User,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn continuation_bridge_routes_vscode_to_copilot_only_when_replaying() {
+        // VS Code Copilot has no CLI; continuing it must drive through the
+        // Copilot CLI (its `continuation_via` sibling) — but ONLY when we're
+        // actually replaying a transcript.
+        assert_eq!(
+            continuation_bridge_kind(&AgentKind::VsCodeFork, true),
+            AgentKind::Copilot,
+            "VS Code continuation bridges to Copilot CLI when replaying"
+        );
+        // Not replaying (no context) → unchanged (a fresh VS Code ask has no
+        // driver anyway, but we don't silently redirect it).
+        assert_eq!(
+            continuation_bridge_kind(&AgentKind::VsCodeFork, false),
+            AgentKind::VsCodeFork
+        );
+        // An agent with its own CLL is never redirected, replaying or not.
+        assert_eq!(
+            continuation_bridge_kind(&AgentKind::Cursor, true),
+            AgentKind::Cursor
+        );
+        assert_eq!(
+            continuation_bridge_kind(&AgentKind::ClaudeCode, true),
+            AgentKind::ClaudeCode
+        );
+    }
+
+    #[test]
+    fn split_for_compaction_keeps_recent_hot_turns() {
+        // Fewer than the hot count → all "recent", nothing older.
+        let few: Vec<_> = (0..5).map(|i| turn(&format!("t{i}"))).collect();
+        let (older, recent) = split_for_compaction(&few);
+        assert!(older.is_empty());
+        assert_eq!(recent.len(), 5);
+
+        // More than the hot count → older is everything before the last N.
+        let many: Vec<_> = (0..CONTINUATION_HOT_TURNS + 7)
+            .map(|i| turn(&format!("t{i}")))
+            .collect();
+        let (older, recent) = split_for_compaction(&many);
+        assert_eq!(recent.len(), CONTINUATION_HOT_TURNS, "recent = hot layer");
+        assert_eq!(older.len(), 7, "older = the rest");
+        // Ordering preserved: recent is the TAIL.
+        assert_eq!(
+            recent.last().unwrap().text,
+            format!("t{}", CONTINUATION_HOT_TURNS + 6)
+        );
+        assert_eq!(older[0].text, "t0");
+    }
+
+    #[test]
+    fn transcript_chars_sums_turn_text() {
+        let turns = vec![turn("abc"), turn("de"), turn("")];
+        assert_eq!(transcript_chars(&turns), 5);
+    }
+
+    #[test]
+    fn summarize_prompt_includes_the_older_text_and_a_word_cap() {
+        let p = summarize_older_prompt("User: earlier stuff");
+        assert!(p.contains("earlier stuff"));
+        assert!(p.to_lowercase().contains("400 words"));
+        assert!(p.to_lowercase().contains("summary"));
+    }
+
     fn sample_proposal() -> FixProposal {
         FixProposal {
             diagnosis: "PORT is read before the env var is set".to_string(),
@@ -9714,8 +10045,17 @@ mod tests {
         ));
         assert!(is_resume_recoverable_error("session not found"));
         assert!(is_resume_recoverable_error("invalid session id"));
+        // Resume-incompatibility class (CAPTURED LIVE): the persisted transcript
+        // references tools the headless resume context doesn't load → retry fresh.
+        assert!(is_resume_recoverable_error(
+            r#"400 {"type":"error","error":{"type":"invalid_request_error","message":"Tool reference 'TaskCreate' not found in available tools"}}"#
+        ));
+        assert!(is_resume_recoverable_error(
+            "Tool reference 'Foo' not found in available tools"
+        ));
         // Non-recoverable: auth / missing binary / generic — must NOT retry
-        // fresh (a fresh session wouldn't fix these).
+        // fresh (a fresh session wouldn't fix these). In particular "command not
+        // found: claude" must NOT match the tool-incompatibility class.
         assert!(!is_resume_recoverable_error("not signed in"));
         assert!(!is_resume_recoverable_error("command not found: claude"));
         assert!(!is_resume_recoverable_error(
