@@ -125,7 +125,7 @@ impl KindTag {
 /// | Copilot | `copilot` | `-p {prompt} -s` | (none) | plain text |
 /// | Cursor | `cursor-agent` | `-p {prompt} --output-format json` | `--resume={id}` | cursor-json |
 /// | Gemini | `gemini` | `-p {prompt}` | (none) | plain text |
-/// | Codex | `codex` | `exec --json {prompt}` | `exec resume --last --json` | codex-jsonl |
+/// | Codex | `codex` | `exec --skip-git-repo-check --json {prompt}` | `exec resume --skip-git-repo-check {id} {prompt} --json` | codex-jsonl |
 pub const COMMAND_MAP: &[DriveSpec] = &[
     DriveSpec {
         kind_tag: KindTag::ClaudeCode,
@@ -209,8 +209,24 @@ pub const COMMAND_MAP: &[DriveSpec] = &[
         // {prompt}). VERIFIED LIVE: `codex exec resume <SESSION_ID> "<prompt>"`
         // accepts the pinned id + follow-up prompt (the prior `--last` ignored
         // the id and always took the most-recent session).
-        oneshot_args: &["exec", "--json", "{prompt}"],
-        resume_args: &["exec", "resume", "{id}", "{prompt}", "--json"],
+        //
+        // `--skip-git-repo-check`: by default `codex exec` REFUSES to run outside
+        // a trusted git repo ("Not inside a trusted directory and
+        // --skip-git-repo-check was not specified") — which fails BEFORE any model
+        // call when Bluey drives from a non-git cwd (e.g. a meeting overlay with no
+        // project open). The flag makes the drive cwd-independent. VERIFIED via
+        // `codex exec --help` AND `codex exec resume --help` (both accept it). It
+        // only relaxes the git-repo gate; the read-only sandbox posture
+        // (`-c sandbox_mode="read-only"`) still blocks writes.
+        oneshot_args: &["exec", "--skip-git-repo-check", "--json", "{prompt}"],
+        resume_args: &[
+            "exec",
+            "resume",
+            "--skip-git-repo-check",
+            "{id}",
+            "{prompt}",
+            "--json",
+        ],
         parser: OutputParser::CodexJsonl,
     },
 ];
@@ -1243,10 +1259,37 @@ mod tests {
             vec![
                 "exec",
                 "resume",
+                // --skip-git-repo-check makes resume cwd-independent (no git repo
+                // required); the id + prompt substitution is unaffected by it.
+                "--skip-git-repo-check",
                 "019a4a48-d3b4-7591-9e80-1b84ca5868f8",
                 "the follow-up question",
                 "--json",
             ]
+        );
+    }
+
+    #[test]
+    fn test_codex_skip_git_repo_check_on_both_paths() {
+        // Codex must carry --skip-git-repo-check on BOTH the oneshot and resume
+        // drives so it runs from any cwd (a non-git dir would otherwise fail the
+        // git-repo gate before any model call — found via direct probe from /tmp).
+        let spec = spec(KindTag::Codex);
+
+        // Oneshot.
+        let (_, oneshot) = build_argv(spec, &Question::new("hi"));
+        assert!(
+            oneshot.iter().any(|a| a == "--skip-git-repo-check"),
+            "oneshot must skip the git-repo check, got {oneshot:?}"
+        );
+
+        // Resume.
+        let mut q = Question::new("hi");
+        q.resume = Some("019a4a48-d3b4-7591-9e80-1b84ca5868f8".to_string());
+        let (_, resume) = build_argv(spec, &q);
+        assert!(
+            resume.iter().any(|a| a == "--skip-git-repo-check"),
+            "resume must skip the git-repo check, got {resume:?}"
         );
     }
 
