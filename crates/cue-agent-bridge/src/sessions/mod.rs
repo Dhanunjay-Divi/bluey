@@ -7,7 +7,8 @@
 //! - [`jsonl`] — Claude Code / Codex newline-delimited JSON.
 //! - [`vscdb`] — Cursor / VS Code-family `state.vscdb` SQLite store.
 //! - [`json_files`] — VS Code / Copilot `chatSessions/*.json` files.
-//! - [`protobuf`] — Antigravity `*.pb` (safe stub; wire format unknown).
+//! - [`antigravity`] — Antigravity plaintext conversation index (+ SQLite/JSONL
+//!   bodies).
 //!
 //! Security invariants enforced by every decoder (design §6):
 //!
@@ -22,10 +23,10 @@
 
 use crate::{SessionFormat, SessionRef, SessionStore, Transcript};
 
+pub mod antigravity;
 pub mod claude_app;
 pub mod json_files;
 pub mod jsonl;
-pub mod protobuf;
 pub mod vscdb;
 
 /// Decodes one agent's session store, read-only and bounded.
@@ -48,7 +49,7 @@ pub fn reader_for(format: SessionFormat) -> Box<dyn SessionReader> {
         SessionFormat::Jsonl => Box::new(jsonl::JsonlReader),
         SessionFormat::SqliteVscdb => Box::new(vscdb::VscdbReader),
         SessionFormat::JsonFiles => Box::new(json_files::JsonFilesReader),
-        SessionFormat::Protobuf => Box::new(protobuf::ProtobufReader),
+        SessionFormat::AntigravityIndex => Box::new(antigravity::AntigravityReader),
         SessionFormat::ClaudeAppIndex => Box::new(claude_app::ClaudeAppReader),
     }
 }
@@ -109,7 +110,9 @@ pub(crate) fn is_boilerplate_title(text: &str) -> bool {
         "<environment_context>", // Codex injects this as the first turn
         "<cwd>",
         "<user_instructions>",
-        "you are a ", // system role prompts ("You are a Rust architect…")
+        "# agents.md instructions for", // Codex injects this AGENTS.md context block
+        "you are a ",                   // system role prompts ("You are a Rust architect…")
+        "you are the github copilot cli", // Copilot system prompt
         "system:",
         "caveat: the messages below", // Claude Code system caveat banner
     ];

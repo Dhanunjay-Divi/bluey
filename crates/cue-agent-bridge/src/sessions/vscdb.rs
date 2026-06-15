@@ -1,17 +1,42 @@
 //! Cursor / VS Code-family SQLite (`state.vscdb`) session decoder.
 //!
-//! Storage layout (design §3): `…/User/globalStorage/state.vscdb`, a key/value
-//! table `cursorDiskKV` whose JSON values include:
-//! - `composerData:<id>` — one conversation. JSON with assorted keys across
-//!   Cursor versions (`title`, `createdAt`, `conversationMap`,
-//!   `fullConversationHeadersOnly`, `richText`, …).
-//! - `bubbleId:<composerId>:<bubbleId>` — one message within a conversation.
+//! Storage layout (design §3). Cursor keeps conversation data in **two** kinds
+//! of store, both `state.vscdb` SQLite files:
 //!
-//! The DB can be **multi-gigabyte and live**, so every access here is:
+//! 1. The **global** store at `…/User/globalStorage/state.vscdb` — the
+//!    `store.path` we are handed. Its `cursorDiskKV` table holds the rich
+//!    conversation bodies:
+//!    - `composerData:<id>` — one conversation's manifest (`name`, `createdAt`,
+//!      `lastUpdatedAt`, `fullConversationHeadersOnly`, …).
+//!    - `bubbleId:<composerId>:<bubbleId>` — one message within a conversation.
+//!
+//!    The global store does NOT record which **project** a conversation belongs
+//!    to.
+//! 2. The **per-workspace** stores at `…/User/workspaceStorage/<hash>/
+//!    state.vscdb`, one per IDE window/project. Each holds a lightweight
+//!    composer LIST in its `ItemTable` under key `composer.composerData`
+//!    (`{allComposers:[{composerId,name,createdAt,lastUpdatedAt}]}`) and a
+//!    sibling `workspace.json` (`{"folder":"file:///path"}`) giving the real
+//!    project path. These add (a) the workspace→project mapping for global
+//!    conversations and (b) conversations the global store no longer carries.
+//!
+//! [`VscdbReader::list`] reads BOTH: the global store for rich, body-backed
+//! sessions, then every workspace store to attach projects and surface
+//! workspace-only sessions. [`VscdbReader::read`] reads only the global store,
+//! where the message bodies live.
+//!
+//! The global DB can be **multi-gigabyte and live**, so every access here is:
 //! - opened **read-only + `immutable=1`** (never writes, never takes a lock),
 //! - queried with SQL `LIMIT` (never `SELECT *` of the whole table),
+//! - bounded: at most [`MAX_WORKSPACE_STORES`] workspace stores are scanned,
 //! - defensive about schema drift: a missing field degrades (empty title /
 //!   skipped row) rather than erroring or panicking.
+//!
+//! Security: only the `state.vscdb` files and the sibling `workspace.json` are
+//! ever read inside the workspace dirs — never any other file.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
@@ -24,8 +49,36 @@ pub struct VscdbReader;
 
 const TITLE_SNIPPET_CHARS: usize = 80;
 
+/// Upper bound on how many per-workspace stores we scan in one `list` call.
+/// A machine can accumulate hundreds of workspace dirs; the global store already
+/// carries the rich bodies, so the workspace pass is purely additive (projects +
+/// extra sessions) and is safe to cap. 200 comfortably covers real machines
+/// (51 on the dev box) while bounding worst-case work.
+const MAX_WORKSPACE_STORES: usize = 200;
+
+/// `ItemTable` key under which a workspace store keeps its composer LIST.
+const WORKSPACE_COMPOSER_KEY: &str = "composer.composerData";
+
 impl SessionReader for VscdbReader {
     fn list(&self, store: &SessionStore, limit: usize) -> anyhow::Result<Vec<SessionRef>> {
+        // Internal accumulator carrying the recency key alongside the ref, plus
+        // a flag for whether this session has a real body in the global store
+        // (used so a body-backed global session always wins over a list-only
+        // workspace entry on dedup).
+        struct Entry {
+            updated: u64,
+            rf: SessionRef,
+            from_global: bool,
+        }
+
+        // composerId -> Entry. Insertion-merged across the global store and
+        // every workspace store; dedup is by id.
+        let mut by_id: HashMap<String, Entry> = HashMap::new();
+
+        // ---- Pass 1: the global store (rich, body-backed conversations). ----
+        // This is exactly the prior behavior. The global store has the
+        // conversation headers + bubbles, so its sessions are the "real" ones
+        // the read() path can decode in full.
         let conn = open_readonly(store)?;
         // Pull composer rows lazily, bounded. We over-fetch slightly only to
         // re-sort by parsed `createdAt`, then truncate to `limit`.
@@ -49,7 +102,6 @@ impl SessionReader for VscdbReader {
             })
             .map_err(|e| BridgeError::Session(e.to_string()))?;
 
-        let mut refs: Vec<(u64, SessionRef)> = Vec::new();
         for row in rows {
             // A bad row degrades: skip it, keep going.
             let (key, value) = match row {
@@ -68,29 +120,94 @@ impl SessionReader for VscdbReader {
             if conversation_headers(&parsed).is_empty() {
                 continue;
             }
-            // Title: the composer's own `title` if set (rare), else the first
-            // user message — looked up via the conversation headers, since the
-            // text lives on a separate `bubbleId:` row, not on the composer.
-            let title = parsed
-                .get("title")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(|s| snippet(s, TITLE_SNIPPET_CHARS))
+            // Title: Cursor stores its own AI-curated conversation title in
+            // `name` (NOT `title`, which does not exist on real composer rows —
+            // verified 0/227 on a live store). `name` is clean and typo-free
+            // ("Build failure due to syntax error") where the first user bubble
+            // is often a typo'd or pasted blob. Prefer `name` → `subtitle` →
+            // first user message (looked up via the headers, since bubble text
+            // lives on a separate `bubbleId:` row). Run the chosen string
+            // through `clean_title` so the shared boilerplate filter applies.
+            let title = composer_title_field(&parsed)
+                .and_then(|s| super::clean_title(Some(s), TITLE_SNIPPET_CHARS))
                 .or_else(|| first_user_title(&conn, id, &parsed));
-            let created = parsed.get("createdAt").and_then(Value::as_u64).unwrap_or(0);
-            refs.push((
-                created,
-                SessionRef {
-                    id: id.to_string(),
-                    title,
-                    updated_at: created.to_string(),
-                    project: None,
+            // Recency: `lastUpdatedAt` is last activity; `createdAt` is the
+            // start. Prefer the former, falling back to the latter. Both are
+            // epoch milliseconds on real stores.
+            let updated = parsed
+                .get("lastUpdatedAt")
+                .and_then(Value::as_u64)
+                .or_else(|| parsed.get("createdAt").and_then(Value::as_u64))
+                .unwrap_or(0);
+            by_id.insert(
+                id.to_string(),
+                Entry {
+                    updated,
+                    rf: SessionRef {
+                        id: id.to_string(),
+                        title,
+                        updated_at: updated.to_string(),
+                        project: None,
+                    },
+                    from_global: true,
                 },
-            ));
+            );
         }
-        // Most-recent first, then bound to limit.
-        refs.sort_by_key(|(created, _)| std::cmp::Reverse(*created));
-        Ok(refs.into_iter().take(limit).map(|(_, r)| r).collect())
+
+        // ---- Pass 2: the per-workspace stores (projects + extra sessions). --
+        // Each workspace store lists its composers in ItemTable and names its
+        // project in a sibling workspace.json. We use it to (a) attach the
+        // project to global sessions and (b) surface workspace-only sessions
+        // (curated `name` present) that the global store no longer carries.
+        for ws in workspace_stores(&store.path) {
+            let project = ws.project.as_deref();
+            for c in read_workspace_composers(&ws.db) {
+                match by_id.get_mut(&c.id) {
+                    // Already seen (in global or an earlier workspace): just
+                    // backfill the project if we don't have one yet. Never
+                    // downgrade a body-backed global title/recency.
+                    Some(existing) => {
+                        if existing.rf.project.is_none() {
+                            existing.rf.project = project.map(str::to_string);
+                        }
+                    }
+                    // Workspace-only: surface it IF it has a curated title
+                    // (proves a real conversation, mirroring the global
+                    // "skip empty drafts" rule). Its body isn't in the global
+                    // store, so read() will return an empty transcript — but
+                    // the row is still useful (title + project + recency).
+                    None => {
+                        let Some(title) = super::clean_title(c.name.clone(), TITLE_SNIPPET_CHARS)
+                        else {
+                            continue;
+                        };
+                        by_id.insert(
+                            c.id.clone(),
+                            Entry {
+                                updated: c.updated,
+                                rf: SessionRef {
+                                    id: c.id.clone(),
+                                    title: Some(title),
+                                    updated_at: c.updated.to_string(),
+                                    project: project.map(str::to_string),
+                                },
+                                from_global: false,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        // Most-recent first; body-backed (global) sessions break ties ahead of
+        // list-only workspace ones. Then bound to limit.
+        let mut entries: Vec<Entry> = by_id.into_values().collect();
+        entries.sort_by(|a, b| {
+            b.updated
+                .cmp(&a.updated)
+                .then(b.from_global.cmp(&a.from_global))
+        });
+        Ok(entries.into_iter().take(limit).map(|e| e.rf).collect())
     }
 
     fn read(&self, store: &SessionStore, id: &str, max_turns: usize) -> anyhow::Result<Transcript> {
@@ -133,6 +250,158 @@ impl SessionReader for VscdbReader {
     }
 }
 
+/// One per-workspace store: the `state.vscdb` path plus the project folder its
+/// sibling `workspace.json` points at (when resolvable).
+struct WorkspaceStore {
+    db: PathBuf,
+    project: Option<String>,
+}
+
+/// One composer listed in a workspace store's `allComposers`.
+struct WorkspaceComposer {
+    id: String,
+    name: Option<String>,
+    /// Recency in epoch ms: `lastUpdatedAt` falling back to `createdAt`.
+    updated: u64,
+}
+
+/// Enumerate the per-workspace stores that sit alongside the given **global**
+/// vscdb. The global store lives at `…/User/globalStorage/state.vscdb`; the
+/// workspace stores live at `…/User/workspaceStorage/<hash>/state.vscdb`. We
+/// derive `workspaceStorage` from the global path's grandparent (`User/`) so the
+/// caller hands us only the one global path, exactly as `discover.rs` provides.
+///
+/// Read-only and fail-soft: a missing/unreadable `workspaceStorage` yields an
+/// empty list, and the scan is bounded to [`MAX_WORKSPACE_STORES`] entries.
+/// Only the `state.vscdb` and sibling `workspace.json` are touched — no other
+/// file in a workspace dir is read.
+fn workspace_stores(global_vscdb: &Path) -> Vec<WorkspaceStore> {
+    // …/User/globalStorage/state.vscdb → …/User → …/User/workspaceStorage
+    let Some(user_dir) = global_vscdb.parent().and_then(Path::parent) else {
+        return Vec::new();
+    };
+    let ws_root = user_dir.join("workspaceStorage");
+    let read = match std::fs::read_dir(&ws_root) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut out = Vec::new();
+    for child in read.flatten() {
+        if out.len() >= MAX_WORKSPACE_STORES {
+            break;
+        }
+        let dir = child.path();
+        let db = dir.join("state.vscdb");
+        // Cheap existence gate before any SQLite open; skip dirs without a store.
+        if std::fs::metadata(&db).is_err() {
+            continue;
+        }
+        let project = read_workspace_folder(&dir.join("workspace.json"));
+        out.push(WorkspaceStore { db, project });
+    }
+    out
+}
+
+/// Read the project path from a workspace's `workspace.json` (`{"folder":
+/// "file:///path"}`). Returns a filesystem path for `file://` URLs (percent-
+/// decoded); for `vscode-remote://` (SSH/dev-container) folders the host-side
+/// path is not a local filesystem path, so we return the raw URI as a label
+/// rather than a misleading local path. `None` when the file is absent,
+/// unreadable, or has no `folder`. Read-only and fail-soft.
+fn read_workspace_folder(workspace_json: &Path) -> Option<String> {
+    let raw = std::fs::read_to_string(workspace_json).ok()?;
+    let parsed: Value = serde_json::from_str(&raw).ok()?;
+    let folder = parsed.get("folder").and_then(Value::as_str)?.trim();
+    if folder.is_empty() {
+        return None;
+    }
+    if let Some(rest) = folder.strip_prefix("file://") {
+        // `file:///Users/...` → `/Users/...`; percent-decode `%20` etc. so the
+        // project leaf renders cleanly (e.g. "Job Matching Algorithm").
+        Some(percent_decode(rest))
+    } else {
+        // Remote (vscode-remote://…) or other scheme: keep the URI as a label;
+        // it is NOT a local path, so we must not present it as one.
+        Some(folder.to_string())
+    }
+}
+
+/// Minimal percent-decoder for `file://` URL paths (`%20` → space, …).
+/// Dependency-free; leaves malformed/incomplete escapes untouched. UTF-8
+/// multi-byte sequences (each byte its own `%XX`) are reassembled and decoded
+/// lossily.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Read the composer LIST from one workspace store's `ItemTable`
+/// (`composer.composerData` → `{allComposers:[…]}`). Bodies are NOT here — only
+/// `{composerId, name, createdAt, lastUpdatedAt}` per composer. Read-only +
+/// `immutable=1`; a missing key / unreadable DB / bad JSON degrades to an empty
+/// list. Composers without an id are skipped.
+fn read_workspace_composers(db: &Path) -> Vec<WorkspaceComposer> {
+    let conn = match open_readonly_path(db) {
+        Some(c) => c,
+        None => return Vec::new(),
+    };
+    let raw: String = match conn.query_row(
+        "SELECT value FROM ItemTable WHERE key = ?1 LIMIT 1",
+        [WORKSPACE_COMPOSER_KEY],
+        |row| row.get(0),
+    ) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let parsed: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let Some(all) = parsed.get("allComposers").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for c in all {
+        let Some(id) = c.get("composerId").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = c
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let updated = c
+            .get("lastUpdatedAt")
+            .and_then(Value::as_u64)
+            .or_else(|| c.get("createdAt").and_then(Value::as_u64))
+            .unwrap_or(0);
+        out.push(WorkspaceComposer {
+            id: id.to_string(),
+            name,
+            updated,
+        });
+    }
+    out
+}
+
 /// Load and parse a `composerData:<id>` row.
 fn load_composer(conn: &Connection, id: &str) -> Option<Value> {
     let key = format!("composerData:{id}");
@@ -144,6 +413,21 @@ fn load_composer(conn: &Connection, id: &str) -> Option<Value> {
         )
         .ok()?;
     serde_json::from_str(&value).ok()
+}
+
+/// The composer's own stored title, across Cursor field names. Real composer
+/// rows use `name` (AI-curated) and `subtitle`; older/other surfaces may use
+/// `title`. First non-empty wins. Returned raw — the caller runs `clean_title`.
+fn composer_title_field(composer: &Value) -> Option<String> {
+    for field in ["name", "subtitle", "title"] {
+        if let Some(s) = composer.get(field).and_then(Value::as_str) {
+            let s = s.trim();
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// The ordered `fullConversationHeadersOnly` list (each `{bubbleId, type}`).
@@ -203,17 +487,27 @@ fn first_user_title(conn: &Connection, id: &str, composer: &Value) -> Option<Str
 }
 
 /// Open the store read-only with `immutable=1` so a live/locked DB is never
-/// written or blocked. Never falls back to a writable handle.
+/// written or blocked. Never falls back to a writable handle. Surfaces an
+/// [`BridgeError::Unreadable`] error so the (global) store's failure propagates.
 fn open_readonly(store: &SessionStore) -> anyhow::Result<Connection> {
-    let path = store.path.to_string_lossy();
+    open_readonly_path(&store.path)
+        .ok_or_else(|| BridgeError::Unreadable(store.path.clone()).into())
+}
+
+/// Open any vscdb file read-only with `immutable=1`, or `None` if it can't be
+/// opened. Shared by the global-store open above and the per-workspace store
+/// reader, which is fail-soft (a bad workspace DB is simply skipped). Never
+/// writes, never locks, never falls back to a writable handle.
+fn open_readonly_path(path: &Path) -> Option<Connection> {
+    let p = path.to_string_lossy();
     // URI form lets us pass `immutable=1`; the flag tells SQLite the file will
     // not change, so it skips locking entirely (safe for our read-only use).
-    let uri = format!("file:{path}?immutable=1&mode=ro");
+    let uri = format!("file:{p}?immutable=1&mode=ro");
     Connection::open_with_flags(
         uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
     )
-    .map_err(|_| BridgeError::Unreadable(store.path.clone()).into())
+    .ok()
 }
 
 /// Map a Cursor bubble JSON value to a normalized [`Turn`], or `None` if it
@@ -287,11 +581,13 @@ mod tests {
         // Two composer conversations with differing createdAt for recency.
         // conv-older: has content (a header) + an older createdAt, so it lists
         // but sorts after conv-new.
+        // conv-older uses ONLY a first-user-bubble for its title (no `name`),
+        // proving the fallback chain still works when Cursor didn't curate one.
         conn.execute(
             "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
             rusqlite::params![
                 "composerData:conv-older",
-                r#"{"title":"Older chat","createdAt":1000,"fullConversationHeadersOnly":[{"bubbleId":"o1","type":1}]}"#
+                r#"{"createdAt":1000,"lastUpdatedAt":1500,"fullConversationHeadersOnly":[{"bubbleId":"o1","type":1}]}"#
             ],
         )
         .unwrap();
@@ -300,14 +596,16 @@ mod tests {
             rusqlite::params!["bubbleId:conv-older:o1", r#"{"type":1,"text":"older q"}"#],
         )
         .unwrap();
-        // conv-new: the real Cursor shape — message text lives on separate
-        // `bubbleId:` rows, and the composer's `fullConversationHeadersOnly`
-        // is the ORDERED manifest of {bubbleId, type} (1=user, 2=assistant).
+        // conv-new: the real Cursor shape — the AI-curated title lives in `name`
+        // (NOT `title`), the first user bubble is a typo'd blob that must NOT win
+        // over `name`, message text lives on separate `bubbleId:` rows, and
+        // `fullConversationHeadersOnly` is the ORDERED manifest of {bubbleId,
+        // type} (1=user, 2=assistant). `lastUpdatedAt` > conv-older's, so newest.
         conn.execute(
             "INSERT INTO cursorDiskKV VALUES (?1, ?2)",
             rusqlite::params![
                 "composerData:conv-new",
-                r#"{"title":"Newer chat","createdAt":2000,"fullConversationHeadersOnly":[{"bubbleId":"b1","type":1},{"bubbleId":"b2","type":2},{"bubbleId":"b3","type":2}]}"#
+                r#"{"name":"Build failure due to syntax error","subtitle":"edited main.rs","createdAt":2000,"lastUpdatedAt":3000,"fullConversationHeadersOnly":[{"bubbleId":"b1","type":1},{"bubbleId":"b2","type":2},{"bubbleId":"b3","type":2}]}"#
             ],
         )
         .unwrap();
@@ -358,9 +656,18 @@ mod tests {
         // content (listed, newest first); conv-bare is an empty auto-created
         // draft and is FILTERED OUT so users see only real sessions.
         assert_eq!(refs.len(), 2, "empty draft (conv-bare) must be excluded");
-        assert_eq!(refs[0].id, "conv-new", "newest first");
-        assert_eq!(refs[0].title.as_deref(), Some("Newer chat"));
+        assert_eq!(refs[0].id, "conv-new", "newest first (by lastUpdatedAt)");
+        // The AI-curated `name` wins over the first user bubble ("Question?").
+        assert_eq!(
+            refs[0].title.as_deref(),
+            Some("Build failure due to syntax error"),
+            "Cursor's `name` field must be the title, not the first bubble"
+        );
+        // conv-older has no `name` → falls back to its first user bubble.
         assert_eq!(refs[1].id, "conv-older");
+        assert_eq!(refs[1].title.as_deref(), Some("older q"));
+        // Recency uses lastUpdatedAt (conv-new 3000 > conv-older 1500).
+        assert_eq!(refs[0].updated_at, "3000");
         assert!(
             !refs.iter().any(|r| r.id == "conv-bare"),
             "empty session must not appear"
@@ -414,5 +721,241 @@ mod tests {
         let store = store_at(db);
         let t = reader.read(&store, "does-not-exist", 10).expect("read");
         assert!(t.turns.is_empty());
+    }
+
+    // ----- Per-workspace store merge (projects + workspace-only sessions) -----
+    //
+    // Cursor's IDE writes BOTH a global store (rich bodies, no project) and one
+    // store per workspace (`User/workspaceStorage/<hash>/state.vscdb`, a
+    // lightweight `composer.composerData` list) plus a `workspace.json` naming
+    // the project. The reader must derive `workspaceStorage` from the global
+    // path, attach the project to global sessions, and surface workspace-only
+    // sessions the global store no longer carries — without regressing the
+    // existing global-only behavior.
+
+    /// Build the real Cursor layout under `root`:
+    /// `root/User/globalStorage/state.vscdb` (the `make_db` fixture) and return
+    /// the global store path. The workspace stores are added by `add_workspace`.
+    fn make_global_layout(root: &std::path::Path) -> std::path::PathBuf {
+        let global = root.join("User/globalStorage/state.vscdb");
+        std::fs::create_dir_all(global.parent().unwrap()).expect("mkdir globalStorage");
+        make_db(&global);
+        global
+    }
+
+    /// Add one workspace store under `root/User/workspaceStorage/<hash>/` with
+    /// the given `allComposers` JSON array and an optional `workspace.json`
+    /// `folder` value. Mirrors the on-disk shape (`ItemTable` + `cursorDiskKV`).
+    fn add_workspace(
+        root: &std::path::Path,
+        hash: &str,
+        all_composers: &str,
+        folder: Option<&str>,
+    ) {
+        let dir = root.join("User/workspaceStorage").join(hash);
+        std::fs::create_dir_all(&dir).expect("mkdir workspace");
+        let db = dir.join("state.vscdb");
+        let conn = Connection::open(&db).expect("open workspace db");
+        // Real workspace stores carry both tables; the composer list is in
+        // ItemTable under `composer.composerData`.
+        conn.execute_batch(
+            "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);
+             CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT);",
+        )
+        .expect("create workspace tables");
+        conn.execute(
+            "INSERT INTO ItemTable VALUES ('composer.composerData', ?1)",
+            rusqlite::params![format!(r#"{{"allComposers":{all_composers}}}"#)],
+        )
+        .expect("insert composer list");
+        if let Some(f) = folder {
+            std::fs::write(dir.join("workspace.json"), format!(r#"{{"folder":"{f}"}}"#))
+                .expect("write workspace.json");
+        }
+    }
+
+    #[test]
+    fn workspace_attaches_project_to_global_session_and_keeps_one_on_dedup() {
+        // The SAME composer (`conv-new`) appears in the global store (with a
+        // body) AND in a workspace's allComposers (with a project). The merge
+        // must keep ONE entry, retain the global body-backed title/recency, and
+        // attach the workspace's project.
+        let root = tempfile::tempdir().expect("tempdir");
+        let global = make_global_layout(root.path());
+        add_workspace(
+            root.path(),
+            "ws-hash-a",
+            r#"[{"composerId":"conv-new","name":"stale ws name","createdAt":1,"lastUpdatedAt":2}]"#,
+            Some("file:///Users/me/Developer/Bluey"),
+        );
+
+        let refs = VscdbReader.list(&store_at(global), 50).expect("list");
+        let conv_new: Vec<_> = refs.iter().filter(|r| r.id == "conv-new").collect();
+        assert_eq!(conv_new.len(), 1, "dedup keeps a single conv-new entry");
+        let c = conv_new[0];
+        // Body-backed global title wins over the workspace's stale `name`.
+        assert_eq!(
+            c.title.as_deref(),
+            Some("Build failure due to syntax error"),
+            "global body-backed title must win over workspace name"
+        );
+        // Global recency preserved (3000), not the workspace's 2.
+        assert_eq!(c.updated_at, "3000", "global recency preserved");
+        // Project attached from the workspace.json folder (percent-decoded path).
+        assert_eq!(
+            c.project.as_deref(),
+            Some("/Users/me/Developer/Bluey"),
+            "project resolved from workspace.json folder"
+        );
+    }
+
+    #[test]
+    fn workspace_only_named_sessions_surface_with_project() {
+        // A composer that exists ONLY in a workspace (no global body) but has a
+        // curated `name` must surface as a session with its project. An UNNAMED
+        // workspace-only composer (an empty draft) must NOT surface.
+        let root = tempfile::tempdir().expect("tempdir");
+        let global = make_global_layout(root.path());
+        add_workspace(
+            root.path(),
+            "ws-hash-b",
+            r#"[
+                {"composerId":"ws-only-1","name":"Designing the landing page","createdAt":4000,"lastUpdatedAt":5000},
+                {"composerId":"ws-only-blank","createdAt":100,"lastUpdatedAt":200}
+            ]"#,
+            Some("file:///Users/me/Projects/Heyloo"),
+        );
+
+        let refs = VscdbReader.list(&store_at(global), 50).expect("list");
+        // The 2 global sessions (conv-new, conv-older) PLUS the 1 named
+        // workspace-only session = 3. The blank workspace-only draft is skipped.
+        assert_eq!(refs.len(), 3, "named ws-only session added; blank skipped");
+        let ws_only = refs
+            .iter()
+            .find(|r| r.id == "ws-only-1")
+            .expect("named workspace-only session surfaces");
+        assert_eq!(ws_only.title.as_deref(), Some("Designing the landing page"));
+        assert_eq!(
+            ws_only.project.as_deref(),
+            Some("/Users/me/Projects/Heyloo")
+        );
+        // ws-only-1 has the newest lastUpdatedAt (5000) → sorts first.
+        assert_eq!(refs[0].id, "ws-only-1", "newest overall sorts first");
+        assert!(
+            !refs.iter().any(|r| r.id == "ws-only-blank"),
+            "unnamed workspace-only draft must not surface"
+        );
+    }
+
+    #[test]
+    fn no_workspace_storage_preserves_global_only_behavior() {
+        // With the real global layout but NO workspaceStorage dir at all, the
+        // listing is exactly the global-only result (2 sessions, no projects) —
+        // the workspace pass must be a no-op, never an error.
+        let root = tempfile::tempdir().expect("tempdir");
+        let global = make_global_layout(root.path());
+        // Intentionally do NOT create User/workspaceStorage.
+
+        let refs = VscdbReader.list(&store_at(global), 50).expect("list");
+        assert_eq!(refs.len(), 2, "global-only sessions unchanged");
+        assert!(
+            refs.iter().all(|r| r.project.is_none()),
+            "no project without a workspace store"
+        );
+    }
+
+    #[test]
+    fn corrupt_or_partial_workspace_store_is_skipped_fail_soft() {
+        // A workspace dir with a corrupt vscdb, and another with NO composer
+        // key, must both degrade silently — the global sessions still list and a
+        // valid sibling workspace's session still surfaces.
+        let root = tempfile::tempdir().expect("tempdir");
+        let global = make_global_layout(root.path());
+
+        // Corrupt DB.
+        let bad_dir = root.path().join("User/workspaceStorage/ws-bad");
+        std::fs::create_dir_all(&bad_dir).expect("mkdir bad");
+        std::fs::write(bad_dir.join("state.vscdb"), b"not-sqlite").expect("write corrupt");
+        std::fs::write(bad_dir.join("workspace.json"), r#"{"folder":"file:///x"}"#)
+            .expect("write ws json");
+
+        // Valid sibling with a named workspace-only composer.
+        add_workspace(
+            root.path(),
+            "ws-good",
+            r#"[{"composerId":"good-1","name":"Valid sibling session","createdAt":6000,"lastUpdatedAt":7000}]"#,
+            Some("file:///Users/me/Good"),
+        );
+
+        let refs = VscdbReader.list(&store_at(global), 50).expect("list");
+        assert!(
+            refs.iter().any(|r| r.id == "good-1"),
+            "valid sibling session surfaces despite a corrupt neighbor"
+        );
+        assert!(
+            refs.iter().any(|r| r.id == "conv-new"),
+            "global sessions still list"
+        );
+    }
+
+    #[test]
+    fn read_workspace_folder_decodes_file_url_and_keeps_remote_uri() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // file:// with percent-encoding → decoded local path.
+        let f1 = dir.path().join("a.json");
+        std::fs::write(
+            &f1,
+            r#"{"folder":"file:///Users/me/Job%20Matching%20Algorithm"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_workspace_folder(&f1).as_deref(),
+            Some("/Users/me/Job Matching Algorithm")
+        );
+
+        // vscode-remote:// → kept verbatim (NOT presented as a local path).
+        let f2 = dir.path().join("b.json");
+        std::fs::write(
+            &f2,
+            r#"{"folder":"vscode-remote://ssh-remote%2Bhost/home/p"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_workspace_folder(&f2).as_deref(),
+            Some("vscode-remote://ssh-remote%2Bhost/home/p")
+        );
+
+        // Missing folder / missing file → None.
+        let f3 = dir.path().join("c.json");
+        std::fs::write(&f3, r#"{}"#).unwrap();
+        assert_eq!(read_workspace_folder(&f3), None);
+        assert_eq!(read_workspace_folder(&dir.path().join("nope.json")), None);
+    }
+
+    #[test]
+    fn percent_decode_handles_spaces_unicode_and_bad_escapes() {
+        assert_eq!(percent_decode("/a%20b"), "/a b");
+        // UTF-8 "é" = 0xC3 0xA9, each byte its own escape.
+        assert_eq!(percent_decode("/caf%C3%A9"), "/café");
+        // A dangling/incomplete escape is left untouched, never panics.
+        assert_eq!(percent_decode("/x%2"), "/x%2");
+        assert_eq!(percent_decode("/y%zz"), "/y%zz");
+        assert_eq!(percent_decode("/plain/path"), "/plain/path");
+    }
+
+    #[test]
+    fn workspace_store_path_math_derives_workspacestorage_from_global() {
+        // The reader must locate workspaceStorage as a sibling of globalStorage,
+        // both under User/ — derived purely from the global vscdb path.
+        let global = std::path::Path::new("/data/Cursor/User/globalStorage/state.vscdb");
+        let user = global.parent().and_then(std::path::Path::parent).unwrap();
+        assert!(user.ends_with("User"));
+        assert_eq!(
+            user.join("workspaceStorage"),
+            std::path::Path::new("/data/Cursor/User/workspaceStorage")
+        );
+        // And `workspace_stores` returns empty (no panic) for a path whose
+        // workspaceStorage does not exist.
+        assert!(workspace_stores(global).is_empty());
     }
 }

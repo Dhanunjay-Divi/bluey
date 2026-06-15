@@ -63,6 +63,22 @@ pub(crate) fn read_transcript_file(file: &Path, max_turns: usize) -> anyhow::Res
     if max_turns == 0 {
         return Ok(Transcript { turns });
     }
+    // Gemini's legacy `.json` sessions are ONE pretty-printed JSON object with a
+    // `messages[]` array — line-by-line decoding is meaningless for them (a
+    // physical line is a fragment, and one stray valid line could yield a
+    // partial transcript). Route `.json` straight to whole-file parsing; the
+    // `.jsonl` streaming path below is left completely untouched (zero risk to
+    // Claude/Codex/Copilot, whose stores are always `.jsonl`).
+    if file.extension().and_then(|e| e.to_str()) == Some("json") {
+        if let Some(msgs) = whole_file_messages(file) {
+            for value in msgs.iter().take(max_turns) {
+                if let Some(turn) = turn_from_value(value) {
+                    turns.push(turn);
+                }
+            }
+        }
+        return Ok(Transcript { turns });
+    }
     // Stream line-by-line and stop at `max_turns` — never load the whole
     // file (sessions reach 10 MB+). A pathologically long single line is
     // bounded by `MAX_LINE_BYTES` so a corrupt/huge line can't blow memory.
@@ -91,6 +107,26 @@ pub(crate) fn read_transcript_file(file: &Path, max_turns: usize) -> anyhow::Res
     Ok(Transcript { turns })
 }
 
+/// Parse a whole file as a single JSON object and return its `messages` array,
+/// for Gemini's legacy `chats/session-*.json` format. Bounded by file size so a
+/// huge file can't be slurped; fail-soft (returns `None` on any problem).
+fn whole_file_messages(file: &Path) -> Option<Vec<Value>> {
+    // A conversation transcript object is small relative to a streamed JSONL log;
+    // cap the whole-file read so this fallback can't blow memory on a stray large
+    // `.json`.
+    const MAX_WHOLE_FILE_BYTES: u64 = 16 * 1024 * 1024;
+    let meta = std::fs::metadata(file).ok()?;
+    if meta.len() > MAX_WHOLE_FILE_BYTES {
+        return None;
+    }
+    let text = std::fs::read_to_string(file).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    value
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|a| a.to_vec())
+}
+
 /// Enumerate candidate `*.jsonl` files for a store path.
 ///
 /// Handles three layouts:
@@ -112,16 +148,25 @@ fn enumerate_files(path: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Append `*.jsonl` files at `dir` and recurse into subdirs up to `depth`.
+/// Append session files at `dir` and recurse into subdirs up to `depth`.
 /// Read-only, fail-soft: an unreadable dir is skipped.
+///
+/// Collects `*.jsonl` everywhere. Also collects legacy `*.json` **only inside a
+/// `chats/` directory** — that is Gemini CLI's pre-JSONL layout
+/// (`~/.gemini/tmp/<token>/chats/session-*.json`, a single JSON object with a
+/// `messages[]` array). Scoping the `.json` pickup to `chats/` keeps stray
+/// config `.json` files (and other agents' stores, which have no `chats/` dir)
+/// out of the listing — so this cannot disturb Claude/Codex/Copilot.
 fn collect_jsonl(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
+    let in_chats_dir = dir.file_name().is_some_and(|n| n == "chats");
     for entry in entries.flatten() {
         let p = entry.path();
         if p.is_file() {
-            if p.extension().is_some_and(|e| e == "jsonl") {
+            let ext = p.extension().and_then(|e| e.to_str());
+            if ext == Some("jsonl") || (in_chats_dir && ext == Some("json")) {
                 out.push(p);
             }
         } else if p.is_dir() && depth > 0 {
@@ -141,29 +186,38 @@ fn resolve_file(path: &Path, id: &str, _store: &SessionStore) -> PathBuf {
         return flat;
     }
     // The id is a file stem; the file may be nested (Claude 1 level, Codex by
-    // date). Match on the file stem OR — for brain transcripts whose stem is
-    // always "transcript" — on the derived session-dir id, mirroring how
-    // `session_ref_for` assigns the id.
+    // date). Match on the file stem OR — for layouts whose stem is generic
+    // (Copilot `events`, Antigravity brain `transcript`) — on the derived
+    // session-dir id, mirroring how `session_ref_for` assigns the id.
     enumerate_files(path)
         .into_iter()
         .find(|f| {
             let stem = f.file_stem().map(|s| s.to_string_lossy().into_owned());
-            if stem.as_deref() == Some(id) {
-                return true;
-            }
-            stem.as_deref() == Some("transcript")
-                && session_id_from_brain_path(f).as_deref() == Some(id)
+            stem.as_deref() == Some(id) || session_id_from_dir(f).as_deref() == Some(id)
         })
         .unwrap_or(flat)
 }
 
-/// For an Antigravity brain transcript at
-/// `…/brain/<session-id>/.system_generated/logs/transcript.jsonl`, return the
-/// `<session-id>` directory name (3 levels above the file). `None` if the path
-/// doesn't match that shape.
-fn session_id_from_brain_path(file: &Path) -> Option<String> {
-    // file → logs → .system_generated → <session-id>
-    let session_dir = file.parent()?.parent()?.parent()?;
+/// Some agents name EVERY session file the same generic stem and put the real
+/// session id in an ancestor **directory** name, so the file stem is useless as
+/// an id. This returns the real id for those layouts, or `None` for normal
+/// `<id>.jsonl` files (where the stem IS the id).
+///
+/// Handled layouts:
+/// - **Copilot CLI:** `…/session-state/<id>/events.jsonl` — id = the immediate
+///   parent dir. (Stem is always `events`.)
+/// - **Antigravity brain:** `…/brain/<id>/.system_generated/logs/transcript.jsonl`
+///   — id = the dir 3 levels up. (Stem is always `transcript`.)
+fn session_id_from_dir(file: &Path) -> Option<String> {
+    let stem = file.file_stem()?.to_str()?;
+    let session_dir = match stem {
+        // Copilot: events.jsonl lives directly under the <id> dir.
+        "events" => file.parent()?,
+        // Antigravity brain: transcript.jsonl is 3 levels under the <id> dir.
+        "transcript" => file.parent()?.parent()?.parent()?,
+        // Normal layout — the file stem is the id.
+        _ => return None,
+    };
     session_dir
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -224,26 +278,26 @@ fn decode_project_dir(dir_name: &str) -> Option<String> {
 /// Build a [`SessionRef`] from a file: id = stem, updated_at = mtime epoch,
 /// title = first user-message snippet, project = decoded parent dir name.
 fn session_ref_for(file: &Path) -> Option<SessionRef> {
-    // Most layouts name the file by session id (`<id>.jsonl`). Some (Antigravity
-    // brain: `<id>/.system_generated/logs/transcript.jsonl`) name EVERY file
-    // `transcript.jsonl`, so the stem is useless — derive the id from the
-    // session directory instead.
+    // Most layouts name the file by session id (`<id>.jsonl`). Some put the id in
+    // an ancestor dir and use a generic stem (Copilot `<id>/events.jsonl`,
+    // Antigravity brain `<id>/…/transcript.jsonl`) — derive the id from the dir.
     let stem = file.file_stem()?.to_string_lossy().into_owned();
-    let id = if stem == "transcript" {
-        session_id_from_brain_path(file).unwrap_or(stem)
-    } else {
-        stem
-    };
+    let id = session_id_from_dir(file).unwrap_or(stem);
     let updated_at = mtime_epoch_string(file);
     let project = file
         .parent()
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().into_owned())
         .and_then(|name| decode_project_dir(&name));
-    // Title: first real-topic user message → cleaned; else a project-based
-    // fallback so the row is never blank/unidentifiable (handles Codex rollouts
-    // and Claude sessions whose first turns are all boilerplate).
-    let title = super::clean_title(first_user_snippet(file), TITLE_SNIPPET_CHARS)
+    // Title priority:
+    //   1. Claude's own stored title — `customTitle` (user-set) or `aiTitle`
+    //      (Claude-generated). These are clean, human-readable titles that
+    //      Claude itself shows; ~18% of CLI sessions carry one. Prefer them.
+    //   2. The first real-topic user message → cleaned.
+    //   3. A project-based fallback so the row is never blank (Codex rollouts /
+    //      sessions whose first turns are all boilerplate).
+    let title = super::clean_title(stored_title(file), TITLE_SNIPPET_CHARS)
+        .or_else(|| super::clean_title(first_user_snippet(file), TITLE_SNIPPET_CHARS))
         .or_else(|| super::fallback_label(project.as_deref(), &updated_at));
     Some(SessionRef {
         id,
@@ -251,6 +305,54 @@ fn session_ref_for(file: &Path) -> Option<SessionRef> {
         updated_at,
         project,
     })
+}
+
+/// Read Claude's own stored session title, if present: a `customTitle`
+/// (user-set, via `/rename`) or `aiTitle` (Claude-generated) record. These are
+/// emitted as dedicated JSONL lines, e.g. `{"type":"ai-title","aiTitle":"…"}`,
+/// and re-emitted as the title is updated, so the LAST occurrence is the current
+/// one. `customTitle` outranks `aiTitle`. Returns `None` for non-Claude formats
+/// (Codex/Copilot/etc. have no such records) so their title path is unchanged.
+///
+/// Bounded by line COUNT, not just line bytes: a session can reach 10 MB+, so we
+/// scan at most `MAX_TITLE_LINES_SCANNED` lines and keep the freshest title seen.
+/// Real title records sit within this budget; the cap guarantees this never
+/// stalls on a pathological file (the prior reader had no title-record path at
+/// all, so this is strictly additive and fail-soft).
+fn stored_title(file: &Path) -> Option<String> {
+    const MAX_TITLE_LINES_SCANNED: usize = 50_000;
+    let handle = std::fs::File::open(file).ok()?;
+    let reader = BufReader::new(handle);
+    let mut ai_title: Option<String> = None;
+    let mut custom_title: Option<String> = None;
+    for (scanned, line) in reader.lines().enumerate() {
+        if scanned >= MAX_TITLE_LINES_SCANNED {
+            break;
+        }
+        let Ok(line) = line else { break };
+        let line = line.trim();
+        // Cheap pre-filter: only parse lines that mention a title field. The vast
+        // majority of lines (turns, tool calls) are skipped without JSON parsing.
+        if line.len() > MAX_LINE_BYTES
+            || !(line.contains("aiTitle") || line.contains("customTitle"))
+        {
+            continue;
+        }
+        let Ok(value): Result<Value, _> = serde_json::from_str(line) else {
+            continue;
+        };
+        if let Some(s) = value.get("customTitle").and_then(Value::as_str) {
+            if !s.trim().is_empty() {
+                custom_title = Some(s.to_string()); // last wins
+            }
+        }
+        if let Some(s) = value.get("aiTitle").and_then(Value::as_str) {
+            if !s.trim().is_empty() {
+                ai_title = Some(s.to_string()); // last wins
+            }
+        }
+    }
+    custom_title.or(ai_title)
 }
 
 /// Find the first user message that is a REAL topic (not boilerplate), to use
@@ -282,7 +384,21 @@ fn first_user_snippet(file: &Path) -> Option<String> {
                 }
                 user_turns_seen += 1;
                 if user_turns_seen >= MAX_USER_TURNS_SCANNED {
-                    break;
+                    return None;
+                }
+            }
+        }
+    }
+    // Legacy single-object `.json` fallback (Gemini): same first-real-user-turn
+    // search over the whole-file `messages[]`.
+    if let Some(msgs) = whole_file_messages(file) {
+        for value in msgs.iter().take(MAX_USER_TURNS_SCANNED * 2) {
+            if let Some(turn) = turn_from_value(value) {
+                if turn.role == Role::User
+                    && !turn.text.trim().is_empty()
+                    && !super::is_boilerplate_title(&turn.text)
+                {
+                    return Some(turn.text);
                 }
             }
         }
@@ -304,14 +420,22 @@ fn first_user_snippet(file: &Path) -> Option<String> {
 fn turn_from_value(value: &Value) -> Option<Turn> {
     // Codex wraps the real event under `payload`; unwrap it first so the same
     // role/content logic applies to Claude and Codex alike.
-    let value = value.get("payload").unwrap_or(value);
-    // Prefer a nested `message` object (Claude), else the top level.
-    let msg = value.get("message").unwrap_or(value);
+    let outer = value.get("payload").unwrap_or(value);
+    // GitHub Copilot CLI nests role/content under a `data` object (sibling to
+    // the dotted `type`), e.g. `{"type":"user.message","data":{"content":…}}`.
+    // Descend into it so Copilot turns parse. This is a no-op for every other
+    // vendor: Claude/Codex/Cursor lines have no top-level `data` key (verified
+    // against real session stores), so `unwrap_or(outer)` returns `outer`
+    // unchanged and cannot regress the working path. The role is still read
+    // from the OUTER object's `type` (Copilot's dotted role lives there).
+    let inner = outer.get("data").unwrap_or(outer);
+    // Prefer a nested `message` object (Claude), else the (data-unwrapped) level.
+    let msg = inner.get("message").unwrap_or(inner);
 
     let role_str = msg
         .get("role")
         .and_then(Value::as_str)
-        .or_else(|| value.get("type").and_then(Value::as_str))?;
+        .or_else(|| outer.get("type").and_then(Value::as_str))?;
     let role = match role_str {
         "user" => Role::User,
         "assistant" => Role::Assistant,
@@ -319,6 +443,8 @@ fn turn_from_value(value: &Value) -> Option<Turn> {
         // Antigravity brain-transcript dialect: USER_INPUT / MODEL_* / etc.
         s if s.eq_ignore_ascii_case("user_input") => Role::User,
         s if s.starts_with("MODEL") || s.starts_with("ASSISTANT") => Role::Assistant,
+        // Gemini CLI dialect: assistant turns are tagged "gemini".
+        s if s.eq_ignore_ascii_case("gemini") => Role::Assistant,
         // GitHub Copilot CLI dialect: dotted event types like "user.message" /
         // "assistant.message". Match on the segment before the dot so the
         // shared reader recognizes Copilot turns instead of dropping them to
@@ -328,7 +454,7 @@ fn turn_from_value(value: &Value) -> Option<Turn> {
         _ => Role::Other,
     };
 
-    let text = extract_text(msg).or_else(|| extract_text(value))?;
+    let text = extract_text(msg).or_else(|| extract_text(inner))?;
     let text = text.trim().to_string();
     if text.is_empty() {
         return None;
@@ -473,6 +599,229 @@ mod tests {
         // A path that does not exist → naive '-'→'/' split, never panics.
         let decoded = decode_project_dir("-no-such-path-here-xyz").expect("decoded");
         assert!(decoded.starts_with('/'));
+    }
+
+    #[test]
+    fn claude_stored_title_beats_first_user_message() {
+        // A Claude session whose first user turn is a real topic, but which also
+        // carries Claude's own `ai-title` (and later a `customTitle`). The stored
+        // title must win, and `customTitle` must outrank `aiTitle`. The freshest
+        // (last) record wins.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("sess-titled.jsonl");
+        let mut f = std::fs::File::create(&file).expect("create");
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"role":"user","content":"fix the parser bug pls"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"ai-title","aiTitle":"Stale title","sessionId":"x"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"ai-title","aiTitle":"Fix the JSONL parser bug","sessionId":"x"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"role":"user","content":"another turn"}}}}"#
+        )
+        .unwrap();
+        writeln!(f, r#"{{"customTitle":"My pinned name"}}"#).unwrap();
+        drop(f);
+
+        let reader = JsonlReader;
+        let store = store_at(dir.path().to_path_buf());
+        let refs = reader.list(&store, 10).expect("list");
+        assert_eq!(
+            refs[0].title.as_deref(),
+            Some("My pinned name"),
+            "customTitle outranks aiTitle and first-message"
+        );
+
+        // Without a customTitle, the freshest aiTitle wins over the first message.
+        let file2 = dir.path().join("sess-ai.jsonl");
+        let mut g = std::fs::File::create(&file2).expect("create");
+        writeln!(
+            g,
+            r#"{{"type":"user","message":{{"role":"user","content":"fix the parser bug pls"}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            g,
+            r#"{{"type":"ai-title","aiTitle":"Fix the JSONL parser bug"}}"#
+        )
+        .unwrap();
+        drop(g);
+        let refs2 = reader
+            .list(&store_at(dir.path().to_path_buf()), 10)
+            .expect("list");
+        let ai = refs2.iter().find(|r| r.id == "sess-ai").expect("found");
+        assert_eq!(ai.title.as_deref(), Some("Fix the JSONL parser bug"));
+
+        // A session with NO stored title falls back to the first user message
+        // exactly as before (no-op proof for the 82% of sessions without one).
+        let file3 = dir.path().join("sess-plain.jsonl");
+        let mut h = std::fs::File::create(&file3).expect("create");
+        writeln!(
+            h,
+            r#"{{"type":"user","message":{{"role":"user","content":"What is the auth flow?"}}}}"#
+        )
+        .unwrap();
+        drop(h);
+        let refs3 = reader
+            .list(&store_at(dir.path().to_path_buf()), 10)
+            .expect("list");
+        let plain = refs3.iter().find(|r| r.id == "sess-plain").expect("found");
+        assert_eq!(plain.title.as_deref(), Some("What is the auth flow?"));
+    }
+
+    #[test]
+    fn copilot_data_nested_turns_parse_and_claude_codex_unaffected() {
+        // GitHub Copilot CLI: role from dotted `type`, text under `data.content`.
+        // Previously dropped (we only unwrapped `payload`/`message`) → 0 turns,
+        // 0 titles. The `data` unwrap must now surface these.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("copilot-x.jsonl");
+        let mut f = std::fs::File::create(&file).expect("create");
+        writeln!(
+            f,
+            r#"{{"type":"system.message","data":{{"role":"system","content":"You are the GitHub Copilot CLI"}},"id":"a","timestamp":"t"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"user.message","data":{{"content":"reply with LIVEPROOF7"}},"id":"b","timestamp":"t"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant.message","data":{{"content":"LIVEPROOF7","model":"claude-haiku-4.5"}},"id":"c"}}"#
+        )
+        .unwrap();
+        // Lifecycle line with no text — still skipped.
+        writeln!(f, r#"{{"type":"session.start","data":{{"cwd":"/x"}}}}"#).unwrap();
+        drop(f);
+
+        let reader = JsonlReader;
+        let store = store_at(dir.path().to_path_buf());
+        let t = reader.read(&store, "copilot-x", 10).expect("read");
+        assert_eq!(
+            t.turns.len(),
+            3,
+            "system+user+assistant parse, lifecycle skipped"
+        );
+        assert_eq!(t.turns[0].role, Role::System);
+        assert_eq!(t.turns[1].role, Role::User);
+        assert_eq!(t.turns[1].text, "reply with LIVEPROOF7");
+        assert_eq!(t.turns[2].role, Role::Assistant);
+        assert_eq!(t.turns[2].text, "LIVEPROOF7");
+
+        // Title derives from the first user turn (was 0 before the fix).
+        let refs = reader.list(&store, 10).expect("list");
+        assert_eq!(refs[0].title.as_deref(), Some("reply with LIVEPROOF7"));
+
+        // No-op proof: Claude (`message`-nested) and Codex (`payload`-nested)
+        // shapes have no top-level `data` key, so they parse exactly as before.
+        let claude = serde_json::json!({
+            "type":"user","message":{"role":"user","content":"claude turn"}
+        });
+        let codex = serde_json::json!({
+            "type":"response_item",
+            "payload":{"type":"message","role":"assistant",
+                       "content":[{"type":"output_text","text":"codex turn"}]}
+        });
+        let gemini = serde_json::json!({"type":"gemini","content":"gemini reply"});
+        assert_eq!(turn_from_value(&claude).unwrap().text, "claude turn");
+        assert_eq!(turn_from_value(&claude).unwrap().role, Role::User);
+        assert_eq!(turn_from_value(&codex).unwrap().text, "codex turn");
+        assert_eq!(turn_from_value(&codex).unwrap().role, Role::Assistant);
+        // Gemini assistant role mapping.
+        assert_eq!(turn_from_value(&gemini).unwrap().role, Role::Assistant);
+    }
+
+    #[test]
+    fn copilot_session_id_is_parent_dir_not_events_stem() {
+        // Copilot CLI: `session-state/<UUID>/events.jsonl`. The id must be the
+        // <UUID> parent dir, NOT the stem "events" (which would collide across
+        // every session). read() must also resolve by that derived id.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("session-state");
+        let uuid = "6ff60527-b096-4a34-a875-fbdf71c6d61e";
+        let sess = root.join(uuid);
+        std::fs::create_dir_all(&sess).unwrap();
+        std::fs::write(
+            sess.join("events.jsonl"),
+            "{\"type\":\"user.message\",\"data\":{\"content\":\"hello copilot\"}}\n",
+        )
+        .unwrap();
+
+        let reader = JsonlReader;
+        let store = store_at(dir.path().to_path_buf());
+        let refs = reader.list(&store, 10).expect("list");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].id, uuid, "id is the UUID dir, not 'events'");
+        assert_eq!(refs[0].title.as_deref(), Some("hello copilot"));
+
+        // read() resolves by the derived UUID id (not the stem).
+        let t = reader.read(&store, uuid, 10).expect("read");
+        assert_eq!(t.turns.len(), 1);
+        assert_eq!(t.turns[0].text, "hello copilot");
+    }
+
+    #[test]
+    fn gemini_legacy_json_single_object_with_messages_array() {
+        // Gemini's pre-JSONL format: ONE pretty-printed JSON object with a
+        // `messages[]` array, living in a `chats/` dir. The line-oriented reader
+        // yields nothing; the whole-file fallback must decode it. `.json` is only
+        // picked up inside `chats/`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let chats = dir.path().join("tok").join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let file = chats.join("session-2026-06-01T10-00-abcd1234.json");
+        std::fs::write(
+            &file,
+            r#"{
+  "sessionId": "abcd1234",
+  "projectHash": "tok",
+  "startTime": "2026-06-01T10:00:00Z",
+  "lastUpdated": "2026-06-01T10:05:00Z",
+  "messages": [
+    {"id":"1","timestamp":"t","type":"user","content":"set up the registry row"},
+    {"id":"2","timestamp":"t","type":"gemini","content":"Done."}
+  ]
+}"#,
+        )
+        .unwrap();
+        // A stray top-level .json (NOT in chats/) must be ignored.
+        std::fs::write(dir.path().join("settings.json"), r#"{"theme":"dark"}"#).unwrap();
+
+        let reader = JsonlReader;
+        let store = store_at(dir.path().to_path_buf());
+
+        // list: the legacy session is found and titled from its first user msg;
+        // settings.json is not picked up.
+        let refs = reader.list(&store, 10).expect("list");
+        assert_eq!(
+            refs.len(),
+            1,
+            "only the chats/*.json session, not settings.json"
+        );
+        assert_eq!(refs[0].id, "session-2026-06-01T10-00-abcd1234");
+        assert_eq!(refs[0].title.as_deref(), Some("set up the registry row"));
+
+        // read: both turns decode, gemini → Assistant.
+        let t = reader
+            .read(&store, "session-2026-06-01T10-00-abcd1234", 10)
+            .expect("read");
+        assert_eq!(t.turns.len(), 2);
+        assert_eq!(t.turns[0].role, Role::User);
+        assert_eq!(t.turns[0].text, "set up the registry row");
+        assert_eq!(t.turns[1].role, Role::Assistant);
+        assert_eq!(t.turns[1].text, "Done.");
     }
 
     #[test]

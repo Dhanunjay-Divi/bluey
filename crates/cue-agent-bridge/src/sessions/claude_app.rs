@@ -200,13 +200,21 @@ fn claude_projects_jsonl(cwd: &str, cli_session_id: &str) -> PathBuf {
         .join(format!("{cli_session_id}.jsonl"))
 }
 
-/// Encode an absolute `cwd` into Claude Code's project-dir name: every `/` and
-/// `.` becomes `-` (so `/Users/ms/Developer/Bluey` → `-Users-ms-Developer-Bluey`,
-/// and a `/.hidden` segment yields `--hidden`). This mirrors Claude Code's own
-/// on-disk encoding and is the inverse of `jsonl::decode_project_dir`.
+/// Encode an absolute `cwd` into Claude Code's project-dir name: **every
+/// non-alphanumeric character** becomes `-` (so `/Users/ms/Developer/Bluey` →
+/// `-Users-ms-Developer-Bluey`, a `/.hidden` segment yields `--hidden`, and a
+/// path with spaces/apostrophes like `/…/Divi's Agenda` → `-…-Divi-s-Agenda`).
+/// This mirrors Claude Code's own on-disk encoding (the Agent SDK source uses
+/// the regex `[^a-zA-Z0-9] → -`) and is the inverse of `jsonl::decode_project_dir`.
+///
+/// Previously this mapped only `/` and `.`, so any project whose path contained
+/// a space, apostrophe, underscore, parenthesis, etc. encoded to a directory
+/// that does not exist on disk → the second hop read an empty transcript. This
+/// is a strict superset of the old mapping (`/` and `.` are themselves
+/// non-alphanumeric), so paths of only letters/digits/`/`/`.` are unaffected.
 fn encode_project_dir(cwd: &str) -> String {
     cwd.chars()
-        .map(|c| if c == '/' || c == '.' { '-' } else { c })
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
 }
 
@@ -240,6 +248,15 @@ mod tests {
             encode_project_dir("/Users/ms/.config/x"),
             "-Users-ms--config-x"
         );
+        // Spaces and apostrophes are non-alphanumeric → '-' (real case:
+        // "/Users/ms/Developer/Divi's Agenda" was reading an empty transcript
+        // before, because the old mapping left " " and "'" untouched).
+        assert_eq!(
+            encode_project_dir("/Users/ms/Developer/Divi's Agenda"),
+            "-Users-ms-Developer-Divi-s-Agenda"
+        );
+        // Underscores and parens too.
+        assert_eq!(encode_project_dir("/a/my_proj (v2)"), "-a-my-proj--v2-");
     }
 
     #[test]
