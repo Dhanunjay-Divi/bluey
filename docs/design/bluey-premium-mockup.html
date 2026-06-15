@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bluey · Dashboard (aurora glass)</title>
+<style>
+:root{
+  --tx-1:rgba(255,255,255,.95); --tx-2:rgba(255,255,255,.60); --tx-3:rgba(255,255,255,.40); --tx-4:rgba(255,255,255,.22);
+  --hairline:rgba(255,255,255,.09); --hairline-s:rgba(255,255,255,.15);
+  --accent:#3B82F6; --accent-hover:#5191F7; --accent-tx:#A8C7FB; --accent-bg:rgba(59,130,246,.16);
+  --ok:#34D27B;
+  --r-sm:8px; --r-md:10px; --r-lg:12px; --r-xl:16px; --r-2xl:22px;
+  --top-hi:inset 0 1px 0 rgba(255,255,255,.08);
+  --font:-apple-system,"SF Pro Display","SF Pro Text",BlinkMacSystemFont,"Inter","Segoe UI",system-ui,sans-serif;
+  /* glass fills (translucent, sit over the aurora) */
+  --glass:rgba(18,21,27,.52); --glass-2:rgba(28,32,40,.55); --glass-in:rgba(255,255,255,.05);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#000;padding:28px;display:flex;justify-content:center;font-family:var(--font);-webkit-font-smoothing:antialiased}
+/* ---------- the WINDOW with its own subtle aurora background ---------- */
+.win{position:relative;width:1180px;height:760px;border-radius:var(--r-2xl);overflow:hidden;color:var(--tx-1);
+  box-shadow:0 40px 120px rgba(0,0,0,.6);border:1px solid var(--hairline)}
+.aurora{position:absolute;inset:0;
+  background:
+    radial-gradient(820px 460px at 14% 16%, rgba(58,108,210,.40) 0%, transparent 62%),
+    radial-gradient(760px 540px at 88% 84%, rgba(150,60,150,.34) 0%, transparent 58%),
+    radial-gradient(680px 480px at 62% 26%, rgba(40,150,140,.30) 0%, transparent 55%),
+    radial-gradient(620px 600px at 30% 88%, rgba(90,70,200,.26) 0%, transparent 60%),
+    linear-gradient(140deg,#0a0f18,#120c22 60%,#0b0d12);
+  filter:saturate(1.05)}
+.grain{position:absolute;inset:0;backdrop-filter:none}
+.layout{position:relative;height:100%;display:grid;grid-template-columns:236px 1fr}
+
+.tl{position:absolute;top:18px;left:20px;display:flex;gap:8px;z-index:6}
+.tl i{width:12px;height:12px;border-radius:50%}
+.tl .r{background:#ff5f57}.tl .y{background:#febc2e}.tl .g{background:#28c840}
+
+/* ---------- Sidebar (glass) ---------- */
+.side{background:var(--glass);-webkit-backdrop-filter:blur(30px) saturate(1.6);backdrop-filter:blur(30px) saturate(1.6);
+  border-right:1px solid var(--hairline);padding:46px 14px 16px;display:flex;flex-direction:column}
+.brand{display:flex;align-items:center;gap:10px;padding:0 10px 18px}
+.logo{width:26px;height:26px;border-radius:7px;background:linear-gradient(160deg,#2E6FE0,#3B82F6);
+  display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;box-shadow:var(--top-hi)}
+.brand b{font-size:15px;font-weight:600;letter-spacing:-.01em}
+.nav{display:flex;flex-direction:column;gap:1px}
+.navi{display:flex;align-items:center;gap:11px;height:34px;padding:0 11px;border-radius:var(--r-sm);
+  color:var(--tx-2);font-size:13px;font-weight:500;letter-spacing:-.005em;cursor:default}
+.navi:hover{background:rgba(255,255,255,.06);color:var(--tx-1)}
+.navi.on{background:var(--accent-bg);color:#fff}
+.navi.on .ic{color:var(--accent-tx)}
+.ic{width:16px;height:16px;display:inline-block;opacity:.9}
+.seclbl{font-size:10.5px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--tx-4);padding:16px 11px 7px}
+.acct{margin-top:auto;display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:var(--r-md);
+  border:1px solid var(--hairline);background:rgba(255,255,255,.04)}
+.av{width:28px;height:28px;border-radius:50%;background:rgba(255,255,255,.08);display:flex;align-items:center;justify-content:center;
+  font-size:11px;font-weight:600;color:var(--tx-2)}
+.acct .nm{font-size:12.5px;font-weight:500}.acct .em{font-size:11px;color:var(--tx-3)}
+
+/* ---------- Main ---------- */
+.main{display:flex;flex-direction:column;min-width:0}
+.top{height:56px;border-bottom:1px solid var(--hairline);display:flex;align-items:center;gap:14px;padding:0 24px;
+  background:rgba(10,13,18,.28);-webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px)}
+.h1{font-size:17px;font-weight:600;letter-spacing:-.01em}
+.crumb{font-size:13px;color:var(--tx-3)}
+.spacer{flex:1}
+.search{display:flex;align-items:center;gap:8px;height:32px;width:240px;padding:0 11px;
+  background:rgba(255,255,255,.06);border:1px solid var(--hairline);border-radius:var(--r-sm);
+  color:var(--tx-3);font-size:12.5px}
+.kbd{margin-left:auto;font-size:10.5px;color:var(--tx-4);border:1px solid var(--hairline);border-radius:4px;padding:1px 5px}
+.btn{height:32px;padding:0 14px;border-radius:var(--r-sm);font-size:12.5px;font-weight:600;
+  display:inline-flex;align-items:center;gap:7px;cursor:default;letter-spacing:-.005em}
+.btn.pri{background:var(--accent);color:#fff;box-shadow:var(--top-hi)}
+.btn.pri:hover{background:var(--accent-hover)}
+.btn.gho{background:rgba(255,255,255,.05);color:var(--tx-2);border:1px solid var(--hairline)}
+.body{flex:1;overflow:auto;padding:22px 24px 28px}
+
+/* agent picker (glass cards) */
+.agrid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:22px}
+.acard{background:var(--glass);-webkit-backdrop-filter:blur(24px) saturate(1.5);backdrop-filter:blur(24px) saturate(1.5);
+  border:1px solid var(--hairline);border-radius:var(--r-lg);padding:14px 15px;box-shadow:var(--top-hi);position:relative}
+.acard.sel{border-color:rgba(59,130,246,.5);background:var(--glass-2)}
+.acard .row{display:flex;align-items:center;gap:11px}
+.aico{width:34px;height:34px;border-radius:9px;background:rgba(255,255,255,.07);border:1px solid var(--hairline);
+  display:flex;align-items:center;justify-content:center;font-size:15px}
+.acard .an{font-size:14px;font-weight:600;letter-spacing:-.01em}
+.acard .am{font-size:11.5px;color:var(--tx-3);margin-top:1px}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px rgba(52,210,123,.16)}
+.amini{display:flex;gap:14px;margin-top:12px;padding-top:11px;border-top:1px solid var(--hairline)}
+.amini div{font-size:11px;color:var(--tx-3)}
+.amini b{color:var(--tx-1);font-weight:600;font-variant-numeric:tabular-nums}
+
+.sh{display:flex;align-items:center;gap:9px;margin:6px 2px 13px}
+.sh h2{font-size:13px;font-weight:600;color:var(--tx-2);letter-spacing:-.005em}
+.sh .ct{font-size:11px;color:var(--tx-4)}
+
+.slist{display:flex;flex-direction:column;gap:7px}
+.sproj{font-size:11px;font-weight:600;color:var(--tx-3);letter-spacing:.02em;margin:12px 2px 4px;display:flex;align-items:center;gap:7px}
+.sitem{display:flex;align-items:center;gap:13px;padding:11px 14px;
+  background:var(--glass);-webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px);
+  border:1px solid var(--hairline);border-radius:var(--r-md)}
+.sitem:hover{background:var(--glass-2);border-color:var(--hairline-s)}
+.sitem .ti{flex:1;min-width:0}
+.sitem .tt{font-size:13.5px;font-weight:500;letter-spacing:-.005em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sitem .mt{font-size:11.5px;color:var(--tx-3);margin-top:2px}
+.tag{font-size:10.5px;font-weight:600;padding:2px 8px;border-radius:99px;letter-spacing:.01em}
+.tag.live{background:var(--accent-bg);color:var(--accent-tx)}
+.tag.idle{background:rgba(255,255,255,.06);color:var(--tx-3)}
+.cont{height:28px;padding:0 13px;border-radius:var(--r-sm);font-size:12px;font-weight:600;
+  background:transparent;color:var(--accent-tx);border:1px solid rgba(59,130,246,.32);display:inline-flex;align-items:center;gap:6px}
+.cont:hover{background:var(--accent-bg)}
+svg{display:block}
+</style>
+</head>
+<body>
+<div class="win">
+  <div class="aurora"></div>
+  <div class="tl"><i class="r"></i><i class="y"></i><i class="g"></i></div>
+  <div class="layout">
+
+    <aside class="side">
+      <div class="brand"><div class="logo">B</div><b>Bluey</b></div>
+      <div class="seclbl">Workspace</div>
+      <nav class="nav">
+        <div class="navi"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 12l9-9 9 9M5 10v10h14V10"/></svg>Home</div>
+        <div class="navi"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3.2"/><path d="M12 4v2M12 18v2M4 12h2M18 12h2"/></svg>Live session</div>
+        <div class="navi"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6h16M4 12h16M4 18h10"/></svg>Responses</div>
+      </nav>
+      <div class="seclbl">Coding agents</div>
+      <nav class="nav">
+        <div class="navi on"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="5" width="16" height="14" rx="2.5"/><path d="M9 10l2 2-2 2M13 14h2"/></svg>Agents &amp; chats</div>
+        <div class="navi"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l8 4v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7z"/></svg>Connectors</div>
+      </nav>
+      <div class="seclbl">System</div>
+      <nav class="nav">
+        <div class="navi"><svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>Settings</div>
+      </nav>
+      <div class="acct"><div class="av">MS</div><div><div class="nm">Sashreek</div><div class="em">knackkit@gmail.com</div></div></div>
+    </aside>
+
+    <main class="main">
+      <div class="top">
+        <div class="h1">Agents &amp; chats</div>
+        <div class="crumb">/ Claude Code</div>
+        <div class="spacer"></div>
+        <div class="search"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>Search chats…<span class="kbd">⌘K</span></div>
+        <div class="btn gho">Refresh</div>
+        <div class="btn pri"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 5v14M5 12h14"/></svg>New chat</div>
+      </div>
+
+      <div class="body">
+        <div class="agrid">
+          <div class="acard sel">
+            <div class="row"><div class="aico">◆</div><div style="flex:1"><div class="an">Claude Code</div><div class="am">v2.0.42 · CLI + app</div></div><div class="dot"></div></div>
+            <div class="amini"><div><b>314</b> chats</div><div><b>1</b> connector</div><div>resume ✓</div></div>
+          </div>
+          <div class="acard">
+            <div class="row"><div class="aico">✦</div><div style="flex:1"><div class="an">Cursor</div><div class="am">IDE + CLI</div></div><div class="dot"></div></div>
+            <div class="amini"><div><b>115</b> chats</div><div><b>7</b> connectors</div><div>replay ✓</div></div>
+          </div>
+          <div class="acard">
+            <div class="row"><div class="aico">▲</div><div style="flex:1"><div class="an">Gemini</div><div class="am">CLI</div></div><div class="dot"></div></div>
+            <div class="amini"><div><b>149</b> chats</div><div><b>1</b> connector</div><div>replay ✓</div></div>
+          </div>
+        </div>
+
+        <div class="sh"><h2>Recent chats</h2><span class="ct">· grouped by project</span></div>
+
+        <div class="slist">
+          <div class="sproj"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7h6l2 2h10v9H3z"/></svg>/Users/ms/Developer/Bluey</div>
+          <div class="sitem"><div class="ti"><div class="tt">Session-continuation architecture across all agents</div><div class="mt">42 turns · 2 min ago</div></div><span class="tag live">active</span><div class="cont">Continue</div></div>
+          <div class="sitem"><div class="ti"><div class="tt">Fix Cursor IDE per-workspace store reading</div><div class="mt">18 turns · 1 hr ago</div></div><span class="tag idle">idle</span><div class="cont">Continue</div></div>
+
+          <div class="sproj"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 7h6l2 2h10v9H3z"/></svg>/Users/ms/Developer/Staffing&nbsp;Desk</div>
+          <div class="sitem"><div class="ti"><div class="tt">Fix CEIPAL storage-state env var name mismatch</div><div class="mt">27 turns · yesterday</div></div><span class="tag idle">idle</span><div class="cont">Continue</div></div>
+          <div class="sitem"><div class="ti"><div class="tt">Claude Code vLLM Jetson deployment plan</div><div class="mt">63 turns · 2 days ago</div></div><span class="tag idle">idle</span><div class="cont">Continue</div></div>
+        </div>
+      </div>
+    </main>
+  </div>
+</div>
+</body>
+</html>
