@@ -223,7 +223,10 @@ fn spec_for(kind: &AgentKind) -> Option<&'static DriveSpec> {
 
 /// Tunable limits for a single drive. Defaults are production-safe; callers
 /// (the daemon) may tighten them.
-#[derive(Debug, Clone, Copy)]
+///
+/// Not `Copy` because [`model_override`](DriveOptions::model_override) carries an
+/// owned argv slice; clone it explicitly when a copy is needed.
+#[derive(Debug, Clone)]
 pub struct DriveOptions {
     /// Wall-clock timeout before the child is killed.
     pub timeout: Duration,
@@ -232,6 +235,15 @@ pub struct DriveOptions {
     /// Write posture for this drive (see [`DriveMode`]). Defaults to
     /// [`DriveMode::Answer`] so existing callers keep plain-answer behavior.
     pub mode: DriveMode,
+    /// An optional per-run **model override**: the exact argv pair to APPEND to
+    /// the drive so the agent runs under a specific model (e.g. Codex's
+    /// `["-m", "gpt-5.1-codex"]`). This is how the model-fallback self-resolver
+    /// ([`crate::model_resolve`]) re-drives a model-blocked agent under a model
+    /// the account DOES support — without editing the user's config. Empty (the
+    /// default) appends nothing, so existing callers are unchanged. The pair is
+    /// data the resolver reads off the registry row (`model_flag` + a
+    /// `fallback_models` entry); the drive layer never names a model itself.
+    pub model_override: Vec<String>,
 }
 
 impl Default for DriveOptions {
@@ -240,6 +252,7 @@ impl Default for DriveOptions {
             timeout: DEFAULT_TIMEOUT,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             mode: DriveMode::Answer,
+            model_override: Vec::new(),
         }
     }
 }
@@ -351,16 +364,50 @@ fn mcp_allow_args_for_agent(agent: &AgentKind) -> Vec<String> {
     if names.is_empty() {
         return Vec::new();
     }
-    // Emit ONE flag + ONE comma-joined value (`--flag a,b,c`), NOT a
-    // space-separated multi-value (`--flag a b c`). The latter is a greedy
-    // yargs array that collides with the `-p {prompt}` value and makes Gemini
-    // misparse the prompt as a positional `query` ("Cannot use both a positional
-    // prompt and the --prompt (-p) flag together"). VERIFIED LIVE: the
-    // comma-joined form answers cleanly for any number of servers, while the
-    // space-separated form fails with >1 server. The only agents with an
-    // `mcp_allow_flag` today are Gemini and Antigravity (both the gemini CLI),
-    // which accept the comma form.
-    vec![flag.to_string(), names.join(",")]
+    render_mcp_allow_args(flag, entry.mcp_allow_style, &names)
+}
+
+/// Render an MCP allow-list to argv per the agent's [`McpAllowStyle`]. **Pure**
+/// (no I/O), so the per-CLI shaping is unit-testable without discovery. Returns
+/// empty for a flag with no style (a registry bug — safe default: no approval).
+fn render_mcp_allow_args(
+    flag: &str,
+    style: Option<registry::McpAllowStyle>,
+    names: &[String],
+) -> Vec<String> {
+    match style {
+        // gemini-family: ONE flag + ONE comma-joined value (`--flag a,b,c`). A
+        // space-separated multi-value is a greedy yargs array that collides with
+        // `-p {prompt}` ("Cannot use both a positional prompt and --prompt").
+        // VERIFIED LIVE: the comma form answers cleanly for any server count.
+        Some(registry::McpAllowStyle::ServerNameCsv) => {
+            vec![flag.to_string(), names.join(",")]
+        }
+        // Claude: `--allowed-tools "mcp__a mcp__b"` — approval is by tool-name
+        // pattern; an MCP server `<s>` exposes tools under the `mcp__<s>` prefix.
+        // Space-separated patterns in a SINGLE value (Claude's flag is a
+        // multi-value that accepts one quoted arg fine).
+        Some(registry::McpAllowStyle::ClaudeToolPattern) => {
+            let patterns = names
+                .iter()
+                .map(|n| format!("mcp__{n}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            vec![flag.to_string(), patterns]
+        }
+        // Copilot: a repeated `--allow-tool <server>` per server.
+        Some(registry::McpAllowStyle::CopilotAllowTool) => {
+            let mut out = Vec::with_capacity(names.len() * 2);
+            for n in names {
+                out.push(flag.to_string());
+                out.push(n.clone());
+            }
+            out
+        }
+        // A flag with no declared style is a registry bug; emit nothing rather
+        // than guess a shape (safe default: no auto-approval).
+        None => Vec::new(),
+    }
 }
 
 /// Build the full argv for a drive, layering the [`DriveMode`] Fix-profile args
@@ -472,7 +519,19 @@ pub async fn drive_with_options(
 
     // Assemble argv with the requested mode. An unsupported ApplyFix returns
     // `Err` here — before any subprocess is spawned (the apply gate).
-    let (program, args) = build_argv_with_mode(&spec, &agent, &question, opts.mode, &mcp_allow)?;
+    let (program, mut args) =
+        build_argv_with_mode(&spec, &agent, &question, opts.mode, &mcp_allow)?;
+
+    // Append the per-run model override LAST (e.g. Codex's `-m gpt-5.1-codex`).
+    // This is the model-fallback self-resolver ([`crate::model_resolve`])
+    // re-driving under an account-supported model; the pair is data the resolver
+    // read off the registry (`model_flag` + a `fallback_models` entry), never a
+    // model named here. Appended after the prompt and other flags — the agents
+    // that take a model flag accept it in any position (VERIFIED LIVE for
+    // Codex's `-m`). Empty by default, so non-fallback drives are byte-identical.
+    for tok in &opts.model_override {
+        args.push(tok.clone());
+    }
 
     // Log shape only — never the prompt text (it may carry meeting content).
     tracing::debug!(
@@ -1011,7 +1070,9 @@ impl ParseState {
 }
 
 /// CLI-backed [`Driver`] over [`COMMAND_MAP`].
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// Not `Copy` because [`DriveOptions`] now carries an owned `model_override`.
+#[derive(Debug, Clone, Default)]
 pub struct CliDriver {
     opts: DriveOptions,
 }
@@ -1026,7 +1087,7 @@ impl CliDriver {
 #[async_trait::async_trait]
 impl Driver for CliDriver {
     async fn drive(&self, agent: AgentKind, question: Question) -> Result<AnswerStream> {
-        drive_with_options(agent, question, self.opts).await
+        drive_with_options(agent, question, self.opts.clone()).await
     }
 }
 
@@ -1219,6 +1280,60 @@ mod tests {
         assert_eq!(out[1], "github,perplexity-ask,tradingview");
         // The dangerous space-separated form would have len 4; guard against it.
         assert!(!out.iter().any(|a| a == "perplexity-ask"));
+    }
+
+    #[test]
+    fn test_mcp_allow_args_render_per_style() {
+        use registry::McpAllowStyle;
+        let names = vec!["perplexity".to_string(), "github".to_string()];
+
+        // gemini-family: ONE flag + comma-joined value.
+        let csv = render_mcp_allow_args(
+            "--allowed-mcp-server-names",
+            Some(McpAllowStyle::ServerNameCsv),
+            &names,
+        );
+        assert_eq!(
+            csv,
+            vec![
+                "--allowed-mcp-server-names".to_string(),
+                "perplexity,github".to_string()
+            ]
+        );
+
+        // Claude: `--allowed-tools "mcp__perplexity mcp__github"` (tool patterns,
+        // single space-joined value).
+        let claude = render_mcp_allow_args(
+            "--allowed-tools",
+            Some(McpAllowStyle::ClaudeToolPattern),
+            &names,
+        );
+        assert_eq!(
+            claude,
+            vec![
+                "--allowed-tools".to_string(),
+                "mcp__perplexity mcp__github".to_string()
+            ]
+        );
+
+        // Copilot: repeated `--allow-tool <server>` per server.
+        let copilot = render_mcp_allow_args(
+            "--allow-tool",
+            Some(McpAllowStyle::CopilotAllowTool),
+            &names,
+        );
+        assert_eq!(
+            copilot,
+            vec![
+                "--allow-tool".to_string(),
+                "perplexity".to_string(),
+                "--allow-tool".to_string(),
+                "github".to_string(),
+            ]
+        );
+
+        // A flag with no style is a registry bug → emit nothing (safe default).
+        assert!(render_mcp_allow_args("--x", None, &names).is_empty());
     }
 
     #[test]

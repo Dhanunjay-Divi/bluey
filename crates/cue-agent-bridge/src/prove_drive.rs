@@ -150,13 +150,83 @@ pub async fn prove_drive_all(include_cloud: bool) -> Vec<AgentDriveProof> {
 
 /// Drive a single agent kind once with the canary, bounded by [`DRIVE_TIMEOUT`].
 /// Consumes the real [`AnswerChunk`] stream from the production [`crate::drive`].
+///
+/// This is a **faithful single attempt**: it surfaces the agent's REAL terminal
+/// error verbatim (no model-fallback retry). Callers that want the propose/apply
+/// model-block resolution use it as the raw probe — e.g. `bluey agent
+/// resolve-model` drives this once to OBSERVE the failure, then runs its own
+/// consent-gated resolution. The matrix Ask step instead uses
+/// [`drive_once_resolving_model`], which layers the fallback loop on top.
 pub async fn drive_once(kind: AgentKind) -> DriveProof {
+    drive_once_with_model(kind, &[]).await
+}
+
+/// Like [`drive_once`], but **self-resolves a model-policy block**: if the agent
+/// is signed in yet the requested model is blocked for the account (the real
+/// Codex/ChatGPT case), it re-drives under a fallback model the account supports
+/// — exactly like the daemon's answer path — using the registry's
+/// `fallback_models` + `model_flag` (data-driven, no agent named). It tries each
+/// fallback once; if every fallback is also blocked, it returns a `Failed` whose
+/// reason is the honest BYOT guidance (connect an API key) rather than the raw
+/// vendor 400, so the matrix Ask cell tells the truth. Bounded: a fallback is
+/// recorded once tried, so the loop can never cycle. Non-model failures and a
+/// successful answer are returned exactly as [`drive_once`] would.
+pub async fn drive_once_resolving_model(kind: AgentKind) -> DriveProof {
+    use crate::model_resolve::{byot_guidance_line, decide_model_block, ModelLoopStep};
+
+    let display = registry::KindTag::from_agent_kind(&kind)
+        .and_then(registry::entry_for)
+        .map(|e| e.display_name)
+        .unwrap_or("the agent");
+
+    let mut model_override: Vec<String> = Vec::new();
+    let mut tried_models: Vec<String> = Vec::new();
+    loop {
+        let proof = drive_once_with_model(kind.clone(), &model_override).await;
+        // Only a terminal agent error is a candidate for a model-block retry; an
+        // Answered/Skipped/timeout proof is returned as-is.
+        let DriveProof::Failed { reason, elapsed_ms } = &proof else {
+            return proof;
+        };
+        match decide_model_block(&kind, reason, &tried_models) {
+            ModelLoopStep::RetryWithModel {
+                fallback_model,
+                model_flag_args,
+            } => {
+                tried_models.push(fallback_model.to_string());
+                model_override = model_flag_args;
+                // Re-drive under the fallback model on the next loop turn.
+                continue;
+            }
+            ModelLoopStep::ConnectApiKey(byot) => {
+                // Exhausted every fallback — report the honest BYOT guidance as
+                // the Ask outcome, not the raw 400.
+                return DriveProof::Failed {
+                    reason: byot_guidance_line(display, &byot),
+                    elapsed_ms: *elapsed_ms,
+                };
+            }
+            // Not a model block (auth, runtime, timeout, …) — keep the real error.
+            ModelLoopStep::NotModelBlock => return proof,
+        }
+    }
+}
+
+/// One real canary drive, with an optional per-run model override appended (the
+/// model-fallback retry). Returns the honest [`DriveProof`]; the model-block
+/// retry decision lives in the [`drive_once_resolving_model`] loop that calls it.
+async fn drive_once_with_model(kind: AgentKind, model_override: &[String]) -> DriveProof {
     let started = Instant::now();
     let question = Question::new(PROVE_PROMPT);
 
-    // Spawn the real drive. A spawn failure (missing binary / no credential) is a
-    // skip-shaped outcome surfaced as Failed with the real reason.
-    let stream = match crate::drive(kind, question).await {
+    // Spawn the real drive, threading the model override (empty = none, so the
+    // base case is byte-identical to a plain `crate::drive`). A spawn failure
+    // (missing binary / no credential) is surfaced as Failed with the real reason.
+    let opts = crate::drive::DriveOptions {
+        model_override: model_override.to_vec(),
+        ..Default::default()
+    };
+    let stream = match crate::drive::drive_with_options(kind, question, opts).await {
         Ok(s) => s,
         Err(e) => {
             return DriveProof::Failed {
@@ -604,15 +674,18 @@ pub async fn validate_agent(kind: &AgentKind) -> AgentScorecard {
     // Steps 2 + 3 — Sessions + Title quality (read-only, from disk).
     let sessions = sessions_step(kind, found).await;
 
-    // Step 4 — Ask (reuses the production drive path via `drive_once`). Only
-    // attempted when the agent is detected as drivable; otherwise skip-shaped so
-    // we don't spend a spawn on a known-absent agent.
+    // Step 4 — Ask (reuses the production drive path). Only attempted when the
+    // agent is detected as drivable; otherwise skip-shaped so we don't spend a
+    // spawn on a known-absent agent. Uses the model-block-RESOLVING variant so
+    // the scorecard reflects what the daemon's answer path actually does: a
+    // blocked model auto-falls-back, and an account where every model is blocked
+    // shows the honest BYOT guidance rather than a raw vendor 400.
     let ask = if detect.status == CellStatus::Fail || detect.status == CellStatus::Skip {
         DriveProof::Skipped {
             reason: format!("not driven: detect = {}", detect.detail),
         }
     } else {
-        drive_once(kind.clone()).await
+        drive_once_resolving_model(kind.clone()).await
     };
 
     // Step 5 — MCP (Agent B's probe). Only meaningful once the agent answered.

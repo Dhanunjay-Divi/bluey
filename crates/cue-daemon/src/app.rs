@@ -2236,6 +2236,7 @@ fn list_agent_sessions(kind: &str) -> Vec<AgentSessionSummary> {
                     id: r.id,
                     title,
                     updated_at: r.updated_at,
+                    project: r.project,
                 }
             })
             .collect(),
@@ -5000,9 +5001,17 @@ struct DriveOutcome {
 /// failed in a way a fresh (no-resume) retry can recover — too-large or
 /// not-found (see [`is_resume_recoverable_error`]). The real CLI error text is
 /// preserved in `reason` so the user sees the truth, not a hardcoded guess.
+///
+/// `raw_error` carries the UNMODIFIED terminal-error text (only set for a
+/// terminal [`AnswerChunk::Error`], not for spawn/render failures), so the
+/// caller can classify it — e.g. detect a model-policy block via
+/// [`cue_agent_bridge::model_resolve::decide_model_block`] and retry under a
+/// fallback model. `reason` is the truncated, user-facing phrasing; `raw_error`
+/// is the full text the classifier needs.
 struct DriveFailure {
     reason: String,
     resume_recoverable: bool,
+    raw_error: Option<String>,
 }
 
 /// Whether an agent error message is the "prompt/conversation too large to fit
@@ -5047,12 +5056,14 @@ async fn drive_answer_attempt(
     label: &str,
     payload: &ProviderRequestPayload,
     resume: Option<&str>,
+    model_override: &[String],
     stream: &mut Option<&mut OverlayAnswerStream>,
 ) -> Result<DriveOutcome, DriveFailure> {
     let question = agent_question_from_payload(payload, resume);
     debug!(
         agent = %label,
         resuming = resume.is_some(),
+        model_override = model_override.len(),
         "driving attached agent for answer"
     );
 
@@ -5064,6 +5075,8 @@ async fn drive_answer_attempt(
     // structured audit line per HTTP call (vendor, endpoint, status — never
     // the token).
     let answer_stream = if cue_agent_bridge::cloud::is_cloud_kind(kind) {
+        // Cloud vendors don't take a per-run CLI model flag, so a model override
+        // (only ever set for a local-CLI model-block fallback) does not apply.
         match cue_agent_bridge::cloud::drive_cloud(kind.clone(), question).await {
             Ok(answer_stream) => answer_stream,
             Err(error) => {
@@ -5071,17 +5084,27 @@ async fn drive_answer_attempt(
                 return Err(DriveFailure {
                     reason: "isn't connected or set up".to_string(),
                     resume_recoverable: false,
+                    raw_error: None,
                 });
             }
         }
     } else {
-        match cue_agent_bridge::drive(kind.clone(), question).await {
+        // Local CLI: drive through the options-aware entry point so a model
+        // fallback (e.g. Codex `-m gpt-5.1-codex`) can be appended without
+        // touching the user's config. An empty override (the common case)
+        // produces byte-identical argv to the plain `drive`.
+        let opts = cue_agent_bridge::drive::DriveOptions {
+            model_override: model_override.to_vec(),
+            ..Default::default()
+        };
+        match cue_agent_bridge::drive::drive_with_options(kind.clone(), question, opts).await {
             Ok(answer_stream) => answer_stream,
             Err(error) => {
                 debug!(agent = %label, error = %error, "agent drive failed to start");
                 return Err(DriveFailure {
                     reason: "isn't installed or signed in".to_string(),
                     resume_recoverable: false,
+                    raw_error: None,
                 });
             }
         }
@@ -5098,6 +5121,7 @@ async fn drive_answer_attempt(
             return Err(DriveFailure {
                 reason: "couldn't render the answer".to_string(),
                 resume_recoverable: false,
+                raw_error: None,
             });
         }
     }
@@ -5129,6 +5153,9 @@ async fn drive_answer_attempt(
                 return Err(DriveFailure {
                     reason,
                     resume_recoverable: recoverable,
+                    // Keep the FULL text so the caller can classify it (e.g. a
+                    // model-policy block → fallback-model retry).
+                    raw_error: Some(message),
                 });
             }
         }
@@ -5208,12 +5235,34 @@ async fn answer_with_agent(
     //     ("Prompt is too long"-class), retry ONCE with resume stripped: a fresh
     //     session in the project dir still has the code, CLAUDE.md, and all MCP
     //     connectors (context lives in the repo/config, not mostly in the chat).
+    //  3. If the agent is signed in but the requested MODEL is blocked for the
+    //     account (the real Codex/ChatGPT case — "model is not supported when
+    //     using Codex with a ChatGPT account"), retry under a fallback model the
+    //     account supports (data-driven, from the registry row's `fallback_models`
+    //     + `model_flag`). Try each fallback once; if EVERY fallback is also
+    //     blocked, surface the honest BYOT guidance (connect an API key) instead
+    //     of looping or leaking the raw 400. See `cue_agent_bridge::model_resolve`.
     // Bluey never summarizes with its own AI; a fresh session simply lets the
     // agent re-derive context with its own tools.
+    use cue_agent_bridge::model_resolve::{byot_guidance_line, decide_model_block, ModelLoopStep};
     let mut attempt_resume = resume_session;
     let mut tried_fresh_fallback = false;
+    // The per-run model override appended to the next drive (empty = none) and
+    // the models already tried-and-blocked in THIS answer, so the resolver
+    // advances through the fallback list and then to BYOT — bounded, never a loop.
+    let mut model_override: Vec<String> = Vec::new();
+    let mut tried_models: Vec<String> = Vec::new();
     let (body, cost_usd) = loop {
-        match drive_answer_attempt(&kind, &label, payload, attempt_resume, &mut stream).await {
+        match drive_answer_attempt(
+            &kind,
+            &label,
+            payload,
+            attempt_resume,
+            &model_override,
+            &mut stream,
+        )
+        .await
+        {
             Ok(outcome) => break (outcome.body, outcome.cost_usd),
             Err(failure) => {
                 // Recoverable resume failures (session too large OR not found)
@@ -5228,6 +5277,49 @@ async fn answer_with_agent(
                     attempt_resume = None;
                     continue;
                 }
+
+                // Model-policy block? Only a terminal agent error carries the raw
+                // text; classify it and, if the model is blocked, retry under a
+                // fallback (or surface BYOT once exhausted). Data-driven via the
+                // registry — no agent named here.
+                if let Some(raw) = failure.raw_error.as_deref() {
+                    match decide_model_block(&kind, raw, &tried_models) {
+                        ModelLoopStep::RetryWithModel {
+                            fallback_model,
+                            model_flag_args,
+                        } => {
+                            warn!(
+                                agent = %label,
+                                fallback_model,
+                                "requested model is blocked for this account; retrying under a fallback model"
+                            );
+                            tried_models.push(fallback_model.to_string());
+                            model_override = model_flag_args;
+                            continue;
+                        }
+                        ModelLoopStep::ConnectApiKey(byot) => {
+                            // Every fallback was also blocked — the honest BYOT
+                            // path. Not `agent_not_ready` (that says "install and
+                            // sign in", which is wrong: the CLI IS installed and
+                            // signed in — only the model is gated).
+                            warn!(
+                                agent = %label,
+                                "all fallback models blocked for this account; surfacing BYOT guidance"
+                            );
+                            return Ok(agent_model_blocked(
+                                provider,
+                                &mut stream,
+                                fallback_depth,
+                                &label,
+                                &byot_guidance_line(&label, &byot),
+                            )
+                            .await);
+                        }
+                        // Not a model block — fall through to the honest error.
+                        ModelLoopStep::NotModelBlock => {}
+                    }
+                }
+
                 return Ok(agent_not_ready(
                     provider,
                     &mut stream,
@@ -5306,6 +5398,44 @@ Bluey answers live through your agent and never on your behalf."
         attempts: vec![
             RouteAttemptMetadata::started(provider.clone(), fallback_depth)
                 .failed(format!("agent not ready: {label} {reason}")),
+        ],
+    }
+}
+
+/// Push an honest guidance card for a **model-policy block** that survived every
+/// fallback model: the agent is installed and signed in, but the account can't
+/// use any model Bluey can drive it with, so the only path is BYOT (connect an
+/// API key). Distinct from [`agent_not_ready`] — that one tells the user to
+/// "install and sign in", which is wrong here (both are already true). `guidance`
+/// is the data-driven [`byot_guidance_line`] (names the blocked model, the
+/// resolve-model command, and the API-key env var).
+async fn agent_model_blocked(
+    provider: &ProviderSelector,
+    stream: &mut Option<&mut OverlayAnswerStream>,
+    fallback_depth: usize,
+    label: &str,
+    guidance: &str,
+) -> AgentRouteOutcome {
+    let body = format!("Your {label} CLI {guidance}");
+    if let Some(stream) = stream.as_mut() {
+        let _ = push_system_card(
+            &stream.daemon,
+            CardKind::Warning,
+            "Model blocked — connect an API key",
+            body.clone(),
+        )
+        .await;
+        let _ = stream.finish(&body).await;
+    }
+    let safety = SafetyOutcome::pass().with_notice(format!(
+        "attached agent ({label}) model blocked for this account; BYOT guidance shown"
+    ));
+    AgentRouteOutcome {
+        answer: body,
+        safety,
+        attempts: vec![
+            RouteAttemptMetadata::started(provider.clone(), fallback_depth)
+                .failed(format!("agent model blocked: {label}")),
         ],
     }
 }

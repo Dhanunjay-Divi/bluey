@@ -475,6 +475,102 @@ pub fn fallback_retry_args(agent: &AgentKind, error: &str) -> Option<Vec<String>
     }
 }
 
+/// The decision a **retrying drive loop** (the daemon's answer path, the matrix
+/// Ask step) takes after one drive attempt failed. This is the single,
+/// fully-testable step the loop repeats: classify the real error, then —
+/// given the models already tried-and-blocked in THIS loop — say whether to
+/// re-drive under a fallback model, to stop and surface the BYOT path, or that
+/// the failure was never a model block at all (so the loop leaves it alone).
+///
+/// The loop drives it like this (no agent ever named — all data):
+/// ```ignore
+/// let mut tried: Vec<String> = Vec::new();
+/// loop {
+///     match decide_model_block(&agent, &err, &tried) {
+///         ModelLoopStep::RetryWithModel { fallback_model, model_flag_args } => {
+///             tried.push(fallback_model.to_string());
+///             // re-drive with `model_flag_args` appended; on success break,
+///             // on a new error set `err` and continue.
+///         }
+///         ModelLoopStep::ConnectApiKey(byot) => break surface_byot(&byot),
+///         ModelLoopStep::NotModelBlock => break surface_original(&err),
+///     }
+/// }
+/// ```
+/// Bounded by construction: each retry records its `fallback_model` in `tried`,
+/// so [`plan_resolution`] advances to the next fallback and, once all are
+/// exhausted, returns [`ConnectApiKey`](ModelProposal::ConnectApiKey) — the loop
+/// can never cycle forever.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelLoopStep {
+    /// Re-drive the SAME question under a fallback model the account is expected
+    /// to support. `model_flag_args` is the argv pair to append
+    /// (`[model_flag, fallback_model]`); `fallback_model` is echoed so the loop
+    /// can record it in its tried-list before retrying.
+    RetryWithModel {
+        fallback_model: &'static str,
+        model_flag_args: Vec<String>,
+    },
+    /// No subscription model remains (or the agent takes no model flag): stop and
+    /// surface the BYOT path. Carries the full [`ByotProposal`] so the caller can
+    /// render an honest message ([`byot_guidance_line`]) and, later, drive an
+    /// enrollment.
+    ConnectApiKey(ByotProposal),
+    /// The failure was not a model block — the loop must not swap models; surface
+    /// the original error (the auth/runtime resolvers, or the raw text, own it).
+    NotModelBlock,
+}
+
+/// One step of the model-fallback loop: classify `error` for `agent` and, with
+/// the models already `tried` this loop, decide what to do next. Pure and
+/// data-driven (reads only the registry via [`plan_resolution`]); the single
+/// unit-testable brain of the "blocked → try fallbacks → exhausted → BYOT"
+/// behavior, with no live agent required.
+pub fn decide_model_block(agent: &AgentKind, error: &str, tried: &[String]) -> ModelLoopStep {
+    match classify_error(agent, error) {
+        ModelDiagnosis::NotAModelProblem => ModelLoopStep::NotModelBlock,
+        ModelDiagnosis::ModelBlocked(blocked) => match plan_resolution(&blocked, tried) {
+            ModelProposal::RetryWithModel {
+                fallback_model,
+                model_flag_args,
+                ..
+            } => ModelLoopStep::RetryWithModel {
+                fallback_model,
+                model_flag_args,
+            },
+            ModelProposal::ConnectApiKey(byot) => ModelLoopStep::ConnectApiKey(byot),
+        },
+    }
+}
+
+/// The honest, user-facing one-line guidance shown when every subscription model
+/// is blocked for this account and the only remaining path is BYOT (connect an
+/// API key). Centralizes the message so the daemon's answer card, the CLI, and
+/// the matrix all say the same true thing. `agent_label` is the display name
+/// (e.g. "Codex"). Data-driven: the env-var/vendor come from the
+/// [`ByotProposal`] the resolver built off the registry.
+///
+/// Points at `bluey agent resolve-model <agent>` — the command that runs the
+/// propose-and-apply BYOT flow (probe → detect the block → guide enrollment) —
+/// and names the API-key env var the CLI reads, so the message is actionable.
+pub fn byot_guidance_line(agent_label: &str, byot: &ByotProposal) -> String {
+    let blocked = byot
+        .blocked_model
+        .as_deref()
+        .unwrap_or("the configured model");
+    let env = byot
+        .api_key_env
+        .map(|e| format!(" (set {e}, or run the agent's `--api-key` login)"))
+        .unwrap_or_default();
+    format!(
+        "couldn't answer: your account blocked `{blocked}` for {agent_label}, and every \
+         fallback model is also blocked for this account. Connect an API key to keep using \
+         {agent_label} — run `bluey agent resolve-model {vendor}`{env}; Bluey stores the \
+         key in your OS keychain and drives under it. (Your config was not changed.)",
+        vendor = byot.keychain_vendor,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,6 +853,141 @@ mod tests {
         assert!(
             line.contains("OPENAI_API_KEY"),
             "BYOT line should name the env var: {line}"
+        );
+    }
+
+    // ---- decide_model_block: the daemon/matrix retrying-loop brain. --------
+
+    #[test]
+    fn decide_model_block_returns_not_model_block_for_non_model_errors() {
+        // Auth / runtime / transient errors must leave the loop alone.
+        for err in [
+            "401 Unauthorized",
+            "binary `codex` not found on PATH",
+            "Error: model is overloaded (529)",
+        ] {
+            assert_eq!(
+                decide_model_block(&AgentKind::Codex, err, &[]),
+                ModelLoopStep::NotModelBlock,
+                "non-model error wrongly entered the model loop: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_model_block_first_step_retries_with_first_fallback() {
+        // The real Codex block, nothing tried yet → retry with the first
+        // fallback and the `-m` pair.
+        match decide_model_block(&AgentKind::Codex, REAL_CODEX_BLOCK, &[]) {
+            ModelLoopStep::RetryWithModel {
+                fallback_model,
+                model_flag_args,
+            } => {
+                assert_eq!(fallback_model, "gpt-5.1-codex");
+                assert_eq!(model_flag_args, vec!["-m", "gpt-5.1-codex"]);
+            }
+            other => panic!("expected RetryWithModel, got {other:?}"),
+        }
+    }
+
+    /// THE scenario the brief calls out: model blocked → try each fallback in
+    /// turn (each also blocked on this account) → fallbacks exhausted → the loop
+    /// lands on the BYOT guidance, in a BOUNDED number of steps (never forever).
+    #[test]
+    fn decide_model_block_loop_exhausts_fallbacks_then_yields_byot() {
+        let fallbacks = fallback_models_for(&AgentKind::Codex);
+        assert!(
+            !fallbacks.is_empty(),
+            "Codex must have fallbacks to exhaust"
+        );
+
+        // Simulate the daemon loop: every retry comes back ModelBlocked (the real
+        // machine state — ALL subscription models blocked).
+        let mut tried: Vec<String> = Vec::new();
+        let mut retried_models: Vec<&'static str> = Vec::new();
+        let mut byot_seen = false;
+        // Hard upper bound so a regression that fails to advance can't hang the
+        // test: at most one step per fallback, plus the terminal BYOT step.
+        for _ in 0..(fallbacks.len() + 2) {
+            match decide_model_block(&AgentKind::Codex, REAL_CODEX_BLOCK, &tried) {
+                ModelLoopStep::RetryWithModel {
+                    fallback_model,
+                    model_flag_args,
+                } => {
+                    // The pair always leads with the registry model flag.
+                    assert_eq!(model_flag_args.first().map(String::as_str), Some("-m"));
+                    assert_eq!(
+                        model_flag_args.get(1).map(String::as_str),
+                        Some(fallback_model)
+                    );
+                    // Never re-propose a model already tried (loop is making progress).
+                    assert!(
+                        !tried.iter().any(|t| t == fallback_model),
+                        "re-proposed an already-tried model: {fallback_model}"
+                    );
+                    retried_models.push(fallback_model);
+                    tried.push(fallback_model.to_string());
+                }
+                ModelLoopStep::ConnectApiKey(byot) => {
+                    // Exhausted → BYOT. Data-driven Codex enrollment metadata.
+                    assert_eq!(byot.agent, AgentKind::Codex);
+                    assert_eq!(byot.keychain_vendor, "codex");
+                    assert_eq!(byot.api_key_env, Some("OPENAI_API_KEY"));
+                    byot_seen = true;
+                    break;
+                }
+                ModelLoopStep::NotModelBlock => panic!("real block misclassified mid-loop"),
+            }
+        }
+
+        assert!(
+            byot_seen,
+            "loop never reached the BYOT step (possible infinite loop)"
+        );
+        // Every distinct fallback that isn't the already-blocked model was tried
+        // exactly once before BYOT — bounded and complete.
+        let expected: Vec<&str> = fallbacks
+            .iter()
+            .copied()
+            .filter(|m| !m.eq_ignore_ascii_case("gpt-5.1-codex-max"))
+            .collect();
+        assert_eq!(
+            retried_models, expected,
+            "fallbacks were not tried in registry order, once each"
+        );
+    }
+
+    #[test]
+    fn byot_guidance_line_is_honest_and_actionable() {
+        // Build the BYOT step the loop ends on, then render the guidance.
+        let blocked = ModelBlocked {
+            agent: AgentKind::Codex,
+            blocked_model: Some("gpt-5.1-codex-max".to_string()),
+            hint: Some("ChatGPT account".to_string()),
+        };
+        let all_tried: Vec<String> = fallback_models_for(&AgentKind::Codex)
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let ModelProposal::ConnectApiKey(byot) = plan_resolution(&blocked, &all_tried) else {
+            panic!("all fallbacks tried should yield BYOT");
+        };
+        let line = byot_guidance_line("Codex", &byot);
+        // Names the blocked model, the agent, the real command, and the env var —
+        // and is NOT the raw "model is not supported" passthrough.
+        assert!(
+            line.contains("gpt-5.1-codex-max"),
+            "names blocked model: {line}"
+        );
+        assert!(line.contains("Codex"), "names the agent: {line}");
+        assert!(
+            line.contains("bluey agent resolve-model codex"),
+            "points at the resolve-model command: {line}"
+        );
+        assert!(line.contains("OPENAI_API_KEY"), "names the env var: {line}");
+        assert!(
+            !line.contains("is not supported when using"),
+            "must not be the raw vendor error passthrough: {line}"
         );
     }
 }
