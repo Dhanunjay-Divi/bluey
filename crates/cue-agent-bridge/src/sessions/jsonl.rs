@@ -284,11 +284,18 @@ fn session_ref_for(file: &Path) -> Option<SessionRef> {
     let stem = file.file_stem()?.to_string_lossy().into_owned();
     let id = session_id_from_dir(file).unwrap_or(stem);
     let updated_at = mtime_epoch_string(file);
+    // Project resolution, in priority order. Claude's encoded-cwd dir name
+    // (`-Users-ms-…`) decodes directly. When that doesn't apply (the parent dir
+    // is a date / `chats` / a UUID for Codex/Gemini/Copilot), fall back to a
+    // format-specific extractor that reads the cwd the format DOES carry. Each
+    // is gated by a structural cue (not an agent name) and is read-only +
+    // fail-soft, so it degrades to `None` rather than erroring.
     let project = file
         .parent()
         .and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().into_owned())
-        .and_then(|name| decode_project_dir(&name));
+        .and_then(|name| decode_project_dir(&name))
+        .or_else(|| project_from_format(file));
     // Title priority:
     //   1. Claude's own stored title — `customTitle` (user-set) or `aiTitle`
     //      (Claude-generated). These are clean, human-readable titles that
@@ -305,6 +312,93 @@ fn session_ref_for(file: &Path) -> Option<SessionRef> {
         updated_at,
         project,
     })
+}
+
+/// Resolve a session's project/cwd from the on-disk format when the Claude
+/// encoded-dir scheme doesn't apply. Tries each format-specific extractor; the
+/// cues (file stem, parent-dir name, line-1 `type`) are structural, never an
+/// agent name. Read-only, bounded, fail-soft → `None` on any miss.
+fn project_from_format(file: &Path) -> Option<String> {
+    // Codex: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, line 1 is
+    // `{"type":"session_meta","payload":{"cwd":"…"}}`.
+    if let Some(cwd) = codex_session_meta_cwd(file) {
+        return Some(cwd);
+    }
+    // Copilot: `~/.copilot/session-state/<id>/events.jsonl` — the sibling
+    // `workspace.yaml` carries `cwd:`.
+    if let Some(cwd) = copilot_workspace_cwd(file) {
+        return Some(cwd);
+    }
+    // Gemini: `~/.gemini/tmp/<token>/chats/*.jsonl` — `~/.gemini/projects.json`
+    // maps a real cwd path to that token; invert it.
+    if let Some(cwd) = gemini_token_cwd(file) {
+        return Some(cwd);
+    }
+    None
+}
+
+/// Codex: read `payload.cwd` from the first-line `session_meta` record. Only the
+/// first line is read (cheap). Gated on the record `type` being `session_meta`,
+/// so it never fires for other formats.
+fn codex_session_meta_cwd(file: &Path) -> Option<String> {
+    let handle = std::fs::File::open(file).ok()?;
+    let mut first = String::new();
+    BufReader::new(handle).read_line(&mut first).ok()?;
+    let v: Value = serde_json::from_str(first.trim()).ok()?;
+    if v.get("type").and_then(Value::as_str) != Some("session_meta") {
+        return None;
+    }
+    let cwd = v
+        .get("payload")
+        .and_then(|p| p.get("cwd"))
+        .and_then(Value::as_str)?;
+    (!cwd.is_empty()).then(|| cwd.to_string())
+}
+
+/// Copilot: read `cwd:` from the sibling `workspace.yaml` next to an
+/// `events.jsonl`. Gated on the file stem being `events`. A minimal line-scan
+/// (no YAML dep): the first `cwd: <path>` line wins.
+fn copilot_workspace_cwd(file: &Path) -> Option<String> {
+    if file.file_stem()?.to_str()? != "events" {
+        return None;
+    }
+    let yaml = file.parent()?.join("workspace.yaml");
+    let text = std::fs::read_to_string(&yaml).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("cwd:") {
+            let cwd = rest.trim().trim_matches(['"', '\'']);
+            if !cwd.is_empty() {
+                return Some(cwd.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Gemini: the session lives in `…/tmp/<token>/chats/<file>.jsonl`; the token is
+/// the grandparent dir name. `~/.gemini/projects.json` maps `{ "<cwd>": "<token>" }`
+/// — invert it to recover the real cwd. Gated on the parent dir being `chats`.
+/// Legacy SHA-named tmp dirs aren't in projects.json and resolve to `None`.
+fn gemini_token_cwd(file: &Path) -> Option<String> {
+    let parent = file.parent()?;
+    if parent.file_name()?.to_str()? != "chats" {
+        return None;
+    }
+    let token = parent.parent()?.file_name()?.to_str()?.to_string();
+    // `…/tmp/<token>/chats` → the `.gemini` dir is three levels above the token.
+    let gemini_dir = parent.parent()?.parent()?.parent()?;
+    let projects_json = gemini_dir.join("projects.json");
+    let text = std::fs::read_to_string(&projects_json).ok()?;
+    let map: Value = serde_json::from_str(&text).ok()?;
+    // Shape: a top-level object (or a `projects` sub-object) of cwd → token.
+    let obj = map.get("projects").unwrap_or(&map).as_object()?;
+    for (cwd, tok) in obj {
+        if tok.as_str() == Some(token.as_str()) && !cwd.is_empty() {
+            return Some(cwd.clone());
+        }
+    }
+    None
 }
 
 /// Read Claude's own stored session title, if present: a `customTitle`
@@ -741,6 +835,70 @@ mod tests {
         assert_eq!(turn_from_value(&codex).unwrap().role, Role::Assistant);
         // Gemini assistant role mapping.
         assert_eq!(turn_from_value(&gemini).unwrap().role, Role::Assistant);
+    }
+
+    #[test]
+    fn project_resolved_from_format_for_codex_copilot_gemini() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        // --- Codex: rollout with a session_meta line carrying payload.cwd ---
+        let codex = root.join("2026").join("06").join("15");
+        std::fs::create_dir_all(&codex).unwrap();
+        let codex_file = codex.join("rollout-2026-06-15T00-00-00-abc.jsonl");
+        std::fs::write(
+            &codex_file,
+            "{\"type\":\"session_meta\",\"payload\":{\"cwd\":\"/Users/ms/Developer/Bluey\"}}\n{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hi\"}]}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            session_ref_for(&codex_file)
+                .and_then(|r| r.project)
+                .as_deref(),
+            Some("/Users/ms/Developer/Bluey"),
+            "Codex project comes from session_meta.payload.cwd"
+        );
+
+        // --- Copilot: events.jsonl with a sibling workspace.yaml `cwd:` ---
+        let cop = root.join("session-state").join("uuid-xyz");
+        std::fs::create_dir_all(&cop).unwrap();
+        std::fs::write(
+            cop.join("events.jsonl"),
+            "{\"type\":\"user.message\",\"data\":{\"content\":\"hello\"}}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cop.join("workspace.yaml"),
+            "name: thing\ncwd: /Users/ms/Desktop/Heyloo\ngit_root: /Users/ms/Desktop/Heyloo\n",
+        )
+        .unwrap();
+        let cop_file = cop.join("events.jsonl");
+        assert_eq!(
+            session_ref_for(&cop_file)
+                .and_then(|r| r.project)
+                .as_deref(),
+            Some("/Users/ms/Desktop/Heyloo"),
+            "Copilot project comes from sibling workspace.yaml cwd"
+        );
+
+        // --- Gemini: chats/*.jsonl under <token>, projects.json maps cwd→token ---
+        let gem_root = root.join(".gemini");
+        let chats = gem_root.join("tmp").join("bluey").join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        std::fs::write(
+            gem_root.join("projects.json"),
+            "{\"/Users/ms/Developer/Bluey\":\"bluey\",\"/Users/ms\":\"ms\"}",
+        )
+        .unwrap();
+        let gem_file = chats.join("session-2026-06-15T00-00-abcd.jsonl");
+        std::fs::write(&gem_file, "{\"type\":\"user\",\"content\":\"hi\"}\n").unwrap();
+        assert_eq!(
+            session_ref_for(&gem_file)
+                .and_then(|r| r.project)
+                .as_deref(),
+            Some("/Users/ms/Developer/Bluey"),
+            "Gemini project comes from inverting projects.json token map"
+        );
     }
 
     #[test]

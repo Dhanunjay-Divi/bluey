@@ -147,10 +147,14 @@ pub const COMMAND_MAP: &[DriveSpec] = &[
         // answer — DOC-CONFIRMED
         // (https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference).
         oneshot_args: &["-p", "{prompt}", "-s"],
-        // No documented resume/continue flag for the programmatic CLI
-        // (DOC-CONFIRMED absent — same reference page lists no --resume /
-        // --continue). Leave empty rather than passing an unsupported flag.
-        resume_args: &[],
+        // Resume a specific prior session by id: `--resume=<id>` (appended after
+        // the oneshot `-p {prompt} -s`). VERIFIED LIVE on copilot 1.0.62 with a
+        // 3-turn codeword test — `copilot -p "<q>" --resume=<uuid> -s` recalled
+        // state a no-resume control did not. The id is the `~/.copilot/
+        // session-state/<uuid>/` dir name (the same id our reader assigns). NOTE:
+        // bare `--resume` (no value) opens an interactive picker (useless
+        // headless); the `=<id>` form takes the id directly and needs no picker.
+        resume_args: &["--resume={id}"],
         // No JSON output flag is documented; stdout is plain text. DOC-CONFIRMED.
         parser: OutputParser::PlainText,
     },
@@ -1191,21 +1195,27 @@ mod tests {
     }
 
     #[test]
-    fn test_build_argv_copilot_has_silent_flag_and_no_resume() {
-        // Copilot one-shot carries `-s` (silent); resume is undocumented, so it
-        // appends nothing even when a resume id is set.
+    fn test_build_argv_copilot_silent_flag_and_resume_by_id() {
+        // Copilot one-shot carries `-s` (silent). Resume appends `--resume=<id>`
+        // (VERIFIED LIVE on 1.0.62 via a 3-turn codeword test) — the `=<id>` form
+        // takes the session id directly, no interactive picker.
         let spec = spec(KindTag::Copilot);
         let mut q = Question::new("q");
         let (_, oneshot) = build_argv(spec, &q);
         assert!(oneshot.iter().any(|a| a == "-s"), "expected -s silent flag");
+        assert!(
+            !oneshot.iter().any(|a| a.starts_with("--resume")),
+            "one-shot (no resume id) must NOT carry --resume"
+        );
 
-        q.resume = Some("anything".to_string());
+        q.resume = Some("uuid-1234".to_string());
         let (_, resumed) = build_argv(spec, &q);
-        // No resume flag exists, so resuming yields the same argv as one-shot.
-        assert_eq!(oneshot, resumed);
-        assert!(!resumed.iter().any(|a| a == "--continue"));
-        assert!(!resumed.iter().any(|a| a == "--resume"));
-        assert!(!resumed.iter().any(|a| a == "anything"));
+        assert!(
+            resumed.iter().any(|a| a == "--resume=uuid-1234"),
+            "resume must append --resume=<id>, got {resumed:?}"
+        );
+        // Still a headless one-shot: keeps -p/-s, just adds the resume target.
+        assert!(resumed.iter().any(|a| a == "-s"));
     }
 
     #[test]

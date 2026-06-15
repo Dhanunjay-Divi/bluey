@@ -722,14 +722,26 @@ pub const REGISTRY: &[AgentEntry] = &[
         data_dir_globs: &[".codex"],
         app_data_windows: &[],
         // The CLI rollouts (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`,
-        // plaintext JSONL) are the ONLY readable Codex surface. The ChatGPT
-        // desktop app keeps a SEPARATE conversation store at
+        // plaintext JSONL) are the canonical, legitimately-readable Codex surface
+        // (204 here). The ChatGPT DESKTOP app keeps a SEPARATE store at
         // `~/Library/Application Support/com.openai.chat/conversations-v3-*/*.data`
-        // (~81 GUI-only conversations, disjoint from the CLI set) but those are
-        // AES-GCM encrypted via Electron safeStorage (key in the macOS Keychain),
-        // with no plaintext index/title/SQLite catalog — verified unreadable
-        // 2026-06-14, same situation as Antigravity's encrypted per-conversation
-        // `.pb` bodies. So we do NOT attempt the desktop store.
+        // (~81 GUI conversations, DISJOINT from the CLI set — desktop ids are
+        // UUIDv4, rollouts are UUIDv7, 0 overlap), but Bluey **intentionally does
+        // NOT read it**, and this is the correct call, not a limitation:
+        //   • The `.data` blobs are encrypted via Electron `safeStorage`; the key
+        //     is a macOS Keychain item whose ACL is bound to OpenAI's Team ID
+        //     (`2DC432GLL2`). A process not signed with that Team ID cannot read
+        //     the key WITHOUT a per-access login-password prompt — unusable for a
+        //     passive copilot — and the only prompt-free route is injecting into
+        //     the signed ChatGPT app, a security bypass Bluey must never do.
+        //   • OpenAI ENCRYPTED this deliberately (a July-2024 fix after the app
+        //     was found storing chats in plaintext). Reading it would defeat a
+        //     control they added on purpose — wrong on ethics, not just feasibility.
+        //   • The only legitimate path is the app's own user-initiated Export
+        //     (Settings → Data Controls), which yields a separate `conversations.json`
+        //     — a manual action, not a live store Bluey can read autonomously.
+        // Verified 2026-06-15 (web + on-disk + keychain-ACL analysis). Same posture
+        // as Antigravity's encrypted per-conversation `.pb` bodies.
         session_format: Some(SessionFormat::Jsonl),
         jsonl_subdir: "sessions",
         drive_command: &["codex", "exec", "{prompt}"],
