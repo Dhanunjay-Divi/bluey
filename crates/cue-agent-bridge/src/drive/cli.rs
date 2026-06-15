@@ -264,6 +264,11 @@ pub struct DriveOptions {
     /// data the resolver reads off the registry row (`model_flag` + a
     /// `fallback_models` entry); the drive layer never names a model itself.
     pub model_override: Vec<String>,
+    /// Working directory to spawn the child in. Set from [`Question::cwd`] by
+    /// [`drive_with_options`]. **Critical for cwd-scoped resume** (Claude resolves
+    /// `--resume <id>` against `~/.claude/projects/<encoded-cwd>/`). `None` → the
+    /// child inherits the daemon's cwd (unchanged for fresh, non-resumed drives).
+    pub cwd: Option<String>,
 }
 
 impl Default for DriveOptions {
@@ -273,6 +278,7 @@ impl Default for DriveOptions {
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             mode: DriveMode::Answer,
             model_override: Vec::new(),
+            cwd: None,
         }
     }
 }
@@ -519,7 +525,7 @@ pub async fn drive_with_mode(
 pub async fn drive_with_options(
     agent: AgentKind,
     question: Question,
-    opts: DriveOptions,
+    mut opts: DriveOptions,
 ) -> Result<AnswerStream> {
     let spec = match spec_for(&agent) {
         Some(s) => *s,
@@ -527,6 +533,12 @@ pub async fn drive_with_options(
             anyhow::bail!("agent {agent:?} has no CLI drive command");
         }
     };
+
+    // Drive from the question's cwd when set (the session's project dir) so
+    // cwd-scoped resume resolves correctly. An explicit `opts.cwd` (rare) wins.
+    if opts.cwd.is_none() {
+        opts.cwd = question.cwd.clone();
+    }
 
     // For an answer, resolve the scoped MCP allow-list (the agent's own server
     // names) so its read-tools fire headless while writes stay gated. Empty for
@@ -581,6 +593,25 @@ fn run_stream(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+
+        // Spawn in the session's project dir when known (cwd-scoped resume needs
+        // it). Only set it if it exists AND has real content — a missing path
+        // would fail the spawn, and an EMPTY dir (e.g. an un-synced iCloud
+        // placeholder like a CookWise folder under `Mobile Documents/…CloudDocs`,
+        // which exists but holds 0 files) makes the agent error/hang with nothing
+        // to read. In both cases fall back to the inherited cwd: the continuation
+        // still works via the replayed conversation context, just not anchored to
+        // a project that isn't really here.
+        if let Some(dir) = opts.cwd.as_deref() {
+            let p = std::path::Path::new(dir);
+            let usable = p.is_dir()
+                && std::fs::read_dir(p)
+                    .map(|mut entries| entries.next().is_some())
+                    .unwrap_or(false);
+            if usable {
+                cmd.current_dir(dir);
+            }
+        }
 
         // Self-resolve a runtime-version mismatch (e.g. the Copilot CLI requires
         // Node ≥ 24 but the active node is older): if this binary won't launch on

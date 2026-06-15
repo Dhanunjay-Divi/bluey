@@ -51,12 +51,30 @@ impl SessionReader for JsonFilesReader {
             .map(|m| m.len() > MAX_READ_PARSE_BYTES)
             .unwrap_or(false)
         {
-            turns.push(Turn {
-                role: Role::System,
-                text: "This session is too large to load fully here. Open it in \
-                       the app, or ask a focused question."
-                    .to_string(),
-            });
+            // Too big to parse whole — but a continuation only needs the RECENT
+            // turns (the compaction layer keeps recent + summarizes older). Read
+            // a bounded slice of the tail and recover the most recent messages,
+            // matching the hierarchical-memory approach rather than swallowing a
+            // 141 MB transcript. Fail-soft: an honest placeholder if even that
+            // recovers nothing.
+            let recent = recent_turns_from_tail(&file, max_turns);
+            if recent.is_empty() {
+                turns.push(Turn {
+                    role: Role::System,
+                    text: "This session is too large to load fully here, and its \
+                           recent turns could not be recovered. Open it in the app, \
+                           or ask a focused question."
+                        .to_string(),
+                });
+            } else {
+                turns.push(Turn {
+                    role: Role::System,
+                    text: "[…older turns omitted: large session, showing recent \
+                           messages…]"
+                        .to_string(),
+                });
+                turns.extend(recent);
+            }
             return Ok(Transcript { turns });
         }
         let contents = std::fs::read_to_string(&file)
@@ -169,8 +187,57 @@ fn session_ref_for(file: &Path) -> Option<SessionRef> {
         id,
         title,
         updated_at,
-        project: None,
+        // The workspace folder this chat belongs to, from the sibling
+        // `workspace.json` (two dirs up: `<hash>/chatSessions/<id>.json` →
+        // `<hash>/workspace.json`). Critical for continuation: a bridged drive
+        // (VS Code Copilot → Copilot CLI) must run in the chat's OWN project, or
+        // the agent answers about whatever repo the daemon happens to sit in.
+        project: workspace_folder_for(file),
     })
+}
+
+/// Read the project folder for a VS Code chat from its workspace's
+/// `workspace.json` (`{"folder":"file:///path"}`). The session file lives at
+/// `…/workspaceStorage/<hash>/chatSessions/<id>.json`, so `workspace.json` is two
+/// directories up. Strips the `file://` scheme and percent-decodes. `None` for a
+/// `vscode-remote://` folder (not a local path) or when absent. Read-only,
+/// fail-soft.
+fn workspace_folder_for(file: &Path) -> Option<String> {
+    // file → chatSessions → <hash>
+    let hash_dir = file.parent()?.parent()?;
+    let ws = hash_dir.join("workspace.json");
+    let text = std::fs::read_to_string(&ws).ok()?;
+    let v: Value = serde_json::from_str(&text).ok()?;
+    let folder = v.get("folder").and_then(Value::as_str)?;
+    let path = folder.strip_prefix("file://")?; // local folders only
+    let decoded = percent_decode(path);
+    (!decoded.is_empty()).then_some(decoded)
+}
+
+/// Minimal percent-decoder for `file://` paths (e.g. `%20` → space), no extra
+/// dependency. Leaves malformed escapes as-is.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = |b: u8| match b {
+                b'0'..=b'9' => Some(b - b'0'),
+                b'a'..=b'f' => Some(b - b'a' + 10),
+                b'A'..=b'F' => Some(b - b'A' + 10),
+                _ => None,
+            };
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Cheap check: does this (small) session file contain at least one message?
@@ -196,6 +263,11 @@ const MAX_TITLE_PARSE_BYTES: u64 = 2 * 1024 * 1024;
 /// Max file size we will fully parse on an explicit `read` (session selected).
 /// Reading is intentional so the cap is higher than the title cap, but still
 /// bounded — a 141 MB chat file would otherwise take many seconds to parse.
+/// Above this we do NOT swallow the whole file: [`recent_turns_from_tail`]
+/// recovers just the most recent turns (which is all a continuation needs — the
+/// compaction layer keeps recent + summarizes older anyway), matching the
+/// hierarchical-memory approach the coding agents use rather than replaying a
+/// giant transcript whole.
 const MAX_READ_PARSE_BYTES: u64 = 25 * 1024 * 1024;
 
 /// Bytes read from the **tail** of an oversized file to recover `customTitle`.
@@ -279,6 +351,74 @@ fn custom_title_from_tail(file: &Path, size: u64) -> Option<String> {
     } else {
         Some(snippet(trimmed, TITLE_SNIPPET_CHARS))
     }
+}
+
+/// Bytes read from the tail of an oversized file to recover RECENT turns for a
+/// continuation. Larger than the title tail scan (we want several recent
+/// messages, not just `customTitle`), but still bounded so a 141 MB file is
+/// never read whole. ~2 MB comfortably holds the last several request/response
+/// pairs even with verbose tool payloads.
+const RECENT_TAIL_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Recover the most recent USER messages from the tail of an oversized VS Code
+/// chat, for continuation. Reads a bounded tail slice and extracts every
+/// `"message":{"text":"…"}` user-text it can find, keeping the last `max_turns`
+/// (most recent). This is the hierarchical "recent layer" — the daemon's
+/// compaction summarizes anything older — and avoids parsing a giant transcript
+/// whole. Assistant responses are not recovered from the tail (their structure
+/// is large/nested); the recent user thread is what a continuation needs to pick
+/// up the topic. Fail-soft → empty on any read/scan failure.
+fn recent_turns_from_tail(file: &Path, max_turns: usize) -> Vec<Turn> {
+    let Ok(size) = std::fs::metadata(file).map(|m| m.len()) else {
+        return Vec::new();
+    };
+    let Ok(mut f) = std::fs::File::open(file) else {
+        return Vec::new();
+    };
+    let start = size.saturating_sub(RECENT_TAIL_BYTES);
+    if f.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut buf = Vec::with_capacity(RECENT_TAIL_BYTES as usize);
+    if f.take(RECENT_TAIL_BYTES).read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let tail = String::from_utf8_lossy(&buf);
+
+    // Scan for each user message. VS Code chat files are PRETTY-PRINTED, so a
+    // request serializes as `"message": {\n  "parts": [...],\n  "text": "<user
+    // text>"\n }` — the `"message"` key and the `"text"` value are NOT adjacent
+    // (whitespace + a `parts` array sit between them). VERIFIED on a real 141 MB
+    // file: this finds the recent user prompts (the last sits ~0.4 MB from EOF).
+    // For each `"message"` key, scan the FIRST `"text"` value within a bounded
+    // window after it (the user prompt) — bounded so we never run past the
+    // message object into response payloads.
+    const MSG_TEXT_WINDOW: usize = 16 * 1024;
+    let mut texts: Vec<String> = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(rel) = tail[search_from..].find("\"message\"") {
+        let abs = search_from + rel;
+        let window_end = (abs + MSG_TEXT_WINDOW).min(tail.len());
+        if let Some(text) = scan_json_string_value(&tail[abs..window_end], "text") {
+            let t = text.trim();
+            if !t.is_empty() {
+                texts.push(snippet(t, 4000));
+            }
+        }
+        search_from = abs + "\"message\"".len();
+    }
+
+    // Keep the most recent `max_turns` (the tail's later matches are newer).
+    if texts.len() > max_turns {
+        texts = texts.split_off(texts.len() - max_turns);
+    }
+    texts
+        .into_iter()
+        .map(|text| Turn {
+            role: Role::User,
+            text,
+        })
+        .collect()
 }
 
 /// Recover the first user message from the first [`HEAD_SCAN_BYTES`] of an
@@ -684,5 +824,83 @@ mod tests {
         assert_eq!(scan_json_string_value(frag, "missing"), None);
         // Value cut off before the closing quote → None (bounded-read safety).
         assert_eq!(scan_json_string_value(r#""k": "unterminated"#, "k"), None);
+    }
+}
+
+#[cfg(test)]
+mod tail_recent_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn recent_turns_from_tail_recovers_pretty_printed_user_messages() {
+        // Mirror the REAL VS Code big-file shape (VERIFIED on a 141 MB file):
+        // PRETTY-PRINTED, each request's `"message"` has a `parts` array BEFORE
+        // its `"text"` (so key and value are not adjacent), and large response
+        // payloads sit between requests. The tail scan must still pull the recent
+        // user `text` values, skipping `parts`/response noise.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("big.json");
+        let mut f = std::fs::File::create(&file).expect("create");
+        writeln!(f, "{{").unwrap();
+        writeln!(f, "  \"version\": 3,").unwrap();
+        writeln!(f, "  \"requests\": [").unwrap();
+        for i in 0..5 {
+            writeln!(f, "    {{").unwrap();
+            writeln!(f, "      \"requestId\": \"r{i}\",").unwrap();
+            // message: parts array FIRST, then text. On REAL data `parts[].text`
+            // and `message.text` are identical copies of the user's prompt
+            // (VERIFIED on a 141 MB file: `parts[0].text == message.text`), so the
+            // scan grabbing the first `"text"` after `"message"` gets the prompt
+            // either way. The fixture mirrors that (same text in both).
+            writeln!(f, "      \"message\": {{").unwrap();
+            writeln!(
+                f,
+                "        \"parts\": [ {{ \"range\": {{ \"start\": 0 }}, \"text\": \"user question number {i}\", \"kind\": \"text\" }} ],"
+            )
+            .unwrap();
+            writeln!(f, "        \"text\": \"user question number {i}\"").unwrap();
+            writeln!(f, "      }},").unwrap();
+            // A big response blob between messages (simulates the heavy payload).
+            writeln!(
+                f,
+                "      \"response\": [ {{ \"value\": \"{}\" }} ]",
+                "x".repeat(2000)
+            )
+            .unwrap();
+            writeln!(f, "    }},").unwrap();
+        }
+        writeln!(f, "    null").unwrap();
+        writeln!(f, "  ]").unwrap();
+        writeln!(f, "}}").unwrap();
+        drop(f);
+
+        // Keep only the last 3 (most recent).
+        let turns = recent_turns_from_tail(&file, 3);
+        assert!(!turns.is_empty(), "must recover recent user turns");
+        assert!(turns.len() <= 3, "bounded to max_turns");
+        // The MOST RECENT user question (4) is present; an early one (0) is not.
+        let joined: String = turns
+            .iter()
+            .map(|t| t.text.clone())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            joined.contains("user question number 4"),
+            "recent kept: {joined}"
+        );
+        assert!(
+            !joined.contains("user question number 0"),
+            "oldest dropped: {joined}"
+        );
+        assert!(turns.iter().all(|t| t.role == Role::User));
+    }
+
+    #[test]
+    fn recent_turns_from_tail_empty_on_no_messages() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("none.json");
+        std::fs::write(&file, br#"{"version":3,"requests":[]}"#).unwrap();
+        assert!(recent_turns_from_tail(&file, 5).is_empty());
     }
 }
