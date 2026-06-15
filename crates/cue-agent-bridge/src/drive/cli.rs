@@ -743,50 +743,13 @@ fn run_stream(
     Box::pin(s)
 }
 
-/// Decide whether `program` needs to be driven under a different runtime, and
-/// if so return the `PATH` value the child should get (the satisfying runtime's
-/// bin dir prepended to the inherited `PATH`). Returns `None` — leaving the
-/// child to inherit the parent `PATH` unchanged — when the program launches
-/// fine, when its failure is not a runtime-version mismatch, or when no
-/// satisfying runtime is installed.
-///
-/// Fully fail-soft and read-only: it probes `<program> --version` (the same
-/// cheap, side-effect-free probe `provision.rs` uses), and only on a
-/// runtime-version error does it consult [`crate::runtime_resolve`] to locate a
-/// satisfying runtime and build the per-spawn `PATH`. It never mutates
-/// `std::env`, never installs anything, and never runs the agent's real work.
+/// Decide whether `program` needs to be driven under a different runtime,
+/// returning the per-spawn `PATH` the child should get. Thin wrapper over
+/// [`crate::runtime_resolve::runtime_path_for_program`] (shared with the
+/// MCP-tools enumerator); see that function for the full contract. Fail-soft
+/// and read-only — `None` means inherit the parent `PATH` unchanged.
 fn runtime_path_for(program: &str) -> Option<String> {
-    // Probe the binary's launch behavior. A clean `--version` exit means no
-    // runtime problem — nothing to resolve.
-    let output = std::process::Command::new(program)
-        .arg("--version")
-        .output()
-        .ok()?;
-    if output.status.success() {
-        return None;
-    }
-    // Some CLIs print the launch error to stderr, some to stdout.
-    let mut err_text = String::from_utf8_lossy(&output.stderr).into_owned();
-    if err_text.trim().is_empty() {
-        err_text = String::from_utf8_lossy(&output.stdout).into_owned();
-    }
-
-    // Is this a runtime-version mismatch we can satisfy from an installed
-    // runtime? `resolve_for_launch_error` returns None for any non-runtime error
-    // (auth, network, …) and for an unsatisfiable requirement.
-    let resolution = crate::runtime_resolve::resolve_for_launch_error(&err_text)?;
-
-    let current = std::env::var("PATH").unwrap_or_default();
-    let child_path = crate::runtime_resolve::prepend_path(&resolution.bin_dir, &current);
-    tracing::info!(
-        binary = %program,
-        runtime = %resolution.req.kind.label(),
-        found_version = %resolution.found_version,
-        // Path of the prepended bin dir only — never the prompt or full env.
-        runtime_bin_dir = %resolution.bin_dir.display(),
-        "driving agent under a satisfying runtime via per-spawn PATH",
-    );
-    Some(child_path)
+    crate::runtime_resolve::runtime_path_for_program(program)
 }
 
 /// Drain a child's stderr into a bounded, trimmed string for error reporting.

@@ -493,16 +493,35 @@ impl SessionsResult {
 
 /// The MCP step outcome for a scorecard.
 ///
-/// The MCP step measures **availability**, not live execution: does the user's
-/// agent have MCP connectors wired up that Bluey can detect and inherit? That is
-/// a read-only config read (no drive, no model quota, no flaky external call) —
-/// the product question is "are the tools there," not "do they return data right
-/// now" (a connector being rate-limited/misconfigured is the user's concern, not
-/// a measure of whether Bluey works).
+/// The MCP step measures **availability**, not model execution: can the user's
+/// agent SEE and launch its MCP connectors that Bluey can detect and inherit?
+/// This is still a read-only, **NON-quota** check — it never drives the model.
+///
+/// It now prefers a stronger, LIVE signal over a config read, with an honest
+/// fallback so it can never regress below today:
+/// - [`LiveEnumerated`](McpStep::LiveEnumerated) — the agent's own
+///   `mcp list` / `mcp list-tools` command ran and reported its servers (and,
+///   for Cursor, the per-server TOOLS). This proves the agent can actually see /
+///   launch the connectors, not merely that they sit in a file. The command
+///   launches the connector process / reads health — no model call, no quota.
+/// - [`Available`](McpStep::Available) — the **config-only fallback**: the live
+///   command had no equivalent for this agent, or it failed/timed out, so we fell
+///   back to reading the connector config (the prior Level-1 behavior). Reported
+///   distinctly so the cell is honest about which signal it is.
+/// - [`NoneConfigured`](McpStep::NoneConfigured) / [`NoConfig`](McpStep::NoConfig)
+///   — a config exists but declares none, or none was located.
 #[derive(Debug, Clone)]
 pub enum McpStep {
-    /// Connectors were read: how many MCP servers this agent exposes, and a
-    /// sample of their names.
+    /// LIVE Level-2: the agent's own list command enumerated its MCP surface.
+    /// `servers` are the live-reported server names; `tools` are per-server tool
+    /// names when the agent enumerates them (Cursor), else empty.
+    LiveEnumerated {
+        servers: Vec<String>,
+        tools: Vec<String>,
+    },
+    /// Config-only fallback (Level-1): connectors were read from the config —
+    /// how many MCP servers this agent exposes, and a sample of their names.
+    /// Used only when the live command is unavailable or failed for this agent.
     Available { count: usize, names: Vec<String> },
     /// The agent has a config location but it declares no MCP servers.
     NoneConfigured,
@@ -510,20 +529,51 @@ pub enum McpStep {
     NoConfig,
 }
 
+/// How many live-enumerated server/tool names to sample into the cell detail.
+const MCP_LIVE_SAMPLE: usize = 6;
+
 impl McpStep {
     /// Map the MCP step onto a matrix cell.
     ///
-    /// 🟢 the agent exposes ≥1 MCP connector (tools available to inherit);
-    /// ⬜ a config exists but declares none, or no config was located.
+    /// 🟢 the agent's connectors were LIVE-enumerated (strongest) OR ≥1 connector
+    /// was found in config (fallback) — both mean tools are available to inherit;
+    /// the detail text says which signal it is. ⬜ a config exists but declares
+    /// none, or no config was located.
     fn cell(&self) -> StepResult {
         match self {
+            McpStep::LiveEnumerated { servers, tools } => {
+                let detail = if !tools.is_empty() {
+                    // Per-tool signal (Cursor): name the servers + tool count, and
+                    // sample a few tool names.
+                    let tool_sample = sample_join(tools, MCP_LIVE_SAMPLE);
+                    let server_sample = sample_join(servers, MCP_LIVE_SAMPLE);
+                    format!(
+                        "live: {} server(s) [{}], {} tool(s) ({})",
+                        servers.len(),
+                        server_sample,
+                        tools.len(),
+                        tool_sample,
+                    )
+                } else {
+                    // Server-only signal (Claude/Gemini/Copilot): name the servers.
+                    format!(
+                        "live: {} MCP server(s) ({})",
+                        servers.len(),
+                        sample_join(servers, MCP_LIVE_SAMPLE),
+                    )
+                };
+                StepResult::pass(detail)
+            }
             McpStep::Available { count, names } => {
                 let sample = if names.is_empty() {
                     String::new()
                 } else {
                     format!(" ({})", names.join(", "))
                 };
-                StepResult::pass(format!("{count} MCP connector(s) available{sample}"))
+                // "(config-only)" is the honest distinction from the live signal.
+                StepResult::pass(format!(
+                    "config-only: {count} MCP connector(s) available{sample}"
+                ))
             }
             McpStep::NoneConfigured => {
                 StepResult::skip("config present, no MCP servers declared".to_string())
@@ -531,6 +581,19 @@ impl McpStep {
             McpStep::NoConfig => StepResult::skip("no connector config located".to_string()),
         }
     }
+}
+
+/// Join up to `max` items with `, `, appending `…` when truncated. Empty → "".
+fn sample_join(items: &[String], max: usize) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let shown: Vec<&str> = items.iter().take(max).map(|s| s.as_str()).collect();
+    let mut s = shown.join(", ");
+    if items.len() > max {
+        s.push('…');
+    }
+    s
 }
 
 /// Which surface an agent belongs to, for `validate_category`.
@@ -640,9 +703,11 @@ impl AgentScorecard {
 /// Run all 5 steps for ONE agent, sequentially and fail-soft.
 ///
 /// A red step still records its real reason and never aborts the others, so the
-/// row is always complete. Read steps (detect/sessions/title/MCP) are local and
-/// fast — the MCP step is a read-only connector-availability check, no drive; only
-/// the ask step spends real model quota (bounded by [`DRIVE_TIMEOUT`]).
+/// row is always complete. The MCP step prefers a LIVE enumeration of the agent's
+/// own MCP servers/tools (the agent's `mcp list` command — read-only, NO model
+/// call, NO quota) and falls back to a config read; it never drives the model.
+/// Detect/sessions/title are local and fast. Only the Ask step spends real model
+/// quota (bounded by [`DRIVE_TIMEOUT`]).
 ///
 /// **Spends real quota** on the Ask step for any drivable agent — call only on
 /// explicit user request.
@@ -682,8 +747,11 @@ pub async fn validate_agent(kind: &AgentKind) -> AgentScorecard {
         drive_once_resolving_model(kind.clone()).await
     };
 
-    // Step 5 — MCP availability (read-only connector read; no drive, no quota).
-    let mcp = mcp_step(kind);
+    // Step 5 — MCP availability. Prefers a LIVE enumeration of the agent's own
+    // MCP servers/tools (the agent's `mcp list` command — read-only, NO model
+    // call, NO quota), falling back to the connector-config read. Never drives
+    // the model.
+    let mcp = mcp_step(kind).await;
 
     AgentScorecard {
         display_name,
@@ -902,15 +970,50 @@ async fn read_first_user_turns(store: &SessionStore, id: &str) -> Vec<String> {
     }
 }
 
-/// Step 5 — MCP: are the user's MCP connectors **available** for Bluey to
-/// inherit? This is a READ-ONLY connector-config read — it never drives the
-/// agent and never spends model quota. The product question is "does the agent
-/// have MCP tools wired up," not "do those tools return live data right now" (a
-/// rate-limited/misconfigured connector is the user's concern; its tools are
-/// still *available* to the agent, which is what Bluey detects and inherits).
+/// Step 5 — MCP: can the user's agent SEE and launch its MCP connectors for
+/// Bluey to inherit? This is READ-ONLY and **NON-quota** — it never drives the
+/// model. The product question is "does the agent have MCP tools wired up and
+/// visible," not "do those tools return live data right now" (a rate-limited /
+/// misconfigured connector is the user's concern; its tools are still
+/// *available* to the agent, which is what Bluey detects and inherits).
 ///
-/// Up to [`MCP_NAME_SAMPLE`] connector names are listed for at-a-glance context.
-fn mcp_step(kind: &AgentKind) -> McpStep {
+/// Two-level signal, strongest-first, with an honest fallback so it can never
+/// regress below the prior config-read.
+///
+/// **Level 2 (live):** run the agent's own `mcp list` / `mcp list-tools` command
+/// ([`crate::mcp_tools`]) and report the servers (and, for Cursor, the per-server
+/// TOOLS) the agent itself sees. These commands launch the connector process /
+/// read health — no model call, no quota — and are bounded + secret-redacted. A
+/// 🟢 here is the truthful "the agent can launch its MCP tools" signal.
+///
+/// **Level 1 (config-only fallback):** if the agent has no live command, or it
+/// failed/timed out, fall back to reading the connector config (the prior
+/// behavior). Reported distinctly (`config-only: …`) so the cell stays honest.
+///
+/// `async` because Level 2 spawns the agent's list process (bounded by the
+/// enumerator's own timeout); the fallback config read is synchronous.
+async fn mcp_step(kind: &AgentKind) -> McpStep {
+    use crate::mcp_tools::{enumerate_mcp_tools, McpToolsResult};
+
+    // Level 2 first: ask the agent to enumerate its own MCP surface. Non-quota,
+    // bounded, fail-soft.
+    match enumerate_mcp_tools(kind).await {
+        McpToolsResult::Enumerated { servers, tools } => {
+            return McpStep::LiveEnumerated { servers, tools };
+        }
+        // No live command for this agent, or it failed/timed out → fall through
+        // to the Level-1 config read so we never regress below today.
+        McpToolsResult::NoCommand | McpToolsResult::Failed(_) => {}
+    }
+
+    mcp_step_config_only(kind)
+}
+
+/// Level-1 config-read fallback for [`mcp_step`]: read the agent's connector
+/// config (no spawn, no quota) and report availability. Up to [`MCP_NAME_SAMPLE`]
+/// connector names are sampled for at-a-glance context. Extracted so the
+/// fallback is a single pure-ish call and is unit-testable in isolation.
+fn mcp_step_config_only(kind: &AgentKind) -> McpStep {
     const MCP_NAME_SAMPLE: usize = 6;
     let config = crate::discover_agents()
         .into_iter()
@@ -1258,19 +1361,66 @@ mod tests {
 
     #[test]
     fn mcp_step_availability_maps_to_cell_status() {
-        // ≥1 connector available → 🟢, with the count + names in the detail.
+        // ≥1 connector available (config-only fallback) → 🟢, with the count +
+        // names in the detail, clearly marked "config-only" so it is NOT confused
+        // with the live signal.
         let avail = McpStep::Available {
             count: 2,
             names: vec!["perplexity".into(), "github".into()],
         };
         assert_eq!(avail.cell().status, CellStatus::Pass);
         assert!(avail.cell().detail.contains("2 MCP connector(s) available"));
+        assert!(avail.cell().detail.contains("config-only"));
         assert!(avail.cell().detail.contains("perplexity"));
 
         // Config present but no servers declared → ⬜.
         assert_eq!(McpStep::NoneConfigured.cell().status, CellStatus::Skip);
         // No connector config located → ⬜.
         assert_eq!(McpStep::NoConfig.cell().status, CellStatus::Skip);
+    }
+
+    #[test]
+    fn mcp_step_live_enumerated_maps_to_pass_and_says_live() {
+        // Server-only live signal (Claude/Gemini/Copilot): 🟢, names listed, and
+        // marked "live" to distinguish it from the config-only fallback.
+        let server_only = McpStep::LiveEnumerated {
+            servers: vec!["perplexity".into(), "github".into()],
+            tools: vec![],
+        };
+        let cell = server_only.cell();
+        assert_eq!(cell.status, CellStatus::Pass);
+        assert!(cell.detail.contains("live:"), "detail: {}", cell.detail);
+        assert!(cell.detail.contains("2 MCP server(s)"));
+        assert!(cell.detail.contains("perplexity"));
+        // The live signal must NOT be labeled config-only.
+        assert!(!cell.detail.contains("config-only"));
+
+        // Per-tool live signal (Cursor): server count + tool count + sampled
+        // tool names, also 🟢.
+        let with_tools = McpStep::LiveEnumerated {
+            servers: vec!["perplexity".into()],
+            tools: vec![
+                "perplexity_ask".into(),
+                "perplexity_reason".into(),
+                "perplexity_research".into(),
+                "perplexity_search".into(),
+            ],
+        };
+        let cell = with_tools.cell();
+        assert_eq!(cell.status, CellStatus::Pass);
+        assert!(cell.detail.contains("4 tool(s)"), "detail: {}", cell.detail);
+        assert!(cell.detail.contains("perplexity_ask"));
+        assert!(cell.detail.contains("live:"));
+    }
+
+    #[test]
+    fn sample_join_caps_and_marks_truncation() {
+        let items: Vec<String> = (0..10).map(|i| format!("s{i}")).collect();
+        let joined = sample_join(&items, 3);
+        assert_eq!(joined, "s0, s1, s2…");
+        // No truncation marker when within the cap.
+        assert_eq!(sample_join(&items[..2], 6), "s0, s1");
+        assert_eq!(sample_join(&[], 6), "");
     }
 
     // ---- 5-step matrix: render -------------------------------------------
@@ -1363,5 +1513,25 @@ mod tests {
             "off-canary ask should render a warn glyph"
         );
         assert!(out.contains("answered off-canary"));
+    }
+
+    #[test]
+    fn render_scorecard_shows_live_enumerated_mcp_with_tools() {
+        // When the MCP step is LIVE-enumerated (Cursor's per-tool path), the row
+        // surfaces the live tool names + count, not the config-only wording.
+        let mut cards = sample_cards();
+        cards[0].mcp = McpStep::LiveEnumerated {
+            servers: vec!["perplexity".into()],
+            tools: vec![
+                "perplexity_ask".into(),
+                "perplexity_reason".into(),
+                "perplexity_research".into(),
+                "perplexity_search".into(),
+            ],
+        };
+        let out = render_scorecard(&cards);
+        assert!(out.contains("live:"), "should show a live MCP detail");
+        assert!(out.contains("perplexity_ask"), "should name a live tool");
+        assert!(out.contains("4 tool(s)"));
     }
 }

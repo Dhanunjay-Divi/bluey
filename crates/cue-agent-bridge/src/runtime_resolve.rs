@@ -462,6 +462,51 @@ pub fn resolve_for_launch_error(error_text: &str) -> Option<RuntimeResolution> {
     locate_runtime(&req)
 }
 
+/// Decide whether `program` needs to be driven under a different runtime, and
+/// if so return the `PATH` value the child should get (the satisfying runtime's
+/// bin dir prepended to the inherited `PATH`). Returns `None` — leaving the
+/// child to inherit the parent `PATH` unchanged — when the program launches
+/// fine, when its failure is not a runtime-version mismatch, or when no
+/// satisfying runtime is installed.
+///
+/// Fully fail-soft and read-only: it probes `<program> --version` (a cheap,
+/// side-effect-free probe), and only on a runtime-version error does it consult
+/// [`resolve_for_launch_error`] to locate a satisfying runtime and build the
+/// per-spawn `PATH`. It never mutates `std::env`, never installs anything, and
+/// never runs the program's real work. Shared by the drive layer (so a too-old
+/// active Node still launches the Copilot CLI) and the MCP-tools enumerator (so
+/// `copilot mcp list` runs under Node ≥ 24).
+pub fn runtime_path_for_program(program: &str) -> Option<String> {
+    // Probe the binary's launch behavior. A clean `--version` exit means no
+    // runtime problem — nothing to resolve.
+    let output = Command::new(program).arg("--version").output().ok()?;
+    if output.status.success() {
+        return None;
+    }
+    // Some CLIs print the launch error to stderr, some to stdout.
+    let mut err_text = String::from_utf8_lossy(&output.stderr).into_owned();
+    if err_text.trim().is_empty() {
+        err_text = String::from_utf8_lossy(&output.stdout).into_owned();
+    }
+
+    // Is this a runtime-version mismatch we can satisfy from an installed
+    // runtime? `resolve_for_launch_error` returns None for any non-runtime error
+    // (auth, network, …) and for an unsatisfiable requirement.
+    let resolution = resolve_for_launch_error(&err_text)?;
+
+    let current = std::env::var("PATH").unwrap_or_default();
+    let child_path = prepend_path(&resolution.bin_dir, &current);
+    tracing::info!(
+        binary = %program,
+        runtime = %resolution.req.kind.label(),
+        found_version = %resolution.found_version,
+        // Path of the prepended bin dir only — never the prompt or full env.
+        runtime_bin_dir = %resolution.bin_dir.display(),
+        "running binary under a satisfying runtime via per-spawn PATH",
+    );
+    Some(child_path)
+}
+
 /// Build the `PATH` value for a child process by **prepending** `bin_dir` to
 /// `current_path` (using the platform path separator), de-duplicating so the
 /// same dir is not added twice. Pure: returns the new string, mutates nothing.

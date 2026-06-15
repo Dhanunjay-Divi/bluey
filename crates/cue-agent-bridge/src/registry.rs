@@ -108,6 +108,33 @@ pub struct AgentEntry {
     /// `--device-auth` flag; claude's `setup-token` is interactive with no
     /// no-browser switch. [`LoginAuth::None`] for agents with no CLI login.
     pub login_auth: LoginAuth,
+    /// The agent's OWN "list my MCP servers" CLI invocation — the argv AFTER the
+    /// binary (e.g. `&["mcp", "list"]`) — as DATA, so the validation matrix can
+    /// run it to confirm the agent can actually SEE/launch its MCP tools (a
+    /// LIVE Level-2 signal), not merely that they sit in a config file (Level
+    /// 1). This is **read-only and NON-quota**: the command lists/health-checks
+    /// connectors; it never drives the model. VERIFIED live per CLI (2026-06):
+    /// claude/gemini/copilot=`mcp list`; cursor enumerates per-server TOOLS via
+    /// `mcp list-tools <server>` (see [`mcp_list_tools_per_server`]); antigravity
+    /// drives through `gemini`, so it shares `gemini mcp list`. `None` for agents
+    /// with no such CLI (Aider/Windsurf/VS Code, and the Claude-app index rows
+    /// that are not themselves CLI-driven). Consumed by [`crate::mcp_tools`];
+    /// never special-cased by agent name in logic.
+    ///
+    /// SECURITY: only the `mcp list` / `mcp list-tools` forms are listed here —
+    /// NEVER `mcp get <name>`, which dumps the connector's env (API keys) in
+    /// plaintext. The list forms were verified to print server names + health
+    /// only, no secret values.
+    pub mcp_list_command: Option<&'static [&'static str]>,
+    /// When `true`, [`mcp_list_command`] is the *prefix* of a PER-SERVER tool
+    /// enumeration: the runner first reads the agent's configured server names
+    /// (the Level-1 config path) and then runs `<mcp_list_command> <server>` for
+    /// each, collecting the real TOOL names. Only Cursor needs this — its
+    /// `cursor-agent mcp list-tools <server>` returns the actual tools of one
+    /// server (the richest per-tool signal). `false` for the server-level
+    /// `mcp list` agents (claude/gemini/copilot), whose single command lists all
+    /// servers at once.
+    pub mcp_list_tools_per_server: bool,
 }
 
 /// How an agent's CLI login is made headless-friendly (device-code / printed
@@ -350,6 +377,11 @@ pub const REGISTRY: &[AgentEntry] = &[
         // "(CLI)" disambiguates the terminal Claude Code from the Claude app's
         // "(App)" / "(Agent)" rows below, which share the same engine + store.
         display_name: "Claude Code (CLI)",
+        // `claude mcp list` launches each configured server and prints its health
+        // (`<name>: <cmd> - ✓ Connected`). Server-level, with a live connection
+        // check. VERIFIED live. NEVER `mcp get` (leaks the server env / API key).
+        mcp_list_command: Some(&["mcp", "list"]),
+        mcp_list_tools_per_server: false,
         binary_candidates: &["claude"],
         app_bundles: &["Claude.app"],
         app_dirs_windows: &["Claude"],
@@ -394,6 +426,11 @@ pub const REGISTRY: &[AgentEntry] = &[
         login_command: Some(&["claude", "setup-token"]),
         login_auth: LoginAuth::InteractiveOnly,
         display_name: "Claude Code (App)",
+        // GUI-surface index row (not itself CLI-driven in the matrix; classified
+        // GUI). The CLI row above already provides the live `claude mcp list`
+        // signal, so this row stays config-only (Level-1 fallback).
+        mcp_list_command: None,
+        mcp_list_tools_per_server: false,
         // No separate binary — driven through the same `claude` CLI.
         binary_candidates: &["claude"],
         app_bundles: &["Claude.app"],
@@ -425,6 +462,9 @@ pub const REGISTRY: &[AgentEntry] = &[
         login_command: Some(&["claude", "setup-token"]),
         login_auth: LoginAuth::InteractiveOnly,
         display_name: "Claude Code (Agent)",
+        // GUI-surface index row (see the App row); config-only fallback.
+        mcp_list_command: None,
+        mcp_list_tools_per_server: false,
         binary_candidates: &["claude"],
         app_bundles: &["Claude.app"],
         app_dirs_windows: &["Claude"],
@@ -456,6 +496,13 @@ pub const REGISTRY: &[AgentEntry] = &[
             value: "1",
         },
         display_name: "Cursor",
+        // Cursor enumerates the actual TOOLS of one server via
+        // `cursor-agent mcp list-tools <server>` (e.g. `perplexity` →
+        // perplexity_ask/_reason/_research/_search) — the richest per-tool live
+        // signal. The runner reads the configured server names first, then runs
+        // this prefix per server (see `mcp_list_tools_per_server`). VERIFIED live.
+        mcp_list_command: Some(&["mcp", "list-tools"]),
+        mcp_list_tools_per_server: true,
         binary_candidates: &["cursor-agent", "cursor"],
         app_bundles: &["Cursor.app"],
         app_dirs_windows: &["cursor", "Cursor"],
@@ -495,6 +542,10 @@ pub const REGISTRY: &[AgentEntry] = &[
         login_command: None,
         login_auth: LoginAuth::None,
         display_name: "Antigravity",
+        // Antigravity drives through the `gemini` CLI, so it shares Gemini's
+        // server-level `gemini mcp list` (server name + connected health).
+        mcp_list_command: Some(&["mcp", "list"]),
+        mcp_list_tools_per_server: false,
         // Sessions are read from Antigravity's plaintext conversation INDEX
         // (`agyhub_summaries_proto.pb`) — it lists ALL conversations with their
         // real titles + projects (the desktop UI lists from this same index).
@@ -548,6 +599,13 @@ pub const REGISTRY: &[AgentEntry] = &[
         // install as two agents reading the same files; it now reads only the
         // standalone CLI's store.
         display_name: "GitHub Copilot CLI",
+        // `copilot mcp list` prints `User servers:` + `  <name> (local)`.
+        // Server-level. Copilot requires Node ≥ 24; the runner drives this under
+        // a satisfying runtime via the shared per-spawn PATH (same
+        // `runtime_resolve` path the drive layer uses), so the list runs even
+        // when the active node is older. VERIFIED live under node 24.
+        mcp_list_command: Some(&["mcp", "list"]),
+        mcp_list_tools_per_server: false,
         binary_candidates: &["copilot"],
         app_bundles: &[],
         app_dirs_windows: &[],
@@ -594,6 +652,10 @@ pub const REGISTRY: &[AgentEntry] = &[
         login_command: None,
         login_auth: LoginAuth::None,
         display_name: "Gemini CLI",
+        // `gemini mcp list` prints `✓ <name>: <cmd> (stdio) - Connected`.
+        // Server-level + connected health. VERIFIED live.
+        mcp_list_command: Some(&["mcp", "list"]),
+        mcp_list_tools_per_server: false,
         binary_candidates: &["gemini"],
         app_bundles: &[],
         app_dirs_windows: &[],
@@ -649,6 +711,11 @@ pub const REGISTRY: &[AgentEntry] = &[
         login_command: Some(&["codex", "login"]),
         login_auth: LoginAuth::DeviceCodeArgs(&["--device-auth"]),
         display_name: "Codex",
+        // No verified non-quota `codex mcp list` equivalent, so Codex stays on
+        // the Level-1 config read (the matrix falls back automatically). Left
+        // `None` rather than guessing a command that might drive the model.
+        mcp_list_command: None,
+        mcp_list_tools_per_server: false,
         binary_candidates: &["codex"],
         app_bundles: &[],
         app_dirs_windows: &[],
@@ -712,6 +779,9 @@ pub const REGISTRY: &[AgentEntry] = &[
         login_command: None,
         login_auth: LoginAuth::None,
         display_name: "Aider",
+        // No MCP-list CLI (Aider has no MCP surface here); config-only.
+        mcp_list_command: None,
+        mcp_list_tools_per_server: false,
         binary_candidates: &["aider"],
         app_bundles: &[],
         app_dirs_windows: &[],
@@ -739,6 +809,9 @@ pub const REGISTRY: &[AgentEntry] = &[
         login_command: None,
         login_auth: LoginAuth::None,
         display_name: "Windsurf",
+        // No headless CLI to enumerate MCP; config-only fallback.
+        mcp_list_command: None,
+        mcp_list_tools_per_server: false,
         binary_candidates: &["windsurf"],
         app_bundles: &["Windsurf.app"],
         app_dirs_windows: &["Windsurf"],
@@ -767,6 +840,9 @@ pub const REGISTRY: &[AgentEntry] = &[
         login_command: None,
         login_auth: LoginAuth::None,
         display_name: "VS Code",
+        // No headless CLI to enumerate MCP; config-only fallback.
+        mcp_list_command: None,
+        mcp_list_tools_per_server: false,
         binary_candidates: &["code"],
         app_bundles: &["Visual Studio Code.app"],
         app_dirs_windows: &["Microsoft VS Code"],

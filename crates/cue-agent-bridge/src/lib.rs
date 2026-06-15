@@ -26,6 +26,7 @@ pub mod discover;
 pub mod drive;
 pub mod fix;
 pub mod mcp_probe;
+pub mod mcp_tools;
 pub mod model_resolve;
 pub mod prove;
 pub mod prove_drive;
