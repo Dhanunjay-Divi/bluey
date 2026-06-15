@@ -445,7 +445,16 @@ fn vscdb_path(dir: &Path) -> PathBuf {
 /// A candidate that actually declares MCP servers wins over one that does not
 /// (so an empty `settings.json` never shadows a populated `~/.claude.json`).
 fn locate_connector_config(dir: &Path) -> Option<PathBuf> {
-    const NAMES: &[&str] = &["mcp.json", "mcp_config.json", "settings.json"];
+    // Common MCP config filenames across agents. `mcp-config.json` (hyphen) is
+    // GitHub Copilot CLI's user MCP file (`~/.copilot/mcp-config.json`, per
+    // `copilot --help`'s `--additional-mcp-config`); the others cover
+    // Cursor/Gemini (`mcp.json`/`mcp_config.json`) and VS Code (`settings.json`).
+    const NAMES: &[&str] = &[
+        "mcp.json",
+        "mcp_config.json",
+        "mcp-config.json",
+        "settings.json",
+    ];
 
     let mut candidates: Vec<PathBuf> = Vec::new();
     // Sibling `<dirname>.json` (e.g. ~/.claude → ~/.claude.json).
@@ -489,7 +498,12 @@ fn locate_session_store(dir: &Path, entry: &AgentEntry) -> Option<SessionStore> 
         SessionFormat::Jsonl => join_glob(dir, entry.jsonl_subdir),
         SessionFormat::SqliteVscdb => vscdb_path(dir),
         SessionFormat::JsonFiles => join_glob(dir, "User/workspaceStorage"),
-        SessionFormat::Protobuf => join_glob(dir, "conversations"),
+        // The store path points at the plaintext INDEX FILE itself, never the
+        // data-dir root (which can hold credential files like settings.json /
+        // oauth_creds.json). The reader derives `conversations/` and `brain/`
+        // from the index file's parent. Pointing at a specific file (not the
+        // dir) keeps this reader from ever enumerating the secret-bearing root.
+        SessionFormat::AntigravityIndex => join_glob(dir, "agyhub_summaries_proto.pb"),
         // The Claude-app index lives at `<data_dir>/<subdir>` (the per-mode
         // session-index folder); the reader walks `<account>/<workspace>/`
         // beneath it. `jsonl_subdir` carries the subdir name for this row.
@@ -629,6 +643,32 @@ mod tests {
     }
 
     #[test]
+    fn locate_connector_config_finds_copilot_hyphenated_name() {
+        // GitHub Copilot CLI keeps user MCP servers in `mcp-config.json` (hyphen),
+        // not `mcp_config.json`. Discovery must find it, or Copilot connectors are
+        // invisible (the gap this regression test guards).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let copilot = dir.path().join(".copilot");
+        std::fs::create_dir_all(&copilot).expect("mkdir");
+        let cfg = copilot.join("mcp-config.json");
+        std::fs::write(
+            &cfg,
+            r#"{"mcpServers":{"perplexity":{"command":"npx","args":["-y","@perplexity-ai/mcp-server"]}}}"#,
+        )
+        .expect("write");
+
+        let found = locate_connector_config(&copilot).expect("must locate mcp-config.json");
+        assert_eq!(
+            found, cfg,
+            "Copilot's hyphenated mcp-config.json must be found"
+        );
+        assert!(
+            config_has_mcp_servers(&found),
+            "the located config declares MCP servers"
+        );
+    }
+
+    #[test]
     fn test_distinct_other_forks_stay_separate() {
         let mut acc = Accumulator::default();
         acc.add(
@@ -712,6 +752,112 @@ mod tests {
         let got = vscdb_path(Path::new("/data/Cursor"));
         assert!(got.ends_with("User/globalStorage/state.vscdb"));
         assert!(got.starts_with("/data/Cursor"));
+    }
+
+    // ----- Credential-safety scoping (security invariant, design §6) -----
+    //
+    // The agent's data-dir ROOT holds auth/credential files (e.g. Gemini keeps
+    // `settings.json`, `oauth_creds.json`, `google_accounts.json` directly in
+    // `~/.gemini`). Session reading must NEVER be rooted at that directory: a
+    // reader walking the data-dir root could enumerate those secret files. The
+    // session store must instead point at a transcript-only SUBDIR. These tests
+    // pin that scoping so a future registry edit cannot silently widen it back
+    // to the secret-bearing root.
+
+    #[test]
+    fn test_gemini_cli_has_no_session_store_so_data_dir_root_is_never_walked() {
+        // The Gemini CLI keeps its secrets (settings.json with MCP env tokens,
+        // oauth_creds.json, google_accounts.json) directly in its data-dir root.
+        // It declares `session_format: None`, so NO session store is ever built
+        // for it — the root is never handed to a SessionReader to enumerate.
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Seed the kind of secret-bearing files that live in ~/.gemini, plus a
+        // stray transcript-looking file, to prove none of them get picked up.
+        std::fs::write(dir.path().join("settings.json"), r#"{"mcpServers":{}}"#)
+            .expect("write settings");
+        std::fs::write(dir.path().join("oauth_creds.json"), "{}").expect("write creds");
+        std::fs::write(dir.path().join("session.jsonl"), "{}").expect("write stray");
+
+        let store = locate_session_store(dir.path(), entry(KindTag::Gemini));
+        assert!(
+            store.is_none(),
+            "Gemini CLI must yield NO session store (session_format=None); \
+             got a store that would expose the data-dir root: {store:?}"
+        );
+    }
+
+    #[test]
+    fn test_antigravity_session_store_is_scoped_below_data_dir_root() {
+        // Antigravity shares ~/.gemini/antigravity and IS session-read. Its store
+        // path must point at the plaintext INDEX FILE (agyhub_summaries_proto.pb),
+        // never the data-dir root that holds sibling secrets. The reader derives
+        // conversations/ and brain/ from the index file's parent.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        // Secret-bearing files at the data-dir root (must NEVER be the store path).
+        std::fs::write(root.join("settings.json"), r#"{"mcpServers":{}}"#).expect("write settings");
+        std::fs::write(root.join("oauth_creds.json"), "{}").expect("write creds");
+        // The real index location.
+        let index = root.join("agyhub_summaries_proto.pb");
+        std::fs::write(&index, b"\x0a\x00").expect("write index");
+
+        let store = locate_session_store(root, entry(KindTag::Antigravity))
+            .expect("antigravity store exists when the index file is present");
+
+        // Scoped strictly BELOW the root: equal to the index file, a strict
+        // descendant of the root (so the root itself is never the store path).
+        assert_eq!(store.path, index, "store must point at the index file");
+        assert_eq!(store.format, SessionFormat::AntigravityIndex);
+        assert!(
+            store.path.starts_with(root) && store.path != root,
+            "store path must be a strict descendant of the data-dir root, not the \
+             root itself (which holds settings.json / oauth_creds.json): {:?}",
+            store.path
+        );
+        assert_eq!(
+            store.path.file_name().and_then(|n| n.to_str()),
+            Some("agyhub_summaries_proto.pb"),
+            "store leaf must be the index file, not the secret-bearing root"
+        );
+    }
+
+    #[test]
+    fn test_no_session_store_resolves_to_a_bare_data_dir_root() {
+        // Cross-agent guarantee: for EVERY registry row that is session-read, the
+        // resolved store path is a strict descendant of the data-dir root, never
+        // the root itself. This is the general form of the Gemini-specific guard
+        // above — it catches any future row whose subdir is accidentally "" or
+        // otherwise collapses onto the root where credential files can live.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        // Create the union of subdirs the readers expect, so locate_session_store
+        // resolves a real path for each format instead of bailing on existence.
+        for sub in ["brain", "projects", "sessions", "session-state", "tmp"] {
+            std::fs::create_dir_all(root.join(sub)).expect("mkdir sub");
+        }
+        std::fs::create_dir_all(root.join("conversations")).expect("mkdir conv");
+        std::fs::create_dir_all(root.join("User/workspaceStorage")).expect("mkdir ws");
+        build_synthetic_vscdb(&root.join("User/globalStorage/state.vscdb"));
+        // Antigravity's store is the index FILE; create it so that row resolves
+        // (and is verified to not collapse onto the root).
+        std::fs::write(root.join("agyhub_summaries_proto.pb"), b"\x0a\x00").expect("write index");
+
+        for row in REGISTRY {
+            if let Some(store) = locate_session_store(root, row) {
+                assert!(
+                    store.path != root,
+                    "{:?}: session store resolved to the bare data-dir root, \
+                     which can hold credential files — must be a subdir",
+                    row.kind_tag
+                );
+                assert!(
+                    store.path.starts_with(root),
+                    "{:?}: store path escaped the data-dir root: {:?}",
+                    row.kind_tag,
+                    store.path
+                );
+            }
+        }
     }
 
     #[test]

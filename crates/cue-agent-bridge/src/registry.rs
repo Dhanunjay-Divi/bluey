@@ -55,6 +55,10 @@ pub struct AgentEntry {
     /// approval that never arrives headless (and are therefore blocked). `None`
     /// for agents that load MCP without a flag (Claude) or have no MCP.
     pub mcp_allow_flag: Option<&'static str>,
+    /// How [`mcp_allow_flag`]'s value(s) are SHAPED for this agent's CLI (see
+    /// [`McpAllowStyle`]). `None` only when `mcp_allow_flag` is `None`. Lets each
+    /// CLI's allow-list syntax stay data, not a code branch.
+    pub mcp_allow_style: Option<McpAllowStyle>,
     /// Review-gated "Fix" profile: the extra args that switch this agent
     /// between propose-only and apply (see [`FixProfile`]).
     pub fix: FixProfile,
@@ -183,6 +187,27 @@ pub struct FixProfile {
     /// `false` = this agent can propose but cannot be driven to apply at all
     /// (no CLI). An apply request for such an agent must error, not spawn.
     pub apply_supported: bool,
+}
+
+/// How an agent's CLI expresses "auto-approve these MCP servers' tools in
+/// headless mode" — the SHAPE of the allow-list args, since each CLI differs.
+/// The drive layer reads the agent's own configured MCP server names and renders
+/// them per this style. Keeping the shape as data (not an `if agent == …`) is
+/// what lets a new agent be a registry row, not a code branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpAllowStyle {
+    /// One flag + ONE comma-joined value: `--flag a,b,c`. The gemini-family CLIs
+    /// (`--allowed-mcp-server-names`) need the comma form — a space-separated
+    /// multi-value collides with `-p {prompt}` (verified live).
+    ServerNameCsv,
+    /// Claude Code: `--allowed-tools "mcp__a mcp__b"` — approval is by TOOL-NAME
+    /// pattern, and an MCP server `a` exposes tools under the `mcp__a` prefix.
+    /// Space-separated tool patterns in a single value.
+    ClaudeToolPattern,
+    /// GitHub Copilot CLI: a repeated `--allow-tool <server>` per server (the
+    /// flag takes one tool/server and may be given multiple times); approves the
+    /// named MCP servers' tools without the interactive permission prompt.
+    CopilotAllowTool,
 }
 
 /// Prefix that marks a [`AgentEntry::data_dir_globs`] entry as a macOS-only
@@ -334,7 +359,15 @@ pub const REGISTRY: &[AgentEntry] = &[
         jsonl_subdir: "projects",
         drive_command: &["claude", "-p", "{prompt}"],
         answer_args: &[],
-        mcp_allow_flag: None,
+        // Claude approves MCP tools by TOOL-NAME pattern via `--allowed-tools`
+        // (verified `claude --help`). An MCP server `<s>` exposes tools under the
+        // `mcp__<s>` prefix, so the drive layer renders `--allowed-tools
+        // "mcp__<s> …"`. Without it, headless `claude -p` asks for permission and
+        // answers from training data instead of firing the tool (caught live by
+        // the MCP matrix's no-live-data check). This approves only the agent's
+        // own configured MCP servers — file/shell write tools stay gated.
+        mcp_allow_flag: Some("--allowed-tools"),
+        mcp_allow_style: Some(McpAllowStyle::ClaudeToolPattern),
         install: Some(InstallRecipe {
             method: InstallMethod::CurlScript,
             spec: "https://claude.ai/install.sh",
@@ -372,6 +405,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         drive_command: &["claude", "-p", "{prompt}"],
         answer_args: &[],
         mcp_allow_flag: None,
+        mcp_allow_style: None,
         // Install handled by the CLI row; the app is GUI-installed out of band.
         install: None,
         fix: FixProfile {
@@ -401,6 +435,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         drive_command: &["claude", "-p", "{prompt}"],
         answer_args: &[],
         mcp_allow_flag: None,
+        mcp_allow_style: None,
         install: None,
         fix: FixProfile {
             propose_args: &["--permission-mode", "plan"],
@@ -436,6 +471,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         // trust exists, so we add none. NEEDS-LIVE-VERIFY (the trust-gate
         // behavior for read-only MCP tools in `-p` mode is unconfirmed).
         mcp_allow_flag: None,
+        mcp_allow_style: None,
         // NEVER `--plan`: Cursor's `--plan` flag is a known bug that writes
         // files. Propose = omit `--force` + rely on the prompt.
         install: Some(InstallRecipe {
@@ -459,10 +495,13 @@ pub const REGISTRY: &[AgentEntry] = &[
         login_command: None,
         login_auth: LoginAuth::None,
         display_name: "Antigravity",
-        // Sessions are read from the `brain/<id>/.system_generated/logs/
-        // transcript.jsonl` files — these are READABLE JSONL (verified on a real
-        // machine), unlike the sibling `conversations/*.pb` protobuf which is
-        // encrypted. So we read the brain transcripts (JSONL), NOT the `.pb`.
+        // Sessions are read from Antigravity's plaintext conversation INDEX
+        // (`agyhub_summaries_proto.pb`) — it lists ALL conversations with their
+        // real titles + projects (the desktop UI lists from this same index).
+        // Bodies are resolved per-session by the reader: `brain/<id>/…/
+        // transcript.jsonl` (richest) or `conversations/<id>.db` (SQLite);
+        // encrypted `conversations/<id>.pb` bodies are list-only. The earlier
+        // brain-only JSONL approach saw ~6 of ~105 conversations.
         // `agy` is Antigravity 2.0's CLI (successor to gemini-cli); listed first
         // so discovery prefers it for driving when installed, else `gemini`.
         binary_candidates: &["agy", "antigravity", "gemini"],
@@ -470,11 +509,15 @@ pub const REGISTRY: &[AgentEntry] = &[
         app_dirs_windows: &["Antigravity"],
         data_dir_globs: &[".gemini/antigravity"],
         app_data_windows: &[],
-        session_format: Some(SessionFormat::Jsonl),
-        jsonl_subdir: "brain",
+        session_format: Some(SessionFormat::AntigravityIndex),
+        // The AntigravityIndex reader works from the store root, not a subdir;
+        // `jsonl_subdir` is unused for this format (kept non-empty for the
+        // struct; the reader never reads it).
+        jsonl_subdir: "",
         drive_command: &["gemini", "-p", "{prompt}"],
         answer_args: &[],
         mcp_allow_flag: Some("--allowed-mcp-server-names"),
+        mcp_allow_style: Some(McpAllowStyle::ServerNameCsv),
         // Antigravity drives through the `gemini` CLI, so it shares Gemini's
         // approval-mode flags.
         install: Some(InstallRecipe {
@@ -516,15 +559,16 @@ pub const REGISTRY: &[AgentEntry] = &[
         jsonl_subdir: "session-state",
         drive_command: &["copilot", "-p", "{prompt}"],
         answer_args: &[],
-        // Copilot auto-denies tools headlessly unless allowed. Its scoped flag
-        // is `--allow-tool='SERVER(tool)'` — it needs per-*tool* names, not bare
-        // server names, so the registry's "flag + server-name list" mechanism
-        // (which works for Gemini's `--allowed-mcp-server-names`) cannot drive
-        // it. We therefore set None here and do NOT use the blanket, unsafe
-        // `--allow-all-tools`. Per-tool scoping requires enumerating tool names.
-        // NEEDS-LIVE-VERIFY
-        // (https://docs.github.com/en/copilot/how-tos/copilot-cli/use-copilot-cli/allowing-tools).
-        mcp_allow_flag: None,
+        // Copilot auto-denies tools headlessly unless allowed. Its scoped flag is
+        // a repeated `--allow-tool <name>` (verified `copilot --help`), which
+        // approves the named MCP server's tools without the permission prompt.
+        // The drive layer emits one `--allow-tool <server>` per configured MCP
+        // server (CopilotAllowTool style) — scoped to the agent's own servers, so
+        // we never use the blanket, unsafe `--allow-all-tools`. Without it,
+        // headless `copilot -p` answers "I don't have access to web search tools"
+        // instead of firing the connector (caught live by the MCP matrix).
+        mcp_allow_flag: Some("--allow-tool"),
+        mcp_allow_style: Some(McpAllowStyle::CopilotAllowTool),
         // Copilot has no native propose flag; propose is prompt-only. Apply
         // needs `--allow-all-tools` (without it `-p` stalls).
         install: Some(InstallRecipe {
@@ -555,11 +599,18 @@ pub const REGISTRY: &[AgentEntry] = &[
         app_dirs_windows: &[],
         data_dir_globs: &[".gemini"],
         app_data_windows: &[],
-        session_format: None,
-        jsonl_subdir: "projects",
+        // Gemini CLI auto-persists every conversation (no flag) as JSONL under
+        // `~/.gemini/tmp/<project-token>/chats/session-*.jsonl` (verified: 76
+        // sessions on a real machine). The store was previously mis-pointed at
+        // `projects` with no format, so Gemini listed 0 sessions. The shared
+        // JSONL reader already understands the per-line `user`/`gemini`/`$set`/
+        // header shapes; it recurses to the `chats/` dir within MAX_DEPTH.
+        session_format: Some(SessionFormat::Jsonl),
+        jsonl_subdir: "tmp",
         drive_command: &["gemini", "-p", "{prompt}"],
         answer_args: &[],
         mcp_allow_flag: Some("--allowed-mcp-server-names"),
+        mcp_allow_style: Some(McpAllowStyle::ServerNameCsv),
         install: Some(InstallRecipe {
             method: InstallMethod::NpmGlobal,
             spec: "@google/gemini-cli",
@@ -603,6 +654,15 @@ pub const REGISTRY: &[AgentEntry] = &[
         app_dirs_windows: &[],
         data_dir_globs: &[".codex"],
         app_data_windows: &[],
+        // The CLI rollouts (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`,
+        // plaintext JSONL) are the ONLY readable Codex surface. The ChatGPT
+        // desktop app keeps a SEPARATE conversation store at
+        // `~/Library/Application Support/com.openai.chat/conversations-v3-*/*.data`
+        // (~81 GUI-only conversations, disjoint from the CLI set) but those are
+        // AES-GCM encrypted via Electron safeStorage (key in the macOS Keychain),
+        // with no plaintext index/title/SQLite catalog — verified unreadable
+        // 2026-06-14, same situation as Antigravity's encrypted per-conversation
+        // `.pb` bodies. So we do NOT attempt the desktop store.
         session_format: Some(SessionFormat::Jsonl),
         jsonl_subdir: "sessions",
         drive_command: &["codex", "exec", "{prompt}"],
@@ -620,6 +680,7 @@ pub const REGISTRY: &[AgentEntry] = &[
             "approval_policy=\"never\"",
         ],
         mcp_allow_flag: None,
+        mcp_allow_style: None,
         install: Some(InstallRecipe {
             method: InstallMethod::NpmGlobal,
             spec: "@openai/codex",
@@ -661,6 +722,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         drive_command: &["aider", "--message", "{prompt}"],
         answer_args: &[],
         mcp_allow_flag: None,
+        mcp_allow_style: None,
         install: None,
         fix: FixProfile {
             propose_args: &["--dry-run"],
@@ -687,6 +749,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         drive_command: &[],
         answer_args: &[],
         mcp_allow_flag: None,
+        mcp_allow_style: None,
         // No headless CLI to drive an apply — propose-capable only.
         install: None,
         fix: FixProfile {
@@ -714,6 +777,7 @@ pub const REGISTRY: &[AgentEntry] = &[
         drive_command: &[],
         answer_args: &[],
         mcp_allow_flag: None,
+        mcp_allow_style: None,
         // No headless CLI to drive an apply — propose-capable only.
         install: None,
         fix: FixProfile {

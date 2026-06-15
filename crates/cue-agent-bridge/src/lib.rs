@@ -234,8 +234,13 @@ pub enum SessionFormat {
     Jsonl,
     /// VS Code-family `state.vscdb` SQLite store (Cursor, VS Code).
     SqliteVscdb,
-    /// Protobuf conversation files (Antigravity `*.pb`).
-    Protobuf,
+    /// Antigravity's plaintext conversation **index**
+    /// (`~/.gemini/antigravity/agyhub_summaries_proto.pb`): a protobuf listing
+    /// every conversation's `(uuid, title, project)`. Bodies live separately in
+    /// `conversations/<uuid>.db` (SQLite) or `brain/<uuid>/…/transcript.jsonl`;
+    /// the reader resolves the richest readable body per session. Encrypted
+    /// `conversations/<uuid>.pb` bodies are list-only (no readable transcript).
+    AntigravityIndex,
     /// One JSON file per session (VS Code / Copilot `chatSessions/*.json`).
     JsonFiles,
     /// The Claude desktop app's session **index**: one `local_*.json` per
