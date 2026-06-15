@@ -55,6 +55,12 @@ pub struct AgentSessionSummary {
     pub title: Option<String>,
     /// Best-effort last-updated marker (RFC3339 or epoch string, per source).
     pub updated_at: String,
+    /// The project/workspace path the session belongs to, when the source
+    /// records it (e.g. Cursor's per-workspace store, Claude's cwd, Antigravity's
+    /// index). `None` when the source has no project association. Defaults to
+    /// `None` on older serialized payloads.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[cfg(test)]
@@ -117,6 +123,7 @@ mod tests {
             id: "abc123".to_string(),
             title: Some("System design prep".to_string()),
             updated_at: "1717000000".to_string(),
+            project: Some("/Users/me/Developer/Bluey".to_string()),
         };
         let json = serde_json::to_string(&with_title).expect("serialize");
         let parsed: AgentSessionSummary = serde_json::from_str(&json).expect("deserialize");
@@ -126,8 +133,16 @@ mod tests {
             id: "def456".to_string(),
             title: None,
             updated_at: "0".to_string(),
+            project: None,
         };
         let json = serde_json::to_string(&without_title).expect("serialize");
         assert!(json.contains(r#""title":null"#));
+
+        // Older payloads without a `project` field still deserialize (serde
+        // default), so the wire format stays backward-compatible.
+        let legacy: AgentSessionSummary =
+            serde_json::from_str(r#"{"id":"x","title":null,"updated_at":"0"}"#)
+                .expect("legacy payload deserializes");
+        assert_eq!(legacy.project, None);
     }
 }

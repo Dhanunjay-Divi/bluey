@@ -284,6 +284,7 @@ mod tests {
                 id: "s1".to_string(),
                 title: Some("Prep".to_string()),
                 updated_at: "1717000000".to_string(),
+                project: None,
             }],
         };
         let connectors = DaemonResponse::AgentConnectors {

@@ -353,6 +353,7 @@ mod tests {
                 id: "s1".to_string(),
                 title: Some("Refactor".to_string()),
                 updated_at: "1717000000".to_string(),
+                project: None,
             }],
         };
         let json = serde_json::to_string(&command).expect("serialize");

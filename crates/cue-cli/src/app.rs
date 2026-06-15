@@ -2816,7 +2816,15 @@ fn print_agent_sessions(sessions: &[AgentSessionSummary]) {
     }
     for session in sessions {
         let title = session.title.as_deref().unwrap_or("(untitled)");
-        println!("{}  {}  {}", session.id, session.updated_at, title);
+        match session.project.as_deref() {
+            Some(project) if !project.is_empty() => {
+                println!(
+                    "{}  {}  {}  [{}]",
+                    session.id, session.updated_at, title, project
+                );
+            }
+            _ => println!("{}  {}  {}", session.id, session.updated_at, title),
+        }
     }
 }
 
