@@ -19,6 +19,7 @@ cue-cloud-client = { path = "../cue-cloud-client" }
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true
+cue-agent-bridge = { path = "../cue-agent-bridge" }
 cue-core = { path = "../cue-core" }
 ed25519-dalek = "2"
 libc.workspace = true

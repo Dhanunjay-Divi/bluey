@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -11,6 +12,14 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use clap::Parser;
+use cue_agent_bridge::{
+    discover_agents,
+    drive::{drive_with_mode, DriveMode},
+    fix::{extract_diff, fix_apply_prompt, fix_proposal_prompt, parse_fix_proposal, FixProposal},
+    read_connectors, reader_for,
+    registry::{fix_profile_for, KindTag},
+    AgentKind, AnswerChunk, AuthTier, Capability, DiscoveredAgent, Question as AgentQuestion,
+};
 use cue_core::ai::{
     AnswerFinishReason, AnswerRequest, AnswerResponse, AnswerResponseMetadata, AnswerStreamEvent,
     CostEstimate, ProviderClientConfig, ProviderRequestPayload, RouteAttemptMetadata,
@@ -21,8 +30,9 @@ use cue_core::audio::AudioRuntimeMode;
 use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
 use cue_core::overlay_ipc::ListeningState;
 use cue_core::{
-    analyze_segment, clock, generate_recap, load_account, local_answer, new_trace_id,
-    sanitize_observability_id, trace_id_from_env, AiCapabilities, AiProviderId, AiProviderKind,
+    analyze_segment, clock, generate_recap, load_account, load_settings, local_answer,
+    new_trace_id, sanitize_observability_id, save_settings, trace_id_from_env, AgentConnectorInfo,
+    AgentSessionSummary, AgentSummary, AiCapabilities, AiProviderId, AiProviderKind,
     AiRuntimeStatus, AnswerContext, AnswerContextKind, AudioBackend, AudioCaptureConfig,
     AudioCaptureStatus, AudioChunkMetadata, AudioDeviceDescriptor, AudioDeviceRole,
     AudioPipelineStatus, AudioSourceKind, CardArtifactType, CardKind, CloudEndpointConfig,
@@ -147,6 +157,265 @@ fn streaming_word_chunks(text: &str) -> Vec<String> {
         chunks.push(current);
     }
     chunks
+}
+
+/// Parse the persisted `attached_agent` settings label (a snake_case
+/// [`AgentKind`], e.g. `"claude_code"`) into a concrete [`AgentKind`].
+///
+/// Pure and total: returns `None` for an absent, blank, or unrecognized
+/// label. Only registry agents are selectable for driving — a freeform
+/// `Other`/`Unknown` value is intentionally rejected so we never route a
+/// live answer to something we cannot drive.
+fn parse_attached_agent(label: Option<&str>) -> Option<AgentKind> {
+    let label = label.map(str::trim).filter(|value| !value.is_empty())?;
+    // `AgentKind` derives serde with `rename_all = "snake_case"`; round-trip
+    // the bare label through JSON to map it onto a known variant.
+    let quoted = serde_json::to_string(label).ok()?;
+    let kind: AgentKind = serde_json::from_str(&quoted).ok()?;
+    match kind {
+        AgentKind::Other(_) | AgentKind::Unknown => None,
+        kind => Some(kind),
+    }
+}
+
+/// Normalize an inbound resume `session_id` into a value safe to persist:
+/// trims surrounding whitespace and maps an absent or blank id to `None`, so a
+/// blank string is never stored as a "session to resume".
+fn normalize_resume_session(session_id: Option<String>) -> Option<String> {
+    session_id
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+/// Char budget over which a Replay-tier continuation summarizes older turns
+/// instead of replaying them whole. Below the drive layer's safety-net budget so
+/// the summary path engages BEFORE the net has to trim. ~4 chars/token.
+const CONTINUATION_SUMMARY_BUDGET: usize = 360_000;
+
+/// How many most-recent turns are always kept VERBATIM when compacting a long
+/// transcript for Replay-tier continuation (the "hot layer"); older turns are
+/// summarized. Mirrors the hierarchical-memory pattern the coding agents use.
+const CONTINUATION_HOT_TURNS: usize = 12;
+
+/// Split a transcript for Replay-tier compaction: returns `(older, recent)`
+/// where `recent` is the last [`CONTINUATION_HOT_TURNS`] turns and `older` is
+/// everything before. Pure — the caller summarizes `older` (via a drive through
+/// the user's own agent) and replays `[summary] + recent`. Returns `(&[], all)`
+/// when the transcript already fits within `CONTINUATION_HOT_TURNS`.
+fn split_for_compaction(
+    turns: &[cue_agent_bridge::Turn],
+) -> (&[cue_agent_bridge::Turn], &[cue_agent_bridge::Turn]) {
+    if turns.len() <= CONTINUATION_HOT_TURNS {
+        return (&[], turns);
+    }
+    let cut = turns.len() - CONTINUATION_HOT_TURNS;
+    (&turns[..cut], &turns[cut..])
+}
+
+/// Total character size of a transcript's turn text — the cheap proxy for
+/// "is this too big to replay whole" (~4 chars/token).
+fn transcript_chars(turns: &[cue_agent_bridge::Turn]) -> usize {
+    turns.iter().map(|t| t.text.len()).sum()
+}
+
+/// The prompt asked of the user's OWN agent to compress the older part of a long
+/// conversation (Bluey runs no AI of its own — the user's agent summarizes the
+/// user's conversation). Bounded output so the summary itself stays small.
+fn summarize_older_prompt(older_text: &str) -> String {
+    format!(
+        "Summarize the earlier part of our conversation below in at most 400 words. \
+Preserve key decisions, file names, code identifiers, and any open questions or \
+next steps. Output ONLY the summary, no preamble.\n\n----- earlier conversation -----\n{older_text}"
+    )
+}
+
+/// How long an un-approved Fix proposal stays valid. After this, the id is
+/// dropped and an Approve referencing it is rejected — so a stale plan the user
+/// walked away from can never be applied later.
+const FIX_PROPOSAL_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Hard cap on outstanding proposals, so a stuck/abusive UI cannot grow the map
+/// without bound. When full, the oldest entry is evicted to make room.
+const MAX_PENDING_FIXES: usize = 16;
+
+/// A Fix proposal awaiting the user's Approve/Reject decision.
+///
+/// Held in the daemon keyed by a server-minted `proposal_id`. The apply lane is
+/// reachable only by presenting that id back via
+/// [`OverlayEvent::FixApprovalResponded`]; an unknown or expired id is rejected
+/// (PLAN-FIX-BUTTON §6.1, §6.3 — no replay of a stale or edited plan), and the
+/// entry is removed the moment it is consumed (one-shot).
+struct PendingFix {
+    /// The parsed proposal as the agent returned it; pinned so apply uses the
+    /// exact approved content, not anything the UI could have altered.
+    proposal: FixProposal,
+    /// Which agent produced it (and must perform the apply).
+    agent: AgentKind,
+    /// When it was stored, for TTL expiry.
+    created_at: Instant,
+}
+
+impl PendingFix {
+    /// Has this proposal outlived [`FIX_PROPOSAL_TTL`] as of `now`?
+    fn is_expired(&self, now: Instant) -> bool {
+        now.duration_since(self.created_at) >= FIX_PROPOSAL_TTL
+    }
+}
+
+/// Drop every entry older than the TTL, then — if still at/over capacity —
+/// evict oldest-first until under [`MAX_PENDING_FIXES`]. Pure (operates on a
+/// borrowed map + an injected `now`) so it can be unit-tested without a clock.
+fn prune_pending_fixes(map: &mut HashMap<uuid::Uuid, PendingFix>, now: Instant) {
+    map.retain(|_, pending| !pending.is_expired(now));
+    while map.len() >= MAX_PENDING_FIXES {
+        // Find the oldest remaining entry and remove it. `min_by_key` over the
+        // creation instant gives a deterministic eviction order.
+        let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, pending)| pending.created_at)
+            .map(|(id, _)| *id)
+        else {
+            break;
+        };
+        map.remove(&oldest);
+    }
+}
+
+/// Take a still-valid pending fix out of `map` by id, or return `None` if the
+/// id is unknown or the entry has expired (expired entries are removed in
+/// passing). Removal-on-take makes approval one-shot: the same id can never
+/// drive a second apply, and a stale id never drives any.
+fn take_valid_pending_fix(
+    map: &mut HashMap<uuid::Uuid, PendingFix>,
+    proposal_id: &uuid::Uuid,
+    now: Instant,
+) -> Option<PendingFix> {
+    let pending = map.remove(proposal_id)?;
+    if pending.is_expired(now) {
+        return None;
+    }
+    Some(pending)
+}
+
+/// Whether `agent` can be driven to *apply* a fix, read straight off the
+/// registry's per-agent Fix profile (data-driven; no agent is named here).
+/// Agents with no registry row (`Other`/`Unknown`) and agents whose profile
+/// has `apply_supported = false` (e.g. no CLI) both return `false`.
+fn agent_apply_supported(agent: &AgentKind) -> bool {
+    KindTag::from_agent_kind(agent)
+        .and_then(fix_profile_for)
+        .map(|profile| profile.apply_supported)
+        .unwrap_or(false)
+}
+
+/// Build the [`OverlayCommand::PushFixProposal`] for a proposed fix: copies the
+/// three contract sections, extracts a renderable diff from the FIX section (if
+/// any), and stamps whether the producing agent can apply. Pure mapping, so the
+/// proposal-card payload is unit-testable without driving an agent.
+fn push_fix_proposal_command(
+    proposal_id: uuid::Uuid,
+    proposal: &FixProposal,
+    apply_supported: bool,
+) -> OverlayCommand {
+    OverlayCommand::PushFixProposal {
+        proposal_id,
+        diagnosis: proposal.diagnosis.clone(),
+        reasoning: proposal.reasoning.clone(),
+        fix: proposal.fix.clone(),
+        diff: extract_diff(&proposal.fix),
+        apply_supported,
+    }
+}
+
+/// Build the answer card's `source` string. The base form is
+/// `"{source} ({request_id})"`. When an agent answered, the agent's snake_case
+/// kind label is prepended (e.g. `"claude_code agent · overlay ask (id)"`) so
+/// the overlay's `agentLabel` detection relabels the card to the agent's badge
+/// (CLAUDE / CURSOR). With no agent attached the base form is returned
+/// unchanged, leaving Bluey-mediated answers badged BLUEY.
+fn answer_card_source(source: &str, request_id: uuid::Uuid, agent_label: Option<&str>) -> String {
+    match agent_label {
+        Some(label) => format!("{label} agent · {source} ({request_id})"),
+        None => format!("{source} ({request_id})"),
+    }
+}
+
+/// Stable snake_case label for an [`AgentKind`], used as the agent provider's
+/// model id and in user-facing labels (display label, conversation turn).
+fn agent_model_label(kind: &AgentKind) -> String {
+    match serde_json::to_value(kind) {
+        Ok(serde_json::Value::String(label)) => label,
+        // `Other(label)` serializes as an object; fall back to its inner label.
+        _ => match kind {
+            AgentKind::Other(label) => label.clone(),
+            _ => "agent".to_string(),
+        },
+    }
+}
+
+/// Friendly, human-facing name for an [`AgentKind`], used in the discovery UI.
+fn agent_display_name(kind: &AgentKind) -> String {
+    // Single source of truth: the registry row's `display_name`. Local rows
+    // live in `crate::registry::REGISTRY`; cloud rows live in
+    // `crate::cloud::registry::CLOUD_REGISTRY`; `display_name_for` walks both
+    // so this stays one branch.
+    //
+    // The `Unknown` fallback covers an `AgentKind::Unknown` (no registry tag)
+    // and the impossible "kind has a tag but no row" case, both of which
+    // resolve to a uniform "Unknown agent" label. `AgentKind::Other(label)`
+    // is handled inside `display_name_for` so it returns its own label.
+    cue_agent_bridge::registry::display_name_for(kind)
+        .unwrap_or_else(|| "Unknown agent".to_string())
+}
+
+/// `snake_case` wire label for a [`Capability`], matching the UI DTO contract.
+fn capability_label(capability: Capability) -> String {
+    match capability {
+        Capability::Drive => "drive",
+        Capability::ReadOnly => "read_only",
+        Capability::NeedsTrust => "needs_trust",
+        Capability::NeedsReauth => "needs_reauth",
+        Capability::CloudBlocked => "cloud_blocked",
+    }
+    .to_string()
+}
+
+/// `snake_case` wire label for an [`AuthTier`].
+fn auth_tier_label(tier: AuthTier) -> String {
+    match tier {
+        AuthTier::EnvAuth => "env_auth",
+        AuthTier::HostedOauth => "hosted_oauth",
+        AuthTier::None_ => "none",
+    }
+    .to_string()
+}
+
+/// A connector is "ready" when it needs no re-login: env-auth or no auth.
+/// Hosted-OAuth connectors are not ready until a (future) re-auth flow runs.
+fn auth_tier_ready(tier: AuthTier) -> bool {
+    matches!(tier, AuthTier::EnvAuth | AuthTier::None_)
+}
+
+/// Pure mapping from a [`DiscoveredAgent`] (plus values the daemon resolved via
+/// filesystem IO) onto the wire [`AgentSummary`]. Kept free of IO so it is unit
+/// testable: the caller passes the connector counts, the optional session
+/// count, and the attached flag.
+fn agent_summary_from_discovered(
+    agent: &DiscoveredAgent,
+    connector_count: usize,
+    ready_connector_count: usize,
+    session_count: Option<usize>,
+    attached: bool,
+) -> AgentSummary {
+    AgentSummary {
+        kind: agent_model_label(&agent.kind),
+        display_name: agent_display_name(&agent.kind),
+        capability: capability_label(agent.capability),
+        connector_count,
+        ready_connector_count,
+        session_count,
+        attached,
+    }
 }
 
 fn next_answer_generation(daemon: &Arc<Daemon>) -> u64 {
@@ -433,6 +702,10 @@ struct Daemon {
     balance_watch: crate::cloud::balance::BalanceWatch,
     answer_generation: AtomicU64,
     active_answer_card: Mutex<Option<(u64, uuid::Uuid)>>,
+    /// Outstanding Fix proposals awaiting Approve/Reject, keyed by a server-
+    /// minted proposal id. The apply lane is reachable only by echoing a live id
+    /// back (Fix-button slice F3); see [`PendingFix`] and [`take_valid_pending_fix`].
+    pending_fixes: Mutex<HashMap<uuid::Uuid, PendingFix>>,
     system_audio: Mutex<Option<crate::audio::system_capture::SystemAudioCapture>>,
     live_transcript_tx: broadcast::Sender<LiveTranscriptEvent>,
     rag: Option<Arc<crate::db::rag::RagPipeline>>,
@@ -552,6 +825,7 @@ pub async fn run() -> Result<()> {
         balance_watch,
         answer_generation: AtomicU64::new(0),
         active_answer_card: Mutex::new(None),
+        pending_fixes: Mutex::new(HashMap::new()),
         system_audio: Mutex::new(None),
         live_transcript_tx: broadcast::channel(64).0,
         rag: rag_pipeline,
@@ -1178,7 +1452,66 @@ async fn handle_request_inner(
                 items: meeting.map(|m| m.action_items).unwrap_or_default(),
             })
         }
+        DaemonRequest::AgentList => {
+            let agents = discover_agent_summaries(daemon).await;
+            Ok(DaemonResponse::Agents { agents })
+        }
+        DaemonRequest::AgentAttach { kind, session_id } => {
+            let Some(parsed) = parse_attached_agent(Some(&kind)) else {
+                return Ok(DaemonResponse::Error {
+                    message: format!("\"{kind}\" is not a coding agent Bluey can attach"),
+                });
+            };
+            let label = agent_model_label(&parsed);
+            let session = normalize_resume_session(session_id);
+            persist_attached_agent(daemon, Some(label), session).await?;
+            let agents = discover_agent_summaries(daemon).await;
+            Ok(DaemonResponse::Agents { agents })
+        }
+        DaemonRequest::AgentDetach => {
+            persist_attached_agent(daemon, None, None).await?;
+            Ok(DaemonResponse::Ok)
+        }
+        DaemonRequest::AgentSessions { kind } => {
+            let settings = load_settings(&daemon.paths).unwrap_or_default();
+            if !settings.allow_agent_session_history {
+                return Ok(DaemonResponse::AgentSessions {
+                    sessions: Vec::new(),
+                });
+            }
+            let sessions = tokio::task::spawn_blocking(move || list_agent_sessions(&kind))
+                .await
+                .unwrap_or_else(|error| {
+                    debug!("agent session list task panicked: {error}");
+                    Vec::new()
+                });
+            Ok(DaemonResponse::AgentSessions { sessions })
+        }
+        DaemonRequest::AgentConnectors { kind } => {
+            let connectors = tokio::task::spawn_blocking(move || list_agent_connectors(&kind))
+                .await
+                .unwrap_or_else(|error| {
+                    debug!("agent connector list task panicked: {error}");
+                    Vec::new()
+                });
+            Ok(DaemonResponse::AgentConnectors { connectors })
+        }
     }
+}
+
+/// Discover agents and map them to [`AgentSummary`] DTOs off the async runtime.
+/// Shared by the IPC `AgentList`/`AgentAttach` handlers; fail-soft to an empty
+/// list on a discovery panic.
+async fn discover_agent_summaries(daemon: &Arc<Daemon>) -> Vec<AgentSummary> {
+    let settings = load_settings(&daemon.paths).unwrap_or_default();
+    let attached = settings.attached_agent.clone();
+    let allow_history = settings.allow_agent_session_history;
+    tokio::task::spawn_blocking(move || build_agent_summaries(&attached, allow_history))
+        .await
+        .unwrap_or_else(|error| {
+            debug!("agent discovery task panicked: {error}");
+            Vec::new()
+        })
 }
 
 async fn send_overlay(daemon: &Arc<Daemon>, command: OverlayCommand) -> Result<()> {
@@ -1381,6 +1714,48 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         OverlayEvent::RemoveContextRequested { id } => {
             handle_remove_context_requested(daemon, id).await?;
         }
+        OverlayEvent::AgentListRequested => {
+            refresh_overlay_agents(daemon).await;
+        }
+        OverlayEvent::AgentAttachRequested { kind, session_id } => {
+            handle_agent_attach(daemon, &kind, session_id.as_deref()).await;
+        }
+        OverlayEvent::AgentDetachRequested => {
+            handle_agent_detach(daemon).await;
+        }
+        OverlayEvent::AgentSessionsRequested { kind } => {
+            handle_agent_sessions_requested(daemon, &kind).await;
+        }
+        OverlayEvent::AgentConnectorsRequested { kind } => {
+            handle_agent_connectors_requested(daemon, &kind).await;
+        }
+        OverlayEvent::ConnectorReauthRequested { kind, name } => {
+            handle_connector_reauth_requested(daemon, &kind, &name).await;
+        }
+        OverlayEvent::FixRequested { card_id, question } => {
+            handle_fix_requested(daemon, card_id, &question).await;
+        }
+        OverlayEvent::FixApprovalResponded {
+            proposal_id,
+            approved,
+        } => {
+            handle_fix_approval(daemon, proposal_id, approved).await;
+        }
+        OverlayEvent::BillingDisclosureResponded {
+            vendor_short,
+            accepted,
+            pending_kind,
+            pending_session_id,
+        } => {
+            handle_billing_disclosure_response(
+                daemon,
+                &vendor_short,
+                accepted,
+                &pending_kind,
+                pending_session_id.as_deref(),
+            )
+            .await;
+        }
         OverlayEvent::InstructionsRequested => {
             // Drive Idle -> InstructionsOpen while the daemon-owned prompt is
             // open. The guard resets on save, cancel, or error.
@@ -1559,6 +1934,737 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
     }
 
     Ok(())
+}
+
+/// Cap on how many recent agent sessions are listed for the picker. Listing is
+/// bounded so a multi-GB session store is never fully decoded.
+const AGENT_SESSION_LIST_CAP: usize = 40;
+
+/// Cap used when estimating a session count for the discovery summary. Smaller
+/// than the picker cap so the discovery list stays cheap; a store with more
+/// than this many sessions reports exactly the cap.
+const AGENT_SESSION_COUNT_CAP: usize = 20;
+
+/// Discover agents (filesystem IO, off the async runtime), map them to
+/// [`AgentSummary`] DTOs, and push the list to the overlay. Fail-soft: any
+/// discovery or read error degrades to an empty list with a debug log.
+async fn refresh_overlay_agents(daemon: &Arc<Daemon>) {
+    let settings = load_settings(&daemon.paths).unwrap_or_default();
+    let attached = settings.attached_agent.clone();
+    let allow_history = settings.allow_agent_session_history;
+
+    let started = Instant::now();
+    let agents =
+        tokio::task::spawn_blocking(move || build_agent_summaries(&attached, allow_history))
+            .await
+            .unwrap_or_else(|error| {
+                warn!("agent discovery task PANICKED: {error}");
+                Vec::new()
+            });
+
+    info!(
+        count = agents.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "agents: sending SetAgents (discovery complete)"
+    );
+    let _ = send_overlay(daemon, OverlayCommand::SetAgents { agents }).await;
+}
+
+/// Blocking core of [`refresh_overlay_agents`]: discover agents and map each to
+/// an [`AgentSummary`]. Runs on a blocking thread; never panics.
+fn build_agent_summaries(attached: &Option<String>, allow_history: bool) -> Vec<AgentSummary> {
+    discover_agents()
+        .iter()
+        .map(|agent| {
+            let label = agent_model_label(&agent.kind);
+            let (connector_count, ready_connector_count) = match &agent.connector_config_path {
+                Some(path) => {
+                    let connectors = read_connectors(path);
+                    let ready = connectors
+                        .iter()
+                        .filter(|c| auth_tier_ready(c.auth_tier))
+                        .count();
+                    (connectors.len(), ready)
+                }
+                None => (0, 0),
+            };
+            let session_count = if allow_history {
+                count_agent_sessions(agent)
+            } else {
+                None
+            };
+            let is_attached = attached.as_deref() == Some(label.as_str());
+            agent_summary_from_discovered(
+                agent,
+                connector_count,
+                ready_connector_count,
+                session_count,
+                is_attached,
+            )
+        })
+        .collect()
+}
+
+/// Best-effort recent-session count, bounded to [`AGENT_SESSION_COUNT_CAP`].
+/// Returns `None` when the agent has no session store or the read fails — the
+/// UI renders "unknown" rather than a wrong number.
+fn count_agent_sessions(agent: &DiscoveredAgent) -> Option<usize> {
+    let store = agent.session_store.as_ref()?;
+    match reader_for(store.format).list(store, AGENT_SESSION_COUNT_CAP) {
+        Ok(sessions) => Some(sessions.len()),
+        Err(error) => {
+            debug!(
+                agent = %agent_model_label(&agent.kind),
+                error = %error,
+                "agent session count read failed"
+            );
+            None
+        }
+    }
+}
+
+/// Attach `kind` as the active agent: validate, gate on BYOT disclosure when
+/// the agent is a cloud BYOT vendor, then persist and re-emit the list.
+/// `session_id` (a session to resume) is normalized and persisted so the next
+/// answer continues that session via the agent's `--resume` flag.
+///
+/// BYOT gate: if the registry row maps to a cloud vendor whose
+/// `billing_model` is `ApiCredits` (bring-your-own-token, billed against the
+/// user's own vendor account) AND the user has not previously acknowledged
+/// the disclosure for that vendor (in `settings.accepted_byot_vendors`), the
+/// daemon pushes a [`OverlayCommand::PushBillingDisclosure`] and returns
+/// without persisting. The acknowledgement event
+/// ([`OverlayEvent::BillingDisclosureResponded`]) calls
+/// [`handle_billing_disclosure_response`], which records the vendor and
+/// re-runs the attach — this time skipping the gate.
+async fn handle_agent_attach(daemon: &Arc<Daemon>, kind: &str, session_id: Option<&str>) {
+    let Some(parsed) = parse_attached_agent(Some(kind)) else {
+        debug!(kind, "ignored attach request for unknown agent kind");
+        push_system_card(
+            daemon,
+            CardKind::Warning,
+            "Agent not recognized",
+            format!("\"{kind}\" is not a coding agent Bluey can attach."),
+        )
+        .await;
+        return;
+    };
+
+    // BYOT disclosure gate. Reads the registry row directly — no per-vendor
+    // hardcoded branches. The gate only fires for cloud agents whose row
+    // declares `BillingModel::ApiCredits` (a.k.a. BYOT).
+    if let Some(gate) = needs_byot_disclosure(daemon, &parsed) {
+        info!(
+            vendor = %gate.vendor_short,
+            kind = %kind,
+            "BYOT billing disclosure required before attaching cloud agent",
+        );
+        let _ = send_overlay(
+            daemon,
+            OverlayCommand::PushBillingDisclosure {
+                vendor_short: gate.vendor_short,
+                vendor_display_name: gate.display_name,
+                billing_model: gate.billing_model,
+                disclosure: gate.disclosure,
+                pending_kind: kind.to_string(),
+                pending_session_id: session_id.map(|s| s.to_string()),
+            },
+        )
+        .await;
+        // IMPORTANT: do NOT persist the attached agent yet — the daemon
+        // only commits when `handle_billing_disclosure_response` runs.
+        return;
+    }
+
+    let label = agent_model_label(&parsed);
+    let session = normalize_resume_session(session_id.map(str::to_string));
+
+    if let Err(error) = persist_attached_agent(daemon, Some(label.clone()), session).await {
+        warn!("failed to persist attached agent: {error:#}");
+        push_system_card(
+            daemon,
+            CardKind::Warning,
+            "Could not attach agent",
+            format!("{error:#}"),
+        )
+        .await;
+        return;
+    }
+
+    refresh_overlay_agents(daemon).await;
+}
+
+/// Result of [`needs_byot_disclosure`] when the disclosure is required.
+struct ByotDisclosureGate {
+    vendor_short: String,
+    display_name: String,
+    billing_model: String,
+    disclosure: String,
+}
+
+/// Inspect the registry to decide whether attaching `kind` requires a BYOT
+/// disclosure first. Returns `Some(gate)` when:
+/// 1. `kind` maps to a cloud row in `crate::cloud::registry::CLOUD_REGISTRY`,
+/// 2. that row's `billing_model` is BYOT (`ApiCredits`), and
+/// 3. the row's `vendor_short` is NOT yet in
+///    `settings.accepted_byot_vendors`.
+///
+/// `None` means either the agent isn't a cloud BYOT vendor (local CLI agents
+/// always return `None`) or the user has already acknowledged this vendor's
+/// disclosure on this install. The check NEVER names a vendor inline — it
+/// reads the registry row's data.
+fn needs_byot_disclosure(daemon: &Arc<Daemon>, kind: &AgentKind) -> Option<ByotDisclosureGate> {
+    let tag = cue_agent_bridge::registry::KindTag::from_agent_kind(kind)?;
+    let cloud_row = cue_agent_bridge::cloud::registry::cloud_entry_for(tag)?;
+    if !matches!(
+        cloud_row.billing_model,
+        cue_agent_bridge::cloud::registry::BillingModel::ApiCredits,
+    ) {
+        return None;
+    }
+    let settings = load_settings(&daemon.paths).unwrap_or_default();
+    if settings
+        .accepted_byot_vendors
+        .iter()
+        .any(|v| v == cloud_row.vendor_short)
+    {
+        return None;
+    }
+    Some(ByotDisclosureGate {
+        vendor_short: cloud_row.vendor_short.to_string(),
+        display_name: cloud_row.display_name.to_string(),
+        billing_model: cloud_row.billing_model.as_str().to_string(),
+        disclosure: cloud_row.consent_warning.to_string(),
+    })
+}
+
+/// Handle the BYOT disclosure response: on accept, record the vendor in
+/// settings and re-run the original attach (which now passes the gate); on
+/// decline, log + push a guidance card and discard the pending attach.
+async fn handle_billing_disclosure_response(
+    daemon: &Arc<Daemon>,
+    vendor_short: &str,
+    accepted: bool,
+    pending_kind: &str,
+    pending_session_id: Option<&str>,
+) {
+    if !accepted {
+        info!(
+            vendor = %vendor_short,
+            pending_kind = %pending_kind,
+            "BYOT disclosure declined — no attach performed",
+        );
+        push_system_card(
+            daemon,
+            CardKind::Warning,
+            "Cloud agent not attached",
+            format!(
+                "You declined the {vendor_short} billing disclosure. \
+                 Nothing was stored. Reattach the agent to see the disclosure again."
+            ),
+        )
+        .await;
+        return;
+    }
+
+    // Persist acknowledgement first — that way a crash between here and the
+    // re-attach doesn't trap the user in an infinite disclosure loop.
+    let persist = (|| -> anyhow::Result<()> {
+        let mut settings = load_settings(&daemon.paths)?;
+        if !settings
+            .accepted_byot_vendors
+            .iter()
+            .any(|v| v == vendor_short)
+        {
+            settings
+                .accepted_byot_vendors
+                .push(vendor_short.to_string());
+        }
+        settings.touch();
+        save_settings(&daemon.paths, &settings)
+    })();
+
+    if let Err(error) = persist {
+        warn!(
+            vendor = %vendor_short,
+            "failed to persist BYOT acknowledgement: {error:#}",
+        );
+        push_system_card(
+            daemon,
+            CardKind::Warning,
+            "Could not record disclosure",
+            format!("{error:#}"),
+        )
+        .await;
+        return;
+    }
+
+    info!(
+        vendor = %vendor_short,
+        pending_kind = %pending_kind,
+        "BYOT disclosure accepted — completing pending attach",
+    );
+
+    // Re-run the original attach. The gate now passes (vendor is in
+    // accepted_byot_vendors) and the agent is persisted normally.
+    handle_agent_attach(daemon, pending_kind, pending_session_id).await;
+}
+
+/// Detach the active agent: clear the agent and any resume session, persist,
+/// and re-emit the list.
+async fn handle_agent_detach(daemon: &Arc<Daemon>) {
+    if let Err(error) = persist_attached_agent(daemon, None, None).await {
+        warn!("failed to detach agent: {error:#}");
+        return;
+    }
+    refresh_overlay_agents(daemon).await;
+}
+
+/// Load settings, set `attached_agent` plus the session to resume, `touch()`,
+/// and persist via the shared settings writer. Centralizes the read-modify-write
+/// so both attach and detach share one code path. Detach passes `None` for both
+/// so the resume session never outlives the agent it belonged to.
+async fn persist_attached_agent(
+    daemon: &Arc<Daemon>,
+    agent: Option<String>,
+    session: Option<String>,
+) -> Result<()> {
+    let mut settings = load_settings(&daemon.paths)?;
+    settings.attached_agent = agent;
+    settings.attached_session = session;
+    settings.touch();
+    save_settings(&daemon.paths, &settings)
+}
+
+/// List one agent's prior sessions, gated on the session-history consent flag.
+/// When consent is off, an empty list is sent (the UI prompts the user to opt
+/// in). All store IO runs off the async runtime and is fail-soft.
+async fn handle_agent_sessions_requested(daemon: &Arc<Daemon>, kind: &str) {
+    let settings = load_settings(&daemon.paths).unwrap_or_default();
+    if !settings.allow_agent_session_history {
+        // Consent gate OFF — this is the common "clicked an agent, saw nothing"
+        // path. Log it explicitly so it is never a silent no-op in diagnosis.
+        info!(
+            kind,
+            "agent sessions: consent gate OFF (allow_agent_session_history=false) \
+             → returning EMPTY list"
+        );
+        let _ = send_overlay(
+            daemon,
+            OverlayCommand::SetAgentSessions {
+                kind: kind.to_string(),
+                sessions: Vec::new(),
+            },
+        )
+        .await;
+        return;
+    }
+
+    let kind_owned = kind.to_string();
+    let sessions = tokio::task::spawn_blocking(move || list_agent_sessions(&kind_owned))
+        .await
+        .unwrap_or_else(|error| {
+            warn!(kind, "agent session list task PANICKED: {error}");
+            Vec::new()
+        });
+
+    info!(
+        kind,
+        count = sessions.len(),
+        "agent sessions: sending SetAgentSessions"
+    );
+    let _ = send_overlay(
+        daemon,
+        OverlayCommand::SetAgentSessions {
+            kind: kind.to_string(),
+            sessions,
+        },
+    )
+    .await;
+}
+
+/// Blocking core of [`handle_agent_sessions_requested`]: find the agent and
+/// decode up to [`AGENT_SESSION_LIST_CAP`] session refs. Never panics; a
+/// missing agent / store or a read error yields an empty list.
+fn list_agent_sessions(kind: &str) -> Vec<AgentSessionSummary> {
+    let Some(agent) = find_discovered_agent(kind) else {
+        return Vec::new();
+    };
+    let Some(store) = agent.session_store.as_ref() else {
+        return Vec::new();
+    };
+    // Generic, registry-driven fallback label for sessions whose content has no
+    // readable title (e.g. encrypted/opaque stores). Computed ONCE from the
+    // agent's display name — never hardcoded per agent/reader.
+    let display = cue_agent_bridge::registry::display_name_for(&agent.kind)
+        .unwrap_or_else(|| "Session".to_string());
+
+    // De-dup: the Claude CLI store and the Claude-app stores point at the SAME
+    // transcript files (the app indexes them by `cliSessionId`, which is the CLI
+    // file stem). When listing the CLI row, drop any session already surfaced by
+    // an app row so the same conversation doesn't appear twice — the app row
+    // keeps it (its pre-computed title is richer). Empty for every other agent.
+    let claimed_by_app = if matches!(agent.kind, AgentKind::ClaudeCode) {
+        app_claimed_claude_session_ids()
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    match reader_for(store.format).list(store, AGENT_SESSION_LIST_CAP) {
+        Ok(refs) => refs
+            .into_iter()
+            .filter(|r| !claimed_by_app.contains(&r.id))
+            .map(|r| {
+                let title = r.title.or_else(|| {
+                    let short: String = r.id.split('-').next().unwrap_or(&r.id).to_string();
+                    Some(format!("{display} session {short}"))
+                });
+                AgentSessionSummary {
+                    id: r.id,
+                    title,
+                    updated_at: r.updated_at,
+                    project: r.project,
+                }
+            })
+            .collect(),
+        Err(error) => {
+            debug!(kind, error = %error, "agent session list read failed");
+            Vec::new()
+        }
+    }
+}
+
+/// The set of Claude session ids (`cliSessionId`s) claimed by the Claude-app
+/// stores (Code mode + agent mode). Used to de-duplicate the CLI row's listing
+/// against the richer app rows. Fail-soft: a store that can't be read simply
+/// contributes nothing (so at worst a session shows under both rows, never
+/// fewer than it should). Each id is a JSONL file stem shared across stores.
+fn app_claimed_claude_session_ids() -> std::collections::HashSet<String> {
+    let mut claimed = std::collections::HashSet::new();
+    for kind in [AgentKind::ClaudeCodeApp, AgentKind::ClaudeCodeAgent] {
+        let label = agent_model_label(&kind);
+        let Some(agent) = find_discovered_agent(&label) else {
+            continue;
+        };
+        let Some(store) = agent.session_store.as_ref() else {
+            continue;
+        };
+        if let Ok(refs) = reader_for(store.format).list(store, AGENT_SESSION_LIST_CAP) {
+            claimed.extend(refs.into_iter().map(|r| r.id));
+        }
+    }
+    claimed
+}
+
+/// Read one agent's inherited MCP connectors (shape + readiness only) and push
+/// them to the overlay. Connector config is not secret, so this is not gated on
+/// the session-history consent flag.
+async fn handle_agent_connectors_requested(daemon: &Arc<Daemon>, kind: &str) {
+    let kind_owned = kind.to_string();
+    let connectors = tokio::task::spawn_blocking(move || list_agent_connectors(&kind_owned))
+        .await
+        .unwrap_or_else(|error| {
+            warn!(kind, "agent connector list task PANICKED: {error}");
+            Vec::new()
+        });
+
+    info!(
+        kind,
+        count = connectors.len(),
+        "agent connectors: sending SetAgentConnectors"
+    );
+    let _ = send_overlay(
+        daemon,
+        OverlayCommand::SetAgentConnectors {
+            kind: kind.to_string(),
+            connectors,
+        },
+    )
+    .await;
+}
+
+/// Blocking core of [`handle_agent_connectors_requested`]: find the agent and
+/// read its connector config into [`AgentConnectorInfo`] DTOs (never secrets).
+fn list_agent_connectors(kind: &str) -> Vec<AgentConnectorInfo> {
+    let Some(agent) = find_discovered_agent(kind) else {
+        return Vec::new();
+    };
+    let Some(path) = agent.connector_config_path.as_ref() else {
+        return Vec::new();
+    };
+    read_connectors(path)
+        .into_iter()
+        .map(|c| AgentConnectorInfo {
+            name: c.name,
+            auth_tier: auth_tier_label(c.auth_tier),
+            ready: auth_tier_ready(c.auth_tier),
+        })
+        .collect()
+}
+
+/// Re-auth one hosted-OAuth connector. Real OAuth is future work; for now this
+/// logs and re-emits the connector list so the UI can refresh state.
+async fn handle_connector_reauth_requested(daemon: &Arc<Daemon>, kind: &str, name: &str) {
+    // TODO(slice-reauth): drive the actual per-connector OAuth re-login. The
+    // bridge does not yet expose a re-auth entry point, so we only log and
+    // refresh the connector view.
+    debug!(kind, connector = name, "connector re-auth requested (stub)");
+    push_system_card(
+        daemon,
+        CardKind::System,
+        "Re-auth not available yet",
+        format!("Re-authenticating \"{name}\" will be supported in a later update."),
+    )
+    .await;
+    handle_agent_connectors_requested(daemon, kind).await;
+}
+
+/// Read the currently attached agent (and any session to resume) from settings.
+/// Returns `None` when nothing is attached or the stored label is not a
+/// drivable registry agent — the Fix lane never routes to an undrivable target.
+fn attached_agent_for_fix(daemon: &Arc<Daemon>) -> Option<(AgentKind, Option<String>)> {
+    let settings = load_settings(&daemon.paths).unwrap_or_default();
+    let agent = parse_attached_agent(settings.attached_agent.as_deref())?;
+    let resume = normalize_resume_session(settings.attached_session);
+    Some((agent, resume))
+}
+
+/// Drive `agent` in `mode` against `question`, accumulating the full streamed
+/// text. Returns `Ok(body)` on a clean run or `Err(reason)` for a spawn
+/// failure / terminal agent error / empty output — the caller turns the reason
+/// into a Warning card. Never applies anything itself; the mode + the prompt
+/// are what gate write access.
+async fn drive_and_collect(
+    agent: AgentKind,
+    question: AgentQuestion,
+    mode: DriveMode,
+) -> std::result::Result<String, String> {
+    let stream = drive_with_mode(agent, question, mode)
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+    futures_util::pin_mut!(stream);
+    let mut body = String::new();
+    while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+        match chunk {
+            AnswerChunk::Started { .. } | AnswerChunk::Done { .. } => {}
+            AnswerChunk::Delta(delta) => body.push_str(&delta),
+            AnswerChunk::Error(message) => return Err(message),
+        }
+    }
+    if body.trim().is_empty() {
+        return Err("the agent returned no output".to_string());
+    }
+    Ok(body)
+}
+
+/// Handle a **Fix** click: drive the attached agent in propose-only mode, parse
+/// the structured proposal, store it under a fresh id, and push the proposal
+/// card. Nothing is applied here (PLAN-FIX-BUTTON §4 steps 2–4). When no agent
+/// is attached, or the agent can't produce a structured proposal, a Warning
+/// card is shown and no proposal is stored — so there is nothing to approve.
+async fn handle_fix_requested(daemon: &Arc<Daemon>, _card_id: Option<uuid::Uuid>, question: &str) {
+    if question.trim().is_empty() {
+        push_system_card(
+            daemon,
+            CardKind::Warning,
+            "Nothing to fix",
+            "Fix needs a problem to work on. Ask the agent something first.",
+        )
+        .await;
+        return;
+    }
+
+    let Some((agent, resume)) = attached_agent_for_fix(daemon) else {
+        push_system_card(
+            daemon,
+            CardKind::Warning,
+            "Attach an agent to use Fix",
+            "Fix routes the repair through your own coding agent. Attach one, then try again.",
+        )
+        .await;
+        return;
+    };
+
+    // Propose works for any drivable agent; whether it can later *apply* is
+    // surfaced on the card so the UI can disable Approve up front.
+    let apply_supported = agent_apply_supported(&agent);
+
+    let prompt = fix_proposal_prompt(question);
+    let agent_question = AgentQuestion {
+        prompt,
+        context: None,
+        resume,
+        cwd: None,
+    };
+    debug!(
+        agent = %agent_model_label(&agent),
+        apply_supported,
+        "driving attached agent to propose a fix"
+    );
+
+    let output = match drive_and_collect(agent.clone(), agent_question, DriveMode::ProposeFix).await
+    {
+        Ok(output) => output,
+        Err(reason) => {
+            // Surface a guidance hint for the common not-installed / not-signed-in
+            // failure without echoing the (possibly long) raw error.
+            debug!(detail = %reason, "fix proposal drive failed");
+            push_system_card(
+                daemon,
+                CardKind::Warning,
+                "Fix proposal failed",
+                "The agent couldn't propose a fix. Check that its CLI is installed and signed in, \
+then try again.",
+            )
+            .await;
+            return;
+        }
+    };
+
+    let proposal = match parse_fix_proposal(&output) {
+        Ok(proposal) => proposal,
+        Err(error) => {
+            debug!(detail = %error, "fix proposal did not match the structured contract");
+            push_system_card(
+                daemon,
+                CardKind::Warning,
+                "Couldn't read the fix proposal",
+                "The agent didn't return a structured fix proposal, so nothing was applied. \
+Try Fix again.",
+            )
+            .await;
+            return;
+        }
+    };
+
+    // Mint an id and store the proposal so a later Approve can be id-matched.
+    let proposal_id = uuid::Uuid::new_v4();
+    let now = Instant::now();
+    {
+        let mut pending = daemon.pending_fixes.lock().await;
+        prune_pending_fixes(&mut pending, now);
+        pending.insert(
+            proposal_id,
+            PendingFix {
+                proposal: proposal.clone(),
+                agent,
+                created_at: now,
+            },
+        );
+    }
+
+    let command = push_fix_proposal_command(proposal_id, &proposal, apply_supported);
+    let _ = send_overlay(daemon, command).await;
+}
+
+/// Handle an Approve/Reject for a Fix proposal. The id is matched against a
+/// still-pending, non-expired proposal; an unknown or stale id is rejected
+/// (PLAN-FIX-BUTTON §6.1, §6.3). Reject discards the entry. Approve re-checks
+/// apply-capability, then drives the agent in apply mode and streams the result
+/// into a card. Either way the entry is consumed once (one-shot).
+async fn handle_fix_approval(daemon: &Arc<Daemon>, proposal_id: uuid::Uuid, approved: bool) {
+    let now = Instant::now();
+    let pending = {
+        let mut map = daemon.pending_fixes.lock().await;
+        prune_pending_fixes(&mut map, now);
+        take_valid_pending_fix(&mut map, &proposal_id, now)
+    };
+
+    let Some(pending) = pending else {
+        // Unknown id, already-consumed id, or expired proposal: never apply.
+        push_system_card(
+            daemon,
+            CardKind::Warning,
+            "Fix no longer available",
+            "This fix proposal is no longer available. Run Fix again to get a fresh proposal.",
+        )
+        .await;
+        return;
+    };
+
+    if !approved {
+        push_system_card(
+            daemon,
+            CardKind::System,
+            "Fix discarded",
+            "The proposed fix was discarded. Nothing was changed.",
+        )
+        .await;
+        return;
+    }
+
+    // Re-check apply-capability at approve time (defense in depth — the card may
+    // be stale, or the attached agent could have changed).
+    if !agent_apply_supported(&pending.agent) {
+        push_system_card(
+            daemon,
+            CardKind::Warning,
+            "This agent can't apply fixes",
+            "This agent can propose fixes but can't apply them automatically. Apply it yourself \
+from the proposal.",
+        )
+        .await;
+        return;
+    }
+
+    // Push a status card and stream the apply result into it.
+    let card = CueCard::new(CardKind::System, "Applying fix…", "Working with the agent…")
+        .with_source("fix");
+    let card_id = card.id;
+    let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
+
+    let prompt = fix_apply_prompt(&pending.proposal);
+    let resume = attached_agent_for_fix(daemon).and_then(|(_, resume)| resume);
+    let agent_question = AgentQuestion {
+        prompt,
+        context: None,
+        resume,
+        cwd: None,
+    };
+    debug!(
+        agent = %agent_model_label(&pending.agent),
+        "applying approved fix through the attached agent"
+    );
+
+    match drive_and_collect(pending.agent.clone(), agent_question, DriveMode::ApplyFix).await {
+        Ok(output) => {
+            let _ = send_overlay(
+                daemon,
+                OverlayCommand::UpdateCard {
+                    id: card_id,
+                    body: output,
+                    done: true,
+                    cost_label: None,
+                    artifact: None,
+                },
+            )
+            .await;
+        }
+        Err(reason) => {
+            debug!(detail = %reason, "fix apply drive failed");
+            let _ = send_overlay(
+                daemon,
+                OverlayCommand::UpdateCard {
+                    id: card_id,
+                    body: "The agent couldn't apply the fix. Nothing may have changed; \
+review your working tree."
+                        .to_string(),
+                    done: true,
+                    cost_label: None,
+                    artifact: None,
+                },
+            )
+            .await;
+        }
+    }
+}
+
+/// Discover agents and return the one whose label matches `kind`, if any.
+/// Blocking; call from inside `spawn_blocking`.
+fn find_discovered_agent(kind: &str) -> Option<DiscoveredAgent> {
+    discover_agents()
+        .into_iter()
+        .find(|agent| agent_model_label(&agent.kind) == kind)
 }
 
 async fn start_screen_capture(
@@ -3801,6 +4907,27 @@ async fn answer_with_provider_runtime(
     }
     let generation_id = next_answer_generation(daemon);
 
+    // Agent bridge (Slice 4): when the user has attached a coding agent, route
+    // the answer through it instead of Bluey's normal providers. A single
+    // Agent step replaces the route so `resolve_answer_route` dispatches to the
+    // agent driver. With no agent attached this block is a no-op and the
+    // existing provider route is used unchanged.
+    //
+    // Slice 5b: if the attach pinned a session to resume, carry it alongside so
+    // the agent driver replays into that session via `--resume`. Settings are
+    // read once here and the kind, the session, and the card-source label are
+    // all derived from it.
+    let mut resume_session: Option<String> = None;
+    let mut agent_source_label: Option<String> = None;
+    if let Ok(settings) = load_settings(&daemon.paths) {
+        if let Some(kind) = parse_attached_agent(settings.attached_agent.as_deref()) {
+            let label = agent_model_label(&kind);
+            request.route = ProviderRoute::direct(ProviderSelector::agent(label.clone()));
+            resume_session = normalize_resume_session(settings.attached_session);
+            agent_source_label = Some(label);
+        }
+    }
+
     let (meeting_snapshot, answer_meeting) = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard.is_none() {
@@ -3851,27 +4978,37 @@ async fn answer_with_provider_runtime(
     .await;
     write_state(daemon).await?;
 
-    let answer_card = CueCard::new(CardKind::Answer, "Bluey", "Thinking...")
-        .with_source(format!("{} ({})", source, request.metadata.request_id));
+    let answer_card =
+        CueCard::new(CardKind::Answer, "Bluey", "Thinking...").with_source(answer_card_source(
+            &source,
+            request.metadata.request_id,
+            agent_source_label.as_deref(),
+        ));
     let answer_card_id = answer_card.id;
     let _ = send_overlay(daemon, OverlayCommand::PushCard { card: answer_card }).await;
     register_active_answer_card(daemon, generation_id, answer_card_id).await;
     let mut overlay_stream =
         OverlayAnswerStream::new(Arc::clone(daemon), answer_card_id, generation_id);
 
-    let outcome =
-        match resolve_answer_route(&request, &answer_meeting, Some(&mut overlay_stream)).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                if is_answer_generation_current(daemon, generation_id) {
-                    let _ = overlay_stream
-                        .finish(&user_facing_answer_error(&error))
-                        .await;
-                }
-                clear_active_answer_card(daemon, generation_id, answer_card_id).await;
-                return Err(error);
+    let outcome = match resolve_answer_route(
+        &request,
+        &answer_meeting,
+        resume_session.as_deref(),
+        Some(&mut overlay_stream),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if is_answer_generation_current(daemon, generation_id) {
+                let _ = overlay_stream
+                    .finish(&user_facing_answer_error(&error))
+                    .await;
             }
-        };
+            clear_active_answer_card(daemon, generation_id, answer_card_id).await;
+            return Err(error);
+        }
+    };
     let safety = outcome.safety.clone();
     let metadata =
         AnswerResponseMetadata::new(request.metadata.request_id, outcome.provider.clone())
@@ -4298,6 +5435,7 @@ struct AnswerRouteOutcome {
 async fn resolve_answer_route(
     request: &AnswerRequest,
     meeting: &MeetingRecord,
+    resume_session: Option<&str>,
     mut stream: Option<&mut OverlayAnswerStream>,
 ) -> Result<AnswerRouteOutcome> {
     let mut attempts = Vec::new();
@@ -4373,6 +5511,30 @@ async fn resolve_answer_route(
             });
         }
 
+        if matches!(step.provider.provider_kind, AiProviderKind::Agent) {
+            let started_at = Instant::now();
+            let stream_ref = stream.as_mut().map(|stream| &mut **stream);
+            let outcome = answer_with_agent(
+                &step.provider,
+                &payload,
+                meeting,
+                resume_session,
+                stream_ref,
+                fallback_depth,
+            )
+            .await?;
+            let latency_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+            attempts.extend(outcome.attempts);
+            return Ok(AnswerRouteOutcome {
+                provider: step.provider.clone(),
+                answer: outcome.answer,
+                attempts,
+                latency_ms,
+                token_usage: None,
+                safety: outcome.safety,
+            });
+        }
+
         if let Some(message) = config.unavailable_message() {
             attempts.push(
                 RouteAttemptMetadata::started(step.provider.clone(), fallback_depth)
@@ -4421,6 +5583,723 @@ async fn resolve_answer_route(
         request.metadata.request_id,
         failures.join("; ")
     ))
+}
+
+/// The outcome of driving an attached agent: the rendered answer (real or
+/// guidance), the safety notice to attach, and a single attempt record.
+struct AgentRouteOutcome {
+    answer: String,
+    safety: SafetyOutcome,
+    attempts: Vec<RouteAttemptMetadata>,
+}
+
+/// Build the grounding [`AgentQuestion`] for the attached agent from the
+/// answer payload: the user's question plus a bounded transcript flattened
+/// from the request context. `resume` pins a prior session to continue (the
+/// agent driver maps it to `--resume`/`--continue`); `None` starts fresh.
+/// Pure string/struct assembly — no I/O.
+fn agent_question_from_payload(
+    payload: &ProviderRequestPayload,
+    resume: Option<&str>,
+) -> AgentQuestion {
+    let mut turns = Vec::new();
+    if let Some(instructions) = payload
+        .instructions
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        turns.push(cue_agent_bridge::Turn {
+            role: cue_agent_bridge::Role::System,
+            text: instructions.clone(),
+        });
+    }
+    for context in &payload.context {
+        if context.content.trim().is_empty() {
+            continue;
+        }
+        let role = match context.kind {
+            AnswerContextKind::System => cue_agent_bridge::Role::System,
+            _ => cue_agent_bridge::Role::Other,
+        };
+        turns.push(cue_agent_bridge::Turn {
+            role,
+            text: context.content.clone(),
+        });
+    }
+    AgentQuestion {
+        prompt: payload.question.clone(),
+        context: (!turns.is_empty()).then_some(cue_agent_bridge::Transcript { turns }),
+        resume: resume
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string),
+        // cwd is resolved by the tier-aware continuation step (see
+        // `apply_continuation_tier`), not here — this stays pure string assembly.
+        cwd: None,
+    }
+}
+
+/// Upgrade a [`Question`] to **continue a specific prior session** with the
+/// attached agent, per the agent's [`ContinuationTier`] (see
+/// `docs/vendors/SESSION-CONTINUATION-ARCHITECTURE.md`). Called by the answer
+/// path when a session is pinned; a no-op when `session_id` is `None`.
+///
+/// - **NativeResume** (Claude/Codex/Copilot): set `resume = <id>` and `cwd =
+///   <session project>` so the agent's own `--resume` continues it (cwd is
+///   critical — Claude's resume is cwd-scoped) and the VENDOR compacts context.
+/// - **Replay** (Cursor/VsCode/Gemini/Antigravity): the agent can't resume by id,
+///   so LOAD the transcript and put it in `context`. If it's too big to replay
+///   whole, summarize the older turns via a drive through the USER's OWN agent
+///   (Bluey runs no AI) and replay `[summary] + recent`. Fail-soft: a failed
+///   summary falls back to the raw transcript (the drive layer's budget trims it).
+async fn apply_continuation_tier(
+    question: &mut AgentQuestion,
+    agent: &AgentKind,
+    session_id: Option<&str>,
+) {
+    let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) else {
+        return; // fresh question — nothing to continue
+    };
+    let Some(tag) = cue_agent_bridge::registry::KindTag::from_agent_kind(agent) else {
+        return;
+    };
+    let Some(entry) = cue_agent_bridge::registry::entry_for(tag) else {
+        return;
+    };
+
+    // Resolve the session's project (cwd) and — for Replay — its transcript.
+    let (project, transcript) =
+        resolve_session_for_continuation(agent, session_id, entry.continuation).await;
+
+    // Will the project dir actually be usable as a cwd? (exists + non-empty —
+    // mirrors the drive layer's guard). A missing/empty dir means a cwd-scoped
+    // native resume (Claude) would resolve against the WRONG directory and
+    // silently start fresh, losing all context.
+    let cwd_usable = project.as_deref().is_some_and(|p| {
+        let path = std::path::Path::new(p);
+        path.is_dir()
+            && std::fs::read_dir(path)
+                .map(|mut e| e.next().is_some())
+                .unwrap_or(false)
+    });
+    match entry.continuation {
+        cue_agent_bridge::registry::ContinuationTier::NativeResume if cwd_usable => {
+            // Normal native resume: drive in the project dir, resume by id, let
+            // the vendor handle context compaction.
+            question.cwd = project;
+            question.resume = Some(session_id.to_string());
+        }
+        cue_agent_bridge::registry::ContinuationTier::NativeResume => {
+            // Native resume but the project cwd is MISSING/EMPTY (e.g. a moved or
+            // un-synced folder). A cwd-scoped `--resume` (Claude) would resolve
+            // against the wrong directory and silently start fresh with NO
+            // context. So degrade to REPLAY: drop the resume id and the unusable
+            // cwd, and replay the transcript as context instead — the
+            // continuation still works, just without the vendor's native resume.
+            question.resume = None;
+            question.cwd = None;
+            if let Some(t) = transcript {
+                question.context = Some(maybe_compact(agent, t).await);
+            }
+        }
+        cue_agent_bridge::registry::ContinuationTier::Replay => {
+            // No native resume: replay the transcript as context. Never pass a
+            // resume id (the agent's --resume can't target it / would mis-fire).
+            // Set the project cwd ONLY if usable, so the agent operates in the
+            // right repo without crashing on a missing/empty folder.
+            question.resume = None;
+            if cwd_usable {
+                question.cwd = project;
+            }
+            if let Some(t) = transcript {
+                question.context = Some(maybe_compact(agent, t).await);
+            }
+        }
+    }
+}
+
+/// The kind to ACTUALLY drive for a (possibly cross-surface) continuation. When
+/// `replaying` and the agent declares a `continuation_via` sibling — i.e. it has
+/// no CLI of its own but its transcript can be continued through a sibling's CLI
+/// (VS Code Copilot → Copilot CLI) — return the sibling kind. Otherwise return
+/// the original kind unchanged. Pure registry lookup, data-driven.
+fn continuation_bridge_kind(kind: &AgentKind, replaying: bool) -> AgentKind {
+    if !replaying {
+        return kind.clone();
+    }
+    let via = cue_agent_bridge::registry::KindTag::from_agent_kind(kind)
+        .and_then(cue_agent_bridge::registry::entry_for)
+        .and_then(|e| e.continuation_via);
+    match via {
+        Some(tag) => tag.to_agent_kind(),
+        None => kind.clone(),
+    }
+}
+
+/// Find a session's project path, plus (for Replay tier) its full transcript.
+/// Read-only, fail-soft → `(None, None)` when the agent/store/session isn't found.
+async fn resolve_session_for_continuation(
+    agent: &AgentKind,
+    session_id: &str,
+    tier: cue_agent_bridge::registry::ContinuationTier,
+) -> (Option<String>, Option<cue_agent_bridge::Transcript>) {
+    let Some(discovered) = discover_agents().into_iter().find(|d| &d.kind == agent) else {
+        return (None, None);
+    };
+    let Some(store) = discovered.session_store.as_ref() else {
+        return (None, None);
+    };
+    let reader = reader_for(store.format);
+
+    // Project: from the session's SessionRef (the readers now populate it).
+    let project = reader
+        .list(store, AGENT_SESSION_LIST_CAP)
+        .ok()
+        .and_then(|refs| {
+            refs.into_iter()
+                .find(|r| r.id == session_id)
+                .and_then(|r| r.project)
+        });
+
+    // Transcript: always needed for Replay; for NativeResume it's a SAFETY NET
+    // used only if the project cwd turns out unusable (so a missed cwd-scoped
+    // resume still has context). Load it for both — it's a bounded read, far
+    // cheaper than the drive itself, and `apply_continuation_tier` only attaches
+    // it for NativeResume when actually needed. Whether the project is usable
+    // depends on the filesystem, which this resolver already touches.
+    let _ = tier; // both tiers load it now; kept for signature/back-compat
+    let transcript = reader
+        .read(store, session_id, CONTINUATION_READ_MAX_TURNS)
+        .ok();
+
+    (project, transcript)
+}
+
+/// Cap on turns loaded from a session being continued via Replay — bounded so a
+/// pathological transcript can't blow memory before compaction runs.
+const CONTINUATION_READ_MAX_TURNS: usize = 4_000;
+
+/// If a Replay transcript is too big to replay whole, summarize its older turns
+/// via a drive through the user's OWN agent and return `[summary] + recent`;
+/// otherwise return it unchanged. Fail-soft: a failed summary returns the raw
+/// transcript (the drive layer's char budget then trims it as the safety net).
+async fn maybe_compact(
+    agent: &AgentKind,
+    transcript: cue_agent_bridge::Transcript,
+) -> cue_agent_bridge::Transcript {
+    if transcript_chars(&transcript.turns) <= CONTINUATION_SUMMARY_BUDGET {
+        return transcript; // fits — replay whole, no extra drive
+    }
+    let (older, recent) = split_for_compaction(&transcript.turns);
+    if older.is_empty() {
+        return transcript;
+    }
+
+    // Flatten the older turns and ask the user's own agent to summarize them.
+    let older_text: String = older
+        .iter()
+        .map(|t| format!("{:?}: {}", t.role, t.text))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let summary_q = AgentQuestion {
+        prompt: summarize_older_prompt(&older_text),
+        context: None,
+        resume: None,
+        cwd: None,
+    };
+    match drive_and_collect(agent.clone(), summary_q, DriveMode::Answer).await {
+        Ok(summary) if !summary.trim().is_empty() => {
+            let mut turns = Vec::with_capacity(recent.len() + 1);
+            turns.push(cue_agent_bridge::Turn {
+                role: cue_agent_bridge::Role::System,
+                text: format!("Summary of the earlier conversation:\n{}", summary.trim()),
+            });
+            turns.extend(recent.iter().cloned());
+            cue_agent_bridge::Transcript { turns }
+        }
+        // Summary failed/empty → raw transcript; the drive budget trims it.
+        _ => transcript,
+    }
+}
+
+/// A successful single drive attempt: the collected answer body + optional cost.
+struct DriveOutcome {
+    body: String,
+    cost_usd: Option<f64>,
+}
+
+/// A failed single drive attempt. `reason` is a human phrase appended after
+/// "Your {agent} CLI {reason}." `resume_recoverable` is true when native resume
+/// failed in a way a fresh (no-resume) retry can recover — too-large or
+/// not-found (see [`is_resume_recoverable_error`]). The real CLI error text is
+/// preserved in `reason` so the user sees the truth, not a hardcoded guess.
+///
+/// `raw_error` carries the UNMODIFIED terminal-error text (only set for a
+/// terminal [`AnswerChunk::Error`], not for spawn/render failures), so the
+/// caller can classify it — e.g. detect a model-policy block via
+/// [`cue_agent_bridge::model_resolve::decide_model_block`] and retry under a
+/// fallback model. `reason` is the truncated, user-facing phrasing; `raw_error`
+/// is the full text the classifier needs.
+struct DriveFailure {
+    reason: String,
+    resume_recoverable: bool,
+    raw_error: Option<String>,
+}
+
+/// Whether an agent error message is the "prompt/conversation too large to fit
+/// Whether an agent error means native **resume specifically** failed in a way
+/// a fresh (no-resume) retry can recover. Two classes, both agent-agnostic:
+///
+/// - **Too large:** the session exceeds the context window and can't be loaded
+///   or compacted headlessly ("prompt is too long", "conversation too long", …).
+/// - **Not resumable:** the pinned session id can't be found/loaded by this CLI
+///   ("no conversation found", "session not found", "invalid session"). Common
+///   when an app-only session was never written to the CLI's shared store, or
+///   the cwd differs.
+///
+/// In both cases a fresh session in the project dir still answers — it has the
+/// code, project rules, and MCP connectors regardless of the prior transcript.
+fn is_resume_recoverable_error(message: &str) -> bool {
+    let m = message.to_lowercase();
+    // Too-large class.
+    let too_large = m.contains("prompt is too long")
+        || m.contains("conversation too long")
+        || m.contains("context length")
+        || m.contains("context window")
+        || m.contains("too many tokens")
+        || (m.contains("maximum") && m.contains("token"));
+    // Session-not-resumable class.
+    let not_resumable = m.contains("no conversation found")
+        || m.contains("session not found")
+        || m.contains("no session")
+        || m.contains("invalid session")
+        || (m.contains("session") && m.contains("not found"));
+    // Resume-incompatibility class: the persisted transcript references tools (or
+    // other state) that aren't available in Bluey's headless resume context, so
+    // the agent rejects replaying it as-is. Seen live: Claude returns
+    // `400 invalid_request_error: "Tool reference 'X' not found in available
+    // tools"` when resuming a session recorded with tools the headless CLI
+    // doesn't load. A fresh (non-resume) drive in the same project still answers,
+    // so this is recoverable the same way an overflow is.
+    let tool_incompatible = m.contains("not found in available tools")
+        || (m.contains("tool reference") && m.contains("not found"));
+    too_large || not_resumable || tool_incompatible
+}
+
+/// Run ONE drive attempt: spawn the agent, stream deltas live to the overlay,
+/// and collect the body. Returns [`DriveFailure`] (without finalizing the card)
+/// on spawn failure or a terminal `AnswerChunk::Error`, so the caller can decide
+/// whether to retry (e.g. fresh session) or surface the failure. A
+/// context-overflow error arrives as a result event with no prior deltas, so the
+/// body is empty on that failure and there is nothing rendered to roll back.
+async fn drive_answer_attempt(
+    kind: &AgentKind,
+    label: &str,
+    payload: &ProviderRequestPayload,
+    resume: Option<&str>,
+    model_override: &[String],
+    stream: &mut Option<&mut OverlayAnswerStream>,
+) -> Result<DriveOutcome, DriveFailure> {
+    let mut question = agent_question_from_payload(payload, resume);
+    // When a prior session is pinned, continue it per the agent's tier:
+    // NativeResume → set resume id + the session's project as cwd (Claude's
+    // resume is cwd-scoped); Replay → load + (if huge) compact the transcript
+    // into context. No-op for a fresh question. Local agents only — cloud
+    // continuation is the cloud adapter's concern.
+    if !cue_agent_bridge::cloud::is_cloud_kind(kind) {
+        apply_continuation_tier(&mut question, kind, resume).await;
+    }
+
+    // Cross-surface continuation bridge: an agent with NO CLI of its own (e.g.
+    // VS Code Copilot, the extension) but a `continuation_via` sibling continues
+    // its conversation by REPLAYING its transcript through that sibling's CLI
+    // (the Copilot CLI — same GitHub Copilot account). Only when we actually
+    // loaded a transcript to replay (Replay continuation produced context);
+    // otherwise the kind is unchanged. Data-driven — never an `if agent == …`.
+    let drive_kind = continuation_bridge_kind(kind, question.context.is_some());
+
+    debug!(
+        agent = %label,
+        drive_via = ?drive_kind,
+        resuming = resume.is_some(),
+        replay_context = question.context.is_some(),
+        cwd_set = question.cwd.is_some(),
+        model_override = model_override.len(),
+        "driving attached agent for answer"
+    );
+    let kind = &drive_kind;
+
+    // Pick the right driver by the agent's registry kind, not by name. Cloud
+    // agents (Cursor Cloud, Copilot Cloud, …) have a row in
+    // `cue_agent_bridge::cloud::CLOUD_REGISTRY` and dispatch through the
+    // cloud adapter; local-CLI agents go through the existing drive layer.
+    // The cloud adapter loads credentials from the OS keychain and emits one
+    // structured audit line per HTTP call (vendor, endpoint, status — never
+    // the token).
+    let answer_stream = if cue_agent_bridge::cloud::is_cloud_kind(kind) {
+        // Cloud vendors don't take a per-run CLI model flag, so a model override
+        // (only ever set for a local-CLI model-block fallback) does not apply.
+        match cue_agent_bridge::cloud::drive_cloud(kind.clone(), question).await {
+            Ok(answer_stream) => answer_stream,
+            Err(error) => {
+                debug!(agent = %label, error = %error, "cloud agent drive failed to start");
+                return Err(DriveFailure {
+                    reason: "isn't connected or set up".to_string(),
+                    resume_recoverable: false,
+                    raw_error: None,
+                });
+            }
+        }
+    } else {
+        // Local CLI: drive through the options-aware entry point so a model
+        // fallback (e.g. Codex `-m gpt-5.1-codex`) can be appended without
+        // touching the user's config. An empty override (the common case)
+        // produces byte-identical argv to the plain `drive`.
+        let opts = cue_agent_bridge::drive::DriveOptions {
+            model_override: model_override.to_vec(),
+            ..Default::default()
+        };
+        match cue_agent_bridge::drive::drive_with_options(kind.clone(), question, opts).await {
+            Ok(answer_stream) => answer_stream,
+            Err(error) => {
+                debug!(agent = %label, error = %error, "agent drive failed to start");
+                return Err(DriveFailure {
+                    reason: "isn't installed or signed in".to_string(),
+                    resume_recoverable: false,
+                    raw_error: None,
+                });
+            }
+        }
+    };
+
+    futures_util::pin_mut!(answer_stream);
+    let mut body = String::new();
+    let mut cost_usd: Option<f64> = None;
+    // Reset the placeholder body ("Thinking with agent...") so streamed deltas
+    // render on their own.
+    if let Some(stream) = stream.as_mut() {
+        // A stream IO failure here is non-recoverable for this attempt.
+        if stream.set_body(String::new(), false).await.is_err() {
+            return Err(DriveFailure {
+                reason: "couldn't render the answer".to_string(),
+                resume_recoverable: false,
+                raw_error: None,
+            });
+        }
+    }
+
+    while let Some(chunk) = futures_util::StreamExt::next(&mut answer_stream).await {
+        match chunk {
+            AnswerChunk::Started { .. } => {}
+            AnswerChunk::Delta(delta) => {
+                body.push_str(&delta);
+                if let Some(stream) = stream.as_mut() {
+                    let _ = stream.push_delta(&delta).await;
+                }
+            }
+            AnswerChunk::Done { cost_usd: cost } => {
+                cost_usd = cost;
+            }
+            AnswerChunk::Error(message) => {
+                let recoverable = is_resume_recoverable_error(&message);
+                debug!(
+                    agent = %label,
+                    detail = %message,
+                    resume_recoverable = recoverable,
+                    "agent reported a terminal error"
+                );
+                // Surface the REAL error text (truncated), not a hardcoded guess.
+                // (If recoverable, the caller retries fresh and the user never
+                // sees this reason; it's the terminal-failure phrasing.)
+                let reason = format!("couldn't answer ({})", truncate_reason(&message));
+                return Err(DriveFailure {
+                    reason,
+                    resume_recoverable: recoverable,
+                    // Keep the FULL text so the caller can classify it (e.g. a
+                    // model-policy block → fallback-model retry).
+                    raw_error: Some(message),
+                });
+            }
+        }
+    }
+
+    Ok(DriveOutcome { body, cost_usd })
+}
+
+/// Trim a raw agent error to a short, single-line phrase for the guidance card.
+fn truncate_reason(message: &str) -> String {
+    let one_line: String = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= 80 {
+        one_line
+    } else {
+        let mut s: String = one_line.chars().take(80).collect();
+        s.push('…');
+        s
+    }
+}
+
+/// Drive the attached coding agent and stream its answer through the overlay.
+///
+/// Routing rule (PLAN §10): Bluey NEVER answers from the user's context with
+/// its own AI here. If the agent CLI is missing or not signed in, we surface a
+/// guidance WARNING card and resolve the answer to that same guidance text —
+/// we do not silently fall back to a Bluey provider.
+async fn answer_with_agent(
+    provider: &ProviderSelector,
+    payload: &ProviderRequestPayload,
+    _meeting: &MeetingRecord,
+    resume_session: Option<&str>,
+    mut stream: Option<&mut OverlayAnswerStream>,
+    fallback_depth: usize,
+) -> Result<AgentRouteOutcome> {
+    let label = provider
+        .model
+        .as_ref()
+        .map(|model| model.as_str().to_string())
+        .unwrap_or_else(|| "agent".to_string());
+    let Some(kind) = parse_attached_agent(Some(&label)) else {
+        return Ok(agent_not_ready(
+            provider,
+            &mut stream,
+            fallback_depth,
+            &label,
+            "isn't a recognized agent",
+        )
+        .await);
+    };
+
+    // Cloud task-shaped vendors (Codex Cloud, Copilot Coding Agent, Cursor
+    // Cloud, etc.) don't answer in a single turn — they kick off a remote
+    // task that opens a PR minutes later. Bluey's overlay is built around
+    // streaming turns, so for now we surface an honest guidance card
+    // instead of trying to wait synchronously. Reads the cloud registry as
+    // DATA — no per-vendor `if` here, the path is uniform for any future
+    // task-shaped vendor.
+    if let Some(tag) = cue_agent_bridge::registry::KindTag::from_agent_kind(&kind) {
+        if let Some(cloud_entry) = cue_agent_bridge::cloud::registry::cloud_entry_for(tag) {
+            if cloud_entry.task_shaped {
+                let mins = (cloud_entry.max_task_duration_secs / 60).max(1);
+                let reason = format!(
+                    "is a cloud task-shaped agent — Bluey delegates a task that opens a PR \
+                     up to {mins} min later; live in-meeting answers are not supported yet"
+                );
+                return Ok(
+                    agent_not_ready(provider, &mut stream, fallback_depth, &label, &reason).await,
+                );
+            }
+        }
+    }
+
+    // Escalation ladder (PLAN §7.8), agent-agnostic:
+    //  1. Try native resume first — the agent loads + auto-compacts its own
+    //     session. Works for ~every normal session.
+    //  2. If that fails because the session is too large to fit/compact
+    //     ("Prompt is too long"-class), retry ONCE with resume stripped: a fresh
+    //     session in the project dir still has the code, CLAUDE.md, and all MCP
+    //     connectors (context lives in the repo/config, not mostly in the chat).
+    //  3. If the agent is signed in but the requested MODEL is blocked for the
+    //     account (the real Codex/ChatGPT case — "model is not supported when
+    //     using Codex with a ChatGPT account"), retry under a fallback model the
+    //     account supports (data-driven, from the registry row's `fallback_models`
+    //     + `model_flag`). Try each fallback once; if EVERY fallback is also
+    //     blocked, surface the honest BYOT guidance (connect an API key) instead
+    //     of looping or leaking the raw 400. See `cue_agent_bridge::model_resolve`.
+    // Bluey never summarizes with its own AI; a fresh session simply lets the
+    // agent re-derive context with its own tools.
+    use cue_agent_bridge::model_resolve::{byot_guidance_line, decide_model_block, ModelLoopStep};
+    let mut attempt_resume = resume_session;
+    let mut tried_fresh_fallback = false;
+    // The per-run model override appended to the next drive (empty = none) and
+    // the models already tried-and-blocked in THIS answer, so the resolver
+    // advances through the fallback list and then to BYOT — bounded, never a loop.
+    let mut model_override: Vec<String> = Vec::new();
+    let mut tried_models: Vec<String> = Vec::new();
+    let (body, cost_usd) = loop {
+        match drive_answer_attempt(
+            &kind,
+            &label,
+            payload,
+            attempt_resume,
+            &model_override,
+            &mut stream,
+        )
+        .await
+        {
+            Ok(outcome) => break (outcome.body, outcome.cost_usd),
+            Err(failure) => {
+                // Recoverable resume failures (session too large OR not found)
+                // retry once without resume — a fresh session in the project dir
+                // still answers. Only when we WERE resuming, at most once.
+                if failure.resume_recoverable && attempt_resume.is_some() && !tried_fresh_fallback {
+                    tried_fresh_fallback = true;
+                    warn!(
+                        agent = %label,
+                        "native resume failed (too large or not found); retrying fresh (no --resume)"
+                    );
+                    attempt_resume = None;
+                    continue;
+                }
+
+                // Model-policy block? Only a terminal agent error carries the raw
+                // text; classify it and, if the model is blocked, retry under a
+                // fallback (or surface BYOT once exhausted). Data-driven via the
+                // registry — no agent named here.
+                if let Some(raw) = failure.raw_error.as_deref() {
+                    match decide_model_block(&kind, raw, &tried_models) {
+                        ModelLoopStep::RetryWithModel {
+                            fallback_model,
+                            model_flag_args,
+                        } => {
+                            warn!(
+                                agent = %label,
+                                fallback_model,
+                                "requested model is blocked for this account; retrying under a fallback model"
+                            );
+                            tried_models.push(fallback_model.to_string());
+                            model_override = model_flag_args;
+                            continue;
+                        }
+                        ModelLoopStep::ConnectApiKey(byot) => {
+                            // Every fallback was also blocked — the honest BYOT
+                            // path. Not `agent_not_ready` (that says "install and
+                            // sign in", which is wrong: the CLI IS installed and
+                            // signed in — only the model is gated).
+                            warn!(
+                                agent = %label,
+                                "all fallback models blocked for this account; surfacing BYOT guidance"
+                            );
+                            return Ok(agent_model_blocked(
+                                provider,
+                                &mut stream,
+                                fallback_depth,
+                                &label,
+                                &byot_guidance_line(&label, &byot),
+                            )
+                            .await);
+                        }
+                        // Not a model block — fall through to the honest error.
+                        ModelLoopStep::NotModelBlock => {}
+                    }
+                }
+
+                return Ok(agent_not_ready(
+                    provider,
+                    &mut stream,
+                    fallback_depth,
+                    &label,
+                    &failure.reason,
+                )
+                .await);
+            }
+        }
+    };
+
+    if body.trim().is_empty() {
+        return Ok(agent_not_ready(
+            provider,
+            &mut stream,
+            fallback_depth,
+            &label,
+            "returned no answer",
+        )
+        .await);
+    }
+
+    if let Some(stream) = stream.as_mut() {
+        let cost_label = match cost_usd {
+            Some(cost) => format!("${cost:.4} · {label}"),
+            None => format!("on your {label} plan"),
+        };
+        stream
+            .finish_with_cost_label(&body, Some(cost_label))
+            .await?;
+    }
+
+    let safety = SafetyOutcome::pass().with_notice(format!(
+        "answered by your attached agent ({label}); no Bluey provider call was made"
+    ));
+    Ok(AgentRouteOutcome {
+        answer: body,
+        safety,
+        attempts: vec![
+            RouteAttemptMetadata::started(provider.clone(), fallback_depth).succeeded(0),
+        ],
+    })
+}
+
+/// Push a guidance WARNING card and resolve the answer card to the same text.
+/// Used whenever the attached agent cannot answer live — never a silent
+/// fallback to Bluey's own AI.
+async fn agent_not_ready(
+    provider: &ProviderSelector,
+    stream: &mut Option<&mut OverlayAnswerStream>,
+    fallback_depth: usize,
+    label: &str,
+    reason: &str,
+) -> AgentRouteOutcome {
+    let body = format!(
+        "Your {label} CLI {reason}. Install it and sign in, then ask again — \
+Bluey answers live through your agent and never on your behalf."
+    );
+    if let Some(stream) = stream.as_mut() {
+        let _ = push_system_card(
+            &stream.daemon,
+            CardKind::Warning,
+            "Agent not ready",
+            body.clone(),
+        )
+        .await;
+        let _ = stream.finish(&body).await;
+    }
+    let safety = SafetyOutcome::pass().with_notice(format!(
+        "attached agent ({label}) not ready; guidance shown"
+    ));
+    AgentRouteOutcome {
+        answer: body,
+        safety,
+        attempts: vec![
+            RouteAttemptMetadata::started(provider.clone(), fallback_depth)
+                .failed(format!("agent not ready: {label} {reason}")),
+        ],
+    }
+}
+
+/// Push an honest guidance card for a **model-policy block** that survived every
+/// fallback model: the agent is installed and signed in, but the account can't
+/// use any model Bluey can drive it with, so the only path is BYOT (connect an
+/// API key). Distinct from [`agent_not_ready`] — that one tells the user to
+/// "install and sign in", which is wrong here (both are already true). `guidance`
+/// is the data-driven [`byot_guidance_line`] (names the blocked model, the
+/// resolve-model command, and the API-key env var).
+async fn agent_model_blocked(
+    provider: &ProviderSelector,
+    stream: &mut Option<&mut OverlayAnswerStream>,
+    fallback_depth: usize,
+    label: &str,
+    guidance: &str,
+) -> AgentRouteOutcome {
+    let body = format!("Your {label} CLI {guidance}");
+    if let Some(stream) = stream.as_mut() {
+        let _ = push_system_card(
+            &stream.daemon,
+            CardKind::Warning,
+            "Model blocked — connect an API key",
+            body.clone(),
+        )
+        .await;
+        let _ = stream.finish(&body).await;
+    }
+    let safety = SafetyOutcome::pass().with_notice(format!(
+        "attached agent ({label}) model blocked for this account; BYOT guidance shown"
+    ));
+    AgentRouteOutcome {
+        answer: body,
+        safety,
+        attempts: vec![
+            RouteAttemptMetadata::started(provider.clone(), fallback_depth)
+                .failed(format!("agent model blocked: {label}")),
+        ],
+    }
 }
 
 async fn call_chat_provider(
@@ -8262,6 +10141,114 @@ mod tests {
             .is_some_and(|instructions| instructions.contains("### Code")));
     }
 
+    // ---- BYOT billing disclosure (Anthropic Managed Agents) -------------
+
+    #[test]
+    fn anthropic_cloud_row_is_byot_in_cloud_registry() {
+        // Pin the contract the daemon's BYOT gate relies on: the Anthropic
+        // Managed Agents row in the CLOUD_REGISTRY carries `vendor_short =
+        // "anthropic"` and `billing_model = ApiCredits` (BYOT), with a
+        // non-placeholder consent_warning. If any of these change, the
+        // disclosure flow silently breaks — better to fail this test.
+        use cue_agent_bridge::cloud::registry::{cloud_entry_for, BillingModel};
+        use cue_agent_bridge::registry::KindTag;
+
+        let row =
+            cloud_entry_for(KindTag::AnthropicCloud).expect("AnthropicCloud row in CLOUD_REGISTRY");
+        assert_eq!(row.vendor_short, "anthropic");
+        assert_eq!(row.billing_model, BillingModel::ApiCredits);
+        assert!(!row.consent_warning.starts_with("PLACEHOLDER"));
+        assert!(
+            row.consent_warning
+                .to_lowercase()
+                .contains("anthropic console api key"),
+            "BYOT consent text must call out Console API key (not subscription)"
+        );
+    }
+
+    #[test]
+    fn push_billing_disclosure_serializes_with_documented_fields() {
+        // The OverlayCommand wire shape is a contract with the overlay UI.
+        // Pin every field the overlay reads, so a future rename breaks this
+        // test instead of silently breaking the UI.
+        let cmd = OverlayCommand::PushBillingDisclosure {
+            vendor_short: "anthropic".to_string(),
+            vendor_display_name: "Claude Agent (Cloud)".to_string(),
+            billing_model: "api_credits".to_string(),
+            disclosure: "Spend appears on platform.claude.com/usage.".to_string(),
+            pending_kind: "anthropic_cloud".to_string(),
+            pending_session_id: None,
+        };
+        let json = serde_json::to_value(&cmd).expect("serialize");
+        assert_eq!(json["type"], "push_billing_disclosure");
+        assert_eq!(json["vendor_short"], "anthropic");
+        assert_eq!(json["vendor_display_name"], "Claude Agent (Cloud)");
+        assert_eq!(json["billing_model"], "api_credits");
+        assert!(json["disclosure"]
+            .as_str()
+            .unwrap()
+            .contains("platform.claude.com"));
+        assert_eq!(json["pending_kind"], "anthropic_cloud");
+        // pending_session_id is omitted when None (the skip_serializing_if attribute).
+        assert!(json.get("pending_session_id").is_none());
+    }
+
+    #[test]
+    fn billing_disclosure_responded_round_trips() {
+        // The response shape the UI sends back must round-trip through serde
+        // so the daemon's match arm fires reliably. Pin the wire form.
+        let json = serde_json::json!({
+            "type": "billing_disclosure_responded",
+            "vendor_short": "anthropic",
+            "accepted": true,
+            "pending_kind": "anthropic_cloud",
+            "pending_session_id": "sess_resume_abc"
+        });
+        let evt: cue_core::OverlayEvent =
+            serde_json::from_value(json).expect("deserialize OverlayEvent");
+        match evt {
+            cue_core::OverlayEvent::BillingDisclosureResponded {
+                vendor_short,
+                accepted,
+                pending_kind,
+                pending_session_id,
+            } => {
+                assert_eq!(vendor_short, "anthropic");
+                assert!(accepted);
+                assert_eq!(pending_kind, "anthropic_cloud");
+                assert_eq!(pending_session_id.as_deref(), Some("sess_resume_abc"));
+            }
+            other => panic!("expected BillingDisclosureResponded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn needs_byot_disclosure_skips_local_cli_agents() {
+        // The BYOT gate must NEVER fire for a local CLI agent — those have
+        // no `BillingModel`. A regression where local agents trigger the
+        // modal would block normal attach flows. We can't easily build a
+        // Daemon in this test, but we can prove the underlying registry
+        // lookup behaves correctly: a local kind has no cloud row.
+        use cue_agent_bridge::cloud::registry::cloud_entry_for;
+        use cue_agent_bridge::registry::KindTag;
+
+        for local in [
+            KindTag::ClaudeCode,
+            KindTag::Cursor,
+            KindTag::Copilot,
+            KindTag::Gemini,
+            KindTag::Codex,
+            KindTag::Aider,
+            KindTag::Windsurf,
+            KindTag::VsCode,
+        ] {
+            assert!(
+                cloud_entry_for(local).is_none(),
+                "{local:?} must NOT have a cloud-registry row — that would trigger BYOT for a local agent"
+            );
+        }
+    }
+
     #[test]
     fn overlay_ui_state_scope_enters_then_resets_to_idle() {
         use cue_core::overlay_ipc::OverlayUiState;
@@ -8479,5 +10466,511 @@ mod tests {
         assert!(context.contains("[Large doc from test]"));
         assert!(context.contains("[compacted]"));
         assert!(context.chars().count() < long_doc.chars().count());
+    }
+
+    #[test]
+    fn parse_attached_agent_maps_known_snake_case_labels() {
+        assert_eq!(
+            parse_attached_agent(Some("claude_code")),
+            Some(AgentKind::ClaudeCode)
+        );
+        assert_eq!(
+            parse_attached_agent(Some("cursor")),
+            Some(AgentKind::Cursor)
+        );
+        assert_eq!(
+            parse_attached_agent(Some(" codex ")),
+            Some(AgentKind::Codex)
+        );
+        // Cloud-vendor labels — same serde round-trip, no special case in
+        // the parser. Adding a cloud vendor must Just Work via the snake_case
+        // round-trip, with no per-vendor branch in this function.
+        assert_eq!(
+            parse_attached_agent(Some("copilot_cloud")),
+            Some(AgentKind::CopilotCloud)
+        );
+        assert_eq!(
+            parse_attached_agent(Some("cursor_cloud")),
+            Some(AgentKind::CursorCloud)
+        );
+    }
+
+    #[test]
+    fn parse_attached_agent_rejects_absent_blank_and_unknown() {
+        assert_eq!(parse_attached_agent(None), None);
+        assert_eq!(parse_attached_agent(Some("")), None);
+        assert_eq!(parse_attached_agent(Some("   ")), None);
+        // Unrecognized labels and the inert/freeform variants are not drivable.
+        assert_eq!(parse_attached_agent(Some("not_a_real_agent")), None);
+        assert_eq!(parse_attached_agent(Some("unknown")), None);
+    }
+
+    #[test]
+    fn agent_model_label_roundtrips_known_kinds() {
+        assert_eq!(agent_model_label(&AgentKind::ClaudeCode), "claude_code");
+        assert_eq!(agent_model_label(&AgentKind::Cursor), "cursor");
+        assert_eq!(
+            agent_model_label(&AgentKind::Other("zed".to_string())),
+            "zed"
+        );
+    }
+
+    #[test]
+    fn capability_and_auth_tier_labels_are_snake_case() {
+        assert_eq!(capability_label(Capability::Drive), "drive");
+        assert_eq!(capability_label(Capability::ReadOnly), "read_only");
+        assert_eq!(capability_label(Capability::NeedsTrust), "needs_trust");
+        assert_eq!(capability_label(Capability::NeedsReauth), "needs_reauth");
+        assert_eq!(capability_label(Capability::CloudBlocked), "cloud_blocked");
+
+        assert_eq!(auth_tier_label(AuthTier::EnvAuth), "env_auth");
+        assert_eq!(auth_tier_label(AuthTier::HostedOauth), "hosted_oauth");
+        assert_eq!(auth_tier_label(AuthTier::None_), "none");
+    }
+
+    #[test]
+    fn auth_tier_ready_only_for_env_auth_and_none() {
+        // Env-auth and no-auth connectors are usable as-is; hosted-OAuth needs
+        // a re-login first, so it is not counted as ready.
+        assert!(auth_tier_ready(AuthTier::EnvAuth));
+        assert!(auth_tier_ready(AuthTier::None_));
+        assert!(!auth_tier_ready(AuthTier::HostedOauth));
+    }
+
+    #[test]
+    fn agent_summary_maps_discovered_fields_and_attached_flag() {
+        let agent = DiscoveredAgent {
+            kind: AgentKind::ClaudeCode,
+            install_evidence: vec![std::path::PathBuf::from("claude")],
+            capability: Capability::Drive,
+            connector_config_path: None,
+            session_store: None,
+        };
+
+        let attached = agent_summary_from_discovered(&agent, 3, 2, Some(7), true);
+        assert_eq!(attached.kind, "claude_code");
+        // The CLI surface is labeled "(CLI)" to disambiguate it from the Claude
+        // app's "(App)" / "(Agent)" rows, which share the same engine.
+        assert_eq!(attached.display_name, "Claude Code (CLI)");
+        assert_eq!(attached.capability, "drive");
+        assert_eq!(attached.connector_count, 3);
+        assert_eq!(attached.ready_connector_count, 2);
+        assert_eq!(attached.session_count, Some(7));
+        assert!(attached.attached);
+
+        // A different agent that is not the attached one reports attached=false
+        // and carries an unknown (None) session count.
+        let other = DiscoveredAgent {
+            kind: AgentKind::Cursor,
+            install_evidence: vec![],
+            capability: Capability::ReadOnly,
+            connector_config_path: None,
+            session_store: None,
+        };
+        let summary = agent_summary_from_discovered(&other, 0, 0, None, false);
+        assert_eq!(summary.kind, "cursor");
+        assert_eq!(summary.capability, "read_only");
+        assert_eq!(summary.session_count, None);
+        assert!(!summary.attached);
+    }
+
+    #[test]
+    fn attached_agent_label_survives_selector_roundtrip() {
+        // The selection path stores the label as the agent provider's model;
+        // it must round-trip back to the same kind for dispatch.
+        let label = agent_model_label(&AgentKind::ClaudeCode);
+        let selector = ProviderSelector::agent(label);
+        let model = selector.model.as_ref().map(|m| m.as_str().to_string());
+        assert_eq!(
+            parse_attached_agent(model.as_deref()),
+            Some(AgentKind::ClaudeCode)
+        );
+    }
+
+    #[test]
+    fn agent_question_from_payload_carries_prompt_and_context() {
+        let route = ProviderRoute::direct(ProviderSelector::agent("claude_code"));
+        let request = cue_core::ai::AnswerRequest::new("What did we decide?", route)
+            .with_instructions("Be concise")
+            .with_context(AnswerContext::transcript("Alice: ship it"));
+        let payload = ProviderRequestPayload::from_request(
+            &request,
+            ProviderSelector::agent("claude_code"),
+            None,
+            "claude_code",
+            RouteBudget::realtime(),
+        );
+
+        let question = agent_question_from_payload(&payload, None);
+        assert_eq!(question.prompt, "What did we decide?");
+        assert!(question.resume.is_none());
+        let transcript = question.context.expect("context present");
+        // System instruction + one transcript context turn.
+        assert_eq!(transcript.turns.len(), 2);
+        assert_eq!(transcript.turns[0].role, cue_agent_bridge::Role::System);
+        assert_eq!(transcript.turns[0].text, "Be concise");
+        assert_eq!(transcript.turns[1].text, "Alice: ship it");
+    }
+
+    #[test]
+    fn agent_question_from_payload_has_no_context_when_empty() {
+        let route = ProviderRoute::direct(ProviderSelector::agent("claude_code"));
+        let request = cue_core::ai::AnswerRequest::new("Hi", route);
+        let payload = ProviderRequestPayload::from_request(
+            &request,
+            ProviderSelector::agent("claude_code"),
+            None,
+            "claude_code",
+            RouteBudget::realtime(),
+        );
+        let question = agent_question_from_payload(&payload, None);
+        assert!(question.context.is_none());
+    }
+
+    #[test]
+    fn agent_question_from_payload_threads_resume_session() {
+        let route = ProviderRoute::direct(ProviderSelector::agent("claude_code"));
+        let request = cue_core::ai::AnswerRequest::new("Continue", route);
+        let payload = ProviderRequestPayload::from_request(
+            &request,
+            ProviderSelector::agent("claude_code"),
+            None,
+            "claude_code",
+            RouteBudget::realtime(),
+        );
+        // A real session id resumes; surrounding whitespace is trimmed.
+        let question = agent_question_from_payload(&payload, Some("  sess-7 "));
+        assert_eq!(question.resume.as_deref(), Some("sess-7"));
+        // A blank id never becomes a resume target.
+        let blank = agent_question_from_payload(&payload, Some("   "));
+        assert!(blank.resume.is_none());
+    }
+
+    #[test]
+    fn normalize_resume_session_trims_and_rejects_blank() {
+        assert_eq!(normalize_resume_session(None), None);
+        assert_eq!(normalize_resume_session(Some(String::new())), None);
+        assert_eq!(normalize_resume_session(Some("   ".to_string())), None);
+        assert_eq!(
+            normalize_resume_session(Some("  abc-1 ".to_string())).as_deref(),
+            Some("abc-1")
+        );
+    }
+
+    fn turn(text: &str) -> cue_agent_bridge::Turn {
+        cue_agent_bridge::Turn {
+            role: cue_agent_bridge::Role::User,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn continuation_bridge_routes_vscode_to_copilot_only_when_replaying() {
+        // VS Code Copilot has no CLI; continuing it must drive through the
+        // Copilot CLI (its `continuation_via` sibling) — but ONLY when we're
+        // actually replaying a transcript.
+        assert_eq!(
+            continuation_bridge_kind(&AgentKind::VsCodeFork, true),
+            AgentKind::Copilot,
+            "VS Code continuation bridges to Copilot CLI when replaying"
+        );
+        // Not replaying (no context) → unchanged (a fresh VS Code ask has no
+        // driver anyway, but we don't silently redirect it).
+        assert_eq!(
+            continuation_bridge_kind(&AgentKind::VsCodeFork, false),
+            AgentKind::VsCodeFork
+        );
+        // An agent with its own CLL is never redirected, replaying or not.
+        assert_eq!(
+            continuation_bridge_kind(&AgentKind::Cursor, true),
+            AgentKind::Cursor
+        );
+        assert_eq!(
+            continuation_bridge_kind(&AgentKind::ClaudeCode, true),
+            AgentKind::ClaudeCode
+        );
+    }
+
+    #[test]
+    fn split_for_compaction_keeps_recent_hot_turns() {
+        // Fewer than the hot count → all "recent", nothing older.
+        let few: Vec<_> = (0..5).map(|i| turn(&format!("t{i}"))).collect();
+        let (older, recent) = split_for_compaction(&few);
+        assert!(older.is_empty());
+        assert_eq!(recent.len(), 5);
+
+        // More than the hot count → older is everything before the last N.
+        let many: Vec<_> = (0..CONTINUATION_HOT_TURNS + 7)
+            .map(|i| turn(&format!("t{i}")))
+            .collect();
+        let (older, recent) = split_for_compaction(&many);
+        assert_eq!(recent.len(), CONTINUATION_HOT_TURNS, "recent = hot layer");
+        assert_eq!(older.len(), 7, "older = the rest");
+        // Ordering preserved: recent is the TAIL.
+        assert_eq!(
+            recent.last().unwrap().text,
+            format!("t{}", CONTINUATION_HOT_TURNS + 6)
+        );
+        assert_eq!(older[0].text, "t0");
+    }
+
+    #[test]
+    fn transcript_chars_sums_turn_text() {
+        let turns = vec![turn("abc"), turn("de"), turn("")];
+        assert_eq!(transcript_chars(&turns), 5);
+    }
+
+    #[test]
+    fn summarize_prompt_includes_the_older_text_and_a_word_cap() {
+        let p = summarize_older_prompt("User: earlier stuff");
+        assert!(p.contains("earlier stuff"));
+        assert!(p.to_lowercase().contains("400 words"));
+        assert!(p.to_lowercase().contains("summary"));
+    }
+
+    fn sample_proposal() -> FixProposal {
+        FixProposal {
+            diagnosis: "PORT is read before the env var is set".to_string(),
+            reasoning: "Read it lazily to fix the ordering".to_string(),
+            fix: "Apply this:\n```diff\n--- a/x\n+++ b/x\n@@\n-1\n+2\n```".to_string(),
+            raw: String::new(),
+        }
+    }
+
+    fn insert_pending(
+        map: &mut HashMap<uuid::Uuid, PendingFix>,
+        agent: AgentKind,
+        created_at: Instant,
+    ) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        map.insert(
+            id,
+            PendingFix {
+                proposal: sample_proposal(),
+                agent,
+                created_at,
+            },
+        );
+        id
+    }
+
+    #[test]
+    fn take_valid_pending_fix_returns_and_removes_a_live_entry() {
+        let mut map = HashMap::new();
+        let now = Instant::now();
+        let id = insert_pending(&mut map, AgentKind::ClaudeCode, now);
+
+        let taken = take_valid_pending_fix(&mut map, &id, now).expect("live id resolves");
+        assert_eq!(taken.agent, AgentKind::ClaudeCode);
+        // One-shot: the entry is gone, so a second approval with the same id fails.
+        assert!(map.is_empty());
+        assert!(take_valid_pending_fix(&mut map, &id, now).is_none());
+    }
+
+    #[test]
+    fn take_valid_pending_fix_rejects_unknown_id() {
+        let mut map = HashMap::new();
+        let now = Instant::now();
+        let _present = insert_pending(&mut map, AgentKind::Codex, now);
+        // A different, never-issued id is rejected without disturbing the map.
+        let unknown = uuid::Uuid::new_v4();
+        assert!(take_valid_pending_fix(&mut map, &unknown, now).is_none());
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn take_valid_pending_fix_rejects_expired_id() {
+        let mut map = HashMap::new();
+        let created = Instant::now();
+        let id = insert_pending(&mut map, AgentKind::Aider, created);
+        // Simulate "now" past the TTL: the id is no longer applyable...
+        let later = created + FIX_PROPOSAL_TTL + Duration::from_secs(1);
+        assert!(take_valid_pending_fix(&mut map, &id, later).is_none());
+        // ...and the expired entry is removed in passing (no replay later).
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn prune_pending_fixes_drops_expired_entries() {
+        let mut map = HashMap::new();
+        let base = Instant::now();
+        let fresh = insert_pending(&mut map, AgentKind::ClaudeCode, base);
+        let stale = insert_pending(
+            &mut map,
+            AgentKind::Codex,
+            base - FIX_PROPOSAL_TTL - Duration::from_secs(1),
+        );
+        prune_pending_fixes(&mut map, base);
+        assert!(map.contains_key(&fresh));
+        assert!(!map.contains_key(&stale));
+    }
+
+    #[test]
+    fn prune_pending_fixes_evicts_oldest_when_over_capacity() {
+        let mut map = HashMap::new();
+        let base = Instant::now();
+        // Fill to capacity with staggered, non-expired timestamps (oldest first).
+        let mut ids = Vec::new();
+        for i in 0..MAX_PENDING_FIXES {
+            let created = base - Duration::from_secs((MAX_PENDING_FIXES - i) as u64);
+            ids.push(insert_pending(&mut map, AgentKind::ClaudeCode, created));
+        }
+        assert_eq!(map.len(), MAX_PENDING_FIXES);
+        // Pruning at capacity makes room for one more by evicting the oldest.
+        prune_pending_fixes(&mut map, base);
+        assert!(map.len() < MAX_PENDING_FIXES);
+        assert!(!map.contains_key(&ids[0]), "oldest entry should be evicted");
+    }
+
+    #[test]
+    fn agent_apply_supported_reads_the_registry_profile() {
+        // Claude Code is drivable + apply-capable per the registry.
+        assert!(agent_apply_supported(&AgentKind::ClaudeCode));
+        // Windsurf has no CLI -> apply_supported = false.
+        assert!(!agent_apply_supported(&AgentKind::Windsurf));
+        // Untagged kinds have no row, so they can't apply.
+        assert!(!agent_apply_supported(&AgentKind::Unknown));
+        assert!(!agent_apply_supported(&AgentKind::Other("x".to_string())));
+    }
+
+    #[test]
+    fn push_fix_proposal_command_carries_sections_diff_and_apply_flag() {
+        let id = uuid::Uuid::new_v4();
+        let proposal = sample_proposal();
+        let command = push_fix_proposal_command(id, &proposal, true);
+        match command {
+            OverlayCommand::PushFixProposal {
+                proposal_id,
+                diagnosis,
+                reasoning,
+                fix,
+                diff,
+                apply_supported,
+            } => {
+                assert_eq!(proposal_id, id);
+                assert_eq!(diagnosis, proposal.diagnosis);
+                assert_eq!(reasoning, proposal.reasoning);
+                assert_eq!(fix, proposal.fix);
+                assert!(apply_supported);
+                // The fenced ```diff block is extracted for the UI.
+                let diff = diff.expect("a diff block is present");
+                assert!(diff.starts_with("--- a/x"));
+                assert!(!diff.contains("```"));
+            }
+            other => panic!("expected push_fix_proposal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn push_fix_proposal_command_has_no_diff_for_commands_only_fix() {
+        let id = uuid::Uuid::new_v4();
+        let proposal = FixProposal {
+            diagnosis: "stale cache".to_string(),
+            reasoning: "rebuild".to_string(),
+            fix: "cargo clean\ncargo build".to_string(),
+            raw: String::new(),
+        };
+        let command = push_fix_proposal_command(id, &proposal, false);
+        match command {
+            OverlayCommand::PushFixProposal {
+                diff,
+                apply_supported,
+                ..
+            } => {
+                assert_eq!(diff, None);
+                assert!(!apply_supported);
+            }
+            other => panic!("expected push_fix_proposal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fix_events_are_accepted_by_production_validator() {
+        // The new Fix events must pass the overlay gate (default-allowed in any
+        // UI state) so they reach the handler.
+        let state = parking_lot::Mutex::new(cue_core::overlay_ipc::OverlayUiState::Idle);
+        let requested = validate_and_decode_overlay_line(
+            r#"{"type":"fix_requested","token":"tok","question":"the build fails"}"#,
+            "tok",
+            &state,
+        )
+        .expect("fix_requested should decode");
+        assert!(matches!(requested, OverlayEvent::FixRequested { .. }));
+
+        let responded = validate_and_decode_overlay_line(
+            r#"{"type":"fix_approval_responded","token":"tok","proposal_id":"00000000-0000-0000-0000-000000000000","approved":true}"#,
+            "tok",
+            &state,
+        )
+        .expect("fix_approval_responded should decode");
+        match responded {
+            OverlayEvent::FixApprovalResponded {
+                proposal_id,
+                approved,
+            } => {
+                assert_eq!(proposal_id, uuid::Uuid::nil());
+                assert!(approved);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn answer_card_source_labels_agent_and_passes_overlay_detection() {
+        let id = uuid::Uuid::nil();
+        // No agent attached: base form, no agent signal.
+        let plain = answer_card_source("overlay ask", id, None);
+        assert_eq!(plain, format!("overlay ask ({id})"));
+        assert!(!plain.to_lowercase().contains("agent"));
+
+        // Agent attached: the snake_case kind label is present so the overlay's
+        // `agentLabel` detection relabels the card (here: CLAUDE).
+        let agentic = answer_card_source("overlay ask", id, Some("claude_code"));
+        assert!(agentic.contains("claude_code"));
+        assert!(agentic.to_lowercase().contains("agent"));
+        assert!(agentic.contains(&id.to_string()));
+    }
+
+    #[test]
+    fn resume_recoverable_error_matches_too_large_and_not_found_classes() {
+        // Too-large class — the agents' real overflow phrasings.
+        assert!(is_resume_recoverable_error("Prompt is too long"));
+        assert!(is_resume_recoverable_error("Error: conversation too long"));
+        assert!(is_resume_recoverable_error("exceeds the context window"));
+        assert!(is_resume_recoverable_error(
+            "206453 tokens > 200000 maximum"
+        ));
+        // Not-resumable class — pinned session id can't be loaded by the CLI.
+        assert!(is_resume_recoverable_error(
+            "No conversation found with session ID: 12dea178-…"
+        ));
+        assert!(is_resume_recoverable_error("session not found"));
+        assert!(is_resume_recoverable_error("invalid session id"));
+        // Resume-incompatibility class (CAPTURED LIVE): the persisted transcript
+        // references tools the headless resume context doesn't load → retry fresh.
+        assert!(is_resume_recoverable_error(
+            r#"400 {"type":"error","error":{"type":"invalid_request_error","message":"Tool reference 'TaskCreate' not found in available tools"}}"#
+        ));
+        assert!(is_resume_recoverable_error(
+            "Tool reference 'Foo' not found in available tools"
+        ));
+        // Non-recoverable: auth / missing binary / generic — must NOT retry
+        // fresh (a fresh session wouldn't fix these). In particular "command not
+        // found: claude" must NOT match the tool-incompatibility class.
+        assert!(!is_resume_recoverable_error("not signed in"));
+        assert!(!is_resume_recoverable_error("command not found: claude"));
+        assert!(!is_resume_recoverable_error(
+            "rate limited, try again later"
+        ));
+        assert!(!is_resume_recoverable_error(""));
+    }
+
+    #[test]
+    fn truncate_reason_collapses_whitespace_and_caps_length() {
+        assert_eq!(truncate_reason("  a   b\n c "), "a b c");
+        let long = "x".repeat(200);
+        let out = truncate_reason(&long);
+        assert!(out.chars().count() <= 81, "capped to ~80 + ellipsis");
+        assert!(out.ends_with('…'));
     }
 }

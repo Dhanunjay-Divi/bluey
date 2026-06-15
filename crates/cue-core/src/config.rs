@@ -64,6 +64,35 @@ pub struct CueSettings {
     /// Codex Stage 24: persisted disguise mode (none / activity / terminal / settings).
     #[serde(default = "default_disguise_mode")]
     pub disguise_mode: String,
+
+    /// Agent bridge: global consent to read other agents' session history.
+    /// Off by default — reading a prior agent session requires opt-in.
+    #[serde(default)]
+    pub allow_agent_session_history: bool,
+    /// Agent bridge: the attached coding agent, as a snake_case [`AgentKind`]
+    /// label (e.g. "claude_code"). `None` means no agent is attached and
+    /// answers route through Bluey's normal providers.
+    #[serde(default)]
+    pub attached_agent: Option<String>,
+    /// Agent bridge: the session id to resume on the attached agent, if the
+    /// user attached with a session to continue. `None` means start a fresh
+    /// session. Cleared on detach.
+    #[serde(default)]
+    pub attached_session: Option<String>,
+
+    /// Agent bridge: vendors for which the user has acknowledged the BYOT
+    /// billing disclosure. Each entry is a lowercase `vendor_short` string
+    /// from the cloud registry row (e.g. `"anthropic"`, `"codex_cloud"`).
+    /// The daemon refuses to mark a BYOT (`BillingModel::ApiCredits`) cloud
+    /// agent attached until its vendor appears in this list — that's how the
+    /// disclosure modal is unbypassable.
+    ///
+    /// Empty by default. Once a user acknowledges a vendor's disclosure, the
+    /// vendor stays in this list across daemon restarts so they aren't
+    /// re-prompted on every launch. Removed when the user detaches and
+    /// explicitly clears their stored credential.
+    #[serde(default)]
+    pub accepted_byot_vendors: Vec<String>,
 }
 
 impl Default for CueSettings {
@@ -81,6 +110,10 @@ impl Default for CueSettings {
             auto_disguise_prompted: false,
             auto_disguise_enabled: false,
             disguise_mode: "activity".to_string(),
+            allow_agent_session_history: false,
+            attached_agent: None,
+            attached_session: None,
+            accepted_byot_vendors: Vec::new(),
         }
     }
 }
@@ -142,4 +175,67 @@ fn write_private_json<T: Serialize>(path: &std::path::Path, value: &T) -> Result
 
 fn default_disguise_mode() -> String {
     "activity".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_settings_without_agent_fields_still_load() {
+        // A config written before the agent-bridge fields existed must still
+        // deserialize, defaulting the new fields.
+        let legacy = r#"{
+            "default_model": "Bluey Auto",
+            "default_mode": "General",
+            "answer_style": null,
+            "overlay_opacity": 0.9,
+            "audio_system_enabled": true,
+            "audio_microphone_enabled": true,
+            "cloud_sync_enabled": false,
+            "retention_days": 30,
+            "updated_at": "0"
+        }"#;
+        let settings: CueSettings = serde_json::from_str(legacy).expect("legacy config loads");
+        assert!(!settings.allow_agent_session_history);
+        assert_eq!(settings.attached_agent, None);
+        assert_eq!(settings.attached_session, None);
+    }
+
+    #[test]
+    fn agent_fields_roundtrip_through_json() {
+        let settings = CueSettings {
+            allow_agent_session_history: true,
+            attached_agent: Some("claude_code".to_string()),
+            attached_session: Some("sess-42".to_string()),
+            ..CueSettings::default()
+        };
+        let json = serde_json::to_string(&settings).expect("serialize");
+        let parsed: CueSettings = serde_json::from_str(&json).expect("deserialize");
+        assert!(parsed.allow_agent_session_history);
+        assert_eq!(parsed.attached_agent.as_deref(), Some("claude_code"));
+        assert_eq!(parsed.attached_session.as_deref(), Some("sess-42"));
+    }
+
+    #[test]
+    fn legacy_settings_with_agent_but_no_session_still_load() {
+        // A config written after `attached_agent` existed but before
+        // `attached_session` was added must still deserialize, defaulting the
+        // session to `None`.
+        let legacy = r#"{
+            "default_model": "Bluey Auto",
+            "default_mode": "General",
+            "answer_style": null,
+            "overlay_opacity": 0.9,
+            "audio_system_enabled": true,
+            "audio_microphone_enabled": true,
+            "cloud_sync_enabled": false,
+            "retention_days": 30,
+            "updated_at": "0",
+            "attached_agent": "claude_code"
+        }"#;
+        let settings: CueSettings = serde_json::from_str(legacy).expect("legacy config loads");
+        assert_eq!(settings.attached_agent.as_deref(), Some("claude_code"));
+        assert_eq!(settings.attached_session, None);
+    }
 }

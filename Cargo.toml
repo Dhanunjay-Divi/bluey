@@ -9,6 +9,7 @@ members = [
     "crates/cue-rag",
     "crates/cue-cloud-client",
     "crates/cue-router",
+    "crates/cue-agent-bridge",
 ]
 resolver = "2"
 
@@ -50,6 +51,7 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 url = "2.5"
 wiremock = "0.6"
 obfstr = "0.4"
+tempfile = "3"
 
 [profile.release]
 # Client hardening / distribution posture:

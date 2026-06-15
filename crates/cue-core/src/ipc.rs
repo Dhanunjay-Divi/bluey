@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    sanitize_observability_id, ActionItem, AiRuntimeStatus, AnswerRequest, AnswerResponse,
-    AnswerStreamEvent, AudioPipelineStatus, CloudSyncStatus, ContextArtifact, CueCard, DaemonState,
-    MeetingRecap, MemoryHit, OverlayPosition, Speaker,
+    sanitize_observability_id, ActionItem, AgentConnectorInfo, AgentSessionSummary, AgentSummary,
+    AiRuntimeStatus, AnswerRequest, AnswerResponse, AnswerStreamEvent, AudioPipelineStatus,
+    CloudSyncStatus, ContextArtifact, CueCard, DaemonState, MeetingRecap, MemoryHit,
+    OverlayPosition, Speaker,
 };
 
 pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:57321";
@@ -88,6 +89,26 @@ pub enum DaemonRequest {
     CloudSyncNow,
     Recap,
     ActionItems,
+    /// Discover installed coding agents and summarize each (capability,
+    /// connectors, sessions, attach state).
+    AgentList,
+    /// Attach `kind` as the active answer-routing agent. `session_id` optionally
+    /// pins a prior session to resume (validated in, persisted later).
+    AgentAttach {
+        kind: String,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    /// Clear the active agent; answers fall back to Bluey's normal providers.
+    AgentDetach,
+    /// List one agent's prior sessions (gated on session-history consent).
+    AgentSessions {
+        kind: String,
+    },
+    /// List one agent's inherited MCP connectors (shape + readiness only).
+    AgentConnectors {
+        kind: String,
+    },
 }
 
 impl DaemonRequest {
@@ -158,6 +179,15 @@ pub enum DaemonResponse {
     CloudStatus {
         status: CloudSyncStatus,
     },
+    Agents {
+        agents: Vec<AgentSummary>,
+    },
+    AgentSessions {
+        sessions: Vec<AgentSessionSummary>,
+    },
+    AgentConnectors {
+        connectors: Vec<AgentConnectorInfo>,
+    },
     Error {
         message: String,
     },
@@ -194,5 +224,84 @@ mod tests {
     #[test]
     fn shutdown_is_detected_inside_trace_envelope() {
         assert!(DaemonRequest::Shutdown.with_trace_id("trace").is_shutdown());
+    }
+
+    #[test]
+    fn agent_request_variants_round_trip() {
+        let cases = [
+            DaemonRequest::AgentList,
+            DaemonRequest::AgentAttach {
+                kind: "claude_code".to_string(),
+                session_id: Some("abc".to_string()),
+            },
+            DaemonRequest::AgentDetach,
+            DaemonRequest::AgentSessions {
+                kind: "cursor".to_string(),
+            },
+            DaemonRequest::AgentConnectors {
+                kind: "codex".to_string(),
+            },
+        ];
+        for request in cases {
+            let json = serde_json::to_string(&request).expect("serialize request");
+            let decoded: DaemonRequest = serde_json::from_str(&json).expect("decode request");
+            assert_eq!(
+                serde_json::to_string(&decoded).expect("re-serialize"),
+                json,
+                "request variant should round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_attach_session_id_defaults_when_absent() {
+        let json = r#"{"type":"agent_attach","kind":"claude_code"}"#;
+        let decoded: DaemonRequest = serde_json::from_str(json).expect("decode");
+        match decoded {
+            DaemonRequest::AgentAttach { kind, session_id } => {
+                assert_eq!(kind, "claude_code");
+                assert_eq!(session_id, None);
+            }
+            other => panic!("expected agent_attach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_response_variants_round_trip() {
+        let agents = DaemonResponse::Agents {
+            agents: vec![AgentSummary {
+                kind: "claude_code".to_string(),
+                display_name: "Claude Code".to_string(),
+                capability: "drive".to_string(),
+                connector_count: 2,
+                ready_connector_count: 1,
+                session_count: Some(4),
+                attached: true,
+            }],
+        };
+        let sessions = DaemonResponse::AgentSessions {
+            sessions: vec![AgentSessionSummary {
+                id: "s1".to_string(),
+                title: Some("Prep".to_string()),
+                updated_at: "1717000000".to_string(),
+                project: None,
+            }],
+        };
+        let connectors = DaemonResponse::AgentConnectors {
+            connectors: vec![AgentConnectorInfo {
+                name: "filesystem".to_string(),
+                auth_tier: "env_auth".to_string(),
+                ready: true,
+            }],
+        };
+        for response in [agents, sessions, connectors] {
+            let json = serde_json::to_string(&response).expect("serialize response");
+            let decoded: DaemonResponse = serde_json::from_str(&json).expect("decode response");
+            assert_eq!(
+                serde_json::to_string(&decoded).expect("re-serialize"),
+                json,
+                "response variant should round-trip"
+            );
+        }
     }
 }

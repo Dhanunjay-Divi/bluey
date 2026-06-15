@@ -1097,6 +1097,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52560adf09603e58c9a7ee1fe1dcb95a16927b17c127f0ac02d6e768a0e25bc1"
 
 [[package]]
+name = "cue-agent-bridge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "base64 0.22.1",
+ "futures-util",
+ "keyring",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "url",
+ "wiremock",
+]
+
+[[package]]
 name = "cue-cli"
 version = "0.1.10"
 dependencies = [
@@ -1104,6 +1126,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "cue-agent-bridge",
  "cue-cloud-client",
  "cue-core",
  "ed25519-dalek",
@@ -1167,6 +1190,7 @@ dependencies = [
  "chrono",
  "clap",
  "cpal",
+ "cue-agent-bridge",
  "cue-cloud-client",
  "cue-core",
  "cue-llm",

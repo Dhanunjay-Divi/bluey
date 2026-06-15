@@ -1,0 +1,3 @@
+{"role":"user","text":"What does the auth service do?"}
+{"role":"assistant","text":"It issues and validates JWTs for the API gateway."}
+{"role":"system","text":"session-meta: id=abc123"}

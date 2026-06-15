@@ -362,6 +362,7 @@ private final class ComposerTextView: NSTextView {
         super.keyDown(with: event)
     }
 
+    // Clicking the text view must make it first responder so keystrokes land.
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         super.mouseDown(with: event)
@@ -387,6 +388,8 @@ private final class ComposerTextView: NSTextView {
     }
 }
 
+/// The rounded background behind the composer. Clicking anywhere on it (not just
+/// the text glyphs) focuses the composer, so the whole bar reads as one input.
 private final class ComposerSurfaceView: NSView {
     weak var composer: ComposerTextView?
 
@@ -447,6 +450,96 @@ private struct OverlaySessionItem {
     let isActive: Bool
 }
 
+// MARK: - Agent-bridge wire DTOs (Slice 5b)
+//
+// Shape-only mirrors of crates/cue-core/src/agent_ui.rs. They carry a
+// connector's name / auth tier / readiness and a session id / title /
+// timestamp — never an env value, token, or message body. Field names match
+// the Rust serde `snake_case` form exactly so JSON decodes one-to-one.
+
+private struct AgentSummary {
+    let kind: String
+    let displayName: String
+    /// snake_case capability: drive / read_only / needs_trust / needs_reauth /
+    /// cloud_blocked.
+    let capability: String
+    let connectorCount: Int
+    let readyConnectorCount: Int
+    let sessionCount: Int?
+    let attached: Bool
+}
+
+private struct AgentSessionSummary {
+    let id: String
+    let title: String?
+    let updatedAt: String
+}
+
+private struct AgentConnectorInfo {
+    let name: String
+    /// snake_case auth tier: env_auth / hosted_oauth / none.
+    let authTier: String
+    let ready: Bool
+}
+
+/// Capability presentation: the snake_case `capability` string mapped to a
+/// drawer chip label, accent color, and a "dimmed / non-tappable" flag for
+/// `cloud_blocked`. Colors come straight from BlueyTheme (PLAN §9 surface 1).
+private struct AgentCapability {
+    let label: String
+    let color: NSColor
+    let dimmed: Bool
+
+    init(_ raw: String) {
+        switch raw {
+        case "drive":
+            label = "live"
+            color = BlueyTheme.green
+            dimmed = false
+        case "read_only":
+            label = "history only"
+            color = BlueyTheme.textDim
+            dimmed = false
+        case "needs_trust":
+            label = "needs trust"
+            color = BlueyTheme.warning
+            dimmed = false
+        case "needs_reauth":
+            label = "re-auth"
+            color = BlueyTheme.warning
+            dimmed = false
+        case "cloud_blocked":
+            label = "unavailable"
+            color = NSColor(red: 1.0, green: 0.44, blue: 0.40, alpha: 1.0)
+            dimmed = true
+        default:
+            label = raw.replacingOccurrences(of: "_", with: " ")
+            color = BlueyTheme.textDim
+            dimmed = false
+        }
+    }
+}
+
+/// Compact uppercase label for an agent kind, used on the pill-adjacent
+/// header badge and the agent-answer card role badge (CLAUDE / CURSOR / …).
+private func agentShortLabel(_ kind: String) -> String {
+    switch kind {
+    case "claude_code": return "CLAUDE"
+    case "cursor": return "CURSOR"
+    case "codex": return "CODEX"
+    case "gemini": return "GEMINI"
+    case "windsurf": return "WINDSURF"
+    case "aider": return "AIDER"
+    default:
+        // Strip a trailing "_code" / "_cli" and uppercase the first token.
+        let base = kind
+            .replacingOccurrences(of: "_code", with: "")
+            .replacingOccurrences(of: "_cli", with: "")
+        let head = base.split(separator: "_").first.map(String.init) ?? base
+        return head.uppercased()
+    }
+}
+
 /// Inbound commands from the daemon.
 private enum OverlayCommand {
     case ping
@@ -465,8 +558,25 @@ private enum OverlayCommand {
     case transcriptFinal(source: String, text: String)
     case pushCard(CueCard)
     case updateCard(id: String, body: String, done: Bool, costLabel: String?, artifact: OverlayArtifact?)
+    case setAgents([AgentSummary])
+    case setAgentSessions(kind: String, sessions: [AgentSessionSummary])
+    case setAgentConnectors(kind: String, connectors: [AgentConnectorInfo])
+    case pushFixProposal(FixProposal)
     case shutdown
     case unknown(String)
+}
+
+/// A review-gated Fix proposal pushed by the daemon (Fix-button slice F4).
+/// Mirrors `OverlayCommand::PushFixProposal` in crates/cue-core/src/overlay.rs.
+/// `diff` is absent when the agent only proposed commands (no unified diff);
+/// `applySupported` is false for agents that cannot be driven to apply.
+private struct FixProposal {
+    let proposalId: String
+    let diagnosis: String
+    let reasoning: String
+    let fix: String
+    let diff: String?
+    let applySupported: Bool
 }
 
 private func parseCommand(_ line: String) -> OverlayCommand {
@@ -545,6 +655,59 @@ private func parseCommand(_ line: String) -> OverlayCommand {
             artifact = try? JSONDecoder().decode(OverlayArtifact.self, from: artifactData)
         }
         return .updateCard(id: id, body: body, done: done, costLabel: costLabel, artifact: artifact)
+    case "set_agents":
+        let rawAgents = obj["agents"] as? [[String: Any]] ?? []
+        let agents = rawAgents.map { item in
+            AgentSummary(
+                kind: item["kind"] as? String ?? "",
+                displayName: item["display_name"] as? String ?? "Coding agent",
+                capability: item["capability"] as? String ?? "read_only",
+                connectorCount: item["connector_count"] as? Int ?? 0,
+                readyConnectorCount: item["ready_connector_count"] as? Int ?? 0,
+                sessionCount: item["session_count"] as? Int,
+                attached: item["attached"] as? Bool ?? false
+            )
+        }.filter { !$0.kind.isEmpty }
+        return .setAgents(agents)
+    case "set_agent_sessions":
+        let kind = obj["kind"] as? String ?? ""
+        let rawSessions = obj["sessions"] as? [[String: Any]] ?? []
+        let sessions = rawSessions.map { item in
+            AgentSessionSummary(
+                id: item["id"] as? String ?? "",
+                title: item["title"] as? String,
+                updatedAt: item["updated_at"] as? String ?? ""
+            )
+        }.filter { !$0.id.isEmpty }
+        return .setAgentSessions(kind: kind, sessions: sessions)
+    case "set_agent_connectors":
+        let kind = obj["kind"] as? String ?? ""
+        let rawConnectors = obj["connectors"] as? [[String: Any]] ?? []
+        let connectors = rawConnectors.map { item in
+            AgentConnectorInfo(
+                name: item["name"] as? String ?? "connector",
+                authTier: item["auth_tier"] as? String ?? "none",
+                ready: item["ready"] as? Bool ?? false
+            )
+        }
+        return .setAgentConnectors(kind: kind, connectors: connectors)
+    case "push_fix_proposal":
+        // Defensive decode: an unknown/missing proposal_id is unusable (the
+        // approve/reject echo is id-matched upstream), so drop the command
+        // rather than render an un-actionable card. The diff is optional and
+        // is omitted from the wire form when absent -> nil.
+        guard let proposalId = obj["proposal_id"] as? String, !proposalId.isEmpty else {
+            return .unknown(line)
+        }
+        let proposal = FixProposal(
+            proposalId: proposalId,
+            diagnosis: obj["diagnosis"] as? String ?? "",
+            reasoning: obj["reasoning"] as? String ?? "",
+            fix: obj["fix"] as? String ?? "",
+            diff: obj["diff"] as? String,
+            applySupported: obj["apply_supported"] as? Bool ?? false
+        )
+        return .pushFixProposal(proposal)
     default:
         return .unknown(line)
     }
@@ -721,6 +884,57 @@ private func emitSessionRename(id: String, title: String) {
 
 private func emitSessionDelete(id: String) {
     emitEvent(["type": "session_delete_requested", "id": id])
+}
+
+// MARK: - Agent-bridge emit helpers (Slice 5b)
+//
+// Each event is a dict tagged with "type", matching OverlayEvent's serde
+// `snake_case` form in crates/cue-core/src/overlay.rs. Optional fields are
+// omitted (not sent as null) so the daemon's `#[serde(default)]` applies.
+
+private func emitAgentListRequested() {
+    emitEvent(["type": "agent_list_requested"])
+}
+
+private func emitAgentAttachRequested(kind: String, sessionId: String?) {
+    var p: [String: Any] = ["type": "agent_attach_requested", "kind": kind]
+    if let sessionId, !sessionId.isEmpty { p["session_id"] = sessionId }
+    emitEvent(p)
+}
+
+private func emitAgentDetachRequested() {
+    emitEvent(["type": "agent_detach_requested"])
+}
+
+private func emitAgentSessionsRequested(kind: String) {
+    emitEvent(["type": "agent_sessions_requested", "kind": kind])
+}
+
+private func emitAgentConnectorsRequested(kind: String) {
+    emitEvent(["type": "agent_connectors_requested", "kind": kind])
+}
+
+private func emitConnectorReauthRequested(kind: String, name: String) {
+    emitEvent(["type": "connector_reauth_requested", "kind": kind, "name": name])
+}
+
+// MARK: - Fix-button emit helpers (Slice F4)
+//
+// Mirror OverlayEvent::FixRequested / FixApprovalResponded. `card_id` is
+// omitted (not null) when nil so the daemon's `#[serde(default)]` applies.
+
+private func emitFixRequested(cardId: String?, question: String) {
+    var p: [String: Any] = ["type": "fix_requested", "question": question]
+    if let cardId, !cardId.isEmpty { p["card_id"] = cardId }
+    emitEvent(p)
+}
+
+private func emitFixApprovalResponded(proposalId: String, approved: Bool) {
+    emitEvent([
+        "type": "fix_approval_responded",
+        "proposal_id": proposalId,
+        "approved": approved,
+    ])
 }
 
 private func emitCardRendered(id: String) {
@@ -1056,6 +1270,17 @@ private final class PillView: NSView {
     var onEnd: (() -> Void)?
     private var runState: PillRunState = .ready
 
+    /// Small cyan agent glyph shown at the pill's trailing edge while a coding
+    /// agent is attached. Glyph-only — no text, so the pill never truncates
+    /// (agent-bridge Slice 5b, PLAN §9 surface 4).
+    var agentAttached: Bool = false {
+        didSet {
+            guard agentAttached != oldValue else { return }
+            agentGlyph.isHidden = !agentAttached
+            needsLayout = true
+        }
+    }
+
     private let logoMark = BlueyLogoView()
     private let wordmarkView = BlueyWordmarkView()
     private let dotView = NSView()
@@ -1063,6 +1288,7 @@ private final class PillView: NSView {
     private let styleButton = NSButton(title: "", target: nil, action: nil)
     private let runButton = NSButton(title: "", target: nil, action: nil)
     private let endButton = NSButton(title: "", target: nil, action: nil)
+    private let agentGlyph = NSImageView()
     private var backgroundOpacity: CGFloat = 0.94
 
     override init(frame frameRect: NSRect) {
@@ -1117,6 +1343,22 @@ private final class PillView: NSView {
         controlRail.addSubview(runButton)
         controlRail.addSubview(endButton)
         updateRunStateDisplay()
+
+        // Agent-bridge: trailing-edge agent badge, hidden until an agent attaches.
+        agentGlyph.wantsLayer = true
+        agentGlyph.isHidden = true
+        agentGlyph.imageScaling = .scaleProportionallyDown
+        agentGlyph.contentTintColor = BlueyTheme.cyan
+        agentGlyph.layer?.backgroundColor = BlueyTheme.cyan.withAlphaComponent(0.16).cgColor
+        agentGlyph.layer?.cornerRadius = 9
+        agentGlyph.layer?.borderWidth = 1
+        agentGlyph.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.55).cgColor
+        agentGlyph.toolTip = "A coding agent is attached"
+        if let image = symbolImage("cpu") {
+            image.isTemplate = true
+            agentGlyph.image = image
+        }
+        addSubview(agentGlyph)
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -1140,9 +1382,21 @@ private final class PillView: NSView {
         runButton.frame = NSRect(x: 23.5, y: 2, width: buttonSide, height: buttonSide)
         endButton.frame = NSRect(x: 42, y: 2, width: buttonSide, height: buttonSide)
 
+        // Agent-bridge: glyph-only agent badge tucked just left of the control
+        // rail when an agent is attached, so the pill never truncates.
+        let glyphSide: CGFloat = 18
+        if agentAttached {
+            let glyphX = controlRail.frame.minX - glyphSide - 6
+            agentGlyph.frame = NSRect(
+                x: glyphX, y: (bounds.height - glyphSide) / 2,
+                width: glyphSide, height: glyphSide)
+            agentGlyph.layer?.cornerRadius = glyphSide / 2
+        }
+
         wordmarkView.frame = NSRect(x: 36, y: (bounds.height - 18) / 2 + 1, width: 50, height: 18)
         let dotSize: CGFloat = 7
-        let dotX = min(wordmarkView.frame.maxX + 2, controlRail.frame.minX - dotSize - 7)
+        let trailingLimit = agentAttached ? agentGlyph.frame.minX - 6 : controlRail.frame.minX - 7
+        let dotX = min(wordmarkView.frame.maxX + 2, trailingLimit - dotSize)
         dotView.frame = NSRect(x: dotX, y: bounds.midY + 4.5, width: dotSize, height: dotSize)
         dotView.layer?.cornerRadius = dotSize / 2
     }
@@ -1318,6 +1572,15 @@ private final class PillView: NSView {
 
 // MARK: - Card feed view
 
+/// The user's one-shot decision on a Fix proposal card (Slice F4). `pending`
+/// shows Approve/Reject; the terminal states disable both buttons so a proposal
+/// can never be double-submitted.
+private enum FixProposalState: Equatable {
+    case pending
+    case applying
+    case discarded
+}
+
 private struct RenderedCard {
     let id: String
     let kind: String
@@ -1326,6 +1589,14 @@ private struct RenderedCard {
     var done: Bool
     var costLabel: String?
     var artifact: OverlayArtifact?
+    /// Free-form provenance from CueCard.source (e.g. "claude_code agent").
+    /// When an answer card's source names a coding agent, the role badge and
+    /// status reflect that agent instead of BLUEY (agent-bridge Slice 5b).
+    var source: String?
+    /// Set only for kind == "fix_proposal" cards (Slice F4): the proposal
+    /// payload plus the user's pending/applying/discarded decision.
+    var fixProposal: FixProposal? = nil
+    var fixState: FixProposalState = .pending
 }
 
 private enum CanvasKind {
@@ -1391,6 +1662,14 @@ private final class FeedView: NSView {
     private let emptyState = NSView()
     var onTranscript: ((RenderedCard) -> Void)?
     var onOpenURL: ((URL) -> Void)?
+    /// Fired when the user taps **Fix** on an agent answer card (Slice F4).
+    /// Carries the source card id + its body text (the problem to fix).
+    var onFixRequested: ((_ cardId: String, _ question: String) -> Void)?
+    /// Interactive controls inside cards (Fix / Approve / Reject buttons). The
+    /// feed/workspace region is normally click-through; the panel consults
+    /// `hasInteractiveControl(at:)` so only these button frames capture the
+    /// mouse, leaving the rest of the feed transparent to the app underneath.
+    private let interactiveControls = NSHashTable<NSView>.weakObjects()
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1421,6 +1700,30 @@ private final class FeedView: NSView {
         ])
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    /// Register a button so the panel's pass-through tracking treats its frame
+    /// as interactive. Enabled state is re-checked live at hit-test time, so a
+    /// disabled (already-submitted) button stops capturing the mouse.
+    private func registerInteractive(_ control: NSView) {
+        interactiveControls.add(control)
+    }
+
+    /// True when `point` (in FeedView coordinates) lands on an enabled card
+    /// button. Used by ExpandedPanelView.isInteractiveAtScreenPoint so card
+    /// affordances are clickable without making the whole feed opaque to mouse
+    /// events. Disabled buttons (terminal proposal states) return false.
+    func hasInteractiveControl(at point: NSPoint) -> Bool {
+        guard let hit = hitTest(point) else { return false }
+        var node: NSView? = hit
+        while let current = node {
+            if interactiveControls.contains(current) {
+                if let control = current as? NSControl { return control.isEnabled }
+                return true
+            }
+            node = current.superview
+        }
+        return false
+    }
 
     func push(_ card: RenderedCard) {
         if normalizedCardKind(card.kind) == "transcript" {
@@ -1491,10 +1794,28 @@ private final class FeedView: NSView {
 
     private func removeAllCards() {
         cards.removeAll()
+        interactiveControls.removeAllObjects()
         for view in stack.arrangedSubviews {
             stack.removeArrangedSubview(view)
             view.removeFromSuperview()
         }
+    }
+
+    /// Transition a Fix proposal card to a terminal/transient state (Slice F4)
+    /// and rebuild just its subview so the buttons reflect the new state. The
+    /// proposal id doubles as the card id, so we match on it directly.
+    private func setFixState(proposalId: String, to state: FixProposalState) {
+        guard let idx = cards.firstIndex(where: {
+            $0.kind == "fix_proposal" && $0.id == proposalId
+        }) else { return }
+        guard case .pending = cards[idx].fixState else { return } // one-shot
+        cards[idx].fixState = state
+        let existing = stack.arrangedSubviews[idx]
+        stack.removeArrangedSubview(existing)
+        existing.removeFromSuperview()
+        let view = makeCardView(cards[idx])
+        stack.insertArrangedSubview(view, at: idx)
+        view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
     }
 
     private func configureEmptyState() {
@@ -1577,11 +1898,17 @@ private final class FeedView: NSView {
     }
 
     private func makeCardView(_ card: RenderedCard) -> NSView {
+        // Agent-bridge: review-gated Fix proposals render as their own card.
+        if normalizedCardKind(card.kind) == "fix_proposal", let proposal = card.fixProposal {
+            return makeFixProposalView(proposal, state: card.fixState)
+        }
         let kind = normalizedCardKind(card.kind)
         let accent = BlueyTheme.accent(for: kind)
         let rightAligned = isUserSide(card)
         let answerLike = kind == "answer"
         let signInLike = loginURL(from: card) != nil
+        // Agent answers (final, not streaming) get a compact Fix affordance.
+        let showFix = answerLike && !signInLike && card.done && agentLabel(from: card.source) != nil
         let row = NSView()
         row.translatesAutoresizingMaskIntoConstraints = false
 
@@ -1731,6 +2058,23 @@ private final class FeedView: NSView {
                 signInButton.widthAnchor.constraint(equalToConstant: 150),
                 signInButton.heightAnchor.constraint(equalToConstant: 38),
             ])
+        } else if showFix {
+            // Compact cyan "Fix" affordance under an agent answer. Asks the
+            // attached agent to PROPOSE a fix for this answer (Slice F4).
+            let fixButton = NSButton(title: "Fix", target: self, action: #selector(fixButtonClicked(_:)))
+            fixButton.translatesAutoresizingMaskIntoConstraints = false
+            fixButton.identifier = NSUserInterfaceItemIdentifier(card.id)
+            fixButton.toolTip = "Ask your agent to propose a fix for this answer"
+            styleFixButton(fixButton)
+            bubble.addSubview(fixButton)
+            registerInteractive(fixButton)
+            constraints.append(contentsOf: [
+                fixButton.topAnchor.constraint(equalTo: bodyLabel.bottomAnchor, constant: 10),
+                fixButton.leadingAnchor.constraint(equalTo: metaLabel.leadingAnchor),
+                fixButton.heightAnchor.constraint(equalToConstant: 26),
+                fixButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 64),
+                fixButton.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -12),
+            ])
         } else {
             constraints.append(bodyLabel.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -12))
         }
@@ -1808,9 +2152,340 @@ private final class FeedView: NSView {
         onOpenURL?(url)
     }
 
+    /// Small cyan-accented pill used for the per-answer **Fix** button. Matches
+    /// the agent UI's compact-control look (Slice 5b) at a smaller scale.
+    private func styleFixButton(_ button: NSButton) {
+        button.isBordered = false
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 13
+        button.layer?.backgroundColor = BlueyTheme.cyanSoft.cgColor
+        button.layer?.borderWidth = 1
+        button.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.45).cgColor
+        button.font = NSFont.systemFont(ofSize: 11, weight: .bold)
+        button.contentTintColor = BlueyTheme.cyan
+        if let image = symbolImage("wrench.and.screwdriver") {
+            image.isTemplate = true
+            button.image = image
+            button.imagePosition = .imageLeading
+            button.imageHugsTitle = true
+            button.imageScaling = .scaleProportionallyDown
+        }
+        button.attributedTitle = NSAttributedString(
+            string: "Fix",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 11, weight: .bold),
+                .foregroundColor: BlueyTheme.cyan,
+            ])
+        button.alignment = .center
+    }
+
+    @objc private func fixButtonClicked(_ sender: NSButton) {
+        guard let cardId = sender.identifier?.rawValue,
+              let card = cards.first(where: { $0.id == cardId })
+        else { return }
+        onFixRequested?(cardId, card.body)
+    }
+
+    // MARK: Fix proposal card (Slice F4)
+
+    /// Render a review-gated Fix proposal: DIAGNOSIS / REASONING / FIX sections
+    /// (FIX shown as a monospace diff block when a unified diff is present) plus
+    /// Approve / Reject. Approve is disabled when the agent can't apply. The
+    /// `state` drives the terminal "Applying…" / "Discarded" presentation.
+    private func makeFixProposalView(_ proposal: FixProposal, state: FixProposalState) -> NSView {
+        let warn = BlueyTheme.warning
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        let bubble = NSView()
+        bubble.wantsLayer = true
+        bubble.layer?.backgroundColor = BlueyTheme.surface.cgColor
+        bubble.layer?.cornerRadius = 14
+        bubble.layer?.borderWidth = 1
+        // A distinct warning/amber accent sets the review-gated proposal apart
+        // from ordinary cyan answer cards.
+        bubble.layer?.borderColor = warn.withAlphaComponent(0.45).cgColor
+        bubble.layer?.shadowColor = NSColor.black.cgColor
+        bubble.layer?.shadowOpacity = 0.16
+        bubble.layer?.shadowRadius = 10
+        bubble.layer?.shadowOffset = NSSize(width: 0, height: -4)
+        bubble.translatesAutoresizingMaskIntoConstraints = false
+
+        let metaLabel = NSTextField(labelWithString: "PROPOSED FIX")
+        metaLabel.font = NSFont.systemFont(ofSize: 11, weight: .bold)
+        metaLabel.textColor = warn
+        metaLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let stateLabel = NSTextField(labelWithString: fixStateBadge(state))
+        stateLabel.font = NSFont.monospacedSystemFont(ofSize: 9.5, weight: .semibold)
+        stateLabel.textColor = BlueyTheme.textDim
+        stateLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        // Vertical content stack: the three labeled sections, then the diff (if
+        // any), then the action row.
+        let content = NSStackView()
+        content.orientation = .vertical
+        content.alignment = .leading
+        content.spacing = 10
+        content.translatesAutoresizingMaskIntoConstraints = false
+
+        // Each section/diff/action fills the content width so wrapping labels
+        // wrap at the bubble edge instead of taking intrinsic width.
+        func addFullWidth(_ view: NSView) {
+            content.addArrangedSubview(view)
+            view.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
+        }
+
+        addFullWidth(makeFixSection(title: "DIAGNOSIS", body: proposal.diagnosis))
+        addFullWidth(makeFixSection(title: "REASONING", body: proposal.reasoning))
+
+        if let diff = proposal.diff, !diff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            addFullWidth(makeFixSectionHeader("FIX"))
+            addFullWidth(makeDiffBlock(diff))
+        } else {
+            addFullWidth(makeFixSection(title: "FIX", body: proposal.fix))
+        }
+
+        let actionRow = makeFixActionRow(proposal: proposal, state: state)
+        addFullWidth(actionRow)
+
+        row.addSubview(bubble)
+        bubble.addSubview(metaLabel)
+        bubble.addSubview(stateLabel)
+        bubble.addSubview(content)
+
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(greaterThanOrEqualTo: bubble.heightAnchor),
+            bubble.topAnchor.constraint(equalTo: row.topAnchor),
+            bubble.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+            bubble.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 8),
+            bubble.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -8),
+
+            metaLabel.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 12),
+            metaLabel.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 14),
+
+            stateLabel.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
+            stateLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
+            stateLabel.leadingAnchor.constraint(greaterThanOrEqualTo: metaLabel.trailingAnchor, constant: 8),
+
+            content.topAnchor.constraint(equalTo: metaLabel.bottomAnchor, constant: 10),
+            content.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 14),
+            content.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
+            content.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -14),
+        ])
+        return row
+    }
+
+    private func fixStateBadge(_ state: FixProposalState) -> String {
+        switch state {
+        case .pending:   return "awaiting review"
+        case .applying:  return "applying…"
+        case .discarded: return "discarded"
+        }
+    }
+
+    private func makeFixSectionHeader(_ title: String) -> NSView {
+        let label = NSTextField(labelWithString: title)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = NSFont.systemFont(ofSize: 10, weight: .heavy)
+        label.textColor = BlueyTheme.cyan
+        return label
+    }
+
+    private func makeFixSection(title: String, body: String) -> NSView {
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.alignment = .leading
+        container.spacing = 3
+        container.translatesAutoresizingMaskIntoConstraints = false
+
+        container.addArrangedSubview(makeFixSectionHeader(title))
+
+        let text = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        let bodyLabel = NSTextField(wrappingLabelWithString: text.isEmpty ? "—" : text)
+        bodyLabel.translatesAutoresizingMaskIntoConstraints = false
+        bodyLabel.font = NSFont.systemFont(ofSize: 12.5, weight: .regular)
+        bodyLabel.textColor = BlueyTheme.text
+        bodyLabel.preferredMaxLayoutWidth = 460
+        container.addArrangedSubview(bodyLabel)
+        bodyLabel.widthAnchor.constraint(equalTo: container.widthAnchor).isActive = true
+        return container
+    }
+
+    /// Monospace diff block. `+`/`-` lines are tinted green/red; hunk headers
+    /// (`@@`) cyan; everything else dim. Plain monospace if coloring fails.
+    private func makeDiffBlock(_ diff: String) -> NSView {
+        let panel = NSView()
+        panel.translatesAutoresizingMaskIntoConstraints = false
+        panel.wantsLayer = true
+        panel.layer?.backgroundColor = BlueyTheme.panelDeep.cgColor
+        panel.layer?.cornerRadius = 8
+        panel.layer?.borderWidth = 1
+        panel.layer?.borderColor = BlueyTheme.hairline.cgColor
+
+        let label = NSTextField(labelWithString: "")
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.attributedStringValue = attributedDiff(diff)
+        label.isEditable = false
+        label.isSelectable = true
+        label.drawsBackground = false
+        label.isBezeled = false
+        label.lineBreakMode = .byClipping
+        label.maximumNumberOfLines = 0
+        label.preferredMaxLayoutWidth = 440
+
+        panel.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.topAnchor.constraint(equalTo: panel.topAnchor, constant: 8),
+            label.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 10),
+            label.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -10),
+            label.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -8),
+        ])
+        return panel
+    }
+
+    private func attributedDiff(_ diff: String) -> NSAttributedString {
+        let mono = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        let result = NSMutableAttributedString()
+        let lines = diff.components(separatedBy: "\n")
+        for (idx, line) in lines.enumerated() {
+            let color: NSColor
+            if line.hasPrefix("+++") || line.hasPrefix("---") {
+                color = BlueyTheme.textDim
+            } else if line.hasPrefix("@@") {
+                color = BlueyTheme.cyan
+            } else if line.hasPrefix("+") {
+                color = BlueyTheme.green
+            } else if line.hasPrefix("-") {
+                color = NSColor(red: 1.0, green: 0.45, blue: 0.45, alpha: 1.0)
+            } else {
+                color = BlueyTheme.textDim
+            }
+            let suffix = idx == lines.count - 1 ? "" : "\n"
+            result.append(NSAttributedString(
+                string: line + suffix,
+                attributes: [.font: mono, .foregroundColor: color]))
+        }
+        return result
+    }
+
+    private func makeFixActionRow(proposal: FixProposal, state: FixProposalState) -> NSView {
+        let container = NSStackView()
+        container.orientation = .vertical
+        container.alignment = .leading
+        container.spacing = 5
+        container.translatesAutoresizingMaskIntoConstraints = false
+
+        let buttonRow = NSStackView()
+        buttonRow.orientation = .horizontal
+        buttonRow.alignment = .centerY
+        buttonRow.spacing = 8
+        buttonRow.translatesAutoresizingMaskIntoConstraints = false
+
+        let pending = { if case .pending = state { return true }; return false }()
+        let approveEnabled = pending && proposal.applySupported
+
+        let approve = NSButton(title: "Approve", target: self, action: #selector(approveFixClicked(_:)))
+        approve.translatesAutoresizingMaskIntoConstraints = false
+        approve.identifier = NSUserInterfaceItemIdentifier(proposal.proposalId)
+        approve.isEnabled = approveEnabled
+        styleFixActionButton(approve, symbol: "checkmark", primary: true, enabled: approveEnabled)
+        buttonRow.addArrangedSubview(approve)
+        registerInteractive(approve)
+
+        let reject = NSButton(title: "Reject", target: self, action: #selector(rejectFixClicked(_:)))
+        reject.translatesAutoresizingMaskIntoConstraints = false
+        reject.identifier = NSUserInterfaceItemIdentifier(proposal.proposalId)
+        reject.isEnabled = pending
+        styleFixActionButton(reject, symbol: "xmark", primary: false, enabled: pending)
+        buttonRow.addArrangedSubview(reject)
+        registerInteractive(reject)
+
+        NSLayoutConstraint.activate([
+            approve.heightAnchor.constraint(equalToConstant: 30),
+            approve.widthAnchor.constraint(greaterThanOrEqualToConstant: 104),
+            reject.heightAnchor.constraint(equalToConstant: 30),
+            reject.widthAnchor.constraint(greaterThanOrEqualToConstant: 96),
+        ])
+
+        container.addArrangedSubview(buttonRow)
+
+        // Caption: explain a disabled Approve, or echo the terminal decision.
+        let captionText: String?
+        switch state {
+        case .pending:
+            captionText = proposal.applySupported
+                ? nil
+                : "This agent can't apply automatically"
+        case .applying:
+            captionText = "Applying… sent to your agent"
+        case .discarded:
+            captionText = "Discarded — nothing was applied"
+        }
+        if let captionText {
+            let caption = NSTextField(labelWithString: captionText)
+            caption.translatesAutoresizingMaskIntoConstraints = false
+            caption.font = NSFont.systemFont(ofSize: 10, weight: .medium)
+            caption.textColor = state == .applying ? BlueyTheme.cyan : BlueyTheme.textDim
+            caption.lineBreakMode = .byTruncatingTail
+            container.addArrangedSubview(caption)
+        }
+        return container
+    }
+
+    private func styleFixActionButton(_ button: NSButton, symbol: String, primary: Bool, enabled: Bool) {
+        button.isBordered = false
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 15
+        let baseFill: NSColor = primary
+            ? NSColor(red: 0.07, green: 0.19, blue: 0.24, alpha: 0.98)
+            : NSColor.white.withAlphaComponent(0.070)
+        let baseBorder: NSColor = primary
+            ? BlueyTheme.cyan.withAlphaComponent(0.55)
+            : NSColor.white.withAlphaComponent(0.12)
+        button.layer?.backgroundColor = baseFill.cgColor
+        button.layer?.borderWidth = 1
+        button.layer?.borderColor = baseBorder.cgColor
+        button.alphaValue = enabled ? 1.0 : 0.4
+        button.font = NSFont.systemFont(ofSize: 12, weight: .bold)
+        let titleColor: NSColor = primary ? BlueyTheme.text : BlueyTheme.textDim
+        button.attributedTitle = NSAttributedString(
+            string: button.title,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 12, weight: .bold),
+                .foregroundColor: titleColor,
+            ])
+        button.contentTintColor = primary ? BlueyTheme.cyan : BlueyTheme.textDim
+        if let image = symbolImage(symbol) {
+            image.isTemplate = true
+            button.image = image
+            button.imagePosition = .imageLeading
+            button.imageHugsTitle = true
+            button.imageScaling = .scaleProportionallyDown
+        }
+        button.alignment = .center
+    }
+
+    @objc private func approveFixClicked(_ sender: NSButton) {
+        guard sender.isEnabled, let proposalId = sender.identifier?.rawValue else { return }
+        // One-shot: flip to Applying (disables both buttons) before emitting so
+        // a fast double-click can't re-submit.
+        setFixState(proposalId: proposalId, to: .applying)
+        emitFixApprovalResponded(proposalId: proposalId, approved: true)
+    }
+
+    @objc private func rejectFixClicked(_ sender: NSButton) {
+        guard sender.isEnabled, let proposalId = sender.identifier?.rawValue else { return }
+        setFixState(proposalId: proposalId, to: .discarded)
+        emitFixApprovalResponded(proposalId: proposalId, approved: false)
+    }
+
     private func kindLabel(_ card: RenderedCard) -> String {
         switch normalizedCardKind(card.kind) {
-        case "answer":      return "BLUEY"
+        case "answer":
+            // Agent-mediated answers badge the agent (CLAUDE / CURSOR) instead
+            // of BLUEY; the cyan rail stays (Bluey-mediated). Slice 5b.
+            return agentLabel(from: card.source) ?? "BLUEY"
         case "question":    return "YOU"
         case "action_item": return "ACTION"
         case "decision":    return "DECISION"
@@ -1820,6 +2495,32 @@ private final class FeedView: NSView {
         case "system":      return "SYSTEM"
         default:            return "BLUEY"
         }
+    }
+
+    /// Detect a coding-agent provenance inside a free-form CueCard.source and
+    /// return its uppercase badge label, or nil for plain Bluey answers.
+    private func agentLabel(from source: String?) -> String? {
+        guard let source, !source.isEmpty else { return nil }
+        let lower = source.lowercased()
+        // Only treat as an agent answer when the source actually signals one.
+        guard lower.contains("agent") || lower.contains("claude_code")
+            || lower.contains("cursor") || lower.contains("codex")
+            || lower.contains("gemini") || lower.contains("windsurf")
+            || lower.contains("aider")
+        else { return nil }
+        let known: [(needle: String, label: String)] = [
+            ("claude_code", "CLAUDE"),
+            ("claude", "CLAUDE"),
+            ("cursor", "CURSOR"),
+            ("codex", "CODEX"),
+            ("gemini", "GEMINI"),
+            ("windsurf", "WINDSURF"),
+            ("aider", "AIDER"),
+        ]
+        for entry in known where lower.contains(entry.needle) {
+            return entry.label
+        }
+        return "AGENT"
     }
 
     private func displayTitle(for card: RenderedCard) -> String {
@@ -1908,7 +2609,12 @@ private final class FeedView: NSView {
         if loginURL(from: card) != nil { return "login" }
         if let costLabel = card.costLabel, !costLabel.isEmpty { return costLabel }
         switch normalizedCardKind(card.kind) {
-        case "answer":   return ""
+        case "answer":
+            // No cost label yet: name the agent that produced the answer.
+            if let label = agentLabel(from: card.source) {
+                return "answered by your \(label.lowercased())"
+            }
+            return ""
         case "question": return "sent"
         default:         return ""
         }
@@ -2209,6 +2915,26 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     let latestSessionButton: NSButton
     let sessionScroll: NSScrollView
     let sessionStack: NSStackView
+    // Agent-bridge surfaces (Slice 5b). A parallel drawer mirroring
+    // sessionDrawer's geometry, plus a bottom connector sheet reusing the
+    // close-confirm overlay pattern.
+    let agentDrawer: NSView
+    let agentDrawerTitleLabel: NSTextField
+    let agentDrawerBackButton: NSButton
+    let agentDrawerCloseButton: NSButton
+    let agentDrawerCaption: NSTextField
+    let agentScroll: NSScrollView
+    let agentStack: NSStackView
+    let agentButton: NSButton
+    let agentBadge: NSTextField
+    let connectorSheetOverlay: NSView
+    let connectorSheetPanel: NSView
+    let connectorSheetTitle: NSTextField
+    let connectorSheetSummary: NSTextField
+    let connectorSheetScroll: NSScrollView
+    let connectorSheetStack: NSStackView
+    let connectorSheetCancelButton: NSButton
+    let connectorSheetAttachButton: NSButton
     let answerStyleOverlay: NSView
     let answerStylePanel: NSView
     let answerStyleLabel: NSTextField
@@ -2245,12 +2971,30 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     var onClose: (() -> Void)?
     var onOpacityChanged: ((Double) -> Void)?
     var onListeningStateChanged: ((PillRunState) -> Void)?
+    /// Notifies the coordinator when an agent attaches/detaches so the pill can
+    /// show or hide its glyph-only agent badge (Slice 5b).
+    var onAgentAttachmentChanged: ((Bool) -> Void)?
     private var recordingActive = false
     private var transcriptSnippets: [String] = []
     private var sessionItems: [OverlaySessionItem] = []
     private var editingSessionId: String?
     private var pendingDeleteSessionId: String?
     private var renameField: NSTextField?
+    // Agent-bridge state (Slice 5b).
+    private enum AgentDrawerStage {
+        case picker
+        case sessions(kind: String, displayName: String)
+    }
+    private var agentDrawerStage: AgentDrawerStage = .picker
+    private var agentSummaries: [AgentSummary] = []
+    private var agentListLoaded = false
+    private var agentSessions: [AgentSessionSummary] = []
+    private var agentSessionsLoaded = false
+    private var attachedAgentKind: String?
+    private var pendingConnectorKind: String?
+    private var pendingConnectorSessionId: String?
+    private var pendingConnectorInfos: [AgentConnectorInfo] = []
+    private var pendingConnectorsLoaded = false
     private var canvasWidthConstraint: NSLayoutConstraint?
     private var composerBarHeightConstraint: NSLayoutConstraint?
     private var composerTextHeightConstraint: NSLayoutConstraint?
@@ -2314,6 +3058,24 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         latestSessionButton = NSButton(title: "Continue latest", target: nil, action: nil)
         sessionScroll = NSScrollView()
         sessionStack = NSStackView()
+        agentDrawer = NSView()
+        agentDrawerTitleLabel = NSTextField(labelWithString: "Coding agents")
+        agentDrawerBackButton = NSButton(title: "", target: nil, action: nil)
+        agentDrawerCloseButton = NSButton(title: "", target: nil, action: nil)
+        agentDrawerCaption = NSTextField(
+            wrappingLabelWithString: "Answers run on your machine — your agent replies.")
+        agentScroll = NSScrollView()
+        agentStack = NSStackView()
+        agentButton = NSButton(title: "Agent", target: nil, action: nil)
+        agentBadge = NSTextField(labelWithString: "No agent")
+        connectorSheetOverlay = NSView()
+        connectorSheetPanel = NSView()
+        connectorSheetTitle = NSTextField(labelWithString: "Inherited connectors")
+        connectorSheetSummary = NSTextField(labelWithString: "")
+        connectorSheetScroll = NSScrollView()
+        connectorSheetStack = NSStackView()
+        connectorSheetCancelButton = NSButton(title: "Cancel", target: nil, action: nil)
+        connectorSheetAttachButton = NSButton(title: "Attach", target: nil, action: nil)
         answerStyleOverlay = ModalBlockerView()
         answerStylePanel = NSView()
         answerStyleLabel = NSTextField(labelWithString: "How Bluey should answer")
@@ -2379,6 +3141,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         feed.onOpenURL = { url in
             NSWorkspace.shared.open(url)
         }
+        // Tapping Fix on an agent answer asks the daemon to drive a propose-only
+        // fix; nothing is applied until the proposal card is approved (Slice F4).
+        feed.onFixRequested = { cardId, question in
+            emitFixRequested(cardId: cardId, question: question)
+        }
 
         for view in [
             headerBar,
@@ -2403,6 +3170,23 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             latestSessionButton,
             sessionScroll,
             sessionStack,
+            agentDrawer,
+            agentDrawerTitleLabel,
+            agentDrawerBackButton,
+            agentDrawerCloseButton,
+            agentDrawerCaption,
+            agentScroll,
+            agentStack,
+            agentButton,
+            agentBadge,
+            connectorSheetOverlay,
+            connectorSheetPanel,
+            connectorSheetTitle,
+            connectorSheetSummary,
+            connectorSheetScroll,
+            connectorSheetStack,
+            connectorSheetCancelButton,
+            connectorSheetAttachButton,
             answerStyleOverlay,
             answerStylePanel,
             answerStyleLabel,
@@ -2455,6 +3239,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             brandStack,
             routeBadge,
             knowledgeBadge,
+            agentBadge,
             headerSpacer,
             canvasToggleButton,
             balanceLabel,
@@ -2476,6 +3261,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         sessionDrawer.addSubview(drawerCloseButton)
         sessionDrawer.addSubview(latestSessionButton)
         sessionDrawer.addSubview(sessionScroll)
+        addSubview(agentDrawer)
+        agentDrawer.addSubview(agentDrawerBackButton)
+        agentDrawer.addSubview(agentDrawerTitleLabel)
+        agentDrawer.addSubview(agentDrawerCloseButton)
+        agentDrawer.addSubview(agentScroll)
+        agentDrawer.addSubview(agentDrawerCaption)
         addSubview(transcriptStrip)
         transcriptStrip.addSubview(transcriptActivityDot)
         transcriptStrip.addSubview(transcriptStateLabel)
@@ -2489,6 +3280,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         composerSurface.addSubview(recordingButton)
         composerSurface.addSubview(askButton)
         composerBar.addSubview(attachButton)
+        composerBar.addSubview(agentButton)
         composerBar.addSubview(instructionsButton)
         composerBar.addSubview(opacityControl)
         opacityControl.addSubview(opacityLabel)
@@ -2504,6 +3296,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         answerStylePanel.addSubview(answerStyleLabel)
         answerStylePanel.addSubview(answerStyleBox)
         answerStylePanel.addSubview(answerStyleSaveButton)
+        // Agent-bridge: inherited-connector confirmation sheet (Slice 5b),
+        // another full-screen modal layered above the workspace.
+        addSubview(connectorSheetOverlay)
+        connectorSheetOverlay.addSubview(connectorSheetPanel)
+        connectorSheetPanel.addSubview(connectorSheetTitle)
+        connectorSheetPanel.addSubview(connectorSheetSummary)
+        connectorSheetPanel.addSubview(connectorSheetScroll)
+        connectorSheetPanel.addSubview(connectorSheetCancelButton)
+        connectorSheetPanel.addSubview(connectorSheetAttachButton)
         addSubview(closeConfirmOverlay)
         closeConfirmOverlay.addSubview(closeConfirmPanel)
         closeConfirmPanel.addSubview(closeConfirmTitle)
@@ -2517,6 +3318,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         attachmentStrip.layer?.zPosition = 40
         composerBar.layer?.zPosition = 50
         toastView.layer?.zPosition = 70
+
+        // Bind the agent scroll views' document stacks before activating the
+        // stack-in-clip-view constraints below (they need a shared ancestor).
+        // Full visual styling happens later in styleAgentSurfaces().
+        agentScroll.documentView = agentStack
+        connectorSheetScroll.documentView = connectorSheetStack
 
         let canvasWidth = canvasPane.widthAnchor.constraint(equalToConstant: 0)
         canvasWidthConstraint = canvasWidth
@@ -2641,6 +3448,46 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             sessionStack.bottomAnchor.constraint(lessThanOrEqualTo: sessionScroll.contentView.bottomAnchor),
             sessionStack.widthAnchor.constraint(equalTo: sessionScroll.widthAnchor),
 
+            // Agent drawer mirrors sessionDrawer geometry, widened to 230pt
+            // (PLAN §9) so capability chips + connector counts truncate-tail.
+            agentDrawer.topAnchor.constraint(equalTo: feed.topAnchor, constant: 10),
+            agentDrawer.leadingAnchor.constraint(equalTo: feed.leadingAnchor, constant: 10),
+            agentDrawer.widthAnchor.constraint(equalToConstant: 230),
+            agentDrawer.bottomAnchor.constraint(equalTo: transcriptStrip.topAnchor, constant: -10),
+
+            agentDrawerBackButton.topAnchor.constraint(equalTo: agentDrawer.topAnchor, constant: 12),
+            agentDrawerBackButton.leadingAnchor.constraint(equalTo: agentDrawer.leadingAnchor, constant: 10),
+            agentDrawerBackButton.widthAnchor.constraint(equalToConstant: 26),
+            agentDrawerBackButton.heightAnchor.constraint(equalToConstant: 26),
+
+            agentDrawerTitleLabel.centerYAnchor.constraint(equalTo: agentDrawerBackButton.centerYAnchor),
+            agentDrawerTitleLabel.leadingAnchor.constraint(equalTo: agentDrawerBackButton.trailingAnchor, constant: 8),
+            agentDrawerTitleLabel.trailingAnchor.constraint(equalTo: agentDrawerCloseButton.leadingAnchor, constant: -8),
+
+            agentDrawerCloseButton.centerYAnchor.constraint(equalTo: agentDrawerBackButton.centerYAnchor),
+            agentDrawerCloseButton.trailingAnchor.constraint(equalTo: agentDrawer.trailingAnchor, constant: -10),
+            agentDrawerCloseButton.widthAnchor.constraint(equalToConstant: 26),
+            agentDrawerCloseButton.heightAnchor.constraint(equalToConstant: 26),
+
+            agentScroll.topAnchor.constraint(equalTo: agentDrawerBackButton.bottomAnchor, constant: 10),
+            agentScroll.leadingAnchor.constraint(equalTo: agentDrawer.leadingAnchor, constant: 8),
+            agentScroll.trailingAnchor.constraint(equalTo: agentDrawer.trailingAnchor, constant: -8),
+            agentScroll.bottomAnchor.constraint(equalTo: agentDrawerCaption.topAnchor, constant: -8),
+
+            agentStack.leadingAnchor.constraint(equalTo: agentScroll.contentView.leadingAnchor),
+            agentStack.topAnchor.constraint(equalTo: agentScroll.contentView.topAnchor),
+            agentStack.trailingAnchor.constraint(equalTo: agentScroll.contentView.trailingAnchor),
+            agentStack.bottomAnchor.constraint(lessThanOrEqualTo: agentScroll.contentView.bottomAnchor),
+            agentStack.widthAnchor.constraint(equalTo: agentScroll.widthAnchor),
+
+            agentDrawerCaption.leadingAnchor.constraint(equalTo: agentDrawer.leadingAnchor, constant: 12),
+            agentDrawerCaption.trailingAnchor.constraint(equalTo: agentDrawer.trailingAnchor, constant: -12),
+            agentDrawerCaption.bottomAnchor.constraint(equalTo: agentDrawer.bottomAnchor, constant: -12),
+
+            agentBadge.heightAnchor.constraint(equalToConstant: 26),
+            agentBadge.widthAnchor.constraint(greaterThanOrEqualToConstant: 92),
+            agentBadge.widthAnchor.constraint(lessThanOrEqualToConstant: 158),
+
             answerStyleOverlay.topAnchor.constraint(equalTo: topAnchor),
             answerStyleOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
             answerStyleOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -2724,7 +3571,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             attachButton.widthAnchor.constraint(equalToConstant: 32),
             attachButton.heightAnchor.constraint(equalToConstant: 32),
 
-            instructionsButton.leadingAnchor.constraint(equalTo: attachButton.trailingAnchor, constant: 8),
+            agentButton.leadingAnchor.constraint(equalTo: attachButton.trailingAnchor, constant: 8),
+            agentButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
+            agentButton.widthAnchor.constraint(equalToConstant: 84),
+            agentButton.heightAnchor.constraint(equalToConstant: 36),
+
+            instructionsButton.leadingAnchor.constraint(equalTo: agentButton.trailingAnchor, constant: 8),
             instructionsButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
             instructionsButton.widthAnchor.constraint(equalToConstant: 80),
             instructionsButton.heightAnchor.constraint(equalToConstant: 32),
@@ -2787,6 +3639,47 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             closeConfirmTurnOffButton.leadingAnchor.constraint(equalTo: closeConfirmCancelButton.trailingAnchor, constant: 12),
             closeConfirmTurnOffButton.trailingAnchor.constraint(equalTo: closeConfirmPanel.trailingAnchor, constant: -18),
             closeConfirmTurnOffButton.heightAnchor.constraint(equalTo: closeConfirmCancelButton.heightAnchor),
+
+            // Connector inheritance sheet — bottom confirm, reusing the
+            // close-confirm overlay pattern (PLAN §9 surface 3).
+            connectorSheetOverlay.topAnchor.constraint(equalTo: topAnchor),
+            connectorSheetOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
+            connectorSheetOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
+            connectorSheetOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            connectorSheetPanel.centerXAnchor.constraint(equalTo: connectorSheetOverlay.centerXAnchor),
+            connectorSheetPanel.centerYAnchor.constraint(equalTo: connectorSheetOverlay.centerYAnchor),
+            connectorSheetPanel.widthAnchor.constraint(equalToConstant: 380),
+
+            connectorSheetTitle.topAnchor.constraint(equalTo: connectorSheetPanel.topAnchor, constant: 18),
+            connectorSheetTitle.leadingAnchor.constraint(equalTo: connectorSheetPanel.leadingAnchor, constant: 18),
+            connectorSheetTitle.trailingAnchor.constraint(equalTo: connectorSheetPanel.trailingAnchor, constant: -18),
+
+            connectorSheetSummary.topAnchor.constraint(equalTo: connectorSheetTitle.bottomAnchor, constant: 6),
+            connectorSheetSummary.leadingAnchor.constraint(equalTo: connectorSheetTitle.leadingAnchor),
+            connectorSheetSummary.trailingAnchor.constraint(equalTo: connectorSheetTitle.trailingAnchor),
+
+            connectorSheetScroll.topAnchor.constraint(equalTo: connectorSheetSummary.bottomAnchor, constant: 12),
+            connectorSheetScroll.leadingAnchor.constraint(equalTo: connectorSheetPanel.leadingAnchor, constant: 14),
+            connectorSheetScroll.trailingAnchor.constraint(equalTo: connectorSheetPanel.trailingAnchor, constant: -14),
+            connectorSheetScroll.heightAnchor.constraint(equalToConstant: 168),
+
+            connectorSheetStack.leadingAnchor.constraint(equalTo: connectorSheetScroll.contentView.leadingAnchor),
+            connectorSheetStack.topAnchor.constraint(equalTo: connectorSheetScroll.contentView.topAnchor),
+            connectorSheetStack.trailingAnchor.constraint(equalTo: connectorSheetScroll.contentView.trailingAnchor),
+            connectorSheetStack.bottomAnchor.constraint(lessThanOrEqualTo: connectorSheetScroll.contentView.bottomAnchor),
+            connectorSheetStack.widthAnchor.constraint(equalTo: connectorSheetScroll.widthAnchor),
+
+            connectorSheetCancelButton.topAnchor.constraint(equalTo: connectorSheetScroll.bottomAnchor, constant: 14),
+            connectorSheetCancelButton.leadingAnchor.constraint(equalTo: connectorSheetPanel.leadingAnchor, constant: 18),
+            connectorSheetCancelButton.bottomAnchor.constraint(equalTo: connectorSheetPanel.bottomAnchor, constant: -18),
+            connectorSheetCancelButton.widthAnchor.constraint(equalToConstant: 158),
+            connectorSheetCancelButton.heightAnchor.constraint(equalToConstant: 34),
+
+            connectorSheetAttachButton.topAnchor.constraint(equalTo: connectorSheetCancelButton.topAnchor),
+            connectorSheetAttachButton.leadingAnchor.constraint(equalTo: connectorSheetCancelButton.trailingAnchor, constant: 12),
+            connectorSheetAttachButton.trailingAnchor.constraint(equalTo: connectorSheetPanel.trailingAnchor, constant: -18),
+            connectorSheetAttachButton.heightAnchor.constraint(equalTo: connectorSheetCancelButton.heightAnchor),
         ])
 
         navButton.target = self
@@ -2816,6 +3709,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         opacitySlider.action = #selector(opacityChanged)
         composer.onSubmit = { [weak self] in self?.askClicked() }
         composer.onMeasuredHeight = { [weak self] height in self?.setComposerTextHeight(height) }
+        // Clicking the rounded surface (not just the glyphs) focuses the composer.
         (composerSurface as? ComposerSurfaceView)?.composer = composer
         recordingButton.target = self
         recordingButton.action = #selector(recordingClicked)
@@ -2827,11 +3721,26 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         attachButton.action = #selector(attachClicked)
         instructionsButton.target = self
         instructionsButton.action = #selector(instructionsClicked)
+        agentButton.target = self
+        agentButton.action = #selector(agentClicked)
+        agentBadge.addGestureRecognizer(
+            NSClickGestureRecognizer(target: self, action: #selector(agentBadgeClicked)))
+        agentDrawerBackButton.target = self
+        agentDrawerBackButton.action = #selector(agentDrawerBackClicked)
+        agentDrawerCloseButton.target = self
+        agentDrawerCloseButton.action = #selector(agentDrawerCloseClicked)
+        connectorSheetCancelButton.target = self
+        connectorSheetCancelButton.action = #selector(connectorSheetCancelClicked)
+        connectorSheetAttachButton.target = self
+        connectorSheetAttachButton.action = #selector(connectorSheetAttachClicked)
 
         sessionDrawer.isHidden = true
+        agentDrawer.isHidden = true
+        connectorSheetOverlay.isHidden = true
         answerStyleOverlay.isHidden = true
         canvasPane.isHidden = true
         canvasToggleButton.isHidden = true
+        agentBadge.isHidden = true
         canvasPane.onCollapse = { [weak self] in self?.setCanvasOpen(false) }
         canvasPane.onToggleFullWindow = { [weak self] in self?.toggleCanvasFullWindow() }
         canvasPane.setFullWindow(false)
@@ -2844,11 +3753,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         styleControlButton(recordingButton, symbol: "waveform", accent: false)
         styleControlButton(instructionsButton, symbol: "text.bubble", accent: false)
         styleIconButton(attachButton, symbol: "plus", fallback: "+")
+        styleControlButton(agentButton, symbol: "cpu", accent: false)
         styleControlButton(analyzeButton, symbol: "sparkle.magnifyingglass", accent: false)
         styleControlButton(askButton, symbol: "arrow.up", accent: true)
         styleHeaderIconButton(hideButton, symbol: "eye.slash", fallback: "-")
         styleHeaderIconButton(closeButton, symbol: "xmark", fallback: "x")
         updateFullSizeButtonChrome()
+        styleAgentSurfaces()
         configureTooltips()
         setContextItems([])
         setTranscriptState("IDLE", active: false)
@@ -3025,6 +3936,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if !closeConfirmOverlay.isHidden {
             return true
         }
+        if !connectorSheetOverlay.isHidden {
+            return true
+        }
         if !answerStyleOverlay.isHidden {
             return true
         }
@@ -3036,6 +3950,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return true
         }
         if hitsExplicitInteractiveChrome(at: localPoint) {
+            return true
+        }
+        if !agentDrawer.isHidden && agentDrawer.frame.contains(localPoint) {
+            return true
+        }
+        // Card affordances (Fix / Approve / Reject) live inside the otherwise
+        // click-through feed: capture the mouse only over an enabled button so
+        // the rest of the feed stays transparent to the app underneath (F4).
+        let feedPoint = feed.convert(windowPoint, from: nil)
+        if feed.hasInteractiveControl(at: feedPoint) {
             return true
         }
         return hasInteractiveView(at: localPoint)
@@ -3533,6 +4457,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         closeButton.toolTip = "Turn Bluey off. Run bluey on to start again."
         recordingButton.toolTip = "Start or stop listening"
         instructionsButton.toolTip = "How Bluey should answer"
+        agentButton.toolTip = "Attach a coding agent to answer from your context"
         attachButton.toolTip = "Attach files"
         analyzeButton.toolTip = "Analyse screen"
         askButton.toolTip = "Answer with Enter or Command+Enter. Shift+Enter adds a new line."
@@ -3750,6 +4675,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     @objc private func toggleSessionsClicked() {
+        // Sessions and agent drawers share the left rail — only one at a time.
+        agentDrawer.isHidden = true
         sessionDrawer.isHidden.toggle()
         statusLabel.stringValue = sessionDrawer.isHidden ? statusLabel.stringValue : "Sessions"
     }
@@ -4265,6 +5192,696 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
     }
 
+    // MARK: - Agent-bridge surfaces (Slice 5b)
+
+    private func styleAgentSurfaces() {
+        agentDrawer.wantsLayer = true
+        agentDrawer.layer?.backgroundColor = NSColor(red: 0.035, green: 0.040, blue: 0.050, alpha: 0.98).cgColor
+        agentDrawer.layer?.cornerRadius = 16
+        agentDrawer.layer?.borderWidth = 1
+        agentDrawer.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.20).cgColor
+        agentDrawer.layer?.shadowColor = NSColor.black.cgColor
+        agentDrawer.layer?.shadowOpacity = 0.26
+        agentDrawer.layer?.shadowRadius = 18
+        agentDrawer.layer?.shadowOffset = NSSize(width: 0, height: -8)
+        agentDrawer.layer?.zPosition = 11
+
+        agentDrawerTitleLabel.font = NSFont.systemFont(ofSize: 13, weight: .bold)
+        agentDrawerTitleLabel.textColor = BlueyTheme.text
+        agentDrawerTitleLabel.lineBreakMode = .byTruncatingTail
+        agentDrawerTitleLabel.maximumNumberOfLines = 1
+
+        agentDrawerCaption.font = NSFont.systemFont(ofSize: 9.5, weight: .medium)
+        agentDrawerCaption.textColor = BlueyTheme.textDim
+        agentDrawerCaption.lineBreakMode = .byWordWrapping
+        agentDrawerCaption.maximumNumberOfLines = 2
+
+        styleHeaderIconButton(agentDrawerBackButton, symbol: "chevron.left", fallback: "<")
+        styleHeaderIconButton(agentDrawerCloseButton, symbol: "xmark", fallback: "x")
+        agentDrawerBackButton.toolTip = "Back to agents"
+        agentDrawerCloseButton.toolTip = "Close"
+
+        agentStack.orientation = .vertical
+        agentStack.alignment = .centerX
+        agentStack.spacing = 6
+        agentStack.edgeInsets = NSEdgeInsets(top: 2, left: 0, bottom: 2, right: 0)
+
+        agentScroll.drawsBackground = false
+        agentScroll.hasVerticalScroller = true
+        agentScroll.hasHorizontalScroller = false
+        agentScroll.autohidesScrollers = true
+        agentScroll.borderType = .noBorder
+        agentScroll.documentView = agentStack
+        agentScroll.scrollerStyle = .overlay
+
+        agentBadge.font = NSFont.systemFont(ofSize: 11.3, weight: .bold)
+        agentBadge.textColor = BlueyTheme.cyan
+        agentBadge.alignment = .center
+        agentBadge.lineBreakMode = .byTruncatingTail
+        agentBadge.maximumNumberOfLines = 1
+        agentBadge.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        agentBadge.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        agentBadge.wantsLayer = true
+        agentBadge.layer?.backgroundColor = BlueyTheme.cyan.withAlphaComponent(0.10).cgColor
+        agentBadge.layer?.cornerRadius = 13
+        agentBadge.layer?.borderWidth = 1
+        agentBadge.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.40).cgColor
+        agentBadge.toolTip = "Attached coding agent — tap to switch or detach"
+
+        connectorSheetOverlay.wantsLayer = true
+        connectorSheetOverlay.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.52).cgColor
+        connectorSheetOverlay.layer?.zPosition = 95
+
+        connectorSheetPanel.wantsLayer = true
+        connectorSheetPanel.layer?.backgroundColor = BlueyTheme.panelDeep.cgColor
+        connectorSheetPanel.layer?.cornerRadius = 18
+        connectorSheetPanel.layer?.borderWidth = 1
+        connectorSheetPanel.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.30).cgColor
+        connectorSheetPanel.layer?.shadowColor = NSColor.black.cgColor
+        connectorSheetPanel.layer?.shadowOpacity = 0.34
+        connectorSheetPanel.layer?.shadowRadius = 22
+        connectorSheetPanel.layer?.shadowOffset = .zero
+
+        connectorSheetTitle.font = NSFont.systemFont(ofSize: 15, weight: .bold)
+        connectorSheetTitle.textColor = BlueyTheme.text
+        connectorSheetTitle.alignment = .center
+        connectorSheetSummary.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        connectorSheetSummary.textColor = BlueyTheme.textDim
+        connectorSheetSummary.alignment = .center
+        connectorSheetSummary.lineBreakMode = .byTruncatingTail
+
+        connectorSheetStack.orientation = .vertical
+        connectorSheetStack.alignment = .centerX
+        connectorSheetStack.spacing = 6
+        connectorSheetScroll.drawsBackground = false
+        connectorSheetScroll.hasVerticalScroller = true
+        connectorSheetScroll.hasHorizontalScroller = false
+        connectorSheetScroll.autohidesScrollers = true
+        connectorSheetScroll.borderType = .noBorder
+        connectorSheetScroll.documentView = connectorSheetStack
+        connectorSheetScroll.scrollerStyle = .overlay
+
+        styleControlButton(connectorSheetCancelButton, symbol: "xmark", accent: false)
+        styleControlButton(connectorSheetAttachButton, symbol: "link", accent: true)
+        connectorSheetCancelButton.toolTip = "Cancel"
+        connectorSheetAttachButton.toolTip = "Attach this agent"
+    }
+
+    // Open the agent picker drawer and request a fresh agent list. Closes the
+    // session drawer so only one left-rail surface shows at a time.
+    private func openAgentDrawer() {
+        sessionDrawer.isHidden = true
+        agentDrawerStage = .picker
+        agentDrawer.isHidden = false
+        if !agentListLoaded {
+            renderAgentLoading()
+        } else {
+            renderAgentPicker()
+        }
+        emitAgentListRequested()
+    }
+
+    @objc private func agentClicked() {
+        if agentDrawer.isHidden {
+            openAgentDrawer()
+        } else {
+            agentDrawer.isHidden = true
+        }
+    }
+
+    @objc private func agentBadgeClicked() {
+        openAgentDrawer()
+    }
+
+    @objc private func agentDrawerCloseClicked() {
+        agentDrawer.isHidden = true
+    }
+
+    @objc private func agentDrawerBackClicked() {
+        agentDrawerStage = .picker
+        if agentListLoaded {
+            renderAgentPicker()
+        } else {
+            renderAgentLoading()
+            emitAgentListRequested()
+        }
+    }
+
+    func setAgents(_ agents: [AgentSummary]) {
+        agentSummaries = agents
+        agentListLoaded = true
+        attachedAgentKind = agents.first(where: { $0.attached })?.kind
+        updateAgentBadge()
+        // Only repaint the picker if the drawer is showing the picker stage.
+        if !agentDrawer.isHidden, case .picker = agentDrawerStage {
+            renderAgentPicker()
+        }
+    }
+
+    private func clearAgentStack() {
+        for view in agentStack.arrangedSubviews {
+            agentStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+    }
+
+    private func addAgentStackRow(_ row: NSView) {
+        agentStack.addArrangedSubview(row)
+        row.widthAnchor.constraint(equalTo: agentStack.widthAnchor, constant: -2).isActive = true
+    }
+
+    private func renderAgentLoading() {
+        agentDrawerTitleLabel.stringValue = "Coding agents"
+        agentDrawerBackButton.isHidden = true
+        agentDrawerCaption.stringValue = "Answers run on your machine — your agent replies."
+        clearAgentStack()
+        addAgentStackRow(makeAgentMessageRow("Finding coding agents…", dim: true))
+    }
+
+    private func renderAgentPicker() {
+        agentDrawerTitleLabel.stringValue = "Coding agents"
+        agentDrawerBackButton.isHidden = true
+        agentDrawerCaption.stringValue = "Answers run on your machine — your agent replies."
+        clearAgentStack()
+        guard !agentSummaries.isEmpty else {
+            addAgentStackRow(makeAgentMessageRow("No coding agents found", dim: true))
+            return
+        }
+        for agent in agentSummaries {
+            addAgentStackRow(makeAgentRow(agent))
+        }
+    }
+
+    // One picker row: name + capability chip + "{n} tools · {n} sessions".
+    // Attached rows render cyan-active with a ✕ detach affordance.
+    private func makeAgentRow(_ agent: AgentSummary) -> NSView {
+        let cap = AgentCapability(agent.capability)
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.wantsLayer = true
+        row.layer?.backgroundColor = agent.attached
+            ? BlueyTheme.cyanSoft.cgColor
+            : NSColor.white.withAlphaComponent(cap.dimmed ? 0.02 : 0.035).cgColor
+        row.layer?.cornerRadius = 12
+        row.layer?.borderWidth = 1
+        row.layer?.borderColor = agent.attached
+            ? BlueyTheme.cyan.withAlphaComponent(0.40).cgColor
+            : BlueyTheme.hairline.cgColor
+
+        let title = NSTextField(labelWithString: agent.displayName)
+        title.translatesAutoresizingMaskIntoConstraints = false
+        title.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+        title.textColor = cap.dimmed ? BlueyTheme.textDim : BlueyTheme.text
+        title.lineBreakMode = .byTruncatingTail
+
+        let chip = makeCapabilityChip(cap)
+
+        let sessions = agent.sessionCount ?? 0
+        let subtitleText = "\(agent.connectorCount) tools · \(sessions) sessions"
+        let subtitle = NSTextField(labelWithString: subtitleText)
+        subtitle.translatesAutoresizingMaskIntoConstraints = false
+        subtitle.font = NSFont.systemFont(ofSize: 9.5, weight: .medium)
+        subtitle.textColor = BlueyTheme.textDim
+        subtitle.lineBreakMode = .byTruncatingTail
+
+        row.addSubview(title)
+        row.addSubview(chip)
+        row.addSubview(subtitle)
+
+        // A transparent click button fills the row for tappable agents.
+        let tappable = !cap.dimmed
+        var trailingRef = row.trailingAnchor
+        var trailingConst: CGFloat = -10
+        if agent.attached {
+            let detach = NSButton(title: "", target: self, action: #selector(agentDetachClicked))
+            detach.translatesAutoresizingMaskIntoConstraints = false
+            detach.isBordered = false
+            detach.contentTintColor = BlueyTheme.cyan
+            detach.toolTip = "Detach \(agent.displayName)"
+            if let image = symbolImage("xmark.circle.fill") {
+                image.isTemplate = true
+                detach.image = image
+                detach.imagePosition = .imageOnly
+                detach.imageScaling = .scaleProportionallyDown
+            } else {
+                detach.title = "✕"
+                detach.font = NSFont.systemFont(ofSize: 11, weight: .bold)
+            }
+            row.addSubview(detach)
+            NSLayoutConstraint.activate([
+                detach.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -8),
+                detach.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+                detach.widthAnchor.constraint(equalToConstant: 26),
+                detach.heightAnchor.constraint(equalToConstant: 26),
+            ])
+            trailingRef = detach.leadingAnchor
+            trailingConst = -6
+        } else if tappable {
+            let openButton = NSButton(title: "", target: self, action: #selector(agentRowClicked(_:)))
+            openButton.translatesAutoresizingMaskIntoConstraints = false
+            openButton.isBordered = false
+            openButton.tag = agentIndex(agent.kind)
+            row.addSubview(openButton)
+            NSLayoutConstraint.activate([
+                openButton.topAnchor.constraint(equalTo: row.topAnchor),
+                openButton.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+                openButton.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+                openButton.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+            ])
+        }
+
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 52),
+
+            title.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
+            title.topAnchor.constraint(equalTo: row.topAnchor, constant: 8),
+            title.trailingAnchor.constraint(lessThanOrEqualTo: chip.leadingAnchor, constant: -6),
+
+            chip.centerYAnchor.constraint(equalTo: title.centerYAnchor),
+            chip.trailingAnchor.constraint(equalTo: trailingRef, constant: trailingConst),
+
+            subtitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 2),
+            subtitle.trailingAnchor.constraint(equalTo: trailingRef, constant: trailingConst),
+        ])
+        return row
+    }
+
+    private func makeCapabilityChip(_ cap: AgentCapability) -> NSView {
+        let chip = NSTextField(labelWithString: cap.label)
+        chip.translatesAutoresizingMaskIntoConstraints = false
+        chip.font = NSFont.monospacedSystemFont(ofSize: 8.5, weight: .bold)
+        chip.textColor = cap.color
+        chip.alignment = .center
+        chip.wantsLayer = true
+        chip.layer?.backgroundColor = cap.color.withAlphaComponent(0.14).cgColor
+        chip.layer?.cornerRadius = 8
+        chip.layer?.borderWidth = 1
+        chip.layer?.borderColor = cap.color.withAlphaComponent(0.36).cgColor
+        chip.setContentCompressionResistancePriority(.required, for: .horizontal)
+        NSLayoutConstraint.activate([
+            chip.heightAnchor.constraint(equalToConstant: 17),
+            chip.widthAnchor.constraint(greaterThanOrEqualToConstant: 52),
+        ])
+        return chip
+    }
+
+    private func makeAgentMessageRow(_ text: String, dim: Bool) -> NSView {
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        label.textColor = dim ? BlueyTheme.textDim : BlueyTheme.text
+        label.alignment = .center
+        label.translatesAutoresizingMaskIntoConstraints = false
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(label)
+        NSLayoutConstraint.activate([
+            label.topAnchor.constraint(equalTo: row.topAnchor, constant: 14),
+            label.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -14),
+            label.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 8),
+            label.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -8),
+        ])
+        return row
+    }
+
+    private func agentIndex(_ kind: String) -> Int {
+        agentSummaries.firstIndex(where: { $0.kind == kind }) ?? -1
+    }
+
+    @objc private func agentRowClicked(_ sender: NSButton) {
+        guard sender.tag >= 0, sender.tag < agentSummaries.count else { return }
+        let agent = agentSummaries[sender.tag]
+        // Drivable / read-only agents move to the session picker.
+        agentDrawerStage = .sessions(kind: agent.kind, displayName: agent.displayName)
+        agentSessions = []
+        agentSessionsLoaded = false
+        renderAgentSessions()
+        emitAgentSessionsRequested(kind: agent.kind)
+    }
+
+    @objc private func agentDetachClicked() {
+        attachedAgentKind = nil
+        emitAgentDetachRequested()
+        // Optimistically reflect detach; the daemon re-emits set_agents to confirm.
+        agentSummaries = agentSummaries.map { agent in
+            AgentSummary(
+                kind: agent.kind, displayName: agent.displayName, capability: agent.capability,
+                connectorCount: agent.connectorCount, readyConnectorCount: agent.readyConnectorCount,
+                sessionCount: agent.sessionCount, attached: false)
+        }
+        updateAgentBadge()
+        if case .picker = agentDrawerStage { renderAgentPicker() }
+    }
+
+    // MARK: Session picker (agent drawer push-nav)
+
+    func setAgentSessions(kind: String, sessions: [AgentSessionSummary]) {
+        // Ignore late deliveries for an agent we've navigated away from.
+        guard case let .sessions(currentKind, _) = agentDrawerStage, currentKind == kind else {
+            return
+        }
+        agentSessions = sessions
+        agentSessionsLoaded = true
+        renderAgentSessions()
+    }
+
+    private func renderAgentSessions() {
+        guard case let .sessions(kind, displayName) = agentDrawerStage else { return }
+        agentDrawerTitleLabel.stringValue = displayName
+        agentDrawerBackButton.isHidden = false
+        agentDrawerCaption.stringValue = "Connectors run from your agent. Bluey stores nothing."
+        clearAgentStack()
+
+        // Pinned quick-actions: continue most recent + fresh.
+        let newest = agentSessions.first?.id
+        addAgentStackRow(makeQuickAttachRow(
+            title: "Continue most recent",
+            subtitle: newest == nil ? "No past sessions yet" : "Resume your latest agent context",
+            accent: true,
+            kind: kind,
+            sessionId: newest,
+            enabled: newest != nil))
+        addAgentStackRow(makeQuickAttachRow(
+            title: "Fresh — no past context",
+            subtitle: "Start the agent clean",
+            accent: false,
+            kind: kind,
+            sessionId: nil,
+            enabled: true))
+
+        if !agentSessionsLoaded {
+            addAgentStackRow(makeAgentMessageRow("Loading sessions…", dim: true))
+            return
+        }
+        guard !agentSessions.isEmpty else {
+            addAgentStackRow(makeAgentMessageRow(
+                "Session history off — enable in settings", dim: true))
+            return
+        }
+        for session in agentSessions {
+            addAgentStackRow(makeAgentSessionRow(kind: kind, session: session))
+        }
+    }
+
+    private func makeQuickAttachRow(
+        title: String, subtitle: String, accent: Bool,
+        kind: String, sessionId: String?, enabled: Bool
+    ) -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.wantsLayer = true
+        row.layer?.backgroundColor = accent
+            ? BlueyTheme.cyanSoft.cgColor
+            : NSColor.white.withAlphaComponent(0.035).cgColor
+        row.layer?.cornerRadius = 12
+        row.layer?.borderWidth = 1
+        row.layer?.borderColor = accent
+            ? BlueyTheme.cyan.withAlphaComponent(0.40).cgColor
+            : BlueyTheme.hairline.cgColor
+        row.alphaValue = enabled ? 1.0 : 0.5
+
+        let titleLabel = NSTextField(labelWithString: title)
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.font = NSFont.systemFont(ofSize: 11.5, weight: .bold)
+        titleLabel.textColor = accent ? BlueyTheme.cyan : BlueyTheme.text
+        titleLabel.lineBreakMode = .byTruncatingTail
+
+        let subtitleLabel = NSTextField(labelWithString: subtitle)
+        subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        subtitleLabel.font = NSFont.systemFont(ofSize: 9.5, weight: .medium)
+        subtitleLabel.textColor = BlueyTheme.textDim
+        subtitleLabel.lineBreakMode = .byTruncatingTail
+
+        row.addSubview(titleLabel)
+        row.addSubview(subtitleLabel)
+        if enabled {
+            let button = NSButton(title: "", target: self, action: #selector(quickAttachClicked(_:)))
+            button.translatesAutoresizingMaskIntoConstraints = false
+            button.isBordered = false
+            button.identifier = NSUserInterfaceItemIdentifier(attachToken(kind: kind, sessionId: sessionId))
+            row.addSubview(button)
+            NSLayoutConstraint.activate([
+                button.topAnchor.constraint(equalTo: row.topAnchor),
+                button.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+                button.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+                button.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+            ])
+        }
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 48),
+            titleLabel.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
+            titleLabel.topAnchor.constraint(equalTo: row.topAnchor, constant: 8),
+            titleLabel.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -10),
+            subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            subtitleLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
+            subtitleLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
+        ])
+        return row
+    }
+
+    private func makeAgentSessionRow(kind: String, session: AgentSessionSummary) -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.wantsLayer = true
+        row.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.035).cgColor
+        row.layer?.cornerRadius = 12
+        row.layer?.borderWidth = 1
+        row.layer?.borderColor = BlueyTheme.hairline.cgColor
+
+        let titleLabel = NSTextField(labelWithString: session.title ?? "Untitled session")
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+        titleLabel.textColor = BlueyTheme.text
+        titleLabel.lineBreakMode = .byTruncatingTail
+
+        let subtitleLabel = NSTextField(labelWithString: session.updatedAt)
+        subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        subtitleLabel.font = NSFont.monospacedSystemFont(ofSize: 9, weight: .medium)
+        subtitleLabel.textColor = BlueyTheme.textDim
+        subtitleLabel.lineBreakMode = .byTruncatingTail
+
+        let button = NSButton(title: "", target: self, action: #selector(quickAttachClicked(_:)))
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.isBordered = false
+        button.identifier = NSUserInterfaceItemIdentifier(attachToken(kind: kind, sessionId: session.id))
+
+        row.addSubview(button)
+        row.addSubview(titleLabel)
+        row.addSubview(subtitleLabel)
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 48),
+            button.topAnchor.constraint(equalTo: row.topAnchor),
+            button.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            button.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+            button.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+            titleLabel.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
+            titleLabel.topAnchor.constraint(equalTo: row.topAnchor, constant: 8),
+            titleLabel.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -10),
+            subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            subtitleLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
+            subtitleLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
+        ])
+        return row
+    }
+
+    // "kind|sessionId" identifier round-trips an attach target through the
+    // button without a side table; empty session segment means attach fresh.
+    private func attachToken(kind: String, sessionId: String?) -> String {
+        "\(kind)|\(sessionId ?? "")"
+    }
+
+    @objc private func quickAttachClicked(_ sender: NSButton) {
+        guard let raw = sender.identifier?.rawValue else { return }
+        let parts = raw.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
+        guard let kind = parts.first.map(String.init), !kind.isEmpty else { return }
+        let sessionId = parts.count > 1 && !parts[1].isEmpty ? String(parts[1]) : nil
+        beginAttachFlow(kind: kind, sessionId: sessionId)
+    }
+
+    // MARK: Connector inheritance sheet
+
+    // Stage the attach target, then surface the connector sheet. The daemon's
+    // connectors arrive async; attach is never blocked on re-auth gaps.
+    private func beginAttachFlow(kind: String, sessionId: String?) {
+        pendingConnectorKind = kind
+        pendingConnectorSessionId = sessionId
+        pendingConnectorInfos = []
+        pendingConnectorsLoaded = false
+        renderConnectorSheet()
+        connectorSheetOverlay.isHidden = false
+        connectorSheetOverlay.alphaValue = 0
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.12
+            self.connectorSheetOverlay.animator().alphaValue = 1
+        }
+        emitAgentConnectorsRequested(kind: kind)
+    }
+
+    func setAgentConnectors(kind: String, connectors: [AgentConnectorInfo]) {
+        guard pendingConnectorKind == kind, !connectorSheetOverlay.isHidden else { return }
+        pendingConnectorInfos = connectors
+        pendingConnectorsLoaded = true
+        renderConnectorSheet()
+    }
+
+    private func renderConnectorSheet() {
+        let displayName = agentSummaries.first(where: { $0.kind == pendingConnectorKind })?.displayName
+            ?? "agent"
+        connectorSheetTitle.stringValue = "\(displayName) connectors"
+        for view in connectorSheetStack.arrangedSubviews {
+            connectorSheetStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+
+        guard pendingConnectorsLoaded else {
+            connectorSheetSummary.stringValue = "Reading inherited connectors…"
+            let row = makeAgentMessageRow("Loading…", dim: true)
+            connectorSheetStack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: connectorSheetStack.widthAnchor, constant: -2).isActive = true
+            return
+        }
+
+        let total = pendingConnectorInfos.count
+        let ready = pendingConnectorInfos.filter { $0.ready }.count
+        let needReauth = total - ready
+        if total == 0 {
+            connectorSheetSummary.stringValue = "No inherited connectors — attach runs clean."
+        } else if needReauth > 0 {
+            connectorSheetSummary.stringValue =
+                "\(ready) of \(total) connectors ready · \(needReauth) need re-auth"
+        } else {
+            connectorSheetSummary.stringValue = "\(ready) of \(total) connectors ready"
+        }
+
+        for connector in pendingConnectorInfos {
+            let row = makeConnectorRow(connector)
+            connectorSheetStack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: connectorSheetStack.widthAnchor, constant: -2).isActive = true
+        }
+    }
+
+    private func makeConnectorRow(_ connector: AgentConnectorInfo) -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.wantsLayer = true
+        row.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.035).cgColor
+        row.layer?.cornerRadius = 10
+        row.layer?.borderWidth = 1
+        row.layer?.borderColor = BlueyTheme.hairline.cgColor
+
+        let name = NSTextField(labelWithString: connector.name)
+        name.translatesAutoresizingMaskIntoConstraints = false
+        name.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+        name.textColor = BlueyTheme.text
+        name.lineBreakMode = .byTruncatingTail
+
+        let tierColor: NSColor = connector.ready ? BlueyTheme.green : BlueyTheme.warning
+        let tierText = connectorTierText(connector)
+        let tier = NSTextField(labelWithString: tierText)
+        tier.translatesAutoresizingMaskIntoConstraints = false
+        tier.font = NSFont.monospacedSystemFont(ofSize: 9, weight: .bold)
+        tier.textColor = tierColor
+        tier.alignment = .right
+        tier.lineBreakMode = .byTruncatingTail
+        tier.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        row.addSubview(name)
+        row.addSubview(tier)
+
+        if !connector.ready {
+            let reauth = NSButton(title: "", target: self, action: #selector(connectorReauthClicked(_:)))
+            reauth.translatesAutoresizingMaskIntoConstraints = false
+            reauth.isBordered = false
+            reauth.contentTintColor = BlueyTheme.warning
+            reauth.identifier = NSUserInterfaceItemIdentifier(connector.name)
+            reauth.toolTip = "Re-authenticate \(connector.name)"
+            if let image = symbolImage("arrow.clockwise") {
+                image.isTemplate = true
+                reauth.image = image
+                reauth.imagePosition = .imageOnly
+                reauth.imageScaling = .scaleProportionallyDown
+            } else {
+                reauth.title = "↻"
+                reauth.font = NSFont.systemFont(ofSize: 11, weight: .bold)
+            }
+            row.addSubview(reauth)
+            NSLayoutConstraint.activate([
+                reauth.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -8),
+                reauth.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+                reauth.widthAnchor.constraint(equalToConstant: 24),
+                reauth.heightAnchor.constraint(equalToConstant: 24),
+                tier.trailingAnchor.constraint(equalTo: reauth.leadingAnchor, constant: -6),
+            ])
+        } else {
+            tier.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -10).isActive = true
+        }
+
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 38),
+            name.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
+            name.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            name.trailingAnchor.constraint(lessThanOrEqualTo: tier.leadingAnchor, constant: -8),
+            tier.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+        ])
+        return row
+    }
+
+    private func connectorTierText(_ connector: AgentConnectorInfo) -> String {
+        switch connector.authTier {
+        case "env_auth": return connector.ready ? "env · ready" : "env · re-auth"
+        case "hosted_oauth": return connector.ready ? "oauth · ready" : "oauth · re-auth"
+        default: return connector.ready ? "ready" : "re-auth"
+        }
+    }
+
+    @objc private func connectorReauthClicked(_ sender: NSButton) {
+        guard let name = sender.identifier?.rawValue, let kind = pendingConnectorKind else { return }
+        emitConnectorReauthRequested(kind: kind, name: name)
+        sender.toolTip = "Re-auth requested for \(name)"
+    }
+
+    @objc private func connectorSheetCancelClicked() {
+        dismissConnectorSheet()
+    }
+
+    @objc private func connectorSheetAttachClicked() {
+        guard let kind = pendingConnectorKind else { return }
+        let sessionId = pendingConnectorSessionId
+        emitAgentAttachRequested(kind: kind, sessionId: sessionId)
+        attachedAgentKind = kind
+        dismissConnectorSheet()
+        agentDrawer.isHidden = true
+        // Optimistic badge; the daemon confirms with set_agents.
+        updateAgentBadge()
+    }
+
+    private func dismissConnectorSheet() {
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.10
+            self.connectorSheetOverlay.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            guard let self else { return }
+            self.connectorSheetOverlay.isHidden = true
+            self.connectorSheetOverlay.alphaValue = 1
+        })
+    }
+
+    // MARK: Attached-state badge
+
+    private func updateAgentBadge() {
+        guard let kind = attachedAgentKind,
+              let agent = agentSummaries.first(where: { $0.kind == kind })
+        else {
+            agentBadge.isHidden = true
+            onAgentAttachmentChanged?(false)
+            return
+        }
+        agentBadge.isHidden = false
+        agentBadge.stringValue = "\(agentShortLabel(kind)) · \(agent.readyConnectorCount)/\(agent.connectorCount) tools"
+        statusLabel.stringValue = "agent: \(agent.displayName)"
+        onAgentAttachmentChanged?(true)
+    }
+
     func resetSessionSurface() {
         feed.clear()
         hideSystemToast(immediately: true)
@@ -4287,6 +5904,24 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
         feed.push(card)
         routeCanvasIfNeeded(card)
+    }
+
+    /// Render a review-gated Fix proposal as a dedicated card in the feed
+    /// (Slice F4). Carries the proposal payload + a pending decision state; the
+    /// feed's Approve/Reject buttons echo back via emitFixApprovalResponded.
+    func pushFixProposal(_ proposal: FixProposal) {
+        let card = RenderedCard(
+            id: proposal.proposalId,
+            kind: "fix_proposal",
+            title: "Proposed fix",
+            body: "",
+            done: true,
+            costLabel: nil,
+            artifact: nil,
+            source: nil,
+            fixProposal: proposal,
+            fixState: .pending)
+        feed.push(card)
     }
 
     func updateCard(id: String, body: String, done: Bool, costLabel: String?, artifact: OverlayArtifact?) {
@@ -5404,6 +7039,9 @@ private final class OverlayApp {
             self?.overlayOpacity = opacity
             self?.pillView?.applyBackgroundOpacity(opacity)
         }
+        view.onAgentAttachmentChanged = { [weak self] attached in
+            self?.pillView?.agentAttached = attached
+        }
         expandedWindow = window
         expandedView = view
         view.setListeningState(currentRunState)
@@ -5502,10 +7140,20 @@ private final class OverlayApp {
             expandedView?.pushCard(RenderedCard(
                 id: card.id, kind: card.kind, title: card.title,
                 body: card.body, done: true, costLabel: card.costLabel,
-                artifact: card.artifact))
+                artifact: card.artifact, source: card.source))
         case .updateCard(let id, let body, let done, let costLabel, let artifact):
             ensureExpandedWindow()
             expandedView?.updateCard(id: id, body: body, done: done, costLabel: costLabel, artifact: artifact)
+        case .setAgents(let agents):
+            ensureExpandedWindow()
+            expandedView?.setAgents(agents)
+        case .setAgentSessions(let kind, let sessions):
+            expandedView?.setAgentSessions(kind: kind, sessions: sessions)
+        case .setAgentConnectors(let kind, let connectors):
+            expandedView?.setAgentConnectors(kind: kind, connectors: connectors)
+        case .pushFixProposal(let proposal):
+            ensureExpandedWindow()
+            expandedView?.pushFixProposal(proposal)
         case .shutdown:
             emitLifecycle("shutdown")
             NSApp.terminate(nil)
@@ -5528,7 +7176,8 @@ private final class OverlayApp {
             body: body,
             done: true,
             costLabel: nil,
-            artifact: nil)
+            artifact: nil,
+            source: nil)
         if signInURL != nil || title.localizedCaseInsensitiveContains("sign in") {
             view.showSignedOutLogin(url: signInURL)
             pillView?.dotColor = BlueyTheme.warning

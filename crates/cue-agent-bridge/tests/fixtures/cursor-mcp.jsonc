@@ -1,0 +1,16 @@
+{
+    // Cursor-style mcp.json with trailing commas (real-world gotcha)
+    "mcpServers": {
+        "filesystem": {
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+        },
+        "postgres": {
+            "command": "pg-mcp",
+            "env": { "PG_URL": "redacted-not-read" },
+        },
+        "supabase": {
+            "url": "https://mcp.supabase.com/sse"
+        },
+    },
+}
