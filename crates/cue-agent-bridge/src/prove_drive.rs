@@ -30,7 +30,6 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 
-use crate::mcp_probe::{self, McpProbeResult};
 use crate::titler::{self, TitleSource};
 use crate::{
     discover_agents, reader_for, registry, AgentKind, AnswerChunk, DiscoveredAgent, Question, Role,
@@ -494,47 +493,42 @@ impl SessionsResult {
 
 /// The MCP step outcome for a scorecard.
 ///
-/// Reuses Agent B's probe result ([`McpProbeResult`]) directly when the probe
-/// ran, and adds a `NotRun` arm for the cases the matrix short-circuits before
-/// paying for a call (the agent never answered the canary, or it has no
-/// connector with a known read-only probe). No re-modeling of the probe itself.
+/// The MCP step measures **availability**, not live execution: does the user's
+/// agent have MCP connectors wired up that Bluey can detect and inherit? That is
+/// a read-only config read (no drive, no model quota, no flaky external call) —
+/// the product question is "are the tools there," not "do they return data right
+/// now" (a connector being rate-limited/misconfigured is the user's concern, not
+/// a measure of whether Bluey works).
 #[derive(Debug, Clone)]
 pub enum McpStep {
-    /// The probe ran; this is Agent B's verbatim result.
-    Ran(McpProbeResult),
-    /// The probe was deliberately not run, with the honest reason.
-    NotRun(String),
+    /// Connectors were read: how many MCP servers this agent exposes, and a
+    /// sample of their names.
+    Available { count: usize, names: Vec<String> },
+    /// The agent has a config location but it declares no MCP servers.
+    NoneConfigured,
+    /// No connector config file was located for this agent.
+    NoConfig,
 }
 
 impl McpStep {
     /// Map the MCP step onto a matrix cell.
     ///
-    /// 🟢 the connector fired with live data; 🟡 the agent answered but the data
-    /// wasn't verifiably live (alive-but-unproven); 🔴 the probe drive failed
-    /// (real reason); ⬜ no probe was run / no probeable connector.
+    /// 🟢 the agent exposes ≥1 MCP connector (tools available to inherit);
+    /// ⬜ a config exists but declares none, or no config was located.
     fn cell(&self) -> StepResult {
         match self {
-            McpStep::Ran(McpProbeResult::Fired {
-                connector,
-                family,
-                elapsed_ms,
-                ..
-            }) => StepResult::pass(format!("{family} via {connector} fired ({elapsed_ms} ms)")),
-            McpStep::Ran(McpProbeResult::NoLiveData {
-                connector,
-                family,
-                answer,
-                elapsed_ms,
-            }) => StepResult::warn(format!(
-                "{family} via {connector}: no live data — {answer:?} ({elapsed_ms} ms)"
-            )),
-            McpStep::Ran(McpProbeResult::Failed { reason, elapsed_ms }) => {
-                StepResult::fail(format!("{reason} ({elapsed_ms} ms)"))
+            McpStep::Available { count, names } => {
+                let sample = if names.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", names.join(", "))
+                };
+                StepResult::pass(format!("{count} MCP connector(s) available{sample}"))
             }
-            McpStep::Ran(McpProbeResult::NoProbe) => {
-                StepResult::skip("no connector with a known read-only probe".to_string())
+            McpStep::NoneConfigured => {
+                StepResult::skip("config present, no MCP servers declared".to_string())
             }
-            McpStep::NotRun(reason) => StepResult::skip(reason.clone()),
+            McpStep::NoConfig => StepResult::skip("no connector config located".to_string()),
         }
     }
 }
@@ -646,9 +640,9 @@ impl AgentScorecard {
 /// Run all 5 steps for ONE agent, sequentially and fail-soft.
 ///
 /// A red step still records its real reason and never aborts the others, so the
-/// row is always complete. Read steps (detect/sessions/title) are local and
-/// fast; the ask step spends real model quota and is bounded by
-/// [`DRIVE_TIMEOUT`]; the MCP step runs only when wired (else records NotRun).
+/// row is always complete. Read steps (detect/sessions/title/MCP) are local and
+/// fast — the MCP step is a read-only connector-availability check, no drive; only
+/// the ask step spends real model quota (bounded by [`DRIVE_TIMEOUT`]).
 ///
 /// **Spends real quota** on the Ask step for any drivable agent — call only on
 /// explicit user request.
@@ -688,8 +682,8 @@ pub async fn validate_agent(kind: &AgentKind) -> AgentScorecard {
         drive_once_resolving_model(kind.clone()).await
     };
 
-    // Step 5 — MCP (Agent B's probe). Only meaningful once the agent answered.
-    let mcp = mcp_step(kind, &ask).await;
+    // Step 5 — MCP availability (read-only connector read; no drive, no quota).
+    let mcp = mcp_step(kind);
 
     AgentScorecard {
         display_name,
@@ -908,24 +902,36 @@ async fn read_first_user_turns(store: &SessionStore, id: &str) -> Vec<String> {
     }
 }
 
-/// Step 5 — MCP: drive the agent to fire one of its OWN connectors and return
-/// live data, via Agent B's probe ([`crate::mcp_probe`]).
+/// Step 5 — MCP: are the user's MCP connectors **available** for Bluey to
+/// inherit? This is a READ-ONLY connector-config read — it never drives the
+/// agent and never spends model quota. The product question is "does the agent
+/// have MCP tools wired up," not "do those tools return live data right now" (a
+/// rate-limited/misconfigured connector is the user's concern; its tools are
+/// still *available* to the agent, which is what Bluey detects and inherits).
 ///
-/// Short-circuits to `NotRun` when the agent never answered the canary (the
-/// probe would just fail the same way and cost another spawn) or when it has no
-/// connector with a known read-only probe (`pick_probe` returns `None`). When a
-/// probe exists and the agent is alive, runs the REAL probe — one more model
-/// call against the user's account.
-async fn mcp_step(kind: &AgentKind, ask: &DriveProof) -> McpStep {
-    // Only probe a live agent — a dead one would fail the same way for free.
-    if !matches!(ask, DriveProof::Answered { .. }) {
-        return McpStep::NotRun("ask did not answer (probe needs a live agent)".to_string());
+/// Up to [`MCP_NAME_SAMPLE`] connector names are listed for at-a-glance context.
+fn mcp_step(kind: &AgentKind) -> McpStep {
+    const MCP_NAME_SAMPLE: usize = 6;
+    let config = crate::discover_agents()
+        .into_iter()
+        .find(|d| &d.kind == kind)
+        .and_then(|d| d.connector_config_path);
+    let Some(path) = config else {
+        return McpStep::NoConfig;
+    };
+    let conns = crate::read_connectors(&path);
+    if conns.is_empty() {
+        return McpStep::NoneConfigured;
     }
-    // No connector with a known read-only probe → honest skip, no call.
-    if mcp_probe::pick_probe(kind).is_none() {
-        return McpStep::Ran(McpProbeResult::NoProbe);
+    let names = conns
+        .iter()
+        .take(MCP_NAME_SAMPLE)
+        .map(|c| c.name.clone())
+        .collect();
+    McpStep::Available {
+        count: conns.len(),
+        names,
     }
-    McpStep::Ran(mcp_probe::run_mcp_probe(kind).await)
 }
 
 /// Render the full 5-step matrix: agent rows × 5 columns, each cell a glyph +
@@ -1225,7 +1231,7 @@ mod tests {
                 sessions: vec![],
             },
             ask,
-            mcp: McpStep::NotRun("n/a".into()),
+            mcp: McpStep::NoConfig,
         };
         let pass = card(DriveProof::Answered {
             echoed_canary: true,
@@ -1251,51 +1257,20 @@ mod tests {
     }
 
     #[test]
-    fn mcp_step_maps_probe_result_to_cell_status() {
-        // Fired (live data) → 🟢.
-        assert_eq!(
-            McpStep::Ran(McpProbeResult::Fired {
-                connector: "perplexity-ask".into(),
-                family: "web-search",
-                answer: "1.96.0".into(),
-                elapsed_ms: 10,
-            })
-            .cell()
-            .status,
-            CellStatus::Pass
-        );
-        // Answered but unproven → 🟡.
-        assert_eq!(
-            McpStep::Ran(McpProbeResult::NoLiveData {
-                connector: "github".into(),
-                family: "github",
-                answer: "I can't access real-time data".into(),
-                elapsed_ms: 10,
-            })
-            .cell()
-            .status,
-            CellStatus::Warn
-        );
-        // Drive failed → 🔴.
-        assert_eq!(
-            McpStep::Ran(McpProbeResult::Failed {
-                reason: "429 rate limited".into(),
-                elapsed_ms: 10,
-            })
-            .cell()
-            .status,
-            CellStatus::Fail
-        );
-        // No probeable connector → ⬜.
-        assert_eq!(
-            McpStep::Ran(McpProbeResult::NoProbe).cell().status,
-            CellStatus::Skip
-        );
-        // Deliberately not run → ⬜.
-        assert_eq!(
-            McpStep::NotRun("ask did not answer".into()).cell().status,
-            CellStatus::Skip
-        );
+    fn mcp_step_availability_maps_to_cell_status() {
+        // ≥1 connector available → 🟢, with the count + names in the detail.
+        let avail = McpStep::Available {
+            count: 2,
+            names: vec!["perplexity".into(), "github".into()],
+        };
+        assert_eq!(avail.cell().status, CellStatus::Pass);
+        assert!(avail.cell().detail.contains("2 MCP connector(s) available"));
+        assert!(avail.cell().detail.contains("perplexity"));
+
+        // Config present but no servers declared → ⬜.
+        assert_eq!(McpStep::NoneConfigured.cell().status, CellStatus::Skip);
+        // No connector config located → ⬜.
+        assert_eq!(McpStep::NoConfig.cell().status, CellStatus::Skip);
     }
 
     // ---- 5-step matrix: render -------------------------------------------
@@ -1327,12 +1302,10 @@ mod tests {
                     answer: "LIVEPROOF7".into(),
                     elapsed_ms: 1200,
                 },
-                mcp: McpStep::Ran(McpProbeResult::Fired {
-                    connector: "perplexity-ask".into(),
-                    family: "web-search",
-                    answer: "1.96.0, May 28 2026".into(),
-                    elapsed_ms: 3400,
-                }),
+                mcp: McpStep::Available {
+                    count: 1,
+                    names: vec!["perplexity-ask".into()],
+                },
             },
             // A not-installed agent: detect fails, the rest skip.
             AgentScorecard {
@@ -1348,7 +1321,7 @@ mod tests {
                 ask: DriveProof::Skipped {
                     reason: "not driven: detect = not installed on this machine".into(),
                 },
-                mcp: McpStep::NotRun("ask did not answer (probe needs a live agent)".into()),
+                mcp: McpStep::NoConfig,
             },
         ]
     }
@@ -1363,10 +1336,11 @@ mod tests {
         // Both agents appear as rows.
         assert!(out.contains("Codex"));
         assert!(out.contains("Aider"));
-        // The green agent shows pass glyphs and the MCP detail (connector + family).
+        // The green agent shows pass glyphs and the MCP availability detail
+        // (connector count + sampled name).
         assert!(out.contains("🟢"));
         assert!(out.contains("perplexity-ask"));
-        assert!(out.contains("web-search"));
+        assert!(out.contains("MCP connector(s) available"));
         // The absent agent surfaces the REAL reason, not a guess, and a 🔴/⬜ mix.
         assert!(out.contains("not installed on this machine"));
         assert!(out.contains("🔴"));

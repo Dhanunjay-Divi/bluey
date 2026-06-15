@@ -514,8 +514,9 @@ struct ProveArgs {
     cloud: bool,
     /// Run the full 5-STEP VALIDATION MATRIX (Detect · Sessions · Title · Ask ·
     /// MCP) for one category of agents, SEQUENTIALLY. This is the "is it all
-    /// working?" scorecard. The Ask and MCP steps each spend real model quota on
-    /// your account, one agent at a time. Use `--category` to choose which set.
+    /// working?" scorecard. Only the Ask step spends real model quota on your
+    /// account (one agent at a time); MCP is a read-only availability check. Use
+    /// `--category` to choose which set.
     #[arg(long)]
     matrix: bool,
     /// Which agent category the `--matrix` scorecard runs: `cli` (local CLI
@@ -2281,8 +2282,8 @@ question and spends real model quota.\n"
             }
 
             // Opt-in FULL 5-STEP MATRIX scorecard for one category, run
-            // sequentially (one agent fully before the next). The Ask + MCP
-            // steps spend real model quota.
+            // sequentially (one agent fully before the next). Only the Ask step
+            // spends real model quota; MCP is a read-only availability check.
             if args.matrix {
                 use cue_agent_bridge::prove_drive::{
                     render_scorecard, validate_category, AgentCategory,
@@ -2297,7 +2298,7 @@ question and spends real model quota.\n"
                 eprintln!(
                     "Running the 5-STEP VALIDATION MATRIX for the {} category — \
 this drives each agent SEQUENTIALLY and spends real model quota on the Ask \
-and MCP steps.\n",
+step (MCP is a read-only availability check).\n",
                     category.label()
                 );
                 let cards = validate_category(category).await;
