@@ -4282,7 +4282,7 @@ fn visible_question_for_source(question: &str, source: &str) -> (String, String)
             "Analyse Screen".to_string(),
             "Analyse the captured screenshot context.".to_string(),
         ),
-        _ => ("You".to_string(), question.to_string()),
+        _ => ("Question".to_string(), question.to_string()),
     }
 }
 
@@ -8129,6 +8129,22 @@ mod tests {
         assert!(system.contains("updated whole architecture"));
         assert!(system.contains("Approach, Code, Explanation, Complexity, Edge cases"));
         assert!(system.contains("fenced Markdown code blocks"));
+    }
+
+    #[test]
+    fn overlay_question_cards_are_titled_question() {
+        let (title, body) = visible_question_for_source("What changed?", "overlay ask");
+
+        assert_eq!(title, "Question");
+        assert_eq!(body, "What changed?");
+    }
+
+    #[test]
+    fn overlay_screen_analysis_cards_keep_specific_title() {
+        let (title, body) = visible_question_for_source("Analyse everything", "overlay analyse");
+
+        assert_eq!(title, "Analyse Screen");
+        assert_eq!(body, "Analyse the current browser page or screen context.");
     }
 
     #[test]

@@ -1753,7 +1753,7 @@ private final class FeedView: NSView {
 
         let metaLabel = NSTextField(labelWithString: kindLabel(card))
         metaLabel.font = NSFont.systemFont(ofSize: 11, weight: .bold)
-        metaLabel.textColor = rightAligned ? NSColor.black.withAlphaComponent(0.58) : accent
+        metaLabel.textColor = metaLabelColor(for: card, rightAligned: rightAligned, accent: accent)
         metaLabel.translatesAutoresizingMaskIntoConstraints = false
 
         let titleText = displayTitle(for: card)
@@ -1774,6 +1774,9 @@ private final class FeedView: NSView {
         bodyLabel.alignment = signInURL == nil ? .left : .center
         bodyLabel.translatesAutoresizingMaskIntoConstraints = false
         bodyLabel.preferredMaxLayoutWidth = signInURL == nil ? (rightAligned ? 360 : 480) : 430
+        if let attributedBody = attributedChatBody(for: card, text: bodyText, rightAligned: rightAligned) {
+            bodyLabel.attributedStringValue = attributedBody
+        }
 
         let statusLabel = NSTextField(labelWithString: statusText(for: card))
         statusLabel.font = NSFont.monospacedSystemFont(ofSize: 9.5, weight: .semibold)
@@ -1966,18 +1969,29 @@ private final class FeedView: NSView {
 
     private func kindLabel(_ card: RenderedCard) -> String {
         switch normalizedCardKind(card.kind) {
-        case "answer":      return "BLUEY"
-        case "question":    return "YOU"
+        case "answer":      return "Bluey"
+        case "question":    return "Question"
         case "action_item": return "ACTION"
         case "decision":    return "DECISION"
         case "context":     return "CONTEXT"
         case "transcript":
             let source = card.title.trimmingCharacters(in: .whitespacesAndNewlines)
-            return source.isEmpty ? "AUDIO" : source.uppercased()
+            return source.isEmpty ? "Audio" : source
         case "warning":     return "WARNING"
         case "system":      return "SYSTEM"
-        default:            return "BLUEY"
+        default:            return "Bluey"
         }
+    }
+
+    private func metaLabelColor(for card: RenderedCard, rightAligned: Bool, accent: NSColor) -> NSColor {
+        let kind = normalizedCardKind(card.kind)
+        if kind == "transcript" {
+            return sourceMarkerColor(rightAligned: rightAligned)
+        }
+        if kind == "question" {
+            return rightAligned ? NSColor.black.withAlphaComponent(0.54) : BlueyTheme.green
+        }
+        return rightAligned ? NSColor.black.withAlphaComponent(0.58) : accent
     }
 
     private func displayTitle(for card: RenderedCard) -> String {
@@ -1996,6 +2010,41 @@ private final class FeedView: NSView {
 
     private func bodyFont(for card: RenderedCard) -> NSFont {
         return NSFont.systemFont(ofSize: 13.5, weight: .regular)
+    }
+
+    private func attributedChatBody(for card: RenderedCard, text: String, rightAligned: Bool) -> NSAttributedString? {
+        let kind = normalizedCardKind(card.kind)
+        guard kind == "question" || kind == "transcript" else { return nil }
+        let font = bodyFont(for: card)
+        let attributed = NSMutableAttributedString(
+            string: text,
+            attributes: [
+                .font: font,
+                .foregroundColor: rightAligned ? NSColor.black : BlueyTheme.text,
+            ])
+        let sourceFont = NSFont.systemFont(ofSize: font.pointSize, weight: .bold)
+        let sourceColor = sourceMarkerColor(rightAligned: rightAligned)
+        let fullRange = NSRange(location: 0, length: (text as NSString).length)
+        guard let regex = try? NSRegularExpression(pattern: #"(?m)^(System|Mic|Audio)(:|\s·)"#) else {
+            return attributed
+        }
+        regex.enumerateMatches(in: text, range: fullRange) { match, _, _ in
+            guard let match, match.numberOfRanges > 1 else { return }
+            let labelRange = match.range(at: 1)
+            attributed.addAttributes(
+                [
+                    .font: sourceFont,
+                    .foregroundColor: sourceColor,
+                ],
+                range: labelRange)
+        }
+        return attributed
+    }
+
+    private func sourceMarkerColor(rightAligned: Bool) -> NSColor {
+        rightAligned
+            ? NSColor(red: 0.00, green: 0.42, blue: 0.20, alpha: 1.0)
+            : BlueyTheme.green
     }
 
     private func chatBody(for card: RenderedCard, rawBody: String) -> String {
@@ -5023,22 +5072,21 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let label = transcriptSourceLabel(title)
         rememberTranscriptForAnswer(label: label, body: body, final: true)
         setTranscriptState(recordingActive ? "TRANSCRIBING" : "CAPTURED", active: recordingActive)
-        updateTranscriptStripText("Captured · \(label) · \(body)", scrollToEnd: true)
+        updateTranscriptStripText("\(label) · \(body)", scrollToEnd: true)
     }
 
     func appendLiveTranscript(source: String, text: String, final: Bool) {
         let body = displayTranscriptText(text)
         let label = transcriptSourceLabel(source)
         let state = recordingActive ? "TRANSCRIBING" : (final ? "CAPTURED" : "HEARD")
-        let prefix = recordingActive ? "Transcribing" : (final ? "Captured" : "Heard")
         guard !body.isEmpty else {
             setTranscriptState(state, active: recordingActive)
-            updateTranscriptStripText("\(prefix) · \(label) audio is live", scrollToEnd: false)
+            updateTranscriptStripText("\(label) audio is live", scrollToEnd: false)
             return
         }
         rememberTranscriptForAnswer(label: label, body: body, final: final)
         setTranscriptState(state, active: recordingActive)
-        updateTranscriptStripText("\(prefix) · \(label) · \(body)", scrollToEnd: true)
+        updateTranscriptStripText("\(label) · \(body)", scrollToEnd: true)
     }
 
     private func rememberTranscriptForAnswer(label: String, body: String, final: Bool) {
