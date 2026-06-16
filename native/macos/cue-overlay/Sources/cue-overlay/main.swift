@@ -3334,7 +3334,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func hitsPassThroughInteractiveRegion(at localPoint: NSPoint, screenPoint: NSPoint) -> Bool {
-        if hitsView(interactionModeButton, at: localPoint, padding: 10) {
+        if hitsExplicitInteractiveChrome(at: localPoint) {
             return true
         }
         if feed.hasCopyControl(atScreenPoint: screenPoint) {
@@ -4808,7 +4808,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             showSystemToast(
                 title: passThroughMode ? "Click-through on" : "Interactive on",
                 body: passThroughMode
-                    ? "Background clicks pass through. Text, scroll, and this toggle stay available."
+                    ? "Empty space passes through. Bluey controls and text stay available."
                     : "Buttons, composer, and window controls are clickable.",
                 duration: 2.0)
         }
@@ -5809,8 +5809,8 @@ private final class OverlayApp {
             else { return }
 
             // Interactive mode keeps the whole panel clickable. Pass-through
-            // mode only keeps text regions and the mode toggle active so the
-            // host app beneath Bluey can receive ordinary clicks.
+            // mode keeps Bluey chrome and visible text interactive while empty
+            // workspace/background regions pass clicks through to the host app.
             let wantsMouse = expandedView.shouldReceiveMouseEvents(at: NSEvent.mouseLocation)
             if expandedWindow.ignoresMouseEvents == wantsMouse {
                 expandedWindow.ignoresMouseEvents = !wantsMouse
