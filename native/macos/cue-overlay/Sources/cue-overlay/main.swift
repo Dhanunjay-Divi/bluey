@@ -1460,7 +1460,6 @@ private final class FeedView: NSView {
     func push(_ card: RenderedCard) {
         if normalizedCardKind(card.kind) == "transcript" {
             onTranscript?(card)
-            pushTranscriptCard(card)
             emitCardRendered(id: card.id)
             return
         }
@@ -1779,7 +1778,7 @@ private final class FeedView: NSView {
         statusLabel.font = NSFont.monospacedSystemFont(ofSize: 9.5, weight: .semibold)
         statusLabel.textColor = rightAligned ? NSColor.black.withAlphaComponent(0.46) : BlueyTheme.textDim
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
-        let copyButton = signInURL == nil && !rightAligned
+        let copyButton = shouldShowCopyButton(for: card, rightAligned: rightAligned, signInURL: signInURL)
             ? makeCopyCardButton(text: rawBody.isEmpty ? bodyText : rawBody, rightAligned: rightAligned)
             : nil
 
@@ -1915,6 +1914,12 @@ private final class FeedView: NSView {
         }
         button.toolTip = "Copy this message"
         return button
+    }
+
+    private func shouldShowCopyButton(for card: RenderedCard, rightAligned: Bool, signInURL: URL?) -> Bool {
+        guard signInURL == nil, !rightAligned, let artifact = card.artifact else { return false }
+        let type = artifact.artifactType.lowercased()
+        return type == "code" || type == "system_design"
     }
 
     @objc private func copyCardClicked(_ sender: CopyCardButton) {
@@ -4927,9 +4932,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return
         }
         rememberTranscriptForAnswer(label: label, body: body, final: final)
-        if final {
-            feed.pushTranscript(source: label, body: body)
-        }
         setTranscriptState(state, active: recordingActive)
         updateTranscriptStripText("\(prefix) · \(label) · \(body)", scrollToEnd: true)
     }
