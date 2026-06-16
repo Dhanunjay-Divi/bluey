@@ -359,8 +359,8 @@ private final class ComposerTextView: NSTextView {
             if event.modifierFlags.contains(.shift) {
                 insertNewline(nil)
             } else {
-                // Enter submits. Shift+Enter keeps a multiline thought inside
-                // the composer.
+                // Enter submits. Cmd+Enter is shown as the explicit shortcut,
+                // and Shift+Enter keeps a multiline thought inside the composer.
                 onSubmit?()
             }
             return
@@ -905,18 +905,34 @@ private final class ModalBlockerView: NSView {
 private final class HeaderDragView: NSView {
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard !isHidden, alphaValue > 0.01, bounds.contains(point) else { return nil }
-        guard let hit = super.hitTest(point) else { return self }
-        if hit === self { return self }
-        return preservesHeaderHit(for: hit) ? hit : self
+        if let control = interactiveHit(in: self, point: point) {
+            return control
+        }
+        return self
     }
 
     override func mouseDown(with event: NSEvent) {
         let localPoint = convert(event.locationInWindow, from: nil)
-        if let hit = hitTest(localPoint), hit !== self {
+        if let hit = interactiveHit(in: self, point: localPoint), hit !== self {
             super.mouseDown(with: event)
             return
         }
         window?.performDrag(with: event)
+    }
+
+    private func interactiveHit(in view: NSView, point: NSPoint) -> NSView? {
+        for subview in view.subviews.reversed() {
+            guard !subview.isHidden, subview.alphaValue > 0.01 else { continue }
+            let subPoint = subview.convert(point, from: view)
+            guard subview.bounds.insetBy(dx: -6, dy: -6).contains(subPoint) else { continue }
+            if preservesHeaderHit(for: subview) {
+                return subview.hitTest(subPoint) ?? subview
+            }
+            if let nested = interactiveHit(in: subview, point: subPoint) {
+                return nested
+            }
+        }
+        return nil
     }
 
     private func preservesHeaderHit(for view: NSView) -> Bool {
@@ -2467,7 +2483,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         composerSurface = ComposerSurfaceView()
         composer = ComposerTextView(frame: .zero, textContainer: nil)
         recordingButton = NSButton(title: "Listen", target: nil, action: nil)
-        askButton = NSButton(title: "Answer ↵", target: nil, action: nil)
+        askButton = NSButton(title: "Answer ⌘↵", target: nil, action: nil)
         analyzeButton = NSButton(title: "Screen", target: nil, action: nil)
         attachButton = NSButton(title: "", target: nil, action: nil)
         instructionsButton = NSButton(title: "Tone", target: nil, action: nil)
@@ -2961,6 +2977,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         recordingButton.action = #selector(recordingClicked)
         askButton.target = self
         askButton.action = #selector(askClicked)
+        askButton.keyEquivalent = "\r"
+        askButton.keyEquivalentModifierMask = [.command]
         analyzeButton.target = self
         analyzeButton.action = #selector(analyzeClicked)
         attachButton.target = self
@@ -3047,8 +3065,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         ).cgColor
         modelMenu.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.075)).cgColor
         modelMenu.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.12)).cgColor
-        balanceLabel.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.055)).cgColor
-        balanceLabel.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.10)).cgColor
+        balanceLabel.layer?.backgroundColor = NSColor.clear.cgColor
+        balanceLabel.layer?.borderColor = NSColor.clear.cgColor
         toastView.layer?.backgroundColor = NSColor(
             red: 0.018,
             green: 0.023,
@@ -3073,7 +3091,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         ).cgColor
         composerSurface.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.050)).cgColor
         composerSurface.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.12)).cgColor
-        opacityControl.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.065)).cgColor
+        opacityControl.layer?.backgroundColor = NSColor.clear.cgColor
+        opacityControl.layer?.borderColor = NSColor.clear.cgColor
         closeConfirmPanel.layer?.backgroundColor = BlueyTheme.panelDeep
             .withAlphaComponent(materialAlpha(0.97))
             .cgColor
@@ -3457,10 +3476,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         balanceLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
         balanceLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         balanceLabel.wantsLayer = true
-        balanceLabel.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.055).cgColor
-        balanceLabel.layer?.cornerRadius = 14
-        balanceLabel.layer?.borderWidth = 1
-        balanceLabel.layer?.borderColor = NSColor.white.withAlphaComponent(0.10).cgColor
+        balanceLabel.layer?.backgroundColor = NSColor.clear.cgColor
+        balanceLabel.layer?.cornerRadius = 0
+        balanceLabel.layer?.borderWidth = 0
+        balanceLabel.layer?.borderColor = NSColor.clear.cgColor
     }
 
     private func configureSystemToast() {
@@ -3632,10 +3651,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         composerSurface.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
 
         opacityControl.wantsLayer = true
-        opacityControl.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.065).cgColor
+        opacityControl.layer?.backgroundColor = NSColor.clear.cgColor
         opacityControl.layer?.cornerRadius = 16
-        opacityControl.layer?.borderWidth = 1
-        opacityControl.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.16).cgColor
+        opacityControl.layer?.borderWidth = 0
+        opacityControl.layer?.borderColor = NSColor.clear.cgColor
         opacityControl.toolTip = "Overlay opacity"
         opacityLabel.stringValue = "Opacity"
         opacityLabel.font = NSFont.systemFont(ofSize: 10.2, weight: .semibold)
@@ -3709,7 +3728,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         instructionsButton.toolTip = "How Bluey should answer"
         attachButton.toolTip = "Attach files"
         analyzeButton.toolTip = "Analyse screen"
-        askButton.toolTip = "Answer with Enter. Shift+Enter adds a new line."
+        askButton.toolTip = "Answer with Cmd+Enter. Enter also answers; Shift+Enter adds a new line."
         latestSessionButton.toolTip = "Continue the latest recording"
         answerStyleSaveButton.toolTip = "Save answer style for this session"
     }
@@ -3742,7 +3761,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func styleHeaderBadge(_ label: NSTextField, textColor: NSColor) {
-        label.font = NSFont.systemFont(ofSize: 10.6, weight: .bold)
+        label.font = NSFont.systemFont(ofSize: 10.8, weight: .bold)
         label.textColor = textColor
         label.alignment = .center
         label.lineBreakMode = .byTruncatingMiddle
@@ -3757,20 +3776,20 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         label.setContentHuggingPriority(.defaultLow, for: .horizontal)
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.wantsLayer = true
-        label.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.052).cgColor
-        label.layer?.cornerRadius = 12
-        label.layer?.borderWidth = 1
-        label.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.16).cgColor
+        label.layer?.backgroundColor = NSColor.clear.cgColor
+        label.layer?.cornerRadius = 0
+        label.layer?.borderWidth = 0
+        label.layer?.borderColor = NSColor.clear.cgColor
     }
 
     private func styleHeaderIconButton(_ button: NSButton, symbol: String, fallback: String) {
         button.title = fallback
         button.isBordered = false
         button.wantsLayer = true
-        button.layer?.cornerRadius = 15
-        button.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.070).cgColor
-        button.layer?.borderWidth = 1
-        button.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
+        button.layer?.cornerRadius = 0
+        button.layer?.backgroundColor = NSColor.clear.cgColor
+        button.layer?.borderWidth = 0
+        button.layer?.borderColor = NSColor.clear.cgColor
         button.font = NSFont.systemFont(ofSize: 12, weight: .bold)
         button.contentTintColor = BlueyTheme.text
         if let image = symbolImage(symbol) {
@@ -3795,12 +3814,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         button.title = fallback
         button.isBordered = false
         button.wantsLayer = true
-        button.layer?.cornerRadius = accent ? 20 : 16
-        button.layer?.backgroundColor = accent
-            ? NSColor(red: 0.07, green: 0.19, blue: 0.24, alpha: 0.98).cgColor
-            : NSColor.white.withAlphaComponent(0.070).cgColor
-        button.layer?.borderWidth = 1
-        button.layer?.borderColor = (accent ? BlueyTheme.cyan.withAlphaComponent(0.58) : NSColor.white.withAlphaComponent(0.12)).cgColor
+        button.layer?.cornerRadius = 0
+        button.layer?.backgroundColor = NSColor.clear.cgColor
+        button.layer?.borderWidth = 0
+        button.layer?.borderColor = NSColor.clear.cgColor
         button.font = NSFont.systemFont(ofSize: 12, weight: .bold)
         button.contentTintColor = accent ? BlueyTheme.text : BlueyTheme.cyan
         if let image = symbolImage(symbol) {
@@ -4142,8 +4159,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         statusLabel.stringValue = "Login needed"
         routeBadge.stringValue = "Sign in"
         routeBadge.textColor = BlueyTheme.warning
-        routeBadge.layer?.borderColor = BlueyTheme.warning.withAlphaComponent(0.28).cgColor
-        routeBadge.layer?.backgroundColor = BlueyTheme.warning.withAlphaComponent(0.08).cgColor
+        routeBadge.layer?.borderColor = NSColor.clear.cgColor
+        routeBadge.layer?.backgroundColor = NSColor.clear.cgColor
         balanceLabel.stringValue = "Login"
         setKnowledgeBadge("Docs locked", accent: BlueyTheme.textDim)
         composer.placeholder = url == nil ? "Sign in to use managed answers..." : "Sign in, then ask anything..."
@@ -4155,8 +4172,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         statusLabel.toolTip = nil
         routeBadge.stringValue = "● Ready"
         routeBadge.textColor = BlueyTheme.green
-        routeBadge.layer?.borderColor = BlueyTheme.green.withAlphaComponent(0.30).cgColor
-        routeBadge.layer?.backgroundColor = BlueyTheme.green.withAlphaComponent(0.075).cgColor
+        routeBadge.layer?.borderColor = NSColor.clear.cgColor
+        routeBadge.layer?.backgroundColor = NSColor.clear.cgColor
         if balanceLabel.stringValue == "Login" {
             balanceLabel.stringValue = "Balance --"
         }
@@ -4179,8 +4196,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         stopKnowledgeIndexing()
         knowledgeBadge.stringValue = text
         knowledgeBadge.textColor = accent
-        knowledgeBadge.layer?.borderColor = accent.withAlphaComponent(0.30).cgColor
-        knowledgeBadge.layer?.backgroundColor = accent.withAlphaComponent(0.08).cgColor
+        knowledgeBadge.layer?.borderColor = NSColor.clear.cgColor
+        knowledgeBadge.layer?.backgroundColor = NSColor.clear.cgColor
     }
 
     private func startKnowledgeIndexing() {
@@ -4198,8 +4215,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let frame = knowledgeIndexFrames[knowledgeIndexFrame % knowledgeIndexFrames.count]
         knowledgeBadge.stringValue = frame
         knowledgeBadge.textColor = BlueyTheme.green
-        knowledgeBadge.layer?.borderColor = BlueyTheme.green.withAlphaComponent(0.36).cgColor
-        knowledgeBadge.layer?.backgroundColor = BlueyTheme.green.withAlphaComponent(0.075).cgColor
+        knowledgeBadge.layer?.borderColor = NSColor.clear.cgColor
+        knowledgeBadge.layer?.backgroundColor = NSColor.clear.cgColor
         knowledgeBadge.toolTip = "Indexing attached documents"
     }
 
@@ -4352,8 +4369,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func updateAudioRouteBadge(_ text: String, accent: NSColor) {
         routeBadge.stringValue = text
         routeBadge.textColor = accent
-        routeBadge.layer?.borderColor = accent.withAlphaComponent(0.30).cgColor
-        routeBadge.layer?.backgroundColor = accent.withAlphaComponent(0.075).cgColor
+        routeBadge.layer?.borderColor = NSColor.clear.cgColor
+        routeBadge.layer?.backgroundColor = NSColor.clear.cgColor
     }
 
     private func updateRouteBadge(
