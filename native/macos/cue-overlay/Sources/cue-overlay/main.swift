@@ -1439,6 +1439,7 @@ private final class FeedView: NSView {
         scroll.scrollerStyle = .overlay
         scroll.borderType = .noBorder
         scroll.drawsBackground = false
+        scroll.contentInsets = NSEdgeInsets(top: 8, left: 0, bottom: 10, right: 0)
         scroll.documentView = stack
         scroll.translatesAutoresizingMaskIntoConstraints = false
         scroll.contentView.wantsLayer = true
@@ -2121,7 +2122,9 @@ private final class FeedView: NSView {
     private func scrollToBottom() {
         DispatchQueue.main.async { [weak self] in
             guard let s = self else { return }
-            let bottom = NSPoint(x: 0, y: max(0, s.stack.bounds.height - s.scroll.contentView.bounds.height))
+            let maxOffset = max(0, s.stack.bounds.height - s.scroll.contentView.bounds.height)
+            let targetY = s.stack.isFlipped ? maxOffset : 0
+            let bottom = NSPoint(x: 0, y: targetY)
             s.scroll.contentView.scroll(to: bottom)
             s.scroll.reflectScrolledClipView(s.scroll.contentView)
         }
@@ -3066,7 +3069,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             red: 0.018,
             green: 0.022,
             blue: 0.030,
-            alpha: materialAlpha(0.99, floor: 0.96)
+            alpha: 1.0
         ).cgColor
         modelMenu.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.075)).cgColor
         modelMenu.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.12)).cgColor
@@ -3419,12 +3422,30 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 y: workspaceBottom,
                 width: max(0, bounds.width - 20),
                 height: workspaceTop - workspaceBottom)
+            let canvasWidth = canvasOpen ? min(
+                max(0, canvasWidthConstraint?.constant ?? 0),
+                max(0, workspace.bounds.width - 268)
+            ) : 0
+            let canvasGap: CGFloat = canvasWidth > 0 ? 8 : 0
+            let feedWidth = max(0, workspace.bounds.width - canvasWidth - canvasGap)
+            feed.frame = NSRect(
+                x: 0,
+                y: 0,
+                width: feedWidth,
+                height: workspace.bounds.height)
+            canvasPane.frame = NSRect(
+                x: feed.frame.maxX + canvasGap,
+                y: 0,
+                width: canvasWidth,
+                height: workspace.bounds.height)
+            feed.needsLayout = true
+            canvasPane.needsLayout = true
         }
     }
 
     private func configureHeader() {
         headerBar.wantsLayer = true
-        headerBar.layer?.backgroundColor = NSColor(red: 0.018, green: 0.022, blue: 0.030, alpha: 0.99).cgColor
+        headerBar.layer?.backgroundColor = NSColor(red: 0.018, green: 0.022, blue: 0.030, alpha: 1.0).cgColor
         headerBar.layer?.cornerRadius = 21
         headerBar.layer?.borderWidth = 1
         headerBar.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.18).cgColor
