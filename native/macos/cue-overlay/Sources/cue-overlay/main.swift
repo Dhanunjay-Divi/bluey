@@ -40,6 +40,12 @@ private func displayTranscriptText(_ text: String) -> String {
         return ""
     }
     return trimmed
+        .replacingOccurrences(
+            of: #"(?i)\b(?:system|mic|microphone|audio)\s*:\s*"#,
+            with: "",
+            options: .regularExpression)
+        .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
 private enum BlueyTheme {
@@ -1402,19 +1408,25 @@ private final class FeedView: NSView {
         wantsLayer = true
         layer?.backgroundColor = BlueyTheme.panel.cgColor
         layer?.cornerRadius = 16
+        layer?.masksToBounds = true
         layer?.borderWidth = 1
         layer?.borderColor = BlueyTheme.hairline.cgColor
 
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 12
-        stack.edgeInsets = NSEdgeInsets(top: 16, left: 0, bottom: 16, right: 0)
+        stack.edgeInsets = NSEdgeInsets(top: 20, left: 0, bottom: 16, right: 0)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.scrollerStyle = .overlay
+        scroll.borderType = .noBorder
         scroll.drawsBackground = false
         scroll.documentView = stack
         scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.contentView.wantsLayer = true
+        scroll.contentView.layer?.masksToBounds = true
         addSubview(scroll)
         configureEmptyState()
         NSLayoutConstraint.activate([
@@ -1427,9 +1439,12 @@ private final class FeedView: NSView {
     }
     required init?(coder: NSCoder) { fatalError() }
 
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     func push(_ card: RenderedCard) {
         if normalizedCardKind(card.kind) == "transcript" {
             onTranscript?(card)
+            pushTranscriptCard(card)
             emitCardRendered(id: card.id)
             return
         }
@@ -1445,6 +1460,20 @@ private final class FeedView: NSView {
         emitCardRendered(id: card.id)
     }
 
+    func pushTranscript(source: String, body: String) {
+        let cleanBody = displayTranscriptText(body)
+        guard !cleanBody.isEmpty else { return }
+        let card = RenderedCard(
+            id: "transcript-\(UUID().uuidString)",
+            kind: "transcript",
+            title: source,
+            body: cleanBody,
+            done: true,
+            costLabel: nil,
+            artifact: nil)
+        pushTranscriptCard(card)
+    }
+
     @discardableResult
     func update(id: String, body: String, done: Bool, costLabel: String?, artifact: OverlayArtifact?) -> RenderedCard? {
         guard let idx = cards.firstIndex(where: { $0.id == id }) else { return nil }
@@ -1456,13 +1485,7 @@ private final class FeedView: NSView {
         if let artifact {
             cards[idx].artifact = artifact
         }
-        // Replace the corresponding subview.
-        let existing = stack.arrangedSubviews[idx]
-        stack.removeArrangedSubview(existing)
-        existing.removeFromSuperview()
-        let view = makeCardView(cards[idx])
-        stack.insertArrangedSubview(view, at: idx)
-        view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        replaceCardView(at: idx)
         scrollToBottom()
         return cards[idx]
     }
@@ -1470,6 +1493,19 @@ private final class FeedView: NSView {
     func clear() {
         removeAllCards()
         emptyState.isHidden = false
+    }
+
+    func forwardScrollWheel(_ event: NSEvent) {
+        scroll.scrollWheel(with: event)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        scroll.scrollWheel(with: event)
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard bounds.contains(point) else { return nil }
+        return super.hitTest(point) ?? scroll
     }
 
     func hasCopyControl(atScreenPoint screenPoint: NSPoint) -> Bool {
@@ -1500,6 +1536,99 @@ private final class FeedView: NSView {
             stack.removeArrangedSubview(view)
             view.removeFromSuperview()
         }
+    }
+
+    private func pushTranscriptCard(_ input: RenderedCard) {
+        let source = transcriptCardSource(input)
+        let cleanBody = displayTranscriptText(input.body)
+        guard !cleanBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        let card = RenderedCard(
+            id: input.id,
+            kind: input.kind,
+            title: source,
+            body: cleanBody,
+            done: input.done,
+            costLabel: input.costLabel,
+            artifact: input.artifact)
+
+        emptyState.isHidden = true
+        if let lastIndex = cards.indices.last,
+           normalizedCardKind(cards[lastIndex].kind) == "transcript",
+           transcriptCardSource(cards[lastIndex]) == source {
+            let merged = mergedTranscriptBody(cards[lastIndex].body, card.body)
+            guard merged != cards[lastIndex].body else {
+                scrollToBottom()
+                return
+            }
+            cards[lastIndex].body = merged
+            replaceCardView(at: lastIndex)
+            scrollToBottom()
+            return
+        }
+
+        cards.append(card)
+        let view = makeCardView(card)
+        stack.addArrangedSubview(view)
+        view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        scrollToBottom()
+    }
+
+    private func replaceCardView(at idx: Int) {
+        guard stack.arrangedSubviews.indices.contains(idx) else { return }
+        let existing = stack.arrangedSubviews[idx]
+        stack.removeArrangedSubview(existing)
+        existing.removeFromSuperview()
+        let view = makeCardView(cards[idx])
+        stack.insertArrangedSubview(view, at: idx)
+        view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+    }
+
+    private func transcriptCardSource(_ card: RenderedCard) -> String {
+        let title = card.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !title.isEmpty {
+            let lower = title.lowercased()
+            if lower.contains("microphone") || lower.contains("mic") || lower == "user" {
+                return "Mic"
+            }
+            if lower.contains("system") {
+                return "System"
+            }
+            return title.capitalized
+        }
+        return "Audio"
+    }
+
+    private func mergedTranscriptBody(_ existing: String, _ incoming: String) -> String {
+        let old = existing.trimmingCharacters(in: .whitespacesAndNewlines)
+        let new = incoming.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !old.isEmpty else { return new }
+        guard !new.isEmpty else { return old }
+
+        let oldNorm = normalizeTranscriptBody(old)
+        let newNorm = normalizeTranscriptBody(new)
+        if oldNorm == newNorm || oldNorm.contains(newNorm) { return old }
+        if newNorm.contains(oldNorm) { return new }
+
+        let oldWords = old.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        let newWords = new.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        let maxOverlap = min(oldWords.count, newWords.count, 8)
+        if maxOverlap > 0 {
+            for count in stride(from: maxOverlap, through: 1, by: -1) {
+                let suffix = oldWords.suffix(count).joined(separator: " ")
+                let prefix = newWords.prefix(count).joined(separator: " ")
+                if normalizeTranscriptBody(suffix) == normalizeTranscriptBody(prefix) {
+                    return (oldWords + newWords.dropFirst(count)).joined(separator: " ")
+                }
+            }
+        }
+        return "\(old) \(new)"
+    }
+
+    private func normalizeTranscriptBody(_ value: String) -> String {
+        value
+            .lowercased()
+            .replacingOccurrences(of: #"[^a-z0-9]+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func configureEmptyState() {
@@ -1820,7 +1949,9 @@ private final class FeedView: NSView {
         case "action_item": return "ACTION"
         case "decision":    return "DECISION"
         case "context":     return "CONTEXT"
-        case "transcript":  return "TRANSCRIPT"
+        case "transcript":
+            let source = card.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            return source.isEmpty ? "AUDIO" : source.uppercased()
         case "warning":     return "WARNING"
         case "system":      return "SYSTEM"
         default:            return "BLUEY"
@@ -2371,6 +2502,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         layer?.shadowOpacity = 0.28
         layer?.shadowRadius = 24
         layer?.shadowOffset = .zero
+        workspace.wantsLayer = true
+        workspace.layer?.backgroundColor = NSColor.clear.cgColor
+        workspace.layer?.masksToBounds = true
 
         configureHeader()
         configureSystemToast()
@@ -2583,7 +2717,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             canvasToggleButton.widthAnchor.constraint(equalToConstant: 30),
             canvasToggleButton.heightAnchor.constraint(equalToConstant: 30),
 
-            workspace.topAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: 8),
+            workspace.topAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: 12),
             workspace.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             workspace.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             workspace.bottomAnchor.constraint(equalTo: transcriptStrip.topAnchor, constant: -8),
@@ -2909,7 +3043,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             red: 0.018,
             green: 0.022,
             blue: 0.030,
-            alpha: materialAlpha(0.92)
+            alpha: materialAlpha(0.99, floor: 0.96)
         ).cgColor
         modelMenu.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.075)).cgColor
         modelMenu.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.12)).cgColor
@@ -2947,11 +3081,30 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         canvasPane.applyBackgroundOpacity(backgroundOpacity)
     }
 
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53, dismissActiveOverlay() {
             return
         }
         super.keyDown(with: event)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        let localPoint = convert(event.locationInWindow, from: nil)
+        if rectForView(feed).contains(localPoint) {
+            feed.forwardScrollWheel(event)
+            return
+        }
+        if rectForView(canvasPane).contains(localPoint) {
+            canvasPane.scrollWheel(with: event)
+            return
+        }
+        if !sessionDrawer.isHidden, rectForView(sessionScroll).contains(localPoint) {
+            sessionScroll.scrollWheel(with: event)
+            return
+        }
+        super.scrollWheel(with: event)
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -3060,6 +3213,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             closeButton,
             routeBadge,
             knowledgeBadge,
+            feed,
+            canvasPane,
             transcriptStrip,
             attachmentStrip,
             composerSurface,
@@ -3078,6 +3233,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             let rect = view.convert(view.bounds, to: self).insetBy(dx: -8, dy: -8)
             return rect.contains(localPoint)
         }
+    }
+
+    private func rectForView(_ view: NSView) -> NSRect {
+        view.convert(view.bounds, to: self)
     }
 
     private func hasInteractiveView(at localPoint: NSPoint) -> Bool {
@@ -3228,11 +3387,20 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 width: max(0, bounds.width - 20),
                 height: height)
         }
+        let workspaceBottom = transcriptStrip.frame.maxY + 8
+        let workspaceTop = headerBar.frame.minY - 12
+        if workspaceTop > workspaceBottom {
+            workspace.frame = NSRect(
+                x: 10,
+                y: workspaceBottom,
+                width: max(0, bounds.width - 20),
+                height: workspaceTop - workspaceBottom)
+        }
     }
 
     private func configureHeader() {
         headerBar.wantsLayer = true
-        headerBar.layer?.backgroundColor = NSColor(red: 0.018, green: 0.022, blue: 0.030, alpha: 0.92).cgColor
+        headerBar.layer?.backgroundColor = NSColor(red: 0.018, green: 0.022, blue: 0.030, alpha: 0.99).cgColor
         headerBar.layer?.cornerRadius = 21
         headerBar.layer?.borderWidth = 1
         headerBar.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.18).cgColor
@@ -3866,7 +4034,24 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     @objc private func askClicked() {
         let raw = composer.string.trimmingCharacters(in: .whitespacesAndNewlines)
-        let q = raw.isEmpty ? transcriptQuestionForAnswer() : raw
+        let q: String
+        if raw.isEmpty {
+            guard let transcriptQuestion = transcriptQuestionForAnswer() else {
+                showSystemToast(for: RenderedCard(
+                    id: "empty-answer-\(UUID().uuidString)",
+                    kind: "system",
+                    title: "Nothing to answer yet",
+                    body: "Type a question or start Listen so Bluey has transcript context.",
+                    done: true,
+                    costLabel: nil,
+                    artifact: nil))
+                window?.makeFirstResponder(composer)
+                return
+            }
+            q = transcriptQuestion
+        } else {
+            q = raw
+        }
         composer.clearText()
         let route = selectedRoute()
         updateRouteBadge(for: q, selectedRoute: route)
@@ -4711,21 +4896,25 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let label = transcriptSourceLabel(title)
         rememberTranscriptForAnswer(label: label, body: body, final: true)
         setTranscriptState(recordingActive ? "TRANSCRIBING" : "CAPTURED", active: recordingActive)
-        updateTranscriptStripText("\(label) \(body)", scrollToEnd: true)
+        updateTranscriptStripText("Captured · \(label) · \(body)", scrollToEnd: true)
     }
 
     func appendLiveTranscript(source: String, text: String, final: Bool) {
         let body = displayTranscriptText(text)
         let label = transcriptSourceLabel(source)
         let state = recordingActive ? "TRANSCRIBING" : (final ? "CAPTURED" : "HEARD")
+        let prefix = recordingActive ? "Transcribing" : (final ? "Captured" : "Heard")
         guard !body.isEmpty else {
             setTranscriptState(state, active: recordingActive)
-            updateTranscriptStripText("\(label) audio is live", scrollToEnd: false)
+            updateTranscriptStripText("\(prefix) · \(label) audio is live", scrollToEnd: false)
             return
         }
         rememberTranscriptForAnswer(label: label, body: body, final: final)
+        if final {
+            feed.pushTranscript(source: label, body: body)
+        }
         setTranscriptState(state, active: recordingActive)
-        updateTranscriptStripText("\(label) \(body)", scrollToEnd: true)
+        updateTranscriptStripText("\(prefix) · \(label) · \(body)", scrollToEnd: true)
     }
 
     private func rememberTranscriptForAnswer(label: String, body: String, final: Bool) {
@@ -4748,7 +4937,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
     }
 
-    private func transcriptQuestionForAnswer() -> String {
+    private func transcriptQuestionForAnswer() -> String? {
         var lines = transcriptSnippets
         if let live = latestLiveTranscriptLine, lines.last != live {
             lines.append(live)
@@ -4756,9 +4945,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let joined = compactTranscriptQuestionLines(Array(lines.suffix(12)))
             .joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !joined.isEmpty else {
-            return "Answer from the current Bluey session."
-        }
+        guard !joined.isEmpty else { return nil }
         return joined
     }
 
@@ -4885,7 +5072,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 .font: font,
                 .foregroundColor: BlueyTheme.textDim,
             ])
-        for label in ["Mic", "System", "Audio"] where attributed.string.hasPrefix("\(label) ") || attributed.string == label {
+        for label in ["Transcribing", "Captured", "Heard", "Starting", "Mic", "System", "Audio"]
+            where attributed.string.hasPrefix(label) || attributed.string == label {
             let range = NSRange(location: 0, length: label.count)
             attributed.addAttributes(
                 [
