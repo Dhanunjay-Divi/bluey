@@ -2359,6 +2359,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     let knowledgeBadge: NSTextField
     let balanceLabel: NSTextField
     let fullSizeButton: NSButton
+    let interactionModeButton: NSButton
     let canvasToggleButton: NSButton
     let navButton: NSButton
     let newSessionButton: NSButton
@@ -2433,6 +2434,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var preCanvasFullWindowFrame: NSRect?
     private var windowFullSize = false
     private var preWindowFullSizeFrame: NSRect?
+    private var passThroughMode = false
     private struct ResizeEdges: OptionSet {
         let rawValue: Int
         static let left = ResizeEdges(rawValue: 1 << 0)
@@ -2465,6 +2467,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         knowledgeBadge = NSTextField(labelWithString: "Docs empty")
         balanceLabel = NSTextField(labelWithString: "Balance --")
         fullSizeButton = NSButton(title: "", target: nil, action: nil)
+        interactionModeButton = NSButton(title: "", target: nil, action: nil)
         canvasToggleButton = NSButton(title: "", target: nil, action: nil)
         navButton = NSButton(title: "", target: nil, action: nil)
         newSessionButton = NSButton(title: "", target: nil, action: nil)
@@ -2557,6 +2560,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             knowledgeBadge,
             balanceLabel,
             fullSizeButton,
+            interactionModeButton,
             canvasToggleButton,
             navButton,
             newSessionButton,
@@ -2623,6 +2627,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             canvasToggleButton,
             balanceLabel,
             fullSizeButton,
+            interactionModeButton,
             hideButton,
             closeButton,
         ] {
@@ -2733,6 +2738,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
             fullSizeButton.widthAnchor.constraint(equalToConstant: 26),
             fullSizeButton.heightAnchor.constraint(equalToConstant: 26),
+
+            interactionModeButton.widthAnchor.constraint(equalToConstant: 26),
+            interactionModeButton.heightAnchor.constraint(equalToConstant: 26),
 
             balanceLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 76),
             balanceLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 106),
@@ -2970,6 +2978,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         hideButton.action = #selector(hideClicked)
         fullSizeButton.target = self
         fullSizeButton.action = #selector(fullSizeClicked)
+        interactionModeButton.target = self
+        interactionModeButton.action = #selector(interactionModeClicked)
         closeButton.target = self
         closeButton.action = #selector(closeClicked)
         closeConfirmCancelButton.target = self
@@ -3015,6 +3025,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         styleHeaderIconButton(hideButton, symbol: "eye.slash", fallback: "-")
         styleHeaderIconButton(closeButton, symbol: "xmark", fallback: "x")
         updateFullSizeButtonChrome()
+        updateInteractionModeChrome(showToast: false)
         configureTooltips()
         setContextItems([])
         setTranscriptState("IDLE", active: false)
@@ -3218,6 +3229,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             let drawerPoint = sessionDrawer.convert(localPoint, from: self)
             return sessionDrawer.bounds.contains(drawerPoint)
         }
+        if passThroughMode {
+            return hitsPassThroughInteractiveRegion(at: localPoint, screenPoint: screenPoint)
+        }
         if !resizeEdges(at: localPoint).isEmpty {
             return true
         }
@@ -3228,6 +3242,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             || feed.hasCopyControl(atScreenPoint: screenPoint)
     }
 
+    func shouldReceiveMouseEvents(at screenPoint: NSPoint) -> Bool {
+        if passThroughMode {
+            return isInteractiveAtScreenPoint(screenPoint)
+        }
+        return true
+    }
+
     private func hitsExplicitInteractiveChrome(at localPoint: NSPoint) -> Bool {
         let controls: [NSView] = [
             headerBar,
@@ -3236,6 +3257,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             canvasToggleButton,
             balanceLabel,
             fullSizeButton,
+            interactionModeButton,
             hideButton,
             closeButton,
             routeBadge,
@@ -3260,6 +3282,26 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             let rect = view.convert(view.bounds, to: self).insetBy(dx: -8, dy: -8)
             return rect.contains(localPoint)
         }
+    }
+
+    private func hitsPassThroughInteractiveRegion(at localPoint: NSPoint, screenPoint: NSPoint) -> Bool {
+        if hitsView(interactionModeButton, at: localPoint, padding: 10) {
+            return true
+        }
+        if feed.hasCopyControl(atScreenPoint: screenPoint) {
+            return true
+        }
+        for textRegion in [feed, canvasPane, transcriptStrip] {
+            if hitsView(textRegion, at: localPoint, padding: 2) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func hitsView(_ view: NSView, at localPoint: NSPoint, padding: CGFloat) -> Bool {
+        guard !view.isHidden, view.alphaValue > 0.01 else { return false }
+        return rectForView(view).insetBy(dx: -padding, dy: -padding).contains(localPoint)
     }
 
     private func rectForView(_ view: NSView) -> NSRect {
@@ -3748,6 +3790,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         canvasToggleButton.toolTip = "Open or collapse the canvas"
         balanceLabel.toolTip = "Remaining Bluey balance"
         fullSizeButton.toolTip = windowFullSize ? "Restore Bluey size" : "Make Bluey full size"
+        interactionModeButton.toolTip = passThroughMode
+            ? "Click-through on. Click to make Bluey interactive."
+            : "Interactive on. Click to pass background clicks through."
         hideButton.toolTip = "Hide to pill"
         closeButton.toolTip = "Turn Bluey off. Run bluey on to start again."
         recordingButton.toolTip = "Start or stop listening"
@@ -3872,6 +3917,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     @objc private func fullSizeClicked() {
         toggleWindowFullSize()
+    }
+
+    @objc private func interactionModeClicked() {
+        passThroughMode.toggle()
+        updateInteractionModeChrome()
     }
 
     func showTurnOffConfirmation() {
@@ -4572,6 +4622,22 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         return nil
     }
 
+    private func showSystemToast(title: String, body: String, duration: TimeInterval) {
+        toastHideWorkItem?.cancel()
+        toastTitleLabel.stringValue = title
+        toastBodyLabel.stringValue = systemToastBody(body)
+        statusLabel.stringValue = title
+
+        toastView.isHidden = false
+        toastView.animator().alphaValue = 1
+
+        let work = DispatchWorkItem { [weak self] in
+            self?.hideSystemToast(immediately: false)
+        }
+        toastHideWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: work)
+    }
+
     private func showSystemToast(for card: RenderedCard) {
         toastHideWorkItem?.cancel()
         let title = card.title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4679,6 +4745,24 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let fallback = windowFullSize ? "↙" : "↗"
         styleHeaderIconButton(fullSizeButton, symbol: symbol, fallback: fallback)
         fullSizeButton.toolTip = windowFullSize ? "Restore Bluey size" : "Make Bluey full size"
+    }
+
+    private func updateInteractionModeChrome(showToast: Bool = true) {
+        let symbol = passThroughMode ? "cursorarrow.rays" : "hand.tap"
+        let fallback = passThroughMode ? "P" : "I"
+        styleHeaderIconButton(interactionModeButton, symbol: symbol, fallback: fallback)
+        interactionModeButton.contentTintColor = passThroughMode ? BlueyTheme.cyan : BlueyTheme.text
+        interactionModeButton.toolTip = passThroughMode
+            ? "Click-through on. Click to make Bluey interactive."
+            : "Interactive on. Click to pass background clicks through."
+        if showToast {
+            showSystemToast(
+                title: passThroughMode ? "Click-through on" : "Interactive on",
+                body: passThroughMode
+                    ? "Background clicks pass through. Text, scroll, and this toggle stay available."
+                    : "Buttons, composer, and window controls are clickable.",
+                duration: 2.0)
+        }
     }
 
     private func expandWindowFullSize() {
@@ -5668,22 +5752,20 @@ private final class OverlayApp {
 
     private func startExpandedPassthroughTracking() {
         expandedPassthroughTimer?.invalidate()
-        expandedPassthroughTimer = Timer.scheduledTimer(withTimeInterval: 0.06, repeats: true) { [weak self] _ in
+        expandedPassthroughTimer = Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { [weak self] _ in
             guard
                 let self,
                 let expandedWindow = self.expandedWindow,
-                expandedWindow.isVisible
+                expandedWindow.isVisible,
+                let expandedView = self.expandedView
             else { return }
 
-            // The expanded panel is an interactive control surface. Earlier
-            // builds tried to make non-control regions pass clicks through by
-            // flipping the whole NSWindow's ignoresMouseEvents flag from a
-            // timer. In practice that made timing-sensitive controls feel
-            // broken: a click could arrive while the entire window was still
-            // ignoring events. Keep the expanded window clickable and reserve
-            // full click-through for the collapsed pill/hidden states.
-            if expandedWindow.ignoresMouseEvents {
-                expandedWindow.ignoresMouseEvents = false
+            // Interactive mode keeps the whole panel clickable. Pass-through
+            // mode only keeps text regions and the mode toggle active so the
+            // host app beneath Bluey can receive ordinary clicks.
+            let wantsMouse = expandedView.shouldReceiveMouseEvents(at: NSEvent.mouseLocation)
+            if expandedWindow.ignoresMouseEvents == wantsMouse {
+                expandedWindow.ignoresMouseEvents = !wantsMouse
             }
         }
     }
