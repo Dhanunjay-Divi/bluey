@@ -1634,7 +1634,7 @@ private final class FeedView: NSView {
         statusLabel.font = NSFont.monospacedSystemFont(ofSize: 9.5, weight: .semibold)
         statusLabel.textColor = rightAligned ? NSColor.black.withAlphaComponent(0.46) : BlueyTheme.textDim
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
-        let copyButton = signInURL == nil
+        let copyButton = signInURL == nil && !rightAligned
             ? makeCopyCardButton(text: rawBody.isEmpty ? bodyText : rawBody, rightAligned: rightAligned)
             : nil
 
@@ -2252,6 +2252,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     var onListeningStateChanged: ((PillRunState) -> Void)?
     private var recordingActive = false
     private var transcriptSnippets: [String] = []
+    private var latestLiveTranscriptLine: String?
     private var sessionItems: [OverlaySessionItem] = []
     private var editingSessionId: String?
     private var pendingDeleteSessionId: String?
@@ -3865,9 +3866,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     @objc private func askClicked() {
         let raw = composer.string.trimmingCharacters(in: .whitespacesAndNewlines)
-        let q = raw.isEmpty
-            ? "Answer the latest clear question or useful context from this Bluey session."
-            : raw
+        let q = raw.isEmpty ? transcriptQuestionForAnswer() : raw
         composer.clearText()
         let route = selectedRoute()
         updateRouteBadge(for: q, selectedRoute: route)
@@ -4275,6 +4274,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         hideSystemToast(immediately: true)
         setContextItems([])
         transcriptSnippets.removeAll()
+        latestLiveTranscriptLine = nil
         updateTranscriptStripText("Live captions preview", scrollToEnd: false)
         setTranscriptState("IDLE", active: false)
         routeBadge.stringValue = "● Ready"
@@ -4709,6 +4709,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         guard !body.isEmpty else { return }
 
         let label = transcriptSourceLabel(title)
+        rememberTranscriptForAnswer(label: label, body: body, final: true)
         setTranscriptState(recordingActive ? "TRANSCRIBING" : "CAPTURED", active: recordingActive)
         updateTranscriptStripText("\(label) \(body)", scrollToEnd: true)
     }
@@ -4722,8 +4723,126 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             updateTranscriptStripText("\(label) audio is live", scrollToEnd: false)
             return
         }
+        rememberTranscriptForAnswer(label: label, body: body, final: final)
         setTranscriptState(state, active: recordingActive)
         updateTranscriptStripText("\(label) \(body)", scrollToEnd: true)
+    }
+
+    private func rememberTranscriptForAnswer(label: String, body: String, final: Bool) {
+        let cleanBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanBody.isEmpty else { return }
+        let line = "\(label): \(cleanBody)"
+        if final {
+            latestLiveTranscriptLine = nil
+            if let last = transcriptSnippets.last,
+               shouldReplaceTranscriptMemoryLine(last, with: line) {
+                transcriptSnippets[transcriptSnippets.count - 1] = longerTranscriptMemoryLine(last, line)
+            } else if transcriptSnippets.last != line {
+                transcriptSnippets.append(line)
+            }
+            if transcriptSnippets.count > 12 {
+                transcriptSnippets.removeFirst(transcriptSnippets.count - 12)
+            }
+        } else {
+            latestLiveTranscriptLine = line
+        }
+    }
+
+    private func transcriptQuestionForAnswer() -> String {
+        var lines = transcriptSnippets
+        if let live = latestLiveTranscriptLine, lines.last != live {
+            lines.append(live)
+        }
+        let joined = compactTranscriptQuestionLines(Array(lines.suffix(12)))
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !joined.isEmpty else {
+            return "Answer from the current Bluey session."
+        }
+        return joined
+    }
+
+    private func compactTranscriptQuestionLines(_ lines: [String]) -> [String] {
+        var order: [String] = []
+        var bodies: [String: String] = [:]
+        for line in lines {
+            let parsed = parsedTranscriptMemoryLine(line)
+            let label = parsed.label
+            let body = parsed.body
+            guard !body.isEmpty else { continue }
+            if bodies[label] == nil {
+                order.append(label)
+                bodies[label] = body
+            } else if let existing = bodies[label] {
+                bodies[label] = mergedTranscriptBody(existing, body)
+            }
+        }
+        return order.compactMap { label in
+            guard let body = bodies[label]?.trimmingCharacters(in: .whitespacesAndNewlines), !body.isEmpty else {
+                return nil
+            }
+            return "\(label): \(body)"
+        }
+    }
+
+    private func parsedTranscriptMemoryLine(_ line: String) -> (label: String, body: String) {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let colon = trimmed.firstIndex(of: ":") else {
+            return ("Audio", trimmed)
+        }
+        let label = String(trimmed[..<colon]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let bodyStart = trimmed.index(after: colon)
+        let body = String(trimmed[bodyStart...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return (label.isEmpty ? "Audio" : label, body)
+    }
+
+    private func mergedTranscriptBody(_ existing: String, _ incoming: String) -> String {
+        let old = existing.trimmingCharacters(in: .whitespacesAndNewlines)
+        let new = incoming.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !old.isEmpty else { return new }
+        guard !new.isEmpty else { return old }
+
+        let oldNorm = normalizeTranscriptMemoryLine(old)
+        let newNorm = normalizeTranscriptMemoryLine(new)
+        if oldNorm == newNorm || oldNorm.contains(newNorm) { return old }
+        if newNorm.contains(oldNorm) { return new }
+
+        let oldWords = old.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        let newWords = new.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+        let maxOverlap = min(oldWords.count, newWords.count, 8)
+        if maxOverlap > 0 {
+            for count in stride(from: maxOverlap, through: 1, by: -1) {
+                let suffix = oldWords.suffix(count).joined(separator: " ")
+                let prefix = newWords.prefix(count).joined(separator: " ")
+                if normalizeTranscriptMemoryLine(suffix) == normalizeTranscriptMemoryLine(prefix) {
+                    return (oldWords + newWords.dropFirst(count)).joined(separator: " ")
+                }
+            }
+        }
+
+        return "\(old) \(new)"
+    }
+
+    private func shouldReplaceTranscriptMemoryLine(_ old: String, with new: String) -> Bool {
+        let oldNorm = normalizeTranscriptMemoryLine(old)
+        let newNorm = normalizeTranscriptMemoryLine(new)
+        guard !oldNorm.isEmpty, !newNorm.isEmpty else { return false }
+        return oldNorm == newNorm
+            || oldNorm.hasPrefix(newNorm)
+            || newNorm.hasPrefix(oldNorm)
+            || oldNorm.contains(newNorm)
+            || newNorm.contains(oldNorm)
+    }
+
+    private func longerTranscriptMemoryLine(_ first: String, _ second: String) -> String {
+        first.count >= second.count ? first : second
+    }
+
+    private func normalizeTranscriptMemoryLine(_ value: String) -> String {
+        value
+            .lowercased()
+            .replacingOccurrences(of: #"[^a-z0-9]+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func transcriptSourceLabel(_ raw: String) -> String {
