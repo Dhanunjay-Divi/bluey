@@ -353,8 +353,8 @@ private final class ComposerTextView: NSTextView {
             if event.modifierFlags.contains(.shift) {
                 insertNewline(nil)
             } else {
-                // Enter and Command+Enter both submit. Shift+Enter keeps a
-                // multiline thought inside the composer.
+                // Enter submits. Shift+Enter keeps a multiline thought inside
+                // the composer.
                 onSubmit?()
             }
             return
@@ -905,6 +905,11 @@ private final class HeaderDragView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        let localPoint = convert(event.locationInWindow, from: nil)
+        if let hit = hitTest(localPoint), hit !== self {
+            super.mouseDown(with: event)
+            return
+        }
         window?.performDrag(with: event)
     }
 
@@ -2330,7 +2335,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         composerSurface = ComposerSurfaceView()
         composer = ComposerTextView(frame: .zero, textContainer: nil)
         recordingButton = NSButton(title: "Listen", target: nil, action: nil)
-        askButton = NSButton(title: "Answer ⌘↵", target: nil, action: nil)
+        askButton = NSButton(title: "Answer ↵", target: nil, action: nil)
         analyzeButton = NSButton(title: "Screen", target: nil, action: nil)
         attachButton = NSButton(title: "", target: nil, action: nil)
         instructionsButton = NSButton(title: "Tone", target: nil, action: nil)
@@ -2646,8 +2651,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             answerStyleOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
             answerStyleOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
 
-            answerStylePanel.centerXAnchor.constraint(equalTo: centerXAnchor),
-            answerStylePanel.centerYAnchor.constraint(equalTo: centerYAnchor, constant: 24),
+            answerStylePanel.centerXAnchor.constraint(equalTo: workspace.centerXAnchor),
+            answerStylePanel.centerYAnchor.constraint(equalTo: workspace.centerYAnchor),
             answerStylePanel.widthAnchor.constraint(equalToConstant: 360),
 
             answerStyleLabel.topAnchor.constraint(equalTo: answerStylePanel.topAnchor, constant: 18),
@@ -2765,8 +2770,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             closeConfirmOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
             closeConfirmOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
 
-            closeConfirmPanel.centerXAnchor.constraint(equalTo: centerXAnchor),
-            closeConfirmPanel.centerYAnchor.constraint(equalTo: centerYAnchor, constant: 24),
+            closeConfirmPanel.centerXAnchor.constraint(equalTo: workspace.centerXAnchor),
+            closeConfirmPanel.centerYAnchor.constraint(equalTo: workspace.centerYAnchor),
             closeConfirmPanel.widthAnchor.constraint(equalToConstant: 360),
 
             closeConfirmTitle.topAnchor.constraint(equalTo: closeConfirmPanel.topAnchor, constant: 18),
@@ -3535,7 +3540,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         instructionsButton.toolTip = "How Bluey should answer"
         attachButton.toolTip = "Attach files"
         analyzeButton.toolTip = "Analyse screen"
-        askButton.toolTip = "Answer with Enter or Command+Enter. Shift+Enter adds a new line."
+        askButton.toolTip = "Answer with Enter. Shift+Enter adds a new line."
         latestSessionButton.toolTip = "Continue the latest recording"
         answerStyleSaveButton.toolTip = "Save answer style for this session"
     }
@@ -4703,50 +4708,36 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let body = displayTranscriptText(card.body)
         guard !body.isEmpty else { return }
 
-        let label = title.isEmpty ? "Transcript" : title
-        transcriptSnippets.append("\(label): \(body)")
-        if transcriptSnippets.count > 6 {
-            transcriptSnippets.removeFirst(transcriptSnippets.count - 6)
-        }
+        let label = transcriptSourceLabel(title)
         setTranscriptState(recordingActive ? "TRANSCRIBING" : "CAPTURED", active: recordingActive)
-        updateTranscriptStripText(transcriptSnippets.joined(separator: "   "), scrollToEnd: true)
+        updateTranscriptStripText("\(label) \(body)", scrollToEnd: true)
     }
 
     func appendLiveTranscript(source: String, text: String, final: Bool) {
         let body = displayTranscriptText(text)
-        let cleanSource = source
-            .replacingOccurrences(of: "_", with: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let lowerSource = cleanSource.lowercased()
-        let label: String
-        if lowerSource.contains("microphone") || lowerSource.contains("mic") {
-            label = "Mic"
-        } else if lowerSource.contains("system") {
-            label = "System"
-        } else {
-            label = cleanSource.isEmpty ? "Audio" : cleanSource.capitalized
-        }
+        let label = transcriptSourceLabel(source)
+        let state = recordingActive ? "TRANSCRIBING" : (final ? "CAPTURED" : "HEARD")
         guard !body.isEmpty else {
-            setTranscriptState(recordingActive ? "\(shortAudioLabel(label)) LIVE" : (final ? "CAPTURED" : "HEARD"), active: recordingActive)
+            setTranscriptState(state, active: recordingActive)
+            updateTranscriptStripText("\(label) audio is live", scrollToEnd: false)
             return
         }
-        transcriptSnippets.append("\(label): \(body)")
-        if transcriptSnippets.count > 6 {
-            transcriptSnippets.removeFirst(transcriptSnippets.count - 6)
-        }
-        setTranscriptState(recordingActive ? "\(shortAudioLabel(label)) LIVE" : (final ? "CAPTURED" : "HEARD"), active: recordingActive)
-        updateTranscriptStripText(transcriptSnippets.joined(separator: "   "), scrollToEnd: true)
+        setTranscriptState(state, active: recordingActive)
+        updateTranscriptStripText("\(label) \(body)", scrollToEnd: true)
     }
 
-    private func shortAudioLabel(_ label: String) -> String {
-        switch label.lowercased() {
-        case "mic":
-            return "MIC"
-        case "system":
-            return "SYS"
-        default:
-            return "AUDIO"
+    private func transcriptSourceLabel(_ raw: String) -> String {
+        let clean = raw
+            .replacingOccurrences(of: "_", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = clean.lowercased()
+        if lower.contains("microphone") || lower.contains("mic") || lower == "user" {
+            return "Mic"
         }
+        if lower.contains("system") {
+            return "System"
+        }
+        return clean.isEmpty ? "Audio" : clean.capitalized
     }
 
     private func updateTranscriptStripText(_ text: String, scrollToEnd: Bool) {
@@ -4775,21 +4766,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 .font: font,
                 .foregroundColor: BlueyTheme.textDim,
             ])
-        for label in ["Mic:", "System:"] {
-            var searchRange = NSRange(location: 0, length: attributed.length)
-            while true {
-                let found = (attributed.string as NSString).range(of: label, options: [], range: searchRange)
-                if found.location == NSNotFound { break }
-                attributed.addAttributes(
-                    [
-                        .font: sourceFont,
-                        .foregroundColor: BlueyTheme.green,
-                    ],
-                    range: found)
-                let nextLocation = found.location + found.length
-                if nextLocation >= attributed.length { break }
-                searchRange = NSRange(location: nextLocation, length: attributed.length - nextLocation)
-            }
+        for label in ["Mic", "System", "Audio"] where attributed.string.hasPrefix("\(label) ") || attributed.string == label {
+            let range = NSRange(location: 0, length: label.count)
+            attributed.addAttributes(
+                [
+                    .font: sourceFont,
+                    .foregroundColor: BlueyTheme.green,
+                ],
+                range: range)
+            break
         }
         return attributed
     }
