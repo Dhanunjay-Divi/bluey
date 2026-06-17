@@ -2646,7 +2646,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         headerLogo = BlueyLogoView()
         headerWordmark = BlueyWordmarkView()
         headerSpacer = NSView()
-        statusLabel = NSTextField(labelWithString: "New recording")
+        statusLabel = NSTextField(labelWithString: "Bluey online")
         modelMenu = NSPopUpButton(frame: .zero, pullsDown: false)
         routeBadge = NSTextField(labelWithString: "● Ready")
         knowledgeBadge = NSTextField(labelWithString: "Docs empty")
@@ -4331,7 +4331,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         editingSessionId = nil
         pendingDeleteSessionId = nil
         dismissCloseConfirm(animated: true)
-        statusLabel.stringValue = "Session deleted"
+        setHeaderSubtitle()
         emitSessionDelete(id: id)
     }
 
@@ -4361,7 +4361,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     @objc private func toggleSessionsClicked() {
         sessionDrawer.isHidden.toggle()
-        statusLabel.stringValue = sessionDrawer.isHidden ? statusLabel.stringValue : "Sessions"
+        setHeaderSubtitle()
     }
 
     @objc private func closeSessionsClicked() {
@@ -4391,7 +4391,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let previousFrame = preserveFrame ? window?.frame : nil
         resetSessionSurface()
         composer.clearText()
-        statusLabel.stringValue = "New recording"
+        setHeaderSubtitle()
         sessionDrawer.isHidden = true
         if let previousFrame {
             layoutSubtreeIfNeeded()
@@ -4402,14 +4402,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     @objc private func continueSessionClicked() {
         sessionDrawer.isHidden = true
-        statusLabel.stringValue = "Latest recording"
+        setHeaderSubtitle()
         emitSimple("session_continue_requested")
     }
 
     @objc private func saveAnswerStyleClicked() {
         let text = answerStyleBox.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         emitInstructions(text: text)
-        statusLabel.stringValue = text.isEmpty ? "Default style" : "Answer style saved"
+        setHeaderSubtitle()
         dismissAnswerStyleEditor(animated: true)
     }
 
@@ -4451,16 +4451,17 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             recordingActive = false
             onListeningStateChanged?(.paused)
             recordingButton.title = "Listen"
-            statusLabel.stringValue = "Paused"
+            setHeaderSubtitle()
             composer.placeholder = "Ask anything..."
+            updateAudioRouteBadge("● Ready", accent: BlueyTheme.green)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
-            setTranscriptState("PAUSED", active: false)
+            setTranscriptState("IDLE", active: false)
         } else {
             emitSimple("recording_start_requested")
             recordingActive = false
             onListeningStateChanged?(.connecting)
             recordingButton.title = "Starting"
-            statusLabel.stringValue = "Starting audio"
+            setHeaderSubtitle()
             composer.placeholder = "Starting audio..."
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
             setTranscriptState("STARTING", active: true)
@@ -4497,7 +4498,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     @objc private func analyzeClicked() {
         routeBadge.stringValue = "Vision · deep"
-        statusLabel.stringValue = "Reading screen"
+        setHeaderSubtitle("Analyzing screen")
         emitSimple("analyze_screen_requested")
     }
 
@@ -4640,8 +4641,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         balanceLabel.stringValue = clean.isEmpty ? "Balance --" : clean
     }
 
+    private func setHeaderSubtitle(_ text: String = "Bluey online") {
+        statusLabel.stringValue = text
+    }
+
     func showSignedOutLogin(url: URL?) {
-        statusLabel.stringValue = "Login needed"
+        setHeaderSubtitle("Local ready")
         routeBadge.stringValue = "Sign in"
         routeBadge.textColor = BlueyTheme.warning
         routeBadge.layer?.borderColor = NSColor.clear.cgColor
@@ -4653,7 +4658,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func showSignedInReady() {
-        statusLabel.stringValue = recordingActive ? "Listening" : "Ready"
+        setHeaderSubtitle()
         statusLabel.toolTip = nil
         routeBadge.stringValue = "● Ready"
         routeBadge.textColor = BlueyTheme.green
@@ -4807,7 +4812,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         case .connecting:
             recordingActive = false
             recordingButton.title = "Starting"
-            statusLabel.stringValue = "Connecting"
+            setHeaderSubtitle()
             composer.placeholder = "Connecting audio..."
             updateAudioRouteBadge("● Starting", accent: BlueyTheme.green)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
@@ -4816,7 +4821,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         case .listening:
             recordingActive = true
             recordingButton.title = "Stop"
-            statusLabel.stringValue = "Listening"
+            setHeaderSubtitle()
             composer.placeholder = "Listening... type a follow-up anytime"
             updateAudioRouteBadge("● Listening", accent: BlueyTheme.green)
             styleControlButton(recordingButton, symbol: "stop.fill", accent: true)
@@ -4825,16 +4830,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         case .paused:
             recordingActive = false
             recordingButton.title = "Listen"
-            statusLabel.stringValue = "Paused"
+            setHeaderSubtitle()
             composer.placeholder = "Ask anything..."
-            updateAudioRouteBadge("● Paused", accent: BlueyTheme.textDim)
+            updateAudioRouteBadge("● Ready", accent: BlueyTheme.green)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
-            setTranscriptState("PAUSED", active: false)
+            setTranscriptState("IDLE", active: false)
             seedTranscriptPreviewIfEmpty("Live captions preview")
         case .failed:
             recordingActive = false
             recordingButton.title = "Listen"
-            statusLabel.stringValue = "Audio needs attention"
+            setHeaderSubtitle("Audio issue")
             composer.placeholder = "Ask anything..."
             updateAudioRouteBadge("● Audio", accent: BlueyTheme.warning)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
@@ -4842,7 +4847,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         case .ready:
             recordingActive = false
             recordingButton.title = "Listen"
-            statusLabel.stringValue = "Ready"
+            setHeaderSubtitle()
             composer.placeholder = "Ask anything..."
             updateAudioRouteBadge("● Ready", accent: BlueyTheme.green)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
@@ -5035,7 +5040,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         toastHideWorkItem?.cancel()
         toastTitleLabel.stringValue = title
         toastBodyLabel.stringValue = systemToastBody(body)
-        statusLabel.stringValue = title
+        setHeaderSubtitle()
 
         toastView.isHidden = false
         toastView.animator().alphaValue = 1
@@ -5053,7 +5058,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let body = systemToastBody(card.body)
         toastTitleLabel.stringValue = title.isEmpty ? "Bluey" : title
         toastBodyLabel.stringValue = body
-        statusLabel.stringValue = toastTitleLabel.stringValue
+        setHeaderSubtitle()
 
         toastView.isHidden = false
         toastView.animator().alphaValue = 1
