@@ -157,6 +157,19 @@ private enum ExpandedPanelMetrics {
             visibleFrame.maxY - fitted.size.height - screenInset)
         return fitted
     }
+
+    static func fillVisibleScreenFrame(_ frame: NSRect, visibleFrame: NSRect) -> NSRect {
+        var fitted = frame
+        fitted.size.width = min(max(360, fitted.size.width), visibleFrame.width)
+        fitted.size.height = min(max(minHeight, fitted.size.height), visibleFrame.height)
+        fitted.origin.x = min(
+            max(visibleFrame.minX, fitted.origin.x),
+            visibleFrame.maxX - fitted.size.width)
+        fitted.origin.y = min(
+            max(visibleFrame.minY, fitted.origin.y),
+            visibleFrame.maxY - fitted.size.height)
+        return fitted
+    }
 }
 
 private enum PillMetrics {
@@ -745,10 +758,11 @@ private final class OverlayWindow: NSWindow {
     var maximumFrameWidth: CGFloat?
     var minimumFrameHeight: CGFloat?
     var maximumFrameHeight: CGFloat?
-    private weak var pendingManualButton: NSButton?
+    var fillsVisibleFrame = false
     var contentCornerRadius: CGFloat? {
         didSet { applyContentCornerMask() }
     }
+    private weak var pendingManualButton: NSButton?
 
     override var contentView: NSView? {
         didSet { applyContentCornerMask() }
@@ -790,7 +804,7 @@ private final class OverlayWindow: NSWindow {
     override func sendEvent(_ event: NSEvent) {
         switch event.type {
         case .leftMouseDown:
-            if let button = buttonAtWindowPoint(event.locationInWindow) {
+            if let button = manualButton(atWindowPoint: event.locationInWindow) {
                 pendingManualButton = button
                 button.highlight(true)
                 return
@@ -798,9 +812,8 @@ private final class OverlayWindow: NSWindow {
         case .leftMouseUp:
             if let button = pendingManualButton {
                 button.highlight(false)
-                if let hitButton = buttonAtWindowPoint(event.locationInWindow),
-                   hitButton === button || hitButton.isDescendant(of: button) || button.isDescendant(of: hitButton)
-                {
+                let releaseButton = manualButton(atWindowPoint: event.locationInWindow)
+                if releaseButton === button || button.frame.contains(button.superview?.convert(event.locationInWindow, from: nil) ?? .zero) {
                     button.performClick(nil)
                 }
                 pendingManualButton = nil
@@ -815,30 +828,6 @@ private final class OverlayWindow: NSWindow {
             break
         }
         super.sendEvent(event)
-    }
-
-    private func buttonAtWindowPoint(_ point: NSPoint) -> NSButton? {
-        guard let contentView else { return nil }
-        if let panel = contentView as? ExpandedPanelView,
-           let button = panel.manualButton(atWindowPoint: point)
-        {
-            return button
-        }
-        let localPoint = contentView.convert(point, from: nil)
-        guard let hit = contentView.hitTest(localPoint) else { return nil }
-        var current: NSView? = hit
-        while let view = current {
-            if let button = view as? NSButton,
-               button.isEnabled,
-               !button.isHidden,
-               button.alphaValue > 0.01
-            {
-                return button
-            }
-            if view === contentView { break }
-            current = view.superview
-        }
-        return nil
     }
 
     private func applyContentCornerMask() {
@@ -857,6 +846,10 @@ private final class OverlayWindow: NSWindow {
                 frameView.layer?.cornerCurve = .continuous
             }
         }
+    }
+
+    private func manualButton(atWindowPoint point: NSPoint) -> NSButton? {
+        (contentView as? ExpandedPanelView)?.manualButton(atWindowPoint: point)
     }
 
     override func setFrame(_ frameRect: NSRect, display displayFlag: Bool) {
@@ -943,6 +936,12 @@ private final class OverlayWindow: NSWindow {
         let visibleFrame = screen?.visibleFrame
             ?? NSScreen.main?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        if fillsVisibleFrame {
+            let fullScreenFrame = screen?.frame
+                ?? NSScreen.main?.frame
+                ?? visibleFrame
+            return ExpandedPanelMetrics.fillVisibleScreenFrame(clamped, visibleFrame: fullScreenFrame)
+        }
         let screenMaxWidth = max(360, visibleFrame.width - inset * 2)
         clamped.size.width = min(clamped.size.width, screenMaxWidth)
         if let minimumFrameWidth, minimumFrameWidth <= screenMaxWidth {
@@ -984,6 +983,8 @@ private final class ModalBlockerView: NSView {
 }
 
 private final class HeaderDragView: NSView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard !isHidden, alphaValue > 0.01, bounds.contains(point) else { return nil }
         if let control = interactiveHit(in: self, point: point) {
@@ -1034,6 +1035,11 @@ private final class HeaderDragView: NSView {
         }
         return false
     }
+}
+
+private final class HeaderShieldView: NSView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override var acceptsFirstResponder: Bool { false }
 }
 
 private final class CopyCardButton: NSButton {
@@ -1163,6 +1169,8 @@ private final class PillView: NSView {
     var onAsk: (() -> Void)?
     var onEnd: (() -> Void)?
     private var runState: PillRunState = .ready
+    private var mouseDownLocation: NSPoint?
+    private var didDragFromMouseDown = false
 
     private let logoMark = BlueyLogoView()
     private let wordmarkView = BlueyWordmarkView()
@@ -1227,6 +1235,23 @@ private final class PillView: NSView {
         updateRunStateDisplay()
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override var acceptsFirstResponder: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard bounds.contains(point), !isHidden, alphaValue > 0.01 else { return nil }
+        let railPoint = convert(point, to: controlRail)
+        if controlRail.bounds.contains(railPoint) {
+            for button in [styleButton, runButton, endButton].reversed() {
+                let buttonPoint = controlRail.convert(railPoint, to: button)
+                if button.bounds.contains(buttonPoint), !button.isHidden, button.alphaValue > 0.01 {
+                    return button
+                }
+            }
+        }
+        return self
+    }
 
     override func layout() {
         super.layout()
@@ -1399,27 +1424,31 @@ private final class PillView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        let startLocation = event.locationInWindow
-        var didDrag = false
-        var keepGoing = true
-        while keepGoing {
-            guard let next = window?.nextEvent(matching: [.leftMouseDragged, .leftMouseUp])
-            else { break }
-            switch next.type {
-            case .leftMouseDragged:
-                let dx = next.locationInWindow.x - startLocation.x
-                let dy = next.locationInWindow.y - startLocation.y
-                if abs(dx) > 4 || abs(dy) > 4 {
-                    didDrag = true
-                    window?.performDrag(with: event)
-                    keepGoing = false
-                }
-            case .leftMouseUp:
-                if !didDrag { onClick?() }
-                keepGoing = false
-            default:
-                keepGoing = false
-            }
+        window?.makeKey()
+        mouseDownLocation = event.locationInWindow
+        didDragFromMouseDown = false
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let start = mouseDownLocation else {
+            super.mouseDragged(with: event)
+            return
+        }
+        let dx = event.locationInWindow.x - start.x
+        let dy = event.locationInWindow.y - start.y
+        guard abs(dx) > 4 || abs(dy) > 4 else { return }
+        didDragFromMouseDown = true
+        mouseDownLocation = nil
+        window?.performDrag(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        defer {
+            mouseDownLocation = nil
+            didDragFromMouseDown = false
+        }
+        if !didDragFromMouseDown {
+            onClick?()
         }
     }
 }
@@ -1512,7 +1541,7 @@ private final class FeedView: NSView {
         stack.orientation = .vertical
         stack.alignment = .centerX
         stack.spacing = 12
-        stack.edgeInsets = NSEdgeInsets(top: 20, left: 0, bottom: 16, right: 0)
+        stack.edgeInsets = NSEdgeInsets(top: 28, left: 0, bottom: 16, right: 0)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         scroll.hasVerticalScroller = true
@@ -1523,6 +1552,8 @@ private final class FeedView: NSView {
         scroll.contentInsets = NSEdgeInsets(top: 8, left: 0, bottom: 10, right: 0)
         scroll.documentView = stack
         scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.wantsLayer = true
+        scroll.layer?.masksToBounds = true
         scroll.contentView.wantsLayer = true
         scroll.contentView.layer?.masksToBounds = true
         addSubview(scroll)
@@ -2471,6 +2502,16 @@ private final class CanvasPaneView: NSView {
 // MARK: - Expanded panel (feed + composer)
 
 private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    private enum ChromeMetrics {
+        static let headerGuardHeight: CGFloat = 86
+        static let headerBarHeight: CGFloat = 42
+        static let headerHorizontalInset: CGFloat = 10
+        static let headerTopInset: CGFloat = 14
+        static let workspaceTopInset: CGFloat = 92
+    }
+
     let feed: FeedView
     let workspace: NSView
     let canvasPane: CanvasPaneView
@@ -2478,6 +2519,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     let toastTitleLabel: NSTextField
     let toastBodyLabel: NSTextField
     let headerBar: HeaderDragView
+    let headerChrome: HeaderShieldView
     let headerStack: NSStackView
     let brandStack: NSStackView
     let headerLogo: BlueyLogoView
@@ -2587,6 +2629,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         toastTitleLabel = NSTextField(labelWithString: "")
         toastBodyLabel = NSTextField(wrappingLabelWithString: "")
         headerBar = HeaderDragView()
+        headerChrome = HeaderShieldView()
         headerStack = NSStackView()
         brandStack = NSStackView()
         headerLogo = BlueyLogoView()
@@ -2680,6 +2723,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         for view in [
             headerBar,
+            headerChrome,
             headerStack,
             brandStack,
             headerLogo,
@@ -2743,27 +2787,29 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         ] {
             view.translatesAutoresizingMaskIntoConstraints = false
         }
+        // The header bar owns its controls. Earlier builds kept the controls
+        // as root-level siblings positioned over a constrained header, which
+        // made z-order and hit testing fragile after resize/fullscreen passes.
+        headerBar.translatesAutoresizingMaskIntoConstraints = false
+        headerChrome.translatesAutoresizingMaskIntoConstraints = false
+        headerStack.translatesAutoresizingMaskIntoConstraints = true
+        headerStack.isHidden = true
+        // These rows are manually pinned in keepFixedChromeInBounds(). Keeping
+        // Auto Layout in charge of the same frames caused visible chrome and
+        // mouse hit regions to drift after fullscreen/restore passes.
+        for manualFrameView in [
+            headerChrome,
+            headerBar,
+            workspace,
+            transcriptStrip,
+            attachmentStrip,
+            composerBar,
+        ] {
+            manualFrameView.translatesAutoresizingMaskIntoConstraints = true
+        }
 
-        headerBar.addSubview(headerStack)
         brandStack.addArrangedSubview(headerWordmark)
         brandStack.addArrangedSubview(statusLabel)
-        for view in [
-            navButton,
-            newSessionButton,
-            headerLogo,
-            brandStack,
-            routeBadge,
-            knowledgeBadge,
-            headerSpacer,
-            canvasToggleButton,
-            balanceLabel,
-            fullSizeButton,
-            interactionModeButton,
-            hideButton,
-            closeButton,
-        ] {
-            headerStack.addArrangedSubview(view)
-        }
         addSubview(workspace)
         workspace.addSubview(feed)
         workspace.addSubview(canvasPane)
@@ -2796,9 +2842,28 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         opacityControl.addSubview(opacityValueLabel)
         composerBar.addSubview(modelMenu)
         composerBar.addSubview(analyzeButton)
-        // Add the header late in the root view so it paints above the scroll
-        // workspace. Full-screen modal overlays are added after this.
+        // Add a non-content top shield below the interactive header. It masks
+        // any scroll-view overshoot during resize/restore while keeping the
+        // actual Bluey header controls fully clickable.
+        addSubview(headerChrome)
         addSubview(headerBar)
+        for view in [
+            navButton,
+            newSessionButton,
+            headerLogo,
+            brandStack,
+            routeBadge,
+            knowledgeBadge,
+            canvasToggleButton,
+            balanceLabel,
+            fullSizeButton,
+            interactionModeButton,
+            hideButton,
+            closeButton,
+        ] {
+            headerBar.addSubview(view)
+            view.translatesAutoresizingMaskIntoConstraints = true
+        }
         addSubview(answerStyleOverlay)
         answerStyleOverlay.addSubview(answerStylePanel)
         answerStylePanel.addSubview(answerStyleLabel)
@@ -2811,8 +2876,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         closeConfirmPanel.addSubview(closeConfirmCancelButton)
         closeConfirmPanel.addSubview(closeConfirmTurnOffButton)
         // Keep the fixed chrome rows above transparent scroll/canvas surfaces
-        // even when AppKit re-lays out the dense center workspace.
-        headerBar.layer?.zPosition = 50
+        // even when AppKit re-lays out the dense center workspace. The shield
+        // sits below the real header and never receives mouse events.
+        headerChrome.layer?.zPosition = 44
+        headerBar.layer?.zPosition = 45
         transcriptStrip.layer?.zPosition = 40
         attachmentStrip.layer?.zPosition = 40
         composerBar.layer?.zPosition = 50
@@ -2828,62 +2895,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         attachmentStripHeightConstraint = attachmentStripHeight
 
         NSLayoutConstraint.activate([
-            headerBar.topAnchor.constraint(equalTo: topAnchor, constant: 10),
-            headerBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            headerBar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            headerBar.heightAnchor.constraint(equalToConstant: 42),
-
-            headerStack.leadingAnchor.constraint(equalTo: headerBar.leadingAnchor, constant: 9),
-            headerStack.trailingAnchor.constraint(equalTo: headerBar.trailingAnchor, constant: -9),
-            headerStack.topAnchor.constraint(equalTo: headerBar.topAnchor, constant: 4),
-            headerStack.bottomAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: -4),
-
-            navButton.widthAnchor.constraint(equalToConstant: 30),
-            navButton.heightAnchor.constraint(equalToConstant: 30),
-
-            newSessionButton.widthAnchor.constraint(equalToConstant: 30),
-            newSessionButton.heightAnchor.constraint(equalToConstant: 30),
-
-            headerLogo.widthAnchor.constraint(equalToConstant: 28),
-            headerLogo.heightAnchor.constraint(equalToConstant: 28),
-
             headerWordmark.widthAnchor.constraint(equalToConstant: 62),
             headerWordmark.heightAnchor.constraint(equalToConstant: 22),
-
-            brandStack.widthAnchor.constraint(greaterThanOrEqualToConstant: 72),
-            brandStack.widthAnchor.constraint(lessThanOrEqualToConstant: 128),
-
-            routeBadge.widthAnchor.constraint(greaterThanOrEqualToConstant: 86),
-            routeBadge.widthAnchor.constraint(lessThanOrEqualToConstant: 126),
-            routeBadge.heightAnchor.constraint(equalToConstant: 24),
-
-            knowledgeBadge.widthAnchor.constraint(greaterThanOrEqualToConstant: 86),
-            knowledgeBadge.widthAnchor.constraint(lessThanOrEqualToConstant: 126),
-            knowledgeBadge.heightAnchor.constraint(equalToConstant: 24),
-
-            closeButton.widthAnchor.constraint(equalToConstant: 26),
-            closeButton.heightAnchor.constraint(equalToConstant: 26),
-
-            hideButton.widthAnchor.constraint(equalToConstant: 26),
-            hideButton.heightAnchor.constraint(equalToConstant: 26),
-
-            fullSizeButton.widthAnchor.constraint(equalToConstant: 26),
-            fullSizeButton.heightAnchor.constraint(equalToConstant: 26),
-
-            interactionModeButton.widthAnchor.constraint(equalToConstant: 26),
-            interactionModeButton.heightAnchor.constraint(equalToConstant: 26),
-
-            balanceLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 76),
-            balanceLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 106),
-            balanceLabel.heightAnchor.constraint(equalToConstant: 24),
-
-            canvasToggleButton.widthAnchor.constraint(equalToConstant: 30),
-            canvasToggleButton.heightAnchor.constraint(equalToConstant: 30),
-
-            workspace.topAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: 12),
-            workspace.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            workspace.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            workspace.bottomAnchor.constraint(equalTo: transcriptStrip.topAnchor, constant: -8),
 
             feed.topAnchor.constraint(equalTo: workspace.topAnchor),
             feed.leadingAnchor.constraint(equalTo: workspace.leadingAnchor),
@@ -2896,7 +2909,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             canvasPane.bottomAnchor.constraint(equalTo: workspace.bottomAnchor),
             canvasWidth,
 
-            toastView.topAnchor.constraint(equalTo: workspace.topAnchor, constant: 14),
+            toastView.topAnchor.constraint(equalTo: workspace.topAnchor, constant: 18),
             toastView.centerXAnchor.constraint(equalTo: centerXAnchor),
             toastView.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.52),
             toastView.widthAnchor.constraint(greaterThanOrEqualToConstant: 280),
@@ -2968,11 +2981,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             answerStyleSaveButton.bottomAnchor.constraint(equalTo: answerStylePanel.bottomAnchor, constant: -18),
             answerStyleSaveButton.heightAnchor.constraint(equalToConstant: 36),
 
-            transcriptStrip.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            transcriptStrip.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            transcriptStrip.bottomAnchor.constraint(equalTo: attachmentStrip.topAnchor, constant: -6),
-            transcriptStrip.heightAnchor.constraint(equalToConstant: 26),
-
             transcriptActivityDot.leadingAnchor.constraint(equalTo: transcriptStrip.leadingAnchor, constant: 11),
             transcriptActivityDot.centerYAnchor.constraint(equalTo: transcriptStrip.centerYAnchor),
             transcriptActivityDot.widthAnchor.constraint(equalToConstant: 7),
@@ -2987,20 +2995,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             transcriptScroll.trailingAnchor.constraint(equalTo: transcriptStrip.trailingAnchor, constant: -10),
             transcriptScroll.bottomAnchor.constraint(equalTo: transcriptStrip.bottomAnchor, constant: -2),
 
-            attachmentStrip.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            attachmentStrip.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            attachmentStrip.bottomAnchor.constraint(equalTo: composerBar.topAnchor, constant: -6),
-            attachmentStripHeight,
-
             attachmentStack.leadingAnchor.constraint(equalTo: attachmentStrip.contentView.leadingAnchor),
             attachmentStack.topAnchor.constraint(equalTo: attachmentStrip.contentView.topAnchor),
             attachmentStack.bottomAnchor.constraint(equalTo: attachmentStrip.contentView.bottomAnchor),
             attachmentStack.heightAnchor.constraint(equalTo: attachmentStrip.heightAnchor),
-
-            composerBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            composerBar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            composerBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
-            composerBarHeight,
 
             composerSurface.topAnchor.constraint(equalTo: composerBar.topAnchor, constant: 8),
             composerSurface.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 12),
@@ -3213,6 +3211,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             blue: 0.030,
             alpha: 1.0
         ).cgColor
+        headerChrome.layer?.backgroundColor = NSColor(
+            red: 0.008,
+            green: 0.011,
+            blue: 0.016,
+            alpha: 1.0
+        ).cgColor
         modelMenu.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.075)).cgColor
         modelMenu.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.12)).cgColor
         balanceLabel.layer?.backgroundColor = NSColor.clear.cgColor
@@ -3249,8 +3253,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         feed.applyBackgroundOpacity(backgroundOpacity)
         canvasPane.applyBackgroundOpacity(backgroundOpacity)
     }
-
-    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53, dismissActiveOverlay() {
@@ -3422,6 +3424,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func hitsExplicitInteractiveChrome(at localPoint: NSPoint) -> Bool {
         let controls: [NSView] = [
             headerBar,
+            headerChrome,
+            headerStack,
             navButton,
             newSessionButton,
             canvasToggleButton,
@@ -3436,6 +3440,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             canvasPane,
             transcriptStrip,
             attachmentStrip,
+            composerBar,
             composerSurface,
             composer,
             recordingButton,
@@ -3443,7 +3448,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             attachButton,
             instructionsButton,
             opacityControl,
+            opacityLabel,
             opacitySlider,
+            opacityValueLabel,
             modelMenu,
             analyzeButton,
         ]
@@ -3481,7 +3488,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func hasInteractiveView(at localPoint: NSPoint) -> Bool {
         var hit: NSView? = hitTest(localPoint)
         while let view = hit {
-            if view === self || view === workspace || view === headerBar || view === composerBar {
+            if view === self || view === workspace || view === headerBar || view === headerChrome || view === composerBar {
                 hit = view.superview
                 continue
             }
@@ -3605,58 +3612,198 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func keepFixedChromeInBounds() {
-        // Defensive guard for AppKit/autolayout edge cases. The window can
-        // report content bounds taller than the visible frame in some launch
-        // paths, so pin fixed chrome to the real visible height and keep its
-        // stacking order above dense transcript/card content.
-        guard bounds.height >= ExpandedPanelMetrics.minHeight else { return }
-        headerBar.isHidden = false
-        headerBar.layer?.zPosition = 1_000
-        headerStack.layer?.zPosition = 1_001
-        transcriptStrip.layer?.zPosition = 900
-        attachmentStrip.layer?.zPosition = 900
-        composerBar.layer?.zPosition = 1_000
-        let visibleHeight = min(bounds.height, window?.frame.height ?? bounds.height)
+        // The outer rows are constrained fixed chrome; do not manually
+        // resize the content here. We do pin the header frame explicitly
+        // because this borderless transparent window can otherwise leave the
+        // fixed header unpainted after fullscreen/restore or AppKit fitting
+        // passes. The workspace still sizes from the constraints below it.
+        let windowContentSize = window.map { $0.contentRect(forFrameRect: $0.frame).size }
+        let layoutWidth = max(0, min(bounds.width, windowContentSize?.width ?? bounds.width))
+        let layoutHeight = max(0, min(bounds.height, windowContentSize?.height ?? bounds.height))
+        guard layoutWidth > 120, layoutHeight >= ExpandedPanelMetrics.minHeight else { return }
+        // Some AppKit scroll/document views repaint above ordinary layer
+        // zPosition when the borderless overlay is resized/restored. Reassert
+        // actual sibling order so transcript/feed content can never cover the
+        // Bluey header or make the controls unclickable.
+        let composerHeight = composerBarHeightConstraint?.constant ?? 94
+        let attachmentHeight = attachmentStripHeightConstraint?.constant ?? 0
+        let transcriptHeight: CGFloat = 26
+        let horizontalInset: CGFloat = 10
+        let bottomInset: CGFloat = 10
+        let chromeGap: CGFloat = 6
+        let workspaceGap: CGFloat = 8
+
+        headerChrome.frame = NSRect(
+            x: 0,
+            y: layoutHeight - ChromeMetrics.headerGuardHeight,
+            width: layoutWidth,
+            height: ChromeMetrics.headerGuardHeight)
         headerBar.frame = NSRect(
-            x: 10,
-            y: max(10, visibleHeight - 52),
-            width: max(0, bounds.width - 20),
-            height: 42)
-        headerStack.frame = headerBar.bounds.insetBy(dx: 9, dy: 4)
-        if composerBar.frame.minY < 0 || composerBar.frame.maxY > bounds.height {
-            let height = composerBarHeightConstraint?.constant ?? 94
-            composerBar.frame = NSRect(
-                x: 10,
-                y: 10,
-                width: max(0, bounds.width - 20),
-                height: height)
+            x: ChromeMetrics.headerHorizontalInset,
+            y: layoutHeight - ChromeMetrics.headerTopInset - ChromeMetrics.headerBarHeight,
+            width: max(0, layoutWidth - ChromeMetrics.headerHorizontalInset * 2),
+            height: ChromeMetrics.headerBarHeight)
+
+        composerBar.frame = NSRect(
+            x: horizontalInset,
+            y: bottomInset,
+            width: max(0, layoutWidth - horizontalInset * 2),
+            height: composerHeight)
+        attachmentStrip.frame = NSRect(
+            x: horizontalInset,
+            y: composerBar.frame.maxY + chromeGap,
+            width: max(0, layoutWidth - horizontalInset * 2),
+            height: attachmentHeight)
+        transcriptStrip.frame = NSRect(
+            x: horizontalInset,
+            y: attachmentStrip.frame.maxY + chromeGap,
+            width: max(0, layoutWidth - horizontalInset * 2),
+            height: transcriptHeight)
+        let workspaceBottom = transcriptStrip.frame.maxY + workspaceGap
+        let workspaceTop = headerChrome.frame.minY - workspaceGap
+        workspace.frame = NSRect(
+            x: horizontalInset,
+            y: workspaceBottom,
+            width: max(0, layoutWidth - horizontalInset * 2),
+            height: max(0, workspaceTop - workspaceBottom))
+
+        raiseFixedChromeToFront()
+        layoutHeaderChromeControls()
+        headerBar.isHidden = false
+        headerChrome.isHidden = false
+        headerBar.alphaValue = 1
+        headerChrome.alphaValue = 1
+        headerChrome.layer?.zPosition = 3_990
+        headerBar.layer?.zPosition = 4_000
+        for view in [
+            navButton,
+            newSessionButton,
+            headerLogo,
+            brandStack,
+            routeBadge,
+            knowledgeBadge,
+            canvasToggleButton,
+            balanceLabel,
+            fullSizeButton,
+            interactionModeButton,
+            hideButton,
+            closeButton,
+        ] {
+            view.wantsLayer = true
+            view.layer?.zPosition = 4_010
+            view.alphaValue = 1
+            if view.superview !== headerBar {
+                view.removeFromSuperview()
+                headerBar.addSubview(view, positioned: .above, relativeTo: nil)
+            }
         }
-        let workspaceBottom = transcriptStrip.frame.maxY + 8
-        let workspaceTop = headerBar.frame.minY - 12
-        if workspaceTop > workspaceBottom {
-            workspace.frame = NSRect(
-                x: 10,
-                y: workspaceBottom,
-                width: max(0, bounds.width - 20),
-                height: workspaceTop - workspaceBottom)
-            let canvasWidth = canvasOpen ? min(
-                max(0, canvasWidthConstraint?.constant ?? 0),
-                max(0, workspace.bounds.width - 268)
-            ) : 0
-            let canvasGap: CGFloat = canvasWidth > 0 ? 8 : 0
-            let feedWidth = max(0, workspace.bounds.width - canvasWidth - canvasGap)
-            feed.frame = NSRect(
-                x: 0,
-                y: 0,
-                width: feedWidth,
-                height: workspace.bounds.height)
-            canvasPane.frame = NSRect(
-                x: feed.frame.maxX + canvasGap,
-                y: 0,
-                width: canvasWidth,
-                height: workspace.bounds.height)
-            feed.needsLayout = true
-            canvasPane.needsLayout = true
+        workspace.layer?.zPosition = 1
+        feed.layer?.zPosition = 1
+        canvasPane.layer?.zPosition = 1
+        sessionDrawer.layer?.zPosition = 3_900
+        answerStyleOverlay.layer?.zPosition = 4_200
+        closeConfirmOverlay.layer?.zPosition = 4_300
+        toastView.layer?.zPosition = 4_100
+        transcriptStrip.layer?.zPosition = 3_000
+        attachmentStrip.layer?.zPosition = 3_000
+        composerBar.layer?.zPosition = 4_000
+
+        canvasToggleButton.isHidden = !canvasOpen
+
+        workspace.layer?.masksToBounds = true
+        feed.layer?.masksToBounds = true
+        canvasPane.layer?.masksToBounds = true
+        transcriptStrip.layer?.masksToBounds = true
+        attachmentStrip.layer?.masksToBounds = true
+        composerBar.layer?.masksToBounds = false
+        headerBar.layer?.masksToBounds = false
+        headerChrome.layer?.masksToBounds = true
+
+        workspace.needsLayout = true
+        workspace.layoutSubtreeIfNeeded()
+        headerBar.needsDisplay = true
+        headerChrome.needsDisplay = true
+        brandStack.needsLayout = true
+        brandStack.layoutSubtreeIfNeeded()
+        feed.needsLayout = true
+        canvasPane.needsLayout = true
+        composerBar.needsLayout = true
+        transcriptStrip.needsLayout = true
+    }
+
+    private func raiseFixedChromeToFront() {
+        if headerChrome.superview === self {
+            let topSibling = subviews.last { $0 !== headerChrome }
+            addSubview(headerChrome, positioned: .above, relativeTo: topSibling)
+        }
+        if headerBar.superview === self {
+            let topSibling = subviews.last { $0 !== headerBar }
+            addSubview(headerBar, positioned: .above, relativeTo: topSibling)
+        }
+        for overlay in [sessionDrawer, answerStyleOverlay, closeConfirmOverlay, toastView] {
+            if overlay.superview === self, !overlay.isHidden {
+                let topSibling = subviews.last { $0 !== overlay }
+                addSubview(overlay, positioned: .above, relativeTo: topSibling)
+            }
+        }
+    }
+
+    private func layoutHeaderChromeControls() {
+        let frame = headerBar.bounds
+        guard frame.width > 140 else { return }
+
+        let buttonSize: CGFloat = 30
+        let iconSize: CGFloat = 28
+        let yButton = (frame.height - buttonSize) / 2
+        let yIcon = (frame.height - iconSize) / 2
+        let yBadge = (frame.height - 24) / 2
+
+        var left = CGFloat(12)
+        navButton.frame = NSRect(x: left, y: yButton, width: buttonSize, height: buttonSize)
+        left += buttonSize + 10
+        newSessionButton.frame = NSRect(x: left, y: yButton, width: buttonSize, height: buttonSize)
+        left += buttonSize + 12
+        headerLogo.frame = NSRect(x: left, y: yIcon, width: iconSize, height: iconSize)
+        left += iconSize + 8
+
+        let brandWidth = min(140, max(92, frame.width * 0.16))
+        brandStack.frame = NSRect(x: left, y: 4, width: brandWidth, height: 34)
+        left += brandWidth + 16
+
+        var right = frame.width - 12
+        closeButton.frame = NSRect(x: right - 28, y: yButton + 1, width: 28, height: 28)
+        right -= 36
+        hideButton.frame = NSRect(x: right - 28, y: yButton + 1, width: 28, height: 28)
+        right -= 36
+        interactionModeButton.frame = NSRect(x: right - 28, y: yButton + 1, width: 28, height: 28)
+        right -= 36
+        fullSizeButton.frame = NSRect(x: right - 28, y: yButton + 1, width: 28, height: 28)
+        right -= 40
+
+        let balanceWidth = min(96, max(72, frame.width * 0.12))
+        balanceLabel.frame = NSRect(x: right - balanceWidth, y: yBadge, width: balanceWidth, height: 24)
+        right -= balanceWidth + 10
+
+        if canvasOpen {
+            canvasToggleButton.isHidden = false
+            canvasToggleButton.frame = NSRect(x: right - 28, y: yButton + 1, width: 28, height: 28)
+            right -= 36
+        } else {
+            canvasToggleButton.isHidden = true
+            canvasToggleButton.frame = NSRect(x: right, y: yButton + 1, width: 0, height: 28)
+        }
+
+        let middleWidth = max(0, right - left - 8)
+        let routeWidth = min(128, max(88, middleWidth * 0.46))
+        let docsWidth = min(142, max(0, middleWidth - routeWidth - 10))
+        routeBadge.isHidden = middleWidth < 96
+        knowledgeBadge.isHidden = docsWidth < 76
+        if !routeBadge.isHidden {
+            routeBadge.frame = NSRect(x: left, y: yBadge, width: routeWidth, height: 24)
+            left += routeWidth + 10
+        }
+        if !knowledgeBadge.isHidden {
+            knowledgeBadge.frame = NSRect(x: left, y: yBadge, width: docsWidth, height: 24)
         }
     }
 
@@ -3670,6 +3817,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         headerBar.layer?.shadowOpacity = 0.18
         headerBar.layer?.shadowRadius = 14
         headerBar.layer?.shadowOffset = NSSize(width: 0, height: -6)
+        headerBar.alphaValue = 1
+
+        headerChrome.wantsLayer = true
+        headerChrome.layer?.backgroundColor = NSColor(red: 0.008, green: 0.011, blue: 0.016, alpha: 1.0).cgColor
+        headerChrome.layer?.cornerRadius = 0
+        headerChrome.layer?.borderWidth = 0
+        headerChrome.isHidden = false
 
         headerStack.orientation = .horizontal
         headerStack.alignment = .centerY
@@ -4949,12 +5103,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         windowFullSize = true
         updateFullSizeButtonChrome()
 
-        let screen = window.screen?.visibleFrame
-            ?? NSScreen.main?.visibleFrame
+        let screen = window.screen?.frame
+            ?? NSScreen.main?.frame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let maxWidth = max(ExpandedPanelMetrics.minCompactWidth, screen.width - ExpandedPanelMetrics.screenInset * 2)
-        let maxHeight = max(ExpandedPanelMetrics.minHeight, screen.height - ExpandedPanelMetrics.screenInset * 2)
+        let maxWidth = max(ExpandedPanelMetrics.minCompactWidth, screen.width)
+        let maxHeight = max(ExpandedPanelMetrics.minHeight, screen.height)
         if let overlayWindow = window as? OverlayWindow {
+            overlayWindow.fillsVisibleFrame = true
             overlayWindow.preserveProgrammaticFrameHeight = false
             overlayWindow.minimumFrameWidth = min(ExpandedPanelMetrics.minCompactWidth, maxWidth)
             overlayWindow.maximumFrameWidth = maxWidth
@@ -4966,12 +5121,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         window.maxSize = NSSize(width: maxWidth, height: maxHeight)
         window.contentMaxSize = window.maxSize
 
-        var frame = NSRect(
-            x: screen.midX - maxWidth / 2,
-            y: screen.midY - maxHeight / 2,
-            width: maxWidth,
-            height: maxHeight)
-        frame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(frame, visibleFrame: screen)
+        let frame = ExpandedPanelMetrics.fillVisibleScreenFrame(
+            NSRect(x: screen.minX, y: screen.minY, width: maxWidth, height: maxHeight),
+            visibleFrame: screen)
         updateCanvasWidth()
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.16
@@ -4989,13 +5141,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         restoreCompactWidth()
         updateCanvasWidth()
         updateFullSizeButtonChrome()
+        if let overlayWindow = window as? OverlayWindow {
+            overlayWindow.fillsVisibleFrame = false
+        }
         guard let targetFrame else { return }
         if let overlayWindow = window as? OverlayWindow {
             overlayWindow.preserveProgrammaticFrameHeight = false
             overlayWindow.lockedFrameHeight = targetFrame.height
         }
-        let screen = window.screen?.visibleFrame
-            ?? NSScreen.main?.visibleFrame
+        let screen = window.screen?.frame
+            ?? NSScreen.main?.frame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let fittedFrame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(targetFrame, visibleFrame: screen)
         if let overlayWindow = window as? OverlayWindow {
@@ -5043,12 +5198,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         canvasFullWindow = true
         canvasPane.setFullWindow(true)
 
-        let screen = window.screen?.visibleFrame
-            ?? NSScreen.main?.visibleFrame
+        let screen = window.screen?.frame
+            ?? NSScreen.main?.frame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let maxWidth = max(360, screen.width - ExpandedPanelMetrics.screenInset * 2)
-        let maxHeight = max(ExpandedPanelMetrics.minHeight, screen.height - ExpandedPanelMetrics.screenInset * 2)
+        let maxWidth = max(360, screen.width)
+        let maxHeight = max(ExpandedPanelMetrics.minHeight, screen.height)
         if let overlayWindow = window as? OverlayWindow {
+            overlayWindow.fillsVisibleFrame = true
             overlayWindow.minimumFrameWidth = min(ExpandedPanelMetrics.minCompactWidth, maxWidth)
             overlayWindow.maximumFrameWidth = maxWidth
             overlayWindow.minimumFrameHeight = ExpandedPanelMetrics.minHeight
@@ -5058,12 +5214,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         window.contentMinSize = window.minSize
         window.maxSize = NSSize(width: maxWidth, height: maxHeight)
         window.contentMaxSize = window.maxSize
-        var frame = NSRect(
-            x: screen.midX - maxWidth / 2,
-            y: screen.midY - maxHeight / 2,
-            width: maxWidth,
-            height: maxHeight)
-        frame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(frame, visibleFrame: screen)
+        let frame = ExpandedPanelMetrics.fillVisibleScreenFrame(
+            NSRect(x: screen.minX, y: screen.minY, width: maxWidth, height: maxHeight),
+            visibleFrame: screen)
         updateCanvasWidth()
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.16
@@ -5081,6 +5234,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         preCanvasFullWindowFrame = nil
         restoreCompactWidth()
         updateCanvasWidth()
+        if let overlayWindow = window as? OverlayWindow {
+            overlayWindow.fillsVisibleFrame = false
+        }
         if let targetFrame {
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.16
@@ -5131,6 +5287,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let maximumWidth = max(compactWidth, screen.width - ExpandedPanelMetrics.screenInset * 2)
         let maximumHeight = max(ExpandedPanelMetrics.minHeight, screen.height - ExpandedPanelMetrics.screenInset * 2)
         if let overlayWindow = window as? OverlayWindow {
+            overlayWindow.fillsVisibleFrame = false
             overlayWindow.minimumFrameWidth = minimumWidth
             overlayWindow.maximumFrameWidth = maximumWidth
             overlayWindow.minimumFrameHeight = ExpandedPanelMetrics.minHeight
@@ -5875,6 +6032,7 @@ private final class OverlayApp {
     private var lastExpandedInteractiveMouseAt = CACurrentMediaTime()
     private var currentRunState: PillRunState = .ready
     private var overlayOpacity = 0.94
+    private var expandedModeActive = false
 
     /// Pending boot card, if a Boot command arrived before windows materialised.
     private var pendingBoot: (title: String, lines: [String])?
@@ -5916,7 +6074,8 @@ private final class OverlayApp {
         startIpcLoop()
     }
 
-    private func bringPillToFront() {
+    private func bringPillToFront(force: Bool = false) {
+        guard force || !expandedModeActive else { return }
         centerPillOnMainScreen()
         pillWindow.ignoresMouseEvents = false
         pillWindow.acceptsMouseMovedEvents = true
@@ -5977,7 +6136,7 @@ private final class OverlayApp {
                 if expandedWindow.ignoresMouseEvents {
                     expandedWindow.ignoresMouseEvents = false
                 }
-            } else if now - self.lastExpandedInteractiveMouseAt > 0.45,
+            } else if now - self.lastExpandedInteractiveMouseAt > 1.10,
                       !expandedWindow.ignoresMouseEvents {
                 expandedWindow.ignoresMouseEvents = true
             }
@@ -5987,9 +6146,10 @@ private final class OverlayApp {
     private func expand() {
         ensureExpandedWindow()
         guard let expandedWindow else { return }
+        expandedModeActive = true
         placeExpandedWindowForOpen()
         lastExpandedInteractiveMouseAt = CACurrentMediaTime()
-        pillWindow?.orderOut(nil)
+        hidePillWhileExpanded()
         NSApp.activate(ignoringOtherApps: true)
         expandedWindow.ignoresMouseEvents = false
         expandedWindow.acceptsMouseMovedEvents = true
@@ -5997,6 +6157,7 @@ private final class OverlayApp {
         expandedWindow.makeKeyAndOrderFront(nil)
         DispatchQueue.main.async { [weak self] in
             self?.placeExpandedWindowForOpen()
+            self?.hidePillWhileExpanded()
         }
         emitSimple("shown")
         emitLifecycle("expanded")
@@ -6059,11 +6220,20 @@ private final class OverlayApp {
     }
 
     private func collapse() {
+        expandedModeActive = false
         expandedWindow?.ignoresMouseEvents = false
         expandedWindow?.orderOut(nil)
-        bringPillToFront()
+        pillWindow?.ignoresMouseEvents = false
+        bringPillToFront(force: true)
         emitSimple("hidden")
         emitLifecycle("collapsed")
+    }
+
+    private func hidePillWhileExpanded() {
+        guard let pillWindow else { return }
+        pillWindow.ignoresMouseEvents = true
+        pillWindow.orderOut(nil)
+        pillWindow.setIsVisible(false)
     }
 
     private func setRunState(_ state: PillRunState) {
