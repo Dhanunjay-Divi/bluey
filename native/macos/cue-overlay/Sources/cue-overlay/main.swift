@@ -1772,13 +1772,13 @@ private final class FeedView: NSView {
 
         let title = NSTextField(labelWithString: "New recording")
         title.translatesAutoresizingMaskIntoConstraints = false
-        title.font = NSFont.systemFont(ofSize: 22, weight: .bold)
+        title.font = NSFont.systemFont(ofSize: 20, weight: .bold)
         title.textColor = BlueyTheme.text
         title.alignment = .center
 
-        let subtitle = NSTextField(labelWithString: "Attach documents or drop them here. Auto chooses the fastest accurate answer.")
+        let subtitle = NSTextField(labelWithString: "Ask, listen, or drop documents for context.")
         subtitle.translatesAutoresizingMaskIntoConstraints = false
-        subtitle.font = NSFont.systemFont(ofSize: 12.5, weight: .medium)
+        subtitle.font = NSFont.systemFont(ofSize: 12, weight: .medium)
         subtitle.textColor = BlueyTheme.textDim
         subtitle.alignment = .center
         subtitle.maximumNumberOfLines = 2
@@ -1788,19 +1788,19 @@ private final class FeedView: NSView {
         dropTarget.translatesAutoresizingMaskIntoConstraints = false
         dropTarget.wantsLayer = true
         dropTarget.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.035).cgColor
-        dropTarget.layer?.cornerRadius = 15
+        dropTarget.layer?.cornerRadius = 13
         dropTarget.layer?.borderWidth = 1
         dropTarget.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.24).cgColor
 
-        let dropTitle = NSTextField(labelWithString: "Attach documents or drag and drop")
+        let dropTitle = NSTextField(labelWithString: "Drop documents here")
         dropTitle.translatesAutoresizingMaskIntoConstraints = false
-        dropTitle.font = NSFont.systemFont(ofSize: 12.5, weight: .semibold)
+        dropTitle.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
         dropTitle.textColor = BlueyTheme.text
         dropTitle.alignment = .center
 
         let dropHint = NSTextField(labelWithString: "PDF, DOCX, TXT, MD, code")
         dropHint.translatesAutoresizingMaskIntoConstraints = false
-        dropHint.font = NSFont.systemFont(ofSize: 10.5, weight: .medium)
+        dropHint.font = NSFont.systemFont(ofSize: 10, weight: .medium)
         dropHint.textColor = BlueyTheme.textDim
         dropHint.alignment = .center
 
@@ -1819,26 +1819,26 @@ private final class FeedView: NSView {
             badge.topAnchor.constraint(equalTo: emptyState.topAnchor),
             badge.centerXAnchor.constraint(equalTo: emptyState.centerXAnchor),
 
-            title.topAnchor.constraint(equalTo: badge.bottomAnchor, constant: 8),
+            title.topAnchor.constraint(equalTo: badge.bottomAnchor, constant: 7),
             title.leadingAnchor.constraint(equalTo: emptyState.leadingAnchor),
             title.trailingAnchor.constraint(equalTo: emptyState.trailingAnchor),
 
-            subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 8),
+            subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 6),
             subtitle.leadingAnchor.constraint(equalTo: emptyState.leadingAnchor),
             subtitle.trailingAnchor.constraint(equalTo: emptyState.trailingAnchor),
 
-            dropTarget.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 16),
+            dropTarget.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 12),
             dropTarget.centerXAnchor.constraint(equalTo: emptyState.centerXAnchor),
             dropTarget.widthAnchor.constraint(lessThanOrEqualTo: emptyState.widthAnchor),
-            dropTarget.widthAnchor.constraint(greaterThanOrEqualToConstant: 292),
-            dropTarget.heightAnchor.constraint(equalToConstant: 62),
+            dropTarget.widthAnchor.constraint(greaterThanOrEqualToConstant: 252),
+            dropTarget.heightAnchor.constraint(equalToConstant: 50),
             dropTarget.bottomAnchor.constraint(equalTo: emptyState.bottomAnchor),
 
-            dropTitle.topAnchor.constraint(equalTo: dropTarget.topAnchor, constant: 12),
+            dropTitle.topAnchor.constraint(equalTo: dropTarget.topAnchor, constant: 8),
             dropTitle.leadingAnchor.constraint(equalTo: dropTarget.leadingAnchor, constant: 18),
             dropTitle.trailingAnchor.constraint(equalTo: dropTarget.trailingAnchor, constant: -18),
 
-            dropHint.topAnchor.constraint(equalTo: dropTitle.bottomAnchor, constant: 4),
+            dropHint.topAnchor.constraint(equalTo: dropTitle.bottomAnchor, constant: 2),
             dropHint.leadingAnchor.constraint(equalTo: dropTarget.leadingAnchor, constant: 18),
             dropHint.trailingAnchor.constraint(equalTo: dropTarget.trailingAnchor, constant: -18),
         ])
@@ -2603,6 +2603,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var toastHideWorkItem: DispatchWorkItem?
     private var knowledgeIndexTimer: Timer?
     private var knowledgeIndexFrame = 0
+    private var knowledgeBadgeContentVisible = false
     private var audioPulseTimer: Timer?
     private var audioPulseFrame = 0
     private let knowledgeIndexFrames = [
@@ -2646,10 +2647,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         headerLogo = BlueyLogoView()
         headerWordmark = BlueyWordmarkView()
         headerSpacer = NSView()
-        statusLabel = NSTextField(labelWithString: "Bluey online")
+        statusLabel = NSTextField(labelWithString: "")
         modelMenu = NSPopUpButton(frame: .zero, pullsDown: false)
         routeBadge = NSTextField(labelWithString: "● Ready")
-        knowledgeBadge = NSTextField(labelWithString: "Docs empty")
+        knowledgeBadge = NSTextField(labelWithString: "")
         balanceLabel = NSTextField(labelWithString: "Balance --")
         fullSizeButton = NSButton(title: "", target: nil, action: nil)
         interactionModeButton = NSButton(title: "", target: nil, action: nil)
@@ -3765,58 +3766,59 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let frame = headerBar.bounds
         guard frame.width > 140 else { return }
 
-        let buttonSize: CGFloat = 30
-        let iconSize: CGFloat = 28
+        let buttonSize: CGFloat = 28
+        let iconSize: CGFloat = 26
         let yButton = (frame.height - buttonSize) / 2
         let yIcon = (frame.height - iconSize) / 2
-        let yBadge = (frame.height - 24) / 2
+        let yBadge = (frame.height - 22) / 2
 
-        var left = CGFloat(12)
+        var left = CGFloat(11)
         navButton.frame = NSRect(x: left, y: yButton, width: buttonSize, height: buttonSize)
-        left += buttonSize + 10
+        left += buttonSize + 8
         newSessionButton.frame = NSRect(x: left, y: yButton, width: buttonSize, height: buttonSize)
-        left += buttonSize + 12
+        left += buttonSize + 10
         headerLogo.frame = NSRect(x: left, y: yIcon, width: iconSize, height: iconSize)
-        left += iconSize + 8
+        left += iconSize + 7
 
-        let brandWidth = min(140, max(92, frame.width * 0.16))
-        brandStack.frame = NSRect(x: left, y: 4, width: brandWidth, height: 34)
-        left += brandWidth + 16
+        let brandWidth = min(124, max(88, frame.width * 0.14))
+        let brandHeight: CGFloat = statusLabel.isHidden ? 23 : 34
+        brandStack.frame = NSRect(x: left, y: (frame.height - brandHeight) / 2, width: brandWidth, height: brandHeight)
+        left += brandWidth + 14
 
         var right = frame.width - 12
-        closeButton.frame = NSRect(x: right - 28, y: yButton + 1, width: 28, height: 28)
-        right -= 36
-        hideButton.frame = NSRect(x: right - 28, y: yButton + 1, width: 28, height: 28)
-        right -= 36
-        interactionModeButton.frame = NSRect(x: right - 28, y: yButton + 1, width: 28, height: 28)
-        right -= 36
-        fullSizeButton.frame = NSRect(x: right - 28, y: yButton + 1, width: 28, height: 28)
-        right -= 40
+        closeButton.frame = NSRect(x: right - 26, y: yButton + 1, width: 26, height: 26)
+        right -= 33
+        hideButton.frame = NSRect(x: right - 26, y: yButton + 1, width: 26, height: 26)
+        right -= 33
+        interactionModeButton.frame = NSRect(x: right - 26, y: yButton + 1, width: 26, height: 26)
+        right -= 33
+        fullSizeButton.frame = NSRect(x: right - 26, y: yButton + 1, width: 26, height: 26)
+        right -= 37
 
-        let balanceWidth = min(96, max(72, frame.width * 0.12))
-        balanceLabel.frame = NSRect(x: right - balanceWidth, y: yBadge, width: balanceWidth, height: 24)
-        right -= balanceWidth + 10
+        let balanceWidth = min(86, max(66, frame.width * 0.11))
+        balanceLabel.frame = NSRect(x: right - balanceWidth, y: yBadge, width: balanceWidth, height: 22)
+        right -= balanceWidth + 8
 
         if canvasOpen {
             canvasToggleButton.isHidden = false
-            canvasToggleButton.frame = NSRect(x: right - 28, y: yButton + 1, width: 28, height: 28)
-            right -= 36
+            canvasToggleButton.frame = NSRect(x: right - 26, y: yButton + 1, width: 26, height: 26)
+            right -= 33
         } else {
             canvasToggleButton.isHidden = true
-            canvasToggleButton.frame = NSRect(x: right, y: yButton + 1, width: 0, height: 28)
+            canvasToggleButton.frame = NSRect(x: right, y: yButton + 1, width: 0, height: 26)
         }
 
         let middleWidth = max(0, right - left - 8)
-        let routeWidth = min(128, max(88, middleWidth * 0.46))
-        let docsWidth = min(142, max(0, middleWidth - routeWidth - 10))
+        let routeWidth = min(116, max(78, middleWidth * 0.44))
+        let docsWidth = min(128, max(0, middleWidth - routeWidth - 8))
         routeBadge.isHidden = middleWidth < 96
-        knowledgeBadge.isHidden = docsWidth < 76
+        knowledgeBadge.isHidden = !knowledgeBadgeContentVisible || docsWidth < 72
         if !routeBadge.isHidden {
-            routeBadge.frame = NSRect(x: left, y: yBadge, width: routeWidth, height: 24)
-            left += routeWidth + 10
+            routeBadge.frame = NSRect(x: left, y: yBadge, width: routeWidth, height: 22)
+            left += routeWidth + 8
         }
         if !knowledgeBadge.isHidden {
-            knowledgeBadge.frame = NSRect(x: left, y: yBadge, width: docsWidth, height: 24)
+            knowledgeBadge.frame = NSRect(x: left, y: yBadge, width: docsWidth, height: 22)
         }
     }
 
@@ -3856,6 +3858,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         statusLabel.textColor = BlueyTheme.textDim
         statusLabel.lineBreakMode = .byTruncatingTail
         statusLabel.maximumNumberOfLines = 1
+        statusLabel.isHidden = true
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         modelMenu.addItems(withTitles: ["Auto", "Instant", "Balanced", "Deep"])
@@ -4641,8 +4644,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         balanceLabel.stringValue = clean.isEmpty ? "Balance --" : clean
     }
 
-    private func setHeaderSubtitle(_ text: String = "Bluey online") {
-        statusLabel.stringValue = text
+    private func setHeaderSubtitle(_ text: String = "") {
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        statusLabel.stringValue = clean
+        statusLabel.isHidden = clean.isEmpty
+        layoutHeaderChromeControls()
     }
 
     func showSignedOutLogin(url: URL?) {
@@ -4667,9 +4673,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if balanceLabel.stringValue == "Login" {
             balanceLabel.stringValue = "Balance --"
         }
-        if knowledgeBadge.stringValue == "Docs locked" {
-            setKnowledgeBadge("Docs empty", accent: BlueyTheme.textDim)
-        }
+        setKnowledgeBadge("Docs empty", accent: BlueyTheme.textDim)
         composer.placeholder = recordingActive
             ? "Listening... type a follow-up anytime"
             : "Ask anything..."
@@ -4684,14 +4688,29 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return
         }
         stopKnowledgeIndexing()
-        knowledgeBadge.stringValue = text
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = clean.lowercased()
+        if clean.isEmpty || lower.contains("empty") || lower.contains("locked") {
+            knowledgeBadgeContentVisible = false
+            knowledgeBadge.stringValue = ""
+            knowledgeBadge.isHidden = true
+            knowledgeBadge.toolTip = nil
+            layoutHeaderChromeControls()
+            return
+        }
+        knowledgeBadgeContentVisible = true
+        knowledgeBadge.stringValue = clean
         knowledgeBadge.textColor = accent
         knowledgeBadge.layer?.borderColor = NSColor.clear.cgColor
         knowledgeBadge.layer?.backgroundColor = NSColor.clear.cgColor
+        knowledgeBadge.toolTip = "Attached document status"
+        layoutHeaderChromeControls()
     }
 
     private func startKnowledgeIndexing() {
         knowledgeIndexTimer?.invalidate()
+        knowledgeBadgeContentVisible = true
+        knowledgeBadge.isHidden = false
         knowledgeIndexFrame = 0
         applyKnowledgeIndexFrame()
         knowledgeIndexTimer = Timer.scheduledTimer(withTimeInterval: 0.42, repeats: true) { [weak self] _ in
@@ -4708,6 +4727,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         knowledgeBadge.layer?.borderColor = NSColor.clear.cgColor
         knowledgeBadge.layer?.backgroundColor = NSColor.clear.cgColor
         knowledgeBadge.toolTip = "Indexing attached documents"
+        knowledgeBadgeContentVisible = true
+        layoutHeaderChromeControls()
     }
 
     private func stopKnowledgeIndexing() {
@@ -4993,7 +5014,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if let artifact {
             routeBadge.stringValue = routeBadgeText(for: artifact)
         } else if !done {
-            statusLabel.stringValue = "Answer streaming"
+            setHeaderSubtitle("Answer streaming")
         }
         routeCanvasIfNeeded(card)
     }
@@ -5902,7 +5923,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         guard sender.tag >= 0, sender.tag < sessionItems.count else { return }
         let session = sessionItems[sender.tag]
         sessionDrawer.isHidden = true
-        statusLabel.stringValue = session.title
+        setHeaderSubtitle()
         emitSessionOpen(id: session.id)
     }
 

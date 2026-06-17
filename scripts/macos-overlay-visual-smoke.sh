@@ -48,14 +48,16 @@ require_source "styleIconButton(attachButton, symbol: \"plus\""
 require_source "styleControlButton(instructionsButton, symbol: \"text.bubble\""
 require_source "styleControlButton(askButton, symbol: \"arrow.up\", accent: true)"
 require_source "modelMenu.trailingAnchor.constraint(equalTo: analyzeButton.leadingAnchor"
-require_source "composerBarHeightConstraint?.constant = textHeight + 52"
+require_source "composerBarHeightConstraint?.constant = textHeight + ChromeMetrics.composerExtraChromeHeight"
 require_source "opacityLabel.stringValue = \"Opacity\""
-require_source "opacityControl.widthAnchor.constraint(equalToConstant: 144)"
-require_source "knowledgeBadge = NSTextField(labelWithString: \"Docs empty\")"
+require_source "opacityControl.widthAnchor.constraint(equalToConstant: 122)"
+require_source "knowledgeBadge = NSTextField(labelWithString: \"\")"
+require_source "knowledgeBadgeContentVisible = false"
+require_source "lower.contains(\"empty\") || lower.contains(\"locked\")"
 require_source "routeBadge = NSTextField(labelWithString: \"● Ready\")"
 require_source "composerSurface.addSubview(recordingButton)"
 require_source "composerSurface.addSubview(askButton)"
-require_source "composerBar.heightAnchor.constraint(equalToConstant: 94)"
+require_source "composerBar.heightAnchor.constraint(equalToConstant: ChromeMetrics.composerBaseHeight)"
 require_source "drawerCloseButton = NSButton(title: \"\", target: nil, action: nil)"
 require_source "sessionDrawer.topAnchor.constraint(equalTo: topAnchor, constant: 10)"
 require_source "sessionDrawer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10)"
@@ -67,7 +69,7 @@ require_source "configureFixedChromeLayoutPriorities()"
 require_source "keepFixedChromeInBounds()"
 require_source "PillMetrics.centeredFrame"
 require_source "startExpandedPassthroughTracking()"
-require_source "pillWindow?.orderOut(nil)"
+require_source "pillWindow.orderOut(nil)"
 require_source "private struct ResizeEdges"
 require_source "resizeEdges(at:"
 require_source "private let fullWindowButton = NSButton(title: \"\", target: nil, action: nil)"
@@ -303,7 +305,7 @@ for py in range(header_box[1], header_box[3]):
         if r > 140 and g > 105 and b < 90:
             yellow_accent += 1
 
-if bright < 120 or blue_accent + yellow_accent < 35:
+if bright < 45 or blue_accent + yellow_accent < 35:
     raise AssertionError(
         "expanded overlay header appears missing or clipped: "
         f"bright={bright} accent={blue_accent + yellow_accent} crop={header_box}"
