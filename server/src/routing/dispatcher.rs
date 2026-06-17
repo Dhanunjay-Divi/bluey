@@ -31,8 +31,9 @@ use thiserror::Error;
 use crate::config::UpstreamKeys;
 
 const OPENAI_FAST_MODEL: &str = "gpt-5.4-mini";
-const OPENAI_ACCURATE_MODEL: &str = "gpt-5.4";
-const ANTHROPIC_BALANCED_MODEL: &str = "claude-sonnet-4-6";
+const OPENAI_ACCURATE_MODEL: &str = "gpt-5.5";
+const ANTHROPIC_BALANCED_MODEL: &str = "claude-sonnet-4-6-20260115";
+const ANTHROPIC_DEEP_MODEL: &str = "claude-opus-4-8-20260225";
 const ANTHROPIC_FAST_MODEL: &str = "claude-haiku-4-5-20251001";
 
 #[derive(Debug, Error)]
@@ -275,10 +276,12 @@ pub fn resolve_route_candidates(lane: &str) -> Vec<(&'static str, &'static str)>
         "instant" => vec![
             ("openai", OPENAI_FAST_MODEL),
             ("anthropic", ANTHROPIC_FAST_MODEL),
+            ("anthropic", ANTHROPIC_BALANCED_MODEL),
         ],
         "deep" => vec![
-            ("anthropic", ANTHROPIC_BALANCED_MODEL),
+            ("anthropic", ANTHROPIC_DEEP_MODEL),
             ("openai", OPENAI_ACCURATE_MODEL),
+            ("anthropic", ANTHROPIC_BALANCED_MODEL),
             ("anthropic", ANTHROPIC_FAST_MODEL),
         ],
         "vision" => vec![
@@ -292,6 +295,7 @@ pub fn resolve_route_candidates(lane: &str) -> Vec<(&'static str, &'static str)>
         _ => vec![
             ("anthropic", ANTHROPIC_BALANCED_MODEL),
             ("openai", OPENAI_ACCURATE_MODEL),
+            ("openai", OPENAI_FAST_MODEL),
         ], // balanced default
     }
 }
@@ -1147,6 +1151,7 @@ fn anthropic_thinking_for(model: &str, thinking: ThinkingBudget) -> Option<Anthr
 fn anthropic_supports_manual_thinking(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
     model.contains("claude-3-7")
+        || model.contains("claude-opus-4-8")
         || model.contains("claude-sonnet-4-6")
         || model.contains("claude-haiku-4-5")
 }
@@ -1507,13 +1512,19 @@ mod tests {
         assert_eq!(resolve_route("instant"), ("openai", "gpt-5.4-mini"));
         assert_eq!(
             resolve_route("balanced"),
-            ("anthropic", "claude-sonnet-4-6"),
+            ("anthropic", "claude-sonnet-4-6-20260115"),
         );
-        assert_eq!(resolve_route("deep"), ("anthropic", "claude-sonnet-4-6"),);
-        assert_eq!(resolve_route("vision"), ("openai", "gpt-5.4"));
+        assert_eq!(
+            resolve_route("deep"),
+            ("anthropic", "claude-opus-4-8-20260225"),
+        );
+        assert_eq!(resolve_route("vision"), ("openai", "gpt-5.5"));
         assert_eq!(resolve_route("local"), ("unsupported", "local"));
         // Unknown → balanced default.
-        assert_eq!(resolve_route("???"), ("anthropic", "claude-sonnet-4-6"),);
+        assert_eq!(
+            resolve_route("???"),
+            ("anthropic", "claude-sonnet-4-6-20260115"),
+        );
     }
 
     #[test]
@@ -1522,24 +1533,30 @@ mod tests {
             resolve_route_candidates("instant"),
             vec![
                 ("openai", "gpt-5.4-mini"),
-                ("anthropic", "claude-haiku-4-5-20251001")
+                ("anthropic", "claude-haiku-4-5-20251001"),
+                ("anthropic", "claude-sonnet-4-6-20260115")
             ]
         );
         assert_eq!(
             resolve_route_candidates("balanced"),
-            vec![("anthropic", "claude-sonnet-4-6"), ("openai", "gpt-5.4")]
+            vec![
+                ("anthropic", "claude-sonnet-4-6-20260115"),
+                ("openai", "gpt-5.5"),
+                ("openai", "gpt-5.4-mini")
+            ]
         );
         assert_eq!(
             resolve_route_candidates("deep"),
             vec![
-                ("anthropic", "claude-sonnet-4-6"),
-                ("openai", "gpt-5.4"),
+                ("anthropic", "claude-opus-4-8-20260225"),
+                ("openai", "gpt-5.5"),
+                ("anthropic", "claude-sonnet-4-6-20260115"),
                 ("anthropic", "claude-haiku-4-5-20251001")
             ]
         );
         assert_eq!(
             resolve_route_candidates("vision"),
-            vec![("openai", "gpt-5.4"), ("openai", "gpt-5.4-mini")]
+            vec![("openai", "gpt-5.5"), ("openai", "gpt-5.4-mini")]
         );
         assert!(
             resolve_route_candidates("local").is_empty(),
@@ -1632,7 +1649,7 @@ mod tests {
         let images = vec!["data:image/png;base64,aGVsbG8=".to_string()];
         let err = anthropic_complete(
             "sk-test",
-            "claude-sonnet-4-6",
+            "claude-sonnet-4-6-20260115",
             "system",
             "user",
             None,
@@ -1712,7 +1729,7 @@ mod tests {
         let budget = resolve_thinking_budget("deep", None, None);
 
         let (max_tokens, max_completion_tokens) =
-            openai_effective_token_limit_fields("gpt-5.4", None, budget);
+            openai_effective_token_limit_fields("gpt-5.5", None, budget);
         assert_eq!(max_tokens, None);
         assert_eq!(max_completion_tokens, Some(5120));
     }
@@ -1720,10 +1737,12 @@ mod tests {
     #[test]
     fn anthropic_manual_thinking_only_for_known_supported_models() {
         let budget = resolve_thinking_budget("deep", None, None);
-        let enabled = anthropic_thinking_for("claude-sonnet-4-6", budget).unwrap();
+        let enabled = anthropic_thinking_for("claude-opus-4-8-20260225", budget).unwrap();
         assert_eq!(enabled.ty, "enabled");
         assert_eq!(enabled.budget_tokens, 4096);
+        assert!(anthropic_thinking_for("claude-sonnet-4-6-20260115", budget).is_some());
         assert!(anthropic_thinking_for("claude-haiku-4-5-20251001", budget).is_some());
-        assert!(anthropic_thinking_for("gpt-5.4", budget).is_none());
+        assert!(anthropic_thinking_for("claude-fable-5-20260609", budget).is_none());
+        assert!(anthropic_thinking_for("gpt-5.5", budget).is_none());
     }
 }

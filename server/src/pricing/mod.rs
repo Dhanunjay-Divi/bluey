@@ -2,7 +2,7 @@
 //!
 //! Source of truth lives here AND in `docs/PRICING-MODEL.md`. Any
 //! change to either must be reflected in both. Last reconciled
-//! 2026-06-10 against PRICING-MODEL.md and MODEL-ROUTING.md.
+//! 2026-06-17 against PRICING-MODEL.md and MODEL-ROUTING.md.
 //!
 //! ## Unit semantics
 //!
@@ -39,20 +39,28 @@ pub const PRICING: &[ModelPricing] = &[
         markup_percent: 200,
     },
     ModelPricing {
-        // OpenAI gpt-5.4 (vision-capable): $2.50/1M in, $15/1M out.
+        // OpenAI gpt-5.5 (flagship/vision-capable): $5/1M in, $30/1M out.
         provider: "openai",
-        model: "gpt-5.4",
-        upstream_in_microcents_per_1m: 2_500_000,
-        upstream_out_microcents_per_1m: 15_000_000,
+        model: "gpt-5.5",
+        upstream_in_microcents_per_1m: 5_000_000,
+        upstream_out_microcents_per_1m: 30_000_000,
         markup_percent: 150,
     },
     ModelPricing {
         // Anthropic Claude Sonnet 4.6: $3/1M in, $15/1M out.
         provider: "anthropic",
-        model: "claude-sonnet-4-6",
+        model: "claude-sonnet-4-6-20260115",
         upstream_in_microcents_per_1m: 3_000_000,
         upstream_out_microcents_per_1m: 15_000_000,
         markup_percent: 200,
+    },
+    ModelPricing {
+        // Anthropic Claude Opus 4.8: $15/1M in, $75/1M out.
+        provider: "anthropic",
+        model: "claude-opus-4-8-20260225",
+        upstream_in_microcents_per_1m: 15_000_000,
+        upstream_out_microcents_per_1m: 75_000_000,
+        markup_percent: 150,
     },
     ModelPricing {
         // Anthropic Claude Haiku 4.5: $1/1M in, $5/1M out.
@@ -153,12 +161,18 @@ mod tests {
             lookup("openai", "gpt-5.4-mini").unwrap().markup_percent,
             200
         );
-        assert_eq!(lookup("openai", "gpt-5.4").unwrap().markup_percent, 150);
+        assert_eq!(lookup("openai", "gpt-5.5").unwrap().markup_percent, 150);
         assert_eq!(
-            lookup("anthropic", "claude-sonnet-4-6")
+            lookup("anthropic", "claude-sonnet-4-6-20260115")
                 .unwrap()
                 .markup_percent,
             200
+        );
+        assert_eq!(
+            lookup("anthropic", "claude-opus-4-8-20260225")
+                .unwrap()
+                .markup_percent,
+            150
         );
         assert_eq!(
             lookup("anthropic", "claude-haiku-4-5-20251001")
@@ -190,11 +204,11 @@ mod tests {
 
     #[test]
     fn medium_code_q_charges_few_cents() {
-        // 800 in / 600 out on claude-sonnet-4-6
+        // 800 in / 600 out on claude-sonnet-4-6-20260115
         // raw: 800*3_000_000/1M + 600*15_000_000/1M = 2400 + 9000 = 11400 microcents
         // raw cents: 11400 / 10000 = 1.14 cents → ceil 2
         // 200% markup: 11400 * 3 / 1 = 34200 microcents = 3.42 cents → ceil 4
-        let p = lookup("anthropic", "claude-sonnet-4-6").unwrap();
+        let p = lookup("anthropic", "claude-sonnet-4-6-20260115").unwrap();
         let (bluey, customer) = compute_cost(p, 800, 600);
         assert_eq!(bluey, 2);
         assert_eq!(customer, 4);
@@ -202,13 +216,14 @@ mod tests {
 
     #[test]
     fn deep_question_charges_tens_of_cents() {
-        // 1500 in / 1000 out on claude-sonnet-4-6
-        // raw: 1500*3M/1M + 1000*15M/1M = 4500 + 15000 = 19500 microcents = 1.95 cents → ceil 2
-        // 200% markup: 19500 * 3 = 58500 microcents = 5.85 cents → ceil 6
-        let p = lookup("anthropic", "claude-sonnet-4-6").unwrap();
+        // 1500 in / 1000 out on claude-opus-4-8-20260225.
+        // raw: 1500*15M/1M + 1000*75M/1M = 22500 + 75000 = 97500 microcents
+        // raw cents: 9.75 → ceil 10
+        // 150% markup: 97500 * 2.5 = 243750 microcents = 24.375 cents → ceil 25
+        let p = lookup("anthropic", "claude-opus-4-8-20260225").unwrap();
         let (bluey, customer) = compute_cost(p, 1500, 1000);
-        assert_eq!(bluey, 2);
-        assert_eq!(customer, 6);
+        assert_eq!(bluey, 10);
+        assert_eq!(customer, 25);
     }
 
     #[test]
@@ -218,13 +233,13 @@ mod tests {
         assert_eq!(estimate_cost_ceiling(p, 150, 100), 2);
 
         // Medium question: customer=4 cents. Ceiling = 4 + max(4/10, 1) = 4+1 = 5 cents.
-        let p = lookup("anthropic", "claude-sonnet-4-6").unwrap();
+        let p = lookup("anthropic", "claude-sonnet-4-6-20260115").unwrap();
         assert_eq!(estimate_cost_ceiling(p, 800, 600), 5);
     }
 
     #[test]
     fn bluey_ceiling_uses_upstream_cost_not_markup() {
-        let p = lookup("anthropic", "claude-sonnet-4-6").unwrap();
+        let p = lookup("anthropic", "claude-sonnet-4-6-20260115").unwrap();
         assert_eq!(estimate_bluey_cost_ceiling(p, 800, 600), 3);
     }
 

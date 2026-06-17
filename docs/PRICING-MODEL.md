@@ -7,7 +7,7 @@
 > per-decision sections. Cross-referenced from `DECISIONS.md`,
 > `docs/HOW-IT-WORKS.md`, `FUTURE-IMPLEMENTATIONS.md` R14.13.
 >
-> Last updated: 2026-06-10.
+> Last updated: 2026-06-17.
 
 ---
 
@@ -21,7 +21,7 @@
 | Markup floor | **150%** | user direction 2026-05-19 |
 | Markup tier — Easy/Medium | 200% | absolute cents are tiny; small markup absurd |
 | Markup tier — Deep speculative | 150% | absolute cost is more visible to customer |
-| Markup tier — Vision | 150% | GPT-5.4 vision-capable route pricing already high |
+| Markup tier — Vision | 150% | GPT-5.5 vision-capable route pricing already high |
 | Hard stop | balance < estimated cost → 402 | no debt, no surprise charges |
 | Mid-stream cut | running cost > balance → cut + Bluey eats overrun | customer never sees overrun deduction |
 | Free trial | 10 minutes of active session time | mirrors Pinky |
@@ -43,17 +43,18 @@
 > - The Light tier projection (~3,000 cues per $30) reflects the
 >   1¢ floor; under fractional-cent billing it would be ~10x higher.
 
-> **Provider price snapshot date:** 2026-06-10. List prices from
-> `https://platform.openai.com/docs/pricing` and
-> `https://docs.anthropic.com/en/docs/about-claude/pricing`. Refresh
-> at every minor release. Managed LLM routes currently price
-> OpenAI `gpt-5.4-mini`, OpenAI `gpt-5.4`, Anthropic
-> `claude-sonnet-4-6`, and Anthropic `claude-haiku-4-5-20251001`.
+> **Provider price snapshot date:** 2026-06-17. List prices from
+> `https://openai.com/api/pricing/` and
+> `https://docs.anthropic.com/en/docs/about-claude/models/overview`.
+> Refresh at every minor release. Managed LLM routes currently price
+> OpenAI `gpt-5.4-mini`, OpenAI `gpt-5.5`, Anthropic
+> `claude-sonnet-4-6-20260115`, Anthropic `claude-opus-4-8-20260225`,
+> and Anthropic `claude-haiku-4-5-20251001`.
 > Gemini is not priced here because the managed server has no Gemini
 > dispatcher yet.
 >
 > **Vision tokenization caveat:** "1 image" in the table below is a
-> simplification. OpenAI GPT-5.4 vision input is billed as image/text
+> simplification. OpenAI GPT-5.5 vision input is billed as image/text
 > input tokens; exact image tokens vary with the provider's current
 > `detail` parameter and image dimensions: a 1280×720 screenshot at
 > auto detail decomposes into ~3-4 256×256 tiles (~85 tokens per
@@ -63,12 +64,12 @@
 | Type | Input tokens | Output tokens | Image tokens | Provider/model | Bluey raw cost (input/output split) | Customer pays |
 |---|---|---|---|---|---|---|
 | Easy code | ~150 | ~100 | 0 | `gpt-5.4-mini` Instant | in: $0.000113 + out: $0.000450 = **$0.000563** | raw markup $0.0017; 1¢ minimum |
-| Medium code | ~800 | ~600 | 0 | `claude-sonnet-4-6` Balanced | in: $0.0024 + out: $0.0090 = **$0.0114** | raw markup $0.034; charged 4¢ |
-| Hard code (speculative) | ~1500 + ~1000 | ~500 + ~500 | 0 | `gpt-5.4-mini` + `claude-sonnet-4-6` | Instant: $0.0034 + Deep: $0.0105 = **$0.0139** | raw markup ~$0.042; charged by actual route(s) |
-| System design (speculative) | ~2000 + ~1200 | ~500 + ~2500 | 0 | `gpt-5.4-mini` + `claude-sonnet-4-6` | Instant: $0.0038 + Deep: $0.0411 = **$0.0449** | raw markup ~$0.135; charged by actual route(s) |
-| Vision | ~200 | ~300 | ~3 tiles | `gpt-5.4` vision | image+text in: ~$0.0014 + out: $0.0045 = **$0.0059** | raw markup ~$0.0146; charged 2¢ |
+| Medium code | ~800 | ~600 | 0 | `claude-sonnet-4-6-20260115` Balanced | in: $0.0024 + out: $0.0090 = **$0.0114** | raw markup $0.034; charged 4¢ |
+| Hard code (speculative) | ~1500 + ~1000 | ~500 + ~500 | 0 | `gpt-5.4-mini` + `claude-opus-4-8-20260225` | Instant: $0.0034 + Deep: $0.0525 = **$0.0559** | raw markup ~$0.15; charged by actual route(s) |
+| System design (speculative) | ~2000 + ~1200 | ~500 + ~2500 | 0 | `gpt-5.4-mini` + `claude-opus-4-8-20260225` | Instant: $0.0038 + Deep: $0.2055 = **$0.2093** | raw markup ~$0.53; charged by actual route(s) |
+| Vision | ~200 | ~300 | ~3 tiles | `gpt-5.5` vision | image+text in: ~$0.0027 + out: $0.0090 = **$0.0117** | raw markup ~$0.029; charged 3¢ |
 | Easy general | ~150 | ~150 | 0 | `gpt-5.4-mini` Instant | in: $0.000113 + out: $0.000675 = **$0.000788** | raw markup $0.0024; 1¢ minimum |
-| Medium general | ~400 | ~500 | 0 | `claude-sonnet-4-6` | in: $0.0012 + out: $0.0075 = **$0.0087** | raw markup $0.026; charged 3¢ |
+| Medium general | ~400 | ~500 | 0 | `claude-sonnet-4-6-20260115` | in: $0.0012 + out: $0.0075 = **$0.0087** | raw markup $0.026; charged 3¢ |
 
 **STT pricing used by server meters:**
 

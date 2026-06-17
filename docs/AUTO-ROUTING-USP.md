@@ -10,16 +10,19 @@ Every other AI overlay forces the user to pick a model up-front. Bluey Auto pick
 - A strong model produces a refined **final** answer when the question warrants it.
 - The user sees the draft immediately and the final replaces it in-place when ready.
 
-This is the product USP. It does not require new model capabilities — it stitches existing providers (`anthropic`, `openai`, `ollama`) into a routing layer that classifies first, dispatches second.
+This is the product USP. It does not require the user to pick a model — it
+stitches managed providers (`anthropic`, `openai`) into a routing layer that
+classifies first, dispatches second, and keeps daemon-only local fallback out
+of the customer-facing model picker.
 
 ## Why it matters
 
 | Problem | Today | With Bluey Auto |
 |---|---|---|
-| User picks a model | "Should I use GPT-4o-mini or Claude 3.7?" | Bluey decides per question. |
+| User picks a model | "Should I use a fast model, Sonnet, Opus, or vision?" | Bluey decides per question. |
 | Cheap model on a hard question | Wrong answer, fast. | Wrong draft, then auto-refined to the right answer. |
 | Expensive model on a trivial question | Right answer, slow + costly. | Cheap fast answer; no escalation. |
-| Local-only mode | All-or-nothing toggle. | Same classifier, lane forced to `Local`. |
+| Local-only mode | All-or-nothing toggle. | Daemon-only fallback, not a managed customer lane. |
 | Vision input | User remembers to switch models. | Auto-detected; vision-capable provider always wins. |
 
 ## Architecture
@@ -57,17 +60,32 @@ cue_llm::LlmProvider (anthropic / openai / ollama)
 - **`LatencyLane`** — `instant` | `balanced` | `deep`
 - **Confidence** — `f32` in `[0.0, 1.0]`
 
-### Lanes → providers (StaticPolicy defaults)
+### Lanes → providers (managed defaults, refreshed 2026-06-17)
 
 | Lane | Provider | Model | Max tokens | Stream | Notes |
 |---|---|---|---|---|---|
-| `instant` | OpenAI | `gpt-4o-mini` | 512 | yes | First-token latency optimised |
-| `balanced` | Anthropic | `claude-3-5-sonnet-latest` | 2048 | yes | Default |
-| `deep` | Anthropic | `claude-3-7-sonnet-latest` | 8192 | no | Quality + budget |
-| `vision` | OpenAI | `gpt-4o` | 2048 | yes | Multimodal |
-| `local` | Ollama | `llama3.1` | 2048 | yes | Privacy / offline fallback |
+| `instant` | OpenAI | `gpt-5.4-mini` | 512 | yes | First-token latency and cost optimized |
+| `balanced` | Anthropic | `claude-sonnet-4-6-20260115` | 2048 | yes | Default technical/general answer lane |
+| `deep` | Anthropic | `claude-opus-4-8-20260225` | 8192 | yes | Hard coding, architecture, and reasoning-heavy answers |
+| `vision` | OpenAI | `gpt-5.5` | 2048 | yes | Screen analysis / screenshot / multimodal context |
+| `local` | Daemon only | not a managed cloud route | 2048 | yes | Offline/dev fallback before the server |
 
-`StaticPolicy::local_only()` flips `force_local: true`; routing then always returns the Local lane regardless of classification.
+`StaticPolicy::local_only()` remains available for daemon/dev fallback. Managed
+server routing returns no provider candidates for `local`, so paid customer
+requests never dispatch to a hidden desktop model.
+
+**Evaluated but not enabled in the managed default route:**
+
+- Anthropic `claude-fable-5-20260609`: most capable self-serve Claude in the
+  current model list, but substantially more expensive for routine answers and
+  does not support extended thinking. Keep as a future "max accuracy" lane,
+  not the default Deep lane.
+- Gemini 3.5 Pro / Flash / Flash-Lite: attractive for multimodal/cost
+  diversity, but Bluey does not yet have a Gemini server dispatcher, key pool,
+  pricing row, or billing tests. Add as a separate provider-integration round.
+- Deepgram Flux: likely a better live-conversation STT path than chunked
+  Nova-3, but it belongs with the desktop→server→Deepgram WebSocket relay
+  rather than this LLM routing refresh.
 
 ## Heuristic classifier — what it sees
 
