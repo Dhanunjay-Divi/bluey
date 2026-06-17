@@ -2516,6 +2516,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         static let headerHorizontalInset: CGFloat = 10
         static let headerTopInset: CGFloat = 14
         static let workspaceTopInset: CGFloat = 92
+        static let composerInputHeight: CGFloat = 34
+        static let composerBaseHeight: CGFloat = 78
+        static let composerExtraChromeHeight: CGFloat = 44
+        static let transcriptStripHeight: CGFloat = 22
     }
 
     let feed: FeedView
@@ -2896,8 +2900,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         let canvasWidth = canvasPane.widthAnchor.constraint(equalToConstant: 0)
         canvasWidthConstraint = canvasWidth
-        let composerTextHeight = composerSurface.heightAnchor.constraint(equalToConstant: 42)
-        let composerBarHeight = composerBar.heightAnchor.constraint(equalToConstant: 94)
+        let composerTextHeight = composerSurface.heightAnchor.constraint(equalToConstant: ChromeMetrics.composerInputHeight)
+        let composerBarHeight = composerBar.heightAnchor.constraint(equalToConstant: ChromeMetrics.composerBaseHeight)
         let attachmentStripHeight = attachmentStrip.heightAnchor.constraint(equalToConstant: 0)
         composerTextHeightConstraint = composerTextHeight
         composerBarHeightConstraint = composerBarHeight
@@ -2990,14 +2994,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             answerStyleSaveButton.bottomAnchor.constraint(equalTo: answerStylePanel.bottomAnchor, constant: -18),
             answerStyleSaveButton.heightAnchor.constraint(equalToConstant: 36),
 
-            transcriptActivityDot.leadingAnchor.constraint(equalTo: transcriptStrip.leadingAnchor, constant: 11),
+            transcriptActivityDot.leadingAnchor.constraint(equalTo: transcriptStrip.leadingAnchor, constant: 10),
             transcriptActivityDot.centerYAnchor.constraint(equalTo: transcriptStrip.centerYAnchor),
-            transcriptActivityDot.widthAnchor.constraint(equalToConstant: 7),
-            transcriptActivityDot.heightAnchor.constraint(equalToConstant: 7),
+            transcriptActivityDot.widthAnchor.constraint(equalToConstant: 6),
+            transcriptActivityDot.heightAnchor.constraint(equalToConstant: 6),
 
-            transcriptStateLabel.leadingAnchor.constraint(equalTo: transcriptActivityDot.trailingAnchor, constant: 7),
+            transcriptStateLabel.leadingAnchor.constraint(equalTo: transcriptActivityDot.trailingAnchor, constant: 6),
             transcriptStateLabel.centerYAnchor.constraint(equalTo: transcriptStrip.centerYAnchor),
-            transcriptStateLabel.widthAnchor.constraint(equalToConstant: 88),
+            transcriptStateLabel.widthAnchor.constraint(equalToConstant: 78),
 
             transcriptScroll.topAnchor.constraint(equalTo: transcriptStrip.topAnchor, constant: 2),
             transcriptScroll.leadingAnchor.constraint(equalTo: transcriptStateLabel.trailingAnchor, constant: 8),
@@ -3009,64 +3013,64 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             attachmentStack.bottomAnchor.constraint(equalTo: attachmentStrip.contentView.bottomAnchor),
             attachmentStack.heightAnchor.constraint(equalTo: attachmentStrip.heightAnchor),
 
-            composerSurface.topAnchor.constraint(equalTo: composerBar.topAnchor, constant: 8),
-            composerSurface.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 12),
-            composerSurface.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -12),
+            composerSurface.topAnchor.constraint(equalTo: composerBar.topAnchor, constant: 6),
+            composerSurface.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 10),
+            composerSurface.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -10),
             composerTextHeight,
 
-            composer.topAnchor.constraint(equalTo: composerSurface.topAnchor, constant: 2),
-            composer.leadingAnchor.constraint(equalTo: composerSurface.leadingAnchor, constant: 14),
-            composer.trailingAnchor.constraint(equalTo: recordingButton.leadingAnchor, constant: -8),
-            composer.bottomAnchor.constraint(equalTo: composerSurface.bottomAnchor, constant: -2),
+            composer.topAnchor.constraint(equalTo: composerSurface.topAnchor, constant: 1),
+            composer.leadingAnchor.constraint(equalTo: composerSurface.leadingAnchor, constant: 12),
+            composer.trailingAnchor.constraint(equalTo: recordingButton.leadingAnchor, constant: -7),
+            composer.bottomAnchor.constraint(equalTo: composerSurface.bottomAnchor, constant: -1),
 
-            recordingButton.trailingAnchor.constraint(equalTo: askButton.leadingAnchor, constant: -6),
+            recordingButton.trailingAnchor.constraint(equalTo: askButton.leadingAnchor, constant: -5),
             recordingButton.centerYAnchor.constraint(equalTo: composerSurface.centerYAnchor),
-            recordingButton.widthAnchor.constraint(equalToConstant: 80),
-            recordingButton.heightAnchor.constraint(equalToConstant: 30),
+            recordingButton.widthAnchor.constraint(equalToConstant: 72),
+            recordingButton.heightAnchor.constraint(equalToConstant: 28),
 
-            askButton.trailingAnchor.constraint(equalTo: composerSurface.trailingAnchor, constant: -7),
+            askButton.trailingAnchor.constraint(equalTo: composerSurface.trailingAnchor, constant: -6),
             askButton.centerYAnchor.constraint(equalTo: composerSurface.centerYAnchor),
-            askButton.widthAnchor.constraint(equalToConstant: 106),
-            askButton.heightAnchor.constraint(equalToConstant: 32),
+            askButton.widthAnchor.constraint(equalToConstant: 96),
+            askButton.heightAnchor.constraint(equalToConstant: 30),
 
-            attachButton.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 12),
-            attachButton.bottomAnchor.constraint(equalTo: composerBar.bottomAnchor, constant: -8),
-            attachButton.widthAnchor.constraint(equalToConstant: 32),
-            attachButton.heightAnchor.constraint(equalToConstant: 32),
+            attachButton.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 10),
+            attachButton.bottomAnchor.constraint(equalTo: composerBar.bottomAnchor, constant: -6),
+            attachButton.widthAnchor.constraint(equalToConstant: 28),
+            attachButton.heightAnchor.constraint(equalToConstant: 28),
 
-            instructionsButton.leadingAnchor.constraint(equalTo: attachButton.trailingAnchor, constant: 8),
+            instructionsButton.leadingAnchor.constraint(equalTo: attachButton.trailingAnchor, constant: 7),
             instructionsButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            instructionsButton.widthAnchor.constraint(equalToConstant: 80),
-            instructionsButton.heightAnchor.constraint(equalToConstant: 32),
+            instructionsButton.widthAnchor.constraint(equalToConstant: 70),
+            instructionsButton.heightAnchor.constraint(equalToConstant: 28),
 
-            opacityControl.leadingAnchor.constraint(equalTo: instructionsButton.trailingAnchor, constant: 8),
+            opacityControl.leadingAnchor.constraint(equalTo: instructionsButton.trailingAnchor, constant: 7),
             opacityControl.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            opacityControl.widthAnchor.constraint(equalToConstant: 144),
-            opacityControl.heightAnchor.constraint(equalToConstant: 32),
+            opacityControl.widthAnchor.constraint(equalToConstant: 122),
+            opacityControl.heightAnchor.constraint(equalToConstant: 28),
 
-            opacityLabel.leadingAnchor.constraint(equalTo: opacityControl.leadingAnchor, constant: 12),
+            opacityLabel.leadingAnchor.constraint(equalTo: opacityControl.leadingAnchor, constant: 9),
             opacityLabel.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
-            opacityLabel.widthAnchor.constraint(equalToConstant: 46),
+            opacityLabel.widthAnchor.constraint(equalToConstant: 42),
 
-            opacitySlider.leadingAnchor.constraint(equalTo: opacityLabel.trailingAnchor, constant: 8),
+            opacitySlider.leadingAnchor.constraint(equalTo: opacityLabel.trailingAnchor, constant: 6),
             opacitySlider.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
-            opacitySlider.trailingAnchor.constraint(equalTo: opacityValueLabel.leadingAnchor, constant: -7),
-            opacitySlider.heightAnchor.constraint(equalToConstant: 20),
+            opacitySlider.trailingAnchor.constraint(equalTo: opacityValueLabel.leadingAnchor, constant: -5),
+            opacitySlider.heightAnchor.constraint(equalToConstant: 18),
 
-            opacityValueLabel.trailingAnchor.constraint(equalTo: opacityControl.trailingAnchor, constant: -10),
+            opacityValueLabel.trailingAnchor.constraint(equalTo: opacityControl.trailingAnchor, constant: -8),
             opacityValueLabel.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
-            opacityValueLabel.widthAnchor.constraint(equalToConstant: 22),
+            opacityValueLabel.widthAnchor.constraint(equalToConstant: 20),
 
-            analyzeButton.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -14),
+            analyzeButton.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -12),
             analyzeButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            analyzeButton.widthAnchor.constraint(equalToConstant: 84),
-            analyzeButton.heightAnchor.constraint(equalToConstant: 32),
+            analyzeButton.widthAnchor.constraint(equalToConstant: 76),
+            analyzeButton.heightAnchor.constraint(equalToConstant: 28),
 
-            modelMenu.trailingAnchor.constraint(equalTo: analyzeButton.leadingAnchor, constant: -7),
+            modelMenu.trailingAnchor.constraint(equalTo: analyzeButton.leadingAnchor, constant: -6),
             modelMenu.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            modelMenu.widthAnchor.constraint(greaterThanOrEqualToConstant: 118),
-            modelMenu.widthAnchor.constraint(lessThanOrEqualToConstant: 144),
-            modelMenu.heightAnchor.constraint(equalToConstant: 32),
+            modelMenu.widthAnchor.constraint(greaterThanOrEqualToConstant: 104),
+            modelMenu.widthAnchor.constraint(lessThanOrEqualToConstant: 132),
+            modelMenu.heightAnchor.constraint(equalToConstant: 28),
 
             opacityControl.trailingAnchor.constraint(lessThanOrEqualTo: modelMenu.leadingAnchor, constant: -10),
 
@@ -3634,9 +3638,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         // zPosition when the borderless overlay is resized/restored. Reassert
         // actual sibling order so transcript/feed content can never cover the
         // Bluey header or make the controls unclickable.
-        let composerHeight = composerBarHeightConstraint?.constant ?? 94
+        let composerHeight = composerBarHeightConstraint?.constant ?? ChromeMetrics.composerBaseHeight
         let attachmentHeight = attachmentStripHeightConstraint?.constant ?? 0
-        let transcriptHeight: CGFloat = 26
+        let transcriptHeight: CGFloat = ChromeMetrics.transcriptStripHeight
         let horizontalInset: CGFloat = 10
         let bottomInset: CGFloat = 10
         let chromeGap: CGFloat = 6
@@ -3917,19 +3921,19 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func configureContextRows() {
         transcriptStrip.wantsLayer = true
         transcriptStrip.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.16).cgColor
-        transcriptStrip.layer?.cornerRadius = 13
+        transcriptStrip.layer?.cornerRadius = 11
         transcriptStrip.layer?.borderWidth = 1
         transcriptStrip.layer?.borderColor = BlueyTheme.hairline.cgColor
 
         transcriptActivityDot.wantsLayer = true
-        transcriptActivityDot.layer?.cornerRadius = 3.5
+        transcriptActivityDot.layer?.cornerRadius = 3
         transcriptActivityDot.layer?.backgroundColor = BlueyTheme.textDim.withAlphaComponent(0.55).cgColor
         transcriptActivityDot.layer?.shadowColor = BlueyTheme.cyan.cgColor
         transcriptActivityDot.layer?.shadowOpacity = 0
         transcriptActivityDot.layer?.shadowRadius = 7
         transcriptActivityDot.layer?.shadowOffset = .zero
 
-        transcriptStateLabel.font = NSFont.monospacedSystemFont(ofSize: 9.5, weight: .bold)
+        transcriptStateLabel.font = NSFont.monospacedSystemFont(ofSize: 9, weight: .bold)
         transcriptStateLabel.textColor = BlueyTheme.textDim
         transcriptStateLabel.alignment = .left
         transcriptStateLabel.lineBreakMode = .byTruncatingTail
@@ -3943,7 +3947,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         transcriptLabel.isBezeled = false
         transcriptLabel.drawsBackground = false
-        transcriptLabel.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        transcriptLabel.font = NSFont.systemFont(ofSize: 10.5, weight: .medium)
         transcriptLabel.textColor = BlueyTheme.textDim
         transcriptLabel.lineBreakMode = .byClipping
         transcriptLabel.maximumNumberOfLines = 1
@@ -4042,7 +4046,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func configureComposer() {
         composerBar.wantsLayer = true
         composerBar.layer?.backgroundColor = NSColor(red: 0.014, green: 0.016, blue: 0.022, alpha: 0.94).cgColor
-        composerBar.layer?.cornerRadius = 24
+        composerBar.layer?.cornerRadius = 20
         composerBar.layer?.borderWidth = 1
         composerBar.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.22).cgColor
         composerBar.layer?.shadowColor = NSColor.black.cgColor
@@ -4052,21 +4056,21 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         composerSurface.wantsLayer = true
         composerSurface.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.050).cgColor
-        composerSurface.layer?.cornerRadius = 18
+        composerSurface.layer?.cornerRadius = 16
         composerSurface.layer?.borderWidth = 1
         composerSurface.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
 
         opacityControl.wantsLayer = true
         opacityControl.layer?.backgroundColor = NSColor.clear.cgColor
-        opacityControl.layer?.cornerRadius = 16
+        opacityControl.layer?.cornerRadius = 14
         opacityControl.layer?.borderWidth = 0
         opacityControl.layer?.borderColor = NSColor.clear.cgColor
         opacityControl.toolTip = "Overlay opacity"
         opacityLabel.stringValue = "Opacity"
-        opacityLabel.font = NSFont.systemFont(ofSize: 10.2, weight: .semibold)
+        opacityLabel.font = NSFont.systemFont(ofSize: 9.8, weight: .semibold)
         opacityLabel.textColor = BlueyTheme.textDim
         opacityLabel.alignment = .left
-        opacityValueLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 10.2, weight: .semibold)
+        opacityValueLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 9.8, weight: .semibold)
         opacityValueLabel.textColor = BlueyTheme.textDim
         opacityValueLabel.alignment = .right
         opacitySlider.controlSize = .small
@@ -4145,17 +4149,17 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func styleControlButton(_ button: NSButton, symbol: String, accent: Bool) {
         button.isBordered = false
         button.wantsLayer = true
-        button.layer?.cornerRadius = 16
+        button.layer?.cornerRadius = 14
         button.layer?.backgroundColor = accent
             ? NSColor(red: 0.07, green: 0.19, blue: 0.24, alpha: 0.98).cgColor
             : NSColor.white.withAlphaComponent(0.070).cgColor
         button.layer?.borderWidth = 1
         button.layer?.borderColor = (accent ? BlueyTheme.cyan.withAlphaComponent(0.55) : NSColor.white.withAlphaComponent(0.12)).cgColor
-        button.font = NSFont.systemFont(ofSize: 12, weight: .bold)
+        button.font = NSFont.systemFont(ofSize: 11.5, weight: .bold)
         button.attributedTitle = NSAttributedString(
             string: button.title,
             attributes: [
-                .font: button.font ?? NSFont.systemFont(ofSize: 12, weight: .bold),
+                .font: button.font ?? NSFont.systemFont(ofSize: 11.5, weight: .bold),
                 .foregroundColor: BlueyTheme.text,
             ])
         button.contentTintColor = BlueyTheme.cyan
@@ -4347,10 +4351,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func setComposerTextHeight(_ rawHeight: CGFloat) {
-        let textHeight = min(max(rawHeight, 42), 88)
+        let textHeight = min(max(rawHeight, ChromeMetrics.composerInputHeight), 68)
         guard abs((composerTextHeightConstraint?.constant ?? 0) - textHeight) > 0.5 else { return }
         composerTextHeightConstraint?.constant = textHeight
-        composerBarHeightConstraint?.constant = textHeight + 52
+        composerBarHeightConstraint?.constant = textHeight + ChromeMetrics.composerExtraChromeHeight
         needsLayout = true
         layoutSubtreeIfNeeded()
     }
