@@ -50,7 +50,7 @@ require_source "styleControlButton(askButton, symbol: \"arrow.up\", accent: true
 require_source "modelMenu.trailingAnchor.constraint(equalTo: analyzeButton.leadingAnchor"
 require_source "composerBarHeightConstraint?.constant = textHeight + ChromeMetrics.composerExtraChromeHeight"
 require_source "opacityLabel.stringValue = \"Opacity\""
-require_source "opacityControl.widthAnchor.constraint(equalToConstant: 122)"
+require_source "opacityControl.widthAnchor.constraint(equalToConstant: 112)"
 require_source "knowledgeBadge = NSTextField(labelWithString: \"\")"
 require_source "knowledgeBadgeContentVisible = false"
 require_source "lower.contains(\"empty\") || lower.contains(\"locked\")"

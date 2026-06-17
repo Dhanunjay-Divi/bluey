@@ -1770,15 +1770,15 @@ private final class FeedView: NSView {
         badge.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .bold)
         badge.textColor = BlueyTheme.cyan
 
-        let title = NSTextField(labelWithString: "New recording")
+        let title = NSTextField(labelWithString: "Ready")
         title.translatesAutoresizingMaskIntoConstraints = false
-        title.font = NSFont.systemFont(ofSize: 20, weight: .bold)
+        title.font = NSFont.systemFont(ofSize: 18, weight: .bold)
         title.textColor = BlueyTheme.text
         title.alignment = .center
 
-        let subtitle = NSTextField(labelWithString: "Ask, listen, or drop documents for context.")
+        let subtitle = NSTextField(labelWithString: "Ask anything. Attach documents or analyse the screen when context helps.")
         subtitle.translatesAutoresizingMaskIntoConstraints = false
-        subtitle.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        subtitle.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
         subtitle.textColor = BlueyTheme.textDim
         subtitle.alignment = .center
         subtitle.maximumNumberOfLines = 2
@@ -2516,10 +2516,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         static let headerHorizontalInset: CGFloat = 10
         static let headerTopInset: CGFloat = 14
         static let workspaceTopInset: CGFloat = 92
-        static let composerInputHeight: CGFloat = 34
-        static let composerBaseHeight: CGFloat = 78
-        static let composerExtraChromeHeight: CGFloat = 44
-        static let transcriptStripHeight: CGFloat = 22
+        static let composerInputHeight: CGFloat = 32
+        static let composerBaseHeight: CGFloat = 70
+        static let composerExtraChromeHeight: CGFloat = 38
+        static let transcriptStripHeight: CGFloat = 20
     }
 
     let feed: FeedView
@@ -2592,6 +2592,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var recordingActive = false
     private var transcriptSnippets: [String] = []
     private var latestLiveTranscriptLine: String?
+    private var lastTranscriptStripSource: String?
     private var sessionItems: [OverlaySessionItem] = []
     private var editingSessionId: String?
     private var pendingDeleteSessionId: String?
@@ -3002,7 +3003,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
             transcriptStateLabel.leadingAnchor.constraint(equalTo: transcriptActivityDot.trailingAnchor, constant: 6),
             transcriptStateLabel.centerYAnchor.constraint(equalTo: transcriptStrip.centerYAnchor),
-            transcriptStateLabel.widthAnchor.constraint(equalToConstant: 78),
+            transcriptStateLabel.widthAnchor.constraint(equalToConstant: 64),
 
             transcriptScroll.topAnchor.constraint(equalTo: transcriptStrip.topAnchor, constant: 2),
             transcriptScroll.leadingAnchor.constraint(equalTo: transcriptStateLabel.trailingAnchor, constant: 8),
@@ -3014,64 +3015,64 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             attachmentStack.bottomAnchor.constraint(equalTo: attachmentStrip.contentView.bottomAnchor),
             attachmentStack.heightAnchor.constraint(equalTo: attachmentStrip.heightAnchor),
 
-            composerSurface.topAnchor.constraint(equalTo: composerBar.topAnchor, constant: 6),
-            composerSurface.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 10),
-            composerSurface.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -10),
+            composerSurface.topAnchor.constraint(equalTo: composerBar.topAnchor, constant: 5),
+            composerSurface.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 8),
+            composerSurface.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -8),
             composerTextHeight,
 
             composer.topAnchor.constraint(equalTo: composerSurface.topAnchor, constant: 1),
-            composer.leadingAnchor.constraint(equalTo: composerSurface.leadingAnchor, constant: 12),
-            composer.trailingAnchor.constraint(equalTo: recordingButton.leadingAnchor, constant: -7),
+            composer.leadingAnchor.constraint(equalTo: composerSurface.leadingAnchor, constant: 10),
+            composer.trailingAnchor.constraint(equalTo: recordingButton.leadingAnchor, constant: -6),
             composer.bottomAnchor.constraint(equalTo: composerSurface.bottomAnchor, constant: -1),
 
             recordingButton.trailingAnchor.constraint(equalTo: askButton.leadingAnchor, constant: -5),
             recordingButton.centerYAnchor.constraint(equalTo: composerSurface.centerYAnchor),
-            recordingButton.widthAnchor.constraint(equalToConstant: 72),
-            recordingButton.heightAnchor.constraint(equalToConstant: 28),
+            recordingButton.widthAnchor.constraint(equalToConstant: 68),
+            recordingButton.heightAnchor.constraint(equalToConstant: 26),
 
-            askButton.trailingAnchor.constraint(equalTo: composerSurface.trailingAnchor, constant: -6),
+            askButton.trailingAnchor.constraint(equalTo: composerSurface.trailingAnchor, constant: -5),
             askButton.centerYAnchor.constraint(equalTo: composerSurface.centerYAnchor),
-            askButton.widthAnchor.constraint(equalToConstant: 96),
-            askButton.heightAnchor.constraint(equalToConstant: 30),
+            askButton.widthAnchor.constraint(equalToConstant: 92),
+            askButton.heightAnchor.constraint(equalToConstant: 28),
 
-            attachButton.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 10),
-            attachButton.bottomAnchor.constraint(equalTo: composerBar.bottomAnchor, constant: -6),
-            attachButton.widthAnchor.constraint(equalToConstant: 28),
-            attachButton.heightAnchor.constraint(equalToConstant: 28),
+            attachButton.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 8),
+            attachButton.bottomAnchor.constraint(equalTo: composerBar.bottomAnchor, constant: -5),
+            attachButton.widthAnchor.constraint(equalToConstant: 26),
+            attachButton.heightAnchor.constraint(equalToConstant: 26),
 
-            instructionsButton.leadingAnchor.constraint(equalTo: attachButton.trailingAnchor, constant: 7),
+            instructionsButton.leadingAnchor.constraint(equalTo: attachButton.trailingAnchor, constant: 6),
             instructionsButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            instructionsButton.widthAnchor.constraint(equalToConstant: 70),
-            instructionsButton.heightAnchor.constraint(equalToConstant: 28),
+            instructionsButton.widthAnchor.constraint(equalToConstant: 66),
+            instructionsButton.heightAnchor.constraint(equalToConstant: 26),
 
-            opacityControl.leadingAnchor.constraint(equalTo: instructionsButton.trailingAnchor, constant: 7),
+            opacityControl.leadingAnchor.constraint(equalTo: instructionsButton.trailingAnchor, constant: 6),
             opacityControl.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            opacityControl.widthAnchor.constraint(equalToConstant: 122),
-            opacityControl.heightAnchor.constraint(equalToConstant: 28),
+            opacityControl.widthAnchor.constraint(equalToConstant: 112),
+            opacityControl.heightAnchor.constraint(equalToConstant: 26),
 
-            opacityLabel.leadingAnchor.constraint(equalTo: opacityControl.leadingAnchor, constant: 9),
+            opacityLabel.leadingAnchor.constraint(equalTo: opacityControl.leadingAnchor, constant: 8),
             opacityLabel.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
-            opacityLabel.widthAnchor.constraint(equalToConstant: 42),
+            opacityLabel.widthAnchor.constraint(equalToConstant: 38),
 
-            opacitySlider.leadingAnchor.constraint(equalTo: opacityLabel.trailingAnchor, constant: 6),
+            opacitySlider.leadingAnchor.constraint(equalTo: opacityLabel.trailingAnchor, constant: 5),
             opacitySlider.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
             opacitySlider.trailingAnchor.constraint(equalTo: opacityValueLabel.leadingAnchor, constant: -5),
-            opacitySlider.heightAnchor.constraint(equalToConstant: 18),
+            opacitySlider.heightAnchor.constraint(equalToConstant: 16),
 
-            opacityValueLabel.trailingAnchor.constraint(equalTo: opacityControl.trailingAnchor, constant: -8),
+            opacityValueLabel.trailingAnchor.constraint(equalTo: opacityControl.trailingAnchor, constant: -7),
             opacityValueLabel.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
-            opacityValueLabel.widthAnchor.constraint(equalToConstant: 20),
+            opacityValueLabel.widthAnchor.constraint(equalToConstant: 18),
 
-            analyzeButton.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -12),
+            analyzeButton.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -10),
             analyzeButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            analyzeButton.widthAnchor.constraint(equalToConstant: 76),
-            analyzeButton.heightAnchor.constraint(equalToConstant: 28),
+            analyzeButton.widthAnchor.constraint(equalToConstant: 72),
+            analyzeButton.heightAnchor.constraint(equalToConstant: 26),
 
             modelMenu.trailingAnchor.constraint(equalTo: analyzeButton.leadingAnchor, constant: -6),
             modelMenu.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            modelMenu.widthAnchor.constraint(greaterThanOrEqualToConstant: 104),
-            modelMenu.widthAnchor.constraint(lessThanOrEqualToConstant: 132),
-            modelMenu.heightAnchor.constraint(equalToConstant: 28),
+            modelMenu.widthAnchor.constraint(greaterThanOrEqualToConstant: 98),
+            modelMenu.widthAnchor.constraint(lessThanOrEqualToConstant: 126),
+            modelMenu.heightAnchor.constraint(equalToConstant: 26),
 
             opacityControl.trailingAnchor.constraint(lessThanOrEqualTo: modelMenu.leadingAnchor, constant: -10),
 
@@ -3171,7 +3172,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         updateInteractionModeChrome(showToast: false)
         configureTooltips()
         setContextItems([])
-        setTranscriptState("IDLE", active: false)
+        setTranscriptState("READY", active: false)
         applyOpacity(opacitySlider.doubleValue)
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -3257,8 +3258,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             blue: 0.022,
             alpha: materialAlpha(0.94)
         ).cgColor
-        composerSurface.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.050)).cgColor
-        composerSurface.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.12)).cgColor
+        composerSurface.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.045)).cgColor
+        composerSurface.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.105)).cgColor
         opacityControl.layer?.backgroundColor = NSColor.clear.cgColor
         opacityControl.layer?.borderColor = NSColor.clear.cgColor
         closeConfirmPanel.layer?.backgroundColor = BlueyTheme.panelDeep
@@ -3419,7 +3420,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             guard !subview.isHidden, subview.alphaValue > 0.01 else { continue }
             let modalPanelButton = view === answerStylePanel || view === closeConfirmPanel
             let hitPadding: CGFloat = subview is NSButton
-                ? (modalPanelButton ? 8 : 3)
+                ? (modalPanelButton ? 8 : 7)
                 : 8
             let rect = subview.convert(subview.bounds, to: self)
                 .insetBy(dx: -hitPadding, dy: -hitPadding)
@@ -3437,40 +3438,27 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func hitsExplicitInteractiveChrome(at localPoint: NSPoint) -> Bool {
         let controls: [NSView] = [
-            headerBar,
-            headerChrome,
-            headerStack,
             navButton,
             newSessionButton,
             canvasToggleButton,
-            balanceLabel,
             fullSizeButton,
             interactionModeButton,
             hideButton,
             closeButton,
-            routeBadge,
-            knowledgeBadge,
-            feed,
-            canvasPane,
-            transcriptStrip,
-            attachmentStrip,
-            composerBar,
-            composerSurface,
             composer,
             recordingButton,
             askButton,
             attachButton,
             instructionsButton,
             opacityControl,
-            opacityLabel,
             opacitySlider,
-            opacityValueLabel,
             modelMenu,
             analyzeButton,
         ]
         return controls.contains { view in
             guard !view.isHidden, view.alphaValue > 0.01 else { return false }
-            let rect = view.convert(view.bounds, to: self).insetBy(dx: -18, dy: -16)
+            let padding: CGFloat = view is NSTextView ? 8 : 10
+            let rect = view.convert(view.bounds, to: self).insetBy(dx: -padding, dy: -padding)
             return rect.contains(localPoint)
         }
     }
@@ -3482,7 +3470,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if feed.hasCopyControl(atScreenPoint: screenPoint) {
             return true
         }
-        for textRegion in [feed, canvasPane, transcriptStrip] {
+        for textRegion in [transcriptStrip] {
             if hitsView(textRegion, at: localPoint, padding: 2) {
                 return true
             }
@@ -4049,23 +4037,23 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func configureComposer() {
         composerBar.wantsLayer = true
         composerBar.layer?.backgroundColor = NSColor(red: 0.014, green: 0.016, blue: 0.022, alpha: 0.94).cgColor
-        composerBar.layer?.cornerRadius = 20
+        composerBar.layer?.cornerRadius = 18
         composerBar.layer?.borderWidth = 1
         composerBar.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.22).cgColor
         composerBar.layer?.shadowColor = NSColor.black.cgColor
-        composerBar.layer?.shadowOpacity = 0.22
-        composerBar.layer?.shadowRadius = 18
+        composerBar.layer?.shadowOpacity = 0.18
+        composerBar.layer?.shadowRadius = 14
         composerBar.layer?.shadowOffset = .zero
 
         composerSurface.wantsLayer = true
-        composerSurface.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.050).cgColor
-        composerSurface.layer?.cornerRadius = 16
+        composerSurface.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.045).cgColor
+        composerSurface.layer?.cornerRadius = 14
         composerSurface.layer?.borderWidth = 1
-        composerSurface.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
+        composerSurface.layer?.borderColor = NSColor.white.withAlphaComponent(0.105).cgColor
 
         opacityControl.wantsLayer = true
         opacityControl.layer?.backgroundColor = NSColor.clear.cgColor
-        opacityControl.layer?.cornerRadius = 14
+        opacityControl.layer?.cornerRadius = 13
         opacityControl.layer?.borderWidth = 0
         opacityControl.layer?.borderColor = NSColor.clear.cgColor
         opacityControl.toolTip = "Overlay opacity"
@@ -4152,17 +4140,17 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func styleControlButton(_ button: NSButton, symbol: String, accent: Bool) {
         button.isBordered = false
         button.wantsLayer = true
-        button.layer?.cornerRadius = 14
+        button.layer?.cornerRadius = 13
         button.layer?.backgroundColor = accent
-            ? NSColor(red: 0.07, green: 0.19, blue: 0.24, alpha: 0.98).cgColor
-            : NSColor.white.withAlphaComponent(0.070).cgColor
+            ? NSColor(red: 0.055, green: 0.165, blue: 0.215, alpha: 0.96).cgColor
+            : NSColor.white.withAlphaComponent(0.055).cgColor
         button.layer?.borderWidth = 1
-        button.layer?.borderColor = (accent ? BlueyTheme.cyan.withAlphaComponent(0.55) : NSColor.white.withAlphaComponent(0.12)).cgColor
-        button.font = NSFont.systemFont(ofSize: 11.5, weight: .bold)
+        button.layer?.borderColor = (accent ? BlueyTheme.cyan.withAlphaComponent(0.48) : NSColor.white.withAlphaComponent(0.10)).cgColor
+        button.font = NSFont.systemFont(ofSize: 11, weight: .bold)
         button.attributedTitle = NSAttributedString(
             string: button.title,
             attributes: [
-                .font: button.font ?? NSFont.systemFont(ofSize: 11.5, weight: .bold),
+                .font: button.font ?? NSFont.systemFont(ofSize: 11, weight: .bold),
                 .foregroundColor: BlueyTheme.text,
             ])
         button.contentTintColor = BlueyTheme.cyan
@@ -4458,7 +4446,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             composer.placeholder = "Ask anything..."
             updateAudioRouteBadge("● Ready", accent: BlueyTheme.green)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
-            setTranscriptState("IDLE", active: false)
+            setTranscriptState("READY", active: false)
         } else {
             emitSimple("recording_start_requested")
             recordingActive = false
@@ -4765,7 +4753,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func setTranscriptState(_ text: String, active: Bool) {
-        transcriptStateLabel.stringValue = text
+        let display = text == "TRANSCRIBING" ? "LIVE" : text
+        transcriptStateLabel.stringValue = display
         transcriptStateLabel.textColor = active ? BlueyTheme.green : BlueyTheme.textDim
         transcriptActivityDot.layer?.backgroundColor = (active ? BlueyTheme.green : BlueyTheme.textDim.withAlphaComponent(0.55)).cgColor
         transcriptActivityDot.layer?.shadowOpacity = active ? 0.45 : 0
@@ -4832,6 +4821,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         switch state {
         case .connecting:
             recordingActive = false
+            lastTranscriptStripSource = nil
             recordingButton.title = "Starting"
             setHeaderSubtitle()
             composer.placeholder = "Connecting audio..."
@@ -4841,6 +4831,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             seedTranscriptPreviewIfEmpty("Starting mic + system audio...")
         case .listening:
             recordingActive = true
+            lastTranscriptStripSource = nil
             recordingButton.title = "Stop"
             setHeaderSubtitle()
             composer.placeholder = "Listening... type a follow-up anytime"
@@ -4850,15 +4841,17 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             seedTranscriptPreviewIfEmpty("Mic + System live. Captions appear here.")
         case .paused:
             recordingActive = false
+            lastTranscriptStripSource = nil
             recordingButton.title = "Listen"
             setHeaderSubtitle()
             composer.placeholder = "Ask anything..."
             updateAudioRouteBadge("● Ready", accent: BlueyTheme.green)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
-            setTranscriptState("IDLE", active: false)
+            setTranscriptState("READY", active: false)
             seedTranscriptPreviewIfEmpty("Live captions preview")
         case .failed:
             recordingActive = false
+            lastTranscriptStripSource = nil
             recordingButton.title = "Listen"
             setHeaderSubtitle("Audio issue")
             composer.placeholder = "Ask anything..."
@@ -4867,12 +4860,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             setTranscriptState("FAILED", active: false)
         case .ready:
             recordingActive = false
+            lastTranscriptStripSource = nil
             recordingButton.title = "Listen"
             setHeaderSubtitle()
             composer.placeholder = "Ask anything..."
             updateAudioRouteBadge("● Ready", accent: BlueyTheme.green)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
-            setTranscriptState("IDLE", active: false)
+            setTranscriptState("READY", active: false)
             seedTranscriptPreviewIfEmpty("Live captions preview")
         }
     }
@@ -4988,8 +4982,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         setContextItems([])
         transcriptSnippets.removeAll()
         latestLiveTranscriptLine = nil
+        lastTranscriptStripSource = nil
         updateTranscriptStripText("Live captions preview", scrollToEnd: false)
-        setTranscriptState("IDLE", active: false)
+        setTranscriptState("READY", active: false)
         routeBadge.stringValue = "● Ready"
         routeBadge.textColor = BlueyTheme.green
         latestCanvas = nil
@@ -5481,8 +5476,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         let label = transcriptSourceLabel(title)
         rememberTranscriptForAnswer(label: label, body: body, final: true)
-        setTranscriptState(recordingActive ? "TRANSCRIBING" : "CAPTURED", active: recordingActive)
-        updateTranscriptStripText("\(label) · \(body)", scrollToEnd: true)
+        updateLiveTranscriptStrip(
+            label: label,
+            body: body,
+            state: recordingActive ? "TRANSCRIBING" : "CAPTURED",
+            active: recordingActive,
+            scrollToEnd: true)
     }
 
     func appendLiveTranscript(source: String, text: String, final: Bool) {
@@ -5491,12 +5490,46 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let state = recordingActive ? "TRANSCRIBING" : (final ? "CAPTURED" : "HEARD")
         guard !body.isEmpty else {
             setTranscriptState(state, active: recordingActive)
-            updateTranscriptStripText("\(label) audio is live", scrollToEnd: false)
+            updateLiveTranscriptStrip(
+                label: label,
+                body: "audio is live",
+                state: state,
+                active: recordingActive,
+                scrollToEnd: false)
             return
         }
         rememberTranscriptForAnswer(label: label, body: body, final: final)
-        setTranscriptState(state, active: recordingActive)
-        updateTranscriptStripText("\(label) · \(body)", scrollToEnd: true)
+        updateLiveTranscriptStrip(
+            label: label,
+            body: body,
+            state: state,
+            active: recordingActive,
+            scrollToEnd: true)
+    }
+
+    private func updateLiveTranscriptStrip(
+        label: String,
+        body: String,
+        state: String,
+        active: Bool,
+        scrollToEnd: Bool
+    ) {
+        let cleanBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        setTranscriptState(state, active: active)
+        guard !cleanBody.isEmpty else {
+            updateTranscriptStripText(cleanLabel.isEmpty ? "Listening" : "\(cleanLabel) audio is live", scrollToEnd: false)
+            return
+        }
+
+        let sourceChanged = cleanLabel != lastTranscriptStripSource
+        if sourceChanged {
+            lastTranscriptStripSource = cleanLabel
+        }
+        let line = sourceChanged && !cleanLabel.isEmpty
+            ? "\(cleanLabel) · \(cleanBody)"
+            : cleanBody
+        updateTranscriptStripText(line, scrollToEnd: scrollToEnd)
     }
 
     private func rememberTranscriptForAnswer(label: String, body: String, final: Bool) {
