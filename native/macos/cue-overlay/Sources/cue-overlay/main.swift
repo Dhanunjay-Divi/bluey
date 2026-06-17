@@ -1776,7 +1776,7 @@ private final class FeedView: NSView {
         title.textColor = BlueyTheme.text
         title.alignment = .center
 
-        let subtitle = NSTextField(labelWithString: "Audio, files, screen context, and answers stay in this session.")
+        let subtitle = NSTextField(labelWithString: "Attach documents or drop them here. Auto chooses the fastest accurate answer.")
         subtitle.translatesAutoresizingMaskIntoConstraints = false
         subtitle.font = NSFont.systemFont(ofSize: 12.5, weight: .medium)
         subtitle.textColor = BlueyTheme.textDim
@@ -1784,19 +1784,32 @@ private final class FeedView: NSView {
         subtitle.maximumNumberOfLines = 2
         subtitle.lineBreakMode = .byWordWrapping
 
-        let chips = NSStackView()
-        chips.translatesAutoresizingMaskIntoConstraints = false
-        chips.orientation = .horizontal
-        chips.alignment = .centerY
-        chips.spacing = 8
-        for label in ["Audio", "Files", "Screen", "Canvas"] {
-            chips.addArrangedSubview(emptyChip(label))
-        }
+        let dropTarget = NSView()
+        dropTarget.translatesAutoresizingMaskIntoConstraints = false
+        dropTarget.wantsLayer = true
+        dropTarget.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.035).cgColor
+        dropTarget.layer?.cornerRadius = 15
+        dropTarget.layer?.borderWidth = 1
+        dropTarget.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.24).cgColor
+
+        let dropTitle = NSTextField(labelWithString: "Attach documents or drag and drop")
+        dropTitle.translatesAutoresizingMaskIntoConstraints = false
+        dropTitle.font = NSFont.systemFont(ofSize: 12.5, weight: .semibold)
+        dropTitle.textColor = BlueyTheme.text
+        dropTitle.alignment = .center
+
+        let dropHint = NSTextField(labelWithString: "PDF, DOCX, TXT, MD, code")
+        dropHint.translatesAutoresizingMaskIntoConstraints = false
+        dropHint.font = NSFont.systemFont(ofSize: 10.5, weight: .medium)
+        dropHint.textColor = BlueyTheme.textDim
+        dropHint.alignment = .center
 
         emptyState.addSubview(badge)
         emptyState.addSubview(title)
         emptyState.addSubview(subtitle)
-        emptyState.addSubview(chips)
+        emptyState.addSubview(dropTarget)
+        dropTarget.addSubview(dropTitle)
+        dropTarget.addSubview(dropHint)
 
         NSLayoutConstraint.activate([
             emptyState.centerXAnchor.constraint(equalTo: centerXAnchor),
@@ -1814,28 +1827,21 @@ private final class FeedView: NSView {
             subtitle.leadingAnchor.constraint(equalTo: emptyState.leadingAnchor),
             subtitle.trailingAnchor.constraint(equalTo: emptyState.trailingAnchor),
 
-            chips.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 16),
-            chips.centerXAnchor.constraint(equalTo: emptyState.centerXAnchor),
-            chips.bottomAnchor.constraint(equalTo: emptyState.bottomAnchor),
-        ])
-    }
+            dropTarget.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 16),
+            dropTarget.centerXAnchor.constraint(equalTo: emptyState.centerXAnchor),
+            dropTarget.widthAnchor.constraint(lessThanOrEqualTo: emptyState.widthAnchor),
+            dropTarget.widthAnchor.constraint(greaterThanOrEqualToConstant: 292),
+            dropTarget.heightAnchor.constraint(equalToConstant: 62),
+            dropTarget.bottomAnchor.constraint(equalTo: emptyState.bottomAnchor),
 
-    private func emptyChip(_ text: String) -> NSView {
-        let chip = NSTextField(labelWithString: text)
-        chip.translatesAutoresizingMaskIntoConstraints = false
-        chip.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
-        chip.textColor = BlueyTheme.textDim
-        chip.alignment = .center
-        chip.wantsLayer = true
-        chip.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.035).cgColor
-        chip.layer?.cornerRadius = 10
-        chip.layer?.borderWidth = 1
-        chip.layer?.borderColor = BlueyTheme.hairline.cgColor
-        NSLayoutConstraint.activate([
-            chip.heightAnchor.constraint(equalToConstant: 24),
-            chip.widthAnchor.constraint(greaterThanOrEqualToConstant: 58),
+            dropTitle.topAnchor.constraint(equalTo: dropTarget.topAnchor, constant: 12),
+            dropTitle.leadingAnchor.constraint(equalTo: dropTarget.leadingAnchor, constant: 18),
+            dropTitle.trailingAnchor.constraint(equalTo: dropTarget.trailingAnchor, constant: -18),
+
+            dropHint.topAnchor.constraint(equalTo: dropTitle.bottomAnchor, constant: 4),
+            dropHint.leadingAnchor.constraint(equalTo: dropTarget.leadingAnchor, constant: 18),
+            dropHint.trailingAnchor.constraint(equalTo: dropTarget.trailingAnchor, constant: -18),
         ])
-        return chip
     }
 
     private func makeCardView(_ card: RenderedCard) -> NSView {
@@ -2620,6 +2626,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var resizeStartFrame = NSRect.zero
     private let resizeHitSize: CGFloat = 10
     private var backgroundOpacity: CGFloat = 0.94
+    private var dropHighlightActive = false
 
     override init(frame frameRect: NSRect) {
         feed = FeedView(frame: .zero)
@@ -2686,6 +2693,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         closeConfirmTurnOffButton = NSButton(title: "Turn Off", target: nil, action: nil)
 
         super.init(frame: frameRect)
+
+        registerForDraggedTypes([.fileURL])
 
         (answerStyleOverlay as? ModalBlockerView)?.onEscape = { [weak self] in
             self?.dismissAnswerStyleEditor(animated: true)
@@ -4492,6 +4501,72 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         setKnowledgeBadge("Docs loading", accent: BlueyTheme.warning)
         showKnowledgePlaceholder("Indexing selected files...")
         emitSimple("attach_requested")
+    }
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard !draggedFilePaths(from: sender).isEmpty else { return [] }
+        setDropHighlight(true)
+        return .copy
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        draggedFilePaths(from: sender).isEmpty ? [] : .copy
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        setDropHighlight(false)
+    }
+
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        !draggedFilePaths(from: sender).isEmpty
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let paths = draggedFilePaths(from: sender)
+        setDropHighlight(false)
+        guard !paths.isEmpty else { return false }
+        setKnowledgeBadge("Docs loading", accent: BlueyTheme.warning)
+        showKnowledgePlaceholder(paths.count == 1 ? "Indexing dropped document..." : "Indexing dropped documents...")
+        emitAttachFiles(paths: paths)
+        return true
+    }
+
+    override func concludeDragOperation(_ sender: NSDraggingInfo?) {
+        setDropHighlight(false)
+    }
+
+    private func draggedFilePaths(from sender: NSDraggingInfo) -> [String] {
+        let objects = sender.draggingPasteboard.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true])
+        let urls = (objects as? [URL])
+            ?? (objects as? [NSURL])?.compactMap { $0 as URL }
+            ?? []
+        return urls
+            .map(\.path)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    private func setDropHighlight(_ active: Bool) {
+        guard dropHighlightActive != active else { return }
+        dropHighlightActive = active
+        feed.layer?.borderColor = active
+            ? BlueyTheme.cyan.withAlphaComponent(0.72).cgColor
+            : BlueyTheme.cyan.withAlphaComponent(0.16).cgColor
+        feed.layer?.shadowColor = BlueyTheme.cyan.cgColor
+        feed.layer?.shadowOpacity = active ? 0.22 : 0
+        feed.layer?.shadowRadius = active ? 18 : 0
+        feed.layer?.shadowOffset = .zero
+        if active {
+            showSystemToast(for: RenderedCard(
+                id: "drop-documents-\(UUID().uuidString)",
+                kind: "system",
+                title: "Drop documents",
+                body: "Release to attach them to this Bluey session.",
+                done: true,
+                costLabel: nil,
+                artifact: nil))
+        }
     }
 
     @objc private func removeAttachmentClicked(_ sender: RemoveAttachmentButton) {
