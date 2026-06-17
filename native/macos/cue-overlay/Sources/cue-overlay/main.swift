@@ -745,6 +745,7 @@ private final class OverlayWindow: NSWindow {
     var maximumFrameWidth: CGFloat?
     var minimumFrameHeight: CGFloat?
     var maximumFrameHeight: CGFloat?
+    private weak var pendingManualButton: NSButton?
     var contentCornerRadius: CGFloat? {
         didSet { applyContentCornerMask() }
     }
@@ -777,6 +778,7 @@ private final class OverlayWindow: NSWindow {
         ]
         self.isMovableByWindowBackground = draggable
         self.hidesOnDeactivate = false
+        self.acceptsMouseMovedEvents = true
         // Production keeps the overlay out of screen capture. Capture-visible
         // QA is dev-gated and must never be enabled in customer launch paths.
         self.sharingType = captureVisibleForDebug ? .readOnly : .none
@@ -784,6 +786,60 @@ private final class OverlayWindow: NSWindow {
 
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
+
+    override func sendEvent(_ event: NSEvent) {
+        switch event.type {
+        case .leftMouseDown:
+            if let button = buttonAtWindowPoint(event.locationInWindow) {
+                pendingManualButton = button
+                button.highlight(true)
+                return
+            }
+        case .leftMouseUp:
+            if let button = pendingManualButton {
+                button.highlight(false)
+                if let hitButton = buttonAtWindowPoint(event.locationInWindow),
+                   hitButton === button || hitButton.isDescendant(of: button) || button.isDescendant(of: hitButton)
+                {
+                    button.performClick(nil)
+                }
+                pendingManualButton = nil
+                return
+            }
+        case .leftMouseDragged:
+            if let button = pendingManualButton {
+                button.highlight(false)
+                pendingManualButton = nil
+            }
+        default:
+            break
+        }
+        super.sendEvent(event)
+    }
+
+    private func buttonAtWindowPoint(_ point: NSPoint) -> NSButton? {
+        guard let contentView else { return nil }
+        if let panel = contentView as? ExpandedPanelView,
+           let button = panel.manualButton(atWindowPoint: point)
+        {
+            return button
+        }
+        let localPoint = contentView.convert(point, from: nil)
+        guard let hit = contentView.hitTest(localPoint) else { return nil }
+        var current: NSView? = hit
+        while let view = current {
+            if let button = view as? NSButton,
+               button.isEnabled,
+               !button.isHidden,
+               button.alphaValue > 0.01
+            {
+                return button
+            }
+            if view === contentView { break }
+            current = view.superview
+        }
+        return nil
+    }
 
     private func applyContentCornerMask() {
         guard let radius = contentCornerRadius, let contentView else { return }
@@ -805,10 +861,17 @@ private final class OverlayWindow: NSWindow {
 
     override func setFrame(_ frameRect: NSRect, display displayFlag: Bool) {
         super.setFrame(clampedFrame(frameRect), display: displayFlag)
+        syncContentViewFrame()
     }
 
     override func setFrame(_ frameRect: NSRect, display displayFlag: Bool, animate animateFlag: Bool) {
         super.setFrame(clampedFrame(frameRect), display: displayFlag, animate: animateFlag)
+        syncContentViewFrame()
+        if animateFlag {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
+                self?.syncContentViewFrame()
+            }
+        }
     }
 
     override func setContentSize(_ size: NSSize) {
@@ -824,9 +887,27 @@ private final class OverlayWindow: NSWindow {
             super.setFrame(
                 clampedFrame(NSRect(origin: frame.origin, size: requestedSize)),
                 display: true)
+            syncContentViewFrame()
         } else {
             super.setContentSize(size)
+            syncContentViewFrame()
         }
+    }
+
+    func syncContentViewFrame() {
+        guard let contentView else { return }
+        let contentSize = contentRect(forFrameRect: frame).size
+        let expected = NSRect(origin: .zero, size: contentSize)
+        if abs(contentView.frame.width - expected.width) > 0.5
+            || abs(contentView.frame.height - expected.height) > 0.5
+            || abs(contentView.frame.minX) > 0.5
+            || abs(contentView.frame.minY) > 0.5
+        {
+            contentView.frame = expected
+        }
+        contentView.needsLayout = true
+        contentView.layoutSubtreeIfNeeded()
+        (contentView as? ExpandedPanelView)?.synchronizeWindowGeometry()
     }
 
     private func clampedFrame(_ frame: NSRect) -> NSRect {
@@ -2455,6 +2536,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     var onClose: (() -> Void)?
     var onOpacityChanged: ((Double) -> Void)?
     var onListeningStateChanged: ((PillRunState) -> Void)?
+    var onInteractionModeChanged: ((Bool) -> Void)?
     private var recordingActive = false
     private var transcriptSnippets: [String] = []
     private var latestLiveTranscriptLine: String?
@@ -3298,6 +3380,45 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         return true
     }
 
+    var isPassThroughModeActive: Bool {
+        passThroughMode
+    }
+
+    func manualButton(atWindowPoint point: NSPoint) -> NSButton? {
+        let localPoint = convert(point, from: nil)
+        guard bounds.contains(localPoint) else { return nil }
+        if !closeConfirmOverlay.isHidden,
+           let button = manualButton(in: closeConfirmOverlay, atRootPoint: localPoint) {
+            return button
+        }
+        if !answerStyleOverlay.isHidden,
+           let button = manualButton(in: answerStyleOverlay, atRootPoint: localPoint) {
+            return button
+        }
+        return manualButton(in: self, atRootPoint: localPoint)
+    }
+
+    private func manualButton(in view: NSView, atRootPoint rootPoint: NSPoint) -> NSButton? {
+        for subview in view.subviews.reversed() {
+            guard !subview.isHidden, subview.alphaValue > 0.01 else { continue }
+            let modalPanelButton = view === answerStylePanel || view === closeConfirmPanel
+            let hitPadding: CGFloat = subview is NSButton
+                ? (modalPanelButton ? 8 : 3)
+                : 8
+            let rect = subview.convert(subview.bounds, to: self)
+                .insetBy(dx: -hitPadding, dy: -hitPadding)
+            guard rect.contains(rootPoint) else { continue }
+
+            if let button = subview as? NSButton, button.isEnabled {
+                return button
+            }
+            if let nested = manualButton(in: subview, atRootPoint: rootPoint) {
+                return nested
+            }
+        }
+        return nil
+    }
+
     private func hitsExplicitInteractiveChrome(at localPoint: NSPoint) -> Bool {
         let controls: [NSView] = [
             headerBar,
@@ -3328,7 +3449,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         ]
         return controls.contains { view in
             guard !view.isHidden, view.alphaValue > 0.01 else { return false }
-            let rect = view.convert(view.bounds, to: self).insetBy(dx: -8, dy: -8)
+            let rect = view.convert(view.bounds, to: self).insetBy(dx: -18, dy: -16)
             return rect.contains(localPoint)
         }
     }
@@ -3476,6 +3597,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         feed.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         canvasPane.setContentHuggingPriority(.defaultLow, for: .vertical)
         canvasPane.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+    }
+
+    func synchronizeWindowGeometry() {
+        layoutSubtreeIfNeeded()
+        keepFixedChromeInBounds()
     }
 
     private func keepFixedChromeInBounds() {
@@ -3971,6 +4097,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     @objc private func interactionModeClicked() {
         passThroughMode.toggle()
         updateInteractionModeChrome()
+        onInteractionModeChanged?(passThroughMode)
     }
 
     func showTurnOffConfirmation() {
@@ -4828,6 +4955,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let maxWidth = max(ExpandedPanelMetrics.minCompactWidth, screen.width - ExpandedPanelMetrics.screenInset * 2)
         let maxHeight = max(ExpandedPanelMetrics.minHeight, screen.height - ExpandedPanelMetrics.screenInset * 2)
         if let overlayWindow = window as? OverlayWindow {
+            overlayWindow.preserveProgrammaticFrameHeight = false
             overlayWindow.minimumFrameWidth = min(ExpandedPanelMetrics.minCompactWidth, maxWidth)
             overlayWindow.maximumFrameWidth = maxWidth
             overlayWindow.minimumFrameHeight = ExpandedPanelMetrics.minHeight
@@ -4862,15 +4990,35 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         updateCanvasWidth()
         updateFullSizeButtonChrome()
         guard let targetFrame else { return }
+        if let overlayWindow = window as? OverlayWindow {
+            overlayWindow.preserveProgrammaticFrameHeight = false
+            overlayWindow.lockedFrameHeight = targetFrame.height
+        }
         let screen = window.screen?.visibleFrame
             ?? NSScreen.main?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let fittedFrame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(targetFrame, visibleFrame: screen)
+        if let overlayWindow = window as? OverlayWindow {
+            overlayWindow.lockedFrameHeight = fittedFrame.height
+        }
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.16
             context.timingFunction = CAMediaTimingFunction(name: .easeOut)
             window.animator().setFrame(fittedFrame, display: true)
             self.layoutSubtreeIfNeeded()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { [weak self, weak window] in
+            guard let self, let window else { return }
+            if let overlayWindow = window as? OverlayWindow {
+                overlayWindow.lockedFrameHeight = fittedFrame.height
+                window.setFrame(fittedFrame, display: true)
+                overlayWindow.lockedFrameHeight = nil
+                overlayWindow.preserveProgrammaticFrameHeight = true
+            } else {
+                window.setFrame(fittedFrame, display: true)
+            }
+            self.layoutSubtreeIfNeeded()
+            self.keepFixedChromeInBounds()
         }
     }
 
@@ -5724,6 +5872,7 @@ private final class OverlayApp {
     private var pillView: PillView!
     private var expandedView: ExpandedPanelView?
     private var expandedPassthroughTimer: Timer?
+    private var lastExpandedInteractiveMouseAt = CACurrentMediaTime()
     private var currentRunState: PillRunState = .ready
     private var overlayOpacity = 0.94
 
@@ -5736,7 +5885,7 @@ private final class OverlayApp {
         let screen = OverlayScreenPlacement.activeVisibleFrame()
         pillWindow = OverlayWindow(
             contentRect: PillMetrics.centeredFrame(in: screen),
-            draggable: true)
+            draggable: false)
         pillWindow.contentCornerRadius = pillSize.height / 2
 
         pillView = PillView(frame: NSRect(origin: .zero, size: pillSize))
@@ -5769,6 +5918,8 @@ private final class OverlayApp {
 
     private func bringPillToFront() {
         centerPillOnMainScreen()
+        pillWindow.ignoresMouseEvents = false
+        pillWindow.acceptsMouseMovedEvents = true
         pillWindow.setIsVisible(true)
         pillWindow.orderFrontRegardless()
         pillWindow.makeKeyAndOrderFront(nil)
@@ -5800,7 +5951,7 @@ private final class OverlayApp {
 
     private func startExpandedPassthroughTracking() {
         expandedPassthroughTimer?.invalidate()
-        expandedPassthroughTimer = Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { [weak self] _ in
+        expandedPassthroughTimer = Timer.scheduledTimer(withTimeInterval: 0.015, repeats: true) { [weak self] _ in
             guard
                 let self,
                 let expandedWindow = self.expandedWindow,
@@ -5811,9 +5962,24 @@ private final class OverlayApp {
             // Interactive mode keeps the whole panel clickable. Pass-through
             // mode keeps Bluey chrome and visible text interactive while empty
             // workspace/background regions pass clicks through to the host app.
+            if !expandedView.isPassThroughModeActive {
+                self.lastExpandedInteractiveMouseAt = CACurrentMediaTime()
+                if expandedWindow.ignoresMouseEvents {
+                    expandedWindow.ignoresMouseEvents = false
+                }
+                return
+            }
+
             let wantsMouse = expandedView.shouldReceiveMouseEvents(at: NSEvent.mouseLocation)
-            if expandedWindow.ignoresMouseEvents == wantsMouse {
-                expandedWindow.ignoresMouseEvents = !wantsMouse
+            let now = CACurrentMediaTime()
+            if wantsMouse {
+                self.lastExpandedInteractiveMouseAt = now
+                if expandedWindow.ignoresMouseEvents {
+                    expandedWindow.ignoresMouseEvents = false
+                }
+            } else if now - self.lastExpandedInteractiveMouseAt > 0.45,
+                      !expandedWindow.ignoresMouseEvents {
+                expandedWindow.ignoresMouseEvents = true
             }
         }
     }
@@ -5822,8 +5988,11 @@ private final class OverlayApp {
         ensureExpandedWindow()
         guard let expandedWindow else { return }
         placeExpandedWindowForOpen()
+        lastExpandedInteractiveMouseAt = CACurrentMediaTime()
         pillWindow?.orderOut(nil)
+        NSApp.activate(ignoringOtherApps: true)
         expandedWindow.ignoresMouseEvents = false
+        expandedWindow.acceptsMouseMovedEvents = true
         expandedWindow.orderFrontRegardless()
         expandedWindow.makeKeyAndOrderFront(nil)
         DispatchQueue.main.async { [weak self] in
@@ -5841,7 +6010,7 @@ private final class OverlayApp {
         let minimumWidth = ExpandedPanelMetrics.fittingMinimumWidth(for: screen, targetWidth: expandedWidth)
         let window = OverlayWindow(
             contentRect: expandedFrame,
-            draggable: true,
+            draggable: false,
             resizable: false)
         window.contentCornerRadius = ExpandedPanelMetrics.cornerRadius
         window.preserveProgrammaticFrameHeight = true
@@ -5865,6 +6034,13 @@ private final class OverlayApp {
         view.onOpacityChanged = { [weak self] opacity in
             self?.overlayOpacity = opacity
             self?.pillView?.applyBackgroundOpacity(opacity)
+        }
+        view.onInteractionModeChanged = { [weak self] _ in
+            guard let self, let expandedWindow = self.expandedWindow else { return }
+            self.lastExpandedInteractiveMouseAt = CACurrentMediaTime()
+            expandedWindow.ignoresMouseEvents = false
+            expandedWindow.acceptsMouseMovedEvents = true
+            expandedWindow.makeKeyAndOrderFront(nil)
         }
         expandedWindow = window
         expandedView = view
