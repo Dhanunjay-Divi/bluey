@@ -335,14 +335,16 @@ documentation except as an explicit local QA warning.
 Use honest language:
 
 - Good: capture-excluded overlay, hardened auth, encrypted transport, private
-  cloud storage, keychain tokens, server-side provider keys, audit logs.
+  cloud storage, private local account-token files, legacy keychain fallback
+  where enabled, server-side provider keys, audit logs.
 - Bad: "unbacktraceable", "undetectable", or claims no admin/EDR/root tool can
   inspect software.
 
 Important implemented/expected controls:
 
 - Provider secrets stay server-side.
-- Desktop stores only Bluey auth tokens in OS keychain/credential storage.
+- Desktop stores only Bluey auth tokens in Bluey's private local account profile
+  by default. Legacy keychain/credential storage is fallback-only.
 - Overlay IPC has session-token validation.
 - Debug capture-visible flag is gated to dev and should be release-checked.
 - User data and logs are sensitive; do not publish private docs/logs/session

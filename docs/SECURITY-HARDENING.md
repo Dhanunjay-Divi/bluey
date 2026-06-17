@@ -48,7 +48,7 @@ not security boundaries.
 | Adversary | What they can do | Bluey posture |
 |---|---|---|
 | Curious customer with the installed binary | inspect strings, disassemble, patch local checks | no provider keys in client; server validates account credits, routing, STT session, and usage |
-| Local malware in the user's account | read local DB/JSON, screen, process memory | OS keyring for auth tokens/API keys, private local file permissions, capture-excluded overlay, short-lived server tokens |
+| Local malware in the user's account | read local DB/JSON, screen, process memory | private local account/profile permissions, legacy OS keyring fallback where enabled, capture-excluded overlay, short-lived server tokens |
 | Co-process sending fake overlay events | attempt IPC injection | per-session overlay token, length caps, state-machine validation, install-dir binary verification |
 | Network attacker | observe or tamper with traffic | HTTPS/TLS via rustls; server-side auth; no static provider secrets on desktop |
 | Modified Bluey client | send malformed requests, replay tokens, claim fake usage | server owns billing, idempotency, credit hard stops, request validation, STT relay token claim |
@@ -61,7 +61,7 @@ not security boundaries.
 ### Server-owned provider access
 
 - Managed LLM/STT flow keeps upstream provider keys on `bluey-server`.
-- Desktop login stores only Bluey account tokens in OS keyring.
+- Desktop login stores only Bluey account tokens in Bluey's private local account profile by default. Legacy installs may use the OS keyring fallback when `BLUEY_LEGACY_KEYRING_FALLBACK=1`.
 - Customer desktop no longer needs Deepgram/OpenAI/Anthropic keys in normal managed mode.
 - Direct BYOK/dev provider paths are gated behind explicit development flags such as `BLUEY_DEV_BYOK=1`.
 
@@ -97,9 +97,10 @@ not security boundaries.
 - Local SQLite DB files are created/normalized with private Unix permissions (`0600`), with WAL/SHM sidecars normalized when present.
 - Account/settings JSON already use private file permissions and API-key-shaped settings are rejected from non-secret settings storage.
 
-### Keyring-backed local secrets
+### Local account secrets
 
-- Account tokens use `cue-cloud-client` keyring storage.
+- Account tokens use `cue-cloud-client`'s account-file store by default, preserving account metadata such as saved `api_url` while clearing only tokens on logout.
+- Legacy keyring token storage is supported only behind `BLUEY_LEGACY_KEYRING_FALLBACK=1`, and sign-out clears both stores when the fallback is enabled.
 - STT API keys in developer paths use keyring-backed commands.
 - Dashboard settings rejects secret-shaped keys instead of storing them in normal settings.
 

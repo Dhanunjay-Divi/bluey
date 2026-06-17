@@ -2,7 +2,7 @@
 
 ## Goal
 
-Let the operator test Bluey as a normal customer account while also getting admin access on the server. The desktop app remains normal: users still run `bluey on`, link/login in the browser when needed, and tokens stay in the OS keychain.
+Let the operator test Bluey as a normal customer account while also getting admin access on the server. The desktop app remains normal: users still run `bluey on`, link/login in the browser when needed, and tokens stay in Bluey's private local account profile. Legacy installs may also clear OS keychain tokens when `BLUEY_LEGACY_KEYRING_FALLBACK=1`.
 
 ## Server Switch
 
