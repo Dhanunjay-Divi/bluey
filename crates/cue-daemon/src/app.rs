@@ -32,6 +32,10 @@ use cue_core::{
     OverlaySessionItem, PrivacyFlags, ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget,
     Speaker, TranscriptSegment,
 };
+use cue_llm::{
+    bluey_managed::{BlueyManagedProvider, ManagedLane},
+    LlmProvider as _, LlmRequest,
+};
 use futures_util::{future::join_all, SinkExt, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -50,6 +54,12 @@ struct LiveProviderAnswer {
     answer: String,
     token_usage: Option<TokenUsage>,
     latency_ms: u64,
+}
+
+struct ProviderPromptParts {
+    system: String,
+    user: String,
+    image_data_urls: Vec<String>,
 }
 
 struct OverlayAnswerStream {
@@ -1740,7 +1750,11 @@ async fn build_real_audio_runtime_config(
         ));
     }
 
-    let explicit_stt_api_key = env_first(&["BLUEY_STT_API_KEY", "OPENAI_API_KEY"]);
+    let explicit_stt_api_key = if dev_direct_stt_enabled() {
+        env_first(&["BLUEY_STT_API_KEY", "OPENAI_API_KEY"])
+    } else {
+        None
+    };
     let account = load_account(paths).ok().flatten();
     let account_token = cloud_access_token_from_env().or_else(|| {
         account
@@ -1930,6 +1944,18 @@ fn env_truthy_any(names: &[&str]) -> bool {
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })
+}
+
+fn dev_direct_provider_keys_enabled() -> bool {
+    env_truthy_any(&["BLUEY_DEV_DIRECT_PROVIDERS"])
+}
+
+fn dev_direct_stt_enabled() -> bool {
+    env_truthy_any(&["BLUEY_DEV_DIRECT_STT", "BLUEY_DEV_DIRECT_PROVIDERS"])
+}
+
+fn dev_direct_vision_enabled() -> bool {
+    env_truthy_any(&["BLUEY_DEV_DIRECT_VISION", "BLUEY_DEV_DIRECT_PROVIDERS"])
 }
 
 fn real_stt_chunk_duration_ms(configured: u32) -> u32 {
@@ -3859,19 +3885,25 @@ async fn answer_with_provider_runtime(
     let mut overlay_stream =
         OverlayAnswerStream::new(Arc::clone(daemon), answer_card_id, generation_id);
 
-    let outcome =
-        match resolve_answer_route(&request, &answer_meeting, Some(&mut overlay_stream)).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                if is_answer_generation_current(daemon, generation_id) {
-                    let _ = overlay_stream
-                        .finish(&user_facing_answer_error(&error))
-                        .await;
-                }
-                clear_active_answer_card(daemon, generation_id, answer_card_id).await;
-                return Err(error);
+    let outcome = match resolve_answer_route(
+        &daemon.paths,
+        &request,
+        &answer_meeting,
+        Some(&mut overlay_stream),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if is_answer_generation_current(daemon, generation_id) {
+                let _ = overlay_stream
+                    .finish(&user_facing_answer_error(&error))
+                    .await;
             }
-        };
+            clear_active_answer_card(daemon, generation_id, answer_card_id).await;
+            return Err(error);
+        }
+    };
     let safety = outcome.safety.clone();
     let metadata =
         AnswerResponseMetadata::new(request.metadata.request_id, outcome.provider.clone())
@@ -4296,6 +4328,7 @@ struct AnswerRouteOutcome {
 }
 
 async fn resolve_answer_route(
+    paths: &AppPaths,
     request: &AnswerRequest,
     meeting: &MeetingRecord,
     mut stream: Option<&mut OverlayAnswerStream>,
@@ -4373,6 +4406,44 @@ async fn resolve_answer_route(
             });
         }
 
+        if matches!(step.provider.provider_kind, AiProviderKind::CueManaged) {
+            let stream_ref = stream.as_mut().map(|stream| &mut **stream);
+            match call_bluey_managed_provider(paths, request, &step.provider, &payload, stream_ref)
+                .await
+            {
+                Ok(answer) => {
+                    attempts.push(
+                        RouteAttemptMetadata::started(answer.provider.clone(), fallback_depth)
+                            .succeeded(answer.latency_ms),
+                    );
+                    let safety = SafetyOutcome::pass().with_notice(format!(
+                        "managed Bluey route used: {}",
+                        answer.provider.display_label()
+                    ));
+                    return Ok(AnswerRouteOutcome {
+                        provider: answer.provider,
+                        answer: answer.answer,
+                        attempts,
+                        latency_ms: answer.latency_ms,
+                        token_usage: answer.token_usage,
+                        safety,
+                    });
+                }
+                Err(error) => {
+                    let message = format!(
+                        "{} request failed: {error:#}",
+                        step.provider.display_label()
+                    );
+                    attempts.push(
+                        RouteAttemptMetadata::started(step.provider.clone(), fallback_depth)
+                            .failed(message.clone()),
+                    );
+                    failures.push(message);
+                    continue;
+                }
+            }
+        }
+
         if let Some(message) = config.unavailable_message() {
             attempts.push(
                 RouteAttemptMetadata::started(step.provider.clone(), fallback_depth)
@@ -4421,6 +4492,137 @@ async fn resolve_answer_route(
         request.metadata.request_id,
         failures.join("; ")
     ))
+}
+
+async fn call_bluey_managed_provider(
+    paths: &AppPaths,
+    request: &AnswerRequest,
+    provider: &ProviderSelector,
+    payload: &ProviderRequestPayload,
+    mut stream: Option<&mut OverlayAnswerStream>,
+) -> Result<LiveProviderAnswer> {
+    let client = build_cloud_client(paths, request.metadata.correlation_id.as_deref())?;
+    let lane = managed_lane_for_provider(provider, payload);
+    let managed = BlueyManagedProvider::new(client, lane);
+    let prompt = provider_prompt_parts(payload)?;
+    let llm_request = LlmRequest {
+        system: prompt.system,
+        user: prompt.user,
+        session_id: request
+            .metadata
+            .meeting_id
+            .map(|meeting_id| meeting_id.to_string()),
+        max_tokens: payload.max_output_tokens,
+        temperature: None,
+        reasoning_effort: managed_reasoning_effort(lane),
+        thinking_budget_tokens: None,
+        request_id: Some(payload.request_id.to_string()),
+        image_data_urls: prompt.image_data_urls,
+    };
+    let started_at = Instant::now();
+
+    if payload.stream {
+        let mut chunks = managed
+            .complete_stream(&llm_request)
+            .await
+            .map_err(managed_llm_error)?;
+        let mut answer = String::new();
+        let mut token_usage = None;
+        let mut cost_label = None;
+        let mut saw_finished = false;
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk.map_err(managed_llm_error)?;
+            if !chunk.text.is_empty() {
+                answer.push_str(&chunk.text);
+                if let Some(stream) = stream.as_mut() {
+                    stream.push_delta(&chunk.text).await?;
+                }
+            }
+            if let Some(cost) = chunk.cost.as_ref() {
+                token_usage = Some(token_usage_from_llm_cost(cost));
+            }
+            if let Some(label) = chunk.cost_label {
+                cost_label = Some(label);
+            }
+            if chunk.finished {
+                saw_finished = true;
+            }
+        }
+
+        let answer = answer.trim().to_string();
+        if answer.is_empty() {
+            return Err(anyhow!("managed provider stream returned no answer text"));
+        }
+        if !saw_finished {
+            return Err(anyhow!(
+                "managed provider stream ended before final billing metadata"
+            ));
+        }
+        if let Some(stream) = stream.as_mut() {
+            stream
+                .finish_with_cost_label(&answer, cost_label.clone())
+                .await?;
+        }
+
+        return Ok(LiveProviderAnswer {
+            provider: provider.clone(),
+            answer,
+            token_usage,
+            latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        });
+    }
+
+    let response = managed
+        .complete(&llm_request)
+        .await
+        .map_err(managed_llm_error)?;
+    let answer = response.text.trim().to_string();
+    if answer.is_empty() {
+        return Err(anyhow!("managed provider returned no answer text"));
+    }
+    if let Some(stream) = stream.as_mut() {
+        stream.replay_text(&answer).await?;
+        stream
+            .finish_with_cost_label(&answer, response.cost_label.clone())
+            .await?;
+    }
+    let token_usage = response.cost.as_ref().map(token_usage_from_llm_cost);
+    Ok(LiveProviderAnswer {
+        provider: provider.clone(),
+        answer,
+        token_usage,
+        latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+    })
+}
+
+fn managed_lane_for_provider(
+    provider: &ProviderSelector,
+    payload: &ProviderRequestPayload,
+) -> ManagedLane {
+    provider
+        .model
+        .as_ref()
+        .map(|model| managed_lane_from_value(model.as_str()))
+        .unwrap_or_else(|| managed_lane_from_value(&payload.model))
+}
+
+fn managed_reasoning_effort(lane: ManagedLane) -> Option<String> {
+    match lane {
+        ManagedLane::Deep => Some("high".to_string()),
+        ManagedLane::Balanced | ManagedLane::Vision => Some("medium".to_string()),
+        ManagedLane::Instant => None,
+    }
+}
+
+fn token_usage_from_llm_cost(cost: &cue_llm::LlmCostMetadata) -> TokenUsage {
+    TokenUsage::new(
+        cost.input_tokens.max(0).min(i64::from(u32::MAX)) as u32,
+        cost.output_tokens.max(0).min(i64::from(u32::MAX)) as u32,
+    )
+}
+
+fn managed_llm_error(error: cue_llm::LlmError) -> anyhow::Error {
+    anyhow!("{error}")
 }
 
 async fn call_chat_provider(
@@ -4654,7 +4856,7 @@ Human-speak contract:
 - Include a concise rationale when it helps the user defend the answer, but do not expose hidden chain-of-thought.
 - If the topic needs depth, keep the chat answer speakable and put deeper code/design/detail in the structured sections or artifact.";
 
-fn provider_messages(payload: &ProviderRequestPayload) -> Result<Vec<ChatMessage>> {
+fn provider_prompt_parts(payload: &ProviderRequestPayload) -> Result<ProviderPromptParts> {
     let mut system = String::from(
         "You are Bluey, a concise meeting and work copilot. Answer only from the supplied session context when possible. If context is thin, say what is missing and give the most useful next step.",
     );
@@ -4672,7 +4874,7 @@ fn provider_messages(payload: &ProviderRequestPayload) -> Result<Vec<ChatMessage
         system.push_str(instructions);
     }
 
-    let mut image_parts = Vec::new();
+    let mut image_data_urls = Vec::new();
     let mut text_context = Vec::new();
     for item in &payload.context {
         let title = item.title.as_deref().unwrap_or("Context");
@@ -4686,7 +4888,7 @@ fn provider_messages(payload: &ProviderRequestPayload) -> Result<Vec<ChatMessage
                 .filter(|path| image_mime_for_path(path).is_some())
             {
                 if payload.privacy.allow_image_upload {
-                    image_parts.push(image_part_from_path(path)?);
+                    image_data_urls.push(image_data_url_from_path(path)?);
                     push_provider_context_item(
                         &mut text_context,
                         item.kind,
@@ -4724,18 +4926,35 @@ fn provider_messages(payload: &ProviderRequestPayload) -> Result<Vec<ChatMessage
         )
     };
 
-    let user_content = if image_parts.is_empty() {
-        ChatMessageContent::Text(user)
+    Ok(ProviderPromptParts {
+        system,
+        user,
+        image_data_urls,
+    })
+}
+
+fn provider_messages(payload: &ProviderRequestPayload) -> Result<Vec<ChatMessage>> {
+    let prompt = provider_prompt_parts(payload)?;
+
+    let user_content = if prompt.image_data_urls.is_empty() {
+        ChatMessageContent::Text(prompt.user)
     } else {
-        let mut parts = vec![ChatMessagePart::Text { text: user }];
-        parts.extend(image_parts);
+        let mut parts = vec![ChatMessagePart::Text { text: prompt.user }];
+        parts.extend(
+            prompt
+                .image_data_urls
+                .into_iter()
+                .map(|url| ChatMessagePart::ImageUrl {
+                    image_url: ChatImageUrl { url },
+                }),
+        );
         ChatMessageContent::Parts(parts)
     };
 
     Ok(vec![
         ChatMessage {
             role: "system".to_string(),
-            content: ChatMessageContent::Text(system),
+            content: ChatMessageContent::Text(prompt.system),
         },
         ChatMessage {
             role: "user".to_string(),
@@ -4812,16 +5031,12 @@ fn compact_preserve_lines(text: &str, max_chars: usize) -> String {
     compacted
 }
 
-fn image_part_from_path(path: &Path) -> Result<ChatMessagePart> {
+fn image_data_url_from_path(path: &Path) -> Result<String> {
     let mime = image_mime_for_path(path).context("unsupported image type for vision request")?;
     let bytes =
         std::fs::read(path).with_context(|| format!("failed to read image {}", path.display()))?;
     let encoded = BASE64_STANDARD.encode(bytes);
-    Ok(ChatMessagePart::ImageUrl {
-        image_url: ChatImageUrl {
-            url: format!("data:{mime};base64,{encoded}"),
-        },
-    })
+    Ok(format!("data:{mime};base64,{encoded}"))
 }
 
 fn image_mime_for_path(path: &Path) -> Option<&'static str> {
@@ -4946,52 +5161,72 @@ fn default_model_for_provider(provider_kind: AiProviderKind) -> &'static str {
 }
 
 fn default_answer_request(question: &str) -> AnswerRequest {
-    AnswerRequest::new(question, ai_status_from_env().route).streaming()
-}
-
-fn vision_answer_request(question: &str, provider: ProviderSelector) -> AnswerRequest {
-    let route = ProviderRoute::direct(provider)
-        .require(cue_core::AiCapability::Vision)
-        .with_budgets(RouteBudget::realtime())
-        .with_privacy(PrivacyFlags::managed_commercial().with_image_upload());
+    let route = if dev_direct_provider_keys_enabled() {
+        ai_status_from_env().route
+    } else {
+        managed_provider_route("balanced")
+    };
     AnswerRequest::new(question, route).streaming()
 }
 
-fn select_vision_provider_from_env() -> Option<ProviderSelector> {
+fn vision_answer_request(question: &str, provider: ProviderSelector) -> AnswerRequest {
+    let route = if matches!(provider.provider_kind, AiProviderKind::CueManaged) {
+        managed_provider_route(provider.model_or("vision"))
+    } else {
+        ProviderRoute::direct(provider)
+            .require(cue_core::AiCapability::Vision)
+            .with_budgets(RouteBudget::realtime())
+            .with_privacy(PrivacyFlags::managed_commercial().with_image_upload())
+    };
+    AnswerRequest::new(question, route).streaming()
+}
+
+fn managed_provider_route(lane: &str) -> ProviderRoute {
+    let lane = managed_lane_name_from_value(lane).unwrap_or("balanced");
+    let mut route = ProviderRoute::direct(ProviderSelector::cue_managed(lane))
+        .with_budgets(RouteBudget::realtime())
+        .with_policy(cue_core::ai::RouteSelectionPolicy::Balanced)
+        .with_privacy(PrivacyFlags::managed_commercial());
+    if lane == "vision" {
+        route = route
+            .require(cue_core::AiCapability::Vision)
+            .with_privacy(PrivacyFlags::managed_commercial().with_image_upload());
+    }
+    route
+}
+
+fn select_vision_provider(paths: &AppPaths) -> Option<ProviderSelector> {
     let configured_model = env::var("BLUEY_VISION_MODEL")
         .or_else(|_| env::var("CUE_VISION_MODEL"))
         .ok()
         .filter(|value| !value.trim().is_empty());
 
-    if let Some(provider) = env::var("BLUEY_VISION_PROVIDER")
-        .or_else(|_| env::var("CUE_VISION_PROVIDER"))
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    {
-        return Some(provider_selector(&provider, configured_model.as_deref()));
+    if dev_direct_vision_enabled() {
+        if let Some(provider) = env::var("BLUEY_VISION_PROVIDER")
+            .or_else(|_| env::var("CUE_VISION_PROVIDER"))
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Some(provider_selector(&provider, configured_model.as_deref()));
+        }
+
+        if env_configured("OPENAI_API_KEY") {
+            return Some(provider_selector("openai", configured_model.as_deref()));
+        }
+
+        // Groq vision model names vary by availability. Require an explicit model so
+        // the screenshot fallback does not accidentally send images to a text-only
+        // low-latency default.
+        if env_configured("GROQ_API_KEY") && configured_model.is_some() {
+            return Some(provider_selector("groq", configured_model.as_deref()));
+        }
     }
 
-    if env_configured("OPENAI_API_KEY") {
-        return Some(provider_selector("openai", configured_model.as_deref()));
-    }
-
-    if cloud_token_configured()
-        && env::var("BLUEY_CLOUD_ANSWER_COMPAT")
-            .or_else(|_| env::var("CUE_CLOUD_ANSWER_COMPAT"))
-            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    {
-        return Some(provider_selector(
-            "bluey_managed",
-            configured_model.as_deref(),
+    if cloud_account_linked(paths) {
+        return Some(ProviderSelector::cue_managed(
+            managed_lane_name_from_value(configured_model.as_deref().unwrap_or("vision"))
+                .unwrap_or("vision"),
         ));
-    }
-
-    // Groq vision model names vary by availability. Require an explicit model so
-    // the screenshot fallback does not accidentally send images to a text-only
-    // low-latency default.
-    if env_configured("GROQ_API_KEY") && configured_model.is_some() {
-        return Some(provider_selector("groq", configured_model.as_deref()));
     }
 
     None
@@ -5008,10 +5243,12 @@ fn answer_request_from_overlay(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("auto");
     let model = normalized_overlay_model(provider, model.as_deref());
-    let route = if is_auto_provider(provider) {
-        ProviderRoute::managed_commercial()
-    } else {
+    let route = if let Some(lane) = overlay_managed_lane(provider, model, mode.as_deref()) {
+        managed_provider_route(lane)
+    } else if dev_direct_provider_keys_enabled() {
         ProviderRoute::direct(provider_selector(provider, model))
+    } else {
+        managed_provider_route("balanced")
     };
     let mut request = AnswerRequest::new(question, route).streaming();
 
@@ -5047,6 +5284,53 @@ fn is_auto_provider(provider: &str) -> bool {
         provider.trim().to_ascii_lowercase().as_str(),
         "auto" | "bluey_auto" | "bluey" | "bluey_managed" | "cue" | "cue_managed" | "managed"
     )
+}
+
+fn overlay_managed_lane<'a>(
+    provider: &str,
+    model: Option<&'a str>,
+    mode: Option<&'a str>,
+) -> Option<&'static str> {
+    for value in [model, mode, Some(provider)].into_iter().flatten() {
+        if let Some(lane) = managed_lane_name_from_value(value) {
+            return Some(lane);
+        }
+    }
+    if is_auto_provider(provider) {
+        Some("balanced")
+    } else {
+        None
+    }
+}
+
+fn managed_lane_name_from_value(value: &str) -> Option<&'static str> {
+    let normalized = value.trim().to_ascii_lowercase().replace(['-', '_'], " ");
+    match normalized.as_str() {
+        "instant" | "quick" | "fast" | "easy" | "bluey managed instant" => Some("instant"),
+        "auto" | "balanced" | "normal" | "default" | "general" | "bluey managed balanced" => {
+            Some("balanced")
+        }
+        "deep" | "hard" | "reasoning" | "extra high" | "system design" | "code" => Some("deep"),
+        "vision" | "screen" | "screenshot" | "analyse screen" | "analyze screen" => Some("vision"),
+        _ => None,
+    }
+}
+
+fn managed_lane_from_value(value: &str) -> ManagedLane {
+    match managed_lane_name_from_value(value).unwrap_or("balanced") {
+        "instant" => ManagedLane::Instant,
+        "deep" => ManagedLane::Deep,
+        "vision" => ManagedLane::Vision,
+        _ => ManagedLane::Balanced,
+    }
+}
+
+fn cloud_account_linked(paths: &AppPaths) -> bool {
+    cloud_access_token_from_env().is_some()
+        || load_account(paths)
+            .ok()
+            .flatten()
+            .is_some_and(|account| account.token_configured())
 }
 
 fn normalized_overlay_model<'a>(provider: &str, model: Option<&'a str>) -> Option<&'a str> {
@@ -5473,13 +5757,13 @@ async fn analyze_screen_with_screenshot_fallback(
     page_error: anyhow::Error,
 ) -> Result<()> {
     let page_error_text = format!("{page_error:#}");
-    let Some(provider) = select_vision_provider_from_env() else {
+    let Some(provider) = select_vision_provider(&daemon.paths) else {
         push_system_card(
             daemon,
             CardKind::Warning,
             "Analyse needs vision",
             format!(
-                "Bluey could not read browser page text, and no vision provider is configured for screenshot fallback.\n\nBrowser text error: {}\n\nSet OPENAI_API_KEY, or set BLUEY_VISION_PROVIDER with BLUEY_VISION_MODEL for an OpenAI-compatible vision route.",
+                "Bluey could not read browser page text. Sign in to Bluey for cloud screen analysis, then try again.\n\nBrowser text error: {}\n\nDeveloper direct vision providers require BLUEY_DEV_DIRECT_VISION=1.",
                 compact_snippet(&page_error_text, 520)
             ),
         )
@@ -7559,7 +7843,12 @@ fn enrich_context_artifact(
 }
 
 fn vision_context_available_from_env() -> bool {
-    ai_status_from_env().vision_enabled || select_vision_provider_from_env().is_some()
+    if dev_direct_vision_enabled() && ai_status_from_env().vision_enabled {
+        return true;
+    }
+    AppPaths::discover()
+        .map(|paths| cloud_account_linked(&paths))
+        .unwrap_or_else(|_| cloud_access_token_from_env().is_some())
 }
 
 fn extract_document_text_preview(path: &Path, size_bytes: u64) -> Result<String> {
@@ -8267,11 +8556,8 @@ mod tests {
             request.route.primary.provider.provider_kind,
             AiProviderKind::CueManaged
         );
-        assert!(request.route.fallbacks.iter().any(|step| {
-            step.provider.provider_kind == AiProviderKind::Groq
-                || step.provider.provider_kind == AiProviderKind::Cerebras
-                || step.provider.provider_kind == AiProviderKind::OpenAi
-        }));
+        assert_eq!(request.route.primary.provider.model_or(""), "balanced");
+        assert!(request.route.fallbacks.is_empty());
         assert!(request
             .instructions
             .as_deref()
@@ -8305,7 +8591,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_direct_routes_drop_managed_model_aliases() {
+    fn overlay_raw_provider_without_dev_flag_uses_managed_lane() {
         let request = answer_request_from_overlay(
             "What changed?",
             Some("openai".to_string()),
@@ -8315,9 +8601,36 @@ mod tests {
 
         assert_eq!(
             request.route.primary.provider.provider_kind,
-            AiProviderKind::OpenAi
+            AiProviderKind::CueManaged
         );
-        assert!(request.route.primary.provider.model.is_none());
+        assert_eq!(request.route.primary.provider.model_or(""), "balanced");
+    }
+
+    #[test]
+    fn overlay_model_menu_maps_to_managed_lanes() {
+        let instant = answer_request_from_overlay(
+            "Quick answer",
+            Some("managed".to_string()),
+            Some("instant".to_string()),
+            Some("instant".to_string()),
+        );
+        assert_eq!(
+            instant.route.primary.provider.provider_kind,
+            AiProviderKind::CueManaged
+        );
+        assert_eq!(instant.route.primary.provider.model_or(""), "instant");
+
+        let deep = answer_request_from_overlay(
+            "Design this deeply",
+            Some("managed".to_string()),
+            Some("deep".to_string()),
+            Some("deep".to_string()),
+        );
+        assert_eq!(
+            deep.route.primary.provider.provider_kind,
+            AiProviderKind::CueManaged
+        );
+        assert_eq!(deep.route.primary.provider.model_or(""), "deep");
     }
 
     #[test]

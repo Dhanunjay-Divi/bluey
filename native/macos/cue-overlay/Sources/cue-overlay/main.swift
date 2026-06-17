@@ -6148,11 +6148,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func selectedRoute() -> (provider: String?, model: String?, mode: String?) {
         switch modelMenu.indexOfSelectedItem {
         case 1:
-            return ("openai", "gpt-4o-mini", "general")
+            return ("managed", "instant", "instant")
         case 2:
-            return ("anthropic", "claude-3-5-sonnet-latest", "general")
+            return ("managed", "balanced", "balanced")
         case 3:
-            return ("anthropic", "claude-3-7-sonnet-latest", "general")
+            return ("managed", "deep", "deep")
         default:
             return ("auto", nil, "general")
         }
