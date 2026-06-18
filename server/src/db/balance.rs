@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use chrono::{Duration, Utc};
-use rusqlite::params;
+use rusqlite::{params, Transaction};
 
 use crate::db::DbPool;
 
@@ -37,7 +37,20 @@ pub fn deduct(pool: &DbPool, account_id: &str, cost_cents: i64) -> Result<bool> 
         return Ok(false);
     }
 
-    // FIFO consumption: drain the oldest unexpired batch first.
+    consume_credit_batches_tx(&tx, account_id, cost_cents)?;
+
+    tx.commit()?;
+    Ok(true)
+}
+
+pub(crate) fn consume_credit_batches_tx(
+    tx: &Transaction<'_>,
+    account_id: &str,
+    cost_cents: i64,
+) -> Result<()> {
+    if cost_cents < 0 {
+        anyhow::bail!("cost_cents must be non-negative");
+    }
     let now = Utc::now().to_rfc3339();
     let mut remaining = cost_cents;
     while remaining > 0 {
@@ -63,11 +76,9 @@ pub fn deduct(pool: &DbPool, account_id: &str, cost_cents: i64) -> Result<bool> 
         remaining -= take;
     }
     // If somehow no credit batch existed (shouldn't happen given the entry
-    // balance check passed) we let `remaining > 0` fall through; the
-    // accounts.balance_cents is the canonical source of truth.
-
-    tx.commit()?;
-    Ok(true)
+    // balance check passed) the account balance remains the canonical source
+    // of truth; there is no best-effort way to reconstruct an expired batch.
+    Ok(())
 }
 
 pub fn credit(

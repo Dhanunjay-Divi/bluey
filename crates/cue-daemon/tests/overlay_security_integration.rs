@@ -4,8 +4,8 @@
 //! - Transcript text containing overlay command substrings cannot trigger dispatch
 //! - Malformed JSON with inner type fields is handled safely
 //! - Overlong fields are rejected
-//! - Path traversal in attached files is rejected
-//! - State machine drops events when UI is not in the correct state
+//! - Attach path limits are enforced before daemon-side file handling
+//! - State machine keeps modal-only events gated while allowing drag/drop attach
 
 use std::time::Duration;
 
@@ -123,20 +123,19 @@ async fn overlong_instructions_is_rejected() {
         .contains("instructions field exceeds max length"));
 }
 
-/// Item 7 test 5: path traversal in attached file is rejected.
+/// Item 7 test 5: overlong attach paths are rejected before file handling.
 #[tokio::test]
-async fn path_traversal_in_attached_file_is_rejected() {
-    // Path traversal: the path contains ".." components
+async fn overlong_attached_file_path_is_rejected() {
+    // Drag/drop attach is valid from Idle; canonicalization, file kind filtering,
+    // and traversal rejection happen later in daemon file handling.
     let cmd = OverlayIpcCommand::AttachFilesRequested {
         paths: vec!["../../../etc/passwd".into()],
     };
-    // Length validation passes (it's short), but the state machine should
-    // block it when UI is not in AttachOpen state.
     let kind = OverlayEventKind::from_command(&cmd);
     assert_eq!(kind, OverlayEventKind::AttachFilesRequested);
-    assert!(!kind.is_allowed_in(OverlayUiState::Idle));
+    assert!(kind.is_allowed_in(OverlayUiState::Idle));
 
-    // Also: a path that exceeds MAX_PATH_LEN is rejected
+    // A path that exceeds MAX_PATH_LEN is rejected at the IPC boundary.
     let long_path = "/".to_string() + &"a".repeat(MAX_PATH_LEN + 1);
     let cmd2 = OverlayIpcCommand::AttachFilesRequested {
         paths: vec![long_path],
@@ -144,9 +143,9 @@ async fn path_traversal_in_attached_file_is_rejected() {
     assert!(validate_command_lengths(&cmd2).is_err());
 }
 
-/// Item 7 test 6: state machine drops attach_files_requested when idle.
+/// Item 7 test 6: state machine allows attach_files_requested from idle for drag/drop.
 #[tokio::test]
-async fn state_machine_drops_attach_when_idle() {
+async fn state_machine_allows_drag_drop_attach_when_idle() {
     let opts = OverlaySpawnOptions::new(stub_path());
     let mut handle = NativeOverlayHandle::spawn(opts).await.unwrap();
     assert_eq!(handle.state(), OverlayProcessState::Running);
@@ -169,21 +168,22 @@ async fn state_machine_drops_attach_when_idle() {
     handle.set_ui_state(OverlayUiState::Idle);
     assert_eq!(handle.ui_state(), OverlayUiState::Idle);
 
-    // The state machine validation is tested at the unit level in overlay_ipc.rs
-    // Here we just verify the handle exposes the state correctly
-    assert!(!OverlayEventKind::AttachFilesRequested.is_allowed_in(handle.ui_state()));
+    // The state machine validation is tested at the unit level in overlay_ipc.rs.
+    // Here we verify the handle exposes the state used by the direct drag/drop
+    // attach path.
+    assert!(OverlayEventKind::AttachFilesRequested.is_allowed_in(handle.ui_state()));
 
     handle.shutdown().await;
 }
 
-/// Additional: state machine allows attach after UI opens.
+/// Additional: attach is allowed both after UI opens and after it closes.
 #[tokio::test]
 async fn state_machine_allows_attach_after_ui_opens() {
     let opts = OverlaySpawnOptions::new(stub_path());
     let handle = NativeOverlayHandle::spawn(opts).await.unwrap();
 
-    // Initially blocked
-    assert!(!OverlayEventKind::AttachFilesRequested.is_allowed_in(handle.ui_state()));
+    // Initially valid for drag/drop.
+    assert!(OverlayEventKind::AttachFilesRequested.is_allowed_in(handle.ui_state()));
 
     // Open attach UI
     handle.set_ui_state(OverlayUiState::AttachOpen);
@@ -191,7 +191,7 @@ async fn state_machine_allows_attach_after_ui_opens() {
 
     // Close it
     handle.set_ui_state(OverlayUiState::Idle);
-    assert!(!OverlayEventKind::AttachFilesRequested.is_allowed_in(handle.ui_state()));
+    assert!(OverlayEventKind::AttachFilesRequested.is_allowed_in(handle.ui_state()));
 
     handle.shutdown().await;
 }

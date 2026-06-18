@@ -25,8 +25,9 @@ use tokio_tungstenite::tungstenite::{
 };
 
 use super::AppState;
+use super::stt_accounting::{self, ReserveSessionInput};
 use crate::auth::AuthedAccount;
-use crate::db::{balance, usage};
+use crate::db::usage;
 use crate::pricing;
 
 const DEFAULT_MAX_SECONDS: i64 = 10 * 60;
@@ -74,6 +75,8 @@ struct ClaimedSttSession {
     source: String,
     max_seconds: i64,
     expires_at_ms: i64,
+    reserved_cents: i64,
+    reserved_trial_seconds: i64,
 }
 
 pub async fn create_session(
@@ -97,51 +100,47 @@ pub async fn create_session(
         .unwrap_or(DEFAULT_MAX_SECONDS)
         .clamp(30, MAX_SESSION_SECONDS);
 
-    let balance = balance::current_balance(&state.pool, &account.id).map_err(internal)?;
-    let billable_ceiling_seconds = (max_seconds - account.trial_seconds_remaining).max(0);
-    let estimated_cost_cents = estimate_deepgram_cost_cents(&model, billable_ceiling_seconds)?;
     let estimated_bluey_cost_cents =
-        estimate_deepgram_bluey_cost_cents(&model, billable_ceiling_seconds)?;
+        estimate_deepgram_bluey_cost_cents(&model, max_seconds)?;
     check_upstream_spend_guard(
         &state,
         &account.id,
         estimated_bluey_cost_cents,
         "stt_session",
     )?;
-    if billable_ceiling_seconds > 0 && balance < estimated_cost_cents {
-        return Err((
-            StatusCode::PAYMENT_REQUIRED,
-            "balance is required before starting this STT session".into(),
-        ));
-    }
 
     let token = random_token();
     let now = now_ms();
     let expires_at = now + (max_seconds * 1000);
     let mode = "server_relay";
-    state
-        .pool
-        .get()
-        .map_err(internal)?
-        .execute(
-            "INSERT INTO stt_sessions (
-                session_token, account_id, bluey_session_id, provider, model, source,
-                mode, max_seconds, created_at_ms, expires_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            rusqlite::params![
-                token,
-                account.id,
-                req.session_id,
-                provider,
-                model,
-                req.source,
-                mode,
-                max_seconds,
-                now,
-                expires_at,
-            ],
-        )
-        .map_err(internal)?;
+    let reservation = stt_accounting::reserve_session(
+        &state.pool,
+        ReserveSessionInput {
+            account_id: &account.id,
+            bluey_session_id: &req.session_id,
+            provider: &provider,
+            model: &model,
+            source: &req.source,
+            mode,
+            token: &token,
+            max_seconds,
+            created_at_ms: now,
+            expires_at_ms: expires_at,
+        },
+    )
+    .map_err(stt_accounting::map_create_error)?;
+
+    tracing::info!(
+        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+        source = %req.source,
+        provider = %provider,
+        model = %model,
+        reserved_cents = reservation.reserved_cents,
+        reserved_trial_seconds = reservation.reserved_trial_seconds,
+        reserved_billable_seconds = reservation.reserved_billable_seconds,
+        projected_bluey_cents = reservation.projected_bluey_cents,
+        "STT relay session reserved"
+    );
 
     Ok(Json(SttSessionResponse {
         mode: mode.to_string(),
@@ -210,6 +209,7 @@ fn internal<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
     )
 }
 
+#[cfg(test)]
 fn estimate_deepgram_cost_cents(model: &str, seconds: i64) -> Result<i64, (StatusCode, String)> {
     if seconds <= 0 {
         return Ok(0);
@@ -285,7 +285,8 @@ fn claim_relay_session(
     let conn = state.pool.get().map_err(internal)?;
     let session = conn
         .query_row(
-            "SELECT account_id, bluey_session_id, provider, model, source, max_seconds, expires_at_ms
+            "SELECT account_id, bluey_session_id, provider, model, source, max_seconds, expires_at_ms,
+                    reserved_cents, reserved_trial_seconds
              FROM stt_sessions
              WHERE session_token = ?1 AND account_id = ?2",
             params![token, account_id],
@@ -299,6 +300,8 @@ fn claim_relay_session(
                     source: row.get(4)?,
                     max_seconds: row.get(5)?,
                     expires_at_ms: row.get(6)?,
+                    reserved_cents: row.get(7)?,
+                    reserved_trial_seconds: row.get(8)?,
                 })
             },
         )
@@ -441,32 +444,15 @@ fn finalize_relay_session(
     reason: &str,
 ) -> anyhow::Result<()> {
     let elapsed_ms = elapsed.as_millis().clamp(1, i64::MAX as u128) as i64;
-    let elapsed_seconds = ((elapsed_ms + 999) / 1000).max(1);
-    let conn = state.pool.get()?;
-    let trial_remaining: i64 = conn.query_row(
-        "SELECT trial_seconds_remaining FROM accounts WHERE id = ?1",
-        params![&session.account_id],
-        |row| row.get(0),
+    let settled = stt_accounting::settle_session(
+        &state.pool,
+        &session.token,
+        &session.account_id,
+        &session.model,
+        elapsed_ms,
+        reason,
+        now_ms(),
     )?;
-    drop(conn);
-
-    let free_seconds = trial_remaining.max(0).min(elapsed_seconds);
-    if free_seconds > 0 {
-        let _ =
-            balance::consume_trial_seconds(&state.pool, &session.account_id, free_seconds * 1000)?;
-    }
-    let billable_seconds = elapsed_seconds - free_seconds;
-    let pricing = pricing::lookup("deepgram", &session.model)
-        .ok_or_else(|| anyhow::anyhow!("missing Deepgram pricing for {}", session.model))?;
-    let (bluey_cost, customer_cost) = pricing::compute_cost(pricing, billable_seconds, 0);
-    if customer_cost > 0 && !balance::deduct(&state.pool, &session.account_id, customer_cost)? {
-        tracing::warn!(
-            account_id_hash = %cue_core::account_id_hash_prefix(&session.account_id),
-            customer_cost,
-            billable_seconds,
-            "STT relay overrun absorbed by Bluey because balance was exhausted at close"
-        );
-    }
     usage::record(
         &state.pool,
         &session.account_id,
@@ -477,23 +463,31 @@ fn finalize_relay_session(
             lane: Some(session.source.clone()),
             provider: Some(session.provider.clone()),
             model: Some(session.model.clone()),
-            input_tokens: elapsed_seconds,
+            input_tokens: settled.elapsed_seconds,
             output_tokens: 0,
-            latency_ms: elapsed_ms,
-            cost_cents_to_bluey: bluey_cost,
-            cost_cents_to_customer: customer_cost,
+            latency_ms: settled.elapsed_ms,
+            cost_cents_to_bluey: settled.bluey_cents,
+            cost_cents_to_customer: settled.customer_cents,
             was_speculative: false,
             was_fallback: false,
         },
     )?;
-    state.pool.get()?.execute(
-        "UPDATE stt_sessions
-            SET consumed_seconds = ?1,
-                ended_at_ms = ?2,
-                relay_close_reason = ?3
-          WHERE session_token = ?4",
-        params![elapsed_seconds, now_ms(), reason, &session.token],
-    )?;
+    tracing::info!(
+        account_id_hash = %cue_core::account_id_hash_prefix(&session.account_id),
+        source = %session.source,
+        provider = %session.provider,
+        model = %session.model,
+        elapsed_seconds = settled.elapsed_seconds,
+        billable_seconds = settled.billable_seconds,
+        trial_seconds = settled.trial_seconds,
+        reserved_cents = session.reserved_cents,
+        reserved_trial_seconds = session.reserved_trial_seconds,
+        cost_cents = settled.customer_cents,
+        refunded_cents = settled.refunded_cents,
+        refunded_trial_seconds = settled.refunded_trial_seconds,
+        reason,
+        "STT relay session settled"
+    );
     Ok(())
 }
 
@@ -522,6 +516,8 @@ mod tests {
             source: "microphone".into(),
             max_seconds: 60,
             expires_at_ms: now_ms() + 60_000,
+            reserved_cents: 0,
+            reserved_trial_seconds: 0,
         };
         let url = deepgram_realtime_url(&session);
         assert!(url.contains("model=nova%203%2Ftest"));

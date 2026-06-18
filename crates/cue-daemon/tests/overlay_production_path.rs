@@ -165,14 +165,14 @@ fn line_too_long_rejected_before_parsing() {
 }
 
 #[test]
-fn attach_files_requested_dropped_when_idle() {
+fn attach_files_requested_accepted_when_idle() {
     let state = idle_state(); // Idle
     let line =
         format!(r#"{{"type":"attach_files_requested","paths":["/tmp/foo"],"token":"{TOK}"}}"#);
     let result = validate_line(&line, TOK, state.as_ref());
     assert!(
-        matches!(result, Err(OverlayLineReject::StateNotAllowed { .. })),
-        "AttachFilesRequested must be dropped in Idle state, got {result:?}"
+        result.is_ok(),
+        "AttachFilesRequested from drag/drop must be accepted in Idle, got {result:?}"
     );
 }
 
@@ -359,14 +359,14 @@ fn handler_transition_idle_to_attach_open_unblocks_attach_files() {
     //   3. An event handler (AttachRequested) flips Daemon-side state to
     //      AttachOpen.
     //   4. The reader-thread clone now sees AttachOpen, so the next
-    //      AttachFilesRequested is accepted instead of rejected.
+    //      AttachFilesRequested is still accepted.
     let daemon_state = Arc::new(Mutex::new(OverlayUiState::Idle));
     let reader_state = daemon_state.clone();
 
-    // Step 1: while still Idle, AttachFilesRequested is rejected.
+    // Step 1: drag/drop can submit files directly from Idle.
     let line = format!(r#"{{"type":"attach_files_requested","paths":["/tmp/x"],"token":"{TOK}"}}"#);
     let r1 = validate_line(&line, TOK, reader_state.as_ref());
-    assert!(matches!(r1, Err(OverlayLineReject::StateNotAllowed { .. })));
+    assert!(r1.is_ok());
 
     // Step 2: handler-side mutation simulating
     //   *daemon.overlay_ui_state.lock() = OverlayUiState::AttachOpen;
@@ -381,9 +381,10 @@ fn handler_transition_idle_to_attach_open_unblocks_attach_files() {
 }
 
 #[test]
-fn handler_transition_back_to_idle_blocks_late_attach_files() {
+fn handler_transition_back_to_idle_still_allows_drag_drop_attach_files() {
     // After a successful attach submit, the handler reverts state to Idle.
-    // A late stray AttachFilesRequested (e.g. duplicate event) must be rejected.
+    // A late duplicate drag/drop payload is still accepted by the validator;
+    // duplicate handling belongs to the daemon attach handler, not the IPC gate.
     let daemon_state = Arc::new(Mutex::new(OverlayUiState::AttachOpen));
     let reader_state = daemon_state.clone();
 
@@ -396,9 +397,9 @@ fn handler_transition_back_to_idle_blocks_late_attach_files() {
     // Step 2: handler reverts to Idle after processing the submit.
     *daemon_state.lock() = OverlayUiState::Idle;
 
-    // Step 3: any later stray AttachFilesRequested is rejected.
+    // Step 3: later drag/drop-style AttachFilesRequested remains valid.
     let r2 = validate_line(&line, TOK, reader_state.as_ref());
-    assert!(matches!(r2, Err(OverlayLineReject::StateNotAllowed { .. })));
+    assert!(r2.is_ok());
 }
 
 #[test]

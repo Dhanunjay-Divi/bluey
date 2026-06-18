@@ -367,6 +367,48 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
     ensure_column(&conn, "stt_sessions", "started_at_ms", "INTEGER")?;
     ensure_column(&conn, "stt_sessions", "ended_at_ms", "INTEGER")?;
     ensure_column(&conn, "stt_sessions", "relay_close_reason", "TEXT")?;
+    ensure_column(
+        &conn,
+        "accounts",
+        "reserved_cents",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &conn,
+        "stt_sessions",
+        "reserved_cents",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &conn,
+        "stt_sessions",
+        "settled_cents",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &conn,
+        "stt_sessions",
+        "refunded_cents",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &conn,
+        "stt_sessions",
+        "reserved_trial_seconds",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &conn,
+        "stt_sessions",
+        "settled_trial_seconds",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &conn,
+        "stt_sessions",
+        "refunded_trial_seconds",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     tracing::info!(count = MIGRATIONS.len(), "migrations applied");
     Ok(())
 }

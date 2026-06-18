@@ -1,0 +1,427 @@
+//! STT reservation accounting.
+//!
+//! Live captions can open two relay sessions at once (mic + system). This
+//! module keeps the money/trial reservation state out of the websocket relay
+//! code so each source has to reserve its worst-case budget before any provider
+//! audio stream starts.
+
+use anyhow::Result;
+use rusqlite::{params, OptionalExtension};
+
+use crate::{
+    db::{balance, DbPool},
+    pricing,
+};
+
+#[derive(Debug, Clone)]
+pub(super) struct ReserveSessionInput<'a> {
+    pub account_id: &'a str,
+    pub bluey_session_id: &'a str,
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub source: &'a str,
+    pub mode: &'a str,
+    pub token: &'a str,
+    pub max_seconds: i64,
+    pub created_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReservedSttSession {
+    pub reserved_cents: i64,
+    pub reserved_trial_seconds: i64,
+    pub reserved_billable_seconds: i64,
+    pub projected_bluey_cents: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SettledSttSession {
+    pub elapsed_ms: i64,
+    pub elapsed_seconds: i64,
+    pub billable_seconds: i64,
+    pub trial_seconds: i64,
+    pub customer_cents: i64,
+    pub bluey_cents: i64,
+    pub refunded_cents: i64,
+    pub refunded_trial_seconds: i64,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(super) enum SttAccountingError {
+    #[error("unsupported Deepgram STT model")]
+    UnsupportedModel,
+    #[error("balance is required before starting this STT session")]
+    InsufficientBalance,
+    #[error("STT session was already settled")]
+    AlreadySettled,
+    #[error(transparent)]
+    Db(#[from] anyhow::Error),
+}
+
+pub(super) fn reserve_session(
+    pool: &DbPool,
+    input: ReserveSessionInput<'_>,
+) -> Result<ReservedSttSession, SttAccountingError> {
+    let pricing = pricing::lookup(input.provider, input.model)
+        .ok_or(SttAccountingError::UnsupportedModel)?;
+    let mut conn = pool
+        .get()
+        .map_err(|err| SttAccountingError::Db(err.into()))?;
+    let tx = conn
+        .transaction()
+        .map_err(|err| SttAccountingError::Db(err.into()))?;
+
+    let (available_cents, trial_remaining): (i64, i64) = tx
+        .query_row(
+            "SELECT balance_cents, trial_seconds_remaining
+             FROM accounts
+             WHERE id = ?1",
+            params![input.account_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|err| SttAccountingError::Db(err.into()))?;
+
+    let reserved_trial_seconds = trial_remaining.max(0).min(input.max_seconds);
+    let reserved_billable_seconds = (input.max_seconds - reserved_trial_seconds).max(0);
+    let (projected_bluey_cents, reserved_cents) =
+        pricing::compute_cost(pricing, reserved_billable_seconds, 0);
+    if available_cents < reserved_cents {
+        return Err(SttAccountingError::InsufficientBalance);
+    }
+
+    let updated = tx.execute(
+        "UPDATE accounts
+            SET balance_cents = balance_cents - ?1,
+                reserved_cents = reserved_cents + ?1,
+                trial_seconds_remaining = trial_seconds_remaining - ?2
+          WHERE id = ?3
+            AND balance_cents >= ?1
+            AND trial_seconds_remaining >= ?2",
+        params![
+            reserved_cents,
+            reserved_trial_seconds,
+            input.account_id
+        ],
+    )
+    .map_err(|err| SttAccountingError::Db(err.into()))?;
+    if updated != 1 {
+        return Err(SttAccountingError::InsufficientBalance);
+    }
+
+    tx.execute(
+        "INSERT INTO stt_sessions (
+            session_token, account_id, bluey_session_id, provider, model, source,
+            mode, max_seconds, created_at_ms, expires_at_ms,
+            reserved_cents, reserved_trial_seconds
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            input.token,
+            input.account_id,
+            input.bluey_session_id,
+            input.provider,
+            input.model,
+            input.source,
+            input.mode,
+            input.max_seconds,
+            input.created_at_ms,
+            input.expires_at_ms,
+            reserved_cents,
+            reserved_trial_seconds,
+        ],
+    )
+    .map_err(|err| SttAccountingError::Db(err.into()))?;
+
+    tx.commit()
+        .map_err(|err| SttAccountingError::Db(err.into()))?;
+    Ok(ReservedSttSession {
+        reserved_cents,
+        reserved_trial_seconds,
+        reserved_billable_seconds,
+        projected_bluey_cents,
+    })
+}
+
+pub(super) fn settle_session(
+    pool: &DbPool,
+    session_token: &str,
+    account_id: &str,
+    model: &str,
+    elapsed_ms: i64,
+    reason: &str,
+    now_ms: i64,
+) -> Result<SettledSttSession, SttAccountingError> {
+    let pricing =
+        pricing::lookup("deepgram", model).ok_or(SttAccountingError::UnsupportedModel)?;
+    let elapsed_seconds = ((elapsed_ms.max(1) + 999) / 1000).max(1);
+    let mut conn = pool
+        .get()
+        .map_err(|err| SttAccountingError::Db(err.into()))?;
+    let tx = conn
+        .transaction()
+        .map_err(|err| SttAccountingError::Db(err.into()))?;
+
+    let (max_seconds, reserved_cents, reserved_trial_seconds, ended_at_ms): (
+        i64,
+        i64,
+        i64,
+        Option<i64>,
+    ) = tx
+        .query_row(
+            "SELECT max_seconds, reserved_cents, reserved_trial_seconds, ended_at_ms
+             FROM stt_sessions
+             WHERE session_token = ?1 AND account_id = ?2",
+            params![session_token, account_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|err| SttAccountingError::Db(err.into()))?
+        .ok_or_else(|| SttAccountingError::Db(anyhow::anyhow!("missing STT session")))?;
+
+    if ended_at_ms.is_some() {
+        return Err(SttAccountingError::AlreadySettled);
+    }
+
+    let capped_seconds = elapsed_seconds.min(max_seconds.max(1));
+    let trial_seconds = reserved_trial_seconds.min(capped_seconds);
+    let billable_seconds = capped_seconds - trial_seconds;
+    let (bluey_cents, customer_cents) = pricing::compute_cost(pricing, billable_seconds, 0);
+    let refunded_cents = (reserved_cents - customer_cents).max(0);
+    let extra_cents = (customer_cents - reserved_cents).max(0);
+    let refunded_trial_seconds = (reserved_trial_seconds - trial_seconds).max(0);
+
+    let updated = tx
+        .execute(
+            "UPDATE accounts
+                SET reserved_cents = reserved_cents - ?1,
+                    balance_cents = balance_cents + ?2 - ?3,
+                    trial_seconds_remaining = trial_seconds_remaining + ?4
+              WHERE id = ?5
+                AND reserved_cents >= ?1
+                AND balance_cents >= ?3",
+            params![
+                reserved_cents,
+                refunded_cents,
+                extra_cents,
+                refunded_trial_seconds,
+                account_id
+            ],
+        )
+        .map_err(|err| SttAccountingError::Db(err.into()))?;
+    if updated != 1 {
+        return Err(SttAccountingError::InsufficientBalance);
+    }
+
+    balance::consume_credit_batches_tx(&tx, account_id, customer_cents)
+        .map_err(SttAccountingError::Db)?;
+
+    let updated = tx
+        .execute(
+            "UPDATE stt_sessions
+                SET consumed_seconds = ?1,
+                    settled_cents = ?2,
+                    refunded_cents = ?3,
+                    settled_trial_seconds = ?4,
+                    refunded_trial_seconds = ?5,
+                    ended_at_ms = ?6,
+                    relay_close_reason = ?7
+              WHERE session_token = ?8
+                AND account_id = ?9
+                AND ended_at_ms IS NULL",
+            params![
+                capped_seconds,
+                customer_cents,
+                refunded_cents,
+                trial_seconds,
+                refunded_trial_seconds,
+                now_ms,
+                reason,
+                session_token,
+                account_id
+            ],
+        )
+        .map_err(|err| SttAccountingError::Db(err.into()))?;
+    if updated != 1 {
+        return Err(SttAccountingError::AlreadySettled);
+    }
+
+    tx.commit()
+        .map_err(|err| SttAccountingError::Db(err.into()))?;
+
+    Ok(SettledSttSession {
+        elapsed_ms,
+        elapsed_seconds: capped_seconds,
+        billable_seconds,
+        trial_seconds,
+        customer_cents,
+        bluey_cents,
+        refunded_cents,
+        refunded_trial_seconds,
+    })
+}
+
+pub(super) fn map_create_error(
+    error: SttAccountingError,
+) -> (axum::http::StatusCode, String) {
+    match error {
+        SttAccountingError::UnsupportedModel => (
+            axum::http::StatusCode::BAD_REQUEST,
+            "unsupported Deepgram STT model".to_string(),
+        ),
+        SttAccountingError::InsufficientBalance => (
+            axum::http::StatusCode::PAYMENT_REQUIRED,
+            "balance is required before starting this STT session".to_string(),
+        ),
+        SttAccountingError::AlreadySettled => (
+            axum::http::StatusCode::CONFLICT,
+            "STT session is already closed".to_string(),
+        ),
+        SttAccountingError::Db(err) => {
+            tracing::warn!(error = %err, "STT accounting failed");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                "stt session failed".to_string(),
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{self, accounts::Account, balance, DbPool};
+
+    fn temp_pool() -> DbPool {
+        let path = std::env::temp_dir().join(format!("bluey-stt-res-{}.db", uuid::Uuid::new_v4()));
+        let pool = db::open_pool(&path).unwrap();
+        db::run_migrations(&pool).unwrap();
+        pool
+    }
+
+    fn create_paid_account(pool: &DbPool, email: &str, cents: i64) -> String {
+        let account = Account::create(pool, email, "hash").unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE accounts SET trial_seconds_remaining = 0 WHERE id = ?1",
+                params![&account.id],
+            )
+            .unwrap();
+        balance::credit(pool, &account.id, cents, None).unwrap();
+        account.id
+    }
+
+    fn input<'a>(
+        account_id: &'a str,
+        token: &'a str,
+        max_seconds: i64,
+    ) -> ReserveSessionInput<'a> {
+        ReserveSessionInput {
+            account_id,
+            bluey_session_id: "bluey-session",
+            provider: "deepgram",
+            model: "nova-3",
+            source: "microphone",
+            mode: "server_relay",
+            token,
+            max_seconds,
+            created_at_ms: 1_000,
+            expires_at_ms: 61_000,
+        }
+    }
+
+    #[test]
+    fn reserving_one_stt_source_blocks_second_when_balance_only_covers_one() {
+        let pool = temp_pool();
+        let account_id = create_paid_account(&pool, "one-source@example.com", 11);
+        let first = reserve_session(&pool, input(&account_id, "stt-1", 600)).unwrap();
+        assert_eq!(first.reserved_cents, 11);
+
+        let second = reserve_session(&pool, input(&account_id, "stt-2", 600)).unwrap_err();
+        assert!(matches!(second, SttAccountingError::InsufficientBalance));
+
+        let conn = pool.get().unwrap();
+        let (balance_cents, reserved_cents): (i64, i64) = conn
+            .query_row(
+                "SELECT balance_cents, reserved_cents FROM accounts WHERE id = ?1",
+                params![account_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(balance_cents, 0);
+        assert_eq!(reserved_cents, 11);
+    }
+
+    #[test]
+    fn settlement_refunds_unused_reserved_credit_and_consumes_fifo_actual() {
+        let pool = temp_pool();
+        let account_id = create_paid_account(&pool, "refund@example.com", 1000);
+        let reserved = reserve_session(&pool, input(&account_id, "stt-refund", 600)).unwrap();
+        assert_eq!(reserved.reserved_cents, 11);
+
+        let settled = settle_session(
+            &pool,
+            "stt-refund",
+            &account_id,
+            "nova-3",
+            60_000,
+            "completed",
+            70_000,
+        )
+        .unwrap();
+        assert_eq!(settled.customer_cents, 2);
+        assert_eq!(settled.refunded_cents, 9);
+
+        let conn = pool.get().unwrap();
+        let (balance_cents, reserved_cents): (i64, i64) = conn
+            .query_row(
+                "SELECT balance_cents, reserved_cents FROM accounts WHERE id = ?1",
+                params![account_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let batch_remaining: i64 = conn
+            .query_row(
+                "SELECT remaining_cents FROM credit_batches WHERE account_id = ?1",
+                params![account_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(balance_cents, 998);
+        assert_eq!(reserved_cents, 0);
+        assert_eq!(batch_remaining, 998);
+    }
+
+    #[test]
+    fn trial_seconds_are_reserved_and_unused_trial_is_restored() {
+        let pool = temp_pool();
+        let account = Account::create(&pool, "trial-stt@example.com", "hash").unwrap();
+        let reserved = reserve_session(&pool, input(&account.id, "stt-trial", 60)).unwrap();
+        assert_eq!(reserved.reserved_trial_seconds, 60);
+        assert_eq!(reserved.reserved_cents, 0);
+
+        let settled = settle_session(
+            &pool,
+            "stt-trial",
+            &account.id,
+            "nova-3",
+            10_000,
+            "completed",
+            20_000,
+        )
+        .unwrap();
+        assert_eq!(settled.trial_seconds, 10);
+        assert_eq!(settled.refunded_trial_seconds, 50);
+
+        let trial_left: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT trial_seconds_remaining FROM accounts WHERE id = ?1",
+                params![account.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trial_left, 590);
+    }
+}
