@@ -796,6 +796,7 @@ async fn run(args: RunArgs) -> Result<()> {
 
 async fn cue_on(args: OnArgs) -> Result<()> {
     crate::update::maybe_update_before_on(args.title.as_deref()).await?;
+    ensure_bluey_on_permissions_ready().await?;
 
     let paths = AppPaths::discover()?;
     let settings = load_settings(&paths)?;
@@ -862,6 +863,134 @@ async fn cue_on(args: OnArgs) -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn ensure_bluey_on_permissions_ready() -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        ensure_macos_bluey_on_permissions_ready().await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn ensure_macos_bluey_on_permissions_ready() -> Result<()> {
+    if env_present("BLUEY_SKIP_PERMISSION_PREFLIGHT") {
+        return Ok(());
+    }
+
+    let mut missing = current_macos_permission_checks()
+        .into_iter()
+        .filter(|check| !macos_permission_ready(check.status))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    println!("Bluey needs a few macOS permissions before the pill opens.");
+    println!("Approve the missing items in System Settings; Bluey will continue automatically.");
+    println!("Press Ctrl-C to stop waiting.\n");
+    print_macos_permission_status(&missing);
+    open_macos_permission_panes(&missing);
+
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut last_print = Instant::now();
+    loop {
+        sleep(Duration::from_secs(2)).await;
+        missing = current_macos_permission_checks()
+            .into_iter()
+            .filter(|check| !macos_permission_ready(check.status))
+            .collect();
+
+        if missing.is_empty() {
+            println!("\nAll required macOS permissions are granted. Starting Bluey...");
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            print_macos_permission_status(&missing);
+            bail!(
+                "Bluey is waiting on macOS permission approval. Enable the missing item(s), then run `bluey on` again."
+            );
+        }
+
+        if Instant::now().duration_since(last_print) >= Duration::from_secs(10) {
+            print_macos_permission_status(&missing);
+            last_print = Instant::now();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+struct MacPermissionCheck {
+    name: &'static str,
+    settings_section: &'static str,
+    status: crate::macos_perms::PermissionStatus,
+}
+
+#[cfg(target_os = "macos")]
+fn current_macos_permission_checks() -> Vec<MacPermissionCheck> {
+    use crate::macos_perms::{accessibility_status, microphone_status, screen_recording_status};
+
+    vec![
+        MacPermissionCheck {
+            name: "Accessibility",
+            settings_section: "Privacy_Accessibility",
+            status: accessibility_status(),
+        },
+        MacPermissionCheck {
+            name: "Microphone",
+            settings_section: "Privacy_Microphone",
+            status: microphone_status(),
+        },
+        MacPermissionCheck {
+            name: "Screen Recording",
+            settings_section: "Privacy_ScreenCapture",
+            status: screen_recording_status(),
+        },
+    ]
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_permission_ready(status: crate::macos_perms::PermissionStatus) -> bool {
+    use crate::macos_perms::PermissionStatus;
+    matches!(
+        status,
+        PermissionStatus::Granted | PermissionStatus::NotApplicable | PermissionStatus::Unknown
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn print_macos_permission_status(missing: &[MacPermissionCheck]) {
+    println!("Missing macOS permission(s):");
+    for check in missing {
+        println!("  - {}: {}", check.name, check.status.label());
+        if let Some(hint) = check.status.hint(check.name) {
+            println!("    {hint}");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_macos_permission_panes(missing: &[MacPermissionCheck]) {
+    for check in missing {
+        let uri = macos_permission_settings_uri(check.settings_section);
+        if let Err(error) = Command::new("open").arg(uri).status() {
+            eprintln!(
+                "Could not open System Settings for {} automatically: {error}",
+                check.name
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_permission_settings_uri(section: &str) -> String {
+    format!("x-apple.systempreferences:com.apple.preference.security?{section}")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3043,6 +3172,31 @@ mod tests {
         assert_eq!(
             device_login_url("https://bluey.sh/login?source=desktop", "ABCD-EFGH"),
             "https://bluey.sh/login?source=desktop&user_code=ABCD-EFGH"
+        );
+    }
+
+    #[test]
+    fn bluey_on_permission_gate_blocks_only_actionable_states() {
+        use crate::macos_perms::PermissionStatus;
+
+        assert!(super::macos_permission_ready(PermissionStatus::Granted));
+        assert!(super::macos_permission_ready(
+            PermissionStatus::NotApplicable
+        ));
+        assert!(super::macos_permission_ready(PermissionStatus::Unknown));
+        assert!(!super::macos_permission_ready(PermissionStatus::Denied));
+        assert!(!super::macos_permission_ready(
+            PermissionStatus::NotDetermined
+        ));
+        assert!(!super::macos_permission_ready(PermissionStatus::Restricted));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_permission_settings_uri_points_to_privacy_section() {
+        assert_eq!(
+            super::macos_permission_settings_uri("Privacy_Microphone"),
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
         );
     }
 
