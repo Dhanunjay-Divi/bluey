@@ -5,6 +5,8 @@ pub mod db;
 pub mod export;
 pub mod llm;
 pub mod overlay;
+pub(crate) mod overlay_state;
+pub(crate) mod rag_indexer;
 pub mod secrets;
 pub mod storage;
 pub mod stt;

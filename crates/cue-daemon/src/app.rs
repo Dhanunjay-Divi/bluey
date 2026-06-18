@@ -47,6 +47,11 @@ use tokio_tungstenite::tungstenite::{
 };
 use tracing::{debug, error, info, trace, warn};
 
+use crate::overlay_state::{
+    enter_overlay_ui_state, new_shared_overlay_ui_state, reset_overlay_ui_state_on_scope_exit,
+    SharedOverlayUiState,
+};
+use crate::rag_indexer::RagIndexCoordinator;
 use crate::storage::MeetingStore;
 
 struct LiveProviderAnswer {
@@ -446,8 +451,7 @@ struct Daemon {
     active_answer_card: Mutex<Option<(u64, uuid::Uuid)>>,
     system_audio: Mutex<Option<crate::audio::system_capture::SystemAudioCapture>>,
     live_transcript_tx: broadcast::Sender<LiveTranscriptEvent>,
-    rag: Option<Arc<crate::db::rag::RagPipeline>>,
-    rag_index_lock: Arc<Mutex<()>>,
+    rag_indexer: RagIndexCoordinator,
     /// Per-session token issued at boot. Native overlay must echo this in
     /// every event; mismatched / missing token -> event dropped.
     overlay_session_token: String,
@@ -468,7 +472,7 @@ struct Daemon {
     ///   InstructionsUpdated  when state != InstructionsOpen
     /// while AttachRequested + InstructionsRequested are entry-point events
     /// allowed from any state.
-    overlay_ui_state: std::sync::Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
+    overlay_ui_state: SharedOverlayUiState,
 }
 
 struct OverlayProcess {
@@ -538,7 +542,7 @@ pub async fn run() -> Result<()> {
     let cloud_status = cloud_status_from_env(&paths);
     let (overlay_events_tx, overlay_events_rx) = mpsc::unbounded_channel();
     let overlay_bin = args.overlay_bin.clone();
-    let rag_pipeline = init_rag_pipeline(&paths);
+    let rag_indexer = RagIndexCoordinator::from_paths(&paths);
     let balance_watch = crate::cloud::balance::BalanceWatch::default();
 
     let daemon = Arc::new(Daemon {
@@ -566,13 +570,10 @@ pub async fn run() -> Result<()> {
         active_answer_card: Mutex::new(None),
         system_audio: Mutex::new(None),
         live_transcript_tx: broadcast::channel(64).0,
-        rag: rag_pipeline,
-        rag_index_lock: Arc::new(Mutex::new(())),
+        rag_indexer,
         overlay_session_token: crate::overlay::generate_session_token()
             .context("failed to generate overlay session token")?,
-        overlay_ui_state: std::sync::Arc::new(parking_lot::Mutex::new(
-            cue_core::overlay_ipc::OverlayUiState::Idle,
-        )),
+        overlay_ui_state: new_shared_overlay_ui_state(),
     });
 
     maybe_spawn_balance_polling(&daemon).await;
@@ -1348,34 +1349,6 @@ fn spawn_overlay_event_handler(
             }
         }
     });
-}
-
-struct OverlayUiStateScope {
-    state: std::sync::Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
-}
-
-impl Drop for OverlayUiStateScope {
-    fn drop(&mut self) {
-        *self.state.lock() = cue_core::overlay_ipc::OverlayUiState::Idle;
-    }
-}
-
-fn enter_overlay_ui_state(
-    state: &std::sync::Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
-    next: cue_core::overlay_ipc::OverlayUiState,
-) -> OverlayUiStateScope {
-    *state.lock() = next;
-    OverlayUiStateScope {
-        state: state.clone(),
-    }
-}
-
-fn reset_overlay_ui_state_on_scope_exit(
-    state: &std::sync::Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
-) -> OverlayUiStateScope {
-    OverlayUiStateScope {
-        state: state.clone(),
-    }
 }
 
 async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Result<()> {
@@ -3661,35 +3634,9 @@ async fn add_audio_transcript_segment_inner(
 }
 
 fn index_transcript_for_rag(daemon: &Arc<Daemon>, session_id: String, text: String) {
-    let Some(rag) = daemon.rag.as_ref() else {
-        return;
-    };
-    if text.trim().is_empty() {
-        return;
-    }
-
-    let rag = Arc::clone(rag);
-    let store = daemon.store.clone();
-    let rag_index_lock = Arc::clone(&daemon.rag_index_lock);
-    tokio::spawn(async move {
-        let _guard = rag_index_lock.lock().await;
-        let Ok(session_uuid) = uuid::Uuid::parse_str(&session_id) else {
-            warn!(session_id = %session_id, "skipping RAG transcript index for invalid session id");
-            return;
-        };
-        match store.load_by_id(session_uuid) {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                debug!(session_id = %session_id, "skipping RAG transcript index for deleted session");
-                return;
-            }
-            Err(error) => {
-                warn!(session_id = %session_id, error = %error, "skipping RAG transcript index after session lookup failed");
-                return;
-            }
-        }
-        rag.index_transcript(&session_id, &text).await;
-    });
+    daemon
+        .rag_indexer
+        .index_transcript(daemon.store.clone(), session_id, text);
 }
 
 fn index_context_artifacts_for_rag(
@@ -3697,109 +3644,15 @@ fn index_context_artifacts_for_rag(
     session_id: String,
     artifacts: Vec<ContextArtifact>,
 ) {
-    let Some(rag) = daemon.rag.as_ref() else {
-        return;
-    };
-    if artifacts.is_empty() {
-        return;
-    }
-
-    let rag = Arc::clone(rag);
-    let store = daemon.store.clone();
-    let rag_index_lock = Arc::clone(&daemon.rag_index_lock);
-    tokio::spawn(async move {
-        let _guard = rag_index_lock.lock().await;
-        let Ok(session_uuid) = uuid::Uuid::parse_str(&session_id) else {
-            warn!(session_id = %session_id, "skipping RAG artifact index for invalid session id");
-            return;
-        };
-        match store.load_by_id(session_uuid) {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                debug!(session_id = %session_id, "skipping RAG artifact index for deleted session");
-                return;
-            }
-            Err(error) => {
-                warn!(session_id = %session_id, error = %error, "skipping RAG artifact index after session lookup failed");
-                return;
-            }
-        }
-        for artifact in artifacts {
-            rag.index_context_artifact(&session_id, &artifact).await;
-        }
-    });
+    daemon
+        .rag_indexer
+        .index_context_artifacts(daemon.store.clone(), session_id, artifacts);
 }
 
 fn reindex_meeting_for_rag(daemon: &Arc<Daemon>, meeting: MeetingRecord) {
-    let Some(rag) = daemon.rag.as_ref() else {
-        return;
-    };
-
-    let rag = Arc::clone(rag);
-    let store = daemon.store.clone();
-    let rag_index_lock = Arc::clone(&daemon.rag_index_lock);
-    tokio::spawn(async move {
-        rebuild_meeting_rag_index(rag, store, rag_index_lock, meeting, "session reindex").await
-    });
-}
-
-async fn rebuild_meeting_rag_index(
-    rag: Arc<crate::db::rag::RagPipeline>,
-    store: MeetingStore,
-    rag_index_lock: Arc<Mutex<()>>,
-    meeting: MeetingRecord,
-    reason: &'static str,
-) {
-    let _guard = rag_index_lock.lock().await;
-    let session_id = meeting.id.to_string();
-    match store.load_by_id(meeting.id) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            debug!(session_id = %session_id, reason, "skipping RAG rebuild for deleted session");
-            return;
-        }
-        Err(error) => {
-            warn!(session_id = %session_id, reason, error = %error, "skipping RAG rebuild after session lookup failed");
-            return;
-        }
-    }
-    if let Err(error) = rag.delete_session(&session_id).await {
-        warn!(session_id = %session_id, reason, error = %error, "failed to clear RAG session before rebuild");
-        return;
-    }
-
-    if let Some(summary) = meeting
-        .summary
-        .as_ref()
-        .filter(|summary| !summary.trim().is_empty())
-    {
-        rag.index_transcript(
-            &session_id,
-            &format!("Compacted session summary:\n{}", summary.trim()),
-        )
-        .await;
-    }
-
-    for turn in &meeting.conversation {
-        let question = turn.question.trim();
-        let answer = turn.answer.trim();
-        if !question.is_empty() || !answer.is_empty() {
-            rag.index_transcript(
-                &session_id,
-                &format!("Prior Bluey answer\nQuestion: {question}\nAnswer: {answer}"),
-            )
-            .await;
-        }
-    }
-
-    for segment in &meeting.transcript {
-        if segment.is_final && !segment.text.trim().is_empty() {
-            rag.index_transcript(&session_id, &segment.text).await;
-        }
-    }
-    for artifact in &meeting.context {
-        rag.index_context_artifact(&session_id, artifact).await;
-    }
+    daemon
+        .rag_indexer
+        .reindex_meeting(daemon.store.clone(), meeting);
 }
 
 async fn handle_attach_requested(daemon: &Arc<Daemon>) -> Result<()> {
@@ -5544,9 +5397,6 @@ async fn retrieved_memory_contexts(
     meeting: &MeetingRecord,
     question: &str,
 ) -> Vec<AnswerContext> {
-    let Some(rag) = daemon.rag.as_ref() else {
-        return Vec::new();
-    };
     if question.trim().is_empty() {
         return Vec::new();
     }
@@ -5555,7 +5405,11 @@ async fn retrieved_memory_contexts(
     let mut contexts = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    match rag.query(question, 4, Some(&current_session_id)).await {
+    match daemon
+        .rag_indexer
+        .query(question, 4, Some(&current_session_id))
+        .await
+    {
         Ok(hits) => {
             for hit in hits {
                 if let Some(context) =
@@ -5574,7 +5428,7 @@ async fn retrieved_memory_contexts(
         }
     }
 
-    match rag.query(question, 6, None).await {
+    match daemon.rag_indexer.query(question, 6, None).await {
         Ok(hits) => {
             for hit in hits {
                 if contexts.len() >= 8 {
@@ -6510,17 +6364,7 @@ async fn delete_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<
         anyhow::bail!("session {id} not found");
     }
 
-    if let Some(rag) = daemon.rag.as_ref() {
-        let rag = Arc::clone(rag);
-        let rag_index_lock = Arc::clone(&daemon.rag_index_lock);
-        let session_id = id.to_string();
-        tokio::spawn(async move {
-            let _guard = rag_index_lock.lock().await;
-            if let Err(error) = rag.delete_session(&session_id).await {
-                warn!(session_id = %session_id, error = %error, "failed to clear deleted session RAG index");
-            }
-        });
-    }
+    daemon.rag_indexer.delete_session(id.to_string());
 
     if was_active {
         update_state_from_meeting(daemon, None).await?;
@@ -8338,35 +8182,6 @@ async fn update_state_from_meeting(
     write_state(daemon).await
 }
 
-/// Initialize the RAG pipeline if an OpenAI API key is available.
-/// Returns None (with a log) if no key is configured — RAG is optional.
-fn init_rag_pipeline(paths: &AppPaths) -> Option<Arc<crate::db::rag::RagPipeline>> {
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .ok()
-        .filter(|key| !key.trim().is_empty())
-        .or_else(|| {
-            env_truthy_any(&["BLUEY_DEV_BYOK"])
-                .then(|| crate::secrets::load_api_key("openai").ok().flatten())
-                .flatten()
-        });
-    let Some(api_key) = api_key else {
-        info!("RAG pipeline disabled: no OpenAI API key configured");
-        return None;
-    };
-    let embedder = Arc::new(cue_rag::embedder::OpenAiEmbedder::new(api_key));
-    let store_path = paths.data_dir.join("rag_vectors.db");
-    match crate::db::rag::RagPipeline::new(store_path, embedder) {
-        Ok(pipeline) => {
-            info!("RAG pipeline initialized");
-            Some(Arc::new(pipeline))
-        }
-        Err(e) => {
-            warn!("RAG pipeline init failed: {e:#}");
-            None
-        }
-    }
-}
-
 /// Spawn a best-effort auto-recap via LLM after a session ends.
 /// If no LLM provider is configured, logs a warning and returns.
 fn spawn_auto_recap(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
@@ -8699,32 +8514,6 @@ mod tests {
             .instructions
             .as_deref()
             .is_some_and(|instructions| instructions.contains("### Code")));
-    }
-
-    #[test]
-    fn overlay_ui_state_scope_enters_then_resets_to_idle() {
-        use cue_core::overlay_ipc::OverlayUiState;
-
-        let state = std::sync::Arc::new(parking_lot::Mutex::new(OverlayUiState::Idle));
-        {
-            let _scope = enter_overlay_ui_state(&state, OverlayUiState::AttachOpen);
-            assert_eq!(*state.lock(), OverlayUiState::AttachOpen);
-        }
-
-        assert_eq!(*state.lock(), OverlayUiState::Idle);
-    }
-
-    #[test]
-    fn overlay_ui_state_submit_scope_resets_existing_open_state() {
-        use cue_core::overlay_ipc::OverlayUiState;
-
-        let state = std::sync::Arc::new(parking_lot::Mutex::new(OverlayUiState::InstructionsOpen));
-        {
-            let _scope = reset_overlay_ui_state_on_scope_exit(&state);
-            assert_eq!(*state.lock(), OverlayUiState::InstructionsOpen);
-        }
-
-        assert_eq!(*state.lock(), OverlayUiState::Idle);
     }
 
     #[test]

@@ -705,7 +705,7 @@ async fn router_complete_stream_proxies_anthropic_messages_sse() {
     assert!(second_delta < billing, "delta must arrive before billing");
     assert!(body.contains("\"text\":\"Deep answer\""));
     assert!(body.contains("\"provider\":\"anthropic\""));
-    assert!(body.contains("\"model\":\"claude-sonnet-4-6\""));
+    assert!(body.contains("\"model\":\"claude-sonnet-4-6-20260115\""));
     assert!(body.contains("\"input_tokens\":20"));
     assert!(body.contains("\"output_tokens\":6"));
     assert!(body.contains("data: [DONE]"));
@@ -809,7 +809,7 @@ async fn router_complete_falls_back_when_preferred_provider_429s() {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["text"], "fallback answer");
     assert_eq!(v["provider"], "openai");
-    assert_eq!(v["model"], "gpt-5.4");
+    assert_eq!(v["model"], "gpt-5.5");
 }
 
 #[tokio::test]
@@ -905,7 +905,7 @@ async fn router_complete_reports_upstream_error_after_capacity_skip() {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(500).set_body_string("temporary openai failure"))
-        .expect(1)
+        .expect(2)
         .mount(&h.openai)
         .await;
 
