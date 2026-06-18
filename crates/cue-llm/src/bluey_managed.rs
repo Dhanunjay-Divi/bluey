@@ -142,9 +142,7 @@ impl LlmProvider for BlueyManagedProvider {
                 append_utf8_chunk(&chunk, &mut pending_utf8, &mut buffer)?;
                 for parsed in parse_managed_stream_chunks(&mut buffer) {
                     let parsed = parsed?;
-                    if is_managed_billing_final(&parsed) {
-                        seen_billing_final = true;
-                    }
+                    validate_managed_stream_finality(&parsed, &mut seen_billing_final)?;
                     yield parsed;
                 }
             }
@@ -155,9 +153,7 @@ impl LlmProvider for BlueyManagedProvider {
             }
             for parsed in drain_managed_stream_tail(&mut buffer) {
                 let parsed = parsed?;
-                if is_managed_billing_final(&parsed) {
-                    seen_billing_final = true;
-                }
+                validate_managed_stream_finality(&parsed, &mut seen_billing_final)?;
                 yield parsed;
             }
             if !seen_billing_final {
@@ -168,6 +164,22 @@ impl LlmProvider for BlueyManagedProvider {
         };
         Ok(Box::pin(stream))
     }
+}
+
+fn validate_managed_stream_finality(
+    chunk: &LlmChunk,
+    seen_billing_final: &mut bool,
+) -> Result<(), LlmError> {
+    if is_managed_billing_final(chunk) {
+        *seen_billing_final = true;
+        return Ok(());
+    }
+    if chunk.finished && !*seen_billing_final {
+        return Err(LlmError::Provider(
+            "managed stream ended before final billing metadata".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn append_utf8_chunk(
@@ -895,6 +907,68 @@ mod tests {
             .next()
             .await
             .expect("terminal stream error")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("final billing metadata"));
+    }
+
+    #[tokio::test]
+    async fn complete_stream_errors_when_done_arrives_before_billing_final() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/router/complete/stream"))
+            .and(header("authorization", "Bearer access"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                        "data: [DONE]\n\n",
+                    )),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = CloudClient::new(
+            ClientConfig {
+                base_url: server.uri(),
+                user_agent: "test".into(),
+                timeout: Duration::from_secs(10),
+                trace_id: None,
+            },
+            Arc::new(MemoryStore::new()),
+        )
+        .unwrap();
+        client
+            .save_tokens(Tokens {
+                access: "access".into(),
+                refresh: "refresh".into(),
+                email: "e@example.com".into(),
+            })
+            .unwrap();
+        let provider = BlueyManagedProvider::new(client, ManagedLane::Instant);
+        let mut stream = provider
+            .complete_stream(&LlmRequest {
+                system: "system".into(),
+                user: "user".into(),
+                session_id: Some("sess-1".into()),
+                max_tokens: Some(10),
+                temperature: Some(0.2),
+                reasoning_effort: None,
+                thinking_budget_tokens: None,
+                request_id: Some("req-done-before-billing".into()),
+                image_data_urls: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let first = stream.next().await.expect("first delta").unwrap();
+        assert_eq!(first.text, "partial");
+        let error = stream
+            .next()
+            .await
+            .expect("done-before-billing error")
             .unwrap_err()
             .to_string();
         assert!(error.contains("final billing metadata"));

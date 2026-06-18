@@ -85,6 +85,7 @@ pub enum DaemonRequest {
     AudioStop,
     AiStatus,
     CloudStatus,
+    CloudLogout,
     CloudSyncNow,
     Recap,
     ActionItems,

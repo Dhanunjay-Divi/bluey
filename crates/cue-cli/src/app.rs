@@ -2870,6 +2870,7 @@ async fn bluey_logout_cmd() -> Result<()> {
         println!("Bluey is already logged out.");
         return Ok(());
     }
+    let _ = request(DaemonRequest::CloudLogout).await;
     println!("Bluey account logged out.");
     Ok(())
 }

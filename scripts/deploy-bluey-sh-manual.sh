@@ -23,6 +23,7 @@ rsync -av --delete \
     --exclude '/releases/***' \
     --exclude '/install.sh' \
     --exclude '/latest.json' \
+    --exclude '/latest.json.sig' \
     --exclude 'index.html.bak-*' \
     --exclude 'latest.json.bak-*' \
     web/ "$PUBLISH_HOST:$PUBLISH_PATH/"

@@ -36,7 +36,7 @@ use cue_llm::{
     bluey_managed::{BlueyManagedProvider, ManagedLane},
     LlmProvider as _, LlmRequest,
 };
-use futures_util::{future::join_all, SinkExt, StreamExt};
+use futures_util::{stream::FuturesUnordered, SinkExt, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::Command as TokioCommand;
@@ -440,6 +440,7 @@ struct Daemon {
     audio: Mutex<AudioPipelineStatus>,
     audio_runtime: Mutex<AudioRuntime>,
     cloud: Mutex<CloudSyncStatus>,
+    balance_poll_shutdown: Mutex<Option<watch::Sender<bool>>>,
     balance_watch: crate::cloud::balance::BalanceWatch,
     answer_generation: AtomicU64,
     active_answer_card: Mutex<Option<(u64, uuid::Uuid)>>,
@@ -463,7 +464,7 @@ struct Daemon {
     ///   InstructionsUpdated    -> Idle    (form closes after save)
     ///
     /// The gate then rejects:
-    ///   AttachFilesRequested when state != AttachOpen
+    ///   AttachFilesRequested when state is neither Idle nor AttachOpen
     ///   InstructionsUpdated  when state != InstructionsOpen
     /// while AttachRequested + InstructionsRequested are entry-point events
     /// allowed from any state.
@@ -559,6 +560,7 @@ pub async fn run() -> Result<()> {
             session_id: None,
         }),
         cloud: Mutex::new(cloud_status),
+        balance_poll_shutdown: Mutex::new(None),
         balance_watch,
         answer_generation: AtomicU64::new(0),
         active_answer_card: Mutex::new(None),
@@ -573,7 +575,7 @@ pub async fn run() -> Result<()> {
         )),
     });
 
-    maybe_spawn_balance_polling(&daemon);
+    maybe_spawn_balance_polling(&daemon).await;
 
     if !args.no_overlay {
         match spawn_overlay(
@@ -1110,7 +1112,25 @@ async fn handle_request_inner(
         DaemonRequest::CloudStatus => {
             let status = cloud_status_from_env(&daemon.paths);
             *daemon.cloud.lock().await = status.clone();
+            if status.sync_state == CloudSyncState::Disabled {
+                stop_balance_polling(daemon).await;
+            } else {
+                maybe_spawn_balance_polling(daemon).await;
+            }
             let _ = refresh_overlay_balance(daemon, Some(trace_id)).await;
+            Ok(DaemonResponse::CloudStatus { status })
+        }
+        DaemonRequest::CloudLogout => {
+            stop_balance_polling(daemon).await;
+            let status = cloud_status_from_env(&daemon.paths);
+            *daemon.cloud.lock().await = status.clone();
+            let _ = send_overlay(
+                daemon,
+                OverlayCommand::SetBalance {
+                    label: "--".to_string(),
+                },
+            )
+            .await;
             Ok(DaemonResponse::CloudStatus { status })
         }
         DaemonRequest::CloudSyncNow => {
@@ -1217,7 +1237,12 @@ async fn send_overlay(daemon: &Arc<Daemon>, command: OverlayCommand) -> Result<(
     return Err(anyhow!("overlay process is not running"));
 }
 
-fn maybe_spawn_balance_polling(daemon: &Arc<Daemon>) {
+async fn maybe_spawn_balance_polling(daemon: &Arc<Daemon>) {
+    let mut shutdown_guard = daemon.balance_poll_shutdown.lock().await;
+    if shutdown_guard.is_some() {
+        return;
+    }
+
     let Ok(client) = build_cloud_client(&daemon.paths, None) else {
         debug!("balance polling skipped; account store unavailable");
         return;
@@ -1227,7 +1252,19 @@ fn maybe_spawn_balance_polling(daemon: &Arc<Daemon>) {
         return;
     }
 
-    crate::cloud::balance::spawn_loop(client, daemon.balance_watch.clone());
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    crate::cloud::balance::spawn_loop_with_shutdown(
+        client,
+        daemon.balance_watch.clone(),
+        Some(shutdown_rx),
+    );
+    *shutdown_guard = Some(shutdown_tx);
+}
+
+async fn stop_balance_polling(daemon: &Arc<Daemon>) {
+    if let Some(shutdown_tx) = daemon.balance_poll_shutdown.lock().await.take() {
+        let _ = shutdown_tx.send(true);
+    }
 }
 
 fn spawn_overlay_balance_bridge(daemon: Arc<Daemon>) {
@@ -1766,6 +1803,9 @@ async fn build_real_audio_runtime_config(
         .or_else(|_| env::var("CUE_CLOUD_API_URL"))
         .ok()
         .or_else(|| account.as_ref().map(|account| account.api_url.clone()));
+    let supports_live_relay = sources
+        .iter()
+        .all(|source| matches!(source.ffmpeg_input, FfmpegAudioInput::NativeHelper { .. }));
 
     let (stt_endpoint, stt_api_key, stt_model, stt_provider_label, stt_transport) = if let Some(
         explicit_stt_key,
@@ -1793,7 +1833,9 @@ async fn build_real_audio_runtime_config(
         match (account_token, account_api_url) {
             (Some(token), Some(api_url)) => {
                 let stt_model = env_first(&["BLUEY_STT_MODEL"]).unwrap_or_else(|| "nova-3".into());
-                if env_truthy_any(&["BLUEY_STT_FORCE_CHUNKED", "BLUEY_MANAGED_STT_CHUNKED"]) {
+                if env_truthy_any(&["BLUEY_STT_FORCE_CHUNKED", "BLUEY_MANAGED_STT_CHUNKED"])
+                    || !supports_live_relay
+                {
                     (
                         format!("{}/router/transcribe", api_url.trim_end_matches('/')),
                         token,
@@ -2395,7 +2437,7 @@ async fn real_audio_loop(
     let mut last_transcript_at = Instant::now();
 
     loop {
-        let mut source_jobs = Vec::with_capacity(runtime.sources.len());
+        let mut source_jobs = FuturesUnordered::new();
         for source in &runtime.sources {
             let sequence = match source.source {
                 AudioSourceKind::System => {
@@ -2427,7 +2469,7 @@ async fn real_audio_loop(
             });
         }
 
-        for (source_kind, result) in join_all(source_jobs).await {
+        while let Some((source_kind, result)) = source_jobs.next().await {
             match result {
                 Ok(Some(segment)) => {
                     last_transcript_at = Instant::now();
@@ -2598,6 +2640,25 @@ async fn real_audio_relay_loop(
     let _ = relay_stop_tx.send(true);
     for handle in handles {
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    }
+    if completed_sources >= source_count
+        && daemon
+            .audio
+            .lock()
+            .await
+            .session_id
+            .as_deref()
+            .is_some_and(|active| active == session_id)
+    {
+        let _ = stop_audio_capture(&daemon).await;
+        set_overlay_listening_state(&daemon, ListeningState::Paused).await;
+        push_system_card(
+            &daemon,
+            CardKind::System,
+            "Listening stopped",
+            "Live transcription ended. Press Listen to start a fresh stream.",
+        )
+        .await;
     }
 }
 
@@ -2840,6 +2901,7 @@ async fn maybe_auto_stop_idle_audio(
     }
 
     let _status = stop_audio_capture(daemon).await;
+    set_overlay_listening_state(daemon, ListeningState::Paused).await;
     {
         let mut audio = daemon.audio.lock().await;
         audio.note = Some(format!(
@@ -3504,6 +3566,31 @@ async fn add_audio_transcript_segment_inner(
     if text.is_empty() {
         return Ok(());
     }
+    let source_label = match segment.source {
+        Some(AudioSourceKind::System) => "system",
+        Some(AudioSourceKind::Microphone) => "microphone",
+        None => "unknown",
+    };
+
+    if !segment.is_final {
+        let _ = send_overlay(
+            daemon,
+            OverlayCommand::TranscriptPartial {
+                source: source_label.to_string(),
+                text: text.to_string(),
+            },
+        )
+        .await;
+        let _ = daemon.live_transcript_tx.send(LiveTranscriptEvent {
+            session_id: audio_session_id.unwrap_or_default(),
+            source: source_label.to_string(),
+            text: text.to_string(),
+            is_final: false,
+            speaker: None,
+            ts_ms: clock::now_epoch_ms_string().parse::<u64>().unwrap_or(0),
+        });
+        return Ok(());
+    }
 
     let meeting_snapshot = {
         let mut meeting_guard = daemon.meeting.lock().await;
@@ -3541,15 +3628,18 @@ async fn add_audio_transcript_segment_inner(
         .filter(|label| !label.trim().is_empty())
         .map(|label| format!("{label} STT"))
         .unwrap_or_else(|| "audio STT".to_string());
+    let _ = send_overlay(
+        daemon,
+        OverlayCommand::TranscriptFinal {
+            source: source_label.to_string(),
+            text: text.to_string(),
+        },
+    )
+    .await;
     let card = CueCard::new(CardKind::Transcript, title, text).with_source(source);
     let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
 
     // Broadcast live transcript event for dashboard consumption.
-    let source_label = match segment.source {
-        Some(AudioSourceKind::System) => "system",
-        Some(AudioSourceKind::Microphone) => "microphone",
-        None => "unknown",
-    };
     let ts_ms = meeting_snapshot
         .transcript
         .last()
@@ -3579,9 +3669,25 @@ fn index_transcript_for_rag(daemon: &Arc<Daemon>, session_id: String, text: Stri
     }
 
     let rag = Arc::clone(rag);
+    let store = daemon.store.clone();
     let rag_index_lock = Arc::clone(&daemon.rag_index_lock);
     tokio::spawn(async move {
         let _guard = rag_index_lock.lock().await;
+        let Ok(session_uuid) = uuid::Uuid::parse_str(&session_id) else {
+            warn!(session_id = %session_id, "skipping RAG transcript index for invalid session id");
+            return;
+        };
+        match store.load_by_id(session_uuid) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                debug!(session_id = %session_id, "skipping RAG transcript index for deleted session");
+                return;
+            }
+            Err(error) => {
+                warn!(session_id = %session_id, error = %error, "skipping RAG transcript index after session lookup failed");
+                return;
+            }
+        }
         rag.index_transcript(&session_id, &text).await;
     });
 }
@@ -3599,9 +3705,25 @@ fn index_context_artifacts_for_rag(
     }
 
     let rag = Arc::clone(rag);
+    let store = daemon.store.clone();
     let rag_index_lock = Arc::clone(&daemon.rag_index_lock);
     tokio::spawn(async move {
         let _guard = rag_index_lock.lock().await;
+        let Ok(session_uuid) = uuid::Uuid::parse_str(&session_id) else {
+            warn!(session_id = %session_id, "skipping RAG artifact index for invalid session id");
+            return;
+        };
+        match store.load_by_id(session_uuid) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                debug!(session_id = %session_id, "skipping RAG artifact index for deleted session");
+                return;
+            }
+            Err(error) => {
+                warn!(session_id = %session_id, error = %error, "skipping RAG artifact index after session lookup failed");
+                return;
+            }
+        }
         for artifact in artifacts {
             rag.index_context_artifact(&session_id, &artifact).await;
         }
@@ -3614,20 +3736,33 @@ fn reindex_meeting_for_rag(daemon: &Arc<Daemon>, meeting: MeetingRecord) {
     };
 
     let rag = Arc::clone(rag);
+    let store = daemon.store.clone();
     let rag_index_lock = Arc::clone(&daemon.rag_index_lock);
     tokio::spawn(async move {
-        rebuild_meeting_rag_index(rag, rag_index_lock, meeting, "session reindex").await
+        rebuild_meeting_rag_index(rag, store, rag_index_lock, meeting, "session reindex").await
     });
 }
 
 async fn rebuild_meeting_rag_index(
     rag: Arc<crate::db::rag::RagPipeline>,
+    store: MeetingStore,
     rag_index_lock: Arc<Mutex<()>>,
     meeting: MeetingRecord,
     reason: &'static str,
 ) {
     let _guard = rag_index_lock.lock().await;
     let session_id = meeting.id.to_string();
+    match store.load_by_id(meeting.id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            debug!(session_id = %session_id, reason, "skipping RAG rebuild for deleted session");
+            return;
+        }
+        Err(error) => {
+            warn!(session_id = %session_id, reason, error = %error, "skipping RAG rebuild after session lookup failed");
+            return;
+        }
+    }
     if let Err(error) = rag.delete_session(&session_id).await {
         warn!(session_id = %session_id, reason, error = %error, "failed to clear RAG session before rebuild");
         return;
@@ -4609,8 +4744,7 @@ fn managed_lane_for_provider(
 fn managed_reasoning_effort(lane: ManagedLane) -> Option<String> {
     match lane {
         ManagedLane::Deep => Some("high".to_string()),
-        ManagedLane::Balanced | ManagedLane::Vision => Some("medium".to_string()),
-        ManagedLane::Instant => None,
+        ManagedLane::Instant | ManagedLane::Balanced | ManagedLane::Vision => None,
     }
 }
 
@@ -6355,6 +6489,7 @@ async fn delete_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<
     if is_active {
         let _ = stop_audio_capture(daemon).await;
         let _ = stop_screen_capture(daemon, "session deleted").await;
+        set_overlay_listening_state(daemon, ListeningState::Paused).await;
     }
 
     let was_active = {
@@ -6895,7 +7030,7 @@ async fn shutdown_daemon(daemon: &Arc<Daemon>) {
 /// - Binary path canonicalization + install-dir containment check
 /// - Per-session token passed via env var; events without matching token dropped
 /// - Per-event field length limits; oversized events dropped + logged
-/// - UI state-machine: AttachFilesRequested allowed only when AttachOpen, etc.
+/// - UI state-machine: AttachFilesRequested allowed from drag/drop idle or AttachOpen, etc.
 fn spawn_overlay(
     explicit: Option<&Path>,
     events: mpsc::UnboundedSender<OverlayEvent>,
@@ -7363,9 +7498,11 @@ pub fn validate_and_decode_overlay_line(
         // They drive the transition Idle -> AttachOpen / InstructionsOpen.
         // They MUST be accepted from Idle (otherwise the panels can never open).
         OverlayEvent::AttachRequested | OverlayEvent::InstructionsRequested => true,
-        // AttachFilesRequested is the inner submit from the attach picker;
-        // it makes sense only while the attach panel is open.
-        OverlayEvent::AttachFilesRequested { .. } => current_state == S::AttachOpen,
+        // AttachFilesRequested can come from the attach picker or a direct
+        // drag-and-drop path from the native overlay.
+        OverlayEvent::AttachFilesRequested { .. } => {
+            current_state == S::Idle || current_state == S::AttachOpen
+        }
         // InstructionsUpdated may come from the inline native overlay textbox.
         // Token validation and length caps still apply; no separate modal state
         // is required for this product flow.

@@ -200,7 +200,7 @@ pub struct ApiError {
 struct PricedRoute {
     provider: &'static str,
     model: &'static str,
-    pricing: &'static pricing::ModelPricing,
+    pricing: pricing::ModelPricing,
     estimated_cost_cents: i64,
     estimated_bluey_cost_cents: i64,
 }
@@ -301,6 +301,22 @@ fn release_and_upstream_spend_guard_check(
 /// counts as a response and is surfaced through the normal consume path.
 /// Override with BLUEY_STREAM_FIRST_TOKEN_TIMEOUT_MS.
 const DEFAULT_FIRST_TOKEN_TIMEOUT_MS: u64 = 6_000;
+const DEFAULT_DEEP_FIRST_TOKEN_TIMEOUT_MS: u64 = 30_000;
+
+fn first_token_deadline_for_lane(
+    effective_lane: &str,
+    has_thinking_budget: bool,
+) -> std::time::Duration {
+    if effective_lane == "deep" || has_thinking_budget {
+        let ms = std::env::var("BLUEY_STREAM_DEEP_FIRST_TOKEN_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .unwrap_or(DEFAULT_DEEP_FIRST_TOKEN_TIMEOUT_MS);
+        return std::time::Duration::from_millis(ms);
+    }
+    first_token_deadline()
+}
 
 /// Time budget for managed cloud RAG retrieval before answering. RAG
 /// enrichment is best-effort context, not correctness — it must never
@@ -444,20 +460,26 @@ fn priced_routes_for(
     routing::resolve_route_candidates(lane)
         .into_iter()
         .filter_map(|(provider, model)| {
-            pricing::lookup(provider, model).map(|entry| PricedRoute {
-                provider,
-                model,
-                pricing: entry,
-                estimated_cost_cents: pricing::estimate_cost_ceiling(
-                    entry,
-                    estimated_input_tokens,
-                    max_output_tokens,
-                ),
-                estimated_bluey_cost_cents: pricing::estimate_bluey_cost_ceiling(
-                    entry,
-                    estimated_input_tokens,
-                    max_output_tokens,
-                ),
+            pricing::lookup(provider, model).map(|entry| {
+                let mut route_pricing = *entry;
+                if lane == "deep" {
+                    route_pricing.markup_percent = 150;
+                }
+                PricedRoute {
+                    provider,
+                    model,
+                    pricing: route_pricing,
+                    estimated_cost_cents: pricing::estimate_cost_ceiling(
+                        &route_pricing,
+                        estimated_input_tokens,
+                        max_output_tokens,
+                    ),
+                    estimated_bluey_cost_cents: pricing::estimate_bluey_cost_ceiling(
+                        &route_pricing,
+                        estimated_input_tokens,
+                        max_output_tokens,
+                    ),
+                }
             })
         })
         .collect()
@@ -759,6 +781,8 @@ async fn complete_stream_inner(
         req.reasoning_effort.as_deref(),
         req.thinking_budget_tokens,
     );
+    let has_thinking_budget = !matches!(thinking.mode, routing::ThinkingMode::Off);
+    let first_output_deadline = first_token_deadline_for_lane(effective_lane, has_thinking_budget);
     let effective_max_out = routing::effective_max_output_tokens(req.max_tokens, thinking);
     let max_out = i64::from(effective_max_out);
     let est_in = req
@@ -845,7 +869,6 @@ async fn complete_stream_inner(
         );
         if key_candidates.is_empty() {
             last_error = Some(missing_provider_key_error(route.provider));
-            last_failure_was_capacity = false;
             continue;
         }
 
@@ -917,7 +940,7 @@ async fn complete_stream_inner(
                         model: stream_model,
                         events: mut stream_events,
                     } = streaming;
-                    match tokio::time::timeout(first_token_deadline(), stream_events.next()).await {
+                    match tokio::time::timeout(first_output_deadline, stream_events.next()).await {
                         Ok(first_event) => {
                             selected_route_idx = idx;
                             selected_route = Some(*route);
@@ -948,7 +971,7 @@ async fn complete_stream_inner(
                                 request_id = %req.request_id,
                                 provider = %route.provider,
                                 model = %route.model,
-                                first_token_timeout_ms = first_token_deadline().as_millis() as u64,
+                                first_token_timeout_ms = first_output_deadline.as_millis() as u64,
                                 "streaming first-token deadline exceeded; trying next route"
                             );
                             last_error = Some(anyhow::anyhow!("first-token deadline exceeded"));
@@ -1121,7 +1144,7 @@ async fn complete_stream_inner(
         };
         let elapsed_ms = started.elapsed().as_millis() as i64;
         let (bluey_cost, customer_cost) = pricing::compute_cost(
-            selected_route.pricing,
+            &selected_route.pricing,
             input_tokens,
             output_tokens,
         );
@@ -1144,14 +1167,25 @@ async fn complete_stream_inner(
         } else {
             match balance::deduct(&state.pool, &account.id, customer_cost) {
                 Ok(ok) => {
-                    if !ok {
+                    if ok {
+                        account.trial_seconds_remaining
+                    } else {
                         tracing::warn!(
                             account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                             cost_cents = customer_cost,
-                            "streaming post-completion deduct failed; bluey absorbs overrun"
+                            "streaming post-completion deduct failed"
                         );
+                        idempotency_guard.mark_failed_now();
+                        yield Ok(Event::default().event("error").data(
+                            serde_json::json!({
+                                "error": "insufficient balance after completion; add credits and retry",
+                                "reason": "insufficient_balance",
+                                "reload_url": format!("{}/reload", state.config.public_url),
+                            })
+                            .to_string(),
+                        ));
+                        return;
                     }
-                    account.trial_seconds_remaining
                 }
                 Err(e) => {
                     idempotency_guard.mark_failed_now();
@@ -1560,7 +1594,6 @@ async fn complete_inner(
         );
         if key_candidates.is_empty() {
             last_error = Some(missing_provider_key_error(route.provider));
-            last_failure_was_capacity = false;
             continue;
         }
 
@@ -1722,7 +1755,7 @@ async fn complete_inner(
 
     // 6. Compute actual cost from real token counts.
     let (bluey_cost, customer_cost) = pricing::compute_cost(
-        selected_route.pricing,
+        &selected_route.pricing,
         comp.input_tokens,
         comp.output_tokens,
     );
@@ -2666,7 +2699,6 @@ pub async fn transcribe(
         );
         if key_candidates.is_empty() {
             last_error = Some(missing_provider_key_error(route.provider));
-            last_failure_was_capacity = false;
             continue;
         }
 
@@ -2945,6 +2977,21 @@ mod tests {
     }
 
     #[test]
+    fn deep_first_token_deadline_uses_deep_budget() {
+        std::env::remove_var("BLUEY_STREAM_DEEP_FIRST_TOKEN_TIMEOUT_MS");
+        assert_eq!(
+            first_token_deadline_for_lane("deep", true),
+            std::time::Duration::from_millis(DEFAULT_DEEP_FIRST_TOKEN_TIMEOUT_MS)
+        );
+        std::env::set_var("BLUEY_STREAM_DEEP_FIRST_TOKEN_TIMEOUT_MS", "12000");
+        assert_eq!(
+            first_token_deadline_for_lane("balanced", true),
+            std::time::Duration::from_millis(12_000)
+        );
+        std::env::remove_var("BLUEY_STREAM_DEEP_FIRST_TOKEN_TIMEOUT_MS");
+    }
+
+    #[test]
     fn streaming_idempotency_guard_releases_on_drop_before_billing() {
         let pool = temp_pool();
         let account_id = make_account(&pool, "stream-drop@example.com");
@@ -3019,6 +3066,17 @@ mod tests {
             priced_routes_for("local", 100, 100).is_empty(),
             "local/Ollama fallback must stay daemon-only, not managed cloud"
         );
+    }
+
+    #[test]
+    fn deep_lane_fallbacks_keep_deep_markup() {
+        let routes = priced_routes_for("deep", 1_000, 1_000);
+        let sonnet_fallback = routes
+            .iter()
+            .find(|route| route.provider == "anthropic" && route.model.contains("sonnet"))
+            .expect("deep lane keeps a Sonnet fallback");
+
+        assert_eq!(sonnet_fallback.pricing.markup_percent, 150);
     }
 
     #[test]

@@ -120,7 +120,9 @@ impl OverlayEventKind {
     pub fn is_allowed_in(self, state: OverlayUiState) -> bool {
         match self {
             Self::Pong | Self::RequestSync | Self::Echo | Self::AskRequested => true,
-            Self::AttachFilesRequested => state == OverlayUiState::AttachOpen,
+            Self::AttachFilesRequested => {
+                state == OverlayUiState::Idle || state == OverlayUiState::AttachOpen
+            }
             Self::InstructionsUpdated => state == OverlayUiState::InstructionsOpen,
         }
     }
@@ -314,8 +316,8 @@ mod tests {
     }
 
     #[test]
-    fn attach_files_only_allowed_when_attach_open() {
-        assert!(!OverlayEventKind::AttachFilesRequested.is_allowed_in(OverlayUiState::Idle));
+    fn attach_files_allowed_from_idle_or_attach_open() {
+        assert!(OverlayEventKind::AttachFilesRequested.is_allowed_in(OverlayUiState::Idle));
         assert!(OverlayEventKind::AttachFilesRequested.is_allowed_in(OverlayUiState::AttachOpen));
         assert!(
             !OverlayEventKind::AttachFilesRequested.is_allowed_in(OverlayUiState::InstructionsOpen)

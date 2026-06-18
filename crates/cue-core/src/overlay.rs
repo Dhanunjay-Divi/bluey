@@ -66,6 +66,14 @@ pub enum OverlayCommand {
     ListeningStateChanged {
         state: ListeningState,
     },
+    TranscriptPartial {
+        source: String,
+        text: String,
+    },
+    TranscriptFinal {
+        source: String,
+        text: String,
+    },
     PushCard {
         card: CueCard,
     },

@@ -394,6 +394,7 @@ async fn install_update(plan: &UpdatePlan) -> Result<()> {
         .env("BLUEY_ARTIFACT_URL", &plan.artifact_url)
         .env_remove("BLUEY_SKIP_UPDATE")
         .env_remove("BLUEY_UPDATE_FORCE")
+        .env_remove("BLUEY_SKIP_CHECKSUM")
         .envs(
             plan.artifact_sha256
                 .as_ref()

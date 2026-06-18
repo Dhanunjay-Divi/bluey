@@ -1,9 +1,8 @@
-//! OS keyring–backed token storage.
+//! Bluey account token storage.
 //!
-//! Tokens are stored under the keyring service `bluey_account` with
-//! username keys `access_token` / `refresh_token` / `account_email`.
-//! This deliberately uses a different keyring service than the dev-mode
-//! BYOK keys (`llm_*`) so the namespaces stay distinct.
+//! New installs store tokens in the local Bluey account profile so CLI,
+//! daemon, and dashboard agree on the API URL and device identity. Legacy
+//! keyring storage remains available as an explicit fallback.
 
 use crate::error::{Error, Result};
 
@@ -11,6 +10,7 @@ const KEYRING_SERVICE: &str = "bluey_account";
 const KEY_ACCESS: &str = "access_token";
 const KEY_REFRESH: &str = "refresh_token";
 const KEY_EMAIL: &str = "account_email";
+const DEFAULT_BLUEY_API_URL: &str = "https://bluey.sh";
 
 #[derive(Debug, Clone)]
 pub struct Tokens {
@@ -55,7 +55,7 @@ impl TokenStore for AccountFileStore {
         let mut account = self.load_account()?.unwrap_or_else(|| {
             let mut account = cue_core::AccountConfig::local();
             account.provider = "bluey".to_string();
-            account.api_url = "https://bluey.sh".to_string();
+            account.api_url = default_account_api_url();
             account
         });
         account.provider = if account.provider == "local" {
@@ -94,6 +94,13 @@ impl TokenStore for AccountFileStore {
         account.refresh_token = None;
         self.save_account(&account)
     }
+}
+
+fn default_account_api_url() -> String {
+    std::env::var("BLUEY_API_BASE_URL")
+        .or_else(|_| std::env::var("BLUEY_CLOUD_API_URL"))
+        .or_else(|_| std::env::var("CUE_CLOUD_API_URL"))
+        .unwrap_or_else(|_| DEFAULT_BLUEY_API_URL.to_string())
 }
 
 /// Production keyring-backed store.
@@ -235,6 +242,46 @@ mod tests {
         assert_eq!(loaded.user_id, "new@example.com");
         assert_eq!(loaded.access_token.as_deref(), Some("new-access"));
         assert_eq!(loaded.refresh_token.as_deref(), Some("new-refresh"));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn account_file_store_save_seeds_api_url_from_environment() {
+        let base = std::env::temp_dir().join(format!(
+            "bluey-account-file-env-url-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let paths = cue_core::app_paths::AppPaths {
+            data_dir: base.join("data"),
+            config_dir: base.join("config"),
+            runtime_dir: base.join("run"),
+            state_file: base.join("run/daemon-state.json"),
+            account_file: base.join("config/account.json"),
+            settings_file: base.join("config/settings.json"),
+        };
+
+        std::env::set_var("BLUEY_API_BASE_URL", "http://127.0.0.1:8787");
+        let store = AccountFileStore::new(paths.clone());
+        store
+            .save(&Tokens {
+                access: "access".into(),
+                refresh: "refresh".into(),
+                email: "local@example.com".into(),
+            })
+            .unwrap();
+        std::env::remove_var("BLUEY_API_BASE_URL");
+
+        let loaded = cue_core::load_account(&paths).unwrap().unwrap();
+        assert_eq!(loaded.provider, "bluey");
+        assert_eq!(loaded.api_url, "http://127.0.0.1:8787");
+        assert_eq!(loaded.user_id, "local@example.com");
+        assert_eq!(loaded.access_token.as_deref(), Some("access"));
+        assert_eq!(loaded.refresh_token.as_deref(), Some("refresh"));
 
         let _ = std::fs::remove_dir_all(base);
     }

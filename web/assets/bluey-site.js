@@ -173,17 +173,46 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       })();
     }
 
-    async function apiJson(path, options = {}) {
-      const headers = new Headers(options.headers || {});
-      headers.set('Content-Type', 'application/json');
-      const token = accountToken();
-      if (token) headers.set('Authorization', `Bearer ${token}`);
-      const response = await fetch(path, { ...options, headers });
+    async function refreshAccountToken() {
+      const refreshToken = localStorage.getItem('bluey_refresh_token') || '';
+      if (!refreshToken) return '';
+      const response = await fetch('/auth/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh_token: refreshToken }),
+      });
       let body = null;
       try {
         body = await response.json();
       } catch {
         body = null;
+      }
+      if (!response.ok || !body?.access_token) {
+        clearAccountToken();
+        return '';
+      }
+      setAccountToken(body);
+      return body.access_token;
+    }
+
+    async function apiJson(path, options = {}, hasRetriedAuth = false) {
+      const { skipAuthRefresh, ...fetchOptions } = options;
+      const headers = new Headers(options.headers || {});
+      headers.set('Content-Type', 'application/json');
+      const token = accountToken();
+      if (token) headers.set('Authorization', `Bearer ${token}`);
+      const response = await fetch(path, { ...fetchOptions, headers });
+      let body = null;
+      try {
+        body = await response.json();
+      } catch {
+        body = null;
+      }
+      if (response.status === 401 && !hasRetriedAuth && !skipAuthRefresh) {
+        const refreshed = await refreshAccountToken();
+        if (refreshed) {
+          return apiJson(path, options, true);
+        }
       }
       if (!response.ok) {
         throw new Error(body?.error || `${response.status} ${response.statusText}`);
@@ -662,15 +691,6 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       accountApp.hidden = false;
       downloadApp.hidden = true;
       renderDeviceLinkHint();
-
-      const params = new URLSearchParams(location.search);
-      if (params.get('access_token')) {
-        setAccountToken({
-          access_token: params.get('access_token'),
-          refresh_token: params.get('refresh_token') || '',
-        });
-        history.replaceState(null, '', location.pathname);
-      }
 
       document.getElementById('accountForm').addEventListener('submit', (event) => {
         event.preventDefault();
