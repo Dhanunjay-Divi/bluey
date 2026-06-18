@@ -93,13 +93,13 @@ These comments were reviewed against the current branch and did not need new cod
 - macOS smoke no longer hard-depends on Pillow.
 - Privacy text no longer claims default desktop tokens live only in the OS keychain.
 
-## 5. Remaining / Deferred Items
+## 5. Superseded / Deferred Items
 
-### R-1 — Dual-source STT reservation is still an architecture item
+### R-1 — Dual-source STT reservation is closed in follow-up
 
-The review correctly points out that mic+system can open two STT relay sessions while billing only has close-time deduction semantics. A safe fix needs a server-side reservation/settlement model for STT minutes, or a single aggregate relay session that accounts for multiple active sources. I did not patch this locally because a quick client-only change would either overcharge, undercharge, or create bad retry behavior.
+This was still open when this handoff was first written, but it is no longer open at the current branch tip.
 
-Recommended next round: `STT-BILLING-RESERVATION`, owned by server billing + daemon audio together.
+Follow-up commit `b93882b fix(server): reserve STT relay billing upfront` added server-side reservation/settlement for paid live STT. The server now reserves worst-case session cost/trial seconds before issuing a relay token, refunds unused reserved credit on close, records actual usage after settlement, and rejects a second mic/system relay when the account cannot cover it. See `docs/rounds/STT-RESERVATION-AND-DECOUPLING-FOR-KIRO-REVIEW.md`.
 
 ### R-2 — Auto-renew relay sessions is future polish
 
@@ -132,4 +132,4 @@ Result: all passed on uno.
 1. The deep/thinking first-output deadline is set to 30 seconds by default. That is intentionally safer for quality, but live telemetry may show a lower value works.
 2. RAG tombstone checks depend on `MeetingStore::load_by_id` being the canonical deletion source. If cloud/session sync introduces another deletion ledger, the check should include it.
 3. `BLUEY_UPDATE_PUBKEY` must be set in release build environments. The workflow now fails closed, but operators must create the repository variable before the next signed release.
-4. STT reservation remains unresolved by design; do not consider billing final for high-volume dual-source live caption usage until the reservation round lands.
+4. This doc originally marked STT reservation unresolved; that statement is superseded by `b93882b` and `docs/rounds/STT-RESERVATION-AND-DECOUPLING-FOR-KIRO-REVIEW.md`.
