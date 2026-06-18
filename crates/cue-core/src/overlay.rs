@@ -133,7 +133,10 @@ pub enum OverlayEvent {
     SessionContinueRequested,
     SessionNewRequested,
     ActivePageCaptureRequested,
-    AnalyzeScreenRequested,
+    AnalyzeScreenRequested {
+        #[serde(default)]
+        question: Option<String>,
+    },
     RecapRequested,
     ContextListRequested,
     CaptureStartRequested,

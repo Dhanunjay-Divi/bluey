@@ -76,8 +76,10 @@ private enum BlueyTheme {
     }
 }
 
+private let minimumOverlayBackgroundOpacity: CGFloat = 0.18
+
 private func blueyMaterialAlpha(_ base: CGFloat, opacity: CGFloat, floor: CGFloat = 0.02) -> CGFloat {
-    min(1.0, max(floor, base * min(max(opacity, 0.50), 1.0)))
+    min(1.0, max(floor, base * min(max(opacity, minimumOverlayBackgroundOpacity), 1.0)))
 }
 
 private final class VerticallyCenteredTextFieldCell: NSTextFieldCell {
@@ -105,6 +107,42 @@ private func useCenteredSingleLineCell(_ label: NSTextField) {
     label.drawsBackground = false
     label.isEditable = false
     label.isSelectable = false
+}
+
+private final class OpacityScrubberView: NSView {
+    var value: Double = 0.94 {
+        didSet { needsDisplay = true }
+    }
+    var onChange: ((Double) -> Void)?
+
+    override var acceptsFirstResponder: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, alphaValue > 0.01, bounds.contains(point) else { return nil }
+        return self
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        updateValue(from: event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        updateValue(from: event)
+    }
+
+    private func updateValue(from event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let trackStart = min(bounds.width - 36, CGFloat(50))
+        let trackEnd = max(trackStart + 1, bounds.width - 31)
+        let progress = min(max((point.x - trackStart) / (trackEnd - trackStart), 0), 1)
+        let minimum = Double(minimumOverlayBackgroundOpacity)
+        onChange?(minimum + Double(progress) * (1.0 - minimum))
+    }
 }
 
 private enum ExpandedPanelMetrics {
@@ -716,6 +754,14 @@ private func emitAsk(question: String, provider: String?, model: String?, mode: 
     if let model = model       { p["model"]    = model }
     if let mode = mode         { p["mode"]     = mode }
     emitEvent(p)
+}
+
+private func emitAnalyzeScreen(question: String?) {
+    var payload: [String: Any] = ["type": "analyze_screen_requested"]
+    if let question = question?.trimmingCharacters(in: .whitespacesAndNewlines), !question.isEmpty {
+        payload["question"] = question
+    }
+    emitEvent(payload)
 }
 
 private func emitAttachFiles(paths: [String]) {
@@ -1370,7 +1416,7 @@ private final class PillView: NSView {
     }
 
     func applyBackgroundOpacity(_ opacity: Double) {
-        backgroundOpacity = min(max(CGFloat(opacity), 0.50), 1.0)
+        backgroundOpacity = min(max(CGFloat(opacity), minimumOverlayBackgroundOpacity), 1.0)
         controlRail.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.040)).cgColor
         controlRail.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.085)).cgColor
         configureMiniButton(styleButton, symbol: "text.cursor", fallback: "?", tint: BlueyTheme.cyan)
@@ -2516,9 +2562,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         static let headerHorizontalInset: CGFloat = 10
         static let headerTopInset: CGFloat = 14
         static let workspaceTopInset: CGFloat = 92
-        static let composerInputHeight: CGFloat = 32
-        static let composerBaseHeight: CGFloat = 70
-        static let composerExtraChromeHeight: CGFloat = 38
+        static let composerInputHeight: CGFloat = 26
+        static let composerBaseHeight: CGFloat = 56
+        static let composerExtraChromeHeight: CGFloat = 30
         static let transcriptStripHeight: CGFloat = 20
     }
 
@@ -2572,7 +2618,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     let analyzeButton: NSButton
     let attachButton: NSButton
     let instructionsButton: NSButton
-    let opacityControl: NSView
+    let opacityControl: OpacityScrubberView
     let opacityLabel: NSTextField
     let opacitySlider: NSSlider
     let opacityValueLabel: NSTextField
@@ -2681,13 +2727,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         composerSurface = ComposerSurfaceView()
         composer = ComposerTextView(frame: .zero, textContainer: nil)
         recordingButton = NSButton(title: "Listen", target: nil, action: nil)
-        askButton = NSButton(title: "Answer ⌘↵", target: nil, action: nil)
+        askButton = NSButton(title: "Answer", target: nil, action: nil)
         analyzeButton = NSButton(title: "Screen", target: nil, action: nil)
         attachButton = NSButton(title: "", target: nil, action: nil)
         instructionsButton = NSButton(title: "Tone", target: nil, action: nil)
-        opacityControl = NSView()
+        opacityControl = OpacityScrubberView()
         opacityLabel = NSTextField(labelWithString: "Opacity")
-        opacitySlider = NSSlider(value: 0.94, minValue: 0.50, maxValue: 1.0, target: nil, action: nil)
+        opacitySlider = NSSlider(value: 0.94, minValue: Double(minimumOverlayBackgroundOpacity), maxValue: 1.0, target: nil, action: nil)
         opacityValueLabel = NSTextField(labelWithString: "94")
         hideButton = NSButton(title: "", target: nil, action: nil)
         closeButton = NSButton(title: "x", target: nil, action: nil)
@@ -3015,42 +3061,42 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             attachmentStack.bottomAnchor.constraint(equalTo: attachmentStrip.contentView.bottomAnchor),
             attachmentStack.heightAnchor.constraint(equalTo: attachmentStrip.heightAnchor),
 
-            composerSurface.topAnchor.constraint(equalTo: composerBar.topAnchor, constant: 5),
+            composerSurface.topAnchor.constraint(equalTo: composerBar.topAnchor, constant: 4),
             composerSurface.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 8),
             composerSurface.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -8),
             composerTextHeight,
 
             composer.topAnchor.constraint(equalTo: composerSurface.topAnchor, constant: 1),
-            composer.leadingAnchor.constraint(equalTo: composerSurface.leadingAnchor, constant: 10),
+            composer.leadingAnchor.constraint(equalTo: composerSurface.leadingAnchor, constant: 9),
             composer.trailingAnchor.constraint(equalTo: recordingButton.leadingAnchor, constant: -6),
             composer.bottomAnchor.constraint(equalTo: composerSurface.bottomAnchor, constant: -1),
 
-            recordingButton.trailingAnchor.constraint(equalTo: askButton.leadingAnchor, constant: -5),
+            recordingButton.trailingAnchor.constraint(equalTo: askButton.leadingAnchor, constant: -4),
             recordingButton.centerYAnchor.constraint(equalTo: composerSurface.centerYAnchor),
-            recordingButton.widthAnchor.constraint(equalToConstant: 68),
-            recordingButton.heightAnchor.constraint(equalToConstant: 26),
+            recordingButton.widthAnchor.constraint(equalToConstant: 64),
+            recordingButton.heightAnchor.constraint(equalToConstant: 24),
 
             askButton.trailingAnchor.constraint(equalTo: composerSurface.trailingAnchor, constant: -5),
             askButton.centerYAnchor.constraint(equalTo: composerSurface.centerYAnchor),
-            askButton.widthAnchor.constraint(equalToConstant: 92),
-            askButton.heightAnchor.constraint(equalToConstant: 28),
+            askButton.widthAnchor.constraint(equalToConstant: 76),
+            askButton.heightAnchor.constraint(equalToConstant: 26),
 
             attachButton.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 8),
-            attachButton.bottomAnchor.constraint(equalTo: composerBar.bottomAnchor, constant: -5),
-            attachButton.widthAnchor.constraint(equalToConstant: 26),
-            attachButton.heightAnchor.constraint(equalToConstant: 26),
+            attachButton.bottomAnchor.constraint(equalTo: composerBar.bottomAnchor, constant: -4),
+            attachButton.widthAnchor.constraint(equalToConstant: 24),
+            attachButton.heightAnchor.constraint(equalToConstant: 24),
 
             instructionsButton.leadingAnchor.constraint(equalTo: attachButton.trailingAnchor, constant: 6),
             instructionsButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            instructionsButton.widthAnchor.constraint(equalToConstant: 66),
-            instructionsButton.heightAnchor.constraint(equalToConstant: 26),
+            instructionsButton.widthAnchor.constraint(equalToConstant: 62),
+            instructionsButton.heightAnchor.constraint(equalToConstant: 24),
 
             opacityControl.leadingAnchor.constraint(equalTo: instructionsButton.trailingAnchor, constant: 6),
             opacityControl.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            opacityControl.widthAnchor.constraint(equalToConstant: 112),
-            opacityControl.heightAnchor.constraint(equalToConstant: 26),
+            opacityControl.widthAnchor.constraint(equalToConstant: 132),
+            opacityControl.heightAnchor.constraint(equalToConstant: 24),
 
-            opacityLabel.leadingAnchor.constraint(equalTo: opacityControl.leadingAnchor, constant: 8),
+            opacityLabel.leadingAnchor.constraint(equalTo: opacityControl.leadingAnchor, constant: 7),
             opacityLabel.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
             opacityLabel.widthAnchor.constraint(equalToConstant: 38),
 
@@ -3059,20 +3105,20 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             opacitySlider.trailingAnchor.constraint(equalTo: opacityValueLabel.leadingAnchor, constant: -5),
             opacitySlider.heightAnchor.constraint(equalToConstant: 16),
 
-            opacityValueLabel.trailingAnchor.constraint(equalTo: opacityControl.trailingAnchor, constant: -7),
+            opacityValueLabel.trailingAnchor.constraint(equalTo: opacityControl.trailingAnchor, constant: -6),
             opacityValueLabel.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
-            opacityValueLabel.widthAnchor.constraint(equalToConstant: 18),
+            opacityValueLabel.widthAnchor.constraint(equalToConstant: 24),
 
             analyzeButton.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -10),
             analyzeButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            analyzeButton.widthAnchor.constraint(equalToConstant: 72),
-            analyzeButton.heightAnchor.constraint(equalToConstant: 26),
+            analyzeButton.widthAnchor.constraint(equalToConstant: 68),
+            analyzeButton.heightAnchor.constraint(equalToConstant: 24),
 
             modelMenu.trailingAnchor.constraint(equalTo: analyzeButton.leadingAnchor, constant: -6),
             modelMenu.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
             modelMenu.widthAnchor.constraint(greaterThanOrEqualToConstant: 98),
             modelMenu.widthAnchor.constraint(lessThanOrEqualToConstant: 126),
-            modelMenu.heightAnchor.constraint(equalToConstant: 26),
+            modelMenu.heightAnchor.constraint(equalToConstant: 24),
 
             opacityControl.trailingAnchor.constraint(lessThanOrEqualTo: modelMenu.leadingAnchor, constant: -10),
 
@@ -3132,6 +3178,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         closeConfirmTurnOffButton.action = #selector(confirmTurnOffClicked)
         opacitySlider.target = self
         opacitySlider.action = #selector(opacityChanged)
+        opacityControl.onChange = { [weak self] value in
+            self?.applyOpacity(value)
+        }
         composer.onSubmit = { [weak self] in self?.askClicked() }
         composer.onMeasuredHeight = { [weak self] height in self?.setComposerTextHeight(height) }
         (composerSurface as? ComposerSurfaceView)?.composer = composer
@@ -3438,6 +3487,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func hitsExplicitInteractiveChrome(at localPoint: NSPoint) -> Bool {
         let controls: [NSView] = [
+            headerBar,
+            headerLogo,
+            brandStack,
+            routeBadge,
+            knowledgeBadge,
+            balanceLabel,
             navButton,
             newSessionButton,
             canvasToggleButton,
@@ -3445,15 +3500,22 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             interactionModeButton,
             hideButton,
             closeButton,
+            composerBar,
+            composerSurface,
             composer,
             recordingButton,
             askButton,
             attachButton,
             instructionsButton,
             opacityControl,
+            opacityLabel,
             opacitySlider,
+            opacityValueLabel,
             modelMenu,
             analyzeButton,
+            transcriptStrip,
+            transcriptLabel,
+            transcriptScroll,
         ]
         return controls.contains { view in
             guard !view.isHidden, view.alphaValue > 0.01 else { return false }
@@ -3651,17 +3713,18 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             y: bottomInset,
             width: max(0, layoutWidth - horizontalInset * 2),
             height: composerHeight)
-        attachmentStrip.frame = NSRect(
+        transcriptStrip.frame = NSRect(
             x: horizontalInset,
             y: composerBar.frame.maxY + chromeGap,
             width: max(0, layoutWidth - horizontalInset * 2),
-            height: attachmentHeight)
-        transcriptStrip.frame = NSRect(
-            x: horizontalInset,
-            y: attachmentStrip.frame.maxY + chromeGap,
-            width: max(0, layoutWidth - horizontalInset * 2),
             height: transcriptHeight)
-        let workspaceBottom = transcriptStrip.frame.maxY + workspaceGap
+        let attachmentGap: CGFloat = attachmentHeight > 0 ? chromeGap : 0
+        attachmentStrip.frame = NSRect(
+            x: horizontalInset,
+            y: transcriptStrip.frame.maxY + attachmentGap,
+            width: max(0, layoutWidth - horizontalInset * 2),
+            height: attachmentHeight)
+        let workspaceBottom = (attachmentHeight > 0 ? attachmentStrip.frame.maxY : transcriptStrip.frame.maxY) + workspaceGap
         let workspaceTop = headerChrome.frame.minY - workspaceGap
         workspace.frame = NSRect(
             x: horizontalInset,
@@ -4067,6 +4130,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         opacitySlider.controlSize = .small
         opacitySlider.wantsLayer = true
         opacitySlider.toolTip = "Overlay opacity"
+        opacityControl.value = opacitySlider.doubleValue
 
         composer.placeholder = "Ask anything..."
         composer.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -4142,15 +4206,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         button.wantsLayer = true
         button.layer?.cornerRadius = 13
         button.layer?.backgroundColor = accent
-            ? NSColor(red: 0.055, green: 0.165, blue: 0.215, alpha: 0.96).cgColor
-            : NSColor.white.withAlphaComponent(0.055).cgColor
-        button.layer?.borderWidth = 1
-        button.layer?.borderColor = (accent ? BlueyTheme.cyan.withAlphaComponent(0.48) : NSColor.white.withAlphaComponent(0.10)).cgColor
-        button.font = NSFont.systemFont(ofSize: 11, weight: .bold)
+            ? NSColor(red: 0.045, green: 0.145, blue: 0.190, alpha: 0.94).cgColor
+            : NSColor.white.withAlphaComponent(0.042).cgColor
+        button.layer?.borderWidth = accent ? 0.8 : 0.6
+        button.layer?.borderColor = (accent ? BlueyTheme.cyan.withAlphaComponent(0.42) : NSColor.white.withAlphaComponent(0.075)).cgColor
+        button.font = NSFont.systemFont(ofSize: 10.6, weight: .bold)
         button.attributedTitle = NSAttributedString(
             string: button.title,
             attributes: [
-                .font: button.font ?? NSFont.systemFont(ofSize: 11, weight: .bold),
+                .font: button.font ?? NSFont.systemFont(ofSize: 10.6, weight: .bold),
                 .foregroundColor: BlueyTheme.text,
             ])
         button.contentTintColor = BlueyTheme.cyan
@@ -4331,11 +4395,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func applyOpacity(_ opacity: Double) {
-        let value = min(max(opacity, 0.50), 1.0)
+        let value = min(max(opacity, Double(minimumOverlayBackgroundOpacity)), 1.0)
         backgroundOpacity = CGFloat(value)
         if abs(opacitySlider.doubleValue - value) > 0.001 {
             opacitySlider.doubleValue = value
         }
+        opacityControl.value = value
         opacityValueLabel.stringValue = "\(Int((value * 100.0).rounded()))"
         refreshBackgroundChrome()
         onOpacityChanged?(value)
@@ -4462,23 +4527,17 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     @objc private func askClicked() {
         let raw = composer.string.trimmingCharacters(in: .whitespacesAndNewlines)
-        let q: String
-        if raw.isEmpty {
-            guard let transcriptQuestion = transcriptQuestionForAnswer() else {
-                showSystemToast(for: RenderedCard(
-                    id: "empty-answer-\(UUID().uuidString)",
-                    kind: "system",
-                    title: "Nothing to answer yet",
-                    body: "Type a question or start Listen so Bluey has transcript context.",
-                    done: true,
-                    costLabel: nil,
-                    artifact: nil))
-                window?.makeFirstResponder(composer)
-                return
-            }
-            q = transcriptQuestion
-        } else {
-            q = raw
+        guard let q = composedQuestionForAnswer(typed: raw) else {
+            showSystemToast(for: RenderedCard(
+                id: "empty-answer-\(UUID().uuidString)",
+                kind: "system",
+                title: "Nothing to answer yet",
+                body: "Type a question or start Listen so Bluey has transcript context.",
+                done: true,
+                costLabel: nil,
+                artifact: nil))
+            window?.makeFirstResponder(composer)
+            return
         }
         composer.clearText()
         let route = selectedRoute()
@@ -4488,9 +4547,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     @objc private func analyzeClicked() {
+        let raw = composer.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        let question = composedQuestionForAnswer(typed: raw)
+        if question != nil {
+            composer.clearText()
+        }
         routeBadge.stringValue = "Vision · deep"
         setHeaderSubtitle("Analyzing screen")
-        emitSimple("analyze_screen_requested")
+        emitAnalyzeScreen(question: question)
+        window?.makeFirstResponder(composer)
     }
 
     @objc private func attachClicked() {
@@ -5564,6 +5629,24 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         return joined
     }
 
+    private func composedQuestionForAnswer(typed raw: String) -> String? {
+        let typed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let transcript = transcriptQuestionForAnswer()
+        if typed.isEmpty {
+            return transcript
+        }
+        guard let transcript, !transcript.isEmpty else {
+            return typed
+        }
+        return """
+        User question:
+        \(typed)
+
+        Live captions context:
+        \(transcript)
+        """
+    }
+
     private func compactTranscriptQuestionLines(_ lines: [String]) -> [String] {
         var order: [String] = []
         var bodies: [String: String] = [:]
@@ -6421,7 +6504,7 @@ private final class OverlayApp {
         case .boot(let title, let lines):
             pushBootCard(title: title, lines: lines)
         case .setOpacity(let o):
-            let value = min(max(o, 0.50), 1.0)
+            let value = min(max(o, Double(minimumOverlayBackgroundOpacity)), 1.0)
             overlayOpacity = value
             pillView?.applyBackgroundOpacity(value)
             expandedView?.applyOpacity(value)

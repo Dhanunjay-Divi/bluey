@@ -1456,8 +1456,8 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
                 .await;
             }
         }
-        OverlayEvent::AnalyzeScreenRequested => {
-            if let Err(error) = analyze_active_page_context(daemon).await {
+        OverlayEvent::AnalyzeScreenRequested { question } => {
+            if let Err(error) = analyze_active_page_context(daemon, question.as_deref()).await {
                 push_system_card(
                     daemon,
                     CardKind::Warning,
@@ -5724,17 +5724,28 @@ async fn capture_active_page_context(
     Ok(artifact)
 }
 
-async fn analyze_active_page_context(daemon: &Arc<Daemon>) -> Result<()> {
+async fn analyze_active_page_context(
+    daemon: &Arc<Daemon>,
+    question_context: Option<&str>,
+) -> Result<()> {
     match capture_active_page_context(daemon, "overlay analyse").await {
         Ok(artifact) => {
-            let question = format!(
-                "Analyse the active browser page that was just attached as context: {}. Answer the visible question or prompt if there is one, then give concise next steps.",
+            let mut question = format!(
+                "Analyse the active browser page that was just attached as context: {}.",
                 artifact.title
             );
+            if let Some(context) = question_context
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                question.push_str("\n\nUser and live-caption context:\n");
+                question.push_str(context);
+            }
+            question.push_str("\n\nAnswer the visible question or prompt if there is one, use the provided live-caption context when relevant, then give concise next steps.");
             let _ = answer_question(daemon, question, "overlay analyse").await?;
         }
         Err(page_error) => {
-            analyze_screen_with_screenshot_fallback(daemon, page_error).await?;
+            analyze_screen_with_screenshot_fallback(daemon, page_error, question_context).await?;
         }
     }
     Ok(())
@@ -5743,6 +5754,7 @@ async fn analyze_active_page_context(daemon: &Arc<Daemon>) -> Result<()> {
 async fn analyze_screen_with_screenshot_fallback(
     daemon: &Arc<Daemon>,
     page_error: anyhow::Error,
+    question_context: Option<&str>,
 ) -> Result<()> {
     let page_error_text = format!("{page_error:#}");
     let Some(provider) = select_vision_provider(&daemon.paths) else {
@@ -5797,10 +5809,17 @@ async fn analyze_screen_with_screenshot_fallback(
     let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
     write_state(daemon).await?;
 
-    let question = format!(
+    let mut question = format!(
         "Browser page text was unavailable, so analyze the attached screenshot instead. If the screenshot contains a question, task, code, diagram, or UI, answer it directly and give concise next steps. Browser text error for context: {}",
         compact_snippet(&page_error_text, 260)
     );
+    if let Some(context) = question_context
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        question.push_str("\n\nUser and live-caption context:\n");
+        question.push_str(context);
+    }
     let mut request = vision_answer_request(&question, provider);
     request.context = answer_context_for_question(daemon, &meeting_snapshot, &question).await;
     request.context.push(
