@@ -94,12 +94,33 @@ async fn probe(kind: AgentKind) -> Probe {
 fn report(kind: &str, p: Probe) {
     println!("[ACP handshake] {kind:<12} -> {p:?}");
     match p {
-        Probe::Handshake { .. } => { /* the win we want */ }
-        Probe::NotInstalled(_) => {
-            // Not a failure of our code; surfaced, not asserted-against.
+        // The win we want. If the agent reported a session id, it must be a
+        // non-empty one (a blank id would be a broken handshake masquerading as
+        // success); `None` is acceptable — not every agent echoes it at Started.
+        Probe::Handshake { session_id } => {
+            if let Some(id) = session_id {
+                assert!(
+                    !id.trim().is_empty(),
+                    "{kind}: handshake returned an empty session id"
+                );
+            }
         }
-        Probe::AgentError(_) => {
-            // Reached the agent but it errored (often auth/quota). Surfaced.
+        // Not a failure of our code, but the program name we resolved should be
+        // real (an empty entrypoint would be a spec-map bug, not a missing tool).
+        Probe::NotInstalled(program) => {
+            assert!(
+                !program.trim().is_empty(),
+                "{kind}: NotInstalled with an empty program name (spec-map bug)"
+            );
+        }
+        // Reached the agent but it errored (often auth/quota) — still proves our
+        // client got a reply. The error text must be non-empty so the surfaced
+        // diagnostic is actionable.
+        Probe::AgentError(error) => {
+            assert!(
+                !error.trim().is_empty(),
+                "{kind}: AgentError with no message"
+            );
         }
         Probe::Timeout => panic!("{kind}: ACP handshake timed out (no Started, no error in 30s)"),
     }
