@@ -157,6 +157,8 @@ pub struct ContextArtifact {
     #[serde(default)]
     pub text_preview: Option<String>,
     #[serde(default)]
+    pub markdown_path: Option<String>,
+    #[serde(default)]
     pub processing_status: ContextProcessingStatus,
     #[serde(default)]
     pub processing_error: Option<String>,
@@ -179,6 +181,7 @@ impl ContextArtifact {
             note,
             size_bytes,
             text_preview: None,
+            markdown_path: None,
             processing_status: ContextProcessingStatus::Pending,
             processing_error: None,
             created_at: clock::now_epoch_ms_string(),
@@ -194,6 +197,11 @@ impl ContextArtifact {
         self.text_preview = Some(preview);
         self.processing_status = ContextProcessingStatus::Ready;
         self.processing_error = None;
+        self
+    }
+
+    pub fn with_markdown_path(mut self, path: impl Into<String>) -> Self {
+        self.markdown_path = Some(path.into());
         self
     }
 

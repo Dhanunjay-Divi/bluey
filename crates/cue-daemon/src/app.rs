@@ -47,6 +47,10 @@ use tokio_tungstenite::tungstenite::{
 };
 use tracing::{debug, error, info, trace, warn};
 
+use crate::doc_conversion::{
+    build_markdown_preview, classify_context_path, convert_context_file_to_markdown,
+    is_supported_context_file, write_markdown_artifact,
+};
 use crate::overlay_state::{
     enter_overlay_ui_state, new_shared_overlay_ui_state, reset_overlay_ui_state_on_scope_exit,
     SharedOverlayUiState,
@@ -956,7 +960,7 @@ async fn handle_request_inner(
             Ok(DaemonResponse::Answer { response, events })
         }
         DaemonRequest::ContextAdd { path, title, note } => {
-            let artifact = build_context_artifact(path, title, note)?;
+            let artifact = build_context_artifact(&daemon.paths, path, title, note)?;
             let meeting_snapshot = attach_context_artifacts(daemon, vec![artifact.clone()]).await?;
 
             update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
@@ -3672,7 +3676,7 @@ async fn handle_attach_paths(daemon: &Arc<Daemon>, paths: Vec<PathBuf>) -> Resul
 
     let mut attached = Vec::new();
     for path in paths {
-        if !is_supported_picker_context_file(&path) {
+        if !is_supported_context_file(&path) {
             push_system_card(
                 daemon,
                 CardKind::Warning,
@@ -3689,6 +3693,7 @@ async fn handle_attach_paths(daemon: &Arc<Daemon>, paths: Vec<PathBuf>) -> Resul
         }
 
         match build_context_artifact(
+            &daemon.paths,
             path.display().to_string(),
             path.file_name()
                 .and_then(|name| name.to_str())
@@ -5657,6 +5662,7 @@ async fn capture_loop(daemon: Arc<Daemon>, interval_secs: u64, mut stop_rx: ones
 async fn capture_once_and_attach(daemon: &Arc<Daemon>) -> Result<()> {
     let capture_path = capture_screen_to_file(&daemon.paths).await?;
     let artifact = build_context_artifact(
+        &daemon.paths,
         capture_path.display().to_string(),
         capture_path
             .file_name()
@@ -5699,6 +5705,7 @@ async fn capture_active_page_context(
     let source = source.into();
     let (path, page) = capture_active_page_to_file(&daemon.paths).await?;
     let artifact = build_context_artifact(
+        &daemon.paths,
         path.display().to_string(),
         Some(if page.title.trim().is_empty() {
             "Active page context".to_string()
@@ -5789,6 +5796,7 @@ async fn analyze_screen_with_screenshot_fallback(
 
     let capture_path = capture_screen_to_file(&daemon.paths).await?;
     let artifact = build_context_artifact(
+        &daemon.paths,
         capture_path.display().to_string(),
         Some("Screen capture fallback".to_string()),
         Some(format!(
@@ -7476,6 +7484,7 @@ fn discover_overlay_bin() -> Result<PathBuf> {
 }
 
 fn build_context_artifact(
+    paths: &AppPaths,
     path: String,
     title: Option<String>,
     note: Option<String>,
@@ -7517,7 +7526,7 @@ fn build_context_artifact(
     )
     .with_processing_status(ContextProcessingStatus::Pending);
 
-    let artifact = enrich_context_artifact(artifact, &canonical_path, kind, metadata.len());
+    let artifact = enrich_context_artifact(paths, artifact, &canonical_path, kind, metadata.len());
     validate_context_artifact(&artifact)?;
     Ok(artifact)
 }
@@ -7764,67 +7773,32 @@ fn powershell_single_quoted(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', "''"))
 }
 
-fn classify_context_path(path: &Path) -> ContextKind {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-
-    match extension.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "bmp" | "tiff" => {
-            if path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .is_some_and(|stem| stem.to_ascii_lowercase().contains("diagram"))
-            {
-                ContextKind::Diagram
-            } else {
-                ContextKind::Image
-            }
-        }
-        "rs" | "swift" | "c" | "h" | "cpp" | "hpp" | "js" | "jsx" | "ts" | "tsx" | "py" | "go"
-        | "java" | "kt" | "kts" | "cs" | "rb" | "php" | "sql" | "sh" | "ps1" | "toml" | "yaml"
-        | "yml" | "json" | "html" | "css" | "scss" => ContextKind::Code,
-        "pdf" | "doc" | "docx" | "rtf" => ContextKind::Document,
-        "txt" | "log" | "csv" | "tsv" | "md" | "markdown" | "rst" | "adoc" => ContextKind::Text,
-        _ => ContextKind::Other,
-    }
-}
-
-fn is_supported_picker_context_file(path: &Path) -> bool {
-    matches!(
-        classify_context_path(path),
-        ContextKind::Code | ContextKind::Document | ContextKind::Text
-    )
-}
-
 fn enrich_context_artifact(
+    paths: &AppPaths,
     artifact: ContextArtifact,
     path: &Path,
     kind: ContextKind,
     size_bytes: u64,
 ) -> ContextArtifact {
     match kind {
-        ContextKind::Code | ContextKind::Text => {
-            if size_bytes > 1_000_000 {
-                return artifact.with_processing_error(
-                    "file is over 1 MB; queued for cloud text extraction instead of local preview",
-                );
-            }
-
-            match std::fs::read_to_string(path) {
-                Ok(text) => {
-                    let preview = build_text_preview(&text, 6_000);
+        ContextKind::Code | ContextKind::Text | ContextKind::Document => {
+            match convert_context_file_to_markdown(path, kind, size_bytes) {
+                Ok(markdown) => {
+                    let preview = build_markdown_preview(&markdown);
                     if preview.is_empty() {
                         artifact.with_processing_error("file did not contain readable text")
                     } else {
-                        artifact.with_text_preview(preview)
+                        match write_markdown_artifact(&paths.data_dir, artifact.id, &markdown) {
+                            Ok(markdown_path) => artifact
+                                .with_text_preview(preview)
+                                .with_markdown_path(markdown_path.display().to_string()),
+                            Err(error) => artifact.with_processing_error(format!(
+                                "converted Markdown but could not save local copy: {error:#}"
+                            )),
+                        }
                     }
                 }
-                Err(error) => artifact.with_processing_error(format!(
-                    "local text preview failed; cloud parser can retry later: {error}"
-                )),
+                Err(error) => artifact.with_processing_error(format!("{error:#}")),
             }
         }
         ContextKind::Image | ContextKind::Diagram => {
@@ -7836,11 +7810,6 @@ fn enrich_context_artifact(
                 )
             }
         }
-        ContextKind::Document => match extract_document_text_preview(path, size_bytes) {
-            Ok(preview) if !preview.trim().is_empty() => artifact.with_text_preview(preview),
-            Ok(_) => artifact.with_processing_error("document parser did not find readable text"),
-            Err(error) => artifact.with_processing_error(format!("{error:#}")),
-        },
         ContextKind::Other => artifact.with_unsupported_error(
             "unsupported context file type; attach readable text, Markdown, code, PDF, DOC, or DOCX",
         ),
@@ -7854,187 +7823,6 @@ fn vision_context_available_from_env() -> bool {
     AppPaths::discover()
         .map(|paths| cloud_account_linked(&paths))
         .unwrap_or_else(|_| cloud_access_token_from_env().is_some())
-}
-
-fn extract_document_text_preview(path: &Path, size_bytes: u64) -> Result<String> {
-    if size_bytes > 10_000_000 {
-        return Err(anyhow!(
-            "document is over 10 MB; Bluey cloud parsing must be configured before answers can use it"
-        ));
-    }
-
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let text = match extension.as_str() {
-        "pdf" => extract_pdf_text(path)?,
-        "doc" | "docx" | "rtf" => extract_word_text(path)?,
-        _ => {
-            return Err(anyhow!(
-                "no parser is registered for .{} documents",
-                extension
-            ))
-        }
-    };
-
-    Ok(build_text_preview(&text, 8_000))
-}
-
-fn extract_pdf_text(path: &Path) -> Result<String> {
-    let output = match Command::new("pdftotext")
-        .arg("-layout")
-        .arg(path)
-        .arg("-")
-        .output()
-    {
-        Ok(output) => output,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Err(anyhow!(
-                "PDF text extraction needs `pdftotext` locally or the Bluey cloud parser"
-            ));
-        }
-        Err(error) => return Err(error).context("failed to run PDF text extractor"),
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.trim();
-        return Err(anyhow!(
-            "PDF text extraction failed: {}",
-            if detail.is_empty() {
-                "unknown pdftotext error"
-            } else {
-                detail
-            }
-        ));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-#[cfg(target_os = "macos")]
-fn extract_word_text(path: &Path) -> Result<String> {
-    let output = match Command::new("textutil")
-        .arg("-convert")
-        .arg("txt")
-        .arg("-stdout")
-        .arg(path)
-        .output()
-    {
-        Ok(output) => output,
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Err(anyhow!(
-                "DOC/DOCX text extraction needs macOS `textutil` or the Bluey cloud parser"
-            ));
-        }
-        Err(error) => return Err(error).context("failed to run document text extractor"),
-    };
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.trim();
-        return Err(anyhow!(
-            "document text extraction failed: {}",
-            if detail.is_empty() {
-                "unknown textutil error"
-            } else {
-                detail
-            }
-        ));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-#[cfg(target_os = "windows")]
-fn extract_word_text(path: &Path) -> Result<String> {
-    let script = format!(
-        r#"
-$path = {path}
-$ext = [IO.Path]::GetExtension($path).ToLowerInvariant()
-if ($ext -eq '.docx') {{
-  $dest = Join-Path ([IO.Path]::GetTempPath()) ('bluey-docx-' + [guid]::NewGuid().ToString())
-  New-Item -ItemType Directory -Path $dest | Out-Null
-  try {{
-    Expand-Archive -LiteralPath $path -DestinationPath $dest -Force
-    $xmlPath = Join-Path $dest 'word/document.xml'
-    if (Test-Path $xmlPath) {{
-      [xml]$xml = Get-Content -LiteralPath $xmlPath -Raw
-      $nsm = New-Object System.Xml.XmlNamespaceManager($xml.NameTable)
-      $nsm.AddNamespace('w', 'http://schemas.openxmlformats.org/wordprocessingml/2006/main')
-      ($xml.SelectNodes('//w:t', $nsm) | ForEach-Object {{ $_.InnerText }}) -join ' '
-    }}
-  }} finally {{
-    Remove-Item -LiteralPath $dest -Recurse -Force -ErrorAction SilentlyContinue
-  }}
-}} else {{
-  Write-Error 'Legacy .doc/.rtf parsing needs the Bluey cloud parser on Windows.'
-  exit 2
-}}
-"#,
-        path = powershell_single_quoted(path)
-    );
-    let output = Command::new("powershell")
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-Command")
-        .arg(script)
-        .output()
-        .context("failed to launch Windows document parser")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = stderr.trim();
-        return Err(anyhow!(
-            "document text extraction failed: {}",
-            if detail.is_empty() {
-                "unknown PowerShell parser error"
-            } else {
-                detail
-            }
-        ));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn extract_word_text(_path: &Path) -> Result<String> {
-    Err(anyhow!(
-        "DOC/DOCX text extraction needs the Bluey cloud parser on this platform"
-    ))
-}
-
-fn build_text_preview(text: &str, max_chars: usize) -> String {
-    let mut preview = String::new();
-    let mut previous_blank = false;
-
-    for line in text.lines() {
-        let line = line.trim_end();
-        let is_blank = line.trim().is_empty();
-        if is_blank && previous_blank {
-            continue;
-        }
-        previous_blank = is_blank;
-
-        let next_len = preview.chars().count() + line.chars().count() + 1;
-        if next_len > max_chars {
-            let remaining = max_chars.saturating_sub(preview.chars().count());
-            if remaining > 0 {
-                preview.extend(line.chars().take(remaining));
-            }
-            preview.push_str("\n...");
-            break;
-        }
-
-        preview.push_str(line);
-        preview.push('\n');
-    }
-
-    preview.trim().to_string()
 }
 
 #[cfg(target_os = "macos")]
@@ -8649,17 +8437,6 @@ mod tests {
     #[test]
     fn answer_overlay_artifact_ignores_short_chat() {
         assert!(answer_overlay_artifact("Yes, that is the right next step.").is_none());
-    }
-
-    #[test]
-    fn picker_context_filter_rejects_video_and_key_material() {
-        assert!(is_supported_picker_context_file(Path::new("plan.md")));
-        assert!(is_supported_picker_context_file(Path::new(
-            "architecture.pdf"
-        )));
-        assert!(is_supported_picker_context_file(Path::new("main.rs")));
-        assert!(!is_supported_picker_context_file(Path::new("clip.mp4")));
-        assert!(!is_supported_picker_context_file(Path::new("backup.p12")));
     }
 
     #[test]

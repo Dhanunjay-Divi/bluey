@@ -262,3 +262,41 @@ async fn rag_indexes_context_artifact_with_source_labels() {
         .contains("Source: /Users/example/launch-plan.md"));
     assert!(hits[0].chunk_text.contains("cache invalidation"));
 }
+
+#[tokio::test]
+async fn rag_indexes_saved_markdown_artifact_when_available() {
+    let embedder: Arc<dyn EmbeddingProvider> = Arc::new(MockEmbedder);
+    let pipeline = RagPipeline::new(PathBuf::from(":memory:"), embedder).unwrap();
+    let base = std::env::temp_dir().join(format!("bluey-rag-markdown-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&base).unwrap();
+    let markdown_path = base.join("context.md");
+    std::fs::write(
+        &markdown_path,
+        "# Deep Context\n\nThe converted markdown mentions quasar ledger reconciliation.",
+    )
+    .unwrap();
+
+    let artifact = ContextArtifact::new(
+        ContextKind::Document,
+        "/Users/example/spec.pdf",
+        "Spec",
+        None,
+        Some(128),
+    )
+    .with_text_preview("short preview without the searchable phrase")
+    .with_markdown_path(markdown_path.display().to_string());
+
+    pipeline
+        .index_context_artifact("session-markdown", &artifact)
+        .await;
+
+    let hits = pipeline
+        .query("quasar ledger reconciliation", 5, Some("session-markdown"))
+        .await
+        .unwrap();
+    assert!(hits
+        .iter()
+        .any(|hit| hit.chunk_text.contains("quasar ledger reconciliation")));
+
+    let _ = std::fs::remove_dir_all(base);
+}
