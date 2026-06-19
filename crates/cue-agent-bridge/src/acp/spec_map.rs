@@ -78,10 +78,12 @@ impl TryFrom<&AgentKind> for AcpAgentSpec {
             // NOTE the SDK ctor uses the older `--experimental-acp`; the current
             // flag is `--acp`.
             AgentKind::Gemini => AcpAgentSpec::new("gemini", vec!["--acp".to_string()]),
-            // Cursor: `cursor-agent agent acp` (native).
-            AgentKind::Cursor => {
-                AcpAgentSpec::new("cursor-agent", vec!["agent".to_string(), "acp".to_string()])
-            }
+            // Cursor: `cursor-agent acp` (native). NOTE: the ACP command is
+            // TOP-LEVEL in current builds (verified on 2026.06.16). An older
+            // build used `cursor-agent agent acp`, but that now parses "acp" as a
+            // prompt arg to `agent` and hangs on a TTY (no stdio handshake) — so
+            // the daemon timed out. The subcommand is `acp`, not `agent acp`.
+            AgentKind::Cursor => AcpAgentSpec::new("cursor-agent", vec!["acp".to_string()]),
             // GitHub Copilot CLI: `copilot --acp --stdio` (native, public preview).
             AgentKind::Copilot => {
                 AcpAgentSpec::new("copilot", vec!["--acp".to_string(), "--stdio".to_string()])
@@ -100,20 +102,19 @@ impl TryFrom<&AgentKind> for AcpAgentSpec {
             // `codex-acp` as the entrypoint; confirm at integration time.
             AgentKind::Codex => AcpAgentSpec::new("codex-acp", Vec::new()),
 
+            // Antigravity: ACP via the sibling `gemini --acp`. Antigravity DOES
+            // ship a real CLI (`agy`, a Go binary, v1.0.10 — verified 2026-06-19,
+            // correcting the earlier "only agy-node runtime" note), but `agy`
+            // itself has NO ACP mode (only --print / --conversation / a TUI). Its
+            // registry row already drives through `gemini` (binary_candidates
+            // include gemini; drive_command `gemini -p {prompt}`), and `gemini`
+            // speaks ACP — so Antigravity's ACP entrypoint is `gemini --acp`,
+            // identical to the Gemini arm. (Continuation stays Replay: `agy
+            // --conversation=<uuid>` could resume natively but isn't assumed
+            // installed; the gemini-driven path replays.)
+            AgentKind::Antigravity => AcpAgentSpec::new("gemini", vec!["--acp".to_string()]),
+
             // ---- No (known) local ACP entrypoint ----
-            // Antigravity ships as a VS Code-fork IDE (Antigravity.app), NOT a
-            // command-line agent. The only binary it bundles is `agy-node` — a
-            // Node.js RUNTIME (v24), not an agent CLI — so there is no
-            // `agy --acp` entrypoint. Verified on this machine 2026-06-16.
-            // Antigravity is therefore a GUI/app-form agent only: support it by
-            // reading its session store (see `sessions/antigravity.rs`) and
-            // replaying via the neutral transcript, not over ACP.
-            AgentKind::Antigravity => {
-                anyhow::bail!(
-                    "Antigravity is a GUI IDE with no ACP CLI entrypoint; \
-                     drive it via session-store replay, not ACP"
-                )
-            }
             AgentKind::Aider => {
                 anyhow::bail!("Aider ACP support is unconfirmed; no known local ACP entrypoint")
             }
@@ -155,11 +156,17 @@ mod tests {
 
         let c = spec(AgentKind::Cursor);
         assert_eq!(c.program, "cursor-agent");
-        assert_eq!(c.args, vec!["agent".to_string(), "acp".to_string()]);
+        assert_eq!(c.args, vec!["acp".to_string()]);
 
         let cp = spec(AgentKind::Copilot);
         assert_eq!(cp.program, "copilot");
         assert_eq!(cp.args, vec!["--acp".to_string(), "--stdio".to_string()]);
+
+        // Antigravity drives its ACP through the sibling `gemini --acp` (its own
+        // `agy` CLI has no ACP mode).
+        let a = spec(AgentKind::Antigravity);
+        assert_eq!(a.program, "gemini");
+        assert_eq!(a.args, vec!["--acp".to_string()]);
     }
 
     #[test]
@@ -178,7 +185,6 @@ mod tests {
     #[test]
     fn unsupported_kinds_return_err() {
         for k in [
-            AgentKind::Antigravity,
             AgentKind::Aider,
             AgentKind::CursorCloud,
             AgentKind::CopilotCloud,
