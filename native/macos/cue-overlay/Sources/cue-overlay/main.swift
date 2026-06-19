@@ -109,7 +109,7 @@ private func useCenteredSingleLineCell(_ label: NSTextField) {
     label.isSelectable = false
 }
 
-private final class OpacityScrubberView: NSView {
+private final class OpacityScrubberView: NSControl {
     var value: Double = 0.94 {
         didSet { needsDisplay = true }
     }
@@ -128,6 +128,7 @@ private final class OpacityScrubberView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
         updateValue(from: event)
     }
 
@@ -135,13 +136,46 @@ private final class OpacityScrubberView: NSView {
         updateValue(from: event)
     }
 
+    func updateValue(fromWindowEvent event: NSEvent) {
+        updateValue(from: event)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard bounds.width > 78, bounds.height > 10 else { return }
+        let track = trackRect()
+        NSColor.white.withAlphaComponent(0.10).setFill()
+        NSBezierPath(roundedRect: track, xRadius: track.height / 2, yRadius: track.height / 2).fill()
+
+        let progress = CGFloat((value - Double(minimumOverlayBackgroundOpacity)) / (1.0 - Double(minimumOverlayBackgroundOpacity)))
+        let clampedProgress = min(max(progress, 0), 1)
+        let fillWidth = max(track.height, track.width * clampedProgress)
+        let fill = NSRect(x: track.minX, y: track.minY, width: fillWidth, height: track.height)
+        NSColor(red: 0.20, green: 0.54, blue: 1.0, alpha: 0.95).setFill()
+        NSBezierPath(roundedRect: fill, xRadius: fill.height / 2, yRadius: fill.height / 2).fill()
+
+        let knobCenter = NSPoint(x: track.minX + track.width * clampedProgress, y: track.midY)
+        let knobRect = NSRect(x: knobCenter.x - 7, y: knobCenter.y - 7, width: 14, height: 14)
+        NSColor.white.withAlphaComponent(0.96).setFill()
+        NSBezierPath(ovalIn: knobRect).fill()
+        NSColor.black.withAlphaComponent(0.18).setStroke()
+        let outline = NSBezierPath(ovalIn: knobRect.insetBy(dx: 0.5, dy: 0.5))
+        outline.lineWidth = 1
+        outline.stroke()
+    }
+
     private func updateValue(from event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        let trackStart = min(bounds.width - 36, CGFloat(50))
-        let trackEnd = max(trackStart + 1, bounds.width - 31)
-        let progress = min(max((point.x - trackStart) / (trackEnd - trackStart), 0), 1)
+        let track = trackRect()
+        let progress = min(max((point.x - track.minX) / max(track.width, 1), 0), 1)
         let minimum = Double(minimumOverlayBackgroundOpacity)
         onChange?(minimum + Double(progress) * (1.0 - minimum))
+    }
+
+    private func trackRect() -> NSRect {
+        let start = min(bounds.width - 36, CGFloat(50))
+        let end = max(start + 1, bounds.width - 31)
+        return NSRect(x: start, y: (bounds.height - 4) / 2, width: end - start, height: 4)
     }
 }
 
@@ -792,6 +826,10 @@ private func emitCardRendered(id: String) {
     emitEvent(["type": "card_rendered", "id": id])
 }
 
+private func emitOpacityUpdated(_ opacity: Double) {
+    emitEvent(["type": "opacity_updated", "opacity": opacity])
+}
+
 // MARK: - Overlay NSWindow
 
 /// Borderless, transparent, always-on-top overlay window.
@@ -809,6 +847,7 @@ private final class OverlayWindow: NSWindow {
         didSet { applyContentCornerMask() }
     }
     private weak var pendingManualButton: NSButton?
+    private weak var pendingManualScrubber: OpacityScrubberView?
 
     override var contentView: NSView? {
         didSet { applyContentCornerMask() }
@@ -850,12 +889,22 @@ private final class OverlayWindow: NSWindow {
     override func sendEvent(_ event: NSEvent) {
         switch event.type {
         case .leftMouseDown:
+            if let scrubber = manualOpacityScrubber(atWindowPoint: event.locationInWindow) {
+                pendingManualScrubber = scrubber
+                scrubber.updateValue(fromWindowEvent: event)
+                return
+            }
             if let button = manualButton(atWindowPoint: event.locationInWindow) {
                 pendingManualButton = button
                 button.highlight(true)
                 return
             }
         case .leftMouseUp:
+            if let scrubber = pendingManualScrubber {
+                scrubber.updateValue(fromWindowEvent: event)
+                pendingManualScrubber = nil
+                return
+            }
             if let button = pendingManualButton {
                 button.highlight(false)
                 let releaseButton = manualButton(atWindowPoint: event.locationInWindow)
@@ -866,6 +915,10 @@ private final class OverlayWindow: NSWindow {
                 return
             }
         case .leftMouseDragged:
+            if let scrubber = pendingManualScrubber {
+                scrubber.updateValue(fromWindowEvent: event)
+                return
+            }
             if let button = pendingManualButton {
                 button.highlight(false)
                 pendingManualButton = nil
@@ -896,6 +949,10 @@ private final class OverlayWindow: NSWindow {
 
     private func manualButton(atWindowPoint point: NSPoint) -> NSButton? {
         (contentView as? ExpandedPanelView)?.manualButton(atWindowPoint: point)
+    }
+
+    private func manualOpacityScrubber(atWindowPoint point: NSPoint) -> OpacityScrubberView? {
+        (contentView as? ExpandedPanelView)?.manualOpacityScrubber(atWindowPoint: point)
     }
 
     override func setFrame(_ frameRect: NSRect, display displayFlag: Bool) {
@@ -2563,8 +2620,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         static let headerTopInset: CGFloat = 14
         static let workspaceTopInset: CGFloat = 92
         static let composerInputHeight: CGFloat = 26
-        static let composerBaseHeight: CGFloat = 56
-        static let composerExtraChromeHeight: CGFloat = 30
+        static let composerBaseHeight: CGFloat = 64
+        static let composerExtraChromeHeight: CGFloat = 38
         static let transcriptStripHeight: CGFloat = 20
     }
 
@@ -3061,7 +3118,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             attachmentStack.bottomAnchor.constraint(equalTo: attachmentStrip.contentView.bottomAnchor),
             attachmentStack.heightAnchor.constraint(equalTo: attachmentStrip.heightAnchor),
 
-            composerSurface.topAnchor.constraint(equalTo: composerBar.topAnchor, constant: 4),
+            composerSurface.topAnchor.constraint(equalTo: composerBar.topAnchor, constant: 6),
             composerSurface.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 8),
             composerSurface.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -8),
             composerTextHeight,
@@ -3073,28 +3130,28 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
             recordingButton.trailingAnchor.constraint(equalTo: askButton.leadingAnchor, constant: -4),
             recordingButton.centerYAnchor.constraint(equalTo: composerSurface.centerYAnchor),
-            recordingButton.widthAnchor.constraint(equalToConstant: 64),
-            recordingButton.heightAnchor.constraint(equalToConstant: 24),
+            recordingButton.widthAnchor.constraint(equalToConstant: 60),
+            recordingButton.heightAnchor.constraint(equalToConstant: 22),
 
             askButton.trailingAnchor.constraint(equalTo: composerSurface.trailingAnchor, constant: -5),
             askButton.centerYAnchor.constraint(equalTo: composerSurface.centerYAnchor),
-            askButton.widthAnchor.constraint(equalToConstant: 76),
-            askButton.heightAnchor.constraint(equalToConstant: 26),
+            askButton.widthAnchor.constraint(equalToConstant: 72),
+            askButton.heightAnchor.constraint(equalToConstant: 24),
 
             attachButton.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 8),
-            attachButton.bottomAnchor.constraint(equalTo: composerBar.bottomAnchor, constant: -4),
-            attachButton.widthAnchor.constraint(equalToConstant: 24),
-            attachButton.heightAnchor.constraint(equalToConstant: 24),
+            attachButton.bottomAnchor.constraint(equalTo: composerBar.bottomAnchor, constant: -6),
+            attachButton.widthAnchor.constraint(equalToConstant: 22),
+            attachButton.heightAnchor.constraint(equalToConstant: 22),
 
             instructionsButton.leadingAnchor.constraint(equalTo: attachButton.trailingAnchor, constant: 6),
             instructionsButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            instructionsButton.widthAnchor.constraint(equalToConstant: 62),
-            instructionsButton.heightAnchor.constraint(equalToConstant: 24),
+            instructionsButton.widthAnchor.constraint(equalToConstant: 58),
+            instructionsButton.heightAnchor.constraint(equalToConstant: 22),
 
             opacityControl.leadingAnchor.constraint(equalTo: instructionsButton.trailingAnchor, constant: 6),
             opacityControl.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            opacityControl.widthAnchor.constraint(equalToConstant: 132),
-            opacityControl.heightAnchor.constraint(equalToConstant: 24),
+            opacityControl.widthAnchor.constraint(equalToConstant: 126),
+            opacityControl.heightAnchor.constraint(equalToConstant: 22),
 
             opacityLabel.leadingAnchor.constraint(equalTo: opacityControl.leadingAnchor, constant: 7),
             opacityLabel.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
@@ -3103,7 +3160,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             opacitySlider.leadingAnchor.constraint(equalTo: opacityLabel.trailingAnchor, constant: 5),
             opacitySlider.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
             opacitySlider.trailingAnchor.constraint(equalTo: opacityValueLabel.leadingAnchor, constant: -5),
-            opacitySlider.heightAnchor.constraint(equalToConstant: 16),
+            opacitySlider.heightAnchor.constraint(equalToConstant: 14),
 
             opacityValueLabel.trailingAnchor.constraint(equalTo: opacityControl.trailingAnchor, constant: -6),
             opacityValueLabel.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
@@ -3111,14 +3168,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
             analyzeButton.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -10),
             analyzeButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            analyzeButton.widthAnchor.constraint(equalToConstant: 68),
-            analyzeButton.heightAnchor.constraint(equalToConstant: 24),
+            analyzeButton.widthAnchor.constraint(equalToConstant: 64),
+            analyzeButton.heightAnchor.constraint(equalToConstant: 22),
 
             modelMenu.trailingAnchor.constraint(equalTo: analyzeButton.leadingAnchor, constant: -6),
             modelMenu.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
             modelMenu.widthAnchor.constraint(greaterThanOrEqualToConstant: 98),
             modelMenu.widthAnchor.constraint(lessThanOrEqualToConstant: 126),
-            modelMenu.heightAnchor.constraint(equalToConstant: 24),
+            modelMenu.heightAnchor.constraint(equalToConstant: 22),
 
             opacityControl.trailingAnchor.constraint(lessThanOrEqualTo: modelMenu.leadingAnchor, constant: -10),
 
@@ -3464,6 +3521,22 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         return manualButton(in: self, atRootPoint: localPoint)
     }
 
+    func manualOpacityScrubber(atWindowPoint point: NSPoint) -> OpacityScrubberView? {
+        let localPoint = convert(point, from: nil)
+        guard bounds.contains(localPoint),
+              closeConfirmOverlay.isHidden,
+              answerStyleOverlay.isHidden,
+              !opacityControl.isHidden,
+              opacityControl.alphaValue > 0.01,
+              opacityControl.isEnabled
+        else {
+            return nil
+        }
+        let rect = opacityControl.convert(opacityControl.bounds, to: self)
+            .insetBy(dx: -12, dy: -10)
+        return rect.contains(localPoint) ? opacityControl : nil
+    }
+
     private func manualButton(in view: NSView, atRootPoint rootPoint: NSPoint) -> NSButton? {
         for subview in view.subviews.reversed() {
             guard !subview.isHidden, subview.alphaValue > 0.01 else { continue }
@@ -3559,6 +3632,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             if view is NSButton
                 || view is NSPopUpButton
                 || view is NSSlider
+                || view is OpacityScrubberView
                 || view is NSScroller
                 || view is NSTextView
             {
@@ -3917,7 +3991,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         modelMenu.isBordered = false
         modelMenu.wantsLayer = true
         modelMenu.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.075).cgColor
-        modelMenu.layer?.cornerRadius = 15
+        modelMenu.layer?.cornerRadius = 12
         modelMenu.layer?.borderWidth = 1
         modelMenu.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
         modelMenu.font = NSFont.systemFont(ofSize: 12, weight: .bold)
@@ -4100,7 +4174,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func configureComposer() {
         composerBar.wantsLayer = true
         composerBar.layer?.backgroundColor = NSColor(red: 0.014, green: 0.016, blue: 0.022, alpha: 0.94).cgColor
-        composerBar.layer?.cornerRadius = 18
+        composerBar.layer?.cornerRadius = 16
         composerBar.layer?.borderWidth = 1
         composerBar.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.22).cgColor
         composerBar.layer?.shadowColor = NSColor.black.cgColor
@@ -4110,7 +4184,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         composerSurface.wantsLayer = true
         composerSurface.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.045).cgColor
-        composerSurface.layer?.cornerRadius = 14
+        composerSurface.layer?.cornerRadius = 13
         composerSurface.layer?.borderWidth = 1
         composerSurface.layer?.borderColor = NSColor.white.withAlphaComponent(0.105).cgColor
 
@@ -4129,6 +4203,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         opacityValueLabel.alignment = .right
         opacitySlider.controlSize = .small
         opacitySlider.wantsLayer = true
+        opacitySlider.isHidden = true
         opacitySlider.toolTip = "Overlay opacity"
         opacityControl.value = opacitySlider.doubleValue
 
@@ -4204,7 +4279,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func styleControlButton(_ button: NSButton, symbol: String, accent: Bool) {
         button.isBordered = false
         button.wantsLayer = true
-        button.layer?.cornerRadius = 13
+        button.layer?.cornerRadius = 11
         button.layer?.backgroundColor = accent
             ? NSColor(red: 0.045, green: 0.145, blue: 0.190, alpha: 0.94).cgColor
             : NSColor.white.withAlphaComponent(0.042).cgColor
@@ -4404,6 +4479,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         opacityValueLabel.stringValue = "\(Int((value * 100.0).rounded()))"
         refreshBackgroundChrome()
         onOpacityChanged?(value)
+        emitOpacityUpdated(value)
     }
 
     private func setComposerTextHeight(_ rawHeight: CGFloat) {
@@ -4680,6 +4756,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             analyzeButton,
             attachButton,
             instructionsButton,
+            opacityControl,
             opacitySlider,
             hideButton,
             closeButton,

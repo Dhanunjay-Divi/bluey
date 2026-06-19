@@ -100,6 +100,9 @@ pub enum OverlayEvent {
     Pong,
     Shown,
     Hidden,
+    OpacityUpdated {
+        opacity: f32,
+    },
     AskRequested {
         question: String,
         #[serde(default)]

@@ -1375,6 +1375,11 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             daemon.state.lock().await.overlay_visible = false;
             write_state(daemon).await?;
         }
+        OverlayEvent::OpacityUpdated { opacity } => {
+            let opacity = opacity.clamp(0.05, 1.0);
+            daemon.state.lock().await.overlay_opacity = opacity;
+            write_state(daemon).await?;
+        }
         OverlayEvent::AskRequested {
             question,
             provider,
