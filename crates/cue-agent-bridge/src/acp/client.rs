@@ -80,17 +80,33 @@ impl AcpAgentSpec {
 
     /// Build the SDK's transport component (which spawns the subprocess).
     ///
-    /// Uses [`AcpAgent::from_args`]: the program is the first argv entry and the
-    /// rest are its args (no shell, no env-var prefixes).
+    /// Uses [`AcpAgent::from_args`]: leading `NAME=value` argv entries become the
+    /// child's environment variables, then the program and its args follow (no
+    /// shell).
     ///
-    /// The child inherits this process's environment. The daemon recovers the
-    /// user's real shell `PATH`/env at startup (via `fix_path_env`) so that — in
-    /// an app launched from Finder/Dock — agent binaries and their runtime (e.g.
-    /// `node` for the npm ACP adapters / Copilot CLI) resolve the same way they
-    /// do in the user's terminal. We deliberately do NOT hand-edit `PATH` here:
-    /// the recovered shell environment is the single source of truth.
+    /// The child normally inherits this process's environment. The daemon recovers
+    /// the user's real shell `PATH`/env at startup (via `fix_path_env`) so that —
+    /// in an app launched from Finder/Dock — agent binaries resolve the same way
+    /// they do in the user's terminal.
+    ///
+    /// That is NOT sufficient for runtime-version-sensitive agents, though: the
+    /// **GitHub Copilot CLI hard-requires Node ≥ 24**, but if an older `node` sits
+    /// ahead of a satisfying one on `PATH`, Copilot's npm loader picks the wrong
+    /// one and exits with *"requires Node.js v24 … Currently using v23"* before the
+    /// ACP handshake. The legacy CLI driver already guards this by probing the
+    /// binary and prepending a satisfying runtime's bin dir to the child's `PATH`
+    /// ([`crate::runtime_resolve::runtime_path_for_program`]); the ACP spawn must
+    /// do the same, or Node-pinned agents fail only over ACP. So we apply the same
+    /// resolution and pass the corrected `PATH` as a leading `PATH=…` argv entry
+    /// (consumed by `from_args` as a child env var). When the program launches
+    /// cleanly under the inherited `PATH` (the common case) the probe returns
+    /// `None` and argv is unchanged — the recovered shell env stays the source of
+    /// truth.
     fn to_acp_agent(&self) -> anyhow::Result<AcpAgent> {
-        let mut argv: Vec<String> = Vec::with_capacity(self.args.len() + 1);
+        let mut argv: Vec<String> = Vec::with_capacity(self.args.len() + 2);
+        if let Some(child_path) = crate::runtime_resolve::runtime_path_for_program(&self.program) {
+            argv.push(format!("PATH={child_path}"));
+        }
         argv.push(self.program.clone());
         argv.extend(self.args.iter().cloned());
         AcpAgent::from_args(argv)
