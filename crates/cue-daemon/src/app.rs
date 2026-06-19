@@ -6060,66 +6060,27 @@ async fn drive_answer_attempt(
     );
     let kind = &drive_kind;
 
-    // Pick the right driver by the agent's registry kind, not by name. Cloud
-    // agents (Cursor Cloud, Copilot Cloud, …) have a row in
-    // `cue_agent_bridge::cloud::CLOUD_REGISTRY` and dispatch through the
-    // cloud adapter; local-CLI agents go through the existing drive layer.
-    // The cloud adapter loads credentials from the OS keychain and emits one
-    // structured audit line per HTTP call (vendor, endpoint, status — never
-    // the token).
-    let answer_stream = if cue_agent_bridge::cloud::is_cloud_kind(kind) {
-        // Cloud vendors don't take a per-run CLI model flag, so a model override
-        // (only ever set for a local-CLI model-block fallback) does not apply.
-        match cue_agent_bridge::cloud::drive_cloud(kind.clone(), question).await {
-            Ok(answer_stream) => answer_stream,
-            Err(error) => {
-                debug!(agent = %label, error = %error, "cloud agent drive failed to start");
-                return Err(DriveFailure {
-                    reason: "isn't connected or set up".to_string(),
-                    resume_recoverable: false,
-                    raw_error: None,
-                });
-            }
-        }
-    } else if acp_answer_enabled(kind) {
-        // PHASE 0: opt-in (BLUEY_USE_ACP=1) ACP path for local agents that have an
-        // ACP entrypoint. ACP speaks structured JSON-RPC to the agent's `--acp`
-        // mode (or its adapter) instead of spawning `agent -p` and scraping
-        // stdout — which is fragile (e.g. Gemini's CLI exits non-zero on a TTY
-        // warning). The `question` already carries continuation (resume id + cwd).
-        // Reversible: default builds (flag unset) never take this branch.
-        match cue_agent_bridge::acp::drive_acp(kind.clone(), question).await {
-            Ok(answer_stream) => answer_stream,
-            Err(error) => {
-                debug!(agent = %label, error = %error, "ACP agent drive failed to start");
-                return Err(DriveFailure {
-                    reason: "isn't connected or set up (ACP)".to_string(),
-                    resume_recoverable: false,
-                    raw_error: None,
-                });
-            }
-        }
-    } else {
-        // Local CLI: drive through the options-aware entry point so a model
-        // fallback (e.g. Codex `-m gpt-5.1-codex`) can be appended without
-        // touching the user's config. An empty override (the common case)
-        // produces byte-identical argv to the plain `drive`.
-        let opts = cue_agent_bridge::drive::DriveOptions {
-            model_override: model_override.to_vec(),
-            ..Default::default()
-        };
-        match cue_agent_bridge::drive::drive_with_options(kind.clone(), question, opts).await {
+    // Pick the right driver in ONE place: the spine's `drive_with_overrides`
+    // owns the cloud-vs-ACP-vs-CLI decision (data-driven by the registry row,
+    // never by name), threads the per-run model override into the local-CLI
+    // branch, and ignores it for cloud/ACP (which take no per-run model flag).
+    // Adding an agent is a registry row, not a new branch here. Cloud agents
+    // load credentials from the OS keychain and emit one audit line per HTTP
+    // call (vendor, endpoint, status — never the token).
+    let answer_stream =
+        match cue_agent_bridge::drive_with_overrides(kind.clone(), question, model_override.to_vec())
+            .await
+        {
             Ok(answer_stream) => answer_stream,
             Err(error) => {
                 debug!(agent = %label, error = %error, "agent drive failed to start");
                 return Err(DriveFailure {
-                    reason: "isn't installed or signed in".to_string(),
+                    reason: "isn't connected, installed, or signed in".to_string(),
                     resume_recoverable: false,
                     raw_error: None,
                 });
             }
-        }
-    };
+        };
 
     futures_util::pin_mut!(answer_stream);
     let mut body = String::new();

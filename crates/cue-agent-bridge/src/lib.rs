@@ -79,6 +79,36 @@ pub async fn drive(agent: AgentKind, question: Question) -> anyhow::Result<Answe
     drive_cli(agent, question).await
 }
 
+/// Like [`drive`], but threads a per-run **model override** into the local-CLI
+/// branch (cloud and ACP agents don't take a per-run model flag, so the override
+/// is ignored for them — exactly as [`drive`] would route them).
+///
+/// This is the single dispatch entry point the daemon's answer ladder uses: it
+/// owns the cloud-vs-ACP-vs-CLI decision in ONE place (so adding an agent is a
+/// registry row, never a new dispatch branch in the daemon), while the override
+/// lets the model-block self-resolver re-drive a blocked CLI agent under a
+/// supported model ([`drive::DriveOptions::model_override`]). An empty override
+/// (the common case) is byte-identical to [`drive`].
+pub async fn drive_with_overrides(
+    agent: AgentKind,
+    question: Question,
+    model_override: Vec<String>,
+) -> anyhow::Result<AnswerStream> {
+    if should_use_acp(&agent) {
+        return acp::drive_acp(agent, question).await;
+    }
+    if let Some(tag) = registry::KindTag::from_agent_kind(&agent) {
+        if cloud::cloud_entry_for(tag).is_some() {
+            return cloud::drive_cloud(agent, question).await;
+        }
+    }
+    let opts = drive::DriveOptions {
+        model_override,
+        ..Default::default()
+    };
+    drive::drive_with_options(agent, question, opts).await
+}
+
 /// Whether the top-level [`drive`] should route `agent` through the ACP path.
 ///
 /// Two gates, both required: (1) the opt-in env var `BLUEY_USE_ACP=1` is set
