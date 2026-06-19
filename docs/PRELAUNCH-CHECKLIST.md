@@ -7,6 +7,20 @@
 
 This is the master gate before public alpha. Every item must be ticked or explicitly waived (with rationale) before announcing the product.
 
+## First 100 paid users gate
+
+The first paid launch target is a controlled 100-user alpha, not a worldwide
+ultra-low-latency launch. Use `docs/deploy/FIRST-100-PAID-USERS.md` as the
+operating plan.
+
+- [ ] First-100 architecture and upgrade-trigger doc reviewed by product + ops
+- [ ] Paid-alpha smoke in `docs/deploy/PAID-ALPHA-SMOKE.md` passed on a clean Mac
+- [ ] Square sandbox and low-dollar production reloads credit balances within 30s
+- [ ] Provider accounts funded and provider dashboard alerts/caps configured
+- [ ] Off-host backups configured and one restore/checksum verification passed
+- [ ] Support/refund/dispute owner assigned and mailbox monitored
+- [ ] No release artifact exposes provider keys, BYOK/customer-key paths, local LLM release mode, mock transcript mode, or dev capture flags
+
 ## Code-complete (already shipped on `feat/phase-3-round-12`)
 
 - [x] Server money path: `/router/{complete,embed,transcribe}` + `/router/complete/stream`

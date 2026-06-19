@@ -34,7 +34,9 @@ Caddy routes the API paths to `bluey-server` and serves everything else from
 2. Server host
    - DigitalOcean Ubuntu 24.04 droplet
    - Recommended initial size: 2 vCPU / 2 GB RAM / 50 GB SSD
-   - Region: nearest the first users; one region is fine for alpha
+   - Region: nearest the first users; one region is fine for the first 100
+     controlled paid users, but it is not a worldwide ultra-low-latency claim.
+     See `docs/deploy/FIRST-100-PAID-USERS.md` for upgrade triggers.
    - Firewall: SSH, HTTP, HTTPS only
 
 3. Secrets
