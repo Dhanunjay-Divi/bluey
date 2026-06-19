@@ -1939,15 +1939,14 @@ impl ProviderRegistry {
             }
         }
 
-        let allow_saved_byok = dev_byok_enabled();
-        let allow_byok = allow_saved_byok || !managed_mode;
+        let allow_byok = dev_byok_enabled();
 
         if allow_byok {
             if let Some(key) = std::env::var("OPENAI_API_KEY")
                 .ok()
                 .filter(|k| !k.is_empty())
                 .or_else(|| {
-                    allow_saved_byok
+                    allow_byok
                         .then(|| {
                             cue_daemon::secrets::load_api_key("llm_openai")
                                 .ok()
@@ -1965,7 +1964,7 @@ impl ProviderRegistry {
                 .ok()
                 .filter(|k| !k.is_empty())
                 .or_else(|| {
-                    allow_saved_byok
+                    allow_byok
                         .then(|| {
                             cue_daemon::secrets::load_api_key("llm_anthropic")
                                 .ok()
@@ -1980,23 +1979,22 @@ impl ProviderRegistry {
             }
         }
 
-        // Ollama: register if user opted in via BLUEY_OLLAMA_HOST. The
-        // provider reads OLLAMA_BASE_URL itself; we propagate
-        // BLUEY_OLLAMA_HOST into OLLAMA_BASE_URL if the user has not
-        // set it explicitly so a single env var is enough.
-        // ALWAYS available regardless of managed mode — it is the
-        // privacy/offline LocalFallbackPolicy target.
-        if let Ok(host) = std::env::var("BLUEY_OLLAMA_HOST") {
-            if !host.is_empty() {
-                if std::env::var("OLLAMA_BASE_URL").is_err() {
-                    // SAFETY: this is the daemon process at request time.
-                    unsafe {
-                        std::env::set_var("OLLAMA_BASE_URL", &host);
+        // Ollama is a developer-only local path. Production/customer Bluey
+        // answers must route through bluey-server so provider credentials and
+        // billing remain server-side.
+        if allow_byok {
+            if let Ok(host) = std::env::var("BLUEY_OLLAMA_HOST") {
+                if !host.is_empty() {
+                    if std::env::var("OLLAMA_BASE_URL").is_err() {
+                        // SAFETY: this is the daemon process at request time.
+                        unsafe {
+                            std::env::set_var("OLLAMA_BASE_URL", &host);
+                        }
                     }
+                    let provider: Arc<dyn cue_llm::LlmProvider> =
+                        Arc::new(cue_llm::ollama::OllamaProvider::new());
+                    providers.insert("ollama".to_string(), provider);
                 }
-                let provider: Arc<dyn cue_llm::LlmProvider> =
-                    Arc::new(cue_llm::ollama::OllamaProvider::new());
-                providers.insert("ollama".to_string(), provider);
             }
         }
 
@@ -2069,18 +2067,15 @@ fn build_llm_provider_from_env(
                 )));
             }
         }
+        return None;
     }
 
     let openai_key = std::env::var("OPENAI_API_KEY")
         .ok()
         .filter(|k| !k.is_empty())
         .or_else(|| {
-            allow_byok
-                .then(|| {
-                    cue_daemon::secrets::load_api_key("llm_openai")
-                        .ok()
-                        .flatten()
-                })
+            cue_daemon::secrets::load_api_key("llm_openai")
+                .ok()
                 .flatten()
         })?;
     Some(Box::new(cue_llm::openai::OpenAiProvider::new(openai_key)))

@@ -165,10 +165,10 @@ change.
 ## Internal Developer/Offline Fallback Routing
 
 `StaticPolicy` / `LocalFallbackPolicy` is used for local development,
-BYOK-style testing, and emergency offline fallback. This is not a customer
-model picker and should not appear in the paid product UI. Logged-in production
-accounts use managed routing through `bluey-server`; local fallback is selected
-inside the daemon before a request reaches the cloud.
+BYOK-style testing, and internal offline fallback only. This is not a customer
+model picker and must not appear in the paid product UI. Logged-in production
+accounts use managed routing through `bluey-server`; provider keys stay on the
+server.
 
 | Lane | Provider | Model |
 | --- | --- | --- |
@@ -181,10 +181,10 @@ inside the daemon before a request reaches the cloud.
 The direct Ollama provider default is `llama3.2`, but the router's explicit
 local lane is currently pinned to `llama3.1`.
 
-Direct BYOK providers are developer-gated by `BLUEY_DEV_BYOK=1` once managed
-tokens exist. Ollama can still be enabled through `BLUEY_OLLAMA_HOST` for local
-fallback. The managed server intentionally returns no route candidates for the
-`local` lane and `/router/complete` rejects `lane=local`.
+Direct BYOK providers and local Ollama are developer-gated by
+`BLUEY_DEV_BYOK=1`. `BLUEY_OLLAMA_HOST` is ignored unless that flag is present.
+The managed server intentionally returns no route candidates for the `local`
+lane and `/router/complete` rejects `lane=local`.
 
 ## Speculative Routing
 
@@ -277,7 +277,7 @@ should keep multiple providers and route by task:
 | Human-like technical answer | Anthropic `claude-sonnet-4-6` balanced lane | Strong prose, coding, and reasoning style | Higher latency/cost than fast mini models |
 | Deep coding/system design | Anthropic Sonnet lane with thinking budget, OpenAI `gpt-5.4` fallback | Better multi-step structure and safer tradeoff analysis | More output/thinking tokens, costlier |
 | Screen/image analysis | OpenAI `gpt-5.4` vision lane today; evaluate Gemini vision later | Strong current integration with text+image input through Chat Completions | Gemini may be cheaper/better for some image workloads but is not wired |
-| Offline fallback | Local Whisper/Ollama hidden fallback | Helps demos and outage resilience | Not reliable enough as primary paid experience |
+| Internal offline fallback | Local Whisper/Ollama behind dev flags | Helps demos and outage drills | Not a customer mode; not reliable enough as primary paid experience |
 
 Decision: **have all providers behind the router, expose Auto/Balanced/Deep as
 simple UX concepts, and keep provider/model swaps server-side**. That lets us

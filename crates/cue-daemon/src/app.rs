@@ -8046,14 +8046,13 @@ fn spawn_auto_recap(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
 
 /// Build an LLM provider from env for auto-recap (best-effort).
 fn build_recap_llm_from_env() -> Option<Box<dyn cue_llm::LlmProvider>> {
+    if !env_truthy_any(&["BLUEY_DEV_BYOK", "BLUEY_DEV_DIRECT_PROVIDERS"]) {
+        return None;
+    }
     let key = std::env::var("OPENAI_API_KEY")
         .ok()
         .filter(|k| !k.is_empty())
-        .or_else(|| {
-            env_truthy_any(&["BLUEY_DEV_BYOK"])
-                .then(|| crate::secrets::load_api_key("llm_openai").ok().flatten())
-                .flatten()
-        })?;
+        .or_else(|| crate::secrets::load_api_key("llm_openai").ok().flatten())?;
     Some(Box::new(cue_llm::openai::OpenAiProvider::new(key)))
 }
 

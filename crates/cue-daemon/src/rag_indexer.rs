@@ -313,14 +313,13 @@ fn managed_embedder(paths: &AppPaths) -> anyhow::Result<Option<Arc<dyn Embedding
 }
 
 fn dev_openai_embedder() -> Option<Arc<dyn EmbeddingProvider>> {
+    if !env_truthy("BLUEY_DEV_BYOK") {
+        return None;
+    }
     let api_key = std::env::var("OPENAI_API_KEY")
         .ok()
         .filter(|key| !key.trim().is_empty())
-        .or_else(|| {
-            env_truthy("BLUEY_DEV_BYOK")
-                .then(|| crate::secrets::load_api_key("openai").ok().flatten())
-                .flatten()
-        });
+        .or_else(|| crate::secrets::load_api_key("openai").ok().flatten());
     api_key.map(|api_key| {
         warn!("RAG using direct OpenAI embeddings from local developer configuration");
         Arc::new(cue_rag::embedder::OpenAiEmbedder::new(api_key)) as Arc<dyn EmbeddingProvider>

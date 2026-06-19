@@ -34,10 +34,10 @@ Not shipped in v0.1.0:
   writing / vision task types with confidence scoring; vision keywords
   narrowed so text-only "diagram" / "chart" do not misroute design
   questions to Vision.
-- StaticPolicy maps developer/offline lanes to providers (Instant -> OpenAI
+- StaticPolicy maps developer lanes to providers (Instant -> OpenAI
   gpt-4o-mini, Balanced -> Anthropic claude-3-5-sonnet, Deep ->
-  claude-3-7-sonnet, Vision -> gpt-4o). Its separate daemon-only fallback can
-  use Ollama for local development/offline testing. Vision overrides latency.
+  claude-3-7-sonnet, Vision -> gpt-4o). Direct providers and Ollama require
+  explicit dev flags and are not customer modes. Vision overrides latency.
 - ManagedPolicy maps paid customer traffic to `bluey-managed-*` lanes. It never
   emits a Local lane; local/Ollama fallback is daemon-only and is not exposed as
   a paid customer model.
@@ -102,8 +102,8 @@ were updated alongside this change to match the default-ON behaviour.
 ### Answers And Context
 
 - LLM streaming is implemented end-to-end for overlay cards.
-- OpenAI, Anthropic, Ollama, OpenAI-compatible routing, and managed-route
-  metadata are implemented in code.
+- OpenAI, Anthropic, OpenAI-compatible routing, developer-gated Ollama, and
+  managed-route metadata are implemented in code.
 - Recap/action-item/decision extraction exists for sessions.
 - Provider context compacts transcript, recent Q&A, attachments, screenshots,
   notes, and local memory before model calls.

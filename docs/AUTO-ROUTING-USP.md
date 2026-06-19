@@ -176,9 +176,9 @@ the same; what changes is the dispatcher:
 - v0.2 production default is `ManagedPolicy` + `BlueyManagedProvider`
   which dispatches through `bluey-server`. Bluey owns the keys; the
   customer pays Bluey.
-- Local Ollama / whisper.cpp stay as the **offline / privacy fallback**.
-  The classifier and the `SpeculativeRouter` work identically against
-  fallback providers; only the underlying transport changes.
+- Local Ollama / whisper.cpp stay as **developer-only fallback tooling** behind
+  explicit dev flags. They are not customer modes, and the paid product routes
+  cloud answers through `bluey-server`.
 
 **This is exactly the plug-point design described above** — the
 classifier is decoupled from the dispatcher precisely so the BYOK →
