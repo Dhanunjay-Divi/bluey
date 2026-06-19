@@ -111,6 +111,8 @@ This is the master gate before public alpha. Every item must be ticked or explic
 - [ ] Matching `SQUARE_*_WEBHOOK_SIGNATURE_KEY` set in `/etc/bluey-api/bluey-api.env`
 - [ ] Sandbox test: $30 reload through Square hosted checkout → balance credited within 30s
 - [ ] Production test: real $30 reload through Square hosted checkout → balance credited within 30s
+- [ ] `docs/deploy/ABUSE-FRAUD-CHARGEBACK-PLAYBOOK.md` reviewed by the operator who will handle Square notices
+- [ ] Square failed-webhook/dispute notification mailbox confirmed and monitored
 - [ ] Auto-topup/card-on-file is explicitly deferred until Square saved-card flow is wired; manual reload must be clear in `/account`
 - [x] Customer-facing copy says account credits are non-transferable, have no cash value, and are not a stored-value/gift-card product
 - [ ] Refund/support/privacy/terms pages are published before production payments
@@ -158,6 +160,7 @@ do not advertise it until a real `Bluey.app` artifact exists.
 - [x] Each release tarball contains top-level `bin/bluey` plus helper binaries
 - [x] `SHA256SUMS.txt` hosted next to the tarballs, and `install.sh` verifies it
 - [x] `bluey on` checks the signed release manifest and notifies when an update is available; silent install is disabled by default for alpha
+- [ ] `bash scripts/release-hygiene-scan.sh` passes before publishing site/release artifacts
 - [x] Current-Mac temp-root installer smoke: download, checksum, ad-hoc sign, quarantine strip, CLI symlink, `bluey --version`
 - [ ] Smoke on a clean Mac: `curl -fsSL https://bluey.sh/install.sh | bash` finishes cleanly
 - [ ] Smoke on a clean Mac: old installed Bluey updates itself on next `bluey on`
@@ -204,6 +207,10 @@ without breaking existing customers (the bundle id stays the same).
 - [ ] Data residency disclosed (server region, retention)
 
 ## Smoke test script
+
+For the full paid-alpha customer path, use `docs/deploy/PAID-ALPHA-SMOKE.md`.
+The curl-only smoke below is a narrower API sanity check and does not replace
+the real Mac + Square + provider smoke.
 
 Run this end-to-end against production before announcing:
 

@@ -62,6 +62,16 @@ Bluey validates `x-square-hmacsha256-signature` with the configured webhook
 signature key before processing any event. Completed Square orders are credited
 through the same FIFO credit-batch ledger used by the rest of Bluey.
 
+Operational requirements:
+
+- The endpoint must return 2xx quickly for valid, already-processed events.
+- Processing must be idempotent by Square event/order/payment ID; Square may
+  retry or deliver events more than once.
+- Webhook failures are not a reason to grant credits manually unless an operator
+  verifies the payment in Square and records the Square event/payment ID.
+- Production launch requires one sandbox reload smoke and one low-dollar live
+  reload smoke proving webhook delivery, balance crediting, and idempotent replay.
+
 ## Current Scope
 
 Implemented:
@@ -83,6 +93,8 @@ Compliance notes:
   traffic.
 - Rotate Square credentials before production if they were ever pasted into a
   chat, ticket, or other non-secret channel.
+- Disputes and chargebacks follow
+  `docs/deploy/ABUSE-FRAUD-CHARGEBACK-PLAYBOOK.md`.
 
 Deferred:
 

@@ -116,6 +116,9 @@ not security boundaries.
   trusting update metadata. The signed manifest pins both the release archive
   SHA256 and `install.sh` SHA256, so a compromised static host cannot silently
   swap updater inputs unless the release signing key is also compromised.
+- `scripts/release-hygiene-scan.sh` is the pre-publish guard for release-facing
+  files. It fails on real-looking provider/Square/Resend/JWT secrets and
+  production-unsafe debug flag assignments.
 
 ### Client-side friction
 
@@ -180,6 +183,19 @@ reverse engineer".
 | Dependency audit | catches vulnerable crates | add `cargo deny` / `cargo audit` to CI |
 | Cloud KMS/secrets manager | keeps provider keys out of env files long-term | initial droplet can start with env files; migrate before scale |
 | Postgres + pgvector migration | robust multi-user cloud data plane | SQLite is fine for local cache and early server prototype; Postgres is the production cloud store |
+
+### Paid Alpha Operational Closure
+
+These are mandatory before inviting real paid users:
+
+- Run `docs/deploy/PAID-ALPHA-SMOKE.md` on a clean Mac against the deployed
+  droplet and hosted release artifacts.
+- Confirm Square webhook delivery is green and one sandbox plus one live reload
+  credit balances correctly.
+- Confirm live Deepgram captions, OpenAI/Anthropic answers, screen analysis,
+  document ingestion, sessions, and balance movement with trace IDs.
+- Review `docs/deploy/ABUSE-FRAUD-CHARGEBACK-PLAYBOOK.md` and assign the person
+  who watches failed webhooks, disputes, refunds, and suspicious usage.
 
 ---
 
