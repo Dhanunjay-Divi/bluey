@@ -1717,6 +1717,12 @@ async fn start_audio_capture(
 
 /// Build an STT provider for the system audio continuous capture path.
 async fn build_system_audio_stt_provider() -> anyhow::Result<Box<dyn cue_core::stt::SttProvider>> {
+    if !dev_direct_stt_enabled() {
+        anyhow::bail!(
+            "direct streaming STT providers are debug/dev-only; release builds use Bluey managed STT"
+        );
+    }
+
     use cue_core::pcm::AudioSource;
     use cue_core::stt::SttConfig;
 
@@ -1733,6 +1739,12 @@ async fn build_system_audio_stt_provider() -> anyhow::Result<Box<dyn cue_core::s
 /// Build an STT provider for the microphone path via the factory chain.
 /// Called when the streaming factory is preferred (e.g. LocalWhisper enabled).
 pub async fn build_mic_stt_provider() -> anyhow::Result<Box<dyn cue_core::stt::SttProvider>> {
+    if !dev_direct_stt_enabled() {
+        anyhow::bail!(
+            "direct streaming STT providers are debug/dev-only; release builds use Bluey managed STT"
+        );
+    }
+
     use cue_core::pcm::AudioSource;
     use cue_core::stt::SttConfig;
 
@@ -1973,16 +1985,20 @@ fn env_truthy_any(names: &[&str]) -> bool {
     })
 }
 
+fn dev_env_truthy_any(names: &[&str]) -> bool {
+    cfg!(debug_assertions) && env_truthy_any(names)
+}
+
 fn dev_direct_provider_keys_enabled() -> bool {
-    env_truthy_any(&["BLUEY_DEV_DIRECT_PROVIDERS"])
+    dev_env_truthy_any(&["BLUEY_DEV_DIRECT_PROVIDERS"])
 }
 
 fn dev_direct_stt_enabled() -> bool {
-    env_truthy_any(&["BLUEY_DEV_DIRECT_STT", "BLUEY_DEV_DIRECT_PROVIDERS"])
+    dev_env_truthy_any(&["BLUEY_DEV_DIRECT_STT", "BLUEY_DEV_DIRECT_PROVIDERS"])
 }
 
 fn dev_direct_vision_enabled() -> bool {
-    env_truthy_any(&["BLUEY_DEV_DIRECT_VISION", "BLUEY_DEV_DIRECT_PROVIDERS"])
+    dev_env_truthy_any(&["BLUEY_DEV_DIRECT_VISION", "BLUEY_DEV_DIRECT_PROVIDERS"])
 }
 
 fn real_stt_chunk_duration_ms(configured: u32) -> u32 {
@@ -5768,7 +5784,7 @@ async fn analyze_screen_with_screenshot_fallback(
             CardKind::Warning,
             "Analyse needs vision",
             format!(
-                "Bluey could not read browser page text. Sign in to Bluey for cloud screen analysis, then try again.\n\nBrowser text error: {}\n\nDeveloper direct vision providers require BLUEY_DEV_DIRECT_VISION=1.",
+                "Bluey could not read browser page text. Sign in to Bluey for cloud screen analysis, then try again.\n\nBrowser text error: {}\n\nDeveloper direct vision providers require a debug/dev build with BLUEY_DEV_DIRECT_VISION=1.",
                 compact_snippet(&page_error_text, 520)
             ),
         )
@@ -8046,7 +8062,7 @@ fn spawn_auto_recap(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
 
 /// Build an LLM provider from env for auto-recap (best-effort).
 fn build_recap_llm_from_env() -> Option<Box<dyn cue_llm::LlmProvider>> {
-    if !env_truthy_any(&["BLUEY_DEV_BYOK", "BLUEY_DEV_DIRECT_PROVIDERS"]) {
+    if !dev_env_truthy_any(&["BLUEY_DEV_BYOK", "BLUEY_DEV_DIRECT_PROVIDERS"]) {
         return None;
     }
     let key = std::env::var("OPENAI_API_KEY")

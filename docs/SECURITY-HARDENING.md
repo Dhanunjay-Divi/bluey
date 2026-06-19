@@ -63,7 +63,8 @@ not security boundaries.
 - Managed LLM/STT flow keeps upstream provider keys on `bluey-server`.
 - Desktop login stores Bluey account tokens in OS secure storage by default. The local account profile stores non-secret account metadata only.
 - Customer desktop no longer needs Deepgram/OpenAI/Anthropic keys in normal managed mode.
-- Direct BYOK/dev provider paths are gated behind explicit development flags such as `BLUEY_DEV_BYOK=1`.
+- Direct BYOK/dev provider paths are gated behind explicit development flags
+  such as `BLUEY_DEV_BYOK=1`, and release binaries ignore those flags.
 
 ### Managed STT relay
 

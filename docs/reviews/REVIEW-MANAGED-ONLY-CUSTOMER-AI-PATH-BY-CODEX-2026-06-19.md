@@ -13,13 +13,16 @@ No blocking issues found in the managed-only enforcement patch.
 ## Checks
 
 - Dashboard provider registry no longer registers direct OpenAI/Anthropic
-  providers unless `BLUEY_DEV_BYOK=1`.
-- Ollama is no longer registered from `BLUEY_OLLAMA_HOST` alone.
+  providers unless `BLUEY_DEV_BYOK=1` is set in a debug/dev build.
+- Ollama is no longer registered from `BLUEY_OLLAMA_HOST` alone, and the dev
+  BYOK gate is ignored by release binaries.
 - Legacy dashboard single-shot path no longer falls through to
   `OPENAI_API_KEY` when dev BYOK is disabled.
 - Daemon local RAG embedding ignores local `OPENAI_API_KEY` unless
-  `BLUEY_DEV_BYOK=1`.
-- Daemon auto-recap direct OpenAI path is dev-gated.
+  `BLUEY_DEV_BYOK=1` is set in a debug/dev build.
+- Daemon auto-recap direct OpenAI path is debug/dev-gated.
+- Older direct streaming STT factory paths are debug/dev-gated; release
+  binaries stay on managed STT.
 - Product docs now match the production contract: customer AI/STT/vision/embed
   provider calls go through `bluey-server`; provider keys stay server-side.
 
@@ -29,7 +32,8 @@ No blocking issues found in the managed-only enforcement patch.
   Those are useful project history but should not be treated as current product
   behavior.
 - Provider adapter code remains in the repo. That is acceptable because it is
-  test/dev/server plumbing; customer routing is gated at selection time.
+  test/dev/server plumbing; customer release binaries ignore the runtime dev
+  env flags and customer routing is gated at selection time.
 
 ## Verification
 
@@ -43,4 +47,3 @@ cargo clippy -p cue-dashboard -p cue-daemon --all-targets -- -D warnings
 ```
 
 All passed locally.
-

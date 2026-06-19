@@ -70,9 +70,9 @@ Unlinked install:
 
 Developer fallback:
 
-- `BLUEY_DEV_BYOK=1` is required for direct local OpenAI embeddings. Without
-  that dev flag, even a local `OPENAI_API_KEY` is ignored and the customer path
-  uses Bluey managed `/router/embed`.
+- `BLUEY_DEV_BYOK=1` in a debug/dev build is required for direct local OpenAI
+  embeddings. Release binaries ignore that flag; even a local `OPENAI_API_KEY`
+  is ignored and the customer path uses Bluey managed `/router/embed`.
 
 ## Verification
 

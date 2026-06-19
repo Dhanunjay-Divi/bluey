@@ -313,7 +313,7 @@ fn managed_embedder(paths: &AppPaths) -> anyhow::Result<Option<Arc<dyn Embedding
 }
 
 fn dev_openai_embedder() -> Option<Arc<dyn EmbeddingProvider>> {
-    if !env_truthy("BLUEY_DEV_BYOK") {
+    if !dev_env_truthy("BLUEY_DEV_BYOK") {
         return None;
     }
     let api_key = std::env::var("OPENAI_API_KEY")
@@ -376,6 +376,10 @@ fn env_truthy(name: &str) -> bool {
     std::env::var(name)
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
+}
+
+fn dev_env_truthy(name: &str) -> bool {
+    cfg!(debug_assertions) && env_truthy(name)
 }
 
 #[cfg(test)]

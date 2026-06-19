@@ -37,7 +37,8 @@ Not shipped in v0.1.0:
 - StaticPolicy maps developer lanes to providers (Instant -> OpenAI
   gpt-4o-mini, Balanced -> Anthropic claude-3-5-sonnet, Deep ->
   claude-3-7-sonnet, Vision -> gpt-4o). Direct providers and Ollama require
-  explicit dev flags and are not customer modes. Vision overrides latency.
+  explicit dev flags in debug/dev builds and are not customer modes. Release
+  binaries ignore those flags. Vision overrides latency.
 - ManagedPolicy maps paid customer traffic to `bluey-managed-*` lanes. It never
   emits a Local lane; local/Ollama fallback is daemon-only and is not exposed as
   a paid customer model.

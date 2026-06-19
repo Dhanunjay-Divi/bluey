@@ -1910,9 +1910,10 @@ impl ProviderRegistry {
         // every cloud lane; bluey-server will pick the actual upstream
         // provider+model. Customer pays Bluey; Bluey owns the API keys.
         //
-        // Legacy BYOK direct providers (OpenAI/Anthropic from env or
-        // saved secrets) are gated behind BLUEY_DEV_BYOK=1 so dev workflows
-        // still work without surprising customers in production.
+        // Legacy BYOK direct providers (OpenAI/Anthropic from env or saved
+        // secrets) are gated behind BLUEY_DEV_BYOK=1 in debug/dev builds so
+        // dev workflows still work while shipped customer binaries stay
+        // managed-only.
         let managed_mode = match cloud_client_with_trace(trace_id) {
             Ok(client) => client.current_tokens().is_some(),
             Err(_) => false,
@@ -2054,8 +2055,8 @@ fn build_llm_provider_from_env(
     _db: &State<DbState>,
     trace_id: &str,
 ) -> Option<Box<dyn cue_llm::LlmProvider>> {
-    // Managed mode first: Bluey account tokens take priority over BYOK
-    // unless BLUEY_DEV_BYOK=1 explicitly opts in (matching the
+    // Managed mode first: Bluey account tokens take priority over BYOK unless
+    // a debug/dev build has BLUEY_DEV_BYOK=1 explicitly set (matching the
     // ProviderRegistry policy).
     let allow_byok = dev_byok_enabled();
     if !allow_byok {
@@ -2082,9 +2083,10 @@ fn build_llm_provider_from_env(
 }
 
 fn dev_byok_enabled() -> bool {
-    std::env::var("BLUEY_DEV_BYOK")
-        .ok()
-        .is_some_and(|value| value.trim() == "1")
+    cfg!(debug_assertions)
+        && std::env::var("BLUEY_DEV_BYOK")
+            .ok()
+            .is_some_and(|value| value.trim() == "1")
 }
 
 // ─── R8 nit hardening tests (recheck rollout) ───────────────────────────────

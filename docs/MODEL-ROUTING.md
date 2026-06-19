@@ -182,9 +182,10 @@ The direct Ollama provider default is `llama3.2`, but the router's explicit
 local lane is currently pinned to `llama3.1`.
 
 Direct BYOK providers and local Ollama are developer-gated by
-`BLUEY_DEV_BYOK=1`. `BLUEY_OLLAMA_HOST` is ignored unless that flag is present.
-The managed server intentionally returns no route candidates for the `local`
-lane and `/router/complete` rejects `lane=local`.
+`BLUEY_DEV_BYOK=1` in debug/dev builds only. Release binaries ignore that flag.
+`BLUEY_OLLAMA_HOST` is ignored unless the dev gate is active. The managed
+server intentionally returns no route candidates for the `local` lane and
+`/router/complete` rejects `lane=local`.
 
 ## Speculative Routing
 
@@ -215,7 +216,11 @@ BLUEY_SPECULATIVE_ROUTING=0
 
 ## STT Routing
 
-The streaming STT factory builds this ordered chain:
+Customer desktop installs use Bluey managed STT through `bluey-server`.
+Provider keys stay server-side.
+
+Debug/dev builds can still exercise the older direct streaming STT factory,
+which builds this ordered chain:
 
 1. Deepgram `nova-3`
 2. OpenAI Realtime `gpt-4o-mini-transcribe`
@@ -225,11 +230,14 @@ Environment gates:
 
 | Provider | Key/flag |
 | --- | --- |
-| Deepgram | `DEEPGRAM_API_KEY` or `BLUEY_STT_API_KEY` |
-| OpenAI Realtime fallback | `OPENAI_API_KEY` plus `BLUEY_STT_FALLBACK_OPENAI=1` |
-| LocalWhisper fallback | `BLUEY_STT_LOCAL_WHISPER=1` |
-| Force STT router wrapper | `BLUEY_STT_ROUTER=1` |
-| Dev mock STT | `BLUEY_USE_MOCK_STT=1` |
+| Deepgram | Debug/dev only: `DEEPGRAM_API_KEY` or `BLUEY_STT_API_KEY` |
+| OpenAI Realtime fallback | Debug/dev only: `OPENAI_API_KEY` plus `BLUEY_STT_FALLBACK_OPENAI=1` |
+| LocalWhisper fallback | Debug/dev only: `BLUEY_STT_LOCAL_WHISPER=1` |
+| Force STT router wrapper | Debug/dev only: `BLUEY_STT_ROUTER=1` |
+| Dev mock STT | Debug/dev only: `BLUEY_USE_MOCK_STT=1` |
+
+Release binaries ignore the direct STT env path and route paid/live captions
+through Bluey managed STT.
 
 ### VAD And Endpointing
 
