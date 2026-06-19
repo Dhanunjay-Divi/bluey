@@ -60,9 +60,25 @@
 > IDE store). This table is the source of truth for *which* surfaces exist and what each
 > reads/drives. A "surface" = a distinct `KindTag` registry row OR a distinct on-disk store.
 
+### Do the CLI and the GUI app SHARE sessions? (web-researched 2026-06-19 — NOT assumed)
+Almost none natively share — each surface keeps its OWN store. The one exception is Codex.
+| Agent | CLI store | GUI-app store | Natively SHARE? |
+|---|---|---|---|
+| **Claude** | `~/.claude/projects/*.jsonl` | desktop-app own index | ❌ **NO** — "completely separate, no shared history." The `cliSessionId` field is *meant* to link them but is buggy/broken (anthropics/claude-code #28791, #63082, #58670). On THIS machine Bluey's `ClaudeAppIndex` reader follows that link itself — so Bluey bridges them; the apps don't share natively. |
+| **Codex** | `~/.codex` | VS Code IDE: **shares `~/.codex`** ✅ | ✅ **YES** (CLI + VS Code). JetBrains uses a separate `aia/codex` dir (NOT shared). |
+| **Cursor** | `~/.cursor/chats/` | IDE: `state.vscdb` composers | ❌ **NO** — different stores. |
+| **GitHub Copilot** | `~/.copilot/session-state/` | VS Code: workspaceStorage `chatSessions` | ❌ **NO** — separate. Asymmetric: VS Code *surfaces* CLI sessions, but the CLI's `/chronicle` can't see VS Code chats (github/copilot-cli #3816). |
+| **Antigravity** | `…/antigravity-cli/brain/` | `…/antigravity-ide/brain/` | ❌ **NO** — separate `brain/` dirs (same engine; can export between them). |
+| **Gemini** | `~/.gemini/tmp/<token>/chats` | (no separate desktop app) | — single surface |
+Refs: anthropics/claude-code #28791/#63082/#58670; codex.danielvaughan.com cross-surface-session-sync; github/copilot-cli #3816; medium.com/google-cloud Antigravity CLI+IDE config.
+
+**Implication for Bluey:** because surfaces DON'T natively share, each GUI surface is a
+genuinely distinct store that needs its own 5-cap pass — which is exactly why
+`claude_code_app` and `vs_code_fork` were tested separately from their CLIs (both 5/5).
+
 | Agent family | Surfaces (distinct rows) | Reads sessions from | Drives (answers) via | Continuation mechanism | Covered? |
 |---|---|---|---|---|---|
-| **Claude** | **3 separate rows**: `claude_code` (CLI), `claude_code_app` (desktop App), `claude_code_agent` (App agent-mode) | CLI: `~/.claude/projects/<enc-cwd>/<id>.jsonl`. App/Agent: `~/Library/Application Support/Claude/` index → follows `cliSessionId` into the SAME CLI JSONL files | All three: `claude-agent-acp` adapter (same engine) | NativeResume — true `session/load` by `(id, cwd)`; fork fallback | CLI ✅, App ✅, Agent ⬜ (0 sessions) |
+| **Claude** | **3 separate rows**: `claude_code` (CLI), `claude_code_app` (desktop App), `claude_code_agent` (App agent-mode) — SEPARATE stores (don't natively share, see above) | CLI: `~/.claude/projects/<enc-cwd>/<id>.jsonl`. App/Agent: own `~/Library/Application Support/Claude/` index whose `cliSessionId` Bluey FOLLOWS back into the CLI JSONL files (Bluey bridges them — the apps don't natively share) | All three: `claude-agent-acp` adapter (same engine) | NativeResume — true `session/load` by `(id, cwd)`; fork fallback | CLI ✅, App ✅, Agent ⬜ (0 sessions) |
 | **Codex** | **1 surface only** — `codex`. The VS Code Codex extension and the CLI share `~/.codex`; there is NO separate Codex-IDE row/store. | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | `codex-acp` adapter | NativeResume — true `session/load` by the **inner `session_meta.payload.id` UUID** (NOT the rollout filename) | ✅ (the only surface) |
 | **Cursor** | **1 row** (`cursor`) reading the IDE store. NOTE: the `cursor-agent` CLI ALSO has its own store (`~/.cursor/chats/<ws>/<uuid>/`) that Bluey does **NOT** read — but that's the CLI's *own* sessions, a different id-space. | IDE composers: `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` (`cursorDiskKV` table) | `cursor-agent acp` (ACP) / `cursor-agent -p` (CLI) | **Replay/fork** — its composer id is a SQLite db key, NOT an ACP handle; `session/load` is a known-broken Cursor bug. Replay the transcript. | ✅ (IDE store; the CLI's own `~/.cursor/chats` store is intentionally NOT surfaced) |
 | **Gemini** | **1 surface** — `gemini` | `~/.gemini/tmp/<token>/chats/*.jsonl` | `gemini --acp` (API-key tier) | **Replay/fork** — `--resume` is latest/index, not by-uuid | ✅ |
