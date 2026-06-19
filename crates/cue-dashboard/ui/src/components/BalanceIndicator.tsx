@@ -48,18 +48,21 @@ export function BalanceIndicator() {
           : "Checking";
 
   const tone = snapshot?.low_balance_warning
-    ? "border-amber-500/50 bg-amber-950/50 text-amber-100"
-    : "border-cyan-400/25 bg-zinc-900/85 text-zinc-100";
+    ? "border border-warning/40 bg-warning/10 text-warning"
+    : "border border-hairline bg-bg-raised/85 text-text-primary";
 
   return (
     <div
-      className={`absolute right-5 top-4 z-20 flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold shadow-lg backdrop-blur ${tone}`}
+      className={`absolute right-5 top-4 z-20 flex items-center gap-2 rounded-full px-3 py-1.5 text-footnote font-semibold shadow-lg backdrop-blur ${tone}`}
       title={tooltip(snapshot, status)}
     >
-      <CreditCard size={14} className="text-cyan-300" />
+      <CreditCard
+        size={14}
+        className={snapshot?.low_balance_warning ? "text-warning" : "text-accent-subtle-text"}
+      />
       <span>{label}</span>
       {snapshot?.auto_topup_enabled ? (
-        <span className="text-[10px] text-zinc-400">auto</span>
+        <span className="text-caption text-text-tertiary">auto</span>
       ) : null}
     </div>
   );

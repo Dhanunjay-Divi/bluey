@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bluey · Expanded Panel — redesign (sessions at scale + premium glass)</title>
+<style>
+:root{
+  --tx-1:rgba(255,255,255,.95); --tx-2:rgba(255,255,255,.60); --tx-3:rgba(255,255,255,.40); --tx-4:rgba(255,255,255,.24);
+  --hairline:rgba(255,255,255,.09); --hairline-s:rgba(255,255,255,.15);
+  --accent:#3B82F6; --accent-tx:#A8C7FB; --accent-bg:rgba(59,130,246,.16); --accent-bg-s:rgba(59,130,246,.26);
+  --ok:#34D27B; --warn:#E0A33E;
+  --glass:rgba(18,21,27,.55); --glass-2:rgba(28,32,40,.55); --glass-deep:rgba(12,14,18,.62);
+  --r-sm:8px; --r-md:10px; --r-lg:14px; --r-xl:18px; --r-2xl:22px;
+  --top-hi:inset 0 1px 0 rgba(255,255,255,.08);
+  --font:-apple-system,"SF Pro Display","SF Pro Text",BlinkMacSystemFont,"Inter","Segoe UI",system-ui,sans-serif;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#05070b;padding:26px;display:flex;gap:26px;justify-content:center;align-items:flex-start;flex-wrap:wrap;font-family:var(--font)}
+
+/* fake desktop so transparency reads */
+.desk{position:relative;width:1180px;height:820px;border-radius:16px;overflow:hidden;
+  background:
+    radial-gradient(900px 500px at 16% 18%, #29385f 0%, transparent 60%),
+    radial-gradient(820px 600px at 86% 82%, #4d2748 0%, transparent 55%),
+    radial-gradient(680px 500px at 60% 30%, #1c544d 0%, transparent 50%),
+    linear-gradient(140deg,#0c1320,#160e26);
+  box-shadow:0 40px 120px rgba(0,0,0,.6)}
+.mtg{position:absolute;left:54px;top:60px;width:520px;height:330px;border-radius:14px;
+  background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.07);
+  padding:16px 18px;color:rgba(255,255,255,.42);font-size:12.5px;line-height:1.7}
+.mtg .pill{display:inline-block;background:rgba(255,255,255,.09);border-radius:99px;padding:3px 10px;font-size:11px;margin-bottom:10px}
+.mtg .g{margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.mtg .ph{height:56px;border-radius:8px;background:rgba(255,255,255,.045)}
+
+/* =================== THE EXPANDED PANEL =================== */
+.panel{position:absolute;right:30px;top:42px;width:560px;height:736px;display:flex;flex-direction:column;
+  background:var(--glass);
+  -webkit-backdrop-filter:blur(34px) saturate(1.7);backdrop-filter:blur(34px) saturate(1.7);
+  border:1px solid var(--hairline);border-radius:var(--r-2xl);
+  box-shadow:0 30px 80px rgba(0,0,0,.55), var(--top-hi);overflow:hidden}
+
+/* header: brand + status + minimal controls (decluttered) */
+.head{display:flex;align-items:center;gap:10px;padding:14px 16px 13px;border-bottom:1px solid var(--hairline)}
+.bdot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px rgba(52,210,123,.16);flex:none}
+.head .name{font-size:13.5px;font-weight:600;color:var(--tx-1);letter-spacing:-.01em}
+.head .via{font-size:11.5px;color:var(--tx-3)}
+.head .sp{flex:1}
+.icbtn{width:28px;height:28px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--tx-3);border:1px solid transparent}
+.icbtn:hover{background:rgba(255,255,255,.06);color:var(--tx-1)}
+.seg{display:flex;background:rgba(255,255,255,.05);border:1px solid var(--hairline);border-radius:99px;padding:2px}
+.seg button{font-size:11.5px;font-weight:600;color:var(--tx-3);background:none;border:0;padding:4px 11px;border-radius:99px;cursor:pointer;font-family:inherit}
+.seg button.on{background:var(--accent-bg);color:var(--accent-tx)}
+
+/* body region (switches between Answers feed and Sessions list) */
+.body{flex:1;overflow:hidden;display:flex;flex-direction:column}
+
+/* ---- SESSIONS at scale ---- */
+.sx{display:flex;flex-direction:column;height:100%}
+.searchwrap{padding:12px 14px 8px}
+.search{display:flex;align-items:center;gap:8px;height:34px;padding:0 11px;border-radius:var(--r-md);
+  background:rgba(255,255,255,.05);border:1px solid var(--hairline)}
+.search input{flex:1;background:none;border:0;outline:0;color:var(--tx-1);font-size:13px;font-family:inherit}
+.search input::placeholder{color:var(--tx-3)}
+.search .k{font-size:10.5px;color:var(--tx-4);border:1px solid var(--hairline);border-radius:5px;padding:1px 5px}
+.slist{flex:1;overflow-y:auto;padding:2px 8px 10px}
+.slist::-webkit-scrollbar{width:9px}
+.slist::-webkit-scrollbar-thumb{background:rgba(255,255,255,.10);border-radius:8px;border:2px solid transparent;background-clip:content-box}
+.sgrouphd{display:flex;align-items:center;gap:8px;padding:12px 8px 5px}
+.sgrouphd .t{font-size:11px;font-weight:600;color:var(--tx-3);letter-spacing:.03em;text-transform:uppercase}
+.sgrouphd .ln{flex:1;height:1px;background:var(--hairline)}
+.srow{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:var(--r-md);cursor:pointer;border:1px solid transparent}
+.srow:hover{background:rgba(255,255,255,.05);border-color:var(--hairline)}
+.srow.sel{background:var(--accent-bg);border-color:rgba(59,130,246,.30)}
+.srow .ic{width:26px;height:26px;border-radius:7px;background:rgba(255,255,255,.06);display:flex;align-items:center;justify-content:center;color:var(--tx-3);flex:none;font-size:12px}
+.srow.sel .ic{background:var(--accent-bg-s);color:var(--accent-tx)}
+.srow .mid{flex:1;min-width:0}
+.srow .ti{font-size:13px;color:var(--tx-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;letter-spacing:-.005em}
+.srow .sub{font-size:11px;color:var(--tx-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+.srow .pin{color:var(--tx-4);flex:none;opacity:0}
+.srow:hover .pin{opacity:1}
+.srow .pin.on{opacity:1;color:var(--accent-tx)}
+.srow .when{font-size:10.5px;color:var(--tx-4);flex:none;font-variant-numeric:tabular-nums}
+.showmore{margin:8px 10px 4px;text-align:center;font-size:12px;color:var(--accent-tx);padding:8px;border-radius:var(--r-md);border:1px solid var(--hairline);cursor:pointer}
+.showmore:hover{background:rgba(255,255,255,.04)}
+
+/* ---- Answers feed (kept, cleaned) ---- */
+.feed{flex:1;overflow-y:auto;padding:14px 16px 6px;display:none}
+.qrow{display:flex;gap:9px;align-items:flex-start;margin-bottom:12px}
+.qm{width:20px;height:20px;border-radius:6px;background:rgba(255,255,255,.07);flex:none;display:flex;align-items:center;justify-content:center;color:var(--tx-3);font-size:11px;font-weight:700;margin-top:1px}
+.q{font-size:12.5px;color:var(--tx-2);line-height:1.5}
+.a{font-size:13.5px;color:var(--tx-1);line-height:1.6;letter-spacing:-.005em}
+.a b{font-weight:600}
+
+/* composer (always visible, the ask-loop anchor) */
+.comp{margin:10px 14px 14px;display:flex;align-items:center;gap:9px;min-height:42px;padding:6px 6px 6px 13px;
+  background:rgba(255,255,255,.05);border:1px solid var(--hairline);border-radius:var(--r-lg)}
+.comp .ph{flex:1;font-size:12.5px;color:var(--tx-3)}
+.send{width:30px;height:30px;border-radius:9px;background:var(--accent);display:flex;align-items:center;justify-content:center;flex:none}
+.foot{display:flex;align-items:center;gap:12px;padding:0 16px 12px}
+.foot .m{font-size:10.5px;color:var(--tx-3);display:flex;align-items:center;gap:5px}
+.foot .m b{color:var(--tx-2);font-weight:600;font-variant-numeric:tabular-nums}
+.foot .sp{flex:1}
+.foot .keys{font-size:10.5px;color:var(--tx-4)}
+svg{display:block}
+
+.cap{position:absolute;left:54px;bottom:24px;font-size:12px;color:rgba(255,255,255,.5);max-width:480px;line-height:1.65}
+.cap b{color:rgba(255,255,255,.78);font-weight:600}
+.legend{width:1180px;color:rgba(255,255,255,.62);font-size:13px;line-height:1.7}
+.legend b{color:#fff;font-weight:600}
+.legend code{font-family:"SF Mono",ui-monospace,monospace;font-size:12px;background:rgba(255,255,255,.08);padding:1px 6px;border-radius:5px;color:#cfe0f5}
+</style>
+</head>
+<body>
+
+<div class="desk">
+  <div class="mtg">
+    <span class="pill">Zoom · Weekly sync</span>
+    <div>Screen-share is live. The Bluey panel on the right is invisible to everyone else on the call.</div>
+    <div class="g"><div class="ph"></div><div class="ph"></div><div class="ph"></div><div class="ph"></div></div>
+  </div>
+
+  <!-- ===== EXPANDED PANEL — SESSIONS tab active (the at-scale view) ===== -->
+  <div class="panel">
+    <div class="head">
+      <span class="bdot"></span>
+      <span class="name">Claude</span><span class="via">· your agent</span>
+      <span class="sp"></span>
+      <div class="seg">
+        <button>Answers</button>
+        <button class="on">Sessions</button>
+      </div>
+      <div class="icbtn" title="Minimize"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/></svg></div>
+    </div>
+
+    <div class="body">
+      <div class="sx">
+        <div class="searchwrap">
+          <div class="search">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,.4)" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
+            <input placeholder="Search 318 sessions…" value="">
+            <span class="k">⌘F</span>
+          </div>
+        </div>
+
+        <div class="slist">
+          <!-- PINNED -->
+          <div class="sgrouphd"><span class="t">Pinned</span><span class="ln"></span></div>
+          <div class="srow">
+            <div class="ic"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v6m0 0l3 3m-3-3l-3 3"/><rect x="4" y="11" width="16" height="10" rx="2"/></svg></div>
+            <div class="mid"><div class="ti">Bluey continuation architecture</div><div class="sub">Bluey · 14 turns</div></div>
+            <svg class="pin on" width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M9 4v6l-2 3h10l-2-3V4M12 16v5"/></svg>
+            <span class="when">2d</span>
+          </div>
+
+          <!-- TODAY -->
+          <div class="sgrouphd"><span class="t">Today</span><span class="ln"></span></div>
+          <div class="srow sel">
+            <div class="ic"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+            <div class="mid"><div class="ti">Overlay panel redesign — sessions at scale</div><div class="sub">Bluey · 9 turns · continuing</div></div>
+            <svg class="pin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 4v6l-2 3h10l-2-3V4M12 16v5"/></svg>
+            <span class="when">11:20</span>
+          </div>
+          <div class="srow">
+            <div class="ic"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+            <div class="mid"><div class="ti">Fix overlay merge conflicts</div><div class="sub">Bluey · 5 turns</div></div>
+            <svg class="pin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 4v6l-2 3h10l-2-3V4M12 16v5"/></svg>
+            <span class="when">9:05</span>
+          </div>
+
+          <!-- YESTERDAY -->
+          <div class="sgrouphd"><span class="t">Yesterday</span><span class="ln"></span></div>
+          <div class="srow">
+            <div class="ic"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+            <div class="mid"><div class="ti">CookWise recipe parser</div><div class="sub">CookWise · 22 turns</div></div>
+            <svg class="pin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 4v6l-2 3h10l-2-3V4M12 16v5"/></svg>
+            <span class="when">Jun 14</span>
+          </div>
+          <div class="srow">
+            <div class="ic"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+            <div class="mid"><div class="ti">Daemon IPC consent flag</div><div class="sub">Bluey · 7 turns</div></div>
+            <svg class="pin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 4v6l-2 3h10l-2-3V4M12 16v5"/></svg>
+            <span class="when">Jun 14</span>
+          </div>
+
+          <!-- EARLIER -->
+          <div class="sgrouphd"><span class="t">Earlier this week</span><span class="ln"></span></div>
+          <div class="srow">
+            <div class="ic"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+            <div class="mid"><div class="ti">VS Code → Copilot bridge</div><div class="sub">Bluey · 31 turns</div></div>
+            <svg class="pin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 4v6l-2 3h10l-2-3V4M12 16v5"/></svg>
+            <span class="when">Jun 12</span>
+          </div>
+
+          <div class="showmore">Show 311 more</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="comp">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,.4)" stroke-width="2"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+      <span class="ph">Ask Bluey…  or pick a session above to continue</span>
+      <div class="send"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
+    </div>
+    <div class="foot">
+      <span class="m">claude-opus-4.8</span>
+      <span class="m">perplexity · github</span>
+      <span class="sp"></span>
+      <span class="keys">⌘↩ ask · ⌥ hide</span>
+    </div>
+  </div>
+
+  <div class="cap"><b>Expanded panel — Sessions at scale.</b> Search across all 318, grouped by Pinned / Today / Yesterday / Earlier, recent-first with “show more,” clean glass rows. One refined accent, hairline edges, SF type — matches the dashboard. The composer stays put so the ask-loop is always one keystroke away.</div>
+</div>
+
+<div class="legend">
+  <p><b>What changed vs today.</b> Today the expanded pill dumps every session into a flat stack with no search, no grouping, no pins — unusable at 100s. This redesign: a <b>segmented header</b> (Answers ⇄ Sessions) instead of competing drawers; a <b>search field</b> (<code>⌘F</code>) filtering all sessions live; <b>dated + pinned groups</b> so it’s scannable; <b>recent-first + “show more”</b> so it never floods; <b>premium glass rows</b> with title, project·turns, timestamp, and a hover pin. The composer + meta footer stay fixed so asking is always one keystroke. Same aurora-glass language as the dashboard: <code>#3B82F6</code> accent, <code>rgba(255,255,255,.09)</code> hairlines, no neon, no glow.</p>
+</div>
+
+</body>
+</html>

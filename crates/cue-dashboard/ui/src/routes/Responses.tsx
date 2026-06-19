@@ -79,7 +79,7 @@ export function Responses() {
   const renderCostPill = (r: Pick<CueResponse, "cost_cents" | "balance_cents_after" | "provider" | "model" | "cost_label">) => {
     if (r.cost_label) {
       return (
-        <span className="rounded-full border border-cyan-500/40 bg-cyan-500/10 px-2 py-0.5 text-[11px] font-medium text-cyan-200">
+        <span className="rounded-full bg-accent-subtle px-2 py-0.5 text-caption text-accent-subtle-text">
           {r.cost_label}
         </span>
       );
@@ -88,10 +88,10 @@ export function Responses() {
     if (!cost) return null;
     const balance = formatCents(r.balance_cents_after);
     return (
-      <span className="rounded-full border border-cyan-500/40 bg-cyan-500/10 px-2 py-0.5 text-[11px] font-medium text-cyan-200">
+      <span className="rounded-full bg-accent-subtle px-2 py-0.5 text-caption text-accent-subtle-text">
         {cost}
-        {r.model ? <span className="text-cyan-300/70"> · {r.model}</span> : null}
-        {balance ? <span className="text-cyan-300/70"> · bal {balance}</span> : null}
+        {r.model ? <span className="text-text-tertiary"> · {r.model}</span> : null}
+        {balance ? <span className="text-text-tertiary"> · bal {balance}</span> : null}
       </span>
     );
   };
@@ -106,14 +106,14 @@ export function Responses() {
         ? null
         : `${Math.round(artifact.artifact_confidence * 100)}%`;
     return (
-      <div className="mt-3 rounded border border-cyan-500/30 bg-black/30 p-3">
+      <div className="mt-3 rounded-md border border-hairline bg-bg-input p-3">
         <div className="mb-2 flex items-center justify-between gap-2">
-          <span className="text-[11px] font-semibold uppercase tracking-[0.16em] text-cyan-300">
+          <span className="text-caption font-semibold uppercase tracking-[0.16em] text-accent-subtle-text">
             {label} canvas
           </span>
-          {confidence ? <span className="text-[11px] text-zinc-500">{confidence}</span> : null}
+          {confidence ? <span className="text-caption text-text-tertiary">{confidence}</span> : null}
         </div>
-        <pre className="max-h-64 overflow-auto whitespace-pre-wrap text-xs leading-relaxed text-zinc-200">
+        <pre className="max-h-64 overflow-auto whitespace-pre-wrap text-footnote leading-relaxed text-text-secondary">
           {artifact.artifact_body}
         </pre>
       </div>
@@ -121,45 +121,45 @@ export function Responses() {
   };
 
   const renderCard = (r: CueResponse) => (
-    <div key={r.id} className="rounded border border-zinc-700 bg-zinc-800 p-3 space-y-1">
+    <div key={r.id} className="glass rounded-lg p-3 space-y-1">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <span className="text-xs text-zinc-500">{formatTime(r.ts_ms)}</span>
+          <span className="text-footnote text-text-tertiary">{formatTime(r.ts_ms)}</span>
           {renderCostPill(r)}
         </div>
         <button
           onClick={() => copyToClipboard(r.text)}
-          className="text-xs text-blue-400 hover:text-blue-300"
+          className="text-footnote text-accent-subtle-text transition-colors duration-200 hover:text-text-primary"
         >
           Copy
         </button>
       </div>
       {r.source_text && (
-        <p className="text-xs text-zinc-500 italic truncate">{r.source_text}</p>
+        <p className="text-footnote text-text-tertiary italic truncate">{r.source_text}</p>
       )}
-      <p className="text-sm text-zinc-200 whitespace-pre-wrap">{r.text}</p>
+      <p className="text-callout text-text-primary whitespace-pre-wrap">{r.text}</p>
       {renderArtifact(r)}
     </div>
   );
 
   const renderInflightCard = (id: string, data: InflightResponse) => (
-    <div key={`inflight-${id}`} className="rounded border border-blue-600 bg-zinc-800 p-3 space-y-1 animate-pulse">
+    <div key={`inflight-${id}`} className="glass-strong rounded-lg p-3 space-y-1 animate-pulse">
       <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
-          <span className="text-xs text-blue-400 font-medium">
+          <span className="text-footnote text-accent-subtle-text">
             {data.refined ? "Refined" : "Streaming…"}
           </span>
-          <span className="text-xs text-zinc-500">{data.kind}</span>
+          <span className="text-footnote text-text-tertiary">{data.kind}</span>
           {renderCostPill(data)}
         </div>
         {data.routerMeta ? (
           <LaneBadge meta={data.routerMeta} refined={data.refined} />
         ) : null}
       </div>
-      <p className="text-sm text-zinc-200 whitespace-pre-wrap">
-        {data.text || "⏳"}
+      <p className="text-callout text-text-primary whitespace-pre-wrap">
+        {data.text || (data.done ? <span className="text-text-quaternary">&mdash;</span> : "")}
         {!data.done ? (
-          <span className="inline-block w-1 h-4 bg-blue-400 ml-0.5 animate-pulse" />
+          <span className="inline-block w-1 h-4 bg-accent ml-0.5 animate-pulse" />
         ) : null}
       </p>
       {renderArtifact(data)}
@@ -168,7 +168,7 @@ export function Responses() {
 
   if (!sessionId) {
     return (
-      <div className="p-6 text-zinc-400">
+      <div className="p-6 text-callout text-text-tertiary">
         No active session. Start a meeting to see AI responses.
       </div>
     );
@@ -178,11 +178,11 @@ export function Responses() {
 
   return (
     <div className="p-6 space-y-6 overflow-y-auto max-h-[calc(100vh-4rem)]">
-      <h1 className="text-2xl font-bold">AI Responses</h1>
+      <h1 className="text-title-1 text-text-primary">AI Responses</h1>
 
       {inflightEntries.length > 0 && (
         <section>
-          <h2 className="text-lg font-semibold text-blue-400 mb-2">In Progress</h2>
+          <h2 className="text-headline text-accent-subtle-text mb-2">In Progress</h2>
           <div className="space-y-2">
             {inflightEntries.map(([id, data]) => renderInflightCard(id, data))}
           </div>
@@ -191,27 +191,27 @@ export function Responses() {
 
       {grouped.answer.length > 0 && (
         <section>
-          <h2 className="text-lg font-semibold text-blue-400 mb-2">Answers</h2>
+          <h2 className="text-headline text-text-primary mb-2">Answers</h2>
           <div className="space-y-2">{grouped.answer.map(renderCard)}</div>
         </section>
       )}
 
       {grouped.suggestion.length > 0 && (
         <section>
-          <h2 className="text-lg font-semibold text-green-400 mb-2">Suggestions</h2>
+          <h2 className="text-headline text-success mb-2">Suggestions</h2>
           <div className="space-y-2">{grouped.suggestion.map(renderCard)}</div>
         </section>
       )}
 
       {grouped.recap.length > 0 && (
         <section>
-          <h2 className="text-lg font-semibold text-purple-400 mb-2">Recaps</h2>
+          <h2 className="text-headline text-text-secondary mb-2">Recaps</h2>
           <div className="space-y-2">{grouped.recap.map(renderCard)}</div>
         </section>
       )}
 
       {responses.length === 0 && inflightEntries.length === 0 && (
-        <p className="text-zinc-500">No AI responses yet for this session.</p>
+        <p className="text-callout text-text-tertiary">No AI responses yet for this session.</p>
       )}
     </div>
   );

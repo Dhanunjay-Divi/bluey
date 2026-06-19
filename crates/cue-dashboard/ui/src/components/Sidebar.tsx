@@ -2,6 +2,7 @@ import { NavLink } from "react-router-dom";
 import {
   Home,
   MessageSquare,
+  Bot,
   FileText,
   Keyboard,
   Settings,
@@ -16,6 +17,7 @@ import {
 const links = [
   { to: "/", icon: Home, label: "Home" },
   { to: "/chats", icon: MessageSquare, label: "Chats" },
+  { to: "/agents", icon: Bot, label: "Agents" },
   { to: "/prompts", icon: FileText, label: "Prompts" },
   { to: "/shortcuts", icon: Keyboard, label: "Shortcuts" },
   { to: "/settings", icon: Settings, label: "Settings" },
@@ -29,8 +31,10 @@ const links = [
 
 export function Sidebar() {
   return (
-    <nav className="flex w-52 flex-col border-r border-zinc-800 bg-zinc-900 p-3">
-      <h1 className="mb-4 px-2 text-lg font-bold text-blue-400">bluey</h1>
+    <nav className="glass flex w-52 flex-col border-r border-hairline p-3">
+      <h1 className="mb-4 px-2 text-headline font-semibold tracking-tight text-text-primary">
+        bluey
+      </h1>
       <ul className="flex flex-col gap-1">
         {links.map(({ to, icon: Icon, label }) => (
           <li key={to}>
@@ -38,10 +42,10 @@ export function Sidebar() {
               to={to}
               end={to === "/"}
               className={({ isActive }) =>
-                `flex items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors ${
+                `flex items-center gap-2 rounded-md px-2 py-1.5 text-subhead transition-colors duration-150 ${
                   isActive
-                    ? "bg-blue-600/20 text-blue-400"
-                    : "text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+                    ? "bg-accent-subtle text-accent-subtle-text"
+                    : "text-text-tertiary hover:bg-bg-raised-2 hover:text-text-secondary"
                 }`
               }
             >
@@ -51,7 +55,9 @@ export function Sidebar() {
           </li>
         ))}
       </ul>
-      <div className="mt-auto px-2 text-xs text-zinc-600">⌘K command palette</div>
+      <div className="mt-auto px-2 text-caption text-text-quaternary">
+        &#8984;K command palette
+      </div>
     </nav>
   );
 }

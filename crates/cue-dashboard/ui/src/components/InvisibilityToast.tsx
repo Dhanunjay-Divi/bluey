@@ -34,16 +34,16 @@ export function InvisibilityToast() {
   const isHidden = state === "hidden";
   return (
     <div
-      className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 inline-flex items-center gap-2 rounded-full bg-zinc-900/95 border border-zinc-700 px-4 py-2 shadow-lg shadow-black/30 backdrop-blur animate-in fade-in slide-in-from-bottom-2 duration-150"
+      className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 inline-flex items-center gap-2 rounded-full border border-hairline bg-bg-raised/95 px-4 py-2 shadow-lg shadow-black/30 backdrop-blur animate-in fade-in slide-in-from-bottom-2 duration-150"
       role="status"
       aria-live="polite"
     >
       {isHidden ? (
-        <EyeOff className="h-4 w-4 text-zinc-300" />
+        <EyeOff className="h-4 w-4 text-text-secondary" />
       ) : (
-        <Eye className="h-4 w-4 text-blue-400" />
+        <Eye className="h-4 w-4 text-accent-subtle-text" />
       )}
-      <span className="text-xs font-medium text-zinc-100">
+      <span className="text-footnote font-medium text-text-primary">
         {isHidden ? "Bluey hidden — press F19 to restore" : "Bluey visible"}
       </span>
     </div>

@@ -1,1 +1,233 @@
 @import "tailwindcss";
+
+/* ==========================================================================
+   Bluey — Aurora-Glass Design Tokens
+   --------------------------------------------------------------------------
+   Single source of truth for the "Apple-premium" dark look of the dashboard.
+   Re-skin the whole app by editing the values below.
+
+   Layer 1: @theme   -> Tailwind v4 reads these and GENERATES utilities.
+                        e.g. `--color-bg-base`  -> `bg-bg-base`, `text-bg-base`
+                             `--color-text-primary` -> `text-text-primary`
+                             `--radius-lg`       -> `rounded-lg`
+                             `--font-sans`       -> `font-sans`
+   Layer 2: :root    -> Raw composite values (glass fills, shadows, aurora)
+                        that aren't simple color utilities. Reference with
+                        `var(--glass)`, `var(--top-hi)`, etc.
+   Layer 3: utilities-> `.aurora-bg`, `.glass`, `.glass-strong` for the
+                        panel + background patterns, plus accessibility
+                        fallbacks (reduced-transparency / reduced-motion).
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   Layer 1 — Tailwind v4 @theme (generates utility classes)
+   -------------------------------------------------------------------------- */
+@theme {
+  /* ---- Surfaces (opaque) ---- */
+  --color-bg-base: #0b0d10; /* app backdrop, behind the aurora */
+  --color-bg-raised: #15181c; /* cards / panels (also the glass fallback)  */
+  --color-bg-raised-2: #1c2025; /* nested / selected surfaces */
+  --color-bg-overlay: #202429; /* popovers, menus, command palette */
+  --color-bg-input: #101316; /* text fields, search */
+
+  /* ---- Text (alpha on white — the Apple trick: never opaque grays) ---- */
+  --color-text-primary: rgba(255, 255, 255, 0.92);
+  --color-text-secondary: rgba(255, 255, 255, 0.6);
+  --color-text-tertiary: rgba(255, 255, 255, 0.4);
+  --color-text-quaternary: rgba(255, 255, 255, 0.22);
+
+  /* ---- Hairlines / borders (use via border-hairline / border-hairline-strong) ---- */
+  --color-hairline: rgba(255, 255, 255, 0.09);
+  --color-hairline-strong: rgba(255, 255, 255, 0.15);
+
+  /* ---- Accent — one refined blue ---- */
+  --color-accent: #3b82f6;
+  --color-accent-hover: #5191f7;
+  --color-accent-pressed: #2e6fe0;
+  --color-accent-subtle: rgba(59, 130, 246, 0.16); /* tinted bg behind accent text */
+  --color-accent-subtle-text: #a8c7fb; /* readable accent on accent-subtle */
+
+  /* ---- Semantic (muted, not neon) ---- */
+  --color-success: #30c376;
+  --color-warning: #e0a33e;
+  --color-error: #e5564e;
+
+  /* ---- Radii ---- */
+  --radius-sm: 8px;
+  --radius-md: 10px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-2xl: 22px;
+
+  /* ---- Type ---- */
+  --font-sans:
+    -apple-system, "SF Pro Display", "SF Pro Text", BlinkMacSystemFont, "Inter",
+    system-ui, sans-serif;
+
+  /* Type scale -> generates text-{name} font-size utilities.
+     Each size carries its line-height, weight, and tracking via the matched
+     --text-*--line-height / --font-weight / --letter-spacing keys, so a single
+     `text-title-1` applies size + leading + weight + tracking together. */
+  --text-title-1: 28px;
+  --text-title-1--line-height: 34px;
+  --text-title-1--font-weight: 700;
+  --text-title-1--letter-spacing: -0.02em;
+
+  --text-title-2: 22px;
+  --text-title-2--line-height: 28px;
+  --text-title-2--font-weight: 700;
+  --text-title-2--letter-spacing: -0.015em;
+
+  --text-title-3: 20px;
+  --text-title-3--line-height: 25px;
+  --text-title-3--font-weight: 600;
+  --text-title-3--letter-spacing: -0.01em;
+
+  --text-headline: 17px;
+  --text-headline--line-height: 22px;
+  --text-headline--font-weight: 600;
+  --text-headline--letter-spacing: -0.01em;
+
+  --text-body: 15px;
+  --text-body--line-height: 21px;
+  --text-body--font-weight: 400;
+
+  --text-callout: 14px;
+  --text-callout--line-height: 19px;
+  --text-callout--font-weight: 400;
+
+  --text-subhead: 13px;
+  --text-subhead--line-height: 18px;
+  --text-subhead--font-weight: 500;
+
+  --text-footnote: 12px;
+  --text-footnote--line-height: 16px;
+  --text-footnote--font-weight: 400;
+
+  --text-caption: 11px;
+  --text-caption--line-height: 14px;
+  --text-caption--font-weight: 500;
+
+  /* ---- Motion (also exposed as --ease-* / --duration-* utilities) ---- */
+  --ease-fast: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-base: cubic-bezier(0.32, 0.72, 0, 1);
+  --duration-fast: 120ms;
+  --duration-base: 200ms;
+}
+
+/* --------------------------------------------------------------------------
+   Layer 2 — Raw composite tokens (glass fills, shadows, aurora, motion)
+   These are translucent/multi-value and don't map cleanly to a single
+   color utility, so they live as CSS custom properties. Use with var().
+   -------------------------------------------------------------------------- */
+:root {
+  /* Glass fills — translucent surfaces that sit OVER the aurora background. */
+  --glass: rgba(18, 21, 27, 0.52);
+  --glass-2: rgba(28, 32, 40, 0.55);
+  --glass-inset: rgba(255, 255, 255, 0.05);
+
+  /* Hairlines mirrored as raw vars for use inside composite shadows/borders. */
+  --hairline: rgba(255, 255, 255, 0.09);
+  --hairline-strong: rgba(255, 255, 255, 0.15);
+
+  /* Elevation — the dark top-highlight trick + soft ambient shadow. */
+  --top-hi: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  --elev-2: 0 6px 20px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+
+  /* Motion (raw, for inline transitions in CSS). */
+  --ease-fast: cubic-bezier(0.4, 0, 0.2, 1);
+  --ease-base: cubic-bezier(0.32, 0.72, 0, 1);
+  --duration-fast: 120ms;
+  --duration-base: 200ms;
+
+  /* Aurora background — soft, heavily-blended radial blobs over a dark base.
+     Subtle by design: low-saturation deep blue / magenta / teal / violet.
+     (Blobs copied from docs/design/bluey-premium-mockup.html.) */
+  --aurora:
+    radial-gradient(820px 460px at 14% 16%, rgba(58, 108, 210, 0.4) 0%, transparent 62%),
+    radial-gradient(760px 540px at 88% 84%, rgba(150, 60, 150, 0.34) 0%, transparent 58%),
+    radial-gradient(680px 480px at 62% 26%, rgba(40, 150, 140, 0.3) 0%, transparent 55%),
+    radial-gradient(620px 600px at 30% 88%, rgba(90, 70, 200, 0.26) 0%, transparent 60%),
+    linear-gradient(140deg, #0a0f18, #120c22 60%, #0b0d12);
+}
+
+/* --------------------------------------------------------------------------
+   Base — font + smoothing on the document root
+   -------------------------------------------------------------------------- */
+html,
+body {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  background-color: var(--color-bg-base);
+  color: var(--color-text-primary);
+}
+
+/* --------------------------------------------------------------------------
+   Layer 3 — Reusable pattern utilities
+   -------------------------------------------------------------------------- */
+
+/* Subtle aurora background. Put on the app shell / a full-bleed root layer.
+   `background-attachment: fixed` keeps the aurora steady while content scrolls. */
+.aurora-bg {
+  background-color: var(--color-bg-base);
+  background-image: var(--aurora);
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+  filter: saturate(1.05);
+}
+
+/* Frosted glass panel — translucent fill + blur + hairline + top highlight.
+   Sits over `.aurora-bg`. */
+.glass {
+  background: var(--glass);
+  -webkit-backdrop-filter: blur(30px) saturate(1.6);
+  backdrop-filter: blur(30px) saturate(1.6);
+  border: 1px solid var(--hairline);
+  box-shadow: var(--top-hi);
+}
+
+/* Stronger glass — denser fill, stronger hairline, more elevation.
+   For selected / focused / foreground panels. */
+.glass-strong {
+  background: var(--glass-2);
+  -webkit-backdrop-filter: blur(30px) saturate(1.6);
+  backdrop-filter: blur(30px) saturate(1.6);
+  border: 1px solid var(--hairline-strong);
+  box-shadow: var(--top-hi), var(--elev-2);
+}
+
+/* --------------------------------------------------------------------------
+   Accessibility — degrade gracefully
+   -------------------------------------------------------------------------- */
+
+/* Reduced transparency: drop the blur/translucency for a solid raised surface
+   (keeps contrast for users who disable transparency at the OS level). */
+@media (prefers-reduced-transparency: reduce) {
+  .glass,
+  .glass-strong {
+    background: var(--color-bg-raised);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+
+  .glass-strong {
+    background: var(--color-bg-raised-2);
+  }
+
+  .aurora-bg {
+    background-image: none;
+  }
+}
+
+/* Reduced motion: kill transitions/animations app-wide. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}

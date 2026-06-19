@@ -16,13 +16,13 @@ export function UpdateToast() {
   if (!version) return null;
 
   return (
-    <div className="fixed bottom-4 right-4 z-50 rounded-lg bg-blue-600 px-4 py-3 text-sm text-white shadow-lg">
+    <div className="glass-strong fixed bottom-4 right-4 z-50 rounded-lg px-4 py-3 text-callout text-text-primary">
       <p>
-        Update <strong>v{version}</strong> available.
+        Update <strong className="text-accent-subtle-text">v{version}</strong> available.
       </p>
       <button
         onClick={() => setVersion(null)}
-        className="mt-1 text-xs underline opacity-80 hover:opacity-100"
+        className="mt-1 text-footnote text-text-tertiary underline transition-colors duration-200 hover:text-text-primary"
       >
         Dismiss
       </button>

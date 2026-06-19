@@ -63,20 +63,20 @@ export function CommandPalette() {
   if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center pt-[20vh] bg-black/50">
+    <div className="fixed inset-0 z-50 flex items-start justify-center pt-[20vh] bg-black/40">
       <Command
-        className="w-[500px] rounded-lg border border-zinc-700 bg-zinc-900 shadow-2xl"
+        className="glass-strong w-[500px] rounded-lg"
         onKeyDown={(e: React.KeyboardEvent) => {
           if (e.key === "Escape") setOpen(false);
         }}
       >
         <Command.Input
           placeholder={busy ? "Creating session..." : "Type a command..."}
-          className="w-full border-b border-zinc-700 bg-transparent px-4 py-3 text-sm text-zinc-100 outline-none placeholder:text-zinc-500"
+          className="w-full border-b border-hairline bg-bg-input px-4 py-3 text-callout text-text-primary outline-none placeholder:text-text-tertiary"
           disabled={busy}
         />
         <Command.List className="max-h-[300px] overflow-auto p-2">
-          <Command.Empty className="px-4 py-2 text-sm text-zinc-500">
+          <Command.Empty className="px-4 py-2 text-callout text-text-tertiary">
             No results found.
           </Command.Empty>
           {commands.map((cmd) => (
@@ -84,7 +84,7 @@ export function CommandPalette() {
               key={cmd.label}
               value={cmd.label}
               onSelect={() => run(cmd)}
-              className="cursor-pointer rounded-md px-3 py-2 text-sm text-zinc-300 aria-selected:bg-blue-600/20 aria-selected:text-blue-400"
+              className="cursor-pointer rounded-md px-3 py-2 text-callout text-text-secondary aria-selected:bg-accent-subtle aria-selected:text-accent-subtle-text"
             >
               {cmd.label}
             </Command.Item>

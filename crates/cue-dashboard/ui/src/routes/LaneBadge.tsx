@@ -16,21 +16,21 @@ export function LaneBadge({ meta, refined }: { meta: RouterMeta; refined?: boole
 
   return (
     <div
-      className="flex items-center gap-2 text-[10px] tracking-wide"
+      className="flex items-center gap-2 text-caption tracking-wide"
       title={JSON.stringify(meta, null, 2)}
     >
       <span className={`px-1.5 py-0.5 rounded font-semibold uppercase ${laneClass}`}>
         {lanePrettyName}
       </span>
-      <span className="text-zinc-400">{meta.task_type.replace(/_/g, " ")}</span>
-      <span className="text-zinc-500">·</span>
-      <span className="text-zinc-400">
+      <span className="text-text-tertiary">{meta.task_type.replace(/_/g, " ")}</span>
+      <span className="text-text-quaternary">·</span>
+      <span className="text-text-tertiary">
         {meta.provider_name}/{shortenModel(meta.model)}
       </span>
-      <span className="text-zinc-500">·</span>
-      <span className="text-zinc-400">{Math.round(meta.confidence * 100)}%</span>
+      <span className="text-text-quaternary">·</span>
+      <span className="text-text-tertiary">{Math.round(meta.confidence * 100)}%</span>
       {refined ? (
-        <span className="ml-1 px-1.5 py-0.5 rounded bg-purple-700 text-purple-100 font-semibold">
+        <span className="ml-1 px-1.5 py-0.5 rounded bg-warning/10 text-warning font-semibold">
           REFINED
         </span>
       ) : null}
@@ -41,13 +41,13 @@ export function LaneBadge({ meta, refined }: { meta: RouterMeta; refined?: boole
 function laneStyles(lane: string): string {
   switch (lane) {
     case "instant":
-      return "bg-emerald-700 text-emerald-100";
+      return "bg-success/10 text-success";
     case "balanced":
-      return "bg-blue-700 text-blue-100";
+      return "bg-accent-subtle text-accent-subtle-text";
     case "deep":
-      return "bg-purple-700 text-purple-100";
+      return "bg-warning/10 text-warning";
     default:
-      return "bg-zinc-700 text-zinc-200";
+      return "bg-bg-raised-2 text-text-tertiary border border-hairline";
   }
 }
 

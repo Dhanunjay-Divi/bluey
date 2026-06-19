@@ -36,6 +36,16 @@ impl MeetingStore {
         write_private_json(&self.active_file, meeting)
     }
 
+    /// Drop the active meeting without archiving it. Used for empty auto-created
+    /// shells that hold no content worth keeping.
+    pub fn discard_active(&self) -> Result<()> {
+        if self.active_file.exists() {
+            fs::remove_file(&self.active_file)
+                .with_context(|| format!("failed to remove {}", self.active_file.display()))?;
+        }
+        Ok(())
+    }
+
     pub fn archive(&self, meeting: &MeetingRecord) -> Result<PathBuf> {
         let filename = format!("{}-{}.json", meeting.started_at, meeting.id);
         let path = self.archive_dir.join(filename);

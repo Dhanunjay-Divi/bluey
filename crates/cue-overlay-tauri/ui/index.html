@@ -1,0 +1,907 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bluey</title>
+<style>
+:root{
+  --tx-1:rgba(255,255,255,.96); --tx-2:rgba(255,255,255,.62); --tx-3:rgba(255,255,255,.40); --tx-4:rgba(255,255,255,.24);
+  --hairline:rgba(255,255,255,.10); --hairline-s:rgba(255,255,255,.17);
+  --accent:#3B82F6; --accent-tx:#AFC9FB; --accent-bg:rgba(59,130,246,.18); --accent-bg-s:rgba(59,130,246,.30);
+  --ok:#3BD17B; --warn:#E3A93F; --danger:#E5564E;
+  --glass:rgba(17,20,26,.72); --glass-2:rgba(26,30,38,.78); --glass-hi:rgba(255,255,255,.05);
+  --r-sm:8px; --r-md:11px; --r-lg:14px; --r-xl:18px; --r-2xl:24px;
+  --top-hi:inset 0 1px 0 rgba(255,255,255,.09);
+  --shadow:0 28px 80px rgba(0,0,0,.55);
+  --font:-apple-system,"SF Pro Display","SF Pro Text",BlinkMacSystemFont,"Inter","Segoe UI",system-ui,sans-serif;
+  --mono:"SF Mono",ui-monospace,"JetBrains Mono",monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;width:100%;background:transparent !important;font-family:var(--font);color:var(--tx-1);overflow:hidden}
+/* A transparent margin around the panel so its rounded corners sit INSIDE the
+   window rectangle against true transparency — no sharp window edge ghosting. */
+.panel{position:fixed;top:4px;left:4px;right:4px;bottom:4px;display:flex;flex-direction:column;border-radius:var(--r-2xl);overflow:hidden;
+  background:
+    radial-gradient(620px 380px at 14% 14%, rgba(58,108,210,.18) 0%, transparent 60%),
+    radial-gradient(540px 420px at 88% 86%, rgba(150,60,150,.14) 0%, transparent 58%),
+    radial-gradient(480px 360px at 60% 26%, rgba(40,150,140,.12) 0%, transparent 55%),
+    var(--glass);
+  -webkit-backdrop-filter:saturate(1.7) blur(40px); backdrop-filter:saturate(1.7) blur(40px);
+  border:1px solid var(--hairline); box-shadow:var(--shadow),var(--top-hi)}
+
+/* HEADER (.ph) — flush, hairline below, drag region */
+.ph{display:flex;align-items:center;gap:10px;padding:13px 14px;border-bottom:1px solid var(--hairline);cursor:grab}
+.ph:active{cursor:grabbing}
+.ph .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px rgba(59,209,123,.16);flex:none}
+.ph .nm{font-size:13px;font-weight:600;letter-spacing:-.01em}
+.ph .via{font-size:11px;color:var(--tx-3)}
+.ph .sp{flex:1}
+.ph .seg{display:flex;background:rgba(255,255,255,.05);border:1px solid var(--hairline);border-radius:10px;padding:2px;-webkit-app-region:no-drag}
+.ph .seg button{font-size:11.5px;font-weight:600;color:var(--tx-3);background:none;border:0;padding:4px 12px;border-radius:8px;cursor:pointer;font-family:inherit;letter-spacing:-.005em}
+.ph .seg button.on{background:var(--accent-bg);color:var(--accent-tx)}
+.subseg{display:flex;background:rgba(255,255,255,.05);border:1px solid var(--hairline);border-radius:10px;padding:2px;margin:0 0 10px}
+.subseg button{flex:1;font-size:11.5px;font-weight:600;color:var(--tx-3);background:none;border:0;padding:5px 0;border-radius:8px;cursor:pointer;font-family:inherit;letter-spacing:-.005em}
+.subseg button.on{background:var(--accent-bg);color:var(--accent-tx)}
+.ph .x{width:26px;height:26px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--tx-3);-webkit-app-region:no-drag;cursor:pointer}
+.ph .x:hover{background:rgba(255,255,255,.06);color:var(--tx-1)}
+svg{display:block}
+
+.body{flex:1;overflow-y:auto;padding:16px 16px 8px}
+
+/* TIMELINE THREAD (.turn) */
+.turn{position:relative;padding-left:26px;margin-bottom:15px}
+.turn .rail{position:absolute;left:8px;top:3px;width:16px;height:16px;border-radius:5px;display:flex;align-items:center;justify-content:center;flex:none}
+.turn .rail.heard{background:rgba(255,255,255,.07);color:var(--tx-3)}
+.turn .rail.screen{background:var(--accent-bg);color:var(--accent-tx)}
+.turn .rail.you{background:var(--glass-hi);color:var(--tx-2)}
+.turn .rail.bluey{background:var(--accent-bg);color:var(--accent-tx)}
+.turn::before{content:"";position:absolute;left:15.5px;top:21px;bottom:-15px;width:1px;background:var(--hairline)}
+.turn:last-child::before{display:none}
+.turn .lab{font-size:10px;font-weight:700;letter-spacing:.05em;color:var(--tx-3);margin-bottom:3px;display:flex;align-items:center;gap:7px}
+.turn .lab .who2{color:var(--accent-tx)} .turn .lab .heard2{color:var(--tx-3)}
+.turn .lab .t{margin-left:auto;font-weight:400;color:var(--tx-4);font-variant-numeric:tabular-nums;letter-spacing:0}
+.turn .heardtxt{font-size:12.5px;color:var(--tx-2);line-height:1.5;font-style:italic}
+.turn .scap{display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:9px;background:var(--glass-hi);border:1px solid var(--hairline);margin-bottom:7px}
+.turn .scap .th{width:46px;height:30px;border-radius:5px;background:rgba(120,140,200,.16);border:1px solid var(--hairline);flex:none;display:flex;align-items:center;justify-content:center;color:var(--tx-3)}
+.turn .scap .sl{font-size:11.5px;color:var(--tx-2)}
+.turn .scap .sl b{color:var(--tx-1);font-weight:600;display:block;font-size:12px}
+.turn .ask2{font-size:13px;color:var(--tx-1);line-height:1.5}
+.turn .ans2{font-size:13.5px;color:var(--tx-1);line-height:1.6;letter-spacing:-.005em}
+.turn .ans2 b{font-weight:600}
+.turn .ans2 .code{font-family:var(--mono);font-size:11.5px;background:rgba(255,255,255,.06);padding:1px 6px;border-radius:5px;color:#cfe0f5}
+.diff{font-family:var(--mono);font-size:11px;line-height:1.55;background:rgba(0,0,0,.28);border:1px solid var(--hairline);border-radius:8px;padding:8px 10px;margin-top:6px;white-space:pre;color:#cfe0f5}
+
+/* CONTEXT BAR */
+.ctxbar{display:flex;align-items:center;gap:8px;margin:0 16px 4px;padding:6px 10px;border-radius:9px;background:rgba(59,130,246,.07);border:1px solid rgba(59,130,246,.14)}
+.ctxbar svg{stroke:var(--accent-tx);flex:none}
+.ctxbar span{font-size:11px;color:var(--tx-2)}
+.ctxbar b{color:var(--accent-tx);font-weight:600}
+
+/* COMPOSER */
+.comp{margin:8px 14px;display:flex;align-items:center;gap:9px;min-height:44px;padding:6px 7px 6px 8px;border-radius:var(--r-lg);background:rgba(255,255,255,.05);border:1px solid var(--hairline)}
+.comp .plus{width:32px;height:32px;border-radius:10px;background:rgba(255,255,255,.05);border:1px solid var(--hairline);display:flex;align-items:center;justify-content:center;color:var(--tx-2);flex:none;cursor:pointer}
+.comp .field{flex:1;font-size:13px;color:var(--tx-1);background:none;border:0;outline:0;font-family:inherit}
+.comp .field::placeholder{color:var(--tx-3)}
+.comp .listen{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--tx-3);padding:0 8px;cursor:pointer}
+.comp .send{width:32px;height:32px;border-radius:10px;background:var(--accent);display:flex;align-items:center;justify-content:center;flex:none;box-shadow:var(--top-hi);cursor:pointer}
+.foot{display:flex;align-items:center;gap:11px;padding:0 16px 13px}
+.foot .m{font-size:10.5px;color:var(--tx-3)}
+.foot .sp{flex:1}
+.foot .keys{font-size:10.5px;color:var(--tx-4);font-family:var(--mono)}
+.body::-webkit-scrollbar{width:9px}
+.body::-webkit-scrollbar-thumb{background:rgba(255,255,255,.10);border-radius:8px;border:2px solid transparent;background-clip:content-box}
+
+
+/* ===== assembled screen fragments ===== */
+.hx{display:flex;flex-direction:column;height:100%}
+.srch{margin:12px 14px 8px;display:flex;align-items:center;gap:9px;height:36px;padding:0 12px;border-radius:var(--r-md);
+  background:rgba(255,255,255,.05);border:1px solid var(--hairline)}
+.srch input{flex:1;background:none;border:0;outline:0;color:var(--tx-1);font-size:13px;font-family:inherit}
+.srch input::placeholder{color:var(--tx-3)}
+.srch .k{font-size:10px;color:var(--tx-4);border:1px solid var(--hairline);border-radius:5px;padding:1px 5px;font-family:var(--mono)}
+.slist{flex:1;overflow-y:auto;padding:0 8px 10px}
+.shd{display:flex;align-items:center;gap:9px;padding:13px 8px 5px}
+.shd .t{font-size:10.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--tx-3)}
+.shd .ln{flex:1;height:1px;background:var(--hairline)}
+.srow{display:flex;align-items:center;gap:11px;padding:9px 10px;border-radius:var(--r-md);cursor:pointer;border:1px solid transparent}
+.srow:hover{background:rgba(255,255,255,.05);border-color:var(--hairline)}
+.srow.sel{background:var(--accent-bg);border-color:var(--accent-bg-s)}
+.srow .ic{width:28px;height:28px;border-radius:8px;background:rgba(255,255,255,.06);display:flex;align-items:center;justify-content:center;color:var(--tx-3);flex:none}
+.srow.sel .ic{background:var(--accent-bg-s);color:var(--accent-tx)}
+.srow .mid{flex:1;min-width:0}
+.srow .ti{font-size:13px;color:var(--tx-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;letter-spacing:-.005em}
+.srow .sub{font-size:11px;color:var(--tx-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+.srow .pin{color:var(--tx-4);flex:none;opacity:0}
+.srow:hover .pin{opacity:.9}
+.srow .pin.on{opacity:1;color:var(--accent-tx)}
+.srow .wh{font-size:10px;color:var(--tx-4);flex:none;font-variant-numeric:tabular-nums}
+.more{margin:8px 10px 4px;text-align:center;font-size:12px;color:var(--accent-tx);padding:9px;border-radius:var(--r-md);border:1px solid var(--hairline);cursor:pointer}
+.more:hover{background:rgba(255,255,255,.04)}
+.ax{flex:1;overflow-y:auto;padding:14px 14px 8px}
+.acard{border:1px solid var(--hairline);border-radius:var(--r-lg);padding:13px 14px;margin-bottom:10px;background:var(--glass-hi)}
+.acard.on{border-color:var(--accent-bg-s);background:var(--accent-bg)}
+.acard .top{display:flex;align-items:center;gap:9px}
+.acard .nm{font-size:13.5px;font-weight:600;color:var(--tx-1);letter-spacing:-.01em}
+.acard .sp{flex:1}
+.cap{font-size:10px;font-weight:600;letter-spacing:.02em;padding:2px 8px;border-radius:99px}
+.cap.ready{background:var(--accent-bg);color:var(--accent-tx)}
+.cap.ro{background:rgba(255,255,255,.06);color:var(--tx-3)}
+.cap.warn{background:rgba(227,169,63,.14);color:var(--warn)}
+.cap.blk{background:rgba(229,86,78,.14);color:var(--danger)}
+.acard .meta{font-size:11px;color:var(--tx-3);margin-top:6px}
+.acard .act{display:flex;gap:8px;margin-top:11px}
+/* session-count still computing (phase 2) */
+.counting{color:var(--tx-3);opacity:.7;animation:cuePulse 1.3s ease-in-out infinite}
+@keyframes cuePulse{0%,100%{opacity:.35}50%{opacity:.8}}
+/* Agents-view loader (before first paint) */
+.agload{display:flex;align-items:center;gap:9px;color:var(--tx-3);font-size:12.5px;padding:16px 4px}
+.agload .spin{width:14px;height:14px;border-radius:50%;border:2px solid var(--hairline);border-top-color:var(--accent);animation:cueSpin .7s linear infinite;flex:none}
+@keyframes cueSpin{to{transform:rotate(360deg)}}
+.btn{font-size:12px;font-weight:600;padding:6px 12px;border-radius:9px;cursor:pointer;letter-spacing:-.005em}
+.btn.pri{background:var(--accent);color:#fff;border:1px solid transparent}
+.btn.sec{background:none;color:var(--tx-2);border:1px solid var(--hairline)}
+.btn.sec:hover{color:var(--tx-1);border-color:var(--hairline-s)}
+/* ===== dim backdrop wrapper (shared by all three modals) ===== */
+.modal-overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.42);backdrop-filter:blur(2px);-webkit-backdrop-filter:blur(2px);z-index:50}
+
+/* ===== modal surfaces (verbatim from mockup) ===== */
+.modal{width:380px;border-radius:var(--r-xl);overflow:hidden;background:var(--glass-2);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);border:1px solid var(--hairline-s);box-shadow:var(--shadow),var(--top-hi)}
+.modal .mh{padding:15px 17px 0}
+.modal .mh b{font-size:14.5px;font-weight:600;letter-spacing:-.01em}
+.modal .mh p{font-size:12px;color:var(--tx-3);margin-top:4px;line-height:1.5}
+.modal .mb{padding:13px 17px}
+.modal .crow{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid rgba(255,255,255,.05)}
+.modal .crow:last-child{border-bottom:0}
+.modal .crow .cn{flex:1;font-size:12.5px;color:var(--tx-1)}
+.modal .crow .tier{font-size:10px;color:var(--tx-3);border:1px solid var(--hairline);border-radius:99px;padding:1px 7px}
+.modal .crow .rdy{font-size:11px;color:var(--ok);display:flex;align-items:center;gap:4px}
+.modal .crow .na{font-size:11px;color:var(--warn)}
+.modal .disc{font-size:11.5px;color:var(--tx-2);line-height:1.55;max-height:120px;overflow:auto;padding:11px 13px;background:rgba(0,0,0,.22);border:1px solid var(--hairline);border-radius:9px}
+.modal .reauth{font-size:11px;color:var(--tx-3);margin-top:8px;padding:0 17px}
+.modal .reauth code{font-family:var(--mono);background:rgba(255,255,255,.07);padding:1px 5px;border-radius:4px;color:var(--accent-tx)}
+.modal .mf{display:flex;gap:9px;justify-content:flex-end;padding:0 17px 15px}
+
+/* ===== buttons (verbatim from mockup) ===== */
+.btn{font-size:12px;font-weight:600;padding:6px 12px;border-radius:9px;cursor:pointer;letter-spacing:-.005em}
+.btn.pri{background:var(--accent);color:#fff;border:1px solid transparent}
+.btn.sec{background:none;color:var(--tx-2);border:1px solid var(--hairline)}
+.btn.sec:hover{color:var(--tx-1);border-color:var(--hairline-s)}
+/* ============================================================
+   extras.html — three overlay fragments, markup + CSS copied
+   verbatim from docs/design/bluey-overlay-redesign-v2.html.
+   Uses global var(--...) tokens; :root is NOT redefined here.
+   ============================================================ */
+
+/* pill run-states row */
+.pills{position:absolute;left:50%;top:22px;transform:translateX(-50%);display:flex;gap:12px;flex-wrap:wrap;justify-content:center}
+.pill2{display:flex;align-items:center;gap:8px;height:32px;padding:0 13px 0 11px;border-radius:99px;background:var(--glass);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);border:1px solid var(--hairline);box-shadow:0 8px 22px rgba(0,0,0,.35),var(--top-hi)}
+.pill2 .d{width:7px;height:7px;border-radius:50%;flex:none}
+.pill2 .l{font-size:12px;font-weight:600;letter-spacing:-.01em;color:var(--tx-2)}
+.pill2 .wv{display:flex;align-items:flex-end;gap:2px;height:11px}
+.pill2 .wv i{width:2px;background:var(--ok);border-radius:1px;display:block}
+
+/* the "+" menu (replaces the 6-button row) */
+.plusmenu{position:absolute;left:18px;bottom:78px;width:212px;border-radius:var(--r-lg);overflow:hidden;background:var(--glass-2);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);border:1px solid var(--hairline-s);box-shadow:var(--shadow),var(--top-hi)}
+.pm i{display:flex;align-items:center;gap:11px;padding:9px 13px;font-size:12.5px;color:var(--tx-1);cursor:pointer;border-bottom:1px solid rgba(255,255,255,.04)}
+.pm i:last-child{border-bottom:0}
+.pm i:hover{background:rgba(255,255,255,.05)}
+.pm i svg{stroke:var(--tx-3);flex:none}
+.pm i .kk{margin-left:auto;font-size:10px;color:var(--tx-4);font-family:var(--mono)}
+.pm .sechd{font-size:9.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--tx-4);padding:8px 13px 4px}
+
+/* fix-proposal card */
+.fix{border:1px solid rgba(227,169,63,.3);background:rgba(227,169,63,.05);border-radius:var(--r-lg);padding:13px 14px;margin-bottom:16px}
+.fix .fh{display:flex;align-items:center;gap:7px;margin-bottom:9px}
+.fix .fh b{font-size:10.5px;font-weight:700;letter-spacing:.05em;color:var(--warn)}
+.fix .fh .st{margin-left:auto;font-size:10px;color:var(--tx-3);border:1px solid var(--hairline);border-radius:99px;padding:1px 8px}
+.fix .sec{font-size:9.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--tx-3);margin:9px 0 3px}
+.fix .bd{font-size:12.5px;color:var(--tx-1);line-height:1.55}
+.fix .diff{font-family:var(--mono);font-size:11.5px;line-height:1.6;background:rgba(0,0,0,.28);border:1px solid var(--hairline);border-radius:8px;padding:9px 11px;margin-top:4px;white-space:pre}
+.fix .diff .add{color:var(--ok)} .fix .diff .del{color:var(--danger)} .fix .diff .hh{color:var(--accent-tx)}
+.fix .fa{display:flex;gap:8px;margin-top:12px}
+/* ===== ACTION-BAR PILL — the hero: primary actions always one tap ===== */
+.bar-pill{position:static;
+  display:flex;align-items:center;gap:6px;height:40px;padding:0 6px 0 13px;border-radius:99px;
+  background:var(--glass);-webkit-backdrop-filter:saturate(1.7) blur(40px);backdrop-filter:saturate(1.7) blur(40px);
+  border:1px solid var(--hairline);box-shadow:0 14px 38px rgba(0,0,0,.42),var(--top-hi)}
+.bar-pill .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px rgba(59,209,123,.18);flex:none}
+.bar-pill .nm{font-size:12.5px;font-weight:600;letter-spacing:-.01em;margin-right:2px}
+.bar-pill .sep{width:1px;height:18px;background:var(--hairline);margin:0 2px}
+.act{display:flex;align-items:center;gap:7px;height:30px;padding:0 11px;border-radius:99px;cursor:pointer;border:1px solid transparent;color:var(--tx-2)}
+.act:hover{background:rgba(255,255,255,.06);color:var(--tx-1)}
+.act svg{stroke:currentColor;flex:none}
+.act .lb{font-size:12px;font-weight:600;letter-spacing:-.01em}
+.act .kb{font-size:9.5px;color:var(--tx-4);font-family:var(--mono);border:1px solid var(--hairline);border-radius:4px;padding:0 4px;line-height:14px}
+.act.primary{background:var(--accent-bg);color:var(--accent-tx)}
+.act.primary .kb{color:var(--accent-tx);border-color:var(--accent-bg-s)}
+.act.more{padding:0 9px;color:var(--tx-3)}
+.act.listen-on{background:rgba(59,209,123,.14);color:var(--ok)}
+.act.listen-on .wv{display:flex;align-items:flex-end;gap:2px;height:11px}
+.act.listen-on .wv i{width:2px;background:var(--ok);border-radius:1px;display:block}
+
+/* card with a canvas/attachment affordance */
+.cardart{display:flex;align-items:center;gap:9px;margin-top:9px;padding:9px 11px;border-radius:var(--r-md);background:var(--glass-hi);border:1px solid var(--hairline);cursor:pointer}
+.cardart .ci{width:30px;height:30px;border-radius:8px;background:var(--accent-bg);color:var(--accent-tx);display:flex;align-items:center;justify-content:center;flex:none}
+.cardart .ct{flex:1;min-width:0}
+.cardart .ct b{font-size:12.5px;color:var(--tx-1);font-weight:600;display:block}
+.cardart .ct span{font-size:11px;color:var(--tx-3)}
+
+/* canvas pane (split) */
+.canvas{position:absolute;right:34px;top:40px;width:560px;height:700px;display:flex;border-radius:var(--r-2xl);overflow:hidden;background:var(--glass);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);border:1px solid var(--hairline);box-shadow:var(--shadow),var(--top-hi)}
+.canvas .left{width:230px;border-right:1px solid var(--hairline);display:flex;flex-direction:column}
+.canvas .right{flex:1;display:flex;flex-direction:column}
+.canvas .ch{display:flex;align-items:center;gap:8px;padding:12px 13px;border-bottom:1px solid var(--hairline)}
+.canvas .ch .ci{width:26px;height:26px;border-radius:7px;background:var(--accent-bg);color:var(--accent-tx);display:flex;align-items:center;justify-content:center;flex:none}
+.canvas .ch .cn b{font-size:12.5px;display:block;letter-spacing:-.01em}
+.canvas .ch .cn span{font-size:10.5px;color:var(--tx-3)}
+.canvas .ch .sp{flex:1}
+.canvas .ch .cb{width:24px;height:24px;border-radius:7px;display:flex;align-items:center;justify-content:center;color:var(--tx-3)}
+.canvas .ch .cb:hover{background:rgba(255,255,255,.06);color:var(--tx-1)}
+.canvas .code2{flex:1;overflow:auto;padding:13px;font-family:var(--mono);font-size:11.5px;line-height:1.65;color:#cfe0f5}
+.canvas .code2 .kw{color:#A8C7FB} .canvas .code2 .cm{color:var(--tx-3)} .canvas .code2 .st{color:#9FE1CB}
+.canvas .miniqr{padding:11px 13px}
+.canvas .miniqr .qb{background:var(--glass-hi);border:1px solid var(--hairline);border-radius:11px;padding:8px 11px;font-size:12px;color:var(--tx-1);margin-bottom:9px}
+.canvas .miniqr .ab{font-size:12px;color:var(--tx-2);line-height:1.5}
+
+/* pill (collapsed state) positioned top-center of the window */
+#action-pill{position:fixed;top:0;left:0;width:100vw;height:100vh;display:flex;align-items:center;justify-content:center;z-index:50}
+.bar-pill{display:flex;align-items:center;gap:6px;height:40px;padding:0 6px 0 13px;border-radius:99px;
+  background:var(--glass);-webkit-backdrop-filter:saturate(1.7) blur(40px);backdrop-filter:saturate(1.7) blur(40px);
+  border:1px solid var(--hairline);box-shadow:0 14px 38px rgba(0,0,0,.42),var(--top-hi);cursor:grab}
+.bar-pill .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px rgba(59,209,123,.18);flex:none}
+.bar-pill .nm{font-size:12.5px;font-weight:600;letter-spacing:-.01em;margin-right:2px}
+.bar-pill .sep{width:1px;height:18px;background:var(--hairline);margin:0 2px}
+.act{display:flex;align-items:center;gap:7px;height:30px;padding:0 11px;border-radius:99px;cursor:pointer;border:1px solid transparent;color:var(--tx-2);-webkit-app-region:no-drag}
+.act:hover{background:rgba(255,255,255,.06);color:var(--tx-1)}
+.act svg{stroke:currentColor;flex:none}
+.act .lb{font-size:12px;font-weight:600;letter-spacing:-.01em}
+.act .kb{font-size:9.5px;color:var(--tx-4);font-family:var(--mono);border:1px solid var(--hairline);border-radius:4px;padding:0 4px;line-height:14px}
+.act.primary{background:var(--accent-bg);color:var(--accent-tx)}
+.act.primary .kb{color:var(--accent-tx);border-color:var(--accent-bg-s)}
+.act.more{padding:0 9px;color:var(--tx-3)}
+
+
+/* ===== COMPACT PREMIUM PILL (override) — small, icon-only, status-first ===== */
+#action-pill{position:fixed;top:0;left:0;width:100vw;height:100vh;display:flex;align-items:center;justify-content:center;z-index:50}
+#action-pill .bar-pill{position:static;display:inline-flex;align-items:center;gap:4px;height:36px;width:auto;
+  padding:0 6px 0 11px;border-radius:99px;
+  background:var(--glass);-webkit-backdrop-filter:saturate(1.7) blur(40px);backdrop-filter:saturate(1.7) blur(40px);
+  border:1px solid var(--hairline);box-shadow:0 12px 30px rgba(0,0,0,.42),var(--top-hi);cursor:grab}
+#action-pill .bar-pill:active{cursor:grabbing}
+#action-pill .bar-pill .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px rgba(59,209,123,.18);flex:none}
+#action-pill .bar-pill .nm{font-size:12.5px;font-weight:600;letter-spacing:-.01em;color:var(--tx-1);margin:0 2px 0 1px}
+#action-pill .bar-pill .sep{width:1px;height:16px;background:var(--hairline);margin:0 3px}
+/* icon-only actions */
+#action-pill .act{position:relative;display:flex;align-items:center;justify-content:center;width:30px;height:30px;padding:0;border-radius:50%;cursor:pointer;border:1px solid transparent;color:var(--tx-2);-webkit-app-region:no-drag}
+#action-pill .act:hover{background:rgba(255,255,255,.08);color:var(--tx-1)}
+#action-pill .act.primary{background:var(--accent-bg);color:var(--accent-tx)}
+#action-pill .act .lb,#action-pill .act .kb{display:none}     /* hide text labels + hotkey chips */
+#action-pill .act svg{stroke:currentColor;width:15px;height:15px}
+#action-pill .act.more{color:var(--tx-3)}
+/* tooltip on hover (the action name) */
+#action-pill .act::after{content:attr(data-tip);position:absolute;top:38px;left:50%;transform:translateX(-50%);
+  font-size:10.5px;color:var(--tx-1);background:var(--glass-2);border:1px solid var(--hairline);
+  padding:3px 8px;border-radius:7px;white-space:nowrap;opacity:0;pointer-events:none;transition:opacity .12s;-webkit-backdrop-filter:blur(20px);backdrop-filter:blur(20px)}
+#action-pill .act:hover::after{opacity:1}
+
+
+.empty-state{padding:40px 20px;text-align:center;color:var(--tx-3);font-size:13px;line-height:1.6}
+/* bottom-right resize grip (expanded panel only). ~32px hit zone, visible ~22px icon. */
+.rgrip{position:absolute;right:0;bottom:0;width:32px;height:32px;display:flex;align-items:flex-end;justify-content:flex-end;
+  padding:5px;color:var(--tx-3);cursor:nwse-resize;z-index:60;opacity:.7;transition:opacity .12s,color .12s}
+.rgrip svg{width:13px;height:13px}
+.rgrip:hover{opacity:1;color:var(--accent-tx)}
+</style>
+</head>
+<body>
+<div class="panel" style="display:none">
+  <div class="ph">
+    <span class="dot"></span><span class="nm">Bluey</span><span class="via" id="status-text">· ready</span>
+    <span class="sp"></span>
+    <div class="seg"><button class="on">Ask</button><button>History</button><button>Agents</button></div>
+    <div class="x"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/></svg></div>
+  </div>
+
+  <div class="body" id="view-ask">
+</div>
+
+  
+  <div class="body" id="view-history" style="display:none"><div class="hx">
+    <div class="seg subseg" id="hist-subtabs">
+      <button class="on" data-sub="meetings">Meetings</button>
+      <button data-sub="agents">Agent sessions</button>
+    </div>
+    <div class="srch">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--tx-3)" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
+      <input placeholder="Search sessions…">
+      <span class="k">⌘F</span>
+    </div>
+    <!-- Bluey's own meeting conversations -->
+    <div class="slist" id="hist-meetings"></div>
+    <!-- One agent's own coding sessions (only populated after picking an agent) -->
+    <div class="slist" id="hist-agents" style="display:none"></div>
+  </div></div>
+  <div class="body" id="view-agents" style="display:none"><div class="ax"></div></div>
+  <div class="ctxbar"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M9 12l2 2 4-4M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z"/></svg><span id="ctx-summary">In context: 0 turns</span></div>
+
+  <div class="comp">
+    <div class="plus"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg></div>
+    <input class="field" placeholder="Ask a follow-up…">
+    <span class="listen"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3zM5 11a7 7 0 0 0 14 0M12 18v3"/></svg>Listen</span>
+    <div class="send"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4"><path d="M12 19V5M5 12l7-7 7 7"/></svg></div>
+  </div>
+  <div class="foot"><span class="m" id="model-label"></span><span class="m" id="conn-label"></span><span class="sp"></span><span class="keys">⌘↩ ask · ⌥ hide</span></div>
+  <!-- bottom-right resize grip (panel only); calls startResizeDragging on mousedown -->
+  <div class="rgrip" id="resize-grip" title="Drag to resize"><svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M13 4L4 13M13 8L8 13M13 12L12 13"/></svg></div>
+
+  </div>
+
+<!-- overlay elements (hidden, JS-toggled) -->
+<!-- (1) Inherited connectors — connector sheet -->
+<div class="modal-overlay" id="modal-connectors" style="display:none">
+  <div class="modal">
+    <div class="mh"><b>Inherited connectors</b><p>From Claude Code · shape &amp; readiness only, never secrets.</p></div>
+    <div class="mb">
+      <div class="crow"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--tx-3)" stroke-width="2"><circle cx="12" cy="12" r="9"/></svg><span class="cn">perplexity</span><span class="tier">env-auth</span><span class="rdy"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M5 12l5 5L20 7"/></svg>ready</span></div>
+      <div class="crow"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--tx-3)" stroke-width="2"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-4a3 3 0 0 0-1-2c3 0 6-2 6-6a5 5 0 0 0-1-3 5 5 0 0 0 0-3s-1 0-3 1a12 12 0 0 0-6 0C8 0 7 0 7 0a5 5 0 0 0 0 3 5 5 0 0 0-1 3c0 4 3 6 6 6a3 3 0 0 0-1 2v4"/></svg><span class="cn">github</span><span class="tier">oauth</span><span class="na">login expired</span></div>
+    </div>
+    <div class="reauth">github needs login — run <code>/mcp</code> in Claude to reconnect.</div>
+    <div class="mf"><span class="btn sec">Cancel</span><span class="btn pri">Attach</span></div>
+  </div>
+</div>
+
+<!-- (2) Before attaching Anthropic (Claude API) — BYOT billing disclosure -->
+<div class="modal-overlay" id="modal-billing" style="display:none">
+  <div class="modal">
+    <div class="mh"><b>Before attaching Anthropic (Claude API)</b><p>Bring-your-own-key · please review.</p></div>
+    <div class="mb">
+      <div class="disc">This uses your own Anthropic API key. Usage is billed to your account by Anthropic, not Bluey. Conversations may be ineligible for zero-data-retention. You can manage or revoke your key in the Anthropic Console.</div>
+    </div>
+    <div class="mf"><span class="btn sec">Decline</span><span class="btn pri">Accept &amp; attach</span></div>
+  </div>
+</div>
+
+<!-- (3) Turn Bluey off? — turn-off confirm -->
+<div class="modal-overlay" id="modal-turnoff" style="display:none">
+  <div class="modal" style="width:360px">
+    <div class="mh"><b>Turn Bluey off?</b><p>This closes Bluey completely. To start again, run <code style="font-family:var(--mono);font-size:11px">bluey on</code>.</p></div>
+    <div class="mf" style="padding-top:13px"><span class="btn sec">Cancel</span><span class="btn pri" style="background:var(--danger)">Turn off</span></div>
+  </div>
+</div>
+<!-- ============ 1) THE "+" MENU ============ -->
+<div id="plus-menu" style="display:none">
+  <div class="plusmenu">
+    <div class="pm">
+      <div class="sechd">Add to context</div>
+      <i><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>Attach files</i>
+      <i><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M2 12h20"/></svg>Capture browser page</i>
+      <div class="sechd">Session</div>
+      <i><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>New session</i>
+      <i><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 7h18M3 12h18M3 17h10"/></svg>Recap</i>
+      <i><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>Answer style</i>
+      <i><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 1-.1 1l2 1.6-2 3.4-2.4-1a7 7 0 0 1-1.7 1l-.4 2.5h-4l-.4-2.5a7 7 0 0 1-1.7-1l-2.4 1-2-3.4 2-1.6a7 7 0 0 1 0-2l-2-1.6 2-3.4 2.4 1a7 7 0 0 1 1.7-1L9 2h4l.4 2.5a7 7 0 0 1 1.7 1l2.4-1 2 3.4-2 1.6a7 7 0 0 1 .1 1z"/></svg>Opacity &amp; settings</i>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 2) THE FIX-PROPOSAL CARD ============ -->
+<div id="fix-card-sample" style="display:none">
+  <div class="fix">
+    <div class="fh"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--warn)" stroke-width="2"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg><b>PROPOSED FIX</b><span class="st">awaiting review</span></div>
+    <div class="sec">Diagnosis</div><div class="bd">Row width is constrained to <span style="font-family:var(--mono);font-size:11.5px">sessionStack</span> before <span style="font-family:var(--mono);font-size:11.5px">addArrangedSubview</span> — no common ancestor yet.</div>
+    <div class="sec">Fix</div>
+    <div class="diff"><span class="hh">@@ stack alignment @@</span>
+<span class="del">- sessionStack.alignment = .centerX</span>
+<span class="add">+ sessionStack.alignment = .width   // stack owns row width</span>
+<span class="del">- row.widthAnchor.constraint(equalTo: stack…).isActive = true</span></div>
+    <div class="fa"><span class="btn pri">Approve &amp; apply</span><span class="btn sec">Reject</span></div>
+  </div>
+</div>
+
+<!-- ============ 3) THE PILL 5 RUN-STATES ============ -->
+<div id="pill-states" style="display:none">
+  <div class="pills">
+    <div class="pill2"><span class="d" style="background:var(--ok);box-shadow:0 0 0 3px rgba(59,209,123,.18)"></span><span class="l">Ready</span></div>
+    <div class="pill2"><span class="d" style="background:var(--warn);box-shadow:0 0 0 3px rgba(227,169,63,.18)"></span><span class="l">Connecting</span></div>
+    <div class="pill2"><span class="wv"><i style="height:5px"></i><i style="height:11px"></i><i style="height:7px"></i><i style="height:9px"></i></span><span class="l" style="color:var(--ok)">Listening</span></div>
+    <div class="pill2"><span class="d" style="background:var(--tx-3)"></span><span class="l">Paused</span></div>
+    <div class="pill2"><span class="d" style="background:var(--danger);box-shadow:0 0 0 3px rgba(229,86,78,.18)"></span><span class="l" style="color:var(--danger)">Needs attention</span></div>
+  </div>
+</div>
+<!-- ACTION-BAR PILL: primary actions always one tap -->
+<div id="action-pill">
+  <div class="bar-pill">
+    <span class="dot"></span><span class="nm">Bluey</span>
+    <span class="sep"></span>
+    <div class="act primary" data-tip="Ask · ⌥A"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg></div>
+    <div class="act" data-tip="Screen · ⌥S"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 21h8"/></svg></div>
+    <div class="act" data-tip="Listen · ⌥L"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 2a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3zM5 11a7 7 0 0 0 14 0M12 18v3"/></svg></div>
+    <div class="act" data-tip="History · ⌥H"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+    <div class="act more"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/></svg></div>
+  </div>
+</div>
+
+<!-- CANVAS: rich artifacts open in a split pane beside the conversation -->
+<div id="canvas-view" style="display:none">
+  <div class="canvas">
+    <div class="left">
+      <div class="ch"><span class="dot" style="width:7px;height:7px;border-radius:50%;background:var(--ok)"></span><div class="cn"><b>Bluey</b><span>conversation</span></div></div>
+      <div class="miniqr">
+        <div class="qb">show me the compaction function</div>
+        <div class="ab">Here’s <span style="font-family:var(--mono);font-size:11px;color:#cfe0f5">render_prompt_within</span> — it keeps recent turns and summarizes the rest. Opened in the canvas →</div>
+        <div class="cardart" style="margin-top:11px"><div class="ci"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3H5a2 2 0 0 0-2 2v3m0 8v3a2 2 0 0 0 2 2h3m8 0h3a2 2 0 0 0 2-2v-3m0-8V5a2 2 0 0 0-2-2h-3"/></svg></div><div class="ct"><b>Code canvas</b><span>render.rs · 38 lines</span></div></div>
+      </div>
+    </div>
+    <div class="right">
+      <div class="ch"><span class="ci"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3H5a2 2 0 0 0-2 2v3m0 8v3a2 2 0 0 0 2 2h3m8 0h3a2 2 0 0 0 2-2v-3m0-8V5a2 2 0 0 0-2-2h-3"/></svg></span><div class="cn"><b>Code canvas</b><span>render.rs</span></div><span class="sp"></span>
+        <div class="cb"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></div>
+        <div class="cb"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg></div>
+        <div class="cb"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg></div>
+      </div>
+      <div class="code2"><span class="cm">// keep recent turns verbatim, summarize the rest</span>
+<span class="kw">fn</span> render_prompt_within(budget: usize) -> String {
+    <span class="kw">let</span> recent = self.tail_turns(HOT_LAYER);
+    <span class="kw">if</span> self.fits(budget) {
+        <span class="kw">return</span> self.replay_all();
+    }
+    <span class="kw">let</span> summary = self.drive_summary(
+        <span class="st">"Summarize earlier in ≤K words"</span>
+    );
+    format!(<span class="st">"{summary}\n{recent}"</span>)
+}</div>
+    </div>
+  </div>
+</div>
+
+
+
+
+<script>
+(function(){
+  // ===== Backend IPC bridge =====
+  var T = (window.__TAURI__ && window.__TAURI__.event) ? window.__TAURI__.event : null;
+  var INV = (window.__TAURI__ && window.__TAURI__.core) ? window.__TAURI__.core.invoke : null;
+
+  function emit(obj){
+    // send an OverlayEvent to the daemon via the Rust invoke command (reliable)
+    if (INV) { try { INV('overlay_send', { event: JSON.stringify(obj) }); } catch(e){} }
+  }
+  window.blueyEmit = emit;
+
+  // ---- render incoming commands ----
+  function feedEl(){ return document.getElementById('view-ask'); }
+
+  function railFor(kind, source){
+    if (kind === 'transcript') return {cls:'heard', lab:'HEARD', label2:'heard2'};
+    if (kind === 'question')   return {cls:'you',   lab:'YOU · ASKED', label2:''};
+    if (source && /screen|vision/i.test(source)) return {cls:'screen', lab:'SCREEN', label2:'who2'};
+    return {cls:'bluey', lab:'BLUEY', label2:'who2'};
+  }
+
+  function pushCard(card){
+    var feed = feedEl(); if(!feed) return;
+    // De-dupe the optimistic local question: the UI shows your question instantly
+    // (id "local-…") for snappy feedback, then the daemon echoes its own question
+    // card for the same text. Without this, the message renders twice. When the
+    // daemon's question card arrives, drop the matching pending local one.
+    if (card.kind === 'question' && String(card.id||'').indexOf('local-') !== 0){
+      var pending = feed.querySelectorAll('.turn[data-card-id^="local-"]');
+      for (var i=0;i<pending.length;i++){
+        var pb = pending[i].querySelector('.ask2');
+        if (pb && pb.textContent === (card.body||'')){ pending[i].remove(); break; }
+      }
+    }
+    var r = railFor(card.kind, card.source);
+    var div = document.createElement('div');
+    div.className = 'turn'; div.dataset.cardId = card.id || '';
+    var bodyCls = (card.kind==='transcript') ? 'heardtxt' : (card.kind==='question' ? 'ask2' : 'ans2');
+    var meta = card.cost_label ? card.cost_label : '';
+    div.innerHTML =
+      '<span class="rail '+r.cls+'"></span>'+
+      '<div class="lab"><span class="'+r.label2+'">'+r.lab+'</span><span class="t">'+meta+'</span></div>'+
+      '<div class="'+bodyCls+'"></div>';
+    div.querySelector('.'+bodyCls).textContent = card.body || '';
+    feed.appendChild(div);
+    feed.scrollTop = feed.scrollHeight;
+  }
+  function updateCard(id, body, cost){
+    var feed=feedEl(); if(!feed) return;
+    var el = feed.querySelector('[data-card-id="'+id+'"]');
+    if(!el){ pushCard({id:id, kind:'answer', body:body, cost_label:cost}); return; }
+    var b = el.querySelector('.ans2, .ask2, .heardtxt'); if(b) b.textContent = body || '';
+    if(cost){ var t=el.querySelector('.lab .t'); if(t) t.textContent = cost; }
+  }
+
+  function setSessionsPage(d){
+    // d = { sessions:[...], total, has_more, offset } — Bluey MEETING conversations.
+    var list = document.getElementById('hist-meetings'); if(!list) return;
+    var appending = (d.offset||0) > 0;
+    var groups = { Pinned:[], Today:[], Yesterday:[], Earlier:[] };
+    var now = Date.now();
+    (d.sessions||[]).forEach(function(s){
+      if (s.pinned) { groups.Pinned.push(s); return; }
+      var ts = parseInt(s.updated_at||'0',10) || 0;
+      var ageH = (now - ts)/3600000;
+      if (ageH < 24) groups.Today.push(s);
+      else if (ageH < 48) groups.Yesterday.push(s);
+      else groups.Earlier.push(s);
+    });
+    if(!appending){ list.innerHTML=''; } else { var oldMore=list.querySelector('.more'); if(oldMore) oldMore.remove(); }
+    ['Pinned','Today','Yesterday','Earlier'].forEach(function(g){
+      if(!groups[g].length) return;
+      var h=document.createElement('div'); h.className='shd';
+      h.innerHTML='<span class="t">'+g+'</span><span class="ln"></span>'; list.appendChild(h);
+      groups[g].forEach(function(s){
+        var row=document.createElement('div'); row.className='srow'; row.dataset.id=s.id;
+        var sub=(s.project?s.project+' · ':'')+(s.turn_count!=null?s.turn_count+' turns':(s.subtitle||''));
+        row.innerHTML='<div class="ic"></div><div class="mid"><div class="ti"></div><div class="sub"></div></div>';
+        row.querySelector('.ti').textContent=s.title||'Untitled';
+        row.querySelector('.sub').textContent=sub;
+        if(s.is_active) row.classList.add('sel');
+        list.appendChild(row);
+      });
+    });
+    if(d.has_more){
+      var m=document.createElement('div'); m.className='more';
+      m.textContent='Show '+Math.max(0,(d.total||0)-(d.sessions||[]).length)+' more';
+      list.appendChild(m);
+    }
+  }
+
+  // ---- History sub-tabs: Meetings (Bluey conversations) vs Agent sessions ----
+  // NOTE: these MUST live in this script block — the click delegate + the tab
+  // handlers that call them are in this block too. (They were previously defined
+  // in the second <script>, which is a separate scope, so every call threw a
+  // ReferenceError and the sub-tabs silently did nothing.)
+  var histActiveAgent = null;            // which agent's sessions are loaded (null = none picked)
+  function showHistSub(which){           // 'meetings' | 'agents'
+    var sub=document.getElementById('hist-subtabs');
+    if(sub) sub.querySelectorAll('button').forEach(function(b){ b.classList.toggle('on', b.dataset.sub===which); });
+    var m=document.getElementById('hist-meetings'); var a=document.getElementById('hist-agents');
+    if(m) m.style.display=(which==='meetings')?'':'none';
+    if(a) a.style.display=(which==='agents')?'':'none';
+    if(which==='agents' && !histActiveAgent){
+      // No agent picked yet — prompt the user to choose one in the Agents tab.
+      if(a) a.innerHTML='<div class="sub" style="padding:10px 4px">Pick an agent in the Agents tab, then “View sessions”.</div>';
+    }
+  }
+  window.__showHistSub = showHistSub;
+
+  // Render ONE agent's own coding sessions (Claude/Cursor/Copilot chats) into the
+  // History view. These are distinct from Bluey meeting rows: clicking one
+  // attaches that agent and resumes that session, so each row carries the agent
+  // kind + a marker the click delegate uses to emit agent_attach_requested.
+  function setAgentSessions(d){
+    var list = document.getElementById('hist-agents'); if(!list) return;
+    list.innerHTML='';
+    var kind = d.kind || '';
+    // Switch the History view to the Agent-sessions sub-tab and remember the agent.
+    histActiveAgent = kind;
+    showHistSub('agents');
+    var sessions = d.sessions || [];
+    var hdr=document.createElement('div'); hdr.className='shd';
+    hdr.innerHTML='<span class="t">'+(kind||'agent')+' sessions</span><span class="ln"></span>';
+    list.appendChild(hdr);
+    if(!sessions.length){
+      var empty=document.createElement('div'); empty.className='sub'; empty.style.padding='8px 4px';
+      empty.textContent='No sessions found for this agent.';
+      list.appendChild(empty); return;
+    }
+    sessions.forEach(function(s){
+      var row=document.createElement('div'); row.className='srow';
+      row.dataset.agentKind=kind; row.dataset.sessionId=s.id;
+      row.innerHTML='<div class="ic"></div><div class="mid"><div class="ti"></div><div class="sub"></div></div>';
+      row.querySelector('.ti').textContent=s.title||'Untitled session';
+      row.querySelector('.sub').textContent=(s.project?s.project:'');
+      list.appendChild(row);
+    });
+  }
+
+  // Agents-view loading state: shown the moment the Agents tab opens, until the
+  // daemon's first (fast) SetAgents lands. Discovery's fast paint is ~tens of ms;
+  // session counts then fill in afterwards (each card shows "counting…").
+  var agentsLoading=false;
+  function showAgentsLoading(){
+    var wrap=document.querySelector('#view-agents .ax'); if(!wrap) return;
+    // Only show the full loader if there are no cards yet (don't blank a populated list).
+    if(wrap.querySelector('.acard')) return;
+    agentsLoading=true;
+    wrap.innerHTML='<div class="agload"><span class="spin"></span><span>Finding your agents…</span></div>';
+  }
+
+  function setAgents(d){
+    var wrap=document.querySelector('#view-agents .ax'); if(!wrap) return;
+    agentsLoading = false;                 // first paint arrived — drop the top loader
+    wrap.innerHTML='';
+    var agents = d.agents||[];
+    if(!agents.length){
+      wrap.innerHTML='<div class="sub" style="padding:10px 4px">No coding agents found.</div>';
+      return;
+    }
+    agents.forEach(function(a){
+      var capMap={drive:['Active','ready'],read_only:['Read-only','ro'],needs_reauth:['Needs re-auth','warn'],needs_trust:['Needs trust','warn'],cloud_blocked:['Cloud blocked','blk']};
+      var cap=capMap[a.capability]||[a.capability,'ro'];
+      var card=document.createElement('div'); card.className='acard'+(a.attached?' on':''); card.dataset.kind=a.kind;
+      var actions = a.attached
+        ? '<span class="btn sec" data-act="detach">Stop using</span><span class="btn sec" data-act="sessions">View sessions</span>'
+        : (a.capability==='cloud_blocked' ? '' : '<span class="btn pri" data-act="use">Use this agent</span><span class="btn sec" data-act="sessions">View sessions</span>');
+      // session_count === null means counts are still being computed (phase 2);
+      // show a subtle "counting…" instead of omitting, so it reads as in-progress.
+      var sessText = (a.session_count!=null)
+        ? ' · '+a.session_count+' sessions'
+        : ' · <span class="counting">counting…</span>';
+      card.innerHTML=
+        '<div class="top"><span class="nm"></span><span class="sp"></span><span class="cap '+cap[1]+'">'+cap[0]+'</span></div>'+
+        '<div class="meta">'+(a.ready_connector_count||0)+'/'+(a.connector_count||0)+' connectors ready'+sessText+'</div>'+
+        (actions?'<div class="act">'+actions+'</div>':'');
+      card.querySelector('.nm').textContent=a.display_name||a.kind;
+      wrap.appendChild(card);
+    });
+  }
+
+  function handleCommand(line){
+    var cmd; try { cmd = JSON.parse(line); } catch(e){ return; }
+    switch(cmd.type){
+      case 'push_card': if(cmd.card) pushCard(cmd.card); break;
+      case 'update_card': updateCard(cmd.id, cmd.body, cmd.cost_label); break;
+      case 'set_sessions': setSessionsPage({sessions:cmd.sessions, total:(cmd.sessions||[]).length, has_more:false}); break;
+      case 'set_sessions_page': setSessionsPage(cmd); break;
+      case 'set_agent_sessions': setAgentSessions(cmd); break;
+      case 'set_agents': setAgents(cmd); break;
+      case 'set_context_items': setContextSummary(cmd); break;
+      case 'clear': { var f=feedEl(); if(f) f.querySelectorAll('.turn').forEach(function(x){x.remove();}); if(window.__selectTab) window.__selectTab('Ask'); break; }
+      // listening_state_changed, set_balance, etc. -> can wire later
+    }
+  }
+
+  if (T && T.listen) T.listen('overlay://command', function(ev){ handleCommand(ev.payload); });
+  // diagnostic for debugging the bridge
+  (function(fn){ if(document.readyState!=='loading') fn(); else window.addEventListener('DOMContentLoaded', fn); })(function(){
+    var k=document.querySelector('.foot .keys');
+    if(k) k.textContent='[INV:'+(INV?'y':'n')+' EVT:'+(T?'y':'n')+'] '+k.textContent;
+  });
+
+  // ---- wire UI actions to events ----
+  (function(fn){ if(document.readyState!=='loading') fn(); else window.addEventListener('DOMContentLoaded', fn); })(function(){
+    // send question
+    var field=document.querySelector('.comp .field');
+    var send=document.querySelector('.comp .send');
+    function ask(){
+      var q=(field&&field.value||'').trim(); if(!q) return;
+      pushCard({id:'local-'+Date.now(), kind:'question', body:q});
+      emit({type:'ask_requested', question:q, provider:null, model:null, mode:null});
+      if(field) field.value='';
+    }
+    if(send) send.addEventListener('click', ask);
+    if(field) field.addEventListener('keydown', function(e){ if(e.key==='Enter' && (e.metaKey||!e.shiftKey)){ e.preventDefault(); ask(); } });
+
+    // pill/panel actions -> real events
+    document.querySelectorAll('#action-pill .act').forEach(function(a){
+      var tip=(a.getAttribute('data-tip')||'');
+      a.addEventListener('click', function(){
+        if(/Screen/.test(tip)) emit({type:'analyze_screen_requested'});
+        else if(/Listen/.test(tip)) emit({type:'recording_start_requested'});
+        // Ask/History handled by the panel-toggle script (expands)
+      });
+    });
+
+    // History tab opening -> request real sessions
+    var histTab=Array.prototype.find.call(document.querySelectorAll('.ph .seg button'),function(b){return b.textContent.trim()==='History';});
+    // History tab -> default to the Meetings sub-tab and load meetings.
+    if(histTab) histTab.addEventListener('click', function(){ showHistSub('meetings'); emit({type:'sessions_requested', offset:0, limit:30, search:''}); });
+    // Agents tab -> show loader immediately, then request agents.
+    var agTab=Array.prototype.find.call(document.querySelectorAll('.ph .seg button'),function(b){return b.textContent.trim()==='Agents';});
+    if(agTab) agTab.addEventListener('click', function(){ showAgentsLoading(); emit({type:'agent_list_requested'}); });
+    // (History sub-tab clicks are handled in the document-level delegate below,
+    //  which is the robust path used for all dynamically-toggled controls.)
+    // search box — searches whichever sub-tab is active
+    var sb=document.querySelector('#view-history .srch input');
+    if(sb) sb.addEventListener('input', function(){
+      var onAgents=document.querySelector('#hist-subtabs button[data-sub="agents"].on');
+      if(onAgents && histActiveAgent) emit({type:'agent_sessions_requested', kind:histActiveAgent, offset:0, limit:30, search:sb.value});
+      else emit({type:'sessions_requested', offset:0, limit:30, search:sb.value});
+    });
+
+    // ---- robust delegation for dynamically-created buttons ----
+    document.addEventListener('click', function(ev){
+      // History sub-tab switch (Meetings | Agent sessions)
+      var subBtn = ev.target.closest('#hist-subtabs button[data-sub]');
+      if (subBtn){
+        var which=subBtn.dataset.sub;
+        showHistSub(which);
+        if(which==='meetings') emit({type:'sessions_requested', offset:0, limit:30, search:''});
+        else if(which==='agents' && histActiveAgent) emit({type:'agent_sessions_requested', kind:histActiveAgent, offset:0, limit:30, search:''});
+        return;
+      }
+      // agent card buttons
+      var ab = ev.target.closest('#view-agents [data-act]');
+      if (ab){
+        var card = ab.closest('.acard'); var kind = card ? card.dataset.kind : '';
+        var act = ab.dataset.act;
+        if(act==='use'){
+          // Optimistic feedback so the click never feels dead; the daemon's
+          // SetAgents re-render replaces this with the real attached state.
+          ab.textContent='Attaching…'; ab.style.pointerEvents='none'; ab.style.opacity='.6';
+          emit({type:'agent_attach_requested', kind:kind, session_id:null});
+        }
+        else if(act==='detach'){
+          ab.textContent='Stopping…'; ab.style.pointerEvents='none'; ab.style.opacity='.6';
+          emit({type:'agent_detach_requested'});
+        }
+        else if(act==='sessions'){ if(window.__selectTab) window.__selectTab('History'); emit({type:'agent_sessions_requested', kind:kind, offset:0, limit:30, search:''}); }
+        return;
+      }
+      // history session row
+      var row = ev.target.closest('#view-history .srow');
+      if (row){
+        // Agent coding-session row: attach that agent and resume THAT session.
+        if (row.dataset.agentKind && row.dataset.sessionId){
+          emit({type:'agent_attach_requested', kind:row.dataset.agentKind, session_id:row.dataset.sessionId});
+          if(window.__selectTab) window.__selectTab('Ask');
+          return;
+        }
+        // Bluey meeting row: open that meeting. Debounce + switch to Ask so the
+        // click gives immediate feedback (the daemon clears+replays the thread).
+        if (row.dataset.id){
+          if (row.dataset.opening) return;            // ignore rapid re-clicks
+          row.dataset.opening = '1';
+          setTimeout(function(){ delete row.dataset.opening; }, 1500);
+          emit({type:'session_open_requested', id:row.dataset.id});
+          if(window.__selectTab) window.__selectTab('Ask');
+          return;
+        }
+      }
+      // history show-more (Meetings list only)
+      var more = ev.target.closest('#hist-meetings .more');
+      if (more){ emit({type:'sessions_requested', offset:document.querySelectorAll('#hist-meetings .srow').length, limit:30, search:''}); return; }
+      // composer "+" menu toggle
+      var plus = ev.target.closest('.comp .plus');
+      if (plus){ var pm=document.getElementById('plus-menu'); if(pm) pm.style.display = (pm.style.display==='none'||!pm.style.display)?'block':'none'; return; }
+      // click outside + menu closes it
+      if (!ev.target.closest('#plus-menu')){ var pm2=document.getElementById('plus-menu'); if(pm2 && pm2.style.display!=='none') pm2.style.display='none'; }
+    });
+
+  });
+})();
+</script>
+<script>
+(function(){
+  function $(s){ return document.querySelector(s); }
+  function show(id){ var e=document.getElementById(id); if(e) e.style.display=''; }
+  function hide(id){ var e=document.getElementById(id); if(e) e.style.display='none'; }
+
+  // Tauri window resize via the injected global (no import needed)
+  function setMode(expanded){
+    try {
+      if (window.__TAURI__ && window.__TAURI__.core && window.__TAURI__.core.invoke) {
+        window.__TAURI__.core.invoke('set_overlay_mode', { expanded: expanded });
+      }
+    } catch(e){}
+  }
+
+  function collapseToPill(){
+    var panel=$('.panel'); if(panel) panel.style.display='none';
+    show('action-pill');
+    setMode(false);
+  }
+  function expandToPanel(){
+    hide('action-pill');
+    var panel=$('.panel'); if(panel) panel.style.display='flex';
+    setMode(true);
+  }
+
+  var tabs, views={ 'Ask':'view-ask','History':'view-history','Agents':'view-agents' };
+  function selectTab(name){
+    if(!tabs) tabs=document.querySelectorAll('.ph .seg button');
+    tabs.forEach(function(x){ x.classList.toggle('on', x.textContent.trim()===name); });
+    Object.keys(views).forEach(function(k){
+      var el=document.getElementById(views[k]); if(el) el.style.display=(k===name)?'':'none';
+    });
+  }
+  window.__selectTab = selectTab;
+  window.selectTab = selectTab;
+
+  // The current Tauri window handle (withGlobalTauri exposes the window API).
+  function appWindow(){
+    try {
+      var w = window.__TAURI__ && window.__TAURI__.window;
+      if (w && w.getCurrentWindow) return w.getCurrentWindow();
+      if (w && w.appWindow) return w.appWindow; // older shape
+    } catch(e){}
+    return null;
+  }
+
+  // Controls whose CLICK must always fire (typing/activating), never absorbed by
+  // a drag. We still allow a press-and-DRAG that starts on them — the movement
+  // threshold below means a real click on these still works, while a deliberate
+  // drag from anywhere (including over them) moves the window.
+  function isControl(el){
+    return !!(el && el.closest(
+      'button, input, textarea, select, .act, .seg, .x, .send, .listen, .plus, .srow, .acard, [data-act], [data-sub], #resize-grip'
+    ));
+  }
+
+  // Drag-from-anywhere with a movement threshold. On mousedown over the pill or
+  // the panel header we DON'T immediately startDragging (that would swallow the
+  // click on an icon). Instead we watch the pointer: if it moves more than a few
+  // px before mouseup, it's a drag → hand off to the OS via startDragging(); if
+  // it barely moves, we do nothing and the normal click fires the control.
+  // This gives the biggest possible grab area (the whole pill/header) without
+  // breaking taps on the icons. startDragging() is the reliable path for a
+  // borderless nspanel where CSS -webkit-app-region is not honored.
+  var DRAG_THRESHOLD = 4; // px
+  function attachDragFromAnywhere(zone){
+    if (!zone) return;
+    zone.addEventListener('mousedown', function(ev){
+      if (ev.button !== 0) return;           // left button only
+      var startX = ev.clientX, startY = ev.clientY;
+      var startedOnControl = isControl(ev.target);
+      var dragging = false;
+      function onMove(mv){
+        if (dragging) return;
+        if (Math.abs(mv.clientX - startX) > DRAG_THRESHOLD ||
+            Math.abs(mv.clientY - startY) > DRAG_THRESHOLD){
+          dragging = true;
+          cleanup();
+          var win = appWindow();
+          if (win && win.startDragging) win.startDragging().catch(function(){});
+        }
+      }
+      function onUp(){ cleanup(); }
+      function cleanup(){
+        document.removeEventListener('mousemove', onMove, true);
+        document.removeEventListener('mouseup', onUp, true);
+      }
+      // If the press began on a control, only START watching for a drag — the
+      // control's own click still fires on a no-move release. (We never call
+      // preventDefault, so the click is preserved.)
+      void startedOnControl;
+      document.addEventListener('mousemove', onMove, true);
+      document.addEventListener('mouseup', onUp, true);
+    });
+  }
+
+  function wireWindowControls(){
+    attachDragFromAnywhere(document.querySelector('.panel .ph'));
+    attachDragFromAnywhere(document.querySelector('#action-pill .bar-pill'));
+
+    // Bottom-right grip → native resize-drag (panel only). Generous hit zone via
+    // CSS; the visible icon is the affordance.
+    var grip = document.getElementById('resize-grip');
+    if (grip) grip.addEventListener('mousedown', function(ev){
+      if (ev.button !== 0) return;
+      ev.preventDefault(); ev.stopPropagation();
+      var win = appWindow();
+      if (win && win.startResizeDragging){
+        win.startResizeDragging('SouthEast').catch(function(){});
+      }
+    });
+  }
+
+  function wire(){
+    // window drag + resize (borderless nspanel)
+    wireWindowControls();
+    // minimize -> pill
+    var min=$('.ph .x'); if(min) min.addEventListener('click', collapseToPill);
+    // pill click (not on an action) -> expand
+    var pill=$('#action-pill .bar-pill');
+    if(pill) pill.addEventListener('click', function(ev){ if(ev.target.closest('.act')) return; expandToPanel(); });
+    // pill actions
+    document.querySelectorAll('#action-pill .act').forEach(function(a){
+      a.addEventListener('click', function(){
+        var lb=a.querySelector('.lb'); var name=lb?lb.textContent.trim():'';
+        expandToPanel(); if(name==='History'||name==='Ask') selectTab(name);
+      });
+    });
+    // tabs
+    tabs=document.querySelectorAll('.ph .seg button');
+    tabs.forEach(function(b){ b.addEventListener('click', function(){ selectTab(b.textContent.trim()); }); });
+    // marker proves JS ran
+    var k=$('.foot .keys'); if(k && k.textContent.indexOf('JS OK')<0) k.textContent='JS OK · '+k.textContent;
+  }
+  if(document.readyState!=='loading') wire(); else document.addEventListener('DOMContentLoaded', wire);
+})();
+</script>
+</body>
+</html>

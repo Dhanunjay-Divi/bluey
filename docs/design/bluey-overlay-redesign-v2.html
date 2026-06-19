@@ -1,0 +1,781 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bluey · Overlay redesign v2 — full UX, aurora-glass</title>
+<style>
+:root{
+  --tx-1:rgba(255,255,255,.96); --tx-2:rgba(255,255,255,.62); --tx-3:rgba(255,255,255,.40); --tx-4:rgba(255,255,255,.24);
+  --hairline:rgba(255,255,255,.10); --hairline-s:rgba(255,255,255,.17);
+  --accent:#3B82F6; --accent-tx:#AFC9FB; --accent-bg:rgba(59,130,246,.18); --accent-bg-s:rgba(59,130,246,.30);
+  --ok:#3BD17B; --warn:#E3A93F; --danger:#E5564E;
+  --glass:rgba(17,20,26,.52); --glass-2:rgba(26,30,38,.58); --glass-hi:rgba(255,255,255,.05);
+  --r-sm:8px; --r-md:11px; --r-lg:14px; --r-xl:18px; --r-2xl:24px;
+  --top-hi:inset 0 1px 0 rgba(255,255,255,.09);
+  --shadow:0 28px 80px rgba(0,0,0,.55);
+  --blur:saturate(1.8) blur(40px);
+  --font:-apple-system,"SF Pro Display","SF Pro Text",BlinkMacSystemFont,"Inter","Segoe UI",system-ui,sans-serif;
+  --mono:"SF Mono",ui-monospace,"JetBrains Mono",monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#06080d;font-family:var(--font);color:var(--tx-1);padding:30px;display:flex;flex-direction:column;gap:30px;align-items:center}
+.h{width:100%;max-width:1240px;color:var(--tx-2);font-size:13.5px;line-height:1.6}
+.h b{color:#fff;font-weight:600}
+.h .tag{display:inline-block;font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--accent-tx);background:var(--accent-bg);padding:3px 9px;border-radius:99px;margin-bottom:8px}
+
+/* fake desktop so transparency reads */
+.stage{position:relative;width:1240px;max-width:100%;height:780px;border-radius:18px;overflow:hidden;box-shadow:0 40px 130px rgba(0,0,0,.7)}
+.desk{position:absolute;inset:0;
+  background:
+    radial-gradient(820px 460px at 14% 16%, #2a3a63 0%, transparent 60%),
+    radial-gradient(760px 540px at 88% 86%, #4a2747 0%, transparent 56%),
+    radial-gradient(680px 500px at 60% 28%, #1d544c 0%, transparent 52%),
+    radial-gradient(620px 600px at 32% 90%, #2b2456 0%, transparent 58%),
+    linear-gradient(140deg,#0b1220,#160e24 60%,#0a0d14)}
+.mtg{position:absolute;left:56px;top:64px;width:520px;height:340px;border-radius:14px;
+  background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.06);backdrop-filter:blur(2px);
+  padding:18px 20px;color:rgba(255,255,255,.4);font-size:12.5px;line-height:1.7}
+.mtg .pill{display:inline-block;background:rgba(255,255,255,.08);border-radius:99px;padding:3px 11px;font-size:11px;margin-bottom:10px}
+.mtg .grid{margin-top:14px;display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.mtg .ph{height:60px;border-radius:9px;background:rgba(255,255,255,.04)}
+.icn{display:inline-flex;vertical-align:middle}
+svg{display:block}
+
+/* ============ shared glass ============ */
+.glass{background:var(--glass);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);
+  border:1px solid var(--hairline);box-shadow:var(--shadow),var(--top-hi)}
+
+/* ============ A) PILL (idle) ============ */
+.pill{position:absolute;left:50%;top:22px;transform:translateX(-50%);
+  display:flex;align-items:center;gap:9px;height:34px;padding:0 14px 0 12px;border-radius:99px;
+  background:var(--glass);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);
+  border:1px solid var(--hairline);box-shadow:0 10px 30px rgba(0,0,0,.4),var(--top-hi)}
+.pill .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px rgba(59,209,123,.18)}
+.pill .nm{font-size:12.5px;font-weight:600;letter-spacing:-.01em}
+.pill .sep{width:1px;height:14px;background:var(--hairline)}
+.pill .k{font-size:11px;color:var(--tx-3);display:flex;align-items:center;gap:4px}
+.pill .kbd{font-size:10px;color:var(--tx-3);border:1px solid var(--hairline);border-radius:5px;padding:1px 5px;font-family:var(--mono)}
+
+/* ===== ACTION-BAR PILL — the hero: primary actions always one tap ===== */
+.bar-pill{position:absolute;left:50%;top:22px;transform:translateX(-50%);
+  display:flex;align-items:center;gap:6px;height:40px;padding:0 6px 0 13px;border-radius:99px;
+  background:var(--glass);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);
+  border:1px solid var(--hairline);box-shadow:0 14px 38px rgba(0,0,0,.42),var(--top-hi)}
+.bar-pill .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px rgba(59,209,123,.18);flex:none}
+.bar-pill .nm{font-size:12.5px;font-weight:600;letter-spacing:-.01em;margin-right:2px}
+.bar-pill .sep{width:1px;height:18px;background:var(--hairline);margin:0 2px}
+.act{display:flex;align-items:center;gap:7px;height:30px;padding:0 11px;border-radius:99px;cursor:pointer;border:1px solid transparent;color:var(--tx-2)}
+.act:hover{background:rgba(255,255,255,.06);color:var(--tx-1)}
+.act svg{stroke:currentColor;flex:none}
+.act .lb{font-size:12px;font-weight:600;letter-spacing:-.01em}
+.act .kb{font-size:9.5px;color:var(--tx-4);font-family:var(--mono);border:1px solid var(--hairline);border-radius:4px;padding:0 4px;line-height:14px}
+.act.primary{background:var(--accent-bg);color:var(--accent-tx)}
+.act.primary .kb{color:var(--accent-tx);border-color:var(--accent-bg-s)}
+.act.more{padding:0 9px;color:var(--tx-3)}
+.act.listen-on{background:rgba(59,209,123,.14);color:var(--ok)}
+.act.listen-on .wv{display:flex;align-items:flex-end;gap:2px;height:11px}
+.act.listen-on .wv i{width:2px;background:var(--ok);border-radius:1px;display:block}
+
+/* ============ B) ASK bar (fast path — Spotlight-style) ============ */
+.ask{position:absolute;left:50%;top:120px;transform:translateX(-50%);width:600px}
+.ask .bar{display:flex;align-items:center;gap:11px;height:52px;padding:0 8px 0 16px;border-radius:var(--r-xl);
+  background:var(--glass-2);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);
+  border:1px solid var(--hairline-s);box-shadow:var(--shadow),var(--top-hi)}
+.ask .bar .q{flex:1;font-size:15px;color:var(--tx-1);letter-spacing:-.01em}
+.ask .bar .q .cur{display:inline-block;width:2px;height:17px;background:var(--accent);vertical-align:-3px;margin-left:1px;animation:bk 1.1s steps(1) infinite}
+.ask .send{width:36px;height:36px;border-radius:11px;background:var(--accent);display:flex;align-items:center;justify-content:center;box-shadow:var(--top-hi)}
+.ask .ans{margin-top:10px;border-radius:var(--r-lg);padding:15px 17px;
+  background:var(--glass);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);
+  border:1px solid var(--hairline);box-shadow:var(--shadow),var(--top-hi)}
+.ask .ans .who{display:flex;align-items:center;gap:7px;margin-bottom:7px}
+.ask .ans .who b{font-size:11px;font-weight:700;letter-spacing:.05em;color:var(--accent-tx)}
+.ask .ans .who .sp{flex:1}
+.ask .ans .who .meta{font-size:10.5px;color:var(--tx-3);font-variant-numeric:tabular-nums}
+.ask .ans p{font-size:13.5px;color:var(--tx-1);line-height:1.6;letter-spacing:-.005em}
+.ask .ans p .cur{display:inline-block;width:2px;height:14px;background:var(--accent);vertical-align:-2px;margin-left:1px;animation:bk 1.1s steps(1) infinite}
+.ask .hint{margin-top:9px;text-align:center;font-size:11px;color:var(--tx-4)}
+.ask .hint .kbd{font-family:var(--mono);border:1px solid var(--hairline);border-radius:5px;padding:1px 5px;color:var(--tx-3)}
+
+/* ============ C) FULL PANEL ============ */
+.panel{position:absolute;right:34px;top:40px;width:560px;height:700px;display:flex;flex-direction:column;border-radius:var(--r-2xl);overflow:hidden;
+  background:var(--glass);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);
+  border:1px solid var(--hairline);box-shadow:var(--shadow),var(--top-hi)}
+/* header: minimal — identity, status, segmented switch, window dots */
+.ph{display:flex;align-items:center;gap:10px;padding:13px 14px;border-bottom:1px solid var(--hairline)}
+.ph .dot{width:7px;height:7px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3px rgba(59,209,123,.16);flex:none}
+.ph .nm{font-size:13px;font-weight:600;letter-spacing:-.01em}
+.ph .via{font-size:11px;color:var(--tx-3)}
+.ph .sp{flex:1}
+.ph .seg{display:flex;background:rgba(255,255,255,.05);border:1px solid var(--hairline);border-radius:10px;padding:2px}
+.ph .seg button{font-size:11.5px;font-weight:600;color:var(--tx-3);background:none;border:0;padding:4px 12px;border-radius:8px;cursor:pointer;font-family:inherit;letter-spacing:-.005em}
+.ph .seg button.on{background:var(--accent-bg);color:var(--accent-tx)}
+.ph .x{width:26px;height:26px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:var(--tx-3)}
+.ph .x:hover{background:rgba(255,255,255,.06);color:var(--tx-1)}
+
+.body{flex:1;overflow:hidden;display:flex;flex-direction:column}
+
+/* --- ASK tab (answer feed) --- */
+.feed{flex:1;overflow-y:auto;padding:16px 16px 8px}
+.qrow{display:flex;justify-content:flex-end;margin-bottom:12px}
+.qbub{max-width:80%;background:var(--glass-hi);border:1px solid var(--hairline);border-radius:14px 14px 4px 14px;padding:9px 13px;font-size:13px;color:var(--tx-1);line-height:1.5}
+.arow{margin-bottom:16px}
+.arow .who{display:flex;align-items:center;gap:7px;margin-bottom:6px}
+.arow .who b{font-size:10.5px;font-weight:700;letter-spacing:.05em;color:var(--accent-tx)}
+.arow .who .sp{flex:1}
+.arow .who .m{font-size:10px;color:var(--tx-4);font-variant-numeric:tabular-nums}
+.arow .txt{font-size:13.5px;color:var(--tx-1);line-height:1.62;letter-spacing:-.005em}
+.arow .txt b{font-weight:600}
+.arow .bul{display:flex;gap:9px;margin-top:7px}
+.arow .bul .d{width:4px;height:4px;border-radius:50%;background:var(--accent);margin-top:7px;flex:none;opacity:.85}
+.arow .bul span{font-size:13px;color:var(--tx-1);line-height:1.55}
+.arow .code{font-family:var(--mono);font-size:12px;background:rgba(255,255,255,.06);padding:1px 6px;border-radius:5px;color:#cfe0f5}
+/* unified-thread turn types — everything flows into ONE conversation */
+.turn{position:relative;padding-left:26px;margin-bottom:15px}
+.turn .rail{position:absolute;left:8px;top:3px;width:16px;height:16px;border-radius:5px;display:flex;align-items:center;justify-content:center;flex:none}
+.turn .rail.heard{background:rgba(255,255,255,.07);color:var(--tx-3)}
+.turn .rail.screen{background:var(--accent-bg);color:var(--accent-tx)}
+.turn .rail.you{background:var(--glass-hi);color:var(--tx-2)}
+.turn .rail.bluey{background:var(--accent-bg);color:var(--accent-tx)}
+.turn::before{content:"";position:absolute;left:15.5px;top:21px;bottom:-15px;width:1px;background:var(--hairline)}
+.turn:last-child::before{display:none}
+.turn .lab{font-size:10px;font-weight:700;letter-spacing:.05em;color:var(--tx-3);margin-bottom:3px;display:flex;align-items:center;gap:7px}
+.turn .lab .who2{color:var(--accent-tx)} .turn .lab .heard2{color:var(--tx-3)}
+.turn .lab .t{margin-left:auto;font-weight:400;color:var(--tx-4);font-variant-numeric:tabular-nums;letter-spacing:0}
+.turn .heardtxt{font-size:12.5px;color:var(--tx-2);line-height:1.5;font-style:italic}
+.turn .scap{display:flex;align-items:center;gap:9px;padding:7px 10px;border-radius:9px;background:var(--glass-hi);border:1px solid var(--hairline);margin-bottom:7px}
+.turn .scap .th{width:46px;height:30px;border-radius:5px;background:rgba(120,140,200,.16);border:1px solid var(--hairline);flex:none;display:flex;align-items:center;justify-content:center;color:var(--tx-3)}
+.turn .scap .sl{font-size:11.5px;color:var(--tx-2)}
+.turn .scap .sl b{color:var(--tx-1);font-weight:600;display:block;font-size:12px}
+.turn .ask2{font-size:13px;color:var(--tx-1);line-height:1.5}
+.turn .ans2{font-size:13.5px;color:var(--tx-1);line-height:1.6;letter-spacing:-.005em}
+.turn .ans2 b{font-weight:600}
+.turn .ans2 .code{font-family:var(--mono);font-size:11.5px;background:rgba(255,255,255,.06);padding:1px 6px;border-radius:5px;color:#cfe0f5}
+.ctxbar{display:flex;align-items:center;gap:8px;margin:0 16px 4px;padding:6px 10px;border-radius:9px;background:rgba(59,130,246,.07);border:1px solid rgba(59,130,246,.14)}
+.ctxbar svg{stroke:var(--accent-tx);flex:none}
+.ctxbar span{font-size:11px;color:var(--tx-2)}
+.ctxbar b{color:var(--accent-tx);font-weight:600}
+
+/* --- HISTORY tab (sessions at scale) --- */
+.hx{display:flex;flex-direction:column;height:100%}
+.srch{margin:12px 14px 8px;display:flex;align-items:center;gap:9px;height:36px;padding:0 12px;border-radius:var(--r-md);
+  background:rgba(255,255,255,.05);border:1px solid var(--hairline)}
+.srch input{flex:1;background:none;border:0;outline:0;color:var(--tx-1);font-size:13px;font-family:inherit}
+.srch input::placeholder{color:var(--tx-3)}
+.srch .k{font-size:10px;color:var(--tx-4);border:1px solid var(--hairline);border-radius:5px;padding:1px 5px;font-family:var(--mono)}
+.slist{flex:1;overflow-y:auto;padding:0 8px 10px}
+.shd{display:flex;align-items:center;gap:9px;padding:13px 8px 5px}
+.shd .t{font-size:10.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--tx-3)}
+.shd .ln{flex:1;height:1px;background:var(--hairline)}
+.srow{display:flex;align-items:center;gap:11px;padding:9px 10px;border-radius:var(--r-md);cursor:pointer;border:1px solid transparent}
+.srow:hover{background:rgba(255,255,255,.05);border-color:var(--hairline)}
+.srow.sel{background:var(--accent-bg);border-color:var(--accent-bg-s)}
+.srow .ic{width:28px;height:28px;border-radius:8px;background:rgba(255,255,255,.06);display:flex;align-items:center;justify-content:center;color:var(--tx-3);flex:none}
+.srow.sel .ic{background:var(--accent-bg-s);color:var(--accent-tx)}
+.srow .mid{flex:1;min-width:0}
+.srow .ti{font-size:13px;color:var(--tx-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;letter-spacing:-.005em}
+.srow .sub{font-size:11px;color:var(--tx-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+.srow .pin{color:var(--tx-4);flex:none;opacity:0}
+.srow:hover .pin{opacity:.9}
+.srow .pin.on{opacity:1;color:var(--accent-tx)}
+.srow .wh{font-size:10px;color:var(--tx-4);flex:none;font-variant-numeric:tabular-nums}
+.more{margin:8px 10px 4px;text-align:center;font-size:12px;color:var(--accent-tx);padding:9px;border-radius:var(--r-md);border:1px solid var(--hairline);cursor:pointer}
+.more:hover{background:rgba(255,255,255,.04)}
+
+/* --- AGENTS tab --- */
+.ax{flex:1;overflow-y:auto;padding:14px 14px 8px}
+.acard{border:1px solid var(--hairline);border-radius:var(--r-lg);padding:13px 14px;margin-bottom:10px;background:var(--glass-hi)}
+.acard.on{border-color:var(--accent-bg-s);background:var(--accent-bg)}
+.acard .top{display:flex;align-items:center;gap:9px}
+.acard .nm{font-size:13.5px;font-weight:600;color:var(--tx-1);letter-spacing:-.01em}
+.acard .sp{flex:1}
+.cap{font-size:10px;font-weight:600;letter-spacing:.02em;padding:2px 8px;border-radius:99px}
+.cap.ready{background:var(--accent-bg);color:var(--accent-tx)}
+.cap.ro{background:rgba(255,255,255,.06);color:var(--tx-3)}
+.cap.warn{background:rgba(227,169,63,.14);color:var(--warn)}
+.cap.blk{background:rgba(229,86,78,.14);color:var(--danger)}
+.acard .meta{font-size:11px;color:var(--tx-3);margin-top:6px}
+.acard .act{display:flex;gap:8px;margin-top:11px}
+.btn{font-size:12px;font-weight:600;padding:6px 12px;border-radius:9px;cursor:pointer;letter-spacing:-.005em}
+.btn.pri{background:var(--accent);color:#fff;border:1px solid transparent}
+.btn.sec{background:none;color:var(--tx-2);border:1px solid var(--hairline)}
+.btn.sec:hover{color:var(--tx-1);border-color:var(--hairline-s)}
+
+/* composer (fixed) + the single "+" menu instead of a button row */
+.comp{margin:8px 14px;display:flex;align-items:center;gap:9px;min-height:44px;padding:6px 7px 6px 8px;border-radius:var(--r-lg);
+  background:rgba(255,255,255,.05);border:1px solid var(--hairline)}
+.comp .plus{width:32px;height:32px;border-radius:10px;background:rgba(255,255,255,.05);border:1px solid var(--hairline);display:flex;align-items:center;justify-content:center;color:var(--tx-2);flex:none}
+.comp .ph2{flex:1;font-size:13px;color:var(--tx-3)}
+.comp .listen{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--tx-3);padding:0 8px}
+.comp .send{width:32px;height:32px;border-radius:10px;background:var(--accent);display:flex;align-items:center;justify-content:center;flex:none;box-shadow:var(--top-hi)}
+.foot{display:flex;align-items:center;gap:11px;padding:0 16px 13px}
+.foot .m{font-size:10.5px;color:var(--tx-3);display:flex;align-items:center;gap:5px}
+.foot .sp{flex:1}
+.foot .keys{font-size:10.5px;color:var(--tx-4);font-family:var(--mono)}
+
+.cap2{position:absolute;left:56px;bottom:24px;font-size:12px;color:rgba(255,255,255,.5);max-width:440px;line-height:1.6}
+.cap2 b{color:rgba(255,255,255,.78);font-weight:600}
+
+@keyframes bk{50%{opacity:0}}
+
+/* ===== rich card surfaces + menus + modals (full coverage) ===== */
+/* pill run-states row */
+.pills{position:absolute;left:50%;top:22px;transform:translateX(-50%);display:flex;gap:12px;flex-wrap:wrap;justify-content:center}
+.pill2{display:flex;align-items:center;gap:8px;height:32px;padding:0 13px 0 11px;border-radius:99px;background:var(--glass);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);border:1px solid var(--hairline);box-shadow:0 8px 22px rgba(0,0,0,.35),var(--top-hi)}
+.pill2 .d{width:7px;height:7px;border-radius:50%;flex:none}
+.pill2 .l{font-size:12px;font-weight:600;letter-spacing:-.01em;color:var(--tx-2)}
+.pill2 .wv{display:flex;align-items:flex-end;gap:2px;height:11px}
+.pill2 .wv i{width:2px;background:var(--ok);border-radius:1px;display:block}
+
+/* the "+" menu (replaces the 6-button row) */
+.plusmenu{position:absolute;left:18px;bottom:78px;width:212px;border-radius:var(--r-lg);overflow:hidden;background:var(--glass-2);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);border:1px solid var(--hairline-s);box-shadow:var(--shadow),var(--top-hi)}
+.pm i{display:flex;align-items:center;gap:11px;padding:9px 13px;font-size:12.5px;color:var(--tx-1);cursor:pointer;border-bottom:1px solid rgba(255,255,255,.04)}
+.pm i:last-child{border-bottom:0}
+.pm i:hover{background:rgba(255,255,255,.05)}
+.pm i svg{stroke:var(--tx-3);flex:none}
+.pm i .kk{margin-left:auto;font-size:10px;color:var(--tx-4);font-family:var(--mono)}
+.pm .sechd{font-size:9.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--tx-4);padding:8px 13px 4px}
+
+/* attachment strip + knowledge chip (contextual, above composer) */
+.attach{margin:0 14px 0;display:flex;align-items:center;gap:7px;flex-wrap:wrap;padding:7px 2px 1px}
+.chip{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--tx-2);background:var(--glass-hi);border:1px solid var(--hairline);border-radius:8px;padding:4px 8px}
+.chip svg{stroke:var(--tx-3)}
+.chip .rm{color:var(--tx-4);margin-left:2px}
+.chip.idx{color:var(--accent-tx);background:var(--accent-bg);border-color:var(--accent-bg-s)}
+.chip.idx .spn{width:11px;height:11px;border:1.6px solid var(--accent-tx);border-top-color:transparent;border-radius:50%}
+
+/* fix-proposal card */
+.fix{border:1px solid rgba(227,169,63,.3);background:rgba(227,169,63,.05);border-radius:var(--r-lg);padding:13px 14px;margin-bottom:16px}
+.fix .fh{display:flex;align-items:center;gap:7px;margin-bottom:9px}
+.fix .fh b{font-size:10.5px;font-weight:700;letter-spacing:.05em;color:var(--warn)}
+.fix .fh .st{margin-left:auto;font-size:10px;color:var(--tx-3);border:1px solid var(--hairline);border-radius:99px;padding:1px 8px}
+.fix .sec{font-size:9.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--tx-3);margin:9px 0 3px}
+.fix .bd{font-size:12.5px;color:var(--tx-1);line-height:1.55}
+.fix .diff{font-family:var(--mono);font-size:11.5px;line-height:1.6;background:rgba(0,0,0,.28);border:1px solid var(--hairline);border-radius:8px;padding:9px 11px;margin-top:4px;white-space:pre}
+.fix .diff .add{color:var(--ok)} .fix .diff .del{color:var(--danger)} .fix .diff .hh{color:var(--accent-tx)}
+.fix .fa{display:flex;gap:8px;margin-top:12px}
+
+/* card with a canvas/attachment affordance */
+.cardart{display:flex;align-items:center;gap:9px;margin-top:9px;padding:9px 11px;border-radius:var(--r-md);background:var(--glass-hi);border:1px solid var(--hairline);cursor:pointer}
+.cardart .ci{width:30px;height:30px;border-radius:8px;background:var(--accent-bg);color:var(--accent-tx);display:flex;align-items:center;justify-content:center;flex:none}
+.cardart .ct{flex:1;min-width:0}
+.cardart .ct b{font-size:12.5px;color:var(--tx-1);font-weight:600;display:block}
+.cardart .ct span{font-size:11px;color:var(--tx-3)}
+
+/* canvas pane (split) */
+.canvas{position:absolute;right:34px;top:40px;width:560px;height:700px;display:flex;border-radius:var(--r-2xl);overflow:hidden;background:var(--glass);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);border:1px solid var(--hairline);box-shadow:var(--shadow),var(--top-hi)}
+.canvas .left{width:230px;border-right:1px solid var(--hairline);display:flex;flex-direction:column}
+.canvas .right{flex:1;display:flex;flex-direction:column}
+.canvas .ch{display:flex;align-items:center;gap:8px;padding:12px 13px;border-bottom:1px solid var(--hairline)}
+.canvas .ch .ci{width:26px;height:26px;border-radius:7px;background:var(--accent-bg);color:var(--accent-tx);display:flex;align-items:center;justify-content:center;flex:none}
+.canvas .ch .cn b{font-size:12.5px;display:block;letter-spacing:-.01em}
+.canvas .ch .cn span{font-size:10.5px;color:var(--tx-3)}
+.canvas .ch .sp{flex:1}
+.canvas .ch .cb{width:24px;height:24px;border-radius:7px;display:flex;align-items:center;justify-content:center;color:var(--tx-3)}
+.canvas .ch .cb:hover{background:rgba(255,255,255,.06);color:var(--tx-1)}
+.canvas .code2{flex:1;overflow:auto;padding:13px;font-family:var(--mono);font-size:11.5px;line-height:1.65;color:#cfe0f5}
+.canvas .code2 .kw{color:#A8C7FB} .canvas .code2 .cm{color:var(--tx-3)} .canvas .code2 .st{color:#9FE1CB}
+.canvas .miniqr{padding:11px 13px}
+.canvas .miniqr .qb{background:var(--glass-hi);border:1px solid var(--hairline);border-radius:11px;padding:8px 11px;font-size:12px;color:var(--tx-1);margin-bottom:9px}
+.canvas .miniqr .ab{font-size:12px;color:var(--tx-2);line-height:1.5}
+
+/* MODAL layer */
+.modalwrap{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.42);backdrop-filter:blur(2px)}
+.modal{width:380px;border-radius:var(--r-xl);overflow:hidden;background:var(--glass-2);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);border:1px solid var(--hairline-s);box-shadow:var(--shadow),var(--top-hi)}
+.modal .mh{padding:15px 17px 0}
+.modal .mh b{font-size:14.5px;font-weight:600;letter-spacing:-.01em}
+.modal .mh p{font-size:12px;color:var(--tx-3);margin-top:4px;line-height:1.5}
+.modal .mb{padding:13px 17px}
+.modal .crow{display:flex;align-items:center;gap:10px;padding:9px 0;border-bottom:1px solid rgba(255,255,255,.05)}
+.modal .crow:last-child{border-bottom:0}
+.modal .crow .cn{flex:1;font-size:12.5px;color:var(--tx-1)}
+.modal .crow .tier{font-size:10px;color:var(--tx-3);border:1px solid var(--hairline);border-radius:99px;padding:1px 7px}
+.modal .crow .rdy{font-size:11px;color:var(--ok);display:flex;align-items:center;gap:4px}
+.modal .crow .na{font-size:11px;color:var(--warn)}
+.modal .disc{font-size:11.5px;color:var(--tx-2);line-height:1.55;max-height:120px;overflow:auto;padding:11px 13px;background:rgba(0,0,0,.22);border:1px solid var(--hairline);border-radius:9px}
+.modal .reauth{font-size:11px;color:var(--tx-3);margin-top:8px}
+.modal .reauth code{font-family:var(--mono);background:rgba(255,255,255,.07);padding:1px 5px;border-radius:4px;color:var(--accent-tx)}
+.modal .mf{display:flex;gap:9px;justify-content:flex-end;padding:0 17px 15px}
+
+/* opacity popover */
+.pop{position:absolute;left:18px;bottom:78px;width:210px;border-radius:var(--r-lg);padding:13px;background:var(--glass-2);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);border:1px solid var(--hairline-s);box-shadow:var(--shadow),var(--top-hi)}
+.pop .pt{font-size:11px;color:var(--tx-3);margin-bottom:9px;display:flex;justify-content:space-between}
+.pop .track{height:4px;border-radius:99px;background:rgba(255,255,255,.1);position:relative}
+.pop .track .fill{position:absolute;left:0;top:0;bottom:0;width:72%;background:var(--accent);border-radius:99px}
+.pop .track .kn{position:absolute;left:72%;top:50%;transform:translate(-50%,-50%);width:14px;height:14px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.4)}
+
+.legend{width:1240px;max-width:100%;color:var(--tx-2);font-size:13px;line-height:1.7}
+.legend b{color:#fff;font-weight:600}
+.legend code{font-family:var(--mono);font-size:12px;background:rgba(255,255,255,.07);padding:1px 6px;border-radius:5px;color:#cfe0f5}
+.legend h3{color:#fff;font-size:15px;font-weight:600;margin:14px 0 6px}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:10px 26px;margin-top:6px}
+.cols div{font-size:12.5px;color:var(--tx-2)}
+.cols b{color:var(--accent-tx)}
+</style>
+</head>
+<body>
+
+<div class="h">
+  <span class="tag">Overlay redesign v2 · aurora-glass</span><br>
+  <b>The reimagined overlay — built for interviews &amp; live meetings.</b> The pill is an always-visible <b>action bar</b>: the things you reach for under pressure — <b>Ask · Screen · Listen · History</b> — are one tap, never menu-buried, each with a global hotkey so they work even with the panel closed. In an interview, they share a coding problem → you hit <b>⌥S</b> → the answer floats in over your screen, invisible to them. Zero clicks. The full panel (Ask · History · Agents) is for depth; secondary actions (attach, recap, answer-style, opacity) tuck into a “+” menu. Real frosted glass, one refined blue accent, hairline edges, SF type — exactly the dashboard.
+</div>
+
+<!-- ============ STAGE 1: PILL + ASK bar (the fast path) ============ -->
+<div class="stage">
+  <div class="desk"></div>
+  <div class="mtg">
+    <span class="pill">Zoom · Weekly sync</span>
+    <div>Screen-share is live. Bluey floats over your screen, invisible to everyone else on the call.</div>
+    <div class="grid"><div class="ph"></div><div class="ph"></div><div class="ph"></div><div class="ph"></div></div>
+  </div>
+
+  <!-- ACTION-BAR PILL: primary actions always one tap -->
+  <div class="bar-pill">
+    <span class="dot"></span><span class="nm">Bluey</span>
+    <span class="sep"></span>
+    <div class="act primary"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg><span class="lb">Ask</span><span class="kb">⌥A</span></div>
+    <div class="act"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke-width="2"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 21h8"/></svg><span class="lb">Screen</span><span class="kb">⌥S</span></div>
+    <div class="act"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 2a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3zM5 11a7 7 0 0 0 14 0M12 18v3"/></svg><span class="lb">Listen</span><span class="kb">⌥L</span></div>
+    <div class="act"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span class="lb">History</span><span class="kb">⌥H</span></div>
+    <div class="act more"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/></svg></div>
+  </div>
+
+  <!-- ask bar + streamed answer -->
+  <div class="ask">
+    <div class="bar">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="var(--accent-tx)" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
+      <span class="q">how do we handle a conversation that’s too long?<span class="cur"></span></span>
+      <div class="send"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4"><path d="M5 12h14M13 6l6 6-6 6"/></svg></div>
+    </div>
+    <div class="ans">
+      <div class="who"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--accent-tx)" stroke-width="2"><path d="M12 2l2.4 7.4H22l-6 4.6 2.3 7.4-6.3-4.6L5.7 21.4 8 14 2 9.4h7.6z"/></svg><b>BLUEY</b><span class="sp"></span><span class="meta">1.4s · opus-4.8</span></div>
+      <p>Same way the coding agents do — <b>replay the message list, and compact when it overflows.</b> Keep recent turns verbatim, summarize older ones via your own agent, so context never exceeds the window.<span class="cur"></span></p>
+    </div>
+    <div class="hint">Press <span class="kbd">↵</span> to ask · <span class="kbd">⌘↵</span> open panel · <span class="kbd">esc</span> dismiss</div>
+  </div>
+
+  <div class="cap2"><b>Action-bar pill + Ask.</b> <span style="color:rgba(255,255,255,.6)">The pill always shows Ask · Screen · Listen · History — one tap each, hotkeys on every one. ⌥A (or clicking Ask) drops the Spotlight bar; type, ↵, the answer floats in, then tucks away. No hunting, no clutter.</span></div>
+</div>
+
+<!-- ============ STAGE 1b: ⌥S — INSTANT SCREEN ANSWER (the interview hero moment) ============ -->
+<div class="stage">
+  <div class="desk"></div>
+  <!-- a shared coding problem on screen -->
+  <div class="mtg" style="width:560px;height:380px">
+    <span class="pill" style="background:rgba(120,140,200,.18)">Interviewer is sharing · CoderPad</span>
+    <div style="font-family:var(--mono);font-size:12px;color:rgba(255,255,255,.55);line-height:1.7;margin-top:6px">
+      <span style="color:rgba(255,255,255,.4)">// Given an array, return indices of the two</span><br>
+      <span style="color:rgba(255,255,255,.4)">// numbers that add up to target.</span><br>
+      <span style="color:#A8C7FB">function</span> twoSum(nums, target) {<br>
+      &nbsp;&nbsp;<span style="color:rgba(255,255,255,.35)">// your code here</span><br>
+      }
+    </div>
+  </div>
+
+  <!-- the pill, with Screen lit -->
+  <div class="bar-pill">
+    <span class="dot"></span><span class="nm">Bluey</span><span class="sep"></span>
+    <div class="act"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg><span class="lb">Ask</span><span class="kb">⌥A</span></div>
+    <div class="act primary"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke-width="2"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 21h8"/></svg><span class="lb">Screen</span><span class="kb">⌥S</span></div>
+    <div class="act"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 2a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3zM5 11a7 7 0 0 0 14 0M12 18v3"/></svg><span class="lb">Listen</span><span class="kb">⌥L</span></div>
+    <div class="act"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span class="lb">History</span><span class="kb">⌥H</span></div>
+    <div class="act more"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/></svg></div>
+  </div>
+
+  <!-- answer floats in directly (no panel) -->
+  <div class="ask" style="top:96px;right:34px;left:auto;transform:none;width:480px">
+    <div class="ans" style="margin-top:0">
+      <div class="who"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--accent-tx)" stroke-width="2"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 21h8"/></svg><b>SCREEN · BLUEY</b><span class="sp"></span><span class="meta">captured · 1.2s</span></div>
+      <p>Classic two-sum. Use a hash map for O(n):</p>
+      <div class="diff" style="font-family:var(--mono);font-size:11.5px;line-height:1.6;background:rgba(0,0,0,.28);border:1px solid var(--hairline);border-radius:8px;padding:9px 11px;margin-top:8px;white-space:pre;color:#cfe0f5"><span style="color:#A8C7FB">const</span> seen = <span style="color:#A8C7FB">new</span> Map();
+<span style="color:#A8C7FB">for</span> (<span style="color:#A8C7FB">let</span> i = 0; i &lt; nums.length; i++) {
+  <span style="color:#A8C7FB">const</span> need = target - nums[i];
+  <span style="color:#A8C7FB">if</span> (seen.has(need)) <span style="color:#A8C7FB">return</span> [seen.get(need), i];
+  seen.set(nums[i], i);
+}</div>
+    </div>
+    <div class="hint">⌥S captured the screen · invisible to the call · added to your conversation · <span class="kbd">esc</span> hide</div>
+  </div>
+
+  <div class="cap2"><b>The interview moment.</b> <span style="color:rgba(255,255,255,.6)">They share a problem → ⌥S → Bluey captures the screen and the answer floats in, over your view, invisible to them. This peek is just the latest turn — it ALSO lands in the one continuous thread (next stage), with everything said and shown, in context.</span></div>
+</div>
+
+<!-- ============ STAGE 2: PANEL · ASK — ONE CONTINUOUS THREAD ============ -->
+<div class="stage">
+  <div class="desk"></div>
+  <div class="mtg">
+    <span class="pill">Interview · CoderPad</span>
+    <div>Everything — what they say, the screen they share, your questions — flows into one conversation, in context.</div>
+    <div class="grid"><div class="ph"></div><div class="ph"></div><div class="ph"></div><div class="ph"></div></div>
+  </div>
+
+  <div class="panel">
+    <div class="ph">
+      <span class="wv" style="display:flex;align-items:flex-end;gap:2px;height:11px"><i style="width:2px;height:5px;background:var(--ok);border-radius:1px"></i><i style="width:2px;height:11px;background:var(--ok);border-radius:1px"></i><i style="width:2px;height:7px;background:var(--ok);border-radius:1px"></i></span>
+      <span class="nm">Bluey</span><span class="via">· listening</span>
+      <span class="sp"></span>
+      <div class="seg"><button class="on">Ask</button><button>History</button><button>Agents</button></div>
+      <div class="x"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/></svg></div>
+    </div>
+    <div class="body">
+      <div class="feed" style="padding-top:14px">
+        <!-- 1. they SPOKE (transcript flows in) -->
+        <div class="turn">
+          <span class="rail heard"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3zM5 11a7 7 0 0 0 14 0M12 18v3"/></svg></span>
+          <div class="lab"><span class="heard2">INTERVIEWER · HEARD</span><span class="t">just now</span></div>
+          <div class="heardtxt">“Okay, let’s do a coding one. Can you write two-sum, and walk me through the time complexity?”</div>
+        </div>
+        <!-- 2. they SHARED A SCREEN → ⌥S captured it → answer references what they SAID -->
+        <div class="turn">
+          <span class="rail screen"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 21h8"/></svg></span>
+          <div class="lab"><span class="who2">SCREEN · ⌥S</span><span class="t">1.2s</span></div>
+          <div class="scap"><div class="th"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3M3 16v3a2 2 0 0 0 2 2h3m13-5v3a2 2 0 0 1-2 2h-3"/></svg></div><div class="sl"><b>CoderPad — twoSum stub</b>captured from shared screen</div></div>
+          <div class="ans2">Hash-map approach — <b>O(n)</b> time, O(n) space (they asked about complexity):
+            <div class="diff" style="font-family:var(--mono);font-size:11px;line-height:1.55;background:rgba(0,0,0,.28);border:1px solid var(--hairline);border-radius:8px;padding:8px 10px;margin-top:6px;white-space:pre;color:#cfe0f5"><span style="color:#A8C7FB">const</span> seen = <span style="color:#A8C7FB">new</span> Map();
+<span style="color:#A8C7FB">for</span> (<span style="color:#A8C7FB">let</span> i = 0; i &lt; nums.length; i++) {
+  <span style="color:#A8C7FB">const</span> need = target - nums[i];
+  <span style="color:#A8C7FB">if</span> (seen.has(need)) <span style="color:#A8C7FB">return</span> [seen.get(need), i];
+  seen.set(nums[i], i);
+}</div>
+          </div>
+        </div>
+        <!-- 3. YOU asked a follow-up → answer knows the screen + what was said -->
+        <div class="turn">
+          <span class="rail you"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20M8 11h8"/></svg></span>
+          <div class="lab"><span>YOU · ASKED</span><span class="t">now</span></div>
+          <div class="ask2">what if they ask for the brute-force first?</div>
+        </div>
+        <div class="turn">
+          <span class="rail bluey"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l2.4 7.4H22l-6 4.6 2.3 7.4-6.3-4.6L5.7 21.4 8 14 2 9.4h7.6z"/></svg></span>
+          <div class="lab"><span class="who2">BLUEY</span><span class="t">0.8s · $0.02</span></div>
+          <div class="ans2">Nested loop — <b>O(n²)</b>, no extra space. Say: “Brute force checks every pair; I’ll optimize with a hash map to one pass.” That framing is what they’re listening for.</div>
+        </div>
+      </div>
+    </div>
+    <!-- context bar: shows the thread is one shared context -->
+    <div class="ctxbar"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M9 12l2 2 4-4M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z"/></svg><span>In context: <b>transcript</b> · <b>1 screen</b> · 2 turns — every answer uses the whole thread</span></div>
+    <div class="comp">
+      <div class="plus"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg></div>
+      <span class="ph2">Ask a follow-up…</span>
+      <span class="listen listen-on" style="display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--ok);padding:0 8px"><span class="wv" style="display:flex;align-items:flex-end;gap:2px;height:11px"><i style="width:2px;height:5px;background:var(--ok);border-radius:1px"></i><i style="width:2px;height:11px;background:var(--ok);border-radius:1px"></i><i style="width:2px;height:7px;background:var(--ok);border-radius:1px"></i></span>Listening</span>
+      <div class="send"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4"><path d="M12 19V5M5 12l7-7 7 7"/></svg></div>
+    </div>
+    <div class="foot"><span class="m">opus-4.8</span><span class="m">perplexity · github</span><span class="sp"></span><span class="keys">⌘↩ ask · ⌥ hide</span></div>
+  </div>
+
+  <div class="cap2"><b>Panel · Ask — one continuous thread.</b> <span style="color:rgba(255,255,255,.6)">What they say (Listen), the screen they share (⌥S), and your questions all flow into the SAME conversation, on a timeline. Each answer uses the whole context — the screen answer cited their spoken question; the follow-up knows the screen. Not fragments — one coherent thread.</span></div>
+</div>
+
+<!-- ============ STAGE 3: FULL PANEL — HISTORY tab (sessions at scale) ============ -->
+<div class="stage">
+  <div class="desk"></div>
+  <div class="mtg">
+    <span class="pill">Zoom · Weekly sync</span>
+    <div>History handles hundreds of sessions — search, grouped by date, pinned on top.</div>
+    <div class="grid"><div class="ph"></div><div class="ph"></div><div class="ph"></div><div class="ph"></div></div>
+  </div>
+
+  <div class="panel">
+    <div class="ph">
+      <span class="dot"></span><span class="nm">Bluey</span><span class="via">· managed</span>
+      <span class="sp"></span>
+      <div class="seg"><button>Ask</button><button class="on">History</button><button>Agents</button></div>
+      <div class="x"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/></svg></div>
+    </div>
+    <div class="body">
+      <div class="hx">
+        <div class="srch">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--tx-3)" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
+          <input placeholder="Search 318 sessions…">
+          <span class="k">⌘F</span>
+        </div>
+        <div class="slist">
+          <div class="shd"><span class="t">Pinned</span><span class="ln"></span></div>
+          <div class="srow">
+            <div class="ic"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+            <div class="mid"><div class="ti">Bluey continuation architecture</div><div class="sub">Bluey · 14 turns</div></div>
+            <svg class="pin on" width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M9 4v6l-2 3h10l-2-3V4z"/></svg><span class="wh">2d</span>
+          </div>
+          <div class="shd"><span class="t">Today</span><span class="ln"></span></div>
+          <div class="srow sel">
+            <div class="ic"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+            <div class="mid"><div class="ti">Overlay redesign — sessions at scale</div><div class="sub">Bluey · 9 turns · continuing</div></div>
+            <svg class="pin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 4v6l-2 3h10l-2-3V4z"/></svg><span class="wh">11:20</span>
+          </div>
+          <div class="srow">
+            <div class="ic"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+            <div class="mid"><div class="ti">Fix overlay merge conflicts</div><div class="sub">Bluey · 5 turns</div></div>
+            <svg class="pin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 4v6l-2 3h10l-2-3V4z"/></svg><span class="wh">9:05</span>
+          </div>
+          <div class="shd"><span class="t">Yesterday</span><span class="ln"></span></div>
+          <div class="srow">
+            <div class="ic"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+            <div class="mid"><div class="ti">CookWise recipe parser</div><div class="sub">CookWise · 22 turns</div></div>
+            <svg class="pin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 4v6l-2 3h10l-2-3V4z"/></svg><span class="wh">Jun 14</span>
+          </div>
+          <div class="more">Show 313 more</div>
+        </div>
+      </div>
+    </div>
+    <div class="comp">
+      <div class="plus"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg></div>
+      <span class="ph2">Ask Bluey…  or pick a session to continue</span>
+      <div class="send"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4"><path d="M12 19V5M5 12l7-7 7 7"/></svg></div>
+    </div>
+    <div class="foot"><span class="m">318 sessions</span><span class="sp"></span><span class="keys">↵ continue · ⌘F search</span></div>
+  </div>
+
+  <div class="cap2"><b>Panel · History.</b> <span style="color:rgba(255,255,255,.6)">The fix for “hundreds of sessions, no scroll.” Live search, grouped Pinned → Today → Yesterday → older, recent-first with “show more,” pin to keep. Clean glass rows.</span></div>
+</div>
+
+<!-- ============ STAGE 4: FULL PANEL — AGENTS tab ============ -->
+<div class="stage">
+  <div class="desk"></div>
+  <div class="mtg">
+    <span class="pill">Zoom · Weekly sync</span>
+    <div>Agents — pick which of your own coding agents answers, with its own tools.</div>
+    <div class="grid"><div class="ph"></div><div class="ph"></div><div class="ph"></div><div class="ph"></div></div>
+  </div>
+
+  <div class="panel">
+    <div class="ph">
+      <span class="dot" style="background:var(--accent);box-shadow:0 0 0 3px var(--accent-bg)"></span><span class="nm">Claude</span><span class="via">· your agent</span>
+      <span class="sp"></span>
+      <div class="seg"><button>Ask</button><button>History</button><button class="on">Agents</button></div>
+      <div class="x"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/></svg></div>
+    </div>
+    <div class="body">
+      <div class="ax">
+        <div class="acard on">
+          <div class="top"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--accent-tx)" stroke-width="2"><path d="M12 2l2.4 7.4H22l-6 4.6 2.3 7.4-6.3-4.6L5.7 21.4 8 14 2 9.4h7.6z"/></svg><span class="nm">Claude Code</span><span class="sp"></span><span class="cap ready">Active</span></div>
+          <div class="meta">3/3 connectors ready · 12 sessions</div>
+          <div class="act"><span class="btn sec">Stop using</span><span class="btn sec">View sessions</span></div>
+        </div>
+        <div class="acard">
+          <div class="top"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--tx-2)" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="4"/></svg><span class="nm">Codex</span><span class="sp"></span><span class="cap warn">Needs re-auth</span></div>
+          <div class="meta">0/2 connectors ready · 5 sessions</div>
+          <div class="act"><span class="btn pri">Use this agent</span><span class="btn sec">View sessions</span></div>
+        </div>
+        <div class="acard">
+          <div class="top"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--tx-2)" stroke-width="2"><circle cx="12" cy="12" r="9"/></svg><span class="nm">Cursor</span><span class="sp"></span><span class="cap ro">Read-only</span></div>
+          <div class="meta">1/1 connectors ready · 8 sessions</div>
+          <div class="act"><span class="btn pri">Use this agent</span><span class="btn sec">View sessions</span></div>
+        </div>
+        <div class="acard">
+          <div class="top"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--tx-2)" stroke-width="2"><path d="M4 4h16v16H4z"/></svg><span class="nm">Antigravity</span><span class="sp"></span><span class="cap blk">Cloud blocked</span></div>
+          <div class="meta">0/0 connectors ready</div>
+        </div>
+      </div>
+    </div>
+    <div class="comp">
+      <div class="plus"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg></div>
+      <span class="ph2">Ask Claude…</span>
+      <div class="send"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4"><path d="M12 19V5M5 12l7-7 7 7"/></svg></div>
+    </div>
+    <div class="foot"><span class="m">claude · perplexity · github</span><span class="sp"></span><span class="keys">answers run on your machine</span></div>
+  </div>
+
+  <div class="cap2"><b>Panel · Agents.</b> <span style="color:rgba(255,255,255,.6)">Borrow your own agent. Capability badges (Active / Needs re-auth / Read-only / Cloud blocked), connector readiness, attach/continue. Same as the dashboard, on the overlay’s shape.</span></div>
+</div>
+
+<!-- ============ STAGE 5: PILL RUN-STATES ============ -->
+<div class="stage" style="height:200px">
+  <div class="desk"></div>
+  <div class="pills">
+    <div class="pill2"><span class="d" style="background:var(--ok);box-shadow:0 0 0 3px rgba(59,209,123,.18)"></span><span class="l">Ready</span></div>
+    <div class="pill2"><span class="d" style="background:var(--warn);box-shadow:0 0 0 3px rgba(227,169,63,.18)"></span><span class="l">Connecting</span></div>
+    <div class="pill2"><span class="wv"><i style="height:5px"></i><i style="height:11px"></i><i style="height:7px"></i><i style="height:9px"></i></span><span class="l" style="color:var(--ok)">Listening</span></div>
+    <div class="pill2"><span class="d" style="background:var(--tx-3)"></span><span class="l">Paused</span></div>
+    <div class="pill2"><span class="d" style="background:var(--danger);box-shadow:0 0 0 3px rgba(229,86,78,.18)"></span><span class="l" style="color:var(--danger)">Needs attention</span></div>
+  </div>
+  <div class="cap2" style="bottom:18px"><b>Pill · 5 run-states.</b> <span style="color:rgba(255,255,255,.6)">Ready / Connecting / Listening (audio waveform) / Paused / Needs-attention. The whole status surface — calm, glass, one glance.</span></div>
+</div>
+
+<!-- ============ STAGE 6: "+" MENU + ATTACHMENT STRIP (secondary actions, decluttered) ============ -->
+<div class="stage">
+  <div class="desk"></div>
+  <div class="mtg"><span class="pill">Zoom · Weekly sync</span><div>Every secondary action lives in one “+” menu — not a six-button row.</div><div class="grid"><div class="ph"></div><div class="ph"></div><div class="ph"></div><div class="ph"></div></div></div>
+
+  <div class="panel">
+    <div class="ph">
+      <span class="dot"></span><span class="nm">Bluey</span><span class="via">· managed</span>
+      <span class="sp"></span>
+      <div class="seg"><button class="on">Ask</button><button>History</button><button>Agents</button></div>
+      <div class="x"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/></svg></div>
+    </div>
+    <div class="body">
+      <div class="feed">
+        <div class="qrow"><div class="qbub">summarize the JD I attached</div></div>
+        <div class="arow">
+          <div class="who"><b>BLUEY</b><span class="sp"></span><span class="m">1.1s · $0.03</span></div>
+          <div class="txt">The role wants production LLM experience, RAG, and Rust/TS. Strong match on your agent-bridge work.</div>
+        </div>
+      </div>
+    </div>
+    <!-- knowledge chip + attachment strip (contextual, only when files attached) -->
+    <div class="attach">
+      <span class="chip"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>GenAI Engineer JD.pdf<span class="rm"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M6 6l12 12M18 6L6 18"/></svg></span></span>
+      <span class="chip idx"><span class="spn"></span>Indexing screenshot…</span>
+    </div>
+    <div class="comp">
+      <div class="plus" style="background:var(--accent-bg);border-color:var(--accent-bg-s);color:var(--accent-tx)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg></div>
+      <span class="ph2">Ask a follow-up…</span>
+      <span class="listen"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a3 3 0 0 1 3 3v6a3 3 0 0 1-6 0V5a3 3 0 0 1 3-3zM5 11a7 7 0 0 0 14 0M12 18v3"/></svg>Listen</span>
+      <div class="send"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4"><path d="M12 19V5M5 12l7-7 7 7"/></svg></div>
+    </div>
+    <div class="foot"><span class="m">opus-4.8</span><span class="sp"></span><span class="keys">⌘↩ ask</span></div>
+
+    <!-- the open + menu -->
+    <div class="plusmenu">
+      <div class="pm">
+        <div class="sechd">Add to context</div>
+        <i><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>Attach files</i>
+        <i><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M2 12h20"/></svg>Capture browser page</i>
+        <div class="sechd">Session</div>
+        <i><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>New session</i>
+        <i><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 7h18M3 12h18M3 17h10"/></svg>Recap</i>
+        <i><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>Answer style</i>
+        <i><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 1-.1 1l2 1.6-2 3.4-2.4-1a7 7 0 0 1-1.7 1l-.4 2.5h-4l-.4-2.5a7 7 0 0 1-1.7-1l-2.4 1-2-3.4 2-1.6a7 7 0 0 1 0-2l-2-1.6 2-3.4 2.4 1a7 7 0 0 1 1.7-1L9 2h4l.4 2.5a7 7 0 0 1 1.7 1l2.4-1 2 3.4-2 1.6a7 7 0 0 1 .1 1z"/></svg>Opacity &amp; settings</i>
+      </div>
+    </div>
+  </div>
+
+  <div class="cap2"><b>The “+” menu — secondary only.</b> <span style="color:rgba(255,255,255,.6)">The time-critical actions (Ask/Screen/Listen/History) live on the pill. Only the genuinely secondary ones tuck in here: Attach · Capture browser page · New session · Recap · Answer style · Opacity. Attachments show as chips above the composer (with an indexing spinner) — only when present.</span></div>
+</div>
+
+<!-- ============ STAGE 7: FIX-PROPOSAL CARD (agent fix flow) ============ -->
+<div class="stage">
+  <div class="desk"></div>
+  <div class="mtg"><span class="pill">Zoom · Weekly sync</span><div>Agent answers can propose a reviewed fix — diagnosis, reasoning, diff, approve/reject.</div><div class="grid"><div class="ph"></div><div class="ph"></div><div class="ph"></div><div class="ph"></div></div></div>
+
+  <div class="panel">
+    <div class="ph">
+      <span class="dot" style="background:var(--accent);box-shadow:0 0 0 3px var(--accent-bg)"></span><span class="nm">Claude</span><span class="via">· your agent</span>
+      <span class="sp"></span>
+      <div class="seg"><button class="on">Ask</button><button>History</button><button>Agents</button></div>
+      <div class="x"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14"/></svg></div>
+    </div>
+    <div class="body">
+      <div class="feed">
+        <div class="qrow"><div class="qbub">the session list crashes at scale — fix it</div></div>
+        <div class="arow">
+          <div class="who"><b>CLAUDE · AGENT</b><span class="sp"></span><span class="m">2.3s</span></div>
+          <div class="txt">The list pins each row’s width to the stack before it’s added to the hierarchy — an unsatisfiable constraint. Proposed fix below.</div>
+        </div>
+        <!-- fix proposal card -->
+        <div class="fix">
+          <div class="fh"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--warn)" stroke-width="2"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg><b>PROPOSED FIX</b><span class="st">awaiting review</span></div>
+          <div class="sec">Diagnosis</div><div class="bd">Row width is constrained to <span style="font-family:var(--mono);font-size:11.5px">sessionStack</span> before <span style="font-family:var(--mono);font-size:11.5px">addArrangedSubview</span> — no common ancestor yet.</div>
+          <div class="sec">Fix</div>
+          <div class="diff"><span class="hh">@@ stack alignment @@</span>
+<span class="del">- sessionStack.alignment = .centerX</span>
+<span class="add">+ sessionStack.alignment = .width   // stack owns row width</span>
+<span class="del">- row.widthAnchor.constraint(equalTo: stack…).isActive = true</span></div>
+          <div class="fa"><span class="btn pri">Approve &amp; apply</span><span class="btn sec">Reject</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="comp">
+      <div class="plus"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg></div>
+      <span class="ph2">Ask a follow-up…</span>
+      <div class="send"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.4"><path d="M12 19V5M5 12l7-7 7 7"/></svg></div>
+    </div>
+    <div class="foot"><span class="m">claude · runs on your machine</span><span class="sp"></span><span class="keys">⌘↩ ask</span></div>
+  </div>
+
+  <div class="cap2"><b>Fix proposal.</b> <span style="color:rgba(255,255,255,.6)">From an agent answer: a reviewed card with Diagnosis / Reasoning / a unified diff (+green −red), and Approve&amp;apply / Reject. Nothing applies without your tap. States: awaiting → applying → done.</span></div>
+</div>
+
+<!-- ============ STAGE 8: CANVAS PANE (artifacts) ============ -->
+<div class="stage">
+  <div class="desk"></div>
+  <div class="mtg"><span class="pill">Zoom · Weekly sync</span><div>Rich artifacts (code, diagrams, docs) open in a canvas beside the conversation.</div><div class="grid"><div class="ph"></div><div class="ph"></div><div class="ph"></div><div class="ph"></div></div></div>
+
+  <div class="canvas">
+    <div class="left">
+      <div class="ch"><span class="dot" style="width:7px;height:7px;border-radius:50%;background:var(--ok)"></span><div class="cn"><b>Bluey</b><span>conversation</span></div></div>
+      <div class="miniqr">
+        <div class="qb">show me the compaction function</div>
+        <div class="ab">Here’s <span style="font-family:var(--mono);font-size:11px;color:#cfe0f5">render_prompt_within</span> — it keeps recent turns and summarizes the rest. Opened in the canvas →</div>
+        <div class="cardart" style="margin-top:11px"><div class="ci"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3H5a2 2 0 0 0-2 2v3m0 8v3a2 2 0 0 0 2 2h3m8 0h3a2 2 0 0 0 2-2v-3m0-8V5a2 2 0 0 0-2-2h-3"/></svg></div><div class="ct"><b>Code canvas</b><span>render.rs · 38 lines</span></div></div>
+      </div>
+    </div>
+    <div class="right">
+      <div class="ch"><span class="ci"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 3H5a2 2 0 0 0-2 2v3m0 8v3a2 2 0 0 0 2 2h3m8 0h3a2 2 0 0 0 2-2v-3m0-8V5a2 2 0 0 0-2-2h-3"/></svg></span><div class="cn"><b>Code canvas</b><span>render.rs</span></div><span class="sp"></span>
+        <div class="cb"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg></div>
+        <div class="cb"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg></div>
+        <div class="cb"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 6l12 12M18 6L6 18"/></svg></div>
+      </div>
+      <div class="code2"><span class="cm">// keep recent turns verbatim, summarize the rest</span>
+<span class="kw">fn</span> render_prompt_within(budget: usize) -> String {
+    <span class="kw">let</span> recent = self.tail_turns(HOT_LAYER);
+    <span class="kw">if</span> self.fits(budget) {
+        <span class="kw">return</span> self.replay_all();
+    }
+    <span class="kw">let</span> summary = self.drive_summary(
+        <span class="st">"Summarize earlier in ≤K words"</span>
+    );
+    format!(<span class="st">"{summary}\n{recent}"</span>)
+}</div>
+    </div>
+  </div>
+
+  <div class="cap2"><b>Canvas.</b> <span style="color:rgba(255,255,255,.6)">5 kinds — code / system-design / screen / document / structured. Opens beside the chat from a card, with copy / expand-to-full-window / collapse. Monospace, syntax-tinted.</span></div>
+</div>
+
+<!-- ============ STAGE 9: MODALS — connector / billing / turn-off ============ -->
+<div class="stage" style="height:520px">
+  <div class="desk"></div>
+
+  <!-- connector sheet -->
+  <div style="position:absolute;left:40px;top:40px;width:380px">
+    <div class="modal" style="position:relative">
+      <div class="mh"><b>Inherited connectors</b><p>From Claude Code · shape &amp; readiness only, never secrets.</p></div>
+      <div class="mb">
+        <div class="crow"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--tx-3)" stroke-width="2"><circle cx="12" cy="12" r="9"/></svg><span class="cn">perplexity</span><span class="tier">env-auth</span><span class="rdy"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M5 12l5 5L20 7"/></svg>ready</span></div>
+        <div class="crow"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--tx-3)" stroke-width="2"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-4a3 3 0 0 0-1-2c3 0 6-2 6-6a5 5 0 0 0-1-3 5 5 0 0 0 0-3s-1 0-3 1a12 12 0 0 0-6 0C8 0 7 0 7 0a5 5 0 0 0 0 3 5 5 0 0 0-1 3c0 4 3 6 6 6a3 3 0 0 0-1 2v4"/></svg><span class="cn">github</span><span class="tier">oauth</span><span class="na">login expired</span></div>
+      </div>
+      <div class="reauth">github needs login — run <code>/mcp</code> in Claude to reconnect.</div>
+      <div class="mf"><span class="btn sec">Cancel</span><span class="btn pri">Attach</span></div>
+    </div>
+  </div>
+
+  <!-- billing disclosure -->
+  <div style="position:absolute;right:40px;top:40px;width:380px">
+    <div class="modal" style="position:relative">
+      <div class="mh"><b>Before attaching Anthropic (Claude API)</b><p>Bring-your-own-key · please review.</p></div>
+      <div class="mb">
+        <div class="disc">This uses your own Anthropic API key. Usage is billed to your account by Anthropic, not Bluey. Conversations may be ineligible for zero-data-retention. You can manage or revoke your key in the Anthropic Console.</div>
+      </div>
+      <div class="mf"><span class="btn sec">Decline</span><span class="btn pri">Accept &amp; attach</span></div>
+    </div>
+  </div>
+
+  <!-- turn-off confirm -->
+  <div style="position:absolute;left:50%;bottom:34px;transform:translateX(-50%);width:360px">
+    <div class="modal" style="position:relative">
+      <div class="mh"><b>Turn Bluey off?</b><p>This closes Bluey completely. To start again, run <code style="font-family:var(--mono);font-size:11px">bluey on</code>.</p></div>
+      <div class="mf" style="padding-top:13px"><span class="btn sec">Cancel</span><span class="btn pri" style="background:var(--danger)">Turn off</span></div>
+    </div>
+  </div>
+
+  <div class="cap2" style="bottom:6px;left:50%;transform:translateX(-50%);text-align:center;max-width:560px"><b>Modals.</b> <span style="color:rgba(255,255,255,.6)">Connector sheet (auth tiers, expired→“run /mcp in Claude”) · BYOT billing disclosure (the G4 fix — unblocks cloud-agent attach) · turn-off confirm. Glass, centered, Escape-dismiss.</span></div>
+</div>
+
+<div class="legend">
+  <h3>What changed — the whole UX, not a recolor</h3>
+  <div class="cols">
+    <div><b>Three calm states</b> — pill (idle), Ask bar (fast path), full panel. Was: one cluttered panel for everything.</div>
+    <div><b>Ask bar = Spotlight</b> — ⌥Space → type → answer floats in → tucks away. The 90% case, zero chrome.</div>
+    <div><b>Segmented panel</b> — Ask · History · Agents. Was: overlapping drawers + a faded tab strip bolted on.</div>
+    <div><b>History at scale</b> — search + date groups + pins + show-more. Was: flat list capped at 8, no search.</div>
+    <div><b>One “+” menu</b> — screen / attach / recap / capture tucked away. Was: a six-button footer row.</div>
+    <div><b>Killed the clutter</b> — no Docs-empty badge, no captions strip jammed mid-panel, no opacity slider on the face.</div>
+    <div><b>Real frosted glass</b> — <code>backdrop-filter: blur saturate</code>, you see the desktop through it. Was: a near-opaque black box.</div>
+    <div><b>Dashboard-exact tokens</b> — <code>#3B82F6</code> accent, white-alpha text, hairlines, SF type. No neon cyan, no glow.</div>
+  </div>
+  <p style="margin-top:14px;color:var(--tx-3);font-size:12px">All 54 existing features still live here — answers, 9 card kinds, fix-proposals, canvas, sessions CRUD, agents + connectors, billing-disclosure modal, knowledge/attach, recording, screen capture, recap — just reorganized into this calm structure instead of crammed onto one face. The pill keeps its 5 run-states; nothing is dropped.</p>
+</div>
+
+</body>
+</html>

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
+import { X } from "lucide-react";
 import { invoke } from "../lib/tauri";
 
 type AudioSource = "microphone" | "system";
@@ -55,24 +56,24 @@ export function PermissionBanner() {
         return (
           <div
             key={source}
-            className="flex items-start justify-between rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200"
+            className="glass flex items-start justify-between rounded-lg border border-warning/40 bg-warning/10 px-4 py-3 text-callout text-warning"
           >
             <div>
               <p className="font-semibold">{title}</p>
-              <p className="mt-0.5 opacity-80">{body}</p>
+              <p className="mt-0.5 text-footnote text-text-secondary">{body}</p>
               <button
                 onClick={() => openSettings(source)}
-                className="mt-2 rounded bg-amber-600 px-3 py-1 text-xs font-medium text-white hover:bg-amber-700"
+                className="mt-2 rounded-md bg-warning/15 border border-warning/30 px-3 py-1 text-footnote font-medium text-warning transition-colors duration-200 hover:bg-warning/25"
               >
                 Open Privacy Settings
               </button>
             </div>
             <button
               onClick={() => dismiss(source)}
-              className="ml-3 text-amber-600 hover:text-amber-800 dark:text-amber-400"
+              className="ml-3 text-text-tertiary transition-colors duration-200 hover:text-text-primary"
               aria-label="Dismiss"
             >
-              ✕
+              <X size={14} />
             </button>
           </div>
         );

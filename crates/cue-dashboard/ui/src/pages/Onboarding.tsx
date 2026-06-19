@@ -15,11 +15,11 @@ import { Loader2, Shield, ArrowRight, Check, Eye, EyeOff } from "lucide-react";
  *      "deep_link_login"), shows a clean spinner with cancel option.
  *   3. Linked — short success state with a "Get started" button.
  *
- * Design tokens locked here (used throughout the dashboard):
- *   surface: bg-zinc-950
- *   card:    bg-zinc-900 border-zinc-800
- *   accent:  text-blue-400 / bg-blue-500 (Bluey brand)
- *   text:    text-zinc-100 (primary), text-zinc-400 (secondary), text-zinc-500 (tertiary)
+ * Design tokens (aurora-glass system, defined in src/index.css):
+ *   surface: app shell aurora (no wrapper bg)
+ *   card:    .glass / .glass-strong (frosted panels)
+ *   accent:  text-accent-subtle-text / bg-accent (one refined blue)
+ *   text:    text-text-primary / text-text-secondary / text-text-tertiary
  */
 
 type Step = "welcome" | "authorizing" | "linked" | "error";
@@ -75,7 +75,7 @@ export function Onboarding({ onComplete }: { onComplete?: () => void }) {
   }
 
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100 flex items-center justify-center p-6">
+    <div className="min-h-screen text-text-primary flex items-center justify-center p-6">
       <div className="w-full max-w-md">
         {step === "welcome" && <WelcomeStep onSignIn={startSignIn} />}
         {step === "authorizing" && <AuthorizingStep onCancel={cancel} />}
@@ -94,28 +94,28 @@ function WelcomeStep({ onSignIn }: { onSignIn: () => void }) {
   return (
     <div className="space-y-8">
       <div className="text-center space-y-3">
-        <div className="inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-blue-500/15 text-blue-400">
+        <div className="inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-accent-subtle text-accent-subtle-text">
           <BlueyMark />
         </div>
-        <h1 className="text-2xl font-semibold tracking-tight">Welcome to Bluey</h1>
-        <p className="text-sm text-zinc-400 leading-relaxed">
+        <h1 className="text-title-1">Welcome to Bluey</h1>
+        <p className="text-callout text-text-tertiary leading-relaxed">
           A quiet AI copilot that listens, suggests answers, and stays out of the way.
         </p>
       </div>
 
-      <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 space-y-3">
+      <div className="glass rounded-xl p-4 space-y-3">
         <div className="flex items-start gap-3">
-          <EyeOff className="h-4 w-4 text-zinc-400 mt-0.5 shrink-0" />
-          <div className="text-xs text-zinc-300 leading-relaxed">
-            <span className="font-medium text-zinc-100">Hidden by default.</span>{" "}
+          <EyeOff className="h-4 w-4 text-text-tertiary mt-0.5 shrink-0" />
+          <div className="text-footnote text-text-secondary leading-relaxed">
+            <span className="font-medium text-text-primary">Hidden by default.</span>{" "}
             Bluey runs disguised in your menu bar so screen-shares and meeting
             recordings never see it. You can toggle visibility anytime.
           </div>
         </div>
         <div className="flex items-start gap-3">
-          <Shield className="h-4 w-4 text-zinc-400 mt-0.5 shrink-0" />
-          <div className="text-xs text-zinc-300 leading-relaxed">
-            <span className="font-medium text-zinc-100">Sign in is browser-based.</span>{" "}
+          <Shield className="h-4 w-4 text-text-tertiary mt-0.5 shrink-0" />
+          <div className="text-footnote text-text-secondary leading-relaxed">
+            <span className="font-medium text-text-primary">Sign in is browser-based.</span>{" "}
             We&apos;ll open your browser; you sign in once. No passwords or codes
             to type into Bluey.
           </div>
@@ -124,13 +124,13 @@ function WelcomeStep({ onSignIn }: { onSignIn: () => void }) {
 
       <button
         onClick={onSignIn}
-        className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-blue-500 hover:bg-blue-400 text-white font-medium py-2.5 transition-colors"
+        className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-accent hover:bg-accent-hover text-white font-medium py-2.5 transition-colors duration-200"
       >
         Sign in with browser
         <ArrowRight className="h-4 w-4" />
       </button>
 
-      <p className="text-xs text-zinc-500 text-center">
+      <p className="text-footnote text-text-tertiary text-center">
         New to Bluey? You&apos;ll create an account in the same flow.
       </p>
     </div>
@@ -140,21 +140,21 @@ function WelcomeStep({ onSignIn }: { onSignIn: () => void }) {
 function AuthorizingStep({ onCancel }: { onCancel: () => void }) {
   return (
     <div className="space-y-6 text-center">
-      <div className="inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-blue-500/15 text-blue-400">
+      <div className="inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-accent-subtle text-accent-subtle-text">
         <Loader2 className="h-6 w-6 animate-spin" />
       </div>
       <div className="space-y-2">
-        <h2 className="text-xl font-semibold">Waiting for browser…</h2>
-        <p className="text-sm text-zinc-400 leading-relaxed">
+        <h2 className="text-title-3">Waiting for browser…</h2>
+        <p className="text-callout text-text-tertiary leading-relaxed">
           Complete sign-in in your browser. We&apos;ll detect it automatically
           when you&apos;re done.
         </p>
       </div>
-      <div className="rounded-lg bg-zinc-900 border border-zinc-800 p-3 text-xs text-zinc-500 leading-relaxed">
+      <div className="glass rounded-lg p-3 text-footnote text-text-tertiary leading-relaxed">
         Browser didn&apos;t open?{" "}
         <button
           onClick={onCancel}
-          className="text-blue-400 hover:text-blue-300 underline"
+          className="text-accent-subtle-text hover:text-text-primary underline transition-colors duration-200"
         >
           Try again
         </button>
@@ -179,27 +179,27 @@ function LinkedStep({ email, onComplete }: { email: string; onComplete?: () => v
   }
   return (
     <div className="space-y-6 text-center">
-      <div className="inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-emerald-500/15 text-emerald-400">
+      <div className="inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-success/10 text-success">
         <Check className="h-6 w-6" />
       </div>
       <div className="space-y-2">
-        <h2 className="text-xl font-semibold">You&apos;re in.</h2>
-        <p className="text-sm text-zinc-400 leading-relaxed">
-          Signed in as <span className="text-zinc-200 font-medium">{email}</span>.
+        <h2 className="text-title-3">You&apos;re in.</h2>
+        <p className="text-callout text-text-tertiary leading-relaxed">
+          Signed in as <span className="text-text-primary font-medium">{email}</span>.
         </p>
       </div>
-      <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-4 space-y-3 text-left">
+      <div className="glass rounded-xl p-4 space-y-3 text-left">
         <div className="flex items-start gap-3">
-          <Eye className="h-4 w-4 text-zinc-400 mt-0.5 shrink-0" />
-          <div className="text-xs text-zinc-300 leading-relaxed">
-            <span className="font-medium text-zinc-100">Press F19</span> (or
+          <Eye className="h-4 w-4 text-text-tertiary mt-0.5 shrink-0" />
+          <div className="text-footnote text-text-secondary leading-relaxed">
+            <span className="font-medium text-text-primary">Press F19</span> (or
             the menu-bar icon) anytime to show or hide Bluey.
           </div>
         </div>
       </div>
       <button
         onClick={finish}
-        className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-blue-500 hover:bg-blue-400 text-white font-medium py-2.5 transition-colors"
+        className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-accent hover:bg-accent-hover text-white font-medium py-2.5 transition-colors duration-200"
       >
         Get started
         <ArrowRight className="h-4 w-4" />
@@ -211,18 +211,18 @@ function LinkedStep({ email, onComplete }: { email: string; onComplete?: () => v
 function ErrorStep({ error, onRetry }: { error: string; onRetry: () => void }) {
   return (
     <div className="space-y-6 text-center">
-      <div className="inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-red-500/15 text-red-400">
+      <div className="inline-flex h-12 w-12 items-center justify-center rounded-2xl bg-error/10 text-error">
         <span className="text-xl">!</span>
       </div>
       <div className="space-y-2">
-        <h2 className="text-xl font-semibold">Sign-in didn&apos;t complete</h2>
-        <p className="text-sm text-zinc-400 leading-relaxed break-words">
+        <h2 className="text-title-3">Sign-in didn&apos;t complete</h2>
+        <p className="text-callout text-text-tertiary leading-relaxed break-words">
           {error}
         </p>
       </div>
       <button
         onClick={onRetry}
-        className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-blue-500 hover:bg-blue-400 text-white font-medium py-2.5 transition-colors"
+        className="w-full inline-flex items-center justify-center gap-2 rounded-lg bg-accent hover:bg-accent-hover text-white font-medium py-2.5 transition-colors duration-200"
       >
         Try again
       </button>

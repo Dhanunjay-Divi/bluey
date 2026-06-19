@@ -15,6 +15,11 @@ path = "src/bin/bluey-daemon.rs"
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 cue-cloud-client = { path = "../cue-cloud-client" }
+# Recover the user's real shell PATH/env at startup. When the app is launched
+# from Finder/Dock (not a terminal), the daemon inherits a minimal PATH and
+# would not find the user's installed agents (Homebrew/nvm/etc) or node. The
+# crate is git-only (not on crates.io), declared like tauri-nspanel.
+fix-path-env = { git = "https://github.com/tauri-apps/fix-path-env-rs", branch = "dev" }
 thiserror.workspace = true
 keyring.workspace = true
 parking_lot.workspace = true

@@ -114,8 +114,8 @@ export function SessionDetail() {
     }
   }
 
-  if (loading) return <p className="text-zinc-500">Loading session...</p>;
-  if (error) return <p className="text-red-400">Error: {error}</p>;
+  if (loading) return <p className="text-text-tertiary">Loading session...</p>;
+  if (error) return <p className="text-error">Error: {error}</p>;
   if (!session) return null;
 
   return (
@@ -135,11 +135,11 @@ export function SessionDetail() {
                     setTitleDraft(session.title);
                   }
                 }}
-                className="w-full rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2 text-xl font-semibold"
+                className="w-full rounded-md border border-hairline bg-bg-input px-3 py-2 text-title-3"
               />
               <button
                 onClick={saveTitle}
-                className="rounded-md bg-blue-600 px-3 py-2 text-sm font-medium hover:bg-blue-500"
+                className="rounded-md bg-accent px-3 py-2 text-callout font-medium text-white hover:bg-accent-hover"
               >
                 Save
               </button>
@@ -148,44 +148,44 @@ export function SessionDetail() {
             <button
               onClick={() => setEditingTitle(true)}
               title="Click to rename"
-              className="text-left text-xl font-semibold hover:text-zinc-300"
+              className="text-left text-title-3 hover:text-text-secondary"
             >
               {session.title}
             </button>
           )}
-          <p className="mt-1 text-xs text-zinc-500">
+          <p className="mt-1 text-footnote text-text-tertiary">
             ID {session.id.slice(0, 8)} · created{" "}
             {new Date(session.created_at).toLocaleString()} · {session.token_count} tokens
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
           <span
-            className={`rounded-full px-2 py-0.5 text-xs ${
+            className={`rounded-full px-2 py-0.5 text-footnote ${
               session.status === "active"
-                ? "bg-green-900/50 text-green-400"
+                ? "bg-success/10 text-success"
                 : session.status === "archived"
-                  ? "bg-zinc-700 text-zinc-400"
-                  : "bg-yellow-900/50 text-yellow-400"
+                  ? "bg-bg-raised-2 text-text-tertiary"
+                  : "bg-warning/10 text-warning"
             }`}
           >
             {session.status}
           </span>
           {activeId === session.id && (
-            <span className="rounded-full bg-blue-900/40 px-2 py-0.5 text-xs text-blue-300">
+            <span className="rounded-full bg-accent-subtle px-2 py-0.5 text-footnote text-accent-subtle-text">
               active
             </span>
           )}
           {session.status !== "archived" && (
             <button
               onClick={handleArchive}
-              className="rounded px-2 py-1 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+              className="rounded px-2 py-1 text-footnote text-text-tertiary hover:bg-bg-raised-2 hover:text-text-primary"
             >
               Archive
             </button>
           )}
           <button
             onClick={handleDelete}
-            className="rounded px-2 py-1 text-xs text-red-400 hover:bg-red-950 hover:text-red-300"
+            className="rounded px-2 py-1 text-footnote text-error hover:bg-error/10 hover:text-error"
           >
             Delete
           </button>
@@ -193,9 +193,9 @@ export function SessionDetail() {
       </div>
 
       <div>
-        <h3 className="mb-2 text-sm font-medium text-zinc-400">Turns</h3>
+        <h3 className="mb-2 text-callout font-medium text-text-tertiary">Turns</h3>
         {turns.length === 0 ? (
-          <p className="text-sm text-zinc-600">
+          <p className="text-callout text-text-quaternary">
             No turns yet. This session has no conversation history.
           </p>
         ) : (
@@ -203,20 +203,20 @@ export function SessionDetail() {
             {turns.map((t) => (
               <li
                 key={t.id}
-                className="rounded-md border border-zinc-800 bg-zinc-900 px-4 py-3 text-sm"
+                className="glass rounded-md px-4 py-3 text-callout"
               >
-                <div className="mb-1 flex items-center gap-2 text-xs text-zinc-500">
-                  <span className="rounded bg-zinc-800 px-1.5 py-0.5">{t.lane}</span>
+                <div className="mb-1 flex items-center gap-2 text-footnote text-text-tertiary">
+                  <span className="rounded bg-bg-raised-2 px-1.5 py-0.5">{t.lane}</span>
                   <span>
                     {t.provider}/{t.model}
                   </span>
                   {t.duration_ms !== null && <span>{t.duration_ms}ms</span>}
                 </div>
-                <p className="text-zinc-300">
-                  <span className="text-zinc-500">user:</span> {t.user_message}
+                <p className="text-text-secondary">
+                  <span className="text-text-tertiary">user:</span> {t.user_message}
                 </p>
-                <p className="mt-1 text-zinc-300">
-                  <span className="text-zinc-500">model:</span> {t.model_response}
+                <p className="mt-1 text-text-secondary">
+                  <span className="text-text-tertiary">model:</span> {t.model_response}
                 </p>
               </li>
             ))}

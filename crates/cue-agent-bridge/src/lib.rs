@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub mod acp;
 pub mod adaptive;
 pub mod auth_resolve;
 pub mod capability;
@@ -56,6 +57,14 @@ pub use sessions::{reader_for, SessionReader};
 /// cloud vendors flow through the same overlay stream contract (Started +
 /// Delta + Done, or terminal Error).
 pub async fn drive(agent: AgentKind, question: Question) -> anyhow::Result<AnswerStream> {
+    // Opt-in ACP path (PHASE 2, reversible): only when `BLUEY_USE_ACP=1` AND the
+    // agent has an ACP entrypoint. Default builds never take this branch, so the
+    // CLI/cloud routing below is byte-for-byte unchanged. Read is defensive
+    // (`var_os`, no panic).
+    if should_use_acp(&agent) {
+        return acp::drive_acp(agent, question).await;
+    }
+
     // Cloud row wins when present: the same `KindTag` can appear in both
     // tables (e.g. `Copilot` / `CopilotCloud` are distinct tags), so a
     // cloud-only tag flows to the cloud route and a local-only tag flows
@@ -67,6 +76,19 @@ pub async fn drive(agent: AgentKind, question: Question) -> anyhow::Result<Answe
         }
     }
     drive_cli(agent, question).await
+}
+
+/// Whether the top-level [`drive`] should route `agent` through the ACP path.
+///
+/// Two gates, both required: (1) the opt-in env var `BLUEY_USE_ACP=1` is set
+/// (read defensively via `var_os`, never panics; any other value keeps ACP
+/// off), and (2) the agent actually has an ACP entrypoint. Factored out so the
+/// routing decision is unit-testable without spawning a subprocess.
+fn should_use_acp(agent: &AgentKind) -> bool {
+    let opted_in = std::env::var_os("BLUEY_USE_ACP")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    opted_in && acp::drive::has_acp_spec(agent)
 }
 
 /// A known (or generically detected) coding agent.

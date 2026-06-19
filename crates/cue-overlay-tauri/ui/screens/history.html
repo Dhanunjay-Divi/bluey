@@ -1,0 +1,60 @@
+<style>
+.hx{display:flex;flex-direction:column;height:100%}
+.srch{margin:12px 14px 8px;display:flex;align-items:center;gap:9px;height:36px;padding:0 12px;border-radius:var(--r-md);
+  background:rgba(255,255,255,.05);border:1px solid var(--hairline)}
+.srch input{flex:1;background:none;border:0;outline:0;color:var(--tx-1);font-size:13px;font-family:inherit}
+.srch input::placeholder{color:var(--tx-3)}
+.srch .k{font-size:10px;color:var(--tx-4);border:1px solid var(--hairline);border-radius:5px;padding:1px 5px;font-family:var(--mono)}
+.slist{flex:1;overflow-y:auto;padding:0 8px 10px}
+.shd{display:flex;align-items:center;gap:9px;padding:13px 8px 5px}
+.shd .t{font-size:10.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--tx-3)}
+.shd .ln{flex:1;height:1px;background:var(--hairline)}
+.srow{display:flex;align-items:center;gap:11px;padding:9px 10px;border-radius:var(--r-md);cursor:pointer;border:1px solid transparent}
+.srow:hover{background:rgba(255,255,255,.05);border-color:var(--hairline)}
+.srow.sel{background:var(--accent-bg);border-color:var(--accent-bg-s)}
+.srow .ic{width:28px;height:28px;border-radius:8px;background:rgba(255,255,255,.06);display:flex;align-items:center;justify-content:center;color:var(--tx-3);flex:none}
+.srow.sel .ic{background:var(--accent-bg-s);color:var(--accent-tx)}
+.srow .mid{flex:1;min-width:0}
+.srow .ti{font-size:13px;color:var(--tx-1);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;letter-spacing:-.005em}
+.srow .sub{font-size:11px;color:var(--tx-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+.srow .pin{color:var(--tx-4);flex:none;opacity:0}
+.srow:hover .pin{opacity:.9}
+.srow .pin.on{opacity:1;color:var(--accent-tx)}
+.srow .wh{font-size:10px;color:var(--tx-4);flex:none;font-variant-numeric:tabular-nums}
+.more{margin:8px 10px 4px;text-align:center;font-size:12px;color:var(--accent-tx);padding:9px;border-radius:var(--r-md);border:1px solid var(--hairline);cursor:pointer}
+.more:hover{background:rgba(255,255,255,.04)}
+</style>
+
+<div class="hx">
+  <div class="srch">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--tx-3)" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4-4"/></svg>
+    <input placeholder="Search 318 sessions…">
+    <span class="k">⌘F</span>
+  </div>
+  <div class="slist">
+    <div class="shd"><span class="t">Pinned</span><span class="ln"></span></div>
+    <div class="srow">
+      <div class="ic"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+      <div class="mid"><div class="ti">Bluey continuation architecture</div><div class="sub">Bluey · 14 turns</div></div>
+      <svg class="pin on" width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M9 4v6l-2 3h10l-2-3V4z"/></svg><span class="wh">2d</span>
+    </div>
+    <div class="shd"><span class="t">Today</span><span class="ln"></span></div>
+    <div class="srow sel">
+      <div class="ic"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+      <div class="mid"><div class="ti">Overlay redesign — sessions at scale</div><div class="sub">Bluey · 9 turns · continuing</div></div>
+      <svg class="pin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 4v6l-2 3h10l-2-3V4z"/></svg><span class="wh">11:20</span>
+    </div>
+    <div class="srow">
+      <div class="ic"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+      <div class="mid"><div class="ti">Fix overlay merge conflicts</div><div class="sub">Bluey · 5 turns</div></div>
+      <svg class="pin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 4v6l-2 3h10l-2-3V4z"/></svg><span class="wh">9:05</span>
+    </div>
+    <div class="shd"><span class="t">Yesterday</span><span class="ln"></span></div>
+    <div class="srow">
+      <div class="ic"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+      <div class="mid"><div class="ti">CookWise recipe parser</div><div class="sub">CookWise · 22 turns</div></div>
+      <svg class="pin" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 4v6l-2 3h10l-2-3V4z"/></svg><span class="wh">Jun 14</span>
+    </div>
+    <div class="more">Show 313 more</div>
+  </div>
+</div>

@@ -282,6 +282,20 @@ impl MeetingRecord {
         }
     }
 
+    /// Whether this meeting holds anything worth keeping: spoken transcript,
+    /// attached context, a conversation, or a written summary. Empty meetings
+    /// are auto-created shells (e.g. from a stray screen capture) that should
+    /// not be resumed on boot or shown in History.
+    pub fn has_content(&self) -> bool {
+        !self.transcript.is_empty()
+            || !self.context.is_empty()
+            || !self.conversation.is_empty()
+            || self
+                .summary
+                .as_ref()
+                .is_some_and(|summary| !summary.trim().is_empty())
+    }
+
     pub fn last_transcript_text(&self, count: usize) -> String {
         let start = self.transcript.len().saturating_sub(count);
         self.transcript[start..]

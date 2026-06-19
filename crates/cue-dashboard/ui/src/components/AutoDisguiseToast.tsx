@@ -68,21 +68,21 @@ export function AutoDisguiseToast() {
 
   return (
     <div
-      className="fixed top-4 right-4 z-50 max-w-sm rounded-xl bg-zinc-900 border border-zinc-800 shadow-2xl shadow-blue-500/10 p-4 animate-in slide-in-from-top-4 duration-200"
+      className="glass-strong fixed top-4 right-4 z-50 max-w-sm rounded-xl p-4 animate-in slide-in-from-top-4 duration-200"
       role="status"
       aria-live="polite"
     >
       <div className="flex items-start gap-3">
-        <div className="shrink-0 mt-0.5 inline-flex h-8 w-8 items-center justify-center rounded-lg bg-blue-500/15 text-blue-400">
+        <div className="shrink-0 mt-0.5 inline-flex h-8 w-8 items-center justify-center rounded-lg bg-accent-subtle text-accent-subtle-text">
           <Eye className="h-4 w-4" />
         </div>
         <div className="flex-1 min-w-0">
-          <h4 className="text-sm font-semibold text-zinc-100">
+          <h4 className="text-callout font-semibold text-text-primary">
             Auto-disguise during meetings?
           </h4>
-          <p className="mt-1 text-xs text-zinc-400 leading-relaxed">
+          <p className="mt-1 text-footnote text-text-tertiary leading-relaxed">
             We noticed{" "}
-            <span className="text-zinc-200 font-medium">{friendlyName}</span>{" "}
+            <span className="text-text-primary font-medium">{friendlyName}</span>{" "}
             is in front. Bluey can disguise itself automatically when
             meeting apps are open so screen-shares don&apos;t reveal it.
           </p>
@@ -90,14 +90,14 @@ export function AutoDisguiseToast() {
             <button
               disabled={busy}
               onClick={accept}
-              className="text-xs font-medium px-3 py-1.5 rounded-md bg-blue-500 hover:bg-blue-400 text-white disabled:opacity-50"
+              className="text-footnote font-medium px-3 py-1.5 rounded-md bg-accent hover:bg-accent-hover text-white disabled:opacity-50"
             >
               Yes, auto-disguise
             </button>
             <button
               disabled={busy}
               onClick={decline}
-              className="text-xs font-medium px-3 py-1.5 rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-200 disabled:opacity-50"
+              className="text-footnote font-medium px-3 py-1.5 rounded-md bg-bg-raised-2 hover:bg-bg-raised-2 text-text-primary disabled:opacity-50"
             >
               No thanks
             </button>
@@ -105,7 +105,7 @@ export function AutoDisguiseToast() {
         </div>
         <button
           onClick={decline}
-          className="shrink-0 text-zinc-500 hover:text-zinc-300"
+          className="shrink-0 text-text-tertiary hover:text-text-secondary"
           aria-label="Dismiss"
         >
           <X className="h-4 w-4" />

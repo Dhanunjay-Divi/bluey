@@ -87,16 +87,16 @@ export function Chats() {
     });
   }, [sessions, filter, query]);
 
-  if (loading) return <p className="text-zinc-500">Loading sessions...</p>;
-  if (error) return <p className="text-red-400">Error: {error}</p>;
+  if (loading) return <p className="text-callout text-text-tertiary">Loading sessions...</p>;
+  if (error) return <p className="text-callout text-error">Error: {error}</p>;
 
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-4">
-        <h2 className="text-xl font-semibold">Sessions</h2>
+        <h2 className="text-title-2 text-text-primary">Sessions</h2>
         <button
           onClick={handleCreate}
-          className="rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium hover:bg-blue-500"
+          className="rounded-md bg-accent px-3 py-1.5 text-subhead text-white transition-colors duration-200 hover:bg-accent-hover"
         >
           New Session
         </button>
@@ -107,15 +107,17 @@ export function Chats() {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Search by title..."
-          className="flex-1 rounded-md border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-sm placeholder-zinc-600 focus:border-zinc-600 focus:outline-none"
+          className="flex-1 rounded-md border border-hairline bg-bg-input px-3 py-1.5 text-callout placeholder-text-quaternary transition-colors duration-200 focus:border-hairline-strong focus:outline-none"
         />
-        <div className="flex items-center gap-1 rounded-md border border-zinc-800 bg-zinc-900 p-0.5 text-xs">
+        <div className="flex items-center gap-1 rounded-md border border-hairline bg-bg-input p-0.5 text-footnote">
           {(["all", "active", "paused", "archived"] as Filter[]).map((f) => (
             <button
               key={f}
               onClick={() => setFilter(f)}
-              className={`rounded px-2 py-1 capitalize ${
-                filter === f ? "bg-zinc-800 text-zinc-200" : "text-zinc-500 hover:text-zinc-300"
+              className={`rounded px-2 py-1 capitalize transition-colors duration-200 ${
+                filter === f
+                  ? "bg-bg-raised-2 text-text-primary"
+                  : "text-text-tertiary hover:text-text-secondary"
               }`}
             >
               {f}
@@ -125,7 +127,7 @@ export function Chats() {
       </div>
 
       {filtered.length === 0 ? (
-        <p className="text-zinc-500">
+        <p className="text-callout text-text-tertiary">
           {sessions.length === 0
             ? "No sessions yet. Create one to get started."
             : "No sessions match the current filter."}
@@ -138,33 +140,33 @@ export function Chats() {
               <li
                 key={s.id}
                 onClick={() => navigate(`/session/${s.id}`)}
-                className={`flex items-center justify-between rounded-md border px-4 py-3 transition-colors cursor-pointer ${
+                className={`flex items-center justify-between rounded-md px-4 py-3 transition-colors duration-200 cursor-pointer ${
                   isActive
-                    ? "border-blue-700 bg-blue-950/30"
-                    : "border-zinc-800 bg-zinc-900 hover:bg-zinc-850 hover:border-zinc-700"
+                    ? "glass-strong border-accent"
+                    : "glass hover:bg-bg-raised-2 hover:border-hairline-strong"
                 }`}
               >
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
-                    <p className="truncate font-medium">{s.title}</p>
+                    <p className="truncate text-headline text-text-primary">{s.title}</p>
                     {isActive && (
-                      <span className="shrink-0 rounded-full bg-blue-900/40 px-2 py-0.5 text-xs text-blue-300">
+                      <span className="shrink-0 rounded-full bg-accent-subtle px-2 py-0.5 text-caption text-accent-subtle-text">
                         active
                       </span>
                     )}
                   </div>
-                  <p className="text-xs text-zinc-500">
+                  <p className="text-footnote text-text-tertiary">
                     {new Date(s.created_at).toLocaleString()} · {s.token_count} tokens
                   </p>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
                   <span
-                    className={`rounded-full px-2 py-0.5 text-xs ${
+                    className={`rounded-full px-2 py-0.5 text-caption ${
                       s.status === "active"
-                        ? "bg-green-900/50 text-green-400"
+                        ? "bg-success/10 text-success"
                         : s.status === "archived"
-                          ? "bg-zinc-700 text-zinc-400"
-                          : "bg-yellow-900/50 text-yellow-400"
+                          ? "bg-bg-raised-2 text-text-tertiary"
+                          : "bg-warning/10 text-warning"
                     }`}
                   >
                     {s.status}
@@ -172,14 +174,14 @@ export function Chats() {
                   {s.status !== "archived" && (
                     <button
                       onClick={(e) => handleArchive(s.id, e)}
-                      className="rounded px-2 py-1 text-xs text-zinc-400 hover:bg-zinc-800 hover:text-zinc-200"
+                      className="rounded px-2 py-1 text-footnote text-text-tertiary transition-colors duration-200 hover:bg-bg-raised-2 hover:text-text-primary"
                     >
                       Archive
                     </button>
                   )}
                   <button
                     onClick={(e) => handleDelete(s.id, s.title, e)}
-                    className="rounded px-2 py-1 text-xs text-red-400 hover:bg-red-950 hover:text-red-300"
+                    className="rounded px-2 py-1 text-footnote text-error transition-colors duration-200 hover:bg-error/10"
                   >
                     Delete
                   </button>

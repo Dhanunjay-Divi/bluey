@@ -47,21 +47,21 @@ export function LiveTranscriptList({ segments }: Props) {
         <div key={`${seg.ts_ms}-${i}`} className="flex items-start gap-2">
           <span className="mt-0.5 shrink-0">
             {seg.source === "microphone" ? (
-              <Mic size={14} className="text-blue-400" />
+              <Mic size={14} className="text-accent-subtle-text" />
             ) : (
-              <Monitor size={14} className="text-green-400" />
+              <Monitor size={14} className="text-success" />
             )}
           </span>
           <span
             className={
               seg.is_final
-                ? "text-zinc-200"
-                : "text-zinc-500 italic"
+                ? "text-text-primary"
+                : "text-text-tertiary italic"
             }
           >
             {seg.text}
           </span>
-          <span className="ml-auto shrink-0 text-xs text-zinc-600">
+          <span className="ml-auto shrink-0 text-footnote text-text-quaternary">
             {new Date(seg.ts_ms).toLocaleTimeString()}
           </span>
         </div>

@@ -1,0 +1,76 @@
+<style>
+/* ============================================================
+   extras.html — three overlay fragments, markup + CSS copied
+   verbatim from docs/design/bluey-overlay-redesign-v2.html.
+   Uses global var(--...) tokens; :root is NOT redefined here.
+   ============================================================ */
+
+/* pill run-states row */
+.pills{position:absolute;left:50%;top:22px;transform:translateX(-50%);display:flex;gap:12px;flex-wrap:wrap;justify-content:center}
+.pill2{display:flex;align-items:center;gap:8px;height:32px;padding:0 13px 0 11px;border-radius:99px;background:var(--glass);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);border:1px solid var(--hairline);box-shadow:0 8px 22px rgba(0,0,0,.35),var(--top-hi)}
+.pill2 .d{width:7px;height:7px;border-radius:50%;flex:none}
+.pill2 .l{font-size:12px;font-weight:600;letter-spacing:-.01em;color:var(--tx-2)}
+.pill2 .wv{display:flex;align-items:flex-end;gap:2px;height:11px}
+.pill2 .wv i{width:2px;background:var(--ok);border-radius:1px;display:block}
+
+/* the "+" menu (replaces the 6-button row) */
+.plusmenu{position:absolute;left:18px;bottom:78px;width:212px;border-radius:var(--r-lg);overflow:hidden;background:var(--glass-2);-webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur);border:1px solid var(--hairline-s);box-shadow:var(--shadow),var(--top-hi)}
+.pm i{display:flex;align-items:center;gap:11px;padding:9px 13px;font-size:12.5px;color:var(--tx-1);cursor:pointer;border-bottom:1px solid rgba(255,255,255,.04)}
+.pm i:last-child{border-bottom:0}
+.pm i:hover{background:rgba(255,255,255,.05)}
+.pm i svg{stroke:var(--tx-3);flex:none}
+.pm i .kk{margin-left:auto;font-size:10px;color:var(--tx-4);font-family:var(--mono)}
+.pm .sechd{font-size:9.5px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:var(--tx-4);padding:8px 13px 4px}
+
+/* fix-proposal card */
+.fix{border:1px solid rgba(227,169,63,.3);background:rgba(227,169,63,.05);border-radius:var(--r-lg);padding:13px 14px;margin-bottom:16px}
+.fix .fh{display:flex;align-items:center;gap:7px;margin-bottom:9px}
+.fix .fh b{font-size:10.5px;font-weight:700;letter-spacing:.05em;color:var(--warn)}
+.fix .fh .st{margin-left:auto;font-size:10px;color:var(--tx-3);border:1px solid var(--hairline);border-radius:99px;padding:1px 8px}
+.fix .sec{font-size:9.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--tx-3);margin:9px 0 3px}
+.fix .bd{font-size:12.5px;color:var(--tx-1);line-height:1.55}
+.fix .diff{font-family:var(--mono);font-size:11.5px;line-height:1.6;background:rgba(0,0,0,.28);border:1px solid var(--hairline);border-radius:8px;padding:9px 11px;margin-top:4px;white-space:pre}
+.fix .diff .add{color:var(--ok)} .fix .diff .del{color:var(--danger)} .fix .diff .hh{color:var(--accent-tx)}
+.fix .fa{display:flex;gap:8px;margin-top:12px}
+</style>
+
+<!-- ============ 1) THE "+" MENU ============ -->
+<div id="plus-menu" style="display:none">
+  <div class="plusmenu">
+    <div class="pm">
+      <div class="sechd">Add to context</div>
+      <i><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></svg>Attach files</i>
+      <i><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M2 12h20"/></svg>Capture browser page</i>
+      <div class="sechd">Session</div>
+      <i><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>New session</i>
+      <i><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M3 7h18M3 12h18M3 17h10"/></svg>Recap</i>
+      <i><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>Answer style</i>
+      <i><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 1-.1 1l2 1.6-2 3.4-2.4-1a7 7 0 0 1-1.7 1l-.4 2.5h-4l-.4-2.5a7 7 0 0 1-1.7-1l-2.4 1-2-3.4 2-1.6a7 7 0 0 1 0-2l-2-1.6 2-3.4 2.4 1a7 7 0 0 1 1.7-1L9 2h4l.4 2.5a7 7 0 0 1 1.7 1l2.4-1 2 3.4-2 1.6a7 7 0 0 1 .1 1z"/></svg>Opacity &amp; settings</i>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 2) THE FIX-PROPOSAL CARD ============ -->
+<div id="fix-card-sample">
+  <div class="fix">
+    <div class="fh"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--warn)" stroke-width="2"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/></svg><b>PROPOSED FIX</b><span class="st">awaiting review</span></div>
+    <div class="sec">Diagnosis</div><div class="bd">Row width is constrained to <span style="font-family:var(--mono);font-size:11.5px">sessionStack</span> before <span style="font-family:var(--mono);font-size:11.5px">addArrangedSubview</span> — no common ancestor yet.</div>
+    <div class="sec">Fix</div>
+    <div class="diff"><span class="hh">@@ stack alignment @@</span>
+<span class="del">- sessionStack.alignment = .centerX</span>
+<span class="add">+ sessionStack.alignment = .width   // stack owns row width</span>
+<span class="del">- row.widthAnchor.constraint(equalTo: stack…).isActive = true</span></div>
+    <div class="fa"><span class="btn pri">Approve &amp; apply</span><span class="btn sec">Reject</span></div>
+  </div>
+</div>
+
+<!-- ============ 3) THE PILL 5 RUN-STATES ============ -->
+<div id="pill-states">
+  <div class="pills">
+    <div class="pill2"><span class="d" style="background:var(--ok);box-shadow:0 0 0 3px rgba(59,209,123,.18)"></span><span class="l">Ready</span></div>
+    <div class="pill2"><span class="d" style="background:var(--warn);box-shadow:0 0 0 3px rgba(227,169,63,.18)"></span><span class="l">Connecting</span></div>
+    <div class="pill2"><span class="wv"><i style="height:5px"></i><i style="height:11px"></i><i style="height:7px"></i><i style="height:9px"></i></span><span class="l" style="color:var(--ok)">Listening</span></div>
+    <div class="pill2"><span class="d" style="background:var(--tx-3)"></span><span class="l">Paused</span></div>
+    <div class="pill2"><span class="d" style="background:var(--danger);box-shadow:0 0 0 3px rgba(229,86,78,.18)"></span><span class="l" style="color:var(--danger)">Needs attention</span></div>
+  </div>
+</div>

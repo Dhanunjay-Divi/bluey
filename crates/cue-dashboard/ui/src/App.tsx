@@ -13,6 +13,9 @@ import { UpdateToast } from "./components/UpdateToast";
 import { PermissionBanner } from "./components/PermissionBanner";
 import { Onboarding } from "./pages/Onboarding";
 import { Settings } from "./pages/Settings";
+import { Home } from "./pages/Home";
+import { Agents } from "./pages/Agents";
+import { AgentSessions } from "./pages/AgentSessions";
 import { InvisibilityToast } from "./components/InvisibilityToast";
 import { AutoDisguiseToast } from "./components/AutoDisguiseToast";
 
@@ -112,9 +115,11 @@ function App() {
       <PermissionPoller />
       <Routes>
         <Route element={<DashboardLayout />}>
-          <Route index element={<Placeholder name="Home" />} />
+          <Route index element={<Home />} />
           <Route path="chats" element={<Chats />} />
           <Route path="session/:id" element={<SessionDetail />} />
+          <Route path="agents" element={<Agents />} />
+          <Route path="agents/:kind" element={<AgentSessions />} />
           <Route path="prompts" element={<Placeholder name="Prompts" />} />
           <Route path="shortcuts" element={<Placeholder name="Shortcuts" />} />
           <Route path="settings" element={<Settings />} />

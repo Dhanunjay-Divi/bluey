@@ -353,6 +353,46 @@ fn agent_model_label(kind: &AgentKind) -> String {
     }
 }
 
+/// Whether the agent identified by its `snake_case` kind string (as carried in
+/// [`AgentSummary::kind`]) is the currently-attached one. Shared by the cache
+/// flag-flip path ([`refresh_overlay_agents_attached_only`]) and the full
+/// discovery path so both compute `attached` identically.
+fn is_agent_kind_attached(kind: &str, attached_label: Option<&str>) -> bool {
+    let Some(attached_label) = attached_label else {
+        return false;
+    };
+    match parse_attached_agent(Some(kind)) {
+        Some(parsed) => agent_model_label(&parsed) == attached_label,
+        None => false,
+    }
+}
+
+/// The generic placeholder title given to meetings auto-created without a content
+/// source. New meetings should get a real title from their first question or
+/// transcript line; this label is only the last-resort fallback.
+const GENERIC_MEETING_TITLE: &str = "Ad hoc meeting";
+
+/// Derive a clean, glance-able meeting title from a piece of text (the first
+/// question or transcript line) using the shared mechanical titler — no LLM, no
+/// cost. Returns `None` when the text is noise/empty so callers can decide their
+/// own fallback.
+fn mechanical_title_for_meeting(text: &str) -> Option<String> {
+    cue_agent_bridge::titler::mechanical_title(text, cue_agent_bridge::titler::MAX_TITLE_WORDS)
+}
+
+/// Like [`mechanical_title_for_meeting`] but always yields a title, falling back
+/// to the generic placeholder when the text has no usable title.
+fn meeting_title_from(text: &str) -> String {
+    mechanical_title_for_meeting(text).unwrap_or_else(|| GENERIC_MEETING_TITLE.to_string())
+}
+
+/// Whether a meeting still carries a generic/placeholder title (so it should be
+/// upgraded from the first real question/transcript that arrives).
+fn is_generic_meeting_title(title: &str) -> bool {
+    let t = title.trim();
+    t.is_empty() || t == GENERIC_MEETING_TITLE
+}
+
 /// Friendly, human-facing name for an [`AgentKind`], used in the discovery UI.
 fn agent_display_name(kind: &AgentKind) -> String {
     // Single source of truth: the registry row's `display_name`. Local rows
@@ -731,6 +771,10 @@ struct Daemon {
     /// while AttachRequested + InstructionsRequested are entry-point events
     /// allowed from any state.
     overlay_ui_state: std::sync::Arc<parking_lot::Mutex<cue_core::overlay_ipc::OverlayUiState>>,
+    /// Last agent list produced by full discovery (`refresh_overlay_agents`).
+    /// Attach/detach reuse this and only flip the `attached` flag, so rapid
+    /// "Use" clicks don't each trigger a fresh ~15s filesystem rediscovery.
+    agent_cache: Mutex<Option<Vec<cue_core::agent_ui::AgentSummary>>>,
 }
 
 struct OverlayProcess {
@@ -791,11 +835,55 @@ pub async fn run() -> Result<()> {
         "cue_daemon=info,cue_core=info,cue_cloud_client=info,cue_llm=info,cue_router=info",
     );
 
+    // Recover the user's real shell environment FIRST, before anything reads
+    // PATH (agent discovery, spawning agent CLIs/adapters, node-based ACP
+    // adapters). When the app is launched from Finder/Dock rather than a
+    // terminal, the process inherits a minimal PATH that omits Homebrew, nvm,
+    // ~/.local/bin, etc. — so installed agents and `node` would be invisible.
+    // `fix_all_vars` runs the user's login shell once and imports its env into
+    // this process. Fail-soft: a shell error must never block daemon startup —
+    // we just continue with the inherited (minimal) environment and log it.
+    if let Err(error) = fix_path_env::fix_all_vars() {
+        warn!("could not recover shell environment (PATH may be incomplete): {error}");
+    } else {
+        info!("recovered shell environment for agent discovery + spawning");
+    }
+
     let args = Args::parse();
     let paths = AppPaths::discover()?;
     paths.ensure()?;
     let store = MeetingStore::new(&paths)?;
-    let active_meeting = store.load_active()?;
+    // Do NOT silently resume a leftover "active" meeting on boot. A stray screen
+    // capture or transcript segment auto-creates an ad-hoc meeting and persists it
+    // as active; resuming it makes the daemon reattach to old junk on every launch
+    // ("Continuing Ad hoc meeting..."). Instead: archive it if it has real content
+    // (so nothing is lost), discard it if it's an empty shell, and start clean.
+    //
+    // Fail-soft: a corrupt/unparseable active file must NOT crash boot — discard it.
+    match store.load_active() {
+        Ok(Some(leftover)) => {
+            if leftover.has_content() {
+                if let Err(error) = store.archive(&leftover) {
+                    warn!("failed to archive leftover active meeting on boot: {error:#}");
+                } else {
+                    info!(
+                        meeting_id = %leftover.id,
+                        "archived leftover active meeting on boot (not resuming)"
+                    );
+                }
+            } else if let Err(error) = store.discard_active() {
+                warn!("failed to discard empty leftover active meeting on boot: {error:#}");
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            warn!("active meeting file unreadable on boot, discarding it: {error:#}");
+            if let Err(discard_err) = store.discard_active() {
+                warn!("failed to discard unreadable active meeting: {discard_err:#}");
+            }
+        }
+    }
+    let active_meeting: Option<MeetingRecord> = None;
     let initial_state = state_from_active_meeting(active_meeting.as_ref());
     let cloud_status = cloud_status_from_env(&paths);
     let (overlay_events_tx, overlay_events_rx) = mpsc::unbounded_channel();
@@ -835,6 +923,7 @@ pub async fn run() -> Result<()> {
         overlay_ui_state: std::sync::Arc::new(parking_lot::Mutex::new(
             cue_core::overlay_ipc::OverlayUiState::Idle,
         )),
+        agent_cache: Mutex::new(None),
     });
 
     maybe_spawn_balance_polling(&daemon);
@@ -1163,7 +1252,8 @@ async fn handle_request_inner(
             let Some((meeting_snapshot, cards, indexed_segment)) = ({
                 let mut meeting_guard = daemon.meeting.lock().await;
                 if meeting_guard.is_none() {
-                    *meeting_guard = Some(MeetingRecord::new(Some("Ad hoc meeting".to_string())));
+                    // Title from the first transcript line (mechanical, no LLM).
+                    *meeting_guard = Some(MeetingRecord::new(Some(meeting_title_from(&text))));
                 }
 
                 let meeting = meeting_guard.as_mut().expect("meeting exists");
@@ -1496,6 +1586,11 @@ async fn handle_request_inner(
                 });
             Ok(DaemonResponse::AgentConnectors { connectors })
         }
+        DaemonRequest::SetAgentSessionHistory { enabled } => {
+            persist_session_history_consent(daemon, enabled).await?;
+            info!(enabled, "agent session-history consent updated via IPC");
+            Ok(DaemonResponse::Ok)
+        }
     }
 }
 
@@ -1506,7 +1601,9 @@ async fn discover_agent_summaries(daemon: &Arc<Daemon>) -> Vec<AgentSummary> {
     let settings = load_settings(&daemon.paths).unwrap_or_default();
     let attached = settings.attached_agent.clone();
     let allow_history = settings.allow_agent_session_history;
-    tokio::task::spawn_blocking(move || build_agent_summaries(&attached, allow_history))
+    // CLI path renders the SESSIONS column, so it wants the counts (it's a
+    // one-shot command, latency is acceptable there).
+    tokio::task::spawn_blocking(move || build_agent_summaries(&attached, allow_history, true))
         .await
         .unwrap_or_else(|error| {
             debug!("agent discovery task panicked: {error}");
@@ -1723,8 +1820,13 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         OverlayEvent::AgentDetachRequested => {
             handle_agent_detach(daemon).await;
         }
-        OverlayEvent::AgentSessionsRequested { kind } => {
-            handle_agent_sessions_requested(daemon, &kind).await;
+        OverlayEvent::AgentSessionsRequested {
+            kind,
+            offset,
+            limit,
+            search,
+        } => {
+            handle_agent_sessions_requested(daemon, &kind, offset, limit, &search).await;
         }
         OverlayEvent::AgentConnectorsRequested { kind } => {
             handle_agent_connectors_requested(daemon, &kind).await;
@@ -1799,6 +1901,19 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         }
         OverlayEvent::SessionNewRequested => {
             start_new_session(daemon, "overlay session").await?;
+        }
+        OverlayEvent::SessionsRequested {
+            offset,
+            limit,
+            search,
+        } => {
+            handle_overlay_sessions_requested(daemon, offset, limit, search).await;
+        }
+        OverlayEvent::SessionPinRequested { id } => {
+            handle_overlay_session_pin(daemon, id, true).await;
+        }
+        OverlayEvent::SessionUnpinRequested { id } => {
+            handle_overlay_session_pin(daemon, id, false).await;
         }
         OverlayEvent::ActivePageCaptureRequested => {
             if let Err(error) = capture_active_page_context(daemon, "overlay page").await {
@@ -1945,34 +2060,104 @@ const AGENT_SESSION_LIST_CAP: usize = 40;
 /// than this many sessions reports exactly the cap.
 const AGENT_SESSION_COUNT_CAP: usize = 20;
 
-/// Discover agents (filesystem IO, off the async runtime), map them to
-/// [`AgentSummary`] DTOs, and push the list to the overlay. Fail-soft: any
-/// discovery or read error degrades to an empty list with a debug log.
+/// Discover agents and push them to the overlay in TWO phases so the UI feels
+/// instant:
+///   1. Fast first paint — discover installs + connectors (no session counts,
+///      which are the ~15s part) and send `SetAgents` immediately. Cards appear
+///      in ~tens of ms with `session_count = None` (the UI shows a "…" spinner).
+///   2. Background fill — recompute WITH session counts and send an updated
+///      `SetAgents`; the cards' counts resolve from "…" to the real number.
+///
+/// Fail-soft: any discovery/read error degrades to an empty list with a log.
 async fn refresh_overlay_agents(daemon: &Arc<Daemon>) {
     let settings = load_settings(&daemon.paths).unwrap_or_default();
     let attached = settings.attached_agent.clone();
     let allow_history = settings.allow_agent_session_history;
 
+    // ---- Phase 1: instant paint (no counts) ----
     let started = Instant::now();
-    let agents =
-        tokio::task::spawn_blocking(move || build_agent_summaries(&attached, allow_history))
-            .await
-            .unwrap_or_else(|error| {
-                warn!("agent discovery task PANICKED: {error}");
-                Vec::new()
-            });
+    let attached_p1 = attached.clone();
+    let agents = tokio::task::spawn_blocking(move || {
+        build_agent_summaries(&attached_p1, allow_history, false)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        warn!("agent discovery task PANICKED: {error}");
+        Vec::new()
+    });
 
     info!(
         count = agents.len(),
         elapsed_ms = started.elapsed().as_millis() as u64,
-        "agents: sending SetAgents (discovery complete)"
+        "agents: sending SetAgents (fast paint, counts pending)"
     );
+    *daemon.agent_cache.lock().await = Some(agents.clone());
+    let _ = send_overlay(daemon, OverlayCommand::SetAgents { agents }).await;
+
+    // ---- Phase 2: fill session counts in the background ----
+    if allow_history {
+        let daemon = Arc::clone(daemon);
+        tokio::spawn(async move {
+            let started = Instant::now();
+            let counted = tokio::task::spawn_blocking(move || {
+                build_agent_summaries(&attached, allow_history, true)
+            })
+            .await
+            .unwrap_or_default();
+            if counted.is_empty() {
+                return;
+            }
+            info!(
+                count = counted.len(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "agents: sending SetAgents (counts filled)"
+            );
+            // Only overwrite the cache if an attach/detach hasn't changed it in a
+            // way that matters; the attached flag is recomputed here from the same
+            // settings, so it's consistent. Re-send so the UI fills the counts.
+            *daemon.agent_cache.lock().await = Some(counted.clone());
+            let _ = send_overlay(&daemon, OverlayCommand::SetAgents { agents: counted }).await;
+        });
+    }
+}
+
+/// Re-send the agent list with the `attached` flag updated, WITHOUT re-running
+/// the expensive (~15s) filesystem discovery. Used on attach/detach so rapid
+/// "Use" clicks give instant feedback instead of stacking rediscoveries (the
+/// runaway-loop bug). Falls back to a full refresh only if nothing is cached.
+async fn refresh_overlay_agents_attached_only(daemon: &Arc<Daemon>) {
+    let attached_label = load_settings(&daemon.paths)
+        .ok()
+        .and_then(|s| s.attached_agent);
+    let cached = {
+        let guard = daemon.agent_cache.lock().await;
+        guard.clone()
+    };
+    let Some(mut agents) = cached else {
+        // No cache yet — do a normal (slow) discovery once.
+        refresh_overlay_agents(daemon).await;
+        return;
+    };
+    for agent in &mut agents {
+        agent.attached = is_agent_kind_attached(&agent.kind, attached_label.as_deref());
+    }
+    *daemon.agent_cache.lock().await = Some(agents.clone());
     let _ = send_overlay(daemon, OverlayCommand::SetAgents { agents }).await;
 }
 
 /// Blocking core of [`refresh_overlay_agents`]: discover agents and map each to
 /// an [`AgentSummary`]. Runs on a blocking thread; never panics.
-fn build_agent_summaries(attached: &Option<String>, allow_history: bool) -> Vec<AgentSummary> {
+///
+/// `with_counts` controls the expensive part: counting an agent's sessions reads
+/// (and parses) its session store, which can be gigabytes (Cursor/Code/Claude),
+/// so a full count takes ~15s. When `false`, `session_count` is left `None` and
+/// discovery returns in milliseconds — used for the instant first paint, with a
+/// background pass (`with_counts = true`) filling the numbers in afterwards.
+fn build_agent_summaries(
+    attached: &Option<String>,
+    allow_history: bool,
+    with_counts: bool,
+) -> Vec<AgentSummary> {
     discover_agents()
         .iter()
         .map(|agent| {
@@ -1988,7 +2173,7 @@ fn build_agent_summaries(attached: &Option<String>, allow_history: bool) -> Vec<
                 }
                 None => (0, 0),
             };
-            let session_count = if allow_history {
+            let session_count = if allow_history && with_counts {
                 count_agent_sessions(agent)
             } else {
                 None
@@ -2091,7 +2276,34 @@ async fn handle_agent_attach(daemon: &Arc<Daemon>, kind: &str, session_id: Optio
         return;
     }
 
-    refresh_overlay_agents(daemon).await;
+    // Always give feedback on a successful attach — silence here is the "nothing
+    // happened" bug. Tailor the message to what attaching actually enables, read
+    // from the cached capability for this agent.
+    let capability = {
+        let guard = daemon.agent_cache.lock().await;
+        guard
+            .as_ref()
+            .and_then(|agents| agents.iter().find(|a| a.kind == kind))
+            .map(|a| a.capability.clone())
+    };
+    let detail = match capability.as_deref() {
+        Some("read_only") => format!(
+            "{label} is attached, but Bluey can only read its history and context — \
+             it can't drive this agent yet."
+        ),
+        Some("needs_reauth") => format!(
+            "{label} is attached but needs a re-login before it's usable. Open its \
+             connectors to re-authenticate."
+        ),
+        Some("needs_trust") => {
+            format!("{label} is attached but needs to be trusted before Bluey can drive it.")
+        }
+        _ => format!("{label} is attached and ready."),
+    };
+    push_system_card(daemon, CardKind::System, "Agent attached", detail).await;
+
+    // Cheap re-send (flip attached flag) — no ~15s rediscovery on every click.
+    refresh_overlay_agents_attached_only(daemon).await;
 }
 
 /// Result of [`needs_byot_disclosure`] when the disclosure is required.
@@ -2217,7 +2429,8 @@ async fn handle_agent_detach(daemon: &Arc<Daemon>) {
         warn!("failed to detach agent: {error:#}");
         return;
     }
-    refresh_overlay_agents(daemon).await;
+    // Cheap re-send (clear attached flag) — no ~15s rediscovery.
+    refresh_overlay_agents_attached_only(daemon).await;
 }
 
 /// Load settings, set `attached_agent` plus the session to resume, `touch()`,
@@ -2236,10 +2449,29 @@ async fn persist_attached_agent(
     save_settings(&daemon.paths, &settings)
 }
 
+/// Persist the session-history consent flag to the daemon's settings (the only
+/// writer over IPC — the UI's consent toggle routes here, not the dashboard's
+/// local SQLite, which never reaches the daemon).
+async fn persist_session_history_consent(daemon: &Arc<Daemon>, enabled: bool) -> Result<()> {
+    let mut settings = load_settings(&daemon.paths)?;
+    settings.allow_agent_session_history = enabled;
+    settings.touch();
+    save_settings(&daemon.paths, &settings)
+}
+
 /// List one agent's prior sessions, gated on the session-history consent flag.
 /// When consent is off, an empty list is sent (the UI prompts the user to opt
-/// in). All store IO runs off the async runtime and is fail-soft.
-async fn handle_agent_sessions_requested(daemon: &Arc<Daemon>, kind: &str) {
+/// in). `offset`/`limit`/`search` support the redesigned at-scale list: the
+/// decoded refs are filtered (case-insensitive over title + project) and
+/// windowed before sending. All store IO runs off the async runtime and is
+/// fail-soft.
+async fn handle_agent_sessions_requested(
+    daemon: &Arc<Daemon>,
+    kind: &str,
+    offset: usize,
+    limit: usize,
+    search: &str,
+) {
     let settings = load_settings(&daemon.paths).unwrap_or_default();
     if !settings.allow_agent_session_history {
         // Consent gate OFF — this is the common "clicked an agent, saw nothing"
@@ -2261,16 +2493,38 @@ async fn handle_agent_sessions_requested(daemon: &Arc<Daemon>, kind: &str) {
     }
 
     let kind_owned = kind.to_string();
-    let sessions = tokio::task::spawn_blocking(move || list_agent_sessions(&kind_owned))
+    let mut sessions = tokio::task::spawn_blocking(move || list_agent_sessions(&kind_owned))
         .await
         .unwrap_or_else(|error| {
             warn!(kind, "agent session list task PANICKED: {error}");
             Vec::new()
         });
 
+    // Filter + window to match the requested page (defaults reproduce the prior
+    // "first page, unfiltered" behavior).
+    let needle = search.trim().to_lowercase();
+    if !needle.is_empty() {
+        sessions.retain(|s| {
+            s.title
+                .as_deref()
+                .is_some_and(|t| t.to_lowercase().contains(&needle))
+                || s.project
+                    .as_deref()
+                    .is_some_and(|p| p.to_lowercase().contains(&needle))
+        });
+    }
+    let page_limit = if limit == 0 {
+        OVERLAY_SESSIONS_PAGE_DEFAULT
+    } else {
+        limit.min(OVERLAY_SESSIONS_PAGE_MAX)
+    };
+    let sessions: Vec<AgentSessionSummary> =
+        sessions.into_iter().skip(offset).take(page_limit).collect();
+
     info!(
         kind,
         count = sessions.len(),
+        offset,
         "agent sessions: sending SetAgentSessions"
     );
     let _ = send_overlay(
@@ -4005,6 +4259,7 @@ async fn refresh_overlay_context_items(daemon: &Arc<Daemon>, meeting: &MeetingRe
         daemon,
         OverlayCommand::SetContextItems {
             items: overlay_context_items(meeting),
+            turns: meeting.conversation.len(),
         },
     )
     .await;
@@ -4013,7 +4268,10 @@ async fn refresh_overlay_context_items(daemon: &Arc<Daemon>, meeting: &MeetingRe
 async fn refresh_overlay_sessions(daemon: &Arc<Daemon>) {
     let active_id = daemon.meeting.lock().await.as_ref().map(|m| m.id);
     match overlay_session_items(daemon, active_id) {
-        Ok(sessions) => {
+        Ok(mut sessions) => {
+            // Legacy initial-paint path: send the first page only. The
+            // redesigned panel pages past this via `SessionsRequested`.
+            sessions.truncate(OVERLAY_SESSIONS_INITIAL_CAP);
             let _ = send_overlay(daemon, OverlayCommand::SetSessions { sessions }).await;
         }
         Err(error) => {
@@ -4022,10 +4280,82 @@ async fn refresh_overlay_sessions(daemon: &Arc<Daemon>) {
     }
 }
 
+/// Answer an [`OverlayEvent::SessionsRequested`]: build the full sorted list,
+/// filter + window it, and reply with [`OverlayCommand::SetSessionsPage`].
+async fn handle_overlay_sessions_requested(
+    daemon: &Arc<Daemon>,
+    offset: usize,
+    limit: usize,
+    search: String,
+) {
+    let active_id = daemon.meeting.lock().await.as_ref().map(|m| m.id);
+    let all = match overlay_session_items(daemon, active_id) {
+        Ok(items) => items,
+        Err(error) => {
+            debug!("overlay session page skipped: {error:#}");
+            Vec::new()
+        }
+    };
+    let (sessions, total, has_more) = paginate_overlay_sessions(all, offset, limit, &search);
+    let _ = send_overlay(
+        daemon,
+        OverlayCommand::SetSessionsPage {
+            sessions,
+            total,
+            offset,
+            has_more,
+            query: search,
+        },
+    )
+    .await;
+}
+
+/// Persist a session pin/unpin, then re-send the affected (first) page so the
+/// move to/from the pinned group is reflected immediately.
+async fn handle_overlay_session_pin(daemon: &Arc<Daemon>, id: uuid::Uuid, pinned: bool) {
+    if let Err(error) = persist_overlay_session_pin(daemon, id, pinned).await {
+        debug!("overlay session pin persist skipped: {error:#}");
+    }
+    handle_overlay_sessions_requested(daemon, 0, OVERLAY_SESSIONS_PAGE_DEFAULT, String::new())
+        .await;
+}
+
+async fn persist_overlay_session_pin(
+    daemon: &Arc<Daemon>,
+    id: uuid::Uuid,
+    pinned: bool,
+) -> Result<()> {
+    let mut settings = load_settings(&daemon.paths)?;
+    settings
+        .pinned_overlay_sessions
+        .retain(|&existing| existing != id);
+    if pinned {
+        settings.pinned_overlay_sessions.push(id);
+    }
+    settings.touch();
+    save_settings(&daemon.paths, &settings)
+}
+
+/// Initial-paint cap for the legacy one-shot [`OverlayCommand::SetSessions`]
+/// push. The redesigned panel pages past this via `SessionsRequested`.
+const OVERLAY_SESSIONS_INITIAL_CAP: usize = 8;
+/// Default page size when the UI requests a session page without specifying one.
+const OVERLAY_SESSIONS_PAGE_DEFAULT: usize = 30;
+/// Hard ceiling on a single session page (clamp the UI's `limit`).
+const OVERLAY_SESSIONS_PAGE_MAX: usize = 100;
+
+/// Build the FULL, de-duplicated, content-bearing session list — sorted
+/// pinned-first then most-recent. Both the legacy initial-paint push (which
+/// takes the first [`OVERLAY_SESSIONS_INITIAL_CAP`]) and the paginated
+/// `SessionsRequested` handler (which filters + windows) consume this; the cap
+/// is applied by the caller, never here.
 fn overlay_session_items(
     daemon: &Arc<Daemon>,
     active_id: Option<uuid::Uuid>,
 ) -> Result<Vec<OverlaySessionItem>> {
+    let pinned = load_settings(&daemon.paths)
+        .map(|s| s.pinned_overlay_sessions)
+        .unwrap_or_default();
     let mut seen = std::collections::HashSet::new();
     let mut items = Vec::new();
     for meeting in daemon.store.all_meetings()? {
@@ -4033,14 +4363,10 @@ fn overlay_session_items(
             continue;
         }
         let is_active = Some(meeting.id) == active_id;
-        let has_content = !meeting.transcript.is_empty()
-            || !meeting.context.is_empty()
-            || !meeting.conversation.is_empty()
-            || meeting
-                .summary
-                .as_ref()
-                .is_some_and(|summary| !summary.trim().is_empty());
-        if !is_active && !has_content {
+        // Hide empty/auto-created meeting shells from History. Keep the active
+        // meeting only if it actually has content (an empty active meeting is a
+        // shell that shouldn't clutter the session list).
+        if !meeting.has_content() {
             continue;
         }
         let mut bits = Vec::new();
@@ -4064,6 +4390,17 @@ fn overlay_session_items(
                 plural_s(meeting.conversation.len())
             ));
         }
+        // Best-effort recency marker: last activity (ended) else start.
+        let updated_at = meeting
+            .ended_at
+            .clone()
+            .unwrap_or_else(|| meeting.started_at.clone());
+        // Turn count = conversational exchanges, when any.
+        let turn_count = if meeting.conversation.is_empty() {
+            None
+        } else {
+            Some(meeting.conversation.len())
+        };
         items.push(OverlaySessionItem {
             id: meeting.id,
             title: meeting.title,
@@ -4073,9 +4410,57 @@ fn overlay_session_items(
                 bits.join(" · ")
             },
             is_active,
+            // Bluey's own recordings are not project-scoped (unlike agent
+            // sessions), so there is no project to filter on here.
+            project: None,
+            updated_at,
+            turn_count,
+            pinned: pinned.contains(&meeting.id),
         });
     }
-    Ok(items.into_iter().take(8).collect())
+    // Sort: pinned first, then most-recent (descending `updated_at`). The
+    // markers are epoch-ms strings so lexicographic == chronological for equal
+    // widths; pad-free comparison is fine here since all are same-era ms.
+    items.sort_by(|a, b| {
+        b.pinned
+            .cmp(&a.pinned)
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
+    });
+    Ok(items)
+}
+
+/// Filter (case-insensitive over title + project), then window a session list
+/// to `offset..offset+limit`. Returns the page plus the pre-paging match total
+/// and whether more remain — the shape [`OverlayCommand::SetSessionsPage`] needs.
+fn paginate_overlay_sessions(
+    all: Vec<OverlaySessionItem>,
+    offset: usize,
+    limit: usize,
+    search: &str,
+) -> (Vec<OverlaySessionItem>, usize, bool) {
+    let needle = search.trim().to_lowercase();
+    let filtered: Vec<OverlaySessionItem> = if needle.is_empty() {
+        all
+    } else {
+        all.into_iter()
+            .filter(|item| {
+                item.title.to_lowercase().contains(&needle)
+                    || item
+                        .project
+                        .as_deref()
+                        .is_some_and(|p| p.to_lowercase().contains(&needle))
+            })
+            .collect()
+    };
+    let total = filtered.len();
+    let limit = if limit == 0 {
+        OVERLAY_SESSIONS_PAGE_DEFAULT
+    } else {
+        limit.min(OVERLAY_SESSIONS_PAGE_MAX)
+    };
+    let page: Vec<OverlaySessionItem> = filtered.into_iter().skip(offset).take(limit).collect();
+    let has_more = offset.saturating_add(page.len()) < total;
+    (page, total, has_more)
 }
 
 fn plural_s(count: usize) -> &'static str {
@@ -4931,9 +5316,22 @@ async fn answer_with_provider_runtime(
     let (meeting_snapshot, answer_meeting) = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard.is_none() {
-            let meeting = MeetingRecord::new(Some("Ad hoc meeting".to_string()));
+            // Title the new meeting from the question being asked (mechanical, no
+            // LLM) instead of a generic "Ad hoc meeting". Falls back to the
+            // generic label only when the question is noise/empty.
+            let meeting = MeetingRecord::new(Some(meeting_title_from(&request.question)));
             daemon.store.save_active(&meeting)?;
             *meeting_guard = Some(meeting);
+        } else if let Some(meeting) = meeting_guard.as_mut() {
+            // The meeting already exists but may have been created without a good
+            // title source (e.g. from a file-attach). Upgrade a still-generic
+            // title from this first real question.
+            if is_generic_meeting_title(&meeting.title) {
+                if let Some(better) = mechanical_title_for_meeting(&request.question) {
+                    meeting.title = better;
+                    daemon.store.save_active(meeting)?;
+                }
+            }
         }
 
         let meeting = meeting_guard.as_ref().expect("meeting exists");
@@ -5656,6 +6054,7 @@ async fn apply_continuation_tier(
     question: &mut AgentQuestion,
     agent: &AgentKind,
     session_id: Option<&str>,
+    via_acp: bool,
 ) {
     let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) else {
         return; // fresh question — nothing to continue
@@ -5683,8 +6082,38 @@ async fn apply_continuation_tier(
                 .unwrap_or(false)
     });
     match entry.continuation {
+        // ACP path. The on-disk session id IS the SDK's resume key — `session/load`
+        // resolves `~/.claude/projects/<encoded-cwd>/<id>.jsonl` and the CWD is part
+        // of that path (platform.claude.com/docs/en/agent-sdk/sessions). So:
+        //   - cwd usable  → attempt TRUE resume (set `resume` + the session's project
+        //     cwd) AND keep the transcript in `context` as a fork fallback. The ACP
+        //     drive tries `session/load` first; if it yields no prior context it
+        //     retries as fresh + replayed context (fork). Best of both: exact
+        //     in-place resume when it works, non-destructive fork when it doesn't.
+        //   - cwd missing → resume can't resolve the path (would silently start
+        //     fresh), so go straight to fork: drop `resume`, replay the transcript.
+        cue_agent_bridge::registry::ContinuationTier::NativeResume if via_acp => {
+            if cwd_usable {
+                info!(
+                    session = %session_id,
+                    cwd = project.as_deref().unwrap_or(""),
+                    "ACP continuation: TRUE resume (session/load) with fork fallback"
+                );
+                question.cwd = project;
+                question.resume = Some(session_id.to_string());
+            } else {
+                question.resume = None;
+                info!(
+                    session = %session_id,
+                    "ACP continuation: cwd unusable → FORK (replay context, no resume)"
+                );
+            }
+            if let Some(t) = transcript {
+                question.context = Some(maybe_compact(agent, t).await);
+            }
+        }
         cue_agent_bridge::registry::ContinuationTier::NativeResume if cwd_usable => {
-            // Normal native resume: drive in the project dir, resume by id, let
+            // Non-ACP native resume: drive in the project dir, resume by id, let
             // the vendor handle context compaction.
             question.cwd = project;
             question.resume = Some(session_id.to_string());
@@ -5892,6 +6321,16 @@ fn is_resume_recoverable_error(message: &str) -> bool {
 /// whether to retry (e.g. fresh session) or surface the failure. A
 /// context-overflow error arrives as a result event with no prior deltas, so the
 /// body is empty on that failure and there is nothing rendered to roll back.
+/// Whether to drive `kind` over ACP for the answer: opt-in `BLUEY_USE_ACP=1` AND
+/// the agent has an ACP entrypoint. Default builds (flag unset) return false, so
+/// the answer path is unchanged. PHASE 0 — see PLAN-AGENT-MEETING-ORACLE.
+fn acp_answer_enabled(kind: &AgentKind) -> bool {
+    let opted_in = std::env::var_os("BLUEY_USE_ACP")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    opted_in && cue_agent_bridge::acp::AcpAgentSpec::try_from(kind).is_ok()
+}
+
 async fn drive_answer_attempt(
     kind: &AgentKind,
     label: &str,
@@ -5906,8 +6345,15 @@ async fn drive_answer_attempt(
     // resume is cwd-scoped); Replay → load + (if huge) compact the transcript
     // into context. No-op for a fresh question. Local agents only — cloud
     // continuation is the cloud adapter's concern.
+    //
+    // `via_acp`: when we drive over ACP, native resume-by-id is unreliable — the
+    // session id we read from the on-disk store is NOT the id the agent's ACP
+    // `session/load` can target (id-space mismatch, see anthropics/claude-code
+    // #8069 + the ACP loadSession divergence). So over ACP we REPLAY the
+    // transcript as context instead of trusting `session/load`.
+    let via_acp = acp_answer_enabled(kind);
     if !cue_agent_bridge::cloud::is_cloud_kind(kind) {
-        apply_continuation_tier(&mut question, kind, resume).await;
+        apply_continuation_tier(&mut question, kind, resume, via_acp).await;
     }
 
     // Cross-surface continuation bridge: an agent with NO CLI of its own (e.g.
@@ -5945,6 +6391,24 @@ async fn drive_answer_attempt(
                 debug!(agent = %label, error = %error, "cloud agent drive failed to start");
                 return Err(DriveFailure {
                     reason: "isn't connected or set up".to_string(),
+                    resume_recoverable: false,
+                    raw_error: None,
+                });
+            }
+        }
+    } else if acp_answer_enabled(kind) {
+        // PHASE 0: opt-in (BLUEY_USE_ACP=1) ACP path for local agents that have an
+        // ACP entrypoint. ACP speaks structured JSON-RPC to the agent's `--acp`
+        // mode (or its adapter) instead of spawning `agent -p` and scraping
+        // stdout — which is fragile (e.g. Gemini's CLI exits non-zero on a TTY
+        // warning). The `question` already carries continuation (resume id + cwd).
+        // Reversible: default builds (flag unset) never take this branch.
+        match cue_agent_bridge::acp::drive_acp(kind.clone(), question).await {
+            Ok(answer_stream) => answer_stream,
+            Err(error) => {
+                debug!(agent = %label, error = %error, "ACP agent drive failed to start");
+                return Err(DriveFailure {
+                    reason: "isn't connected or set up (ACP)".to_string(),
                     resume_recoverable: false,
                     raw_error: None,
                 });
@@ -7894,6 +8358,23 @@ async fn open_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<Me
 
     reindex_meeting_for_rag(daemon, selected.clone());
     update_state_from_meeting(daemon, Some(&selected)).await?;
+
+    // Rebuild the overlay thread to SHOW the opened session's conversation.
+    // Previously this only made the meeting active + pushed a "0 transcript,
+    // 0 context" status card, so a conversation-only session looked empty and
+    // the user re-clicked thinking nothing happened. Clear the thread, then
+    // replay each prior turn as a question + answer card.
+    let _ = send_overlay(daemon, OverlayCommand::Clear).await;
+    for turn in &selected.conversation {
+        let question = CueCard::new(CardKind::Question, String::new(), turn.question.clone());
+        let _ = send_overlay(daemon, OverlayCommand::PushCard { card: question }).await;
+        let mut answer = CueCard::new(CardKind::Answer, String::new(), turn.answer.clone());
+        if let Some(source) = turn.source.as_deref().filter(|s| !s.trim().is_empty()) {
+            answer = answer.with_source(source);
+        }
+        let _ = send_overlay(daemon, OverlayCommand::PushCard { card: answer }).await;
+    }
+
     refresh_overlay_context_items(daemon, &selected).await;
     refresh_overlay_sessions(daemon).await;
     push_system_card(
@@ -7901,8 +8382,9 @@ async fn open_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<Me
         CardKind::System,
         "Session loaded",
         format!(
-            "Continuing {}.\n{} transcript segment(s), {} context item(s).{}",
+            "Continuing {}.\n{} turn(s), {} transcript segment(s), {} context item(s).{}",
             selected.title,
+            selected.conversation.len(),
             selected.transcript.len(),
             selected.context.len(),
             archived_summary
@@ -7984,7 +8466,14 @@ async fn delete_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<
 
     if was_active {
         update_state_from_meeting(daemon, None).await?;
-        let _ = send_overlay(daemon, OverlayCommand::SetContextItems { items: vec![] }).await;
+        let _ = send_overlay(
+            daemon,
+            OverlayCommand::SetContextItems {
+                items: vec![],
+                turns: 0,
+            },
+        )
+        .await;
     }
     refresh_overlay_sessions(daemon).await;
     push_system_card(
@@ -8577,7 +9066,11 @@ fn should_use_macos_socket_overlay(path: &Path) -> bool {
     }
     path.file_name()
         .and_then(|name| name.to_str())
-        .map(|name| name == "bluey-overlay-macos" || name == "cue-overlay-macos")
+        .map(|name| {
+            name == "bluey-overlay-macos"
+                || name == "cue-overlay-macos"
+                || name.contains("cue-overlay-tauri")
+        })
         .unwrap_or(false)
 }
 
@@ -8658,7 +9151,15 @@ fn macos_overlay_launch_command(
     socket_path: &Path,
     expected_token: &str,
 ) -> Command {
-    if !macos_overlay_force_raw_helper() {
+    // The Tauri overlay is a plain binary (no .app bundle launch); never route it
+    // through `open <BlueyOverlay.app>` (that's the legacy Swift overlay).
+    let is_tauri_overlay = resolved
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.contains("cue-overlay-tauri"))
+        .unwrap_or(false);
+
+    if !is_tauri_overlay && !macos_overlay_force_raw_helper() {
         if let Some(app_bundle) = macos_overlay_app_bundle_for_binary(resolved) {
             return macos_overlay_open_app_command(&app_bundle, socket_path, expected_token);
         }
@@ -8667,7 +9168,12 @@ fn macos_overlay_launch_command(
     let mut command = Command::new(resolved);
     command
         .env("BLUEY_OVERLAY_SESSION_TOKEN", expected_token)
-        .env("BLUEY_OVERLAY_SOCKET", socket_path);
+        .env("BLUEY_OVERLAY_SOCKET", socket_path)
+        // Also pass as CLI args so the Tauri overlay finds them either way.
+        .arg("--bluey-overlay-socket")
+        .arg(socket_path)
+        .arg("--bluey-overlay-session-token")
+        .arg(expected_token);
     command
 }
 
@@ -8983,6 +9489,12 @@ fn discover_overlay_bin() -> Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         let mut candidates = Vec::new();
+        // Tauri overlay (the new HTML/Tauri overlay that replaces the Swift one).
+        // Preferred when present; falls through to the legacy Swift overlay paths.
+        candidates.extend([
+            cwd.join("target/debug/cue-overlay-tauri"),
+            cwd.join("target/release/cue-overlay-tauri"),
+        ]);
         if cfg!(debug_assertions) {
             candidates.extend([
                 cwd.join("native/macos/cue-overlay/.build/bluey-overlay-macos"),
@@ -10513,6 +11025,39 @@ mod tests {
             agent_model_label(&AgentKind::Other("zed".to_string())),
             "zed"
         );
+    }
+
+    #[test]
+    fn is_agent_kind_attached_matches_the_attached_label() {
+        // The cheap cache flip (refresh_overlay_agents_attached_only) must compute
+        // `attached` identically to the full discovery path: the snake_case kind
+        // string round-trips to the same label the setting stores.
+        assert!(is_agent_kind_attached("claude_code", Some("claude_code")));
+        assert!(is_agent_kind_attached("cursor", Some("cursor")));
+        // Wrong agent, no attached agent, and unknown kinds are never attached.
+        assert!(!is_agent_kind_attached("claude_code", Some("cursor")));
+        assert!(!is_agent_kind_attached("claude_code", None));
+        assert!(!is_agent_kind_attached(
+            "not_a_real_agent",
+            Some("not_a_real_agent")
+        ));
+    }
+
+    #[test]
+    fn meeting_title_derives_from_text_and_falls_back() {
+        // A real question yields a clean title (not the generic placeholder).
+        let t = meeting_title_from("How do I fix the overlay duplicate message?");
+        assert_ne!(t, GENERIC_MEETING_TITLE);
+        assert!(t.to_lowercase().contains("overlay"));
+
+        // Noise / empty falls back to the generic placeholder.
+        assert_eq!(meeting_title_from(""), GENERIC_MEETING_TITLE);
+        assert_eq!(meeting_title_from("   "), GENERIC_MEETING_TITLE);
+
+        // Generic-title detection drives the upgrade-on-first-question path.
+        assert!(is_generic_meeting_title(GENERIC_MEETING_TITLE));
+        assert!(is_generic_meeting_title(""));
+        assert!(!is_generic_meeting_title("How do I fix the overlay?"));
     }
 
     #[test]

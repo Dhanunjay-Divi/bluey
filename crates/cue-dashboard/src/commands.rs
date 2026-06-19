@@ -859,6 +859,87 @@ pub fn set_llm_chain(providers: Vec<String>, db: State<DbState>) -> Result<(), S
     db.save_setting("llm.chain", &chain)
         .map_err(|e| e.to_string())
 }
+
+// ===== Agent bridge: thin Tauri wrappers over daemon IPC =====
+//
+// Each command round-trips a single `DaemonRequest` through `daemon_ipc` and
+// returns the inner Vec from the matching `DaemonResponse` variant, surfacing
+// `DaemonResponse::Error` as `Err`. The daemon owns all discovery/consent logic;
+// these are pure passthroughs so the React UI can call the backend over IPC.
+
+/// Discover installed coding agents and summarize each (capability, connector
+/// counts, optional session count, attach state).
+#[tauri::command]
+pub async fn agent_list() -> Result<Vec<cue_core::AgentSummary>, String> {
+    match daemon_ipc(DaemonRequest::AgentList).await? {
+        DaemonResponse::Agents { agents } => Ok(agents),
+        DaemonResponse::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon response: {other:?}")),
+    }
+}
+
+/// Attach `kind` as the active answer-routing agent, optionally pinning a prior
+/// `session_id` to resume. Returns the refreshed agent list.
+#[tauri::command]
+pub async fn agent_attach(
+    kind: String,
+    session_id: Option<String>,
+) -> Result<Vec<cue_core::AgentSummary>, String> {
+    match daemon_ipc(DaemonRequest::AgentAttach { kind, session_id }).await? {
+        DaemonResponse::Agents { agents } => Ok(agents),
+        DaemonResponse::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon response: {other:?}")),
+    }
+}
+
+/// Clear the active agent (answers fall back to Bluey's normal providers), then
+/// re-list so the UI gets the post-detach state in one call. `AgentDetach`
+/// itself acks with `DaemonResponse::Ok`, so we follow it with `AgentList`.
+#[tauri::command]
+pub async fn agent_detach() -> Result<Vec<cue_core::AgentSummary>, String> {
+    match daemon_ipc(DaemonRequest::AgentDetach).await? {
+        DaemonResponse::Ok => agent_list().await,
+        DaemonResponse::Agents { agents } => Ok(agents),
+        DaemonResponse::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon response: {other:?}")),
+    }
+}
+
+/// List one agent's prior sessions (gated daemon-side on session-history
+/// consent; returns an empty list when consent is off).
+#[tauri::command]
+pub async fn agent_sessions(kind: String) -> Result<Vec<cue_core::AgentSessionSummary>, String> {
+    match daemon_ipc(DaemonRequest::AgentSessions { kind }).await? {
+        DaemonResponse::AgentSessions { sessions } => Ok(sessions),
+        DaemonResponse::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon response: {other:?}")),
+    }
+}
+
+/// List one agent's inherited MCP connectors (shape + readiness only, never
+/// secrets).
+#[tauri::command]
+pub async fn agent_connectors(kind: String) -> Result<Vec<cue_core::AgentConnectorInfo>, String> {
+    match daemon_ipc(DaemonRequest::AgentConnectors { kind }).await? {
+        DaemonResponse::AgentConnectors { connectors } => Ok(connectors),
+        DaemonResponse::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon response: {other:?}")),
+    }
+}
+
+/// Set the session-history consent flag in the daemon's settings. Reading an
+/// agent's prior sessions (`agent_sessions`) is gated on this; the toggle in the
+/// UI routes here. The daemon is the single source of truth for the flag — the
+/// dashboard's local settings store never reaches it.
+#[tauri::command]
+pub async fn set_agent_session_history(enabled: bool) -> Result<(), String> {
+    match daemon_ipc(DaemonRequest::SetAgentSessionHistory { enabled }).await? {
+        DaemonResponse::Ok => Ok(()),
+        DaemonResponse::Error { message } => Err(message),
+        other => Err(format!("unexpected daemon response: {other:?}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -901,6 +982,65 @@ mod tests {
     #[test]
     fn daemon_addr_defaults_to_standard_addr() {
         assert_eq!(DEFAULT_DAEMON_ADDR, "127.0.0.1:57321");
+    }
+
+    /// Mirrors `daemon_ipc_wraps_dashboard_request_with_trace` but for the agent
+    /// surface: verifies `AgentList` serializes as a trace-wrapped `agent_list`
+    /// request and that an `Agents` payload decodes back into the inner Vec the
+    /// `agent_list` command returns.
+    #[tokio::test]
+    async fn agent_list_request_round_trips_through_daemon_ipc() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let response = DaemonResponse::Agents {
+                agents: vec![cue_core::AgentSummary {
+                    kind: "claude_code".to_string(),
+                    display_name: "Claude Code".to_string(),
+                    capability: "drive".to_string(),
+                    connector_count: 2,
+                    ready_connector_count: 1,
+                    session_count: Some(3),
+                    attached: true,
+                }],
+            };
+            writer
+                .write_all(serde_json::to_string(&response).unwrap().as_bytes())
+                .await
+                .unwrap();
+            writer.write_all(b"\n").await.unwrap();
+            line
+        });
+
+        let response =
+            daemon_ipc_with_trace_to_addr(DaemonRequest::AgentList, "agent-list-trace", &addr)
+                .await
+                .unwrap();
+        let agents = match response {
+            DaemonResponse::Agents { agents } => agents,
+            other => panic!("expected Agents response, got {other:?}"),
+        };
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].kind, "claude_code");
+        assert!(agents[0].attached);
+
+        let line = server.await.unwrap();
+        let request: DaemonRequest = serde_json::from_str(line.trim()).unwrap();
+        match request {
+            DaemonRequest::WithTrace { trace_id, request } => {
+                assert_eq!(trace_id, "agent-list-trace");
+                assert!(matches!(*request, DaemonRequest::AgentList));
+            }
+            other => panic!("agent_list request was not trace-wrapped: {other:?}"),
+        }
     }
 
     #[test]

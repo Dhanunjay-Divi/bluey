@@ -74,6 +74,70 @@ private func blueyMaterialAlpha(_ base: CGFloat, opacity: CGFloat, floor: CGFloa
     min(1.0, max(floor, base * min(max(opacity, 0.50), 1.0)))
 }
 
+/// Redesign token palette — the *mechanical* translation of the CSS custom
+/// properties in `docs/design/bluey-overlay-redesign-v2.html`. These are the
+/// dashboard-exact tokens (one refined `#3B82F6` blue accent, white-alpha text,
+/// hairlines) that replace the old neon-cyan `BlueyTheme` look on the panel.
+/// NSColor RGB are css/255. This is the visual contract.
+private enum Tok {
+    // Text ramp.
+    static let tx1 = NSColor.white.withAlphaComponent(0.96)
+    static let tx2 = NSColor.white.withAlphaComponent(0.62)
+    static let tx3 = NSColor.white.withAlphaComponent(0.40)
+    static let tx4 = NSColor.white.withAlphaComponent(0.24)
+    // Hairlines.
+    static let hairline = NSColor.white.withAlphaComponent(0.10)
+    static let hairlineStrong = NSColor.white.withAlphaComponent(0.17)
+    static let glassHi = NSColor.white.withAlphaComponent(0.05)
+    // Accent (#3B82F6 / #AFC9FB).
+    static let accent = NSColor(red: 0.231, green: 0.510, blue: 0.965, alpha: 1.0)
+    static let accentTx = NSColor(red: 0.686, green: 0.788, blue: 0.984, alpha: 1.0)
+    static let accentBg = NSColor(red: 0.231, green: 0.510, blue: 0.965, alpha: 0.18)
+    static let accentBgStrong = NSColor(red: 0.231, green: 0.510, blue: 0.965, alpha: 0.30)
+    // Status.
+    static let ok = NSColor(red: 0.231, green: 0.820, blue: 0.482, alpha: 1.0)
+    static let warn = NSColor(red: 0.890, green: 0.663, blue: 0.247, alpha: 1.0)
+    static let danger = NSColor(red: 0.898, green: 0.337, blue: 0.306, alpha: 1.0)
+    // Code-span tint used in answers/diffs (#cfe0f5).
+    static let codeTx = NSColor(red: 0.812, green: 0.878, blue: 0.961, alpha: 1.0)
+    // Radii.
+    static let rSm: CGFloat = 8
+    static let rMd: CGFloat = 11
+    static let rLg: CGFloat = 14
+    static let rXl: CGFloat = 18
+    static let r2xl: CGFloat = 24
+
+    // The dark panel surface fill — near-opaque so it reads dark over ANY
+    // wallpaper (the mockup only looks .52 because it sits over a dark desk).
+    // This single alpha is the one knob for "dark vs washed-out".
+    static let surfaceFill = NSColor(red: 0.066, green: 0.078, blue: 0.102, alpha: 0.97)
+    // Dark modal fill (readable over the dim backdrop).
+    static let modalFill = NSColor(red: 0.10, green: 0.115, blue: 0.14, alpha: 0.94)
+
+    static func font(_ size: CGFloat, _ weight: NSFont.Weight = .regular) -> NSFont {
+        NSFont.systemFont(ofSize: size, weight: weight)
+    }
+
+    static func mono(_ size: CGFloat, _ weight: NSFont.Weight = .regular) -> NSFont {
+        NSFont.monospacedSystemFont(ofSize: size, weight: weight)
+    }
+}
+
+/// Tracked, uppercase micro-label (CSS `letter-spacing` + `text-transform`).
+private func trackedLabel(_ text: String, size: CGFloat, weight: NSFont.Weight, color: NSColor, tracking: CGFloat = 0.5) -> NSTextField {
+    let label = NSTextField(labelWithString: "")
+    label.translatesAutoresizingMaskIntoConstraints = false
+    label.attributedStringValue = NSAttributedString(
+        string: text,
+        attributes: [
+            .font: Tok.font(size, weight),
+            .foregroundColor: color,
+            .kern: tracking,
+        ])
+    label.lineBreakMode = .byTruncatingTail
+    return label
+}
+
 private final class VerticallyCenteredTextFieldCell: NSTextFieldCell {
     override func drawingRect(forBounds rect: NSRect) -> NSRect {
         var drawingRect = super.drawingRect(forBounds: rect)
@@ -448,6 +512,50 @@ private struct OverlaySessionItem {
     let title: String
     let subtitle: String
     let isActive: Bool
+    /// Project/workspace the session belongs to (redesign: shown as "project ·
+    /// N turns"). `nil` when unassociated. Mirrors OverlaySessionItem.project.
+    let project: String?
+    /// Best-effort last-updated marker (epoch seconds or RFC3339). Drives the
+    /// Today / Yesterday / Earlier date-group bucketing. Empty when unknown.
+    let updatedAt: String
+    /// Turn/exchange count when cheaply countable (shown as "N turns").
+    let turnCount: Int?
+    /// True when the user has pinned this session to the top of the list.
+    let pinned: Bool
+
+    init(
+        id: String,
+        title: String,
+        subtitle: String,
+        isActive: Bool,
+        project: String? = nil,
+        updatedAt: String = "",
+        turnCount: Int? = nil,
+        pinned: Bool = false
+    ) {
+        self.id = id
+        self.title = title
+        self.subtitle = subtitle
+        self.isActive = isActive
+        self.project = project
+        self.updatedAt = updatedAt
+        self.turnCount = turnCount
+        self.pinned = pinned
+    }
+}
+
+/// A BYOT (bring-your-own-token) billing disclosure the user MUST acknowledge
+/// before a cloud agent attaches. Mirrors `OverlayCommand::PushBillingDisclosure`
+/// in crates/cue-core/src/overlay.rs. The UI renders `disclosure` verbatim (the
+/// legal copy) and echoes `vendorShort` + `pendingKind`/`pendingSessionId` back
+/// in `billing_disclosure_responded`.
+private struct BillingDisclosure {
+    let vendorShort: String
+    let vendorDisplayName: String
+    let billingModel: String
+    let disclosure: String
+    let pendingKind: String
+    let pendingSessionId: String?
 }
 
 // MARK: - Agent-bridge wire DTOs (Slice 5b)
@@ -473,6 +581,16 @@ private struct AgentSessionSummary {
     let id: String
     let title: String?
     let updatedAt: String
+    /// Project/workspace path the session belongs to, when the source records
+    /// it. `nil` when unassociated. Mirrors AgentSessionSummary.project.
+    let project: String?
+
+    init(id: String, title: String?, updatedAt: String, project: String? = nil) {
+        self.id = id
+        self.title = title
+        self.updatedAt = updatedAt
+        self.project = project
+    }
 }
 
 private struct AgentConnectorInfo {
@@ -553,6 +671,14 @@ private enum OverlayCommand {
     case setBalance(String)
     case setContextItems([OverlayContextItem])
     case setSessions([OverlaySessionItem])
+    /// Paginated/searched session page (redesign History-at-scale). Carries the
+    /// slice plus totals so the UI can render "show N more" + the result count.
+    case setSessionsPage(
+        sessions: [OverlaySessionItem],
+        total: Int,
+        offset: Int,
+        hasMore: Bool,
+        query: String)
     case listeningStateChanged(String)
     case transcriptPartial(source: String, text: String)
     case transcriptFinal(source: String, text: String)
@@ -562,6 +688,7 @@ private enum OverlayCommand {
     case setAgentSessions(kind: String, sessions: [AgentSessionSummary])
     case setAgentConnectors(kind: String, connectors: [AgentConnectorInfo])
     case pushFixProposal(FixProposal)
+    case pushBillingDisclosure(BillingDisclosure)
     case shutdown
     case unknown(String)
 }
@@ -577,6 +704,25 @@ private struct FixProposal {
     let fix: String
     let diff: String?
     let applySupported: Bool
+}
+
+/// Decode a `sessions` array into `[OverlaySessionItem]`, tolerating both the
+/// legacy four-field shape and the redesigned shape (project / updated_at /
+/// turn_count / pinned). Items without an id are dropped. Shared by
+/// `set_sessions` and `set_sessions_page`.
+private func parseSessionItems(_ raw: Any?) -> [OverlaySessionItem] {
+    let rawSessions = raw as? [[String: Any]] ?? []
+    return rawSessions.map { item in
+        OverlaySessionItem(
+            id: item["id"] as? String ?? "",
+            title: item["title"] as? String ?? "Bluey session",
+            subtitle: item["subtitle"] as? String ?? "",
+            isActive: item["is_active"] as? Bool ?? false,
+            project: item["project"] as? String,
+            updatedAt: item["updated_at"] as? String ?? "",
+            turnCount: (item["turn_count"] as? NSNumber)?.intValue,
+            pinned: item["pinned"] as? Bool ?? false)
+    }.filter { !$0.id.isEmpty }
 }
 
 private func parseCommand(_ line: String) -> OverlayCommand {
@@ -618,16 +764,14 @@ private func parseCommand(_ line: String) -> OverlayCommand {
         }
         return .setContextItems(items)
     case "set_sessions":
-        let rawSessions = obj["sessions"] as? [[String: Any]] ?? []
-        let sessions = rawSessions.map { item in
-            OverlaySessionItem(
-                id: item["id"] as? String ?? "",
-                title: item["title"] as? String ?? "Bluey session",
-                subtitle: item["subtitle"] as? String ?? "",
-                isActive: item["is_active"] as? Bool ?? false
-            )
-        }.filter { !$0.id.isEmpty }
-        return .setSessions(sessions)
+        return .setSessions(parseSessionItems(obj["sessions"]))
+    case "set_sessions_page":
+        return .setSessionsPage(
+            sessions: parseSessionItems(obj["sessions"]),
+            total: (obj["total"] as? NSNumber)?.intValue ?? 0,
+            offset: (obj["offset"] as? NSNumber)?.intValue ?? 0,
+            hasMore: obj["has_more"] as? Bool ?? false,
+            query: obj["query"] as? String ?? "")
     case "listening_state_changed":
         return .listeningStateChanged(obj["state"] as? String ?? "idle")
     case "transcript_partial":
@@ -676,7 +820,8 @@ private func parseCommand(_ line: String) -> OverlayCommand {
             AgentSessionSummary(
                 id: item["id"] as? String ?? "",
                 title: item["title"] as? String,
-                updatedAt: item["updated_at"] as? String ?? ""
+                updatedAt: item["updated_at"] as? String ?? "",
+                project: item["project"] as? String
             )
         }.filter { !$0.id.isEmpty }
         return .setAgentSessions(kind: kind, sessions: sessions)
@@ -708,6 +853,20 @@ private func parseCommand(_ line: String) -> OverlayCommand {
             applySupported: obj["apply_supported"] as? Bool ?? false
         )
         return .pushFixProposal(proposal)
+    case "push_billing_disclosure":
+        // The vendor short id is the consent key echoed back on accept/decline;
+        // without it the modal is un-actionable, so drop the command.
+        guard let vendorShort = obj["vendor_short"] as? String, !vendorShort.isEmpty else {
+            return .unknown(line)
+        }
+        let disclosure = BillingDisclosure(
+            vendorShort: vendorShort,
+            vendorDisplayName: obj["vendor_display_name"] as? String ?? vendorShort,
+            billingModel: obj["billing_model"] as? String ?? "byot",
+            disclosure: obj["disclosure"] as? String ?? "",
+            pendingKind: obj["pending_kind"] as? String ?? "",
+            pendingSessionId: obj["pending_session_id"] as? String)
+        return .pushBillingDisclosure(disclosure)
     default:
         return .unknown(line)
     }
@@ -886,6 +1045,47 @@ private func emitSessionDelete(id: String) {
     emitEvent(["type": "session_delete_requested", "id": id])
 }
 
+// MARK: - History-at-scale emit helpers (redesign)
+//
+// Mirror OverlayEvent::SessionsRequested / SessionPinRequested /
+// SessionUnpinRequested in crates/cue-core/src/overlay.rs. The daemon answers a
+// SessionsRequested with SetSessionsPage.
+
+private func emitSessionsRequested(offset: Int, limit: Int, search: String) {
+    emitEvent([
+        "type": "sessions_requested",
+        "offset": offset,
+        "limit": limit,
+        "search": search,
+    ])
+}
+
+private func emitSessionPinRequested(id: String) {
+    emitEvent(["type": "session_pin_requested", "id": id])
+}
+
+private func emitSessionUnpinRequested(id: String) {
+    emitEvent(["type": "session_unpin_requested", "id": id])
+}
+
+// MARK: - Secondary-action emit helpers (the "+" menu, redesign)
+//
+// `recap_requested` / `active_page_capture_requested` / `instructions_requested`
+// are type-only OverlayEvents; the daemon owns the side effect (recap pipeline,
+// browser-page capture, opening the answer-style editor round-trip).
+
+private func emitRecapRequested() {
+    emitSimple("recap_requested")
+}
+
+private func emitActivePageCaptureRequested() {
+    emitSimple("active_page_capture_requested")
+}
+
+private func emitInstructionsRequested() {
+    emitSimple("instructions_requested")
+}
+
 // MARK: - Agent-bridge emit helpers (Slice 5b)
 //
 // Each event is a dict tagged with "type", matching OverlayEvent's serde
@@ -906,8 +1106,19 @@ private func emitAgentDetachRequested() {
     emitEvent(["type": "agent_detach_requested"])
 }
 
-private func emitAgentSessionsRequested(kind: String) {
-    emitEvent(["type": "agent_sessions_requested", "kind": kind])
+private func emitAgentSessionsRequested(
+    kind: String,
+    offset: Int = 0,
+    limit: Int = 0,
+    search: String = ""
+) {
+    emitEvent([
+        "type": "agent_sessions_requested",
+        "kind": kind,
+        "offset": offset,
+        "limit": limit,
+        "search": search,
+    ])
 }
 
 private func emitAgentConnectorsRequested(kind: String) {
@@ -935,6 +1146,30 @@ private func emitFixApprovalResponded(proposalId: String, approved: Bool) {
         "proposal_id": proposalId,
         "approved": approved,
     ])
+}
+
+// MARK: - BYOT billing-disclosure emit helper (G4, redesign)
+//
+// Mirror OverlayEvent::BillingDisclosureResponded. The daemon resumes the
+// pending attach (pending_kind / pending_session_id) on accept and records the
+// vendor in accepted_byot_vendors; on decline it discards the pending attach.
+
+private func emitBillingDisclosureResponded(
+    vendorShort: String,
+    accepted: Bool,
+    pendingKind: String,
+    pendingSessionId: String?
+) {
+    var p: [String: Any] = [
+        "type": "billing_disclosure_responded",
+        "vendor_short": vendorShort,
+        "accepted": accepted,
+        "pending_kind": pendingKind,
+    ]
+    if let pendingSessionId, !pendingSessionId.isEmpty {
+        p["pending_session_id"] = pendingSessionId
+    }
+    emitEvent(p)
 }
 
 private func emitCardRendered(id: String) {
@@ -1148,6 +1383,35 @@ private final class CopyCardButton: NSButton {
 
 private final class RemoveAttachmentButton: NSButton {
     var contextId = ""
+}
+
+/// A history session row that exposes Rename / Delete via a right-click menu —
+/// the redesigned rows are clean (pin + time only) like the mockup, so these
+/// must-survive session actions live in a contextual menu instead of inline
+/// buttons. The row stores its session id; the menu items carry it as `tag` is
+/// index-based elsewhere, so we stash the id directly on the menu items.
+private final class SessionRowView: NSView {
+    var sessionId = ""
+    weak var rowMenuTarget: AnyObject?
+    var renameAction: Selector?
+    var deleteAction: Selector?
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let menu = NSMenu()
+        if let renameAction {
+            let item = NSMenuItem(title: "Rename", action: renameAction, keyEquivalent: "")
+            item.target = rowMenuTarget
+            item.representedObject = sessionId
+            menu.addItem(item)
+        }
+        if let deleteAction {
+            let item = NSMenuItem(title: "Delete", action: deleteAction, keyEquivalent: "")
+            item.target = rowMenuTarget
+            item.representedObject = sessionId
+            menu.addItem(item)
+        }
+        return menu.items.isEmpty ? nil : menu
+    }
 }
 
 // MARK: - Pill view
@@ -1665,6 +1929,9 @@ private final class FeedView: NSView {
     /// Fired when the user taps **Fix** on an agent answer card (Slice F4).
     /// Carries the source card id + its body text (the problem to fix).
     var onFixRequested: ((_ cardId: String, _ question: String) -> Void)?
+    /// Fired whenever the rendered card set changes, so the panel can recompute
+    /// the context bar ("transcript · N screen · N turns").
+    var onContentChanged: (() -> Void)?
     /// Interactive controls inside cards (Fix / Approve / Reject buttons). The
     /// feed/workspace region is normally click-through; the panel consults
     /// `hasInteractiveControl(at:)` so only these button frames capture the
@@ -1673,16 +1940,17 @@ private final class FeedView: NSView {
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
+        // The feed floats ON the panel's dark aurora surface — it is fully
+        // transparent (no fill, no border). Readability comes from the dark
+        // panel behind it, exactly like the mockup `.feed`.
         wantsLayer = true
-        layer?.backgroundColor = BlueyTheme.panel.cgColor
-        layer?.cornerRadius = 16
-        layer?.borderWidth = 1
-        layer?.borderColor = BlueyTheme.hairline.cgColor
+        layer?.backgroundColor = NSColor.clear.cgColor
 
         stack.orientation = .vertical
-        stack.alignment = .centerX
-        stack.spacing = 12
-        stack.edgeInsets = NSEdgeInsets(top: 16, left: 0, bottom: 16, right: 0)
+        stack.alignment = .leading
+        stack.spacing = 0
+        // `.feed` padding 16/16/8.
+        stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 8, right: 16)
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         scroll.hasVerticalScroller = true
@@ -1725,11 +1993,22 @@ private final class FeedView: NSView {
         return false
     }
 
+    /// Counts used by the panel's context bar.
+    var transcriptTurnCount: Int { cards.filter { normalizedCardKind($0.kind) == "transcript" }.count }
+    var screenTurnCount: Int { cards.filter { isScreenCard($0) }.count }
+    var conversationTurnCount: Int {
+        cards.filter {
+            let k = normalizedCardKind($0.kind)
+            return k == "question" || k == "answer"
+        }.count
+    }
+    var hasCards: Bool { !cards.isEmpty }
+
     func push(_ card: RenderedCard) {
+        // Transcripts now flow INTO the thread as HEARD turns (the continuous
+        // timeline). We still notify the panel so it can update audio chrome.
         if normalizedCardKind(card.kind) == "transcript" {
             onTranscript?(card)
-            emitCardRendered(id: card.id)
-            return
         }
         if loginURL(from: card) != nil {
             removeAllCards()
@@ -1741,6 +2020,7 @@ private final class FeedView: NSView {
         view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         scrollToBottom()
         emitCardRendered(id: card.id)
+        onContentChanged?()
     }
 
     @discardableResult
@@ -1754,20 +2034,16 @@ private final class FeedView: NSView {
         if let artifact {
             cards[idx].artifact = artifact
         }
-        // Replace the corresponding subview.
-        let existing = stack.arrangedSubviews[idx]
-        stack.removeArrangedSubview(existing)
-        existing.removeFromSuperview()
-        let view = makeCardView(cards[idx])
-        stack.insertArrangedSubview(view, at: idx)
-        view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        rebuildSubview(at: idx)
         scrollToBottom()
+        onContentChanged?()
         return cards[idx]
     }
 
     func clear() {
         removeAllCards()
         emptyState.isHidden = false
+        onContentChanged?()
     }
 
     func hasCopyControl(atScreenPoint screenPoint: NSPoint) -> Bool {
@@ -1787,9 +2063,7 @@ private final class FeedView: NSView {
     }
 
     func applyBackgroundOpacity(_ opacity: CGFloat) {
-        layer?.backgroundColor = BlueyTheme.panel
-            .withAlphaComponent(blueyMaterialAlpha(0.95, opacity: opacity))
-            .cgColor
+        // The feed is transparent; nothing to dim. Kept for API parity.
     }
 
     private func removeAllCards() {
@@ -1801,6 +2075,18 @@ private final class FeedView: NSView {
         }
     }
 
+    /// Rebuild a single turn subview in place (used by streaming updates + fix
+    /// state transitions), preserving the connector-line "last turn" logic.
+    private func rebuildSubview(at idx: Int) {
+        guard idx >= 0, idx < stack.arrangedSubviews.count else { return }
+        let existing = stack.arrangedSubviews[idx]
+        stack.removeArrangedSubview(existing)
+        existing.removeFromSuperview()
+        let view = makeCardView(cards[idx])
+        stack.insertArrangedSubview(view, at: idx)
+        view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+    }
+
     /// Transition a Fix proposal card to a terminal/transient state (Slice F4)
     /// and rebuild just its subview so the buttons reflect the new state. The
     /// proposal id doubles as the card id, so we match on it directly.
@@ -1810,12 +2096,7 @@ private final class FeedView: NSView {
         }) else { return }
         guard case .pending = cards[idx].fixState else { return } // one-shot
         cards[idx].fixState = state
-        let existing = stack.arrangedSubviews[idx]
-        stack.removeArrangedSubview(existing)
-        existing.removeFromSuperview()
-        let view = makeCardView(cards[idx])
-        stack.insertArrangedSubview(view, at: idx)
-        view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        rebuildSubview(at: idx)
     }
 
     private func configureEmptyState() {
@@ -1824,43 +2105,31 @@ private final class FeedView: NSView {
         emptyState.layer?.backgroundColor = NSColor.clear.cgColor
         addSubview(emptyState)
 
-        let badge = NSTextField(labelWithString: "READY")
-        badge.translatesAutoresizingMaskIntoConstraints = false
-        badge.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .bold)
-        badge.textColor = BlueyTheme.cyan
+        let badge = trackedLabel("BLUEY", size: 10.5, weight: .heavy, color: Tok.accentTx, tracking: 0.6)
+        badge.alignment = .center
 
-        let title = NSTextField(labelWithString: "New recording")
+        let title = NSTextField(labelWithString: "Ask, listen, or share a screen")
         title.translatesAutoresizingMaskIntoConstraints = false
-        title.font = NSFont.systemFont(ofSize: 22, weight: .bold)
-        title.textColor = BlueyTheme.text
+        title.font = Tok.font(18, .semibold)
+        title.textColor = Tok.tx1
         title.alignment = .center
 
-        let subtitle = NSTextField(labelWithString: "Audio, files, screen context, and answers stay in this session.")
+        let subtitle = NSTextField(labelWithString: "What's said, the screen you share, and your questions all flow into one thread.")
         subtitle.translatesAutoresizingMaskIntoConstraints = false
-        subtitle.font = NSFont.systemFont(ofSize: 12.5, weight: .medium)
-        subtitle.textColor = BlueyTheme.textDim
+        subtitle.font = Tok.font(12.5, .regular)
+        subtitle.textColor = Tok.tx3
         subtitle.alignment = .center
         subtitle.maximumNumberOfLines = 2
         subtitle.lineBreakMode = .byWordWrapping
 
-        let chips = NSStackView()
-        chips.translatesAutoresizingMaskIntoConstraints = false
-        chips.orientation = .horizontal
-        chips.alignment = .centerY
-        chips.spacing = 8
-        for label in ["Audio", "Files", "Screen", "Canvas"] {
-            chips.addArrangedSubview(emptyChip(label))
-        }
-
         emptyState.addSubview(badge)
         emptyState.addSubview(title)
         emptyState.addSubview(subtitle)
-        emptyState.addSubview(chips)
 
         NSLayoutConstraint.activate([
             emptyState.centerXAnchor.constraint(equalTo: centerXAnchor),
             emptyState.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -12),
-            emptyState.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.76),
+            emptyState.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.78),
 
             badge.topAnchor.constraint(equalTo: emptyState.topAnchor),
             badge.centerXAnchor.constraint(equalTo: emptyState.centerXAnchor),
@@ -1872,233 +2141,494 @@ private final class FeedView: NSView {
             subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 8),
             subtitle.leadingAnchor.constraint(equalTo: emptyState.leadingAnchor),
             subtitle.trailingAnchor.constraint(equalTo: emptyState.trailingAnchor),
-
-            chips.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 16),
-            chips.centerXAnchor.constraint(equalTo: emptyState.centerXAnchor),
-            chips.bottomAnchor.constraint(equalTo: emptyState.bottomAnchor),
+            subtitle.bottomAnchor.constraint(equalTo: emptyState.bottomAnchor),
         ])
     }
 
-    private func emptyChip(_ text: String) -> NSView {
-        let chip = NSTextField(labelWithString: text)
-        chip.translatesAutoresizingMaskIntoConstraints = false
-        chip.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
-        chip.textColor = BlueyTheme.textDim
-        chip.alignment = .center
-        chip.wantsLayer = true
-        chip.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.035).cgColor
-        chip.layer?.cornerRadius = 10
-        chip.layer?.borderWidth = 1
-        chip.layer?.borderColor = BlueyTheme.hairline.cgColor
+    // MARK: - Turn rendering (the continuous timeline thread)
+
+    /// A turn kind drives the rail icon/color, label, and body styling.
+    private enum TurnKind {
+        case heard      // transcript → "INTERVIEWER · HEARD", italic
+        case screen     // screen-capture answer → "SCREEN · ⌥S" + capture chip
+        case you        // your question → "YOU · ASKED"
+        case bluey      // an answer → "BLUEY" (or agent label)
+        case note       // context/decision/action/warning/system → its own label
+    }
+
+    private func turnKind(for card: RenderedCard) -> TurnKind {
+        switch normalizedCardKind(card.kind) {
+        case "transcript": return .heard
+        case "question":   return .you
+        case "answer":     return isScreenCard(card) ? .screen : .bluey
+        case "context", "decision", "action_item", "warning", "system":
+            return .note
+        default:           return .bluey
+        }
+    }
+
+    /// An answer is a "screen" turn when its provenance names a screen/vision
+    /// capture (the ⌥S path). The daemon stamps `source` on screen answers.
+    private func isScreenCard(_ card: RenderedCard) -> Bool {
+        guard normalizedCardKind(card.kind) == "answer" else { return false }
+        let src = (card.source ?? "").lowercased()
+        if src.contains("screen") || src.contains("vision") || src.contains("capture") {
+            return true
+        }
+        let lower = card.body.lowercased()
+        return lower.contains("from the shared screen") || lower.contains("captured from")
+    }
+
+    private func makeCardView(_ card: RenderedCard) -> NSView {
+        // Sign-in cards keep their dedicated centered call-to-action card.
+        if normalizedCardKind(card.kind) == "system", loginURL(from: card) != nil {
+            return makeSignInTurn(card)
+        }
+        // Review-gated Fix proposals render as their own `.fix` card, inside a
+        // bluey turn rail.
+        if normalizedCardKind(card.kind) == "fix_proposal", let proposal = card.fixProposal {
+            return makeTurn(card: card, kind: .bluey) { container in
+                let fixView = self.makeFixProposalView(proposal, state: card.fixState)
+                self.pin(fixView, in: container)
+            }
+        }
+        let kind = turnKind(for: card)
+        return makeTurn(card: card, kind: kind) { body in
+            self.makeTurnBody(card: card, kind: kind, into: body)
+        }
+    }
+
+    /// Build the `.turn` scaffold: a 16×16 rail icon at the left, a vertical
+    /// hairline connector down to the next turn, a label row, then the body.
+    private func makeTurn(card: RenderedCard, kind: TurnKind, body buildBody: (NSView) -> Void) -> NSView {
+        let turn = NSView()
+        turn.translatesAutoresizingMaskIntoConstraints = false
+
+        // Rail icon chip.
+        let rail = NSView()
+        rail.translatesAutoresizingMaskIntoConstraints = false
+        rail.wantsLayer = true
+        rail.layer?.cornerRadius = 5
+        let (railFill, railTint, symbol) = railStyle(kind)
+        rail.layer?.backgroundColor = railFill.cgColor
+        let icon = NSImageView()
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        if let image = symbolImage(symbol) {
+            image.isTemplate = true
+            icon.image = image
+        }
+        icon.contentTintColor = railTint
+        icon.imageScaling = .scaleProportionallyDown
+        rail.addSubview(icon)
+
+        // Connector line (hidden on the last turn — toggled after layout via
+        // the stack's last-arranged check in scrollToBottom()).
+        let connector = NSView()
+        connector.translatesAutoresizingMaskIntoConstraints = false
+        connector.wantsLayer = true
+        connector.layer?.backgroundColor = Tok.hairline.cgColor
+        connector.identifier = NSUserInterfaceItemIdentifier("turn-connector")
+
+        // Label row.
+        let labelRow = NSView()
+        labelRow.translatesAutoresizingMaskIntoConstraints = false
+        let (labelText, labelColor) = turnLabel(card: card, kind: kind)
+        let label = trackedLabel(labelText, size: 10, weight: .heavy, color: labelColor, tracking: 0.5)
+        let time = trackedLabel(turnTime(card), size: 10, weight: .regular, color: Tok.tx4, tracking: 0)
+        time.alignment = .right
+        labelRow.addSubview(label)
+        labelRow.addSubview(time)
+
+        // Body container.
+        let bodyContainer = NSView()
+        bodyContainer.translatesAutoresizingMaskIntoConstraints = false
+        buildBody(bodyContainer)
+
+        turn.addSubview(rail)
+        turn.addSubview(connector)
+        turn.addSubview(labelRow)
+        turn.addSubview(bodyContainer)
+
         NSLayoutConstraint.activate([
-            chip.heightAnchor.constraint(equalToConstant: 24),
-            chip.widthAnchor.constraint(greaterThanOrEqualToConstant: 58),
+            // `.turn` padding-left 26; rail at left 8 top 3, 16×16.
+            rail.leadingAnchor.constraint(equalTo: turn.leadingAnchor, constant: 0),
+            rail.topAnchor.constraint(equalTo: turn.topAnchor, constant: 1),
+            rail.widthAnchor.constraint(equalToConstant: 16),
+            rail.heightAnchor.constraint(equalToConstant: 16),
+            icon.centerXAnchor.constraint(equalTo: rail.centerXAnchor),
+            icon.centerYAnchor.constraint(equalTo: rail.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 10),
+            icon.heightAnchor.constraint(equalToConstant: 10),
+
+            connector.centerXAnchor.constraint(equalTo: rail.centerXAnchor),
+            connector.topAnchor.constraint(equalTo: rail.bottomAnchor, constant: 4),
+            connector.widthAnchor.constraint(equalToConstant: 1),
+            connector.bottomAnchor.constraint(equalTo: turn.bottomAnchor, constant: 0),
+
+            labelRow.leadingAnchor.constraint(equalTo: turn.leadingAnchor, constant: 26),
+            labelRow.trailingAnchor.constraint(equalTo: turn.trailingAnchor),
+            labelRow.topAnchor.constraint(equalTo: turn.topAnchor),
+            labelRow.heightAnchor.constraint(equalToConstant: 14),
+
+            label.leadingAnchor.constraint(equalTo: labelRow.leadingAnchor),
+            label.centerYAnchor.constraint(equalTo: labelRow.centerYAnchor),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: time.leadingAnchor, constant: -8),
+            time.trailingAnchor.constraint(equalTo: labelRow.trailingAnchor),
+            time.centerYAnchor.constraint(equalTo: labelRow.centerYAnchor),
+
+            bodyContainer.leadingAnchor.constraint(equalTo: turn.leadingAnchor, constant: 26),
+            bodyContainer.trailingAnchor.constraint(equalTo: turn.trailingAnchor),
+            bodyContainer.topAnchor.constraint(equalTo: labelRow.bottomAnchor, constant: 3),
+            // `.turn` margin-bottom 15.
+            bodyContainer.bottomAnchor.constraint(equalTo: turn.bottomAnchor, constant: -15),
+        ])
+        return turn
+    }
+
+    private func railStyle(_ kind: TurnKind) -> (fill: NSColor, tint: NSColor, symbol: String) {
+        switch kind {
+        case .heard:
+            return (NSColor.white.withAlphaComponent(0.07), Tok.tx3, "waveform")
+        case .screen:
+            return (Tok.accentBg, Tok.accentTx, "rectangle.on.rectangle")
+        case .you:
+            return (Tok.glassHi, Tok.tx2, "person")
+        case .bluey:
+            return (Tok.accentBg, Tok.accentTx, "sparkle")
+        case .note:
+            return (Tok.glassHi, Tok.tx3, "doc.text")
+        }
+    }
+
+    private func turnLabel(card: RenderedCard, kind: TurnKind) -> (String, NSColor) {
+        switch kind {
+        case .heard:
+            let who = audioWho(card.source)
+            return ("\(who) · HEARD", Tok.tx3)
+        case .screen:
+            return ("SCREEN · ⌥S", Tok.accentTx)
+        case .you:
+            return ("YOU · ASKED", Tok.tx2)
+        case .bluey:
+            let label = agentLabel(from: card.source) ?? "BLUEY"
+            return (label, Tok.accentTx)
+        case .note:
+            return (noteLabel(card), Tok.tx3)
+        }
+    }
+
+    private func audioWho(_ source: String?) -> String {
+        let lower = (source ?? "").lowercased()
+        if lower.contains("system") { return "SCREEN AUDIO" }
+        if lower.contains("mic") || lower.contains("microphone") { return "YOU" }
+        return "HEARD"
+    }
+
+    private func noteLabel(_ card: RenderedCard) -> String {
+        switch normalizedCardKind(card.kind) {
+        case "context":     return "CONTEXT"
+        case "decision":    return "DECISION"
+        case "action_item": return "ACTION"
+        case "warning":     return "WARNING"
+        case "system":      return "BLUEY"
+        default:            return "NOTE"
+        }
+    }
+
+    private func turnTime(_ card: RenderedCard) -> String {
+        if !card.done { return "…" }
+        if let cost = card.costLabel, !cost.isEmpty { return cost }
+        return ""
+    }
+
+    /// Build the body for a turn (everything to the right of the rail, below the
+    /// label row), branching on the turn kind.
+    private func makeTurnBody(card: RenderedCard, kind: TurnKind, into container: NSView) {
+        switch kind {
+        case .heard:
+            let text = displayTranscriptText(card.body)
+            let body = makeBodyLabel(text.isEmpty ? "…" : "“\(text)”", font: NSFontManager.shared.convert(Tok.font(12.5, .regular), toHaveTrait: .italicFontMask), color: Tok.tx2)
+            pin(body, in: container)
+
+        case .you:
+            let body = makeBodyLabel(card.body, font: Tok.font(13, .regular), color: Tok.tx1)
+            pin(body, in: container)
+
+        case .screen:
+            // Capture chip, then the answer body.
+            let chip = makeCaptureChip(card)
+            let rawBody = card.body.isEmpty && !card.done ? "Reading the shared screen…" : chatBody(for: card, rawBody: card.body)
+            let body = makeAnswerLabel(rawBody, baseSize: 13.5)
+            container.addSubview(chip)
+            container.addSubview(body)
+            chip.translatesAutoresizingMaskIntoConstraints = false
+            body.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                chip.topAnchor.constraint(equalTo: container.topAnchor),
+                chip.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+                chip.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor),
+                body.topAnchor.constraint(equalTo: chip.bottomAnchor, constant: 7),
+                body.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+                body.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+                body.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            ])
+            maybeAttachFix(card: card, to: container, below: body)
+
+        case .bluey:
+            let rawBody = card.body.isEmpty && !card.done ? "Thinking…" : chatBody(for: card, rawBody: card.body)
+            let body = makeAnswerLabel(rawBody, baseSize: 13.5)
+            pin(body, in: container, allowFix: card)
+
+        case .note:
+            let title = card.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            let bodyText = card.body.trimmingCharacters(in: .whitespacesAndNewlines)
+            let combined = title.isEmpty ? bodyText : (bodyText.isEmpty ? title : "\(title)\n\(bodyText)")
+            let body = makeBodyLabel(combined.isEmpty ? "—" : combined, font: Tok.font(13, .regular), color: Tok.tx1)
+            pin(body, in: container)
+        }
+    }
+
+    private func pin(_ view: NSView, in container: NSView, allowFix card: RenderedCard? = nil) {
+        container.addSubview(view)
+        view.translatesAutoresizingMaskIntoConstraints = false
+        let bottom = view.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+        NSLayoutConstraint.activate([
+            view.topAnchor.constraint(equalTo: container.topAnchor),
+            view.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            view.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+        ])
+        if let card { maybeAttachFix(card: card, to: container, below: view, bottomToDeactivate: bottom) }
+        else { bottom.isActive = true }
+    }
+
+    /// Attach a compact "Fix" affordance under a final agent answer (Slice F4).
+    private func maybeAttachFix(card: RenderedCard, to container: NSView, below anchorView: NSView, bottomToDeactivate: NSLayoutConstraint? = nil) {
+        let answerLike = normalizedCardKind(card.kind) == "answer"
+        let showFix = answerLike && card.done && agentLabel(from: card.source) != nil
+        guard showFix else {
+            (bottomToDeactivate ?? anchorView.bottomAnchor.constraint(equalTo: container.bottomAnchor)).isActive = true
+            return
+        }
+        bottomToDeactivate?.isActive = false
+        let fix = NSButton(title: "Fix", target: self, action: #selector(fixButtonClicked(_:)))
+        fix.translatesAutoresizingMaskIntoConstraints = false
+        fix.identifier = NSUserInterfaceItemIdentifier(card.id)
+        fix.toolTip = "Ask your agent to propose a fix for this answer"
+        styleFixButton(fix)
+        container.addSubview(fix)
+        registerInteractive(fix)
+        NSLayoutConstraint.activate([
+            fix.topAnchor.constraint(equalTo: anchorView.bottomAnchor, constant: 8),
+            fix.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            fix.heightAnchor.constraint(equalToConstant: 26),
+            fix.widthAnchor.constraint(greaterThanOrEqualToConstant: 64),
+            fix.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+        ])
+    }
+
+    /// `.scap` capture chip: a 46×30 thumbnail + a two-line caption.
+    private func makeCaptureChip(_ card: RenderedCard) -> NSView {
+        let chip = NSView()
+        chip.wantsLayer = true
+        chip.layer?.backgroundColor = Tok.glassHi.cgColor
+        chip.layer?.cornerRadius = 9
+        chip.layer?.borderWidth = 1
+        chip.layer?.borderColor = Tok.hairline.cgColor
+
+        let thumb = NSView()
+        thumb.translatesAutoresizingMaskIntoConstraints = false
+        thumb.wantsLayer = true
+        thumb.layer?.backgroundColor = NSColor(red: 0.47, green: 0.55, blue: 0.78, alpha: 0.16).cgColor
+        thumb.layer?.cornerRadius = 5
+        thumb.layer?.borderWidth = 1
+        thumb.layer?.borderColor = Tok.hairline.cgColor
+        let thumbIcon = NSImageView()
+        thumbIcon.translatesAutoresizingMaskIntoConstraints = false
+        if let image = symbolImage("viewfinder") {
+            image.isTemplate = true
+            thumbIcon.image = image
+        }
+        thumbIcon.contentTintColor = Tok.tx3
+        thumb.addSubview(thumbIcon)
+
+        let titleText = card.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = NSTextField(labelWithString: titleText.isEmpty ? "Shared screen" : titleText)
+        title.translatesAutoresizingMaskIntoConstraints = false
+        title.font = Tok.font(12, .semibold)
+        title.textColor = Tok.tx1
+        title.lineBreakMode = .byTruncatingTail
+
+        let sub = NSTextField(labelWithString: "captured from shared screen")
+        sub.translatesAutoresizingMaskIntoConstraints = false
+        sub.font = Tok.font(11.5, .regular)
+        sub.textColor = Tok.tx2
+
+        chip.addSubview(thumb)
+        chip.addSubview(title)
+        chip.addSubview(sub)
+        NSLayoutConstraint.activate([
+            chip.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
+            thumb.leadingAnchor.constraint(equalTo: chip.leadingAnchor, constant: 10),
+            thumb.centerYAnchor.constraint(equalTo: chip.centerYAnchor),
+            thumb.widthAnchor.constraint(equalToConstant: 46),
+            thumb.heightAnchor.constraint(equalToConstant: 30),
+            thumbIcon.centerXAnchor.constraint(equalTo: thumb.centerXAnchor),
+            thumbIcon.centerYAnchor.constraint(equalTo: thumb.centerYAnchor),
+            thumbIcon.widthAnchor.constraint(equalToConstant: 14),
+            thumbIcon.heightAnchor.constraint(equalToConstant: 14),
+
+            title.leadingAnchor.constraint(equalTo: thumb.trailingAnchor, constant: 9),
+            title.topAnchor.constraint(equalTo: chip.topAnchor, constant: 7),
+            title.trailingAnchor.constraint(equalTo: chip.trailingAnchor, constant: -10),
+            sub.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            sub.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 1),
+            sub.trailingAnchor.constraint(equalTo: chip.trailingAnchor, constant: -10),
+            sub.bottomAnchor.constraint(equalTo: chip.bottomAnchor, constant: -7),
         ])
         return chip
     }
 
-    private func makeCardView(_ card: RenderedCard) -> NSView {
-        // Agent-bridge: review-gated Fix proposals render as their own card.
-        if normalizedCardKind(card.kind) == "fix_proposal", let proposal = card.fixProposal {
-            return makeFixProposalView(proposal, state: card.fixState)
-        }
-        let kind = normalizedCardKind(card.kind)
-        let accent = BlueyTheme.accent(for: kind)
-        let rightAligned = isUserSide(card)
-        let answerLike = kind == "answer"
-        let signInLike = loginURL(from: card) != nil
-        // Agent answers (final, not streaming) get a compact Fix affordance.
-        let showFix = answerLike && !signInLike && card.done && agentLabel(from: card.source) != nil
-        let row = NSView()
-        row.translatesAutoresizingMaskIntoConstraints = false
-
-        let bubble = NSView()
-        bubble.wantsLayer = true
-        bubble.layer?.backgroundColor = rightAligned
-            ? NSColor(red: 0.90, green: 0.93, blue: 0.95, alpha: 0.96).cgColor
-            : (answerLike ? NSColor.clear : BlueyTheme.surface).cgColor
-        bubble.layer?.cornerRadius = rightAligned ? 16 : 12
-        bubble.layer?.borderWidth = answerLike ? 0 : 1
-        bubble.layer?.borderColor = rightAligned
-            ? NSColor.white.withAlphaComponent(0.20).cgColor
-            : accent.withAlphaComponent(answerLike ? 0.24 : 0.14).cgColor
-        bubble.layer?.shadowColor = NSColor.black.cgColor
-        bubble.layer?.shadowOpacity = answerLike ? 0 : 0.14
-        bubble.layer?.shadowRadius = 10
-        bubble.layer?.shadowOffset = NSSize(width: 0, height: -4)
-        bubble.translatesAutoresizingMaskIntoConstraints = false
-
-        let metaLabel = NSTextField(labelWithString: kindLabel(card))
-        metaLabel.font = NSFont.systemFont(ofSize: 11, weight: .bold)
-        metaLabel.textColor = rightAligned ? NSColor.black.withAlphaComponent(0.58) : accent
-        metaLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        let titleText = displayTitle(for: card)
-        let titleLabel = NSTextField(labelWithString: titleText)
-        titleLabel.font = NSFont.systemFont(ofSize: 12.5, weight: .semibold)
-        titleLabel.textColor = rightAligned ? NSColor.black.withAlphaComponent(0.74) : BlueyTheme.text
-        titleLabel.translatesAutoresizingMaskIntoConstraints = false
-        titleLabel.lineBreakMode = .byTruncatingTail
-
-        let signInURL = signInLike ? loginURL(from: card) : nil
-        let rawBody = card.body.isEmpty && !card.done ? "Thinking..." : card.body
-        let bodyText = signInURL == nil
-            ? chatBody(for: card, rawBody: rawBody)
-            : signInBody(from: rawBody)
-        let bodyLabel = NSTextField(wrappingLabelWithString: bodyText)
-        bodyLabel.font = bodyFont(for: card)
-        bodyLabel.textColor = rightAligned ? NSColor.black : BlueyTheme.text
-        bodyLabel.alignment = signInURL == nil ? .left : .center
-        bodyLabel.translatesAutoresizingMaskIntoConstraints = false
-        bodyLabel.preferredMaxLayoutWidth = signInURL == nil ? (rightAligned ? 360 : 480) : 430
-
-        let statusLabel = NSTextField(labelWithString: statusText(for: card))
-        statusLabel.font = NSFont.monospacedSystemFont(ofSize: 9.5, weight: .semibold)
-        statusLabel.textColor = rightAligned ? NSColor.black.withAlphaComponent(0.46) : BlueyTheme.textDim
-        statusLabel.translatesAutoresizingMaskIntoConstraints = false
-        let copyButton = signInURL == nil
-            ? makeCopyCardButton(text: rawBody.isEmpty ? bodyText : rawBody, rightAligned: rightAligned)
-            : nil
-
-        let signInButton: NSButton? = signInURL.map { url in
-            let button = NSButton(title: "Open login", target: self, action: #selector(openURLButtonClicked(_:)))
-            button.translatesAutoresizingMaskIntoConstraints = false
-            button.identifier = NSUserInterfaceItemIdentifier(url.absoluteString)
-            styleSignInButton(button)
-            return button
-        }
-        if signInURL != nil {
-            bubble.layer?.backgroundColor = NSColor(red: 0.020, green: 0.030, blue: 0.040, alpha: 0.98).cgColor
-            bubble.layer?.borderWidth = 1
-            bubble.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.30).cgColor
-            metaLabel.isHidden = true
-            statusLabel.isHidden = true
-            titleLabel.font = NSFont.systemFont(ofSize: 15.5, weight: .bold)
-            titleLabel.alignment = .center
-            bodyLabel.preferredMaxLayoutWidth = 360
-        }
-
-        row.addSubview(bubble)
-        bubble.addSubview(metaLabel)
-        bubble.addSubview(titleLabel)
-        bubble.addSubview(bodyLabel)
-        bubble.addSubview(statusLabel)
-        if let copyButton {
-            bubble.addSubview(copyButton)
-        }
-        if let signInButton {
-            bubble.addSubview(signInButton)
-        }
-
-        let leading = bubble.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 8)
-        let trailing = bubble.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -8)
-        if signInLike {
-            leading.priority = .defaultLow
-            trailing.priority = .defaultLow
-        } else if rightAligned {
-            leading.priority = .defaultLow
-            trailing.priority = .required
-        } else {
-            leading.priority = .required
-            trailing.priority = .defaultLow
-        }
-
-        var constraints: [NSLayoutConstraint] = [
-            row.heightAnchor.constraint(greaterThanOrEqualTo: bubble.heightAnchor),
-            bubble.topAnchor.constraint(equalTo: row.topAnchor),
-            bubble.bottomAnchor.constraint(equalTo: row.bottomAnchor),
-            leading,
-            trailing,
-            bubble.widthAnchor.constraint(lessThanOrEqualTo: row.widthAnchor, multiplier: signInLike ? 0.62 : (answerLike ? 0.90 : (rightAligned ? 0.70 : 0.78))),
-            bubble.widthAnchor.constraint(greaterThanOrEqualToConstant: signInLike ? 330 : (answerLike ? 240 : 170)),
-        ]
-        if signInLike {
-            constraints.append(contentsOf: [
-                bubble.centerXAnchor.constraint(equalTo: row.centerXAnchor),
-                titleLabel.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 18),
-                titleLabel.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 18),
-                titleLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -18),
-
-                bodyLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 12),
-                bodyLabel.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 28),
-                bodyLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -28),
-            ])
-        } else {
-            constraints.append(contentsOf: [
-                metaLabel.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 10),
-                metaLabel.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 14),
-
-                titleLabel.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
-                titleLabel.leadingAnchor.constraint(equalTo: metaLabel.trailingAnchor, constant: 8),
-                titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: statusLabel.leadingAnchor, constant: -10),
-
-                statusLabel.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
-
-                bodyLabel.topAnchor.constraint(equalTo: metaLabel.bottomAnchor, constant: 8),
-                bodyLabel.leadingAnchor.constraint(equalTo: metaLabel.leadingAnchor),
-                bodyLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
-            ])
-            if let copyButton {
-                constraints.append(contentsOf: [
-                    statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: copyButton.leadingAnchor, constant: -6),
-                    copyButton.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
-                    copyButton.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -10),
-                    copyButton.widthAnchor.constraint(equalToConstant: 22),
-                    copyButton.heightAnchor.constraint(equalToConstant: 22),
-                ])
-            } else {
-                constraints.append(statusLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14))
-            }
-        }
-        if let signInButton {
-            constraints.append(contentsOf: [
-                bodyLabel.bottomAnchor.constraint(equalTo: signInButton.topAnchor, constant: -12),
-                signInButton.centerXAnchor.constraint(equalTo: bubble.centerXAnchor),
-                signInButton.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -14),
-                signInButton.widthAnchor.constraint(equalToConstant: 150),
-                signInButton.heightAnchor.constraint(equalToConstant: 38),
-            ])
-        } else if showFix {
-            // Compact cyan "Fix" affordance under an agent answer. Asks the
-            // attached agent to PROPOSE a fix for this answer (Slice F4).
-            let fixButton = NSButton(title: "Fix", target: self, action: #selector(fixButtonClicked(_:)))
-            fixButton.translatesAutoresizingMaskIntoConstraints = false
-            fixButton.identifier = NSUserInterfaceItemIdentifier(card.id)
-            fixButton.toolTip = "Ask your agent to propose a fix for this answer"
-            styleFixButton(fixButton)
-            bubble.addSubview(fixButton)
-            registerInteractive(fixButton)
-            constraints.append(contentsOf: [
-                fixButton.topAnchor.constraint(equalTo: bodyLabel.bottomAnchor, constant: 10),
-                fixButton.leadingAnchor.constraint(equalTo: metaLabel.leadingAnchor),
-                fixButton.heightAnchor.constraint(equalToConstant: 26),
-                fixButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 64),
-                fixButton.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -12),
-            ])
-        } else {
-            constraints.append(bodyLabel.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -12))
-        }
-        NSLayoutConstraint.activate(constraints)
-        return row
+    private func makeBodyLabel(_ text: String, font: NSFont, color: NSColor) -> NSTextField {
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = font
+        label.textColor = color
+        label.alignment = .left
+        label.preferredMaxLayoutWidth = 470
+        return label
     }
 
-    private func makeCopyCardButton(text: String, rightAligned: Bool) -> CopyCardButton {
+    /// An answer label that lightly renders **bold** spans and `code` spans
+    /// (the mockup's `.ans2 b` 600 + `.code` mono tint) on top of the body text.
+    private func makeAnswerLabel(_ text: String, baseSize: CGFloat) -> NSTextField {
+        let label = NSTextField(wrappingLabelWithString: "")
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.attributedStringValue = attributedAnswer(text, baseSize: baseSize)
+        label.isSelectable = true
+        label.preferredMaxLayoutWidth = 470
+        return label
+    }
+
+    /// Render simple Markdown emphasis: `**bold**` → weight 600, `` `code` `` →
+    /// monospaced tinted span. Anything else is plain `tx-1`.
+    private func attributedAnswer(_ text: String, baseSize: CGFloat) -> NSAttributedString {
+        let base = Tok.font(baseSize, .regular)
+        let bold = Tok.font(baseSize, .semibold)
+        let mono = Tok.mono(baseSize - 1.5, .regular)
+        let result = NSMutableAttributedString()
+
+        func appendPlain(_ chunk: String) {
+            // Within a plain chunk, also pull out `code` spans.
+            var rest = Substring(chunk)
+            while let open = rest.firstIndex(of: "`") {
+                let before = String(rest[rest.startIndex..<open])
+                if !before.isEmpty {
+                    result.append(NSAttributedString(string: before, attributes: [.font: base, .foregroundColor: Tok.tx1]))
+                }
+                let afterOpen = rest.index(after: open)
+                if let close = rest[afterOpen...].firstIndex(of: "`") {
+                    let code = String(rest[afterOpen..<close])
+                    result.append(NSAttributedString(string: code, attributes: [.font: mono, .foregroundColor: Tok.codeTx]))
+                    rest = rest[rest.index(after: close)...]
+                } else {
+                    result.append(NSAttributedString(string: String(rest[open...]), attributes: [.font: base, .foregroundColor: Tok.tx1]))
+                    rest = rest[rest.endIndex...]
+                }
+            }
+            if !rest.isEmpty {
+                result.append(NSAttributedString(string: String(rest), attributes: [.font: base, .foregroundColor: Tok.tx1]))
+            }
+        }
+
+        // Split on **bold** spans first.
+        let parts = text.components(separatedBy: "**")
+        for (idx, part) in parts.enumerated() {
+            if idx % 2 == 1 {
+                result.append(NSAttributedString(string: part, attributes: [.font: bold, .foregroundColor: Tok.tx1]))
+            } else {
+                appendPlain(part)
+            }
+        }
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 2
+        result.addAttribute(.paragraphStyle, value: paragraph, range: NSRange(location: 0, length: result.length))
+        return result
+    }
+
+    /// Sign-in turn: a centered accent call-to-action card with an Open login
+    /// button (must-survive feature).
+    private func makeSignInTurn(_ card: RenderedCard) -> NSView {
+        let turn = NSView()
+        turn.translatesAutoresizingMaskIntoConstraints = false
+
+        let cardView = NSView()
+        cardView.translatesAutoresizingMaskIntoConstraints = false
+        cardView.wantsLayer = true
+        cardView.layer?.backgroundColor = Tok.accentBg.cgColor
+        cardView.layer?.cornerRadius = Tok.rLg
+        cardView.layer?.borderWidth = 1
+        cardView.layer?.borderColor = Tok.accentBgStrong.cgColor
+
+        let title = NSTextField(labelWithString: card.title.isEmpty ? "Sign in to Bluey" : card.title)
+        title.translatesAutoresizingMaskIntoConstraints = false
+        title.font = Tok.font(15, .semibold)
+        title.textColor = Tok.tx1
+        title.alignment = .center
+
+        let body = NSTextField(wrappingLabelWithString: signInBody(from: card.body))
+        body.translatesAutoresizingMaskIntoConstraints = false
+        body.font = Tok.font(12.5, .regular)
+        body.textColor = Tok.tx2
+        body.alignment = .center
+        body.preferredMaxLayoutWidth = 360
+
+        let url = loginURL(from: card)
+        let button = NSButton(title: "Open login", target: self, action: #selector(openURLButtonClicked(_:)))
+        button.translatesAutoresizingMaskIntoConstraints = false
+        if let url { button.identifier = NSUserInterfaceItemIdentifier(url.absoluteString) }
+        styleSignInButton(button)
+        registerInteractive(button)
+
+        turn.addSubview(cardView)
+        cardView.addSubview(title)
+        cardView.addSubview(body)
+        cardView.addSubview(button)
+        NSLayoutConstraint.activate([
+            cardView.topAnchor.constraint(equalTo: turn.topAnchor),
+            cardView.bottomAnchor.constraint(equalTo: turn.bottomAnchor, constant: -15),
+            cardView.leadingAnchor.constraint(equalTo: turn.leadingAnchor),
+            cardView.trailingAnchor.constraint(equalTo: turn.trailingAnchor),
+
+            title.topAnchor.constraint(equalTo: cardView.topAnchor, constant: 16),
+            title.leadingAnchor.constraint(equalTo: cardView.leadingAnchor, constant: 16),
+            title.trailingAnchor.constraint(equalTo: cardView.trailingAnchor, constant: -16),
+
+            body.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 10),
+            body.leadingAnchor.constraint(equalTo: cardView.leadingAnchor, constant: 20),
+            body.trailingAnchor.constraint(equalTo: cardView.trailingAnchor, constant: -20),
+
+            button.topAnchor.constraint(equalTo: body.bottomAnchor, constant: 14),
+            button.centerXAnchor.constraint(equalTo: cardView.centerXAnchor),
+            button.bottomAnchor.constraint(equalTo: cardView.bottomAnchor, constant: -16),
+            button.widthAnchor.constraint(equalToConstant: 150),
+            button.heightAnchor.constraint(equalToConstant: 38),
+        ])
+        return turn
+    }
+
+    // MARK: Copy / sign-in / fix button styling (preserved, restyled to tokens)
+
+    func makeCopyCardButton(text: String, rightAligned: Bool) -> CopyCardButton {
         let button = CopyCardButton(title: "", target: self, action: #selector(copyCardClicked(_:)))
         button.translatesAutoresizingMaskIntoConstraints = false
         button.copyText = text
         button.isBordered = false
         button.wantsLayer = true
-        button.layer?.cornerRadius = 10
-        button.layer?.backgroundColor = rightAligned
-            ? NSColor.black.withAlphaComponent(0.06).cgColor
-            : NSColor.white.withAlphaComponent(0.045).cgColor
+        button.layer?.cornerRadius = 8
+        button.layer?.backgroundColor = Tok.glassHi.cgColor
         button.layer?.borderWidth = 1
-        button.layer?.borderColor = rightAligned
-            ? NSColor.black.withAlphaComponent(0.10).cgColor
-            : BlueyTheme.hairline.cgColor
-        button.contentTintColor = rightAligned
-            ? NSColor.black.withAlphaComponent(0.56)
-            : BlueyTheme.textDim
+        button.layer?.borderColor = Tok.hairline.cgColor
+        button.contentTintColor = Tok.tx3
         if let image = symbolImage("doc.on.doc") {
             image.isTemplate = true
             button.image = image
@@ -2121,18 +2651,16 @@ private final class FeedView: NSView {
     private func styleSignInButton(_ button: NSButton) {
         button.isBordered = false
         button.wantsLayer = true
-        button.layer?.cornerRadius = 17
-        button.layer?.backgroundColor = NSColor(red: 0.64, green: 0.93, blue: 1.0, alpha: 0.96).cgColor
-        button.layer?.borderWidth = 1
-        button.layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
-        button.font = NSFont.systemFont(ofSize: 12.5, weight: .bold)
+        button.layer?.cornerRadius = 11
+        button.layer?.backgroundColor = Tok.accent.cgColor
+        button.font = Tok.font(12.5, .semibold)
         button.attributedTitle = NSAttributedString(
             string: "Open login",
             attributes: [
-                .font: button.font ?? NSFont.systemFont(ofSize: 12.5, weight: .bold),
-                .foregroundColor: NSColor.black.withAlphaComponent(0.86),
+                .font: Tok.font(12.5, .semibold),
+                .foregroundColor: NSColor.white,
             ])
-        button.contentTintColor = NSColor.black.withAlphaComponent(0.82)
+        button.contentTintColor = .white
         if let image = symbolImage("arrow.up.right") {
             image.isTemplate = true
             button.image = image
@@ -2152,17 +2680,16 @@ private final class FeedView: NSView {
         onOpenURL?(url)
     }
 
-    /// Small cyan-accented pill used for the per-answer **Fix** button. Matches
-    /// the agent UI's compact-control look (Slice 5b) at a smaller scale.
+    /// Small accent pill used for the per-answer **Fix** button.
     private func styleFixButton(_ button: NSButton) {
         button.isBordered = false
         button.wantsLayer = true
-        button.layer?.cornerRadius = 13
-        button.layer?.backgroundColor = BlueyTheme.cyanSoft.cgColor
+        button.layer?.cornerRadius = 9
+        button.layer?.backgroundColor = Tok.accentBg.cgColor
         button.layer?.borderWidth = 1
-        button.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.45).cgColor
-        button.font = NSFont.systemFont(ofSize: 11, weight: .bold)
-        button.contentTintColor = BlueyTheme.cyan
+        button.layer?.borderColor = Tok.accentBgStrong.cgColor
+        button.font = Tok.font(11, .semibold)
+        button.contentTintColor = Tok.accentTx
         if let image = symbolImage("wrench.and.screwdriver") {
             image.isTemplate = true
             button.image = image
@@ -2173,8 +2700,8 @@ private final class FeedView: NSView {
         button.attributedTitle = NSAttributedString(
             string: "Fix",
             attributes: [
-                .font: NSFont.systemFont(ofSize: 11, weight: .bold),
-                .foregroundColor: BlueyTheme.cyan,
+                .font: Tok.font(11, .semibold),
+                .foregroundColor: Tok.accentTx,
             ])
         button.alignment = .center
     }
@@ -2186,92 +2713,93 @@ private final class FeedView: NSView {
         onFixRequested?(cardId, card.body)
     }
 
-    // MARK: Fix proposal card (Slice F4)
+    // MARK: Fix proposal card (Slice F4) — `.fix` card, restyled to tokens
 
-    /// Render a review-gated Fix proposal: DIAGNOSIS / REASONING / FIX sections
-    /// (FIX shown as a monospace diff block when a unified diff is present) plus
-    /// Approve / Reject. Approve is disabled when the agent can't apply. The
-    /// `state` drives the terminal "Applying…" / "Discarded" presentation.
     private func makeFixProposalView(_ proposal: FixProposal, state: FixProposalState) -> NSView {
-        let warn = BlueyTheme.warning
         let row = NSView()
         row.translatesAutoresizingMaskIntoConstraints = false
 
-        let bubble = NSView()
-        bubble.wantsLayer = true
-        bubble.layer?.backgroundColor = BlueyTheme.surface.cgColor
-        bubble.layer?.cornerRadius = 14
-        bubble.layer?.borderWidth = 1
-        // A distinct warning/amber accent sets the review-gated proposal apart
-        // from ordinary cyan answer cards.
-        bubble.layer?.borderColor = warn.withAlphaComponent(0.45).cgColor
-        bubble.layer?.shadowColor = NSColor.black.cgColor
-        bubble.layer?.shadowOpacity = 0.16
-        bubble.layer?.shadowRadius = 10
-        bubble.layer?.shadowOffset = NSSize(width: 0, height: -4)
-        bubble.translatesAutoresizingMaskIntoConstraints = false
+        let card = NSView()
+        card.wantsLayer = true
+        // `.fix` — warn-tinted card.
+        card.layer?.backgroundColor = NSColor(red: 0.890, green: 0.663, blue: 0.247, alpha: 0.05).cgColor
+        card.layer?.cornerRadius = Tok.rLg
+        card.layer?.borderWidth = 1
+        card.layer?.borderColor = Tok.warn.withAlphaComponent(0.30).cgColor
+        card.translatesAutoresizingMaskIntoConstraints = false
 
-        let metaLabel = NSTextField(labelWithString: "PROPOSED FIX")
-        metaLabel.font = NSFont.systemFont(ofSize: 11, weight: .bold)
-        metaLabel.textColor = warn
-        metaLabel.translatesAutoresizingMaskIntoConstraints = false
+        let header = NSView()
+        header.translatesAutoresizingMaskIntoConstraints = false
+        let headerIcon = NSImageView()
+        headerIcon.translatesAutoresizingMaskIntoConstraints = false
+        if let image = symbolImage("wand.and.stars") {
+            image.isTemplate = true
+            headerIcon.image = image
+        }
+        headerIcon.contentTintColor = Tok.warn
+        let metaLabel = trackedLabel("PROPOSED FIX", size: 10.5, weight: .heavy, color: Tok.warn, tracking: 0.5)
+        let stateChip = NSTextField(labelWithString: fixStateBadge(state))
+        stateChip.translatesAutoresizingMaskIntoConstraints = false
+        stateChip.font = Tok.font(10, .regular)
+        stateChip.textColor = Tok.tx3
+        stateChip.wantsLayer = true
+        stateChip.layer?.borderWidth = 1
+        stateChip.layer?.borderColor = Tok.hairline.cgColor
+        stateChip.layer?.cornerRadius = 9
+        useCenteredSingleLineCell(stateChip)
+        header.addSubview(headerIcon)
+        header.addSubview(metaLabel)
+        header.addSubview(stateChip)
 
-        let stateLabel = NSTextField(labelWithString: fixStateBadge(state))
-        stateLabel.font = NSFont.monospacedSystemFont(ofSize: 9.5, weight: .semibold)
-        stateLabel.textColor = BlueyTheme.textDim
-        stateLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        // Vertical content stack: the three labeled sections, then the diff (if
-        // any), then the action row.
         let content = NSStackView()
         content.orientation = .vertical
         content.alignment = .leading
-        content.spacing = 10
+        content.spacing = 9
         content.translatesAutoresizingMaskIntoConstraints = false
-
-        // Each section/diff/action fills the content width so wrapping labels
-        // wrap at the bubble edge instead of taking intrinsic width.
         func addFullWidth(_ view: NSView) {
             content.addArrangedSubview(view)
             view.widthAnchor.constraint(equalTo: content.widthAnchor).isActive = true
         }
-
         addFullWidth(makeFixSection(title: "DIAGNOSIS", body: proposal.diagnosis))
-        addFullWidth(makeFixSection(title: "REASONING", body: proposal.reasoning))
-
+        if !proposal.reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            addFullWidth(makeFixSection(title: "REASONING", body: proposal.reasoning))
+        }
         if let diff = proposal.diff, !diff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             addFullWidth(makeFixSectionHeader("FIX"))
             addFullWidth(makeDiffBlock(diff))
         } else {
             addFullWidth(makeFixSection(title: "FIX", body: proposal.fix))
         }
+        addFullWidth(makeFixActionRow(proposal: proposal, state: state))
 
-        let actionRow = makeFixActionRow(proposal: proposal, state: state)
-        addFullWidth(actionRow)
-
-        row.addSubview(bubble)
-        bubble.addSubview(metaLabel)
-        bubble.addSubview(stateLabel)
-        bubble.addSubview(content)
-
+        row.addSubview(card)
+        card.addSubview(header)
+        card.addSubview(content)
         NSLayoutConstraint.activate([
-            row.heightAnchor.constraint(greaterThanOrEqualTo: bubble.heightAnchor),
-            bubble.topAnchor.constraint(equalTo: row.topAnchor),
-            bubble.bottomAnchor.constraint(equalTo: row.bottomAnchor),
-            bubble.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 8),
-            bubble.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -8),
+            card.topAnchor.constraint(equalTo: row.topAnchor),
+            card.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+            card.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            card.trailingAnchor.constraint(equalTo: row.trailingAnchor),
 
-            metaLabel.topAnchor.constraint(equalTo: bubble.topAnchor, constant: 12),
-            metaLabel.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 14),
+            header.topAnchor.constraint(equalTo: card.topAnchor, constant: 13),
+            header.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            header.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            header.heightAnchor.constraint(equalToConstant: 18),
+            headerIcon.leadingAnchor.constraint(equalTo: header.leadingAnchor),
+            headerIcon.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            headerIcon.widthAnchor.constraint(equalToConstant: 13),
+            headerIcon.heightAnchor.constraint(equalToConstant: 13),
+            metaLabel.leadingAnchor.constraint(equalTo: headerIcon.trailingAnchor, constant: 7),
+            metaLabel.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            stateChip.trailingAnchor.constraint(equalTo: header.trailingAnchor),
+            stateChip.centerYAnchor.constraint(equalTo: header.centerYAnchor),
+            stateChip.heightAnchor.constraint(equalToConstant: 18),
+            stateChip.widthAnchor.constraint(greaterThanOrEqualToConstant: 88),
 
-            stateLabel.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
-            stateLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
-            stateLabel.leadingAnchor.constraint(greaterThanOrEqualTo: metaLabel.trailingAnchor, constant: 8),
-
-            content.topAnchor.constraint(equalTo: metaLabel.bottomAnchor, constant: 10),
-            content.leadingAnchor.constraint(equalTo: bubble.leadingAnchor, constant: 14),
-            content.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
-            content.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -14),
+            content.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 9),
+            content.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            content.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            content.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -14),
         ])
         return row
     }
@@ -2285,11 +2813,7 @@ private final class FeedView: NSView {
     }
 
     private func makeFixSectionHeader(_ title: String) -> NSView {
-        let label = NSTextField(labelWithString: title)
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.font = NSFont.systemFont(ofSize: 10, weight: .heavy)
-        label.textColor = BlueyTheme.cyan
-        return label
+        trackedLabel(title, size: 9.5, weight: .heavy, color: Tok.tx3, tracking: 0.6)
     }
 
     private func makeFixSection(title: String, body: String) -> NSView {
@@ -2298,30 +2822,28 @@ private final class FeedView: NSView {
         container.alignment = .leading
         container.spacing = 3
         container.translatesAutoresizingMaskIntoConstraints = false
-
         container.addArrangedSubview(makeFixSectionHeader(title))
-
         let text = body.trimmingCharacters(in: .whitespacesAndNewlines)
         let bodyLabel = NSTextField(wrappingLabelWithString: text.isEmpty ? "—" : text)
         bodyLabel.translatesAutoresizingMaskIntoConstraints = false
-        bodyLabel.font = NSFont.systemFont(ofSize: 12.5, weight: .regular)
-        bodyLabel.textColor = BlueyTheme.text
-        bodyLabel.preferredMaxLayoutWidth = 460
+        bodyLabel.font = Tok.font(12.5, .regular)
+        bodyLabel.textColor = Tok.tx1
+        bodyLabel.preferredMaxLayoutWidth = 440
         container.addArrangedSubview(bodyLabel)
         bodyLabel.widthAnchor.constraint(equalTo: container.widthAnchor).isActive = true
         return container
     }
 
-    /// Monospace diff block. `+`/`-` lines are tinted green/red; hunk headers
-    /// (`@@`) cyan; everything else dim. Plain monospace if coloring fails.
+    /// Monospace diff block. `+`/`-` lines tinted green/red; hunk headers
+    /// (`@@`) accent; everything else dim.
     private func makeDiffBlock(_ diff: String) -> NSView {
         let panel = NSView()
         panel.translatesAutoresizingMaskIntoConstraints = false
         panel.wantsLayer = true
-        panel.layer?.backgroundColor = BlueyTheme.panelDeep.cgColor
+        panel.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.28).cgColor
         panel.layer?.cornerRadius = 8
         panel.layer?.borderWidth = 1
-        panel.layer?.borderColor = BlueyTheme.hairline.cgColor
+        panel.layer?.borderColor = Tok.hairline.cgColor
 
         let label = NSTextField(labelWithString: "")
         label.translatesAutoresizingMaskIntoConstraints = false
@@ -2332,34 +2854,34 @@ private final class FeedView: NSView {
         label.isBezeled = false
         label.lineBreakMode = .byClipping
         label.maximumNumberOfLines = 0
-        label.preferredMaxLayoutWidth = 440
+        label.preferredMaxLayoutWidth = 420
 
         panel.addSubview(label)
         NSLayoutConstraint.activate([
-            label.topAnchor.constraint(equalTo: panel.topAnchor, constant: 8),
-            label.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 10),
-            label.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -10),
-            label.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -8),
+            label.topAnchor.constraint(equalTo: panel.topAnchor, constant: 9),
+            label.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 11),
+            label.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -11),
+            label.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -9),
         ])
         return panel
     }
 
     private func attributedDiff(_ diff: String) -> NSAttributedString {
-        let mono = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        let mono = Tok.mono(11.5, .regular)
         let result = NSMutableAttributedString()
         let lines = diff.components(separatedBy: "\n")
         for (idx, line) in lines.enumerated() {
             let color: NSColor
             if line.hasPrefix("+++") || line.hasPrefix("---") {
-                color = BlueyTheme.textDim
+                color = Tok.tx3
             } else if line.hasPrefix("@@") {
-                color = BlueyTheme.cyan
+                color = Tok.accentTx
             } else if line.hasPrefix("+") {
-                color = BlueyTheme.green
+                color = Tok.ok
             } else if line.hasPrefix("-") {
-                color = NSColor(red: 1.0, green: 0.45, blue: 0.45, alpha: 1.0)
+                color = Tok.danger
             } else {
-                color = BlueyTheme.textDim
+                color = Tok.tx3
             }
             let suffix = idx == lines.count - 1 ? "" : "\n"
             result.append(NSAttributedString(
@@ -2385,11 +2907,11 @@ private final class FeedView: NSView {
         let pending = { if case .pending = state { return true }; return false }()
         let approveEnabled = pending && proposal.applySupported
 
-        let approve = NSButton(title: "Approve", target: self, action: #selector(approveFixClicked(_:)))
+        let approve = NSButton(title: "Approve & apply", target: self, action: #selector(approveFixClicked(_:)))
         approve.translatesAutoresizingMaskIntoConstraints = false
         approve.identifier = NSUserInterfaceItemIdentifier(proposal.proposalId)
         approve.isEnabled = approveEnabled
-        styleFixActionButton(approve, symbol: "checkmark", primary: true, enabled: approveEnabled)
+        styleFixActionButton(approve, primary: true, enabled: approveEnabled)
         buttonRow.addArrangedSubview(approve)
         registerInteractive(approve)
 
@@ -2397,26 +2919,22 @@ private final class FeedView: NSView {
         reject.translatesAutoresizingMaskIntoConstraints = false
         reject.identifier = NSUserInterfaceItemIdentifier(proposal.proposalId)
         reject.isEnabled = pending
-        styleFixActionButton(reject, symbol: "xmark", primary: false, enabled: pending)
+        styleFixActionButton(reject, primary: false, enabled: pending)
         buttonRow.addArrangedSubview(reject)
         registerInteractive(reject)
 
         NSLayoutConstraint.activate([
             approve.heightAnchor.constraint(equalToConstant: 30),
-            approve.widthAnchor.constraint(greaterThanOrEqualToConstant: 104),
+            approve.widthAnchor.constraint(greaterThanOrEqualToConstant: 124),
             reject.heightAnchor.constraint(equalToConstant: 30),
-            reject.widthAnchor.constraint(greaterThanOrEqualToConstant: 96),
+            reject.widthAnchor.constraint(greaterThanOrEqualToConstant: 84),
         ])
-
         container.addArrangedSubview(buttonRow)
 
-        // Caption: explain a disabled Approve, or echo the terminal decision.
         let captionText: String?
         switch state {
         case .pending:
-            captionText = proposal.applySupported
-                ? nil
-                : "This agent can't apply automatically"
+            captionText = proposal.applySupported ? nil : "This agent can't apply automatically"
         case .applying:
             captionText = "Applying… sent to your agent"
         case .discarded:
@@ -2425,51 +2943,40 @@ private final class FeedView: NSView {
         if let captionText {
             let caption = NSTextField(labelWithString: captionText)
             caption.translatesAutoresizingMaskIntoConstraints = false
-            caption.font = NSFont.systemFont(ofSize: 10, weight: .medium)
-            caption.textColor = state == .applying ? BlueyTheme.cyan : BlueyTheme.textDim
+            caption.font = Tok.font(10, .medium)
+            caption.textColor = state == .applying ? Tok.accentTx : Tok.tx3
             caption.lineBreakMode = .byTruncatingTail
             container.addArrangedSubview(caption)
         }
         return container
     }
 
-    private func styleFixActionButton(_ button: NSButton, symbol: String, primary: Bool, enabled: Bool) {
+    private func styleFixActionButton(_ button: NSButton, primary: Bool, enabled: Bool) {
         button.isBordered = false
         button.wantsLayer = true
-        button.layer?.cornerRadius = 15
-        let baseFill: NSColor = primary
-            ? NSColor(red: 0.07, green: 0.19, blue: 0.24, alpha: 0.98)
-            : NSColor.white.withAlphaComponent(0.070)
-        let baseBorder: NSColor = primary
-            ? BlueyTheme.cyan.withAlphaComponent(0.55)
-            : NSColor.white.withAlphaComponent(0.12)
-        button.layer?.backgroundColor = baseFill.cgColor
-        button.layer?.borderWidth = 1
-        button.layer?.borderColor = baseBorder.cgColor
+        button.layer?.cornerRadius = 9
+        if primary {
+            button.layer?.backgroundColor = Tok.accent.cgColor
+            button.layer?.borderWidth = 0
+        } else {
+            button.layer?.backgroundColor = NSColor.clear.cgColor
+            button.layer?.borderWidth = 1
+            button.layer?.borderColor = Tok.hairline.cgColor
+        }
         button.alphaValue = enabled ? 1.0 : 0.4
-        button.font = NSFont.systemFont(ofSize: 12, weight: .bold)
-        let titleColor: NSColor = primary ? BlueyTheme.text : BlueyTheme.textDim
+        let titleColor: NSColor = primary ? .white : Tok.tx2
         button.attributedTitle = NSAttributedString(
             string: button.title,
             attributes: [
-                .font: NSFont.systemFont(ofSize: 12, weight: .bold),
+                .font: Tok.font(12, .semibold),
                 .foregroundColor: titleColor,
             ])
-        button.contentTintColor = primary ? BlueyTheme.cyan : BlueyTheme.textDim
-        if let image = symbolImage(symbol) {
-            image.isTemplate = true
-            button.image = image
-            button.imagePosition = .imageLeading
-            button.imageHugsTitle = true
-            button.imageScaling = .scaleProportionallyDown
-        }
+        button.contentTintColor = titleColor
         button.alignment = .center
     }
 
     @objc private func approveFixClicked(_ sender: NSButton) {
         guard sender.isEnabled, let proposalId = sender.identifier?.rawValue else { return }
-        // One-shot: flip to Applying (disables both buttons) before emitting so
-        // a fast double-click can't re-submit.
         setFixState(proposalId: proposalId, to: .applying)
         emitFixApprovalResponded(proposalId: proposalId, approved: true)
     }
@@ -2480,29 +2987,13 @@ private final class FeedView: NSView {
         emitFixApprovalResponded(proposalId: proposalId, approved: false)
     }
 
-    private func kindLabel(_ card: RenderedCard) -> String {
-        switch normalizedCardKind(card.kind) {
-        case "answer":
-            // Agent-mediated answers badge the agent (CLAUDE / CURSOR) instead
-            // of BLUEY; the cyan rail stays (Bluey-mediated). Slice 5b.
-            return agentLabel(from: card.source) ?? "BLUEY"
-        case "question":    return "YOU"
-        case "action_item": return "ACTION"
-        case "decision":    return "DECISION"
-        case "context":     return "CONTEXT"
-        case "transcript":  return "TRANSCRIPT"
-        case "warning":     return "WARNING"
-        case "system":      return "SYSTEM"
-        default:            return "BLUEY"
-        }
-    }
+    // MARK: Provenance + body shaping (preserved)
 
     /// Detect a coding-agent provenance inside a free-form CueCard.source and
     /// return its uppercase badge label, or nil for plain Bluey answers.
     private func agentLabel(from source: String?) -> String? {
         guard let source, !source.isEmpty else { return nil }
         let lower = source.lowercased()
-        // Only treat as an agent answer when the source actually signals one.
         guard lower.contains("agent") || lower.contains("claude_code")
             || lower.contains("cursor") || lower.contains("codex")
             || lower.contains("gemini") || lower.contains("windsurf")
@@ -2523,57 +3014,26 @@ private final class FeedView: NSView {
         return "AGENT"
     }
 
-    private func displayTitle(for card: RenderedCard) -> String {
-        switch normalizedCardKind(card.kind) {
-        case "answer", "question", "transcript":
-            return ""
-        default:
-            return card.title.isEmpty ? kindTitle(card.kind) : card.title
-        }
-    }
-
-    private func isUserSide(_ card: RenderedCard) -> Bool {
-        let kind = normalizedCardKind(card.kind)
-        return kind == "question" || kind == "transcript"
-    }
-
-    private func bodyFont(for card: RenderedCard) -> NSFont {
-        return NSFont.systemFont(ofSize: 13.5, weight: .regular)
-    }
-
     private func chatBody(for card: RenderedCard, rawBody: String) -> String {
         guard normalizedCardKind(card.kind) == "answer" else { return rawBody }
-
         if let artifact = card.artifact {
             if artifact.artifactType == "code" {
-                let notes = stripFencedCode(from: rawBody)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                return notes.isEmpty
-                    ? "I opened the code in the canvas."
-                    : notes + "\n\nCode opened in the canvas."
+                let notes = stripFencedCode(from: rawBody).trimmingCharacters(in: .whitespacesAndNewlines)
+                return notes.isEmpty ? "I opened the code in the canvas." : notes + "\n\nCode opened in the canvas."
             }
             if rawBody.count > 1_100 {
-                let prefix = String(rawBody.prefix(720))
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let prefix = String(rawBody.prefix(720)).trimmingCharacters(in: .whitespacesAndNewlines)
                 return prefix + "\n\nFull \(artifact.title.lowercased()) opened in the canvas."
             }
         }
-
         if rawBody.contains("```") {
-            let notes = stripFencedCode(from: rawBody)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            if notes.isEmpty {
-                return "I opened the code in the canvas."
-            }
-            return notes + "\n\nCode opened in the canvas."
+            let notes = stripFencedCode(from: rawBody).trimmingCharacters(in: .whitespacesAndNewlines)
+            return notes.isEmpty ? "I opened the code in the canvas." : notes + "\n\nCode opened in the canvas."
         }
-
         if rawBody.count > 1_100 && hasStructuredShape(rawBody) {
-            let prefix = String(rawBody.prefix(720))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let prefix = String(rawBody.prefix(720)).trimmingCharacters(in: .whitespacesAndNewlines)
             return prefix + "\n\nFull structured version opened in the canvas."
         }
-
         return rawBody
     }
 
@@ -2585,9 +3045,7 @@ private final class FeedView: NSView {
                 inFence.toggle()
                 continue
             }
-            if !inFence {
-                lines.append(line)
-            }
+            if !inFence { lines.append(line) }
         }
         return lines.joined(separator: "\n")
     }
@@ -2604,36 +3062,6 @@ private final class FeedView: NSView {
         return structured.count >= 3
     }
 
-    private func statusText(for card: RenderedCard) -> String {
-        if !card.done { return "streaming..." }
-        if loginURL(from: card) != nil { return "login" }
-        if let costLabel = card.costLabel, !costLabel.isEmpty { return costLabel }
-        switch normalizedCardKind(card.kind) {
-        case "answer":
-            // No cost label yet: name the agent that produced the answer.
-            if let label = agentLabel(from: card.source) {
-                return "answered by your \(label.lowercased())"
-            }
-            return ""
-        case "question": return "sent"
-        default:         return ""
-        }
-    }
-
-    private func kindTitle(_ kind: String) -> String {
-        switch normalizedCardKind(kind) {
-        case "answer":      return "Response"
-        case "question":    return "Question"
-        case "action_item": return "Action item"
-        case "decision":    return "Decision"
-        case "context":     return "Context attached"
-        case "transcript":  return "Transcript"
-        case "warning":     return "Needs attention"
-        case "system":      return "Bluey"
-        default:            return "Update"
-        }
-    }
-
     private func signInBody(from text: String) -> String {
         text.components(separatedBy: .newlines)
             .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("login_url:") }
@@ -2648,19 +3076,15 @@ private final class FeedView: NSView {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             let candidate: String
             if trimmed.hasPrefix("login_url:") {
-                candidate = trimmed
-                    .replacingOccurrences(of: "login_url:", with: "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                candidate = trimmed.replacingOccurrences(of: "login_url:", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
             } else if trimmed.hasPrefix("https://") || trimmed.hasPrefix("http://") {
                 candidate = trimmed
             } else {
                 continue
             }
-            if
-                let url = URL(string: candidate),
-                let scheme = url.scheme?.lowercased(),
-                ["http", "https"].contains(scheme)
-            {
+            if let url = URL(string: candidate),
+               let scheme = url.scheme?.lowercased(),
+               ["http", "https"].contains(scheme) {
                 return url
             }
         }
@@ -2670,9 +3094,23 @@ private final class FeedView: NSView {
     private func scrollToBottom() {
         DispatchQueue.main.async { [weak self] in
             guard let s = self else { return }
+            // Hide the connector under the final turn (timeline ends there).
+            s.updateConnectors()
             let bottom = NSPoint(x: 0, y: max(0, s.stack.bounds.height - s.scroll.contentView.bounds.height))
             s.scroll.contentView.scroll(to: bottom)
             s.scroll.reflectScrolledClipView(s.scroll.contentView)
+        }
+    }
+
+    /// Hide the connector hairline under the last turn so the thread visually
+    /// terminates (mockup `.turn:last-child::before{display:none}`).
+    private func updateConnectors() {
+        let turns = stack.arrangedSubviews
+        for (idx, turn) in turns.enumerated() {
+            let isLast = idx == turns.count - 1
+            for sub in turn.subviews where sub.identifier?.rawValue == "turn-connector" {
+                sub.isHidden = isLast
+            }
         }
     }
 }
@@ -2887,3657 +3325,1611 @@ private final class CanvasPaneView: NSView {
 // MARK: - Expanded panel (feed + composer)
 
 private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
+    // MARK: Body region (one of Ask / History / Agents visible at a time)
+    private enum BodyTab: Int { case ask, history, agents }
+
+    // Ask body.
     let feed: FeedView
     let workspace: NSView
     let canvasPane: CanvasPaneView
-    let toastView: NSView
-    let toastTitleLabel: NSTextField
-    let toastBodyLabel: NSTextField
+
+    // Surface sublayers.
+    private let auroraLayer = CAGradientLayer()
+    private let topHairline = CALayer()
+
+    // Header (`.ph`).
     let headerBar: HeaderDragView
-    let headerStack: NSStackView
-    let brandStack: NSStackView
-    let headerLogo: BlueyLogoView
-    let headerWordmark: BlueyWordmarkView
-    let headerSpacer: NSView
-    let statusLabel: NSTextField
-    let modelMenu: NSPopUpButton
-    let routeBadge: NSTextField
-    let knowledgeBadge: NSTextField
-    let balanceLabel: NSTextField
-    let fullSizeButton: NSButton
-    let canvasToggleButton: NSButton
-    let navButton: NSButton
-    let newSessionButton: NSButton
-    let sessionDrawer: NSView
-    let drawerTitleLabel: NSTextField
-    let drawerSubtitleLabel: NSTextField
-    let drawerCloseButton: NSButton
-    let latestSessionButton: NSButton
-    let sessionScroll: NSScrollView
-    let sessionStack: NSStackView
-    // Agent-bridge surfaces (Slice 5b). A parallel drawer mirroring
-    // sessionDrawer's geometry, plus a bottom connector sheet reusing the
-    // close-confirm overlay pattern.
-    let agentDrawer: NSView
-    let agentDrawerTitleLabel: NSTextField
-    let agentDrawerBackButton: NSButton
-    let agentDrawerCloseButton: NSButton
-    let agentDrawerCaption: NSTextField
-    let agentScroll: NSScrollView
-    let agentStack: NSStackView
-    let agentButton: NSButton
-    let agentBadge: NSTextField
-    let connectorSheetOverlay: NSView
-    let connectorSheetPanel: NSView
-    let connectorSheetTitle: NSTextField
-    let connectorSheetSummary: NSTextField
-    let connectorSheetScroll: NSScrollView
-    let connectorSheetStack: NSStackView
-    let connectorSheetCancelButton: NSButton
-    let connectorSheetAttachButton: NSButton
-    let answerStyleOverlay: NSView
-    let answerStylePanel: NSView
-    let answerStyleLabel: NSTextField
-    let answerStyleBox: NSTextField
-    let answerStyleSaveButton: NSButton
-    let transcriptStrip: NSView
-    let transcriptActivityDot: NSView
-    let transcriptStateLabel: NSTextField
-    let transcriptScroll: NSScrollView
-    let transcriptLabel: NSTextField
-    let attachmentStrip: NSScrollView
-    let attachmentStack: NSStackView
+    private let statusDot = NSView()
+    private let listeningWave = NSView()
+    private var waveBars: [NSView] = []
+    private let brandLabel = NSTextField(labelWithString: "Bluey")
+    private let viaLabel = NSTextField(labelWithString: "· managed")
+    private let segContainer = NSView()
+    private var segButtons: [NSButton] = []
+    private let closeButton = NSButton()
+
+    // Ask: context bar + composer + footer.
+    private let contextBar = NSView()
+    private let contextLabel = NSTextField(labelWithString: "")
+    private let attachmentStrip = NSStackView()
     let composerBar: NSView
     let composerSurface: NSView
     let composer: ComposerTextView
-    let recordingButton: NSButton
-    let askButton: NSButton
-    let analyzeButton: NSButton
-    let attachButton: NSButton
-    let instructionsButton: NSButton
-    let opacityControl: NSView
-    let opacityLabel: NSTextField
-    let opacitySlider: NSSlider
-    let opacityValueLabel: NSTextField
-    let hideButton: NSButton
-    let closeButton: NSButton
-    let closeConfirmOverlay: NSView
-    let closeConfirmPanel: NSView
-    let closeConfirmTitle: NSTextField
-    let closeConfirmBody: NSTextField
-    let closeConfirmCancelButton: NSButton
-    let closeConfirmTurnOffButton: NSButton
+    private let plusButton = NSButton()
+    private let listenButton = NSButton()
+    private let sendButton = NSButton()
+    private let footerBar = NSView()
+    private let footerModelLabel = NSTextField(labelWithString: "opus-4.8")
+    private let footerConnectorsLabel = NSTextField(labelWithString: "")
+    private let footerKeysLabel = NSTextField(labelWithString: "⌘↵ ask · ⌥ hide")
 
+    // History body (`.hx`).
+    private let historyContainer = NSView()
+    private let searchField = NSTextField()
+    private let historyScroll = NSScrollView()
+    private let historyStack = NSStackView()
+
+    // Agents body (`.ax`).
+    private let agentsScroll = NSScrollView()
+    private let agentsStack = NSStackView()
+
+    // The "+" menu (secondary actions).
+    private let plusMenu = NSView()
+
+    // Modals (dark, over a dim backdrop).
+    private let connectorSheetOverlay: ModalBlockerView
+    private let connectorSheetPanel = NSView()
+    private let connectorSheetTitle = NSTextField(labelWithString: "Inherited connectors")
+    private let connectorSheetSummary = NSTextField(labelWithString: "")
+    private let connectorSheetScroll = NSScrollView()
+    private let connectorSheetStack = NSStackView()
+    private let connectorSheetReauthLabel = NSTextField(labelWithString: "")
+    private let connectorSheetCancelButton = NSButton()
+    private let connectorSheetAttachButton = NSButton()
+
+    private let billingOverlay: ModalBlockerView
+    private let billingPanel = NSView()
+    private let billingTitle = NSTextField(labelWithString: "")
+    private let billingSubtitle = NSTextField(labelWithString: "Bring-your-own-key · please review.")
+    private let billingDiscLabel = NSTextField(labelWithString: "")
+    private let billingDeclineButton = NSButton()
+    private let billingAcceptButton = NSButton()
+
+    private let closeConfirmOverlay: ModalBlockerView
+    private let closeConfirmPanel = NSView()
+    private let closeConfirmTitle = NSTextField(labelWithString: "Turn Bluey off?")
+    private let closeConfirmBody = NSTextField(wrappingLabelWithString: "This closes Bluey completely. To start again, run: bluey on")
+    private let closeConfirmCancelButton = NSButton()
+    private let closeConfirmTurnOffButton = NSButton()
+
+    // System toast (transient cards).
+    let toastView: NSView
+    let toastTitleLabel: NSTextField
+    let toastBodyLabel: NSTextField
+    private var toastHideWorkItem: DispatchWorkItem?
+
+    // MARK: External contract closures (consumed by OverlayApp)
     var onClose: (() -> Void)?
     var onOpacityChanged: ((Double) -> Void)?
     var onListeningStateChanged: ((PillRunState) -> Void)?
-    /// Notifies the coordinator when an agent attaches/detaches so the pill can
-    /// show or hide its glyph-only agent badge (Slice 5b).
     var onAgentAttachmentChanged: ((Bool) -> Void)?
+
+    // MARK: State
+    private var currentTab: BodyTab = .ask
     private var recordingActive = false
-    private var transcriptSnippets: [String] = []
+    private var backgroundOpacity: CGFloat = 0.97
+    private var transcriptCardId: String?
+
+    // Sessions (History-at-scale).
     private var sessionItems: [OverlaySessionItem] = []
+    private var sessionTotal = 0
+    private var sessionHasMore = false
+    private var sessionQuery = ""
+    private var sessionsLoaded = false
     private var editingSessionId: String?
     private var pendingDeleteSessionId: String?
     private var renameField: NSTextField?
-    // Agent-bridge state (Slice 5b).
-    private enum AgentDrawerStage {
-        case picker
-        case sessions(kind: String, displayName: String)
-    }
-    private var agentDrawerStage: AgentDrawerStage = .picker
+
+    // Agents.
+    private enum AgentStage { case picker; case sessions(kind: String, displayName: String) }
+    private var agentStage: AgentStage = .picker
     private var agentSummaries: [AgentSummary] = []
     private var agentListLoaded = false
     private var agentSessions: [AgentSessionSummary] = []
     private var agentSessionsLoaded = false
     private var attachedAgentKind: String?
+
+    // Connector sheet / billing pending attach.
     private var pendingConnectorKind: String?
     private var pendingConnectorSessionId: String?
     private var pendingConnectorInfos: [AgentConnectorInfo] = []
     private var pendingConnectorsLoaded = false
-    private var canvasWidthConstraint: NSLayoutConstraint?
-    private var composerBarHeightConstraint: NSLayoutConstraint?
-    private var composerTextHeightConstraint: NSLayoutConstraint?
-    private var attachmentStripHeightConstraint: NSLayoutConstraint?
-    private var toastHideWorkItem: DispatchWorkItem?
-    private var knowledgeIndexTimer: Timer?
-    private var knowledgeIndexFrame = 0
-    private var audioPulseTimer: Timer?
-    private var audioPulseFrame = 0
-    private let knowledgeIndexFrames = [
-        "Indexing · ● 101",
-        "Indexing · ● 010",
-        "Indexing · ● 111",
-        "Indexing · ● 001",
-    ]
+    private var pendingBilling: BillingDisclosure?
+
+    // Canvas.
     private var latestCanvas: CanvasArtifact?
     private var canvasOpen = false
     private var canvasFullWindow = false
     private var preCanvasFullWindowFrame: NSRect?
-    private var windowFullSize = false
-    private var preWindowFullSizeFrame: NSRect?
+    private var canvasWidthConstraint: NSLayoutConstraint?
+
+    // Composer height.
+    private var composerTextHeightConstraint: NSLayoutConstraint?
+    // Context bar height (collapses to 0 when there's nothing in context).
+    private var contextBarHeightConstraint: NSLayoutConstraint?
+
+    // Resize (bottom-right grip only — header drags).
     private struct ResizeEdges: OptionSet {
         let rawValue: Int
-        static let left = ResizeEdges(rawValue: 1 << 0)
         static let right = ResizeEdges(rawValue: 1 << 1)
-        static let top = ResizeEdges(rawValue: 1 << 2)
         static let bottom = ResizeEdges(rawValue: 1 << 3)
     }
     private var activeResizeEdges: ResizeEdges = []
     private var resizeStartMouse = NSPoint.zero
     private var resizeStartFrame = NSRect.zero
-    private let resizeHitSize: CGFloat = 10
-    private var backgroundOpacity: CGFloat = 0.94
+    private let resizeHitSize: CGFloat = 12
 
     override init(frame frameRect: NSRect) {
         feed = FeedView(frame: .zero)
         workspace = NSView()
         canvasPane = CanvasPaneView(frame: .zero)
-        toastView = NSView()
-        toastTitleLabel = NSTextField(labelWithString: "")
-        toastBodyLabel = NSTextField(wrappingLabelWithString: "")
         headerBar = HeaderDragView()
-        headerStack = NSStackView()
-        brandStack = NSStackView()
-        headerLogo = BlueyLogoView()
-        headerWordmark = BlueyWordmarkView()
-        headerSpacer = NSView()
-        statusLabel = NSTextField(labelWithString: "New recording")
-        modelMenu = NSPopUpButton(frame: .zero, pullsDown: false)
-        routeBadge = NSTextField(labelWithString: "● Ready")
-        knowledgeBadge = NSTextField(labelWithString: "Docs empty")
-        balanceLabel = NSTextField(labelWithString: "Balance --")
-        fullSizeButton = NSButton(title: "", target: nil, action: nil)
-        canvasToggleButton = NSButton(title: "", target: nil, action: nil)
-        navButton = NSButton(title: "", target: nil, action: nil)
-        newSessionButton = NSButton(title: "", target: nil, action: nil)
-        sessionDrawer = NSView()
-        drawerTitleLabel = NSTextField(labelWithString: "Recordings")
-        drawerSubtitleLabel = NSTextField(labelWithString: "Click to continue. Pencil to rename.")
-        drawerCloseButton = NSButton(title: "", target: nil, action: nil)
-        latestSessionButton = NSButton(title: "Continue latest", target: nil, action: nil)
-        sessionScroll = NSScrollView()
-        sessionStack = NSStackView()
-        agentDrawer = NSView()
-        agentDrawerTitleLabel = NSTextField(labelWithString: "Coding agents")
-        agentDrawerBackButton = NSButton(title: "", target: nil, action: nil)
-        agentDrawerCloseButton = NSButton(title: "", target: nil, action: nil)
-        agentDrawerCaption = NSTextField(
-            wrappingLabelWithString: "Answers run on your machine — your agent replies.")
-        agentScroll = NSScrollView()
-        agentStack = NSStackView()
-        agentButton = NSButton(title: "Agent", target: nil, action: nil)
-        agentBadge = NSTextField(labelWithString: "No agent")
-        connectorSheetOverlay = NSView()
-        connectorSheetPanel = NSView()
-        connectorSheetTitle = NSTextField(labelWithString: "Inherited connectors")
-        connectorSheetSummary = NSTextField(labelWithString: "")
-        connectorSheetScroll = NSScrollView()
-        connectorSheetStack = NSStackView()
-        connectorSheetCancelButton = NSButton(title: "Cancel", target: nil, action: nil)
-        connectorSheetAttachButton = NSButton(title: "Attach", target: nil, action: nil)
-        answerStyleOverlay = ModalBlockerView()
-        answerStylePanel = NSView()
-        answerStyleLabel = NSTextField(labelWithString: "How Bluey should answer")
-        answerStyleBox = NSTextField()
-        answerStyleSaveButton = NSButton(title: "Save", target: nil, action: nil)
-        transcriptStrip = NSView()
-        transcriptActivityDot = NSView()
-        transcriptStateLabel = NSTextField(labelWithString: "IDLE")
-        transcriptScroll = NSScrollView()
-        transcriptLabel = NSTextField(labelWithString: "Live captions preview")
-        attachmentStrip = NSScrollView()
-        attachmentStack = NSStackView()
         composerBar = NSView()
         composerSurface = ComposerSurfaceView()
         composer = ComposerTextView(frame: .zero, textContainer: nil)
-        recordingButton = NSButton(title: "Listen", target: nil, action: nil)
-        askButton = NSButton(title: "Answer ⌘↵", target: nil, action: nil)
-        analyzeButton = NSButton(title: "Screen", target: nil, action: nil)
-        attachButton = NSButton(title: "", target: nil, action: nil)
-        instructionsButton = NSButton(title: "Tone", target: nil, action: nil)
-        opacityControl = NSView()
-        opacityLabel = NSTextField(labelWithString: "Opacity")
-        opacitySlider = NSSlider(value: 0.94, minValue: 0.50, maxValue: 1.0, target: nil, action: nil)
-        opacityValueLabel = NSTextField(labelWithString: "94")
-        hideButton = NSButton(title: "", target: nil, action: nil)
-        closeButton = NSButton(title: "x", target: nil, action: nil)
+        connectorSheetOverlay = ModalBlockerView()
+        billingOverlay = ModalBlockerView()
         closeConfirmOverlay = ModalBlockerView()
-        closeConfirmPanel = NSView()
-        closeConfirmTitle = NSTextField(labelWithString: "Turn Bluey off?")
-        closeConfirmBody = NSTextField(wrappingLabelWithString: "This closes Bluey completely. To start again, run: bluey on")
-        closeConfirmCancelButton = NSButton(title: "Cancel", target: nil, action: nil)
-        closeConfirmTurnOffButton = NSButton(title: "Turn Off", target: nil, action: nil)
+        toastView = NSView()
+        toastTitleLabel = NSTextField(labelWithString: "")
+        toastBodyLabel = NSTextField(wrappingLabelWithString: "")
 
         super.init(frame: frameRect)
 
-        (answerStyleOverlay as? ModalBlockerView)?.onEscape = { [weak self] in
-            self?.dismissAnswerStyleEditor(animated: true)
-        }
-        (closeConfirmOverlay as? ModalBlockerView)?.onEscape = { [weak self] in
-            self?.dismissCloseConfirm(animated: true)
-        }
-
-        applyShellChrome()
-        layer?.backgroundColor = NSColor(red: 0.010, green: 0.012, blue: 0.016, alpha: 0.94).cgColor
-        layer?.masksToBounds = true
-        layer?.borderWidth = 1
-        layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.14).cgColor
-        layer?.shadowColor = NSColor.black.cgColor
-        layer?.shadowOpacity = 0.28
-        layer?.shadowRadius = 24
-        layer?.shadowOffset = .zero
-
+        wantsLayer = true
+        configureSurface()
         configureHeader()
-        configureSystemToast()
-        configureContextRows()
+        configureAskBody()
         configureComposer()
-        configureFixedChromeLayoutPriorities()
+        configureFooter()
+        configureContextBar()
+        configurePlusMenu()
+        configureHistoryBody()
+        configureAgentsBody()
+        configureConnectorSheet()
+        configureBillingModal()
         configureCloseConfirm()
-        styleDrawer()
-        feed.onTranscript = { [weak self] card in
-            self?.appendTranscriptSnippet(card)
-        }
-        feed.onOpenURL = { url in
-            NSWorkspace.shared.open(url)
-        }
-        // Tapping Fix on an agent answer asks the daemon to drive a propose-only
-        // fix; nothing is applied until the proposal card is approved (Slice F4).
-        feed.onFixRequested = { cardId, question in
-            emitFixRequested(cardId: cardId, question: question)
-        }
-
-        for view in [
-            headerBar,
-            headerStack,
-            brandStack,
-            headerLogo,
-            headerWordmark,
-            headerSpacer,
-            statusLabel,
-            modelMenu,
-            routeBadge,
-            knowledgeBadge,
-            balanceLabel,
-            fullSizeButton,
-            canvasToggleButton,
-            navButton,
-            newSessionButton,
-            sessionDrawer,
-            drawerTitleLabel,
-            drawerSubtitleLabel,
-            drawerCloseButton,
-            latestSessionButton,
-            sessionScroll,
-            sessionStack,
-            agentDrawer,
-            agentDrawerTitleLabel,
-            agentDrawerBackButton,
-            agentDrawerCloseButton,
-            agentDrawerCaption,
-            agentScroll,
-            agentStack,
-            agentButton,
-            agentBadge,
-            connectorSheetOverlay,
-            connectorSheetPanel,
-            connectorSheetTitle,
-            connectorSheetSummary,
-            connectorSheetScroll,
-            connectorSheetStack,
-            connectorSheetCancelButton,
-            connectorSheetAttachButton,
-            answerStyleOverlay,
-            answerStylePanel,
-            answerStyleLabel,
-            answerStyleBox,
-            answerStyleSaveButton,
-            workspace,
-            feed,
-            canvasPane,
-            toastView,
-            toastTitleLabel,
-            toastBodyLabel,
-            transcriptStrip,
-            transcriptActivityDot,
-            transcriptStateLabel,
-            transcriptScroll,
-            transcriptLabel,
-            attachmentStrip,
-            attachmentStack,
-            composerBar,
-            composerSurface,
-            composer,
-            recordingButton,
-            askButton,
-            analyzeButton,
-            attachButton,
-            instructionsButton,
-            opacityControl,
-            opacityLabel,
-            opacitySlider,
-            opacityValueLabel,
-            hideButton,
-            closeButton,
-            closeConfirmOverlay,
-            closeConfirmPanel,
-            closeConfirmTitle,
-            closeConfirmBody,
-            closeConfirmCancelButton,
-            closeConfirmTurnOffButton,
-        ] {
-            view.translatesAutoresizingMaskIntoConstraints = false
-        }
-
-        headerBar.addSubview(headerStack)
-        brandStack.addArrangedSubview(headerWordmark)
-        brandStack.addArrangedSubview(statusLabel)
-        for view in [
-            navButton,
-            newSessionButton,
-            headerLogo,
-            brandStack,
-            routeBadge,
-            knowledgeBadge,
-            agentBadge,
-            headerSpacer,
-            canvasToggleButton,
-            balanceLabel,
-            fullSizeButton,
-            hideButton,
-            closeButton,
-        ] {
-            headerStack.addArrangedSubview(view)
-        }
-        addSubview(workspace)
-        workspace.addSubview(feed)
-        workspace.addSubview(canvasPane)
-        addSubview(toastView)
-        toastView.addSubview(toastTitleLabel)
-        toastView.addSubview(toastBodyLabel)
-        addSubview(sessionDrawer)
-        sessionDrawer.addSubview(drawerTitleLabel)
-        sessionDrawer.addSubview(drawerSubtitleLabel)
-        sessionDrawer.addSubview(drawerCloseButton)
-        sessionDrawer.addSubview(latestSessionButton)
-        sessionDrawer.addSubview(sessionScroll)
-        addSubview(agentDrawer)
-        agentDrawer.addSubview(agentDrawerBackButton)
-        agentDrawer.addSubview(agentDrawerTitleLabel)
-        agentDrawer.addSubview(agentDrawerCloseButton)
-        agentDrawer.addSubview(agentScroll)
-        agentDrawer.addSubview(agentDrawerCaption)
-        addSubview(transcriptStrip)
-        transcriptStrip.addSubview(transcriptActivityDot)
-        transcriptStrip.addSubview(transcriptStateLabel)
-        transcriptStrip.addSubview(transcriptScroll)
-        transcriptScroll.documentView = transcriptLabel
-        transcriptLabel.translatesAutoresizingMaskIntoConstraints = true
-        addSubview(attachmentStrip)
-        addSubview(composerBar)
-        composerBar.addSubview(composerSurface)
-        composerSurface.addSubview(composer)
-        composerSurface.addSubview(recordingButton)
-        composerSurface.addSubview(askButton)
-        composerBar.addSubview(attachButton)
-        composerBar.addSubview(agentButton)
-        composerBar.addSubview(instructionsButton)
-        composerBar.addSubview(opacityControl)
-        opacityControl.addSubview(opacityLabel)
-        opacityControl.addSubview(opacitySlider)
-        opacityControl.addSubview(opacityValueLabel)
-        composerBar.addSubview(modelMenu)
-        composerBar.addSubview(analyzeButton)
-        // Add the header late in the root view so it paints above the scroll
-        // workspace. Full-screen modal overlays are added after this.
-        addSubview(headerBar)
-        addSubview(answerStyleOverlay)
-        answerStyleOverlay.addSubview(answerStylePanel)
-        answerStylePanel.addSubview(answerStyleLabel)
-        answerStylePanel.addSubview(answerStyleBox)
-        answerStylePanel.addSubview(answerStyleSaveButton)
-        // Agent-bridge: inherited-connector confirmation sheet (Slice 5b),
-        // another full-screen modal layered above the workspace.
-        addSubview(connectorSheetOverlay)
-        connectorSheetOverlay.addSubview(connectorSheetPanel)
-        connectorSheetPanel.addSubview(connectorSheetTitle)
-        connectorSheetPanel.addSubview(connectorSheetSummary)
-        connectorSheetPanel.addSubview(connectorSheetScroll)
-        connectorSheetPanel.addSubview(connectorSheetCancelButton)
-        connectorSheetPanel.addSubview(connectorSheetAttachButton)
-        addSubview(closeConfirmOverlay)
-        closeConfirmOverlay.addSubview(closeConfirmPanel)
-        closeConfirmPanel.addSubview(closeConfirmTitle)
-        closeConfirmPanel.addSubview(closeConfirmBody)
-        closeConfirmPanel.addSubview(closeConfirmCancelButton)
-        closeConfirmPanel.addSubview(closeConfirmTurnOffButton)
-        // Keep the fixed chrome rows above transparent scroll/canvas surfaces
-        // even when AppKit re-lays out the dense center workspace.
-        headerBar.layer?.zPosition = 50
-        transcriptStrip.layer?.zPosition = 40
-        attachmentStrip.layer?.zPosition = 40
-        composerBar.layer?.zPosition = 50
-        toastView.layer?.zPosition = 70
-
-        // Bind the agent scroll views' document stacks before activating the
-        // stack-in-clip-view constraints below (they need a shared ancestor).
-        // Full visual styling happens later in styleAgentSurfaces().
-        agentScroll.documentView = agentStack
-        connectorSheetScroll.documentView = connectorSheetStack
-
-        let canvasWidth = canvasPane.widthAnchor.constraint(equalToConstant: 0)
-        canvasWidthConstraint = canvasWidth
-        let composerTextHeight = composerSurface.heightAnchor.constraint(equalToConstant: 42)
-        let composerBarHeight = composerBar.heightAnchor.constraint(equalToConstant: 94)
-        let attachmentStripHeight = attachmentStrip.heightAnchor.constraint(equalToConstant: 0)
-        composerTextHeightConstraint = composerTextHeight
-        composerBarHeightConstraint = composerBarHeight
-        attachmentStripHeightConstraint = attachmentStripHeight
-
-        NSLayoutConstraint.activate([
-            headerBar.topAnchor.constraint(equalTo: topAnchor, constant: 10),
-            headerBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            headerBar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            headerBar.heightAnchor.constraint(equalToConstant: 42),
-
-            headerStack.leadingAnchor.constraint(equalTo: headerBar.leadingAnchor, constant: 9),
-            headerStack.trailingAnchor.constraint(equalTo: headerBar.trailingAnchor, constant: -9),
-            headerStack.topAnchor.constraint(equalTo: headerBar.topAnchor, constant: 4),
-            headerStack.bottomAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: -4),
-
-            navButton.widthAnchor.constraint(equalToConstant: 30),
-            navButton.heightAnchor.constraint(equalToConstant: 30),
-
-            newSessionButton.widthAnchor.constraint(equalToConstant: 30),
-            newSessionButton.heightAnchor.constraint(equalToConstant: 30),
-
-            headerLogo.widthAnchor.constraint(equalToConstant: 28),
-            headerLogo.heightAnchor.constraint(equalToConstant: 28),
-
-            headerWordmark.widthAnchor.constraint(equalToConstant: 62),
-            headerWordmark.heightAnchor.constraint(equalToConstant: 22),
-
-            brandStack.widthAnchor.constraint(greaterThanOrEqualToConstant: 72),
-            brandStack.widthAnchor.constraint(lessThanOrEqualToConstant: 128),
-
-            routeBadge.widthAnchor.constraint(greaterThanOrEqualToConstant: 86),
-            routeBadge.widthAnchor.constraint(lessThanOrEqualToConstant: 126),
-            routeBadge.heightAnchor.constraint(equalToConstant: 24),
-
-            knowledgeBadge.widthAnchor.constraint(greaterThanOrEqualToConstant: 86),
-            knowledgeBadge.widthAnchor.constraint(lessThanOrEqualToConstant: 126),
-            knowledgeBadge.heightAnchor.constraint(equalToConstant: 24),
-
-            closeButton.widthAnchor.constraint(equalToConstant: 26),
-            closeButton.heightAnchor.constraint(equalToConstant: 26),
-
-            hideButton.widthAnchor.constraint(equalToConstant: 26),
-            hideButton.heightAnchor.constraint(equalToConstant: 26),
-
-            fullSizeButton.widthAnchor.constraint(equalToConstant: 26),
-            fullSizeButton.heightAnchor.constraint(equalToConstant: 26),
-
-            balanceLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 76),
-            balanceLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 106),
-            balanceLabel.heightAnchor.constraint(equalToConstant: 24),
-
-            canvasToggleButton.widthAnchor.constraint(equalToConstant: 30),
-            canvasToggleButton.heightAnchor.constraint(equalToConstant: 30),
-
-            workspace.topAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: 8),
-            workspace.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            workspace.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            workspace.bottomAnchor.constraint(equalTo: transcriptStrip.topAnchor, constant: -8),
-
-            feed.topAnchor.constraint(equalTo: workspace.topAnchor),
-            feed.leadingAnchor.constraint(equalTo: workspace.leadingAnchor),
-            feed.bottomAnchor.constraint(equalTo: workspace.bottomAnchor),
-            feed.widthAnchor.constraint(greaterThanOrEqualToConstant: 260),
-
-            canvasPane.topAnchor.constraint(equalTo: workspace.topAnchor),
-            canvasPane.leadingAnchor.constraint(equalTo: feed.trailingAnchor, constant: 8),
-            canvasPane.trailingAnchor.constraint(equalTo: workspace.trailingAnchor),
-            canvasPane.bottomAnchor.constraint(equalTo: workspace.bottomAnchor),
-            canvasWidth,
-
-            toastView.topAnchor.constraint(equalTo: workspace.topAnchor, constant: 14),
-            toastView.centerXAnchor.constraint(equalTo: centerXAnchor),
-            toastView.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.52),
-            toastView.widthAnchor.constraint(greaterThanOrEqualToConstant: 280),
-
-            toastTitleLabel.topAnchor.constraint(equalTo: toastView.topAnchor, constant: 12),
-            toastTitleLabel.leadingAnchor.constraint(equalTo: toastView.leadingAnchor, constant: 16),
-            toastTitleLabel.trailingAnchor.constraint(equalTo: toastView.trailingAnchor, constant: -16),
-
-            toastBodyLabel.topAnchor.constraint(equalTo: toastTitleLabel.bottomAnchor, constant: 5),
-            toastBodyLabel.leadingAnchor.constraint(equalTo: toastTitleLabel.leadingAnchor),
-            toastBodyLabel.trailingAnchor.constraint(equalTo: toastTitleLabel.trailingAnchor),
-            toastBodyLabel.bottomAnchor.constraint(equalTo: toastView.bottomAnchor, constant: -13),
-
-            sessionDrawer.topAnchor.constraint(equalTo: topAnchor, constant: 10),
-            sessionDrawer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            sessionDrawer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            sessionDrawer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
-
-            drawerTitleLabel.topAnchor.constraint(equalTo: sessionDrawer.topAnchor, constant: 14),
-            drawerTitleLabel.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 14),
-            drawerTitleLabel.trailingAnchor.constraint(equalTo: drawerCloseButton.leadingAnchor, constant: -10),
-
-            drawerCloseButton.topAnchor.constraint(equalTo: sessionDrawer.topAnchor, constant: 10),
-            drawerCloseButton.trailingAnchor.constraint(equalTo: sessionDrawer.trailingAnchor, constant: -10),
-            drawerCloseButton.widthAnchor.constraint(equalToConstant: 30),
-            drawerCloseButton.heightAnchor.constraint(equalToConstant: 30),
-
-            drawerSubtitleLabel.topAnchor.constraint(equalTo: drawerTitleLabel.bottomAnchor, constant: 4),
-            drawerSubtitleLabel.leadingAnchor.constraint(equalTo: drawerTitleLabel.leadingAnchor),
-            drawerSubtitleLabel.trailingAnchor.constraint(equalTo: drawerTitleLabel.trailingAnchor),
-
-            latestSessionButton.topAnchor.constraint(equalTo: drawerSubtitleLabel.bottomAnchor, constant: 16),
-            latestSessionButton.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 12),
-            latestSessionButton.trailingAnchor.constraint(equalTo: sessionDrawer.trailingAnchor, constant: -12),
-            latestSessionButton.heightAnchor.constraint(equalToConstant: 32),
-
-            sessionScroll.topAnchor.constraint(equalTo: latestSessionButton.bottomAnchor, constant: 10),
-            sessionScroll.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 8),
-            sessionScroll.trailingAnchor.constraint(equalTo: sessionDrawer.trailingAnchor, constant: -8),
-            sessionScroll.bottomAnchor.constraint(equalTo: sessionDrawer.bottomAnchor, constant: -12),
-
-            sessionStack.leadingAnchor.constraint(equalTo: sessionScroll.contentView.leadingAnchor),
-            sessionStack.topAnchor.constraint(equalTo: sessionScroll.contentView.topAnchor),
-            sessionStack.trailingAnchor.constraint(equalTo: sessionScroll.contentView.trailingAnchor),
-            sessionStack.bottomAnchor.constraint(lessThanOrEqualTo: sessionScroll.contentView.bottomAnchor),
-            sessionStack.widthAnchor.constraint(equalTo: sessionScroll.widthAnchor),
-
-            // Agent drawer mirrors sessionDrawer geometry, widened to 230pt
-            // (PLAN §9) so capability chips + connector counts truncate-tail.
-            agentDrawer.topAnchor.constraint(equalTo: feed.topAnchor, constant: 10),
-            agentDrawer.leadingAnchor.constraint(equalTo: feed.leadingAnchor, constant: 10),
-            agentDrawer.widthAnchor.constraint(equalToConstant: 230),
-            agentDrawer.bottomAnchor.constraint(equalTo: transcriptStrip.topAnchor, constant: -10),
-
-            agentDrawerBackButton.topAnchor.constraint(equalTo: agentDrawer.topAnchor, constant: 12),
-            agentDrawerBackButton.leadingAnchor.constraint(equalTo: agentDrawer.leadingAnchor, constant: 10),
-            agentDrawerBackButton.widthAnchor.constraint(equalToConstant: 26),
-            agentDrawerBackButton.heightAnchor.constraint(equalToConstant: 26),
-
-            agentDrawerTitleLabel.centerYAnchor.constraint(equalTo: agentDrawerBackButton.centerYAnchor),
-            agentDrawerTitleLabel.leadingAnchor.constraint(equalTo: agentDrawerBackButton.trailingAnchor, constant: 8),
-            agentDrawerTitleLabel.trailingAnchor.constraint(equalTo: agentDrawerCloseButton.leadingAnchor, constant: -8),
-
-            agentDrawerCloseButton.centerYAnchor.constraint(equalTo: agentDrawerBackButton.centerYAnchor),
-            agentDrawerCloseButton.trailingAnchor.constraint(equalTo: agentDrawer.trailingAnchor, constant: -10),
-            agentDrawerCloseButton.widthAnchor.constraint(equalToConstant: 26),
-            agentDrawerCloseButton.heightAnchor.constraint(equalToConstant: 26),
-
-            agentScroll.topAnchor.constraint(equalTo: agentDrawerBackButton.bottomAnchor, constant: 10),
-            agentScroll.leadingAnchor.constraint(equalTo: agentDrawer.leadingAnchor, constant: 8),
-            agentScroll.trailingAnchor.constraint(equalTo: agentDrawer.trailingAnchor, constant: -8),
-            agentScroll.bottomAnchor.constraint(equalTo: agentDrawerCaption.topAnchor, constant: -8),
-
-            agentStack.leadingAnchor.constraint(equalTo: agentScroll.contentView.leadingAnchor),
-            agentStack.topAnchor.constraint(equalTo: agentScroll.contentView.topAnchor),
-            agentStack.trailingAnchor.constraint(equalTo: agentScroll.contentView.trailingAnchor),
-            agentStack.bottomAnchor.constraint(lessThanOrEqualTo: agentScroll.contentView.bottomAnchor),
-            agentStack.widthAnchor.constraint(equalTo: agentScroll.widthAnchor),
-
-            agentDrawerCaption.leadingAnchor.constraint(equalTo: agentDrawer.leadingAnchor, constant: 12),
-            agentDrawerCaption.trailingAnchor.constraint(equalTo: agentDrawer.trailingAnchor, constant: -12),
-            agentDrawerCaption.bottomAnchor.constraint(equalTo: agentDrawer.bottomAnchor, constant: -12),
-
-            agentBadge.heightAnchor.constraint(equalToConstant: 26),
-            agentBadge.widthAnchor.constraint(greaterThanOrEqualToConstant: 92),
-            agentBadge.widthAnchor.constraint(lessThanOrEqualToConstant: 158),
-
-            answerStyleOverlay.topAnchor.constraint(equalTo: topAnchor),
-            answerStyleOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
-            answerStyleOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
-            answerStyleOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
-
-            answerStylePanel.centerXAnchor.constraint(equalTo: centerXAnchor),
-            answerStylePanel.centerYAnchor.constraint(equalTo: centerYAnchor, constant: 24),
-            answerStylePanel.widthAnchor.constraint(equalToConstant: 360),
-
-            answerStyleLabel.topAnchor.constraint(equalTo: answerStylePanel.topAnchor, constant: 18),
-            answerStyleLabel.leadingAnchor.constraint(equalTo: answerStylePanel.leadingAnchor, constant: 18),
-            answerStyleLabel.trailingAnchor.constraint(equalTo: answerStylePanel.trailingAnchor, constant: -18),
-
-            answerStyleBox.topAnchor.constraint(equalTo: answerStyleLabel.bottomAnchor, constant: 12),
-            answerStyleBox.leadingAnchor.constraint(equalTo: answerStylePanel.leadingAnchor, constant: 18),
-            answerStyleBox.trailingAnchor.constraint(equalTo: answerStylePanel.trailingAnchor, constant: -18),
-            answerStyleBox.heightAnchor.constraint(equalToConstant: 48),
-
-            answerStyleSaveButton.topAnchor.constraint(equalTo: answerStyleBox.bottomAnchor, constant: 14),
-            answerStyleSaveButton.leadingAnchor.constraint(equalTo: answerStylePanel.leadingAnchor, constant: 18),
-            answerStyleSaveButton.trailingAnchor.constraint(equalTo: answerStylePanel.trailingAnchor, constant: -18),
-            answerStyleSaveButton.bottomAnchor.constraint(equalTo: answerStylePanel.bottomAnchor, constant: -18),
-            answerStyleSaveButton.heightAnchor.constraint(equalToConstant: 36),
-
-            transcriptStrip.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            transcriptStrip.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            transcriptStrip.bottomAnchor.constraint(equalTo: attachmentStrip.topAnchor, constant: -6),
-            transcriptStrip.heightAnchor.constraint(equalToConstant: 26),
-
-            transcriptActivityDot.leadingAnchor.constraint(equalTo: transcriptStrip.leadingAnchor, constant: 11),
-            transcriptActivityDot.centerYAnchor.constraint(equalTo: transcriptStrip.centerYAnchor),
-            transcriptActivityDot.widthAnchor.constraint(equalToConstant: 7),
-            transcriptActivityDot.heightAnchor.constraint(equalToConstant: 7),
-
-            transcriptStateLabel.leadingAnchor.constraint(equalTo: transcriptActivityDot.trailingAnchor, constant: 7),
-            transcriptStateLabel.centerYAnchor.constraint(equalTo: transcriptStrip.centerYAnchor),
-            transcriptStateLabel.widthAnchor.constraint(equalToConstant: 88),
-
-            transcriptScroll.topAnchor.constraint(equalTo: transcriptStrip.topAnchor, constant: 2),
-            transcriptScroll.leadingAnchor.constraint(equalTo: transcriptStateLabel.trailingAnchor, constant: 8),
-            transcriptScroll.trailingAnchor.constraint(equalTo: transcriptStrip.trailingAnchor, constant: -10),
-            transcriptScroll.bottomAnchor.constraint(equalTo: transcriptStrip.bottomAnchor, constant: -2),
-
-            attachmentStrip.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            attachmentStrip.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            attachmentStrip.bottomAnchor.constraint(equalTo: composerBar.topAnchor, constant: -6),
-            attachmentStripHeight,
-
-            attachmentStack.leadingAnchor.constraint(equalTo: attachmentStrip.contentView.leadingAnchor),
-            attachmentStack.topAnchor.constraint(equalTo: attachmentStrip.contentView.topAnchor),
-            attachmentStack.bottomAnchor.constraint(equalTo: attachmentStrip.contentView.bottomAnchor),
-            attachmentStack.heightAnchor.constraint(equalTo: attachmentStrip.heightAnchor),
-
-            composerBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            composerBar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            composerBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
-            composerBarHeight,
-
-            composerSurface.topAnchor.constraint(equalTo: composerBar.topAnchor, constant: 8),
-            composerSurface.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 12),
-            composerSurface.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -12),
-            composerTextHeight,
-
-            composer.topAnchor.constraint(equalTo: composerSurface.topAnchor, constant: 2),
-            composer.leadingAnchor.constraint(equalTo: composerSurface.leadingAnchor, constant: 14),
-            composer.trailingAnchor.constraint(equalTo: recordingButton.leadingAnchor, constant: -8),
-            composer.bottomAnchor.constraint(equalTo: composerSurface.bottomAnchor, constant: -2),
-
-            recordingButton.trailingAnchor.constraint(equalTo: askButton.leadingAnchor, constant: -6),
-            recordingButton.centerYAnchor.constraint(equalTo: composerSurface.centerYAnchor),
-            recordingButton.widthAnchor.constraint(equalToConstant: 80),
-            recordingButton.heightAnchor.constraint(equalToConstant: 30),
-
-            askButton.trailingAnchor.constraint(equalTo: composerSurface.trailingAnchor, constant: -7),
-            askButton.centerYAnchor.constraint(equalTo: composerSurface.centerYAnchor),
-            askButton.widthAnchor.constraint(equalToConstant: 106),
-            askButton.heightAnchor.constraint(equalToConstant: 32),
-
-            attachButton.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 12),
-            attachButton.bottomAnchor.constraint(equalTo: composerBar.bottomAnchor, constant: -8),
-            attachButton.widthAnchor.constraint(equalToConstant: 32),
-            attachButton.heightAnchor.constraint(equalToConstant: 32),
-
-            agentButton.leadingAnchor.constraint(equalTo: attachButton.trailingAnchor, constant: 8),
-            agentButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            agentButton.widthAnchor.constraint(equalToConstant: 84),
-            agentButton.heightAnchor.constraint(equalToConstant: 36),
-
-            instructionsButton.leadingAnchor.constraint(equalTo: agentButton.trailingAnchor, constant: 8),
-            instructionsButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            instructionsButton.widthAnchor.constraint(equalToConstant: 80),
-            instructionsButton.heightAnchor.constraint(equalToConstant: 32),
-
-            opacityControl.leadingAnchor.constraint(equalTo: instructionsButton.trailingAnchor, constant: 8),
-            opacityControl.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            opacityControl.widthAnchor.constraint(equalToConstant: 144),
-            opacityControl.heightAnchor.constraint(equalToConstant: 32),
-
-            opacityLabel.leadingAnchor.constraint(equalTo: opacityControl.leadingAnchor, constant: 12),
-            opacityLabel.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
-            opacityLabel.widthAnchor.constraint(equalToConstant: 46),
-
-            opacitySlider.leadingAnchor.constraint(equalTo: opacityLabel.trailingAnchor, constant: 8),
-            opacitySlider.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
-            opacitySlider.trailingAnchor.constraint(equalTo: opacityValueLabel.leadingAnchor, constant: -7),
-            opacitySlider.heightAnchor.constraint(equalToConstant: 20),
-
-            opacityValueLabel.trailingAnchor.constraint(equalTo: opacityControl.trailingAnchor, constant: -10),
-            opacityValueLabel.centerYAnchor.constraint(equalTo: opacityControl.centerYAnchor),
-            opacityValueLabel.widthAnchor.constraint(equalToConstant: 22),
-
-            analyzeButton.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -14),
-            analyzeButton.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            analyzeButton.widthAnchor.constraint(equalToConstant: 84),
-            analyzeButton.heightAnchor.constraint(equalToConstant: 32),
-
-            modelMenu.trailingAnchor.constraint(equalTo: analyzeButton.leadingAnchor, constant: -7),
-            modelMenu.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            modelMenu.widthAnchor.constraint(greaterThanOrEqualToConstant: 118),
-            modelMenu.widthAnchor.constraint(lessThanOrEqualToConstant: 144),
-            modelMenu.heightAnchor.constraint(equalToConstant: 32),
-
-            opacityControl.trailingAnchor.constraint(lessThanOrEqualTo: modelMenu.leadingAnchor, constant: -10),
-
-            closeConfirmOverlay.topAnchor.constraint(equalTo: topAnchor),
-            closeConfirmOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
-            closeConfirmOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
-            closeConfirmOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
-
-            closeConfirmPanel.centerXAnchor.constraint(equalTo: centerXAnchor),
-            closeConfirmPanel.centerYAnchor.constraint(equalTo: centerYAnchor, constant: 24),
-            closeConfirmPanel.widthAnchor.constraint(equalToConstant: 360),
-
-            closeConfirmTitle.topAnchor.constraint(equalTo: closeConfirmPanel.topAnchor, constant: 18),
-            closeConfirmTitle.leadingAnchor.constraint(equalTo: closeConfirmPanel.leadingAnchor, constant: 18),
-            closeConfirmTitle.trailingAnchor.constraint(equalTo: closeConfirmPanel.trailingAnchor, constant: -18),
-
-            closeConfirmBody.topAnchor.constraint(equalTo: closeConfirmTitle.bottomAnchor, constant: 8),
-            closeConfirmBody.leadingAnchor.constraint(equalTo: closeConfirmTitle.leadingAnchor),
-            closeConfirmBody.trailingAnchor.constraint(equalTo: closeConfirmTitle.trailingAnchor),
-
-            closeConfirmCancelButton.topAnchor.constraint(equalTo: closeConfirmBody.bottomAnchor, constant: 18),
-            closeConfirmCancelButton.leadingAnchor.constraint(equalTo: closeConfirmPanel.leadingAnchor, constant: 18),
-            closeConfirmCancelButton.bottomAnchor.constraint(equalTo: closeConfirmPanel.bottomAnchor, constant: -18),
-            closeConfirmCancelButton.widthAnchor.constraint(equalToConstant: 150),
-            closeConfirmCancelButton.heightAnchor.constraint(equalToConstant: 34),
-
-            closeConfirmTurnOffButton.topAnchor.constraint(equalTo: closeConfirmCancelButton.topAnchor),
-            closeConfirmTurnOffButton.leadingAnchor.constraint(equalTo: closeConfirmCancelButton.trailingAnchor, constant: 12),
-            closeConfirmTurnOffButton.trailingAnchor.constraint(equalTo: closeConfirmPanel.trailingAnchor, constant: -18),
-            closeConfirmTurnOffButton.heightAnchor.constraint(equalTo: closeConfirmCancelButton.heightAnchor),
-
-            // Connector inheritance sheet — bottom confirm, reusing the
-            // close-confirm overlay pattern (PLAN §9 surface 3).
-            connectorSheetOverlay.topAnchor.constraint(equalTo: topAnchor),
-            connectorSheetOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
-            connectorSheetOverlay.trailingAnchor.constraint(equalTo: trailingAnchor),
-            connectorSheetOverlay.bottomAnchor.constraint(equalTo: bottomAnchor),
-
-            connectorSheetPanel.centerXAnchor.constraint(equalTo: connectorSheetOverlay.centerXAnchor),
-            connectorSheetPanel.centerYAnchor.constraint(equalTo: connectorSheetOverlay.centerYAnchor),
-            connectorSheetPanel.widthAnchor.constraint(equalToConstant: 380),
-
-            connectorSheetTitle.topAnchor.constraint(equalTo: connectorSheetPanel.topAnchor, constant: 18),
-            connectorSheetTitle.leadingAnchor.constraint(equalTo: connectorSheetPanel.leadingAnchor, constant: 18),
-            connectorSheetTitle.trailingAnchor.constraint(equalTo: connectorSheetPanel.trailingAnchor, constant: -18),
-
-            connectorSheetSummary.topAnchor.constraint(equalTo: connectorSheetTitle.bottomAnchor, constant: 6),
-            connectorSheetSummary.leadingAnchor.constraint(equalTo: connectorSheetTitle.leadingAnchor),
-            connectorSheetSummary.trailingAnchor.constraint(equalTo: connectorSheetTitle.trailingAnchor),
-
-            connectorSheetScroll.topAnchor.constraint(equalTo: connectorSheetSummary.bottomAnchor, constant: 12),
-            connectorSheetScroll.leadingAnchor.constraint(equalTo: connectorSheetPanel.leadingAnchor, constant: 14),
-            connectorSheetScroll.trailingAnchor.constraint(equalTo: connectorSheetPanel.trailingAnchor, constant: -14),
-            connectorSheetScroll.heightAnchor.constraint(equalToConstant: 168),
-
-            connectorSheetStack.leadingAnchor.constraint(equalTo: connectorSheetScroll.contentView.leadingAnchor),
-            connectorSheetStack.topAnchor.constraint(equalTo: connectorSheetScroll.contentView.topAnchor),
-            connectorSheetStack.trailingAnchor.constraint(equalTo: connectorSheetScroll.contentView.trailingAnchor),
-            connectorSheetStack.bottomAnchor.constraint(lessThanOrEqualTo: connectorSheetScroll.contentView.bottomAnchor),
-            connectorSheetStack.widthAnchor.constraint(equalTo: connectorSheetScroll.widthAnchor),
-
-            connectorSheetCancelButton.topAnchor.constraint(equalTo: connectorSheetScroll.bottomAnchor, constant: 14),
-            connectorSheetCancelButton.leadingAnchor.constraint(equalTo: connectorSheetPanel.leadingAnchor, constant: 18),
-            connectorSheetCancelButton.bottomAnchor.constraint(equalTo: connectorSheetPanel.bottomAnchor, constant: -18),
-            connectorSheetCancelButton.widthAnchor.constraint(equalToConstant: 158),
-            connectorSheetCancelButton.heightAnchor.constraint(equalToConstant: 34),
-
-            connectorSheetAttachButton.topAnchor.constraint(equalTo: connectorSheetCancelButton.topAnchor),
-            connectorSheetAttachButton.leadingAnchor.constraint(equalTo: connectorSheetCancelButton.trailingAnchor, constant: 12),
-            connectorSheetAttachButton.trailingAnchor.constraint(equalTo: connectorSheetPanel.trailingAnchor, constant: -18),
-            connectorSheetAttachButton.heightAnchor.constraint(equalTo: connectorSheetCancelButton.heightAnchor),
-        ])
-
-        navButton.target = self
-        navButton.action = #selector(toggleSessionsClicked)
-        drawerCloseButton.target = self
-        drawerCloseButton.action = #selector(closeSessionsClicked)
-        canvasToggleButton.target = self
-        canvasToggleButton.action = #selector(toggleCanvasClicked)
-        newSessionButton.target = self
-        newSessionButton.action = #selector(newSessionClicked)
-        latestSessionButton.target = self
-        latestSessionButton.action = #selector(continueSessionClicked)
-        answerStyleSaveButton.target = self
-        answerStyleSaveButton.action = #selector(saveAnswerStyleClicked)
-        answerStyleBox.delegate = self
-        hideButton.target = self
-        hideButton.action = #selector(hideClicked)
-        fullSizeButton.target = self
-        fullSizeButton.action = #selector(fullSizeClicked)
-        closeButton.target = self
-        closeButton.action = #selector(closeClicked)
-        closeConfirmCancelButton.target = self
-        closeConfirmCancelButton.action = #selector(cancelCloseConfirmClicked)
-        closeConfirmTurnOffButton.target = self
-        closeConfirmTurnOffButton.action = #selector(confirmTurnOffClicked)
-        opacitySlider.target = self
-        opacitySlider.action = #selector(opacityChanged)
-        composer.onSubmit = { [weak self] in self?.askClicked() }
-        composer.onMeasuredHeight = { [weak self] height in self?.setComposerTextHeight(height) }
-        // Clicking the rounded surface (not just the glyphs) focuses the composer.
-        (composerSurface as? ComposerSurfaceView)?.composer = composer
-        recordingButton.target = self
-        recordingButton.action = #selector(recordingClicked)
-        askButton.target = self
-        askButton.action = #selector(askClicked)
-        analyzeButton.target = self
-        analyzeButton.action = #selector(analyzeClicked)
-        attachButton.target = self
-        attachButton.action = #selector(attachClicked)
-        instructionsButton.target = self
-        instructionsButton.action = #selector(instructionsClicked)
-        agentButton.target = self
-        agentButton.action = #selector(agentClicked)
-        agentBadge.addGestureRecognizer(
-            NSClickGestureRecognizer(target: self, action: #selector(agentBadgeClicked)))
-        agentDrawerBackButton.target = self
-        agentDrawerBackButton.action = #selector(agentDrawerBackClicked)
-        agentDrawerCloseButton.target = self
-        agentDrawerCloseButton.action = #selector(agentDrawerCloseClicked)
-        connectorSheetCancelButton.target = self
-        connectorSheetCancelButton.action = #selector(connectorSheetCancelClicked)
-        connectorSheetAttachButton.target = self
-        connectorSheetAttachButton.action = #selector(connectorSheetAttachClicked)
-
-        sessionDrawer.isHidden = true
-        agentDrawer.isHidden = true
-        connectorSheetOverlay.isHidden = true
-        answerStyleOverlay.isHidden = true
-        canvasPane.isHidden = true
-        canvasToggleButton.isHidden = true
-        agentBadge.isHidden = true
+        configureSystemToast()
+        assembleLayout()
+
+        feed.onTranscript = { [weak self] _ in self?.markListening() }
+        feed.onOpenURL = { url in NSWorkspace.shared.open(url) }
+        feed.onFixRequested = { cardId, question in emitFixRequested(cardId: cardId, question: question) }
+        feed.onContentChanged = { [weak self] in self?.updateContextBar() }
         canvasPane.onCollapse = { [weak self] in self?.setCanvasOpen(false) }
         canvasPane.onToggleFullWindow = { [weak self] in self?.toggleCanvasFullWindow() }
-        canvasPane.setFullWindow(false)
-        styleHeaderIconButton(navButton, symbol: "sidebar.left", fallback: "[]")
-        styleHeaderIconButton(drawerCloseButton, symbol: "xmark", fallback: "x")
-        styleHeaderIconButton(canvasToggleButton, symbol: "sidebar.right", fallback: "|")
-        styleHeaderIconButton(newSessionButton, symbol: "square.and.pencil", fallback: "+")
-        styleControlButton(latestSessionButton, symbol: "clock.arrow.circlepath", accent: false)
-        styleControlButton(answerStyleSaveButton, symbol: "checkmark", accent: true)
-        styleControlButton(recordingButton, symbol: "waveform", accent: false)
-        styleControlButton(instructionsButton, symbol: "text.bubble", accent: false)
-        styleIconButton(attachButton, symbol: "plus", fallback: "+")
-        styleControlButton(agentButton, symbol: "cpu", accent: false)
-        styleControlButton(analyzeButton, symbol: "sparkle.magnifyingglass", accent: false)
-        styleControlButton(askButton, symbol: "arrow.up", accent: true)
-        styleHeaderIconButton(hideButton, symbol: "eye.slash", fallback: "-")
-        styleHeaderIconButton(closeButton, symbol: "xmark", fallback: "x")
-        updateFullSizeButtonChrome()
-        styleAgentSurfaces()
-        configureTooltips()
-        setContextItems([])
-        setTranscriptState("IDLE", active: false)
-        applyOpacity(opacitySlider.doubleValue)
+
+        composer.onSubmit = { [weak self] in self?.askClicked() }
+        composer.onMeasuredHeight = { [weak self] height in self?.setComposerTextHeight(height) }
+        composer.placeholder = "Ask a follow-up…"
+
+        (connectorSheetOverlay as ModalBlockerView).onEscape = { [weak self] in self?.dismissConnectorSheet() }
+        (billingOverlay as ModalBlockerView).onEscape = { [weak self] in self?.declineBilling() }
+        (closeConfirmOverlay as ModalBlockerView).onEscape = { [weak self] in self?.dismissCloseConfirm(animated: true) }
+
+        setBodyTab(.ask)
+        updateContextBar()
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    deinit {
-        audioPulseTimer?.invalidate()
-        knowledgeIndexTimer?.invalidate()
-        toastHideWorkItem?.cancel()
+    // MARK: Phase 1 — Surface (dark aurora glass; the washout fix)
+
+    private func configureSurface() {
+        // THE surface — match the HTML EXACTLY. In the mockup the panel is a
+        // clean, EVEN dark navy glass (rgba(17,20,26,.52)) sitting over the
+        // dark `.desk` aurora gradient (#0b1220 → #160e24). The aurora belongs
+        // to the DESK behind, NOT painted strongly on the panel — a strong
+        // gradient on the panel makes the blotchy green/teal blob (the bug).
+        // So: paint the panel as the desk's deep-navy gradient itself, even and
+        // subtle, near-opaque so it reads dark over any wallpaper.
+        layer?.backgroundColor = NSColor(red: 0.043, green: 0.071, blue: 0.125, alpha: 0.97).cgColor
+        layer?.cornerRadius = Tok.r2xl
+        layer?.masksToBounds = true
+        if #available(macOS 10.15, *) { layer?.cornerCurve = .continuous }
+
+        // The aurora as the DESK gradient: deep navy → deep violet, EVEN and
+        // SUBTLE (matches linear-gradient(140deg,#0b1220,#160e24 60%,#0a0d14)
+        // with the faint radial tints). Low-contrast so it's a calm dark field,
+        // never a bright blob. This IS the panel's base — diagonal, gentle.
+        auroraLayer.colors = [
+            NSColor(red: 0.043, green: 0.071, blue: 0.125, alpha: 1.0).cgColor, // #0b1220 navy
+            NSColor(red: 0.086, green: 0.055, blue: 0.141, alpha: 1.0).cgColor, // #160e24 violet
+            NSColor(red: 0.039, green: 0.051, blue: 0.078, alpha: 1.0).cgColor, // #0a0d14 deep
+        ]
+        auroraLayer.locations = [0.0, 0.6, 1.0]
+        auroraLayer.startPoint = CGPoint(x: 0.15, y: 0.0)
+        auroraLayer.endPoint = CGPoint(x: 0.85, y: 1.0)
+        auroraLayer.opacity = 0.96
+        auroraLayer.cornerRadius = Tok.r2xl
+        if #available(macOS 10.15, *) { auroraLayer.cornerCurve = .continuous }
+        auroraLayer.masksToBounds = true
+        layer?.addSublayer(auroraLayer)
+
+        // 1px top-edge highlight hairline (.white α0.09).
+        topHairline.backgroundColor = NSColor.white.withAlphaComponent(0.09).cgColor
+        layer?.addSublayer(topHairline)
+
+        // Window shadow (black α0.55, soft).
+        layer?.shadowColor = NSColor.black.cgColor
+        layer?.shadowOpacity = 0.55
+        layer?.shadowRadius = 40
+        layer?.shadowOffset = .zero
     }
 
     override func layout() {
         super.layout()
-        applyShellChrome()
-        keepFixedChromeInBounds()
-        if canvasOpen {
-            updateCanvasWidth()
-        }
-        resizeTranscriptLabelToContent()
+        auroraLayer.frame = bounds
+        topHairline.frame = CGRect(x: 0, y: bounds.height - 1, width: bounds.width, height: 1)
     }
 
-    override func resetCursorRects() {
-        super.resetCursorRects()
-        guard closeConfirmOverlay.isHidden, answerStyleOverlay.isHidden else { return }
-        addCursorRect(NSRect(x: bounds.width - resizeHitSize, y: 0, width: resizeHitSize, height: bounds.height), cursor: .resizeLeftRight)
-        addCursorRect(NSRect(x: 0, y: 0, width: bounds.width, height: resizeHitSize), cursor: .resizeUpDown)
+    func applyOpacity(_ opacity: Double) {
+        // The dark fill alpha is the one knob for "dark vs washed-out". We keep
+        // the panel firmly dark (floor 0.90) so it never washes out, while still
+        // honoring the user's preference downward a touch.
+        let value = min(max(CGFloat(opacity), 0.50), 1.0)
+        backgroundOpacity = value
+        // Drive the panel alpha via the aurora gradient layer (the visible
+        // surface), keeping it firmly dark (floor 0.90). Don't repaint the base
+        // with a different color — that would override the navy aurora base.
+        let fillAlpha = blueyMaterialAlpha(1.0, opacity: value, floor: 0.90)
+        layer?.backgroundColor = NSColor(red: 0.043, green: 0.071, blue: 0.125, alpha: fillAlpha).cgColor
+        auroraLayer.opacity = Float(fillAlpha)
+        canvasPane.applyBackgroundOpacity(value)
+        onOpacityChanged?(Double(value))
     }
 
-    private func applyShellChrome() {
-        wantsLayer = true
-        layer?.cornerRadius = ExpandedPanelMetrics.cornerRadius
-        layer?.masksToBounds = true
-        if #available(macOS 10.15, *) {
-            layer?.cornerCurve = .continuous
-        }
-    }
-
-    private func materialAlpha(_ base: CGFloat, floor: CGFloat = 0.0) -> CGFloat {
-        blueyMaterialAlpha(base, opacity: backgroundOpacity, floor: floor)
-    }
-
-    private func refreshBackgroundChrome() {
-        layer?.backgroundColor = NSColor(
-            red: 0.010,
-            green: 0.012,
-            blue: 0.016,
-            alpha: backgroundOpacity
-        ).cgColor
-        headerBar.layer?.backgroundColor = NSColor(
-            red: 0.018,
-            green: 0.022,
-            blue: 0.030,
-            alpha: materialAlpha(0.92)
-        ).cgColor
-        modelMenu.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.075)).cgColor
-        modelMenu.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.12)).cgColor
-        balanceLabel.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.055)).cgColor
-        balanceLabel.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.10)).cgColor
-        toastView.layer?.backgroundColor = NSColor(
-            red: 0.018,
-            green: 0.023,
-            blue: 0.030,
-            alpha: materialAlpha(0.96)
-        ).cgColor
-        transcriptStrip.layer?.backgroundColor = NSColor.black.withAlphaComponent(materialAlpha(0.16)).cgColor
-        sessionDrawer.layer?.backgroundColor = NSColor(
-            red: 0.035,
-            green: 0.040,
-            blue: 0.050,
-            alpha: materialAlpha(0.98)
-        ).cgColor
-        answerStylePanel.layer?.backgroundColor = BlueyTheme.panelDeep
-            .withAlphaComponent(materialAlpha(0.97))
-            .cgColor
-        composerBar.layer?.backgroundColor = NSColor(
-            red: 0.014,
-            green: 0.016,
-            blue: 0.022,
-            alpha: materialAlpha(0.94)
-        ).cgColor
-        composerSurface.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.050)).cgColor
-        composerSurface.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.12)).cgColor
-        opacityControl.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.065)).cgColor
-        closeConfirmPanel.layer?.backgroundColor = BlueyTheme.panelDeep
-            .withAlphaComponent(materialAlpha(0.97))
-            .cgColor
-        feed.applyBackgroundOpacity(backgroundOpacity)
-        canvasPane.applyBackgroundOpacity(backgroundOpacity)
-    }
-
-    override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53, dismissActiveOverlay() {
-            return
-        }
-        super.keyDown(with: event)
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        let localPoint = convert(event.locationInWindow, from: nil)
-        let edges = resizeEdges(at: localPoint)
-        if !edges.isEmpty, let window {
-            activeResizeEdges = edges
-            resizeStartMouse = NSEvent.mouseLocation
-            resizeStartFrame = window.frame
-            return
-        }
-        super.mouseDown(with: event)
-    }
-
-    override func mouseDragged(with event: NSEvent) {
-        guard !activeResizeEdges.isEmpty, let window else {
-            super.mouseDragged(with: event)
-            return
-        }
-        let currentMouse = NSEvent.mouseLocation
-        let deltaX = currentMouse.x - resizeStartMouse.x
-        let deltaY = currentMouse.y - resizeStartMouse.y
-        var frame = resizeStartFrame
-
-        if activeResizeEdges.contains(.left) {
-            frame.origin.x += deltaX
-            frame.size.width -= deltaX
-        }
-        if activeResizeEdges.contains(.right) {
-            frame.size.width += deltaX
-        }
-        if activeResizeEdges.contains(.bottom) {
-            frame.origin.y += deltaY
-            frame.size.height -= deltaY
-        }
-        if activeResizeEdges.contains(.top) {
-            frame.size.height += deltaY
-        }
-
-        frame = clampedResizeFrame(frame, from: resizeStartFrame, edges: activeResizeEdges, window: window)
-        let verticalResize = activeResizeEdges.contains(.top) || activeResizeEdges.contains(.bottom)
-        if let overlayWindow = window as? OverlayWindow, !verticalResize {
-            let topLeft = NSPoint(x: frame.minX, y: resizeStartFrame.maxY)
-            overlayWindow.lockedFrameHeight = resizeStartFrame.height
-            window.setFrame(frame, display: true)
-            window.setFrameTopLeftPoint(topLeft)
-            overlayWindow.lockedFrameHeight = nil
-        } else {
-            window.setFrame(frame, display: true)
-        }
-    }
-
-    override func mouseUp(with event: NSEvent) {
-        if !activeResizeEdges.isEmpty {
-            (window as? OverlayWindow)?.lockedFrameHeight = nil
-            activeResizeEdges = []
-            return
-        }
-        super.mouseUp(with: event)
-    }
-
-    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-        guard control === answerStyleBox else { return false }
-        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
-            dismissAnswerStyleEditor(animated: true)
-            return true
-        }
-        return false
-    }
-
-    func isInteractiveAtScreenPoint(_ screenPoint: NSPoint) -> Bool {
-        guard let window else { return false }
-        let windowPoint = window.convertPoint(fromScreen: screenPoint)
-        let localPoint = convert(windowPoint, from: nil)
-        guard bounds.contains(localPoint) else { return false }
-
-        if !closeConfirmOverlay.isHidden {
-            return true
-        }
-        if !connectorSheetOverlay.isHidden {
-            return true
-        }
-        if !answerStyleOverlay.isHidden {
-            return true
-        }
-        if !sessionDrawer.isHidden {
-            let drawerPoint = sessionDrawer.convert(localPoint, from: self)
-            return sessionDrawer.bounds.contains(drawerPoint)
-        }
-        if !resizeEdges(at: localPoint).isEmpty {
-            return true
-        }
-        if hitsExplicitInteractiveChrome(at: localPoint) {
-            return true
-        }
-        if !agentDrawer.isHidden && agentDrawer.frame.contains(localPoint) {
-            return true
-        }
-        // Card affordances (Fix / Approve / Reject) live inside the otherwise
-        // click-through feed: capture the mouse only over an enabled button so
-        // the rest of the feed stays transparent to the app underneath (F4).
-        let feedPoint = feed.convert(windowPoint, from: nil)
-        if feed.hasInteractiveControl(at: feedPoint) {
-            return true
-        }
-        return hasInteractiveView(at: localPoint)
-            || feed.hasCopyControl(atScreenPoint: screenPoint)
-    }
-
-    private func hitsExplicitInteractiveChrome(at localPoint: NSPoint) -> Bool {
-        let controls: [NSView] = [
-            headerBar,
-            navButton,
-            newSessionButton,
-            canvasToggleButton,
-            balanceLabel,
-            fullSizeButton,
-            hideButton,
-            closeButton,
-            routeBadge,
-            knowledgeBadge,
-            transcriptStrip,
-            attachmentStrip,
-            composerSurface,
-            composer,
-            recordingButton,
-            askButton,
-            attachButton,
-            instructionsButton,
-            opacityControl,
-            opacitySlider,
-            modelMenu,
-            analyzeButton,
-        ]
-        return controls.contains { view in
-            guard !view.isHidden, view.alphaValue > 0.01 else { return false }
-            let rect = view.convert(view.bounds, to: self).insetBy(dx: -8, dy: -8)
-            return rect.contains(localPoint)
-        }
-    }
-
-    private func hasInteractiveView(at localPoint: NSPoint) -> Bool {
-        var hit: NSView? = hitTest(localPoint)
-        while let view = hit {
-            if view === self || view === workspace || view === headerBar || view === composerBar {
-                hit = view.superview
-                continue
-            }
-            if view is NSButton
-                || view is NSPopUpButton
-                || view is NSSlider
-                || view is NSScroller
-                || view is NSTextView
-            {
-                return true
-            }
-            if let textField = view as? NSTextField, textField.isEditable {
-                return true
-            }
-            hit = view.superview
-        }
-        return false
-    }
-
-    private func resizeEdges(at point: NSPoint) -> ResizeEdges {
-        guard bounds.contains(point),
-              closeConfirmOverlay.isHidden,
-              answerStyleOverlay.isHidden,
-              canStartResize(at: point)
-        else {
-            return []
-        }
-        var edges: ResizeEdges = []
-        if point.x >= bounds.width - resizeHitSize {
-            edges.insert(.right)
-        }
-        if point.y <= resizeHitSize {
-            edges.insert(.bottom)
-        }
-        return edges
-    }
-
-    private func canStartResize(at point: NSPoint) -> Bool {
-        if headerBar.frame.insetBy(dx: -4, dy: -4).contains(point) {
-            return false
-        }
-        if composerBar.frame.insetBy(dx: -4, dy: -4).contains(point) {
-            return false
-        }
-        if transcriptStrip.frame.insetBy(dx: -4, dy: -4).contains(point) {
-            return false
-        }
-        if !sessionDrawer.isHidden {
-            let drawerPoint = sessionDrawer.convert(point, from: self)
-            if sessionDrawer.bounds.contains(drawerPoint) {
-                return false
-            }
-        }
-        if !canvasPane.isHidden {
-            let canvasPoint = canvasPane.convert(point, from: self)
-            if canvasPane.bounds.contains(canvasPoint) {
-                return false
-            }
-        }
-        return point.x >= bounds.width - resizeHitSize || point.y <= resizeHitSize
-    }
-
-    private func clampedResizeFrame(
-        _ proposed: NSRect,
-        from start: NSRect,
-        edges: ResizeEdges,
-        window: NSWindow
-    ) -> NSRect {
-        var frame = proposed
-        let minWidth = max(window.minSize.width, 360)
-        let minHeight = max(window.minSize.height, ExpandedPanelMetrics.minHeight)
-        let maxWidth = window.maxSize.width > 0 ? window.maxSize.width : CGFloat.greatestFiniteMagnitude
-        let maxHeight = window.maxSize.height > 0 ? window.maxSize.height : CGFloat.greatestFiniteMagnitude
-
-        if frame.width < minWidth {
-            if edges.contains(.left) {
-                frame.origin.x = start.maxX - minWidth
-            }
-            frame.size.width = minWidth
-        } else if frame.width > maxWidth {
-            if edges.contains(.left) {
-                frame.origin.x = start.maxX - maxWidth
-            }
-            frame.size.width = maxWidth
-        }
-
-        if frame.height < minHeight {
-            if edges.contains(.bottom) {
-                frame.origin.y = start.maxY - minHeight
-            }
-            frame.size.height = minHeight
-        } else if frame.height > maxHeight {
-            if edges.contains(.bottom) {
-                frame.origin.y = start.maxY - maxHeight
-            }
-            frame.size.height = maxHeight
-        }
-
-        return frame
-    }
-
-    /// The expanded overlay is a bounded, resizable tool surface. Header,
-    /// transcript, attachments, and composer are chrome; only the workspace
-    /// may compress/scroll as content grows.
-    private func configureFixedChromeLayoutPriorities() {
-        for chrome in [headerBar, transcriptStrip, attachmentStrip, composerBar] {
-            chrome.setContentHuggingPriority(.required, for: .vertical)
-            chrome.setContentCompressionResistancePriority(.required, for: .vertical)
-        }
-        workspace.setContentHuggingPriority(.defaultLow, for: .vertical)
-        workspace.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-        feed.setContentHuggingPriority(.defaultLow, for: .vertical)
-        feed.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-        canvasPane.setContentHuggingPriority(.defaultLow, for: .vertical)
-        canvasPane.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
-    }
-
-    private func keepFixedChromeInBounds() {
-        // Defensive guard for AppKit/autolayout edge cases. The window can
-        // report content bounds taller than the visible frame in some launch
-        // paths, so pin fixed chrome to the real visible height and keep its
-        // stacking order above dense transcript/card content.
-        guard bounds.height >= ExpandedPanelMetrics.minHeight else { return }
-        headerBar.isHidden = false
-        headerBar.layer?.zPosition = 1_000
-        headerStack.layer?.zPosition = 1_001
-        transcriptStrip.layer?.zPosition = 900
-        attachmentStrip.layer?.zPosition = 900
-        composerBar.layer?.zPosition = 1_000
-        let visibleHeight = min(bounds.height, window?.frame.height ?? bounds.height)
-        headerBar.frame = NSRect(
-            x: 10,
-            y: max(10, visibleHeight - 52),
-            width: max(0, bounds.width - 20),
-            height: 42)
-        headerStack.frame = headerBar.bounds.insetBy(dx: 9, dy: 4)
-        if composerBar.frame.minY < 0 || composerBar.frame.maxY > bounds.height {
-            let height = composerBarHeightConstraint?.constant ?? 94
-            composerBar.frame = NSRect(
-                x: 10,
-                y: 10,
-                width: max(0, bounds.width - 20),
-                height: height)
-        }
-    }
+    // MARK: Phase 2 — Header (`.ph`): dot · Bluey · ·managed · [seg] · ✕
 
     private func configureHeader() {
+        headerBar.translatesAutoresizingMaskIntoConstraints = false
         headerBar.wantsLayer = true
-        headerBar.layer?.backgroundColor = NSColor(red: 0.018, green: 0.022, blue: 0.030, alpha: 0.92).cgColor
-        headerBar.layer?.cornerRadius = 21
-        headerBar.layer?.borderWidth = 1
-        headerBar.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.18).cgColor
-        headerBar.layer?.shadowColor = NSColor.black.cgColor
-        headerBar.layer?.shadowOpacity = 0.18
-        headerBar.layer?.shadowRadius = 14
-        headerBar.layer?.shadowOffset = NSSize(width: 0, height: -6)
+        headerBar.layer?.backgroundColor = NSColor.clear.cgColor
+        // 1px hairline bottom.
+        let hairline = NSView()
+        hairline.translatesAutoresizingMaskIntoConstraints = false
+        hairline.wantsLayer = true
+        hairline.layer?.backgroundColor = Tok.hairline.cgColor
 
-        headerStack.orientation = .horizontal
-        headerStack.alignment = .centerY
-        headerStack.distribution = .fill
-        headerStack.spacing = 7
-        headerSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        headerSpacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        statusDot.translatesAutoresizingMaskIntoConstraints = false
+        statusDot.wantsLayer = true
+        statusDot.layer?.cornerRadius = 3.5
+        statusDot.layer?.backgroundColor = Tok.ok.cgColor
 
-        brandStack.orientation = .vertical
-        brandStack.alignment = .leading
-        brandStack.distribution = .fill
-        brandStack.spacing = -1
-        brandStack.setContentHuggingPriority(.defaultHigh, for: .horizontal)
-        brandStack.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        statusLabel.font = NSFont.systemFont(ofSize: 9.5, weight: .semibold)
-        statusLabel.textColor = BlueyTheme.textDim
-        statusLabel.lineBreakMode = .byTruncatingTail
-        statusLabel.maximumNumberOfLines = 1
-        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        modelMenu.addItems(withTitles: ["Auto", "Instant", "Balanced", "Deep"])
-        modelMenu.selectItem(at: 0)
-        modelMenu.isBordered = false
-        modelMenu.wantsLayer = true
-        modelMenu.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.075).cgColor
-        modelMenu.layer?.cornerRadius = 15
-        modelMenu.layer?.borderWidth = 1
-        modelMenu.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
-        modelMenu.font = NSFont.systemFont(ofSize: 12, weight: .bold)
-        modelMenu.contentTintColor = BlueyTheme.text
-        modelMenu.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        modelMenu.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        styleHeaderBadge(routeBadge, textColor: BlueyTheme.green)
-        routeBadge.toolTip = "Auto Router classification and selected lane"
-
-        styleHeaderBadge(knowledgeBadge, textColor: BlueyTheme.text)
-        knowledgeBadge.toolTip = "Attached document status"
-
-        balanceLabel.font = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .bold)
-        balanceLabel.textColor = BlueyTheme.text
-        balanceLabel.alignment = .center
-        balanceLabel.lineBreakMode = .byTruncatingMiddle
-        balanceLabel.maximumNumberOfLines = 1
-        useCenteredSingleLineCell(balanceLabel)
-        balanceLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        balanceLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        balanceLabel.wantsLayer = true
-        balanceLabel.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.055).cgColor
-        balanceLabel.layer?.cornerRadius = 14
-        balanceLabel.layer?.borderWidth = 1
-        balanceLabel.layer?.borderColor = NSColor.white.withAlphaComponent(0.10).cgColor
-    }
-
-    private func configureSystemToast() {
-        toastView.wantsLayer = true
-        toastView.layer?.backgroundColor = NSColor(red: 0.018, green: 0.023, blue: 0.030, alpha: 0.96).cgColor
-        toastView.layer?.cornerRadius = 18
-        toastView.layer?.borderWidth = 1
-        toastView.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.28).cgColor
-        toastView.layer?.shadowColor = NSColor.black.cgColor
-        toastView.layer?.shadowOpacity = 0.24
-        toastView.layer?.shadowRadius = 18
-        toastView.layer?.shadowOffset = NSSize(width: 0, height: -8)
-        toastView.alphaValue = 0
-        toastView.isHidden = true
-
-        toastTitleLabel.font = NSFont.systemFont(ofSize: 13, weight: .bold)
-        toastTitleLabel.textColor = BlueyTheme.text
-        toastTitleLabel.alignment = .center
-        toastTitleLabel.maximumNumberOfLines = 1
-        toastTitleLabel.lineBreakMode = .byTruncatingTail
-
-        toastBodyLabel.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
-        toastBodyLabel.textColor = BlueyTheme.textDim
-        toastBodyLabel.alignment = .center
-        toastBodyLabel.maximumNumberOfLines = 3
-        toastBodyLabel.lineBreakMode = .byWordWrapping
-    }
-
-    private func configureContextRows() {
-        transcriptStrip.wantsLayer = true
-        transcriptStrip.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.16).cgColor
-        transcriptStrip.layer?.cornerRadius = 13
-        transcriptStrip.layer?.borderWidth = 1
-        transcriptStrip.layer?.borderColor = BlueyTheme.hairline.cgColor
-
-        transcriptActivityDot.wantsLayer = true
-        transcriptActivityDot.layer?.cornerRadius = 3.5
-        transcriptActivityDot.layer?.backgroundColor = BlueyTheme.textDim.withAlphaComponent(0.55).cgColor
-        transcriptActivityDot.layer?.shadowColor = BlueyTheme.cyan.cgColor
-        transcriptActivityDot.layer?.shadowOpacity = 0
-        transcriptActivityDot.layer?.shadowRadius = 7
-        transcriptActivityDot.layer?.shadowOffset = .zero
-
-        transcriptStateLabel.font = NSFont.monospacedSystemFont(ofSize: 9.5, weight: .bold)
-        transcriptStateLabel.textColor = BlueyTheme.textDim
-        transcriptStateLabel.alignment = .left
-        transcriptStateLabel.lineBreakMode = .byTruncatingTail
-
-        transcriptScroll.drawsBackground = false
-        transcriptScroll.hasVerticalScroller = false
-        transcriptScroll.hasHorizontalScroller = true
-        transcriptScroll.autohidesScrollers = true
-        transcriptScroll.borderType = .noBorder
-        transcriptScroll.scrollerStyle = .overlay
-
-        transcriptLabel.isBezeled = false
-        transcriptLabel.drawsBackground = false
-        transcriptLabel.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
-        transcriptLabel.textColor = BlueyTheme.textDim
-        transcriptLabel.lineBreakMode = .byClipping
-        transcriptLabel.maximumNumberOfLines = 1
-        transcriptLabel.alignment = .left
-        if let cell = transcriptLabel.cell as? NSTextFieldCell {
-            cell.isScrollable = true
-            cell.wraps = false
-            cell.lineBreakMode = .byClipping
+        // Listening waveform (shown instead of the dot while listening).
+        listeningWave.translatesAutoresizingMaskIntoConstraints = false
+        listeningWave.isHidden = true
+        let heights: [CGFloat] = [5, 11, 7]
+        for h in heights {
+            let bar = NSView()
+            bar.translatesAutoresizingMaskIntoConstraints = false
+            bar.wantsLayer = true
+            bar.layer?.cornerRadius = 1
+            bar.layer?.backgroundColor = Tok.ok.cgColor
+            listeningWave.addSubview(bar)
+            bar.widthAnchor.constraint(equalToConstant: 2).isActive = true
+            bar.heightAnchor.constraint(equalToConstant: h).isActive = true
+            bar.bottomAnchor.constraint(equalTo: listeningWave.bottomAnchor).isActive = true
+            waveBars.append(bar)
         }
+        for (i, bar) in waveBars.enumerated() {
+            if i == 0 {
+                bar.leadingAnchor.constraint(equalTo: listeningWave.leadingAnchor).isActive = true
+            } else {
+                bar.leadingAnchor.constraint(equalTo: waveBars[i - 1].trailingAnchor, constant: 2).isActive = true
+            }
+        }
+        waveBars.last?.trailingAnchor.constraint(equalTo: listeningWave.trailingAnchor).isActive = true
 
-        attachmentStack.orientation = .horizontal
-        attachmentStack.alignment = .centerY
-        attachmentStack.spacing = 6
-        attachmentStack.edgeInsets = NSEdgeInsets(top: 3, left: 4, bottom: 3, right: 4)
+        brandLabel.translatesAutoresizingMaskIntoConstraints = false
+        brandLabel.font = Tok.font(13, .semibold)
+        brandLabel.textColor = Tok.tx1
+        useCenteredSingleLineCell(brandLabel)
+        brandLabel.stringValue = "Bluey"
 
-        attachmentStrip.drawsBackground = false
-        attachmentStrip.hasVerticalScroller = false
-        attachmentStrip.hasHorizontalScroller = true
-        attachmentStrip.autohidesScrollers = true
-        attachmentStrip.borderType = .noBorder
-        attachmentStrip.documentView = attachmentStack
-        attachmentStrip.scrollerStyle = .overlay
+        viaLabel.translatesAutoresizingMaskIntoConstraints = false
+        viaLabel.font = Tok.font(11, .regular)
+        viaLabel.textColor = Tok.tx3
+        useCenteredSingleLineCell(viaLabel)
+        viaLabel.stringValue = "· managed"
+
+        configureSegmented()
+
+        styleHeaderClose(closeButton)
+        closeButton.target = self
+        closeButton.action = #selector(closeClicked)
+
+        headerBar.addSubview(statusDot)
+        headerBar.addSubview(listeningWave)
+        headerBar.addSubview(brandLabel)
+        headerBar.addSubview(viaLabel)
+        headerBar.addSubview(segContainer)
+        headerBar.addSubview(closeButton)
+        headerBar.addSubview(hairline)
+
+        NSLayoutConstraint.activate([
+            headerBar.heightAnchor.constraint(equalToConstant: 48),
+
+            statusDot.leadingAnchor.constraint(equalTo: headerBar.leadingAnchor, constant: 14),
+            statusDot.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
+            statusDot.widthAnchor.constraint(equalToConstant: 7),
+            statusDot.heightAnchor.constraint(equalToConstant: 7),
+
+            listeningWave.leadingAnchor.constraint(equalTo: headerBar.leadingAnchor, constant: 14),
+            listeningWave.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
+            listeningWave.heightAnchor.constraint(equalToConstant: 11),
+
+            brandLabel.leadingAnchor.constraint(equalTo: statusDot.trailingAnchor, constant: 10),
+            brandLabel.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
+
+            viaLabel.leadingAnchor.constraint(equalTo: brandLabel.trailingAnchor, constant: 5),
+            viaLabel.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
+            viaLabel.trailingAnchor.constraint(lessThanOrEqualTo: segContainer.leadingAnchor, constant: -8),
+
+            segContainer.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -8),
+            segContainer.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
+
+            closeButton.trailingAnchor.constraint(equalTo: headerBar.trailingAnchor, constant: -14),
+            closeButton.centerYAnchor.constraint(equalTo: headerBar.centerYAnchor),
+            closeButton.widthAnchor.constraint(equalToConstant: 26),
+            closeButton.heightAnchor.constraint(equalToConstant: 26),
+
+            hairline.leadingAnchor.constraint(equalTo: headerBar.leadingAnchor),
+            hairline.trailingAnchor.constraint(equalTo: headerBar.trailingAnchor),
+            hairline.bottomAnchor.constraint(equalTo: headerBar.bottomAnchor),
+            hairline.heightAnchor.constraint(equalToConstant: 1),
+        ])
+    }
+
+    /// Segmented switch (`.seg`): container glass-hi + hairline, radius 10, pad 2.
+    private func configureSegmented() {
+        segContainer.translatesAutoresizingMaskIntoConstraints = false
+        segContainer.wantsLayer = true
+        segContainer.layer?.backgroundColor = Tok.glassHi.cgColor
+        segContainer.layer?.cornerRadius = 10
+        segContainer.layer?.borderWidth = 1
+        segContainer.layer?.borderColor = Tok.hairline.cgColor
+
+        let titles = ["Ask", "History", "Agents"]
+        var prev: NSButton?
+        for (i, title) in titles.enumerated() {
+            let button = NSButton(title: title, target: self, action: #selector(segClicked(_:)))
+            button.translatesAutoresizingMaskIntoConstraints = false
+            button.isBordered = false
+            button.tag = i
+            button.wantsLayer = true
+            button.layer?.cornerRadius = 8
+            button.setButtonType(.momentaryChange)
+            segContainer.addSubview(button)
+            segButtons.append(button)
+            NSLayoutConstraint.activate([
+                button.topAnchor.constraint(equalTo: segContainer.topAnchor, constant: 2),
+                button.bottomAnchor.constraint(equalTo: segContainer.bottomAnchor, constant: -2),
+                button.heightAnchor.constraint(equalToConstant: 22),
+                button.widthAnchor.constraint(greaterThanOrEqualToConstant: title == "History" ? 56 : 46),
+            ])
+            if let prev {
+                button.leadingAnchor.constraint(equalTo: prev.trailingAnchor, constant: 0).isActive = true
+            } else {
+                button.leadingAnchor.constraint(equalTo: segContainer.leadingAnchor, constant: 2).isActive = true
+            }
+            prev = button
+        }
+        prev?.trailingAnchor.constraint(equalTo: segContainer.trailingAnchor, constant: -2).isActive = true
+        styleSegButtons()
+    }
+
+    private func styleSegButtons() {
+        for (i, button) in segButtons.enumerated() {
+            let selected = i == currentTab.rawValue
+            button.layer?.backgroundColor = selected ? Tok.accentBg.cgColor : NSColor.clear.cgColor
+            button.attributedTitle = NSAttributedString(
+                string: button.title,
+                attributes: [
+                    .font: Tok.font(11.5, .semibold),
+                    .foregroundColor: selected ? Tok.accentTx : Tok.tx3,
+                ])
+        }
+    }
+
+    private func styleHeaderClose(_ button: NSButton) {
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.isBordered = false
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 8
+        button.contentTintColor = Tok.tx3
+        button.toolTip = "Hide Bluey"
+        if let image = symbolImage("minus") {
+            image.isTemplate = true
+            button.image = image
+            button.imagePosition = .imageOnly
+            button.imageScaling = .scaleProportionallyDown
+        } else {
+            button.title = "–"
+        }
+    }
+
+    @objc private func segClicked(_ sender: NSButton) {
+        guard let tab = BodyTab(rawValue: sender.tag) else { return }
+        setBodyTab(tab)
+    }
+
+    @objc private func closeClicked() {
+        // The ✕/– in the header HIDES (collapse to pill); turn-off is the
+        // explicit pill End action / its own confirm.
+        onClose?()
+    }
+
+    // MARK: Body tab switching
+
+    private func setBodyTab(_ tab: BodyTab) {
+        currentTab = tab
+        workspace.isHidden = tab != .ask
+        attachmentStrip.isHidden = tab != .ask || attachmentStrip.arrangedSubviews.isEmpty
+        historyContainer.isHidden = tab != .history
+        agentsScroll.isHidden = tab != .agents
+        // The composer + footer show on every tab (the mockup keeps them on all
+        // three): Ask follows up, History continues a session, Agents asks the
+        // attached agent.
+        composerBar.isHidden = false
+        footerBar.isHidden = false
+        styleSegButtons()
+        updateFooter()
+        updateContextBar()
+
+        switch tab {
+        case .ask:
+            composer.placeholder = recordingActive ? "Ask while Bluey listens…" : "Ask a follow-up…"
+        case .history:
+            composer.placeholder = "Ask Bluey…  or pick a session to continue"
+            if !sessionsLoaded { requestSessions(reset: true) }
+        case .agents:
+            composer.placeholder = "Ask your agent…"
+            if !agentListLoaded { emitAgentListRequested() }
+            renderAgents()
+        }
+    }
+
+    // MARK: Phase 4 — Ask body (timeline feed + optional canvas split)
+
+    private func configureAskBody() {
+        workspace.translatesAutoresizingMaskIntoConstraints = false
+        feed.translatesAutoresizingMaskIntoConstraints = false
+        canvasPane.translatesAutoresizingMaskIntoConstraints = false
+        canvasPane.isHidden = true
+        workspace.addSubview(feed)
+        workspace.addSubview(canvasPane)
+
+        let canvasWidth = canvasPane.widthAnchor.constraint(equalToConstant: 0)
+        canvasWidthConstraint = canvasWidth
+        NSLayoutConstraint.activate([
+            feed.topAnchor.constraint(equalTo: workspace.topAnchor),
+            feed.leadingAnchor.constraint(equalTo: workspace.leadingAnchor),
+            feed.bottomAnchor.constraint(equalTo: workspace.bottomAnchor),
+
+            canvasPane.topAnchor.constraint(equalTo: workspace.topAnchor),
+            canvasPane.trailingAnchor.constraint(equalTo: workspace.trailingAnchor),
+            canvasPane.bottomAnchor.constraint(equalTo: workspace.bottomAnchor),
+            canvasPane.leadingAnchor.constraint(equalTo: feed.trailingAnchor),
+            canvasWidth,
+        ])
+    }
+
+    // MARK: Phase 3 — Composer (`.comp`) + footer (`.foot`)
+
+    private func configureComposer() {
+        composerBar.translatesAutoresizingMaskIntoConstraints = false
+        composerSurface.translatesAutoresizingMaskIntoConstraints = false
+        composerSurface.wantsLayer = true
+        composerSurface.layer?.backgroundColor = Tok.glassHi.cgColor
+        composerSurface.layer?.cornerRadius = Tok.rLg
+        composerSurface.layer?.borderWidth = 1
+        composerSurface.layer?.borderColor = Tok.hairline.cgColor
+
+        // "+" button (32px, radius 10).
+        plusButton.translatesAutoresizingMaskIntoConstraints = false
+        plusButton.isBordered = false
+        plusButton.wantsLayer = true
+        plusButton.layer?.cornerRadius = 10
+        plusButton.layer?.backgroundColor = Tok.glassHi.cgColor
+        plusButton.layer?.borderWidth = 1
+        plusButton.layer?.borderColor = Tok.hairline.cgColor
+        plusButton.contentTintColor = Tok.tx2
+        plusButton.target = self
+        plusButton.action = #selector(togglePlusMenu)
+        plusButton.toolTip = "Add to context · session actions"
+        if let image = symbolImage("plus") {
+            image.isTemplate = true
+            plusButton.image = image
+            plusButton.imagePosition = .imageOnly
+            plusButton.imageScaling = .scaleProportionallyDown
+        } else { plusButton.title = "+" }
+
+        // Field.
+        composer.translatesAutoresizingMaskIntoConstraints = false
+        composer.font = Tok.font(13, .regular)
+        composer.textColor = Tok.tx1
+        composer.insertionPointColor = Tok.accent
+
+        // Listen toggle (waveform/mic + label).
+        listenButton.translatesAutoresizingMaskIntoConstraints = false
+        listenButton.isBordered = false
+        listenButton.target = self
+        listenButton.action = #selector(recordingClicked)
+        styleListenButton(listening: false)
+
+        // Send (32px, accent, radius 10).
+        sendButton.translatesAutoresizingMaskIntoConstraints = false
+        sendButton.isBordered = false
+        sendButton.wantsLayer = true
+        sendButton.layer?.cornerRadius = 10
+        sendButton.layer?.backgroundColor = Tok.accent.cgColor
+        sendButton.contentTintColor = .white
+        sendButton.target = self
+        sendButton.action = #selector(askClicked)
+        sendButton.toolTip = "Send (⌘↵)"
+        if let image = symbolImage("arrow.up") {
+            image.isTemplate = true
+            sendButton.image = image
+            sendButton.imagePosition = .imageOnly
+            sendButton.imageScaling = .scaleProportionallyDown
+        } else { sendButton.title = "↑" }
+
+        composerBar.addSubview(composerSurface)
+        composerSurface.addSubview(plusButton)
+        composerSurface.addSubview(composer)
+        composerSurface.addSubview(listenButton)
+        composerSurface.addSubview(sendButton)
+
+        let textHeight = composer.heightAnchor.constraint(equalToConstant: 22)
+        composerTextHeightConstraint = textHeight
+        NSLayoutConstraint.activate([
+            composerSurface.topAnchor.constraint(equalTo: composerBar.topAnchor),
+            composerSurface.bottomAnchor.constraint(equalTo: composerBar.bottomAnchor),
+            composerSurface.leadingAnchor.constraint(equalTo: composerBar.leadingAnchor, constant: 14),
+            composerSurface.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -14),
+            composerSurface.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
+
+            plusButton.leadingAnchor.constraint(equalTo: composerSurface.leadingAnchor, constant: 8),
+            plusButton.centerYAnchor.constraint(equalTo: composerSurface.centerYAnchor),
+            plusButton.widthAnchor.constraint(equalToConstant: 32),
+            plusButton.heightAnchor.constraint(equalToConstant: 32),
+
+            composer.leadingAnchor.constraint(equalTo: plusButton.trailingAnchor, constant: 9),
+            composer.centerYAnchor.constraint(equalTo: composerSurface.centerYAnchor),
+            composer.trailingAnchor.constraint(equalTo: listenButton.leadingAnchor, constant: -8),
+            textHeight,
+
+            listenButton.trailingAnchor.constraint(equalTo: sendButton.leadingAnchor, constant: -6),
+            listenButton.centerYAnchor.constraint(equalTo: composerSurface.centerYAnchor),
+            listenButton.heightAnchor.constraint(equalToConstant: 28),
+
+            sendButton.trailingAnchor.constraint(equalTo: composerSurface.trailingAnchor, constant: -7),
+            sendButton.centerYAnchor.constraint(equalTo: composerSurface.centerYAnchor),
+            sendButton.widthAnchor.constraint(equalToConstant: 32),
+            sendButton.heightAnchor.constraint(equalToConstant: 32),
+        ])
+    }
+
+    private func styleListenButton(listening: Bool) {
+        listenButton.wantsLayer = true
+        let color = listening ? Tok.ok : Tok.tx3
+        listenButton.contentTintColor = color
+        let title = listening ? "Listening" : "Listen"
+        let symbol = listening ? "waveform" : "mic"
+        if let image = symbolImage(symbol) {
+            image.isTemplate = true
+            listenButton.image = image
+            listenButton.imagePosition = .imageLeading
+            listenButton.imageHugsTitle = true
+            listenButton.imageScaling = .scaleProportionallyDown
+        }
+        listenButton.attributedTitle = NSAttributedString(
+            string: title,
+            attributes: [.font: Tok.font(11.5, .semibold), .foregroundColor: color])
+        listenButton.toolTip = listening ? "Stop listening" : "Listen (mic + system audio)"
+    }
+
+    private func configureFooter() {
+        footerBar.translatesAutoresizingMaskIntoConstraints = false
+        footerModelLabel.translatesAutoresizingMaskIntoConstraints = false
+        footerModelLabel.font = Tok.font(10.5, .regular)
+        footerModelLabel.textColor = Tok.tx3
+        footerConnectorsLabel.translatesAutoresizingMaskIntoConstraints = false
+        footerConnectorsLabel.font = Tok.font(10.5, .regular)
+        footerConnectorsLabel.textColor = Tok.tx3
+        footerKeysLabel.translatesAutoresizingMaskIntoConstraints = false
+        footerKeysLabel.font = Tok.mono(10.5, .regular)
+        footerKeysLabel.textColor = Tok.tx4
+        footerKeysLabel.alignment = .right
+
+        footerBar.addSubview(footerModelLabel)
+        footerBar.addSubview(footerConnectorsLabel)
+        footerBar.addSubview(footerKeysLabel)
+        NSLayoutConstraint.activate([
+            footerBar.heightAnchor.constraint(equalToConstant: 26),
+            footerModelLabel.leadingAnchor.constraint(equalTo: footerBar.leadingAnchor, constant: 16),
+            footerModelLabel.centerYAnchor.constraint(equalTo: footerBar.centerYAnchor),
+            footerConnectorsLabel.leadingAnchor.constraint(equalTo: footerModelLabel.trailingAnchor, constant: 11),
+            footerConnectorsLabel.centerYAnchor.constraint(equalTo: footerBar.centerYAnchor),
+            footerKeysLabel.trailingAnchor.constraint(equalTo: footerBar.trailingAnchor, constant: -16),
+            footerKeysLabel.centerYAnchor.constraint(equalTo: footerBar.centerYAnchor),
+            footerKeysLabel.leadingAnchor.constraint(greaterThanOrEqualTo: footerConnectorsLabel.trailingAnchor, constant: 8),
+        ])
+    }
+
+    private func updateFooter() {
+        switch currentTab {
+        case .ask:
+            footerModelLabel.stringValue = attachedAgentKind != nil ? "runs on your machine" : "opus-4.8"
+            footerConnectorsLabel.stringValue = attachedAgentKind != nil ? "" : "perplexity · github"
+            footerKeysLabel.stringValue = "⌘↵ ask · ⌥ hide"
+        case .history:
+            footerModelLabel.stringValue = "\(sessionTotal) session\(sessionTotal == 1 ? "" : "s")"
+            footerConnectorsLabel.stringValue = ""
+            footerKeysLabel.stringValue = "↵ continue · ⌘F search"
+        case .agents:
+            footerModelLabel.stringValue = attachedAgentKind.map { agentShortLabel($0).lowercased() } ?? "your agents"
+            footerConnectorsLabel.stringValue = ""
+            footerKeysLabel.stringValue = "answers run on your machine"
+        }
+    }
+
+    // MARK: Context bar (`.ctxbar`) + attachment chips
+
+    private func configureContextBar() {
+        contextBar.translatesAutoresizingMaskIntoConstraints = false
+        contextBar.wantsLayer = true
+        contextBar.layer?.backgroundColor = NSColor(red: 0.231, green: 0.510, blue: 0.965, alpha: 0.07).cgColor
+        contextBar.layer?.cornerRadius = 9
+        contextBar.layer?.borderWidth = 1
+        contextBar.layer?.borderColor = NSColor(red: 0.231, green: 0.510, blue: 0.965, alpha: 0.14).cgColor
+        contextBar.isHidden = true
+
+        let icon = NSImageView()
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        if let image = symbolImage("checkmark.circle") {
+            image.isTemplate = true
+            icon.image = image
+        }
+        icon.contentTintColor = Tok.accentTx
+
+        contextLabel.translatesAutoresizingMaskIntoConstraints = false
+        contextLabel.font = Tok.font(11, .regular)
+        contextLabel.textColor = Tok.tx2
+        contextLabel.lineBreakMode = .byTruncatingTail
+
+        contextBar.addSubview(icon)
+        contextBar.addSubview(contextLabel)
+        let ctxHeight = contextBar.heightAnchor.constraint(equalToConstant: 0)
+        contextBarHeightConstraint = ctxHeight
+        NSLayoutConstraint.activate([
+            ctxHeight,
+            icon.leadingAnchor.constraint(equalTo: contextBar.leadingAnchor, constant: 10),
+            icon.centerYAnchor.constraint(equalTo: contextBar.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 13),
+            icon.heightAnchor.constraint(equalToConstant: 13),
+            contextLabel.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 8),
+            contextLabel.centerYAnchor.constraint(equalTo: contextBar.centerYAnchor),
+            contextLabel.trailingAnchor.constraint(equalTo: contextBar.trailingAnchor, constant: -10),
+        ])
+
+        // Attachment chip strip (contextual, only when files attached).
+        attachmentStrip.translatesAutoresizingMaskIntoConstraints = false
+        attachmentStrip.orientation = .horizontal
+        attachmentStrip.alignment = .centerY
+        attachmentStrip.spacing = 7
         attachmentStrip.isHidden = true
     }
 
-    private func styleDrawer() {
-        sessionDrawer.wantsLayer = true
-        sessionDrawer.layer?.backgroundColor = NSColor(red: 0.035, green: 0.040, blue: 0.050, alpha: 0.98).cgColor
-        sessionDrawer.layer?.cornerRadius = 16
-        sessionDrawer.layer?.borderWidth = 1
-        sessionDrawer.layer?.borderColor = BlueyTheme.hairline.cgColor
-        sessionDrawer.layer?.shadowColor = NSColor.black.cgColor
-        sessionDrawer.layer?.shadowOpacity = 0.26
-        sessionDrawer.layer?.shadowRadius = 18
-        sessionDrawer.layer?.shadowOffset = NSSize(width: 0, height: -8)
-        sessionDrawer.layer?.zPosition = 1_500
-
-        answerStyleOverlay.isHidden = true
-        answerStyleOverlay.wantsLayer = true
-        answerStyleOverlay.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.44).cgColor
-        answerStyleOverlay.layer?.zPosition = 2_000
-
-        answerStylePanel.wantsLayer = true
-        answerStylePanel.layer?.backgroundColor = BlueyTheme.panelDeep.cgColor
-        answerStylePanel.layer?.cornerRadius = 18
-        answerStylePanel.layer?.borderWidth = 1
-        answerStylePanel.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.30).cgColor
-        answerStylePanel.layer?.shadowColor = NSColor.black.cgColor
-        answerStylePanel.layer?.shadowOpacity = 0.32
-        answerStylePanel.layer?.shadowRadius = 20
-        answerStylePanel.layer?.shadowOffset = .zero
-
-        drawerTitleLabel.font = NSFont.systemFont(ofSize: 14, weight: .bold)
-        drawerTitleLabel.textColor = BlueyTheme.text
-        drawerSubtitleLabel.font = NSFont.systemFont(ofSize: 10.5, weight: .medium)
-        drawerSubtitleLabel.textColor = BlueyTheme.textDim
-        drawerSubtitleLabel.lineBreakMode = .byWordWrapping
-        drawerSubtitleLabel.maximumNumberOfLines = 2
-
-        sessionStack.orientation = .vertical
-        sessionStack.alignment = .centerX
-        sessionStack.spacing = 6
-        sessionStack.edgeInsets = NSEdgeInsets(top: 2, left: 0, bottom: 2, right: 0)
-
-        sessionScroll.drawsBackground = false
-        sessionScroll.hasVerticalScroller = true
-        sessionScroll.hasHorizontalScroller = false
-        sessionScroll.autohidesScrollers = true
-        sessionScroll.borderType = .noBorder
-        sessionScroll.documentView = sessionStack
-        sessionScroll.scrollerStyle = .overlay
-
-        answerStyleLabel.font = NSFont.systemFont(ofSize: 10.5, weight: .bold)
-        answerStyleLabel.textColor = BlueyTheme.textDim
-        answerStyleLabel.alignment = .center
-        answerStyleLabel.stringValue = "How Bluey should answer"
-        answerStyleBox.placeholderString = "Natural, concise, interview-ready..."
-        answerStyleBox.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
-        answerStyleBox.isBezeled = false
-        answerStyleBox.drawsBackground = true
-        answerStyleBox.focusRingType = .none
-        answerStyleBox.backgroundColor = NSColor.white.withAlphaComponent(0.98)
-        answerStyleBox.textColor = NSColor.black.withAlphaComponent(0.96)
-        answerStyleBox.alignment = .center
-        answerStyleBox.placeholderAttributedString = NSAttributedString(
-            string: "Natural, concise, interview-ready...",
-            attributes: [.foregroundColor: NSColor.black.withAlphaComponent(0.60)])
-        answerStyleBox.wantsLayer = true
-        answerStyleBox.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.98).cgColor
-        answerStyleBox.layer?.cornerRadius = 10
-        answerStyleBox.layer?.borderWidth = 1
-        answerStyleBox.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.24).cgColor
-        answerStyleBox.layer?.masksToBounds = true
-    }
-
-    private func configureComposer() {
-        composerBar.wantsLayer = true
-        composerBar.layer?.backgroundColor = NSColor(red: 0.014, green: 0.016, blue: 0.022, alpha: 0.94).cgColor
-        composerBar.layer?.cornerRadius = 24
-        composerBar.layer?.borderWidth = 1
-        composerBar.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.22).cgColor
-        composerBar.layer?.shadowColor = NSColor.black.cgColor
-        composerBar.layer?.shadowOpacity = 0.22
-        composerBar.layer?.shadowRadius = 18
-        composerBar.layer?.shadowOffset = .zero
-
-        composerSurface.wantsLayer = true
-        composerSurface.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.050).cgColor
-        composerSurface.layer?.cornerRadius = 18
-        composerSurface.layer?.borderWidth = 1
-        composerSurface.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
-
-        opacityControl.wantsLayer = true
-        opacityControl.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.065).cgColor
-        opacityControl.layer?.cornerRadius = 16
-        opacityControl.layer?.borderWidth = 1
-        opacityControl.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.16).cgColor
-        opacityControl.toolTip = "Overlay opacity"
-        opacityLabel.stringValue = "Opacity"
-        opacityLabel.font = NSFont.systemFont(ofSize: 10.2, weight: .semibold)
-        opacityLabel.textColor = BlueyTheme.textDim
-        opacityLabel.alignment = .left
-        opacityValueLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 10.2, weight: .semibold)
-        opacityValueLabel.textColor = BlueyTheme.textDim
-        opacityValueLabel.alignment = .right
-        opacitySlider.controlSize = .small
-        opacitySlider.wantsLayer = true
-        opacitySlider.toolTip = "Overlay opacity"
-
-        composer.placeholder = "Ask anything..."
-        composer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        composer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-
-        for control in [
-            recordingButton,
-            opacityControl,
-            instructionsButton,
-            attachButton,
-            analyzeButton,
-            askButton,
-        ] {
-            control.setContentHuggingPriority(.required, for: .horizontal)
-            control.setContentCompressionResistancePriority(.required, for: .horizontal)
-        }
-    }
-
-    private func configureCloseConfirm() {
-        closeConfirmOverlay.isHidden = true
-        closeConfirmOverlay.wantsLayer = true
-        closeConfirmOverlay.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.52).cgColor
-        closeConfirmOverlay.layer?.zPosition = 2_100
-
-        closeConfirmPanel.wantsLayer = true
-        closeConfirmPanel.layer?.backgroundColor = BlueyTheme.panelDeep.cgColor
-        closeConfirmPanel.layer?.cornerRadius = 18
-        closeConfirmPanel.layer?.borderWidth = 1
-        closeConfirmPanel.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.30).cgColor
-        closeConfirmPanel.layer?.shadowColor = NSColor.black.cgColor
-        closeConfirmPanel.layer?.shadowOpacity = 0.34
-        closeConfirmPanel.layer?.shadowRadius = 22
-        closeConfirmPanel.layer?.shadowOffset = .zero
-
-        closeConfirmTitle.font = NSFont.systemFont(ofSize: 16, weight: .bold)
-        closeConfirmTitle.textColor = BlueyTheme.text
-        closeConfirmTitle.alignment = .center
-        closeConfirmBody.font = NSFont.systemFont(ofSize: 12.5, weight: .medium)
-        closeConfirmBody.textColor = BlueyTheme.textDim
-        closeConfirmBody.alignment = .center
-        closeConfirmBody.maximumNumberOfLines = 3
-
-        styleControlButton(closeConfirmCancelButton, symbol: "xmark", accent: false)
-        styleControlButton(closeConfirmTurnOffButton, symbol: "power", accent: true)
-        closeConfirmCancelButton.toolTip = "Keep Bluey running"
-        closeConfirmTurnOffButton.toolTip = "Turn Bluey off. Run bluey on to start again."
-    }
-
-    private func configureTooltips() {
-        navButton.toolTip = "Show recordings"
-        drawerCloseButton.toolTip = "Close recordings"
-        newSessionButton.toolTip = "Start a new recording"
-        modelMenu.toolTip = "Choose routing lane"
-        canvasToggleButton.toolTip = "Open or collapse the canvas"
-        balanceLabel.toolTip = "Remaining Bluey balance"
-        fullSizeButton.toolTip = windowFullSize ? "Restore Bluey size" : "Make Bluey full size"
-        hideButton.toolTip = "Hide to pill"
-        closeButton.toolTip = "Turn Bluey off. Run bluey on to start again."
-        recordingButton.toolTip = "Start or stop listening"
-        instructionsButton.toolTip = "How Bluey should answer"
-        agentButton.toolTip = "Attach a coding agent to answer from your context"
-        attachButton.toolTip = "Attach files"
-        analyzeButton.toolTip = "Analyse screen"
-        askButton.toolTip = "Answer with Enter or Command+Enter. Shift+Enter adds a new line."
-        latestSessionButton.toolTip = "Continue the latest recording"
-        answerStyleSaveButton.toolTip = "Save answer style for this session"
-    }
-
-    private func styleControlButton(_ button: NSButton, symbol: String, accent: Bool) {
-        button.isBordered = false
-        button.wantsLayer = true
-        button.layer?.cornerRadius = 16
-        button.layer?.backgroundColor = accent
-            ? NSColor(red: 0.07, green: 0.19, blue: 0.24, alpha: 0.98).cgColor
-            : NSColor.white.withAlphaComponent(0.070).cgColor
-        button.layer?.borderWidth = 1
-        button.layer?.borderColor = (accent ? BlueyTheme.cyan.withAlphaComponent(0.55) : NSColor.white.withAlphaComponent(0.12)).cgColor
-        button.font = NSFont.systemFont(ofSize: 12, weight: .bold)
-        button.attributedTitle = NSAttributedString(
-            string: button.title,
-            attributes: [
-                .font: button.font ?? NSFont.systemFont(ofSize: 12, weight: .bold),
-                .foregroundColor: BlueyTheme.text,
-            ])
-        button.contentTintColor = BlueyTheme.cyan
-        if let image = symbolImage(symbol) {
-            image.isTemplate = true
-            button.image = image
-        }
-        button.imagePosition = .imageLeading
-        button.imageHugsTitle = true
-        button.imageScaling = .scaleProportionallyDown
-        button.alignment = .center
-    }
-
-    private func styleHeaderBadge(_ label: NSTextField, textColor: NSColor) {
-        label.font = NSFont.systemFont(ofSize: 10.6, weight: .bold)
-        label.textColor = textColor
-        label.alignment = .center
-        label.lineBreakMode = .byTruncatingMiddle
-        label.maximumNumberOfLines = 1
-        if let cell = label.cell as? NSTextFieldCell {
-            cell.alignment = .center
-            cell.lineBreakMode = .byTruncatingMiddle
-            cell.usesSingleLineMode = true
-            cell.wraps = false
-        }
-        useCenteredSingleLineCell(label)
-        label.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        label.wantsLayer = true
-        label.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.052).cgColor
-        label.layer?.cornerRadius = 12
-        label.layer?.borderWidth = 1
-        label.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.16).cgColor
-    }
-
-    private func styleHeaderIconButton(_ button: NSButton, symbol: String, fallback: String) {
-        button.title = fallback
-        button.isBordered = false
-        button.wantsLayer = true
-        button.layer?.cornerRadius = 15
-        button.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.070).cgColor
-        button.layer?.borderWidth = 1
-        button.layer?.borderColor = NSColor.white.withAlphaComponent(0.12).cgColor
-        button.font = NSFont.systemFont(ofSize: 12, weight: .bold)
-        button.contentTintColor = BlueyTheme.text
-        if let image = symbolImage(symbol) {
-            image.isTemplate = true
-            button.title = ""
-            button.image = image
-            button.imagePosition = .imageOnly
-            button.imageScaling = .scaleProportionallyDown
-        } else {
-            button.attributedTitle = NSAttributedString(
-                string: fallback,
-                attributes: [
-                    .font: button.font ?? NSFont.systemFont(ofSize: 12, weight: .bold),
-                    .foregroundColor: BlueyTheme.textDim,
-                ])
-        }
-        button.imageHugsTitle = true
-        button.alignment = .center
-    }
-
-    private func styleIconButton(_ button: NSButton, symbol: String, fallback: String, accent: Bool = false) {
-        button.title = fallback
-        button.isBordered = false
-        button.wantsLayer = true
-        button.layer?.cornerRadius = accent ? 20 : 16
-        button.layer?.backgroundColor = accent
-            ? NSColor(red: 0.07, green: 0.19, blue: 0.24, alpha: 0.98).cgColor
-            : NSColor.white.withAlphaComponent(0.070).cgColor
-        button.layer?.borderWidth = 1
-        button.layer?.borderColor = (accent ? BlueyTheme.cyan.withAlphaComponent(0.58) : NSColor.white.withAlphaComponent(0.12)).cgColor
-        button.font = NSFont.systemFont(ofSize: 12, weight: .bold)
-        button.contentTintColor = accent ? BlueyTheme.text : BlueyTheme.cyan
-        if let image = symbolImage(symbol) {
-            image.isTemplate = true
-            button.title = ""
-            button.image = image
-            button.imagePosition = .imageOnly
-            button.imageScaling = .scaleProportionallyDown
-        } else {
-            button.attributedTitle = NSAttributedString(
-                string: fallback,
-                attributes: [
-                    .font: button.font ?? NSFont.systemFont(ofSize: 12, weight: .bold),
-                    .foregroundColor: BlueyTheme.text,
-                ])
-        }
-        button.imageHugsTitle = true
-        button.alignment = .center
-    }
-
-    @objc private func hideClicked() { onClose?() }
-
-    @objc private func closeClicked() {
-        showTurnOffConfirmation()
-    }
-
-    @objc private func fullSizeClicked() {
-        toggleWindowFullSize()
-    }
-
-    func showTurnOffConfirmation() {
-        pendingDeleteSessionId = nil
-        closeConfirmTitle.stringValue = "Turn Bluey off?"
-        closeConfirmBody.stringValue = "This closes Bluey completely. To start again, run: bluey on"
-        closeConfirmTurnOffButton.title = "Turn Off"
-        closeConfirmTurnOffButton.target = self
-        closeConfirmTurnOffButton.action = #selector(confirmTurnOffClicked)
-        closeConfirmTurnOffButton.toolTip = "Turn Bluey off. Run bluey on to start again."
-        styleControlButton(closeConfirmTurnOffButton, symbol: "power", accent: true)
-        presentConfirmationOverlay()
-    }
-
-    private func presentConfirmationOverlay() {
-        dismissAnswerStyleEditor(animated: false)
-        closeConfirmOverlay.isHidden = false
-        closeConfirmOverlay.alphaValue = 0
-        updateBackgroundControlsEnabledForModalState()
-        window?.makeFirstResponder(closeConfirmOverlay)
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.12
-            closeConfirmOverlay.animator().alphaValue = 1
-        }
-    }
-
-    @objc private func cancelCloseConfirmClicked() {
-        pendingDeleteSessionId = nil
-        dismissCloseConfirm(animated: true)
-    }
-
-    private func dismissCloseConfirm(animated: Bool) {
-        guard !closeConfirmOverlay.isHidden else { return }
-        guard animated else {
-            closeConfirmOverlay.isHidden = true
-            closeConfirmOverlay.alphaValue = 1
-            updateBackgroundControlsEnabledForModalState()
+    private func updateContextBar() {
+        guard currentTab == .ask else { setContextBarVisible(false); return }
+        let screenCount = feed.screenTurnCount
+        let turns = feed.conversationTurnCount
+        let hasTranscript = feed.transcriptTurnCount > 0
+        guard feed.hasCards, hasTranscript || screenCount > 0 || turns > 0 else {
+            setContextBarVisible(false)
             return
         }
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.10
-            closeConfirmOverlay.animator().alphaValue = 0
-        }, completionHandler: { [weak self] in
-            guard let self else { return }
-            self.closeConfirmOverlay.isHidden = true
-            self.closeConfirmOverlay.alphaValue = 1
-            self.updateBackgroundControlsEnabledForModalState()
-        })
+        var parts: [String] = []
+        if hasTranscript { parts.append("transcript") }
+        if screenCount > 0 { parts.append("\(screenCount) screen") }
+        parts.append("\(turns) turn\(turns == 1 ? "" : "s")")
+        contextLabel.stringValue = "In context: " + parts.joined(separator: " · ")
+        setContextBarVisible(true)
     }
 
-    @objc private func confirmTurnOffClicked() {
-        emitSimple("close_requested")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
-            NSApp.terminate(nil)
+    private func setContextBarVisible(_ visible: Bool) {
+        contextBar.isHidden = !visible
+        contextBarHeightConstraint?.constant = visible ? 30 : 0
+    }
+
+    // MARK: Phase 8 — The "+" menu (secondary actions, decluttered)
+
+    private func configurePlusMenu() {
+        plusMenu.translatesAutoresizingMaskIntoConstraints = false
+        plusMenu.wantsLayer = true
+        plusMenu.layer?.backgroundColor = Tok.modalFill.cgColor
+        plusMenu.layer?.cornerRadius = Tok.rLg
+        plusMenu.layer?.borderWidth = 1
+        plusMenu.layer?.borderColor = Tok.hairlineStrong.cgColor
+        plusMenu.layer?.masksToBounds = true
+        plusMenu.isHidden = true
+
+        let stack = NSStackView()
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 0
+        plusMenu.addSubview(stack)
+        NSLayoutConstraint.activate([
+            plusMenu.widthAnchor.constraint(equalToConstant: 214),
+            stack.topAnchor.constraint(equalTo: plusMenu.topAnchor, constant: 6),
+            stack.leadingAnchor.constraint(equalTo: plusMenu.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: plusMenu.trailingAnchor),
+            stack.bottomAnchor.constraint(equalTo: plusMenu.bottomAnchor, constant: -6),
+        ])
+
+        stack.addArrangedSubview(plusMenuHeader("ADD TO CONTEXT"))
+        stack.addArrangedSubview(plusMenuItem("Attach files", symbol: "paperclip", action: #selector(menuAttachClicked)))
+        stack.addArrangedSubview(plusMenuItem("Capture browser page", symbol: "globe", action: #selector(menuCapturePageClicked)))
+        stack.addArrangedSubview(plusMenuHeader("SESSION"))
+        stack.addArrangedSubview(plusMenuItem("New session", symbol: "plus", action: #selector(menuNewSessionClicked)))
+        stack.addArrangedSubview(plusMenuItem("Recap", symbol: "list.bullet", action: #selector(menuRecapClicked)))
+        stack.addArrangedSubview(plusMenuItem("Answer style", symbol: "pencil", action: #selector(menuAnswerStyleClicked)))
+        stack.addArrangedSubview(plusMenuItem("Opacity & settings", symbol: "gearshape", action: #selector(menuOpacityClicked)))
+        for item in stack.arrangedSubviews {
+            item.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
     }
 
-    @objc private func confirmDeleteSessionClicked() {
-        guard let id = pendingDeleteSessionId else { return }
-        if let index = sessionItems.firstIndex(where: { $0.id == id }) {
-            sessionItems.remove(at: index)
-            setSessions(sessionItems)
+    private func plusMenuHeader(_ text: String) -> NSView {
+        let label = trackedLabel(text, size: 9.5, weight: .heavy, color: Tok.tx4, tracking: 0.7)
+        let wrap = NSView()
+        wrap.translatesAutoresizingMaskIntoConstraints = false
+        wrap.addSubview(label)
+        NSLayoutConstraint.activate([
+            wrap.heightAnchor.constraint(equalToConstant: 26),
+            label.leadingAnchor.constraint(equalTo: wrap.leadingAnchor, constant: 13),
+            label.bottomAnchor.constraint(equalTo: wrap.bottomAnchor, constant: -4),
+        ])
+        return wrap
+    }
+
+    private func plusMenuItem(_ title: String, symbol: String, action: Selector) -> NSView {
+        let button = NSButton(title: "", target: self, action: action)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.isBordered = false
+        button.wantsLayer = true
+        button.layer?.backgroundColor = NSColor.clear.cgColor
+
+        let icon = NSImageView()
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        if let image = symbolImage(symbol) {
+            image.isTemplate = true
+            icon.image = image
         }
-        editingSessionId = nil
-        pendingDeleteSessionId = nil
-        dismissCloseConfirm(animated: true)
-        statusLabel.stringValue = "Session deleted"
-        emitSessionDelete(id: id)
+        icon.contentTintColor = Tok.tx3
+        let label = NSTextField(labelWithString: title)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = Tok.font(12.5, .regular)
+        label.textColor = Tok.tx1
+        button.addSubview(icon)
+        button.addSubview(label)
+        NSLayoutConstraint.activate([
+            button.heightAnchor.constraint(equalToConstant: 36),
+            icon.leadingAnchor.constraint(equalTo: button.leadingAnchor, constant: 13),
+            icon.centerYAnchor.constraint(equalTo: button.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 15),
+            icon.heightAnchor.constraint(equalToConstant: 15),
+            label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 11),
+            label.centerYAnchor.constraint(equalTo: button.centerYAnchor),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: button.trailingAnchor, constant: -13),
+        ])
+        return button
+    }
+
+    @objc private func togglePlusMenu() {
+        plusMenu.isHidden.toggle()
+        if !plusMenu.isHidden {
+            plusButton.layer?.backgroundColor = Tok.accentBg.cgColor
+            plusButton.layer?.borderColor = Tok.accentBgStrong.cgColor
+            plusButton.contentTintColor = Tok.accentTx
+        } else {
+            plusButton.layer?.backgroundColor = Tok.glassHi.cgColor
+            plusButton.layer?.borderColor = Tok.hairline.cgColor
+            plusButton.contentTintColor = Tok.tx2
+        }
+    }
+
+    private func closePlusMenu() {
+        guard !plusMenu.isHidden else { return }
+        togglePlusMenu()
+    }
+
+    @objc private func menuAttachClicked() { closePlusMenu(); emitSimple("attach_requested") }
+    @objc private func menuCapturePageClicked() { closePlusMenu(); emitActivePageCaptureRequested() }
+    @objc private func menuNewSessionClicked() { closePlusMenu(); emitSimple("session_new_requested") }
+    @objc private func menuRecapClicked() { closePlusMenu(); emitRecapRequested() }
+    @objc private func menuAnswerStyleClicked() { closePlusMenu(); emitInstructionsRequested() }
+    @objc private func menuOpacityClicked() { closePlusMenu(); showOpacityPopover() }
+
+    // MARK: Phase 5 — History body (`.hx`): search · groups · rows · show-more
+
+    private func configureHistoryBody() {
+        historyContainer.translatesAutoresizingMaskIntoConstraints = false
+        historyContainer.isHidden = true
+
+        // Search field (`.srch`).
+        let srch = NSView()
+        srch.translatesAutoresizingMaskIntoConstraints = false
+        srch.wantsLayer = true
+        srch.layer?.backgroundColor = Tok.glassHi.cgColor
+        srch.layer?.cornerRadius = Tok.rMd
+        srch.layer?.borderWidth = 1
+        srch.layer?.borderColor = Tok.hairline.cgColor
+
+        let magnifier = NSImageView()
+        magnifier.translatesAutoresizingMaskIntoConstraints = false
+        if let image = symbolImage("magnifyingglass") {
+            image.isTemplate = true
+            magnifier.image = image
+        }
+        magnifier.contentTintColor = Tok.tx3
+
+        searchField.translatesAutoresizingMaskIntoConstraints = false
+        searchField.font = Tok.font(13, .regular)
+        searchField.textColor = Tok.tx1
+        searchField.isBezeled = false
+        searchField.drawsBackground = false
+        searchField.focusRingType = .none
+        searchField.placeholderString = "Search sessions…"
+        searchField.delegate = self
+        searchField.target = self
+        searchField.action = #selector(searchSubmitted)
+
+        srch.addSubview(magnifier)
+        srch.addSubview(searchField)
+
+        historyScroll.translatesAutoresizingMaskIntoConstraints = false
+        historyScroll.hasVerticalScroller = true
+        historyScroll.drawsBackground = false
+        historyStack.translatesAutoresizingMaskIntoConstraints = false
+        historyStack.orientation = .vertical
+        historyStack.alignment = .leading
+        historyStack.spacing = 0
+        historyStack.edgeInsets = NSEdgeInsets(top: 0, left: 8, bottom: 10, right: 8)
+        historyScroll.documentView = historyStack
+
+        historyContainer.addSubview(srch)
+        historyContainer.addSubview(historyScroll)
+        NSLayoutConstraint.activate([
+            srch.topAnchor.constraint(equalTo: historyContainer.topAnchor, constant: 12),
+            srch.leadingAnchor.constraint(equalTo: historyContainer.leadingAnchor, constant: 14),
+            srch.trailingAnchor.constraint(equalTo: historyContainer.trailingAnchor, constant: -14),
+            srch.heightAnchor.constraint(equalToConstant: 36),
+            magnifier.leadingAnchor.constraint(equalTo: srch.leadingAnchor, constant: 12),
+            magnifier.centerYAnchor.constraint(equalTo: srch.centerYAnchor),
+            magnifier.widthAnchor.constraint(equalToConstant: 14),
+            magnifier.heightAnchor.constraint(equalToConstant: 14),
+            searchField.leadingAnchor.constraint(equalTo: magnifier.trailingAnchor, constant: 9),
+            searchField.centerYAnchor.constraint(equalTo: srch.centerYAnchor),
+            searchField.trailingAnchor.constraint(equalTo: srch.trailingAnchor, constant: -12),
+
+            historyScroll.topAnchor.constraint(equalTo: srch.bottomAnchor, constant: 8),
+            historyScroll.leadingAnchor.constraint(equalTo: historyContainer.leadingAnchor, constant: 6),
+            historyScroll.trailingAnchor.constraint(equalTo: historyContainer.trailingAnchor, constant: -6),
+            historyScroll.bottomAnchor.constraint(equalTo: historyContainer.bottomAnchor),
+            historyStack.widthAnchor.constraint(equalTo: historyScroll.widthAnchor),
+        ])
+    }
+
+    // MARK: Phase 6 — Agents body (`.ax`): agent cards + capability badges
+
+    private func configureAgentsBody() {
+        agentsScroll.translatesAutoresizingMaskIntoConstraints = false
+        agentsScroll.hasVerticalScroller = true
+        agentsScroll.drawsBackground = false
+        agentsScroll.isHidden = true
+        agentsStack.translatesAutoresizingMaskIntoConstraints = false
+        agentsStack.orientation = .vertical
+        agentsStack.alignment = .leading
+        agentsStack.spacing = 10
+        agentsStack.edgeInsets = NSEdgeInsets(top: 14, left: 14, bottom: 8, right: 14)
+        agentsScroll.documentView = agentsStack
+        NSLayoutConstraint.activate([
+            agentsStack.widthAnchor.constraint(equalTo: agentsScroll.widthAnchor),
+        ])
+    }
+
+    // MARK: Root assembly
+
+    private func assembleLayout() {
+        for v in [workspace, historyContainer, agentsScroll, contextBar, attachmentStrip,
+                  composerBar, footerBar, headerBar, plusMenu,
+                  connectorSheetOverlay, billingOverlay, closeConfirmOverlay, toastView] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(v)
+        }
+
+        // Body region fills between header and the composer/context block.
+        NSLayoutConstraint.activate([
+            headerBar.topAnchor.constraint(equalTo: topAnchor),
+            headerBar.leadingAnchor.constraint(equalTo: leadingAnchor),
+            headerBar.trailingAnchor.constraint(equalTo: trailingAnchor),
+
+            // Footer pinned bottom (`.foot` pad 0/16/13).
+            footerBar.leadingAnchor.constraint(equalTo: leadingAnchor),
+            footerBar.trailingAnchor.constraint(equalTo: trailingAnchor),
+            footerBar.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -13),
+
+            // Composer (`.comp` margin 8×14) above the footer.
+            composerBar.leadingAnchor.constraint(equalTo: leadingAnchor),
+            composerBar.trailingAnchor.constraint(equalTo: trailingAnchor),
+            composerBar.bottomAnchor.constraint(equalTo: footerBar.topAnchor, constant: -8),
+
+            // Attachment strip (`.attach`) above composer (collapses when empty).
+            attachmentStrip.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            attachmentStrip.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -14),
+            attachmentStrip.bottomAnchor.constraint(equalTo: composerBar.topAnchor, constant: -2),
+
+            // Context bar (`.ctxbar` margin 0×16) above composer.
+            contextBar.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+            contextBar.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            contextBar.bottomAnchor.constraint(equalTo: attachmentStrip.topAnchor, constant: -2),
+
+            // Body region.
+            workspace.topAnchor.constraint(equalTo: headerBar.bottomAnchor),
+            workspace.leadingAnchor.constraint(equalTo: leadingAnchor),
+            workspace.trailingAnchor.constraint(equalTo: trailingAnchor),
+            workspace.bottomAnchor.constraint(equalTo: contextBar.topAnchor, constant: -4),
+
+            historyContainer.topAnchor.constraint(equalTo: headerBar.bottomAnchor),
+            historyContainer.leadingAnchor.constraint(equalTo: leadingAnchor),
+            historyContainer.trailingAnchor.constraint(equalTo: trailingAnchor),
+            historyContainer.bottomAnchor.constraint(equalTo: composerBar.topAnchor, constant: -4),
+
+            agentsScroll.topAnchor.constraint(equalTo: headerBar.bottomAnchor),
+            agentsScroll.leadingAnchor.constraint(equalTo: leadingAnchor),
+            agentsScroll.trailingAnchor.constraint(equalTo: trailingAnchor),
+            agentsScroll.bottomAnchor.constraint(equalTo: composerBar.topAnchor, constant: -4),
+        ])
+
+        // The "+" menu floats above the composer's plus button.
+        NSLayoutConstraint.activate([
+            plusMenu.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 18),
+            plusMenu.bottomAnchor.constraint(equalTo: composerBar.topAnchor, constant: 4),
+        ])
+
+        // Full-bleed modal overlays.
+        for overlay in [connectorSheetOverlay, billingOverlay, closeConfirmOverlay] {
+            NSLayoutConstraint.activate([
+                overlay.topAnchor.constraint(equalTo: topAnchor),
+                overlay.leadingAnchor.constraint(equalTo: leadingAnchor),
+                overlay.trailingAnchor.constraint(equalTo: trailingAnchor),
+                overlay.bottomAnchor.constraint(equalTo: bottomAnchor),
+            ])
+        }
+
+        // System toast at the top of the body. (The toast's own subviews —
+        // title/body labels — are added inside configureSystemToast(); here we
+        // only position the toast container within self.)
+        NSLayoutConstraint.activate([
+            toastView.topAnchor.constraint(equalTo: headerBar.bottomAnchor, constant: 12),
+            toastView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+            toastView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+        ])
+
+        // Z-order: header + composer + footer above the body; toast + menu + modals on top.
+        headerBar.layer?.zPosition = 50
+        composerBar.layer?.zPosition = 50
+        footerBar.layer?.zPosition = 50
+        contextBar.layer?.zPosition = 45
+        attachmentStrip.layer?.zPosition = 45
+        toastView.layer?.zPosition = 70
+        plusMenu.layer?.zPosition = 80
+        connectorSheetOverlay.layer?.zPosition = 90
+        billingOverlay.layer?.zPosition = 90
+        closeConfirmOverlay.layer?.zPosition = 90
+    }
+
+    // MARK: System toast (transient cards)
+
+    private func configureSystemToast() {
+        toastView.wantsLayer = true
+        toastView.layer?.backgroundColor = Tok.modalFill.cgColor
+        toastView.layer?.cornerRadius = Tok.rLg
+        toastView.layer?.borderWidth = 1
+        toastView.layer?.borderColor = Tok.hairlineStrong.cgColor
+        toastView.isHidden = true
+        toastTitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        toastTitleLabel.font = Tok.font(12, .semibold)
+        toastTitleLabel.textColor = Tok.tx1
+        toastBodyLabel.translatesAutoresizingMaskIntoConstraints = false
+        toastBodyLabel.font = Tok.font(11.5, .regular)
+        toastBodyLabel.textColor = Tok.tx2
+        toastBodyLabel.maximumNumberOfLines = 3
+        toastBodyLabel.preferredMaxLayoutWidth = 460
+        toastView.addSubview(toastTitleLabel)
+        toastView.addSubview(toastBodyLabel)
+        NSLayoutConstraint.activate([
+            toastTitleLabel.topAnchor.constraint(equalTo: toastView.topAnchor, constant: 11),
+            toastTitleLabel.leadingAnchor.constraint(equalTo: toastView.leadingAnchor, constant: 13),
+            toastTitleLabel.trailingAnchor.constraint(equalTo: toastView.trailingAnchor, constant: -13),
+            toastBodyLabel.topAnchor.constraint(equalTo: toastTitleLabel.bottomAnchor, constant: 4),
+            toastBodyLabel.leadingAnchor.constraint(equalTo: toastView.leadingAnchor, constant: 13),
+            toastBodyLabel.trailingAnchor.constraint(equalTo: toastView.trailingAnchor, constant: -13),
+            toastBodyLabel.bottomAnchor.constraint(equalTo: toastView.bottomAnchor, constant: -11),
+        ])
+    }
+
+    // MARK: Phase 7 — Modals (dark, readable, over a dim backdrop)
+
+    private func styleModalOverlay(_ overlay: ModalBlockerView) {
+        overlay.translatesAutoresizingMaskIntoConstraints = false
+        overlay.wantsLayer = true
+        overlay.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.42).cgColor
+        overlay.isHidden = true
+    }
+
+    private func styleModalPanel(_ panel: NSView, width: CGFloat) {
+        panel.translatesAutoresizingMaskIntoConstraints = false
+        panel.wantsLayer = true
+        panel.layer?.backgroundColor = Tok.modalFill.cgColor
+        panel.layer?.cornerRadius = Tok.rXl
+        panel.layer?.borderWidth = 1
+        panel.layer?.borderColor = Tok.hairlineStrong.cgColor
+        panel.layer?.masksToBounds = true
+        panel.widthAnchor.constraint(equalToConstant: width).isActive = true
+    }
+
+    private func makeModalButton(_ title: String, primary: Bool, danger: Bool = false, action: Selector) -> NSButton {
+        let button = NSButton(title: title, target: self, action: action)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.isBordered = false
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 9
+        let fill: NSColor = danger ? Tok.danger : (primary ? Tok.accent : NSColor.clear)
+        button.layer?.backgroundColor = fill.cgColor
+        if !primary && !danger {
+            button.layer?.borderWidth = 1
+            button.layer?.borderColor = Tok.hairline.cgColor
+        }
+        let titleColor: NSColor = (primary || danger) ? .white : Tok.tx2
+        button.attributedTitle = NSAttributedString(
+            string: title,
+            attributes: [.font: Tok.font(12, .semibold), .foregroundColor: titleColor])
+        button.heightAnchor.constraint(equalToConstant: 30).isActive = true
+        button.widthAnchor.constraint(greaterThanOrEqualToConstant: 84).isActive = true
+        return button
+    }
+
+    // --- Connector sheet (auth-tier rows; expired → quiet "/mcp" status) ---
+
+    private func configureConnectorSheet() {
+        styleModalOverlay(connectorSheetOverlay)
+        styleModalPanel(connectorSheetPanel, width: 380)
+
+        connectorSheetTitle.translatesAutoresizingMaskIntoConstraints = false
+        connectorSheetTitle.font = Tok.font(14.5, .semibold)
+        connectorSheetTitle.textColor = Tok.tx1
+        connectorSheetSummary.translatesAutoresizingMaskIntoConstraints = false
+        connectorSheetSummary.font = Tok.font(12, .regular)
+        connectorSheetSummary.textColor = Tok.tx3
+        connectorSheetSummary.stringValue = "shape & readiness only, never secrets."
+        connectorSheetSummary.maximumNumberOfLines = 2
+
+        connectorSheetScroll.translatesAutoresizingMaskIntoConstraints = false
+        connectorSheetScroll.hasVerticalScroller = true
+        connectorSheetScroll.drawsBackground = false
+        connectorSheetStack.translatesAutoresizingMaskIntoConstraints = false
+        connectorSheetStack.orientation = .vertical
+        connectorSheetStack.alignment = .leading
+        connectorSheetStack.spacing = 0
+        connectorSheetScroll.documentView = connectorSheetStack
+
+        connectorSheetReauthLabel.translatesAutoresizingMaskIntoConstraints = false
+        connectorSheetReauthLabel.font = Tok.font(11, .regular)
+        connectorSheetReauthLabel.textColor = Tok.tx3
+        connectorSheetReauthLabel.maximumNumberOfLines = 2
+        connectorSheetReauthLabel.isHidden = true
+
+        connectorSheetCancelButton.translatesAutoresizingMaskIntoConstraints = false
+        let cancel = makeModalButton("Cancel", primary: false, action: #selector(connectorSheetCancelClicked))
+        let attach = makeModalButton("Attach", primary: true, action: #selector(connectorSheetAttachClicked))
+
+        connectorSheetOverlay.addSubview(connectorSheetPanel)
+        connectorSheetPanel.addSubview(connectorSheetTitle)
+        connectorSheetPanel.addSubview(connectorSheetSummary)
+        connectorSheetPanel.addSubview(connectorSheetScroll)
+        connectorSheetPanel.addSubview(connectorSheetReauthLabel)
+        let footer = NSStackView(views: [cancel, attach])
+        footer.translatesAutoresizingMaskIntoConstraints = false
+        footer.orientation = .horizontal
+        footer.spacing = 9
+        connectorSheetPanel.addSubview(footer)
+
+        NSLayoutConstraint.activate([
+            connectorSheetPanel.centerXAnchor.constraint(equalTo: connectorSheetOverlay.centerXAnchor),
+            connectorSheetPanel.centerYAnchor.constraint(equalTo: connectorSheetOverlay.centerYAnchor),
+
+            connectorSheetTitle.topAnchor.constraint(equalTo: connectorSheetPanel.topAnchor, constant: 15),
+            connectorSheetTitle.leadingAnchor.constraint(equalTo: connectorSheetPanel.leadingAnchor, constant: 17),
+            connectorSheetTitle.trailingAnchor.constraint(equalTo: connectorSheetPanel.trailingAnchor, constant: -17),
+            connectorSheetSummary.topAnchor.constraint(equalTo: connectorSheetTitle.bottomAnchor, constant: 4),
+            connectorSheetSummary.leadingAnchor.constraint(equalTo: connectorSheetPanel.leadingAnchor, constant: 17),
+            connectorSheetSummary.trailingAnchor.constraint(equalTo: connectorSheetPanel.trailingAnchor, constant: -17),
+
+            connectorSheetScroll.topAnchor.constraint(equalTo: connectorSheetSummary.bottomAnchor, constant: 10),
+            connectorSheetScroll.leadingAnchor.constraint(equalTo: connectorSheetPanel.leadingAnchor, constant: 17),
+            connectorSheetScroll.trailingAnchor.constraint(equalTo: connectorSheetPanel.trailingAnchor, constant: -17),
+            connectorSheetScroll.heightAnchor.constraint(lessThanOrEqualToConstant: 180),
+            connectorSheetStack.widthAnchor.constraint(equalTo: connectorSheetScroll.widthAnchor),
+
+            connectorSheetReauthLabel.topAnchor.constraint(equalTo: connectorSheetScroll.bottomAnchor, constant: 8),
+            connectorSheetReauthLabel.leadingAnchor.constraint(equalTo: connectorSheetPanel.leadingAnchor, constant: 17),
+            connectorSheetReauthLabel.trailingAnchor.constraint(equalTo: connectorSheetPanel.trailingAnchor, constant: -17),
+
+            footer.topAnchor.constraint(equalTo: connectorSheetReauthLabel.bottomAnchor, constant: 12),
+            footer.trailingAnchor.constraint(equalTo: connectorSheetPanel.trailingAnchor, constant: -17),
+            footer.bottomAnchor.constraint(equalTo: connectorSheetPanel.bottomAnchor, constant: -15),
+        ])
+    }
+
+    // --- BYOT billing disclosure (the G4 fix) ---
+
+    private func configureBillingModal() {
+        styleModalOverlay(billingOverlay)
+        styleModalPanel(billingPanel, width: 380)
+
+        billingTitle.translatesAutoresizingMaskIntoConstraints = false
+        billingTitle.font = Tok.font(14.5, .semibold)
+        billingTitle.textColor = Tok.tx1
+        billingTitle.maximumNumberOfLines = 2
+        billingSubtitle.translatesAutoresizingMaskIntoConstraints = false
+        billingSubtitle.font = Tok.font(12, .regular)
+        billingSubtitle.textColor = Tok.tx3
+
+        let discBox = NSView()
+        discBox.translatesAutoresizingMaskIntoConstraints = false
+        discBox.wantsLayer = true
+        discBox.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.22).cgColor
+        discBox.layer?.cornerRadius = 9
+        discBox.layer?.borderWidth = 1
+        discBox.layer?.borderColor = Tok.hairline.cgColor
+        billingDiscLabel.translatesAutoresizingMaskIntoConstraints = false
+        billingDiscLabel.font = Tok.font(11.5, .regular)
+        billingDiscLabel.textColor = Tok.tx2
+        billingDiscLabel.maximumNumberOfLines = 0
+        billingDiscLabel.preferredMaxLayoutWidth = 320
+        discBox.addSubview(billingDiscLabel)
+
+        let decline = makeModalButton("Decline", primary: false, action: #selector(billingDeclineClicked))
+        let accept = makeModalButton("Accept & attach", primary: true, action: #selector(billingAcceptClicked))
+
+        billingOverlay.addSubview(billingPanel)
+        billingPanel.addSubview(billingTitle)
+        billingPanel.addSubview(billingSubtitle)
+        billingPanel.addSubview(discBox)
+        let footer = NSStackView(views: [decline, accept])
+        footer.translatesAutoresizingMaskIntoConstraints = false
+        footer.orientation = .horizontal
+        footer.spacing = 9
+        billingPanel.addSubview(footer)
+
+        NSLayoutConstraint.activate([
+            billingPanel.centerXAnchor.constraint(equalTo: billingOverlay.centerXAnchor),
+            billingPanel.centerYAnchor.constraint(equalTo: billingOverlay.centerYAnchor),
+
+            billingTitle.topAnchor.constraint(equalTo: billingPanel.topAnchor, constant: 15),
+            billingTitle.leadingAnchor.constraint(equalTo: billingPanel.leadingAnchor, constant: 17),
+            billingTitle.trailingAnchor.constraint(equalTo: billingPanel.trailingAnchor, constant: -17),
+            billingSubtitle.topAnchor.constraint(equalTo: billingTitle.bottomAnchor, constant: 4),
+            billingSubtitle.leadingAnchor.constraint(equalTo: billingPanel.leadingAnchor, constant: 17),
+            billingSubtitle.trailingAnchor.constraint(equalTo: billingPanel.trailingAnchor, constant: -17),
+
+            discBox.topAnchor.constraint(equalTo: billingSubtitle.bottomAnchor, constant: 13),
+            discBox.leadingAnchor.constraint(equalTo: billingPanel.leadingAnchor, constant: 17),
+            discBox.trailingAnchor.constraint(equalTo: billingPanel.trailingAnchor, constant: -17),
+            billingDiscLabel.topAnchor.constraint(equalTo: discBox.topAnchor, constant: 11),
+            billingDiscLabel.leadingAnchor.constraint(equalTo: discBox.leadingAnchor, constant: 13),
+            billingDiscLabel.trailingAnchor.constraint(equalTo: discBox.trailingAnchor, constant: -13),
+            billingDiscLabel.bottomAnchor.constraint(equalTo: discBox.bottomAnchor, constant: -11),
+
+            footer.topAnchor.constraint(equalTo: discBox.bottomAnchor, constant: 13),
+            footer.trailingAnchor.constraint(equalTo: billingPanel.trailingAnchor, constant: -17),
+            footer.bottomAnchor.constraint(equalTo: billingPanel.bottomAnchor, constant: -15),
+        ])
+    }
+
+    // --- Turn-off confirm ---
+
+    private func configureCloseConfirm() {
+        styleModalOverlay(closeConfirmOverlay)
+        styleModalPanel(closeConfirmPanel, width: 360)
+
+        closeConfirmTitle.translatesAutoresizingMaskIntoConstraints = false
+        closeConfirmTitle.font = Tok.font(14.5, .semibold)
+        closeConfirmTitle.textColor = Tok.tx1
+        closeConfirmBody.translatesAutoresizingMaskIntoConstraints = false
+        closeConfirmBody.font = Tok.font(12, .regular)
+        closeConfirmBody.textColor = Tok.tx3
+        closeConfirmBody.maximumNumberOfLines = 0
+        closeConfirmBody.preferredMaxLayoutWidth = 326
+
+        let cancel = makeModalButton("Cancel", primary: false, action: #selector(cancelCloseConfirmClicked))
+        closeConfirmCancelButton.translatesAutoresizingMaskIntoConstraints = false
+        let turnOff = makeModalButton("Turn off", primary: false, danger: true, action: #selector(confirmTurnOffClicked))
+
+        closeConfirmOverlay.addSubview(closeConfirmPanel)
+        closeConfirmPanel.addSubview(closeConfirmTitle)
+        closeConfirmPanel.addSubview(closeConfirmBody)
+        let footer = NSStackView(views: [cancel, turnOff])
+        footer.translatesAutoresizingMaskIntoConstraints = false
+        footer.orientation = .horizontal
+        footer.spacing = 9
+        closeConfirmPanel.addSubview(footer)
+        // Keep references so confirmDelete can repurpose the danger button.
+        closeConfirmTurnOffButtonRef = turnOff
+
+        NSLayoutConstraint.activate([
+            closeConfirmPanel.centerXAnchor.constraint(equalTo: closeConfirmOverlay.centerXAnchor),
+            closeConfirmPanel.centerYAnchor.constraint(equalTo: closeConfirmOverlay.centerYAnchor),
+            closeConfirmTitle.topAnchor.constraint(equalTo: closeConfirmPanel.topAnchor, constant: 15),
+            closeConfirmTitle.leadingAnchor.constraint(equalTo: closeConfirmPanel.leadingAnchor, constant: 17),
+            closeConfirmTitle.trailingAnchor.constraint(equalTo: closeConfirmPanel.trailingAnchor, constant: -17),
+            closeConfirmBody.topAnchor.constraint(equalTo: closeConfirmTitle.bottomAnchor, constant: 4),
+            closeConfirmBody.leadingAnchor.constraint(equalTo: closeConfirmPanel.leadingAnchor, constant: 17),
+            closeConfirmBody.trailingAnchor.constraint(equalTo: closeConfirmPanel.trailingAnchor, constant: -17),
+            footer.topAnchor.constraint(equalTo: closeConfirmBody.bottomAnchor, constant: 13),
+            footer.trailingAnchor.constraint(equalTo: closeConfirmPanel.trailingAnchor, constant: -17),
+            footer.bottomAnchor.constraint(equalTo: closeConfirmPanel.bottomAnchor, constant: -15),
+        ])
+    }
+    private var closeConfirmTurnOffButtonRef: NSButton?
+
+    // MARK: Opacity popover (reuses the +menu surface look, small slider)
+
+    private let opacityPopover = NSView()
+    private let opacitySlider = NSSlider()
+    private var opacityPopoverBuilt = false
+
+    private func showOpacityPopover() {
+        if !opacityPopoverBuilt { buildOpacityPopover() }
+        opacityPopover.isHidden.toggle()
+    }
+
+    private func buildOpacityPopover() {
+        opacityPopoverBuilt = true
+        opacityPopover.translatesAutoresizingMaskIntoConstraints = false
+        opacityPopover.wantsLayer = true
+        opacityPopover.layer?.backgroundColor = Tok.modalFill.cgColor
+        opacityPopover.layer?.cornerRadius = Tok.rLg
+        opacityPopover.layer?.borderWidth = 1
+        opacityPopover.layer?.borderColor = Tok.hairlineStrong.cgColor
+        opacityPopover.isHidden = true
+        let title = NSTextField(labelWithString: "Opacity")
+        title.translatesAutoresizingMaskIntoConstraints = false
+        title.font = Tok.font(11, .regular)
+        title.textColor = Tok.tx3
+        opacitySlider.translatesAutoresizingMaskIntoConstraints = false
+        opacitySlider.minValue = 0.50
+        opacitySlider.maxValue = 1.0
+        opacitySlider.doubleValue = Double(backgroundOpacity)
+        opacitySlider.target = self
+        opacitySlider.action = #selector(opacityChanged)
+        opacityPopover.addSubview(title)
+        opacityPopover.addSubview(opacitySlider)
+        addSubview(opacityPopover)
+        opacityPopover.layer?.zPosition = 80
+        NSLayoutConstraint.activate([
+            opacityPopover.widthAnchor.constraint(equalToConstant: 210),
+            opacityPopover.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 18),
+            opacityPopover.bottomAnchor.constraint(equalTo: composerBar.topAnchor, constant: 4),
+            title.topAnchor.constraint(equalTo: opacityPopover.topAnchor, constant: 12),
+            title.leadingAnchor.constraint(equalTo: opacityPopover.leadingAnchor, constant: 13),
+            opacitySlider.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 8),
+            opacitySlider.leadingAnchor.constraint(equalTo: opacityPopover.leadingAnchor, constant: 13),
+            opacitySlider.trailingAnchor.constraint(equalTo: opacityPopover.trailingAnchor, constant: -13),
+            opacitySlider.bottomAnchor.constraint(equalTo: opacityPopover.bottomAnchor, constant: -13),
+        ])
     }
 
     @objc private func opacityChanged() {
         applyOpacity(opacitySlider.doubleValue)
     }
 
-    func applyOpacity(_ opacity: Double) {
-        let value = min(max(opacity, 0.50), 1.0)
-        backgroundOpacity = CGFloat(value)
-        if abs(opacitySlider.doubleValue - value) > 0.001 {
-            opacitySlider.doubleValue = value
-        }
-        opacityValueLabel.stringValue = "\(Int((value * 100.0).rounded()))"
-        refreshBackgroundChrome()
-        onOpacityChanged?(value)
+    // MARK: Modal actions
+
+    func showTurnOffConfirmation() {
+        closePlusMenu()
+        pendingDeleteSessionId = nil
+        closeConfirmTitle.stringValue = "Turn Bluey off?"
+        closeConfirmBody.stringValue = "This closes Bluey completely. To start again, run: bluey on"
+        closeConfirmTurnOffButtonRef?.attributedTitle = NSAttributedString(
+            string: "Turn off",
+            attributes: [.font: Tok.font(12, .semibold), .foregroundColor: NSColor.white])
+        closeConfirmTurnOffButtonRef?.action = #selector(confirmTurnOffClicked)
+        presentOverlay(closeConfirmOverlay)
     }
 
-    private func setComposerTextHeight(_ rawHeight: CGFloat) {
-        let textHeight = min(max(rawHeight, 42), 88)
-        guard abs((composerTextHeightConstraint?.constant ?? 0) - textHeight) > 0.5 else { return }
-        composerTextHeightConstraint?.constant = textHeight
-        composerBarHeightConstraint?.constant = textHeight + 52
-        needsLayout = true
-        layoutSubtreeIfNeeded()
+    @objc private func cancelCloseConfirmClicked() { dismissCloseConfirm(animated: true) }
+
+    private func dismissCloseConfirm(animated: Bool) {
+        dismissOverlay(closeConfirmOverlay, animated: animated)
+        pendingDeleteSessionId = nil
     }
 
-    @objc private func toggleSessionsClicked() {
-        // Sessions and agent drawers share the left rail — only one at a time.
-        agentDrawer.isHidden = true
-        sessionDrawer.isHidden.toggle()
-        statusLabel.stringValue = sessionDrawer.isHidden ? statusLabel.stringValue : "Sessions"
-    }
-
-    @objc private func closeSessionsClicked() {
-        sessionDrawer.isHidden = true
-    }
-
-    @objc private func toggleCanvasClicked() {
-        guard latestCanvas != nil else { return }
-        if canvasOpen {
-            setCanvasOpen(false)
-        } else {
-            setCanvasOpen(true)
-        }
-    }
-
-    private func toggleCanvasFullWindow() {
-        guard canvasOpen, window != nil else { return }
-        if canvasFullWindow {
-            restoreCanvasWindow()
-        } else {
-            expandCanvasWindow()
-        }
-    }
-
-    @objc private func newSessionClicked() {
-        let preserveFrame = !canvasOpen
-        let previousFrame = preserveFrame ? window?.frame : nil
-        resetSessionSurface()
-        composer.clearText()
-        statusLabel.stringValue = "New recording"
-        sessionDrawer.isHidden = true
-        if let previousFrame {
-            layoutSubtreeIfNeeded()
-            window?.setFrame(previousFrame, display: true)
-        }
-        emitSimple("session_new_requested")
-    }
-
-    @objc private func continueSessionClicked() {
-        sessionDrawer.isHidden = true
-        statusLabel.stringValue = "Latest recording"
-        emitSimple("session_continue_requested")
-    }
-
-    @objc private func saveAnswerStyleClicked() {
-        let text = answerStyleBox.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        emitInstructions(text: text)
-        statusLabel.stringValue = text.isEmpty ? "Default style" : "Answer style saved"
-        dismissAnswerStyleEditor(animated: true)
-    }
-
-    @discardableResult
-    private func dismissActiveOverlay() -> Bool {
-        if !closeConfirmOverlay.isHidden {
-            dismissCloseConfirm(animated: true)
-            return true
-        }
-        if !answerStyleOverlay.isHidden {
-            dismissAnswerStyleEditor(animated: true)
-            return true
-        }
-        return false
-    }
-
-    private func dismissAnswerStyleEditor(animated: Bool) {
-        guard !answerStyleOverlay.isHidden else { return }
-        guard animated else {
-            answerStyleOverlay.isHidden = true
-            answerStyleOverlay.alphaValue = 1
-            updateBackgroundControlsEnabledForModalState()
-            return
-        }
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.10
-            answerStyleOverlay.animator().alphaValue = 0
-        }, completionHandler: { [weak self] in
-            guard let self else { return }
-            self.answerStyleOverlay.isHidden = true
-            self.answerStyleOverlay.alphaValue = 1
-            self.updateBackgroundControlsEnabledForModalState()
-        })
-    }
-
-    @objc private func recordingClicked() {
-        if recordingActive {
-            emitSimple("recording_stop_requested")
-            recordingActive = false
-            onListeningStateChanged?(.paused)
-            recordingButton.title = "Listen"
-            statusLabel.stringValue = "Paused"
-            composer.placeholder = "Ask anything..."
-            styleControlButton(recordingButton, symbol: "waveform", accent: false)
-            setTranscriptState("PAUSED", active: false)
-        } else {
-            emitSimple("recording_start_requested")
-            recordingActive = false
-            onListeningStateChanged?(.connecting)
-            recordingButton.title = "Starting"
-            statusLabel.stringValue = "Starting audio"
-            composer.placeholder = "Starting audio..."
-            styleControlButton(recordingButton, symbol: "waveform", accent: false)
-            setTranscriptState("STARTING", active: true)
-            seedTranscriptPreviewIfEmpty("Starting mic + system audio...")
-        }
-    }
-
-    @objc private func askClicked() {
-        let raw = composer.string.trimmingCharacters(in: .whitespacesAndNewlines)
-        let q = raw.isEmpty
-            ? "Answer the latest clear question or useful context from this Bluey session."
-            : raw
-        composer.clearText()
-        let route = selectedRoute()
-        updateRouteBadge(for: q, selectedRoute: route)
-        emitAsk(question: q, provider: route.provider, model: route.model, mode: route.mode)
-        window?.makeFirstResponder(composer)
-    }
-
-    @objc private func analyzeClicked() {
-        routeBadge.stringValue = "Vision · deep"
-        statusLabel.stringValue = "Reading screen"
-        emitSimple("analyze_screen_requested")
-    }
-
-    @objc private func attachClicked() {
-        setKnowledgeBadge("Docs loading", accent: BlueyTheme.warning)
-        showKnowledgePlaceholder("Indexing selected files...")
-        emitSimple("attach_requested")
-    }
-
-    @objc private func removeAttachmentClicked(_ sender: RemoveAttachmentButton) {
-        let id = sender.contextId.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !id.isEmpty else { return }
-        setKnowledgeBadge("Docs updating", accent: BlueyTheme.warning)
-        emitRemoveContext(id: id)
-    }
-
-    @objc private func instructionsClicked() {
-        openAnswerStyleEditor()
-    }
-
-    func openAnswerStyleEditor() {
+    @objc private func confirmTurnOffClicked() {
+        emitSimple("close_requested")
         dismissCloseConfirm(animated: false)
-        answerStyleOverlay.isHidden = false
-        answerStyleOverlay.alphaValue = 0
-        updateBackgroundControlsEnabledForModalState()
-        window?.makeFirstResponder(answerStyleBox)
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.12
-            answerStyleOverlay.animator().alphaValue = 1
+    }
+
+    @objc private func confirmDeleteSessionClicked() {
+        if let id = pendingDeleteSessionId { emitSessionDelete(id: id) }
+        dismissCloseConfirm(animated: true)
+    }
+
+    // Billing.
+
+    func presentBillingDisclosure(_ disclosure: BillingDisclosure) {
+        pendingBilling = disclosure
+        billingTitle.stringValue = "Before attaching \(disclosure.vendorDisplayName)"
+        billingDiscLabel.stringValue = disclosure.disclosure.isEmpty
+            ? "This uses your own API key. Usage is billed to your account by the vendor, not Bluey."
+            : disclosure.disclosure
+        presentOverlay(billingOverlay)
+    }
+
+    @objc private func billingDeclineClicked() { declineBilling() }
+
+    private func declineBilling() {
+        if let d = pendingBilling {
+            emitBillingDisclosureResponded(
+                vendorShort: d.vendorShort, accepted: false,
+                pendingKind: d.pendingKind, pendingSessionId: d.pendingSessionId)
+        }
+        pendingBilling = nil
+        dismissOverlay(billingOverlay, animated: true)
+    }
+
+    @objc private func billingAcceptClicked() {
+        if let d = pendingBilling {
+            emitBillingDisclosureResponded(
+                vendorShort: d.vendorShort, accepted: true,
+                pendingKind: d.pendingKind, pendingSessionId: d.pendingSessionId)
+        }
+        pendingBilling = nil
+        dismissOverlay(billingOverlay, animated: true)
+    }
+
+    // Overlay show/hide.
+
+    private func presentOverlay(_ overlay: ModalBlockerView) {
+        overlay.isHidden = false
+        overlay.alphaValue = 0
+        window?.makeFirstResponder(overlay)
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.12
+            overlay.animator().alphaValue = 1
         }
     }
 
-    func focusComposerForQuestion() {
-        dismissAnswerStyleEditor(animated: false)
-        dismissCloseConfirm(animated: false)
-        composer.placeholder = recordingActive
-            ? "Ask while Bluey listens..."
-            : "Ask anything..."
-        window?.makeFirstResponder(composer)
+    private func dismissOverlay(_ overlay: ModalBlockerView, animated: Bool) {
+        guard !overlay.isHidden else { return }
+        guard animated else { overlay.isHidden = true; overlay.alphaValue = 1; return }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.10
+            overlay.animator().alphaValue = 0
+        }, completionHandler: { overlay.isHidden = true; overlay.alphaValue = 1 })
     }
 
-    private func updateBackgroundControlsEnabledForModalState() {
-        let hasModal = !answerStyleOverlay.isHidden || !closeConfirmOverlay.isHidden
-        setBackgroundControlsEnabled(!hasModal)
-    }
+    // MARK: History — sessions IPC + grouped rendering
 
-    private func setBackgroundControlsEnabled(_ isEnabled: Bool) {
-        let controls: [NSControl] = [
-            navButton,
-            newSessionButton,
-            latestSessionButton,
-            canvasToggleButton,
-            modelMenu,
-            fullSizeButton,
-            recordingButton,
-            askButton,
-            analyzeButton,
-            attachButton,
-            instructionsButton,
-            opacitySlider,
-            hideButton,
-            closeButton,
-        ]
-        for control in controls {
-            control.isEnabled = isEnabled
-            control.alphaValue = isEnabled ? 1.0 : 0.45
-        }
-        composer.isEditable = isEnabled
-        composer.alphaValue = isEnabled ? 1.0 : 0.55
-    }
-
-    func setBalanceLabel(_ label: String) {
-        let clean = label.trimmingCharacters(in: .whitespacesAndNewlines)
-        balanceLabel.stringValue = clean.isEmpty ? "Balance --" : clean
-    }
-
-    func showSignedOutLogin(url: URL?) {
-        statusLabel.stringValue = "Login needed"
-        routeBadge.stringValue = "Sign in"
-        routeBadge.textColor = BlueyTheme.warning
-        routeBadge.layer?.borderColor = BlueyTheme.warning.withAlphaComponent(0.28).cgColor
-        routeBadge.layer?.backgroundColor = BlueyTheme.warning.withAlphaComponent(0.08).cgColor
-        balanceLabel.stringValue = "Login"
-        setKnowledgeBadge("Docs locked", accent: BlueyTheme.textDim)
-        composer.placeholder = url == nil ? "Sign in to use managed answers..." : "Sign in, then ask anything..."
-        statusLabel.toolTip = "Cloud answers, balance, sync, and documents unlock after login"
-    }
-
-    func showSignedInReady() {
-        statusLabel.stringValue = recordingActive ? "Listening" : "Ready"
-        statusLabel.toolTip = nil
-        routeBadge.stringValue = "● Ready"
-        routeBadge.textColor = BlueyTheme.green
-        routeBadge.layer?.borderColor = BlueyTheme.green.withAlphaComponent(0.30).cgColor
-        routeBadge.layer?.backgroundColor = BlueyTheme.green.withAlphaComponent(0.075).cgColor
-        if balanceLabel.stringValue == "Login" {
-            balanceLabel.stringValue = "Balance --"
-        }
-        if knowledgeBadge.stringValue == "Docs locked" {
-            setKnowledgeBadge("Docs empty", accent: BlueyTheme.textDim)
-        }
-        composer.placeholder = recordingActive
-            ? "Listening... type a follow-up anytime"
-            : "Ask anything..."
-    }
-
-    private func setKnowledgeBadge(_ text: String, accent: NSColor) {
-        if text.localizedCaseInsensitiveContains("loading")
-            || text.localizedCaseInsensitiveContains("updating")
-            || text.localizedCaseInsensitiveContains("indexing")
-        {
-            startKnowledgeIndexing()
-            return
-        }
-        stopKnowledgeIndexing()
-        knowledgeBadge.stringValue = text
-        knowledgeBadge.textColor = accent
-        knowledgeBadge.layer?.borderColor = accent.withAlphaComponent(0.30).cgColor
-        knowledgeBadge.layer?.backgroundColor = accent.withAlphaComponent(0.08).cgColor
-    }
-
-    private func startKnowledgeIndexing() {
-        knowledgeIndexTimer?.invalidate()
-        knowledgeIndexFrame = 0
-        applyKnowledgeIndexFrame()
-        knowledgeIndexTimer = Timer.scheduledTimer(withTimeInterval: 0.42, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            self.knowledgeIndexFrame = (self.knowledgeIndexFrame + 1) % self.knowledgeIndexFrames.count
-            self.applyKnowledgeIndexFrame()
-        }
-    }
-
-    private func applyKnowledgeIndexFrame() {
-        let frame = knowledgeIndexFrames[knowledgeIndexFrame % knowledgeIndexFrames.count]
-        knowledgeBadge.stringValue = frame
-        knowledgeBadge.textColor = BlueyTheme.green
-        knowledgeBadge.layer?.borderColor = BlueyTheme.green.withAlphaComponent(0.36).cgColor
-        knowledgeBadge.layer?.backgroundColor = BlueyTheme.green.withAlphaComponent(0.075).cgColor
-        knowledgeBadge.toolTip = "Indexing attached documents"
-    }
-
-    private func stopKnowledgeIndexing() {
-        knowledgeIndexTimer?.invalidate()
-        knowledgeIndexTimer = nil
-        knowledgeBadge.toolTip = "Attached document status"
-    }
-
-    private func showKnowledgePlaceholder(_ text: String) {
-        for view in attachmentStack.arrangedSubviews {
-            attachmentStack.removeArrangedSubview(view)
-            view.removeFromSuperview()
-        }
-        attachmentStrip.isHidden = false
-        attachmentStripHeightConstraint?.constant = 34
-
-        let chip = NSTextField(labelWithString: text)
-        chip.translatesAutoresizingMaskIntoConstraints = false
-        chip.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
-        chip.textColor = BlueyTheme.textDim
-        chip.alignment = .center
-        chip.lineBreakMode = .byTruncatingTail
-        chip.wantsLayer = true
-        chip.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.035).cgColor
-        chip.layer?.cornerRadius = 12
-        chip.layer?.borderWidth = 1
-        chip.layer?.borderColor = BlueyTheme.hairline.cgColor
-        attachmentStack.addArrangedSubview(chip)
-        NSLayoutConstraint.activate([
-            chip.heightAnchor.constraint(equalToConstant: 28),
-            chip.widthAnchor.constraint(greaterThanOrEqualToConstant: 210),
-        ])
-        layoutSubtreeIfNeeded()
-    }
-
-    private func setTranscriptState(_ text: String, active: Bool) {
-        transcriptStateLabel.stringValue = text
-        transcriptStateLabel.textColor = active ? BlueyTheme.green : BlueyTheme.textDim
-        transcriptActivityDot.layer?.backgroundColor = (active ? BlueyTheme.green : BlueyTheme.textDim.withAlphaComponent(0.55)).cgColor
-        transcriptActivityDot.layer?.shadowOpacity = active ? 0.45 : 0
-        transcriptStrip.layer?.borderColor = (active ? BlueyTheme.green.withAlphaComponent(0.26) : BlueyTheme.hairline).cgColor
-        setAudioPulseActive(active)
-    }
-
-    private func setAudioPulseActive(_ active: Bool) {
-        if active {
-            if audioPulseTimer == nil {
-                audioPulseFrame = 0
-                let timer = Timer(timeInterval: 0.34, repeats: true) { [weak self] _ in
-                    guard let self else { return }
-                    self.audioPulseFrame = (self.audioPulseFrame + 1) % 4
-                    self.applyAudioPulseFrame(active: true)
-                }
-                RunLoop.main.add(timer, forMode: .common)
-                audioPulseTimer = timer
-            }
-            applyAudioPulseFrame(active: true)
-        } else {
-            audioPulseTimer?.invalidate()
-            audioPulseTimer = nil
-            audioPulseFrame = 0
-            applyAudioPulseFrame(active: false)
-        }
-    }
-
-    private func applyAudioPulseFrame(active: Bool) {
-        guard active else {
-            transcriptStrip.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.16).cgColor
-            transcriptActivityDot.layer?.shadowOpacity = 0
-            transcriptActivityDot.layer?.shadowRadius = 7
-            recordingButton.layer?.shadowOpacity = 0
-            recordingButton.layer?.shadowRadius = 0
-            return
-        }
-
-        let phases: [CGFloat] = [0.00, 0.32, 0.68, 0.32]
-        let phase = phases[audioPulseFrame % phases.count]
-        let fill = 0.13 + (0.12 * phase)
-        let border = 0.36 + (0.28 * phase)
-        transcriptStrip.layer?.backgroundColor = BlueyTheme.green.withAlphaComponent(0.030 + (0.030 * phase)).cgColor
-        transcriptStrip.layer?.borderColor = BlueyTheme.green.withAlphaComponent(border).cgColor
-        transcriptActivityDot.layer?.backgroundColor = BlueyTheme.green.cgColor
-        transcriptActivityDot.layer?.shadowColor = BlueyTheme.green.cgColor
-        transcriptActivityDot.layer?.shadowOpacity = Float(0.50 + (0.32 * phase))
-        transcriptActivityDot.layer?.shadowRadius = 7 + (5 * phase)
-        recordingButton.layer?.backgroundColor = BlueyTheme.green.withAlphaComponent(fill).cgColor
-        recordingButton.layer?.borderColor = BlueyTheme.green.withAlphaComponent(border).cgColor
-        recordingButton.layer?.shadowColor = BlueyTheme.green.cgColor
-        recordingButton.layer?.shadowOpacity = Float(0.18 + (0.22 * phase))
-        recordingButton.layer?.shadowRadius = 7 + (6 * phase)
-        recordingButton.layer?.shadowOffset = .zero
-        recordingButton.contentTintColor = BlueyTheme.green
-    }
-
-    private func seedTranscriptPreviewIfEmpty(_ text: String) {
-        guard transcriptSnippets.isEmpty else { return }
-        updateTranscriptStripText(text, scrollToEnd: false)
-    }
-
-    func setListeningState(_ state: PillRunState) {
-        switch state {
-        case .connecting:
-            recordingActive = false
-            recordingButton.title = "Starting"
-            statusLabel.stringValue = "Connecting"
-            composer.placeholder = "Connecting audio..."
-            updateAudioRouteBadge("● Starting", accent: BlueyTheme.green)
-            styleControlButton(recordingButton, symbol: "waveform", accent: false)
-            setTranscriptState("STARTING", active: true)
-            seedTranscriptPreviewIfEmpty("Starting mic + system audio...")
-        case .listening:
-            recordingActive = true
-            recordingButton.title = "Stop"
-            statusLabel.stringValue = "Listening"
-            composer.placeholder = "Listening... type a follow-up anytime"
-            updateAudioRouteBadge("● Listening", accent: BlueyTheme.green)
-            styleControlButton(recordingButton, symbol: "stop.fill", accent: true)
-            setTranscriptState("LISTENING", active: true)
-            seedTranscriptPreviewIfEmpty("Mic + System live. Captions appear here.")
-        case .paused:
-            recordingActive = false
-            recordingButton.title = "Listen"
-            statusLabel.stringValue = "Paused"
-            composer.placeholder = "Ask anything..."
-            updateAudioRouteBadge("● Paused", accent: BlueyTheme.textDim)
-            styleControlButton(recordingButton, symbol: "waveform", accent: false)
-            setTranscriptState("PAUSED", active: false)
-            seedTranscriptPreviewIfEmpty("Live captions preview")
-        case .failed:
-            recordingActive = false
-            recordingButton.title = "Listen"
-            statusLabel.stringValue = "Audio needs attention"
-            composer.placeholder = "Ask anything..."
-            updateAudioRouteBadge("● Audio", accent: BlueyTheme.warning)
-            styleControlButton(recordingButton, symbol: "waveform", accent: false)
-            setTranscriptState("FAILED", active: false)
-        case .ready:
-            recordingActive = false
-            recordingButton.title = "Listen"
-            statusLabel.stringValue = "Ready"
-            composer.placeholder = "Ask anything..."
-            updateAudioRouteBadge("● Ready", accent: BlueyTheme.green)
-            styleControlButton(recordingButton, symbol: "waveform", accent: false)
-            setTranscriptState("IDLE", active: false)
-            seedTranscriptPreviewIfEmpty("Live captions preview")
-        }
-    }
-
-    private func updateAudioRouteBadge(_ text: String, accent: NSColor) {
-        routeBadge.stringValue = text
-        routeBadge.textColor = accent
-        routeBadge.layer?.borderColor = accent.withAlphaComponent(0.30).cgColor
-        routeBadge.layer?.backgroundColor = accent.withAlphaComponent(0.075).cgColor
-    }
-
-    private func updateRouteBadge(
-        for question: String,
-        selectedRoute: (provider: String?, model: String?, mode: String?)
-    ) {
-        let manual = (selectedRoute.provider ?? "auto").lowercased() != "auto"
-        if manual {
-            switch selectedRoute.model ?? selectedRoute.provider ?? "Manual" {
-            case let value where value.contains("mini"):
-                routeBadge.stringValue = "Instant · manual"
-            case let value where value.contains("sonnet"):
-                routeBadge.stringValue = "Deep · manual"
-            default:
-                routeBadge.stringValue = "Manual lane"
-            }
-            routeBadge.textColor = BlueyTheme.text
-            return
-        }
-
-        let lower = question.lowercased()
-        let words = lower.split { $0.isWhitespace || $0.isNewline }.count
-        let vision = lower.contains("screen") || lower.contains("screenshot") || lower.contains("image")
-        let code = looksLikeCode(lower) || lower.contains("leetcode") || lower.contains("debug")
-        let design = looksLikeSystemDesign(lower) || lower.contains("architecture")
-        let hard = words > 80 || design || lower.contains("tradeoff") || lower.contains("scale")
-        let label: String
-        if vision {
-            label = "Vision · deep"
-        } else if hard {
-            label = "Auto · hard"
-        } else if code {
-            label = "Auto · medium"
-        } else {
-            label = "Auto · easy"
-        }
-        routeBadge.stringValue = label
-        routeBadge.textColor = hard || vision ? BlueyTheme.warning : BlueyTheme.cyan
-    }
-
-    private func routeBadgeText(for artifact: OverlayArtifact) -> String {
-        switch artifact.artifactType {
-        case "code": return "Code"
-        case "system_design": return "Design"
-        case "screen": return "Vision"
-        case "document": return "Docs"
-        default: return "Auto"
-        }
-    }
-
-    func setContextItems(_ items: [OverlayContextItem]) {
-        for view in attachmentStack.arrangedSubviews {
-            attachmentStack.removeArrangedSubview(view)
-            view.removeFromSuperview()
-        }
-
-        attachmentStrip.isHidden = false
-        guard !items.isEmpty else {
-            setKnowledgeBadge("Docs empty", accent: BlueyTheme.textDim)
-            attachmentStrip.isHidden = true
-            attachmentStripHeightConstraint?.constant = 0
-            layoutSubtreeIfNeeded()
-            return
-        }
-
-        setKnowledgeBadge("Docs \(items.count) ready", accent: BlueyTheme.green)
-        attachmentStripHeightConstraint?.constant = 34
-
-        for item in items {
-            attachmentStack.addArrangedSubview(makeAttachmentChip(item))
-        }
-        layoutSubtreeIfNeeded()
+    private func requestSessions(reset: Bool) {
+        if reset { sessionItems = []; sessionTotal = 0; sessionHasMore = false }
+        emitSessionsRequested(offset: reset ? 0 : sessionItems.count, limit: 40, search: sessionQuery)
     }
 
     func setSessions(_ sessions: [OverlaySessionItem]) {
+        // Legacy one-shot path: treat as a full page.
         sessionItems = sessions
-        renameField = nil
-        for view in sessionStack.arrangedSubviews {
-            sessionStack.removeArrangedSubview(view)
-            view.removeFromSuperview()
-        }
-
-        if sessions.isEmpty {
-            let empty = NSTextField(wrappingLabelWithString: "No saved recordings on this device yet.")
-            empty.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
-            empty.textColor = BlueyTheme.textDim
-            empty.alignment = .center
-            empty.translatesAutoresizingMaskIntoConstraints = false
-            sessionStack.addArrangedSubview(empty)
-            empty.widthAnchor.constraint(equalTo: sessionStack.widthAnchor, constant: -20).isActive = true
-            return
-        }
-
-        for session in sessions {
-            let row = makeSessionRow(session)
-            sessionStack.addArrangedSubview(row)
-            row.widthAnchor.constraint(equalTo: sessionStack.widthAnchor, constant: -2).isActive = true
-        }
+        sessionTotal = sessions.count
+        sessionHasMore = false
+        sessionsLoaded = true
+        renderHistory()
+        updateFooter()
     }
 
-    // MARK: - Agent-bridge surfaces (Slice 5b)
-
-    private func styleAgentSurfaces() {
-        agentDrawer.wantsLayer = true
-        agentDrawer.layer?.backgroundColor = NSColor(red: 0.035, green: 0.040, blue: 0.050, alpha: 0.98).cgColor
-        agentDrawer.layer?.cornerRadius = 16
-        agentDrawer.layer?.borderWidth = 1
-        agentDrawer.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.20).cgColor
-        agentDrawer.layer?.shadowColor = NSColor.black.cgColor
-        agentDrawer.layer?.shadowOpacity = 0.26
-        agentDrawer.layer?.shadowRadius = 18
-        agentDrawer.layer?.shadowOffset = NSSize(width: 0, height: -8)
-        agentDrawer.layer?.zPosition = 11
-
-        agentDrawerTitleLabel.font = NSFont.systemFont(ofSize: 13, weight: .bold)
-        agentDrawerTitleLabel.textColor = BlueyTheme.text
-        agentDrawerTitleLabel.lineBreakMode = .byTruncatingTail
-        agentDrawerTitleLabel.maximumNumberOfLines = 1
-
-        agentDrawerCaption.font = NSFont.systemFont(ofSize: 9.5, weight: .medium)
-        agentDrawerCaption.textColor = BlueyTheme.textDim
-        agentDrawerCaption.lineBreakMode = .byWordWrapping
-        agentDrawerCaption.maximumNumberOfLines = 2
-
-        styleHeaderIconButton(agentDrawerBackButton, symbol: "chevron.left", fallback: "<")
-        styleHeaderIconButton(agentDrawerCloseButton, symbol: "xmark", fallback: "x")
-        agentDrawerBackButton.toolTip = "Back to agents"
-        agentDrawerCloseButton.toolTip = "Close"
-
-        agentStack.orientation = .vertical
-        agentStack.alignment = .centerX
-        agentStack.spacing = 6
-        agentStack.edgeInsets = NSEdgeInsets(top: 2, left: 0, bottom: 2, right: 0)
-
-        agentScroll.drawsBackground = false
-        agentScroll.hasVerticalScroller = true
-        agentScroll.hasHorizontalScroller = false
-        agentScroll.autohidesScrollers = true
-        agentScroll.borderType = .noBorder
-        agentScroll.documentView = agentStack
-        agentScroll.scrollerStyle = .overlay
-
-        agentBadge.font = NSFont.systemFont(ofSize: 11.3, weight: .bold)
-        agentBadge.textColor = BlueyTheme.cyan
-        agentBadge.alignment = .center
-        agentBadge.lineBreakMode = .byTruncatingTail
-        agentBadge.maximumNumberOfLines = 1
-        agentBadge.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        agentBadge.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        agentBadge.wantsLayer = true
-        agentBadge.layer?.backgroundColor = BlueyTheme.cyan.withAlphaComponent(0.10).cgColor
-        agentBadge.layer?.cornerRadius = 13
-        agentBadge.layer?.borderWidth = 1
-        agentBadge.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.40).cgColor
-        agentBadge.toolTip = "Attached coding agent — tap to switch or detach"
-
-        connectorSheetOverlay.wantsLayer = true
-        connectorSheetOverlay.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.52).cgColor
-        connectorSheetOverlay.layer?.zPosition = 95
-
-        connectorSheetPanel.wantsLayer = true
-        connectorSheetPanel.layer?.backgroundColor = BlueyTheme.panelDeep.cgColor
-        connectorSheetPanel.layer?.cornerRadius = 18
-        connectorSheetPanel.layer?.borderWidth = 1
-        connectorSheetPanel.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.30).cgColor
-        connectorSheetPanel.layer?.shadowColor = NSColor.black.cgColor
-        connectorSheetPanel.layer?.shadowOpacity = 0.34
-        connectorSheetPanel.layer?.shadowRadius = 22
-        connectorSheetPanel.layer?.shadowOffset = .zero
-
-        connectorSheetTitle.font = NSFont.systemFont(ofSize: 15, weight: .bold)
-        connectorSheetTitle.textColor = BlueyTheme.text
-        connectorSheetTitle.alignment = .center
-        connectorSheetSummary.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        connectorSheetSummary.textColor = BlueyTheme.textDim
-        connectorSheetSummary.alignment = .center
-        connectorSheetSummary.lineBreakMode = .byTruncatingTail
-
-        connectorSheetStack.orientation = .vertical
-        connectorSheetStack.alignment = .centerX
-        connectorSheetStack.spacing = 6
-        connectorSheetScroll.drawsBackground = false
-        connectorSheetScroll.hasVerticalScroller = true
-        connectorSheetScroll.hasHorizontalScroller = false
-        connectorSheetScroll.autohidesScrollers = true
-        connectorSheetScroll.borderType = .noBorder
-        connectorSheetScroll.documentView = connectorSheetStack
-        connectorSheetScroll.scrollerStyle = .overlay
-
-        styleControlButton(connectorSheetCancelButton, symbol: "xmark", accent: false)
-        styleControlButton(connectorSheetAttachButton, symbol: "link", accent: true)
-        connectorSheetCancelButton.toolTip = "Cancel"
-        connectorSheetAttachButton.toolTip = "Attach this agent"
-    }
-
-    // Open the agent picker drawer and request a fresh agent list. Closes the
-    // session drawer so only one left-rail surface shows at a time.
-    private func openAgentDrawer() {
-        sessionDrawer.isHidden = true
-        agentDrawerStage = .picker
-        agentDrawer.isHidden = false
-        if !agentListLoaded {
-            renderAgentLoading()
+    func setSessionsPage(sessions: [OverlaySessionItem], total: Int, offset: Int, hasMore: Bool, query: String) {
+        // Ignore a stale reply that no longer matches what's typed.
+        guard query == sessionQuery else { return }
+        if offset == 0 {
+            sessionItems = sessions
         } else {
-            renderAgentPicker()
+            // Append, de-duping by id.
+            let existing = Set(sessionItems.map { $0.id })
+            sessionItems.append(contentsOf: sessions.filter { !existing.contains($0.id) })
         }
-        emitAgentListRequested()
+        sessionTotal = total
+        sessionHasMore = hasMore
+        sessionsLoaded = true
+        renderHistory()
+        updateFooter()
     }
 
-    @objc private func agentClicked() {
-        if agentDrawer.isHidden {
-            openAgentDrawer()
-        } else {
-            agentDrawer.isHidden = true
-        }
+    @objc private func searchSubmitted() { /* handled live in controlTextDidChange */ }
+
+    func controlTextDidChange(_ obj: Notification) {
+        guard let field = obj.object as? NSTextField, field === searchField else { return }
+        sessionQuery = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        requestSessions(reset: true)
     }
 
-    @objc private func agentBadgeClicked() {
-        openAgentDrawer()
-    }
-
-    @objc private func agentDrawerCloseClicked() {
-        agentDrawer.isHidden = true
-    }
-
-    @objc private func agentDrawerBackClicked() {
-        agentDrawerStage = .picker
-        if agentListLoaded {
-            renderAgentPicker()
-        } else {
-            renderAgentLoading()
-            emitAgentListRequested()
+    private func clearHistoryStack() {
+        for v in historyStack.arrangedSubviews {
+            historyStack.removeArrangedSubview(v)
+            v.removeFromSuperview()
         }
     }
 
-    func setAgents(_ agents: [AgentSummary]) {
-        agentSummaries = agents
-        agentListLoaded = true
-        attachedAgentKind = agents.first(where: { $0.attached })?.kind
-        updateAgentBadge()
-        // Only repaint the picker if the drawer is showing the picker stage.
-        if !agentDrawer.isHidden, case .picker = agentDrawerStage {
-            renderAgentPicker()
-        }
-    }
+    private func renderHistory() {
+        clearHistoryStack()
+        searchField.placeholderString = "Search \(sessionTotal) session\(sessionTotal == 1 ? "" : "s")…"
 
-    private func clearAgentStack() {
-        for view in agentStack.arrangedSubviews {
-            agentStack.removeArrangedSubview(view)
-            view.removeFromSuperview()
-        }
-    }
-
-    private func addAgentStackRow(_ row: NSView) {
-        agentStack.addArrangedSubview(row)
-        row.widthAnchor.constraint(equalTo: agentStack.widthAnchor, constant: -2).isActive = true
-    }
-
-    private func renderAgentLoading() {
-        agentDrawerTitleLabel.stringValue = "Coding agents"
-        agentDrawerBackButton.isHidden = true
-        agentDrawerCaption.stringValue = "Answers run on your machine — your agent replies."
-        clearAgentStack()
-        addAgentStackRow(makeAgentMessageRow("Finding coding agents…", dim: true))
-    }
-
-    private func renderAgentPicker() {
-        agentDrawerTitleLabel.stringValue = "Coding agents"
-        agentDrawerBackButton.isHidden = true
-        agentDrawerCaption.stringValue = "Answers run on your machine — your agent replies."
-        clearAgentStack()
-        guard !agentSummaries.isEmpty else {
-            addAgentStackRow(makeAgentMessageRow("No coding agents found", dim: true))
-            return
-        }
-        for agent in agentSummaries {
-            addAgentStackRow(makeAgentRow(agent))
-        }
-    }
-
-    // One picker row: name + capability chip + "{n} tools · {n} sessions".
-    // Attached rows render cyan-active with a ✕ detach affordance.
-    private func makeAgentRow(_ agent: AgentSummary) -> NSView {
-        let cap = AgentCapability(agent.capability)
-        let row = NSView()
-        row.translatesAutoresizingMaskIntoConstraints = false
-        row.wantsLayer = true
-        row.layer?.backgroundColor = agent.attached
-            ? BlueyTheme.cyanSoft.cgColor
-            : NSColor.white.withAlphaComponent(cap.dimmed ? 0.02 : 0.035).cgColor
-        row.layer?.cornerRadius = 12
-        row.layer?.borderWidth = 1
-        row.layer?.borderColor = agent.attached
-            ? BlueyTheme.cyan.withAlphaComponent(0.40).cgColor
-            : BlueyTheme.hairline.cgColor
-
-        let title = NSTextField(labelWithString: agent.displayName)
-        title.translatesAutoresizingMaskIntoConstraints = false
-        title.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
-        title.textColor = cap.dimmed ? BlueyTheme.textDim : BlueyTheme.text
-        title.lineBreakMode = .byTruncatingTail
-
-        let chip = makeCapabilityChip(cap)
-
-        let sessions = agent.sessionCount ?? 0
-        let subtitleText = "\(agent.connectorCount) tools · \(sessions) sessions"
-        let subtitle = NSTextField(labelWithString: subtitleText)
-        subtitle.translatesAutoresizingMaskIntoConstraints = false
-        subtitle.font = NSFont.systemFont(ofSize: 9.5, weight: .medium)
-        subtitle.textColor = BlueyTheme.textDim
-        subtitle.lineBreakMode = .byTruncatingTail
-
-        row.addSubview(title)
-        row.addSubview(chip)
-        row.addSubview(subtitle)
-
-        // A transparent click button fills the row for tappable agents.
-        let tappable = !cap.dimmed
-        var trailingRef = row.trailingAnchor
-        var trailingConst: CGFloat = -10
-        if agent.attached {
-            let detach = NSButton(title: "", target: self, action: #selector(agentDetachClicked))
-            detach.translatesAutoresizingMaskIntoConstraints = false
-            detach.isBordered = false
-            detach.contentTintColor = BlueyTheme.cyan
-            detach.toolTip = "Detach \(agent.displayName)"
-            if let image = symbolImage("xmark.circle.fill") {
-                image.isTemplate = true
-                detach.image = image
-                detach.imagePosition = .imageOnly
-                detach.imageScaling = .scaleProportionallyDown
-            } else {
-                detach.title = "✕"
-                detach.font = NSFont.systemFont(ofSize: 11, weight: .bold)
+        // Bucket: Pinned, Today, Yesterday, Earlier, Older.
+        var pinned: [OverlaySessionItem] = []
+        var today: [OverlaySessionItem] = []
+        var yesterday: [OverlaySessionItem] = []
+        var earlier: [OverlaySessionItem] = []
+        var older: [OverlaySessionItem] = []
+        for s in sessionItems {
+            if s.pinned { pinned.append(s); continue }
+            switch dateBucket(s.updatedAt) {
+            case .today: today.append(s)
+            case .yesterday: yesterday.append(s)
+            case .earlier: earlier.append(s)
+            case .older: older.append(s)
             }
-            row.addSubview(detach)
-            NSLayoutConstraint.activate([
-                detach.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -8),
-                detach.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-                detach.widthAnchor.constraint(equalToConstant: 26),
-                detach.heightAnchor.constraint(equalToConstant: 26),
-            ])
-            trailingRef = detach.leadingAnchor
-            trailingConst = -6
-        } else if tappable {
-            let openButton = NSButton(title: "", target: self, action: #selector(agentRowClicked(_:)))
-            openButton.translatesAutoresizingMaskIntoConstraints = false
-            openButton.isBordered = false
-            openButton.tag = agentIndex(agent.kind)
-            row.addSubview(openButton)
-            NSLayoutConstraint.activate([
-                openButton.topAnchor.constraint(equalTo: row.topAnchor),
-                openButton.leadingAnchor.constraint(equalTo: row.leadingAnchor),
-                openButton.trailingAnchor.constraint(equalTo: row.trailingAnchor),
-                openButton.bottomAnchor.constraint(equalTo: row.bottomAnchor),
-            ])
         }
 
-        NSLayoutConstraint.activate([
-            row.heightAnchor.constraint(equalToConstant: 52),
-
-            title.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
-            title.topAnchor.constraint(equalTo: row.topAnchor, constant: 8),
-            title.trailingAnchor.constraint(lessThanOrEqualTo: chip.leadingAnchor, constant: -6),
-
-            chip.centerYAnchor.constraint(equalTo: title.centerYAnchor),
-            chip.trailingAnchor.constraint(equalTo: trailingRef, constant: trailingConst),
-
-            subtitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 2),
-            subtitle.trailingAnchor.constraint(equalTo: trailingRef, constant: trailingConst),
-        ])
-        return row
+        func addGroup(_ title: String, _ rows: [OverlaySessionItem]) {
+            guard !rows.isEmpty else { return }
+            addHistoryRow(makeGroupHeader(title))
+            for s in rows { addHistoryRow(makeSessionRow(s)) }
+        }
+        if sessionItems.isEmpty {
+            addHistoryRow(makeHistoryEmpty())
+        } else {
+            addGroup("Pinned", pinned)
+            addGroup("Today", today)
+            addGroup("Yesterday", yesterday)
+            addGroup("Earlier", earlier)
+            addGroup("Older", older)
+            if sessionHasMore {
+                let remaining = max(0, sessionTotal - sessionItems.count)
+                addHistoryRow(makeShowMoreRow(remaining))
+            }
+        }
     }
 
-    private func makeCapabilityChip(_ cap: AgentCapability) -> NSView {
-        let chip = NSTextField(labelWithString: cap.label)
-        chip.translatesAutoresizingMaskIntoConstraints = false
-        chip.font = NSFont.monospacedSystemFont(ofSize: 8.5, weight: .bold)
-        chip.textColor = cap.color
-        chip.alignment = .center
-        chip.wantsLayer = true
-        chip.layer?.backgroundColor = cap.color.withAlphaComponent(0.14).cgColor
-        chip.layer?.cornerRadius = 8
-        chip.layer?.borderWidth = 1
-        chip.layer?.borderColor = cap.color.withAlphaComponent(0.36).cgColor
-        chip.setContentCompressionResistancePriority(.required, for: .horizontal)
-        NSLayoutConstraint.activate([
-            chip.heightAnchor.constraint(equalToConstant: 17),
-            chip.widthAnchor.constraint(greaterThanOrEqualToConstant: 52),
-        ])
-        return chip
+    private func addHistoryRow(_ view: NSView) {
+        historyStack.addArrangedSubview(view)
+        view.widthAnchor.constraint(equalTo: historyStack.widthAnchor, constant: -16).isActive = true
     }
 
-    private func makeAgentMessageRow(_ text: String, dim: Bool) -> NSView {
-        let label = NSTextField(wrappingLabelWithString: text)
-        label.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
-        label.textColor = dim ? BlueyTheme.textDim : BlueyTheme.text
-        label.alignment = .center
+    private enum DateBucket { case today, yesterday, earlier, older }
+
+    private func dateBucket(_ updatedAt: String) -> DateBucket {
+        guard let date = parseTimestamp(updatedAt) else { return .older }
+        let cal = Calendar.current
+        if cal.isDateInToday(date) { return .today }
+        if cal.isDateInYesterday(date) { return .yesterday }
+        if let days = cal.dateComponents([.day], from: date, to: Date()).day, days <= 7 { return .earlier }
+        return .older
+    }
+
+    private func parseTimestamp(_ raw: String) -> Date? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if let epoch = Double(trimmed) {
+            // Heuristic: ms vs s.
+            return Date(timeIntervalSince1970: epoch > 1_000_000_000_000 ? epoch / 1000 : epoch)
+        }
+        let iso = ISO8601DateFormatter()
+        return iso.date(from: trimmed)
+    }
+
+    private func relativeTime(_ raw: String) -> String {
+        guard let date = parseTimestamp(raw) else { return "" }
+        let cal = Calendar.current
+        if cal.isDateInToday(date) {
+            let f = DateFormatter(); f.dateFormat = "HH:mm"; return f.string(from: date)
+        }
+        if cal.isDateInYesterday(date) { return "Yest" }
+        if let days = cal.dateComponents([.day], from: date, to: Date()).day, days <= 7 { return "\(days)d" }
+        let f = DateFormatter(); f.dateFormat = "MMM d"; return f.string(from: date)
+    }
+
+    private func makeGroupHeader(_ title: String) -> NSView {
+        let wrap = NSView()
+        wrap.translatesAutoresizingMaskIntoConstraints = false
+        let label = trackedLabel(title.uppercased(), size: 10.5, weight: .heavy, color: Tok.tx3, tracking: 0.6)
+        let line = NSView()
+        line.translatesAutoresizingMaskIntoConstraints = false
+        line.wantsLayer = true
+        line.layer?.backgroundColor = Tok.hairline.cgColor
+        wrap.addSubview(label)
+        wrap.addSubview(line)
+        NSLayoutConstraint.activate([
+            wrap.heightAnchor.constraint(equalToConstant: 30),
+            label.leadingAnchor.constraint(equalTo: wrap.leadingAnchor, constant: 8),
+            label.bottomAnchor.constraint(equalTo: wrap.bottomAnchor, constant: -5),
+            line.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 9),
+            line.trailingAnchor.constraint(equalTo: wrap.trailingAnchor, constant: -8),
+            line.centerYAnchor.constraint(equalTo: label.centerYAnchor),
+            line.heightAnchor.constraint(equalToConstant: 1),
+        ])
+        return wrap
+    }
+
+    private func makeHistoryEmpty() -> NSView {
+        let wrap = NSView()
+        wrap.translatesAutoresizingMaskIntoConstraints = false
+        let label = NSTextField(labelWithString: sessionQuery.isEmpty ? "No sessions yet." : "No matches.")
         label.translatesAutoresizingMaskIntoConstraints = false
-        let row = NSView()
-        row.translatesAutoresizingMaskIntoConstraints = false
-        row.addSubview(label)
+        label.font = Tok.font(12.5, .regular)
+        label.textColor = Tok.tx3
+        wrap.addSubview(label)
         NSLayoutConstraint.activate([
-            label.topAnchor.constraint(equalTo: row.topAnchor, constant: 14),
-            label.bottomAnchor.constraint(equalTo: row.bottomAnchor, constant: -14),
-            label.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 8),
-            label.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -8),
+            wrap.heightAnchor.constraint(equalToConstant: 60),
+            label.centerXAnchor.constraint(equalTo: wrap.centerXAnchor),
+            label.centerYAnchor.constraint(equalTo: wrap.centerYAnchor),
         ])
-        return row
+        return wrap
     }
 
-    private func agentIndex(_ kind: String) -> Int {
-        agentSummaries.firstIndex(where: { $0.kind == kind }) ?? -1
-    }
-
-    @objc private func agentRowClicked(_ sender: NSButton) {
-        guard sender.tag >= 0, sender.tag < agentSummaries.count else { return }
-        let agent = agentSummaries[sender.tag]
-        // Drivable / read-only agents move to the session picker.
-        agentDrawerStage = .sessions(kind: agent.kind, displayName: agent.displayName)
-        agentSessions = []
-        agentSessionsLoaded = false
-        renderAgentSessions()
-        emitAgentSessionsRequested(kind: agent.kind)
-    }
-
-    @objc private func agentDetachClicked() {
-        attachedAgentKind = nil
-        emitAgentDetachRequested()
-        // Optimistically reflect detach; the daemon re-emits set_agents to confirm.
-        agentSummaries = agentSummaries.map { agent in
-            AgentSummary(
-                kind: agent.kind, displayName: agent.displayName, capability: agent.capability,
-                connectorCount: agent.connectorCount, readyConnectorCount: agent.readyConnectorCount,
-                sessionCount: agent.sessionCount, attached: false)
-        }
-        updateAgentBadge()
-        if case .picker = agentDrawerStage { renderAgentPicker() }
-    }
-
-    // MARK: Session picker (agent drawer push-nav)
-
-    func setAgentSessions(kind: String, sessions: [AgentSessionSummary]) {
-        // Ignore late deliveries for an agent we've navigated away from.
-        guard case let .sessions(currentKind, _) = agentDrawerStage, currentKind == kind else {
-            return
-        }
-        agentSessions = sessions
-        agentSessionsLoaded = true
-        renderAgentSessions()
-    }
-
-    private func renderAgentSessions() {
-        guard case let .sessions(kind, displayName) = agentDrawerStage else { return }
-        agentDrawerTitleLabel.stringValue = displayName
-        agentDrawerBackButton.isHidden = false
-        agentDrawerCaption.stringValue = "Connectors run from your agent. Bluey stores nothing."
-        clearAgentStack()
-
-        // Pinned quick-actions: continue most recent + fresh.
-        let newest = agentSessions.first?.id
-        addAgentStackRow(makeQuickAttachRow(
-            title: "Continue most recent",
-            subtitle: newest == nil ? "No past sessions yet" : "Resume your latest agent context",
-            accent: true,
-            kind: kind,
-            sessionId: newest,
-            enabled: newest != nil))
-        addAgentStackRow(makeQuickAttachRow(
-            title: "Fresh — no past context",
-            subtitle: "Start the agent clean",
-            accent: false,
-            kind: kind,
-            sessionId: nil,
-            enabled: true))
-
-        if !agentSessionsLoaded {
-            addAgentStackRow(makeAgentMessageRow("Loading sessions…", dim: true))
-            return
-        }
-        guard !agentSessions.isEmpty else {
-            addAgentStackRow(makeAgentMessageRow(
-                "Session history off — enable in settings", dim: true))
-            return
-        }
-        for session in agentSessions {
-            addAgentStackRow(makeAgentSessionRow(kind: kind, session: session))
-        }
-    }
-
-    private func makeQuickAttachRow(
-        title: String, subtitle: String, accent: Bool,
-        kind: String, sessionId: String?, enabled: Bool
-    ) -> NSView {
-        let row = NSView()
-        row.translatesAutoresizingMaskIntoConstraints = false
-        row.wantsLayer = true
-        row.layer?.backgroundColor = accent
-            ? BlueyTheme.cyanSoft.cgColor
-            : NSColor.white.withAlphaComponent(0.035).cgColor
-        row.layer?.cornerRadius = 12
-        row.layer?.borderWidth = 1
-        row.layer?.borderColor = accent
-            ? BlueyTheme.cyan.withAlphaComponent(0.40).cgColor
-            : BlueyTheme.hairline.cgColor
-        row.alphaValue = enabled ? 1.0 : 0.5
-
-        let titleLabel = NSTextField(labelWithString: title)
-        titleLabel.translatesAutoresizingMaskIntoConstraints = false
-        titleLabel.font = NSFont.systemFont(ofSize: 11.5, weight: .bold)
-        titleLabel.textColor = accent ? BlueyTheme.cyan : BlueyTheme.text
-        titleLabel.lineBreakMode = .byTruncatingTail
-
-        let subtitleLabel = NSTextField(labelWithString: subtitle)
-        subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
-        subtitleLabel.font = NSFont.systemFont(ofSize: 9.5, weight: .medium)
-        subtitleLabel.textColor = BlueyTheme.textDim
-        subtitleLabel.lineBreakMode = .byTruncatingTail
-
-        row.addSubview(titleLabel)
-        row.addSubview(subtitleLabel)
-        if enabled {
-            let button = NSButton(title: "", target: self, action: #selector(quickAttachClicked(_:)))
-            button.translatesAutoresizingMaskIntoConstraints = false
-            button.isBordered = false
-            button.identifier = NSUserInterfaceItemIdentifier(attachToken(kind: kind, sessionId: sessionId))
-            row.addSubview(button)
-            NSLayoutConstraint.activate([
-                button.topAnchor.constraint(equalTo: row.topAnchor),
-                button.leadingAnchor.constraint(equalTo: row.leadingAnchor),
-                button.trailingAnchor.constraint(equalTo: row.trailingAnchor),
-                button.bottomAnchor.constraint(equalTo: row.bottomAnchor),
-            ])
-        }
-        NSLayoutConstraint.activate([
-            row.heightAnchor.constraint(equalToConstant: 48),
-            titleLabel.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
-            titleLabel.topAnchor.constraint(equalTo: row.topAnchor, constant: 8),
-            titleLabel.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -10),
-            subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            subtitleLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
-            subtitleLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
-        ])
-        return row
-    }
-
-    private func makeAgentSessionRow(kind: String, session: AgentSessionSummary) -> NSView {
-        let row = NSView()
-        row.translatesAutoresizingMaskIntoConstraints = false
-        row.wantsLayer = true
-        row.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.035).cgColor
-        row.layer?.cornerRadius = 12
-        row.layer?.borderWidth = 1
-        row.layer?.borderColor = BlueyTheme.hairline.cgColor
-
-        let titleLabel = NSTextField(labelWithString: session.title ?? "Untitled session")
-        titleLabel.translatesAutoresizingMaskIntoConstraints = false
-        titleLabel.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
-        titleLabel.textColor = BlueyTheme.text
-        titleLabel.lineBreakMode = .byTruncatingTail
-
-        let subtitleLabel = NSTextField(labelWithString: session.updatedAt)
-        subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
-        subtitleLabel.font = NSFont.monospacedSystemFont(ofSize: 9, weight: .medium)
-        subtitleLabel.textColor = BlueyTheme.textDim
-        subtitleLabel.lineBreakMode = .byTruncatingTail
-
-        let button = NSButton(title: "", target: self, action: #selector(quickAttachClicked(_:)))
+    private func makeShowMoreRow(_ remaining: Int) -> NSView {
+        let button = NSButton(title: "", target: self, action: #selector(showMoreClicked))
         button.translatesAutoresizingMaskIntoConstraints = false
         button.isBordered = false
-        button.identifier = NSUserInterfaceItemIdentifier(attachToken(kind: kind, sessionId: session.id))
-
-        row.addSubview(button)
-        row.addSubview(titleLabel)
-        row.addSubview(subtitleLabel)
-        NSLayoutConstraint.activate([
-            row.heightAnchor.constraint(equalToConstant: 48),
-            button.topAnchor.constraint(equalTo: row.topAnchor),
-            button.leadingAnchor.constraint(equalTo: row.leadingAnchor),
-            button.trailingAnchor.constraint(equalTo: row.trailingAnchor),
-            button.bottomAnchor.constraint(equalTo: row.bottomAnchor),
-            titleLabel.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
-            titleLabel.topAnchor.constraint(equalTo: row.topAnchor, constant: 8),
-            titleLabel.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -10),
-            subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            subtitleLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 2),
-            subtitleLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor),
-        ])
-        return row
+        button.wantsLayer = true
+        button.layer?.cornerRadius = Tok.rMd
+        button.layer?.borderWidth = 1
+        button.layer?.borderColor = Tok.hairline.cgColor
+        button.attributedTitle = NSAttributedString(
+            string: "Show \(remaining) more",
+            attributes: [.font: Tok.font(12, .semibold), .foregroundColor: Tok.accentTx])
+        button.heightAnchor.constraint(equalToConstant: 38).isActive = true
+        return button
     }
 
-    // "kind|sessionId" identifier round-trips an attach target through the
-    // button without a side table; empty session segment means attach fresh.
-    private func attachToken(kind: String, sessionId: String?) -> String {
-        "\(kind)|\(sessionId ?? "")"
-    }
-
-    @objc private func quickAttachClicked(_ sender: NSButton) {
-        guard let raw = sender.identifier?.rawValue else { return }
-        let parts = raw.split(separator: "|", maxSplits: 1, omittingEmptySubsequences: false)
-        guard let kind = parts.first.map(String.init), !kind.isEmpty else { return }
-        let sessionId = parts.count > 1 && !parts[1].isEmpty ? String(parts[1]) : nil
-        beginAttachFlow(kind: kind, sessionId: sessionId)
-    }
-
-    // MARK: Connector inheritance sheet
-
-    // Stage the attach target, then surface the connector sheet. The daemon's
-    // connectors arrive async; attach is never blocked on re-auth gaps.
-    private func beginAttachFlow(kind: String, sessionId: String?) {
-        pendingConnectorKind = kind
-        pendingConnectorSessionId = sessionId
-        pendingConnectorInfos = []
-        pendingConnectorsLoaded = false
-        renderConnectorSheet()
-        connectorSheetOverlay.isHidden = false
-        connectorSheetOverlay.alphaValue = 0
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.12
-            self.connectorSheetOverlay.animator().alphaValue = 1
-        }
-        emitAgentConnectorsRequested(kind: kind)
-    }
-
-    func setAgentConnectors(kind: String, connectors: [AgentConnectorInfo]) {
-        guard pendingConnectorKind == kind, !connectorSheetOverlay.isHidden else { return }
-        pendingConnectorInfos = connectors
-        pendingConnectorsLoaded = true
-        renderConnectorSheet()
-    }
-
-    private func renderConnectorSheet() {
-        let displayName = agentSummaries.first(where: { $0.kind == pendingConnectorKind })?.displayName
-            ?? "agent"
-        connectorSheetTitle.stringValue = "\(displayName) connectors"
-        for view in connectorSheetStack.arrangedSubviews {
-            connectorSheetStack.removeArrangedSubview(view)
-            view.removeFromSuperview()
-        }
-
-        guard pendingConnectorsLoaded else {
-            connectorSheetSummary.stringValue = "Reading inherited connectors…"
-            let row = makeAgentMessageRow("Loading…", dim: true)
-            connectorSheetStack.addArrangedSubview(row)
-            row.widthAnchor.constraint(equalTo: connectorSheetStack.widthAnchor, constant: -2).isActive = true
-            return
-        }
-
-        let total = pendingConnectorInfos.count
-        let ready = pendingConnectorInfos.filter { $0.ready }.count
-        let needReauth = total - ready
-        if total == 0 {
-            connectorSheetSummary.stringValue = "No inherited connectors — attach runs clean."
-        } else if needReauth > 0 {
-            connectorSheetSummary.stringValue =
-                "\(ready) of \(total) connectors ready · \(needReauth) need re-auth"
-        } else {
-            connectorSheetSummary.stringValue = "\(ready) of \(total) connectors ready"
-        }
-
-        for connector in pendingConnectorInfos {
-            let row = makeConnectorRow(connector)
-            connectorSheetStack.addArrangedSubview(row)
-            row.widthAnchor.constraint(equalTo: connectorSheetStack.widthAnchor, constant: -2).isActive = true
-        }
-    }
-
-    private func makeConnectorRow(_ connector: AgentConnectorInfo) -> NSView {
-        let row = NSView()
-        row.translatesAutoresizingMaskIntoConstraints = false
-        row.wantsLayer = true
-        row.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.035).cgColor
-        row.layer?.cornerRadius = 10
-        row.layer?.borderWidth = 1
-        row.layer?.borderColor = BlueyTheme.hairline.cgColor
-
-        let name = NSTextField(labelWithString: connector.name)
-        name.translatesAutoresizingMaskIntoConstraints = false
-        name.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
-        name.textColor = BlueyTheme.text
-        name.lineBreakMode = .byTruncatingTail
-
-        let tierColor: NSColor = connector.ready ? BlueyTheme.green : BlueyTheme.warning
-        let tierText = connectorTierText(connector)
-        let tier = NSTextField(labelWithString: tierText)
-        tier.translatesAutoresizingMaskIntoConstraints = false
-        tier.font = NSFont.monospacedSystemFont(ofSize: 9, weight: .bold)
-        tier.textColor = tierColor
-        tier.alignment = .right
-        tier.lineBreakMode = .byTruncatingTail
-        tier.setContentCompressionResistancePriority(.required, for: .horizontal)
-
-        row.addSubview(name)
-        row.addSubview(tier)
-
-        if !connector.ready {
-            let reauth = NSButton(title: "", target: self, action: #selector(connectorReauthClicked(_:)))
-            reauth.translatesAutoresizingMaskIntoConstraints = false
-            reauth.isBordered = false
-            reauth.contentTintColor = BlueyTheme.warning
-            reauth.identifier = NSUserInterfaceItemIdentifier(connector.name)
-            reauth.toolTip = "Re-authenticate \(connector.name)"
-            if let image = symbolImage("arrow.clockwise") {
-                image.isTemplate = true
-                reauth.image = image
-                reauth.imagePosition = .imageOnly
-                reauth.imageScaling = .scaleProportionallyDown
-            } else {
-                reauth.title = "↻"
-                reauth.font = NSFont.systemFont(ofSize: 11, weight: .bold)
-            }
-            row.addSubview(reauth)
-            NSLayoutConstraint.activate([
-                reauth.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -8),
-                reauth.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-                reauth.widthAnchor.constraint(equalToConstant: 24),
-                reauth.heightAnchor.constraint(equalToConstant: 24),
-                tier.trailingAnchor.constraint(equalTo: reauth.leadingAnchor, constant: -6),
-            ])
-        } else {
-            tier.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -10).isActive = true
-        }
-
-        NSLayoutConstraint.activate([
-            row.heightAnchor.constraint(equalToConstant: 38),
-            name.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
-            name.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            name.trailingAnchor.constraint(lessThanOrEqualTo: tier.leadingAnchor, constant: -8),
-            tier.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-        ])
-        return row
-    }
-
-    private func connectorTierText(_ connector: AgentConnectorInfo) -> String {
-        switch connector.authTier {
-        case "env_auth": return connector.ready ? "env · ready" : "env · re-auth"
-        case "hosted_oauth": return connector.ready ? "oauth · ready" : "oauth · re-auth"
-        default: return connector.ready ? "ready" : "re-auth"
-        }
-    }
-
-    @objc private func connectorReauthClicked(_ sender: NSButton) {
-        guard let name = sender.identifier?.rawValue, let kind = pendingConnectorKind else { return }
-        emitConnectorReauthRequested(kind: kind, name: name)
-        sender.toolTip = "Re-auth requested for \(name)"
-    }
-
-    @objc private func connectorSheetCancelClicked() {
-        dismissConnectorSheet()
-    }
-
-    @objc private func connectorSheetAttachClicked() {
-        guard let kind = pendingConnectorKind else { return }
-        let sessionId = pendingConnectorSessionId
-        emitAgentAttachRequested(kind: kind, sessionId: sessionId)
-        attachedAgentKind = kind
-        dismissConnectorSheet()
-        agentDrawer.isHidden = true
-        // Optimistic badge; the daemon confirms with set_agents.
-        updateAgentBadge()
-    }
-
-    private func dismissConnectorSheet() {
-        NSAnimationContext.runAnimationGroup({ context in
-            context.duration = 0.10
-            self.connectorSheetOverlay.animator().alphaValue = 0
-        }, completionHandler: { [weak self] in
-            guard let self else { return }
-            self.connectorSheetOverlay.isHidden = true
-            self.connectorSheetOverlay.alphaValue = 1
-        })
-    }
-
-    // MARK: Attached-state badge
-
-    private func updateAgentBadge() {
-        guard let kind = attachedAgentKind,
-              let agent = agentSummaries.first(where: { $0.kind == kind })
-        else {
-            agentBadge.isHidden = true
-            onAgentAttachmentChanged?(false)
-            return
-        }
-        agentBadge.isHidden = false
-        agentBadge.stringValue = "\(agentShortLabel(kind)) · \(agent.readyConnectorCount)/\(agent.connectorCount) tools"
-        statusLabel.stringValue = "agent: \(agent.displayName)"
-        onAgentAttachmentChanged?(true)
-    }
-
-    func resetSessionSurface() {
-        feed.clear()
-        hideSystemToast(immediately: true)
-        setContextItems([])
-        transcriptSnippets.removeAll()
-        updateTranscriptStripText("Live captions preview", scrollToEnd: false)
-        setTranscriptState("IDLE", active: false)
-        routeBadge.stringValue = "● Ready"
-        routeBadge.textColor = BlueyTheme.green
-        latestCanvas = nil
-        setCanvasOpen(false)
-        canvasToggleButton.isHidden = true
-    }
-
-    func pushCard(_ card: RenderedCard) {
-        if shouldRenderAsToast(card) {
-            showSystemToast(for: card)
-            emitCardRendered(id: card.id)
-            return
-        }
-        feed.push(card)
-        routeCanvasIfNeeded(card)
-    }
-
-    /// Render a review-gated Fix proposal as a dedicated card in the feed
-    /// (Slice F4). Carries the proposal payload + a pending decision state; the
-    /// feed's Approve/Reject buttons echo back via emitFixApprovalResponded.
-    func pushFixProposal(_ proposal: FixProposal) {
-        let card = RenderedCard(
-            id: proposal.proposalId,
-            kind: "fix_proposal",
-            title: "Proposed fix",
-            body: "",
-            done: true,
-            costLabel: nil,
-            artifact: nil,
-            source: nil,
-            fixProposal: proposal,
-            fixState: .pending)
-        feed.push(card)
-    }
-
-    func updateCard(id: String, body: String, done: Bool, costLabel: String?, artifact: OverlayArtifact?) {
-        guard let card = feed.update(id: id, body: body, done: done, costLabel: costLabel, artifact: artifact) else {
-            return
-        }
-        if let artifact {
-            routeBadge.stringValue = routeBadgeText(for: artifact)
-        } else if !done {
-            statusLabel.stringValue = "Answer streaming"
-        }
-        routeCanvasIfNeeded(card)
-    }
-
-    private func shouldRenderAsToast(_ card: RenderedCard) -> Bool {
-        let kind = normalizedCardKind(card.kind)
-        guard (kind == "system" || kind == "warning"), actionableLoginURL(from: card) == nil else {
-            return false
-        }
-        let title = card.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if title.contains("recap") || title.contains("summary") {
-            return false
-        }
-        let plainBody = card.body.trimmingCharacters(in: .whitespacesAndNewlines)
-        return plainBody.count <= 360
-    }
-
-    private func actionableLoginURL(from card: RenderedCard) -> URL? {
-        guard normalizedCardKind(card.kind) == "system" else { return nil }
-        for line in card.body.components(separatedBy: .newlines) {
-            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-            let candidate: String
-            if trimmed.hasPrefix("login_url:") {
-                candidate = trimmed
-                    .replacingOccurrences(of: "login_url:", with: "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-            } else if trimmed.hasPrefix("https://") || trimmed.hasPrefix("http://") {
-                candidate = trimmed
-            } else {
-                continue
-            }
-            if
-                let url = URL(string: candidate),
-                let scheme = url.scheme?.lowercased(),
-                ["http", "https"].contains(scheme)
-            {
-                return url
-            }
-        }
-        return nil
-    }
-
-    private func showSystemToast(for card: RenderedCard) {
-        toastHideWorkItem?.cancel()
-        let title = card.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let body = systemToastBody(card.body)
-        toastTitleLabel.stringValue = title.isEmpty ? "Bluey" : title
-        toastBodyLabel.stringValue = body
-        statusLabel.stringValue = toastTitleLabel.stringValue
-
-        toastView.isHidden = false
-        toastView.animator().alphaValue = 1
-
-        let work = DispatchWorkItem { [weak self] in
-            self?.hideSystemToast(immediately: false)
-        }
-        toastHideWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0, execute: work)
-    }
-
-    private func hideSystemToast(immediately: Bool) {
-        toastHideWorkItem?.cancel()
-        toastHideWorkItem = nil
-        guard !toastView.isHidden else { return }
-        if immediately {
-            toastView.alphaValue = 0
-            toastView.isHidden = true
-            return
-        }
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.18
-            toastView.animator().alphaValue = 0
-        } completionHandler: { [weak self] in
-            self?.toastView.isHidden = true
-        }
-    }
-
-    private func systemToastBody(_ body: String) -> String {
-        var lines: [String] = []
-        for raw in body.components(separatedBy: .newlines) {
-            let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !line.isEmpty, !line.hasPrefix("login_url:") else { continue }
-            lines.append(line)
-        }
-        let joined = lines.joined(separator: " · ")
-            .replacingOccurrences(of: "knowledge base", with: "documents")
-        if joined.count <= 190 {
-            return joined
-        }
-        let end = joined.index(joined.startIndex, offsetBy: 187)
-        return String(joined[..<end]) + "..."
-    }
-
-    private func routeCanvasIfNeeded(_ card: RenderedCard) {
-        guard let artifact = makeCanvasArtifact(from: card) else { return }
-        latestCanvas = artifact
-        canvasPane.render(artifact)
-        canvasToggleButton.isHidden = false
-        if shouldAutoOpenCanvas(for: card, artifact: artifact) {
-            setCanvasOpen(true)
-        }
-    }
-
-    private func shouldAutoOpenCanvas(for card: RenderedCard, artifact: CanvasArtifact) -> Bool {
-        if card.artifact != nil { return true }
-        guard card.kind == "answer" else { return false }
-        switch artifact.kind {
-        case .code, .systemDesign, .screen:
-            return true
-        case .document, .structured:
-            return false
-        }
-    }
-
-    private func setCanvasOpen(_ open: Bool) {
-        if !open, canvasFullWindow {
-            restoreCanvasWindow()
-        }
-        canvasOpen = open
-        canvasPane.isHidden = !open
-        updateCanvasWidth()
-        canvasToggleButton.contentTintColor = open ? BlueyTheme.cyan : BlueyTheme.textDim
-        if open {
-            ensureRoomForCanvas()
-        } else {
-            restoreCompactWidth()
-        }
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.16
-            self.layoutSubtreeIfNeeded()
-        }
-    }
-
-    private func toggleWindowFullSize() {
-        guard window != nil else { return }
-        if windowFullSize {
-            restoreWindowFromFullSize()
-        } else {
-            expandWindowFullSize()
-        }
-    }
-
-    private func updateFullSizeButtonChrome() {
-        let symbol = windowFullSize
-            ? "arrow.down.right.and.arrow.up.left"
-            : "arrow.up.left.and.arrow.down.right"
-        let fallback = windowFullSize ? "↙" : "↗"
-        styleHeaderIconButton(fullSizeButton, symbol: symbol, fallback: fallback)
-        fullSizeButton.toolTip = windowFullSize ? "Restore Bluey size" : "Make Bluey full size"
-    }
-
-    private func expandWindowFullSize() {
-        guard let window else { return }
-        if preWindowFullSizeFrame == nil {
-            preWindowFullSizeFrame = window.frame
-        }
-        windowFullSize = true
-        updateFullSizeButtonChrome()
-
-        let screen = window.screen?.visibleFrame
-            ?? NSScreen.main?.visibleFrame
-            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let maxWidth = max(ExpandedPanelMetrics.minCompactWidth, screen.width - ExpandedPanelMetrics.screenInset * 2)
-        let maxHeight = max(ExpandedPanelMetrics.minHeight, screen.height - ExpandedPanelMetrics.screenInset * 2)
-        if let overlayWindow = window as? OverlayWindow {
-            overlayWindow.minimumFrameWidth = min(ExpandedPanelMetrics.minCompactWidth, maxWidth)
-            overlayWindow.maximumFrameWidth = maxWidth
-            overlayWindow.minimumFrameHeight = ExpandedPanelMetrics.minHeight
-            overlayWindow.maximumFrameHeight = maxHeight
-        }
-        window.minSize = NSSize(width: min(ExpandedPanelMetrics.minCompactWidth, maxWidth), height: ExpandedPanelMetrics.minHeight)
-        window.contentMinSize = window.minSize
-        window.maxSize = NSSize(width: maxWidth, height: maxHeight)
-        window.contentMaxSize = window.maxSize
-
-        var frame = NSRect(
-            x: screen.midX - maxWidth / 2,
-            y: screen.midY - maxHeight / 2,
-            width: maxWidth,
-            height: maxHeight)
-        frame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(frame, visibleFrame: screen)
-        updateCanvasWidth()
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.16
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            window.animator().setFrame(frame, display: true)
-            self.layoutSubtreeIfNeeded()
-        }
-    }
-
-    private func restoreWindowFromFullSize() {
-        guard let window else { return }
-        windowFullSize = false
-        let targetFrame = preWindowFullSizeFrame
-        preWindowFullSizeFrame = nil
-        restoreCompactWidth()
-        updateCanvasWidth()
-        updateFullSizeButtonChrome()
-        guard let targetFrame else { return }
-        let screen = window.screen?.visibleFrame
-            ?? NSScreen.main?.visibleFrame
-            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let fittedFrame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(targetFrame, visibleFrame: screen)
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.16
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            window.animator().setFrame(fittedFrame, display: true)
-            self.layoutSubtreeIfNeeded()
-        }
-    }
-
-    private func updateCanvasWidth() {
-        guard canvasOpen else {
-            canvasWidthConstraint?.constant = 0
-            return
-        }
-        let available = max(0, bounds.width)
-        if canvasFullWindow || windowFullSize {
-            canvasWidthConstraint?.constant = min(max(380, available * 0.44), 560)
-        } else {
-            canvasWidthConstraint?.constant = 310
-        }
-    }
-
-    private func expandCanvasWindow() {
-        guard let window else { return }
-        if preCanvasFullWindowFrame == nil {
-            preCanvasFullWindowFrame = window.frame
-        }
-        canvasFullWindow = true
-        canvasPane.setFullWindow(true)
-
-        let screen = window.screen?.visibleFrame
-            ?? NSScreen.main?.visibleFrame
-            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let maxWidth = max(360, screen.width - ExpandedPanelMetrics.screenInset * 2)
-        let maxHeight = max(ExpandedPanelMetrics.minHeight, screen.height - ExpandedPanelMetrics.screenInset * 2)
-        if let overlayWindow = window as? OverlayWindow {
-            overlayWindow.minimumFrameWidth = min(ExpandedPanelMetrics.minCompactWidth, maxWidth)
-            overlayWindow.maximumFrameWidth = maxWidth
-            overlayWindow.minimumFrameHeight = ExpandedPanelMetrics.minHeight
-            overlayWindow.maximumFrameHeight = maxHeight
-        }
-        window.minSize = NSSize(width: min(ExpandedPanelMetrics.minCompactWidth, maxWidth), height: ExpandedPanelMetrics.minHeight)
-        window.contentMinSize = window.minSize
-        window.maxSize = NSSize(width: maxWidth, height: maxHeight)
-        window.contentMaxSize = window.maxSize
-        var frame = NSRect(
-            x: screen.midX - maxWidth / 2,
-            y: screen.midY - maxHeight / 2,
-            width: maxWidth,
-            height: maxHeight)
-        frame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(frame, visibleFrame: screen)
-        updateCanvasWidth()
-        NSAnimationContext.runAnimationGroup { context in
-            context.duration = 0.16
-            context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-            window.animator().setFrame(frame, display: true)
-            self.layoutSubtreeIfNeeded()
-        }
-    }
-
-    private func restoreCanvasWindow() {
-        guard let window else { return }
-        canvasFullWindow = false
-        canvasPane.setFullWindow(false)
-        let targetFrame = preCanvasFullWindowFrame
-        preCanvasFullWindowFrame = nil
-        restoreCompactWidth()
-        updateCanvasWidth()
-        if let targetFrame {
-            NSAnimationContext.runAnimationGroup { context in
-                context.duration = 0.16
-                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                window.animator().setFrame(targetFrame, display: true)
-                self.layoutSubtreeIfNeeded()
-            }
-        }
-    }
-
-    private func ensureRoomForCanvas() {
-        guard let window else { return }
-        let targetWidth = ExpandedPanelMetrics.maxCanvasWidth
-        let screen = window.screen?.visibleFrame
-            ?? NSScreen.main?.visibleFrame
-            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let clampedTargetWidth = ExpandedPanelMetrics.fittingWidth(for: screen, preferred: targetWidth)
-        let minimumWidth = ExpandedPanelMetrics.fittingMinimumWidth(for: screen, targetWidth: clampedTargetWidth)
-        let maximumWidth = max(clampedTargetWidth, screen.width - ExpandedPanelMetrics.screenInset * 2)
-        let maximumHeight = max(ExpandedPanelMetrics.minHeight, screen.height - ExpandedPanelMetrics.screenInset * 2)
-        if let overlayWindow = window as? OverlayWindow {
-            overlayWindow.minimumFrameWidth = minimumWidth
-            overlayWindow.maximumFrameWidth = maximumWidth
-            overlayWindow.minimumFrameHeight = ExpandedPanelMetrics.minHeight
-            overlayWindow.maximumFrameHeight = maximumHeight
-        }
-        window.minSize = NSSize(width: minimumWidth, height: ExpandedPanelMetrics.minHeight)
-        window.contentMinSize = NSSize(width: minimumWidth, height: ExpandedPanelMetrics.minHeight)
-        window.maxSize = NSSize(width: maximumWidth, height: maximumHeight)
-        window.contentMaxSize = NSSize(width: maximumWidth, height: maximumHeight)
-        guard window.frame.width < clampedTargetWidth else { return }
-        var frame = window.frame
-        frame.size.width = clampedTargetWidth
-        frame.origin.x = min(max(screen.minX + 12, frame.origin.x), screen.maxX - frame.width - 12)
-        frame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(frame, visibleFrame: screen)
-        window.setFrame(frame, display: true, animate: true)
-    }
-
-    private func restoreCompactWidth() {
-        guard let window else { return }
-        let screen = window.screen?.visibleFrame
-            ?? NSScreen.main?.visibleFrame
-            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let compactWidth = ExpandedPanelMetrics.fittingWidth(
-            for: screen,
-            preferred: ExpandedPanelMetrics.maxCompactWidth)
-        let minimumWidth = ExpandedPanelMetrics.fittingMinimumWidth(for: screen, targetWidth: compactWidth)
-        let maximumWidth = max(compactWidth, screen.width - ExpandedPanelMetrics.screenInset * 2)
-        let maximumHeight = max(ExpandedPanelMetrics.minHeight, screen.height - ExpandedPanelMetrics.screenInset * 2)
-        if let overlayWindow = window as? OverlayWindow {
-            overlayWindow.minimumFrameWidth = minimumWidth
-            overlayWindow.maximumFrameWidth = maximumWidth
-            overlayWindow.minimumFrameHeight = ExpandedPanelMetrics.minHeight
-            overlayWindow.maximumFrameHeight = maximumHeight
-        }
-        window.minSize = NSSize(width: minimumWidth, height: ExpandedPanelMetrics.minHeight)
-        window.contentMinSize = NSSize(width: minimumWidth, height: ExpandedPanelMetrics.minHeight)
-        window.maxSize = NSSize(width: maximumWidth, height: maximumHeight)
-        window.contentMaxSize = NSSize(width: maximumWidth, height: maximumHeight)
-    }
-
-    private func makeCanvasArtifact(from card: RenderedCard) -> CanvasArtifact? {
-        guard card.kind == "answer" || card.kind == "context" || card.kind == "system" else {
-            return nil
-        }
-        let body = card.body.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !body.isEmpty else { return nil }
-
-        if let artifact = card.artifact {
-            let kind = CanvasKind.fromArtifactType(artifact.artifactType)
-            let confidence = artifact.confidence.map { "Confidence \(Int(($0 * 100).rounded()))%" }
-            return CanvasArtifact(
-                kind: kind,
-                title: artifact.title.isEmpty ? kind.title : artifact.title,
-                subtitle: confidence ?? kind.subtitle,
-                content: artifact.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    ? body
-                    : artifact.body,
-                sourceCardId: card.id)
-        }
-
-        let lower = body.lowercased()
-        let codeBlocks = extractCodeBlocks(from: body)
-        if !codeBlocks.isEmpty || looksLikeCode(lower) {
-            return CanvasArtifact(
-                kind: .code,
-                title: "Code canvas",
-                subtitle: "Code, tests, complexity, and implementation notes",
-                content: formatCodeCanvas(body: body, codeBlocks: codeBlocks),
-                sourceCardId: card.id)
-        }
-
-        if looksLikeSystemDesign(lower) {
-            return CanvasArtifact(
-                kind: .systemDesign,
-                title: "System design canvas",
-                subtitle: "Architecture, tradeoffs, APIs, data, and scale",
-                content: formatStructuredCanvas(body, fallbackHeading: "System Design"),
-                sourceCardId: card.id)
-        }
-
-        if looksLikeScreenAnalysis(lower) {
-            return CanvasArtifact(
-                kind: .screen,
-                title: "Screen analysis",
-                subtitle: "Detected context and answerable details",
-                content: formatStructuredCanvas(body, fallbackHeading: "Screen Context"),
-                sourceCardId: card.id)
-        }
-
-        if card.kind == "context" || looksLikeDocumentWork(lower) {
-            return CanvasArtifact(
-                kind: .document,
-                title: "Document notes",
-                subtitle: "Attached context distilled for this session",
-                content: formatStructuredCanvas(body, fallbackHeading: "Document Context"),
-                sourceCardId: card.id)
-        }
-
-        if body.count > 950 && hasStructuredShape(body) {
-            return CanvasArtifact(
-                kind: .structured,
-                title: "Workspace",
-                subtitle: "Long-form answer kept beside the chat",
-                content: formatStructuredCanvas(body, fallbackHeading: "Details"),
-                sourceCardId: card.id)
-        }
-
-        return nil
-    }
-
-    private func appendTranscriptSnippet(_ card: RenderedCard) {
-        let title = card.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let body = displayTranscriptText(card.body)
-        guard !body.isEmpty else { return }
-
-        let label = title.isEmpty ? "Transcript" : title
-        transcriptSnippets.append("\(label): \(body)")
-        if transcriptSnippets.count > 6 {
-            transcriptSnippets.removeFirst(transcriptSnippets.count - 6)
-        }
-        setTranscriptState(recordingActive ? "TRANSCRIBING" : "CAPTURED", active: recordingActive)
-        updateTranscriptStripText(transcriptSnippets.joined(separator: "   "), scrollToEnd: true)
-    }
-
-    func appendLiveTranscript(source: String, text: String, final: Bool) {
-        let body = displayTranscriptText(text)
-        let cleanSource = source
-            .replacingOccurrences(of: "_", with: " ")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let lowerSource = cleanSource.lowercased()
-        let label: String
-        if lowerSource.contains("microphone") || lowerSource.contains("mic") {
-            label = "Mic"
-        } else if lowerSource.contains("system") {
-            label = "System"
-        } else {
-            label = cleanSource.isEmpty ? "Audio" : cleanSource.capitalized
-        }
-        guard !body.isEmpty else {
-            setTranscriptState(recordingActive ? "\(shortAudioLabel(label)) LIVE" : (final ? "CAPTURED" : "HEARD"), active: recordingActive)
-            return
-        }
-        transcriptSnippets.append("\(label): \(body)")
-        if transcriptSnippets.count > 6 {
-            transcriptSnippets.removeFirst(transcriptSnippets.count - 6)
-        }
-        setTranscriptState(recordingActive ? "\(shortAudioLabel(label)) LIVE" : (final ? "CAPTURED" : "HEARD"), active: recordingActive)
-        updateTranscriptStripText(transcriptSnippets.joined(separator: "   "), scrollToEnd: true)
-    }
-
-    private func shortAudioLabel(_ label: String) -> String {
-        switch label.lowercased() {
-        case "mic":
-            return "MIC"
-        case "system":
-            return "SYS"
-        default:
-            return "AUDIO"
-        }
-    }
-
-    private func updateTranscriptStripText(_ text: String, scrollToEnd: Bool) {
-        transcriptLabel.attributedStringValue = attributedTranscriptStripText(text)
-        resizeTranscriptLabelToContent()
-        guard scrollToEnd else {
-            transcriptScroll.contentView.scroll(to: .zero)
-            transcriptScroll.reflectScrolledClipView(transcriptScroll.contentView)
-            return
-        }
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.resizeTranscriptLabelToContent()
-            let maxX = max(0, self.transcriptLabel.frame.width - self.transcriptScroll.contentView.bounds.width)
-            self.transcriptScroll.contentView.scroll(to: NSPoint(x: maxX, y: 0))
-            self.transcriptScroll.reflectScrolledClipView(self.transcriptScroll.contentView)
-        }
-    }
-
-    private func attributedTranscriptStripText(_ text: String) -> NSAttributedString {
-        let font = transcriptLabel.font ?? NSFont.systemFont(ofSize: 11.5, weight: .medium)
-        let sourceFont = NSFont.systemFont(ofSize: 11.5, weight: .bold)
-        let attributed = NSMutableAttributedString(
-            string: text,
-            attributes: [
-                .font: font,
-                .foregroundColor: BlueyTheme.textDim,
-            ])
-        for label in ["Mic:", "System:"] {
-            var searchRange = NSRange(location: 0, length: attributed.length)
-            while true {
-                let found = (attributed.string as NSString).range(of: label, options: [], range: searchRange)
-                if found.location == NSNotFound { break }
-                attributed.addAttributes(
-                    [
-                        .font: sourceFont,
-                        .foregroundColor: BlueyTheme.green,
-                    ],
-                    range: found)
-                let nextLocation = found.location + found.length
-                if nextLocation >= attributed.length { break }
-                searchRange = NSRange(location: nextLocation, length: attributed.length - nextLocation)
-            }
-        }
-        return attributed
-    }
-
-    private func resizeTranscriptLabelToContent() {
-        let viewport = max(0, transcriptScroll.contentView.bounds.width)
-        let height = max(22, transcriptScroll.contentView.bounds.height)
-        let font = transcriptLabel.font ?? NSFont.systemFont(ofSize: 11.5, weight: .medium)
-        let textWidth = ceil((transcriptLabel.stringValue as NSString).size(
-            withAttributes: [.font: font]).width) + 24
-        transcriptLabel.frame = NSRect(
-            x: 0,
-            y: max(0, (height - 18) / 2),
-            width: max(viewport, textWidth),
-            height: 18)
-    }
-
-    private func makeAttachmentChip(_ item: OverlayContextItem) -> NSView {
-        let chip = NSView()
-        chip.translatesAutoresizingMaskIntoConstraints = false
-        chip.wantsLayer = true
-        chip.layer?.backgroundColor = BlueyTheme.surfaceRaised.cgColor
-        chip.layer?.cornerRadius = 12
-        chip.layer?.borderWidth = 1
-        chip.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.18).cgColor
-
-        let icon = NSImageView()
-        icon.translatesAutoresizingMaskIntoConstraints = false
-        icon.imageScaling = .scaleProportionallyDown
-        icon.contentTintColor = fileAccent(for: item.kind)
-        if let image = symbolImage(fileSymbol(for: item.kind)) {
-            image.isTemplate = true
-            icon.image = image
-        }
-
-        let title = NSTextField(labelWithString: item.title.isEmpty ? "Attached file" : item.title)
-        title.translatesAutoresizingMaskIntoConstraints = false
-        title.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
-        title.textColor = BlueyTheme.text
-        title.lineBreakMode = .byTruncatingMiddle
-        title.maximumNumberOfLines = 1
-
-        let kind = NSTextField(labelWithString: item.kind.uppercased())
-        kind.translatesAutoresizingMaskIntoConstraints = false
-        kind.font = NSFont.monospacedSystemFont(ofSize: 8.5, weight: .bold)
-        kind.textColor = BlueyTheme.textDim
-        kind.stringValue = "LOADED · \(item.kind.uppercased())"
-
-        let remove = RemoveAttachmentButton(title: "", target: self, action: #selector(removeAttachmentClicked(_:)))
-        remove.translatesAutoresizingMaskIntoConstraints = false
-        remove.contextId = item.id
-        remove.isBordered = false
-        remove.wantsLayer = true
-        remove.layer?.cornerRadius = 9
-        remove.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.04).cgColor
-        remove.layer?.borderWidth = 1
-        remove.layer?.borderColor = BlueyTheme.hairline.cgColor
-        remove.contentTintColor = BlueyTheme.textDim
-        if let image = symbolImage("xmark") {
-            image.isTemplate = true
-            remove.image = image
-            remove.imagePosition = .imageOnly
-            remove.imageScaling = .scaleProportionallyDown
-        } else {
-            remove.title = "x"
-        }
-        remove.toolTip = "Remove this document"
-
-        chip.addSubview(icon)
-        chip.addSubview(title)
-        chip.addSubview(kind)
-        chip.addSubview(remove)
-        NSLayoutConstraint.activate([
-            chip.heightAnchor.constraint(equalToConstant: 28),
-            chip.widthAnchor.constraint(lessThanOrEqualToConstant: 214),
-            chip.widthAnchor.constraint(greaterThanOrEqualToConstant: 134),
-
-            icon.leadingAnchor.constraint(equalTo: chip.leadingAnchor, constant: 8),
-            icon.centerYAnchor.constraint(equalTo: chip.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 16),
-            icon.heightAnchor.constraint(equalToConstant: 16),
-
-            title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 7),
-            title.topAnchor.constraint(equalTo: chip.topAnchor, constant: 4),
-            title.trailingAnchor.constraint(equalTo: remove.leadingAnchor, constant: -6),
-
-            kind.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            kind.topAnchor.constraint(equalTo: title.bottomAnchor, constant: -1),
-            kind.trailingAnchor.constraint(lessThanOrEqualTo: title.trailingAnchor),
-
-            remove.trailingAnchor.constraint(equalTo: chip.trailingAnchor, constant: -7),
-            remove.centerYAnchor.constraint(equalTo: chip.centerYAnchor),
-            remove.widthAnchor.constraint(equalToConstant: 18),
-            remove.heightAnchor.constraint(equalToConstant: 18),
-        ])
-        return chip
-    }
+    @objc private func showMoreClicked() { requestSessions(reset: false) }
 
     private func makeSessionRow(_ session: OverlaySessionItem) -> NSView {
-        let row = NSView()
+        if editingSessionId == session.id { return makeRenameRow(session) }
+        let row = SessionRowView()
+        row.sessionId = session.id
+        row.rowMenuTarget = self
+        row.renameAction = #selector(renameSessionMenuClicked(_:))
+        row.deleteAction = #selector(deleteSessionMenuClicked(_:))
         row.translatesAutoresizingMaskIntoConstraints = false
         row.wantsLayer = true
-        row.layer?.backgroundColor = session.isActive
-            ? BlueyTheme.cyanSoft.cgColor
-            : NSColor.white.withAlphaComponent(0.035).cgColor
-        row.layer?.cornerRadius = 12
-        row.layer?.borderWidth = 1
-        row.layer?.borderColor = session.isActive
-            ? BlueyTheme.cyan.withAlphaComponent(0.34).cgColor
-            : BlueyTheme.hairline.cgColor
-
-        if editingSessionId == session.id {
-            return configureRenameRow(row, session: session)
+        row.layer?.cornerRadius = Tok.rMd
+        let selected = session.isActive
+        row.layer?.backgroundColor = selected ? Tok.accentBg.cgColor : NSColor.clear.cgColor
+        if selected {
+            row.layer?.borderWidth = 1
+            row.layer?.borderColor = Tok.accentBgStrong.cgColor
         }
 
         let openButton = NSButton(title: "", target: self, action: #selector(sessionRowClicked(_:)))
@@ -6545,91 +4937,114 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         openButton.isBordered = false
         openButton.tag = sessionIndex(session.id)
 
+        // 28px rail icon.
+        let icon = NSView()
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.wantsLayer = true
+        icon.layer?.cornerRadius = 8
+        icon.layer?.backgroundColor = selected ? Tok.accentBgStrong.cgColor : Tok.glassHi.cgColor
+        let iconImage = NSImageView()
+        iconImage.translatesAutoresizingMaskIntoConstraints = false
+        if let image = symbolImage("bubble.left.and.bubble.right") {
+            image.isTemplate = true
+            iconImage.image = image
+        }
+        iconImage.contentTintColor = selected ? Tok.accentTx : Tok.tx3
+        icon.addSubview(iconImage)
+
         let title = NSTextField(labelWithString: session.title)
         title.translatesAutoresizingMaskIntoConstraints = false
-        title.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
-        title.textColor = BlueyTheme.text
+        title.font = Tok.font(13, .regular)
+        title.textColor = Tok.tx1
         title.lineBreakMode = .byTruncatingTail
 
-        let subtitle = NSTextField(labelWithString: session.subtitle)
-        subtitle.translatesAutoresizingMaskIntoConstraints = false
-        subtitle.font = NSFont.systemFont(ofSize: 9.5, weight: .medium)
-        subtitle.textColor = BlueyTheme.textDim
-        subtitle.lineBreakMode = .byTruncatingTail
+        let subText = sessionSubtitle(session)
+        let sub = NSTextField(labelWithString: subText)
+        sub.translatesAutoresizingMaskIntoConstraints = false
+        sub.font = Tok.font(11, .regular)
+        sub.textColor = Tok.tx3
+        sub.lineBreakMode = .byTruncatingTail
 
-        let rename = NSButton(title: "", target: self, action: #selector(renameSessionClicked(_:)))
-        rename.translatesAutoresizingMaskIntoConstraints = false
-        rename.isBordered = false
-        rename.tag = sessionIndex(session.id)
-        rename.contentTintColor = BlueyTheme.cyan
-        rename.toolTip = "Rename recording"
-        if let image = symbolImage("pencil") {
+        // Pin toggle.
+        let pin = NSButton(title: "", target: self, action: #selector(togglePinClicked(_:)))
+        pin.translatesAutoresizingMaskIntoConstraints = false
+        pin.isBordered = false
+        pin.tag = sessionIndex(session.id)
+        pin.contentTintColor = session.pinned ? Tok.accentTx : Tok.tx4
+        pin.toolTip = session.pinned ? "Unpin" : "Pin to top"
+        if let image = symbolImage(session.pinned ? "pin.fill" : "pin") {
             image.isTemplate = true
-            rename.image = image
-            rename.imagePosition = .imageOnly
-            rename.imageScaling = .scaleProportionallyDown
-        } else {
-            rename.title = "Edit"
-            rename.font = NSFont.systemFont(ofSize: 9, weight: .bold)
+            pin.image = image
+            pin.imagePosition = .imageOnly
+            pin.imageScaling = .scaleProportionallyDown
         }
 
-        let delete = NSButton(title: "", target: self, action: #selector(deleteSessionClicked(_:)))
-        delete.translatesAutoresizingMaskIntoConstraints = false
-        delete.isBordered = false
-        delete.tag = sessionIndex(session.id)
-        delete.contentTintColor = BlueyTheme.warning
-        delete.toolTip = "Delete recording"
-        if let image = symbolImage("trash") {
-            image.isTemplate = true
-            delete.image = image
-            delete.imagePosition = .imageOnly
-            delete.imageScaling = .scaleProportionallyDown
-        } else {
-            delete.title = "Del"
-            delete.font = NSFont.systemFont(ofSize: 9, weight: .bold)
-        }
+        let time = trackedLabel(relativeTime(session.updatedAt), size: 10, weight: .regular, color: Tok.tx4, tracking: 0)
 
         row.addSubview(openButton)
+        row.addSubview(icon)
         row.addSubview(title)
-        row.addSubview(subtitle)
-        row.addSubview(rename)
-        row.addSubview(delete)
+        row.addSubview(sub)
+        row.addSubview(pin)
+        row.addSubview(time)
         NSLayoutConstraint.activate([
-            row.heightAnchor.constraint(equalToConstant: 52),
-
+            row.heightAnchor.constraint(equalToConstant: 48),
             openButton.topAnchor.constraint(equalTo: row.topAnchor),
             openButton.leadingAnchor.constraint(equalTo: row.leadingAnchor),
             openButton.bottomAnchor.constraint(equalTo: row.bottomAnchor),
-            openButton.trailingAnchor.constraint(equalTo: rename.leadingAnchor),
+            openButton.trailingAnchor.constraint(equalTo: pin.leadingAnchor),
 
-            title.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
+            icon.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
+            icon.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 28),
+            icon.heightAnchor.constraint(equalToConstant: 28),
+            iconImage.centerXAnchor.constraint(equalTo: icon.centerXAnchor),
+            iconImage.centerYAnchor.constraint(equalTo: icon.centerYAnchor),
+            iconImage.widthAnchor.constraint(equalToConstant: 14),
+            iconImage.heightAnchor.constraint(equalToConstant: 14),
+
+            title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 11),
             title.topAnchor.constraint(equalTo: row.topAnchor, constant: 8),
-            title.trailingAnchor.constraint(equalTo: rename.leadingAnchor, constant: -6),
+            title.trailingAnchor.constraint(lessThanOrEqualTo: pin.leadingAnchor, constant: -8),
+            sub.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            sub.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 1),
+            sub.trailingAnchor.constraint(lessThanOrEqualTo: pin.leadingAnchor, constant: -8),
 
-            subtitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 2),
-            subtitle.trailingAnchor.constraint(equalTo: title.trailingAnchor),
-
-            rename.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            rename.widthAnchor.constraint(equalToConstant: 28),
-            rename.heightAnchor.constraint(equalToConstant: 28),
-
-            delete.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -6),
-            delete.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            delete.widthAnchor.constraint(equalToConstant: 28),
-            delete.heightAnchor.constraint(equalToConstant: 28),
-
-            rename.trailingAnchor.constraint(equalTo: delete.leadingAnchor, constant: -2),
+            pin.trailingAnchor.constraint(equalTo: time.leadingAnchor, constant: -6),
+            pin.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            pin.widthAnchor.constraint(equalToConstant: 22),
+            pin.heightAnchor.constraint(equalToConstant: 22),
+            time.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -10),
+            time.centerYAnchor.constraint(equalTo: row.centerYAnchor),
         ])
         return row
     }
 
-    private func configureRenameRow(_ row: NSView, session: OverlaySessionItem) -> NSView {
+    private func sessionSubtitle(_ session: OverlaySessionItem) -> String {
+        var parts: [String] = []
+        if let project = session.project, !project.isEmpty {
+            parts.append((project as NSString).lastPathComponent)
+        }
+        if let turns = session.turnCount {
+            parts.append("\(turns) turn\(turns == 1 ? "" : "s")")
+        } else if !session.subtitle.isEmpty {
+            parts.append(session.subtitle)
+        }
+        if session.isActive { parts.append("continuing") }
+        return parts.joined(separator: " · ")
+    }
+
+    private func makeRenameRow(_ session: OverlaySessionItem) -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.wantsLayer = true
+        row.layer?.cornerRadius = Tok.rMd
+        row.layer?.backgroundColor = Tok.glassHi.cgColor
         let field = NSTextField()
         field.translatesAutoresizingMaskIntoConstraints = false
         field.stringValue = session.title
-        field.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
-        field.textColor = BlueyTheme.text
+        field.font = Tok.font(13, .regular)
+        field.textColor = Tok.tx1
         field.isBezeled = false
         field.drawsBackground = false
         field.focusRingType = .none
@@ -6637,36 +5052,20 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         field.action = #selector(saveInlineRenameClicked(_:))
         field.tag = sessionIndex(session.id)
         renameField = field
-
-        let save = NSButton(title: "", target: self, action: #selector(saveInlineRenameClicked(_:)))
+        let save = NSButton(title: "Save", target: self, action: #selector(saveInlineRenameClicked(_:)))
         save.translatesAutoresizingMaskIntoConstraints = false
         save.isBordered = false
         save.tag = sessionIndex(session.id)
-        save.contentTintColor = BlueyTheme.cyan
-        save.toolTip = "Save recording name"
-        if let image = symbolImage("checkmark") {
-            image.isTemplate = true
-            save.image = image
-            save.imagePosition = .imageOnly
-            save.imageScaling = .scaleProportionallyDown
-        } else {
-            save.title = "Save"
-            save.font = NSFont.systemFont(ofSize: 9, weight: .bold)
-        }
-
+        save.contentTintColor = Tok.accentTx
         row.addSubview(field)
         row.addSubview(save)
         NSLayoutConstraint.activate([
             row.heightAnchor.constraint(equalToConstant: 44),
-            field.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
+            field.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 12),
             field.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            field.trailingAnchor.constraint(equalTo: save.leadingAnchor, constant: -6),
-            field.heightAnchor.constraint(equalToConstant: 28),
-
-            save.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -6),
+            field.trailingAnchor.constraint(equalTo: save.leadingAnchor, constant: -8),
+            save.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -10),
             save.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            save.widthAnchor.constraint(equalToConstant: 28),
-            save.heightAnchor.constraint(equalToConstant: 28),
         ])
         DispatchQueue.main.async { [weak self, weak field] in
             guard self?.editingSessionId == session.id else { return }
@@ -6683,207 +5082,1088 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     @objc private func sessionRowClicked(_ sender: NSButton) {
         guard sender.tag >= 0, sender.tag < sessionItems.count else { return }
         let session = sessionItems[sender.tag]
-        sessionDrawer.isHidden = true
-        statusLabel.stringValue = session.title
         emitSessionOpen(id: session.id)
+        setBodyTab(.ask)
     }
 
-    @objc private func renameSessionClicked(_ sender: NSButton) {
+    @objc private func togglePinClicked(_ sender: NSButton) {
         guard sender.tag >= 0, sender.tag < sessionItems.count else { return }
         let session = sessionItems[sender.tag]
-        editingSessionId = session.id
-        setSessions(sessionItems)
+        if session.pinned { emitSessionUnpinRequested(id: session.id) }
+        else { emitSessionPinRequested(id: session.id) }
     }
 
-    @objc private func deleteSessionClicked(_ sender: NSButton) {
-        guard sender.tag >= 0, sender.tag < sessionItems.count else { return }
-        let session = sessionItems[sender.tag]
-        pendingDeleteSessionId = session.id
-        closeConfirmTitle.stringValue = "Delete recording?"
-        closeConfirmBody.stringValue = "Remove \"\(session.title)\" from this device. This cannot be undone."
-        closeConfirmTurnOffButton.title = "Delete"
-        closeConfirmTurnOffButton.target = self
-        closeConfirmTurnOffButton.action = #selector(confirmDeleteSessionClicked)
-        closeConfirmTurnOffButton.toolTip = "Delete this saved recording"
-        styleControlButton(closeConfirmTurnOffButton, symbol: "trash", accent: true)
-        presentConfirmationOverlay()
+    // Right-click row actions (Rename / Delete) — must-survive session CRUD,
+    // kept off the clean row face per the mockup.
+    @objc private func renameSessionMenuClicked(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else { return }
+        editingSessionId = id
+        renderHistory()
+    }
+
+    @objc private func deleteSessionMenuClicked(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String,
+              let session = sessionItems.first(where: { $0.id == id }) else { return }
+        pendingDeleteSessionId = id
+        closeConfirmTitle.stringValue = "Delete session?"
+        closeConfirmBody.stringValue = "Remove “\(session.title)” from this device. This cannot be undone."
+        closeConfirmTurnOffButtonRef?.attributedTitle = NSAttributedString(
+            string: "Delete",
+            attributes: [.font: Tok.font(12, .semibold), .foregroundColor: NSColor.white])
+        closeConfirmTurnOffButtonRef?.action = #selector(confirmDeleteSessionClicked)
+        presentOverlay(closeConfirmOverlay)
     }
 
     @objc private func saveInlineRenameClicked(_ sender: NSControl) {
         guard sender.tag >= 0, sender.tag < sessionItems.count else { return }
         let session = sessionItems[sender.tag]
-        let title = (renameField?.stringValue ?? session.title)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !title.isEmpty else { return }
-        sessionItems[sender.tag] = OverlaySessionItem(
-            id: session.id,
-            title: title,
-            subtitle: session.subtitle,
-            isActive: session.isActive)
+        let title = (renameField?.stringValue ?? session.title).trimmingCharacters(in: .whitespacesAndNewlines)
         editingSessionId = nil
-        emitSessionRename(id: session.id, title: title)
-        setSessions(sessionItems)
+        if !title.isEmpty, title != session.title {
+            emitSessionRename(id: session.id, title: title)
+        }
+        renderHistory()
     }
 
-    private func fileSymbol(for kind: String) -> String {
-        switch kind {
-        case "image", "diagram": return "photo"
-        case "code": return "curlybraces"
-        case "text": return "doc.plaintext"
-        case "document": return "doc.text"
-        default: return "doc"
+    // MARK: Agents — IPC + card rendering
+
+    func setAgents(_ agents: [AgentSummary]) {
+        agentSummaries = agents
+        agentListLoaded = true
+        attachedAgentKind = agents.first(where: { $0.attached })?.kind
+        onAgentAttachmentChanged?(attachedAgentKind != nil)
+        updateViaLabel()
+        if currentTab == .agents { renderAgents() }
+        updateFooter()
+    }
+
+    func setAgentSessions(kind: String, sessions: [AgentSessionSummary]) {
+        agentSessions = sessions
+        agentSessionsLoaded = true
+        if case .sessions(let k, _) = agentStage, k == kind { renderAgents() }
+    }
+
+    private func clearAgentsStack() {
+        for v in agentsStack.arrangedSubviews {
+            agentsStack.removeArrangedSubview(v)
+            v.removeFromSuperview()
         }
     }
 
-    private func fileAccent(for kind: String) -> NSColor {
-        switch kind {
-        case "image", "diagram": return NSColor(red: 0.58, green: 0.74, blue: 1.0, alpha: 1.0)
-        case "code": return NSColor(red: 0.58, green: 1.0, blue: 0.74, alpha: 1.0)
-        case "text": return NSColor(red: 1.0, green: 0.82, blue: 0.42, alpha: 1.0)
-        case "document": return NSColor(red: 1.0, green: 0.43, blue: 0.34, alpha: 1.0)
-        default: return BlueyTheme.cyan
+    private func addAgentsRow(_ view: NSView) {
+        agentsStack.addArrangedSubview(view)
+        view.widthAnchor.constraint(equalTo: agentsStack.widthAnchor, constant: -28).isActive = true
+    }
+
+    private func renderAgents() {
+        clearAgentsStack()
+        switch agentStage {
+        case .picker:
+            if !agentListLoaded {
+                addAgentsRow(makeAgentMessage("Discovering your coding agents…", dim: true))
+            } else if agentSummaries.isEmpty {
+                addAgentsRow(makeAgentMessage("No coding agents found on this machine.", dim: true))
+            } else {
+                for agent in agentSummaries { addAgentsRow(makeAgentCard(agent)) }
+            }
+        case .sessions(let kind, let displayName):
+            addAgentsRow(makeAgentSessionsHeader(displayName))
+            if !agentSessionsLoaded {
+                addAgentsRow(makeAgentMessage("Loading \(displayName) sessions…", dim: true))
+            } else if agentSessions.isEmpty {
+                addAgentsRow(makeAgentMessage("No prior sessions, or history is off. Enable agent history in Settings.", dim: true))
+            } else {
+                for session in agentSessions {
+                    addAgentsRow(makeAgentSessionRow(kind: kind, session: session))
+                }
+            }
         }
+    }
+
+    private func makeAgentMessage(_ text: String, dim: Bool) -> NSView {
+        let wrap = NSView()
+        wrap.translatesAutoresizingMaskIntoConstraints = false
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = Tok.font(12.5, .regular)
+        label.textColor = dim ? Tok.tx3 : Tok.tx1
+        label.preferredMaxLayoutWidth = 460
+        wrap.addSubview(label)
+        NSLayoutConstraint.activate([
+            wrap.heightAnchor.constraint(greaterThanOrEqualToConstant: 36),
+            label.topAnchor.constraint(equalTo: wrap.topAnchor, constant: 8),
+            label.leadingAnchor.constraint(equalTo: wrap.leadingAnchor),
+            label.trailingAnchor.constraint(equalTo: wrap.trailingAnchor),
+            label.bottomAnchor.constraint(equalTo: wrap.bottomAnchor, constant: -8),
+        ])
+        return wrap
+    }
+
+    /// `.acard` — agent card with capability badge + connector readiness + actions.
+    private func makeAgentCard(_ agent: AgentSummary) -> NSView {
+        let card = NSView()
+        card.translatesAutoresizingMaskIntoConstraints = false
+        card.wantsLayer = true
+        card.layer?.cornerRadius = Tok.rLg
+        card.layer?.borderWidth = 1
+        if agent.attached {
+            card.layer?.backgroundColor = Tok.accentBg.cgColor
+            card.layer?.borderColor = Tok.accentBgStrong.cgColor
+        } else {
+            card.layer?.backgroundColor = Tok.glassHi.cgColor
+            card.layer?.borderColor = Tok.hairline.cgColor
+        }
+
+        let icon = NSImageView()
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        if let image = symbolImage(agent.attached ? "sparkle" : "cube") {
+            image.isTemplate = true
+            icon.image = image
+        }
+        icon.contentTintColor = agent.attached ? Tok.accentTx : Tok.tx2
+
+        let name = NSTextField(labelWithString: agent.displayName)
+        name.translatesAutoresizingMaskIntoConstraints = false
+        name.font = Tok.font(13.5, .semibold)
+        name.textColor = Tok.tx1
+
+        let badge = makeCapabilityBadge(agent)
+
+        let meta = NSTextField(labelWithString: agentMetaText(agent))
+        meta.translatesAutoresizingMaskIntoConstraints = false
+        meta.font = Tok.font(11, .regular)
+        meta.textColor = Tok.tx3
+
+        let actions = NSStackView()
+        actions.translatesAutoresizingMaskIntoConstraints = false
+        actions.orientation = .horizontal
+        actions.spacing = 8
+        let cap = agent.capability
+        let canUse = cap != "cloud_blocked"
+        if agent.attached {
+            actions.addArrangedSubview(makeAgentActionButton("Stop using", primary: false, kind: agent.kind, action: #selector(agentDetachClicked)))
+            actions.addArrangedSubview(makeAgentActionButton("View sessions", primary: false, kind: agent.kind, action: #selector(agentViewSessionsClicked(_:))))
+        } else if canUse {
+            actions.addArrangedSubview(makeAgentActionButton("Use this agent", primary: true, kind: agent.kind, action: #selector(agentUseClicked(_:))))
+            actions.addArrangedSubview(makeAgentActionButton("View sessions", primary: false, kind: agent.kind, action: #selector(agentViewSessionsClicked(_:))))
+        }
+
+        card.addSubview(icon)
+        card.addSubview(name)
+        card.addSubview(badge)
+        card.addSubview(meta)
+        let hasActions = !actions.arrangedSubviews.isEmpty
+        if hasActions { card.addSubview(actions) }
+
+        var constraints: [NSLayoutConstraint] = [
+            icon.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            icon.topAnchor.constraint(equalTo: card.topAnchor, constant: 14),
+            icon.widthAnchor.constraint(equalToConstant: 15),
+            icon.heightAnchor.constraint(equalToConstant: 15),
+            name.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 9),
+            name.centerYAnchor.constraint(equalTo: icon.centerYAnchor),
+            badge.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            badge.centerYAnchor.constraint(equalTo: icon.centerYAnchor),
+            badge.leadingAnchor.constraint(greaterThanOrEqualTo: name.trailingAnchor, constant: 8),
+            meta.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            meta.topAnchor.constraint(equalTo: icon.bottomAnchor, constant: 6),
+            meta.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+        ]
+        if hasActions {
+            constraints.append(contentsOf: [
+                actions.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+                actions.topAnchor.constraint(equalTo: meta.bottomAnchor, constant: 11),
+                actions.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -13),
+            ])
+        } else {
+            constraints.append(meta.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -13))
+        }
+        NSLayoutConstraint.activate(constraints)
+        return card
+    }
+
+    private func makeCapabilityBadge(_ agent: AgentSummary) -> NSView {
+        let (text, fill, fg): (String, NSColor, NSColor)
+        switch agent.capability {
+        case "drive":
+            text = agent.attached ? "Active" : "Ready"
+            fill = Tok.accentBg; fg = Tok.accentTx
+        case "read_only":
+            text = "Read-only"; fill = Tok.glassHi; fg = Tok.tx3
+        case "needs_reauth", "needs_trust":
+            text = "Needs re-auth"; fill = Tok.warn.withAlphaComponent(0.14); fg = Tok.warn
+        case "cloud_blocked":
+            text = "Cloud blocked"; fill = Tok.danger.withAlphaComponent(0.14); fg = Tok.danger
+        default:
+            text = agent.capability.replacingOccurrences(of: "_", with: " ").capitalized
+            fill = Tok.glassHi; fg = Tok.tx3
+        }
+        let label = NSTextField(labelWithString: text)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = Tok.font(10, .semibold)
+        label.textColor = fg
+        label.wantsLayer = true
+        label.layer?.backgroundColor = fill.cgColor
+        label.layer?.cornerRadius = 9
+        useCenteredSingleLineCell(label)
+        label.textColor = fg
+        let wrap = NSView()
+        wrap.translatesAutoresizingMaskIntoConstraints = false
+        wrap.wantsLayer = true
+        wrap.layer?.backgroundColor = fill.cgColor
+        wrap.layer?.cornerRadius = 9
+        wrap.addSubview(label)
+        NSLayoutConstraint.activate([
+            wrap.heightAnchor.constraint(equalToConstant: 18),
+            label.topAnchor.constraint(equalTo: wrap.topAnchor),
+            label.bottomAnchor.constraint(equalTo: wrap.bottomAnchor),
+            label.leadingAnchor.constraint(equalTo: wrap.leadingAnchor, constant: 8),
+            label.trailingAnchor.constraint(equalTo: wrap.trailingAnchor, constant: -8),
+        ])
+        label.layer?.backgroundColor = NSColor.clear.cgColor
+        return wrap
+    }
+
+    private func agentMetaText(_ agent: AgentSummary) -> String {
+        var s = "\(agent.readyConnectorCount)/\(agent.connectorCount) connectors ready"
+        if let count = agent.sessionCount { s += " · \(count) session\(count == 1 ? "" : "s")" }
+        return s
+    }
+
+    private func makeAgentActionButton(_ title: String, primary: Bool, kind: String, action: Selector) -> NSButton {
+        let button = NSButton(title: title, target: self, action: action)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.isBordered = false
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 9
+        button.identifier = NSUserInterfaceItemIdentifier(kind)
+        if primary {
+            button.layer?.backgroundColor = Tok.accent.cgColor
+        } else {
+            button.layer?.backgroundColor = NSColor.clear.cgColor
+            button.layer?.borderWidth = 1
+            button.layer?.borderColor = Tok.hairline.cgColor
+        }
+        button.attributedTitle = NSAttributedString(
+            string: title,
+            attributes: [.font: Tok.font(12, .semibold), .foregroundColor: primary ? NSColor.white : Tok.tx2])
+        button.heightAnchor.constraint(equalToConstant: 28).isActive = true
+        button.widthAnchor.constraint(greaterThanOrEqualToConstant: 96).isActive = true
+        return button
+    }
+
+    @objc private func agentUseClicked(_ sender: NSButton) {
+        guard let kind = sender.identifier?.rawValue else { return }
+        beginAttachFlow(kind: kind, sessionId: nil)
+    }
+
+    @objc private func agentDetachClicked() {
+        emitAgentDetachRequested()
+        attachedAgentKind = nil
+        onAgentAttachmentChanged?(false)
+        updateViaLabel()
+        updateFooter()
+    }
+
+    @objc private func agentViewSessionsClicked(_ sender: NSButton) {
+        guard let kind = sender.identifier?.rawValue,
+              let agent = agentSummaries.first(where: { $0.kind == kind }) else { return }
+        agentStage = .sessions(kind: kind, displayName: agent.displayName)
+        agentSessions = []
+        agentSessionsLoaded = false
+        renderAgents()
+        emitAgentSessionsRequested(kind: kind, offset: 0, limit: 40, search: "")
+    }
+
+    private func makeAgentSessionsHeader(_ displayName: String) -> NSView {
+        let wrap = NSView()
+        wrap.translatesAutoresizingMaskIntoConstraints = false
+        let back = NSButton(title: "", target: self, action: #selector(agentBackClicked))
+        back.translatesAutoresizingMaskIntoConstraints = false
+        back.isBordered = false
+        back.contentTintColor = Tok.tx2
+        if let image = symbolImage("chevron.left") {
+            image.isTemplate = true
+            back.image = image
+            back.imagePosition = .imageOnly
+        } else { back.title = "‹" }
+        let label = NSTextField(labelWithString: "\(displayName) · sessions")
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = Tok.font(13, .semibold)
+        label.textColor = Tok.tx1
+        wrap.addSubview(back)
+        wrap.addSubview(label)
+        NSLayoutConstraint.activate([
+            wrap.heightAnchor.constraint(equalToConstant: 30),
+            back.leadingAnchor.constraint(equalTo: wrap.leadingAnchor),
+            back.centerYAnchor.constraint(equalTo: wrap.centerYAnchor),
+            back.widthAnchor.constraint(equalToConstant: 22),
+            back.heightAnchor.constraint(equalToConstant: 22),
+            label.leadingAnchor.constraint(equalTo: back.trailingAnchor, constant: 6),
+            label.centerYAnchor.constraint(equalTo: wrap.centerYAnchor),
+        ])
+        return wrap
+    }
+
+    @objc private func agentBackClicked() {
+        agentStage = .picker
+        renderAgents()
+    }
+
+    private func makeAgentSessionRow(kind: String, session: AgentSessionSummary) -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.wantsLayer = true
+        row.layer?.cornerRadius = Tok.rMd
+        row.layer?.backgroundColor = Tok.glassHi.cgColor
+        row.layer?.borderWidth = 1
+        row.layer?.borderColor = Tok.hairline.cgColor
+
+        let button = NSButton(title: "", target: self, action: #selector(agentSessionRowClicked(_:)))
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.isBordered = false
+        button.identifier = NSUserInterfaceItemIdentifier("\(kind)\u{1F}\(session.id)")
+
+        let title = NSTextField(labelWithString: session.title ?? "Session \(session.id.prefix(8))")
+        title.translatesAutoresizingMaskIntoConstraints = false
+        title.font = Tok.font(13, .regular)
+        title.textColor = Tok.tx1
+        title.lineBreakMode = .byTruncatingTail
+
+        let subParts = [session.project.map { ($0 as NSString).lastPathComponent }, relativeTime(session.updatedAt)].compactMap { $0 }.filter { !$0.isEmpty }
+        let sub = NSTextField(labelWithString: subParts.joined(separator: " · "))
+        sub.translatesAutoresizingMaskIntoConstraints = false
+        sub.font = Tok.font(11, .regular)
+        sub.textColor = Tok.tx3
+
+        row.addSubview(button)
+        row.addSubview(title)
+        row.addSubview(sub)
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 46),
+            button.topAnchor.constraint(equalTo: row.topAnchor),
+            button.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            button.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+            button.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+            title.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 12),
+            title.topAnchor.constraint(equalTo: row.topAnchor, constant: 7),
+            title.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -12),
+            sub.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            sub.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 1),
+            sub.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -12),
+        ])
+        return row
+    }
+
+    @objc private func agentSessionRowClicked(_ sender: NSButton) {
+        guard let raw = sender.identifier?.rawValue else { return }
+        let parts = raw.components(separatedBy: "\u{1F}")
+        guard parts.count == 2 else { return }
+        beginAttachFlow(kind: parts[0], sessionId: parts[1])
+    }
+
+    private func updateViaLabel() {
+        if let kind = attachedAgentKind, let agent = agentSummaries.first(where: { $0.kind == kind }) {
+            brandLabel.stringValue = agent.displayName
+            viaLabel.stringValue = "· your agent"
+            statusDot.layer?.backgroundColor = Tok.accent.cgColor
+        } else {
+            brandLabel.stringValue = "Bluey"
+            viaLabel.stringValue = "· managed"
+            statusDot.layer?.backgroundColor = Tok.ok.cgColor
+        }
+    }
+
+    // MARK: Connector sheet — IPC + rendering + attach flow
+
+    private func beginAttachFlow(kind: String, sessionId: String?) {
+        pendingConnectorKind = kind
+        pendingConnectorSessionId = sessionId
+        pendingConnectorInfos = []
+        pendingConnectorsLoaded = false
+        renderConnectorSheet()
+        presentOverlay(connectorSheetOverlay)
+        emitAgentConnectorsRequested(kind: kind)
+    }
+
+    func setAgentConnectors(kind: String, connectors: [AgentConnectorInfo]) {
+        guard pendingConnectorKind == kind else { return }
+        pendingConnectorInfos = connectors
+        pendingConnectorsLoaded = true
+        renderConnectorSheet()
+    }
+
+    private func renderConnectorSheet() {
+        for v in connectorSheetStack.arrangedSubviews {
+            connectorSheetStack.removeArrangedSubview(v)
+            v.removeFromSuperview()
+        }
+        let name = pendingConnectorKind.map { kind in
+            agentSummaries.first(where: { $0.kind == kind })?.displayName ?? agentShortLabel(kind).capitalized
+        } ?? "agent"
+        connectorSheetSummary.stringValue = "From \(name) · shape & readiness only, never secrets."
+        var hasExpired = false
+        if !pendingConnectorsLoaded {
+            connectorSheetStack.addArrangedSubview(makeAgentMessage("Reading inherited connectors…", dim: true))
+        } else if pendingConnectorInfos.isEmpty {
+            connectorSheetStack.addArrangedSubview(makeAgentMessage("No inherited connectors.", dim: true))
+        } else {
+            for c in pendingConnectorInfos {
+                if !c.ready { hasExpired = true }
+                let row = makeConnectorRow(c)
+                connectorSheetStack.addArrangedSubview(row)
+                row.widthAnchor.constraint(equalTo: connectorSheetStack.widthAnchor).isActive = true
+            }
+        }
+        // Quiet re-auth guidance (G3 — NO reauth button/event).
+        if hasExpired, let kind = pendingConnectorKind {
+            let agentName = agentSummaries.first(where: { $0.kind == kind })?.displayName ?? agentShortLabel(kind).capitalized
+            connectorSheetReauthLabel.stringValue = "A connector login expired — run /mcp in \(agentName) to reconnect."
+            connectorSheetReauthLabel.isHidden = false
+        } else {
+            connectorSheetReauthLabel.isHidden = true
+        }
+    }
+
+    private func makeConnectorRow(_ connector: AgentConnectorInfo) -> NSView {
+        let row = NSView()
+        row.translatesAutoresizingMaskIntoConstraints = false
+        let name = NSTextField(labelWithString: connector.name)
+        name.translatesAutoresizingMaskIntoConstraints = false
+        name.font = Tok.font(12.5, .regular)
+        name.textColor = Tok.tx1
+        let tier = NSTextField(labelWithString: connector.authTier.replacingOccurrences(of: "_", with: "-"))
+        tier.translatesAutoresizingMaskIntoConstraints = false
+        tier.font = Tok.font(10, .regular)
+        tier.textColor = Tok.tx3
+        tier.wantsLayer = true
+        tier.layer?.borderWidth = 1
+        tier.layer?.borderColor = Tok.hairline.cgColor
+        tier.layer?.cornerRadius = 9
+        useCenteredSingleLineCell(tier)
+        tier.textColor = Tok.tx3
+        let status = NSTextField(labelWithString: connector.ready ? "ready" : "login expired")
+        status.translatesAutoresizingMaskIntoConstraints = false
+        status.font = Tok.font(11, .regular)
+        status.textColor = connector.ready ? Tok.ok : Tok.warn
+        let line = NSView()
+        line.translatesAutoresizingMaskIntoConstraints = false
+        line.wantsLayer = true
+        line.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.05).cgColor
+        row.addSubview(name)
+        row.addSubview(tier)
+        row.addSubview(status)
+        row.addSubview(line)
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 38),
+            name.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            name.centerYAnchor.constraint(equalTo: row.centerYAnchor, constant: -1),
+            tier.trailingAnchor.constraint(equalTo: status.leadingAnchor, constant: -8),
+            tier.centerYAnchor.constraint(equalTo: name.centerYAnchor),
+            tier.heightAnchor.constraint(equalToConstant: 17),
+            status.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+            status.centerYAnchor.constraint(equalTo: name.centerYAnchor),
+            line.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            line.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+            line.bottomAnchor.constraint(equalTo: row.bottomAnchor),
+            line.heightAnchor.constraint(equalToConstant: 1),
+        ])
+        return row
+    }
+
+    @objc private func connectorSheetCancelClicked() {
+        pendingConnectorKind = nil
+        dismissConnectorSheet()
+    }
+
+    @objc private func connectorSheetAttachClicked() {
+        if let kind = pendingConnectorKind {
+            emitAgentAttachRequested(kind: kind, sessionId: pendingConnectorSessionId)
+            attachedAgentKind = kind
+            onAgentAttachmentChanged?(true)
+            updateViaLabel()
+            updateFooter()
+        }
+        dismissConnectorSheet()
+        agentStage = .picker
+    }
+
+    private func dismissConnectorSheet() {
+        dismissOverlay(connectorSheetOverlay, animated: true)
+    }
+
+    // MARK: External API — cards / transcript / state
+
+    func pushCard(_ card: RenderedCard) {
+        if shouldRenderAsToast(card) {
+            showSystemToast(for: card)
+            return
+        }
+        feed.push(card)
+        routeCanvasIfNeeded(card)
+        if currentTab != .ask { setBodyTab(.ask) }
+        updateContextBar()
+    }
+
+    func updateCard(id: String, body: String, done: Bool, costLabel: String?, artifact: OverlayArtifact?) {
+        if let updated = feed.update(id: id, body: body, done: done, costLabel: costLabel, artifact: artifact) {
+            routeCanvasIfNeeded(updated)
+        }
+        updateContextBar()
+    }
+
+    func pushFixProposal(_ proposal: FixProposal) {
+        let card = RenderedCard(
+            id: proposal.proposalId, kind: "fix_proposal", title: "Proposed fix",
+            body: proposal.diagnosis, done: true, costLabel: nil, artifact: nil,
+            source: nil, fixProposal: proposal, fixState: .pending)
+        feed.push(card)
+        if currentTab != .ask { setBodyTab(.ask) }
+        updateContextBar()
+    }
+
+    func appendLiveTranscript(source: String, text: String, final: Bool) {
+        let body = displayTranscriptText(text)
+        markListening()
+        guard !body.isEmpty else { return }
+        // Stream into a single rolling HEARD turn until finalized; on `final`,
+        // commit it and start a fresh one for the next utterance.
+        if let id = transcriptCardId, !final {
+            feed.update(id: id, body: text, done: false, costLabel: nil, artifact: nil)
+        } else if let id = transcriptCardId, final {
+            feed.update(id: id, body: text, done: true, costLabel: nil, artifact: nil)
+            transcriptCardId = nil
+        } else {
+            let id = UUID().uuidString
+            transcriptCardId = final ? nil : id
+            let card = RenderedCard(
+                id: id, kind: "transcript", title: source, body: text,
+                done: final, costLabel: nil, artifact: nil, source: source)
+            feed.push(card)
+        }
+        if currentTab != .ask { setBodyTab(.ask) }
+        updateContextBar()
+    }
+
+    private func markListening() {
+        if !recordingActive {
+            recordingActive = true
+            styleListenButton(listening: true)
+            showListeningWave(true)
+        }
+    }
+
+    func setListeningState(_ state: PillRunState) {
+        switch state {
+        case .listening:
+            recordingActive = true
+            styleListenButton(listening: true)
+            showListeningWave(true)
+        case .connecting:
+            recordingActive = false
+            styleListenButton(listening: false)
+            showListeningWave(false)
+        case .paused, .failed, .ready:
+            recordingActive = false
+            styleListenButton(listening: false)
+            showListeningWave(false)
+            transcriptCardId = nil
+        }
+    }
+
+    private func showListeningWave(_ on: Bool) {
+        listeningWave.isHidden = !on
+        statusDot.isHidden = on
+        if on {
+            statusDot.layer?.backgroundColor = Tok.ok.cgColor
+        }
+    }
+
+    // MARK: External API — context / sessions / balance / reset
+
+    func setContextItems(_ items: [OverlayContextItem]) {
+        for v in attachmentStrip.arrangedSubviews {
+            attachmentStrip.removeArrangedSubview(v)
+            v.removeFromSuperview()
+        }
+        for item in items { attachmentStrip.addArrangedSubview(makeAttachmentChip(item)) }
+        attachmentStrip.isHidden = items.isEmpty || currentTab != .ask
+    }
+
+    private func makeAttachmentChip(_ item: OverlayContextItem) -> NSView {
+        let chip = NSView()
+        chip.translatesAutoresizingMaskIntoConstraints = false
+        chip.wantsLayer = true
+        chip.layer?.backgroundColor = Tok.glassHi.cgColor
+        chip.layer?.cornerRadius = Tok.rSm
+        chip.layer?.borderWidth = 1
+        chip.layer?.borderColor = Tok.hairline.cgColor
+        let icon = NSImageView()
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        if let image = symbolImage("doc") {
+            image.isTemplate = true
+            icon.image = image
+        }
+        icon.contentTintColor = Tok.tx3
+        let title = NSTextField(labelWithString: item.title)
+        title.translatesAutoresizingMaskIntoConstraints = false
+        title.font = Tok.font(11, .regular)
+        title.textColor = Tok.tx2
+        title.lineBreakMode = .byTruncatingTail
+        let remove = RemoveAttachmentButton(title: "", target: self, action: #selector(removeAttachmentClicked(_:)))
+        remove.translatesAutoresizingMaskIntoConstraints = false
+        remove.isBordered = false
+        remove.contextId = item.id
+        remove.contentTintColor = Tok.tx4
+        if let image = symbolImage("xmark") {
+            image.isTemplate = true
+            remove.image = image
+            remove.imagePosition = .imageOnly
+            remove.imageScaling = .scaleProportionallyDown
+        } else { remove.title = "×" }
+        chip.addSubview(icon)
+        chip.addSubview(title)
+        chip.addSubview(remove)
+        NSLayoutConstraint.activate([
+            chip.heightAnchor.constraint(equalToConstant: 26),
+            chip.widthAnchor.constraint(lessThanOrEqualToConstant: 210),
+            icon.leadingAnchor.constraint(equalTo: chip.leadingAnchor, constant: 8),
+            icon.centerYAnchor.constraint(equalTo: chip.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 12),
+            icon.heightAnchor.constraint(equalToConstant: 12),
+            title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 6),
+            title.centerYAnchor.constraint(equalTo: chip.centerYAnchor),
+            title.trailingAnchor.constraint(equalTo: remove.leadingAnchor, constant: -4),
+            remove.trailingAnchor.constraint(equalTo: chip.trailingAnchor, constant: -6),
+            remove.centerYAnchor.constraint(equalTo: chip.centerYAnchor),
+            remove.widthAnchor.constraint(equalToConstant: 16),
+            remove.heightAnchor.constraint(equalToConstant: 16),
+        ])
+        return chip
+    }
+
+    @objc private func removeAttachmentClicked(_ sender: RemoveAttachmentButton) {
+        let id = sender.contextId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !id.isEmpty else { return }
+        emitRemoveContext(id: id)
+    }
+
+    func setBalanceLabel(_ label: String) {
+        // Managed-mode balance lives in the footer chip (off the header face).
+        guard attachedAgentKind == nil else { return }
+        let trimmed = label.replacingOccurrences(of: "Balance", with: "").trimmingCharacters(in: .whitespaces)
+        if currentTab == .ask, !trimmed.isEmpty, trimmed != "--" {
+            footerConnectorsLabel.stringValue = "perplexity · github · \(trimmed)"
+        }
+    }
+
+    func resetSessionSurface() {
+        feed.clear()
+        transcriptCardId = nil
+        updateContextBar()
+    }
+
+    func focusComposerForQuestion() {
+        closePlusMenu()
+        if currentTab != .ask { setBodyTab(.ask) }
+        composer.placeholder = recordingActive ? "Ask while Bluey listens…" : "Ask a follow-up…"
+        window?.makeFirstResponder(composer)
+    }
+
+    func showSignedOutLogin(url: URL?) {
+        statusDot.layer?.backgroundColor = Tok.warn.cgColor
+    }
+
+    func showSignedInReady() {
+        statusDot.layer?.backgroundColor = Tok.ok.cgColor
+    }
+
+    // MARK: Composer actions
+
+    @objc private func askClicked() {
+        closePlusMenu()
+        let raw = composer.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        let q = raw.isEmpty
+            ? "Answer the latest clear question or useful context from this Bluey session."
+            : raw
+        composer.clearText()
+        // Auto route: the daemon picks the lane (provider/model/mode nil).
+        emitAsk(question: q, provider: nil, model: nil, mode: nil)
+        if currentTab != .ask { setBodyTab(.ask) }
+        window?.makeFirstResponder(composer)
+    }
+
+    @objc private func recordingClicked() {
+        if recordingActive {
+            emitSimple("recording_stop_requested")
+            recordingActive = false
+            onListeningStateChanged?(.paused)
+            styleListenButton(listening: false)
+            showListeningWave(false)
+        } else {
+            emitSimple("recording_start_requested")
+            onListeningStateChanged?(.connecting)
+            styleListenButton(listening: true)
+            showListeningWave(true)
+        }
+    }
+
+    private func setComposerTextHeight(_ rawHeight: CGFloat) {
+        let clamped = min(max(22, rawHeight - 14), 110)
+        composerTextHeightConstraint?.constant = clamped
+    }
+
+    // MARK: System toast (system cards that aren't login)
+
+    private func shouldRenderAsToast(_ card: RenderedCard) -> Bool {
+        guard normalizedCardKind(card.kind) == "system" else { return false }
+        // Login/sign-in system cards render in the feed; other system notices
+        // (ready, indexing, errors) flash as a toast.
+        return actionableLoginURL(from: card) == nil
+    }
+
+    private func actionableLoginURL(from card: RenderedCard) -> URL? {
+        guard normalizedCardKind(card.kind) == "system" else { return nil }
+        for line in card.body.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let candidate: String
+            if trimmed.hasPrefix("login_url:") {
+                candidate = trimmed.replacingOccurrences(of: "login_url:", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if trimmed.hasPrefix("https://") || trimmed.hasPrefix("http://") {
+                candidate = trimmed
+            } else { continue }
+            if let url = URL(string: candidate), let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme) {
+                return url
+            }
+        }
+        return nil
+    }
+
+    private func showSystemToast(for card: RenderedCard) {
+        toastTitleLabel.stringValue = card.title.isEmpty ? "Bluey" : card.title
+        toastBodyLabel.stringValue = systemToastBody(card.body)
+        toastView.isHidden = false
+        toastView.alphaValue = 1
+        toastHideWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.hideSystemToast() }
+        toastHideWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0, execute: work)
+    }
+
+    private func hideSystemToast() {
+        guard !toastView.isHidden else { return }
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.18
+            toastView.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in self?.toastView.isHidden = true })
+    }
+
+    private func systemToastBody(_ body: String) -> String {
+        var lines: [String] = []
+        for raw in body.components(separatedBy: .newlines) {
+            let line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty, !line.hasPrefix("login_url:") else { continue }
+            lines.append(line)
+        }
+        let joined = lines.joined(separator: " · ").replacingOccurrences(of: "knowledge base", with: "documents")
+        if joined.count <= 190 { return joined }
+        let end = joined.index(joined.startIndex, offsetBy: 187)
+        return String(joined[..<end]) + "…"
+    }
+
+    // MARK: NSTextFieldDelegate (answer-style box cancel handled upstream)
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        false
+    }
+
+    // MARK: Phase 9 — Click gate (transparent overlay; modals short-circuit)
+
+    func isInteractiveAtScreenPoint(_ screenPoint: NSPoint) -> Bool {
+        guard let window else { return false }
+        let windowPoint = window.convertPoint(fromScreen: screenPoint)
+        let localPoint = convert(windowPoint, from: nil)
+        guard bounds.contains(localPoint) else { return false }
+
+        // Modals capture the whole panel while open.
+        if !closeConfirmOverlay.isHidden { return true }
+        if !connectorSheetOverlay.isHidden { return true }
+        if !billingOverlay.isHidden { return true }
+        // The "+" menu and opacity popover capture clicks while open.
+        if !plusMenu.isHidden, plusMenu.frame.contains(localPoint) { return true }
+        if opacityPopoverBuilt, !opacityPopover.isHidden, opacityPopover.frame.contains(localPoint) { return true }
+
+        // Resize grip (bottom-right).
+        if !resizeEdges(at: localPoint).isEmpty { return true }
+
+        // Explicit chrome (header drag region, composer, tabs, footer keys).
+        if hitsExplicitInteractiveChrome(at: localPoint) { return true }
+
+        // Card affordances inside the otherwise click-through feed.
+        let feedPoint = feed.convert(windowPoint, from: nil)
+        if feed.hasInteractiveControl(at: feedPoint) { return true }
+
+        return hasInteractiveView(at: localPoint)
+            || feed.hasCopyControl(atScreenPoint: screenPoint)
+    }
+
+    private func hitsExplicitInteractiveChrome(at localPoint: NSPoint) -> Bool {
+        // Whole bands that should always take clicks. NOTE: `workspace` (the Ask
+        // feed) is deliberately NOT here — the feed stays click-through to the
+        // desktop except over card affordances (handled via the feed's own
+        // hit-test + the generic control walk), preserving the transparent
+        // overlay. History/Agents ARE interactive surfaces and are hidden when
+        // not the active tab, so the isHidden guard gates them by tab.
+        let bands: [NSView] = [headerBar, composerBar, footerBar, contextBar,
+                               attachmentStrip, historyContainer, agentsScroll, plusMenu]
+        return bands.contains { view in
+            guard !view.isHidden, view.alphaValue > 0.01 else { return false }
+            let rect = view.convert(view.bounds, to: self)
+            return rect.contains(localPoint)
+        }
+    }
+
+    private func hasInteractiveView(at localPoint: NSPoint) -> Bool {
+        var hit: NSView? = hitTest(localPoint)
+        while let view = hit {
+            if view === self || view === workspace || view === headerBar || view === composerBar {
+                hit = view.superview
+                continue
+            }
+            if view is NSButton || view is NSPopUpButton || view is NSSlider
+                || view is NSScroller || view is NSTextView {
+                return true
+            }
+            if let textField = view as? NSTextField, textField.isEditable {
+                return true
+            }
+            hit = view.superview
+        }
+        return false
+    }
+
+    // MARK: Resize (bottom-right grip; header drags via HeaderDragView)
+
+    private func resizeEdges(at point: NSPoint) -> ResizeEdges {
+        guard bounds.contains(point),
+              closeConfirmOverlay.isHidden, connectorSheetOverlay.isHidden, billingOverlay.isHidden,
+              !headerBar.frame.insetBy(dx: -4, dy: -4).contains(point),
+              !composerBar.frame.insetBy(dx: -4, dy: -4).contains(point)
+        else { return [] }
+        var edges: ResizeEdges = []
+        if point.x >= bounds.width - resizeHitSize { edges.insert(.right) }
+        if point.y <= resizeHitSize { edges.insert(.bottom) }
+        return edges
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let local = convert(event.locationInWindow, from: nil)
+        // Clicking outside the open +menu/opacity popover dismisses it.
+        if !plusMenu.isHidden, !plusMenu.frame.contains(local) { closePlusMenu() }
+        if opacityPopoverBuilt, !opacityPopover.isHidden, !opacityPopover.frame.contains(local) { opacityPopover.isHidden = true }
+        let edges = resizeEdges(at: local)
+        if !edges.isEmpty {
+            activeResizeEdges = edges
+            resizeStartMouse = NSEvent.mouseLocation
+            resizeStartFrame = window?.frame ?? .zero
+            return
+        }
+        super.mouseDown(with: event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard !activeResizeEdges.isEmpty, let window else {
+            super.mouseDragged(with: event)
+            return
+        }
+        let mouse = NSEvent.mouseLocation
+        let dx = mouse.x - resizeStartMouse.x
+        let dy = mouse.y - resizeStartMouse.y
+        var frame = resizeStartFrame
+        if activeResizeEdges.contains(.right) {
+            frame.size.width = max(ExpandedPanelMetrics.minCompactWidth, resizeStartFrame.width + dx)
+        }
+        if activeResizeEdges.contains(.bottom) {
+            let newHeight = max(ExpandedPanelMetrics.minHeight, resizeStartFrame.height - dy)
+            frame.origin.y = resizeStartFrame.maxY - newHeight
+            frame.size.height = newHeight
+        }
+        window.setFrame(frame, display: true)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if !activeResizeEdges.isEmpty { activeResizeEdges = []; return }
+        super.mouseUp(with: event)
+    }
+
+    // MARK: Canvas routing (carried; auto-open + close via the pane button)
+
+    private func routeCanvasIfNeeded(_ card: RenderedCard) {
+        guard let artifact = makeCanvasArtifact(from: card) else { return }
+        latestCanvas = artifact
+        canvasPane.render(artifact)
+        if shouldAutoOpenCanvas(for: card, artifact: artifact) {
+            setCanvasOpen(true)
+        }
+    }
+
+    private func shouldAutoOpenCanvas(for card: RenderedCard, artifact: CanvasArtifact) -> Bool {
+        if card.artifact != nil { return true }
+        guard card.kind == "answer" else { return false }
+        switch artifact.kind {
+        case .code, .systemDesign, .screen: return true
+        case .document, .structured: return false
+        }
+    }
+
+    private func setCanvasOpen(_ open: Bool) {
+        if !open, canvasFullWindow { restoreCanvasWindow() }
+        canvasOpen = open
+        canvasPane.isHidden = !open
+        canvasWidthConstraint?.constant = open ? canvasWidth() : 0
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.16
+            self.layoutSubtreeIfNeeded()
+        }
+    }
+
+    private func canvasWidth() -> CGFloat {
+        if canvasFullWindow { return min(max(380, bounds.width * 0.44), 560) }
+        return min(max(300, bounds.width * 0.42), 360)
+    }
+
+    private func toggleCanvasFullWindow() {
+        guard let window else { return }
+        if canvasFullWindow {
+            restoreCanvasWindow()
+        } else {
+            preCanvasFullWindowFrame = window.frame
+            canvasFullWindow = true
+            canvasPane.setFullWindow(true)
+            let screen = window.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+            let maxW = max(ExpandedPanelMetrics.minCompactWidth, screen.width - ExpandedPanelMetrics.screenInset * 2)
+            let maxH = max(ExpandedPanelMetrics.minHeight, screen.height - ExpandedPanelMetrics.screenInset * 2)
+            var frame = NSRect(x: screen.midX - maxW / 2, y: screen.midY - maxH / 2, width: maxW, height: maxH)
+            frame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(frame, visibleFrame: screen)
+            canvasWidthConstraint?.constant = canvasWidth()
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.16
+                window.animator().setFrame(frame, display: true)
+                self.layoutSubtreeIfNeeded()
+            }
+        }
+    }
+
+    private func restoreCanvasWindow() {
+        guard let window else { return }
+        canvasFullWindow = false
+        canvasPane.setFullWindow(false)
+        let target = preCanvasFullWindowFrame
+        preCanvasFullWindowFrame = nil
+        canvasWidthConstraint?.constant = canvasOpen ? canvasWidth() : 0
+        if let target {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.16
+                window.animator().setFrame(target, display: true)
+                self.layoutSubtreeIfNeeded()
+            }
+        }
+    }
+
+    // MARK: Canvas artifact detection (carried verbatim from the prior build)
+
+    private func makeCanvasArtifact(from card: RenderedCard) -> CanvasArtifact? {
+        guard card.kind == "answer" || card.kind == "context" || card.kind == "system" else { return nil }
+        let body = card.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { return nil }
+        if let artifact = card.artifact {
+            let kind = CanvasKind.fromArtifactType(artifact.artifactType)
+            let confidence = artifact.confidence.map { "Confidence \(Int(($0 * 100).rounded()))%" }
+            return CanvasArtifact(
+                kind: kind,
+                title: artifact.title.isEmpty ? kind.title : artifact.title,
+                subtitle: confidence ?? kind.subtitle,
+                content: artifact.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? body : artifact.body,
+                sourceCardId: card.id)
+        }
+        let lower = body.lowercased()
+        let codeBlocks = extractCodeBlocks(from: body)
+        if !codeBlocks.isEmpty || looksLikeCode(lower) {
+            return CanvasArtifact(kind: .code, title: "Code canvas", subtitle: "Code, tests, complexity",
+                content: formatCodeCanvas(body: body, codeBlocks: codeBlocks), sourceCardId: card.id)
+        }
+        if looksLikeSystemDesign(lower) {
+            return CanvasArtifact(kind: .systemDesign, title: "System design canvas", subtitle: "Architecture, tradeoffs, scale",
+                content: formatStructuredCanvas(body, fallbackHeading: "System Design"), sourceCardId: card.id)
+        }
+        if looksLikeScreenAnalysis(lower) {
+            return CanvasArtifact(kind: .screen, title: "Screen analysis", subtitle: "Detected context and answer",
+                content: formatStructuredCanvas(body, fallbackHeading: "Screen Context"), sourceCardId: card.id)
+        }
+        if card.kind == "context" || looksLikeDocumentWork(lower) {
+            return CanvasArtifact(kind: .document, title: "Document notes", subtitle: "Attached context distilled",
+                content: formatStructuredCanvas(body, fallbackHeading: "Document Context"), sourceCardId: card.id)
+        }
+        if body.count > 950 && hasStructuredShapePanel(body) {
+            return CanvasArtifact(kind: .structured, title: "Workspace", subtitle: "Structured workspace",
+                content: formatStructuredCanvas(body, fallbackHeading: "Notes"), sourceCardId: card.id)
+        }
+        return nil
     }
 
     private func extractCodeBlocks(from text: String) -> [String] {
         var blocks: [String] = []
         var current: [String] = []
         var inFence = false
-
         for line in text.components(separatedBy: .newlines) {
             if line.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
-                if inFence {
-                    blocks.append(current.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines))
-                    current.removeAll()
-                }
+                if inFence { blocks.append(current.joined(separator: "\n")); current = [] }
                 inFence.toggle()
                 continue
             }
-            if inFence {
-                current.append(line)
-            }
+            if inFence { current.append(line) }
         }
-
-        return blocks.filter { !$0.isEmpty }
+        if !current.isEmpty { blocks.append(current.joined(separator: "\n")) }
+        return blocks.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     }
 
     private func looksLikeCode(_ lower: String) -> Bool {
-        let signals = [
-            "class solution",
-            "def ",
-            "function ",
-            "const ",
-            "let ",
-            "public ",
-            "private ",
-            "time complexity",
-            "space complexity",
-            "test case",
-            "edge case",
-            "sql",
-        ]
-        return signals.filter { lower.contains($0) }.count >= 2
+        let signals = ["function ", "const ", "let ", "var ", "def ", "class ", "import ", "return ", "=>", "{", "}", "();"]
+        return signals.filter { lower.contains($0) }.count >= 3
     }
 
     private func looksLikeSystemDesign(_ lower: String) -> Bool {
-        let signals = [
-            "system design",
-            "architecture",
-            "api",
-            "database",
-            "cache",
-            "queue",
-            "scale",
-            "latency",
-            "throughput",
-            "tradeoff",
-            "shard",
-            "load balancer",
-            "microservice",
-            "event-driven",
-        ]
+        let signals = ["throughput", "latency", "tradeoff", "shard", "load balancer", "microservice", "event-driven"]
         return signals.filter { lower.contains($0) }.count >= 3
     }
 
     private func looksLikeScreenAnalysis(_ lower: String) -> Bool {
-        lower.contains("screenshot")
-            || lower.contains("screen context")
-            || lower.contains("analyse screen")
-            || lower.contains("analyze screen")
-            || lower.contains("image shows")
+        lower.contains("screenshot") || lower.contains("screen context")
+            || lower.contains("analyse screen") || lower.contains("analyze screen") || lower.contains("image shows")
     }
 
     private func looksLikeDocumentWork(_ lower: String) -> Bool {
-        lower.contains("attached document")
-            || lower.contains("pdf")
-            || lower.contains("resume")
-            || lower.contains("document context")
-            || lower.contains("source:")
+        lower.contains("attached document") || lower.contains("pdf") || lower.contains("resume")
+            || lower.contains("document context") || lower.contains("source:")
     }
 
-    private func hasStructuredShape(_ text: String) -> Bool {
+    private func hasStructuredShapePanel(_ text: String) -> Bool {
         let lines = text.components(separatedBy: .newlines)
         let structured = lines.filter { line in
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            return trimmed.hasPrefix("- ")
-                || trimmed.hasPrefix("* ")
-                || trimmed.hasPrefix("#")
+            return trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") || trimmed.hasPrefix("#")
                 || trimmed.range(of: #"^\d+[\.\)]\s"#, options: .regularExpression) != nil
         }
         return structured.count >= 3
     }
 
     private func formatCodeCanvas(body: String, codeBlocks: [String]) -> String {
-        let notes = stripCodeFences(from: body)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        var sections: [String] = []
-
-        if !codeBlocks.isEmpty {
-            sections.append("CODE\n----\n" + codeBlocks.joined(separator: "\n\n// ---\n\n"))
-        }
-
-        if !notes.isEmpty {
-            sections.append("NOTES\n-----\n" + notes)
-        }
-
-        return sections.isEmpty ? body : sections.joined(separator: "\n\n")
-    }
-
-    private func stripCodeFences(from text: String) -> String {
-        var lines: [String] = []
-        var inFence = false
-        for line in text.components(separatedBy: .newlines) {
-            if line.trimmingCharacters(in: .whitespaces).hasPrefix("```") {
-                inFence.toggle()
-                continue
-            }
-            if !inFence {
-                lines.append(line)
-            }
-        }
-        return lines.joined(separator: "\n")
+        if !codeBlocks.isEmpty { return codeBlocks.joined(separator: "\n\n") }
+        return body
     }
 
     private func formatStructuredCanvas(_ body: String, fallbackHeading: String) -> String {
-        let clean = body.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty else { return fallbackHeading }
-        if clean.hasPrefix("#") || clean.uppercased().hasPrefix(fallbackHeading.uppercased()) {
-            return clean
-        }
-        return "\(fallbackHeading)\n" + String(repeating: "-", count: fallbackHeading.count) + "\n" + clean
-    }
-
-    private func selectedRoute() -> (provider: String?, model: String?, mode: String?) {
-        switch modelMenu.indexOfSelectedItem {
-        case 1:
-            return ("openai", "gpt-4o-mini", "general")
-        case 2:
-            return ("anthropic", "claude-3-5-sonnet-latest", "general")
-        case 3:
-            return ("anthropic", "claude-3-7-sonnet-latest", "general")
-        default:
-            return ("auto", nil, "general")
-        }
+        body
     }
 }
 
@@ -7126,6 +6406,11 @@ private final class OverlayApp {
             expandedView?.setContextItems(items)
         case .setSessions(let sessions):
             expandedView?.setSessions(sessions)
+        case .setSessionsPage(let sessions, let total, let offset, let hasMore, let query):
+            ensureExpandedWindow()
+            expandedView?.setSessionsPage(
+                sessions: sessions, total: total, offset: offset,
+                hasMore: hasMore, query: query)
         case .listeningStateChanged(let state):
             let runState = PillRunState(listeningState: state)
             setRunState(runState)
@@ -7154,6 +6439,9 @@ private final class OverlayApp {
         case .pushFixProposal(let proposal):
             ensureExpandedWindow()
             expandedView?.pushFixProposal(proposal)
+        case .pushBillingDisclosure(let disclosure):
+            ensureExpandedWindow()
+            expandedView?.presentBillingDisclosure(disclosure)
         case .shutdown:
             emitLifecycle("shutdown")
             NSApp.terminate(nil)

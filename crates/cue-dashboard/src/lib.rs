@@ -109,6 +109,13 @@ pub fn run() {
             // R10: Cue AI hotkey
             commands::request_cue,
             commands::auto_recap,
+            // Agent bridge: coding-agent discovery + attach
+            commands::agent_list,
+            commands::agent_attach,
+            commands::agent_detach,
+            commands::agent_sessions,
+            commands::agent_connectors,
+            commands::set_agent_session_history,
             invisibility_toggle,
             invisibility_state,
             auto_disguise_accept,

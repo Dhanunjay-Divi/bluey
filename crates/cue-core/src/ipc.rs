@@ -109,6 +109,13 @@ pub enum DaemonRequest {
     AgentConnectors {
         kind: String,
     },
+    /// Set the **session-history consent** flag in the daemon's settings. Reading
+    /// a coding agent's prior sessions requires explicit opt-in; this is the only
+    /// writer over IPC (the dashboard's local SQLite settings do NOT reach the
+    /// daemon). The UI's consent toggle routes here.
+    SetAgentSessionHistory {
+        enabled: bool,
+    },
 }
 
 impl DaemonRequest {

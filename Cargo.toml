@@ -10,6 +10,7 @@ members = [
     "crates/cue-cloud-client",
     "crates/cue-router",
     "crates/cue-agent-bridge",
+    "crates/cue-overlay-tauri",
 ]
 resolver = "2"
 
@@ -42,8 +43,18 @@ webrtc-vad = "0.4"
 bytemuck = "1"
 async-trait = "0.1"
 futures-util = "0.3"
+futures = "0.3"
 async-stream = "0.3"
 parking_lot = "0.12"
+
+# ACP — Agent Client Protocol (JSON-RPC over stdio). Official Zed Industries SDK
+# (Apache-2.0). The main crate already bundles the tokio-based `AcpAgent`
+# subprocess spawner + `Stdio` transport (re-exported from its own
+# `acp_agent`/`stdio` modules), so the separate `agent-client-protocol-tokio`
+# helper is NOT needed — and that helper pins an older schema (0.12 vs 0.14's
+# 0.13.6), so depending on it would cause a version skew. Default features only
+# → stable protocol v1 surface (no `unstable_*` features).
+agent-client-protocol = "0.14"
 thiserror = "1.0"
 zerocopy = { version = "0.8", features = ["derive"] }
 keyring = "2"

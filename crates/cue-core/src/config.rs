@@ -93,6 +93,12 @@ pub struct CueSettings {
     /// explicitly clears their stored credential.
     #[serde(default)]
     pub accepted_byot_vendors: Vec<String>,
+
+    /// Overlay: sessions the user has pinned to the top of the redesigned
+    /// at-scale session list. Stored as meeting ids; the overlay's session
+    /// query sorts pinned-first. Empty by default; persists across restarts.
+    #[serde(default)]
+    pub pinned_overlay_sessions: Vec<uuid::Uuid>,
 }
 
 impl Default for CueSettings {
@@ -114,6 +120,7 @@ impl Default for CueSettings {
             attached_agent: None,
             attached_session: None,
             accepted_byot_vendors: Vec::new(),
+            pinned_overlay_sessions: Vec::new(),
         }
     }
 }

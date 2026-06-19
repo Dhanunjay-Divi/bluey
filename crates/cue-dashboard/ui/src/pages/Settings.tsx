@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "../lib/tauri";
 import { Check, Eye, EyeOff, Mail, Trash2, ExternalLink, LogOut } from "lucide-react";
+import { ConsentToggle } from "../components/ConsentToggle";
 
 /**
  * Codex Stage 24: Settings page rewrite.
@@ -10,8 +11,8 @@ import { Check, Eye, EyeOff, Mail, Trash2, ExternalLink, LogOut } from "lucide-r
  *   - Privacy card (disguise picker — section migrated from Stage 18)
  *   - Visibility card (invisibility hotkey + tray reminder)
  *
- * Design tokens: bg-zinc-950 surface, bg-zinc-900 cards, blue-500 brand,
- * red-500 destructive. Same palette as Onboarding.
+ * Design tokens: aurora-glass system — neutral text on .glass panels, the
+ * refined accent for primary actions, error tokens for destructive actions.
  */
 
 const DISGUISE_OPTIONS = [
@@ -30,13 +31,29 @@ interface AccountMe {
 
 export function Settings() {
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100 p-6">
+    <div className="min-h-screen p-6">
       <div className="mx-auto max-w-2xl space-y-6">
-        <h1 className="text-2xl font-semibold tracking-tight">Settings</h1>
+        <h1 className="text-title-1 text-text-primary">Settings</h1>
         <AccountCard />
+        <PrivacyCard />
         <DisguiseCard />
         <VisibilityCard />
       </div>
+    </div>
+  );
+}
+
+function PrivacyCard() {
+  return (
+    <div className="glass rounded-xl p-5 space-y-4">
+      <div>
+        <h3 className="text-headline text-text-primary">Privacy</h3>
+        <p className="text-footnote text-text-tertiary mt-1 leading-relaxed">
+          Controls whether Bluey may read your coding agents&apos; prior
+          sessions to list and continue them.
+        </p>
+      </div>
+      <ConsentToggle />
     </div>
   );
 }
@@ -80,19 +97,19 @@ function AccountCard() {
   }
 
   return (
-    <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-5 space-y-4">
-      <h3 className="font-semibold text-zinc-100">Account</h3>
+    <div className="glass rounded-xl p-5 space-y-4">
+      <h3 className="text-headline text-text-primary">Account</h3>
       {me ? (
-        <div className="space-y-1 text-sm">
-          <div className="flex items-center gap-2 text-zinc-300">
-            <Mail className="h-4 w-4 text-zinc-500" /> {me.email}
+        <div className="space-y-1 text-callout">
+          <div className="flex items-center gap-2 text-text-secondary">
+            <Mail className="h-4 w-4 text-text-tertiary" /> {me.email}
           </div>
-          <div className="text-zinc-400 text-xs">
-            Balance: <span className="text-zinc-200 font-medium tabular-nums">
+          <div className="text-text-tertiary text-footnote">
+            Balance: <span className="text-text-primary font-medium tabular-nums">
               ${(me.balance_cents / 100).toFixed(2)}
             </span>
             {me.trial_seconds_remaining > 0 && (
-              <span className="ml-2 text-emerald-400">
+              <span className="ml-2 text-success">
                 ({Math.round(me.trial_seconds_remaining / 60)} min trial left)
               </span>
             )}
@@ -100,35 +117,35 @@ function AccountCard() {
         </div>
       ) : loaded ? (
         <div className="space-y-2">
-          <p className="text-sm text-zinc-400">
+          <p className="text-callout text-text-tertiary">
             Sign in once in the browser. Bluey stores desktop tokens in the OS keychain.
           </p>
           <button
             onClick={signIn}
-            className="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded-md bg-blue-500 hover:bg-blue-400 text-white"
+            className="inline-flex items-center gap-1 text-callout px-3 py-1.5 rounded-md bg-accent hover:bg-accent-hover text-white transition-colors duration-200"
           >
             Sign in or create account <ExternalLink className="h-3 w-3" />
           </button>
         </div>
       ) : (
-        <p className="text-sm text-zinc-500">Checking account…</p>
+        <p className="text-callout text-text-tertiary">Checking account…</p>
       )}
       {me && <div className="flex flex-wrap gap-2">
         <button
           onClick={openPortal}
-          className="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-100"
+          className="inline-flex items-center gap-1 text-callout px-3 py-1.5 rounded-md border border-hairline hover:border-hairline-strong text-text-secondary hover:text-text-primary transition-colors duration-200"
         >
           Manage billing <ExternalLink className="h-3 w-3" />
         </button>
         <button
           onClick={signOut}
-          className="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-100"
+          className="inline-flex items-center gap-1 text-callout px-3 py-1.5 rounded-md border border-hairline hover:border-hairline-strong text-text-secondary hover:text-text-primary transition-colors duration-200"
         >
           Sign out <LogOut className="h-3 w-3" />
         </button>
         <button
           onClick={deleteAccount}
-          className="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded-md bg-red-500/10 border border-red-500/30 hover:bg-red-500/20 text-red-300"
+          className="inline-flex items-center gap-1 text-callout px-3 py-1.5 rounded-md bg-error/10 border border-error/30 hover:bg-error/20 text-error transition-colors duration-200"
         >
           Delete account <Trash2 className="h-3 w-3" />
         </button>
@@ -148,13 +165,13 @@ function DisguiseCard() {
     catch (e) { console.warn("set_disguise failed", e); }
   }
   return (
-    <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-5 space-y-4">
+    <div className="glass rounded-xl p-5 space-y-4">
       <div>
-        <h3 className="font-semibold text-zinc-100">Disguise</h3>
-        <p className="text-xs text-zinc-400 mt-1 leading-relaxed">
+        <h3 className="text-headline text-text-primary">Disguise</h3>
+        <p className="text-footnote text-text-tertiary mt-1 leading-relaxed">
           How Bluey appears in your menu bar and to screen-shares.{" "}
           <a href="https://bluey.sh/docs/disguise" target="_blank" rel="noreferrer"
-            className="text-blue-400 hover:text-blue-300 underline">Why?</a>
+            className="text-accent-subtle-text underline">Why?</a>
         </p>
       </div>
       <div className="space-y-2">
@@ -165,19 +182,19 @@ function DisguiseCard() {
               key={opt.value}
               onClick={() => update(opt.value)}
               className={
-                "w-full text-left rounded-lg border p-3 transition-colors " +
+                "w-full text-left rounded-lg border p-3 transition-colors duration-200 " +
                 (active
-                  ? "bg-blue-500/10 border-blue-500/40"
-                  : "bg-zinc-950 border-zinc-800 hover:border-zinc-700")
+                  ? "bg-accent-subtle border-accent"
+                  : "bg-bg-input border-hairline hover:border-hairline-strong")
               }
             >
               <div className="flex items-center justify-between">
-                <span className={"text-sm font-medium " + (active ? "text-blue-300" : "text-zinc-200")}>
+                <span className={"text-callout font-medium " + (active ? "text-accent-subtle-text" : "text-text-secondary")}>
                   {opt.label}
                 </span>
-                {active && <Check className="h-4 w-4 text-blue-400" />}
+                {active && <Check className="h-4 w-4 text-accent-subtle-text" />}
               </div>
-              <p className="text-xs text-zinc-500 mt-1">{opt.desc}</p>
+              <p className="text-footnote text-text-tertiary mt-1">{opt.desc}</p>
             </button>
           );
         })}
@@ -188,19 +205,19 @@ function DisguiseCard() {
 
 function VisibilityCard() {
   return (
-    <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-5 space-y-3">
-      <h3 className="font-semibold text-zinc-100">Visibility</h3>
+    <div className="glass rounded-xl p-5 space-y-3">
+      <h3 className="text-headline text-text-primary">Visibility</h3>
       <div className="flex items-start gap-3">
-        <EyeOff className="h-4 w-4 text-zinc-400 mt-0.5 shrink-0" />
-        <p className="text-xs text-zinc-300 leading-relaxed">
-          <kbd className="px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-100 text-[11px] font-mono">F19</kbd>{" "}
+        <EyeOff className="h-4 w-4 text-text-tertiary mt-0.5 shrink-0" />
+        <p className="text-footnote text-text-secondary leading-relaxed">
+          <kbd className="px-1.5 py-0.5 rounded bg-bg-raised-2 text-text-primary text-caption font-mono">F19</kbd>{" "}
           toggles Bluey&apos;s overlay on or off instantly. The menu-bar icon
           and the {`"Invisible"`} tray entry do the same thing.
         </p>
       </div>
       <div className="flex items-start gap-3">
-        <Eye className="h-4 w-4 text-zinc-400 mt-0.5 shrink-0" />
-        <p className="text-xs text-zinc-300 leading-relaxed">
+        <Eye className="h-4 w-4 text-text-tertiary mt-0.5 shrink-0" />
+        <p className="text-footnote text-text-secondary leading-relaxed">
           When meeting apps (Zoom, Teams, Slack, Webex) are in front, Bluey
           can disguise itself automatically. We&apos;ll ask you once.
         </p>

@@ -71,7 +71,7 @@ export function LiveTranscript() {
 
   if (segments.length === 0) {
     return (
-      <div className="flex flex-1 items-center justify-center text-zinc-500">
+      <div className="flex flex-1 items-center justify-center text-text-tertiary">
         <p>No active session. Start one with Cmd+Shift+L.</p>
       </div>
     );
@@ -79,8 +79,8 @@ export function LiveTranscript() {
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
-      <div className="border-b border-zinc-800 px-4 py-2">
-        <h2 className="text-sm font-semibold text-zinc-300">Live Transcript</h2>
+      <div className="border-b border-hairline px-4 py-2">
+        <h2 className="text-callout font-semibold text-text-secondary">Live Transcript</h2>
       </div>
       <LiveTranscriptList segments={segments} />
     </div>

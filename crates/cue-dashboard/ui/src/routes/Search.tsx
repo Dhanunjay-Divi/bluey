@@ -35,7 +35,7 @@ function renderSnippet(snippet: string) {
   }
   return parts.map((p, i) =>
     p.highlight ? (
-      <mark key={i} className="bg-yellow-600/40 text-yellow-200 rounded px-0.5">
+      <mark key={i} className="bg-warning/10 text-warning rounded px-0.5">
         {p.text}
       </mark>
     ) : (
@@ -70,37 +70,37 @@ export function Search() {
   return (
     <div className="space-y-4">
       <div className="relative">
-        <SearchIcon size={16} className="absolute left-3 top-2.5 text-zinc-500" />
+        <SearchIcon size={16} className="absolute left-3 top-2.5 text-text-tertiary" />
         <input
           autoFocus
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Search transcripts..."
-          className="w-full rounded-md border border-zinc-700 bg-zinc-900 pl-9 pr-3 py-2 text-sm"
+          className="w-full rounded-md border border-hairline bg-bg-input pl-9 pr-3 py-2 text-callout"
         />
       </div>
-      {loading && <p className="text-xs text-zinc-500">Searching...</p>}
+      {loading && <p className="text-footnote text-text-tertiary">Searching...</p>}
       {results.length > 0 && (
         <ul className="space-y-2">
           {results.map((hit, i) => (
             <li
               key={`${hit.session_id}-${i}`}
-              className="cursor-pointer rounded-md border border-zinc-800 bg-zinc-900 px-4 py-3 text-sm hover:border-zinc-600"
+              className="glass cursor-pointer rounded-md px-4 py-3 text-callout hover:border-hairline-strong"
               onClick={() => navigate(`/session/${hit.session_id}`)}
             >
-              <div className="flex items-center gap-2 text-xs text-zinc-500 mb-1">
-                <span className={`rounded px-1.5 py-0.5 ${hit.source === "mic" ? "bg-blue-900/40 text-blue-300" : "bg-purple-900/40 text-purple-300"}`}>
+              <div className="flex items-center gap-2 text-footnote text-text-tertiary mb-1">
+                <span className={`rounded px-1.5 py-0.5 ${hit.source === "mic" ? "bg-accent-subtle text-accent-subtle-text" : "bg-bg-raised-2 text-text-tertiary"}`}>
                   {hit.source}
                 </span>
                 <span>{new Date(hit.ts).toLocaleTimeString()}</span>
               </div>
-              <p className="text-zinc-300">{renderSnippet(hit.snippet)}</p>
+              <p className="text-text-secondary">{renderSnippet(hit.snippet)}</p>
             </li>
           ))}
         </ul>
       )}
       {!loading && query.trim() && results.length === 0 && (
-        <p className="text-sm text-zinc-500">No results found.</p>
+        <p className="text-callout text-text-tertiary">No results found.</p>
       )}
     </div>
   );

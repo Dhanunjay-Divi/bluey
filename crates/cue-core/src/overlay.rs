@@ -35,6 +35,21 @@ pub struct OverlaySessionItem {
     pub subtitle: String,
     #[serde(default)]
     pub is_active: bool,
+    /// The project/workspace this session belongs to, when known (used for the
+    /// redesigned panel's project filter chip). `None` when unassociated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Best-effort last-updated marker (epoch seconds or RFC3339 string, per
+    /// source). Drives the date-group bucketing (Today / Yesterday / …). Empty
+    /// string when unknown (older payloads).
+    #[serde(default)]
+    pub updated_at: String,
+    /// Turn/exchange count, when cheaply countable (shown as "N turns").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_count: Option<usize>,
+    /// True when the user has pinned this session to the top of the list.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,9 +75,36 @@ pub enum OverlayCommand {
     },
     SetContextItems {
         items: Vec<OverlayContextItem>,
+        /// Conversation turn count for the active meeting, shown as the overlay's
+        /// "In context: N turns" indicator. `0` when no active meeting / no turns.
+        #[serde(default)]
+        turns: usize,
     },
     SetSessions {
         sessions: Vec<OverlaySessionItem>,
+    },
+    /// Paginated/searched session page — the redesigned panel's at-scale path.
+    /// Unlike [`OverlayCommand::SetSessions`] (a one-shot, capped initial paint),
+    /// this answers an [`OverlayEvent::SessionsRequested`] and carries the slice
+    /// the UI asked for plus the totals it needs to render "show N more" and a
+    /// result count. `sessions` are already sorted by the daemon (pinned first,
+    /// then most-recent) and each item carries its `pinned`/`project`/`updated_at`
+    /// so the UI can group by date and filter by project without another round
+    /// trip. `query`/`offset` are echoed so a late/out-of-order reply can be
+    /// matched to (or discarded against) the UI's current request.
+    SetSessionsPage {
+        sessions: Vec<OverlaySessionItem>,
+        /// Total sessions matching the current `query` (before paging) — the UI
+        /// uses this for "show N more" and the "Search 318 sessions…" count.
+        total: usize,
+        /// The offset this page starts at (echo of the request).
+        offset: usize,
+        /// True when `offset + sessions.len() < total` (more pages remain).
+        has_more: bool,
+        /// Echo of the search string this page answers (empty = unfiltered), so
+        /// the UI can ignore a reply that no longer matches what's typed.
+        #[serde(default)]
+        query: String,
     },
     ListeningStateChanged {
         state: ListeningState,
@@ -191,8 +233,17 @@ pub enum OverlayEvent {
     /// UI detached the currently attached agent.
     AgentDetachRequested,
     /// UI asked for one agent's prior sessions (gated on consent in the daemon).
+    /// `offset`/`limit`/`search` support the redesigned at-scale agent-session
+    /// list; all default (0/0/"") to the prior "first page, unfiltered" behavior
+    /// so existing callers and payloads are unaffected.
     AgentSessionsRequested {
         kind: String,
+        #[serde(default)]
+        offset: usize,
+        #[serde(default)]
+        limit: usize,
+        #[serde(default)]
+        search: String,
     },
     /// UI asked for one agent's inherited MCP connectors.
     AgentConnectorsRequested {
@@ -258,6 +309,30 @@ pub enum OverlayEvent {
     },
     SessionContinueRequested,
     SessionNewRequested,
+    /// UI requested a page of sessions for the at-scale list (redesign). The
+    /// daemon answers with [`OverlayCommand::SetSessionsPage`]: filter by
+    /// `search` (title/project, case-insensitive; empty = all), sort pinned-first
+    /// then most-recent, and return the `offset..offset+limit` window plus the
+    /// total. This replaces the implicit cap-at-8 of [`OverlayCommand::SetSessions`].
+    SessionsRequested {
+        #[serde(default)]
+        offset: usize,
+        /// Page size. The daemon clamps to a sane max; `0` means "daemon default".
+        #[serde(default)]
+        limit: usize,
+        /// Case-insensitive filter over title + project. Empty = unfiltered.
+        #[serde(default)]
+        search: String,
+    },
+    /// UI pinned a session to the top of the list. The daemon persists the pin
+    /// and re-sends the affected page so the move is reflected.
+    SessionPinRequested {
+        id: uuid::Uuid,
+    },
+    /// UI unpinned a previously pinned session.
+    SessionUnpinRequested {
+        id: uuid::Uuid,
+    },
     ActivePageCaptureRequested,
     AnalyzeScreenRequested,
     RecapRequested,
@@ -307,12 +382,13 @@ mod tests {
                 kind: "document".to_string(),
                 path: Some("/tmp/GenAI Engineer JD.pdf".to_string()),
             }],
+            turns: 3,
         })
         .expect("serialize overlay context command");
 
         assert_eq!(
             json,
-            r#"{"type":"set_context_items","items":[{"id":"00000000-0000-0000-0000-000000000000","title":"GenAI Engineer JD.pdf","kind":"document","path":"/tmp/GenAI Engineer JD.pdf"}]}"#
+            r#"{"type":"set_context_items","items":[{"id":"00000000-0000-0000-0000-000000000000","title":"GenAI Engineer JD.pdf","kind":"document","path":"/tmp/GenAI Engineer JD.pdf"}],"turns":3}"#
         );
     }
 
@@ -325,14 +401,111 @@ mod tests {
                 title: "System design prep".to_string(),
                 subtitle: "3 transcripts · 2 files".to_string(),
                 is_active: true,
+                project: None,
+                updated_at: String::new(),
+                turn_count: None,
+                pinned: false,
             }],
         })
         .expect("serialize overlay sessions command");
 
+        // `project`/`turn_count` are `skip_serializing_if = None`, so an item
+        // with neither only adds the always-present `updated_at` + `pinned`.
         assert_eq!(
             json,
-            r#"{"type":"set_sessions","sessions":[{"id":"00000000-0000-0000-0000-000000000000","title":"System design prep","subtitle":"3 transcripts · 2 files","is_active":true}]}"#
+            r#"{"type":"set_sessions","sessions":[{"id":"00000000-0000-0000-0000-000000000000","title":"System design prep","subtitle":"3 transcripts · 2 files","is_active":true,"updated_at":"","pinned":false}]}"#
         );
+    }
+
+    #[test]
+    fn legacy_session_item_decodes_with_defaulted_new_fields() {
+        // An old daemon (pre-redesign) sends only the original four fields. The
+        // extended struct must still decode, defaulting the new ones, so a
+        // version skew never drops the session list.
+        let legacy = r#"{"id":"00000000-0000-0000-0000-000000000000","title":"t","subtitle":"s","is_active":false}"#;
+        let item: OverlaySessionItem = serde_json::from_str(legacy).expect("decode legacy item");
+        assert_eq!(item.project, None);
+        assert_eq!(item.updated_at, "");
+        assert_eq!(item.turn_count, None);
+        assert!(!item.pinned);
+    }
+
+    #[test]
+    fn set_sessions_page_round_trips_with_paging_fields() {
+        let cmd = OverlayCommand::SetSessionsPage {
+            sessions: vec![OverlaySessionItem {
+                id: uuid::Uuid::nil(),
+                title: "Overlay redesign".to_string(),
+                subtitle: "9 turns".to_string(),
+                is_active: true,
+                project: Some("Bluey".to_string()),
+                updated_at: "1718000000".to_string(),
+                turn_count: Some(9),
+                pinned: true,
+            }],
+            total: 318,
+            offset: 0,
+            has_more: true,
+            query: "redesign".to_string(),
+        };
+        let json = serde_json::to_string(&cmd).expect("serialize page");
+        assert!(json.contains(r#""type":"set_sessions_page""#));
+        assert!(json.contains(r#""total":318"#));
+        assert!(json.contains(r#""has_more":true"#));
+        let decoded: OverlayCommand = serde_json::from_str(&json).expect("decode page");
+        assert_eq!(
+            serde_json::to_string(&decoded).expect("re-serialize"),
+            json,
+            "SetSessionsPage should round-trip"
+        );
+    }
+
+    #[test]
+    fn session_paging_and_pin_events_round_trip() {
+        let cases = [
+            OverlayEvent::SessionsRequested {
+                offset: 20,
+                limit: 20,
+                search: "auth".to_string(),
+            },
+            OverlayEvent::SessionPinRequested {
+                id: uuid::Uuid::nil(),
+            },
+            OverlayEvent::SessionUnpinRequested {
+                id: uuid::Uuid::nil(),
+            },
+        ];
+        for event in cases {
+            let json = serde_json::to_string(&event).expect("serialize event");
+            let decoded: OverlayEvent = serde_json::from_str(&json).expect("decode event");
+            assert_eq!(
+                serde_json::to_string(&decoded).expect("re-serialize"),
+                json,
+                "session paging/pin event should round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_sessions_requested_defaults_paging_when_absent() {
+        // The prior wire form carried only `kind`; it must still decode with the
+        // new paging fields defaulted (offset 0, limit 0, empty search).
+        let legacy = r#"{"type":"agent_sessions_requested","kind":"claude_code"}"#;
+        let decoded: OverlayEvent = serde_json::from_str(legacy).expect("decode legacy");
+        match decoded {
+            OverlayEvent::AgentSessionsRequested {
+                kind,
+                offset,
+                limit,
+                search,
+            } => {
+                assert_eq!(kind, "claude_code");
+                assert_eq!(offset, 0);
+                assert_eq!(limit, 0);
+                assert_eq!(search, "");
+            }
+            other => panic!("expected agent_sessions_requested, got {other:?}"),
+        }
     }
 
     #[test]
@@ -431,11 +604,14 @@ mod tests {
 
         let sessions = serde_json::to_string(&OverlayEvent::AgentSessionsRequested {
             kind: "gemini".to_string(),
+            offset: 0,
+            limit: 0,
+            search: String::new(),
         })
         .expect("serialize");
         assert_eq!(
             sessions,
-            r#"{"type":"agent_sessions_requested","kind":"gemini"}"#
+            r#"{"type":"agent_sessions_requested","kind":"gemini","offset":0,"limit":0,"search":""}"#
         );
 
         let reauth = serde_json::to_string(&OverlayEvent::ConnectorReauthRequested {
