@@ -64,6 +64,71 @@ The passive layer already built (discovery, readers, drive, bridge) is the
 
 ---
 
+## 2a. The product shape: an I/O sandwich with the spine in the middle
+
+The two product flavors (interview copilot, meeting-assist) are **not
+alternatives — they are the two ends of the same pipe.** Input on one side,
+output on the other, the agent spine in the middle. Combine them and you have the
+complete loop: *listen → understand → answer with the user's own agent → put the
+answer where it's needed.*
+
+```
+   INPUT (B)                    SPINE                      OUTPUT (A)
+   ─────────                    ─────                      ──────────
+ system/call audio  ─┐                               ┌─►  invisible overlay  (interview)
+ mic                 ─┤   cue-agent-bridge            ├─►  Slack DM / Teams    (meeting)
+ typed question      ─┼─►  tap the user's agent  ────┼─►  back into call chat
+ Slack slash cmd     ─┤   + its MCP → AnswerStream    ├─►  web dashboard
+ meeting transcript  ─┘                               └─►  …
+```
+
+- **B (ingest)** — the system hears the call → live transcript → detect/extract
+  the question + context.
+- **Spine** — taps the user's seasoned agent + its MCP → `AnswerStream`. **Built
+  and proven** (the agent matrix: all 6 agents 5/5; see [[STATUS-AGENT-CAPABILITIES]]).
+- **A (output)** — the answer lands wherever's useful: invisibly in the overlay,
+  in Slack/Teams, back into the meeting chat, the dashboard.
+
+**Bluey already has the B side** — this is NOT greenfield. The daemon already has
+the ingest machinery: system-audio capture (`build_system_audio_stt_provider`),
+the STT pipeline (Deepgram / OpenAI Realtime / LocalWhisper via the factory),
+live transcript segments, meeting records, and RAG indexing of what's said. So
+Bluey already *listens and transcribes*. This session built the **spine** (middle)
+and **one output** (the overlay — now with rich markdown + code cards).
+
+**What's genuinely new to fully combine A+B:** more **output adapters**
+(Slack/Teams) and the **question-detection trigger** (detect a question in the
+live transcript → auto-answer, vs. the user tapping it). The spine in the middle
+does NOT change — that's the entire payoff of decoupling it.
+
+### The two products = same brain, different ends plugged in
+
+| Product | B (input) | Spine | A (output) | Privacy |
+|---|---|---|---|---|
+| **Interview** | local system-audio (hears interviewer) | user's agent | invisible overlay | **fully local — nothing leaves** |
+| **Meeting-assist** | call audio / Slack cmd | user's agent | Slack/Teams/visible | answer leaves to the tool |
+
+The **interview case is the most private combination** (all-local in, invisible
+out) — the "no data retention" principle at its strongest. It is also closest to
+done (ingest exists + spine exists + invisible overlay exists).
+
+### Two honest sub-decisions inside B (scope)
+
+1. **System-audio capture vs. a meeting bot.** Bluey does **local system-audio
+   today** (the user's machine hears the call) — perfect for interviews
+   (invisible, no bot the interviewer sees). A bot that *joins* Zoom as a
+   participant is a different, heavier thing (cloud infra, visible in-call,
+   consent) — only needed for the "shared team assistant" flavor.
+2. **Local-only vs. cloud output.** Answer → invisible overlay = stays on the
+   machine. Answer → Slack = leaves to Slack. Be deliberate — output choice is the
+   privacy moat.
+
+**Status:** ~70% there — ingest exists, spine exists (proven this session), one
+output exists (overlay). Remaining: output adapters + the question-detection
+trigger. (This expands on Phase E below — "The meeting layer".)
+
+---
+
 ## 3. What EXISTS today (committed, real)
 
 | Capability | State | Verified |
@@ -186,10 +251,26 @@ post-meeting push-back to Jira/Notion — all future, none built.
 - Apply the resolver as the fallback inside the session readers (when a pinned
   reader returns 0, try the resolver before giving up).
 
-### Phase E — The meeting layer (closes P9)
-- Question-gate (when is there a real question worth asking the agent?) +
-  rolling context-summarizer (bounded — solves the arg-limit/cost risk too).
-  Wire into the existing audio/STT/daemon pipeline.
+### Phase E — The meeting layer: combine A+B over the spine (closes P9)
+*The I/O sandwich (§2a). B already exists (audio→STT→transcript); the spine
+exists (proven). This phase adds the **trigger** (B→spine) and **more outputs**
+(spine→A). The spine itself does NOT change.*
+- **B-side trigger — question-gate:** detect when the live transcript contains a
+  real question worth asking the agent (vs. ambient chatter). Plus a rolling,
+  bounded context-summarizer (also solves the arg-limit/cost risk). Wire into the
+  existing audio/STT/daemon pipeline. Two modes: **auto-answer** (trigger fires →
+  spine answers) vs. **user-tap** (the current overlay flow).
+- **A-side outputs — adapters:** the answer is an `AnswerStream`; route it to more
+  sinks beyond the overlay — **Slack DM / slash-command**, **Teams**, **back into
+  the call chat**, the **web dashboard**. Each is a thin output adapter; none
+  touch the spine.
+- **Privacy gate per output:** overlay = stays local (interview, strongest
+  privacy); Slack/Teams = answer leaves to the tool (meeting-assist). Make the
+  local-vs-cloud output choice explicit and user-controlled.
+- **DONE =** the full loop runs end-to-end for at least one product: a real call's
+  audio → transcript → detected question → spine answers via the user's agent →
+  answer lands in the chosen output. Interview loop (local audio → spine →
+  invisible overlay) is closest to done and the natural first target.
 
 ### Phase F — Cross-platform (closes P7)
 - Windows: real build + run; verify discovery paths; Windows overlay parity.

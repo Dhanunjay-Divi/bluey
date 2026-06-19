@@ -51,18 +51,22 @@ full-history fork vs context-only fork vs resume-by-id):
 
 | Agent | 1 Read sessions | 2 Name | 3 Project/dir | 4 Resume / Fork | 5 Use MCPs |
 |---|---|---|---|---|---|
-| Claude Code | ✅ | ✅ | ✅ | ✅ **resume (session/load) + fork** — both proven | ✅ |
-| Cursor | | | | | |
-| Codex | | | | resume + fork (`/fork`) — *target* | |
-| Gemini | ✅ | ✅ | ✅ | (resume = "latest"/index only) | |
-| Copilot | | | | | |
-| Antigravity | | | | | |
-| (others) | | | | | |
+| Claude Code | ✅ | ✅ | ✅ | ✅ true resume (session/load) + fork | ✅ |
+| Codex | ✅ | ✅ | ✅ | ✅ true resume (inner UUID) + fork | ✅ |
+| Copilot | ✅ | ✅ | ✅ | ✅ true resume (dir-UUID) + fork | ✅ |
+| Cursor | ✅ | ✅ | ✅ | ✅ fork/replay (id ≠ ACP handle — correct) | ✅ |
+| Gemini | ✅ | ✅ | ✅ | ✅ fork/replay (`--resume` = latest/index) | ✅ |
+| Antigravity | ✅ | ✅ | ✅ | ✅ resume (`agy --conversation`) + fork | ✅ |
 
-> **Claude Code row is COMPLETE (2026-06-19)** — all 5 capabilities verified end-to-end via
-> the CLI (read/name/project from disk; true in-place resume AND fork both proven with real
-> runs + logs; MCP connector actually invoked). See [[STATUS-AGENT-CAPABILITIES]] for evidence.
-> This closes Phase 0 and the Claude portion of Phase 1.
+> **ALL 6 AGENTS COMPLETE (2026-06-19)** — every row verified end-to-end via the CLI
+> (read/name/project from disk; continuation proven with real runs + logs; MCP connector
+> actually invoked). NativeResume agents (Claude/Codex/Copilot) do true in-place
+> `session/load` — the recurring fix was finding the REAL resume id (cwd / inner-UUID /
+> dir-UUID). Replay agents (Cursor/Gemini) do fork/replay, which is their *correct* mode (their
+> id isn't an ACP handle; Cursor's `loadSession:true` is a confirmed-broken Cursor bug).
+> Antigravity drives via its own `agy` CLI (not gemini — gemini dropped the AI Pro tier
+> 2026-06-18). See [[STATUS-AGENT-CAPABILITIES]] for full evidence. **This closes Phases 0, 1,
+> and 4** (the entire agent/spine layer — the middle of the I/O sandwich).
 
 - Capabilities **1–5 are all CLI-verifiable by the agent** (they are data + driving, no GUI).
 - The GUI's only job is to **render** these 5 — that part is user-verified (§2).
@@ -150,12 +154,18 @@ END-TO-END before adding the next. Never call a layer "done" — only call a use
   start to finish, with real output.
 
 ### Phase 3 — Overlay (GUI) as a thin renderer of the proven spine
-*Small surface; the only phase the USER verifies.*
+*Small surface; the only phase the USER verifies. This is the **output (A)** end of
+the I/O sandwich — see [[PLAN-PRODUCTION-VISION]] §2a.*
 - The overlay calls the SAME `answer()` / session-read path as the CLI. Its only jobs: send
   the event, render the streamed answer, list sessions, trigger resume/fork.
 - **DONE =** the **user** confirms by eye: sessions show with names, asking returns a visible
   answer, picking a session continues it visibly. (Agent confirms the data reached the
   overlay; user confirms it rendered.)
+- **Progress (2026-06-19):** rich answer rendering landed — markdown (bold/italic/
+  lists/links) + syntax-highlighted code cards with language label + copy button,
+  streaming-correct (plain while streaming → rich on `done`). Verified in the HTML
+  preview; live-overlay confirmation pending (capture-invisible — user-only). Next:
+  the **desktop-app / GUI vertical** (the full app shell around this renderer).
 
 ### Phase 4 — Scale to all agents (fill the §1a matrix, cheap)
 - Add each remaining agent as a **registry row**; verify its row of the §1a matrix via the CLI
