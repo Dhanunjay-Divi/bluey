@@ -33,5 +33,8 @@ pub mod types;
 pub use auth::{DeviceFlow, DeviceFlowState};
 pub use client::CloudClient;
 pub use error::Error;
-pub use tokens::{AccountFileStore, TokenStore, Tokens};
+pub use tokens::{
+    save_account_profile_and_tokens, save_account_profile_without_tokens, AccountFileStore,
+    SecureAccountStore, TokenStore, Tokens,
+};
 pub use types::*;

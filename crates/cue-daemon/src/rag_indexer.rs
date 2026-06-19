@@ -293,9 +293,6 @@ fn managed_embedder(paths: &AppPaths) -> anyhow::Result<Option<Arc<dyn Embedding
     let Some(account) = load_account(paths)? else {
         return Ok(None);
     };
-    if !account.token_configured() {
-        return Ok(None);
-    }
 
     let base_url = std::env::var("BLUEY_CLOUD_API_URL")
         .or_else(|_| std::env::var("CUE_CLOUD_API_URL"))
@@ -306,8 +303,11 @@ fn managed_embedder(paths: &AppPaths) -> anyhow::Result<Option<Arc<dyn Embedding
     };
     let client = cue_cloud_client::CloudClient::new(
         config,
-        Arc::new(cue_cloud_client::AccountFileStore::new(paths.clone())),
+        Arc::new(cue_cloud_client::SecureAccountStore::new(paths.clone())),
     )?;
+    if client.current_tokens().is_none() {
+        return Ok(None);
+    }
     info!("RAG embeddings configured through Bluey managed router");
     Ok(Some(Arc::new(ManagedBlueyEmbedder::new(client))))
 }
@@ -383,6 +383,21 @@ fn env_truthy(name: &str) -> bool {
 mod tests {
     use super::*;
     use cue_core::{save_account, AccountConfig};
+    use std::sync::Mutex;
+
+    static PLAINTEXT_TOKEN_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_plaintext_token_fallback<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = PLAINTEXT_TOKEN_TEST_LOCK.lock().unwrap();
+        let old = std::env::var_os("BLUEY_ALLOW_PLAINTEXT_TOKENS");
+        std::env::set_var("BLUEY_ALLOW_PLAINTEXT_TOKENS", "1");
+        let result = f();
+        match old {
+            Some(value) => std::env::set_var("BLUEY_ALLOW_PLAINTEXT_TOKENS", value),
+            None => std::env::remove_var("BLUEY_ALLOW_PLAINTEXT_TOKENS"),
+        }
+        result
+    }
 
     fn test_paths() -> AppPaths {
         let base = std::env::temp_dir().join(format!("bluey-managed-rag-{}", uuid::Uuid::new_v4()));
@@ -398,31 +413,35 @@ mod tests {
 
     #[test]
     fn managed_embedder_requires_linked_account_token() {
-        let paths = test_paths();
-        assert!(managed_embedder(&paths).unwrap().is_none());
+        with_plaintext_token_fallback(|| {
+            let paths = test_paths();
+            assert!(managed_embedder(&paths).unwrap().is_none());
 
-        let mut account = AccountConfig::local();
-        account.provider = "bluey".to_string();
-        account.api_url = "http://127.0.0.1:8787".to_string();
-        account.user_id = "tester@bluey.sh".to_string();
-        save_account(&paths, &account).unwrap();
-        assert!(managed_embedder(&paths).unwrap().is_none());
+            let mut account = AccountConfig::local();
+            account.provider = "bluey".to_string();
+            account.api_url = "http://127.0.0.1:8787".to_string();
+            account.user_id = "tester@bluey.sh".to_string();
+            save_account(&paths, &account).unwrap();
+            assert!(managed_embedder(&paths).unwrap().is_none());
+        });
     }
 
     #[test]
     fn managed_embedder_uses_account_file_tokens_without_provider_key() {
-        let paths = test_paths();
-        let mut account = AccountConfig::local();
-        account.provider = "bluey".to_string();
-        account.api_url = "http://127.0.0.1:8787".to_string();
-        account.user_id = "tester@bluey.sh".to_string();
-        account.access_token = Some("desktop-access-token".to_string());
-        account.refresh_token = Some("desktop-refresh-token".to_string());
-        save_account(&paths, &account).unwrap();
+        with_plaintext_token_fallback(|| {
+            let paths = test_paths();
+            let mut account = AccountConfig::local();
+            account.provider = "bluey".to_string();
+            account.api_url = "http://127.0.0.1:8787".to_string();
+            account.user_id = "tester@bluey.sh".to_string();
+            account.access_token = Some("desktop-access-token".to_string());
+            account.refresh_token = Some("desktop-refresh-token".to_string());
+            save_account(&paths, &account).unwrap();
 
-        let embedder = managed_embedder(&paths).unwrap().expect("managed embedder");
-        assert_eq!(embedder.name(), "bluey-managed");
-        assert_eq!(embedder.dim(), MANAGED_EMBED_DIM);
+            let embedder = managed_embedder(&paths).unwrap().expect("managed embedder");
+            assert_eq!(embedder.name(), "bluey-managed");
+            assert_eq!(embedder.dim(), MANAGED_EMBED_DIM);
+        });
     }
 
     #[test]
@@ -437,22 +456,24 @@ mod tests {
 
     #[test]
     fn coordinator_refreshes_after_account_link() {
-        let paths = test_paths();
-        paths.ensure().unwrap();
-        let coordinator = RagIndexCoordinator::from_paths(&paths);
-        assert!(coordinator.pipeline().is_none());
-        assert!(!coordinator.refresh_from_paths(&paths));
+        with_plaintext_token_fallback(|| {
+            let paths = test_paths();
+            paths.ensure().unwrap();
+            let coordinator = RagIndexCoordinator::from_paths(&paths);
+            assert!(coordinator.pipeline().is_none());
+            assert!(!coordinator.refresh_from_paths(&paths));
 
-        let mut account = AccountConfig::local();
-        account.provider = "bluey".to_string();
-        account.api_url = "http://127.0.0.1:8787".to_string();
-        account.user_id = "tester@bluey.sh".to_string();
-        account.access_token = Some("desktop-access-token".to_string());
-        account.refresh_token = Some("desktop-refresh-token".to_string());
-        save_account(&paths, &account).unwrap();
+            let mut account = AccountConfig::local();
+            account.provider = "bluey".to_string();
+            account.api_url = "http://127.0.0.1:8787".to_string();
+            account.user_id = "tester@bluey.sh".to_string();
+            account.access_token = Some("desktop-access-token".to_string());
+            account.refresh_token = Some("desktop-refresh-token".to_string());
+            save_account(&paths, &account).unwrap();
 
-        assert!(coordinator.refresh_from_paths(&paths));
-        assert!(coordinator.pipeline().is_some());
-        assert!(!coordinator.refresh_from_paths(&paths));
+            assert!(coordinator.refresh_from_paths(&paths));
+            assert!(coordinator.pipeline().is_some());
+            assert!(!coordinator.refresh_from_paths(&paths));
+        });
     }
 }

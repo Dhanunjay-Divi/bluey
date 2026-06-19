@@ -1,8 +1,9 @@
 //! Bluey account token storage.
 //!
-//! New installs store tokens in the local Bluey account profile so CLI,
-//! daemon, and dashboard agree on the API URL and device identity. Legacy
-//! keyring storage remains available as an explicit fallback.
+//! New installs store account tokens in OS secure storage. The local Bluey
+//! account profile keeps non-secret metadata such as API URL, workspace, and
+//! device identity. Account-file token storage is retained only as an explicit
+//! development fallback and as a one-time migration path for older installs.
 
 use crate::error::{Error, Result};
 
@@ -47,6 +48,24 @@ impl AccountFileStore {
     fn save_account(&self, account: &cue_core::AccountConfig) -> Result<()> {
         cue_core::save_account(&self.paths, account)
             .map_err(|error| Error::TokenStore(error.to_string()))
+    }
+
+    fn save_profile_without_tokens(&self, tokens: &Tokens) -> Result<()> {
+        let mut account = self.load_account()?.unwrap_or_else(|| {
+            let mut account = cue_core::AccountConfig::local();
+            account.provider = "bluey".to_string();
+            account.api_url = default_account_api_url();
+            account
+        });
+        account.provider = if account.provider == "local" {
+            "bluey".to_string()
+        } else {
+            account.provider
+        };
+        account.user_id = tokens.email.clone();
+        account.access_token = None;
+        account.refresh_token = None;
+        self.save_account(&account)
     }
 }
 
@@ -94,6 +113,151 @@ impl TokenStore for AccountFileStore {
         account.refresh_token = None;
         self.save_account(&account)
     }
+}
+
+/// Default desktop token store.
+///
+/// Tokens are stored in the OS credential store (macOS Keychain, Windows
+/// Credential Manager, or libsecret-compatible stores on Linux). If an older
+/// install still has tokens in `account.json`, the first successful load
+/// migrates them into the secure store and clears them from disk.
+pub struct SecureAccountStore {
+    account_file: AccountFileStore,
+    keyring: KeyringStore,
+}
+
+impl SecureAccountStore {
+    pub fn new(paths: cue_core::app_paths::AppPaths) -> Self {
+        Self {
+            account_file: AccountFileStore::new(paths),
+            keyring: KeyringStore::new(),
+        }
+    }
+}
+
+impl TokenStore for SecureAccountStore {
+    fn save(&self, tokens: &Tokens) -> Result<()> {
+        self.account_file.save_profile_without_tokens(tokens)?;
+        if plaintext_token_fallback_enabled() {
+            tracing::warn!(
+                "using plaintext account-token fallback because BLUEY_ALLOW_PLAINTEXT_TOKENS is enabled"
+            );
+            self.account_file.save(tokens)?;
+            return Ok(());
+        }
+        match self.keyring.save(tokens) {
+            Ok(()) => {
+                self.account_file.clear()?;
+                Ok(())
+            }
+            Err(error) => Err(Error::TokenStore(format!(
+                "secure token storage unavailable: {error}. Bluey will not write account tokens to disk; fix OS credential storage or set BLUEY_ALLOW_PLAINTEXT_TOKENS=1 for local development only."
+            ))),
+        }
+    }
+
+    fn load(&self) -> Result<Option<Tokens>> {
+        if plaintext_token_fallback_enabled() {
+            return self.account_file.load();
+        }
+
+        let keyring_error = match self.keyring.load() {
+            Ok(Some(tokens)) => return Ok(Some(tokens)),
+            Ok(None) => None,
+            Err(error) => Some(error),
+        };
+
+        let Some(tokens) = self.account_file.load()? else {
+            if let Some(error) = keyring_error {
+                tracing::debug!(error = %error, "secure token storage unavailable and no legacy account-file tokens exist");
+            }
+            return Ok(None);
+        };
+        match self.keyring.save(&tokens) {
+            Ok(()) => {
+                self.account_file.clear()?;
+                Ok(Some(tokens))
+            }
+            Err(error) => Err(Error::TokenStore(format!(
+                "found legacy plaintext account tokens but could not migrate them to secure storage: {error}"
+            ))),
+        }
+    }
+
+    fn clear(&self) -> Result<()> {
+        let keyring_result = self.keyring.clear();
+        let file_result = self.account_file.clear();
+        keyring_result.and(file_result)
+    }
+}
+
+pub fn save_account_profile_without_tokens(
+    paths: &cue_core::app_paths::AppPaths,
+    account: &cue_core::AccountConfig,
+) -> Result<()> {
+    let mut profile = account.clone();
+    profile.access_token = None;
+    profile.refresh_token = None;
+    cue_core::save_account(paths, &profile).map_err(|error| Error::TokenStore(error.to_string()))
+}
+
+pub fn save_account_profile_and_tokens(
+    paths: &cue_core::app_paths::AppPaths,
+    account: &cue_core::AccountConfig,
+) -> Result<()> {
+    save_account_profile_without_tokens(paths, account)?;
+    if let Some(tokens) = tokens_from_account(account) {
+        SecureAccountStore::new(paths.clone()).save(&tokens)?;
+    }
+    Ok(())
+}
+
+pub fn tokens_available(paths: &cue_core::app_paths::AppPaths) -> bool {
+    std::env::var_os("BLUEY_CLOUD_TOKEN")
+        .or_else(|| std::env::var_os("BLUEY_API_TOKEN"))
+        .or_else(|| std::env::var_os("CUE_CLOUD_TOKEN"))
+        .or_else(|| std::env::var_os("CUE_API_TOKEN"))
+        .filter(|value| !value.is_empty())
+        .is_some()
+        || SecureAccountStore::new(paths.clone())
+            .load()
+            .ok()
+            .flatten()
+            .is_some()
+}
+
+fn tokens_from_account(account: &cue_core::AccountConfig) -> Option<Tokens> {
+    let access = account
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())?
+        .to_string();
+    Some(Tokens {
+        access,
+        refresh: account.refresh_token.clone().unwrap_or_default(),
+        email: account.user_id.clone(),
+    })
+}
+
+#[cfg(test)]
+fn plaintext_token_fallback_enabled() -> bool {
+    true
+}
+
+#[cfg(not(test))]
+fn plaintext_token_fallback_enabled() -> bool {
+    truthy_env("BLUEY_ALLOW_PLAINTEXT_TOKENS") || truthy_env("BLUEY_DEV_PLAINTEXT_TOKENS")
+}
+
+#[cfg(not(test))]
+fn truthy_env(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn default_account_api_url() -> String {
@@ -282,6 +446,48 @@ mod tests {
         assert_eq!(loaded.user_id, "local@example.com");
         assert_eq!(loaded.access_token.as_deref(), Some("access"));
         assert_eq!(loaded.refresh_token.as_deref(), Some("refresh"));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn save_account_profile_without_tokens_strips_secret_fields() {
+        let base = std::env::temp_dir().join(format!(
+            "bluey-account-profile-no-tokens-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let paths = cue_core::app_paths::AppPaths {
+            data_dir: base.join("data"),
+            config_dir: base.join("config"),
+            runtime_dir: base.join("run"),
+            state_file: base.join("run/daemon-state.json"),
+            account_file: base.join("config/account.json"),
+            settings_file: base.join("config/settings.json"),
+        };
+
+        let mut account = cue_core::AccountConfig::local();
+        account.provider = "bluey".into();
+        account.api_url = "https://staging.bluey.sh".into();
+        account.user_id = "user@example.com".into();
+        account.workspace_id = "workspace-1".into();
+        account.device_id = "device-1".into();
+        account.access_token = Some("secret-access".into());
+        account.refresh_token = Some("secret-refresh".into());
+
+        save_account_profile_without_tokens(&paths, &account).unwrap();
+
+        let loaded = cue_core::load_account(&paths).unwrap().unwrap();
+        assert_eq!(loaded.provider, "bluey");
+        assert_eq!(loaded.api_url, "https://staging.bluey.sh");
+        assert_eq!(loaded.user_id, "user@example.com");
+        assert_eq!(loaded.workspace_id, "workspace-1");
+        assert_eq!(loaded.device_id, "device-1");
+        assert!(loaded.access_token.is_none());
+        assert!(loaded.refresh_token.is_none());
 
         let _ = std::fs::remove_dir_all(base);
     }

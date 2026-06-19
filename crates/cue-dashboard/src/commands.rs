@@ -136,7 +136,7 @@ fn cloud_client_with_trace(trace_id: &str) -> Result<cue_cloud_client::CloudClie
     }
     let client = cue_cloud_client::CloudClient::new(
         config.clone(),
-        Arc::new(cue_cloud_client::AccountFileStore::new(paths)),
+        Arc::new(cue_cloud_client::SecureAccountStore::new(paths)),
     )
     .map_err(|e| format!("account store unavailable: {e}"))?;
     if client.current_tokens().is_some() || !legacy_keyring_fallback_enabled() {

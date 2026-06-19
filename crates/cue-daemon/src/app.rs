@@ -1777,9 +1777,11 @@ async fn build_real_audio_runtime_config(
     };
     let account = load_account(paths).ok().flatten();
     let account_token = cloud_access_token_from_env().or_else(|| {
-        account
-            .as_ref()
-            .and_then(|account| account.access_token.clone())
+        let store = cue_cloud_client::SecureAccountStore::new(paths.clone());
+        cue_cloud_client::TokenStore::load(&store)
+            .ok()
+            .flatten()
+            .map(|tokens| tokens.access)
             .filter(|token| !token.trim().is_empty())
     });
     let account_api_url = env::var("BLUEY_CLOUD_API_URL")
@@ -3143,16 +3145,10 @@ fn build_cloud_client(
         return Ok(cloud_client_with_optional_trace(client, trace_id));
     }
 
-    if let Some(account) = account {
-        if account
-            .access_token
-            .as_deref()
-            .is_some_and(|token| !token.trim().is_empty())
-        {
-            let store = cue_cloud_client::AccountFileStore::new(paths.clone());
-            let client = cue_cloud_client::CloudClient::new(config, Arc::new(store))?;
-            return Ok(cloud_client_with_optional_trace(client, trace_id));
-        }
+    let store = cue_cloud_client::SecureAccountStore::new(paths.clone());
+    let client = cue_cloud_client::CloudClient::new(config.clone(), Arc::new(store))?;
+    if client.current_tokens().is_some() {
+        return Ok(cloud_client_with_optional_trace(client, trace_id));
     }
 
     if env_truthy_any(&["BLUEY_LEGACY_KEYRING_FALLBACK"]) {
@@ -5324,11 +5320,7 @@ fn managed_lane_from_value(value: &str) -> ManagedLane {
 }
 
 fn cloud_account_linked(paths: &AppPaths) -> bool {
-    cloud_access_token_from_env().is_some()
-        || load_account(paths)
-            .ok()
-            .flatten()
-            .is_some_and(|account| account.token_configured())
+    cue_cloud_client::tokens::tokens_available(paths)
 }
 
 fn normalized_overlay_model<'a>(provider: &str, model: Option<&'a str>) -> Option<&'a str> {
@@ -6652,11 +6644,7 @@ fn cloud_status_from_env(paths: &AppPaths) -> CloudSyncStatus {
     );
 
     let account = load_account(paths).ok().flatten();
-    if cloud_token_configured()
-        || account
-            .as_ref()
-            .is_some_and(|account| account.token_configured())
-    {
+    if cloud_token_configured() || cue_cloud_client::tokens::tokens_available(paths) {
         CloudSyncStatus::ready(
             endpoint,
             env::var("BLUEY_WORKSPACE_ID")

@@ -685,7 +685,7 @@ fn dashboard_cloud_client_with_trace(
     }
     cue_cloud_client::CloudClient::new(
         config,
-        Arc::new(cue_cloud_client::AccountFileStore::new(paths)),
+        Arc::new(cue_cloud_client::SecureAccountStore::new(paths)),
     )
 }
 

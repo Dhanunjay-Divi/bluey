@@ -7,7 +7,7 @@
 3. Customer installs Bluey using the terminal installer.
 4. Customer runs `bluey on`.
 5. If the desktop is not linked, Bluey opens `https://bluey.sh/login` and the overlay shows a signed-out state with a clear sign-in CTA.
-6. Customer signs in or creates an account. The browser/device-link flow stores desktop tokens in Bluey's private local account profile; legacy keychain fallback is only used when explicitly enabled.
+6. Customer signs in or creates an account. The browser/device-link flow stores desktop tokens in OS secure storage; the local account profile keeps non-secret metadata such as API URL, workspace, and device identity.
 7. Bluey starts a new recording/session by default. Old sessions remain available through history and cloud sync.
 8. Customer can:
    - Listen to microphone/system transcript.

@@ -76,7 +76,7 @@
         <p>Account-credit batches remain in the ledger for accounting and expire up to 12 months (365 days) after purchase. Session, transcript, document, and saved-history retention follows account/workspace settings and the export/delete controls described in the product.</p>
 
         <h2>Security</h2>
-        <p>Desktop account tokens are stored in a local Bluey account profile. Legacy installs may use the operating-system keychain as a fallback. Provider API keys stay server-side for managed cloud requests. Logs are designed for debugging and support, not for storing raw secrets or full user content.</p>
+        <p>Desktop account tokens are stored in operating-system secure storage such as Keychain or Credential Manager. The local Bluey account profile keeps non-secret metadata like API URL, workspace, and device identity. Provider API keys stay server-side for managed cloud requests. Logs are designed for debugging and support, not for storing raw secrets or full user content.</p>
 
         <h2>Sharing</h2>
         <p>We share data with infrastructure, payment, email, and AI providers only to operate Bluey. We do not sell customer data. Provider usage is governed by Bluey-managed accounts and server-side policies.</p>

@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use cue_core::app_paths::AppPaths;
 use std::fs;
 use std::path::Path;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// Run the doctor check and print a redacted snapshot to stdout.
 pub fn run() -> Result<()> {
@@ -74,6 +74,9 @@ fn build_doctor_json() -> Result<serde_json::Value> {
 
     let paths = AppPaths::discover()?;
     let account = cue_core::load_account(&paths).ok().flatten();
+    let secure_tokens = account
+        .as_ref()
+        .and_then(|_| load_secure_tokens_for_doctor(paths.clone()));
 
     let mut output = json!({
         "schema_version": 1,
@@ -103,8 +106,11 @@ fn build_doctor_json() -> Result<serde_json::Value> {
                 "workspace_id": a.workspace_id,
                 "device_id_hash": cue_core::account_id_hash_prefix(&a.device_id),
                 "linked_at": a.linked_at,
-                "has_access_token": a.access_token.is_some(),
-                "has_refresh_token": a.refresh_token.is_some(),
+                "token_storage": "os_secure_storage",
+                "has_access_token": secure_tokens.is_some(),
+                "has_refresh_token": secure_tokens
+                    .as_ref()
+                    .is_some_and(|tokens| !tokens.refresh.trim().is_empty()),
             }),
             None => json!({ "logged_in": false }),
         },
@@ -348,6 +354,9 @@ fn file_mode_octal(path: &Path) -> Option<u32> {
 fn print_account_section() -> Result<()> {
     let paths = AppPaths::discover()?;
     let account = cue_core::load_account(&paths).ok().flatten();
+    let secure_tokens = account
+        .as_ref()
+        .and_then(|_| load_secure_tokens_for_doctor(paths.clone()));
     match account {
         Some(account) => {
             println!("  status        : logged in");
@@ -363,12 +372,15 @@ fn print_account_section() -> Result<()> {
                 cue_core::account_id_hash_prefix(&account.device_id)
             );
             println!("  linked_at     : {}", account.linked_at);
-            let has_token = account.access_token.is_some();
+            println!("  token storage : OS secure storage");
+            let has_token = secure_tokens.is_some();
             println!(
                 "  access token  : {}",
                 if has_token { "<present>" } else { "<missing>" }
             );
-            let has_refresh = account.refresh_token.is_some();
+            let has_refresh = secure_tokens
+                .as_ref()
+                .is_some_and(|tokens| !tokens.refresh.trim().is_empty());
             println!(
                 "  refresh token : {}",
                 if has_refresh {
@@ -384,6 +396,15 @@ fn print_account_section() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn load_secure_tokens_for_doctor(paths: AppPaths) -> Option<cue_cloud_client::Tokens> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let store = cue_cloud_client::SecureAccountStore::new(paths);
+        let _ = tx.send(cue_cloud_client::TokenStore::load(&store).ok().flatten());
+    });
+    rx.recv_timeout(Duration::from_millis(750)).ok().flatten()
 }
 
 fn print_permissions_section() -> Result<()> {

@@ -15,11 +15,11 @@ use clap::{Args, Parser, Subcommand};
 use cue_core::app_paths::AppPaths;
 use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
 use cue_core::{
-    load_account, load_settings, new_trace_id, save_account, save_settings, trace_id_from_env,
-    AccountConfig, ActionItem, AiProviderId, AiProviderKind, AiRuntimeStatus, AnswerRequest,
-    AnswerResponse, AudioPipelineStatus, CardKind, CloudSyncStatus, ContextArtifact, CueCard,
-    CueSettings, MeetingRecap, MeetingRecord, MemoryHit, OverlayPosition, ProviderRoute,
-    ProviderSelector, Speaker, BLUEY_TRACE_ID_ENV,
+    load_account, load_settings, new_trace_id, save_settings, trace_id_from_env, AccountConfig,
+    ActionItem, AiProviderId, AiProviderKind, AiRuntimeStatus, AnswerRequest, AnswerResponse,
+    AudioPipelineStatus, CardKind, CloudSyncStatus, ContextArtifact, CueCard, CueSettings,
+    MeetingRecap, MeetingRecord, MemoryHit, OverlayPosition, ProviderRoute, ProviderSelector,
+    Speaker, BLUEY_TRACE_ID_ENV,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -1000,19 +1000,12 @@ enum BlueyOnAuthState {
 }
 
 fn bluey_account_linked(paths: &AppPaths) -> bool {
-    if load_account(paths)
-        .ok()
-        .flatten()
-        .is_some_and(|account| account.token_configured())
-    {
-        return true;
-    }
-
-    legacy_keyring_fallback_enabled()
-        && keyring_has_tokens_with_timeout(std::time::Duration::from_secs(1))
-            .ok()
-            .flatten()
-            .unwrap_or(false)
+    cue_cloud_client::tokens::tokens_available(paths)
+        || (legacy_keyring_fallback_enabled()
+            && keyring_has_tokens_with_timeout(std::time::Duration::from_secs(1))
+                .ok()
+                .flatten()
+                .unwrap_or(false))
 }
 
 fn bluey_signin_url() -> String {
@@ -1095,44 +1088,15 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
         browser_login(&api_url, args.user, args.workspace).await?
     };
 
-    save_account(&paths, &account)?;
-
-    // Bluey stores desktop account tokens in the local account profile by
-    // default. The legacy Keychain bridge is opt-in because macOS can prompt
-    // during normal startup/polling, which is jarring for terminal installs.
-    if legacy_keyring_fallback_enabled() {
-        if let Some(access) = account.access_token.clone() {
-            let refresh = account.refresh_token.clone().unwrap_or_default();
-            let email = account.user_id.clone();
-            let tokens = cue_cloud_client::Tokens {
-                access,
-                refresh,
-                email,
-            };
-            match save_keyring_tokens_with_timeout(tokens) {
-                Ok(Some(())) => {}
-                Ok(None) => {
-                    eprintln!(
-                        "warning: legacy keyring token save timed out\n\
-                         (local account profile still works)"
-                    );
-                }
-                Err(e) => {
-                    eprintln!(
-                        "warning: could not save tokens to legacy keyring: {e}\n\
-                         (local account profile still works)"
-                    );
-                }
-            }
-        }
-    }
+    let has_cloud_tokens = account.token_configured();
+    cue_cloud_client::save_account_profile_and_tokens(&paths, &account)?;
 
     println!(
         "Bluey account linked: {} ({})",
         account.provider, account.api_url
     );
-    if account.token_configured() {
-        println!("Cloud token saved for this user profile.");
+    if has_cloud_tokens {
+        println!("Cloud token saved in OS secure storage for this user profile.");
     } else {
         println!("Local account linked. Run `bluey on` later to sign in when the Bluey cloud endpoint is ready.");
     }
@@ -1142,6 +1106,7 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
 async fn print_account() -> Result<()> {
     let paths = AppPaths::discover()?;
     let account = load_account(&paths)?;
+    let has_stored_tokens = cue_cloud_client::tokens::tokens_available(&paths);
     let cloud = request(DaemonRequest::CloudStatus).await.ok();
 
     match account {
@@ -1153,7 +1118,7 @@ async fn print_account() -> Result<()> {
             println!("Device: {}", account.device_id);
             println!(
                 "Token: {}",
-                if account.token_configured() {
+                if has_stored_tokens {
                     "configured"
                 } else {
                     "not configured"
@@ -1350,26 +1315,6 @@ fn truthy_env(name: &str) -> bool {
             )
         })
         .unwrap_or(false)
-}
-
-fn save_keyring_tokens_with_timeout(tokens: cue_cloud_client::Tokens) -> Result<Option<()>> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let result = (|| -> Result<()> {
-            let client = cue_cloud_client::CloudClient::with_default_keyring()
-                .context("failed to open keyring token store")?;
-            client.save_tokens(tokens)?;
-            Ok(())
-        })();
-        let _ = tx.send(result);
-    });
-    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(result) => result.map(Some),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(anyhow!("keyring token save task ended without returning"))
-        }
-    }
 }
 
 fn keyring_has_tokens_with_timeout(timeout: std::time::Duration) -> Result<Option<bool>> {
@@ -2907,17 +2852,10 @@ fn optional_cloud_client() -> Result<Option<cue_cloud_client::CloudClient>> {
             .map_err(Into::into);
     }
 
-    if let Some(account) = account {
-        if account
-            .access_token
-            .as_deref()
-            .is_some_and(|token| !token.trim().is_empty())
-        {
-            let store = cue_cloud_client::AccountFileStore::new(paths.clone());
-            return cue_cloud_client::CloudClient::new(config, Arc::new(store))
-                .map(Some)
-                .map_err(Into::into);
-        }
+    let store = cue_cloud_client::SecureAccountStore::new(paths.clone());
+    let client = cue_cloud_client::CloudClient::new(config.clone(), Arc::new(store))?;
+    if client.current_tokens().is_some() {
+        return Ok(Some(client));
     }
 
     if legacy_keyring_fallback_enabled() {
@@ -2977,7 +2915,7 @@ async fn bluey_credits_cmd() -> Result<()> {
 
 async fn bluey_logout_cmd() -> Result<()> {
     let paths = AppPaths::discover()?;
-    let account_store = cue_cloud_client::AccountFileStore::new(paths.clone());
+    let account_store = cue_cloud_client::SecureAccountStore::new(paths.clone());
     let had_account_tokens = cue_cloud_client::TokenStore::load(&account_store)?.is_some();
     cue_cloud_client::TokenStore::clear(&account_store)?;
 
