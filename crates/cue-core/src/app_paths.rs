@@ -103,6 +103,7 @@ fn product_or_legacy_dir(base: &std::path::Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
 
     #[cfg(unix)]

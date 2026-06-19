@@ -1,5 +1,5 @@
 use std::env;
-use std::io::{ErrorKind, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{
@@ -7035,7 +7035,7 @@ fn spawn_macos_socket_overlay(
     let stream = loop {
         match listener.accept() {
             Ok((stream, _addr)) => break stream,
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if let Some(status) = child
                     .try_wait()
                     .context("failed to poll overlay child during socket handshake")?

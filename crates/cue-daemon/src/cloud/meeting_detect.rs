@@ -11,6 +11,7 @@
 use std::sync::Arc;
 use tokio::sync::watch;
 
+#[cfg(any(target_os = "macos", test))]
 const KNOWN_MEETING_BUNDLES: &[&str] = &[
     "us.zoom.xos",
     "com.microsoft.teams2",

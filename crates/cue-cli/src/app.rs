@@ -1,5 +1,5 @@
 use std::env;
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -2053,15 +2053,10 @@ fn terminate_pid(pid: u32) -> Result<bool> {
         return Ok(true);
     }
     let error = io::Error::last_os_error();
-    if error.kind() == ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) {
+    if error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) {
         return Ok(false);
     }
     Err(error).with_context(|| format!("failed to terminate stale Bluey daemon pid {pid}"))
-}
-
-#[cfg(not(unix))]
-fn terminate_pid(_pid: u32) -> Result<bool> {
-    Ok(false)
 }
 
 #[cfg(unix)]
@@ -2114,6 +2109,7 @@ fn recorded_daemon_command_matches(command: &str, daemon_bin: Option<&Path>) -> 
     true
 }
 
+#[cfg(unix)]
 fn is_daemon_executable_name(path: &str) -> bool {
     Path::new(path)
         .file_name()

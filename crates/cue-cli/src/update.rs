@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::io::{self, IsTerminal, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
