@@ -30,7 +30,7 @@
 | Claude Code (CLI) | ✅ | ✅ | ✅ | ✅ resume✅ + fork✅ | ✅ | **ALL 5 GREEN 2026-06-19.** Cap 4 now BOTH modes: **TRUE in-place resume by id PROVEN** — `bluey agent attach claude_code --session 0d2907a8…` + `bluey ask` → resumed agent answered *"The event **I reported** was the Obama Presidential Center…"* (its own prior turn, not "NO CONTEXT"); daemon logged `TRUE resume (session/load) committed — true in-place resume` (3 runs, deterministic). Root cause of the old failure was **CWD** (resume resolves `~/.claude/projects/<encoded-cwd>/<id>.jsonl`; the cwd is the path key — NOT an id-space mismatch) + my earlier arm forcing replay so session/load was never attempted. **Fork still works** as the automatic fallback (drive_acp tries session/load → on early error replays context; 5 unit tests cover the adapter) and via the cwd-unusable branch (logged `cwd unusable → FORK`). **Cap 5 PROVEN:** driven Claude called `mcp__perplexity__perplexity_ask` — agent uses its OWN connectors; Bluey never touches secrets (adapter loads user MCP via settingSources; we auto-allow). CAVEATS: (a) resume can mutate/corrupt the original JSONL (anthropics/claude-code#36583) → fork stays the safe default for the meeting-oracle; (b) one Claude-**Desktop** session (`6e59107c`, inner id ≠ filename id, deleted project dir) forked to empty context — pre-existing reader edge case, not the resume path. minor: double-render. |
 | Claude Code (App) | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | desktop-app session store; driven via `claude` |
 | Cursor | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | ACP account-limited in earlier test; fork = context-only |
-| Codex | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | `/fork`, `/side`; SDK resume-by-thread-id |
+| Codex | ✅ | ✅ | ✅ | ⚠️ fork✅ / resume❌ | ✅ | **2nd agent — 5/5 functional, VERIFIED 2026-06-19 (post spine-extraction; Codex is just a registry row, ZERO Codex-specific code).** Caps 1-3: `bluey agent sessions codex` lists 20 real `rollout-*.jsonl` sessions w/ titles + projects (`[…/crates/cue-agent-bridge]`). Handshake: `codex-acp` adapter (`/usr/local/bin/codex-acp`) — `acp_handshake_probe::handshake_codex` passes. **Cap 4 — fork✅, true-resume❌ (documented per-agent diff):** planted `tangerine-falcon-92` in a fresh session, resumed by id → recalled it correctly. BUT the log shows true `session/load` FAILED: `invalid session id: expected …`urn:uuid:`… found `r` at 1` — Codex's adapter wants a UUID, our on-disk id is `rollout-…`. The **fork fallback engaged automatically** (`resume_with_fork_fallback`) and replayed context → correct answer. So Codex genuinely has a different id-space (unlike Claude's cwd-keyed resume); fork is its working continuation mode. **Cap 5 PROVEN:** asked for React docs → Codex invoked `mcp.context7.resolve-library-id` + `mcp.context7.query-docs` → answered `useState`. Agent uses its OWN MCP (context7/supabase from `~/.codex/config.toml`); Bluey never touched secrets. **Display gap (not a cap failure):** `bluey agent connectors codex` shows 0/0 — our connector reader doesn't parse Codex's TOML `[mcp_servers.*]` format (only JSON). Follow-up task spawned. |
 | Gemini | ✅ | ✅ | ✅ | ⬜ | ⬜ | read/name/project VERIFIED 2026-06-18 via `bluey agent sessions gemini`. native ACP; `--resume` takes "latest"/index, NOT uuid. MCP connector: `github` (ready). |
 | Copilot | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | native ACP (`--acp --stdio`); needs Node 24 |
 | Antigravity | ⬜ | ⬜ | ⬜ | 🚫 | ⬜ | GUI IDE, no ACP CLI — sessions read-only via store |
@@ -84,6 +84,20 @@
   the "spine built but not wired into the real chain" gap. → Caps 4 (resume/fork) + 5 (MCP) go
   through ACP, so they can't work via the real ask until the daemon's agent-answer is routed
   through the spine `drive()`. **First Phase-0 build task: wire answer_with_agent → spine.**
+- 2026-06-19 — **✅ 2nd AGENT (Codex) PROVEN 5/5 — the spine-as-rows design validated.**
+  After the spine extraction, lighting up Codex required NO Codex-specific code — it
+  was already a registry row + the `codex-acp` spec. Verified via CLI: read/name/project
+  (20 `rollout-*` sessions), handshake (probe passes), Cap 4 fork (planted+recalled
+  `tangerine-falcon-92`), Cap 5 MCP (`mcp.context7.*` tools invoked → `useState`).
+  **Key finding — Codex true-resume genuinely fails (id-space):** `session/load` rejects
+  our on-disk id with `invalid session id: …`urn:uuid:`… found `r` at 1` (Codex wants a
+  UUID; our id is `rollout-…`). This is the FIRST agent where the id-space mismatch is
+  real (Claude's was a CWD issue, not id-space). The **fork fallback engaged
+  automatically** and produced a correct answer — proving `resume_with_fork_fallback`
+  does its job on an agent whose resume legitimately can't target our id. Codex's working
+  continuation mode is fork. Also surfaced a display-only gap: connector reader doesn't
+  parse Codex's TOML `[mcp_servers.*]` (MCP-use works regardless). Daemon log target for
+  the fork-fallback: `cue_agent_bridge::acp::drive`.
 - 2026-06-19 — **✅ TRUE RESUME INDEPENDENTLY RE-VERIFIED (2nd session, parallel audit).**
   Fresh end-to-end run on a *different* real session (`0241c147…`, project `/Users/ms/Developer/
   Staffing Desk`): pinned via `bluey agent attach claude_code --session <id>`, then `bluey ask`
