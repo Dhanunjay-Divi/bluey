@@ -16,6 +16,8 @@
 
 pub mod compaction;
 pub mod recoverable;
+pub mod tier;
 
 pub use compaction::{maybe_compact, split_for_compaction, summarize_older_prompt, transcript_chars};
 pub use recoverable::is_resume_recoverable_error;
+pub use tier::{apply_tier, continuation_bridge_kind, resolve_session, CONTINUATION_READ_MAX_TURNS};
