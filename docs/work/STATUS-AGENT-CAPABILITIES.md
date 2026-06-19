@@ -37,8 +37,12 @@
 | Copilot — VS Code (`vs_code_fork`) | ✅ | ✅ | ✅ | ✅ fork/replay via Copilot-CLI bridge | ✅ | **GUI-agent #2 — 5/5 VERIFIED 2026-06-19, NO code fix needed (runtime-pin already handled).** The in-editor GitHub Copilot Chat surface (read_only — no CLI of its own). Caps 1-3: 8 real VS Code chat sessions from `~/Library/Application Support/Code/User/workspaceStorage/<hash>/chatSessions/*.json` (`JsonFiles` reader) w/ real `customTitle`s + projects ("Automated Job Posting System Overview" `[/…/Automated posting]`, etc.). **Cap 4 = cross-surface bridge (its correct mode):** registry `continuation_via: Copilot` → `continuation_bridge_kind` returns Copilot → the VS Code transcript is replayed as context through the **Copilot CLI** (same GitHub account). PROVEN: attached `8f2616a0` → recalled real content (*"event-driven email + scheduled-report ingestion pipeline, Outlook webhook → n8n → Gemini/COLA…"*); log shows the bridge spawned `copilot` AND `runtime_resolve` pinned **Node 24** (`found_version 24.13.0` — the one risk the investigation flagged is handled, because the bridged drive goes through the CLI driver's runtime resolution). **Cap 5:** through the bridge, listed its MCP tools (`github-mcp-server-*`). Note: the bridged Copilot CLI uses its OWN `~/.copilot/mcp-config.json`, not VS Code's `mcp.json` (documented cross-surface seam; MCP-use proven regardless). Connector display reads VS Code's `mcp.json` (playwright ready, context7 needs-reauth = 1/2). |
 | Aider | ⬜ | ⬜ | ⬜ | ⬜ | ⬜ | programmatic surface unconfirmed |
 
-> Surfaces: the matrix above tracks the **CLI/spine** (what we can verify). GUI rendering of
-> each is tracked separately below once Phase 3 starts.
+> Surfaces: the matrix rows ARE per-surface (e.g. `Claude Code (CLI)` and `Claude Code (App)`
+> are separate rows = separate surfaces). See the **SURFACE MAP** below for which agents have
+> multiple surfaces (Claude: CLI/App/Agent; Copilot: CLI/VS Code) vs a single one (Codex,
+> Cursor, Gemini, Antigravity). All rows here are **backend/spine-verified via the CLI harness**
+> (`bluey agent`/`ask` + log-grep); GUI *rendering* of these in the overlay is the separate
+> user-verified Phase-3 table above.
 
 ### GUI rendering (Phase 3 — USER-verified only)
 | Capability | Renders in overlay? | Confirmed by user? | Notes |
@@ -46,6 +50,33 @@
 | Session list (name + project) | ⬜ | ⬜ | |
 | Ask → answer streams/renders | ⬜ | ⬜ | |
 | Pick session → resume/fork visibly | ⬜ | ⬜ | |
+
+---
+
+## SURFACE MAP — how many surfaces each agent has, and how each is SUPPOSED to work
+> **Read this FIRST before "testing the GUI/app version" of an agent.** The confusion
+> that caused re-loops: "CLI vs GUI" is a real distinction for SOME agents (separate
+> discovery rows + separate stores) but NOT others (one surface, or one row reading the
+> IDE store). This table is the source of truth for *which* surfaces exist and what each
+> reads/drives. A "surface" = a distinct `KindTag` registry row OR a distinct on-disk store.
+
+| Agent family | Surfaces (distinct rows) | Reads sessions from | Drives (answers) via | Continuation mechanism | Covered? |
+|---|---|---|---|---|---|
+| **Claude** | **3 separate rows**: `claude_code` (CLI), `claude_code_app` (desktop App), `claude_code_agent` (App agent-mode) | CLI: `~/.claude/projects/<enc-cwd>/<id>.jsonl`. App/Agent: `~/Library/Application Support/Claude/` index → follows `cliSessionId` into the SAME CLI JSONL files | All three: `claude-agent-acp` adapter (same engine) | NativeResume — true `session/load` by `(id, cwd)`; fork fallback | CLI ✅, App ✅, Agent ⬜ (0 sessions) |
+| **Codex** | **1 surface only** — `codex`. The VS Code Codex extension and the CLI share `~/.codex`; there is NO separate Codex-IDE row/store. | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | `codex-acp` adapter | NativeResume — true `session/load` by the **inner `session_meta.payload.id` UUID** (NOT the rollout filename) | ✅ (the only surface) |
+| **Cursor** | **1 row** (`cursor`) reading the IDE store. NOTE: the `cursor-agent` CLI ALSO has its own store (`~/.cursor/chats/<ws>/<uuid>/`) that Bluey does **NOT** read — but that's the CLI's *own* sessions, a different id-space. | IDE composers: `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` (`cursorDiskKV` table) | `cursor-agent acp` (ACP) / `cursor-agent -p` (CLI) | **Replay/fork** — its composer id is a SQLite db key, NOT an ACP handle; `session/load` is a known-broken Cursor bug. Replay the transcript. | ✅ (IDE store; the CLI's own `~/.cursor/chats` store is intentionally NOT surfaced) |
+| **Gemini** | **1 surface** — `gemini` | `~/.gemini/tmp/<token>/chats/*.jsonl` | `gemini --acp` (API-key tier) | **Replay/fork** — `--resume` is latest/index, not by-uuid | ✅ |
+| **Antigravity** | **1 real row** (`antigravity`). The `Antigravity` / `Antigravity IDE` read_only rows are DUPLICATE footprints of the same install (App-bundle detected separately) — NOT separate surfaces. | `~/.gemini/antigravity/` (index `agyhub_summaries_proto.pb` + `conversations/<uuid>` + `brain/<uuid>`). The IDE App-Support `state.vscdb` holds only UI state, no transcripts. | `agy -p` / `agy --conversation <uuid>` (its OWN tier — NOT `gemini`, which dropped the Pro tier 2026-06-18) | Replay tier in the spine; `agy --conversation <uuid>` resumes natively at the CLI level (exposed UUID IS agy's key) | ✅ (`antigravity` row; the IDE/dup rows fixed to not break — see `cursorDiskKV` fix) |
+| **GitHub Copilot** | **2 separate surfaces**: `copilot` (the standalone CLI) AND `vs_code_fork` (the in-editor VS Code Copilot Chat) — DIFFERENT stores, same GitHub account | CLI: `~/.copilot/session-state/<UUID>/events.jsonl`. VS Code: `~/Library/Application Support/Code/User/workspaceStorage/<hash>/chatSessions/*.json` (`JsonFiles`) | CLI: `copilot --acp` (true resume). VS Code: NO CLI → **bridges to the `copilot` CLI** (`continuation_via: Copilot`) | CLI: NativeResume (dir-UUID). VS Code: replay the transcript THROUGH the Copilot CLI bridge | CLI ✅, VS Code ✅ |
+| **VS Code Insiders** | footprint row `Code - Insiders` (read_only) — a VS Code-family fork, like `vs_code_fork` but the Insiders channel | `~/Library/Application Support/Code - Insiders/User/workspaceStorage/.../chatSessions/*.json` (`JsonFiles`, after the cursorDiskKV-shape fix) | (read_only; would bridge like vs_code_fork) | replay | reads 5 sessions after the fix; not run through the full 5-cap harness |
+| **Aider** | unconfirmed | unconfirmed | unconfirmed | unconfirmed | ⬜ |
+
+**The rule that prevents re-looping:** before "doing the GUI version" of agent X, check this table.
+- If X has **multiple rows** (Claude: CLI+App+Agent; Copilot: CLI+VS Code) → each row is a real
+  separate surface that needs its own 5-cap pass (different store, maybe different drive/continuation).
+- If X has **one row / one store** (Codex, Cursor, Gemini, Antigravity) → there is no separate
+  "GUI version" to test; the single surface is already it. Cursor's row reads the IDE store; the
+  `cursor-agent` CLI's own `~/.cursor/chats` store is a deliberate non-target (different id-space).
 
 ---
 
