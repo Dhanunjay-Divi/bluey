@@ -108,9 +108,10 @@ prod is the kind of thing that ships outages.
 - `latest.json` has a detached Ed25519 signature at `latest.json.sig`.
   The CLI build embeds the matching raw public key via
   `BLUEY_UPDATE_PUBKEY=<base64 raw 32-byte ed25519 public key>`. A
-  signed manifest pins both the platform artifact SHA256 and
-  `install.sh` SHA256; unsigned manifests are notify-only and cannot
-  install unless `BLUEY_UPDATE_ALLOW_UNSIGNED=1` is set for local testing.
+  signed manifest pins both the platform artifact SHA256 and the platform
+  installer SHA256 (`install.sh` on macOS/Linux, `install.ps1` on Windows);
+  unsigned manifests are notify-only and cannot install unless
+  `BLUEY_UPDATE_ALLOW_UNSIGNED=1` is set for local testing.
 - If any check disagrees, stop. Do not promote. Produce a new release id
   and run local preprod again.
 

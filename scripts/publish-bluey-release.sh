@@ -29,12 +29,14 @@ PUBLISH_PATH="${PUBLISH_PATH:-/var/www/bluey}"
 SIGNING_KEY_FILE="${BLUEY_RELEASE_SIGNING_KEY_FILE:-}"
 
 mkdir -p "$STAGE_DIR/releases/$VERSION_TAG"
-rm -f "$STAGE_DIR/latest.json" "$STAGE_DIR/latest.json.sig" "$STAGE_DIR/install.sh"
+rm -f "$STAGE_DIR/latest.json" "$STAGE_DIR/latest.json.sig" "$STAGE_DIR/install.sh" "$STAGE_DIR/install.ps1"
 rm -f "$STAGE_DIR/releases/$VERSION_TAG"/bluey-*.tar.gz
 rm -f "$STAGE_DIR/releases/$VERSION_TAG"/SHA256SUMS.txt
 
 cp ops/install/install.sh "$STAGE_DIR/install.sh"
 chmod 0644 "$STAGE_DIR/install.sh"
+cp ops/install/install.ps1 "$STAGE_DIR/install.ps1"
+chmod 0644 "$STAGE_DIR/install.ps1"
 
 artifacts=()
 for platform in darwin-arm64 darwin-universal darwin-x86_64 windows-x86_64 linux-x86_64; do
@@ -87,9 +89,12 @@ version, version_tag, stage_dir, public_base, *pairs = sys.argv[1:]
 platforms = {}
 release_dir = os.path.join(stage_dir, "releases", version_tag)
 install_path = os.path.join(stage_dir, "install.sh")
+windows_install_path = os.path.join(stage_dir, "install.ps1")
 
 with open(install_path, "rb") as fh:
     install_digest = hashlib.sha256(fh.read()).hexdigest()
+with open(windows_install_path, "rb") as fh:
+    windows_install_digest = hashlib.sha256(fh.read()).hexdigest()
 
 for pair in pairs:
     platform, filename = pair.split(":", 1)
@@ -110,6 +115,11 @@ manifest = {
         "url": "install.sh",
         "sha256": install_digest,
         "size_bytes": os.path.getsize(install_path),
+    },
+    "windows_install": {
+        "url": "install.ps1",
+        "sha256": windows_install_digest,
+        "size_bytes": os.path.getsize(windows_install_path),
     },
     "platforms": dict(sorted(platforms.items())),
     "release_notes_url": f"releases/{version_tag}/RELEASE.md",
@@ -150,6 +160,7 @@ if [ "${PUBLISH_DO:-0}" = "1" ]; then
     ssh "$PUBLISH_HOST" "mkdir -p '$PUBLISH_PATH/releases/$VERSION_TAG'"
     root_files=(
         "$STAGE_DIR/install.sh"
+        "$STAGE_DIR/install.ps1"
         "$STAGE_DIR/latest.json"
     )
     if [ -f "$STAGE_DIR/latest.json.sig" ]; then

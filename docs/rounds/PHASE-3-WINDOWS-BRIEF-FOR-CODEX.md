@@ -121,19 +121,21 @@ transcript-aware answer.
    - `bin\bluey-daemon.exe`
    - `bin\bluey-overlay.exe`
    - `bin\bluey-whisper.exe` (with whisper.cpp statically linked)
-2. PowerShell installer `scripts\install.ps1`:
-   - Extracts to `%LOCALAPPDATA%\Programs\bluey\<version>\`.
-   - Adds `%LOCALAPPDATA%\Programs\bluey\bin` to user PATH (without sudo).
-   - Mirrors the macOS `scripts/install.sh` behavior including `BLUEY_ARCHIVE`
-     opt-in for local archive validation and SHA256SUMS.txt verification.
+2. PowerShell installer `ops\install\install.ps1`:
+   - Extracts to `%LOCALAPPDATA%\Bluey\bin`.
+   - Adds `%LOCALAPPDATA%\Bluey\bin` to user PATH (without sudo).
+   - Mirrors the macOS `ops/install/install.sh` behavior with release-manifest
+     discovery and SHA256 verification.
 3. Daemon startup: on Windows the daemon should self-register as a Task
    Scheduler entry OR rely on the user manually running `bluey on`. Pick the
    latter for v0.1.x simplicity.
 
 **Acceptance:**
 ```pwsh
-$env:BLUEY_ARCHIVE = "dist\bluey-0.1.x-windows-x86_64.zip"
-.\scripts\install.ps1
+$env:BLUEY_VERSION = "0.1.x"
+$env:BLUEY_ARTIFACT_URL = "https://bluey.sh/releases/v0.1.x/bluey-0.1.x-windows-x86_64.zip"
+$env:BLUEY_ARTIFACT_SHA256 = "<sha256>"
+.\ops\install\install.ps1
 bluey on
 # pill appears
 bluey off
@@ -147,7 +149,7 @@ Windows branch looking at `native/windows/cue-overlay/build/bluey-overlay.exe`
 mode. Same shape exists for `audio/system_capture.rs` and `stt/whisper/mod.rs`.
 
 **Action:** verify the install path discovery works after `install.ps1`
-extracts to `%LOCALAPPDATA%\Programs\bluey\<version>\bin`. The daemon's
+extracts to `%LOCALAPPDATA%\Bluey\bin`. The daemon's
 `current_exe()` plus sibling lookup should resolve all helpers.
 
 ### W6 — Process masquerading (deferred from W1.0)
@@ -205,7 +207,7 @@ cargo clippy --all-targets -- -D warnings
 cargo build --target x86_64-pc-windows-msvc --release
 cargo test --target x86_64-pc-windows-msvc
 make package-windows-x86_64
-.\scripts\install.ps1 -BlueyArchive .\dist\bluey-0.1.x-windows-x86_64.zip
+.\ops\install\install.ps1
 bluey on; bluey off
 ```
 

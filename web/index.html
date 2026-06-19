@@ -358,7 +358,7 @@
           <span class="download-card-action">Show terminal steps</span>
         </article>
 
-        <article class="download-card disabled" aria-disabled="true">
+        <article class="download-card" data-platform-card="windows" role="button" tabindex="0" aria-label="Show Windows PowerShell install instructions" aria-controls="windowsInstallInstructions" aria-expanded="false">
           <div class="download-card-head">
             <div class="platform-name">
               <span class="os-icon" aria-hidden="true">
@@ -368,10 +368,10 @@
               </span>
               <span>Windows</span>
             </div>
-            <span class="availability soon">Roadmap</span>
+            <span class="availability">Ready</span>
           </div>
-          <p>Windows is next. We are polishing the desktop helper before opening the installer.</p>
-          <span class="download-card-action soon">Coming soon</span>
+          <p>Windows 10/11 x64 installs from PowerShell. Bluey uses the same account, credits, and cloud answers as macOS.</p>
+          <span class="download-card-action">Show PowerShell steps</span>
         </article>
 
         <article class="download-card disabled" aria-disabled="true">
@@ -419,6 +419,34 @@
           </div>
         </div>
         <div class="instruction-help">If Bluey needs you to sign in, it opens the account page for you.</div>
+      </section>
+
+      <section class="platform-instructions" id="windowsInstallInstructions" data-platform-instructions="windows" hidden>
+        <h2>Windows setup</h2>
+        <p>Install once from PowerShell, then start Bluey with one command.</p>
+        <div class="instruction-steps">
+          <div class="instruction-step">
+            <span class="instruction-num">1</span>
+            <div class="instruction-body">
+              <p>Open <strong>PowerShell</strong> and run:</p>
+              <div class="install-command">
+                <code>irm https://bluey.sh/install.ps1 | iex</code>
+                <button class="copy-command" type="button" data-copy="irm https://bluey.sh/install.ps1 | iex">Copy</button>
+              </div>
+            </div>
+          </div>
+          <div class="instruction-step">
+            <span class="instruction-num">2</span>
+            <div class="instruction-body">
+              <p>Then start Bluey:</p>
+              <div class="install-command">
+                <code>bluey on</code>
+                <button class="copy-command" type="button" data-copy="bluey on">Copy</button>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="instruction-help">Bluey installs per-user under <code>%LOCALAPPDATA%\Bluey</code> and checks signed updates before starting.</div>
       </section>
 
       <div class="download-note">

@@ -41,11 +41,14 @@ Existing Windows pieces:
 
 Known gaps:
 
-- No production `install.ps1` yet.
-- No signed/checksummed hosted Windows artifact yet.
+- Production `install.ps1` exists under `ops/install/install.ps1` and is
+  published to `https://bluey.sh/install.ps1`.
+- The signed release manifest supports a Windows-specific installer hash via
+  `windows_install` and a `windows-x86_64` artifact entry.
 - Makefile Windows packaging currently does not include all native helpers.
 - Release matrix is not enabled for Windows release artifacts.
-- Web download copy correctly still says Windows is coming soon.
+- Web download copy exposes the Windows PowerShell path:
+  `irm https://bluey.sh/install.ps1 | iex`.
 - The Windows whisper helper is a stub; release behavior must either use
   managed STT only or document a no-local-whisper waiver.
 - Clean Windows 10/11 paid flow has not passed.
@@ -68,10 +71,9 @@ powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
   `bin/bluey-audio.exe`.
 - Either ship a real `cue-whisper.exe` or explicitly waive local whisper for
   Windows and route captions through managed Bluey STT only.
-- Add `scripts/install.ps1` with:
-  per-user install under `%LOCALAPPDATA%\Programs\bluey`, checksum
-  verification, PATH/shim setup, reinstall/upgrade behavior, and uninstall
-  notes.
+- Keep `ops/install/install.ps1` passing on a clean Windows 10/11 account:
+  per-user install under `%LOCALAPPDATA%\Bluey`, checksum verification,
+  PATH setup, reinstall/upgrade behavior, and unsigned-build guidance.
 - Publish SHA256 and signed update manifest entries for the Windows artifact.
 - `bluey on` starts daemon and overlay without dev flags.
 - The first visible state is the compact pill, not a large expanded window.

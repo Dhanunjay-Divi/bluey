@@ -22,6 +22,7 @@ rsync -av --delete \
     --exclude '/backups/***' \
     --exclude '/releases/***' \
     --exclude '/install.sh' \
+    --exclude '/install.ps1' \
     --exclude '/latest.json' \
     --exclude '/latest.json.sig' \
     --exclude 'index.html.bak-*' \
@@ -38,5 +39,6 @@ echo "[manual-deploy] live checks"
 curl -fsS "https://bluey.sh/health" >/dev/null
 curl -fsS "https://bluey.sh/latest.json" >/dev/null
 curl -fsS "https://bluey.sh/install.sh" >/dev/null
+curl -fsS "https://bluey.sh/install.ps1" >/dev/null
 
 echo "[manual-deploy] done"

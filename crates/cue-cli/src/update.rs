@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 
 const DEFAULT_MANIFEST_URL: &str = "https://bluey.sh/latest.json";
 const DEFAULT_INSTALL_PATH: &str = "/install.sh";
+const DEFAULT_WINDOWS_INSTALL_PATH: &str = "/install.ps1";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Deserialize)]
@@ -26,6 +27,8 @@ struct ReleaseManifest {
     version: String,
     #[serde(default)]
     install: Option<InstallScriptArtifact>,
+    #[serde(default)]
+    windows_install: Option<InstallScriptArtifact>,
     #[serde(default)]
     platforms: HashMap<String, PlatformArtifact>,
 }
@@ -191,14 +194,14 @@ async fn check_for_update() -> Result<Option<UpdatePlan>> {
     }
 
     let install_override = env::var("BLUEY_UPDATE_INSTALL_URL").ok();
-    let install_from_manifest = manifest.install.as_ref();
+    let install_from_manifest = select_install_artifact(&manifest);
     let install_url = if let Some(url) = install_override.as_deref() {
         url.to_string()
     } else if let Some(install) = install_from_manifest {
         resolve_artifact_url(&manifest_url, &install.url)
             .with_context(|| format!("invalid installer URL: {}", install.url))?
     } else {
-        format!("{manifest_origin}{DEFAULT_INSTALL_PATH}")
+        format!("{manifest_origin}{}", default_install_path())
     };
     let install_sha256 = install_override
         .is_none()
@@ -361,7 +364,7 @@ fn ensure_update_installable(plan: &UpdatePlan) -> Result<()> {
         bail!("refusing to install update without a verified release manifest");
     }
     if plan.install_sha256.is_none() && !env_flag("BLUEY_UPDATE_ALLOW_UNSIGNED") {
-        bail!("refusing to install update because latest.json does not pin install.sh sha256");
+        bail!("refusing to install update because latest.json does not pin installer sha256");
     }
     if plan.artifact_sha256.is_none() && !env_flag("BLUEY_UPDATE_ALLOW_UNSIGNED") {
         bail!("refusing to install update because latest.json does not pin artifact sha256");
@@ -388,11 +391,12 @@ async fn install_update(plan: &UpdatePlan) -> Result<()> {
     best_effort_stop_running_bluey();
 
     println!("Updating Bluey to {}...", plan.version);
-    let status = Command::new("bash")
-        .arg(&script)
+    let mut command = installer_command(&script);
+    let status = command
         .env("BLUEY_VERSION", &plan.version)
         .env("BLUEY_DOWNLOAD_HOST", &plan.manifest_origin)
         .env("BLUEY_ARTIFACT_URL", &plan.artifact_url)
+        .env("BLUEY_INSTALL_CONTEXT", "update")
         .env_remove("BLUEY_SKIP_UPDATE")
         .env_remove("BLUEY_UPDATE_FORCE")
         .env_remove("BLUEY_SKIP_CHECKSUM")
@@ -437,18 +441,36 @@ async fn download_install_script(url: &str, expected_sha256: Option<&str>) -> Re
         bail!("installer sha256 missing from signed update manifest");
     }
 
-    let text = std::str::from_utf8(&bytes).context("installer was not UTF-8 shell text")?;
-    if !text.starts_with("#!/") {
-        bail!("installer response did not look like a shell script");
-    }
+    let _ = std::str::from_utf8(&bytes).context("installer was not UTF-8 text")?;
 
     let path = env::temp_dir().join(format!(
-        "bluey-install-{}-{}.sh",
+        "bluey-install-{}-{}.{}",
         std::process::id(),
-        unix_timestamp_millis()
+        unix_timestamp_millis(),
+        installer_extension()
     ));
     fs::write(&path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(path)
+}
+
+fn installer_command(script: &Path) -> Command {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("powershell.exe");
+        command
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(script);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        let mut command = Command::new("bash");
+        command.arg(script);
+        command
+    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -507,6 +529,33 @@ fn select_artifact(manifest: &ReleaseManifest) -> Option<(String, PlatformArtifa
         }
     }
     None
+}
+
+fn select_install_artifact(manifest: &ReleaseManifest) -> Option<&InstallScriptArtifact> {
+    if cfg!(windows) {
+        manifest
+            .windows_install
+            .as_ref()
+            .or(manifest.install.as_ref())
+    } else {
+        manifest.install.as_ref()
+    }
+}
+
+fn default_install_path() -> &'static str {
+    if cfg!(windows) {
+        DEFAULT_WINDOWS_INSTALL_PATH
+    } else {
+        DEFAULT_INSTALL_PATH
+    }
+}
+
+fn installer_extension() -> &'static str {
+    if cfg!(windows) {
+        "ps1"
+    } else {
+        "sh"
+    }
 }
 
 fn current_platform() -> String {
@@ -685,6 +734,7 @@ mod tests {
         let mut manifest = ReleaseManifest {
             version: "9.9.9".to_string(),
             install: None,
+            windows_install: None,
             platforms: HashMap::new(),
         };
         manifest.platforms.insert(
@@ -699,6 +749,22 @@ mod tests {
             let (platform, _) = select_artifact(&manifest).unwrap();
             assert_eq!(platform, "darwin-universal");
         }
+    }
+
+    #[test]
+    fn parses_platform_specific_windows_installer_metadata() {
+        let manifest: ReleaseManifest = serde_json::from_str(
+            r#"{
+              "version": "9.9.9",
+              "install": {"url": "install.sh", "sha256": "unix"},
+              "windows_install": {"url": "install.ps1", "sha256": "win"},
+              "platforms": {}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(manifest.install.unwrap().url, "install.sh");
+        assert_eq!(manifest.windows_install.unwrap().sha256.unwrap(), "win");
     }
 
     #[test]

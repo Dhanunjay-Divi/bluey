@@ -170,7 +170,8 @@ cargo build --release -p cue-cli --bin bluey
 ```
 
 `latest.json.sig` is a detached signature over the exact bytes of
-`latest.json`. The signed manifest also pins `install.sh` and archive
+`latest.json`. The signed manifest also pins the platform installer
+(`install.sh` on macOS/Linux, `install.ps1` on Windows) and archive
 SHA256 values. Do not publish with `BLUEY_RELEASE_ALLOW_UNSIGNED=1`
 outside local release testing.
 
