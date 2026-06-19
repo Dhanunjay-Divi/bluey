@@ -17,9 +17,9 @@ use crate::{
     error::{Error, Result},
     tokens::{TokenStore, Tokens},
     types::{
-        AuthResponse, CloudSessionBundle, InsufficientBalanceBody, RagQueryRequest,
-        RagQueryResponse, SessionListResponse, SttSessionRequest, SttSessionResponse,
-        SyncBatchRequest, SyncBatchResponse,
+        AuthResponse, CloudSessionBundle, EmbedRequest, EmbedResponse, InsufficientBalanceBody,
+        RagQueryRequest, RagQueryResponse, SessionListResponse, SttSessionRequest,
+        SttSessionResponse, SyncBatchRequest, SyncBatchResponse,
     },
 };
 
@@ -234,6 +234,10 @@ impl CloudClient {
 
     pub async fn query_rag(&self, request: &RagQueryRequest) -> Result<RagQueryResponse> {
         self.auth_post("/rag/query", request).await
+    }
+
+    pub async fn embed(&self, request: &EmbedRequest) -> Result<EmbedResponse> {
+        self.auth_post("/router/embed", request).await
     }
 
     pub async fn create_stt_session(

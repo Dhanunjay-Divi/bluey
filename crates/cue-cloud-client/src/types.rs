@@ -119,16 +119,18 @@ pub struct CompleteResponse {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EmbedRequest {
-    pub text: String,
+    pub request_id: String,
+    pub input: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct EmbedResponse {
-    pub embedding: Vec<f32>,
+    pub vector: Vec<f32>,
     pub provider: String,
     pub model: String,
+    pub input_tokens: i64,
     pub cost_cents: i64,
     pub balance_cents_after: i64,
 }
