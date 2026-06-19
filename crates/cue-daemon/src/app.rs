@@ -1121,6 +1121,7 @@ async fn handle_request_inner(
                 stop_balance_polling(daemon).await;
             } else {
                 maybe_spawn_balance_polling(daemon).await;
+                daemon.rag_indexer.refresh_from_paths(&daemon.paths);
             }
             let _ = refresh_overlay_balance(daemon, Some(trace_id)).await;
             Ok(DaemonResponse::CloudStatus { status })

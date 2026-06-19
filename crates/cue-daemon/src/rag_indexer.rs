@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -63,27 +63,47 @@ impl EmbeddingProvider for ManagedBlueyEmbedder {
 
 #[derive(Clone)]
 pub(crate) struct RagIndexCoordinator {
-    pipeline: Option<Arc<crate::db::rag::RagPipeline>>,
+    pipeline: Arc<RwLock<Option<Arc<crate::db::rag::RagPipeline>>>>,
     session_lock: Arc<Mutex<()>>,
 }
 
 impl RagIndexCoordinator {
     pub(crate) fn from_paths(paths: &AppPaths) -> Self {
         Self {
-            pipeline: init_rag_pipeline(paths),
+            pipeline: Arc::new(RwLock::new(init_rag_pipeline(paths))),
             session_lock: Arc::new(Mutex::new(())),
         }
     }
 
+    pub(crate) fn refresh_from_paths(&self, paths: &AppPaths) -> bool {
+        if self.pipeline().is_some() {
+            return false;
+        }
+
+        let Some(pipeline) = init_rag_pipeline(paths) else {
+            return false;
+        };
+
+        let Ok(mut guard) = self.pipeline.write() else {
+            warn!("failed to acquire RAG pipeline lock for refresh");
+            return false;
+        };
+        if guard.is_some() {
+            return false;
+        }
+        *guard = Some(pipeline);
+        info!("RAG pipeline enabled after Bluey account link");
+        true
+    }
+
     pub(crate) fn index_transcript(&self, store: MeetingStore, session_id: String, text: String) {
-        let Some(rag) = self.pipeline.as_ref() else {
+        let Some(rag) = self.pipeline() else {
             return;
         };
         if text.trim().is_empty() {
             return;
         }
 
-        let rag = Arc::clone(rag);
         let session_lock = Arc::clone(&self.session_lock);
         tokio::spawn(async move {
             let _guard = session_lock.lock().await;
@@ -100,14 +120,13 @@ impl RagIndexCoordinator {
         session_id: String,
         artifacts: Vec<ContextArtifact>,
     ) {
-        let Some(rag) = self.pipeline.as_ref() else {
+        let Some(rag) = self.pipeline() else {
             return;
         };
         if artifacts.is_empty() {
             return;
         }
 
-        let rag = Arc::clone(rag);
         let session_lock = Arc::clone(&self.session_lock);
         tokio::spawn(async move {
             let _guard = session_lock.lock().await;
@@ -121,11 +140,10 @@ impl RagIndexCoordinator {
     }
 
     pub(crate) fn reindex_meeting(&self, store: MeetingStore, meeting: MeetingRecord) {
-        let Some(rag) = self.pipeline.as_ref() else {
+        let Some(rag) = self.pipeline() else {
             return;
         };
 
-        let rag = Arc::clone(rag);
         let session_lock = Arc::clone(&self.session_lock);
         tokio::spawn(async move {
             rebuild_meeting_rag_index(rag, store, session_lock, meeting, "session reindex").await
@@ -133,11 +151,10 @@ impl RagIndexCoordinator {
     }
 
     pub(crate) fn delete_session(&self, session_id: String) {
-        let Some(rag) = self.pipeline.as_ref() else {
+        let Some(rag) = self.pipeline() else {
             return;
         };
 
-        let rag = Arc::clone(rag);
         let session_lock = Arc::clone(&self.session_lock);
         tokio::spawn(async move {
             let _guard = session_lock.lock().await;
@@ -153,10 +170,20 @@ impl RagIndexCoordinator {
         limit: usize,
         session_id: Option<&str>,
     ) -> Result<Vec<cue_rag::RagHit>> {
-        let Some(rag) = self.pipeline.as_ref() else {
+        let Some(rag) = self.pipeline() else {
             return Ok(Vec::new());
         };
         rag.query(query_text, limit, session_id).await
+    }
+
+    fn pipeline(&self) -> Option<Arc<crate::db::rag::RagPipeline>> {
+        match self.pipeline.read() {
+            Ok(guard) => guard.clone(),
+            Err(_) => {
+                warn!("failed to acquire RAG pipeline lock");
+                None
+            }
+        }
     }
 }
 
@@ -406,5 +433,26 @@ mod tests {
             bounded_embed_input(&long).chars().count(),
             MAX_MANAGED_EMBED_INPUT_CHARS
         );
+    }
+
+    #[test]
+    fn coordinator_refreshes_after_account_link() {
+        let paths = test_paths();
+        paths.ensure().unwrap();
+        let coordinator = RagIndexCoordinator::from_paths(&paths);
+        assert!(coordinator.pipeline().is_none());
+        assert!(!coordinator.refresh_from_paths(&paths));
+
+        let mut account = AccountConfig::local();
+        account.provider = "bluey".to_string();
+        account.api_url = "http://127.0.0.1:8787".to_string();
+        account.user_id = "tester@bluey.sh".to_string();
+        account.access_token = Some("desktop-access-token".to_string());
+        account.refresh_token = Some("desktop-refresh-token".to_string());
+        save_account(&paths, &account).unwrap();
+
+        assert!(coordinator.refresh_from_paths(&paths));
+        assert!(coordinator.pipeline().is_some());
+        assert!(!coordinator.refresh_from_paths(&paths));
     }
 }

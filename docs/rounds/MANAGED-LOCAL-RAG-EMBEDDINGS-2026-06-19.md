@@ -44,7 +44,12 @@ is how vectors are created:
   - Added `ManagedBlueyEmbedder`, implementing `cue_rag::EmbeddingProvider`.
   - RAG initialization now prefers managed Bluey embeddings when an account is
     linked.
+  - The coordinator can refresh after account linking, so users do not need to
+    restart Bluey to enable managed local RAG.
   - Direct OpenAI embeddings remain an explicit developer fallback only.
+- `crates/cue-daemon/src/app.rs`
+  - Refreshes the RAG pipeline when `CloudStatus` observes a newly linked
+    account.
 
 ## Operational Behavior
 
@@ -59,6 +64,8 @@ Customer install:
 Unlinked install:
 
 - RAG is disabled until the user signs in.
+- After sign-in, the daemon receives `CloudStatus` and initializes managed RAG
+  in-place.
 - The overlay can still run local capture/session UI without provider keys.
 
 Developer fallback:
@@ -91,8 +98,5 @@ bluey on
 ## Areas To Review
 
 - Whether the 8,192 character managed embed input cap should be lower or higher.
-- Whether local RAG should auto-reinitialize after a user signs in without
-  restarting the daemon. Current behavior initializes on daemon start, so a
-  fresh `bluey on` after login is the safest path.
 - Whether the server should expose a batch embed endpoint later to reduce
   per-chunk HTTP overhead for large documents.
