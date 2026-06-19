@@ -22,12 +22,16 @@ the desktop contract.
 - 100 paid users total.
 - Expected active concurrency: 5-15 users.
 - Burst concurrency to plan for: 20-30 active sessions.
-- Supported client for alpha: macOS terminal-installed Bluey.
+- Supported client for the first paid alpha: macOS terminal-installed Bluey,
+  unless `docs/deploy/WINDOWS-PAID-ALPHA-READINESS.md` passes its P0 gate on a
+  clean Windows 10/11 machine.
 - Billing: manual Square credit reloads.
 - Provider keys: server-side only. No customer provider keys in release builds.
 - User laptop installs only the Bluey desktop client, helper binaries, local
   cache, and local session/RAG files. Users do not install Redis, Postgres,
   Docker, pgvector, or any cloud infrastructure.
+- Windows, when enabled, uses the same cloud and billing architecture. It does
+  not get a separate backend.
 
 ## First 100 Architecture
 
@@ -69,6 +73,7 @@ model choices, rate/capacity policy, and billing stay controlled.
 - Multi-region API servers.
 - Customer BYOK or local LLM release mode.
 - A separate `api.bluey.sh` host.
+- Windows public support before the Windows paid-alpha readiness gate passes.
 
 These are upgrade steps, not launch blockers.
 
@@ -169,4 +174,5 @@ Then run the full user path in `docs/deploy/PAID-ALPHA-SMOKE.md`.
 - Configure and verify the off-host backup destination.
 - Confirm support/refund/dispute mailbox ownership.
 - Run the clean-Mac paid-alpha smoke with real credits.
-
+- If Windows is included in the first 100 users, run the Windows paid-alpha gate
+  in `docs/deploy/WINDOWS-PAID-ALPHA-READINESS.md`.

@@ -20,6 +20,7 @@ operating plan.
 - [ ] Off-host backups configured and one restore/checksum verification passed
 - [ ] Support/refund/dispute owner assigned and mailbox monitored
 - [ ] No release artifact exposes provider keys, BYOK/customer-key paths, local LLM release mode, mock transcript mode, or dev capture flags
+- [ ] If Windows users are invited, `docs/deploy/WINDOWS-PAID-ALPHA-READINESS.md` P0 is fully passed on a clean Windows 10/11 machine
 
 ## Code-complete (already shipped on `feat/phase-3-round-12`)
 
@@ -199,6 +200,22 @@ available later, the install path can be upgraded transparently
 without breaking existing customers (the bundle id stays the same).
 
 - [ ] (optional) Migrate to signed bundle via Apple Developer Program when convenient — non-blocking for v0.2 alpha
+
+### Windows paid-alpha track
+
+Windows is a parallel launch track. It does not block a macOS-only first paid
+alpha, but it is a blocker before inviting paid Windows users.
+
+- [ ] Canonical Windows artifact includes `bluey.exe`, `bluey-daemon.exe`, `bluey-overlay.exe`, and `bluey-audio.exe`
+- [ ] Windows installer is per-user, verifies checksums, updates PATH/shims, and documents uninstall
+- [ ] `bluey on` starts daemon and overlay without dev flags
+- [ ] Compact pill appears first; click expands; all controls are clickable in interactive mode
+- [ ] Sign-in/deep-link flow works from Windows against `bluey.sh`
+- [ ] Mic and system captions use managed Bluey STT; no provider keys are present on the desktop
+- [ ] Managed Answer flow streams, deducts cost, and updates balance
+- [ ] Capture exclusion verified with Snipping Tool and at least one meeting/recording app
+- [ ] Support zip/log export redacts tokens, provider keys, device codes, and sensitive local paths
+- [ ] Signed update manifest includes the Windows artifact and `bluey update` verifies it before install
 
 ### Monitoring
 
