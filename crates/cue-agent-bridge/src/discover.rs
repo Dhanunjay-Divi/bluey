@@ -421,10 +421,29 @@ fn scan_vscode_support_root(acc: &mut Accumulator, root: &Path, known: &[(&str, 
             .unwrap_or_else(|| AgentKind::Other(dir_name.clone()));
 
         let connector_config = locate_connector_config(&dir.join("User"));
-        let session_store = Some(SessionStore {
-            path: vscdb,
-            format: SessionFormat::SqliteVscdb,
-        });
+        // Pick the reader by what the store ACTUALLY is, not by "it's a .vscdb":
+        //   - `cursorDiskKV` table present → Cursor's rich composer store →
+        //     `SqliteVscdb` (the only format `VscdbReader` can read).
+        //   - else it's a plain VS Code-family store (`ItemTable` only —
+        //     Antigravity, VS Code Insiders, etc.); its chats live as
+        //     `User/workspaceStorage/<hash>/chatSessions/*.json` → `JsonFiles`.
+        //   - else no readable session store (still discovered for connectors).
+        // Without this gate, every fork got `SqliteVscdb` and non-Cursor forks
+        // threw `no such table: cursorDiskKV` on every session read.
+        let workspace_storage = dir.join("User").join("workspaceStorage");
+        let session_store = if sqlite_has_table(&vscdb, "cursorDiskKV") {
+            Some(SessionStore {
+                path: vscdb,
+                format: SessionFormat::SqliteVscdb,
+            })
+        } else if path_exists(&workspace_storage) {
+            Some(SessionStore {
+                path: workspace_storage,
+                format: SessionFormat::JsonFiles,
+            })
+        } else {
+            None
+        };
         acc.add(kind, dir, connector_config, session_store);
     }
 }
@@ -615,6 +634,28 @@ pub fn probe_sqlite_store(path: &Path) -> bool {
     }
 }
 
+/// Whether a SQLite store contains a table named `table`. Read-only + immutable
+/// (safe against a live store). Used to tell a **Cursor** `state.vscdb` (which
+/// has the proprietary `cursorDiskKV` table) apart from a plain VS Code-family
+/// `state.vscdb` (only `ItemTable`). Antigravity / VS Code Insiders / other forks
+/// all ship the plain shape, so blindly assigning the Cursor reader to them makes
+/// the session read throw `no such table: cursorDiskKV`.
+pub fn sqlite_has_table(path: &Path, table: &str) -> bool {
+    use rusqlite::OpenFlags;
+    let uri = format!("file:{}?immutable=1&mode=ro", path.display());
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI;
+    match rusqlite::Connection::open_with_flags(&uri, flags) {
+        Ok(conn) => conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1 LIMIT 1",
+                [table],
+                |_| Ok(()),
+            )
+            .is_ok(),
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,6 +760,10 @@ mod tests {
 
     /// Build a minimal valid SQLite `state.vscdb` at `path` so the read-only
     /// probe in fork detection succeeds. Synthetic — no real data.
+    /// A faithful **Cursor** `state.vscdb`: both the VS Code-standard `ItemTable`
+    /// AND Cursor's proprietary `cursorDiskKV` (the table `VscdbReader` queries).
+    /// The fork detector now keys the reader off `cursorDiskKV`'s presence, so a
+    /// Cursor fixture must include it to be assigned the `SqliteVscdb` reader.
     fn build_synthetic_vscdb(path: &Path) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).expect("create vscdb parent");
@@ -726,9 +771,25 @@ mod tests {
         let conn = rusqlite::Connection::open(path).expect("create synthetic vscdb");
         conn.execute_batch(
             "CREATE TABLE ItemTable (key TEXT, value BLOB);
-             INSERT INTO ItemTable VALUES ('synthetic', 'x');",
+             INSERT INTO ItemTable VALUES ('synthetic', 'x');
+             CREATE TABLE cursorDiskKV (key TEXT, value BLOB);",
         )
         .expect("seed synthetic vscdb");
+    }
+
+    /// A plain VS Code-family `state.vscdb` (only `ItemTable`, NO `cursorDiskKV`)
+    /// — what Antigravity / VS Code Insiders / non-Cursor forks ship. Used to
+    /// prove the detector does NOT assign them the Cursor reader.
+    fn build_plain_vscode_vscdb(path: &Path) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create vscdb parent");
+        }
+        let conn = rusqlite::Connection::open(path).expect("create plain vscdb");
+        conn.execute_batch(
+            "CREATE TABLE ItemTable (key TEXT, value BLOB);
+             INSERT INTO ItemTable VALUES ('synthetic', 'x');",
+        )
+        .expect("seed plain vscdb");
     }
 
     #[test]
@@ -973,6 +1034,56 @@ mod tests {
                 .iter()
                 .any(|a| matches!(&a.kind, AgentKind::Other(n) if n == "MysteryWinFork")),
             "unknown windows-style fork detected as Other"
+        );
+    }
+
+    #[test]
+    fn non_cursor_fork_gets_jsonfiles_not_cursor_reader() {
+        // A plain VS Code-family fork (Antigravity / Insiders): `state.vscdb` with
+        // ONLY `ItemTable` (no `cursorDiskKV`) + a `User/workspaceStorage` chats
+        // dir. The detector must NOT assign Cursor's `SqliteVscdb` reader (which
+        // would throw `no such table: cursorDiskKV`); it must use `JsonFiles`
+        // pointing at workspaceStorage.
+        let root = tempfile::tempdir().expect("tempdir");
+        let fork = root.path().join("Antigravity IDE");
+        build_plain_vscode_vscdb(&fork.join("User/globalStorage/state.vscdb"));
+        std::fs::create_dir_all(fork.join("User/workspaceStorage")).expect("mkdir ws");
+
+        let mut acc = Accumulator::default();
+        scan_vscode_support_root(&mut acc, root.path(), &[]);
+        let store = acc
+            .finish()
+            .into_iter()
+            .find(|a| matches!(&a.kind, AgentKind::Other(n) if n == "Antigravity IDE"))
+            .and_then(|a| a.session_store);
+        let store = store.expect("non-cursor fork still gets a store");
+        assert_eq!(
+            store.format,
+            SessionFormat::JsonFiles,
+            "plain VS Code store → JsonFiles, never the cursorDiskKV reader"
+        );
+        assert!(store.path.ends_with("User/workspaceStorage"));
+    }
+
+    #[test]
+    fn plain_vscode_fork_without_chats_has_no_session_store() {
+        // A plain fork with neither cursorDiskKV nor a workspaceStorage chats dir
+        // → no readable session store (still discovered for connectors), rather
+        // than a broken Cursor-reader store.
+        let root = tempfile::tempdir().expect("tempdir");
+        let fork = root.path().join("Antigravity");
+        build_plain_vscode_vscdb(&fork.join("User/globalStorage/state.vscdb"));
+
+        let mut acc = Accumulator::default();
+        scan_vscode_support_root(&mut acc, root.path(), &[]);
+        let agent = acc
+            .finish()
+            .into_iter()
+            .find(|a| matches!(&a.kind, AgentKind::Other(n) if n == "Antigravity"));
+        let agent = agent.expect("fork still discovered");
+        assert!(
+            agent.session_store.is_none(),
+            "no cursorDiskKV + no chats dir → no session store (not a broken one)"
         );
     }
 
