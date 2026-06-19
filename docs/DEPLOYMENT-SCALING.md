@@ -77,15 +77,37 @@ Queue names, retry policy, and worker ownership are tracked in `../infra/queues/
 Local desktop:
 
 - SQLite for meeting cache, settings, pending sync queue, and recent memory.
+- Local Markdown files for converted attachments and readable document context.
+- Local SQLite-backed RAG/vector store for fast per-device retrieval. The current
+  implementation stores embeddings as SQLite BLOBs and searches with Rust cosine
+  similarity; migrate to `sqlite-vec`/`usearch` only when per-device chunk counts
+  make linear scan too slow.
 - Temporary capture directory with cleanup.
-- Encrypted local token storage through Keychain on macOS and Credential Manager on Windows.
+- Local account/profile storage for Bluey tokens. OS keychain support is
+  retained as a legacy/fallback mode, but provider API keys must remain
+  server-side for the product path.
+
+Normal users on macOS or Windows should never install Redis, Postgres,
+pgvector, Docker, or any database server. The desktop bundle owns its local
+SQLite files and helper binaries.
 
 Cloud:
 
-- Postgres for users, workspaces, meetings, transcript/event metadata, permissions, billing state, device sessions, audit logs.
-- Object storage for screenshots, documents, exports, and optional retained audio chunks.
-- Vector index for RAG chunks. `pgvector` is enough for early scale; dedicated vector infra can come later.
-- Redis or queue service for background jobs.
+- **Alpha:** one DigitalOcean droplet running `bluey-server` + SQLite behind
+  Caddy. This is enough for internal testers and a small paid alpha as long as
+  the live smoke, backups, Square webhooks, and provider probes are green.
+- **Object storage:** Cloudflare R2, or another S3-compatible bucket, for large
+  blobs and global static artifacts: signed release tarballs, `latest.json` /
+  `latest.json.sig`, backups, support zips, synced raw documents, screenshots,
+  optional audio chunks, and exports. R2 is not the source of truth for billing,
+  accounts, ledgers, or vector search.
+- **Before multi-server:** Redis/Valkey for shared provider-capacity buckets,
+  cooldowns, and rate-limit state. In-process buckets are acceptable for a
+  single server only.
+- **When cloud memory/search grows:** Postgres + `pgvector` for users,
+  workspaces, session metadata, billing ledger, cloud-synced memory chunks, and
+  tenant-scoped vector search. Dedicated vector infrastructure can come later.
+- Queue/cache: Redis-compatible managed service or cloud-native queue adapter.
 - KMS/secrets manager for provider keys and envelope encryption.
 
 The first Postgres schema outline is tracked in `../infra/migrations/001_initial_cloud_schema.sql`.
@@ -115,11 +137,16 @@ desktop audio/screen/context -> Bluey cloud stream -> STT/vision/RAG -> provider
 Scale independently:
 
 - Realtime answer gateway: horizontally scaled WebSocket/SSE service.
-- STT workers: autoscale by active audio sessions.
+- STT relay workers: autoscale by active audio sessions. A single US-East
+  droplet is fine for alpha, but worldwide realtime captions eventually need
+  regional relay nodes so audio does not hairpin through one region before
+  reaching the STT provider.
 - Vision/OCR workers: queue-based, burstable.
 - Embedding workers: queue-based, retryable, idempotent.
 - RAG query service: low-latency cache for active meetings and workspace memory.
 - Artifact service: direct-to-object-storage uploads with short-lived signed URLs.
+- Release artifact delivery: Cloudflare/R2 edge cache for fast global installs
+  on macOS, Windows, and Linux.
 
 Reliability:
 
@@ -149,6 +176,21 @@ Reliability:
 - For multi-instance deployment, move the capacity buckets from in-process
   governor state to Redis/shared counters so 1000+ active users respect one
   global provider budget.
+
+Worldwide release posture:
+
+- **Downloads/updates:** serve from Cloudflare/R2-backed static files. This keeps
+  installer and update latency low globally and avoids making the DigitalOcean
+  app server a binary-download bottleneck.
+- **Runtime alpha:** one DigitalOcean region. This is operationally simple and
+  acceptable for early testers; LLM/STT provider time dominates most requests.
+- **Runtime wider release:** add regional stateless gateways for live STT,
+  screen/vision ingress, and answer streaming. Keep account/billing data in one
+  primary database until we have enough traffic to justify multi-region data
+  complexity.
+- **Windows parity:** use the same server APIs, R2 artifacts, account model, and
+  local SQLite/RAG design. Only packaging, capture helpers, and overlay
+  invisibility/click-through behavior are platform-specific.
 
 ## Product Gaps To Prioritize
 

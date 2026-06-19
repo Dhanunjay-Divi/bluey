@@ -4,7 +4,7 @@
 # Uses sqlite3's `.backup` (online backup API) so it is safe to run
 # while bluey-api.service is live. Rotates 14 hourly + 14 daily local
 # snapshots. If OFFSITE_DESTINATION is set, ships the latest hourly to
-# that destination (S3 path or rsync target).
+# that destination (S3-compatible path or rsync target).
 #
 # Install: cp ops/backup-bluey-db.sh /usr/local/sbin/backup-bluey-db.sh
 #          chmod 750 /usr/local/sbin/backup-bluey-db.sh
@@ -20,7 +20,15 @@ DAILY_KEEP=14
 # Optional off-host destination. Examples:
 #   OFFSITE_DESTINATION=s3://my-bucket/bluey-api-backups/
 #   OFFSITE_DESTINATION=user@backuphost:/srv/backups/bluey-api/
+#
+# For Cloudflare R2 or any S3-compatible object store, set:
+#   BLUEY_BACKUP_S3_ENDPOINT_URL=https://<account-id>.r2.cloudflarestorage.com
+# The aws CLI also needs credentials in its normal env/config:
+#   AWS_ACCESS_KEY_ID=...
+#   AWS_SECRET_ACCESS_KEY=...
+#   AWS_DEFAULT_REGION=auto
 OFFSITE_DESTINATION="${OFFSITE_DESTINATION:-}"
+BLUEY_BACKUP_S3_ENDPOINT_URL="${BLUEY_BACKUP_S3_ENDPOINT_URL:-}"
 
 file_size_bytes() {
     if stat -c%s "$1" >/dev/null 2>&1; then
@@ -66,10 +74,15 @@ fi
 if [ -n "$OFFSITE_DESTINATION" ]; then
     case "$OFFSITE_DESTINATION" in
         s3://*)
-            # Requires aws cli + credentials.
+            # Requires aws cli + credentials. BLUEY_BACKUP_S3_ENDPOINT_URL
+            # makes this work with Cloudflare R2 and other S3-compatible stores.
             if command -v aws >/dev/null; then
-                aws s3 cp "$hourly_target" "$OFFSITE_DESTINATION" --quiet
-                aws s3 cp "${hourly_target}.sha256" "$OFFSITE_DESTINATION" --quiet
+                aws_args=()
+                if [ -n "$BLUEY_BACKUP_S3_ENDPOINT_URL" ]; then
+                    aws_args+=(--endpoint-url "$BLUEY_BACKUP_S3_ENDPOINT_URL")
+                fi
+                aws "${aws_args[@]}" s3 cp "$hourly_target" "$OFFSITE_DESTINATION" --quiet
+                aws "${aws_args[@]}" s3 cp "${hourly_target}.sha256" "$OFFSITE_DESTINATION" --quiet
             else
                 echo "OFFSITE_DESTINATION is s3:// but aws CLI is not installed" >&2
                 exit 1

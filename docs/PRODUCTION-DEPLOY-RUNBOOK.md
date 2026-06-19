@@ -169,7 +169,20 @@ cat > /etc/cron.d/bluey-api-backup <<'EOF'
 EOF
 ```
 
-The script lives at `ops/backup-bluey-db.sh` in this repo. It uses SQLite's online backup API (safe with the daemon running) and rotates the last 14 hourly + 14 daily snapshots locally; off-host shipping to S3/SFTP is configured by editing the `OFFSITE_DESTINATION` variable.
+The script lives at `ops/backup-bluey-db.sh` in this repo. It uses SQLite's online backup API (safe with the daemon running) and rotates the last 14 hourly + 14 daily snapshots locally; off-host shipping to S3-compatible storage/SFTP is configured by setting `OFFSITE_DESTINATION`.
+
+For Cloudflare R2:
+
+```bash
+OFFSITE_DESTINATION=s3://<bucket>/bluey-api-backups/
+BLUEY_BACKUP_S3_ENDPOINT_URL=https://<cloudflare-account-id>.r2.cloudflarestorage.com
+AWS_ACCESS_KEY_ID=<r2-access-key-id>
+AWS_SECRET_ACCESS_KEY=<r2-secret-access-key>
+AWS_DEFAULT_REGION=auto
+```
+
+Keep these values in root-owned environment/cron config on the server. They must
+never be shipped in the desktop app.
 
 ## 10. Monitoring
 
