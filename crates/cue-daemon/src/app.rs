@@ -187,48 +187,6 @@ fn normalize_resume_session(session_id: Option<String>) -> Option<String> {
         .filter(|id| !id.is_empty())
 }
 
-/// Char budget over which a Replay-tier continuation summarizes older turns
-/// instead of replaying them whole. Below the drive layer's safety-net budget so
-/// the summary path engages BEFORE the net has to trim. ~4 chars/token.
-const CONTINUATION_SUMMARY_BUDGET: usize = 360_000;
-
-/// How many most-recent turns are always kept VERBATIM when compacting a long
-/// transcript for Replay-tier continuation (the "hot layer"); older turns are
-/// summarized. Mirrors the hierarchical-memory pattern the coding agents use.
-const CONTINUATION_HOT_TURNS: usize = 12;
-
-/// Split a transcript for Replay-tier compaction: returns `(older, recent)`
-/// where `recent` is the last [`CONTINUATION_HOT_TURNS`] turns and `older` is
-/// everything before. Pure — the caller summarizes `older` (via a drive through
-/// the user's own agent) and replays `[summary] + recent`. Returns `(&[], all)`
-/// when the transcript already fits within `CONTINUATION_HOT_TURNS`.
-fn split_for_compaction(
-    turns: &[cue_agent_bridge::Turn],
-) -> (&[cue_agent_bridge::Turn], &[cue_agent_bridge::Turn]) {
-    if turns.len() <= CONTINUATION_HOT_TURNS {
-        return (&[], turns);
-    }
-    let cut = turns.len() - CONTINUATION_HOT_TURNS;
-    (&turns[..cut], &turns[cut..])
-}
-
-/// Total character size of a transcript's turn text — the cheap proxy for
-/// "is this too big to replay whole" (~4 chars/token).
-fn transcript_chars(turns: &[cue_agent_bridge::Turn]) -> usize {
-    turns.iter().map(|t| t.text.len()).sum()
-}
-
-/// The prompt asked of the user's OWN agent to compress the older part of a long
-/// conversation (Bluey runs no AI of its own — the user's agent summarizes the
-/// user's conversation). Bounded output so the summary itself stays small.
-fn summarize_older_prompt(older_text: &str) -> String {
-    format!(
-        "Summarize the earlier part of our conversation below in at most 400 words. \
-Preserve key decisions, file names, code identifiers, and any open questions or \
-next steps. Output ONLY the summary, no preamble.\n\n----- earlier conversation -----\n{older_text}"
-    )
-}
-
 /// How long an un-approved Fix proposal stays valid. After this, the id is
 /// dropped and an Approve referencing it is rejected — so a stale plan the user
 /// walked away from can never be applied later.
@@ -2538,76 +2496,31 @@ async fn handle_agent_sessions_requested(
 }
 
 /// Blocking core of [`handle_agent_sessions_requested`]: find the agent and
-/// decode up to [`AGENT_SESSION_LIST_CAP`] session refs. Never panics; a
-/// missing agent / store or a read error yields an empty list.
+/// decode up to [`AGENT_SESSION_LIST_CAP`] session refs, then map them to the UI
+/// [`AgentSessionSummary`] DTO. The read + Claude CLI↔app de-dup + fallback-title
+/// logic lives in the spine
+/// ([`cue_agent_bridge::sessions::summaries::list_for_agent`]); this just
+/// resolves the agent against the discovery set and crosses the bridge→UI type
+/// boundary. Never panics; a missing agent / store or a read error yields an
+/// empty list.
 fn list_agent_sessions(kind: &str) -> Vec<AgentSessionSummary> {
-    let Some(agent) = find_discovered_agent(kind) else {
+    let agents = discover_agents();
+    let Some(agent) = agents
+        .iter()
+        .find(|a| agent_model_label(&a.kind) == kind)
+    else {
         return Vec::new();
     };
-    let Some(store) = agent.session_store.as_ref() else {
-        return Vec::new();
-    };
-    // Generic, registry-driven fallback label for sessions whose content has no
-    // readable title (e.g. encrypted/opaque stores). Computed ONCE from the
-    // agent's display name — never hardcoded per agent/reader.
-    let display = cue_agent_bridge::registry::display_name_for(&agent.kind)
-        .unwrap_or_else(|| "Session".to_string());
 
-    // De-dup: the Claude CLI store and the Claude-app stores point at the SAME
-    // transcript files (the app indexes them by `cliSessionId`, which is the CLI
-    // file stem). When listing the CLI row, drop any session already surfaced by
-    // an app row so the same conversation doesn't appear twice — the app row
-    // keeps it (its pre-computed title is richer). Empty for every other agent.
-    let claimed_by_app = if matches!(agent.kind, AgentKind::ClaudeCode) {
-        app_claimed_claude_session_ids()
-    } else {
-        std::collections::HashSet::new()
-    };
-
-    match reader_for(store.format).list(store, AGENT_SESSION_LIST_CAP) {
-        Ok(refs) => refs
-            .into_iter()
-            .filter(|r| !claimed_by_app.contains(&r.id))
-            .map(|r| {
-                let title = r.title.or_else(|| {
-                    let short: String = r.id.split('-').next().unwrap_or(&r.id).to_string();
-                    Some(format!("{display} session {short}"))
-                });
-                AgentSessionSummary {
-                    id: r.id,
-                    title,
-                    updated_at: r.updated_at,
-                    project: r.project,
-                }
-            })
-            .collect(),
-        Err(error) => {
-            debug!(kind, error = %error, "agent session list read failed");
-            Vec::new()
-        }
-    }
-}
-
-/// The set of Claude session ids (`cliSessionId`s) claimed by the Claude-app
-/// stores (Code mode + agent mode). Used to de-duplicate the CLI row's listing
-/// against the richer app rows. Fail-soft: a store that can't be read simply
-/// contributes nothing (so at worst a session shows under both rows, never
-/// fewer than it should). Each id is a JSONL file stem shared across stores.
-fn app_claimed_claude_session_ids() -> std::collections::HashSet<String> {
-    let mut claimed = std::collections::HashSet::new();
-    for kind in [AgentKind::ClaudeCodeApp, AgentKind::ClaudeCodeAgent] {
-        let label = agent_model_label(&kind);
-        let Some(agent) = find_discovered_agent(&label) else {
-            continue;
-        };
-        let Some(store) = agent.session_store.as_ref() else {
-            continue;
-        };
-        if let Ok(refs) = reader_for(store.format).list(store, AGENT_SESSION_LIST_CAP) {
-            claimed.extend(refs.into_iter().map(|r| r.id));
-        }
-    }
-    claimed
+    cue_agent_bridge::sessions::summaries::list_for_agent(agent, &agents, AGENT_SESSION_LIST_CAP)
+        .into_iter()
+        .map(|r| AgentSessionSummary {
+            id: r.id,
+            title: r.title,
+            updated_at: r.updated_at,
+            project: r.project,
+        })
+        .collect()
 }
 
 /// Read one agent's inherited MCP connectors (shape + readiness only) and push
@@ -3058,22 +2971,6 @@ async fn build_system_audio_stt_provider() -> anyhow::Result<Box<dyn cue_core::s
     crate::stt::factory::build_stt_chain(&stt_cfg, AudioSource::System)
         .await
         .map_err(|e| anyhow::anyhow!("STT factory: {e}"))
-}
-
-/// Build an STT provider for the microphone path via the factory chain.
-/// Called when the streaming factory is preferred (e.g. LocalWhisper enabled).
-pub async fn build_mic_stt_provider() -> anyhow::Result<Box<dyn cue_core::stt::SttProvider>> {
-    use cue_core::pcm::AudioSource;
-    use cue_core::stt::SttConfig;
-
-    let stt_cfg = SttConfig {
-        source: AudioSource::Microphone,
-        ..Default::default()
-    };
-
-    crate::stt::factory::build_stt_chain(&stt_cfg, AudioSource::Microphone)
-        .await
-        .map_err(|e| anyhow::anyhow!("STT factory (mic): {e}"))
 }
 
 async fn build_real_audio_runtime_config(
@@ -6210,45 +6107,28 @@ const CONTINUATION_READ_MAX_TURNS: usize = 4_000;
 
 /// If a Replay transcript is too big to replay whole, summarize its older turns
 /// via a drive through the user's OWN agent and return `[summary] + recent`;
-/// otherwise return it unchanged. Fail-soft: a failed summary returns the raw
-/// transcript (the drive layer's char budget then trims it as the safety net).
+/// otherwise return it unchanged. The compaction policy lives in the spine
+/// ([`cue_agent_bridge::continuation::maybe_compact`]); the daemon injects the
+/// summarizer — driving `agent` in [`DriveMode::Answer`] and returning its body
+/// (`None` on failure/empty, which makes the spine fall back to the raw
+/// transcript so the drive layer's char budget trims it as the safety net).
 async fn maybe_compact(
     agent: &AgentKind,
     transcript: cue_agent_bridge::Transcript,
 ) -> cue_agent_bridge::Transcript {
-    if transcript_chars(&transcript.turns) <= CONTINUATION_SUMMARY_BUDGET {
-        return transcript; // fits — replay whole, no extra drive
-    }
-    let (older, recent) = split_for_compaction(&transcript.turns);
-    if older.is_empty() {
-        return transcript;
-    }
-
-    // Flatten the older turns and ask the user's own agent to summarize them.
-    let older_text: String = older
-        .iter()
-        .map(|t| format!("{:?}: {}", t.role, t.text))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let summary_q = AgentQuestion {
-        prompt: summarize_older_prompt(&older_text),
-        context: None,
-        resume: None,
-        cwd: None,
-    };
-    match drive_and_collect(agent.clone(), summary_q, DriveMode::Answer).await {
-        Ok(summary) if !summary.trim().is_empty() => {
-            let mut turns = Vec::with_capacity(recent.len() + 1);
-            turns.push(cue_agent_bridge::Turn {
-                role: cue_agent_bridge::Role::System,
-                text: format!("Summary of the earlier conversation:\n{}", summary.trim()),
-            });
-            turns.extend(recent.iter().cloned());
-            cue_agent_bridge::Transcript { turns }
-        }
-        // Summary failed/empty → raw transcript; the drive budget trims it.
-        _ => transcript,
-    }
+    let agent = agent.clone();
+    cue_agent_bridge::continuation::maybe_compact(transcript, |prompt| async move {
+        let summary_q = AgentQuestion {
+            prompt,
+            context: None,
+            resume: None,
+            cwd: None,
+        };
+        drive_and_collect(agent, summary_q, DriveMode::Answer)
+            .await
+            .ok()
+    })
+    .await
 }
 
 /// A successful single drive attempt: the collected answer body + optional cost.
@@ -6260,8 +6140,9 @@ struct DriveOutcome {
 /// A failed single drive attempt. `reason` is a human phrase appended after
 /// "Your {agent} CLI {reason}." `resume_recoverable` is true when native resume
 /// failed in a way a fresh (no-resume) retry can recover — too-large or
-/// not-found (see [`is_resume_recoverable_error`]). The real CLI error text is
-/// preserved in `reason` so the user sees the truth, not a hardcoded guess.
+/// not-found (see [`cue_agent_bridge::continuation::is_resume_recoverable_error`]).
+/// The real CLI error text is preserved in `reason` so the user sees the truth,
+/// not a hardcoded guess.
 ///
 /// `raw_error` carries the UNMODIFIED terminal-error text (only set for a
 /// terminal [`AnswerChunk::Error`], not for spawn/render failures), so the
@@ -6273,46 +6154,6 @@ struct DriveFailure {
     reason: String,
     resume_recoverable: bool,
     raw_error: Option<String>,
-}
-
-/// Whether an agent error message is the "prompt/conversation too large to fit
-/// Whether an agent error means native **resume specifically** failed in a way
-/// a fresh (no-resume) retry can recover. Two classes, both agent-agnostic:
-///
-/// - **Too large:** the session exceeds the context window and can't be loaded
-///   or compacted headlessly ("prompt is too long", "conversation too long", …).
-/// - **Not resumable:** the pinned session id can't be found/loaded by this CLI
-///   ("no conversation found", "session not found", "invalid session"). Common
-///   when an app-only session was never written to the CLI's shared store, or
-///   the cwd differs.
-///
-/// In both cases a fresh session in the project dir still answers — it has the
-/// code, project rules, and MCP connectors regardless of the prior transcript.
-fn is_resume_recoverable_error(message: &str) -> bool {
-    let m = message.to_lowercase();
-    // Too-large class.
-    let too_large = m.contains("prompt is too long")
-        || m.contains("conversation too long")
-        || m.contains("context length")
-        || m.contains("context window")
-        || m.contains("too many tokens")
-        || (m.contains("maximum") && m.contains("token"));
-    // Session-not-resumable class.
-    let not_resumable = m.contains("no conversation found")
-        || m.contains("session not found")
-        || m.contains("no session")
-        || m.contains("invalid session")
-        || (m.contains("session") && m.contains("not found"));
-    // Resume-incompatibility class: the persisted transcript references tools (or
-    // other state) that aren't available in Bluey's headless resume context, so
-    // the agent rejects replaying it as-is. Seen live: Claude returns
-    // `400 invalid_request_error: "Tool reference 'X' not found in available
-    // tools"` when resuming a session recorded with tools the headless CLI
-    // doesn't load. A fresh (non-resume) drive in the same project still answers,
-    // so this is recoverable the same way an overflow is.
-    let tool_incompatible = m.contains("not found in available tools")
-        || (m.contains("tool reference") && m.contains("not found"));
-    too_large || not_resumable || tool_incompatible
 }
 
 /// Run ONE drive attempt: spawn the agent, stream deltas live to the overlay,
@@ -6465,7 +6306,8 @@ async fn drive_answer_attempt(
                 cost_usd = cost;
             }
             AnswerChunk::Error(message) => {
-                let recoverable = is_resume_recoverable_error(&message);
+                let recoverable =
+                    cue_agent_bridge::continuation::is_resume_recoverable_error(&message);
                 debug!(
                     agent = %label,
                     detail = %message,
@@ -11236,43 +11078,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn split_for_compaction_keeps_recent_hot_turns() {
-        // Fewer than the hot count → all "recent", nothing older.
-        let few: Vec<_> = (0..5).map(|i| turn(&format!("t{i}"))).collect();
-        let (older, recent) = split_for_compaction(&few);
-        assert!(older.is_empty());
-        assert_eq!(recent.len(), 5);
-
-        // More than the hot count → older is everything before the last N.
-        let many: Vec<_> = (0..CONTINUATION_HOT_TURNS + 7)
-            .map(|i| turn(&format!("t{i}")))
-            .collect();
-        let (older, recent) = split_for_compaction(&many);
-        assert_eq!(recent.len(), CONTINUATION_HOT_TURNS, "recent = hot layer");
-        assert_eq!(older.len(), 7, "older = the rest");
-        // Ordering preserved: recent is the TAIL.
-        assert_eq!(
-            recent.last().unwrap().text,
-            format!("t{}", CONTINUATION_HOT_TURNS + 6)
-        );
-        assert_eq!(older[0].text, "t0");
-    }
-
-    #[test]
-    fn transcript_chars_sums_turn_text() {
-        let turns = vec![turn("abc"), turn("de"), turn("")];
-        assert_eq!(transcript_chars(&turns), 5);
-    }
-
-    #[test]
-    fn summarize_prompt_includes_the_older_text_and_a_word_cap() {
-        let p = summarize_older_prompt("User: earlier stuff");
-        assert!(p.contains("earlier stuff"));
-        assert!(p.to_lowercase().contains("400 words"));
-        assert!(p.to_lowercase().contains("summary"));
-    }
-
     fn sample_proposal() -> FixProposal {
         FixProposal {
             diagnosis: "PORT is read before the env var is set".to_string(),
@@ -11474,40 +11279,6 @@ mod tests {
         assert!(agentic.contains("claude_code"));
         assert!(agentic.to_lowercase().contains("agent"));
         assert!(agentic.contains(&id.to_string()));
-    }
-
-    #[test]
-    fn resume_recoverable_error_matches_too_large_and_not_found_classes() {
-        // Too-large class — the agents' real overflow phrasings.
-        assert!(is_resume_recoverable_error("Prompt is too long"));
-        assert!(is_resume_recoverable_error("Error: conversation too long"));
-        assert!(is_resume_recoverable_error("exceeds the context window"));
-        assert!(is_resume_recoverable_error(
-            "206453 tokens > 200000 maximum"
-        ));
-        // Not-resumable class — pinned session id can't be loaded by the CLI.
-        assert!(is_resume_recoverable_error(
-            "No conversation found with session ID: 12dea178-…"
-        ));
-        assert!(is_resume_recoverable_error("session not found"));
-        assert!(is_resume_recoverable_error("invalid session id"));
-        // Resume-incompatibility class (CAPTURED LIVE): the persisted transcript
-        // references tools the headless resume context doesn't load → retry fresh.
-        assert!(is_resume_recoverable_error(
-            r#"400 {"type":"error","error":{"type":"invalid_request_error","message":"Tool reference 'TaskCreate' not found in available tools"}}"#
-        ));
-        assert!(is_resume_recoverable_error(
-            "Tool reference 'Foo' not found in available tools"
-        ));
-        // Non-recoverable: auth / missing binary / generic — must NOT retry
-        // fresh (a fresh session wouldn't fix these). In particular "command not
-        // found: claude" must NOT match the tool-incompatibility class.
-        assert!(!is_resume_recoverable_error("not signed in"));
-        assert!(!is_resume_recoverable_error("command not found: claude"));
-        assert!(!is_resume_recoverable_error(
-            "rate limited, try again later"
-        ));
-        assert!(!is_resume_recoverable_error(""));
     }
 
     #[test]

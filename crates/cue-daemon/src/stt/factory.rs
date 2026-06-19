@@ -10,7 +10,6 @@
 //!
 //! - `build_system_audio_stt_provider()` — continuous system-audio capture
 //!   (`BLUEY_SYSTEM_AUDIO_CONTINUOUS=1` + `BLUEY_SYSTEM_AUDIO_STT=1`).
-//! - `build_mic_stt_provider()` — a public helper for future use.
 //!
 //! ## Mic + chunk-based real-audio path is NOT routed through this factory
 //!

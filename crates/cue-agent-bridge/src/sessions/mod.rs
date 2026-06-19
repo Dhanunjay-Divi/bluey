@@ -27,6 +27,7 @@ pub mod antigravity;
 pub mod claude_app;
 pub mod json_files;
 pub mod jsonl;
+pub mod summaries;
 pub mod vscdb;
 
 /// Decodes one agent's session store, read-only and bounded.

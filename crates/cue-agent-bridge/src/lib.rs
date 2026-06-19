@@ -23,6 +23,7 @@ pub mod auth_resolve;
 pub mod capability;
 pub mod cloud;
 pub mod connectors;
+pub mod continuation;
 pub mod discover;
 pub mod drive;
 pub mod fix;
