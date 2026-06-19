@@ -188,12 +188,17 @@ fn resolve_file(path: &Path, id: &str, _store: &SessionStore) -> PathBuf {
     // The id is a file stem; the file may be nested (Claude 1 level, Codex by
     // date). Match on the file stem OR — for layouts whose stem is generic
     // (Copilot `events`, Antigravity brain `transcript`) — on the derived
-    // session-dir id, mirroring how `session_ref_for` assigns the id.
+    // session-dir id, mirroring how `session_ref_for` assigns the id. For Codex,
+    // `session_ref_for` exposes the inner `session_meta.payload.id` UUID (not the
+    // `rollout-…` stem), so also match that — but ONLY after the cheap stem/dir
+    // checks miss, since reading line 1 of every file is comparatively costly.
     enumerate_files(path)
         .into_iter()
         .find(|f| {
             let stem = f.file_stem().map(|s| s.to_string_lossy().into_owned());
-            stem.as_deref() == Some(id) || session_id_from_dir(f).as_deref() == Some(id)
+            stem.as_deref() == Some(id)
+                || session_id_from_dir(f).as_deref() == Some(id)
+                || codex_session_meta_id(f).as_deref() == Some(id)
         })
         .unwrap_or(flat)
 }
@@ -278,11 +283,19 @@ fn decode_project_dir(dir_name: &str) -> Option<String> {
 /// Build a [`SessionRef`] from a file: id = stem, updated_at = mtime epoch,
 /// title = first user-message snippet, project = decoded parent dir name.
 fn session_ref_for(file: &Path) -> Option<SessionRef> {
-    // Most layouts name the file by session id (`<id>.jsonl`). Some put the id in
-    // an ancestor dir and use a generic stem (Copilot `<id>/events.jsonl`,
-    // Antigravity brain `<id>/…/transcript.jsonl`) — derive the id from the dir.
+    // Session id, in priority order:
+    //   1. Codex: the inner `session_meta.payload.id` UUID — the id the adapter's
+    //      `session/load` resumes by. The rollout FILENAME (`rollout-<ts>-<uuid>`)
+    //      is NOT accepted by the adapter, so using it would silently break true
+    //      resume (→ fork fallback). This is the Codex analogue of Claude's
+    //      "the cwd is the resolver" fix.
+    //   2. Generic-stem layouts (Copilot `<id>/events.jsonl`, Antigravity brain
+    //      `<id>/…/transcript.jsonl`) — derive the id from the ancestor dir.
+    //   3. Normal `<id>.jsonl` — the file stem IS the id.
     let stem = file.file_stem()?.to_string_lossy().into_owned();
-    let id = session_id_from_dir(file).unwrap_or(stem);
+    let id = codex_session_meta_id(file)
+        .or_else(|| session_id_from_dir(file))
+        .unwrap_or(stem);
     let updated_at = mtime_epoch_string(file);
     // Project resolution, in priority order:
     //   1. The cwd the FORMAT records (authoritative). Claude/Codex store the
@@ -378,10 +391,17 @@ fn claude_record_cwd(file: &Path) -> Option<String> {
     None
 }
 
-/// Codex: read `payload.cwd` from the first-line `session_meta` record. Only the
-/// first line is read (cheap). Gated on the record `type` being `session_meta`,
-/// so it never fires for other formats.
-fn codex_session_meta_cwd(file: &Path) -> Option<String> {
+/// Codex: read the first-line `session_meta` record (cheap — one line). Returns
+/// `(id, cwd)` from `payload.id` / `payload.cwd`. Gated on the record `type`
+/// being `session_meta`, so it never fires for other formats.
+///
+/// The `id` matters for **resume**: Codex's rollout FILENAME is
+/// `rollout-<timestamp>-<uuid>.jsonl`, but the `codex-acp` adapter's
+/// `session/load` rejects that stem — it wants the bare UUID, which Codex records
+/// here as `payload.id`. Using the filename stem makes true resume fail with
+/// `invalid session id: … found 'r' at 1` and silently fall back to fork. So the
+/// listed id must be this inner UUID (see [`session_ref_for`] / [`find_session_file`]).
+fn codex_session_meta(file: &Path) -> Option<(Option<String>, Option<String>)> {
     let handle = std::fs::File::open(file).ok()?;
     let mut first = String::new();
     BufReader::new(handle).read_line(&mut first).ok()?;
@@ -389,11 +409,27 @@ fn codex_session_meta_cwd(file: &Path) -> Option<String> {
     if v.get("type").and_then(Value::as_str) != Some("session_meta") {
         return None;
     }
-    let cwd = v
-        .get("payload")
-        .and_then(|p| p.get("cwd"))
-        .and_then(Value::as_str)?;
-    (!cwd.is_empty()).then(|| cwd.to_string())
+    let payload = v.get("payload");
+    let nonempty = |p: &Value, key: &str| {
+        p.get(key)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let id = payload.and_then(|p| nonempty(p, "id"));
+    let cwd = payload.and_then(|p| nonempty(p, "cwd"));
+    Some((id, cwd))
+}
+
+/// Codex: the inner `session_meta.payload.id` (the UUID the adapter resumes by),
+/// or `None` for non-Codex files.
+fn codex_session_meta_id(file: &Path) -> Option<String> {
+    codex_session_meta(file).and_then(|(id, _)| id)
+}
+
+/// Codex: `payload.cwd` from the first-line `session_meta` record, or `None`.
+fn codex_session_meta_cwd(file: &Path) -> Option<String> {
+    codex_session_meta(file).and_then(|(_, cwd)| cwd)
 }
 
 /// Copilot: read `cwd:` from the sibling `workspace.yaml` next to an
@@ -969,6 +1005,41 @@ mod tests {
         let t = reader.read(&store, uuid, 10).expect("read");
         assert_eq!(t.turns.len(), 1);
         assert_eq!(t.turns[0].text, "hello copilot");
+    }
+
+    #[test]
+    fn codex_session_id_is_inner_meta_uuid_not_rollout_stem() {
+        // Codex: `…/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`. The adapter's
+        // `session/load` resumes by the inner `session_meta.payload.id` UUID, NOT
+        // the `rollout-…` filename stem (which it rejects). So the listed id must
+        // be that UUID, and read() must resolve the file back by it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let day = dir.path().join("2026").join("06").join("19");
+        std::fs::create_dir_all(&day).unwrap();
+        let uuid = "019ee05c-e0bd-7ff1-9791-d412f9ae241a";
+        let file = day.join("rollout-2026-06-19T09-50-43-019ee05c-e0bd-7ff1-9791-d412f9ae241a.jsonl");
+        std::fs::write(
+            &file,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{uuid}\",\"cwd\":\"/Users/ms/Developer/Bluey\"}}}}\n\
+                 {{\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"hi codex\"}}]}}}}\n"
+            ),
+        )
+        .unwrap();
+
+        let reader = JsonlReader;
+        let store = store_at(dir.path().to_path_buf());
+        let refs = reader.list(&store, 10).expect("list");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            refs[0].id, uuid,
+            "id is the inner session_meta UUID, not the rollout-… stem"
+        );
+
+        // read() resolves by the inner UUID (the id the adapter resumes by).
+        let t = reader.read(&store, uuid, 10).expect("read by inner uuid");
+        assert_eq!(t.turns.len(), 1);
+        assert_eq!(t.turns[0].text, "hi codex");
     }
 
     #[test]
