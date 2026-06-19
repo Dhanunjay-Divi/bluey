@@ -92,6 +92,7 @@ pub enum KindTag {
     Cursor,
     Gemini,
     Codex,
+    Antigravity,
 }
 
 impl KindTag {
@@ -108,9 +109,11 @@ impl KindTag {
             }
             AgentKind::Copilot => Some(KindTag::Copilot),
             AgentKind::Cursor => Some(KindTag::Cursor),
-            // Antigravity drives through the `gemini` CLI; Gemini CLI is the
-            // same row.
-            AgentKind::Gemini | AgentKind::Antigravity => Some(KindTag::Gemini),
+            AgentKind::Gemini => Some(KindTag::Gemini),
+            // Antigravity drives through its OWN `agy` CLI (its own account tier),
+            // NOT `gemini` — `gemini` stopped serving the AI Pro/Ultra/free tiers
+            // on 2026-06-18 (they moved to `agy`). Separate row from Gemini.
+            AgentKind::Antigravity => Some(KindTag::Antigravity),
             AgentKind::Codex => Some(KindTag::Codex),
             _ => None,
         }
@@ -232,6 +235,25 @@ pub const COMMAND_MAP: &[DriveSpec] = &[
             "--json",
         ],
         parser: OutputParser::CodexJsonl,
+    },
+    DriveSpec {
+        kind_tag: KindTag::Antigravity,
+        // Antigravity ships `agy` (Go CLI, v1.0.10). It has NO ACP stdio mode, so
+        // it's driven here via its non-interactive print mode rather than over
+        // ACP. CRUCIALLY this uses `agy`'s OWN account tier (Google AI Pro/Ultra),
+        // NOT `gemini` — as of 2026-06-18 the `gemini` CLI stopped serving those
+        // tiers (they moved to `agy`), so driving Antigravity via `gemini` would
+        // hit the dead/quota-capped path. `agy -p "<prompt>"` runs one prompt and
+        // prints the plain-text answer.
+        binary: "agy",
+        oneshot_args: &["-p", "{prompt}"],
+        // Resume by conversation id: `agy --conversation <id> -p "<prompt>"`. The
+        // id Bluey reads from the Antigravity store IS the conversation UUID `agy
+        // --conversation` wants (verified: index/`conversations/<uuid>` share it),
+        // so no id translation is needed. Appended after the oneshot args; agy
+        // accepts the flag in any position.
+        resume_args: &["--conversation", "{id}"],
+        parser: OutputParser::PlainText,
     },
 ];
 
@@ -1542,16 +1564,35 @@ mod tests {
     }
 
     #[test]
-    fn test_antigravity_resolves_to_gemini_drive_but_own_fix_profile() {
-        // Antigravity drives via the gemini spec, yet its Fix profile resolves
-        // off the Antigravity registry row (same approval-mode values).
-        let s = spec(KindTag::Gemini);
+    fn test_antigravity_drives_via_agy_with_skip_permissions_apply() {
+        // Antigravity drives via its OWN `agy` CLI (NOT gemini — gemini dropped
+        // the AI Pro/Ultra/free tiers on 2026-06-18). A plain answer is
+        // `agy -p <prompt>`; resume appends `--conversation <id>`.
+        let s = spec(KindTag::Antigravity);
+        assert_eq!(s.binary, "agy");
+        let (prog, args) = build_argv_with_mode(
+            s,
+            &AgentKind::Antigravity,
+            &Question::new("hello"),
+            DriveMode::Answer,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(prog, "agy");
+        assert_eq!(args, vec!["-p".to_string(), "hello".to_string()]);
+
+        // Fix profile (off the Antigravity registry row): propose adds nothing
+        // (default permission prompt), apply auto-approves via agy's only
+        // permission control. `agy` has NO `--approval-mode` (that was a stale
+        // gemini flag).
         let q = Question::new("propose");
-        let (_, args) =
+        let (_, propose) =
             build_argv_with_mode(s, &AgentKind::Antigravity, &q, DriveMode::ProposeFix, &[])
                 .unwrap();
-        let i = args.iter().position(|a| a == "--approval-mode").unwrap();
-        assert_eq!(args[i + 1], "plan");
+        assert!(!propose.iter().any(|a| a == "--approval-mode"));
+        let (_, apply) =
+            build_argv_with_mode(s, &AgentKind::Antigravity, &q, DriveMode::ApplyFix, &[]).unwrap();
+        assert!(apply.iter().any(|a| a == "--dangerously-skip-permissions"));
     }
 
     #[test]

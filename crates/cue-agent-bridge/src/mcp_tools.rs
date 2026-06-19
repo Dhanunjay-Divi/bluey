@@ -584,11 +584,13 @@ mod tests {
                 e.display_name
             );
         }
-        // Antigravity drives through gemini and shares `mcp list`.
+        // Antigravity drives via its own `agy` CLI (NOT gemini — gemini dropped
+        // the AI Pro/Ultra/free tiers on 2026-06-18). `agy mcp list` opens a TTY
+        // and fails headless, so there is NO live MCP-list probe; connectors come
+        // from the config file via the connector reader instead.
         let antigravity = registry::entry_for(KindTag::Antigravity).unwrap();
-        assert_eq!(antigravity.mcp_list_command, Some(&["mcp", "list"][..]));
-        // Antigravity's list binary is `gemini` (its drive_command), not `agy`.
-        assert_eq!(antigravity.drive_command.first().copied(), Some("gemini"));
+        assert_eq!(antigravity.mcp_list_command, None);
+        assert_eq!(antigravity.drive_command.first().copied(), Some("agy"));
 
         // Cursor is the per-server `mcp list-tools` path.
         let cursor = registry::entry_for(KindTag::Cursor).unwrap();

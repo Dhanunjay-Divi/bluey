@@ -583,9 +583,12 @@ pub const REGISTRY: &[AgentEntry] = &[
         login_command: None,
         login_auth: LoginAuth::None,
         display_name: "Antigravity",
-        // Antigravity drives through the `gemini` CLI, so it shares Gemini's
-        // server-level `gemini mcp list` (server name + connected health).
-        mcp_list_command: Some(&["mcp", "list"]),
+        // No live MCP-list probe: `agy mcp list` opens a TTY/TUI and fails
+        // headless (`bubbletea: could not open TTY`), and `gemini mcp list` is the
+        // dead pre-2026-06-18 tier. MCP connectors are still surfaced — from the
+        // config file (`~/.gemini/config/mcp_config.json`) via the connector
+        // reader — just without a live per-server health probe.
+        mcp_list_command: None,
         mcp_list_tools_per_server: false,
         // Sessions are read from Antigravity's plaintext conversation INDEX
         // (`agyhub_summaries_proto.pb`) — it lists ALL conversations with their
@@ -606,22 +609,36 @@ pub const REGISTRY: &[AgentEntry] = &[
         // `jsonl_subdir` is unused for this format (kept non-empty for the
         // struct; the reader never reads it).
         jsonl_subdir: "",
-        drive_command: &["gemini", "-p", "{prompt}"],
+        // Drive through Antigravity's OWN CLI `agy -p`, NOT `gemini`. As of
+        // 2026-06-18 the `gemini` CLI stopped serving the AI Pro/Ultra/free tiers
+        // (migrated to `agy`); driving via `gemini` now hits the dead/quota-capped
+        // path. `agy` uses Antigravity's account tier. (The CLI driver's
+        // `DriveSpec` for Antigravity in `drive/cli.rs` is the authoritative
+        // argv; this mirrors it for the registry-level consumers.)
+        drive_command: &["agy", "-p", "{prompt}"],
         answer_args: &[],
-        mcp_allow_flag: Some("--allowed-mcp-server-names"),
-        mcp_allow_style: Some(McpAllowStyle::ServerNameCsv),
+        // `agy` has NO scoped MCP allow flag (`--allowed-mcp-server-names` is a
+        // gemini-ism agy rejects); its only tool-permission control is the
+        // all-or-nothing `--dangerously-skip-permissions`. So no per-server allow
+        // args are appended for an answer — agy uses its default permission
+        // behavior. (Writes stay gated; we never pass the skip-permissions flag on
+        // the answer path.)
+        mcp_allow_flag: None,
+        mcp_allow_style: None,
         continuation: ContinuationTier::Replay,
         continuation_via: None,
-        // Antigravity drives through the `gemini` CLI, so it shares Gemini's
-        // approval-mode flags.
         install: Some(InstallRecipe {
             method: InstallMethod::CurlScript,
             spec: "https://antigravity.google/cli/install.sh",
             verify_binary: "agy",
         }),
+        // `agy` gates tool calls behind a permission prompt; `--dangerously-skip-
+        // permissions` auto-approves (the apply lane). For propose-only we keep the
+        // default (no auto-approve) so it plans without acting. (`agy` has no
+        // `--approval-mode plan/yolo`; those were stale gemini flags.)
         fix: FixProfile {
-            propose_args: &["--approval-mode", "plan"],
-            apply_args: &["--approval-mode", "yolo"],
+            propose_args: &[],
+            apply_args: &["--dangerously-skip-permissions"],
             apply_supported: true,
         },
     },

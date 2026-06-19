@@ -102,19 +102,23 @@ impl TryFrom<&AgentKind> for AcpAgentSpec {
             // `codex-acp` as the entrypoint; confirm at integration time.
             AgentKind::Codex => AcpAgentSpec::new("codex-acp", Vec::new()),
 
-            // Antigravity: ACP via the sibling `gemini --acp`. Antigravity DOES
-            // ship a real CLI (`agy`, a Go binary, v1.0.10 — verified 2026-06-19,
-            // correcting the earlier "only agy-node runtime" note), but `agy`
-            // itself has NO ACP mode (only --print / --conversation / a TUI). Its
-            // registry row already drives through `gemini` (binary_candidates
-            // include gemini; drive_command `gemini -p {prompt}`), and `gemini`
-            // speaks ACP — so Antigravity's ACP entrypoint is `gemini --acp`,
-            // identical to the Gemini arm. (Continuation stays Replay: `agy
-            // --conversation=<uuid>` could resume natively but isn't assumed
-            // installed; the gemini-driven path replays.)
-            AgentKind::Antigravity => AcpAgentSpec::new("gemini", vec!["--acp".to_string()]),
-
             // ---- No (known) local ACP entrypoint ----
+            // Antigravity ships a real CLI (`agy`, a Go binary v1.0.10), but `agy`
+            // has NO ACP stdio mode — only `--print` / `--conversation` / an
+            // interactive TUI (feature request google-antigravity/antigravity-cli#31
+            // is still pending). And `gemini --acp` is NOT a substitute: as of
+            // 2026-06-18 the `gemini` CLI stopped serving the AI Pro/Ultra/free
+            // tiers (they moved to `agy`), so `gemini --acp` only reaches the
+            // deprecated/quota-dead path. So Antigravity has no usable ACP
+            // entrypoint — it is driven through the CLI path instead (an `agy`
+            // DriveSpec in `drive/cli.rs`: `agy -p` / `agy --conversation <id>`),
+            // which uses Antigravity's own (non-quota-capped) account tier.
+            AgentKind::Antigravity => {
+                anyhow::bail!(
+                    "Antigravity's `agy` CLI has no ACP stdio mode (and `gemini --acp` \
+                     is the dead pre-2026-06-18 tier); drive it via the `agy` CLI path"
+                )
+            }
             AgentKind::Aider => {
                 anyhow::bail!("Aider ACP support is unconfirmed; no known local ACP entrypoint")
             }
@@ -161,12 +165,6 @@ mod tests {
         let cp = spec(AgentKind::Copilot);
         assert_eq!(cp.program, "copilot");
         assert_eq!(cp.args, vec!["--acp".to_string(), "--stdio".to_string()]);
-
-        // Antigravity drives its ACP through the sibling `gemini --acp` (its own
-        // `agy` CLI has no ACP mode).
-        let a = spec(AgentKind::Antigravity);
-        assert_eq!(a.program, "gemini");
-        assert_eq!(a.args, vec!["--acp".to_string()]);
     }
 
     #[test]
@@ -185,6 +183,7 @@ mod tests {
     #[test]
     fn unsupported_kinds_return_err() {
         for k in [
+            AgentKind::Antigravity,
             AgentKind::Aider,
             AgentKind::CursorCloud,
             AgentKind::CopilotCloud,
