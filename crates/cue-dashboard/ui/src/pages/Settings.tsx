@@ -14,11 +14,31 @@ import { Check, Eye, EyeOff, Mail, Trash2, ExternalLink, LogOut } from "lucide-r
  * red-500 destructive. Same palette as Onboarding.
  */
 
+const platform = typeof navigator === "undefined" ? "" : navigator.userAgent;
+const isWindows = platform.includes("Windows");
+const isMac = platform.includes("Mac");
+
 const DISGUISE_OPTIONS = [
-  { value: "none", label: "Off (visible as Bluey)", desc: "Bluey shows up as itself in your menu bar." },
-  { value: "activity", label: "Activity Monitor", desc: "Recommended. Looks like the system process viewer." },
-  { value: "terminal", label: "Terminal", desc: "Looks like an open terminal window." },
-  { value: "settings", label: "System Settings", desc: "Looks like an open settings pane." },
+  {
+    value: "none",
+    label: "Off (visible as Bluey)",
+    desc: `Bluey shows up as itself in your ${isWindows ? "taskbar tray" : "menu bar"}.`,
+  },
+  {
+    value: "activity",
+    label: isWindows ? "Task Manager" : "Activity Monitor",
+    desc: "Recommended. Uses the system process viewer identity.",
+  },
+  {
+    value: "terminal",
+    label: isWindows ? "Command Prompt" : "Terminal",
+    desc: "Uses the platform terminal identity.",
+  },
+  {
+    value: "settings",
+    label: isMac ? "System Settings" : "Settings",
+    desc: "Uses the platform settings identity.",
+  },
 ];
 
 interface AccountMe {
@@ -101,7 +121,7 @@ function AccountCard() {
       ) : loaded ? (
         <div className="space-y-2">
           <p className="text-sm text-zinc-400">
-            Sign in once in the browser. Bluey stores desktop tokens in the OS keychain.
+            Sign in once in the browser. Bluey stores desktop tokens in your local account profile.
           </p>
           <button
             onClick={signIn}
@@ -152,7 +172,7 @@ function DisguiseCard() {
       <div>
         <h3 className="font-semibold text-zinc-100">Disguise</h3>
         <p className="text-xs text-zinc-400 mt-1 leading-relaxed">
-          How Bluey appears in your menu bar and to screen-shares.{" "}
+          How Bluey appears in your {isWindows ? "taskbar tray" : "menu bar"} and to screen-shares.{" "}
           <a href="https://bluey.sh/docs/disguise" target="_blank" rel="noreferrer"
             className="text-blue-400 hover:text-blue-300 underline">Why?</a>
         </p>
@@ -194,8 +214,8 @@ function VisibilityCard() {
         <EyeOff className="h-4 w-4 text-zinc-400 mt-0.5 shrink-0" />
         <p className="text-xs text-zinc-300 leading-relaxed">
           <kbd className="px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-100 text-[11px] font-mono">F19</kbd>{" "}
-          toggles Bluey&apos;s overlay on or off instantly. The menu-bar icon
-          and the {`"Invisible"`} tray entry do the same thing.
+          toggles Bluey&apos;s overlay on or off instantly. The tray icon and
+          the {`"Invisible"`} tray entry do the same thing.
         </p>
       </div>
       <div className="flex items-start gap-3">

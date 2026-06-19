@@ -1037,24 +1037,12 @@ pub fn set_disguise(mode: String, app: AppHandle) -> Result<(), String> {
     let req = cue_stealth::build_request(disguise_mode, None);
     cue_stealth::apply_disguise(&req).map_err(|e| e.to_string())?;
 
-    // Codex follow-up: real menu-bar tray icon swap. Disguise PNGs are
+    // Codex follow-up: real tray icon swap. Disguise PNGs are
     // embedded at compile time via include_bytes! so they are part of
     // the signed app bundle (no runtime path lookup, no missing-file
     // class). None mode restores the default Bluey icon.
     if let Some(tray) = app.tray_by_id("main") {
-        let icon_bytes: Option<&'static [u8]> = match disguise_mode {
-            cue_stealth::DisguiseMode::None => None,
-            cue_stealth::DisguiseMode::Activity => {
-                Some(include_bytes!("../icons/disguise/mac/activity.png"))
-            }
-            cue_stealth::DisguiseMode::Terminal => {
-                Some(include_bytes!("../icons/disguise/mac/terminal.png"))
-            }
-            cue_stealth::DisguiseMode::Settings => {
-                Some(include_bytes!("../icons/disguise/mac/settings.png"))
-            }
-        };
-        match icon_bytes {
+        match disguise_icon_bytes(disguise_mode) {
             Some(bytes) => match tauri::image::Image::from_bytes(bytes) {
                 Ok(img) => {
                     if let Err(e) = tray.set_icon(Some(img)) {
@@ -1093,6 +1081,43 @@ pub fn set_disguise(mode: String, app: AppHandle) -> Result<(), String> {
     persist_core_disguise_mode(disguise_mode.as_str());
 
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn disguise_icon_bytes(mode: cue_stealth::DisguiseMode) -> Option<&'static [u8]> {
+    match mode {
+        cue_stealth::DisguiseMode::None => None,
+        cue_stealth::DisguiseMode::Activity => {
+            Some(include_bytes!("../icons/disguise/mac/activity.png"))
+        }
+        cue_stealth::DisguiseMode::Terminal => {
+            Some(include_bytes!("../icons/disguise/mac/terminal.png"))
+        }
+        cue_stealth::DisguiseMode::Settings => {
+            Some(include_bytes!("../icons/disguise/mac/settings.png"))
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn disguise_icon_bytes(mode: cue_stealth::DisguiseMode) -> Option<&'static [u8]> {
+    match mode {
+        cue_stealth::DisguiseMode::None => None,
+        cue_stealth::DisguiseMode::Activity => {
+            Some(include_bytes!("../icons/disguise/win/activity.png"))
+        }
+        cue_stealth::DisguiseMode::Terminal => {
+            Some(include_bytes!("../icons/disguise/win/terminal.png"))
+        }
+        cue_stealth::DisguiseMode::Settings => {
+            Some(include_bytes!("../icons/disguise/win/settings.png"))
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn disguise_icon_bytes(_mode: cue_stealth::DisguiseMode) -> Option<&'static [u8]> {
+    None
 }
 
 fn persist_core_disguise_mode(mode: &str) {

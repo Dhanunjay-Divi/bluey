@@ -421,15 +421,15 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let disguise_submenu = SubmenuBuilder::new(app, "Disguise")
         .item(&MenuItemBuilder::with_id("disguise:none", label("none", "Off")).build(app)?)
         .item(
-            &MenuItemBuilder::with_id("disguise:activity", label("activity", "Activity Monitor"))
+            &MenuItemBuilder::with_id("disguise:activity", label("activity", activity_label()))
                 .build(app)?,
         )
         .item(
-            &MenuItemBuilder::with_id("disguise:terminal", label("terminal", "Terminal"))
+            &MenuItemBuilder::with_id("disguise:terminal", label("terminal", terminal_label()))
                 .build(app)?,
         )
         .item(
-            &MenuItemBuilder::with_id("disguise:settings", label("settings", "System Settings"))
+            &MenuItemBuilder::with_id("disguise:settings", label("settings", settings_label()))
                 .build(app)?,
         )
         .build()?;
@@ -514,6 +514,36 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .build(app)?;
 
     Ok(())
+}
+
+#[cfg(target_os = "windows")]
+fn activity_label() -> &'static str {
+    "Task Manager"
+}
+
+#[cfg(not(target_os = "windows"))]
+fn activity_label() -> &'static str {
+    "Activity Monitor"
+}
+
+#[cfg(target_os = "windows")]
+fn terminal_label() -> &'static str {
+    "Command Prompt"
+}
+
+#[cfg(not(target_os = "windows"))]
+fn terminal_label() -> &'static str {
+    "Terminal"
+}
+
+#[cfg(target_os = "macos")]
+fn settings_label() -> &'static str {
+    "System Settings"
+}
+
+#[cfg(not(target_os = "macos"))]
+fn settings_label() -> &'static str {
+    "Settings"
 }
 
 fn show_main_window(app: &tauri::AppHandle) {

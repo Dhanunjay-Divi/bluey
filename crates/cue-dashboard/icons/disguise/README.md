@@ -1,12 +1,14 @@
 # Disguise Icons
 
-Placeholder icons used when Cue is running in disguise mode. Each mode
-makes the app appear as a different system utility in the dock/taskbar.
+Placeholder icons used when Bluey is running in disguise mode. Each mode
+changes the app-facing identity to a familiar system utility.
 
-**Status:** Icon assets are on disk but NOT yet wired into the running app.
-The `apply_disguise` function changes process name and window title only.
-Dock/taskbar icon changes (`window.set_icon()`) are deferred until
-production-quality icons are available. See IMPL-PHASE-3-ROUND-8.md.
+**Status:** macOS and Windows tray icons are embedded in the dashboard binary
+and swapped at runtime by `set_disguise`. The dashboard window title is updated
+on both platforms. macOS also gets best-effort process title changes. Windows
+gets AppUserModelID/taskbar identity changes, but the executable image name in
+Task Manager remains the shipped binary name; Windows does not support safely
+renaming that at runtime.
 
 ## Structure
 
@@ -36,22 +38,18 @@ To regenerate or replace with production-quality icons:
 
 ## Manual Smoke Test
 
-> **Note:** Steps 3/5 below (dock/taskbar icon changes) are NOT yet
-> functional. Only window title and process name changes are active.
-> TODO: Wire `window.set_icon()` in cue-stealth once production icons land.
-
 ### macOS
-1. Open Cue → Settings → Stealth & Disguise section.
+1. Open Bluey -> Settings -> Disguise section.
 2. Select "Activity Monitor" from the dropdown.
-3. ~~Verify the dock icon changes to the activity placeholder.~~ (deferred)
+3. Verify the tray/menu-bar icon changes to the activity placeholder.
 4. Check Activity Monitor label appears in the app menu bar.
-5. Switch to "Terminal" — verify ~~dock icon and~~ menu bar update.
-6. Switch to "None" — verify original Cue title restores.
+5. Switch to "Terminal" and verify tray/menu-bar icon and menu bar update.
+6. Switch to "None" and verify original Bluey title restores.
 
 ### Windows
-1. Open Cue → Settings → Stealth & Disguise section.
+1. Open Bluey -> Settings -> Disguise section.
 2. Select "Task Manager" from the dropdown.
-3. ~~Verify the taskbar icon changes to the activity placeholder.~~ (deferred)
-4. Check window title shows "Task Manager".
-5. Switch to "Command Prompt" — verify ~~taskbar icon and~~ title update.
-6. Switch to "None" — verify original Cue title restores.
+3. Verify the tray/taskbar icon changes to the activity placeholder.
+4. Check the dashboard window title shows "Task Manager".
+5. Switch to "Command Prompt" and verify tray/taskbar icon and title update.
+6. Switch to "None" and verify original Bluey title restores.
