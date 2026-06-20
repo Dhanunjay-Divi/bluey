@@ -2695,6 +2695,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var recordingActive = false
     private var transcriptSnippets: [String] = []
     private var latestLiveTranscriptLine: String?
+    private var consumedTranscriptFingerprints: [String] = []
     private var lastTranscriptStripSource: String?
     private var sessionItems: [OverlaySessionItem] = []
     private var editingSessionId: String?
@@ -4616,6 +4617,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return
         }
         composer.clearText()
+        consumeTranscriptBufferForAnswer()
         let route = selectedRoute()
         updateRouteBadge(for: q, selectedRoute: route)
         emitAsk(question: q, provider: route.provider, model: route.model, mode: route.mode)
@@ -5678,6 +5680,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let cleanBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanBody.isEmpty else { return }
         let line = "\(label): \(cleanBody)"
+        if transcriptLineWasJustConsumed(line) {
+            if !final {
+                latestLiveTranscriptLine = nil
+            }
+            return
+        }
         if final {
             latestLiveTranscriptLine = nil
             if let last = transcriptSnippets.last,
@@ -5704,6 +5712,25 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !joined.isEmpty else { return nil }
         return joined
+    }
+
+    private func consumeTranscriptBufferForAnswer() {
+        var lines = transcriptSnippets
+        if let live = latestLiveTranscriptLine, lines.last != live {
+            lines.append(live)
+        }
+        for line in lines {
+            let fingerprint = transcriptMemoryFingerprint(line)
+            guard !fingerprint.isEmpty else { continue }
+            if !consumedTranscriptFingerprints.contains(fingerprint) {
+                consumedTranscriptFingerprints.append(fingerprint)
+            }
+        }
+        if consumedTranscriptFingerprints.count > 24 {
+            consumedTranscriptFingerprints.removeFirst(consumedTranscriptFingerprints.count - 24)
+        }
+        transcriptSnippets.removeAll()
+        latestLiveTranscriptLine = nil
     }
 
     private func composedQuestionForAnswer(typed raw: String) -> String? {
@@ -5798,6 +5825,29 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func longerTranscriptMemoryLine(_ first: String, _ second: String) -> String {
         first.count >= second.count ? first : second
+    }
+
+    private func transcriptMemoryFingerprint(_ line: String) -> String {
+        normalizeTranscriptMemoryLine(parsedTranscriptMemoryLine(line).body)
+    }
+
+    private func transcriptLineWasJustConsumed(_ line: String) -> Bool {
+        let fingerprint = transcriptMemoryFingerprint(line)
+        guard !fingerprint.isEmpty else { return false }
+        let words = fingerprint.split(separator: " ").count
+        for consumed in consumedTranscriptFingerprints {
+            guard !consumed.isEmpty else { continue }
+            if consumed == fingerprint { return true }
+            let consumedWords = consumed.split(separator: " ").count
+            let shorter = min(words, consumedWords)
+            let longer = max(words, consumedWords)
+            if shorter > 0,
+               longer <= shorter + 4,
+               (consumed.contains(fingerprint) || fingerprint.contains(consumed)) {
+                return true
+            }
+        }
+        return false
     }
 
     private func normalizeTranscriptMemoryLine(_ value: String) -> String {
