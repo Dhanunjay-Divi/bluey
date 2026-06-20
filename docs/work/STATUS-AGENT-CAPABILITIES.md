@@ -187,6 +187,37 @@ genuinely distinct store that needs its own 5-cap pass — which is exactly why
   it. Workaround during testing: restart the daemon between heavy resume tests. (Follow-up task spawned.)
 
 ## Verification log (append-only — date, what was tested, result)
+- 2026-06-20 — **✅ READER-LAYER HARDENING (H1–H3) — production-maintainable session
+  reading + a LIVE drift CAUGHT and FIXED.** Research (3-angle workflow + web) confirmed
+  the custom store-reading IS the production standard (CCHV reads 10+ agents the same way)
+  and that vendor format drift is an operational certainty — with two corrections to my
+  plan: the canary must be **ratio-based** (not "flags zero") and degrade **per-row** (not
+  all-or-nothing). Built exactly that:
+  - **H1 — ratio-based `ReaderHealth`** (`Parsed{parsed, raw_total}` + `parse_ratio()` +
+    `is_total_drift()` = parsed 0 of raw>0). Each of the 5 readers overrides `health()`
+    to count its OWN raw unit: jsonl = files whose BODY decodes ≥1 turn (list() always
+    surfaces a row from id+mtime, so body-decode is the real bar); vscdb = body-bearing
+    composer rows (empty auto-drafts + workspace-only excluded so a healthy store is ~1.0
+    not ~0.14); json_files/claude_app = index files that deserialize; antigravity = protobuf
+    index records that decode. (sessions/{mod,jsonl,vscdb,json_files,claude_app,antigravity}.rs)
+  - **H2 — per-row degradation + one structured warning.** Readers already skip a bad
+    row and keep the rest; `list_with_health_check()` adds the missing piece — exactly one
+    `unrecognized_format{agent, store_path, parsed, raw_total}` tracing warn when a store
+    holds raw records but parses none. prove.rs routes through it. (sessions/mod.rs, prove.rs)
+  - **H3 — ratio canary against REAL stores** (`tests/reader_health_canary.rs`): discovers
+    every store on the machine, asserts none `is_total_drift()` and content stores clear a
+    0.5 parse-ratio floor; SKIPS absent agents (not flaky on minimal CI). **This caught a
+    real LIVE drift:** the Claude **App** index dropped its `completedTurns` field, so the
+    old non-Option `#[serde(default)] u64` read 0 for every session and the emptiness filter
+    hid the ENTIRE app-agent history (0 of 18 parsed). FIXED: `completed_turns: Option<u64>`,
+    skip only on explicit `Some(0)` (body presence is verified at read-time anyway). Re-run:
+    14/18, and all 10 real stores now green (Claude CLI 254/256, Codex 255/256, Copilot
+    89/89, Cursor 31/31, Antigravity 110/110, Gemini 164/168, …). Regression test added with
+    the real new-format field set. (sessions/claude_app.rs)
+  Gate: 600 lib + 9 discover + 1 canary + 4 resolver tests green, clippy clean, fmt clean,
+  whole workspace builds. Also fixed a pre-existing stale fork test (`generic_vscode_fork_
+  detector_finds_unknown_fork`) that predated the C6 store-shape gate. tracing-subscriber
+  added as a TEST-ONLY dev-dep (drift-warning capture). Commits: 7e0b37d (H1+H2), + H3 below.
 - 2026-06-20 — **✅ BACKEND COMPLETION RUN — adversarial gap-audit → fixed all 9 items.**
   A 5-auditor workflow found the real gaps (not assumed); fixed each with a
   machine-checkable proof + a regression gate (581→589 bridge tests, 0 regressions,

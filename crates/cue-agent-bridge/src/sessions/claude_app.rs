@@ -51,10 +51,14 @@ struct AppIndex {
     /// Whether the user archived the session (kept out of the default list).
     #[serde(rename = "isArchived", default)]
     is_archived: bool,
-    /// Count of completed turns (NOT the turns themselves). Used to drop empty
-    /// sessions from the listing.
-    #[serde(rename = "completedTurns", default)]
-    completed_turns: u64,
+    /// Count of completed turns (NOT the turns themselves), when the app records
+    /// it. OPTIONAL on purpose: newer Claude App builds dropped `completedTurns`
+    /// from the index (verified on a live store — 18/18 sessions had no such
+    /// field), so a non-`Option` `#[serde(default)]` u64 silently read 0 for
+    /// EVERY session and the emptiness filter hid the entire app history. We now
+    /// only use it as a NEGATIVE signal when it is explicitly present and zero.
+    #[serde(rename = "completedTurns")]
+    completed_turns: Option<u64>,
 }
 
 /// Reader for [`SessionFormat::ClaudeAppIndex`](crate::SessionFormat::ClaudeAppIndex).
@@ -166,7 +170,12 @@ fn session_ref_for(file: &Path) -> Option<(SessionRef, String)> {
     let bytes = std::fs::read(file).ok()?;
     let index: AppIndex = serde_json::from_slice(&bytes).ok()?;
 
-    if index.is_archived || index.completed_turns == 0 {
+    // Skip archived sessions, and skip a session ONLY when the index explicitly
+    // records zero completed turns (a never-used draft). When `completedTurns` is
+    // absent — as in newer app builds — we do NOT treat that as empty; the body's
+    // real existence is verified in `read()` (it follows `cliSessionId` into the
+    // shared JSONL and returns an empty transcript if there's nothing there).
+    if index.is_archived || index.completed_turns == Some(0) {
         return None;
     }
     let cli_session_id = index.cli_session_id?;
@@ -311,6 +320,46 @@ mod tests {
         assert_eq!(
             refs[0].project.as_deref(),
             Some("/Users/ms/Developer/Bluey")
+        );
+    }
+
+    #[test]
+    fn list_handles_newer_index_without_completed_turns_field() {
+        // Regression for a LIVE drift caught by the health canary: newer Claude
+        // App builds dropped `completedTurns` from the index. With the old
+        // non-Option `#[serde(default)]` u64 it read 0 for every session and the
+        // emptiness filter hid ALL app history (0 of 18 parsed on the real store).
+        // The field set + key names here mirror a real on-disk file.
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("acct").join("ws");
+        write(
+            &ws.join("local_new.json"),
+            r#"{"sessionId":"s1","cliSessionId":"b936d14e","title":"Job applications tracker","cwd":"/Users/ms/Developer/Bluey","lastActivityAt":1777936435440,"isArchived":false,"initialMessage":"track my applications","model":"opus","accountName":"Albert"}"#,
+        );
+        // An archived new-format session is still skipped.
+        write(
+            &ws.join("local_arch.json"),
+            r#"{"cliSessionId":"arch-1","title":"Old","cwd":"/x","isArchived":true}"#,
+        );
+
+        let store = SessionStore {
+            path: dir.path().to_path_buf(),
+            format: crate::SessionFormat::ClaudeAppIndex,
+        };
+        let refs = ClaudeAppReader.list(&store, 10).unwrap();
+        assert_eq!(
+            refs.len(),
+            1,
+            "new-format session lists despite no completedTurns; archived skipped"
+        );
+        assert_eq!(refs[0].id, "b936d14e");
+        assert_eq!(refs[0].title.as_deref(), Some("Job applications tracker"));
+
+        // And health() reports it as fully parsed — no false drift.
+        let h = ClaudeAppReader.health(&store);
+        assert!(
+            !h.is_total_drift(),
+            "new format must not look like drift: {h:?}"
         );
     }
 

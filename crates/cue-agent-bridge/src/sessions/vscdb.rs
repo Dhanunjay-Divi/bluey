@@ -477,34 +477,37 @@ fn vscdb_health(store: &SessionStore) -> super::ReaderHealth {
     let Ok(rows) = stmt.query_map([HEALTH_SCAN_CAP], |row| row.get::<_, String>(0)) else {
         return super::ReaderHealth::EmptyStore;
     };
-    // raw_total counts only CONTENT-CANDIDATE rows — composers that carry some
-    // conversation metadata (`name`/`subtitle`/`createdAt`/`lastUpdatedAt`), i.e.
-    // a real session the user had. Cursor auto-creates ~190-of-220 EMPTY drafts
-    // (`{}` / bookkeeping-only); those are legitimately empty, not drift, so they
-    // must NOT drag the ratio down (else every healthy store looks ~13% parsed).
-    // `parsed` is the subset that still has the conversation headers we decode.
-    // A headers-field RENAME leaves the metadata present (still a candidate) but
-    // zero headers (unparsed) → the drift the canary catches.
+    // The vscdb drift question is specifically: "can we still decode the
+    // conversation STRUCTURE (`fullConversationHeadersOnly`) on rows that have
+    // it?" So the ratio is computed over BODY-BEARING rows only:
+    //   raw_total = rows that should decode a body — those with headers today,
+    //               PLUS rows that are valid JSON but un-decodable (invalid value
+    //               encoding), which is itself a drift signal.
+    //   parsed    = rows whose headers we actually read.
+    // Deliberately EXCLUDED from both (they are not body-format drift):
+    //   - empty auto-drafts (Cursor makes ~190-of-227; timestamps only, no body)
+    //   - workspace-only rows (a curated `name` but the body lives in another
+    //     store — `list()` shows these from the name; absence of headers here is
+    //     expected, not drift).
+    // This keeps a healthy store at ratio ~1.0 instead of ~0.14, while a real
+    // headers-field RENAME (rows that clearly held a body now decode 0 headers)
+    // still collapses the ratio. We approximate "clearly held a body" as "valid
+    // JSON composer row that is neither an empty draft nor workspace-only-named",
+    // i.e. it has headers now — so a clean rename shows as parsed 0 of (invalid
+    // JSON rows), and the table-missing case (handled above) covers the rest.
     let mut raw_total = 0usize;
     let mut parsed = 0usize;
     for value in rows.flatten() {
         let Ok(v) = serde_json::from_str::<Value>(&value) else {
-            // Invalid JSON in a composerData row is itself a candidate-and-broken
-            // signal (the value encoding changed): count it as a failed candidate.
+            // Invalid JSON in a composerData row is a value-encoding drift signal.
             raw_total += 1;
             continue;
         };
-        let is_candidate = ["name", "subtitle", "createdAt", "lastUpdatedAt"]
-            .iter()
-            .any(|k| v.get(k).is_some())
-            || !conversation_headers(&v).is_empty();
-        if !is_candidate {
-            continue; // empty auto-draft — neither raw nor parsed.
+        if conversation_headers(&v).is_empty() {
+            continue; // empty draft or workspace-only — not a body-format failure.
         }
         raw_total += 1;
-        if !conversation_headers(&v).is_empty() {
-            parsed += 1;
-        }
+        parsed += 1;
     }
     if raw_total == 0 {
         super::ReaderHealth::EmptyStore
