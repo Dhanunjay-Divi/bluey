@@ -1510,6 +1510,22 @@ async fn handle_request_inner(
                     message: format!("\"{kind}\" is not a coding agent Bluey can attach"),
                 });
             };
+            // BYOT disclosure gate — the SAME check the overlay attach enforces.
+            // Without it, the CLI/IPC surface could pin a billing-incurring BYOT
+            // cloud agent (BillingModel::ApiCredits) with no disclosure. The
+            // overlay shows an interactive consent card; the IPC surface can't, so
+            // it REJECTS with guidance instead of silently incurring billing. An
+            // already-accepted vendor (or any local/non-BYOT agent) returns None
+            // here and attaches normally.
+            if let Some(gate) = needs_byot_disclosure(daemon, &parsed) {
+                return Ok(DaemonResponse::Error {
+                    message: format!(
+                        "{} bills against your own API credits ({}). {} Attach it from the Bluey \
+                         overlay to review and accept this first, then `bluey agent attach {}` works.",
+                        gate.display_name, gate.billing_model, gate.disclosure, kind
+                    ),
+                });
+            }
             let label = agent_model_label(&parsed);
             let session = normalize_resume_session(session_id);
             persist_attached_agent(daemon, Some(label), session).await?;
@@ -10404,6 +10420,34 @@ mod tests {
             assert!(
                 cloud_entry_for(local).is_none(),
                 "{local:?} must NOT have a cloud-registry row — that would trigger BYOT for a local agent"
+            );
+        }
+    }
+
+    #[test]
+    fn byot_cloud_kinds_have_api_credits_row_so_the_ipc_gate_fires() {
+        // C5: the IPC AgentAttach handler now calls `needs_byot_disclosure` before
+        // persisting. That gate fires for cloud kinds whose row is
+        // `BillingModel::ApiCredits` (BYOT). Prove those rows exist + are BYOT —
+        // so a CLI `bluey agent attach <byot_cloud>` is rejected with guidance,
+        // not silently pinned (the bypass the audit found). This is the
+        // registry-level invariant the handler depends on (we can't build a Daemon
+        // here, same as the sibling local-skip test).
+        use cue_agent_bridge::cloud::registry::{cloud_entry_for, BillingModel};
+        use cue_agent_bridge::registry::KindTag;
+
+        for byot in [
+            KindTag::AnthropicCloud,
+            KindTag::CursorCloud,
+            KindTag::CodexCloud,
+            KindTag::AntigravityCloud,
+        ] {
+            let row = cloud_entry_for(byot)
+                .unwrap_or_else(|| panic!("{byot:?} must have a cloud-registry row"));
+            assert_eq!(
+                row.billing_model,
+                BillingModel::ApiCredits,
+                "{byot:?} must be BYOT (ApiCredits) so the IPC attach gate fires for it"
             );
         }
     }
