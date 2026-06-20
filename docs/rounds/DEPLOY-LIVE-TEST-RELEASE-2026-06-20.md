@@ -10,7 +10,9 @@ Deploy the current Bluey code for live paid testing without GitHub Actions. The 
 2. Build the macOS arm64 release artifact locally with the update public key embedded.
 3. Publish `latest.json`, `latest.json.sig`, install scripts, checksums, and artifacts directly to the droplet.
 4. Smoke the live install/update endpoints from `bluey.sh`.
-5. Leave `bluey-dev.db` untracked and untouched.
+5. Rebuild and restart the deployed `bluey-server` manually from the same
+   pushed commit so `/health` reports the live-test commit.
+6. Leave `bluey-dev.db` untracked and untouched.
 
 ## Verification Log
 
@@ -53,7 +55,15 @@ Deploy the current Bluey code for live paid testing without GitHub Actions. The 
   - SRI: `sha384-vMCEeyJi2Wcd8RUDxf+1KqM9WZaKg1tKXQQCLMqqIk84ffTjXjfxbQ2Fo+fxUSss`
 - Server health remains OK:
   - `https://bluey.sh/health`
-  - live server commit: `e8f10f38117958bd6a0e7bfcd3316d039679e1e0`
+  - live server commit: `f5b245ba36d2a3f59c1bdada842ce1747f7a98fc`
+- Server was manually redeployed after the release publish:
+  - synced workspace to `/opt/bluey-build`
+  - built on the droplet with `BLUEY_GIT_COMMIT=f5b245ba36d2a3f59c1bdada842ce1747f7a98fc`
+  - backed up `/usr/local/bin/bluey-server`
+  - installed `/opt/bluey-build/server/target/release/bluey-server`
+  - restarted `bluey-api.service`
+  - `systemctl is-active bluey-api.service` -> `active`
+  - warning logs for the restart window -> no entries
 - Pricing endpoint remains OK and reflects the live account/reload policy.
 
 ## Notes
