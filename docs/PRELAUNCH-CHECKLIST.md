@@ -17,6 +17,10 @@ operating plan.
 - [ ] Paid-alpha smoke in `docs/deploy/PAID-ALPHA-SMOKE.md` passed on a clean Mac
 - [ ] Square sandbox and low-dollar production reloads credit balances within 30s
 - [ ] Provider accounts funded and provider dashboard alerts/caps configured
+- [ ] Model freshness gate completed per `docs/MODEL-ROUTING.md`: current
+      provider model docs checked, route/pricing table reviewed, and live
+      provider smoke plan recorded for OpenAI, Anthropic, Gemini, Deepgram, and
+      embeddings
 - [ ] Off-host backups configured and one restore/checksum verification passed
 - [ ] Support/refund/dispute owner assigned and mailbox monitored
 - [ ] No release artifact exposes provider keys, BYOK/customer-key paths, local LLM release mode, mock transcript mode, or dev capture flags

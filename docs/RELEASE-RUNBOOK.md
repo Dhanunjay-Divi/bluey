@@ -20,6 +20,9 @@ artifact to prod. Never rebuild between preprod and prod.
 - [ ] All branches in scope are merged into `main` (no rebase needed).
 - [ ] Codex chain review on the merge target has returned 🟢.
 - [ ] `docs/rounds/PHASE-3-ROUND-N-PLAN.md` is up to date for the round.
+- [ ] Model freshness gate in `docs/MODEL-ROUTING.md` is complete for this
+      release: provider docs checked, route table/pricing reviewed, capacity
+      notes reviewed, and live smoke plan recorded.
 - [ ] `FUTURE-IMPLEMENTATIONS.md` has the items shipped this release moved
       to its `## Cleanup / archived` section.
 - [ ] `docs/release/RELEASE-vX.Y.Z.md` is drafted (release notes).
@@ -111,6 +114,12 @@ Required sections:
 - Verification log (the pipeline output above)
 - Artifact table with name + size + sha256
 - Test count progression
+- Model freshness table with:
+  - checked date
+  - OpenAI / Anthropic / Gemini / Deepgram / embedding model ids
+  - pricing snapshot date
+  - changed route candidates, if any
+  - live-smoke trace ids or explicit waiver
 
 ---
 

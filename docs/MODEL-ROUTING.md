@@ -7,6 +7,44 @@ currently implemented in the Bluey codebase. It is intentionally operational:
 it says what runs today, which keys are required, and which provider ideas are
 not wired yet.
 
+## Model Freshness Release Gate
+
+Provider model catalogs and prices change frequently. Before every deploy that
+can reach paying users, treat model freshness as a required release gate:
+
+1. Check the official provider docs/dashboards for OpenAI, Anthropic, Gemini,
+   Deepgram, and the embedding provider in use.
+2. Confirm each Bluey lane still points at an available, non-deprecated model:
+   `instant`, `balanced`, `deep`, `vision`, `embed`, and STT.
+3. Re-check pricing for every routed model and update
+   `server/src/pricing/mod.rs` if any upstream price changed.
+4. Re-check provider rate-limit and context-window notes. If a new model is
+   better but has tighter limits, either keep the old model or update capacity
+   env vars and fallback order in the same release.
+5. Run the model-routing tests and at least one live smoke per provider with
+   funded keys before promoting the deploy:
+
+   ```bash
+   cargo test --manifest-path server/Cargo.toml routing::dispatcher -- --nocapture
+   cargo test --manifest-path server/Cargo.toml pricing -- --nocapture
+   # Operator smoke: instant, balanced, deep, vision, embed, STT against deployed env.
+   ```
+
+6. Record the check in the release notes or round doc:
+
+   ```text
+   Model freshness checked: YYYY-MM-DD
+   OpenAI: <model ids> / pricing checked
+   Anthropic: <model ids> / pricing checked
+   Gemini: <model ids> / pricing checked
+   Deepgram/STT: <model ids> / pricing checked
+   Embeddings: <model ids> / pricing checked
+   Live smoke: pass/fail + trace ids
+   ```
+
+Do not silently switch a production route to a new model just because it exists.
+Every model change must include pricing, fallback, capacity, and smoke evidence.
+
 ## Managed LLM Routing
 
 When a user is logged in, the desktop talks to `bluey-server` through
