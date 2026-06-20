@@ -187,6 +187,41 @@ genuinely distinct store that needs its own 5-cap pass — which is exactly why
   it. Workaround during testing: restart the daemon between heavy resume tests. (Follow-up task spawned.)
 
 ## Verification log (append-only — date, what was tested, result)
+- 2026-06-20 — **✅ BACKEND COMPLETION RUN — adversarial gap-audit → fixed all 9 items.**
+  A 5-auditor workflow found the real gaps (not assumed); fixed each with a
+  machine-checkable proof + a regression gate (581→589 bridge tests, 0 regressions,
+  clippy clean throughout). Items:
+  - **C4** (resume integrity): an empty resume (Done with no Delta) was silently
+    accepted as success — the relocated fake-success trap. Now forks instead, so
+    the user never gets a silent empty answer. (acp/drive.rs)
+  - **C1** (USP): Codex MCP servers live in `~/.codex/config.toml` (TOML) — were
+    unread → 0/0 connectors. Now parsed secret-free → 5 connectors live. (connectors.rs,
+    discover.rs, toml dep)
+  - **C2** (USP anti-fake): Cap-5 verifier proved tool *availability*, not *firing*
+    (a 401'd connector read as "MCP works"). Added `McpStep::Fired` — proven only
+    when a real `[tool: …]` ToolCall is observed mid-answer. (prove_drive.rs)
+  - **C3** (USP): the `claude-agent-acp` adapter ALREADY hardcodes
+    `settingSources:["user","project","local"]`, so it loads user MCP — verified
+    live (perplexity fired over ACP). Documented; do NOT add settingSources flags.
+  - **C5** (security): IPC `AgentAttach` bypassed the BYOT disclosure gate the
+    overlay enforces — now rejects un-disclosed BYOT cloud attach. (app.rs)
+  - **C6** (read/name/project): deduped the 3 Antigravity rows → 1; percent-decode
+    project paths (no more `%20` mojibake). (discover.rs, antigravity.rs)
+  - **C7**: Bluey's own Replay banner + summary prompts leaked as session titles —
+    now classified as boilerplate. (sessions/mod.rs)
+  - **C9**: deduped the ACP-route gate (`should_use_acp` is now the single source;
+    daemon delegates) so route + continuation can't desync. (lib.rs, app.rs)
+  - **C8**: regression coverage for the (already-fixed) detach-clears + recoverable-
+    retry was found ALREADY present (`normalize_resume_session` + `is_resume_recoverable_error`
+    tests) — no new work needed.
+  Production decision recorded: ACP stays opt-in (`BLUEY_USE_ACP=1`) for v1 — the
+  spine has no CLI fallback if `drive_acp` errors before any Delta, so flipping the
+  default would turn adapter/handshake failures into hard answer failures. Sequenced
+  path to eventually flip it is in the gap-audit (add a spine-level no-Delta CLI
+  fallback first). Commits: e983997, d72465b, 8aa4d82, 7f5860e, 7f6e52d, a9cd6a9,
+  3305296, 3f3a45e.
+
+
 - 2026-06-19 — **✅ FORK-READER MISASSIGNMENT FIXED (the 5th fix — non-Cursor VS Code forks).**
   SYMPTOM: every fork with a `state.vscdb` got Cursor's `SqliteVscdb` reader, so non-Cursor forks
   (Antigravity IDE, VS Code Insiders, the Antigravity App-Support footprint) threw `no such table:
