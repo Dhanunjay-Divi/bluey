@@ -1,0 +1,4 @@
+{"type": "user", "cwd": "/Users/example/Projects/demo", "sessionId": "redacted", "message": {"role": "user", "content": "redacted user message"}}
+{"type": "assistant", "sessionId": "redacted", "message": {"role": "assistant", "content": [{"type": "text", "text": "redacted reply"}]}}
+{"type": "custom-title", "customTitle": "redacted title", "sessionId": "redacted"}
+{"type": "ai-title", "aiTitle": "redacted ai title", "sessionId": "redacted"}

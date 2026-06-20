@@ -1,0 +1,11 @@
+{
+  "sessionId": "00000000-aaaa-bbbb-cccc-000000000001",
+  "cliSessionId": "11111111-aaaa-bbbb-cccc-000000000002",
+  "title": "Example session title",
+  "cwd": "/Users/example/Projects/demo",
+  "lastActivityAt": 1777000000000,
+  "isArchived": false,
+  "model": "opus",
+  "initialMessage": "redacted user message",
+  "accountName": "Example"
+}
