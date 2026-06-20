@@ -187,6 +187,26 @@ genuinely distinct store that needs its own 5-cap pass — which is exactly why
   it. Workaround during testing: restart the daemon between heavy resume tests. (Follow-up task spawned.)
 
 ## Verification log (append-only — date, what was tested, result)
+- 2026-06-20 — **✅ ANTIGRAVITY IDE READER merged + SELF-RE-VERIFIED against the real
+  store (H6).** The Antigravity **IDE** desktop app is a SEPARATE install from the
+  Antigravity 2.0 app — a real gap my earlier C6 fix had wrongly deleted as a "broken
+  footprint." Merged the worktree-built `AntigravityIdeReader` onto the hardened branch
+  (manual graft on `antigravity.rs` so it composed with H1's `health()`/`count_index_
+  records`, clean apply on lib/registry/mod/discover/spec_map; new `antigravity_ide.rs`).
+  The IDE store's INDEX is its VS Code-style `state.vscdb` `ItemTable` key
+  `antigravityUnifiedStateSync.trajectorySummaries` (base64→protobuf of uuid/title/project);
+  its BODIES are the SAME `.db`/`brain` formats as 2.0, so `read_body_from_root` + the
+  protobuf `Buf` + `strip_file_scheme`/`lossy` are now shared `pub(super)`. Added a proper
+  H1-style `health()` override (raw = trajectory records, parsed = those with a uuid).
+  **Did NOT trust the sub-agent — re-verified myself:** (a) `discover_agents` finds it as a
+  DISTINCT row at `…/Antigravity IDE/User/globalStorage/state.vscdb`, separate from the 2.0
+  `…/.gemini/antigravity/agyhub_summaries_proto.pb`; (b) the live canary reads the real store
+  **1/1 (ratio 1.00)**; (c) an INDEPENDENT Python decode of the same raw `trajectorySummaries`
+  blob also found exactly 1 conversation record — the Rust count matches the bytes, not a fake.
+  All 11 real stores green in the canary; 609 lib + 9 discover + 3 fixtures + 1 canary + 5
+  security + 4 resolver tests pass; clippy + fmt clean; whole workspace builds. (Antigravity
+  IDE is read-only/replay-only — no CLI, no ACP entrypoint — so `spec_map` bails for it.)
+  Commit below.
 - 2026-06-20 — **✅ READER-LAYER HARDENING (H1–H3) — production-maintainable session
   reading + a LIVE drift CAUGHT and FIXED.** Research (3-angle workflow + web) confirmed
   the custom store-reading IS the production standard (CCHV reads 10+ agents the same way)

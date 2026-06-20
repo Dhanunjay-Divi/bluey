@@ -24,6 +24,7 @@
 use crate::{SessionFormat, SessionRef, SessionStore, Transcript};
 
 pub mod antigravity;
+pub mod antigravity_ide;
 pub mod claude_app;
 pub mod json_files;
 pub mod jsonl;
@@ -167,6 +168,7 @@ pub fn reader_for(format: SessionFormat) -> Box<dyn SessionReader> {
         SessionFormat::SqliteVscdb => Box::new(vscdb::VscdbReader),
         SessionFormat::JsonFiles => Box::new(json_files::JsonFilesReader),
         SessionFormat::AntigravityIndex => Box::new(antigravity::AntigravityReader),
+        SessionFormat::AntigravityIdeIndex => Box::new(antigravity_ide::AntigravityIdeReader),
         SessionFormat::ClaudeAppIndex => Box::new(claude_app::ClaudeAppReader),
     }
 }

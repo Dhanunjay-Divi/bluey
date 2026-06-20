@@ -83,28 +83,11 @@ impl SessionReader for AntigravityReader {
     }
 
     fn read(&self, store: &SessionStore, id: &str, max_turns: usize) -> anyhow::Result<Transcript> {
-        if max_turns == 0 {
-            return Ok(Transcript { turns: Vec::new() });
-        }
+        // The 2.0 store root (holding `conversations/` + `brain/`) is the index
+        // file's parent. The IDE reader shares the SAME body logic via a
+        // different root (see [`read_body_from_root`]).
         let root = store.path.parent().unwrap_or(&store.path);
-        // Prefer the brain JSONL transcript (richest readable body) when present.
-        let brain = root
-            .join("brain")
-            .join(id)
-            .join(".system_generated")
-            .join("logs")
-            .join("transcript.jsonl");
-        if brain.is_file() {
-            return super::jsonl::read_transcript_file(&brain, max_turns);
-        }
-        // Else the newer SQLite body, if this conversation has one.
-        let db = root.join("conversations").join(format!("{id}.db"));
-        if db.is_file() {
-            return Ok(read_db_body(&db, max_turns));
-        }
-        // Encrypted `.pb`-only conversation: listed (with title+project) but no
-        // readable body. Return empty rather than erroring.
-        Ok(Transcript { turns: Vec::new() })
+        Ok(read_body_from_root(root, id, max_turns))
     }
 
     /// Drift health for the protobuf conversation index. The raw unit is each
@@ -122,6 +105,51 @@ impl SessionReader for AntigravityReader {
         let raw_total = count_index_records(index).max(if parsed == 0 { 1 } else { parsed });
         super::ReaderHealth::Parsed { parsed, raw_total }
     }
+}
+
+/// Resolve the richest READABLE body for a conversation `id` under `root`
+/// (the store root that holds `conversations/` and `brain/`), bounded to
+/// `max_turns`. Shared by BOTH the Antigravity 2.0 reader (root =
+/// `~/.gemini/antigravity`) and the Antigravity IDE reader (root =
+/// `~/.gemini/antigravity-ide`), since the two stores use the IDENTICAL body
+/// formats — only their session indexes differ.
+///
+/// Order, richest first: `brain/<id>/.system_generated/logs/transcript.jsonl`
+/// (JSONL) → `conversations/<id>.db` (plaintext SQLite). An encrypted
+/// `conversations/<id>.pb`-only conversation has no readable body, so this
+/// returns an empty transcript (it is still *listed*, with title+project, from
+/// whichever index named it). Fail-soft: `max_turns == 0` short-circuits.
+pub(super) fn read_body_from_root(root: &Path, id: &str, max_turns: usize) -> Transcript {
+    if max_turns == 0 {
+        return Transcript { turns: Vec::new() };
+    }
+    // Prefer the brain JSONL transcript (richest readable body) when present.
+    let brain = root
+        .join("brain")
+        .join(id)
+        .join(".system_generated")
+        .join("logs")
+        .join("transcript.jsonl");
+    if brain.is_file() {
+        if let Ok(t) = super::jsonl::read_transcript_file(&brain, max_turns) {
+            return t;
+        }
+    }
+    // Else the newer SQLite body, if this conversation has one.
+    let db = root.join("conversations").join(format!("{id}.db"));
+    if db.is_file() {
+        return read_db_body(&db, max_turns);
+    }
+    // Encrypted `.pb`-only conversation: listed (with title+project) but no
+    // readable body. Return empty rather than erroring.
+    Transcript { turns: Vec::new() }
+}
+
+/// The on-disk body path for a conversation `id` under `root` (`.db` preferred
+/// for recency; `.pb` is the encrypted fallback that at least gives an mtime).
+/// `None` if neither exists. Shared by both Antigravity readers' recency math.
+pub(super) fn body_path_for_root(root: &Path, id: &str) -> Option<PathBuf> {
+    body_path(root, id)
 }
 
 /// The on-disk body path for a conversation `uuid`, if any readable/known body
@@ -157,20 +185,20 @@ struct Summary {
 // ---------------------------------------------------------------------------
 
 /// A cursor over protobuf bytes with fail-soft varint/field reads.
-struct Buf<'a> {
+pub(super) struct Buf<'a> {
     b: &'a [u8],
     i: usize,
 }
 
 impl<'a> Buf<'a> {
-    fn new(b: &'a [u8]) -> Self {
+    pub(super) fn new(b: &'a [u8]) -> Self {
         Buf { b, i: 0 }
     }
-    fn done(&self) -> bool {
+    pub(super) fn done(&self) -> bool {
         self.i >= self.b.len()
     }
     /// Read a base-128 varint. `None` on truncation/overlong.
-    fn varint(&mut self) -> Option<u64> {
+    pub(super) fn varint(&mut self) -> Option<u64> {
         let mut val: u64 = 0;
         let mut shift = 0u32;
         loop {
@@ -188,7 +216,7 @@ impl<'a> Buf<'a> {
     }
     /// Read a length-delimited byte slice (wire type 2). `None` if it would run
     /// past the buffer.
-    fn len_delim(&mut self) -> Option<&'a [u8]> {
+    pub(super) fn len_delim(&mut self) -> Option<&'a [u8]> {
         let len = self.varint()? as usize;
         let end = self.i.checked_add(len)?;
         if end > self.b.len() {
@@ -200,7 +228,7 @@ impl<'a> Buf<'a> {
     }
     /// Skip a field's payload given its wire type. Returns `false` on a wire type
     /// we don't handle (groups) or on truncation, so the caller can stop.
-    fn skip(&mut self, wire: u64) -> bool {
+    pub(super) fn skip(&mut self, wire: u64) -> bool {
         match wire {
             0 => self.varint().is_some(),    // varint
             1 => self.advance(8),            // 64-bit
@@ -219,7 +247,7 @@ impl<'a> Buf<'a> {
         }
     }
     /// Read the next `(field_number, wire_type)` tag. `None` at clean EOF.
-    fn tag(&mut self) -> Option<(u64, u64)> {
+    pub(super) fn tag(&mut self) -> Option<(u64, u64)> {
         if self.done() {
             return None;
         }
@@ -381,7 +409,7 @@ fn parse_workspace_uri(bytes: &[u8]) -> Option<String> {
 }
 
 /// `file:///Users/me/x` → `/Users/me/x`; leaves non-file URIs/paths untouched.
-fn strip_file_scheme(uri: &str) -> String {
+pub(super) fn strip_file_scheme(uri: &str) -> String {
     // Strip the scheme AND percent-decode, so a project path like
     // `file:///Users/ms/GEMMA4%20Vision%20test` becomes `/Users/ms/GEMMA4 Vision
     // test` instead of leaving raw `%20` mojibake in the displayed project.
@@ -391,7 +419,7 @@ fn strip_file_scheme(uri: &str) -> String {
 
 /// Lossy-UTF8 a byte slice into an owned String (index strings are UTF-8 but we
 /// never panic on a stray byte).
-fn lossy(b: &[u8]) -> String {
+pub(super) fn lossy(b: &[u8]) -> String {
     String::from_utf8_lossy(b).into_owned()
 }
 

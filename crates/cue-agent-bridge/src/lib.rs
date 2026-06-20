@@ -144,6 +144,16 @@ pub enum AgentKind {
     ClaudeCodeAgent,
     Cursor,
     Antigravity,
+    /// The **Antigravity IDE** desktop app — a SEPARATE install from the
+    /// `Antigravity` 2.0 app above. Its conversations live in their own store
+    /// (`~/.gemini/antigravity-ide/`, with `conversations/<uuid>.db` SQLite and
+    /// `brain/<uuid>/…/transcript.jsonl` bodies — the SAME body format as the
+    /// 2.0 app), but its session INDEX is NOT a `agyhub_summaries_proto.pb`
+    /// proto; instead it lives in the IDE's VS Code-style state store
+    /// (`Library/Application Support/Antigravity IDE/User/globalStorage/
+    /// state.vscdb`, `ItemTable` key `antigravityUnifiedStateSync.trajectory
+    /// Summaries`). Read-only / replay-only (fork). Driven by no CLI of its own.
+    AntigravityIde,
     /// Cursor's cloud-hosted **Background Agents** (a.k.a. Cloud Agents).
     /// Distinct from the local `Cursor` (the IDE) — this row points at
     /// `https://api.cursor.com` and dispatches asynchronous, PR-producing
@@ -298,6 +308,18 @@ pub enum SessionFormat {
     /// the reader resolves the richest readable body per session. Encrypted
     /// `conversations/<uuid>.pb` bodies are list-only (no readable transcript).
     AntigravityIndex,
+    /// The **Antigravity IDE** session index, stored in the IDE's VS Code-style
+    /// `state.vscdb` (`ItemTable` key `antigravityUnifiedStateSync.trajectory
+    /// Summaries`) as a base64-wrapped protobuf of `(uuid, title, project)` rows.
+    /// Distinct from [`AntigravityIndex`](SessionFormat::AntigravityIndex) (the
+    /// 2.0 app's `agyhub_summaries_proto.pb`), which the IDE store does NOT have.
+    /// Bodies are resolved from `~/.gemini/antigravity-ide/conversations/<uuid>.db`
+    /// (SQLite) and `brain/<uuid>/…/transcript.jsonl` — the same readable formats
+    /// the 2.0 reader uses, shared via the antigravity reader's body functions.
+    /// The store `path` points at the `state.vscdb` index file (never the
+    /// credential-bearing data-dir root); the reader derives the bodies dir from
+    /// `$HOME/.gemini/antigravity-ide`.
+    AntigravityIdeIndex,
     /// One JSON file per session (VS Code / Copilot `chatSessions/*.json`).
     JsonFiles,
     /// The Claude desktop app's session **index**: one `local_*.json` per

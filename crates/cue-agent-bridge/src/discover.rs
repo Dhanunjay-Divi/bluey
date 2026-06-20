@@ -540,6 +540,25 @@ fn locate_session_store(dir: &Path, entry: &AgentEntry) -> Option<SessionStore> 
         // from the index file's parent. Pointing at a specific file (not the
         // dir) keeps this reader from ever enumerating the secret-bearing root.
         SessionFormat::AntigravityIndex => join_glob(dir, "agyhub_summaries_proto.pb"),
+        // The Antigravity IDE's session INDEX is NOT under the dotfile data dir
+        // (`dir` = `~/.gemini/antigravity-ide`, which holds only the BODIES);
+        // it lives in the IDE's VS Code-style state store under App-Support. We
+        // derive that path from `$HOME` — the dotfile dir's grandparent
+        // (`~/.gemini/antigravity-ide` → `~/.gemini` → `~`). The reader reads
+        // ONLY the index file here and resolves bodies back under `dir` from
+        // `$HOME` itself, so this row never enumerates either credential-bearing
+        // root. (If the grandparent can't be resolved, fall back to the dotfile
+        // dir so `path_exists` below simply fails the row — never a panic.)
+        SessionFormat::AntigravityIdeIndex => dir
+            .parent()
+            .and_then(Path::parent)
+            .map(|home| {
+                join_glob(
+                    home,
+                    "Library/Application Support/Antigravity IDE/User/globalStorage/state.vscdb",
+                )
+            })
+            .unwrap_or_else(|| dir.to_path_buf()),
         // The Claude-app index lives at `<data_dir>/<subdir>` (the per-mode
         // session-index folder); the reader walks `<account>/<workspace>/`
         // beneath it. `jsonl_subdir` carries the subdir name for this row.
@@ -900,6 +919,56 @@ mod tests {
     }
 
     #[test]
+    fn test_antigravity_ide_store_points_at_app_support_vscdb_not_the_dotfile_root() {
+        // The IDE's BODIES live under the dotfile `~/.gemini/antigravity-ide`,
+        // but its session INDEX is the App-Support `state.vscdb` — a DIFFERENT
+        // tree. `locate_session_store` must derive that App-Support index path
+        // from the dotfile dir's grandparent ($HOME), never point at the
+        // credential-bearing dotfile root.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = dir.path();
+        // The dotfile data dir discovery passes in (holds bodies + mcp_config).
+        let dotfile = home.join(".gemini").join("antigravity-ide");
+        std::fs::create_dir_all(dotfile.join("conversations")).expect("mkdir conv");
+        // The real App-Support index location.
+        let index = home.join(
+            "Library/Application Support/Antigravity IDE/User/globalStorage/state.vscdb"
+                .replace('/', std::path::MAIN_SEPARATOR_STR),
+        );
+        std::fs::create_dir_all(index.parent().unwrap()).expect("mkdir index parent");
+        std::fs::write(&index, b"\x00").expect("write index file");
+
+        let store = locate_session_store(&dotfile, entry(KindTag::AntigravityIde))
+            .expect("IDE store exists when the App-Support index file is present");
+
+        assert_eq!(store.format, SessionFormat::AntigravityIdeIndex);
+        assert_eq!(
+            store.path, index,
+            "store must point at the App-Support state.vscdb index"
+        );
+        // It must NOT be under the dotfile data dir (which holds the bodies and
+        // the secret-bearing mcp_config.json).
+        assert!(
+            !store.path.starts_with(&dotfile),
+            "IDE index must live OUTSIDE the dotfile data dir, got {:?}",
+            store.path
+        );
+    }
+
+    #[test]
+    fn test_antigravity_ide_store_absent_when_no_app_support_index() {
+        // No App-Support vscdb → no store (the row is still discovered for its
+        // connector config, but session-listing is simply empty, never a panic).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dotfile = dir.path().join(".gemini").join("antigravity-ide");
+        std::fs::create_dir_all(&dotfile).expect("mkdir dotfile");
+        assert!(
+            locate_session_store(&dotfile, entry(KindTag::AntigravityIde)).is_none(),
+            "no store without the App-Support index"
+        );
+    }
+
+    #[test]
     fn test_no_session_store_resolves_to_a_bare_data_dir_root() {
         // Cross-agent guarantee: for EVERY registry row that is session-read, the
         // resolved store path is a strict descendant of the data-dir root, never
@@ -1062,7 +1131,12 @@ mod tests {
         // them, not mint `Other("Antigravity")` duplicate rows.
         let root = tempfile::tempdir().expect("tempdir");
         for name in ["Antigravity", "Antigravity IDE"] {
-            build_plain_vscode_vscdb(&root.path().join(name).join("User/globalStorage/state.vscdb"));
+            build_plain_vscode_vscdb(
+                &root
+                    .path()
+                    .join(name)
+                    .join("User/globalStorage/state.vscdb"),
+            );
         }
         // A genuine non-skipped fork in the same root proves the skip is targeted.
         build_plain_vscode_vscdb(

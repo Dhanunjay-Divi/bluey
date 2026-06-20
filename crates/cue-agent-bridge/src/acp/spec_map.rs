@@ -130,7 +130,10 @@ impl TryFrom<&AgentKind> for AcpAgentSpec {
             | AgentKind::GeminiCloud => {
                 anyhow::bail!("{agent:?} is a cloud agent, not a local ACP subprocess")
             }
-            AgentKind::VsCodeFork | AgentKind::Windsurf => {
+            AgentKind::VsCodeFork | AgentKind::Windsurf | AgentKind::AntigravityIde => {
+                // The Antigravity IDE is a read-only/replay surface with no CLI
+                // of its own (and no ACP stdio mode) — it is continued by replay,
+                // never an ACP subprocess.
                 anyhow::bail!("{agent:?} has no known local ACP entrypoint")
             }
             AgentKind::Other(label) => {

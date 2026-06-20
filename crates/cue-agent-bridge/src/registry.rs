@@ -297,6 +297,10 @@ pub enum KindTag {
     ClaudeCodeAgent,
     Cursor,
     Antigravity,
+    /// The Antigravity IDE desktop app — a separate install from `Antigravity`
+    /// (the 2.0 app). Read-only/replay surface; its session index lives in the
+    /// IDE's `state.vscdb`, its bodies under `~/.gemini/antigravity-ide`.
+    AntigravityIde,
     /// Cursor's cloud-hosted Background Agents. Distinct from `Cursor` (the
     /// local IDE/CLI); routed through [`crate::cloud::cursor`].
     CursorCloud,
@@ -348,6 +352,7 @@ impl KindTag {
             KindTag::ClaudeCodeAgent => AgentKind::ClaudeCodeAgent,
             KindTag::Cursor => AgentKind::Cursor,
             KindTag::Antigravity => AgentKind::Antigravity,
+            KindTag::AntigravityIde => AgentKind::AntigravityIde,
             KindTag::CursorCloud => AgentKind::CursorCloud,
             KindTag::CopilotCloud => AgentKind::CopilotCloud,
             KindTag::Copilot => AgentKind::Copilot,
@@ -375,6 +380,7 @@ impl KindTag {
             AgentKind::ClaudeCodeAgent => Some(KindTag::ClaudeCodeAgent),
             AgentKind::Cursor => Some(KindTag::Cursor),
             AgentKind::Antigravity => Some(KindTag::Antigravity),
+            AgentKind::AntigravityIde => Some(KindTag::AntigravityIde),
             AgentKind::CursorCloud => Some(KindTag::CursorCloud),
             AgentKind::CopilotCloud => Some(KindTag::CopilotCloud),
             AgentKind::Copilot => Some(KindTag::Copilot),
@@ -640,6 +646,68 @@ pub const REGISTRY: &[AgentEntry] = &[
             propose_args: &[],
             apply_args: &["--dangerously-skip-permissions"],
             apply_supported: true,
+        },
+    },
+    // The Antigravity IDE desktop app — a SEPARATE install from the `Antigravity`
+    // (2.0) row above. Its conversations are invisible to that row: the IDE store
+    // (`~/.gemini/antigravity-ide/`) has NO `agyhub_summaries_proto.pb` index, so
+    // the AntigravityIndex reader's `list()` finds nothing there. The IDE's index
+    // instead lives in its VS Code-style state store
+    // (`Library/Application Support/Antigravity IDE/User/globalStorage/
+    // state.vscdb`, `ItemTable` key `antigravityUnifiedStateSync.trajectory
+    // Summaries`); the AntigravityIdeIndex reader lists from there and resolves
+    // bodies from `~/.gemini/antigravity-ide` (SAME `.db`/brain body format the
+    // 2.0 reader already decodes — shared via the antigravity reader's body fns).
+    AgentEntry {
+        kind_tag: KindTag::AntigravityIde,
+        // No CLI of its own to drive — read-only/replay surface.
+        fallback_models: &[],
+        model_flag: None,
+        login_command: None,
+        login_auth: LoginAuth::None,
+        display_name: "Antigravity IDE",
+        // No headless CLI to enumerate MCP; connectors are surfaced from the
+        // IDE's own `~/.gemini/antigravity-ide/mcp_config.json` (located by the
+        // data-dir glob below) via the secret-free connector reader — no live
+        // per-server health probe.
+        mcp_list_command: None,
+        mcp_list_tools_per_server: false,
+        // No standalone IDE CLI on PATH and no `.app` bundle name we drive by;
+        // discovery proves this row from the dotfile data dir below. (The
+        // App-Support `Antigravity IDE` dir is intentionally skipped by the fork
+        // detector — see `FORK_DETECT_SKIP_DIRS` in discover.rs — so this proper
+        // registry row owns the surface instead of a bare `Other(...)` fork row.)
+        binary_candidates: &[],
+        app_bundles: &["Antigravity IDE.app"],
+        app_dirs_windows: &["Antigravity IDE"],
+        // The dotfile data dir holds the conversation BODIES
+        // (`conversations/<uuid>.db`, `brain/<uuid>/…`) AND the IDE's own
+        // `mcp_config.json`. The session INDEX (the vscdb `trajectorySummaries`
+        // row) lives elsewhere (App-Support); `locate_session_store` derives that
+        // index path from `$HOME` for the AntigravityIdeIndex format, while this
+        // glob anchors discovery + connector-config location at the dotfile dir.
+        data_dir_globs: &[".gemini/antigravity-ide"],
+        app_data_windows: &[],
+        session_format: Some(SessionFormat::AntigravityIdeIndex),
+        // The AntigravityIdeIndex reader works from the vscdb index + the bodies
+        // dir, not a JSONL subdir; kept non-empty for the struct (never read).
+        jsonl_subdir: "",
+        // No drivable CLI: the IDE is a GUI app with no headless answer mode.
+        drive_command: &[],
+        answer_args: &[],
+        mcp_allow_flag: None,
+        mcp_allow_style: None,
+        // Replay/fork: the IDE conversation ids are not resumable cross-store via
+        // a CLI (mirrors Cursor / Gemini / the 2.0 Antigravity row).
+        continuation: ContinuationTier::Replay,
+        continuation_via: None,
+        // GUI-installed out of band; no CLI installer.
+        install: None,
+        // No headless CLI to drive an apply — read/propose only.
+        fix: FixProfile {
+            propose_args: &[],
+            apply_args: &[],
+            apply_supported: false,
         },
     },
     AgentEntry {
@@ -1004,6 +1072,7 @@ mod tests {
             "Claude Code (Agent)",
             "Cursor",
             "Antigravity",
+            "Antigravity IDE",
             "GitHub Copilot CLI",
             "Gemini CLI",
             "Codex",
@@ -1022,6 +1091,47 @@ mod tests {
     fn test_kind_tag_maps_to_agent_kind() {
         assert_eq!(KindTag::ClaudeCode.to_agent_kind(), AgentKind::ClaudeCode);
         assert_eq!(KindTag::VsCode.to_agent_kind(), AgentKind::VsCodeFork);
+        // The IDE round-trips through both directions of the kind/tag mapping.
+        assert_eq!(
+            KindTag::AntigravityIde.to_agent_kind(),
+            AgentKind::AntigravityIde
+        );
+        assert_eq!(
+            KindTag::from_agent_kind(&AgentKind::AntigravityIde),
+            Some(KindTag::AntigravityIde)
+        );
+    }
+
+    #[test]
+    fn test_antigravity_ide_row_is_distinct_replay_only_surface() {
+        // The IDE row is a SEPARATE surface from the 2.0 `Antigravity` row: its
+        // own dotfile data dir, its own index format, and a read-only/replay
+        // (fork) posture — it must never claim a drivable CLI or apply path.
+        let ide = row(KindTag::AntigravityIde);
+        let two_oh = row(KindTag::Antigravity);
+        assert_eq!(ide.display_name, "Antigravity IDE");
+        assert_ne!(ide.display_name, two_oh.display_name);
+        assert_eq!(
+            ide.session_format,
+            Some(SessionFormat::AntigravityIdeIndex),
+            "IDE uses its own index format, not the 2.0 proto index"
+        );
+        assert_eq!(ide.data_dir_globs, &[".gemini/antigravity-ide"]);
+        assert_ne!(
+            ide.data_dir_globs, two_oh.data_dir_globs,
+            "IDE reads a different store than the 2.0 app"
+        );
+        assert_eq!(ide.continuation, ContinuationTier::Replay, "fork-only");
+        assert!(
+            ide.binary_candidates.is_empty() && ide.drive_command.is_empty(),
+            "the IDE has no drivable CLI of its own"
+        );
+        assert!(
+            !ide.fix.apply_supported,
+            "no headless apply path for a GUI-only IDE"
+        );
+        // The 2.0 row is left untouched: still its proto index + Replay tier.
+        assert_eq!(two_oh.session_format, Some(SessionFormat::AntigravityIndex));
     }
 
     #[test]
