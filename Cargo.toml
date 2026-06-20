@@ -11,6 +11,7 @@ members = [
     "crates/cue-router",
     "crates/cue-agent-bridge",
     "crates/cue-overlay-tauri",
+    "crates/cue-meeting-overlay",
 ]
 resolver = "2"
 

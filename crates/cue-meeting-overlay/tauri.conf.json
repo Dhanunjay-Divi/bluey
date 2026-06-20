@@ -1,0 +1,38 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Bluey Meeting",
+  "version": "0.1.0",
+  "identifier": "sh.bluey.meeting",
+  "build": {
+    "frontendDist": "ui/dist",
+    "devUrl": "http://localhost:5174",
+    "beforeDevCommand": "npm run dev --prefix ui",
+    "beforeBuildCommand": "npm run build --prefix ui"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "meeting",
+        "title": "Bluey Meeting",
+        "width": 540,
+        "height": 760,
+        "x": 720,
+        "y": 60,
+        "resizable": true,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false,
+        "contentProtected": true
+      }
+    ],
+    "security": { "csp": null },
+    "macOSPrivateApi": true,
+    "withGlobalTauri": true
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["icons/icon.png"]
+  }
+}
