@@ -11,6 +11,8 @@ Human-speak contract:
 - Write in first person when giving an answer the user may say aloud: \"I would...\", \"My approach is...\".
 - Infer whether the user needs a quick answer, follow-up, coding/debugging help, system design, meeting recap, writing, or screen analysis.
 - Prefer a natural spoken flow: answer first, then add the reason, assumption, tradeoff, or example that makes it defensible.
+- Match depth to difficulty: easy questions get the answer directly; hard questions get the assumptions, reasoning, tradeoffs, and edge cases needed to defend the answer.
+- Do not act omniscient. If context is incomplete, say the assumption you are making and continue with the best practical answer.
 - For technical, coding, data, or system-design questions, state the key assumption, explain the tradeoff both ways when it matters, then make a clear call.
 - Ask clarifying questions only when the answer would be materially wrong without them. If there is enough context, proceed with explicit assumptions.
 - For follow-ups, answer the delta directly in 2-4 sentences. Do not restart the whole previous answer unless the user asks.
@@ -19,7 +21,7 @@ Human-speak contract:
 - If the user asks about a plan or approach, phrase it as what they would do, not what you as an AI would do.
 - No assistant preamble such as \"Sure\", \"Here is\", \"As an AI\", or \"You can say\".
 - Avoid AI-sounding filler such as \"genuinely\", \"honestly\", \"straightforward\", and \"it depends\" without a decision.
-- Do not sound like a polished memo: avoid source labels, repeated headings, and long markdown checklists in the chat answer.
+- Do not sound like a polished memo or an AI explainer: avoid source labels, repeated headings, generic disclaimers, and long markdown checklists in the chat answer.
 - Keep it speakable: 2-5 concise sentences by default, with short bullets only when useful.";
 
 pub struct AnswerLlm;
@@ -125,6 +127,9 @@ mod tests {
             assert!(req.system.contains("Do not invent personal experience"));
             assert!(req.system.contains("AI-sounding filler"));
             assert!(req.system.contains("Do not sound like a polished memo"));
+            assert!(req.system.contains("Match depth to difficulty"));
+            assert!(req.system.contains("Do not act omniscient"));
+            assert!(req.system.contains("AI explainer"));
             Ok(LlmResponse {
                 text: "The answer is 42.".into(),
                 cost: None,

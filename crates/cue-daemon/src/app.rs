@@ -4861,6 +4861,8 @@ Human-speak contract:
 - Infer the question type from the wording and context: quick answer, follow-up, coding, debugging, system design, meeting recap, writing, or screen analysis.
 - Use first person when the user needs wording they can say aloud: \"I would...\", \"My approach is...\", \"The reason I prefer...\". For factual answers, answer directly.
 - Prefer a natural spoken flow: answer first, then add the reason, assumption, tradeoff, or example that makes it defensible.
+- Match depth to difficulty: easy questions get the answer directly; hard questions get the assumptions, reasoning, tradeoffs, and edge cases needed to defend the answer.
+- Do not act omniscient. If context is incomplete, say the assumption you are making and continue with the best practical answer.
 - For technical, coding, data, or system-design questions, state the key assumption, explain the tradeoff both ways when it matters, then make a clear call.
 - Ask at most 1-3 clarifying questions only when the answer would be materially wrong without them. If the context is enough, proceed with explicit assumptions.
 - For follow-ups, answer the delta directly in 2-4 sentences. Do not restart the whole previous answer unless the user asks.
@@ -4868,7 +4870,7 @@ Human-speak contract:
 - Do not invent personal experience, shipped work, metrics, or ownership that is not in the question or session context.
 - No assistant preamble such as \"Sure\", \"Here is\", \"As an AI\", or \"You can say\".
 - Avoid AI-sounding filler such as \"genuinely\", \"honestly\", \"straightforward\", and \"it depends\" without a decision.
-- Do not sound like a polished memo: avoid source labels, repeated headings, and long markdown checklists in the chat answer.
+- Do not sound like a polished memo or an AI explainer: avoid source labels, repeated headings, generic disclaimers, and long markdown checklists in the chat answer.
 - Include a concise rationale when it helps the user defend the answer, but do not expose hidden chain-of-thought.
 - If the topic needs depth, keep the chat answer speakable and put deeper code/design/detail in the structured sections or artifact.";
 
@@ -4879,7 +4881,7 @@ fn provider_prompt_parts(payload: &ProviderRequestPayload) -> Result<ProviderPro
     system.push_str("\n\n");
     system.push_str(HUMAN_SPEAK_CONTRACT);
     system.push_str(
-        "\n\nOutput format:\n- Stream a clear, readable answer with short line breaks.\n- Put the direct, speakable answer first as one natural paragraph whenever possible.\n- Do not turn normal chat answers into a markdown outline. Use headings only when the task truly needs structure or when an artifact/canvas will render the deeper detail.\n- Auto-detect the task type. For coding, debugging, algorithms, API, or configuration questions, use this shape after the talk track when useful: Approach, Code, Explanation, Complexity, Edge cases. Put code in fenced Markdown code blocks with a language tag when possible.\n- For code follow-ups or requested changes, return the full updated implementation or full replacement snippet in the artifact/canvas body, not only a tiny line diff, unless the user explicitly asks for a patch.\n- For system design questions, use Architecture, Data flow, Components, Scaling, Tradeoffs, and Risks / next steps after the talk track when useful.\n- For system design follow-ups, return the updated whole architecture section in the artifact/canvas body so the canvas remains the current source of truth.\n- For design/debug/product questions, use compact bullets with concrete next steps.\n- Avoid long paragraphs; make the overlay easy to scan while it streams.",
+        "\n\nOutput format:\n- Stream a clear, readable answer with short line breaks.\n- Put the direct, speakable answer first as one natural paragraph whenever possible.\n- Do not turn normal chat answers into a markdown outline. Use headings only when the task truly needs structure or when an artifact/canvas will render the deeper detail.\n- Auto-detect the task type. For coding, debugging, algorithms, API, or configuration questions, use this shape after the talk track when useful: Approach, Patch, Explanation, Complexity, Edge cases. Put code in fenced Markdown code blocks with a language tag when possible.\n- For code follow-ups or requested changes, prefer in-place edits: name the file/function, show only the changed block or unified diff, and explain where it lands. Do not replace the whole implementation unless the user explicitly asks, the file is new, or a full replacement is materially safer than a patch.\n- For system design questions, be clear and concrete: Architecture, Data flow, APIs/contracts, Storage, Scaling, Tradeoffs, Failure modes, Observability, and Rollout / next steps when useful.\n- For system design follow-ups, update only the affected design section and call out what changed so the canvas stays the current source of truth without rewriting unrelated sections.\n- For design/debug/product questions, use compact bullets with concrete next steps.\n- Avoid long paragraphs; make the overlay easy to scan while it streams.",
     );
     if let Some(instructions) = payload
         .instructions
@@ -5278,10 +5280,10 @@ fn answer_request_from_overlay(
 fn mode_instructions(mode: &str) -> String {
     match mode.trim().to_ascii_lowercase().as_str() {
         "code" => {
-            "Answer in Code mode. Use a scan-friendly layout with `### Approach`, `### Code`, `### Explanation`, `### Complexity`, and `### Edge cases`. Put the main implementation in one fenced code block with a language tag so Bluey can render it as the code pane. Keep commentary practical and avoid unrelated theory.".to_string()
+            "Answer in Code mode. Use a scan-friendly layout with `### Approach`, `### Patch`, `### Explanation`, `### Complexity`, and `### Edge cases`. Preserve the existing implementation by default: show the smallest safe changed block or unified diff, and name exactly where it belongs. Only provide a full replacement when the user asks for it, the file is new, or the surrounding code is too small for a safe patch. Keep commentary practical and avoid unrelated theory.".to_string()
         }
         "system design" | "system-design" | "design" => {
-            "Answer in System Design mode. Use `### Architecture`, `### Data flow`, `### Components`, `### Scaling`, `### Tradeoffs`, and `### Risks / next steps`. Prefer concrete services, storage choices, queues, cache boundaries, APIs, and failure modes. Use compact bullets and simple text diagrams when useful.".to_string()
+            "Answer in System Design mode. Use `### Architecture`, `### Data flow`, `### APIs / contracts`, `### Storage`, `### Scaling`, `### Tradeoffs`, `### Failure modes`, `### Observability`, and `### Rollout / next steps` when useful. Prefer concrete services, storage choices, queues, cache boundaries, APIs, capacity assumptions, and failure modes. Use compact bullets and simple text diagrams when useful; for follow-ups, update only the affected section unless a full redesign is requested.".to_string()
         }
         "meeting" => {
             "Answer in Meeting mode. Be concise and source-grounded. Use `### Direct answer`, then only the relevant `### Evidence`, `### Decisions`, `### Action items`, and `### Follow-up` sections. Do not over-explain.".to_string()
@@ -5290,7 +5292,7 @@ fn mode_instructions(mode: &str) -> String {
             "Answer in Writing mode. Produce polished copy first, then a short `### Notes` section explaining tone, edits, and optional variants. Keep the draft easy to reuse.".to_string()
         }
         _ => {
-            "Answer in General mode. Auto-detect the task type. Put the direct answer first, then concise bullets for context, reasoning, and next steps. If the question is about code, debugging, algorithms, APIs, config, or terminal commands, still use `### Approach`, `### Code`, `### Explanation`, `### Complexity`, and `### Edge cases`, with fenced code blocks where useful. Keep it practical and easy to scan in a small overlay.".to_string()
+            "Answer in General mode. Auto-detect the task type. Put the direct answer first, then concise bullets for context, reasoning, and next steps. If the question is about code, debugging, algorithms, APIs, config, or terminal commands, still preserve existing code by default and use `### Approach`, `### Patch`, `### Explanation`, `### Complexity`, and `### Edge cases`, with fenced code blocks where useful. Keep it practical and easy to scan in a small overlay.".to_string()
         }
     }
 }
@@ -8190,13 +8192,17 @@ mod tests {
         assert!(system.contains("No assistant preamble"));
         assert!(system.contains("AI-sounding filler"));
         assert!(system.contains("Do not sound like a polished memo"));
+        assert!(system.contains("Match depth to difficulty"));
+        assert!(system.contains("Do not act omniscient"));
+        assert!(system.contains("AI explainer"));
         assert!(system.contains("concise rationale"));
         assert!(system.contains("Output format"));
         assert!(system.contains("direct, speakable answer first"));
         assert!(system.contains("Do not turn normal chat answers into a markdown outline"));
-        assert!(system.contains("full updated implementation"));
-        assert!(system.contains("updated whole architecture"));
-        assert!(system.contains("Approach, Code, Explanation, Complexity, Edge cases"));
+        assert!(system.contains("prefer in-place edits"));
+        assert!(system.contains("unified diff"));
+        assert!(system.contains("update only the affected design section"));
+        assert!(system.contains("Approach, Patch, Explanation, Complexity, Edge cases"));
         assert!(system.contains("fenced Markdown code blocks"));
     }
 
@@ -8222,10 +8228,14 @@ mod tests {
         let design = mode_instructions("System Design");
         let meeting = mode_instructions("Meeting");
 
-        assert!(code.contains("### Code"));
-        assert!(code.contains("fenced code block"));
+        assert!(code.contains("### Patch"));
+        assert!(code.contains("smallest safe changed block"));
+        assert!(code.contains("full replacement"));
         assert!(design.contains("### Architecture"));
-        assert!(design.contains("failure modes"));
+        assert!(design.contains("### APIs / contracts"));
+        assert!(design.contains("### Failure modes"));
+        assert!(design.contains("### Observability"));
+        assert!(design.contains("full redesign"));
         assert!(meeting.contains("### Action items"));
     }
 
@@ -8234,7 +8244,8 @@ mod tests {
         let general = mode_instructions("General");
 
         assert!(general.contains("Auto-detect the task type"));
-        assert!(general.contains("### Code"));
+        assert!(general.contains("preserve existing code by default"));
+        assert!(general.contains("### Patch"));
         assert!(general.contains("fenced code blocks"));
     }
 
@@ -8341,7 +8352,7 @@ mod tests {
         assert!(request
             .instructions
             .as_deref()
-            .is_some_and(|instructions| instructions.contains("### Code")));
+            .is_some_and(|instructions| instructions.contains("### Patch")));
     }
 
     #[test]
@@ -8396,7 +8407,7 @@ mod tests {
         .expect("merged instructions");
 
         assert!(merged.contains("Mode / request instructions"));
-        assert!(merged.contains("### Code"));
+        assert!(merged.contains("### Patch"));
         assert!(merged.contains("Session answer rules"));
         assert!(merged.contains("Be concise"));
     }
