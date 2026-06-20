@@ -6020,13 +6020,13 @@ struct DriveFailure {
 /// context-overflow error arrives as a result event with no prior deltas, so the
 /// body is empty on that failure and there is nothing rendered to roll back.
 /// Whether to drive `kind` over ACP for the answer: opt-in `BLUEY_USE_ACP=1` AND
-/// the agent has an ACP entrypoint. Default builds (flag unset) return false, so
-/// the answer path is unchanged. PHASE 0 — see PLAN-AGENT-MEETING-ORACLE.
+/// the agent has an ACP entrypoint. Delegates to the spine's
+/// [`cue_agent_bridge::should_use_acp`] — the SINGLE source of truth — so the
+/// daemon's `via_acp` continuation decision can never desync from the spine's
+/// route decision (C9). Default builds (flag unset) return false, so the answer
+/// path is unchanged. PHASE 0 — see PLAN-AGENT-MEETING-ORACLE.
 fn acp_answer_enabled(kind: &AgentKind) -> bool {
-    let opted_in = std::env::var_os("BLUEY_USE_ACP")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    opted_in && cue_agent_bridge::acp::AcpAgentSpec::try_from(kind).is_ok()
+    cue_agent_bridge::should_use_acp(kind)
 }
 
 async fn drive_answer_attempt(

@@ -109,13 +109,16 @@ pub async fn drive_with_overrides(
     drive::drive_with_options(agent, question, opts).await
 }
 
-/// Whether the top-level [`drive`] should route `agent` through the ACP path.
+/// Whether [`drive`] (and the daemon's continuation-tier decision) should route
+/// `agent` through the ACP path. **The single source of truth** — the daemon
+/// MUST call this rather than re-implement it, so the route choice and the
+/// `via_acp` continuation choice can never desync.
 ///
 /// Two gates, both required: (1) the opt-in env var `BLUEY_USE_ACP=1` is set
 /// (read defensively via `var_os`, never panics; any other value keeps ACP
 /// off), and (2) the agent actually has an ACP entrypoint. Factored out so the
 /// routing decision is unit-testable without spawning a subprocess.
-fn should_use_acp(agent: &AgentKind) -> bool {
+pub fn should_use_acp(agent: &AgentKind) -> bool {
     let opted_in = std::env::var_os("BLUEY_USE_ACP")
         .map(|v| v == "1")
         .unwrap_or(false);
@@ -385,4 +388,37 @@ pub enum BridgeError {
     Parse(String),
     #[error("session store error: {0}")]
     Session(String),
+}
+
+#[cfg(test)]
+mod acp_gate_tests {
+    use super::*;
+
+    #[test]
+    fn should_use_acp_is_off_by_default_for_every_agent() {
+        // C9: the SINGLE ACP-route gate. With BLUEY_USE_ACP unset (the production
+        // default — and the default test env), it must be false for EVERY agent,
+        // ACP-capable or not. This proves the opt-in gate and pins the invariant
+        // the daemon now delegates to (so route + via_acp can't desync). We do NOT
+        // mutate the global env var here (that would race other tests); the
+        // opt-in-true branch is exercised live via BLUEY_USE_ACP=1 e2e runs.
+        // (If this test ever runs with BLUEY_USE_ACP=1 in the environment, skip
+        // the assertion rather than fail spuriously.)
+        if std::env::var_os("BLUEY_USE_ACP").map(|v| v == "1").unwrap_or(false) {
+            return;
+        }
+        for agent in [
+            AgentKind::ClaudeCode, // ACP-capable
+            AgentKind::Codex,      // ACP-capable
+            AgentKind::Cursor,     // ACP-capable
+            AgentKind::Gemini,     // ACP-capable
+            AgentKind::Aider,      // no ACP spec
+            AgentKind::Unknown,    // no ACP spec
+        ] {
+            assert!(
+                !should_use_acp(&agent),
+                "{agent:?}: ACP must be OFF when BLUEY_USE_ACP is unset"
+            );
+        }
+    }
 }
