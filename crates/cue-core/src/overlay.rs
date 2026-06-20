@@ -345,6 +345,20 @@ pub enum OverlayEvent {
     CardRendered {
         id: uuid::Uuid,
     },
+    /// Toggle the **session-history consent** flag from the overlay UI (the
+    /// meeting overlay's privacy switch). First-class so the daemon persists it
+    /// the same way the IPC `SetAgentSessionHistory` path does — rather than
+    /// riding the generic [`Lifecycle`](OverlayEvent::Lifecycle) event with no
+    /// handler. `enabled=false` immediately stops the daemon reading prior
+    /// sessions.
+    SessionHistoryConsentRequested {
+        enabled: bool,
+    },
+    /// Cancel the in-flight answer the user just asked for (the overlay's
+    /// stop/cancel affordance). The UI also drops its own answer-chunk listener
+    /// locally; this tells the daemon to reset its overlay UI state so a fresh
+    /// ask starts clean.
+    AskCancelRequested,
     Error {
         message: String,
     },

@@ -2004,6 +2004,22 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
                 debug!("ignored stale overlay exit event while replacement overlay is running");
             }
         }
+        OverlayEvent::SessionHistoryConsentRequested { enabled } => {
+            // First-class consent toggle from the overlay's privacy switch —
+            // persists via the same path as the IPC SetAgentSessionHistory, then
+            // refreshes the agent list so session counts reflect the new setting.
+            persist_session_history_consent(daemon, enabled).await?;
+            info!(enabled, "agent session-history consent updated via overlay");
+            refresh_overlay_agents(daemon).await;
+        }
+        OverlayEvent::AskCancelRequested => {
+            // The overlay UI already drops its own answer-chunk listener; here we
+            // reset the daemon-side overlay UI state so the next ask is clean.
+            // (The current ask runs inline; a deeper mid-flight abort is a
+            // separate change — this is the honest, non-faked scope.)
+            *daemon.overlay_ui_state.lock() = cue_core::overlay_ipc::OverlayUiState::Idle;
+            debug!("overlay ask cancel requested");
+        }
         OverlayEvent::Pong | OverlayEvent::CardRendered { .. } => {}
         OverlayEvent::Error { message } => {
             warn!("overlay error: {message}");
@@ -2521,10 +2537,7 @@ async fn handle_agent_sessions_requested(
 /// empty list.
 fn list_agent_sessions(kind: &str) -> Vec<AgentSessionSummary> {
     let agents = discover_agents();
-    let Some(agent) = agents
-        .iter()
-        .find(|a| agent_model_label(&a.kind) == kind)
-    else {
+    let Some(agent) = agents.iter().find(|a| agent_model_label(&a.kind) == kind) else {
         return Vec::new();
     };
 
@@ -6060,10 +6073,8 @@ async fn drive_answer_attempt(
     // (the Copilot CLI — same GitHub Copilot account). Only when we actually
     // loaded a transcript to replay (Replay continuation produced context);
     // otherwise the kind is unchanged. Data-driven — never an `if agent == …`.
-    let drive_kind = cue_agent_bridge::continuation::continuation_bridge_kind(
-        kind,
-        question.context.is_some(),
-    );
+    let drive_kind =
+        cue_agent_bridge::continuation::continuation_bridge_kind(kind, question.context.is_some());
 
     debug!(
         agent = %label,
@@ -6083,20 +6094,23 @@ async fn drive_answer_attempt(
     // Adding an agent is a registry row, not a new branch here. Cloud agents
     // load credentials from the OS keychain and emit one audit line per HTTP
     // call (vendor, endpoint, status — never the token).
-    let answer_stream =
-        match cue_agent_bridge::drive_with_overrides(kind.clone(), question, model_override.to_vec())
-            .await
-        {
-            Ok(answer_stream) => answer_stream,
-            Err(error) => {
-                debug!(agent = %label, error = %error, "agent drive failed to start");
-                return Err(DriveFailure {
-                    reason: "isn't connected, installed, or signed in".to_string(),
-                    resume_recoverable: false,
-                    raw_error: None,
-                });
-            }
-        };
+    let answer_stream = match cue_agent_bridge::drive_with_overrides(
+        kind.clone(),
+        question,
+        model_override.to_vec(),
+    )
+    .await
+    {
+        Ok(answer_stream) => answer_stream,
+        Err(error) => {
+            debug!(agent = %label, error = %error, "agent drive failed to start");
+            return Err(DriveFailure {
+                reason: "isn't connected, installed, or signed in".to_string(),
+                resume_recoverable: false,
+                raw_error: None,
+            });
+        }
+    };
 
     futures_util::pin_mut!(answer_stream);
     let mut body = String::new();
@@ -8733,6 +8747,10 @@ fn should_use_macos_socket_overlay(path: &Path) -> bool {
             name == "bluey-overlay-macos"
                 || name == "cue-overlay-macos"
                 || name.contains("cue-overlay-tauri")
+                // The meeting overlay (cue-meeting-overlay) is a Tauri app that
+                // speaks the SAME socket OverlayCommand/OverlayEvent transport as
+                // cue-overlay-tauri, so it takes the socket launcher too.
+                || name.contains("cue-meeting-overlay")
         })
         .unwrap_or(false)
 }
@@ -10072,6 +10090,24 @@ fn build_recap_llm_from_env() -> Option<Box<dyn cue_llm::LlmProvider>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn meeting_overlay_uses_the_socket_launcher() {
+        // Gap A: the daemon must route cue-meeting-overlay through the socket
+        // OverlayCommand/OverlayEvent transport (the one its bridge speaks), the
+        // same launcher cue-overlay-tauri uses — not the legacy stdio path.
+        assert!(should_use_macos_socket_overlay(Path::new(
+            "/x/target/debug/cue-meeting-overlay"
+        )));
+        assert!(should_use_macos_socket_overlay(Path::new(
+            "/x/target/debug/cue-overlay-tauri"
+        )));
+        // A plain/unknown overlay binary still falls back to stdio.
+        assert!(!should_use_macos_socket_overlay(Path::new(
+            "/x/target/debug/some-other-overlay"
+        )));
+    }
 
     #[test]
     fn provider_messages_include_image_parts_when_route_allows_upload() {

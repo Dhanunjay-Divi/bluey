@@ -231,15 +231,9 @@ export function createTauriClient(): MeetingClient {
       ),
 
     setSessionHistoryConsent: (enabled) => {
-      // No dedicated OverlayEvent in the contract for consent toggling; the
-      // daemon learns it the next time sessions are requested. Surface intent
-      // via the generic lifecycle channel and resolve immediately (fire-and-
-      // forget, matching the mock's void-return contract).
-      sendEvent({
-        type: "lifecycle",
-        stage: "session_history_consent",
-        status: enabled ? "enabled" : "disabled",
-      });
+      // First-class consent toggle: the daemon persists it the same way the IPC
+      // SetAgentSessionHistory path does, then refreshes the agent list.
+      sendEvent({ type: "session_history_consent_requested", enabled });
       return Promise.resolve();
     },
 
@@ -331,11 +325,10 @@ export function createTauriClient(): MeetingClient {
         cancel: () => {
           if (finished) return;
           finish();
-          // Best-effort: tell the daemon to stop. There's no dedicated
-          // ask-cancel OverlayEvent in the contract, so we signal via the
-          // generic lifecycle channel; the local handler is already detached so
-          // no further chunks reach the UI regardless.
-          sendEvent({ type: "lifecycle", stage: "ask_cancel", status: "requested" });
+          // First-class cancel: the local handler is already detached (finish()),
+          // and this tells the daemon to reset its overlay UI state so the next
+          // ask is clean.
+          sendEvent({ type: "ask_cancel_requested" });
         },
       };
     },
