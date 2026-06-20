@@ -4858,10 +4858,16 @@ fn provider_api_key(config: &ProviderClientConfig) -> Option<String> {
 const HUMAN_SPEAK_CONTRACT: &str = "\
 Human-speak contract:
 - Start with a short talk track the user could say naturally, not a meta answer about what to say.
-- Use first person for plans, tradeoffs, and explanations: \"I would...\", \"My approach is...\", \"The reason I prefer...\".
-- Prefer a natural spoken flow: acknowledge the question, give the core answer, then add the reason or example.
+- Infer the question type from the wording and context: quick answer, follow-up, coding, debugging, system design, meeting recap, writing, or screen analysis.
+- Use first person when the user needs wording they can say aloud: \"I would...\", \"My approach is...\", \"The reason I prefer...\". For factual answers, answer directly.
+- Prefer a natural spoken flow: answer first, then add the reason, assumption, tradeoff, or example that makes it defensible.
+- For technical, coding, data, or system-design questions, state the key assumption, explain the tradeoff both ways when it matters, then make a clear call.
+- Ask at most 1-3 clarifying questions only when the answer would be materially wrong without them. If the context is enough, proceed with explicit assumptions.
+- For follow-ups, answer the delta directly in 2-4 sentences. Do not restart the whole previous answer unless the user asks.
+- Treat transcript, screen, and attached documents as the user's current working context. Prefer the latest relevant turn and avoid repeating stale context.
 - Do not invent personal experience, shipped work, metrics, or ownership that is not in the question or session context.
 - No assistant preamble such as \"Sure\", \"Here is\", \"As an AI\", or \"You can say\".
+- Avoid AI-sounding filler such as \"genuinely\", \"honestly\", \"straightforward\", and \"it depends\" without a decision.
 - Do not sound like a polished memo: avoid source labels, repeated headings, and long markdown checklists in the chat answer.
 - Include a concise rationale when it helps the user defend the answer, but do not expose hidden chain-of-thought.
 - If the topic needs depth, keep the chat answer speakable and put deeper code/design/detail in the structured sections or artifact.";
@@ -8174,9 +8180,15 @@ mod tests {
         };
 
         assert!(system.contains("Human-speak contract"));
+        assert!(system.contains("Infer the question type"));
         assert!(system.contains("first person"));
+        assert!(system.contains("technical, coding, data, or system-design questions"));
+        assert!(system.contains("Ask at most 1-3 clarifying questions"));
+        assert!(system.contains("For follow-ups, answer the delta directly"));
+        assert!(system.contains("Prefer the latest relevant turn"));
         assert!(system.contains("Do not invent personal experience"));
         assert!(system.contains("No assistant preamble"));
+        assert!(system.contains("AI-sounding filler"));
         assert!(system.contains("Do not sound like a polished memo"));
         assert!(system.contains("concise rationale"));
         assert!(system.contains("Output format"));

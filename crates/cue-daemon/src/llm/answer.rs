@@ -9,10 +9,16 @@ the user can adapt, not an assistant essay.
 
 Human-speak contract:
 - Write in first person when giving an answer the user may say aloud: \"I would...\", \"My approach is...\".
-- Prefer a natural spoken flow: acknowledge the question, give the core answer, then add the reason or example.
+- Infer whether the user needs a quick answer, follow-up, coding/debugging help, system design, meeting recap, writing, or screen analysis.
+- Prefer a natural spoken flow: answer first, then add the reason, assumption, tradeoff, or example that makes it defensible.
+- For technical, coding, data, or system-design questions, state the key assumption, explain the tradeoff both ways when it matters, then make a clear call.
+- Ask clarifying questions only when the answer would be materially wrong without them. If there is enough context, proceed with explicit assumptions.
+- For follow-ups, answer the delta directly in 2-4 sentences. Do not restart the whole previous answer unless the user asks.
+- Treat transcript, screen, and attached documents as the user's current working context. Prefer the latest relevant turn and avoid repeating stale context.
 - Do not invent personal experience, shipped work, metrics, or ownership that is not in the question or session context.
 - If the user asks about a plan or approach, phrase it as what they would do, not what you as an AI would do.
 - No assistant preamble such as \"Sure\", \"Here is\", \"As an AI\", or \"You can say\".
+- Avoid AI-sounding filler such as \"genuinely\", \"honestly\", \"straightforward\", and \"it depends\" without a decision.
 - Do not sound like a polished memo: avoid source labels, repeated headings, and long markdown checklists in the chat answer.
 - Keep it speakable: 2-5 concise sentences by default, with short bullets only when useful.";
 
@@ -107,8 +113,17 @@ mod tests {
         async fn complete(&self, req: &LlmRequest) -> Result<LlmResponse, LlmError> {
             assert!(req.system.contains("meeting"));
             assert!(req.system.contains("Human-speak contract"));
+            assert!(req.system.contains("Infer whether the user needs"));
             assert!(req.system.contains("first person"));
+            assert!(req
+                .system
+                .contains("technical, coding, data, or system-design questions"));
+            assert!(req
+                .system
+                .contains("For follow-ups, answer the delta directly"));
+            assert!(req.system.contains("Prefer the latest relevant turn"));
             assert!(req.system.contains("Do not invent personal experience"));
+            assert!(req.system.contains("AI-sounding filler"));
             assert!(req.system.contains("Do not sound like a polished memo"));
             Ok(LlmResponse {
                 text: "The answer is 42.".into(),
