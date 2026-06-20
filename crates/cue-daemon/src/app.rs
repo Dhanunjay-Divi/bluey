@@ -8832,12 +8832,15 @@ fn macos_overlay_launch_command(
     socket_path: &Path,
     expected_token: &str,
 ) -> Command {
-    // The Tauri overlay is a plain binary (no .app bundle launch); never route it
-    // through `open <BlueyOverlay.app>` (that's the legacy Swift overlay).
+    // A Tauri overlay (interview cue-overlay-tauri OR the meeting overlay
+    // cue-meeting-overlay) is a plain binary — run it directly. NEVER route it
+    // through `open <BlueyOverlay.app>` (that's the legacy Swift interview
+    // overlay; doing so would launch the WRONG UI, e.g. show the interview UI in
+    // place of the meeting overlay).
     let is_tauri_overlay = resolved
         .file_name()
         .and_then(|n| n.to_str())
-        .map(|n| n.contains("cue-overlay-tauri"))
+        .map(|n| n.contains("cue-overlay-tauri") || n.contains("cue-meeting-overlay"))
         .unwrap_or(false);
 
     if !is_tauri_overlay && !macos_overlay_force_raw_helper() {
@@ -10107,6 +10110,24 @@ mod tests {
         assert!(!should_use_macos_socket_overlay(Path::new(
             "/x/target/debug/some-other-overlay"
         )));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn meeting_overlay_runs_as_a_plain_binary_not_the_legacy_app() {
+        // Regression for the launch bug: the meeting overlay must be run DIRECTLY
+        // (its own program path), never routed through `open <BlueyOverlay.app>`
+        // (the legacy Swift interview overlay). Routing it through the .app
+        // launched the WRONG UI (the interview overlay) in place of the meeting
+        // overlay. The launch command's program must be the resolved binary,
+        // NOT `/usr/bin/open`.
+        let bin = Path::new("/x/target/debug/cue-meeting-overlay");
+        let cmd = macos_overlay_launch_command(bin, Path::new("/tmp/x.sock"), "tok");
+        assert_eq!(
+            cmd.get_program(),
+            bin.as_os_str(),
+            "meeting overlay must run directly, not via /usr/bin/open <app>"
+        );
     }
 
     #[test]
