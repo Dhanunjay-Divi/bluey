@@ -79,6 +79,68 @@
 - Public research/trust paper derived from the harness, explaining Bluey's
   consent-based context architecture and defensive recommendations.
 
+### Future Addition: Browser Connector
+
+Bluey should eventually have a user-installed browser connector for Chrome, and
+later other browsers where feasible. The goal is Codex-style browser context for
+normal user-approved work, not hidden surveillance or credential extraction.
+
+What it should enable:
+
+- Read the current tab title, URL, visible text, selected text, basic DOM/layout
+  structure, links/buttons/forms, and console errors when the user grants tab
+  access.
+- Let the user ask Bluey to summarize the current page, compare it with the
+  meeting transcript, or use it alongside screen context and attached docs.
+- Let Bluey propose browser actions such as click, type, open tab, navigate, or
+  copy text, then require user approval before sensitive actions.
+- Keep an overlay indicator such as `Chrome connected` and `current tab used`
+  whenever browser context is included in an answer.
+- Log browser actions at a user-readable level: tab read, button clicked, text
+  typed, form submitted, navigation opened.
+
+Non-goals and safety limits:
+
+- Do not scrape cookies, passwords, session tokens, hidden fields, browser
+  storage, or data the page did not visibly expose to the user.
+- Do not bypass site restrictions, assessment environments, CAPTCHAs, payment
+  flows, or authorization boundaries.
+- Require confirmation before form submit, message send, upload, delete,
+  permission accept, payment, account/security changes, or any irreversible
+  action.
+- Keep all provider keys server-side. The extension should talk only to the
+  local Bluey daemon or a local native-messaging bridge.
+
+Candidate architecture:
+
+```text
+Chrome extension
+  -> native messaging or local websocket
+Bluey daemon
+  -> sanitized BrowserContext artifact
+Bluey server / router
+  -> answer or proposed action
+Overlay UI
+  -> user approves risky action
+Chrome extension
+  -> executes click/type/navigation only after approval
+```
+
+Implementation plan when we return to this:
+
+1. Add `extensions/chrome-bluey/` as a Manifest V3 extension.
+2. Add daemon bridge commands for `browser_context`, `browser_action_preview`,
+   and `browser_action_confirmed`.
+3. Add a `BrowserContext` artifact type that can be combined with transcript,
+   screen, attached documents, and session memory.
+4. Add overlay UI for `Chrome connected`, `Use current tab`, and action preview.
+5. Teach server prompts and routing to distinguish browser context from screen
+   OCR and document context.
+6. Add policy tests so unsafe data and unsafe actions are blocked before any
+   model call or extension execution.
+7. Add integration tests with mocked extension events before enabling real
+   browser control.
+
 ## Reliability Principles
 
 - The live meeting path must never block on recap, storage compaction, embeddings, or network retries.
