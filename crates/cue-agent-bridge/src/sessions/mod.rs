@@ -101,6 +101,13 @@ pub(crate) fn is_boilerplate_title(text: &str) -> bool {
     const MARKERS: &[&str] = &[
         "this session is being continued",
         "continued from a previous conversation",
+        // Bluey's OWN generated turns must never become titles: the Replay banner
+        // prepended to fork/replay continuations, and the 8-word summary prompt
+        // the titler/compactor sends. Both were leaking as titles across
+        // Copilot/Gemini/Codex.
+        "context from a prior conversation",
+        "summarize this conversation",
+        "summarize the earlier part of our conversation", // the compaction prompt
         "you are proposing a fix",
         "propose-only",
         "===diagnosis===",
@@ -180,4 +187,30 @@ pub(crate) fn strip_wrapper_tags(text: &str) -> String {
         out.push(c);
     }
     out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_boilerplate_title;
+
+    #[test]
+    fn bluey_own_generated_turns_are_boilerplate_not_titles() {
+        // C7: Bluey's own Replay banner + summary/compaction prompts were leaking
+        // as session titles across Copilot/Gemini/Codex. They must classify as
+        // boilerplate so the reader falls back to a real title or a sane default.
+        for junk in [
+            "Context from a prior conversation: User: what was the bug?",
+            "context from a prior conversation\nNote: ...",
+            "Summarize this conversation's topic in at most 8 words. Reply with only the title.",
+            "Summarize the earlier part of our conversation below in at most 400 words.",
+        ] {
+            assert!(
+                is_boilerplate_title(junk),
+                "should be boilerplate, was treated as a real title: {junk:?}"
+            );
+        }
+        // A genuine user title must NOT be flagged.
+        assert!(!is_boilerplate_title("Fix the chunker boundary bug"));
+        assert!(!is_boilerplate_title("Refactor the auth module"));
+    }
 }
