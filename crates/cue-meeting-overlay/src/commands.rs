@@ -9,7 +9,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, State};
 
-use crate::ipc::{request, DaemonLink};
+use crate::ipc::{request, DaemonLink, EventSender};
 
 /// Pull a named array field out of a `DaemonResponse` Value, or surface the
 /// daemon's `error` message.
@@ -84,18 +84,43 @@ pub async fn set_agent_session_history(
     array_field(resp, "_ignored").map(|_| ())
 }
 
-/// Ask the attached agent; the daemon's `Answer` IPC returns the full response +
-/// the streamed events. We forward each event to the UI as a `meeting://answer/<id>`
-/// chunk so the UI renders the thinking → streamed answer flow. (The daemon's
-/// current Answer IPC is request/response with the event list; a future push
-/// socket can make this token-by-token without changing the UI contract.)
+/// Ask the attached agent.
+///
+/// **Preferred (socket / push path):** when the daemon launched us over the Unix
+/// socket, the UI should ask by sending an `ask_requested` `OverlayEvent` via the
+/// `overlay_send` invoke command. The daemon then streams the answer back as the
+/// `push_card` → `update_card`* `OverlayCommand` sequence on `overlay://command`,
+/// which the UI renders directly. That path needs no round-trip here.
+///
+/// To keep the UI's existing `MeetingClient.ask(id, question)` working even when
+/// the socket is live, this command ALSO forwards an `ask_requested` event over
+/// the socket writer when it is connected — the streamed answer arrives over
+/// `overlay://command`, so no `meeting://answer/<id>` chunks are emitted here.
+///
+/// **Fallback (TCP pull path):** when no socket is connected (standalone dev, or
+/// before the daemon wires the push feed), we fall back to the daemon's
+/// request/response `Answer` IPC and emit the full text as `meeting://answer/<id>`
+/// chunks so the UI still renders the thinking → answer flow.
 #[tauri::command]
 pub async fn meeting_ask(
     app: AppHandle,
     link: State<'_, DaemonLink>,
+    sender: State<'_, EventSender>,
     id: String,
     question: String,
 ) -> Result<(), String> {
+    // Socket path: forward an `ask_requested` OverlayEvent; the answer streams
+    // back over `overlay://command` (push_card → update_card*). No TCP round-trip.
+    {
+        let guard = sender.0.lock().await;
+        if let Some(tx) = guard.as_ref() {
+            let event = json!({ "type": "ask_requested", "question": question }).to_string();
+            let _ = tx.send(event);
+            return Ok(());
+        }
+    }
+
+    // Fallback (no socket): TCP request/response Answer IPC.
     let cancelled = Arc::new(AtomicBool::new(false));
     link.cancels
         .lock()

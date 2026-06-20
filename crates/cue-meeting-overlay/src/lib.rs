@@ -150,6 +150,7 @@ mod macos {
 pub fn run() {
     tauri::Builder::default()
         .manage(ipc::DaemonLink::default())
+        .manage(ipc::EventSender(tokio::sync::Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             commands::agent_list,
             commands::agent_attach,
@@ -159,6 +160,7 @@ pub fn run() {
             commands::set_agent_session_history,
             commands::meeting_ask,
             commands::meeting_ask_cancel,
+            ipc::overlay_send,
         ])
         .setup(|app| {
             // Accessory app — no Dock icon (an invisible meeting overlay must not
@@ -176,9 +178,11 @@ pub fn run() {
                 macos::clear_window_chrome(app.handle());
             }
 
-            // Connect to the daemon IPC socket (when launched by the daemon) and
-            // forward its transcript/answer events to the UI.
-            ipc::start(app.handle());
+            // Connect to the daemon's Unix socket (when launched by the daemon)
+            // and forward its OverlayCommand stream to the UI as `overlay://command`,
+            // while pushing UI OverlayEvents back over the same socket. Standalone
+            // dev (no socket arg) → no-op; the UI's mock fills in.
+            ipc::start(app.handle(), ipc::IpcArgs::from_process());
             Ok(())
         })
         .run(tauri::generate_context!())
