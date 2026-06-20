@@ -414,6 +414,19 @@ fn scan_vscode_support_root(acc: &mut Accumulator, root: &Path, known: &[(&str, 
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
+        // Skip Electron App-Support footprints of agents whose REAL store is
+        // elsewhere (a dotfile dir), so the fork detector doesn't mint duplicate
+        // rows. Antigravity ships `Antigravity` / `Antigravity IDE` App-Support
+        // dirs (UI state only — no transcripts), while its real conversations
+        // live in `~/.gemini/antigravity` (read by the drive-capable `antigravity`
+        // row). Without this skip, these become `Other("Antigravity"[ IDE])`
+        // duplicate rows showing 0 sessions. (Their glob is the dotfile, so
+        // `known_vscode_dirs` can't map them to the real kind to merge instead.)
+        const FORK_DETECT_SKIP_DIRS: &[&str] = &["Antigravity", "Antigravity IDE"];
+        if FORK_DETECT_SKIP_DIRS.contains(&dir_name.as_str()) {
+            continue;
+        }
+
         let kind = known
             .iter()
             .find(|(name, _)| *name == dir_name)
@@ -1042,14 +1055,51 @@ mod tests {
     }
 
     #[test]
-    fn non_cursor_fork_gets_jsonfiles_not_cursor_reader() {
-        // A plain VS Code-family fork (Antigravity / Insiders): `state.vscdb` with
-        // ONLY `ItemTable` (no `cursorDiskKV`) + a `User/workspaceStorage` chats
-        // dir. The detector must NOT assign Cursor's `SqliteVscdb` reader (which
-        // would throw `no such table: cursorDiskKV`); it must use `JsonFiles`
-        // pointing at workspaceStorage.
+    fn antigravity_electron_footprint_is_skipped_not_duplicated() {
+        // C6a: the App-Support `Antigravity` / `Antigravity IDE` Electron dirs are
+        // pure footprints (UI state, no transcripts) of the real `antigravity`
+        // row whose store is `~/.gemini/antigravity`. The fork detector must SKIP
+        // them, not mint `Other("Antigravity")` duplicate rows.
         let root = tempfile::tempdir().expect("tempdir");
-        let fork = root.path().join("Antigravity IDE");
+        for name in ["Antigravity", "Antigravity IDE"] {
+            build_plain_vscode_vscdb(&root.path().join(name).join("User/globalStorage/state.vscdb"));
+        }
+        // A genuine non-skipped fork in the same root proves the skip is targeted.
+        build_plain_vscode_vscdb(
+            &root
+                .path()
+                .join("SomeOtherFork")
+                .join("User/globalStorage/state.vscdb"),
+        );
+
+        let mut acc = Accumulator::default();
+        scan_vscode_support_root(&mut acc, root.path(), &[]);
+        let agents = acc.finish();
+
+        assert!(
+            !agents
+                .iter()
+                .any(|a| matches!(&a.kind, AgentKind::Other(n) if n.starts_with("Antigravity"))),
+            "Antigravity Electron footprints must be skipped, not minted as rows"
+        );
+        assert!(
+            agents
+                .iter()
+                .any(|a| matches!(&a.kind, AgentKind::Other(n) if n == "SomeOtherFork")),
+            "a non-skipped fork is still detected (skip is targeted, not blanket)"
+        );
+    }
+
+    #[test]
+    fn non_cursor_fork_gets_jsonfiles_not_cursor_reader() {
+        // A plain VS Code-family fork (e.g. Windsurf / Insiders): `state.vscdb`
+        // with ONLY `ItemTable` (no `cursorDiskKV`) + a `User/workspaceStorage`
+        // chats dir. The detector must NOT assign Cursor's `SqliteVscdb` reader
+        // (which would throw `no such table: cursorDiskKV`); it must use
+        // `JsonFiles` pointing at workspaceStorage. (Uses a non-skipped fork name
+        // — the Antigravity Electron footprints are intentionally skipped.)
+        let root = tempfile::tempdir().expect("tempdir");
+        let fork = root.path().join("Windsurf");
         build_plain_vscode_vscdb(&fork.join("User/globalStorage/state.vscdb"));
         std::fs::create_dir_all(fork.join("User/workspaceStorage")).expect("mkdir ws");
 
@@ -1058,7 +1108,7 @@ mod tests {
         let store = acc
             .finish()
             .into_iter()
-            .find(|a| matches!(&a.kind, AgentKind::Other(n) if n == "Antigravity IDE"))
+            .find(|a| matches!(&a.kind, AgentKind::Other(n) if n == "Windsurf"))
             .and_then(|a| a.session_store);
         let store = store.expect("non-cursor fork still gets a store");
         assert_eq!(
@@ -1075,7 +1125,7 @@ mod tests {
         // → no readable session store (still discovered for connectors), rather
         // than a broken Cursor-reader store.
         let root = tempfile::tempdir().expect("tempdir");
-        let fork = root.path().join("Antigravity");
+        let fork = root.path().join("Windsurf");
         build_plain_vscode_vscdb(&fork.join("User/globalStorage/state.vscdb"));
 
         let mut acc = Accumulator::default();
@@ -1083,7 +1133,7 @@ mod tests {
         let agent = acc
             .finish()
             .into_iter()
-            .find(|a| matches!(&a.kind, AgentKind::Other(n) if n == "Antigravity"));
+            .find(|a| matches!(&a.kind, AgentKind::Other(n) if n == "Windsurf"));
         let agent = agent.expect("fork still discovered");
         assert!(
             agent.session_store.is_none(),

@@ -55,6 +55,29 @@ pub fn reader_for(format: SessionFormat) -> Box<dyn SessionReader> {
     }
 }
 
+/// Minimal percent-decoder for `file://` URL paths (`%20` → space, …). Shared so
+/// every reader decodes project paths the same way. UTF-8-lossy, fail-soft: a
+/// bad/short `%` escape is left as-is rather than panicking.
+pub(crate) fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Best-effort last-modified marker for a path, as an epoch-seconds string.
 ///
 /// `SessionRef::updated_at` is documented as "RFC3339 or epoch string, per

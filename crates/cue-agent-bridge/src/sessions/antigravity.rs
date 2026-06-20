@@ -332,7 +332,11 @@ fn parse_workspace_uri(bytes: &[u8]) -> Option<String> {
 
 /// `file:///Users/me/x` → `/Users/me/x`; leaves non-file URIs/paths untouched.
 fn strip_file_scheme(uri: &str) -> String {
-    uri.strip_prefix("file://").unwrap_or(uri).to_string()
+    // Strip the scheme AND percent-decode, so a project path like
+    // `file:///Users/ms/GEMMA4%20Vision%20test` becomes `/Users/ms/GEMMA4 Vision
+    // test` instead of leaving raw `%20` mojibake in the displayed project.
+    let stripped = uri.strip_prefix("file://").unwrap_or(uri);
+    super::percent_decode(stripped)
 }
 
 /// Lossy-UTF8 a byte slice into an owned String (index strings are UTF-8 but we
@@ -452,6 +456,17 @@ fn text_from_value(value: &serde_json::Value) -> Option<String> {
 mod tests {
     use super::*;
     use crate::SessionFormat;
+
+    #[test]
+    fn strip_file_scheme_decodes_percent_escapes() {
+        // C6b: a `file://` project URL with spaces must decode, not show mojibake.
+        assert_eq!(
+            strip_file_scheme("file:///Users/ms/Developer/GEMMA4%20Vision%20test%2026b%20MOE"),
+            "/Users/ms/Developer/GEMMA4 Vision test 26b MOE"
+        );
+        // No scheme + no escapes → unchanged.
+        assert_eq!(strip_file_scheme("/Users/ms/Bluey"), "/Users/ms/Bluey");
+    }
 
     /// The store path is the INDEX FILE itself (mirrors `discover.rs`), so tests
     /// pass the data-dir root and we append the index filename here.
