@@ -512,6 +512,14 @@ impl SessionsResult {
 ///   — a config exists but declares none, or none was located.
 #[derive(Debug, Clone)]
 pub enum McpStep {
+    /// STRONGEST (Level-3): during a real connector-forcing drive the agent
+    /// actually INVOKED an MCP tool — an ACP `ToolCall` (a `[tool: …]` chunk) was
+    /// observed mid-answer. This is the only level that proves Cap-5 for real: the
+    /// tool FIRED, not merely that it's listed/configured. Holds the tool
+    /// title(s) seen. Independent of whether the tool then returned data (a
+    /// quota'd/401 connector still fires) — so it's the anti-fake gate the USP
+    /// needs. (Costs a real model call; only set on an explicit firing probe.)
+    Fired { tools: Vec<String> },
     /// LIVE Level-2: the agent's own list command enumerated its MCP surface.
     /// `servers` are the live-reported server names; `tools` are per-server tool
     /// names when the agent enumerates them (Cursor), else empty.
@@ -541,6 +549,11 @@ impl McpStep {
     /// none, or no config was located.
     fn cell(&self) -> StepResult {
         match self {
+            McpStep::Fired { tools } => StepResult::pass(format!(
+                "FIRED: agent invoked {} MCP tool call(s) mid-answer ({})",
+                tools.len(),
+                sample_join(tools, MCP_LIVE_SAMPLE),
+            )),
             McpStep::LiveEnumerated { servers, tools } => {
                 let detail = if !tools.is_empty() {
                     // Per-tool signal (Cursor): name the servers + tool count, and
@@ -1009,6 +1022,58 @@ async fn mcp_step(kind: &AgentKind) -> McpStep {
     mcp_step_config_only(kind)
 }
 
+/// LEVEL 3 (the anti-fake Cap-5 gate): drive the agent with a prompt that forces
+/// an MCP tool call and detect whether a tool actually FIRED — proving the USP
+/// (the driven agent uses its own connectors), not merely that connectors are
+/// listed/configured. Returns [`McpStep::Fired`] with the observed tool title(s)
+/// if a `[tool: …]` chunk arrives; otherwise falls through to [`mcp_step`]
+/// (live-list / config) so it never regresses below the cheaper signals.
+///
+/// **Spends a real model call** — call only on an explicit firing probe, never in
+/// the default read-only matrix. A quota'd/401 connector STILL fires the tool, so
+/// this stays green even when the live data call fails (which is the whole point:
+/// we prove invocation, independent of the connector's own availability).
+pub async fn mcp_step_with_firing(kind: &AgentKind, prompt: &str) -> McpStep {
+    let question = Question::new(prompt);
+    let stream = match crate::drive(kind.clone(), question).await {
+        Ok(s) => s,
+        Err(_) => return mcp_step(kind).await,
+    };
+    futures_util::pin_mut!(stream);
+    let mut tools: Vec<String> = Vec::new();
+    let deadline = tokio::time::Instant::now() + DRIVE_TIMEOUT;
+    while let Ok(Some(chunk)) = tokio::time::timeout_at(deadline, stream.next())
+        .await
+        .map_err(|_| ())
+    {
+        if let AnswerChunk::Delta(d) = &chunk {
+            if let Some(title) = tool_title_from_delta(d) {
+                if !tools.contains(&title) {
+                    tools.push(title);
+                }
+            }
+        }
+        if matches!(chunk, AnswerChunk::Done { .. } | AnswerChunk::Error(_)) {
+            break;
+        }
+    }
+    if tools.is_empty() {
+        // No tool fired — fall back to the cheaper signals (don't claim Fired).
+        mcp_step(kind).await
+    } else {
+        McpStep::Fired { tools }
+    }
+}
+
+/// Extract the tool title from a `[tool: <title>]` Delta chunk, if it is one.
+/// This marker is emitted ONLY for an ACP `ToolCall` update (`format_tool_call`),
+/// never as user/agent prose — so its presence is a reliable tool-firing signal.
+fn tool_title_from_delta(delta: &str) -> Option<String> {
+    let rest = delta.strip_prefix("[tool: ")?;
+    let title = rest.trim_end_matches(']').trim();
+    (!title.is_empty()).then(|| title.to_string())
+}
+
 /// Level-1 config-read fallback for [`mcp_step`]: read the agent's connector
 /// config (no spawn, no quota) and report availability. Up to [`MCP_NAME_SAMPLE`]
 /// connector names are sampled for at-a-glance context. Extracted so the
@@ -1411,6 +1476,43 @@ mod tests {
         assert!(cell.detail.contains("4 tool(s)"), "detail: {}", cell.detail);
         assert!(cell.detail.contains("perplexity_ask"));
         assert!(cell.detail.contains("live:"));
+    }
+
+    #[test]
+    fn tool_title_from_delta_detects_only_the_tool_marker() {
+        // The firing signal: a `[tool: <title>]` chunk yields the title.
+        assert_eq!(
+            tool_title_from_delta("[tool: mcp__perplexity__perplexity_ask]"),
+            Some("mcp__perplexity__perplexity_ask".to_string())
+        );
+        assert_eq!(
+            tool_title_from_delta("[tool: github-mcp-server-search_code]"),
+            Some("github-mcp-server-search_code".to_string())
+        );
+        // Plain answer text (even if it mentions tools) must NOT be a firing
+        // signal — only our exact marker counts, so a 401'd connector's apology
+        // text can't be mistaken for a real firing.
+        assert_eq!(tool_title_from_delta("I will use the perplexity tool now."), None);
+        assert_eq!(tool_title_from_delta("see [tool: x] mid-sentence"), None);
+        assert_eq!(tool_title_from_delta("[tool: ]"), None);
+    }
+
+    #[test]
+    fn mcp_fired_is_the_strongest_cap5_signal() {
+        // FIRED (tool actually invoked mid-answer) is the anti-fake gate — a Pass
+        // whose detail says FIRED, distinct from the live-enumerate / config-only
+        // levels (which only prove availability, not invocation).
+        let fired = McpStep::Fired {
+            tools: vec!["mcp__perplexity__perplexity_ask".into()],
+        };
+        let cell = fired.cell();
+        assert_eq!(cell.status, CellStatus::Pass);
+        assert!(cell.detail.contains("FIRED"), "detail: {}", cell.detail);
+        assert!(cell.detail.contains("1 MCP tool call"), "detail: {}", cell.detail);
+        assert!(cell.detail.contains("perplexity_ask"));
+        // Must NOT read as config-only / merely-available.
+        assert!(!cell.detail.contains("config-only"));
+        assert!(!cell.detail.contains("available"));
     }
 
     #[test]
