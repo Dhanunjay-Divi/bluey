@@ -102,6 +102,15 @@ impl AcpAgentSpec {
     /// cleanly under the inherited `PATH` (the common case) the probe returns
     /// `None` and argv is unchanged — the recovered shell env stays the source of
     /// truth.
+    /// # MCP / the USP — do NOT add settingSources flags here
+    /// The driven agent must use the USER's own MCP connectors (the product USP).
+    /// We deliberately pass NO `settingSources`/`--mcp-config` flags to the
+    /// adapters: the `claude-agent-acp` adapter ALREADY hardcodes
+    /// `settingSources: ["user", "project", "local"]` internally (verified in its
+    /// `acp-agent.js`), so it loads `~/.claude.json`'s user MCP servers on its
+    /// own. Live-verified: Claude over ACP fires `mcp__perplexity__perplexity_ask`
+    /// from the user's config. Passing a wrong `settingSources` value here could
+    /// make the adapter refuse to start — so leave MCP scoping to the adapter.
     fn to_acp_agent(&self) -> anyhow::Result<AcpAgent> {
         let mut argv: Vec<String> = Vec::with_capacity(self.args.len() + 2);
         if let Some(child_path) = crate::runtime_resolve::runtime_path_for_program(&self.program) {
