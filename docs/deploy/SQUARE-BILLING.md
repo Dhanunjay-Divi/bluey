@@ -67,6 +67,15 @@ Operational requirements:
 - The endpoint must return 2xx quickly for valid, already-processed events.
 - Processing must be idempotent by Square event/order/payment ID; Square may
   retry or deliver events more than once.
+- Bluey credits only when the signed Square event passes the reload invariant:
+  the Bluey account metadata matches the Square reload reference, currency is
+  `USD`, the Square paid amount matches `bluey_amount_cents`, the amount is at
+  least the configured reload minimum, and exactly one Square payment ID backs
+  the credit batch.
+- Any account, amount, currency, or payment-id mismatch is treated as a fraud or
+  integration signal. The webhook fails closed, no spendable balance is created,
+  and the event must be reviewed against the Square dashboard before retrying or
+  issuing an explicit internal credit.
 - Webhook failures are not a reason to grant credits manually unless an operator
   verifies the payment in Square and records the Square event/payment ID.
 - Production launch requires one sandbox reload smoke and one low-dollar live
@@ -80,6 +89,11 @@ Implemented:
 - Outbound Square API calls pin `Square-Version: 2025-04-16`.
 - `/billing/square/webhook` verifies the Square signature and credits completed
   reload orders/payment events.
+- Square hosted-checkout orders carry Bluey metadata for account id and expected
+  reload cents. Webhook processing rejects mismatches between metadata,
+  reference id, Square total, line-item/tender amount, and the credited amount.
+- Square saved-card Auto Reload validates the returned payment amount, currency,
+  customer id, and reference id before crediting a completed payment.
 - Preprod/prod credential switching via `SQUARE_ENVIRONMENT`.
 - Integration tests for Square checkout and webhook crediting.
 

@@ -21,6 +21,7 @@ operator contract before wider paid alpha.
 |---|---|---|
 | Stolen card reload | new account, new card, high usage immediately after reload, unusual geo/IP churn | put account in review, cap paid usage, preserve evidence |
 | Chargeback/dispute | Square dispute notification or dashboard alert | freeze disputed credit batch if possible, stop auto reload, prepare evidence |
+| Reload amount mismatch | Square paid amount, currency, metadata, reference id, or Bluey credited amount do not match | fail closed, do not credit, put account/event in operator review |
 | Trial abuse | many accounts from same IP/device pattern, repeated zero-spend usage | reduce trial access, require verified email, block suspicious signup patterns |
 | Provider-cost abuse | high STT hours or deep-model calls relative to credit | enforce server-side spend guard, capacity limits, and low-balance hard stop |
 | Account sharing/device churn | many devices or locations on one account | require re-auth, add review flag, ask customer to confirm usage |
@@ -62,6 +63,10 @@ Before inviting wider paid testers:
 
 - Keep first reload amount modest (`$15` default). Auto Reload must stay opt-in
   with a visible threshold and reload amount.
+- Treat Square reload math as a hard invariant: `Square paid cents ==
+  Bluey expected cents == credited cents`, currency is `USD`, and the Square
+  account/reference metadata points to the same Bluey account. Any mismatch is
+  a review event, never an automatic balance credit.
 - Keep provider-side billing alerts/caps where providers support them.
 - Keep Bluey app-level spend guard enabled during alpha.
 - Review high-spend accounts daily until monitoring is automated.
@@ -74,6 +79,7 @@ Before inviting wider paid testers:
 
 - [ ] Square webhook delivery is green for sandbox and production.
 - [ ] One sandbox reload and one low-dollar live reload have credited correctly.
+- [ ] One sandbox mismatch replay fails closed with no balance movement.
 - [ ] Dispute notification path is known in Square dashboard.
 - [ ] Support mailbox can receive billing/refund requests.
 - [ ] Terms and privacy pages are live and linked from signup/reload.

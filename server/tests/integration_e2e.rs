@@ -159,6 +159,15 @@ fn clear_square_billing_env() {
     std::env::remove_var("SQUARE_SANDBOX_APPLICATION_ID");
 }
 
+fn square_reload_reference_id_for_test(account_id: &str) -> String {
+    let compact = account_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(32)
+        .collect::<String>();
+    format!("br_{compact}")
+}
+
 async fn login(harness: &Harness, email: &str, password: &str) -> serde_json::Value {
     let req = Request::post("/auth/login")
         .header("content-type", "application/json")
@@ -1495,7 +1504,10 @@ async fn billing_square_webhook_credits_completed_order() {
                         "bluey_amount_cents": "3000"
                     },
                     "total_money": {"amount": 3000, "currency": "USD"},
-                    "tenders": [{"payment_id": "payment_square_1"}]
+                    "tenders": [{
+                        "payment_id": "payment_square_1",
+                        "amount_money": {"amount": 3000, "currency": "USD"}
+                    }]
                 }
             }
         }
@@ -1527,6 +1539,183 @@ async fn billing_square_webhook_credits_completed_order() {
         )
         .unwrap();
     assert_eq!(balance, 3000);
+
+    std::env::remove_var("BLUEY_BILLING_PROVIDER");
+    std::env::remove_var("SQUARE_ENVIRONMENT");
+    std::env::remove_var("SQUARE_SANDBOX_ACCESS_TOKEN");
+    std::env::remove_var("SQUARE_SANDBOX_LOCATION_ID");
+    std::env::remove_var("SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY");
+}
+
+#[tokio::test]
+#[serial]
+async fn billing_square_webhook_rejects_amount_mismatch_without_credit() {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    std::env::set_var("BLUEY_BILLING_PROVIDER", "square");
+    std::env::set_var("SQUARE_ENVIRONMENT", "sandbox");
+    std::env::set_var("SQUARE_SANDBOX_ACCESS_TOKEN", "sandbox-token");
+    std::env::set_var("SQUARE_SANDBOX_LOCATION_ID", "sandbox-location");
+    std::env::set_var("SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY", "square-whsec");
+
+    let h = boot_harness().await;
+    let _access = signup_and_login(&h, "square-mismatch@example.com", "longenoughpw").await;
+    let account_id: String = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT id FROM accounts WHERE email = ?1",
+            rusqlite::params!["square-mismatch@example.com"],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    let body = serde_json::to_string(&json!({
+        "event_id": "evt_square_amount_mismatch_1",
+        "type": "order.updated",
+        "data": {
+            "object": {
+                "order": {
+                    "id": "order_amount_mismatch_1",
+                    "state": "COMPLETED",
+                    "reference_id": format!("bluey_reload:{account_id}"),
+                    "metadata": {
+                        "bluey_account_id": account_id,
+                        "bluey_amount_cents": "3000"
+                    },
+                    "total_money": {"amount": 1500, "currency": "USD"},
+                    "tenders": [{
+                        "payment_id": "payment_square_amount_mismatch_1",
+                        "amount_money": {"amount": 1500, "currency": "USD"}
+                    }]
+                }
+            }
+        }
+    }))
+    .unwrap();
+
+    let url = "http://localhost:8080/billing/square/webhook";
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(b"square-whsec").unwrap();
+    mac.update(url.as_bytes());
+    mac.update(body.as_bytes());
+    let signature = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+
+    let req = Request::post("/billing/square/webhook")
+        .header("x-square-hmacsha256-signature", signature)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 500);
+
+    let balance: i64 = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT balance_cents FROM accounts WHERE email = ?1",
+            rusqlite::params!["square-mismatch@example.com"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(balance, 0);
+
+    std::env::remove_var("BLUEY_BILLING_PROVIDER");
+    std::env::remove_var("SQUARE_ENVIRONMENT");
+    std::env::remove_var("SQUARE_SANDBOX_ACCESS_TOKEN");
+    std::env::remove_var("SQUARE_SANDBOX_LOCATION_ID");
+    std::env::remove_var("SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY");
+}
+
+#[tokio::test]
+#[serial]
+async fn billing_square_webhook_rejects_account_reference_mismatch_without_credit() {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    std::env::set_var("BLUEY_BILLING_PROVIDER", "square");
+    std::env::set_var("SQUARE_ENVIRONMENT", "sandbox");
+    std::env::set_var("SQUARE_SANDBOX_ACCESS_TOKEN", "sandbox-token");
+    std::env::set_var("SQUARE_SANDBOX_LOCATION_ID", "sandbox-location");
+    std::env::set_var("SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY", "square-whsec");
+
+    let h = boot_harness().await;
+    let _access_a = signup_and_login(&h, "square-ref-a@example.com", "longenoughpw").await;
+    let _access_b = signup_and_login(&h, "square-ref-b@example.com", "longenoughpw").await;
+    let account_a: String = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT id FROM accounts WHERE email = ?1",
+            rusqlite::params!["square-ref-a@example.com"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let account_b: String = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT id FROM accounts WHERE email = ?1",
+            rusqlite::params!["square-ref-b@example.com"],
+            |r| r.get(0),
+        )
+        .unwrap();
+
+    let body = serde_json::to_string(&json!({
+        "event_id": "evt_square_reference_mismatch_1",
+        "type": "order.updated",
+        "data": {
+            "object": {
+                "order": {
+                    "id": "order_reference_mismatch_1",
+                    "state": "COMPLETED",
+                    "reference_id": format!("bluey_reload:{account_a}"),
+                    "metadata": {
+                        "bluey_account_id": account_b,
+                        "bluey_amount_cents": "3000"
+                    },
+                    "total_money": {"amount": 3000, "currency": "USD"},
+                    "tenders": [{
+                        "payment_id": "payment_square_reference_mismatch_1",
+                        "amount_money": {"amount": 3000, "currency": "USD"}
+                    }]
+                }
+            }
+        }
+    }))
+    .unwrap();
+
+    let url = "http://localhost:8080/billing/square/webhook";
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(b"square-whsec").unwrap();
+    mac.update(url.as_bytes());
+    mac.update(body.as_bytes());
+    let signature = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+
+    let req = Request::post("/billing/square/webhook")
+        .header("x-square-hmacsha256-signature", signature)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 500);
+
+    let total_balance: i64 = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT COALESCE(SUM(balance_cents), 0) FROM accounts WHERE email IN (?1, ?2)",
+            rusqlite::params!["square-ref-a@example.com", "square-ref-b@example.com"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(total_balance, 0);
 
     std::env::remove_var("BLUEY_BILLING_PROVIDER");
     std::env::remove_var("SQUARE_ENVIRONMENT");
@@ -1584,7 +1773,10 @@ async fn billing_square_webhook_rejects_production_signature_while_checkout_is_s
                         "bluey_amount_cents": "1500"
                     },
                     "total_money": {"amount": 1500, "currency": "USD"},
-                    "tenders": [{"payment_id": "payment_square_prod_1"}]
+                    "tenders": [{
+                        "payment_id": "payment_square_prod_1",
+                        "amount_money": {"amount": 1500, "currency": "USD"}
+                    }]
                 }
             }
         }
@@ -1939,7 +2131,10 @@ async fn square_auto_reload_charges_saved_card_when_threshold_crosses() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "payment": {
                 "id": "payment_square_autoreload_1",
-                "status": "COMPLETED"
+                "status": "COMPLETED",
+                "amount_money": {"amount": 1500, "currency": "USD"},
+                "reference_id": square_reload_reference_id_for_test(&account_id),
+                "customer_id": "cus_square_topup"
             }
         })))
         .expect(1)

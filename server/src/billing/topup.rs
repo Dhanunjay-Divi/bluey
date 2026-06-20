@@ -278,6 +278,7 @@ async fn run_square_topup(
         "reference_id": square_reload_reference_id(&account_id),
         "note": "Bluey auto reload"
     });
+    let expected_reference_id = square_reload_reference_id(&account_id);
 
     let resp = reqwest::Client::new()
         .post(square_api_url(&square, "/v2/payments"))
@@ -303,8 +304,19 @@ async fn run_square_topup(
         .pointer("/payment/status")
         .and_then(|v| v.as_str())
         .unwrap_or("UNKNOWN");
-    let payment_id = body
-        .pointer("/payment/id")
+    let payment = body
+        .pointer("/payment")
+        .ok_or_else(|| anyhow!("square payment response missing payment"))?;
+    validate_square_payment_response(
+        payment,
+        &account_id,
+        &expected_reference_id,
+        &square_customer_id,
+        amount_cents,
+    )?;
+
+    let payment_id = payment
+        .pointer("/id")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("square payment response missing payment.id"))?;
 
@@ -327,6 +339,55 @@ async fn run_square_topup(
             square_payment_status = %payment_status,
             "Square auto reload payment created; waiting for webhook completion"
         );
+    }
+
+    Ok(())
+}
+
+fn validate_square_payment_response(
+    payment: &serde_json::Value,
+    account_id: &str,
+    expected_reference_id: &str,
+    expected_customer_id: &str,
+    expected_amount_cents: i64,
+) -> Result<()> {
+    let observed_amount = payment
+        .pointer("/amount_money/amount")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| anyhow!("square payment response missing amount_money.amount"))?;
+    let observed_currency = payment
+        .pointer("/amount_money/currency")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("square payment response missing amount_money.currency"))?;
+    if observed_currency != "USD" {
+        return Err(anyhow!(
+            "Square auto reload currency mismatch: expected USD, got {observed_currency}"
+        ));
+    }
+    if observed_amount != expected_amount_cents {
+        return Err(anyhow!(
+            "Square auto reload amount mismatch: expected {expected_amount_cents} cents, got {observed_amount} cents"
+        ));
+    }
+
+    let observed_reference_id = payment
+        .pointer("/reference_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("square payment response missing reference_id"))?;
+    if observed_reference_id != expected_reference_id {
+        return Err(anyhow!(
+            "Square auto reload reference mismatch for account {}",
+            cue_core::account_id_hash_prefix(account_id)
+        ));
+    }
+
+    if let Some(observed_customer_id) = payment.pointer("/customer_id").and_then(|v| v.as_str()) {
+        if observed_customer_id != expected_customer_id {
+            return Err(anyhow!(
+                "Square auto reload customer mismatch for account {}",
+                cue_core::account_id_hash_prefix(account_id)
+            ));
+        }
     }
 
     Ok(())

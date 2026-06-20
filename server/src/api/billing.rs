@@ -1013,10 +1013,13 @@ async fn handle_checkout_completed(state: &AppState, event: &serde_json::Value) 
 }
 
 async fn handle_square_payment_event(state: &AppState, event: &serde_json::Value) -> Result<()> {
-    let Some((account_id, amount_cents, payment_id)) = extract_square_credit(event)? else {
+    let Some(candidate) = extract_square_credit(event)? else {
         tracing::debug!("square webhook did not contain a completed Bluey reload");
         return Ok(());
     };
+    let account_id = candidate.account_id;
+    let amount_cents = candidate.amount_cents;
+    let payment_id = candidate.payment_id;
 
     let credited = balance::credit_processor_payment(
         &state.pool,
@@ -1043,40 +1046,64 @@ async fn handle_square_payment_event(state: &AppState, event: &serde_json::Value
     Ok(())
 }
 
-fn extract_square_credit(event: &serde_json::Value) -> Result<Option<(String, i64, String)>> {
+#[derive(Debug)]
+struct SquareCreditCandidate {
+    account_id: String,
+    amount_cents: i64,
+    payment_id: String,
+}
+
+fn extract_square_credit(event: &serde_json::Value) -> Result<Option<SquareCreditCandidate>> {
     if let Some(order) = event.pointer("/data/object/order") {
         let state = order.get("state").and_then(|v| v.as_str()).unwrap_or("");
         if state != "COMPLETED" {
             return Ok(None);
         }
-        let account_id = order
-            .pointer("/metadata/bluey_account_id")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .or_else(|| {
-                order
-                    .get("reference_id")
-                    .and_then(|v| v.as_str())
-                    .and_then(square_account_id_from_reference)
-            })
-            .ok_or_else(|| anyhow!("Square order missing bluey account metadata"))?;
-        let amount_cents = order
-            .pointer("/metadata/bluey_amount_cents")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<i64>().ok())
-            .or_else(|| {
-                order
-                    .pointer("/total_money/amount")
-                    .and_then(|v| v.as_i64())
-            })
-            .ok_or_else(|| anyhow!("Square order missing amount"))?;
-        let payment_id = order
-            .pointer("/tenders/0/payment_id")
-            .and_then(|v| v.as_str())
-            .or_else(|| order.get("id").and_then(|v| v.as_str()))
-            .ok_or_else(|| anyhow!("Square order missing id/payment_id"))?
+
+        let account_id = required_square_string(order, "/metadata/bluey_account_id", "account metadata")?
             .to_string();
-        return Ok(Some((account_id, amount_cents, payment_id)));
+        let reference_id =
+            required_square_string(order, "/reference_id", "order reference_id")?;
+        let reference_account_id = square_account_id_from_reference(reference_id)
+            .ok_or_else(|| anyhow!("Square order reference_id is not a Bluey reload reference"))?;
+        ensure_square_account_match(&account_id, &reference_account_id, "order reference_id")?;
+
+        let amount_cents =
+            required_square_metadata_amount(order, "/metadata/bluey_amount_cents")?;
+        ensure_square_reload_amount(amount_cents, "order metadata amount")?;
+        let total_amount =
+            required_square_money_amount(order, "/total_money", "order total_money")?;
+        ensure_square_amount_match(amount_cents, total_amount, "order total_money")?;
+        if let Some(line_amount) =
+            optional_square_money_amount(order, "/line_items/0/base_price_money", "line item price")?
+        {
+            ensure_square_amount_match(amount_cents, line_amount, "line item price")?;
+        }
+
+        let tenders = order
+            .pointer("/tenders")
+            .and_then(|value| value.as_array())
+            .ok_or_else(|| anyhow!("Square order missing tender payment"))?;
+        if tenders.len() != 1 {
+            return Err(anyhow!(
+                "Square order expected exactly one tender payment, found {}",
+                tenders.len()
+            ));
+        }
+        let tender = &tenders[0];
+        if let Some(tender_amount) =
+            optional_square_money_amount(tender, "/amount_money", "tender amount")?
+        {
+            ensure_square_amount_match(amount_cents, tender_amount, "tender amount")?;
+        }
+        let payment_id = required_square_string(tender, "/payment_id", "tender payment_id")?
+            .to_string();
+
+        return Ok(Some(SquareCreditCandidate {
+            account_id,
+            amount_cents,
+            payment_id,
+        }));
     }
 
     if let Some(payment) = event.pointer("/data/object/payment") {
@@ -1084,24 +1111,127 @@ fn extract_square_credit(event: &serde_json::Value) -> Result<Option<(String, i6
         if status != "COMPLETED" {
             return Ok(None);
         }
-        let account_id = payment
-            .get("reference_id")
+        let reference_id =
+            required_square_string(payment, "/reference_id", "payment reference_id")?;
+        let account_id = square_account_id_from_reference(reference_id)
+            .ok_or_else(|| anyhow!("Square payment reference_id is not a Bluey reload reference"))?;
+        if let Some(metadata_account_id) = payment
+            .pointer("/metadata/bluey_account_id")
             .and_then(|v| v.as_str())
-            .and_then(square_account_id_from_reference)
-            .ok_or_else(|| anyhow!("Square payment missing bluey reference_id"))?;
-        let amount_cents = payment
-            .pointer("/amount_money/amount")
-            .and_then(|v| v.as_i64())
-            .ok_or_else(|| anyhow!("Square payment missing amount"))?;
-        let payment_id = payment
-            .get("id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("Square payment missing id"))?
+        {
+            ensure_square_account_match(metadata_account_id, &account_id, "payment metadata")?;
+        }
+
+        let amount_cents =
+            required_square_money_amount(payment, "/amount_money", "payment amount_money")?;
+        ensure_square_reload_amount(amount_cents, "payment amount")?;
+        if let Some(metadata_amount) =
+            optional_square_metadata_amount(payment, "/metadata/bluey_amount_cents")?
+        {
+            ensure_square_amount_match(metadata_amount, amount_cents, "payment metadata amount")?;
+        }
+        let payment_id = required_square_string(payment, "/id", "payment id")?
             .to_string();
-        return Ok(Some((account_id, amount_cents, payment_id)));
+        return Ok(Some(SquareCreditCandidate {
+            account_id,
+            amount_cents,
+            payment_id,
+        }));
     }
 
     Ok(None)
+}
+
+fn required_square_string<'a>(
+    value: &'a serde_json::Value,
+    pointer: &str,
+    label: &str,
+) -> Result<&'a str> {
+    value
+        .pointer(pointer)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| anyhow!("Square reload missing {label}"))
+}
+
+fn optional_square_metadata_amount(
+    value: &serde_json::Value,
+    pointer: &str,
+) -> Result<Option<i64>> {
+    let Some(raw) = value.pointer(pointer).and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    let amount = raw
+        .parse::<i64>()
+        .with_context(|| format!("Square reload metadata amount is not an integer: {raw}"))?;
+    Ok(Some(amount))
+}
+
+fn required_square_metadata_amount(value: &serde_json::Value, pointer: &str) -> Result<i64> {
+    optional_square_metadata_amount(value, pointer)?
+        .ok_or_else(|| anyhow!("Square reload missing Bluey amount metadata"))
+}
+
+fn optional_square_money_amount(
+    value: &serde_json::Value,
+    pointer: &str,
+    label: &str,
+) -> Result<Option<i64>> {
+    let Some(money) = value.pointer(pointer) else {
+        return Ok(None);
+    };
+    let currency = money
+        .pointer("/currency")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("Square reload {label} missing currency"))?;
+    if currency != "USD" {
+        return Err(anyhow!(
+            "Square reload {label} currency mismatch: expected USD, got {currency}"
+        ));
+    }
+    let amount = money
+        .pointer("/amount")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| anyhow!("Square reload {label} missing amount"))?;
+    Ok(Some(amount))
+}
+
+fn required_square_money_amount(
+    value: &serde_json::Value,
+    pointer: &str,
+    label: &str,
+) -> Result<i64> {
+    optional_square_money_amount(value, pointer, label)?
+        .ok_or_else(|| anyhow!("Square reload missing {label}"))
+}
+
+fn ensure_square_account_match(expected: &str, observed: &str, label: &str) -> Result<()> {
+    if expected == observed {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "Square reload account mismatch in {label}: metadata hash {} did not match reference hash {}",
+        cue_core::account_id_hash_prefix(expected),
+        cue_core::account_id_hash_prefix(observed)
+    ))
+}
+
+fn ensure_square_amount_match(expected: i64, observed: i64, label: &str) -> Result<()> {
+    if expected == observed {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "Square reload amount mismatch in {label}: expected {expected} cents, got {observed} cents"
+    ))
+}
+
+fn ensure_square_reload_amount(amount_cents: i64, label: &str) -> Result<()> {
+    if amount_cents >= MINIMUM_RELOAD_CENTS {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "Square reload {label} below minimum reload: {amount_cents} cents"
+    ))
 }
 
 /// Verify Stripe `t=...,v1=...` signature header against the body.
@@ -1324,9 +1454,9 @@ mod tests {
         });
 
         let extracted = extract_square_credit(&event).unwrap().unwrap();
-        assert_eq!(extracted.0, "acct-123");
-        assert_eq!(extracted.1, 3000);
-        assert_eq!(extracted.2, "payment_1");
+        assert_eq!(extracted.account_id, "acct-123");
+        assert_eq!(extracted.amount_cents, 3000);
+        assert_eq!(extracted.payment_id, "payment_1");
     }
 
     #[test]
@@ -1367,9 +1497,12 @@ mod tests {
         });
 
         let extracted = extract_square_credit(&event).unwrap().unwrap();
-        assert_eq!(extracted.0, "833e66ac-0652-43c7-a55e-8d51d9ccc982");
-        assert_eq!(extracted.1, 3000);
-        assert_eq!(extracted.2, "payment_1");
+        assert_eq!(
+            extracted.account_id,
+            "833e66ac-0652-43c7-a55e-8d51d9ccc982"
+        );
+        assert_eq!(extracted.amount_cents, 3000);
+        assert_eq!(extracted.payment_id, "payment_1");
     }
 
     #[test]
