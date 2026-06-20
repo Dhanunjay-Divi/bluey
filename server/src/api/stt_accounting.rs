@@ -307,7 +307,7 @@ mod tests {
                 params![&account.id],
             )
             .unwrap();
-        balance::credit(pool, &account.id, cents, None).unwrap();
+        balance::credit_internal(pool, &account.id, cents, "stt-accounting-test").unwrap();
         account.id
     }
 

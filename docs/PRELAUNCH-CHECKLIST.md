@@ -126,9 +126,13 @@ operating plan.
 - [ ] Matching `SQUARE_*_WEBHOOK_SIGNATURE_KEY` set in `/etc/bluey-api/bluey-api.env`
 - [ ] Sandbox test: $30 reload through Square hosted checkout → balance credited within 30s
 - [ ] Production test: real $30 reload through Square hosted checkout → balance credited within 30s
+- [ ] Square reload duplicate-webhook replay credits exactly once
+- [ ] Square failed/canceled payment webhook creates no spendable credit
 - [ ] `docs/deploy/ABUSE-FRAUD-CHARGEBACK-PLAYBOOK.md` reviewed by the operator who will handle Square notices
 - [ ] Square failed-webhook/dispute notification mailbox confirmed and monitored
-- [ ] Auto-topup/card-on-file is explicitly deferred until Square saved-card flow is wired; manual reload must be clear in `/account`
+- [x] Auto-topup/card-on-file is explicitly deferred until Square saved-card flow is wired; manual reload is clear in `/account`
+- [x] New accounts default to manual reload; legacy Stripe auto-topup is disabled whenever Square is the active billing provider
+- [x] Spendable credit code path requires a processor payment id or explicit internal credit source
 - [x] Customer-facing copy says account credits are non-transferable, have no cash value, and are not a stored-value/gift-card product
 - [ ] Refund/support/privacy/terms pages are published before production payments
 - [ ] Square credentials rotated if any production credential was pasted into a non-secret channel during setup

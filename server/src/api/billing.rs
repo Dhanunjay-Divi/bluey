@@ -1,25 +1,20 @@
 //! Billing integration: Stripe compatibility plus Square checkout.
 //!
 //! v0.2 scope:
-//!   - POST /billing/checkout: creates a Stripe Checkout Session for
-//!     a $30 reload. Returns the hosted-checkout URL the customer is
-//!     redirected to.
-//!   - POST /billing/webhook: validates the Stripe-Signature header
-//!     and handles `checkout.session.completed` to credit the
-//!     customer's balance + record a credit_batches row with the
-//!     stripe_charge_id for audit.
-//!   - Auto-top-up trigger: post-deduction in /router/complete, if
-//!     balance < auto_topup_threshold AND auto_topup_enabled, fire
-//!     a charge against the saved PaymentMethod (off-session).
+//!   - POST /billing/checkout: creates a Square Payment Link when
+//!     Square is active, with Stripe Checkout retained as a compatibility
+//!     path for legacy/staging deployments.
+//!   - POST /billing/square/webhook: validates Square signatures and
+//!     credits balance only for completed Bluey reload payments.
+//!   - POST /billing/webhook: validates Stripe signatures and credits
+//!     only completed Stripe Checkout sessions with a PaymentIntent id.
+//!   - Auto top-up/card-on-file is deferred for Square. Legacy Stripe
+//!     auto top-up runs only when Stripe is the active billing provider.
 //!
-//! Talks Stripe over HTTPS using `reqwest`; no Stripe SDK dependency
-//! to keep the binary lean. The endpoints we touch:
+//! Talks processors over HTTPS using `reqwest`; no vendor SDK dependency
+//! to keep the binary lean. The Stripe endpoints we touch:
 //!   - POST /v1/checkout/sessions
 //!   - POST /v1/payment_intents (off-session for auto-top-up)
-//!
-//! All API calls require STRIPE_SECRET_KEY in the server env. If
-//! unset, billing endpoints return 503 Service Unavailable so the
-//! customer sees a clear "billing not configured" message.
 
 use anyhow::{anyhow, Context, Result};
 use axum::{extract::State, http::StatusCode, Extension, Json};
@@ -731,13 +726,15 @@ async fn handle_checkout_completed(state: &AppState, event: &serde_json::Value) 
     // AND expanded-object shapes so credit idempotency always gets the
     // PI id (defending against duplicate-charge replay) regardless of
     // which webhook expansion mode Stripe is using.
-    let payment_intent_id = extract_payment_intent_id(session);
+    let payment_intent_id = extract_payment_intent_id(session)
+        .ok_or_else(|| anyhow!("Stripe checkout completed without payment_intent; refusing credit"))?;
 
-    let credited = balance::credit(
+    let credited = balance::credit_processor_payment(
         &state.pool,
         &account_id,
         amount_cents,
-        payment_intent_id.as_deref(),
+        "stripe",
+        &payment_intent_id,
     )
     .context("credit account")?;
 
@@ -746,23 +743,20 @@ async fn handle_checkout_completed(state: &AppState, event: &serde_json::Value) 
     // string, fetch /v1/payment_intents/{id} to read .payment_method.
     let mut payment_method_id = extract_payment_method_id_from_session(session);
     if payment_method_id.is_none() {
-        if let (Some(pi_id), Some(stripe_key)) = (
-            payment_intent_id.as_deref(),
-            state.config.stripe_secret_key.as_deref(),
-        ) {
-            match fetch_payment_method_from_stripe(stripe_key, pi_id).await {
+        if let Some(stripe_key) = state.config.stripe_secret_key.as_deref() {
+            match fetch_payment_method_from_stripe(stripe_key, &payment_intent_id).await {
                 Ok(Some(pm)) => payment_method_id = Some(pm),
                 Ok(None) => {
                     tracing::warn!(
                         account_id_hash = %account_id_hash,
-                        payment_intent_id = pi_id,
+                        payment_intent_id = %payment_intent_id,
                         "PaymentIntent retrieve returned no payment_method; auto top-up will rely on customer-default"
                     );
                 }
                 Err(e) => {
                     tracing::warn!(
                         account_id_hash = %account_id_hash,
-                        payment_intent_id = pi_id,
+                        payment_intent_id = %payment_intent_id,
                         error = %e,
                         "PaymentIntent retrieve failed; will use customer-default at auto top-up time"
                     );
@@ -787,14 +781,14 @@ async fn handle_checkout_completed(state: &AppState, event: &serde_json::Value) 
     if !credited {
         tracing::info!(
             account_id_hash = %account_id_hash,
-            payment_intent_id = %payment_intent_id.as_deref().unwrap_or("unknown"),
+            payment_intent_id = %payment_intent_id,
             "checkout.session.completed: charge already credited, no-op"
         );
     } else {
         tracing::info!(
             account_id_hash = %account_id_hash,
             amount_cents,
-            payment_intent_id = %payment_intent_id.as_deref().unwrap_or("unknown"),
+            payment_intent_id = %payment_intent_id,
             "credited from Stripe webhook"
         );
     }
@@ -807,9 +801,14 @@ async fn handle_square_payment_event(state: &AppState, event: &serde_json::Value
         return Ok(());
     };
 
-    let charge_id = format!("square:{payment_id}");
-    let credited = balance::credit(&state.pool, &account_id, amount_cents, Some(&charge_id))
-        .context("credit account from Square")?;
+    let credited = balance::credit_processor_payment(
+        &state.pool,
+        &account_id,
+        amount_cents,
+        "square",
+        &payment_id,
+    )
+    .context("credit account from Square")?;
     if !credited {
         tracing::info!(
             account_id_hash = %cue_core::account_id_hash_prefix(&account_id),

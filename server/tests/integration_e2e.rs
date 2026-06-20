@@ -1626,14 +1626,11 @@ async fn billing_portal_400s_without_stripe_customer() {
 #[tokio::test]
 #[serial]
 async fn auto_topup_off_by_default_does_not_fire_charge() {
-    // New accounts default to auto_topup_enabled=1 in schema, but with
-    // no PaymentMethod on file the topup helper short-circuits. We
-    // exercise that path: low balance + no PM -> NO charge.
     let h = boot_harness().await;
     let access = signup_and_login(&h, "topup@example.com", "longenoughpw").await;
 
-    // Drain trial seconds + balance to force the post-deduct branch to
-    // be reached, but no Stripe customer/PM means topup is skipped.
+    // Drain trial seconds + set a low balance. New accounts default to
+    // manual reload, so even a post-deduct low balance must not charge.
     let conn = h.pool.get().unwrap();
     conn.execute(
         "UPDATE accounts SET trial_seconds_remaining = 0, balance_cents = 100 WHERE email = ?1",
@@ -1685,4 +1682,74 @@ async fn auto_topup_off_by_default_does_not_fire_charge() {
 
     // Give the spawned topup task a chance to run if it would.
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn square_mode_never_runs_legacy_stripe_auto_topup() {
+    std::env::set_var("BLUEY_BILLING_PROVIDER", "square");
+    std::env::set_var("SQUARE_ENVIRONMENT", "sandbox");
+    std::env::set_var("SQUARE_SANDBOX_ACCESS_TOKEN", "sandbox-token");
+    std::env::set_var("SQUARE_SANDBOX_LOCATION_ID", "sandbox-location");
+
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "square-no-stripe-topup@example.com", "longenoughpw").await;
+
+    // Simulate a legacy account that still has Stripe card metadata and
+    // auto-topup enabled. Square is the active provider, so this must not
+    // charge the old Stripe path.
+    let conn = h.pool.get().unwrap();
+    conn.execute(
+        "UPDATE accounts
+            SET trial_seconds_remaining = 0,
+                balance_cents = 100,
+                auto_topup_enabled = 1,
+                stripe_customer_id = 'cus_legacy',
+                stripe_payment_method_id = 'pm_legacy'
+          WHERE email = ?1",
+        rusqlite::params!["square-no-stripe-topup@example.com"],
+    )
+    .unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/v1/payment_intents"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "pi_should_not_fire_in_square_mode",
+            "status": "succeeded"
+        })))
+        .expect(0)
+        .mount(&h.stripe)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        })))
+        .mount(&h.openai)
+        .await;
+
+    let req = Request::post("/router/complete")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "request_id": "square-mode-no-stripe-topup",
+                "system": "",
+                "user": "hi",
+                "lane": "instant"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert!(resp.status() == 200 || resp.status() == 402);
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    std::env::remove_var("BLUEY_BILLING_PROVIDER");
+    std::env::remove_var("SQUARE_ENVIRONMENT");
+    std::env::remove_var("SQUARE_SANDBOX_ACCESS_TOKEN");
+    std::env::remove_var("SQUARE_SANDBOX_LOCATION_ID");
 }

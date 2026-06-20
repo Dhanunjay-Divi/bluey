@@ -1,6 +1,9 @@
-//! Auto top-up: when a customer's balance falls below threshold and
-//! they've enabled auto top-up + saved a Stripe PaymentMethod, charge
-//! the saved card off-session for the configured amount.
+//! Legacy Stripe auto top-up.
+//!
+//! Bluey's active v0.2 billing path is Square manual reload. This module
+//! only runs when the server is explicitly configured for Stripe billing;
+//! Square auto-reload/card-on-file remains deferred until it has a
+//! processor-success-backed attempt ledger.
 //!
 //! Codex Stage 10: this is the dealbreaker for paid v0.2. Without it,
 //! customers hit the hard-stop at $0 and must manually reload via
@@ -23,7 +26,7 @@
 
 use anyhow::{anyhow, Context, Result};
 
-use crate::config::Config;
+use crate::config::{BillingProvider, Config};
 use crate::db::DbPool;
 
 /// In-flight dedupe: stops two concurrent low-balance checks from
@@ -62,6 +65,15 @@ pub fn maybe_spawn(
     auto_topup_amount_cents: i64,
 ) {
     if !auto_topup_enabled {
+        return;
+    }
+    let billing_provider = config.billing_provider();
+    if !matches!(billing_provider, BillingProvider::Stripe) {
+        tracing::debug!(
+            account_id,
+            billing_provider = ?billing_provider,
+            "auto top-up skipped: active billing provider is not Stripe"
+        );
         return;
     }
     if balance_after_cents >= auto_topup_threshold_cents {

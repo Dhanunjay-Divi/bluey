@@ -81,38 +81,40 @@ pub(crate) fn consume_credit_batches_tx(
     Ok(())
 }
 
-pub fn credit(
+fn credit_with_source_id(
     pool: &DbPool,
     account_id: &str,
     amount_cents: i64,
-    stripe_charge_id: Option<&str>,
+    credit_source_id: &str,
 ) -> Result<bool> {
     if amount_cents <= 0 {
         anyhow::bail!("amount_cents must be positive");
+    }
+    let credit_source_id = credit_source_id.trim();
+    if credit_source_id.is_empty() {
+        anyhow::bail!("credit_source_id must be non-empty");
     }
     let mut conn = pool.get()?;
     let tx = conn.transaction()?;
 
     // Codex Stage 6 S6.1 + S6.2: dedupe-then-credit atomically.
-    // If a stripe_charge_id is provided, an existing credit_batches row
-    // with the same charge id means we already credited this payment.
+    // An existing credit_batches row with the same source id means we
+    // already credited this payment/internal grant.
     // Return Ok(false) to signal "no-op already processed" so the
     // webhook handler can mark the event processed without re-running
     // anything else. The whole INSERT+UPDATE pair is wrapped in a
     // transaction so a process crash between the two cannot leave the
     // account ledger inconsistent.
-    if let Some(charge_id) = stripe_charge_id {
-        let existing: Option<i64> = tx
-            .query_row(
-                "SELECT 1 FROM credit_batches WHERE stripe_charge_id = ?1",
-                params![charge_id],
-                |r| r.get(0),
-            )
-            .ok();
-        if existing.is_some() {
-            tx.commit()?;
-            return Ok(false);
-        }
+    let existing: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM credit_batches WHERE stripe_charge_id = ?1",
+            params![credit_source_id],
+            |r| r.get(0),
+        )
+        .ok();
+    if existing.is_some() {
+        tx.commit()?;
+        return Ok(false);
     }
 
     let batch_id = uuid::Uuid::new_v4().to_string();
@@ -127,7 +129,7 @@ pub fn credit(
             account_id,
             amount_cents,
             expires_at,
-            stripe_charge_id
+            credit_source_id
         ],
     )?;
 
@@ -138,6 +140,46 @@ pub fn credit(
 
     tx.commit()?;
     Ok(true)
+}
+
+/// Credit spendable balance from a payment processor event.
+///
+/// This is intentionally explicit: customer spendable credits must come
+/// from a processor-confirmed payment id, not from checkout/link setup.
+/// The backing DB column is still named `stripe_charge_id` for migration
+/// compatibility, but stores namespaced ids such as `square:payment_123`.
+pub fn credit_processor_payment(
+    pool: &DbPool,
+    account_id: &str,
+    amount_cents: i64,
+    provider: &str,
+    processor_payment_id: &str,
+) -> Result<bool> {
+    let provider = provider.trim().to_ascii_lowercase();
+    let processor_payment_id = processor_payment_id.trim();
+    if provider.is_empty() || processor_payment_id.is_empty() {
+        anyhow::bail!("processor credit requires provider and payment id");
+    }
+    let source_id = format!("{provider}:{processor_payment_id}");
+    credit_with_source_id(pool, account_id, amount_cents, &source_id)
+}
+
+/// Credit spendable balance from an explicit internal operator action.
+///
+/// Use this for tests/admin grants only. External payment flows should
+/// call `credit_processor_payment` after the processor confirms payment.
+pub fn credit_internal(
+    pool: &DbPool,
+    account_id: &str,
+    amount_cents: i64,
+    reason: &str,
+) -> Result<bool> {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        anyhow::bail!("internal credit requires a reason");
+    }
+    let source_id = format!("internal:{reason}:{}", uuid::Uuid::new_v4());
+    credit_with_source_id(pool, account_id, amount_cents, &source_id)
 }
 
 pub fn can_afford(pool: &DbPool, account_id: &str, estimated_cost_cents: i64) -> Result<bool> {
@@ -245,9 +287,9 @@ mod tests {
         let pool = temp_pool();
         let id = make_account(&pool, "fifo@example.com");
         // Two reloads, oldest first.
-        credit(&pool, &id, 1000, Some("ch_1")).unwrap();
+        credit_processor_payment(&pool, &id, 1000, "stripe", "ch_1").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
-        credit(&pool, &id, 2000, Some("ch_2")).unwrap();
+        credit_processor_payment(&pool, &id, 2000, "stripe", "ch_2").unwrap();
         // Spend $5: should drain the first batch (1000) entirely + 4 from second.
         assert!(deduct(&pool, &id, 1400).unwrap());
         let conn = pool.get().unwrap();
@@ -268,7 +310,7 @@ mod tests {
     fn deduct_failure_doesnt_touch_batches() {
         let pool = temp_pool();
         let id = make_account(&pool, "broke@example.com");
-        credit(&pool, &id, 100, None).unwrap();
+        credit_internal(&pool, &id, 100, "test-seed").unwrap();
         assert!(!deduct(&pool, &id, 200).unwrap());
         let conn = pool.get().unwrap();
         let r: i64 = conn
@@ -285,7 +327,7 @@ mod tests {
     fn credit_extends_expiry_by_credit_validity_days() {
         let pool = temp_pool();
         let id = make_account(&pool, "expiry@example.com");
-        credit(&pool, &id, 3000, None).unwrap();
+        credit_internal(&pool, &id, 3000, "test-seed").unwrap();
         let conn = pool.get().unwrap();
         let expires_at: String = conn
             .query_row(
@@ -331,22 +373,31 @@ mod tests {
     fn sweep_no_op_when_nothing_expired() {
         let pool = temp_pool();
         let id = make_account(&pool, "fresh@example.com");
-        credit(&pool, &id, 3000, None).unwrap();
+        credit_internal(&pool, &id, 3000, "test-seed").unwrap();
         assert_eq!(sweep_expired(&pool).unwrap(), 0);
     }
 
     #[test]
-    fn credit_idempotent_on_same_stripe_charge_id() {
+    fn credit_idempotent_on_same_processor_payment_id() {
         // Codex Stage 6 S6.1: webhook replay should not double-credit.
         let pool = temp_pool();
         let id = make_account(&pool, "idem-credit@example.com");
-        let first = credit(&pool, &id, 3000, Some("ch_abc")).unwrap();
+        let first = credit_processor_payment(&pool, &id, 3000, "stripe", "ch_abc").unwrap();
         assert!(first); // first credit ran
-        let second = credit(&pool, &id, 3000, Some("ch_abc")).unwrap();
+        let second = credit_processor_payment(&pool, &id, 3000, "stripe", "ch_abc").unwrap();
         assert!(!second); // duplicate detected, no-op
                           // Balance reflects single credit.
         let bal = current_balance(&pool, &id).unwrap();
         assert_eq!(bal, 3000);
+    }
+
+    #[test]
+    fn processor_credit_requires_non_empty_source() {
+        let pool = temp_pool();
+        let id = make_account(&pool, "source-required@example.com");
+        assert!(credit_processor_payment(&pool, &id, 3000, "", "pay_1").is_err());
+        assert!(credit_processor_payment(&pool, &id, 3000, "square", "").is_err());
+        assert_eq!(current_balance(&pool, &id).unwrap(), 0);
     }
 
     #[test]
@@ -359,7 +410,7 @@ mod tests {
         // count drift.
         let pool = temp_pool();
         let id = make_account(&pool, "atomic-credit@example.com");
-        credit(&pool, &id, 5000, None).unwrap();
+        credit_internal(&pool, &id, 5000, "test-seed").unwrap();
         let bal = current_balance(&pool, &id).unwrap();
         assert_eq!(bal, 5000);
         let conn = pool.get().unwrap();

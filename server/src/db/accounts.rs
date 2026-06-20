@@ -109,7 +109,9 @@ impl Account {
         let id = uuid::Uuid::new_v4().to_string();
         let conn = pool.get()?;
         match conn.execute(
-            "INSERT INTO accounts (id, email, password_hash, is_admin) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO accounts
+                (id, email, password_hash, is_admin, auto_topup_enabled)
+             VALUES (?1, ?2, ?3, ?4, 0)",
             params![id, email, password_hash, if is_admin { 1 } else { 0 }],
         ) {
             Ok(_) => {}
@@ -136,7 +138,7 @@ impl Account {
             email: email.to_string(),
             balance_cents: 0,
             trial_seconds_remaining: 600,
-            auto_topup_enabled: true,
+            auto_topup_enabled: false,
             auto_topup_threshold_cents: 500,
             auto_topup_amount_cents: 3000,
             is_admin,

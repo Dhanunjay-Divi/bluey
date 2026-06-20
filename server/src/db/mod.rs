@@ -53,7 +53,7 @@ const MIGRATIONS: &[&str] = &[
         last_login_at               DATETIME,
         balance_cents               INTEGER NOT NULL DEFAULT 0,
         trial_seconds_remaining     INTEGER NOT NULL DEFAULT 600,      -- 10 min free trial
-        auto_topup_enabled          INTEGER NOT NULL DEFAULT 1,
+        auto_topup_enabled          INTEGER NOT NULL DEFAULT 0,
         auto_topup_threshold_cents  INTEGER NOT NULL DEFAULT 500,      -- $5
         auto_topup_amount_cents     INTEGER NOT NULL DEFAULT 3000,     -- $30
         stripe_customer_id          TEXT,
