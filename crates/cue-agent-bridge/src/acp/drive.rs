@@ -126,16 +126,30 @@ where
                     }
                     yield chunk;
                 }
-                AnswerChunk::Done { .. } => {
-                    // Clean finish. If the turn produced no content at all we still
-                    // treat it as a (possibly empty) successful resume rather than
-                    // forking — a `Done` is the agent's own signal it handled the
-                    // turn. Emit the held `Started` so the session id reaches the
-                    // caller, then the `Done`.
-                    if let Some(started) = pending_started.take() {
-                        yield started;
-                    }
+                AnswerChunk::Done { .. } if produced_content => {
+                    // Real resume: content arrived (the `committed` line already
+                    // logged on the first Delta), now a clean finish. Pass it through.
                     yield chunk;
+                    return;
+                }
+                AnswerChunk::Done { .. } => {
+                    // Clean finish but NO content ever arrived. This is the
+                    // masking trap: a broken `session/load` that resolves to an
+                    // empty turn is indistinguishable from a real resume, and
+                    // returning it would hand the user an EMPTY answer in a
+                    // meeting. A `Done`-with-no-Delta is NOT proof of resume — so
+                    // fall back to fork (fresh session + replayed transcript),
+                    // exactly as we do for an early Error. The user gets a
+                    // grounded answer, never silence, and the absence of the
+                    // `committed` line + presence of this warn makes the empty
+                    // case grep-detectable (anti-mask gate).
+                    tracing::warn!(
+                        "ACP resume (session/load) produced an empty turn — UNVERIFIED, falling back to FORK"
+                    );
+                    let mut fork_stream = make_fork();
+                    while let Some(c) = fork_stream.next().await {
+                        yield c;
+                    }
                     return;
                 }
                 AnswerChunk::Error(ref e) if !produced_content => {
@@ -291,9 +305,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clean_done_without_delta_does_not_fork() {
-        // A turn that finishes cleanly with no answer text is still a successful
-        // resume (the agent's own Done is the signal) — do NOT fork.
+    async fn empty_done_without_delta_falls_back_to_fork() {
+        // ANTI-MASK CONTRACT: a resume that finishes with `Done` but NEVER
+        // produced any Delta is NOT proof of a real resume — a broken
+        // `session/load` resolving to an empty turn looks identical. Returning it
+        // would hand the user an EMPTY answer. So it MUST fall back to fork (fresh
+        // session + replayed context), exactly like an early Error. The fork's
+        // own output (here a Delta) is what the caller sees — never the empty Done.
         let forked = Arc::new(AtomicBool::new(false));
         let f = forked.clone();
         let resume = canned(vec![
@@ -304,17 +322,57 @@ mod tests {
         ]);
         let out = collect(resume_with_fork_fallback(resume, move || {
             f.store(true, Ordering::SeqCst);
+            canned(vec![
+                AnswerChunk::Started {
+                    session_id: Some("fork".into()),
+                },
+                AnswerChunk::Delta("forked answer".into()),
+                AnswerChunk::Done { cost_usd: None },
+            ])
+        }))
+        .await;
+
+        assert!(forked.load(Ordering::SeqCst), "empty resume must fork");
+        // The empty resume's Started/Done are dropped; only the fork's stream shows.
+        assert_eq!(
+            out,
+            vec![
+                AnswerChunk::Started {
+                    session_id: Some("fork".into())
+                },
+                AnswerChunk::Delta("forked answer".into()),
+                AnswerChunk::Done { cost_usd: None },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn done_after_real_content_does_not_fork() {
+        // The inverse: once a Delta arrived (real resume committed), a clean Done
+        // passes through and must NOT fork.
+        let forked = Arc::new(AtomicBool::new(false));
+        let f = forked.clone();
+        let resume = canned(vec![
+            AnswerChunk::Started {
+                session_id: Some("s".into()),
+            },
+            AnswerChunk::Delta("real answer".into()),
+            AnswerChunk::Done { cost_usd: None },
+        ]);
+        let out = collect(resume_with_fork_fallback(resume, move || {
+            f.store(true, Ordering::SeqCst);
             canned(vec![])
         }))
         .await;
 
-        assert!(!forked.load(Ordering::SeqCst));
+        assert!(!forked.load(Ordering::SeqCst), "committed resume must NOT fork");
         assert_eq!(
             out,
             vec![
                 AnswerChunk::Started {
                     session_id: Some("s".into())
                 },
+                AnswerChunk::Delta("real answer".into()),
                 AnswerChunk::Done { cost_usd: None },
             ]
         );
