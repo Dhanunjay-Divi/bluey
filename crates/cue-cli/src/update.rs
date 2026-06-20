@@ -88,7 +88,7 @@ pub async fn maybe_update_before_on(title: Option<&str>) -> Result<()> {
 
     match check_for_update().await {
         Ok(Some(plan)) => {
-            if !env_flag("BLUEY_AUTO_UPDATE") {
+            if update_check_only_requested() {
                 print_update_available(&plan);
                 print_update_posture(&plan);
                 return Ok(());
@@ -630,6 +630,21 @@ fn env_flag(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn env_flag_disabled(name: &str) -> bool {
+    env::var(name)
+        .map(|value| flag_value_is_disabled(&value))
+        .unwrap_or(false)
+}
+
+fn flag_value_is_disabled(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    matches!(value.as_str(), "0" | "false" | "no" | "off")
+}
+
+fn update_check_only_requested() -> bool {
+    env_flag("BLUEY_UPDATE_CHECK_ONLY") || env_flag_disabled("BLUEY_AUTO_UPDATE")
+}
+
 fn human_size(bytes: u64) -> String {
     const MB: f64 = 1024.0 * 1024.0;
     if bytes >= 1024 * 1024 {
@@ -855,5 +870,15 @@ mod tests {
             sha256_hex(bytes),
             sha256_hex(b"#!/usr/bin/env bash\necho other\n")
         );
+    }
+
+    #[test]
+    fn explicit_disabled_flag_values_disable_auto_update() {
+        for value in ["0", "false", "no", "off", " FALSE "] {
+            assert!(flag_value_is_disabled(value));
+        }
+        for value in ["", "1", "true", "yes", "on", "maybe"] {
+            assert!(!flag_value_is_disabled(value));
+        }
     }
 }
