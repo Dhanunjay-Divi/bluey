@@ -130,8 +130,10 @@ operating plan.
 - [ ] Square failed/canceled payment webhook creates no spendable credit
 - [ ] `docs/deploy/ABUSE-FRAUD-CHARGEBACK-PLAYBOOK.md` reviewed by the operator who will handle Square notices
 - [ ] Square failed-webhook/dispute notification mailbox confirmed and monitored
-- [x] Auto-topup/card-on-file is explicitly deferred until Square saved-card flow is wired; manual reload is clear in `/account`
 - [x] New accounts default to manual reload; legacy Stripe auto-topup is disabled whenever Square is the active billing provider
+- [x] Square Auto Reload UI is opt-in and requires a saved Square card before it can be enabled
+- [ ] Sandbox saved-card test: save card in `/account` → enable Auto Reload → cross threshold → completed Square payment credits balance exactly once
+- [ ] Production low-dollar Auto Reload test: real saved card → threshold crossing → completed Square payment credits balance exactly once
 - [x] Spendable credit code path requires a processor payment id or explicit internal credit source
 - [x] Customer-facing copy says account credits are non-transferable, have no cash value, and are not a stored-value/gift-card product
 - [ ] Refund/support/privacy/terms pages are published before production payments

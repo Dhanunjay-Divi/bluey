@@ -8,8 +8,9 @@
 //!     credits balance only for completed Bluey reload payments.
 //!   - POST /billing/webhook: validates Stripe signatures and credits
 //!     only completed Stripe Checkout sessions with a PaymentIntent id.
-//!   - Auto top-up/card-on-file is deferred for Square. Legacy Stripe
-//!     auto top-up runs only when Stripe is the active billing provider.
+//!   - POST /billing/square/card: saves a Square card-on-file token for
+//!     explicit Auto Reload; spendable balance is still credited only
+//!     from successful processor payments.
 //!
 //! Talks processors over HTTPS using `reqwest`; no vendor SDK dependency
 //! to keep the binary lean. The Stripe endpoints we touch:
@@ -40,6 +41,11 @@ pub struct CheckoutResponse {
 #[derive(Serialize)]
 pub struct ApiError {
     pub error: String,
+}
+
+#[derive(Deserialize)]
+pub struct SaveSquareCardRequest {
+    pub source_id: String,
 }
 
 const MINIMUM_RELOAD_CENTS: i64 = 3000;
@@ -103,6 +109,74 @@ pub async fn checkout(
         BillingProvider::Square => square_checkout(state, account, req).await,
         BillingProvider::Stripe => stripe_checkout(state, account, req).await,
     }
+}
+
+pub async fn save_square_card(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Json(req): Json<SaveSquareCardRequest>,
+) -> Result<Json<super::account::AccountMe>, (StatusCode, Json<ApiError>)> {
+    if !matches!(state.config.billing_provider(), BillingProvider::Square) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "Square billing is not active.".to_string(),
+            }),
+        ));
+    }
+    let source_id = req.source_id.trim();
+    if source_id.is_empty() || source_id.len() > 512 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: "Card token is invalid.".to_string(),
+            }),
+        ));
+    }
+
+    let square = state.config.square_config();
+    let access_token = square
+        .access_token
+        .as_deref()
+        .ok_or_else(|| square_missing("Square billing not configured"))?;
+
+    let customer_id = if let Some(existing) = account.square_customer_id.clone() {
+        existing
+    } else {
+        create_square_customer(&square, access_token, &account).await?
+    };
+    let card = create_square_card(&square, access_token, &customer_id, source_id, &account).await?;
+    let updated = crate::db::accounts::Account::save_square_card(
+        &state.pool,
+        &account.id,
+        &customer_id,
+        &card.id,
+        card.brand.as_deref(),
+        card.last4.as_deref(),
+    )
+    .map_err(|e| {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            error = %e,
+            "failed to save Square card metadata"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "Could not save card.".to_string(),
+            }),
+        )
+    })?
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: "Account not found.".to_string(),
+            }),
+        )
+    })?;
+
+    Ok(Json(super::account::account_me_payload(&state, updated)))
 }
 
 async fn stripe_checkout(
@@ -240,6 +314,149 @@ fn square_api_url(config: &crate::config::SquareConfig, path: &str) -> String {
         base.trim_end_matches('/'),
         path.trim_start_matches('/')
     )
+}
+
+#[derive(Debug)]
+struct SavedSquareCard {
+    id: String,
+    brand: Option<String>,
+    last4: Option<String>,
+}
+
+async fn create_square_customer(
+    square: &crate::config::SquareConfig,
+    access_token: &str,
+    account: &crate::db::accounts::Account,
+) -> Result<String, (StatusCode, Json<ApiError>)> {
+    let body = serde_json::json!({
+        "idempotency_key": format!("bluey-customer-{}", account.id),
+        "email_address": account.email,
+        "reference_id": account.id,
+    });
+    let account_id_hash = cue_core::account_id_hash_prefix(&account.id);
+    let resp = reqwest::Client::new()
+        .post(square_api_url(square, "/v2/customers"))
+        .bearer_auth(access_token)
+        .header("Square-Version", SQUARE_API_VERSION)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::warn!(
+                account_id_hash = %account_id_hash,
+                error = %e,
+                "Square customer create http failed"
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError {
+                    error: "Could not create Square customer; please retry.".to_string(),
+                }),
+            )
+        })?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        tracing::warn!(
+            account_id_hash = %account_id_hash,
+            square_status = %status,
+            square_body = %log_safe_square_body(&body),
+            "Square customer create failed"
+        );
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ApiError {
+                error: "Could not create Square customer; please retry.".to_string(),
+            }),
+        ));
+    }
+    body.pointer("/customer/id")
+        .and_then(|v| v.as_str())
+        .map(|id| id.to_string())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError {
+                    error: "Square customer response missing id.".to_string(),
+                }),
+            )
+        })
+}
+
+async fn create_square_card(
+    square: &crate::config::SquareConfig,
+    access_token: &str,
+    customer_id: &str,
+    source_id: &str,
+    account: &crate::db::accounts::Account,
+) -> Result<SavedSquareCard, (StatusCode, Json<ApiError>)> {
+    let body = serde_json::json!({
+        "idempotency_key": format!("bluey-card-{}-{}", account.id, uuid::Uuid::new_v4()),
+        "source_id": source_id,
+        "card": {
+            "customer_id": customer_id,
+            "reference_id": account.id,
+        }
+    });
+    let account_id_hash = cue_core::account_id_hash_prefix(&account.id);
+    let resp = reqwest::Client::new()
+        .post(square_api_url(square, "/v2/cards"))
+        .bearer_auth(access_token)
+        .header("Square-Version", SQUARE_API_VERSION)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| {
+            tracing::warn!(
+                account_id_hash = %account_id_hash,
+                error = %e,
+                "Square card create http failed"
+            );
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError {
+                    error: "Could not save card; please retry.".to_string(),
+                }),
+            )
+        })?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        tracing::warn!(
+            account_id_hash = %account_id_hash,
+            square_status = %status,
+            square_body = %log_safe_square_body(&body),
+            "Square card create failed"
+        );
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ApiError {
+                error: "Could not save card; please retry.".to_string(),
+            }),
+        ));
+    }
+    let id = body
+        .pointer("/card/id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError {
+                    error: "Square card response missing id.".to_string(),
+                }),
+            )
+        })?
+        .to_string();
+    let brand = body
+        .pointer("/card/card_brand")
+        .and_then(|v| v.as_str())
+        .map(|value| value.to_string());
+    let last4 = body
+        .pointer("/card/last_4")
+        .and_then(|v| v.as_str())
+        .map(|value| value.to_string());
+
+    Ok(SavedSquareCard { id, brand, last4 })
 }
 
 fn square_missing(message: &str) -> (StatusCode, Json<ApiError>) {

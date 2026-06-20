@@ -1212,6 +1212,8 @@ async fn complete_stream_inner(
                 account.auto_topup_threshold_cents,
                 account.stripe_customer_id.clone(),
                 account.stripe_payment_method_id.clone(),
+                account.square_customer_id.clone(),
+                account.square_card_id.clone(),
                 account.auto_topup_amount_cents,
             );
         }
@@ -1813,6 +1815,8 @@ async fn complete_inner(
             account.auto_topup_threshold_cents,
             account.stripe_customer_id.clone(),
             account.stripe_payment_method_id.clone(),
+            account.square_customer_id.clone(),
+            account.square_card_id.clone(),
             account.auto_topup_amount_cents,
         );
     }
@@ -2467,6 +2471,8 @@ pub async fn embed(
             account.auto_topup_threshold_cents,
             account.stripe_customer_id.clone(),
             account.stripe_payment_method_id.clone(),
+            account.square_customer_id.clone(),
+            account.square_card_id.clone(),
             account.auto_topup_amount_cents,
         );
     }
@@ -2870,6 +2876,8 @@ pub async fn transcribe(
             account.auto_topup_threshold_cents,
             account.stripe_customer_id.clone(),
             account.stripe_payment_method_id.clone(),
+            account.square_customer_id.clone(),
+            account.square_card_id.clone(),
             account.auto_topup_amount_cents,
         );
     }

@@ -135,6 +135,10 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
     // ---- Authenticated (Bearer JWT) -----------------------------------------
     let protected = Router::new()
         .route("/account/me", get(account::me))
+        .route(
+            "/account/billing",
+            axum::routing::patch(account::update_billing_settings),
+        )
         .route("/account/usage", get(account::usage))
         .route(
             "/router/complete",
@@ -179,6 +183,10 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         .route("/usage/event", axum::routing::post(usage::ingest))
         .route("/billing/checkout", axum::routing::post(billing::checkout))
         .route("/billing/portal", axum::routing::post(billing::portal))
+        .route(
+            "/billing/square/card",
+            axum::routing::post(billing::save_square_card),
+        )
         .route("/account/export", get(account::export_data))
         .route(
             "/account/delete",

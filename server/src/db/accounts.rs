@@ -37,61 +37,61 @@ pub struct Account {
     /// retrieved (Stage 6 round-2 fix). Used as the saved card for
     /// off-session auto top-up.
     pub stripe_payment_method_id: Option<String>,
+    /// Square customer id used for card-on-file auto reload.
+    pub square_customer_id: Option<String>,
+    /// Square card id returned by the Cards API. Never raw card data.
+    pub square_card_id: Option<String>,
+    pub square_card_brand: Option<String>,
+    pub square_card_last4: Option<String>,
 }
 
 impl Account {
-    pub fn fetch_by_id(pool: &DbPool, id: &str) -> Result<Option<Self>> {
-        let conn = pool.get()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, email, balance_cents, trial_seconds_remaining,
+    const SELECT_FIELDS: &'static str = "id, email, balance_cents, trial_seconds_remaining,
                     auto_topup_enabled, auto_topup_threshold_cents,
                     auto_topup_amount_cents, is_admin,
-                    stripe_customer_id, stripe_payment_method_id
-             FROM accounts WHERE id = ?1",
-        )?;
+                    stripe_customer_id, stripe_payment_method_id,
+                    square_customer_id, square_card_id,
+                    square_card_brand, square_card_last4";
+
+    fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: r.get(0)?,
+            email: r.get(1)?,
+            balance_cents: r.get(2)?,
+            trial_seconds_remaining: r.get(3)?,
+            auto_topup_enabled: r.get::<_, i64>(4)? == 1,
+            auto_topup_threshold_cents: r.get(5)?,
+            auto_topup_amount_cents: r.get(6)?,
+            is_admin: r.get::<_, i64>(7)? == 1,
+            stripe_customer_id: r.get(8)?,
+            stripe_payment_method_id: r.get(9)?,
+            square_customer_id: r.get(10)?,
+            square_card_id: r.get(11)?,
+            square_card_brand: r.get(12)?,
+            square_card_last4: r.get(13)?,
+        })
+    }
+
+    pub fn fetch_by_id(pool: &DbPool, id: &str) -> Result<Option<Self>> {
+        let conn = pool.get()?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM accounts WHERE id = ?1",
+            Self::SELECT_FIELDS
+        ))?;
         let row = stmt
-            .query_row(params![id], |r| {
-                Ok(Self {
-                    id: r.get(0)?,
-                    email: r.get(1)?,
-                    balance_cents: r.get(2)?,
-                    trial_seconds_remaining: r.get(3)?,
-                    auto_topup_enabled: r.get::<_, i64>(4)? == 1,
-                    auto_topup_threshold_cents: r.get(5)?,
-                    auto_topup_amount_cents: r.get(6)?,
-                    is_admin: r.get::<_, i64>(7)? == 1,
-                    stripe_customer_id: r.get(8)?,
-                    stripe_payment_method_id: r.get(9)?,
-                })
-            })
+            .query_row(params![id], Self::from_row)
             .ok();
         Ok(row)
     }
 
     pub fn fetch_by_email(pool: &DbPool, email: &str) -> Result<Option<Self>> {
         let conn = pool.get()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, email, balance_cents, trial_seconds_remaining,
-                    auto_topup_enabled, auto_topup_threshold_cents,
-                    auto_topup_amount_cents, is_admin,
-                    stripe_customer_id, stripe_payment_method_id
-             FROM accounts WHERE email = ?1",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {} FROM accounts WHERE email = ?1",
+            Self::SELECT_FIELDS
+        ))?;
         let row = stmt
-            .query_row(params![email], |r| {
-                Ok(Self {
-                    id: r.get(0)?,
-                    email: r.get(1)?,
-                    balance_cents: r.get(2)?,
-                    trial_seconds_remaining: r.get(3)?,
-                    auto_topup_enabled: r.get::<_, i64>(4)? == 1,
-                    auto_topup_threshold_cents: r.get(5)?,
-                    auto_topup_amount_cents: r.get(6)?,
-                    is_admin: r.get::<_, i64>(7)? == 1,
-                    stripe_customer_id: r.get(8)?,
-                    stripe_payment_method_id: r.get(9)?,
-                })
-            })
+            .query_row(params![email], Self::from_row)
             .ok();
         Ok(row)
     }
@@ -144,7 +144,58 @@ impl Account {
             is_admin,
             stripe_customer_id: None,
             stripe_payment_method_id: None,
+            square_customer_id: None,
+            square_card_id: None,
+            square_card_brand: None,
+            square_card_last4: None,
         })
+    }
+
+    pub fn update_auto_topup_settings(
+        pool: &DbPool,
+        id: &str,
+        enabled: bool,
+        threshold_cents: i64,
+        amount_cents: i64,
+    ) -> Result<Option<Self>> {
+        let conn = pool.get()?;
+        conn.execute(
+            "UPDATE accounts
+                SET auto_topup_enabled = ?2,
+                    auto_topup_threshold_cents = ?3,
+                    auto_topup_amount_cents = ?4
+              WHERE id = ?1",
+            params![
+                id,
+                if enabled { 1 } else { 0 },
+                threshold_cents,
+                amount_cents
+            ],
+        )?;
+        drop(conn);
+        Self::fetch_by_id(pool, id)
+    }
+
+    pub fn save_square_card(
+        pool: &DbPool,
+        id: &str,
+        customer_id: &str,
+        card_id: &str,
+        card_brand: Option<&str>,
+        card_last4: Option<&str>,
+    ) -> Result<Option<Self>> {
+        let conn = pool.get()?;
+        conn.execute(
+            "UPDATE accounts
+                SET square_customer_id = ?2,
+                    square_card_id = ?3,
+                    square_card_brand = ?4,
+                    square_card_last4 = ?5
+              WHERE id = ?1",
+            params![id, customer_id, card_id, card_brand, card_last4],
+        )?;
+        drop(conn);
+        Self::fetch_by_id(pool, id)
     }
 
     pub fn set_admin(pool: &DbPool, id: &str, is_admin: bool) -> Result<()> {

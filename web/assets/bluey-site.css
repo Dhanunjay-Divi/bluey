@@ -1642,6 +1642,102 @@
       font-weight: 800;
     }
 
+    #accountApp .auto-reload-card {
+      align-items: flex-start;
+      border-color: rgba(99, 216, 255, .18);
+    }
+
+    #accountApp .auto-reload-card.is-on {
+      border-color: rgba(115, 247, 186, .34);
+      background: linear-gradient(135deg, rgba(58, 255, 168, .08), #0a0a0a 45%);
+    }
+
+    #accountApp .auto-reload-method {
+      min-height: 1.1rem;
+      margin-top: .45rem;
+      color: #9aa8b2;
+      font-size: .76rem;
+      font-weight: 700;
+    }
+
+    #accountApp .auto-reload-toggle {
+      display: inline-flex;
+      align-items: center;
+      cursor: pointer;
+      padding-top: .1rem;
+    }
+
+    #accountApp .auto-reload-toggle input {
+      position: absolute;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    #accountApp .auto-reload-toggle span {
+      position: relative;
+      display: inline-flex;
+      width: 3.35rem;
+      height: 1.8rem;
+      border: 1px solid rgba(255, 255, 255, .16);
+      border-radius: 999px;
+      background: #171717;
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .03);
+      transition: border-color .18s ease, background .18s ease;
+    }
+
+    #accountApp .auto-reload-toggle span::after {
+      content: "";
+      position: absolute;
+      left: .23rem;
+      top: .22rem;
+      width: 1.25rem;
+      height: 1.25rem;
+      border-radius: 50%;
+      background: #dce7ec;
+      box-shadow: 0 .25rem .7rem rgba(0, 0, 0, .35);
+      transition: transform .18s ease, background .18s ease;
+    }
+
+    #accountApp .auto-reload-toggle input:checked + span {
+      border-color: rgba(115, 247, 186, .54);
+      background: rgba(42, 205, 135, .18);
+    }
+
+    #accountApp .auto-reload-toggle input:checked + span::after {
+      transform: translateX(1.48rem);
+      background: #73f7ba;
+    }
+
+    #accountApp .auto-reload-toggle input:disabled + span {
+      cursor: not-allowed;
+      opacity: .45;
+    }
+
+    #accountApp .square-card-setup {
+      display: grid;
+      grid-template-columns: minmax(14rem, 1fr) auto;
+      gap: .7rem;
+      align-items: start;
+      margin-top: .85rem;
+      max-width: 35rem;
+    }
+
+    #accountApp .square-card-container {
+      min-height: 2.9rem;
+      border: 1px solid rgba(255, 255, 255, .14);
+      border-radius: 10px;
+      background: #111;
+      padding: .65rem .75rem;
+    }
+
+    #accountApp .square-card-setup .form-note {
+      grid-column: 1 / -1;
+      margin: -.15rem 0 0;
+      color: #666;
+      font-size: .72rem;
+      line-height: 1.35;
+    }
+
     #accountApp .usage-list {
       display: grid;
       gap: .5rem;

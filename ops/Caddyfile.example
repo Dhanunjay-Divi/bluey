@@ -7,7 +7,7 @@
 bluey.sh, www.bluey.sh {
     encode gzip zstd
 
-    @bluey_api path /health /admin/* /auth/* /billing/* /pricing/* /router/* /stt/* /sync/* /rag/* /usage/* /account/me /account/usage /account/export /account/delete
+    @bluey_api path /health /admin/* /auth/* /billing/* /pricing/* /router/* /stt/* /sync/* /rag/* /usage/* /account/me /account/usage /account/billing /account/export /account/delete
 
     handle @bluey_api {
         reverse_proxy 127.0.0.1:8080 {
@@ -36,7 +36,7 @@ bluey.sh, www.bluey.sh {
         Referrer-Policy "strict-origin-when-cross-origin"
         Permissions-Policy "interest-cohort=()"
         # Public web uses bundled CSS/JS with SRI, so no inline-script policy is needed.
-        Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'"
+        Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self' https://web.squarecdn.com https://sandbox.web.squarecdn.com; connect-src 'self' https://connect.squareup.com https://connect.squareupsandbox.com https://web.squarecdn.com https://sandbox.web.squarecdn.com; frame-src https://web.squarecdn.com https://sandbox.web.squarecdn.com; frame-ancestors 'none'"
     }
 
     # Standard log to syslog so journalctl shows access patterns.

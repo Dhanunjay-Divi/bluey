@@ -23,7 +23,7 @@
   <link
     rel="stylesheet"
     href="/assets/bluey-site.css"
-    integrity="sha384-r53nMm3McQX0GAHr0iT5hFv0yiBjurujVTdnRKDZn1cj835WRUR/HMnGpuZ3J2L0"
+    integrity="sha384-RKoFYt3k0UN0ybmNODy/01YOwq7aMMgzVEV3UCyKyDPHYCeXLMVzWDlpu0zzNr0P"
     crossorigin="anonymous"
   >
 </head>
@@ -296,6 +296,23 @@
                 <div class="reload-price">$30</div>
                 <button class="account-button primary" id="reloadButton" type="button">Add credits</button>
               </div>
+            </div>
+
+            <div class="reload-card auto-reload-card" id="autoReloadCard">
+              <div>
+                <h3>Auto Reload</h3>
+                <p id="autoReloadHint">Off by default. Turn it on only after saving a payment method.</p>
+                <div class="auto-reload-method" id="autoReloadMethod"></div>
+                <div class="square-card-setup" id="squareCardSetup" hidden>
+                  <div id="squareCardContainer" class="square-card-container"></div>
+                  <button class="account-button ghost" id="saveSquareCardButton" type="button">Save card</button>
+                  <p class="form-note">Card details are handled by Square. Bluey stores only the saved-card id.</p>
+                </div>
+              </div>
+              <label class="auto-reload-toggle" for="autoReloadToggle">
+                <input id="autoReloadToggle" type="checkbox" />
+                <span></span>
+              </label>
             </div>
 
             <div class="account-message" id="accountMessage"></div>
@@ -572,7 +589,7 @@
 
   <script
     src="/assets/bluey-site.js"
-    integrity="sha384-ugYKvnz+Rwd2XtqMcMQrsb/fcDIlobVHNrA2b4OO4IhVti1neGrxcuVxdvcne5GZ"
+    integrity="sha384-YPDKZukP4CWkheOkWvar7tGdkboro2Mwqny8IPIqitN0ynvkTeqxhn5QCJUzYcbs"
     crossorigin="anonymous"
   ></script>
 </body>

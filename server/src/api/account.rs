@@ -1,10 +1,16 @@
 //! Account endpoints — real implementations.
 
 use axum::{extract::State, http::StatusCode, Extension, Json};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::AppState;
 use crate::auth::AuthedAccount;
+use crate::config::BillingProvider;
+
+const MIN_AUTO_RELOAD_CENTS: i64 = 3000;
+const MAX_AUTO_RELOAD_CENTS: i64 = 10_000;
+const MIN_AUTO_RELOAD_THRESHOLD_CENTS: i64 = 100;
+const MAX_AUTO_RELOAD_THRESHOLD_CENTS: i64 = 5_000;
 
 #[derive(Serialize)]
 pub struct AccountMe {
@@ -16,10 +22,102 @@ pub struct AccountMe {
     pub auto_topup_threshold_cents: i64,
     pub auto_topup_amount_cents: i64,
     pub is_admin: bool,
+    pub billing_provider: String,
+    pub auto_topup_available: bool,
+    pub auto_topup_unavailable_reason: Option<String>,
+    pub saved_payment_method_label: Option<String>,
+    pub square_application_id: Option<String>,
+    pub square_location_id: Option<String>,
+    pub square_environment: Option<String>,
 }
 
-pub async fn me(Extension(AuthedAccount(account)): Extension<AuthedAccount>) -> Json<AccountMe> {
-    Json(AccountMe {
+#[derive(Serialize)]
+pub struct ApiError {
+    pub error: String,
+}
+
+#[derive(Deserialize)]
+pub struct BillingSettingsRequest {
+    pub auto_topup_enabled: bool,
+    pub auto_topup_threshold_cents: Option<i64>,
+    pub auto_topup_amount_cents: Option<i64>,
+}
+
+pub async fn me(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+) -> Json<AccountMe> {
+    Json(account_me_payload(&state, account))
+}
+
+pub async fn update_billing_settings(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Json(req): Json<BillingSettingsRequest>,
+) -> Result<Json<AccountMe>, (StatusCode, Json<ApiError>)> {
+    let amount = req
+        .auto_topup_amount_cents
+        .unwrap_or(account.auto_topup_amount_cents)
+        .clamp(MIN_AUTO_RELOAD_CENTS, MAX_AUTO_RELOAD_CENTS);
+    let threshold = req
+        .auto_topup_threshold_cents
+        .unwrap_or(account.auto_topup_threshold_cents)
+        .clamp(MIN_AUTO_RELOAD_THRESHOLD_CENTS, MAX_AUTO_RELOAD_THRESHOLD_CENTS)
+        .min(amount - 100);
+
+    if req.auto_topup_enabled {
+        let (_, available, reason, _) = auto_topup_capability(&state, &account);
+        if !available {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(ApiError {
+                    error: reason.unwrap_or_else(|| {
+                        "Save a payment method before enabling Auto Reload.".to_string()
+                    }),
+                }),
+            ));
+        }
+    }
+
+    let updated = crate::db::accounts::Account::update_auto_topup_settings(
+        &state.pool,
+        &account.id,
+        req.auto_topup_enabled,
+        threshold,
+        amount,
+    )
+    .map_err(|e| {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            error = %e,
+            "failed to update billing settings"
+        );
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: "Could not update billing settings.".to_string(),
+            }),
+        )
+    })?
+    .ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: "Account not found.".to_string(),
+            }),
+        )
+    })?;
+
+    Ok(Json(account_me_payload(&state, updated)))
+}
+
+pub(crate) fn account_me_payload(
+    state: &AppState,
+    account: crate::db::accounts::Account,
+) -> AccountMe {
+    let (provider, available, reason, payment_label) = auto_topup_capability(state, &account);
+    let square_public = square_public_config(state);
+    AccountMe {
         id: account.id,
         email: account.email,
         balance_cents: account.balance_cents,
@@ -28,7 +126,73 @@ pub async fn me(Extension(AuthedAccount(account)): Extension<AuthedAccount>) -> 
         auto_topup_threshold_cents: account.auto_topup_threshold_cents,
         auto_topup_amount_cents: account.auto_topup_amount_cents,
         is_admin: account.is_admin,
-    })
+        billing_provider: provider,
+        auto_topup_available: available,
+        auto_topup_unavailable_reason: reason,
+        saved_payment_method_label: payment_label,
+        square_application_id: square_public.as_ref().map(|cfg| cfg.0.clone()),
+        square_location_id: square_public.as_ref().map(|cfg| cfg.1.clone()),
+        square_environment: square_public.map(|cfg| cfg.2),
+    }
+}
+
+fn square_public_config(state: &AppState) -> Option<(String, String, String)> {
+    if !matches!(state.config.billing_provider(), BillingProvider::Square) {
+        return None;
+    }
+    let square = state.config.square_config();
+    Some((
+        square.application_id?,
+        square.location_id?,
+        match square.environment {
+            crate::config::SquareEnvironment::Sandbox => "sandbox".to_string(),
+            crate::config::SquareEnvironment::Production => "production".to_string(),
+        },
+    ))
+}
+
+fn auto_topup_capability(
+    state: &AppState,
+    account: &crate::db::accounts::Account,
+) -> (String, bool, Option<String>, Option<String>) {
+    match state.config.billing_provider() {
+        BillingProvider::Stripe => {
+            let label = account
+                .stripe_payment_method_id
+                .as_ref()
+                .map(|_| "Saved Stripe card".to_string());
+            let available = account.stripe_customer_id.is_some()
+                && account.stripe_payment_method_id.is_some()
+                && state.config.stripe_secret_key.is_some();
+            let reason = if available {
+                None
+            } else {
+                Some("Add credits once to save a card before enabling Auto Reload.".to_string())
+            };
+            ("stripe".to_string(), available, reason, label)
+        }
+        BillingProvider::Square => {
+            let label = match (
+                account.square_card_brand.as_deref(),
+                account.square_card_last4.as_deref(),
+            ) {
+                (Some(brand), Some(last4)) => Some(format!("{brand} ending {last4}")),
+                _ if account.square_card_id.is_some() => Some("Saved Square card".to_string()),
+                _ => None,
+            };
+            let square = state.config.square_config();
+            let available = account.square_customer_id.is_some()
+                && account.square_card_id.is_some()
+                && square.access_token.is_some()
+                && square.location_id.is_some();
+            let reason = if available {
+                None
+            } else {
+                Some("Save a card for Auto Reload before turning this on.".to_string())
+            };
+            ("square".to_string(), available, reason, label)
+        }
+    }
 }
 
 #[derive(Serialize)]

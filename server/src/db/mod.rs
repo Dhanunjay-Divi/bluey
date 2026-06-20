@@ -373,6 +373,10 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
         "reserved_cents",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    ensure_column(&conn, "accounts", "square_customer_id", "TEXT")?;
+    ensure_column(&conn, "accounts", "square_card_id", "TEXT")?;
+    ensure_column(&conn, "accounts", "square_card_brand", "TEXT")?;
+    ensure_column(&conn, "accounts", "square_card_last4", "TEXT")?;
     ensure_column(
         &conn,
         "stt_sessions",

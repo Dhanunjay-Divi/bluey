@@ -1,9 +1,9 @@
-//! Legacy Stripe auto top-up.
+//! Processor-backed auto reload.
 //!
-//! Bluey's active v0.2 billing path is Square manual reload. This module
-//! only runs when the server is explicitly configured for Stripe billing;
-//! Square auto-reload/card-on-file remains deferred until it has a
-//! processor-success-backed attempt ledger.
+//! New accounts default to manual reload. When a user explicitly enables
+//! Auto Reload, this module charges the active processor only if that
+//! account has a saved off-session payment method. Spendable balance is
+//! credited only from processor-confirmed payment ids.
 //!
 //! Codex Stage 10: this is the dealbreaker for paid v0.2. Without it,
 //! customers hit the hard-stop at $0 and must manually reload via
@@ -13,21 +13,20 @@
 //!   if !on_trial
 //!      && account.auto_topup_enabled
 //!      && balance_after < account.auto_topup_threshold_cents
-//!      && account.stripe_payment_method_id.is_some()
-//!      && account.stripe_customer_id.is_some()
+//!      && account has a saved payment method for active billing provider
 //!   {
 //!       tokio::spawn(maybe_auto_topup(...))
 //!   }
 //!
 //! The actual charge is fire-and-forget (tokio::spawn) so the customer
-//! request returns immediately with the response. The webhook for the
-//! resulting payment_intent.succeeded event will credit the balance
-//! via the existing /billing/webhook flow.
+//! request returns immediately with the response. Stripe credits via
+//! webhook; Square credits immediately only after a COMPLETED payment
+//! response and then treats the later webhook as an idempotent no-op.
 
 use anyhow::{anyhow, Context, Result};
 
 use crate::config::{BillingProvider, Config};
-use crate::db::DbPool;
+use crate::db::{balance, DbPool};
 
 /// In-flight dedupe: stops two concurrent low-balance checks from
 /// firing two top-ups for the same account in a 60-second window.
@@ -39,6 +38,7 @@ static AUTO_TOPUP_INFLIGHT: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 const INFLIGHT_DEDUPE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const SQUARE_API_VERSION: &str = "2025-04-16";
 
 fn stripe_api_url(path: &str) -> String {
     let base =
@@ -48,6 +48,25 @@ fn stripe_api_url(path: &str) -> String {
         base.trim_end_matches('/'),
         path.trim_start_matches('/')
     )
+}
+
+fn square_api_url(config: &crate::config::SquareConfig, path: &str) -> String {
+    let base = std::env::var("BLUEY_TEST_SQUARE_URL")
+        .unwrap_or_else(|_| config.environment.api_base_url().to_string());
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
+fn square_reload_reference_id(account_id: &str) -> String {
+    let compact = account_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(32)
+        .collect::<String>();
+    format!("br_{compact}")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -62,52 +81,90 @@ pub fn maybe_spawn(
     auto_topup_threshold_cents: i64,
     stripe_customer_id: Option<String>,
     stripe_payment_method_id: Option<String>,
+    square_customer_id: Option<String>,
+    square_card_id: Option<String>,
     auto_topup_amount_cents: i64,
 ) {
     if !auto_topup_enabled {
         return;
     }
-    let billing_provider = config.billing_provider();
-    if !matches!(billing_provider, BillingProvider::Stripe) {
-        tracing::debug!(
-            account_id,
-            billing_provider = ?billing_provider,
-            "auto top-up skipped: active billing provider is not Stripe"
-        );
-        return;
-    }
     if balance_after_cents >= auto_topup_threshold_cents {
         return;
     }
-    let (Some(customer_id), Some(pm_id)) = (stripe_customer_id, stripe_payment_method_id) else {
-        tracing::debug!(
-            account_id,
-            "auto top-up skipped: no saved Stripe customer/payment_method"
-        );
-        return;
-    };
-    if config.stripe_secret_key.is_none() {
-        tracing::debug!("auto top-up skipped: STRIPE_SECRET_KEY not configured");
-        return;
-    }
 
-    tokio::spawn(async move {
-        if let Err(e) = run_topup(
-            pool,
-            config,
-            account_id.clone(),
-            customer_id,
-            pm_id,
-            auto_topup_amount_cents,
-        )
-        .await
-        {
-            tracing::warn!(account_id, error = %e, "auto top-up failed");
+    match config.billing_provider() {
+        BillingProvider::Stripe => {
+            let (Some(customer_id), Some(pm_id)) = (stripe_customer_id, stripe_payment_method_id)
+            else {
+                tracing::debug!(
+                    account_id,
+                    "auto reload skipped: no saved Stripe customer/payment_method"
+                );
+                return;
+            };
+            if config.stripe_secret_key.is_none() {
+                tracing::debug!("auto reload skipped: STRIPE_SECRET_KEY not configured");
+                return;
+            }
+
+            tokio::spawn(async move {
+                if let Err(e) = run_stripe_topup(
+                    pool,
+                    config,
+                    account_id.clone(),
+                    customer_id,
+                    pm_id,
+                    auto_topup_amount_cents,
+                )
+                .await
+                {
+                    tracing::warn!(account_id, error = %e, "auto reload failed");
+                }
+            });
         }
-    });
+        BillingProvider::Square => {
+            let (Some(customer_id), Some(card_id)) = (square_customer_id, square_card_id) else {
+                tracing::debug!(account_id, "auto reload skipped: no saved Square card");
+                return;
+            };
+            let square = config.square_config();
+            if square.access_token.is_none() || square.location_id.is_none() {
+                tracing::debug!("auto reload skipped: Square billing not configured");
+                return;
+            }
+
+            tokio::spawn(async move {
+                if let Err(e) = run_square_topup(
+                    pool,
+                    config,
+                    account_id.clone(),
+                    customer_id,
+                    card_id,
+                    auto_topup_amount_cents,
+                )
+                .await
+                {
+                    tracing::warn!(account_id, error = %e, "auto reload failed");
+                }
+            });
+        }
+    }
 }
 
-async fn run_topup(
+async fn reserve_inflight(account_id: &str) -> bool {
+    let mu = AUTO_TOPUP_INFLIGHT.get_or_init(Default::default);
+    let mut guard = mu.lock().await;
+    let now = std::time::Instant::now();
+    guard.retain(|_, ts| now.duration_since(*ts) < INFLIGHT_DEDUPE_WINDOW);
+    if guard.contains_key(account_id) {
+        tracing::debug!(account_id, "auto reload skipped: already in-flight");
+        return false;
+    }
+    guard.insert(account_id.to_string(), now);
+    true
+}
+
+async fn run_stripe_topup(
     _pool: DbPool,
     config: std::sync::Arc<Config>,
     account_id: String,
@@ -119,17 +176,8 @@ async fn run_topup(
     // within the last 60s. This protects against the case where a burst
     // of cues each see the same low balance before the previous top-up
     // webhook has credited.
-    {
-        let mu = AUTO_TOPUP_INFLIGHT.get_or_init(Default::default);
-        let mut guard = mu.lock().await;
-        let now = std::time::Instant::now();
-        // Sweep stale entries.
-        guard.retain(|_, ts| now.duration_since(*ts) < INFLIGHT_DEDUPE_WINDOW);
-        if guard.contains_key(&account_id) {
-            tracing::debug!(account_id, "auto top-up skipped: already in-flight");
-            return Ok(());
-        }
-        guard.insert(account_id.clone(), now);
+    if !reserve_inflight(&account_id).await {
+        return Ok(());
     }
 
     let stripe_key = config
@@ -168,21 +216,119 @@ async fn run_topup(
         .context("stripe payment_intents.create http")?;
 
     let status = resp.status();
-    let body = resp
+    let _body = resp
         .text()
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
 
     if !status.is_success() {
-        return Err(anyhow!("stripe payment_intents.create {status}: {body}"));
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
+            amount_cents,
+            stripe_status = %status,
+            "stripe auto reload payment failed"
+        );
+        return Err(anyhow!("stripe payment_intents.create returned {status}"));
     }
 
     tracing::info!(
-        account_id,
+        account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
         amount_cents,
         idempotency_key,
-        "auto top-up charge initiated; webhook will credit balance"
+        "auto reload charge initiated; webhook will credit balance"
     );
+    Ok(())
+}
+
+async fn run_square_topup(
+    pool: DbPool,
+    config: std::sync::Arc<Config>,
+    account_id: String,
+    square_customer_id: String,
+    square_card_id: String,
+    amount_cents: i64,
+) -> Result<()> {
+    if !reserve_inflight(&account_id).await {
+        return Ok(());
+    }
+
+    let square = config.square_config();
+    let access_token = square
+        .access_token
+        .as_ref()
+        .ok_or_else(|| anyhow!("SQUARE_ACCESS_TOKEN not configured"))?;
+    let location_id = square
+        .location_id
+        .as_ref()
+        .ok_or_else(|| anyhow!("SQUARE_LOCATION_ID not configured"))?;
+    let idempotency_key = format!(
+        "bluey-square-topup-{account_id}-{}",
+        chrono::Utc::now().format("%Y%m%d%H")
+    );
+    let body = serde_json::json!({
+        "idempotency_key": idempotency_key,
+        "source_id": square_card_id,
+        "amount_money": {
+            "amount": amount_cents,
+            "currency": "USD"
+        },
+        "customer_id": square_customer_id,
+        "location_id": location_id,
+        "autocomplete": true,
+        "reference_id": square_reload_reference_id(&account_id),
+        "note": "Bluey auto reload"
+    });
+
+    let resp = reqwest::Client::new()
+        .post(square_api_url(&square, "/v2/payments"))
+        .bearer_auth(access_token)
+        .header("Square-Version", SQUARE_API_VERSION)
+        .json(&body)
+        .send()
+        .await
+        .context("square payments.create http")?;
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
+            amount_cents,
+            square_status = %status,
+            "Square auto reload payment failed"
+        );
+        return Err(anyhow!("square payments.create returned {status}"));
+    }
+
+    let payment_status = body
+        .pointer("/payment/status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("UNKNOWN");
+    let payment_id = body
+        .pointer("/payment/id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("square payment response missing payment.id"))?;
+
+    if payment_status == "COMPLETED" {
+        let credited =
+            balance::credit_processor_payment(&pool, &account_id, amount_cents, "square", payment_id)
+                .context("credit Square auto reload")?;
+        tracing::info!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
+            amount_cents,
+            square_payment_id = %payment_id,
+            credited,
+            "Square auto reload completed"
+        );
+    } else {
+        tracing::info!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
+            amount_cents,
+            square_payment_id = %payment_id,
+            square_payment_status = %payment_status,
+            "Square auto reload payment created; waiting for webhook completion"
+        );
+    }
+
     Ok(())
 }
 
@@ -225,6 +371,8 @@ mod tests {
             500,
             Some("cus_1".into()),
             Some("pm_1".into()),
+            None,
+            None,
             3000,
         );
         // Test passes if we get here without panicking. Fire-and-forget
@@ -243,6 +391,8 @@ mod tests {
             500,
             Some("cus_1".into()),
             Some("pm_1".into()),
+            None,
+            None,
             3000,
         );
     }
@@ -259,6 +409,8 @@ mod tests {
             500,
             Some("cus_1".into()),
             None, // no PM
+            None,
+            None,
             3000,
         );
     }

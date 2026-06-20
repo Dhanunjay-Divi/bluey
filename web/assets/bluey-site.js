@@ -26,6 +26,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     const isDownloadRoute = downloadRoutes.has(currentPath);
     let pendingSignupEmail = '';
     let accountAuthMode = 'login';
+    let squareCard = null;
+    let squareCardEnvironment = '';
+    let squareCardSetupPromise = null;
 
     function money(cents) {
       return `$${(Number(cents || 0) / 100).toFixed(2)}`;
@@ -483,6 +486,149 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
     }
 
+    function squareScriptUrl(environment) {
+      return environment === 'production'
+        ? 'https://web.squarecdn.com/v1/square.js'
+        : 'https://sandbox.web.squarecdn.com/v1/square.js';
+    }
+
+    async function loadSquareSdk(environment) {
+      if (window.Square?.payments) return;
+      const src = squareScriptUrl(environment);
+      const existing = document.querySelector(`script[data-square-sdk="${environment}"]`);
+      if (existing) {
+        await new Promise((resolve, reject) => {
+          existing.addEventListener('load', resolve, { once: true });
+          existing.addEventListener('error', () => reject(new Error('Could not load Square card form.')), { once: true });
+        });
+        return;
+      }
+      await new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = src;
+        script.async = true;
+        script.dataset.squareSdk = environment;
+        script.onload = resolve;
+        script.onerror = () => reject(new Error('Could not load Square card form.'));
+        document.head.append(script);
+      });
+    }
+
+    async function setupSquareCard(me) {
+      const setup = document.getElementById('squareCardSetup');
+      const container = document.getElementById('squareCardContainer');
+      if (!setup || !container) return;
+      if (!me?.square_application_id || !me?.square_location_id) return;
+      const environment = me.square_environment || 'sandbox';
+      if (squareCard && squareCardEnvironment === environment) return;
+      if (squareCardSetupPromise) return squareCardSetupPromise;
+
+      squareCardSetupPromise = (async () => {
+        await loadSquareSdk(environment);
+        if (!window.Square?.payments) {
+          throw new Error('Square card form is unavailable.');
+        }
+        const payments = window.Square.payments(me.square_application_id, me.square_location_id);
+        container.replaceChildren();
+        squareCard = await payments.card();
+        squareCardEnvironment = environment;
+        await squareCard.attach('#squareCardContainer');
+      })().finally(() => {
+        squareCardSetupPromise = null;
+      });
+      return squareCardSetupPromise;
+    }
+
+    function renderAutoReload(me) {
+      const card = document.getElementById('autoReloadCard');
+      const hint = document.getElementById('autoReloadHint');
+      const method = document.getElementById('autoReloadMethod');
+      const toggle = document.getElementById('autoReloadToggle');
+      const setup = document.getElementById('squareCardSetup');
+      const saveButton = document.getElementById('saveSquareCardButton');
+      if (!card || !hint || !method || !toggle || !setup) return;
+
+      const amount = money(me?.auto_topup_amount_cents || 3000);
+      const threshold = money(me?.auto_topup_threshold_cents || 500);
+      const canSaveSquareCard = me?.billing_provider === 'square'
+        && Boolean(me.square_application_id)
+        && Boolean(me.square_location_id);
+      const hasSavedMethod = Boolean(me?.auto_topup_available);
+      const shouldShowSquareSetup = !hasSavedMethod && canSaveSquareCard;
+
+      card.classList.toggle('is-on', Boolean(me?.auto_topup_enabled));
+      toggle.checked = Boolean(me?.auto_topup_enabled);
+      toggle.disabled = !hasSavedMethod;
+      setup.hidden = !shouldShowSquareSetup;
+      if (saveButton) {
+        saveButton.disabled = !shouldShowSquareSetup;
+        saveButton.textContent = 'Save card';
+      }
+
+      if (me?.auto_topup_enabled) {
+        hint.textContent = `On. Bluey adds ${amount} before balance falls below ${threshold}.`;
+      } else if (hasSavedMethod) {
+        hint.textContent = `Off by default. Turn on to add ${amount} before balance reaches ${threshold}.`;
+      } else if (shouldShowSquareSetup) {
+        hint.textContent = 'Off by default. Save a card with Square to turn on Auto Reload.';
+      } else {
+        hint.textContent = me?.auto_topup_unavailable_reason || 'Add credits once to save a payment method.';
+      }
+
+      method.textContent = me?.saved_payment_method_label
+        ? `Payment method: ${me.saved_payment_method_label}`
+        : shouldShowSquareSetup
+          ? 'Payment method: not saved yet'
+          : '';
+
+      if (shouldShowSquareSetup) {
+        setupSquareCard(me).catch((error) => accountMessage(error.message));
+      }
+    }
+
+    async function updateAutoReload(enabled) {
+      const me = await apiJson('/account/billing', {
+        method: 'PATCH',
+        body: JSON.stringify({ auto_topup_enabled: enabled }),
+      });
+      renderAutoReload(me);
+      accountMessage(enabled
+        ? 'Auto Reload is on. Bluey will reload before your balance reaches the limit.'
+        : 'Auto Reload is off. Bluey will ask you to reload manually.');
+      return me;
+    }
+
+    async function saveSquareCard() {
+      const button = document.getElementById('saveSquareCardButton');
+      if (!squareCard) {
+        throw new Error('Card form is still loading. Try again in a moment.');
+      }
+      const previous = button?.textContent || 'Save card';
+      if (button) {
+        button.disabled = true;
+        button.textContent = 'Saving...';
+      }
+      try {
+        const result = await squareCard.tokenize();
+        if (result.status !== 'OK') {
+          const details = (result.errors || []).map((error) => error.message).filter(Boolean).join(' ');
+          throw new Error(details || 'Card could not be saved.');
+        }
+        let me = await apiJson('/billing/square/card', {
+          method: 'POST',
+          body: JSON.stringify({ source_id: result.token }),
+        });
+        renderAutoReload(me);
+        me = await updateAutoReload(true);
+        renderAutoReload(me);
+      } finally {
+        if (button) {
+          button.disabled = false;
+          button.textContent = previous;
+        }
+      }
+    }
+
     function shortSessionId(id) {
       const value = String(id || '');
       return value.length > 8 ? value.slice(0, 8) : value || 'session';
@@ -643,6 +789,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         ? `${Math.round(me.trial_seconds_remaining / 60)} trial minutes remaining.`
         : 'Paid cloud requests stop at $0. Add credits when ready.';
       renderUsage(usage);
+      renderAutoReload(me);
       if (sessions) setCloudSessionDetail('');
       accountMessage(new URLSearchParams(location.search).get('reload') === 'success'
         ? 'Credits added. If the balance has not updated yet, checkout is still finishing.'
@@ -717,6 +864,21 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
       document.getElementById('reloadButton').addEventListener('click', () => {
         startReload();
+      });
+      document.getElementById('autoReloadToggle')?.addEventListener('change', (event) => {
+        const enabled = Boolean(event.target.checked);
+        event.target.disabled = true;
+        updateAutoReload(enabled)
+          .catch((error) => {
+            accountMessage(error.message);
+            event.target.checked = !enabled;
+          })
+          .finally(() => {
+            loadAccount().catch((error) => accountMessage(error.message));
+          });
+      });
+      document.getElementById('saveSquareCardButton')?.addEventListener('click', () => {
+        saveSquareCard().catch((error) => accountMessage(error.message));
       });
       document.getElementById('refreshSessionsButton').addEventListener('click', () => {
         setCloudSessionDetail('');

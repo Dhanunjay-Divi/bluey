@@ -143,6 +143,22 @@ async fn signup_and_login(harness: &Harness, email: &str, password: &str) -> Str
     auth["access_token"].as_str().unwrap().to_string()
 }
 
+fn set_square_billing_env() {
+    std::env::set_var("BLUEY_BILLING_PROVIDER", "square");
+    std::env::set_var("SQUARE_ENVIRONMENT", "sandbox");
+    std::env::set_var("SQUARE_SANDBOX_ACCESS_TOKEN", "sandbox-token");
+    std::env::set_var("SQUARE_SANDBOX_LOCATION_ID", "sandbox-location");
+    std::env::set_var("SQUARE_SANDBOX_APPLICATION_ID", "sandbox-app");
+}
+
+fn clear_square_billing_env() {
+    std::env::remove_var("BLUEY_BILLING_PROVIDER");
+    std::env::remove_var("SQUARE_ENVIRONMENT");
+    std::env::remove_var("SQUARE_SANDBOX_ACCESS_TOKEN");
+    std::env::remove_var("SQUARE_SANDBOX_LOCATION_ID");
+    std::env::remove_var("SQUARE_SANDBOX_APPLICATION_ID");
+}
+
 async fn login(harness: &Harness, email: &str, password: &str) -> serde_json::Value {
     let req = Request::post("/auth/login")
         .header("content-type", "application/json")
@@ -1611,6 +1627,100 @@ async fn billing_square_webhook_rejects_production_signature_while_checkout_is_s
 
 #[tokio::test]
 #[serial]
+async fn square_auto_reload_requires_saved_card_then_enables() {
+    set_square_billing_env();
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "square-autoreload@example.com", "longenoughpw").await;
+
+    let req = Request::get("/account/me")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let me: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(me["billing_provider"], "square");
+    assert_eq!(me["auto_topup_enabled"], false);
+    assert_eq!(me["auto_topup_available"], false);
+    assert_eq!(me["square_application_id"], "sandbox-app");
+    assert_eq!(me["square_location_id"], "sandbox-location");
+    assert_eq!(me["square_environment"], "sandbox");
+
+    let req = Request::patch("/account/billing")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "auto_topup_enabled": true })).unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+    Mock::given(method("POST"))
+        .and(path("/v2/customers"))
+        .and(header("Square-Version", "2025-04-16"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "customer": { "id": "cus_square_autoreload" }
+        })))
+        .expect(1)
+        .mount(&h.square)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v2/cards"))
+        .and(header("Square-Version", "2025-04-16"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "card": {
+                "id": "ccof:square_card_1",
+                "card_brand": "VISA",
+                "last_4": "4242"
+            }
+        })))
+        .expect(1)
+        .mount(&h.square)
+        .await;
+
+    let req = Request::post("/billing/square/card")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "source_id": "cnon:sandbox-card-nonce" })).unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let me: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(me["auto_topup_enabled"], false);
+    assert_eq!(me["auto_topup_available"], true);
+    assert_eq!(me["saved_payment_method_label"], "VISA ending 4242");
+
+    let req = Request::patch("/account/billing")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "auto_topup_enabled": true })).unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let me: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(me["auto_topup_enabled"], true);
+    assert_eq!(me["auto_topup_available"], true);
+
+    clear_square_billing_env();
+}
+
+#[tokio::test]
+#[serial]
 async fn billing_portal_400s_without_stripe_customer() {
     let h = boot_harness().await;
     let access = signup_and_login(&h, "no-cus@example.com", "longenoughpw").await;
@@ -1687,10 +1797,7 @@ async fn auto_topup_off_by_default_does_not_fire_charge() {
 #[tokio::test]
 #[serial]
 async fn square_mode_never_runs_legacy_stripe_auto_topup() {
-    std::env::set_var("BLUEY_BILLING_PROVIDER", "square");
-    std::env::set_var("SQUARE_ENVIRONMENT", "sandbox");
-    std::env::set_var("SQUARE_SANDBOX_ACCESS_TOKEN", "sandbox-token");
-    std::env::set_var("SQUARE_SANDBOX_LOCATION_ID", "sandbox-location");
+    set_square_billing_env();
 
     let h = boot_harness().await;
     let access = signup_and_login(&h, "square-no-stripe-topup@example.com", "longenoughpw").await;
@@ -1748,8 +1855,111 @@ async fn square_mode_never_runs_legacy_stripe_auto_topup() {
 
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-    std::env::remove_var("BLUEY_BILLING_PROVIDER");
-    std::env::remove_var("SQUARE_ENVIRONMENT");
-    std::env::remove_var("SQUARE_SANDBOX_ACCESS_TOKEN");
-    std::env::remove_var("SQUARE_SANDBOX_LOCATION_ID");
+    clear_square_billing_env();
+}
+
+#[tokio::test]
+#[serial]
+async fn square_auto_reload_charges_saved_card_when_threshold_crosses() {
+    set_square_billing_env();
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "square-card-topup@example.com", "longenoughpw").await;
+
+    let account_id: String = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT id FROM accounts WHERE email = ?1",
+            rusqlite::params!["square-card-topup@example.com"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    h.pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE accounts
+                SET trial_seconds_remaining = 0,
+                    balance_cents = 1000,
+                    auto_topup_enabled = 1,
+                    auto_topup_threshold_cents = 1500,
+                    auto_topup_amount_cents = 3000,
+                    square_customer_id = 'cus_square_topup',
+                    square_card_id = 'ccof:square_card_topup',
+                    square_card_brand = 'VISA',
+                    square_card_last4 = '4242'
+              WHERE email = ?1",
+            rusqlite::params!["square-card-topup@example.com"],
+        )
+        .unwrap();
+
+    Mock::given(method("POST"))
+        .and(path("/v2/payments"))
+        .and(header("Square-Version", "2025-04-16"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "payment": {
+                "id": "payment_square_autoreload_1",
+                "status": "COMPLETED"
+            }
+        })))
+        .expect(1)
+        .mount(&h.square)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+        })))
+        .mount(&h.openai)
+        .await;
+
+    let req = Request::post("/router/complete")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "request_id": "square-card-topup-trigger",
+                "system": "",
+                "user": "hi",
+                "lane": "instant"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    for _ in 0..30 {
+        let balance: i64 = h
+            .pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT balance_cents FROM accounts WHERE id = ?1",
+                rusqlite::params![&account_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if balance >= 3000 {
+            clear_square_billing_env();
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let balance: i64 = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT balance_cents FROM accounts WHERE id = ?1",
+            rusqlite::params![&account_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    clear_square_billing_env();
+    panic!("expected Square auto reload to credit balance, found {balance}");
 }

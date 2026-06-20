@@ -78,6 +78,10 @@ mod admin_tests {
             is_admin,
             stripe_customer_id: None,
             stripe_payment_method_id: None,
+            square_customer_id: None,
+            square_card_id: None,
+            square_card_brand: None,
+            square_card_last4: None,
         }
     }
 
