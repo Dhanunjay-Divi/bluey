@@ -96,6 +96,71 @@ The table above is a rounded view; the running implementation in
 `server/src/pricing/mod.rs::compute_cost` does the full integer-microcent
 arithmetic without floats.
 
+## 2.1 Customer billing formula for discussion
+
+This is the product/business formula we should use when deciding what a
+customer pays for each paid Bluey action. The implementation currently uses
+the simplified `usage_charge_cents` path in `server/src/pricing/mod.rs`;
+future pricing changes should be measured against this formula before code
+changes land.
+
+### Variables
+
+| Symbol | Meaning |
+|---|---|
+| `U` | Upstream provider cost for the request: LLM tokens, STT seconds, vision tokens, embeddings, or RAG calls |
+| `M` | Bluey usage markup for the lane: 200% easy/balanced, 150% deep/vision/STT by current policy |
+| `P` | Payment processor fee allocation. Usually handled at reload time, not per request |
+| `R` | Risk reserve for refunds/disputes/provider variance. Recommended starting value: 5-10% of `U * (1 + M)` |
+| `F` | Customer-facing minimum billable request floor. Current implementation: 1 cent |
+| `C` | Customer charge deducted from wallet credits |
+| `B` | Bluey internal cost recorded for margin/reconciliation |
+
+### Formula
+
+```
+B = U
+
+gross_usage = U * (1 + M)
+risk_reserve = gross_usage * R
+
+C_raw = gross_usage + risk_reserve
+C = ceil_to_cent(max(C_raw, F))
+```
+
+For v0.2 alpha, keep `P` out of per-request metering. Processor fees are
+absorbed when the customer reloads credits. Example: if a user buys $30, the
+wallet receives $30, while finance/reconciliation tracks Square fees separately
+against gross margin.
+
+### Recommended starting policy
+
+| Lane | Markup `M` | Risk reserve `R` | Customer floor `F` |
+|---|---:|---:|---:|
+| Instant/easy text | 200% | 5% | 1 cent |
+| Balanced text/code | 200% | 5% | 1 cent |
+| Deep/system design | 150% | 7.5% | 1 cent |
+| Vision/screen analysis | 150% | 7.5% | 1 cent |
+| Live STT/captions | 150% | 10% | aggregate per session, not per tiny chunk |
+| Embeddings/RAG | 200% | 5% | bundled into answer/session action unless surfaced separately |
+
+### Guardrails
+
+- Never credit spendable balance until Square/Stripe reports a successful payment.
+- Never let a request start unless estimated `C` is available or reserved.
+- Never allow final billing to complete if the final provider usage/billing event is missing.
+- Store both `B` and `C` on usage events so margin can be audited later.
+- Reconcile daily: `sum(customer_charges) - sum(upstream_costs) - processor_fees - refunds/disputes`.
+- Flag accounts for review when expected margin turns negative, payment is disputed, refund is issued, or provider usage exceeds customer wallet deductions.
+
+### Discussion points before locking v0.2 pricing
+
+1. Keep the 1-cent floor or move to microcent wallet accounting?
+2. Apply the risk reserve now or only track it internally until we have real data?
+3. Bundle embeddings/RAG into the answer charge or show separate line items?
+4. Charge live STT by exact seconds, rounded session total, or a per-minute floor?
+5. Keep 150%/200% markup or move to a simpler "2.5x provider cost, 1-cent minimum" rule?
+
 
 ## 3. Three usage tiers (the product MUST show these to customers)
 
