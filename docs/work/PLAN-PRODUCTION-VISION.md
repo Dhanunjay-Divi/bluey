@@ -503,3 +503,135 @@ The **passive foundation is built and proven**. The gap to your full vision is:
 (Phase B), **(3) verify across agents** (Phase C), **(4) build the meeting
 question-gate** (Phase E), then **(5) cross-platform + commercial**. Phases
 A→B→C→E get a real, secure, scalable product on macOS; F+H scale it out.
+
+---
+
+## 9. FUTURE — the Slack/Teams chat-surface assist (separate meeting frontend)
+
+> Status: FUTURE ROADMAP (ROADMAP.md v0.6). NOT being built now. This section
+> corrects and supersedes the earlier §2a framing that pinned "meeting-assist"
+> to "answer leaves to the tool" — that conflated the product with one output
+> choice. The truth is below.
+
+### 9.1 What the product actually is (the two surfaces, corrected)
+
+The **spine never changes**: local capture + the **user's own agent + its MCP**
+→ `AnswerStream`. **No data retention** — Bluey is a conduit, the agent is
+theirs. Two FRONTENDS sit on that one spine:
+
+| Frontend | Input | Output | Data egress |
+|---|---|---|---|
+| **Interview overlay** (exists) | local system audio | invisible overlay | **none — fully local** |
+| **Meeting frontend** (NEW, separate UI) | local system audio (+ optional chat trigger) | its own meeting UI; optionally Slack/Teams | local by default; chat surface only if chosen |
+
+The **meeting frontend is a NEW, separate UI** — not the interview overlay. Its
+core is still **local audio in → the user's agent answers → shown to the user**
+(no egress). The Slack/Teams piece is an *optional* surface within it.
+
+### 9.2 The Slack/Teams flow (what the user described)
+
+The user is talking to someone; a question comes up. From **Slack or Teams** the
+user invokes Bluey (slash command / @mention / DM) → Bluey answers using **their
+own agent + connectors** → the answer is delivered **into that chat** so the user
+can read it and answer the person with it. It **helps the human decide what to
+say** — it is NOT Bluey autonomously speaking for them.
+
+### 9.3 Feasibility — CONFIRMED (researched June 2026)
+
+**Slack** ([slash commands](https://docs.slack.dev/interactivity/implementing-slash-commands/),
+[Socket Mode](https://api.slack.com/apis/socket-mode)):
+- A Slack app answers a **slash command** or an **`app_mention`** event and posts
+  the answer back into the **same channel/thread**.
+- **Ephemeral replies** (`response_type: "ephemeral"`) are visible **only to the
+  invoking user**, not the channel — the privacy-preserving "help ME" path.
+- Async answers (past the 3-second ack) use the `response_url` webhook.
+- **Socket Mode** = events over a WebSocket → **no public HTTPS endpoint
+  required** (fits Bluey's local-first design; the local daemon can hold the
+  socket). Scopes: `commands`, `chat:write`, `app_mentions:read`.
+
+**Microsoft Teams** ([channel/group bots](https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/conversations/channel-and-group-conversations),
+[proactive messages](https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/conversations/send-proactive-messages)):
+- A Bot Framework / Azure Bot replies in the **same channel/group** when
+  `@mentioned` (bots in channels only receive messages when @mentioned, unless
+  granted RSC); supports user mentions + Adaptive Cards.
+- Can send a **1:1 personal message visible only to the user** (proactive
+  message) — the Teams analogue of Slack ephemeral.
+- Requires **Azure Bot registration + app manifest + a public HTTPS messaging
+  endpoint**, and the app **installed into the team/tenant** (admin or user per
+  policy). Channel posts to **private channels are NOT supported**; throttling
+  limits apply.
+
+### 9.3a Surface coverage — which chat apps, and the ranking (researched June 2026)
+
+The deciding feature for EVERY surface is the same: **can it deliver an answer
+visible only to the invoking user (private/ephemeral)?** If yes, the assist stays
+"help ME" with no channel-wide egress. All surfaces below were verified to
+support that. The filter for inclusion is "where corporate / engineering teams
+actually hold conversations," not "every messaging app."
+
+| Surface | Trigger | Private/ephemeral answer? | Infra | Tier |
+|---|---|---|---|---|
+| **Slack** | slash cmd / `app_mention` | ✅ `response_type:"ephemeral"` | Socket Mode → **no public server** | **1 — build first** |
+| **Microsoft Teams** | @mention (Bot Framework) | ✅ 1:1 proactive message | Azure bot + **public HTTPS** + tenant install | **1** |
+| **Discord** | slash command | ✅ native `EPHEMERAL` flag (`1<<6`) | webhook/gateway interactions | **2 — fast follow** |
+| **Google Chat** | slash command | ✅ `privateMessageViewer` (one user) | Workspace app | **2** |
+| **Telegram** | inline query / command | ✅ inline `private` flag | bot API (no server needed) | 3 — note only |
+| **Mattermost / Zulip / Rocket.Chat** | slash command | ✅ ephemeral + `response_url` | self-hosted | 3 — note only |
+| WhatsApp / iMessage / SMS | — | — | — | **OUT** (consumer, wrong audience) |
+| Zoom Team Chat / Webex msg | — | — | — | **OUT** (low primary-chat adoption) |
+
+**Why this ranking maps to the end goal (corporate eng teams):**
+- **Slack + Teams (Tier 1)** = the two halves of corporate: Slack (eng/startup +
+  Slack-first orgs) and Teams (Office 365 / enterprise). Non-negotiable coverage.
+- **Discord + Google Chat (Tier 2)** complete the map: Discord = dev/OSS/startup
+  communities (and the *easiest* technically after Slack — ephemeral is native);
+  Google Chat = the **Google Workspace** orgs (Meet-not-Teams) that Teams misses.
+- **Tier 3** (Telegram, self-hosted Slack-likes) are real but niche — build only
+  on customer pull, not speculatively.
+- **OUT** surfaces are consumer-grade or low-adoption-as-primary-team-chat;
+  adding them dilutes effort for the wrong audience.
+
+Citations: Slack [slash commands](https://docs.slack.dev/interactivity/implementing-slash-commands/) /
+[Socket Mode](https://api.slack.com/apis/socket-mode); Teams
+[channel bots](https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/conversations/channel-and-group-conversations) /
+[proactive](https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/conversations/send-proactive-messages);
+Discord [interactions](https://docs.discord.com/developers/interactions/receiving-and-responding);
+Google Chat [commands](https://developers.google.com/workspace/chat/commands) /
+[private messages](https://developers.google.com/chat/api/guides/v1/messages/private);
+Telegram [inline bots](https://core.telegram.org/bots/inline);
+Mattermost [slash commands](https://developers.mattermost.com/integrate/slash-commands/).
+
+### 9.4 The privacy boundary (the one real design constraint)
+
+A **channel-visible** reply = the answer LEAVING to everyone in that channel. So:
+- **Default = private/ephemeral** (Slack ephemeral, Teams 1:1) → answer reaches
+  ONLY the user → preserves "nothing leaves beyond what the user chose."
+- **Channel-visible posting** = a separate, explicit, **per-action consented**
+  send. Never silent, never automatic (aligns with the global non-negotiables:
+  sending a message on the user's behalf is consent-gated).
+
+### 9.5 Infra note (why it's sequenced later)
+
+- **Slack** can run **without a public server** via Socket Mode — the local
+  daemon could hold the WebSocket. Lightest path.
+- **Teams** needs a **public HTTPS bot endpoint** (cloud infra) + tenant
+  install — heavier, overlaps with the Phase H commercial/cloud track.
+- The **local core loop (interview + live work-meeting) needs none of this** —
+  it is local audio → agent → UI. So Slack/Teams is built **after** the local
+  loop is solid, as an additive output adapter that **does not touch the spine**.
+
+### 9.6 Build shape when the time comes (not now)
+
+1. New **meeting frontend** (separate from the overlay) — local audio → agent →
+   meeting UI, no egress. (This is the real next product surface.)
+2. **Slack adapter** first (Socket Mode, ephemeral default) — input trigger
+   (slash/@mention) + output sink, both thin, spine untouched.
+3. **Teams adapter** second (needs the cloud bot endpoint; pairs with Phase H).
+4. **Discord + Google Chat** as Tier-2 fast-followers once the adapter shape is
+   proven on Slack (Discord ephemeral is native → easiest; Google Chat covers the
+   Workspace orgs). Tier-3 (Telegram, self-hosted) only on customer pull.
+5. **Per-output privacy gate** — explicit "private to me" vs "post to channel"
+   choice on every answer; default private. The adapters share ONE interface
+   (trigger-in → AnswerStream → private-reply-out) so a new surface = a new
+   adapter implementing it, never a spine change — the same data-driven
+   "new surface = a row" discipline the agent registry already uses.
