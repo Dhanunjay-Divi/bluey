@@ -13,6 +13,37 @@
 
 ---
 
+## ⏱️ SURFACE LEDGER — what's DONE vs TODO (read this FIRST; prevents re-loops)
+> A "surface" = a distinct agent presentation (CLI binary vs desktop App vs in-editor) with its
+> OWN session store. Testing one surface does NOT cover another (verified: 0 session-id overlap
+> across all surface pairs). Before "doing the GUI/App version" of an agent, check the SURFACE
+> MAP below — some agents have multiple surfaces (Claude, Copilot), some have only one.
+
+| Surface | Type | Status |
+|---|---|---|
+| `claude_code` | CLI | ✅ 5/5 |
+| `codex` | CLI (= App; shares `~/.codex`, App ignores CLI sessions but Bluey reads the shared store) | ✅ 5/5 |
+| `copilot` | CLI | ✅ 5/5 |
+| `cursor` | CLI/App — ONE Bluey row reading the IDE store (the `cursor-agent` CLI's own `~/.cursor/chats` is a deliberate non-target) | ✅ 5/5 |
+| `gemini` | CLI only (no separate App) | ✅ 5/5 |
+| `antigravity` | CLI (`agy`) — reads the same store the App writes | ✅ 5/5 |
+| `claude_code_app` | Claude **desktop App** (separate index, bridged to CLI JSONL via cliSessionId) | ✅ 5/5 |
+| `vs_code_fork` | **VS Code** Copilot Chat (in-editor; bridges to Copilot CLI for drive) | ✅ 5/5 |
+| `claude_code_agent` | Claude App agent-mode | 🚫 0 sessions — nothing to test |
+| `Code - Insiders` | VS Code Insiders fork | ⚠️ reads 5 sessions after the cursorDiskKV fix; NOT run through the 5-cap harness |
+| **Aider** | CLI | ⬜ programmatic surface unconfirmed |
+
+**TODO — genuinely separate App stores NOT yet 5-cap tested:** *(per the App↔CLI research — these
+Apps keep their own stores, so the CLI pass does NOT cover them)* — **Cursor App** (the editor's
+own composer store IS what `cursor` reads, so likely already covered — confirm), **Antigravity App**
+(`…/antigravity/brain` vs CLI — but `antigravity` row reads the shared store), **GitHub Copilot App**
+(standalone, distinct from `vs_code_fork`), **Codex App** (shares `~/.codex` — likely covered).
+⚠️ Several of these "App" surfaces may already be covered because the Bluey row reads the shared/IDE
+store — VERIFY against the SURFACE MAP before assuming a separate test is needed; do NOT hunt for a
+store that doesn't exist.
+
+---
+
 ## The 5 capabilities (per agent) — see plan §1a
 1. **Read sessions** — list past conversations
 2. **Name** — real chat title
@@ -134,8 +165,39 @@ genuinely distinct store that needs its own 5-cap pass — which is exactly why
   actually call its Jira/GitHub connectors? Test early (plan §5).
 - **Production env**: `fix-path-env` at daemon startup recovers the user's shell PATH so
   agents are found when launched from Finder (not just terminal).
+- **Cursor advertises `loadSession:true` but it is a KNOWN-BROKEN Cursor bug — do NOT wire
+  `session/load` for Cursor.** cursor-agent reports `agentCapabilities.loadSession:true` at
+  initialize, yet `session/load` returns *"Session not found"* even for a sessionId the server
+  itself just minted via `session/new` (forum.cursor.com; unfixed as of Apr 2026). Cursor stays
+  Replay/fork tier ON PURPOSE — its id is a SQLite composer UUID, not an ACP handle. Promoting it
+  off Replay because the capability flag looks green will BREAK it. Cursor-side defect, not a
+  Bluey gap. (This re-loop already happened once — don't repeat it.)
+- **Pick the `.vscdb` session reader by TABLE SHAPE, not by the extension.** Cursor's store has a
+  `cursorDiskKV` table; plain VS Code-family forks (Antigravity IDE, VS Code Insiders) ship a
+  `state.vscdb` with only `ItemTable`. Assigning Cursor's `SqliteVscdb` reader to every `.vscdb`
+  throws `no such table: cursorDiskKV` → broken `-` session counts that LOOK like an empty
+  list / consent bug but aren't. `discover.rs::sqlite_has_table()` probes: `cursorDiskKV` →
+  `SqliteVscdb`; else `User/workspaceStorage` exists → `JsonFiles`; else no store. Fixed in
+  commit 9eb6c1c — do NOT regress when adding a new fork.
+- **MCP "NO MCP" can be a FALSE NEGATIVE.** The user's `perplexity` MCP key is 401/quota-exhausted,
+  so a driven agent that DOES load + call the tool may report "NO MCP" after the 401. Verify Cap 5
+  by checking the agent INVOKED the tool (`[tool: mcp__…]` in output), not by the final wording.
+- **Daemon context-accumulation bug (open):** in a long-running daemon, context accumulates across
+  asks → eventually `Prompt is too long` even for a tiny fresh ask, until a daemon restart clears
+  it. Workaround during testing: restart the daemon between heavy resume tests. (Follow-up task spawned.)
 
 ## Verification log (append-only — date, what was tested, result)
+- 2026-06-19 — **✅ FORK-READER MISASSIGNMENT FIXED (the 5th fix — non-Cursor VS Code forks).**
+  SYMPTOM: every fork with a `state.vscdb` got Cursor's `SqliteVscdb` reader, so non-Cursor forks
+  (Antigravity IDE, VS Code Insiders, the Antigravity App-Support footprint) threw `no such table:
+  cursorDiskKV` on every session read → broken `-` counts. ROOT CAUSE: reader picked by extension
+  ("it's a .vscdb"), not by table shape — only Cursor's store has `cursorDiskKV`; plain VS Code
+  forks have only `ItemTable` and keep chats in `User/workspaceStorage/<hash>/chatSessions/*.json`.
+  FIX (`crates/cue-agent-bridge/src/discover.rs`): added `sqlite_has_table(path, table)` and gated
+  selection — `cursorDiskKV` → `SqliteVscdb`; else `User/workspaceStorage` exists → `JsonFiles`;
+  else no store. VERIFIED: unit test `non_cursor_fork_gets_jsonfiles_not_cursor_reader` (+a 2nd for
+  no-store); live, the `cursorDiskKV` errors are GONE and `Code - Insiders` now reads 5 sessions.
+  Commit 9eb6c1c. (This is the fix the three "see the cursorDiskKV fix" pointers above refer to.)
 - 2026-06-18 — Plan + this tracker created. Nothing in the 5-capability matrix verified yet
   (ACP *handshakes* passed earlier, but that's not the same as the capabilities above).
 - 2026-06-18 — **Phase 0 start (Gemini).** Caps 1/2/3 (read sessions / name / project) ✅
