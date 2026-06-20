@@ -29,6 +29,8 @@ pub struct AccountMe {
     pub square_application_id: Option<String>,
     pub square_location_id: Option<String>,
     pub square_environment: Option<String>,
+    pub billing_restricted: bool,
+    pub billing_restriction_reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -94,6 +96,14 @@ pub async fn update_billing_settings(
     }
 
     if req.auto_topup_enabled {
+        if account.billing_restricted {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ApiError {
+                    error: "Billing is paused while this account is under review.".to_string(),
+                }),
+            ));
+        }
         let (_, available, reason, _) = auto_topup_capability(&state, &account);
         if !available {
             return Err((
@@ -161,6 +171,8 @@ pub(crate) fn account_me_payload(
         square_application_id: square_public.as_ref().map(|cfg| cfg.0.clone()),
         square_location_id: square_public.as_ref().map(|cfg| cfg.1.clone()),
         square_environment: square_public.map(|cfg| cfg.2),
+        billing_restricted: account.billing_restricted,
+        billing_restriction_reason: account.billing_restriction_reason,
     }
 }
 
@@ -189,6 +201,14 @@ fn auto_topup_capability(
                 .stripe_payment_method_id
                 .as_ref()
                 .map(|_| "Saved Stripe card".to_string());
+            if account.billing_restricted {
+                return (
+                    "stripe".to_string(),
+                    false,
+                    Some("Billing is paused while this account is under review.".to_string()),
+                    label,
+                );
+            }
             let available = account.stripe_customer_id.is_some()
                 && account.stripe_payment_method_id.is_some()
                 && state.config.stripe_secret_key.is_some();
@@ -208,6 +228,14 @@ fn auto_topup_capability(
                 _ if account.square_card_id.is_some() => Some("Saved Square card".to_string()),
                 _ => None,
             };
+            if account.billing_restricted {
+                return (
+                    "square".to_string(),
+                    false,
+                    Some("Billing is paused while this account is under review.".to_string()),
+                    label,
+                );
+            }
             let square = state.config.square_config();
             let available = account.square_customer_id.is_some()
                 && account.square_card_id.is_some()

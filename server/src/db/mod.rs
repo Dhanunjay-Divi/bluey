@@ -379,6 +379,14 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
     ensure_column(&conn, "accounts", "square_card_last4", "TEXT")?;
     ensure_column(
         &conn,
+        "accounts",
+        "billing_restricted",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(&conn, "accounts", "billing_restriction_reason", "TEXT")?;
+    ensure_column(&conn, "accounts", "billing_restricted_at", "DATETIME")?;
+    ensure_column(
+        &conn,
         "stt_sessions",
         "reserved_cents",
         "INTEGER NOT NULL DEFAULT 0",

@@ -70,6 +70,7 @@ mod admin_tests {
             } else {
                 "user@example.com".to_string()
             },
+            email_verified_at: None,
             balance_cents: 0,
             trial_seconds_remaining: 0,
             auto_topup_enabled: false,
@@ -82,6 +83,9 @@ mod admin_tests {
             square_card_id: None,
             square_card_brand: None,
             square_card_last4: None,
+            billing_restricted: false,
+            billing_restriction_reason: None,
+            billing_restricted_at: None,
         }
     }
 

@@ -182,6 +182,68 @@ pub fn credit_internal(
     credit_with_source_id(pool, account_id, amount_cents, &source_id)
 }
 
+/// Remove any unused spendable credit from a processor payment.
+///
+/// Refunds/disputes must not leave remaining processor-backed credits usable.
+/// Already-consumed credits are intentionally not reconstructed here; the
+/// billing risk lock stops further paid spend and preserves the evidence trail.
+pub fn revoke_processor_credit(
+    pool: &DbPool,
+    provider: &str,
+    processor_payment_id: &str,
+    reason: &str,
+) -> Result<Option<(String, i64)>> {
+    let provider = provider.trim().to_ascii_lowercase();
+    let processor_payment_id = processor_payment_id.trim();
+    if provider.is_empty() || processor_payment_id.is_empty() {
+        return Ok(None);
+    }
+    let source_id = format!("{provider}:{processor_payment_id}");
+    let mut conn = pool.get()?;
+    let tx = conn.transaction()?;
+
+    let row: Option<(String, String, i64)> = tx
+        .query_row(
+            "SELECT id, account_id, remaining_cents
+               FROM credit_batches
+              WHERE stripe_charge_id = ?1
+              LIMIT 1",
+            params![source_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok();
+    let Some((batch_id, account_id, remaining_cents)) = row else {
+        tx.commit()?;
+        return Ok(None);
+    };
+
+    if remaining_cents > 0 {
+        tx.execute(
+            "UPDATE accounts
+                SET balance_cents = MAX(0, balance_cents - ?1)
+              WHERE id = ?2",
+            params![remaining_cents, &account_id],
+        )?;
+        tx.execute(
+            "UPDATE credit_batches
+                SET remaining_cents = 0,
+                    expired_at = COALESCE(expired_at, datetime('now'))
+              WHERE id = ?1",
+            params![batch_id],
+        )?;
+    }
+    tx.commit()?;
+    tracing::warn!(
+        account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
+        provider = %provider,
+        processor_payment_id = %processor_payment_id,
+        revoked_cents = remaining_cents.max(0),
+        reason = %reason,
+        "processor-backed credits revoked"
+    );
+    Ok(Some((account_id, remaining_cents.max(0))))
+}
+
 pub fn can_afford(pool: &DbPool, account_id: &str, estimated_cost_cents: i64) -> Result<bool> {
     let conn = pool.get()?;
     let balance: i64 = conn.query_row(

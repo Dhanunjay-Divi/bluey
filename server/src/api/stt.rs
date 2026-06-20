@@ -84,6 +84,12 @@ pub async fn create_session(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Json(req): Json<SttSessionRequest>,
 ) -> Result<Json<SttSessionResponse>, (StatusCode, String)> {
+    if account.billing_restricted {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Account usage is paused while billing is under review.".into(),
+        ));
+    }
     if req.session_id.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "session_id is required".into()));
     }

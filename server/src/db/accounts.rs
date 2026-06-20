@@ -23,6 +23,7 @@ pub enum AccountCreateError {
 pub struct Account {
     pub id: String,
     pub email: String,
+    pub email_verified_at: Option<String>,
     pub balance_cents: i64,
     pub trial_seconds_remaining: i64,
     pub auto_topup_enabled: bool,
@@ -43,32 +44,42 @@ pub struct Account {
     pub square_card_id: Option<String>,
     pub square_card_brand: Option<String>,
     pub square_card_last4: Option<String>,
+    pub billing_restricted: bool,
+    pub billing_restriction_reason: Option<String>,
+    pub billing_restricted_at: Option<String>,
 }
 
 impl Account {
-    const SELECT_FIELDS: &'static str = "id, email, balance_cents, trial_seconds_remaining,
+    const SELECT_FIELDS: &'static str = "id, email, email_verified_at,
+                    balance_cents, trial_seconds_remaining,
                     auto_topup_enabled, auto_topup_threshold_cents,
                     auto_topup_amount_cents, is_admin,
                     stripe_customer_id, stripe_payment_method_id,
                     square_customer_id, square_card_id,
-                    square_card_brand, square_card_last4";
+                    square_card_brand, square_card_last4,
+                    billing_restricted, billing_restriction_reason,
+                    billing_restricted_at";
 
     fn from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             id: r.get(0)?,
             email: r.get(1)?,
-            balance_cents: r.get(2)?,
-            trial_seconds_remaining: r.get(3)?,
-            auto_topup_enabled: r.get::<_, i64>(4)? == 1,
-            auto_topup_threshold_cents: r.get(5)?,
-            auto_topup_amount_cents: r.get(6)?,
-            is_admin: r.get::<_, i64>(7)? == 1,
-            stripe_customer_id: r.get(8)?,
-            stripe_payment_method_id: r.get(9)?,
-            square_customer_id: r.get(10)?,
-            square_card_id: r.get(11)?,
-            square_card_brand: r.get(12)?,
-            square_card_last4: r.get(13)?,
+            email_verified_at: r.get(2)?,
+            balance_cents: r.get(3)?,
+            trial_seconds_remaining: r.get(4)?,
+            auto_topup_enabled: r.get::<_, i64>(5)? == 1,
+            auto_topup_threshold_cents: r.get(6)?,
+            auto_topup_amount_cents: r.get(7)?,
+            is_admin: r.get::<_, i64>(8)? == 1,
+            stripe_customer_id: r.get(9)?,
+            stripe_payment_method_id: r.get(10)?,
+            square_customer_id: r.get(11)?,
+            square_card_id: r.get(12)?,
+            square_card_brand: r.get(13)?,
+            square_card_last4: r.get(14)?,
+            billing_restricted: r.get::<_, i64>(15)? == 1,
+            billing_restriction_reason: r.get(16)?,
+            billing_restricted_at: r.get(17)?,
         })
     }
 
@@ -136,6 +147,7 @@ impl Account {
         Ok(Self {
             id,
             email: email.to_string(),
+            email_verified_at: None,
             balance_cents: 0,
             trial_seconds_remaining: 600,
             auto_topup_enabled: false,
@@ -148,6 +160,9 @@ impl Account {
             square_card_id: None,
             square_card_brand: None,
             square_card_last4: None,
+            billing_restricted: false,
+            billing_restriction_reason: None,
+            billing_restricted_at: None,
         })
     }
 
@@ -205,6 +220,62 @@ impl Account {
             params![id, if is_admin { 1 } else { 0 }],
         )?;
         Ok(())
+    }
+
+    pub fn restrict_billing(
+        pool: &DbPool,
+        id: &str,
+        reason: &str,
+        event_id: Option<&str>,
+    ) -> Result<Option<Self>> {
+        let reason = reason.trim();
+        let reason = if reason.is_empty() {
+            "billing_review"
+        } else {
+            reason
+        };
+        let reason_with_event = event_id
+            .filter(|value| !value.trim().is_empty())
+            .map(|event_id| format!("{reason}:{event_id}"))
+            .unwrap_or_else(|| reason.to_string());
+        let conn = pool.get()?;
+        conn.execute(
+            "UPDATE accounts
+                SET billing_restricted = 1,
+                    billing_restriction_reason = ?2,
+                    billing_restricted_at = datetime('now'),
+                    auto_topup_enabled = 0,
+                    stripe_payment_method_id = NULL,
+                    square_card_id = NULL,
+                    square_card_brand = NULL,
+                    square_card_last4 = NULL
+              WHERE id = ?1",
+            params![id, reason_with_event],
+        )?;
+        drop(conn);
+        Self::fetch_by_id(pool, id)
+    }
+
+    pub fn account_id_for_processor_payment(
+        pool: &DbPool,
+        provider: &str,
+        processor_payment_id: &str,
+    ) -> Result<Option<String>> {
+        let provider = provider.trim().to_ascii_lowercase();
+        let processor_payment_id = processor_payment_id.trim();
+        if provider.is_empty() || processor_payment_id.is_empty() {
+            return Ok(None);
+        }
+        let source_id = format!("{provider}:{processor_payment_id}");
+        let conn = pool.get()?;
+        let account_id = conn
+            .query_row(
+                "SELECT account_id FROM credit_batches WHERE stripe_charge_id = ?1",
+                params![source_id],
+                |r| r.get::<_, String>(0),
+            )
+            .ok();
+        Ok(account_id)
     }
 
     /// Look up password hash for login validation.

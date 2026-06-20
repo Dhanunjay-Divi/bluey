@@ -127,6 +127,25 @@ impl Drop for StreamingIdempotencyGuard {
     }
 }
 
+fn billing_restricted_error(account: &Account) -> Option<(StatusCode, Json<ApiError>)> {
+    if !account.billing_restricted {
+        return None;
+    }
+    Some((
+        StatusCode::FORBIDDEN,
+        Json(ApiError {
+            error: "Account usage is paused while billing is under review.".into(),
+            reason: Some(
+                account
+                    .billing_restriction_reason
+                    .clone()
+                    .unwrap_or_else(|| "billing_restricted".into()),
+            ),
+            ..Default::default()
+        }),
+    ))
+}
+
 #[derive(Deserialize)]
 pub struct CompleteRequest {
     /// Client-supplied idempotency key. REQUIRED. Codex S4.1: a retry
@@ -628,6 +647,9 @@ async fn complete_stream_inner(
     req: CompleteRequest,
     trace_id: String,
 ) -> Result<Sse<RouterSseStream>, (StatusCode, Json<ApiError>)> {
+    if let Some(err) = billing_restricted_error(&account) {
+        return Err(err);
+    }
     if req.request_id.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -1343,6 +1365,9 @@ async fn complete_inner(
     req: CompleteRequest,
     trace_id: String,
 ) -> Result<CompleteResponse, (StatusCode, Json<ApiError>)> {
+    if let Some(err) = billing_restricted_error(&account) {
+        return Err(err);
+    }
     // 0. Validate request_id is non-empty.
     if req.request_id.trim().is_empty() {
         return Err((
@@ -2220,6 +2245,9 @@ pub async fn embed(
     >,
     Json(req): Json<EmbedRequest>,
 ) -> Result<Json<EmbedResponse>, (StatusCode, Json<ApiError>)> {
+    if let Some(err) = billing_restricted_error(&account) {
+        return Err(err);
+    }
     if req.request_id.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -2550,6 +2578,9 @@ pub async fn transcribe(
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<TranscribeResponse>, (StatusCode, Json<ApiError>)> {
+    if let Some(err) = billing_restricted_error(&account) {
+        return Err(err);
+    }
     if q.request_id.trim().is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,

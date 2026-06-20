@@ -26,7 +26,7 @@
 use anyhow::{anyhow, Context, Result};
 
 use crate::config::{BillingProvider, Config};
-use crate::db::{balance, DbPool};
+use crate::db::{accounts::Account, balance, DbPool};
 
 /// In-flight dedupe: stops two concurrent low-balance checks from
 /// firing two top-ups for the same account in a 60-second window.
@@ -90,6 +90,31 @@ pub fn maybe_spawn(
     }
     if balance_after_cents >= auto_topup_threshold_cents {
         return;
+    }
+    match Account::fetch_by_id(&pool, &account_id) {
+        Ok(Some(account)) if account.billing_restricted => {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
+                "auto reload skipped: account billing is restricted"
+            );
+            return;
+        }
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
+                "auto reload skipped: account not found"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
+                error = %e,
+                "auto reload skipped: account lookup failed"
+            );
+            return;
+        }
     }
 
     match config.billing_provider() {

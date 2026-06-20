@@ -139,6 +139,15 @@ async fn signup_and_login(harness: &Harness, email: &str, password: &str) -> Str
     let normalized_email = email.trim().to_lowercase();
     let password_hash = auth::password::hash_password(password).unwrap();
     Account::create(&harness.pool, &normalized_email, &password_hash).unwrap();
+    harness
+        .pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE accounts SET email_verified_at = datetime('now') WHERE email = ?1",
+            rusqlite::params![normalized_email],
+        )
+        .unwrap();
     let auth = login(harness, &normalized_email, password).await;
     auth["access_token"].as_str().unwrap().to_string()
 }
@@ -166,6 +175,29 @@ fn square_reload_reference_id_for_test(account_id: &str) -> String {
         .take(32)
         .collect::<String>();
     format!("br_{compact}")
+}
+
+fn square_signature_for_test(secret: &str, body: &str) -> String {
+    use base64::Engine;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let url = "http://localhost:8080/billing/square/webhook";
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(url.as_bytes());
+    mac.update(body.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes())
+}
+
+fn stripe_signature_for_test(secret: &str, body: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let t = chrono::Utc::now().timestamp().to_string();
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(format!("{t}.{body}").as_bytes());
+    let v1 = hex::encode(mac.finalize().into_bytes());
+    format!("t={t},v1={v1}")
 }
 
 async fn login(harness: &Harness, email: &str, password: &str) -> serde_json::Value {
@@ -378,6 +410,51 @@ async fn router_complete_happy_path_with_mocked_openai() {
         .unwrap();
     let resp = h.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+#[serial]
+async fn router_complete_rejects_billing_restricted_account() {
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "restricted-complete@example.com", "longenoughpw").await;
+    let account_id: String = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT id FROM accounts WHERE email = ?1",
+            rusqlite::params!["restricted-complete@example.com"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    Account::restrict_billing(
+        &h.pool,
+        &account_id,
+        "charge.dispute.created",
+        Some("evt_restricted_complete"),
+    )
+    .unwrap();
+
+    let req = Request::post("/router/complete")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "request_id": "test-restricted-complete",
+                "system": "you are helpful",
+                "user": "hello",
+                "lane": "instant"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["error"].as_str().unwrap().contains("paused"));
 }
 
 #[tokio::test]
@@ -1545,6 +1622,198 @@ async fn billing_square_webhook_credits_completed_order() {
     std::env::remove_var("SQUARE_SANDBOX_ACCESS_TOKEN");
     std::env::remove_var("SQUARE_SANDBOX_LOCATION_ID");
     std::env::remove_var("SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY");
+}
+
+#[tokio::test]
+#[serial]
+async fn billing_checkout_requires_verified_email_before_first_payment() {
+    set_square_billing_env();
+    let h = boot_harness().await;
+    let email = "unverified-checkout@example.com";
+    let password_hash = auth::password::hash_password("longenoughpw").unwrap();
+    Account::create(&h.pool, email, &password_hash).unwrap();
+    let auth = login(&h, email, "longenoughpw").await;
+    let access = auth["access_token"].as_str().unwrap();
+
+    let req = Request::post("/billing/checkout")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({ "amount_cents": 3000 })).unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(v["error"]
+        .as_str()
+        .unwrap()
+        .contains("Verify your email"));
+
+    clear_square_billing_env();
+}
+
+#[tokio::test]
+#[serial]
+async fn billing_square_refund_restricts_account_and_revokes_remaining_credit() {
+    set_square_billing_env();
+    std::env::set_var("SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY", "square-whsec");
+    let h = boot_harness().await;
+    let _access = signup_and_login(&h, "square-refund@example.com", "longenoughpw").await;
+    let account_id: String = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT id FROM accounts WHERE email = ?1",
+            rusqlite::params!["square-refund@example.com"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    bluey_server::db::balance::credit_processor_payment(
+        &h.pool,
+        &account_id,
+        3000,
+        "square",
+        "payment_square_refund_1",
+    )
+    .unwrap();
+    h.pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE accounts
+                SET auto_topup_enabled = 1,
+                    square_customer_id = 'cus_square_refund',
+                    square_card_id = 'ccof:square_refund',
+                    square_card_brand = 'VISA',
+                    square_card_last4 = '4242'
+              WHERE id = ?1",
+            rusqlite::params![account_id],
+        )
+        .unwrap();
+
+    let body = serde_json::to_string(&json!({
+        "event_id": "evt_square_refund_1",
+        "type": "refund.updated",
+        "data": {
+            "object": {
+                "refund": {
+                    "id": "refund_square_1",
+                    "payment_id": "payment_square_refund_1",
+                    "status": "COMPLETED"
+                }
+            }
+        }
+    }))
+    .unwrap();
+    let signature = square_signature_for_test("square-whsec", &body);
+    let req = Request::post("/billing/square/webhook")
+        .header("x-square-hmacsha256-signature", signature)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let row: (i64, i64, i64, Option<String>, Option<String>) = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT balance_cents, billing_restricted, auto_topup_enabled,
+                    square_card_id, billing_restriction_reason
+               FROM accounts WHERE id = ?1",
+            rusqlite::params![account_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(row.0, 0);
+    assert_eq!(row.1, 1);
+    assert_eq!(row.2, 0);
+    assert!(row.3.is_none());
+    assert!(row.4.unwrap().contains("refund.updated"));
+
+    clear_square_billing_env();
+    std::env::remove_var("SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY");
+}
+
+#[tokio::test]
+#[serial]
+async fn billing_stripe_dispute_restricts_account_and_revokes_remaining_credit() {
+    let h = boot_harness().await;
+    let _access = signup_and_login(&h, "stripe-dispute@example.com", "longenoughpw").await;
+    let account_id: String = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT id FROM accounts WHERE email = ?1",
+            rusqlite::params!["stripe-dispute@example.com"],
+            |r| r.get(0),
+        )
+        .unwrap();
+    bluey_server::db::balance::credit_processor_payment(
+        &h.pool,
+        &account_id,
+        3000,
+        "stripe",
+        "pi_dispute_1",
+    )
+    .unwrap();
+    h.pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE accounts
+                SET auto_topup_enabled = 1,
+                    stripe_customer_id = 'cus_dispute',
+                    stripe_payment_method_id = 'pm_dispute'
+              WHERE id = ?1",
+            rusqlite::params![account_id],
+        )
+        .unwrap();
+
+    let body = serde_json::to_string(&json!({
+        "id": "evt_stripe_dispute_1",
+        "type": "charge.dispute.created",
+        "data": {
+            "object": {
+                "id": "dp_1",
+                "payment_intent": "pi_dispute_1"
+            }
+        }
+    }))
+    .unwrap();
+    let signature = stripe_signature_for_test("whsec_test_e2e", &body);
+    let req = Request::post("/billing/webhook")
+        .header("Stripe-Signature", signature)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let row: (i64, i64, i64, Option<String>, Option<String>) = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT balance_cents, billing_restricted, auto_topup_enabled,
+                    stripe_payment_method_id, billing_restriction_reason
+               FROM accounts WHERE id = ?1",
+            rusqlite::params![account_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(row.0, 0);
+    assert_eq!(row.1, 1);
+    assert_eq!(row.2, 0);
+    assert!(row.3.is_none());
+    assert!(row.4.unwrap().contains("charge.dispute.created"));
 }
 
 #[tokio::test]

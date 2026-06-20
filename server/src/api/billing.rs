@@ -51,6 +51,29 @@ pub struct SaveSquareCardRequest {
 const MINIMUM_RELOAD_CENTS: i64 = 1500;
 const SQUARE_API_VERSION: &str = "2025-04-16";
 
+fn ensure_payment_setup_allowed(
+    account: &crate::db::accounts::Account,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    if account.billing_restricted {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError {
+                error: "Billing is paused while this account is under review.".to_string(),
+            }),
+        ));
+    }
+    if account.email_verified_at.is_none() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError {
+                error: "Verify your email before adding credits or saving a payment method."
+                    .to_string(),
+            }),
+        ));
+    }
+    Ok(())
+}
+
 fn stripe_api_url(path: &str) -> String {
     let base =
         std::env::var("BLUEY_TEST_STRIPE_URL").unwrap_or_else(|_| "https://api.stripe.com".into());
@@ -105,6 +128,7 @@ pub async fn checkout(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Json(req): Json<CheckoutRequest>,
 ) -> Result<Json<CheckoutResponse>, (StatusCode, Json<ApiError>)> {
+    ensure_payment_setup_allowed(&account)?;
     match state.config.billing_provider() {
         BillingProvider::Square => square_checkout(state, account, req).await,
         BillingProvider::Stripe => stripe_checkout(state, account, req).await,
@@ -116,6 +140,7 @@ pub async fn save_square_card(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Json(req): Json<SaveSquareCardRequest>,
 ) -> Result<Json<super::account::AccountMe>, (StatusCode, Json<ApiError>)> {
+    ensure_payment_setup_allowed(&account)?;
     if !matches!(state.config.billing_provider(), BillingProvider::Square) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -733,6 +758,14 @@ async fn stripe_webhook_impl(
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     }
+    if is_billing_risk_event(event_type) {
+        if let Err(e) =
+            handle_processor_risk_event(&state, "stripe", event_type, event_id, &event).await
+        {
+            tracing::error!(error = %e, event_id, "stripe billing risk handler failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
 
     let _ = conn.execute(
         "UPDATE stripe_webhook_events SET processed_at = datetime('now') WHERE event_id = ?1",
@@ -836,6 +869,15 @@ async fn square_webhook_impl(
     ) {
         if let Err(e) = handle_square_payment_event(&state, &event).await {
             tracing::error!(error = %e, event_id = %stored_event_id, "square webhook handler failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    }
+    if is_billing_risk_event(event_type) {
+        if let Err(e) =
+            handle_processor_risk_event(&state, "square", event_type, &stored_event_id, &event)
+                .await
+        {
+            tracing::error!(error = %e, event_id = %stored_event_id, "square billing risk handler failed");
             return Err(StatusCode::INTERNAL_SERVER_ERROR);
         }
     }
@@ -1044,6 +1086,120 @@ async fn handle_square_payment_event(state: &AppState, event: &serde_json::Value
         );
     }
     Ok(())
+}
+
+fn is_billing_risk_event(event_type: &str) -> bool {
+    let event_type = event_type.to_ascii_lowercase();
+    event_type.contains("dispute") || event_type.contains("refund")
+}
+
+async fn handle_processor_risk_event(
+    state: &AppState,
+    provider: &str,
+    event_type: &str,
+    event_id: &str,
+    event: &serde_json::Value,
+) -> Result<()> {
+    let payment_id = processor_payment_id_from_risk_event(provider, event);
+    let account_id = direct_account_id_from_event(event).or_else(|| {
+        payment_id.as_deref().and_then(|payment_id| {
+            crate::db::accounts::Account::account_id_for_processor_payment(
+                &state.pool,
+                provider,
+                payment_id,
+            )
+            .ok()
+            .flatten()
+        })
+    });
+
+    let Some(account_id) = account_id else {
+        tracing::warn!(
+            provider,
+            event_type,
+            event_id,
+            processor_payment_id = payment_id.as_deref().unwrap_or("unknown"),
+            "billing risk event could not be mapped to account"
+        );
+        return Ok(());
+    };
+
+    if let Some(payment_id) = payment_id.as_deref() {
+        let _ = balance::revoke_processor_credit(&state.pool, provider, payment_id, event_type)
+            .map_err(|e| anyhow!("revoke processor credit: {e}"))?;
+    }
+    let restricted = crate::db::accounts::Account::restrict_billing(
+        &state.pool,
+        &account_id,
+        event_type,
+        Some(event_id),
+    )?
+    .is_some();
+    tracing::warn!(
+        account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
+        provider,
+        event_type,
+        event_id,
+        processor_payment_id = payment_id.as_deref().unwrap_or("unknown"),
+        restricted,
+        "account billing restricted from processor risk event"
+    );
+    Ok(())
+}
+
+fn direct_account_id_from_event(event: &serde_json::Value) -> Option<String> {
+    [
+        "/data/object/client_reference_id",
+        "/data/object/metadata/bluey_account_id",
+        "/data/object/payment/metadata/bluey_account_id",
+        "/data/object/payment/reference_id",
+        "/data/object/order/metadata/bluey_account_id",
+        "/data/object/refund/metadata/bluey_account_id",
+        "/data/object/dispute/metadata/bluey_account_id",
+    ]
+    .into_iter()
+    .find_map(|pointer| event.pointer(pointer).and_then(|v| v.as_str()))
+    .and_then(|value| {
+        square_account_id_from_reference(value).or_else(|| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+    })
+}
+
+fn processor_payment_id_from_risk_event(
+    provider: &str,
+    event: &serde_json::Value,
+) -> Option<String> {
+    match provider {
+        "stripe" => [
+            "/data/object/payment_intent",
+            "/data/object/charge/payment_intent",
+            "/data/object/refund/payment_intent",
+        ]
+        .into_iter()
+        .find_map(|pointer| stripe_id_value(event.pointer(pointer)?)),
+        "square" => [
+            "/data/object/payment/id",
+            "/data/object/refund/payment_id",
+            "/data/object/dispute/payment_id",
+        ]
+        .into_iter()
+        .find_map(|pointer| event.pointer(pointer).and_then(|v| v.as_str()))
+        .map(str::to_string),
+        _ => None,
+    }
+}
+
+fn stripe_id_value(value: &serde_json::Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| value.get("id").and_then(|v| v.as_str()).map(str::to_string))
 }
 
 #[derive(Debug)]
