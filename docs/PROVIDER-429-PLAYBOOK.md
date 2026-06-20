@@ -117,7 +117,7 @@ In priority order:
 
 | Env | Purpose | Default |
 |---|---|---|
-| `OPENAI_API_KEYS` / `ANTHROPIC_API_KEYS` / `DEEPGRAM_API_KEYS` | comma-separated key pools (fall back to singular `*_API_KEY`) | — |
+| `OPENAI_API_KEYS` / `ANTHROPIC_API_KEYS` / `GEMINI_API_KEYS` / `GOOGLE_API_KEYS` / `DEEPGRAM_API_KEYS` | comma-separated key pools (fall back to singular `*_API_KEY`) | - |
 | `BLUEY_PROVIDER_429_COOLDOWN_SECS` | cooldown when no Retry-After header | 30 |
 | `BLUEY_MAX_OUTPUT_TOKENS` | non-thinking output ceiling (TPM/cost) | 2048 |
 | `BLUEY_STREAM_FIRST_TOKEN_TIMEOUT_MS` | stall → fallback deadline (B2) | 6000 |

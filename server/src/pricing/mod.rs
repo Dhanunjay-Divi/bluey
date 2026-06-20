@@ -2,7 +2,7 @@
 //!
 //! Source of truth lives here AND in `docs/PRICING-MODEL.md`. Any
 //! change to either must be reflected in both. Last reconciled
-//! 2026-06-17 against PRICING-MODEL.md and MODEL-ROUTING.md.
+//! 2026-06-20 against PRICING-MODEL.md and MODEL-ROUTING.md.
 //!
 //! ## Unit semantics
 //!
@@ -49,17 +49,17 @@ pub const PRICING: &[ModelPricing] = &[
     ModelPricing {
         // Anthropic Claude Sonnet 4.6: $3/1M in, $15/1M out.
         provider: "anthropic",
-        model: "claude-sonnet-4-6-20260115",
+        model: "claude-sonnet-4-6",
         upstream_in_microcents_per_1m: 3_000_000,
         upstream_out_microcents_per_1m: 15_000_000,
         markup_percent: 200,
     },
     ModelPricing {
-        // Anthropic Claude Opus 4.8: $15/1M in, $75/1M out.
+        // Anthropic Claude Opus 4.8: $5/1M in, $25/1M out.
         provider: "anthropic",
-        model: "claude-opus-4-8-20260225",
-        upstream_in_microcents_per_1m: 15_000_000,
-        upstream_out_microcents_per_1m: 75_000_000,
+        model: "claude-opus-4-8",
+        upstream_in_microcents_per_1m: 5_000_000,
+        upstream_out_microcents_per_1m: 25_000_000,
         markup_percent: 150,
     },
     ModelPricing {
@@ -68,6 +68,31 @@ pub const PRICING: &[ModelPricing] = &[
         model: "claude-haiku-4-5-20251001",
         upstream_in_microcents_per_1m: 1_000_000,
         upstream_out_microcents_per_1m: 5_000_000,
+        markup_percent: 200,
+    },
+    ModelPricing {
+        // Gemini 3.1 Pro preview: use the conservative high-context tier
+        // ($0.90/1M in, $5.40/1M out) until live prompt sizes are measured.
+        provider: "gemini",
+        model: "gemini-3.1-pro-preview",
+        upstream_in_microcents_per_1m: 900_000,
+        upstream_out_microcents_per_1m: 5_400_000,
+        markup_percent: 150,
+    },
+    ModelPricing {
+        // Gemini 3 Flash preview: $0.50/1M in, $3/1M out.
+        provider: "gemini",
+        model: "gemini-3-flash-preview",
+        upstream_in_microcents_per_1m: 500_000,
+        upstream_out_microcents_per_1m: 3_000_000,
+        markup_percent: 200,
+    },
+    ModelPricing {
+        // Gemini 3.1 Flash-Lite: $0.25/1M in, $1.50/1M out.
+        provider: "gemini",
+        model: "gemini-3.1-flash-lite",
+        upstream_in_microcents_per_1m: 250_000,
+        upstream_out_microcents_per_1m: 1_500_000,
         markup_percent: 200,
     },
     ModelPricing {
@@ -163,19 +188,31 @@ mod tests {
         );
         assert_eq!(lookup("openai", "gpt-5.5").unwrap().markup_percent, 150);
         assert_eq!(
-            lookup("anthropic", "claude-sonnet-4-6-20260115")
+            lookup("anthropic", "claude-sonnet-4-6")
                 .unwrap()
                 .markup_percent,
             200
         );
         assert_eq!(
-            lookup("anthropic", "claude-opus-4-8-20260225")
+            lookup("anthropic", "claude-opus-4-8")
                 .unwrap()
                 .markup_percent,
             150
         );
         assert_eq!(
             lookup("anthropic", "claude-haiku-4-5-20251001")
+                .unwrap()
+                .markup_percent,
+            200
+        );
+        assert_eq!(
+            lookup("gemini", "gemini-3.1-pro-preview")
+                .unwrap()
+                .markup_percent,
+            150
+        );
+        assert_eq!(
+            lookup("gemini", "gemini-3.1-flash-lite")
                 .unwrap()
                 .markup_percent,
             200
@@ -204,11 +241,11 @@ mod tests {
 
     #[test]
     fn medium_code_q_charges_few_cents() {
-        // 800 in / 600 out on claude-sonnet-4-6-20260115
+        // 800 in / 600 out on claude-sonnet-4-6
         // raw: 800*3_000_000/1M + 600*15_000_000/1M = 2400 + 9000 = 11400 microcents
         // raw cents: 11400 / 10000 = 1.14 cents → ceil 2
         // 200% markup: 11400 * 3 / 1 = 34200 microcents = 3.42 cents → ceil 4
-        let p = lookup("anthropic", "claude-sonnet-4-6-20260115").unwrap();
+        let p = lookup("anthropic", "claude-sonnet-4-6").unwrap();
         let (bluey, customer) = compute_cost(p, 800, 600);
         assert_eq!(bluey, 2);
         assert_eq!(customer, 4);
@@ -216,14 +253,14 @@ mod tests {
 
     #[test]
     fn deep_question_charges_tens_of_cents() {
-        // 1500 in / 1000 out on claude-opus-4-8-20260225.
-        // raw: 1500*15M/1M + 1000*75M/1M = 22500 + 75000 = 97500 microcents
-        // raw cents: 9.75 → ceil 10
-        // 150% markup: 97500 * 2.5 = 243750 microcents = 24.375 cents → ceil 25
-        let p = lookup("anthropic", "claude-opus-4-8-20260225").unwrap();
+        // 1500 in / 1000 out on claude-opus-4-8.
+        // raw: 1500*5M/1M + 1000*25M/1M = 7500 + 25000 = 32500 microcents
+        // raw cents: 3.25 → ceil 4
+        // 150% markup: 32500 * 2.5 = 81250 microcents = 8.125 cents → ceil 9
+        let p = lookup("anthropic", "claude-opus-4-8").unwrap();
         let (bluey, customer) = compute_cost(p, 1500, 1000);
-        assert_eq!(bluey, 10);
-        assert_eq!(customer, 25);
+        assert_eq!(bluey, 4);
+        assert_eq!(customer, 9);
     }
 
     #[test]
@@ -233,13 +270,13 @@ mod tests {
         assert_eq!(estimate_cost_ceiling(p, 150, 100), 2);
 
         // Medium question: customer=4 cents. Ceiling = 4 + max(4/10, 1) = 4+1 = 5 cents.
-        let p = lookup("anthropic", "claude-sonnet-4-6-20260115").unwrap();
+        let p = lookup("anthropic", "claude-sonnet-4-6").unwrap();
         assert_eq!(estimate_cost_ceiling(p, 800, 600), 5);
     }
 
     #[test]
     fn bluey_ceiling_uses_upstream_cost_not_markup() {
-        let p = lookup("anthropic", "claude-sonnet-4-6-20260115").unwrap();
+        let p = lookup("anthropic", "claude-sonnet-4-6").unwrap();
         assert_eq!(estimate_bluey_cost_ceiling(p, 800, 600), 3);
     }
 

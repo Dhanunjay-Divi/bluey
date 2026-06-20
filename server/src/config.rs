@@ -105,6 +105,8 @@ pub struct UpstreamKeys {
     /// Single key or comma-separated, provider-approved key pool.
     pub anthropic_api_key: Option<String>,
     /// Single key or comma-separated, provider-approved key pool.
+    pub gemini_api_key: Option<String>,
+    /// Single key or comma-separated, provider-approved key pool.
     pub deepgram_api_key: Option<String>,
     pub ollama_base_url: Option<String>,
 }
@@ -130,6 +132,10 @@ impl UpstreamKeys {
         select_key_from_pool(self.anthropic_api_key.as_deref(), shard_key)
     }
 
+    pub fn gemini_key(&self, shard_key: &str) -> Option<&str> {
+        select_key_from_pool(self.gemini_api_key.as_deref(), shard_key)
+    }
+
     pub fn deepgram_key(&self, shard_key: &str) -> Option<&str> {
         select_key_from_pool(self.deepgram_api_key.as_deref(), shard_key)
     }
@@ -138,6 +144,7 @@ impl UpstreamKeys {
         let raw = match provider {
             "openai" => self.openai_api_key.as_deref(),
             "anthropic" => self.anthropic_api_key.as_deref(),
+            "gemini" => self.gemini_api_key.as_deref(),
             "deepgram" => self.deepgram_api_key.as_deref(),
             _ => None,
         };
@@ -185,6 +192,12 @@ impl Config {
         let upstream = UpstreamKeys {
             openai_api_key: env_any(&["OPENAI_API_KEYS", "OPENAI_API_KEY"]),
             anthropic_api_key: env_any(&["ANTHROPIC_API_KEYS", "ANTHROPIC_API_KEY"]),
+            gemini_api_key: env_any(&[
+                "GEMINI_API_KEYS",
+                "GEMINI_API_KEY",
+                "GOOGLE_API_KEYS",
+                "GOOGLE_API_KEY",
+            ]),
             deepgram_api_key: env_any(&["DEEPGRAM_API_KEYS", "DEEPGRAM_API_KEY"]),
             ollama_base_url: std::env::var("OLLAMA_BASE_URL")
                 .ok()
@@ -482,6 +495,17 @@ mod tests {
             seen.insert(keys.deepgram_key(&format!("request-{idx}")).unwrap());
         }
         assert!(seen.len() >= 2, "expected pool to use more than one key");
+    }
+
+    #[test]
+    fn gemini_key_pool_uses_same_sharding() {
+        let keys = UpstreamKeys {
+            gemini_api_key: Some("gm-a,gm-b,gm-c".into()),
+            ..Default::default()
+        };
+        let selected = keys.gemini_key("vision-request").unwrap();
+        assert!(["gm-a", "gm-b", "gm-c"].contains(&selected));
+        assert_eq!(keys.key_candidates("gemini", "vision-request").len(), 3);
     }
 
     #[test]

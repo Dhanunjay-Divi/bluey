@@ -60,26 +60,22 @@ cue_llm::LlmProvider (anthropic / openai / ollama)
 - **`LatencyLane`** — `instant` | `balanced` | `deep`
 - **Confidence** — `f32` in `[0.0, 1.0]`
 
-### Lanes → providers (managed defaults, refreshed 2026-06-17)
+### Lanes -> providers (managed defaults, refreshed 2026-06-20)
 
-| Lane | Provider | Model | Max tokens | Stream | Notes |
+| Lane | Primary | Fallbacks | Max tokens | Stream | Notes |
 |---|---|---|---|---|---|
-| `instant` | OpenAI | `gpt-5.4-mini` | 512 | yes | First-token latency and cost optimized |
-| `balanced` | Anthropic | `claude-sonnet-4-6-20260115` | 2048 | yes | Default technical/general answer lane |
-| `deep` | Anthropic | `claude-opus-4-8-20260225` | 8192 | yes | Hard coding, architecture, and reasoning-heavy answers |
-| `vision` | OpenAI | `gpt-5.5` | 2048 | yes | Screen analysis / screenshot / multimodal context |
+| `instant` | OpenAI `gpt-5.4-mini` | Gemini Flash-Lite, Claude Haiku, Gemini Flash, Claude Sonnet | 512 | yes | First-token latency and cost optimized |
+| `balanced` | Anthropic `claude-sonnet-4-6` | Gemini Pro, OpenAI `gpt-5.5`, Gemini Flash, OpenAI mini | 2048 | yes | Default technical/general answer lane |
+| `deep` | Anthropic `claude-opus-4-8` | Gemini Pro, OpenAI `gpt-5.5`, Claude Sonnet, Gemini Flash | 8192 | yes | Hard coding, architecture, and reasoning-heavy answers |
+| `vision` | OpenAI `gpt-5.5` | Gemini Pro, Gemini Flash, OpenAI mini | 2048 | yes | Screen analysis / screenshot / multimodal context |
 | `local` | Daemon only | not a managed cloud route | 2048 | yes | Offline/dev fallback before the server |
 
 `StaticPolicy::local_only()` remains available for daemon/dev fallback. Managed
 server routing returns no provider candidates for `local`, so paid customer
 requests never dispatch to a hidden desktop model.
 
-**Evaluated but not enabled in the managed default route:**
-
-- Anthropic `claude-fable-5-20260609`: most capable self-serve Claude in the
-  current model list, but substantially more expensive for routine answers and
-  does not support extended thinking. Keep as a future "max accuracy" lane,
-  not the default Deep lane.
+Gemini is server-side only, just like OpenAI and Anthropic. Customers still see
+simple intent controls, not provider names or local keys.
 - Gemini 3.5 Pro / Flash / Flash-Lite: attractive for multimodal/cost
   diversity, but Bluey does not yet have a Gemini server dispatcher, key pool,
   pricing row, or billing tests. Add as a separate provider-integration round.

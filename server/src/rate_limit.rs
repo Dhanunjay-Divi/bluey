@@ -263,6 +263,8 @@ pub struct RateLimiters {
     pub provider_openai_llm: SharedLimiter,
     /// Provider-wide capacity bucket for Anthropic chat requests.
     pub provider_anthropic_llm: SharedLimiter,
+    /// Provider-wide capacity bucket for Gemini chat/vision requests.
+    pub provider_gemini_llm: SharedLimiter,
     /// Provider-wide capacity bucket for OpenAI embeddings.
     pub provider_openai_embed: SharedLimiter,
     /// Provider-wide capacity bucket for Deepgram STT.
@@ -321,6 +323,13 @@ impl Default for RateLimiters {
                 "BLUEY_LIMIT_PROVIDER_ANTHROPIC_LLM_PER_MIN",
                 300,
                 60,
+                redis.clone(),
+            ),
+            provider_gemini_llm: limiter_from_env(
+                "provider_gemini_llm",
+                "BLUEY_LIMIT_PROVIDER_GEMINI_LLM_PER_MIN",
+                600,
+                120,
                 redis.clone(),
             ),
             provider_openai_embed: limiter_from_env(
@@ -411,6 +420,14 @@ impl RateLimiters {
                 .map_err(|retry| CapacityDenied {
                     retry_after_secs: retry,
                     reason: "provider_anthropic_llm_busy",
+                }),
+            "gemini" => self
+                .provider_gemini_llm
+                .check(&key)
+                .await
+                .map_err(|retry| CapacityDenied {
+                    retry_after_secs: retry,
+                    reason: "provider_gemini_llm_busy",
                 }),
             _ => Ok(()),
         }
@@ -713,6 +730,27 @@ mod tests {
             .unwrap_err();
         assert_eq!(denied.reason, "provider_openai_llm_busy");
         assert!(limits.check_provider_llm("openai", "gpt-4o").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn gemini_provider_capacity_has_own_bucket() {
+        let limits = RateLimiters {
+            provider_gemini_llm: SharedLimiter::new("test_provider_gemini_llm", 60, 1, None),
+            ..RateLimiters::default()
+        };
+        limits
+            .check_provider_llm("gemini", "gemini-3.1-pro-preview")
+            .await
+            .unwrap();
+        let denied = limits
+            .check_provider_llm("gemini", "gemini-3.1-pro-preview")
+            .await
+            .unwrap_err();
+        assert_eq!(denied.reason, "provider_gemini_llm_busy");
+        assert!(limits
+            .check_provider_llm("openai", "gpt-5.5")
+            .await
+            .is_ok());
     }
 
     #[test]

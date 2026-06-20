@@ -1,6 +1,6 @@
 # Bluey Model Routing
 
-Last updated: 2026-06-10
+Last updated: 2026-06-20
 
 This document is the source-of-truth snapshot for the model/provider routing
 currently implemented in the Bluey codebase. It is intentionally operational:
@@ -17,8 +17,8 @@ actual upstream models.
 | --- | --- | --- | --- |
 | `instant` | OpenAI | `gpt-5.4-mini` | Easy questions, quick answers, optional cheap draft |
 | `balanced` | Anthropic | `claude-sonnet-4-6` | Default technical/general answer |
-| `deep` | Anthropic | `claude-sonnet-4-6` | Hard coding, system design, long reasoning with a larger thinking/output budget |
-| `vision` | OpenAI | `gpt-5.4` | Analyse Screen, screenshots, image context |
+| `deep` | Anthropic | `claude-opus-4-8` | Hard coding, system design, long reasoning with a larger thinking/output budget |
+| `vision` | OpenAI | `gpt-5.5` | Analyse Screen, screenshots, image context |
 
 ## Thinking Budget Policy
 
@@ -58,7 +58,7 @@ Request overrides use the same concepts:
 
 Provider mapping today:
 
-- Anthropic `claude-sonnet-4-6` maps to `thinking:
+- Anthropic `claude-opus-4-8` and `claude-sonnet-4-6` map to `thinking:
   {"type":"enabled","budget_tokens":...}` and reserves enough
   `max_tokens` for both thinking and visible answer text. The Haiku fallback
   also supports the same manual thinking payload when a caller explicitly asks
@@ -68,8 +68,9 @@ Provider mapping today:
   in the route table are Chat Completions compatible; switching OpenAI managed
   routes to the Responses API is the right future hook for explicit OpenAI
   reasoning controls.
-- Gemini thinking controls are not wired today because Gemini is not in the
-  managed route table yet.
+- Gemini is wired as a managed text/vision candidate. We pass output token and
+  temperature controls today; explicit thinking-budget controls are left to a
+  future Gemini-specific pass once live quality/cost measurements are in.
 
 This gives us the operational knob the user asked for without making every
 easy question slower or more expensive.
@@ -80,10 +81,10 @@ temporarily busy, Bluey tries the next candidate before returning an error.
 
 | Lane | Candidate order |
 | --- | --- |
-| `instant` | OpenAI `gpt-5.4-mini` -> Anthropic `claude-haiku-4-5-20251001` |
-| `balanced` | Anthropic `claude-sonnet-4-6` -> OpenAI `gpt-5.4` |
-| `deep` | Anthropic `claude-sonnet-4-6` -> OpenAI `gpt-5.4` -> Anthropic `claude-haiku-4-5-20251001` |
-| `vision` | OpenAI `gpt-5.4` -> OpenAI `gpt-5.4-mini` |
+| `instant` | OpenAI `gpt-5.4-mini` -> Gemini `gemini-3.1-flash-lite` -> Anthropic `claude-haiku-4-5-20251001` -> Gemini `gemini-3-flash-preview` -> Anthropic `claude-sonnet-4-6` |
+| `balanced` | Anthropic `claude-sonnet-4-6` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Gemini `gemini-3-flash-preview` -> OpenAI `gpt-5.4-mini` |
+| `deep` | Anthropic `claude-opus-4-8` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Anthropic `claude-sonnet-4-6` -> Gemini `gemini-3-flash-preview` |
+| `vision` | OpenAI `gpt-5.5` -> Gemini `gemini-3.1-pro-preview` -> Gemini `gemini-3-flash-preview` -> OpenAI `gpt-5.4-mini` |
 
 Every managed LLM candidate above has a matching entry in
 `server/src/pricing/mod.rs`; the dispatcher unit tests assert this so an
@@ -119,6 +120,7 @@ Default server knobs:
 | --- | ---: | --- |
 | `BLUEY_LIMIT_PROVIDER_OPENAI_LLM_PER_MIN` | 900/min, burst 180 | OpenAI chat/vision capacity |
 | `BLUEY_LIMIT_PROVIDER_ANTHROPIC_LLM_PER_MIN` | 300/min, burst 60 | Anthropic chat capacity |
+| `BLUEY_LIMIT_PROVIDER_GEMINI_LLM_PER_MIN` | 600/min, burst 120 | Gemini text/vision capacity |
 | `BLUEY_LIMIT_PROVIDER_OPENAI_EMBED_PER_MIN` | 900/min, burst 180 | OpenAI embedding capacity |
 | `BLUEY_LIMIT_PROVIDER_DEEPGRAM_STT_PER_MIN` | 600/min, burst 120 | Deepgram STT capacity |
 | `BLUEY_LIMIT_PROVIDER_OPENAI_STT_PER_MIN` | 600/min, burst 120 | OpenAI STT fallback capacity |
@@ -133,8 +135,9 @@ Each capacity env var also supports a `_BURST` suffix, for example
 `BLUEY_LIMIT_PROVIDER_OPENAI_LLM_PER_MIN_BURST=240`.
 
 Provider keys can be supplied either as single-key env vars (`OPENAI_API_KEY`,
-`ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY`) or as comma-separated, provider-approved
-key pools (`OPENAI_API_KEYS`, `ANTHROPIC_API_KEYS`, `DEEPGRAM_API_KEYS`). Bluey
+`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `DEEPGRAM_API_KEY`) or
+as comma-separated, provider-approved key pools (`OPENAI_API_KEYS`,
+`ANTHROPIC_API_KEYS`, `GEMINI_API_KEYS`, `GOOGLE_API_KEYS`, `DEEPGRAM_API_KEYS`). Bluey
 shards requests across the pool. This is for approved capacity across projects,
 regions, or enterprise allocations; do not use it for provider-limit evasion.
 
@@ -283,8 +286,8 @@ should keep multiple providers and route by task:
 | --- | --- | --- | --- |
 | Fast easy answer | OpenAI `gpt-5.4-mini` instant lane | Low latency with much stronger 2026-era baseline quality than the old 4o-mini route | Not ideal for deep reasoning |
 | Human-like technical answer | Anthropic `claude-sonnet-4-6` balanced lane | Strong prose, coding, and reasoning style | Higher latency/cost than fast mini models |
-| Deep coding/system design | Anthropic Sonnet lane with thinking budget, OpenAI `gpt-5.4` fallback | Better multi-step structure and safer tradeoff analysis | More output/thinking tokens, costlier |
-| Screen/image analysis | OpenAI `gpt-5.4` vision lane today; evaluate Gemini vision later | Strong current integration with text+image input through Chat Completions | Gemini may be cheaper/better for some image workloads but is not wired |
+| Deep coding/system design | Anthropic Opus lane with thinking budget, Gemini Pro/OpenAI fallback | Better multi-step structure and safer tradeoff analysis | More output/thinking tokens, costlier |
+| Screen/image analysis | OpenAI `gpt-5.5` vision lane with Gemini Pro/Flash fallback | Strong current integration with text+image input and a second multimodal provider | Needs live smoke to tune quality/cost ordering |
 | Internal offline fallback | Local Whisper/Ollama behind dev flags | Helps demos and outage drills | Not a customer mode; not reliable enough as primary paid experience |
 
 Decision: **have all providers behind the router, expose Auto/Balanced/Deep as
@@ -310,12 +313,12 @@ server route table is the product control plane:
   Completions, so use Chat-compatible GPT-5.4 family models until the server
   has a Responses API path for explicit reasoning controls.
 - **Keep Anthropic** for human-like technical/system-design answers and long
-  structured reasoning. `claude-sonnet-4-6` is the conservative default because
-  it preserves the Messages API shape and supports manual extended thinking in
-  the current dispatcher.
-- **Add Gemini only as a measured server-side candidate** after managed smoke
-  and a real Gemini dispatcher exists: likely first for vision and cheap/fast
-  multimodal fallback, not as a visible customer dropdown item.
+  structured reasoning. `claude-sonnet-4-6` is the balanced default;
+  `claude-opus-4-8` owns the Deep lane when budget allows.
+- **Keep Gemini as a measured server-side candidate** for cheap/fast text
+  fallback, Pro-quality multimodal fallback, and provider-capacity resilience.
+  It remains hidden behind Auto rather than becoming a visible customer vendor
+  dropdown.
 - **Keep Deepgram primary for live STT** and OpenAI Realtime/chunked
   transcription as cloud fallback. LocalWhisper stays hidden/offline/dev.
 - **Do not expose Local** in paid UI. If cloud is unavailable, local fallback can

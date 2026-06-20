@@ -37,6 +37,7 @@ async fn boot_harness() -> Harness {
     boot_harness_with_upstream(UpstreamKeys {
         openai_api_key: Some("sk-test-openai".to_string()),
         anthropic_api_key: Some("sk-test-anthropic".to_string()),
+        gemini_api_key: None,
         deepgram_api_key: Some("dg-test".to_string()),
         ollama_base_url: None,
     })
@@ -361,6 +362,7 @@ async fn router_complete_upstream_spend_guard_blocks_before_provider_hit() {
         UpstreamKeys {
             openai_api_key: Some("sk-test-openai".to_string()),
             anthropic_api_key: Some("sk-test-anthropic".to_string()),
+            gemini_api_key: None,
             deepgram_api_key: Some("dg-test".to_string()),
             ollama_base_url: None,
         },
@@ -705,7 +707,7 @@ async fn router_complete_stream_proxies_anthropic_messages_sse() {
     assert!(second_delta < billing, "delta must arrive before billing");
     assert!(body.contains("\"text\":\"Deep answer\""));
     assert!(body.contains("\"provider\":\"anthropic\""));
-    assert!(body.contains("\"model\":\"claude-sonnet-4-6-20260115\""));
+    assert!(body.contains("\"model\":\"claude-sonnet-4-6\""));
     assert!(body.contains("\"input_tokens\":20"));
     assert!(body.contains("\"output_tokens\":6"));
     assert!(body.contains("data: [DONE]"));
@@ -818,6 +820,7 @@ async fn router_complete_retries_next_openai_key_on_429_without_customer_wait() 
     let upstream = UpstreamKeys {
         openai_api_key: Some("sk-openai-a,sk-openai-b".to_string()),
         anthropic_api_key: Some("sk-test-anthropic".to_string()),
+        gemini_api_key: None,
         deepgram_api_key: Some("dg-test".to_string()),
         ollama_base_url: None,
     };

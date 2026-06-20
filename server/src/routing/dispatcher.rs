@@ -32,9 +32,12 @@ use crate::config::UpstreamKeys;
 
 const OPENAI_FAST_MODEL: &str = "gpt-5.4-mini";
 const OPENAI_ACCURATE_MODEL: &str = "gpt-5.5";
-const ANTHROPIC_BALANCED_MODEL: &str = "claude-sonnet-4-6-20260115";
-const ANTHROPIC_DEEP_MODEL: &str = "claude-opus-4-8-20260225";
+const ANTHROPIC_BALANCED_MODEL: &str = "claude-sonnet-4-6";
+const ANTHROPIC_DEEP_MODEL: &str = "claude-opus-4-8";
 const ANTHROPIC_FAST_MODEL: &str = "claude-haiku-4-5-20251001";
+const GEMINI_PRO_MODEL: &str = "gemini-3.1-pro-preview";
+const GEMINI_FLASH_MODEL: &str = "gemini-3-flash-preview";
+const GEMINI_LITE_MODEL: &str = "gemini-3.1-flash-lite";
 
 #[derive(Debug, Error)]
 #[error("{provider} upstream http {status}")]
@@ -275,17 +278,22 @@ pub fn resolve_route_candidates(lane: &str) -> Vec<(&'static str, &'static str)>
     match lane {
         "instant" => vec![
             ("openai", OPENAI_FAST_MODEL),
+            ("gemini", GEMINI_LITE_MODEL),
             ("anthropic", ANTHROPIC_FAST_MODEL),
+            ("gemini", GEMINI_FLASH_MODEL),
             ("anthropic", ANTHROPIC_BALANCED_MODEL),
         ],
         "deep" => vec![
             ("anthropic", ANTHROPIC_DEEP_MODEL),
+            ("gemini", GEMINI_PRO_MODEL),
             ("openai", OPENAI_ACCURATE_MODEL),
             ("anthropic", ANTHROPIC_BALANCED_MODEL),
-            ("anthropic", ANTHROPIC_FAST_MODEL),
+            ("gemini", GEMINI_FLASH_MODEL),
         ],
         "vision" => vec![
             ("openai", OPENAI_ACCURATE_MODEL),
+            ("gemini", GEMINI_PRO_MODEL),
+            ("gemini", GEMINI_FLASH_MODEL),
             ("openai", OPENAI_FAST_MODEL),
         ],
         // The managed cloud never dispatches local/on-device models. Local
@@ -294,7 +302,9 @@ pub fn resolve_route_candidates(lane: &str) -> Vec<(&'static str, &'static str)>
         "local" => vec![],
         _ => vec![
             ("anthropic", ANTHROPIC_BALANCED_MODEL),
+            ("gemini", GEMINI_PRO_MODEL),
             ("openai", OPENAI_ACCURATE_MODEL),
+            ("gemini", GEMINI_FLASH_MODEL),
             ("openai", OPENAI_FAST_MODEL),
         ], // balanced default
     }
@@ -360,6 +370,23 @@ pub async fn complete(
             )
             .await
         }
+        "gemini" => {
+            let key = keys
+                .gemini_key(&format!("chat:{model}:{system}:{user}"))
+                .ok_or_else(|| anyhow!("GEMINI_API_KEY(S) not configured on bluey-server"))?;
+            gemini_complete(
+                key,
+                model,
+                system,
+                user,
+                max_tokens,
+                temperature,
+                thinking,
+                fallback_input_tokens,
+                image_data_urls,
+            )
+            .await
+        }
         // Codex S4.4: explicit failure for unsupported providers
         // including `ollama` (which only the daemon's local fallback
         // path should run).
@@ -411,6 +438,20 @@ pub async fn complete_with_key(
             )
             .await
         }
+        "gemini" => {
+            gemini_complete(
+                api_key,
+                model,
+                system,
+                user,
+                max_tokens,
+                temperature,
+                thinking,
+                fallback_input_tokens,
+                image_data_urls,
+            )
+            .await
+        }
         other => Err(anyhow!(
             "unsupported provider for managed dispatch: {other}"
         )),
@@ -447,6 +488,20 @@ pub async fn complete_stream_with_key(
         }
         "anthropic" => {
             anthropic_complete_stream(
+                api_key,
+                model,
+                system,
+                user,
+                max_tokens,
+                temperature,
+                thinking,
+                fallback_input_tokens,
+                image_data_urls,
+            )
+            .await
+        }
+        "gemini" => {
+            gemini_complete_stream(
                 api_key,
                 model,
                 system,
@@ -810,6 +865,375 @@ fn openai_user_content<'a>(
     OpenAiMessageContent::Parts(parts)
 }
 
+// ─── Gemini ──────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct GeminiGenerateReq {
+    contents: Vec<GeminiContent>,
+    #[serde(rename = "systemInstruction", skip_serializing_if = "Option::is_none")]
+    system_instruction: Option<GeminiSystemInstruction>,
+    #[serde(rename = "generationConfig", skip_serializing_if = "Option::is_none")]
+    generation_config: Option<GeminiGenerationConfig>,
+}
+
+#[derive(Serialize)]
+struct GeminiContent {
+    role: &'static str,
+    parts: Vec<GeminiPart>,
+}
+
+#[derive(Serialize)]
+struct GeminiSystemInstruction {
+    parts: Vec<GeminiPart>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum GeminiPart {
+    Text {
+        text: String,
+    },
+    InlineData {
+        #[serde(rename = "inlineData")]
+        inline_data: GeminiInlineData,
+    },
+}
+
+#[derive(Serialize)]
+struct GeminiInlineData {
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    data: String,
+}
+
+#[derive(Serialize)]
+struct GeminiGenerationConfig {
+    #[serde(rename = "maxOutputTokens", skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+}
+
+#[derive(Deserialize)]
+struct GeminiGenerateResp {
+    #[serde(default)]
+    candidates: Vec<GeminiCandidate>,
+    #[serde(rename = "usageMetadata")]
+    usage_metadata: Option<GeminiUsage>,
+    error: Option<GeminiError>,
+}
+
+#[derive(Deserialize)]
+struct GeminiCandidate {
+    content: Option<GeminiRespContent>,
+}
+
+#[derive(Deserialize)]
+struct GeminiRespContent {
+    #[serde(default)]
+    parts: Vec<GeminiRespPart>,
+}
+
+#[derive(Deserialize)]
+struct GeminiRespPart {
+    text: Option<String>,
+}
+
+#[derive(Clone, Deserialize)]
+struct GeminiUsage {
+    #[serde(rename = "promptTokenCount")]
+    prompt_token_count: Option<i64>,
+    #[serde(rename = "candidatesTokenCount")]
+    candidates_token_count: Option<i64>,
+    #[serde(rename = "totalTokenCount")]
+    total_token_count: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct GeminiError {
+    message: Option<String>,
+    status: Option<String>,
+}
+
+impl GeminiGenerateResp {
+    fn text(self) -> String {
+        self.candidates
+            .into_iter()
+            .filter_map(|candidate| candidate.content)
+            .flat_map(|content| content.parts)
+            .filter_map(|part| part.text)
+            .collect::<Vec<_>>()
+            .join("")
+    }
+}
+
+impl GeminiUsage {
+    fn token_counts(&self, fallback_input_tokens: i64) -> (i64, i64) {
+        let input_tokens = self.prompt_token_count.unwrap_or(fallback_input_tokens);
+        let output_tokens = self
+            .candidates_token_count
+            .or_else(|| {
+                self.total_token_count
+                    .zip(Some(input_tokens))
+                    .map(|(total, input)| total.saturating_sub(input).max(0))
+            })
+            .unwrap_or(0);
+        (input_tokens, output_tokens)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn gemini_complete(
+    key: &str,
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    thinking: ThinkingBudget,
+    fallback_input_tokens: Option<i64>,
+    image_data_urls: &[String],
+) -> Result<Completion> {
+    let req = gemini_generate_req(system, user, max_tokens, temperature, thinking, image_data_urls)?;
+    let resp = reqwest::Client::new()
+        .post(gemini_url(model, false))
+        .query(&[("key", key)])
+        .json(&req)
+        .send()
+        .await
+        .context("gemini http")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let error = upstream_http_error("gemini", status, resp.headers());
+        let _ = resp.text().await.unwrap_or_default();
+        return Err(error);
+    }
+    let parsed: GeminiGenerateResp = resp.json().await.context("gemini json")?;
+    if let Some(error) = parsed.error {
+        return Err(anyhow!(
+            "gemini error: {}",
+            error
+                .message
+                .or(error.status)
+                .unwrap_or_else(|| "unknown upstream error".to_string())
+        ));
+    }
+    let fallback_input = fallback_input_tokens.unwrap_or(0);
+    let (input_tokens, output_tokens) = parsed
+        .usage_metadata
+        .as_ref()
+        .map(|usage| usage.token_counts(fallback_input))
+        .unwrap_or((fallback_input, 0));
+    Ok(Completion {
+        text: parsed.text(),
+        provider: "gemini".to_string(),
+        model: model.to_string(),
+        input_tokens,
+        output_tokens,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn gemini_complete_stream(
+    key: &str,
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    thinking: ThinkingBudget,
+    fallback_input_tokens: Option<i64>,
+    image_data_urls: &[String],
+) -> Result<StreamingCompletion> {
+    let req = gemini_generate_req(system, user, max_tokens, temperature, thinking, image_data_urls)?;
+    let resp = reqwest::Client::new()
+        .post(gemini_url(model, true))
+        .query(&[("key", key), ("alt", "sse")])
+        .json(&req)
+        .send()
+        .await
+        .context("gemini stream http")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let error = upstream_http_error("gemini", status, resp.headers());
+        let _ = resp.text().await.unwrap_or_default();
+        return Err(error);
+    }
+
+    let provider = "gemini".to_string();
+    let model_string = model.to_string();
+    let fallback_input = fallback_input_tokens.unwrap_or(0);
+    let mut bytes = resp.bytes_stream();
+    let stream = async_stream::try_stream! {
+        let mut buffer = String::new();
+        let mut pending_utf8 = Vec::new();
+        let mut final_usage: Option<GeminiUsage> = None;
+        let mut seen_done = false;
+
+        while let Some(chunk) = bytes.next().await {
+            let chunk = chunk.context("gemini stream read")?;
+            append_utf8_chunk(&chunk, &mut pending_utf8, &mut buffer)?;
+            while let Some((_, data)) = take_sse_event(&mut buffer) {
+                let data = data.trim();
+                if data.is_empty() {
+                    continue;
+                }
+                if data == "[DONE]" {
+                    seen_done = true;
+                    continue;
+                }
+                for delta in parse_gemini_stream_chunk(data, &mut final_usage)? {
+                    yield CompletionStreamEvent::Delta(delta);
+                }
+            }
+        }
+        if !pending_utf8.is_empty() {
+            let tail = std::str::from_utf8(&pending_utf8).context("gemini stream trailing utf8")?;
+            buffer.push_str(tail);
+        }
+        while let Some((_, data)) = take_sse_event(&mut buffer) {
+            let data = data.trim();
+            if data.is_empty() {
+                continue;
+            }
+            if data == "[DONE]" {
+                seen_done = true;
+                continue;
+            }
+            for delta in parse_gemini_stream_chunk(data, &mut final_usage)? {
+                yield CompletionStreamEvent::Delta(delta);
+            }
+        }
+        if seen_done && final_usage.is_none() {
+            Err::<(), anyhow::Error>(anyhow!("gemini stream ended before final usage"))?;
+        }
+        let usage = final_usage
+            .ok_or_else(|| anyhow!("gemini stream ended before final usage"))?;
+        let (input_tokens, output_tokens) = usage.token_counts(fallback_input);
+        yield CompletionStreamEvent::Done {
+            input_tokens,
+            output_tokens,
+        };
+    };
+
+    Ok(StreamingCompletion {
+        provider,
+        model: model_string,
+        events: Box::pin(stream),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gemini_generate_req(
+    system: &str,
+    user: &str,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    thinking: ThinkingBudget,
+    image_data_urls: &[String],
+) -> Result<GeminiGenerateReq> {
+    let mut parts = Vec::with_capacity(image_data_urls.len() + 1);
+    parts.push(GeminiPart::Text {
+        text: user.to_string(),
+    });
+    for data_url in image_data_urls {
+        parts.push(GeminiPart::InlineData {
+            inline_data: gemini_inline_data_from_data_url(data_url)?,
+        });
+    }
+    Ok(GeminiGenerateReq {
+        contents: vec![GeminiContent {
+            role: "user",
+            parts,
+        }],
+        system_instruction: if system.trim().is_empty() {
+            None
+        } else {
+            Some(GeminiSystemInstruction {
+                parts: vec![GeminiPart::Text {
+                    text: system.to_string(),
+                }],
+            })
+        },
+        generation_config: Some(GeminiGenerationConfig {
+            max_output_tokens: Some(effective_max_output_tokens(max_tokens, thinking)),
+            temperature,
+        }),
+    })
+}
+
+fn gemini_inline_data_from_data_url(data_url: &str) -> Result<GeminiInlineData> {
+    let rest = data_url
+        .strip_prefix("data:")
+        .ok_or_else(|| anyhow!("gemini image payload must be a data URL"))?;
+    let (metadata, data) = rest
+        .split_once(',')
+        .ok_or_else(|| anyhow!("gemini image data URL is missing payload"))?;
+    let mut metadata_parts = metadata.split(';');
+    let mime_type = metadata_parts
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("gemini image data URL is missing MIME type"))?;
+    let is_base64 = metadata_parts.any(|part| part.eq_ignore_ascii_case("base64"));
+    if !is_base64 {
+        return Err(anyhow!("gemini image data URL must be base64 encoded"));
+    }
+    if !matches!(
+        mime_type,
+        "image/png" | "image/jpeg" | "image/webp" | "image/gif"
+    ) {
+        return Err(anyhow!("unsupported gemini image MIME type: {mime_type}"));
+    }
+    if data.trim().is_empty() {
+        return Err(anyhow!("gemini image data URL has an empty payload"));
+    }
+    Ok(GeminiInlineData {
+        mime_type: mime_type.to_string(),
+        data: data.to_string(),
+    })
+}
+
+fn gemini_url(model: &str, stream: bool) -> String {
+    let method = if stream {
+        "streamGenerateContent"
+    } else {
+        "generateContent"
+    };
+    override_url(
+        &format!("https://generativelanguage.googleapis.com/v1beta/models/{model}:{method}"),
+        "BLUEY_TEST_GEMINI_URL",
+    )
+}
+
+fn parse_gemini_stream_chunk(
+    data: &str,
+    final_usage: &mut Option<GeminiUsage>,
+) -> Result<Vec<String>> {
+    let parsed: GeminiGenerateResp =
+        serde_json::from_str(data).with_context(|| format!("gemini stream json: {data}"))?;
+    if let Some(error) = parsed.error {
+        return Err(anyhow!(
+            "gemini stream error: {}",
+            error
+                .message
+                .or(error.status)
+                .unwrap_or_else(|| "unknown upstream error".to_string())
+        ));
+    }
+    if let Some(usage) = parsed.usage_metadata.clone() {
+        *final_usage = Some(usage);
+    }
+    Ok(parsed
+        .candidates
+        .into_iter()
+        .filter_map(|candidate| candidate.content)
+        .flat_map(|content| content.parts)
+        .filter_map(|part| part.text)
+        .filter(|text| !text.is_empty())
+        .collect())
+}
+
 // ─── Anthropic ───────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -873,7 +1297,7 @@ async fn anthropic_complete(
 ) -> Result<Completion> {
     if !image_data_urls.is_empty() {
         return Err(anyhow!(
-            "image payloads are only supported by the OpenAI vision route"
+            "image payloads are only supported by managed vision routes"
         ));
     }
 
@@ -985,7 +1409,7 @@ async fn anthropic_complete_stream(
 ) -> Result<StreamingCompletion> {
     if !image_data_urls.is_empty() {
         return Err(anyhow!(
-            "image payloads are only supported by the OpenAI vision route"
+            "image payloads are only supported by managed vision routes"
         ));
     }
 
@@ -1512,18 +1936,15 @@ mod tests {
         assert_eq!(resolve_route("instant"), ("openai", "gpt-5.4-mini"));
         assert_eq!(
             resolve_route("balanced"),
-            ("anthropic", "claude-sonnet-4-6-20260115"),
+            ("anthropic", "claude-sonnet-4-6"),
         );
-        assert_eq!(
-            resolve_route("deep"),
-            ("anthropic", "claude-opus-4-8-20260225"),
-        );
+        assert_eq!(resolve_route("deep"), ("anthropic", "claude-opus-4-8"),);
         assert_eq!(resolve_route("vision"), ("openai", "gpt-5.5"));
         assert_eq!(resolve_route("local"), ("unsupported", "local"));
         // Unknown → balanced default.
         assert_eq!(
             resolve_route("???"),
-            ("anthropic", "claude-sonnet-4-6-20260115"),
+            ("anthropic", "claude-sonnet-4-6"),
         );
     }
 
@@ -1533,30 +1954,40 @@ mod tests {
             resolve_route_candidates("instant"),
             vec![
                 ("openai", "gpt-5.4-mini"),
+                ("gemini", "gemini-3.1-flash-lite"),
                 ("anthropic", "claude-haiku-4-5-20251001"),
-                ("anthropic", "claude-sonnet-4-6-20260115")
+                ("gemini", "gemini-3-flash-preview"),
+                ("anthropic", "claude-sonnet-4-6")
             ]
         );
         assert_eq!(
             resolve_route_candidates("balanced"),
             vec![
-                ("anthropic", "claude-sonnet-4-6-20260115"),
+                ("anthropic", "claude-sonnet-4-6"),
+                ("gemini", "gemini-3.1-pro-preview"),
                 ("openai", "gpt-5.5"),
+                ("gemini", "gemini-3-flash-preview"),
                 ("openai", "gpt-5.4-mini")
             ]
         );
         assert_eq!(
             resolve_route_candidates("deep"),
             vec![
-                ("anthropic", "claude-opus-4-8-20260225"),
+                ("anthropic", "claude-opus-4-8"),
+                ("gemini", "gemini-3.1-pro-preview"),
                 ("openai", "gpt-5.5"),
-                ("anthropic", "claude-sonnet-4-6-20260115"),
-                ("anthropic", "claude-haiku-4-5-20251001")
+                ("anthropic", "claude-sonnet-4-6"),
+                ("gemini", "gemini-3-flash-preview")
             ]
         );
         assert_eq!(
             resolve_route_candidates("vision"),
-            vec![("openai", "gpt-5.5"), ("openai", "gpt-5.4-mini")]
+            vec![
+                ("openai", "gpt-5.5"),
+                ("gemini", "gemini-3.1-pro-preview"),
+                ("gemini", "gemini-3-flash-preview"),
+                ("openai", "gpt-5.4-mini")
+            ]
         );
         assert!(
             resolve_route_candidates("local").is_empty(),
@@ -1612,6 +2043,56 @@ mod tests {
     }
 
     #[test]
+    fn gemini_generate_req_serializes_text_and_image_parts() {
+        let images = vec!["data:image/png;base64,aGVsbG8=".to_string()];
+        let req = gemini_generate_req(
+            "answer clearly",
+            "What is on screen?",
+            Some(1024),
+            Some(0.2),
+            ThinkingBudget::off(),
+            &images,
+        )
+        .unwrap();
+        let value = serde_json::to_value(req).unwrap();
+
+        assert_eq!(value["systemInstruction"]["parts"][0]["text"], "answer clearly");
+        assert_eq!(value["contents"][0]["role"], "user");
+        assert_eq!(value["contents"][0]["parts"][0]["text"], "What is on screen?");
+        assert_eq!(
+            value["contents"][0]["parts"][1]["inlineData"]["mimeType"],
+            "image/png"
+        );
+        assert_eq!(value["generationConfig"]["maxOutputTokens"], 1024);
+    }
+
+    #[test]
+    fn gemini_stream_error_frame_is_not_treated_as_empty_success() {
+        let mut usage = None;
+        let err = parse_gemini_stream_chunk(
+            r#"{"error":{"message":"provider overloaded","status":"RESOURCE_EXHAUSTED"}}"#,
+            &mut usage,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("provider overloaded"));
+        assert!(usage.is_none());
+    }
+
+    #[test]
+    fn gemini_stream_chunk_tracks_final_usage() {
+        let mut usage = None;
+        let deltas = parse_gemini_stream_chunk(
+            r#"{"candidates":[{"content":{"parts":[{"text":"hello"}]}}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"totalTokenCount":10}}"#,
+            &mut usage,
+        )
+        .unwrap();
+
+        assert_eq!(deltas, vec!["hello"]);
+        assert_eq!(usage.unwrap().token_counts(0), (7, 3));
+    }
+
+    #[test]
     fn openai_stream_error_frame_is_not_treated_as_empty_success() {
         let mut usage = None;
         let err = parse_openai_stream_chunk(
@@ -1649,7 +2130,7 @@ mod tests {
         let images = vec!["data:image/png;base64,aGVsbG8=".to_string()];
         let err = anthropic_complete(
             "sk-test",
-            "claude-sonnet-4-6-20260115",
+            "claude-sonnet-4-6",
             "system",
             "user",
             None,
@@ -1662,7 +2143,7 @@ mod tests {
         .unwrap_err();
         assert!(err
             .to_string()
-            .contains("image payloads are only supported by the OpenAI vision route"));
+            .contains("image payloads are only supported by managed vision routes"));
     }
 
     #[test]
@@ -1709,17 +2190,17 @@ mod tests {
 
     #[test]
     fn openai_limit_fields_use_effective_output_budget() {
-        std::env::remove_var("BLUEY_MAX_OUTPUT_TOKENS");
         let off = ThinkingBudget::off();
+        let expected = effective_max_output_tokens(Some(8000), off);
 
         let (max_tokens, max_completion_tokens) =
             openai_effective_token_limit_fields("gpt-5.4-mini", Some(8000), off);
         assert_eq!(max_tokens, None);
-        assert_eq!(max_completion_tokens, Some(DEFAULT_MAX_OUTPUT_TOKENS));
+        assert_eq!(max_completion_tokens, Some(expected));
 
         let (max_tokens, max_completion_tokens) =
             openai_effective_token_limit_fields("gpt-4o", Some(8000), off);
-        assert_eq!(max_tokens, Some(DEFAULT_MAX_OUTPUT_TOKENS));
+        assert_eq!(max_tokens, Some(expected));
         assert_eq!(max_completion_tokens, None);
     }
 
@@ -1737,10 +2218,10 @@ mod tests {
     #[test]
     fn anthropic_manual_thinking_only_for_known_supported_models() {
         let budget = resolve_thinking_budget("deep", None, None);
-        let enabled = anthropic_thinking_for("claude-opus-4-8-20260225", budget).unwrap();
+        let enabled = anthropic_thinking_for("claude-opus-4-8", budget).unwrap();
         assert_eq!(enabled.ty, "enabled");
         assert_eq!(enabled.budget_tokens, 4096);
-        assert!(anthropic_thinking_for("claude-sonnet-4-6-20260115", budget).is_some());
+        assert!(anthropic_thinking_for("claude-sonnet-4-6", budget).is_some());
         assert!(anthropic_thinking_for("claude-haiku-4-5-20251001", budget).is_some());
         assert!(anthropic_thinking_for("claude-fable-5-20260609", budget).is_none());
         assert!(anthropic_thinking_for("gpt-5.5", budget).is_none());
