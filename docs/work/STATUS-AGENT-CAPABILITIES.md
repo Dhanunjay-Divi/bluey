@@ -76,6 +76,17 @@ Refs: openai/codex #21079/#14389; anthropics/claude-code #28791/#49775/#63082/#5
 github/copilot-cli #3816; discuss.ai.google.dev "Antigravity 2.0 IDE/CLI shared brain";
 deployhq.com Cursor 2026 guide.
 
+**Did the CLI tests accidentally show App sessions? NO — verified 2026-06-19.**
+`bluey agent sessions claude_code` (36 ids) vs `claude_code_app` (19 ids) = **0 overlap**.
+So the CLI test exercised CLI sessions only; the App test exercised the 19 App sessions only —
+neither contaminated the other (which is what makes both valid as separate-surface tests).
+Nuance for Claude specifically: the App sessions' underlying JSONL files DO live in the CLI
+store (18/19 are the same `~/.claude/projects/*.jsonl`), BUT (a) the CLI list is capped at ~40
+recent of 870 files, and (b) a dedup (`summaries.rs`: `claimed_by_app` filter) explicitly
+removes app-claimed sessions from the CLI list — so each Claude conversation appears in EXACTLY
+ONE surface's list, never both. For Codex/Cursor/Antigravity/Copilot the App stores are
+physically separate from the CLI, so there's no file overlap at all.
+
 **Implication for Bluey:** because surfaces DON'T natively share, each GUI surface is a
 genuinely distinct store that needs its own 5-cap pass — which is exactly why
 `claude_code_app` and `vs_code_fork` were tested separately from their CLIs (both 5/5).
