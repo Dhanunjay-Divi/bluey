@@ -55,11 +55,46 @@ pub fn read_connectors(path: &Path) -> Vec<Connector> {
             return Vec::new();
         }
     };
-    parse_connectors(&raw, &path.display().to_string())
+    // Codex uses TOML (`config.toml` `[mcp_servers.*]`); every other agent uses
+    // JSON. Dispatch by extension so the right parser runs.
+    if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+        parse_connectors_toml(&raw, &path.display().to_string())
+    } else {
+        parse_connectors(&raw, &path.display().to_string())
+    }
 }
 
-/// Parse connectors from raw config text (JSONC-tolerant). Separated from IO
-/// so it can be unit-tested directly against fixture strings.
+/// Parse connectors from Codex's TOML config, whose servers live in
+/// `[mcp_servers.<name>]` tables. Each server table is re-encoded as JSON and
+/// fed to the SHARED [`classify_server`] — so the secret-free classification
+/// (command/args/url + env *presence* only, never values) is identical across
+/// the JSON and TOML formats, with no duplicated logic.
+pub fn parse_connectors_toml(raw: &str, source_label: &str) -> Vec<Connector> {
+    let value: toml::Value = match raw.parse() {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(source = source_label, error = %e, "codex toml config parse failed");
+            return Vec::new();
+        }
+    };
+
+    let Some(servers) = value.get("mcp_servers").and_then(|v| v.as_table()) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::with_capacity(servers.len());
+    for (name, spec) in servers {
+        if let Ok(json_spec) = serde_json::to_value(spec) {
+            if let Some(conn) = classify_server(name, &json_spec) {
+                out.push(conn);
+            }
+        }
+    }
+    out
+}
+
+/// Parse connectors from raw JSON(C) config text (JSONC-tolerant). Separated from
+/// IO so it can be unit-tested directly against fixture strings.
 pub fn parse_connectors(raw: &str, source_label: &str) -> Vec<Connector> {
     let cleaned = strip_jsonc(raw);
     let value: serde_json::Value = match serde_json::from_str(&cleaned) {
@@ -316,6 +351,52 @@ mod tests {
         } }"#;
         let conns = parse_connectors(raw, "fixture");
         assert!(conns.iter().all(|c| c.auth_tier == AuthTier::None_));
+    }
+
+    #[test]
+    fn test_codex_toml_mcp_servers_parse_secret_free() {
+        // Codex's real config shape (~/.codex/config.toml): `[mcp_servers.<name>]`
+        // tables with command/args/env, plus an http server with a url. The env
+        // block carries a SECRET value — it must classify as EnvAuth but the value
+        // must NEVER appear in the output (the privacy USP).
+        let raw = r#"
+[mcp_servers.context7]
+command = "npx"
+args = ["-y", "@upstash/context7-mcp"]
+
+[mcp_servers.supabase]
+command = "npx"
+args = ["-y", "supabase-mcp"]
+[mcp_servers.supabase.env]
+SUPABASE_ACCESS_TOKEN = "sbp_THIS_IS_A_SECRET_DO_NOT_LEAK"
+
+[mcp_servers.remote]
+url = "https://mcp.example.com/mcp?api_key=ALSO_SECRET"
+"#;
+        let conns = parse_connectors_toml(raw, "codex-fixture");
+        assert_eq!(conns.len(), 3, "all three TOML mcp_servers parsed");
+
+        let supabase = conns.iter().find(|c| c.name == "supabase").unwrap();
+        assert_eq!(
+            supabase.auth_tier,
+            AuthTier::EnvAuth,
+            "env block → EnvAuth (presence only)"
+        );
+
+        let context7 = conns.iter().find(|c| c.name == "context7").unwrap();
+        assert_eq!(context7.auth_tier, AuthTier::None_, "no env → no auth");
+
+        // SECURITY: no secret value (env token OR url query param) may appear in
+        // the serialized connectors.
+        let serialized = serde_json::to_string(&conns).unwrap();
+        assert!(
+            !serialized.contains("sbp_THIS_IS_A_SECRET_DO_NOT_LEAK"),
+            "env secret value must never be surfaced"
+        );
+        assert!(
+            !serialized.contains("api_key=ALSO_SECRET") && !serialized.contains("ALSO_SECRET"),
+            "url query secret must be stripped"
+        );
     }
 
     #[test]

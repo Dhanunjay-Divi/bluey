@@ -17,6 +17,10 @@ reqwest.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Codex stores MCP servers in TOML (`~/.codex/config.toml` `[mcp_servers.*]`),
+# unlike the JSON config every other agent uses. `default-features = false`
+# drops the unneeded datetime/preserve-order features (lean binary).
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["process", "io-util", "time", "rt", "macros"] }
 tracing.workspace = true

@@ -473,6 +473,9 @@ fn locate_connector_config(dir: &Path) -> Option<PathBuf> {
         "mcp_config.json",
         "mcp-config.json",
         "settings.json",
+        // Codex keeps its MCP servers in TOML (`~/.codex/config.toml`
+        // `[mcp_servers.*]`), not JSON — the only TOML config among the agents.
+        "config.toml",
     ];
 
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -497,15 +500,16 @@ fn locate_connector_config(dir: &Path) -> Option<PathBuf> {
         .cloned()
 }
 
-/// Cheap check: does this JSON(C) config declare any MCP servers? Read-only,
-/// fail-soft — a missing/unreadable/malformed file simply returns `false`.
+/// Cheap check: does this config declare any MCP servers? Read-only, fail-soft —
+/// a missing/unreadable/malformed file simply returns `false`.
 fn config_has_mcp_servers(path: &Path) -> bool {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return false;
     };
     // Substring check is enough to rank candidates; the real parse happens in
-    // `connectors::read_connectors`. Matches `mcpServers` or `servers` keys.
-    raw.contains("\"mcpServers\"") || raw.contains("\"servers\"")
+    // `connectors::read_connectors`. JSON: `mcpServers`/`servers`; Codex TOML:
+    // `[mcp_servers.<name>]` tables (and the inline `[mcp_servers]` header).
+    raw.contains("\"mcpServers\"") || raw.contains("\"servers\"") || raw.contains("[mcp_servers")
 }
 
 /// Look for a session store inside an agent's data dir, matching the registry's
