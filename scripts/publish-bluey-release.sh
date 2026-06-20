@@ -152,6 +152,12 @@ else
     echo "warning: latest.json is not signed; publish is disabled unless BLUEY_RELEASE_ALLOW_UNSIGNED=1" >&2
 fi
 
+# Release artifacts may inherit restrictive local permissions, especially zips
+# copied back from Windows machines. Keep staged files web-readable before rsync
+# and repeat the chmod remotely after upload so Caddy never falls through to the
+# SPA index for unreadable artifacts.
+chmod -R u=rwX,go=rX "$STAGE_DIR"
+
 echo "Prepared Bluey release web files:"
 find "$STAGE_DIR" -maxdepth 3 -type f | sort | sed "s#^$ROOT/##"
 
@@ -172,5 +178,6 @@ if [ "${PUBLISH_DO:-0}" = "1" ]; then
     rsync -av --chmod=Fu=rw,Fgo=r,Du=rwx,Dgo=rx \
         "$STAGE_DIR/releases/$VERSION_TAG/" \
         "$PUBLISH_HOST:$PUBLISH_PATH/releases/$VERSION_TAG/"
+    ssh "$PUBLISH_HOST" "chmod -R u=rwX,go=rX '$PUBLISH_PATH/install.sh' '$PUBLISH_PATH/install.ps1' '$PUBLISH_PATH/latest.json' '$PUBLISH_PATH/latest.json.sig' '$PUBLISH_PATH/releases/$VERSION_TAG'"
     echo "Published to $PUBLISH_HOST:$PUBLISH_PATH"
 fi
