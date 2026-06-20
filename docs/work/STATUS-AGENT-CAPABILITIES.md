@@ -60,17 +60,21 @@
 > IDE store). This table is the source of truth for *which* surfaces exist and what each
 > reads/drives. A "surface" = a distinct `KindTag` registry row OR a distinct on-disk store.
 
-### Do the CLI and the GUI app SHARE sessions? (web-researched 2026-06-19 — NOT assumed)
-Almost none natively share — each surface keeps its OWN store. The one exception is Codex.
-| Agent | CLI store | GUI-app store | Natively SHARE? |
+### Do the CLI and the App SHARE sessions? (web-researched 2026-06-19 — NOT assumed)
+**NONE of them functionally share session history between CLI and App.** Each App keeps its
+own session store; only *config* (MCP servers, auth, rules) is shared. So every App is a
+genuinely separate surface needing its own 5-cap pass.
+| Agent | CLI store | App store | App share sessions w/ CLI? |
 |---|---|---|---|
-| **Claude** | `~/.claude/projects/*.jsonl` | desktop-app own index | ❌ **NO** — "completely separate, no shared history." The `cliSessionId` field is *meant* to link them but is buggy/broken (anthropics/claude-code #28791, #63082, #58670). On THIS machine Bluey's `ClaudeAppIndex` reader follows that link itself — so Bluey bridges them; the apps don't share natively. |
-| **Codex** | `~/.codex` | VS Code IDE: **shares `~/.codex`** ✅ | ✅ **YES** (CLI + VS Code). JetBrains uses a separate `aia/codex` dir (NOT shared). |
-| **Cursor** | `~/.cursor/chats/` | IDE: `state.vscdb` composers | ❌ **NO** — different stores. |
-| **GitHub Copilot** | `~/.copilot/session-state/` | VS Code: workspaceStorage `chatSessions` | ❌ **NO** — separate. Asymmetric: VS Code *surfaces* CLI sessions, but the CLI's `/chronicle` can't see VS Code chats (github/copilot-cli #3816). |
-| **Antigravity** | `…/antigravity-cli/brain/` | `…/antigravity-ide/brain/` | ❌ **NO** — separate `brain/` dirs (same engine; can export between them). |
-| **Gemini** | `~/.gemini/tmp/<token>/chats` | (no separate desktop app) | — single surface |
-Refs: anthropics/claude-code #28791/#63082/#58670; codex.danielvaughan.com cross-surface-session-sync; github/copilot-cli #3816; medium.com/google-cloud Antigravity CLI+IDE config.
+| **Claude** | `~/.claude/projects/*.jsonl` | App's own `~/Library/Application Support/Claude/` index | ❌ **NO** — "each maintains their own independent session history"; only config (`~/.claude.json`, MCP, CLAUDE.md) shared. Bluey's `ClaudeAppIndex` reader BRIDGES them by following the index's `cliSessionId` (which is itself buggy upstream — #28791/#63082/#58670). |
+| **Codex** | `~/.codex/sessions/` | same `~/.codex` (`CODEX_HOME`) | ⚠️ **Same dir on disk, but NOT functionally shared** — the Codex Desktop App only surfaces its OWN most-recent session and ignores CLI-created ones (openai/codex #21079, #14389). So the App is still a distinct surface in practice. |
+| **Cursor** | `~/.cursor/chats/` | App: `state.vscdb` composers | ❌ **NO** — different stores. CLI shares MCP/auth/rules with the app, NOT chat history. |
+| **GitHub Copilot** | `~/.copilot/session-state/` | App: VS Code workspaceStorage `chatSessions` | ❌ **NO** — separate. Asymmetric: the App *surfaces* CLI sessions, but the CLI's `/chronicle` can't see App chats (github/copilot-cli #3816). |
+| **Antigravity** | CLI `brain/` | App: `…/antigravity/brain`, IDE: `…/antigravity-ide/brain` | ❌ **NO** — separate `brain/` dirs (same agent core; bidirectional sync exists, stores separate). |
+| **Gemini** | `~/.gemini/tmp/<token>/chats` | (no separate desktop app) | — CLI only |
+Refs: openai/codex #21079/#14389; anthropics/claude-code #28791/#49775/#63082/#58670;
+github/copilot-cli #3816; discuss.ai.google.dev "Antigravity 2.0 IDE/CLI shared brain";
+deployhq.com Cursor 2026 guide.
 
 **Implication for Bluey:** because surfaces DON'T natively share, each GUI surface is a
 genuinely distinct store that needs its own 5-cap pass — which is exactly why
@@ -79,7 +83,7 @@ genuinely distinct store that needs its own 5-cap pass — which is exactly why
 | Agent family | Surfaces (distinct rows) | Reads sessions from | Drives (answers) via | Continuation mechanism | Covered? |
 |---|---|---|---|---|---|
 | **Claude** | **3 separate rows**: `claude_code` (CLI), `claude_code_app` (desktop App), `claude_code_agent` (App agent-mode) — SEPARATE stores (don't natively share, see above) | CLI: `~/.claude/projects/<enc-cwd>/<id>.jsonl`. App/Agent: own `~/Library/Application Support/Claude/` index whose `cliSessionId` Bluey FOLLOWS back into the CLI JSONL files (Bluey bridges them — the apps don't natively share) | All three: `claude-agent-acp` adapter (same engine) | NativeResume — true `session/load` by `(id, cwd)`; fork fallback | CLI ✅, App ✅, Agent ⬜ (0 sessions) |
-| **Codex** | **1 surface only** — `codex`. The VS Code Codex extension and the CLI share `~/.codex`; there is NO separate Codex-IDE row/store. | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | `codex-acp` adapter | NativeResume — true `session/load` by the **inner `session_meta.payload.id` UUID** (NOT the rollout filename) | ✅ (the only surface) |
+| **Codex** | CLI + Desktop App both use `~/.codex` (`CODEX_HOME`). Same dir on disk, but the App ignores CLI sessions (openai/codex #21079) — so the App is a distinct *surface* even though the *store path* is shared. Bluey discovers ONE `codex` row pointing at `~/.codex/sessions`. | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | `codex-acp` adapter | NativeResume — true `session/load` by the **inner `session_meta.payload.id` UUID** (NOT the rollout filename) | ✅ (Bluey reads the shared `~/.codex` store — covers both CLI- and App-created rollouts on disk) |
 | **Cursor** | **1 row** (`cursor`) reading the IDE store. NOTE: the `cursor-agent` CLI ALSO has its own store (`~/.cursor/chats/<ws>/<uuid>/`) that Bluey does **NOT** read — but that's the CLI's *own* sessions, a different id-space. | IDE composers: `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` (`cursorDiskKV` table) | `cursor-agent acp` (ACP) / `cursor-agent -p` (CLI) | **Replay/fork** — its composer id is a SQLite db key, NOT an ACP handle; `session/load` is a known-broken Cursor bug. Replay the transcript. | ✅ (IDE store; the CLI's own `~/.cursor/chats` store is intentionally NOT surfaced) |
 | **Gemini** | **1 surface** — `gemini` | `~/.gemini/tmp/<token>/chats/*.jsonl` | `gemini --acp` (API-key tier) | **Replay/fork** — `--resume` is latest/index, not by-uuid | ✅ |
 | **Antigravity** | **1 real row** (`antigravity`). The `Antigravity` / `Antigravity IDE` read_only rows are DUPLICATE footprints of the same install (App-bundle detected separately) — NOT separate surfaces. | `~/.gemini/antigravity/` (index `agyhub_summaries_proto.pb` + `conversations/<uuid>` + `brain/<uuid>`). The IDE App-Support `state.vscdb` holds only UI state, no transcripts. | `agy -p` / `agy --conversation <uuid>` (its OWN tier — NOT `gemini`, which dropped the Pro tier 2026-06-18) | Replay tier in the spine; `agy --conversation <uuid>` resumes natively at the CLI level (exposed UUID IS agy's key) | ✅ (`antigravity` row; the IDE/dup rows fixed to not break — see `cursorDiskKV` fix) |
