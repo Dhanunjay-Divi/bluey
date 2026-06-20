@@ -11,8 +11,9 @@ operator contract before wider paid alpha.
 - Credits have no cash value, cannot be transferred, and expire up to 365 days
   after purchase.
 - Bluey stops paid cloud usage at zero. Do not allow negative balances.
-- Manual reload is the v0.2 path. Saved-card auto-topup remains deferred until
-  dispute handling and customer controls are stronger.
+- Manual reload is always available. Saved-card Auto Reload is opt-in only,
+  requires a saved Square card, and credits balance only after a processor
+  payment succeeds.
 
 ## Main Risk Scenarios
 
@@ -59,7 +60,8 @@ needed to answer disputes and support tickets:
 
 Before inviting wider paid testers:
 
-- Keep first reload amount modest (`$30` default) and require manual reload.
+- Keep first reload amount modest (`$15` default). Auto Reload must stay opt-in
+  with a visible threshold and reload amount.
 - Keep provider-side billing alerts/caps where providers support them.
 - Keep Bluey app-level spend guard enabled during alpha.
 - Review high-spend accounts daily until monitoring is automated.

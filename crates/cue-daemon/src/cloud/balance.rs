@@ -178,7 +178,7 @@ mod tests {
             trial_seconds_remaining: 0,
             auto_topup_enabled: true,
             auto_topup_threshold_cents: 500,
-            auto_topup_amount_cents: 3000,
+            auto_topup_amount_cents: 1500,
             fetched_at_unix_ms: 1_700_000_000_000,
             low_balance_warning: false,
         };
@@ -200,7 +200,7 @@ mod tests {
             trial_seconds_remaining: 0,
             auto_topup_enabled: true,
             auto_topup_threshold_cents: 500,
-            auto_topup_amount_cents: 3000,
+            auto_topup_amount_cents: 1500,
             fetched_at_unix_ms: 0,
             low_balance_warning: 100 < 500 && 100 > 0,
         };

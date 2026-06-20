@@ -117,8 +117,9 @@ US-East droplet is acceptable.
 ## Operational Limits For The First 100
 
 - Invite manually or use a small allowlist.
-- Keep manual reloads first; saved cards and auto-topup stay deferred.
-- Keep first reload amount simple, currently `$30`.
+- Keep manual reloads first; saved-card Auto Reload is opt-in only after a
+  successful Square card-save flow.
+- Keep first reload amount simple, currently `$15`.
 - Review spend, failed provider calls, refunds, and disputes daily.
 - Keep the Bluey-side upstream spend guard enabled while real usage patterns
   are unknown.

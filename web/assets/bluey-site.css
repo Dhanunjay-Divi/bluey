@@ -1660,6 +1660,48 @@
       font-weight: 700;
     }
 
+    #accountApp .auto-reload-fields {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .65rem;
+      margin-top: .85rem;
+    }
+
+    #accountApp .auto-reload-fields label {
+      display: grid;
+      gap: .3rem;
+      min-width: 8.5rem;
+      color: #6f7b84;
+      font-size: .68rem;
+      font-weight: 900;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+
+    #accountApp .auto-reload-fields input {
+      width: 100%;
+      border: 1px solid rgba(255, 255, 255, .14);
+      border-radius: 10px;
+      background: #111;
+      color: #f2f2f2;
+      font: inherit;
+      font-size: .9rem;
+      font-weight: 800;
+      outline: none;
+      padding: .62rem .72rem;
+    }
+
+    #accountApp .auto-reload-fields input:focus {
+      border-color: rgba(99, 216, 255, .58);
+      box-shadow: 0 0 0 3px rgba(99, 216, 255, .11);
+    }
+
+    #accountApp .auto-reload-rule {
+      margin-top: .7rem;
+      color: #a8b6bf;
+      max-width: 42rem;
+    }
+
     #accountApp .auto-reload-toggle {
       display: inline-flex;
       align-items: center;

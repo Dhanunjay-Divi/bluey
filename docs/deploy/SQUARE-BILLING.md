@@ -96,8 +96,10 @@ Compliance notes:
 - Disputes and chargebacks follow
   `docs/deploy/ABUSE-FRAUD-CHARGEBACK-PLAYBOOK.md`.
 
-Deferred:
+Supported:
 
-- Square saved-card auto top-up. Manual reload is the supported v0.2 path.
-- A Bluey-hosted billing page for card management. `/billing/portal` currently
-  routes Square customers back to `/account?billing=square`.
+- Manual Square reload is always available.
+- Square saved-card Auto Reload is opt-in only. It requires a saved Square
+  card and credits balance only after a completed Square payment succeeds.
+- `/billing/portal` routes Square customers back to `/account?billing=square`
+  for card-save and Auto Reload controls.

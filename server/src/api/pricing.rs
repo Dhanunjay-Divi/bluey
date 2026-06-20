@@ -1,7 +1,7 @@
 //! /pricing/tiers — server-owned tier numbers.
 //!
 //! Codex Stage 10 (S8.3 nit): the CLI bluey usage table previously
-//! hard-coded "Light ~3,000 cues per $30" etc. Those numbers belong
+//! hard-coded reload cue counts. Those numbers belong
 //! on the server so future rebalancing doesn't require a CLI release.
 //!
 //! Public endpoint (no auth). The numbers are the canonical source of
@@ -37,9 +37,9 @@ pub struct MarkupPercent {
 
 pub async fn get_tiers() -> Json<PricingTiers> {
     Json(PricingTiers {
-        reload_amount_cents: 3000,
+        reload_amount_cents: 1500,
         minimum_cue_cents: 1,
-        snapshot_date: "2026-05-19",
+        snapshot_date: "2026-06-20",
         markup_percent: MarkupPercent {
             easy: 200,
             medium: 200,
@@ -50,20 +50,20 @@ pub async fn get_tiers() -> Json<PricingTiers> {
             Tier {
                 name: "light",
                 label: "Light",
-                cues_per_reload: 3000,
-                typical_duration_label: "~3 months",
+                cues_per_reload: 1500,
+                typical_duration_label: "~6 weeks",
             },
             Tier {
                 name: "typical",
                 label: "Typical tech",
-                cues_per_reload: 1380,
-                typical_duration_label: "~5 weeks",
+                cues_per_reload: 690,
+                typical_duration_label: "~2-3 weeks",
             },
             Tier {
                 name: "heavy",
                 label: "Heavy",
-                cues_per_reload: 825,
-                typical_duration_label: "~10 days",
+                cues_per_reload: 410,
+                typical_duration_label: "~5 days",
             },
         ],
     })

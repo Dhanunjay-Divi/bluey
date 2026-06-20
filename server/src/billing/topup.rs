@@ -373,7 +373,7 @@ mod tests {
             Some("pm_1".into()),
             None,
             None,
-            3000,
+            1500,
         );
         // Test passes if we get here without panicking. Fire-and-forget
         // task, if any, would not have run because of the early return.
@@ -393,7 +393,7 @@ mod tests {
             Some("pm_1".into()),
             None,
             None,
-            3000,
+            1500,
         );
     }
 
@@ -411,7 +411,7 @@ mod tests {
             None, // no PM
             None,
             None,
-            3000,
+            1500,
         );
     }
 }

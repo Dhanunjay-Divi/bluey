@@ -50,7 +50,7 @@ Bluey is not a monthly subscription by default.
 │ 2. Verification email confirms account.                          │
 │                                                                  │
 │ 3. Customer redirected to /account dashboard                     │
-│    Sees: "10 minutes free trial. After that, $30 minimum         │
+│    Sees: "10 minutes free trial. After that, $15 minimum         │
 │           reload. We deduct as you use."                         │
 │    Copies install command:                                       │
 │       curl https://bluey.sh/install.sh | sh                     │
@@ -293,19 +293,20 @@ bluey-daemon:
     ┌────────────────────────────────────────────────────┐
     │  💰 Balance: $0.18 — Bluey can't answer that one.  │
     │                                                    │
-    │  Add $30 to continue.                              │
+    │  Add $15 to continue.                              │
     │                                                    │
-    │              [   Add $30 now   ]                   │
+    │              [   Add $15 now   ]                   │
     └────────────────────────────────────────────────────┘
 
-Click "Add $30 now":
+Click "Add $15 now":
   daemon → opens https://bluey.sh/reload
   bluey-server → Square-hosted checkout link
-  on Square webhook success → balance += 3000
+  on Square webhook success → balance += 1500
   daemon polls /account/me, sees new balance, refreshes UI
 
-Saved-card automatic reload is deferred. Do not market it as available
-until Square saved-card support is implemented and reviewed.
+Saved-card Auto Reload is opt-in only. It charges the saved Square card
+only after the account drops below the user-selected threshold, and
+spendable credits appear only after a successful processor payment.
 ```
 
 ## 7. Mid-stream cut (rare edge case)

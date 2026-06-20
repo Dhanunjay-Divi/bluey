@@ -1644,10 +1644,42 @@ async fn square_auto_reload_requires_saved_card_then_enables() {
     let me: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(me["billing_provider"], "square");
     assert_eq!(me["auto_topup_enabled"], false);
+    assert_eq!(me["auto_topup_threshold_cents"], 500);
+    assert_eq!(me["auto_topup_amount_cents"], 1500);
     assert_eq!(me["auto_topup_available"], false);
     assert_eq!(me["square_application_id"], "sandbox-app");
     assert_eq!(me["square_location_id"], "sandbox-location");
     assert_eq!(me["square_environment"], "sandbox");
+
+    let req = Request::patch("/account/billing")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "auto_topup_enabled": false,
+                "auto_topup_threshold_cents": 500,
+                "auto_topup_amount_cents": 1400
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let req = Request::patch("/account/billing")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "auto_topup_enabled": false,
+                "auto_topup_threshold_cents": 1500,
+                "auto_topup_amount_cents": 1500
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
     let req = Request::patch("/account/billing")
         .header("authorization", format!("Bearer {access}"))
@@ -1704,7 +1736,12 @@ async fn square_auto_reload_requires_saved_card_then_enables() {
         .header("authorization", format!("Bearer {access}"))
         .header("content-type", "application/json")
         .body(Body::from(
-            serde_json::to_vec(&json!({ "auto_topup_enabled": true })).unwrap(),
+            serde_json::to_vec(&json!({
+                "auto_topup_enabled": true,
+                "auto_topup_threshold_cents": 500,
+                "auto_topup_amount_cents": 1500
+            }))
+            .unwrap(),
         ))
         .unwrap();
     let resp = h.router.clone().oneshot(req).await.unwrap();
@@ -1715,6 +1752,8 @@ async fn square_auto_reload_requires_saved_card_then_enables() {
     let me: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(me["auto_topup_enabled"], true);
     assert_eq!(me["auto_topup_available"], true);
+    assert_eq!(me["auto_topup_threshold_cents"], 500);
+    assert_eq!(me["auto_topup_amount_cents"], 1500);
 
     clear_square_billing_env();
 }
@@ -1883,8 +1922,8 @@ async fn square_auto_reload_charges_saved_card_when_threshold_crosses() {
                 SET trial_seconds_remaining = 0,
                     balance_cents = 1000,
                     auto_topup_enabled = 1,
-                    auto_topup_threshold_cents = 1500,
-                    auto_topup_amount_cents = 3000,
+                    auto_topup_threshold_cents = 1200,
+                    auto_topup_amount_cents = 1500,
                     square_customer_id = 'cus_square_topup',
                     square_card_id = 'ccof:square_card_topup',
                     square_card_brand = 'VISA',
@@ -1943,7 +1982,7 @@ async fn square_auto_reload_charges_saved_card_when_threshold_crosses() {
                 |r| r.get(0),
             )
             .unwrap();
-        if balance >= 3000 {
+        if balance >= 2400 {
             clear_square_billing_env();
             return;
         }

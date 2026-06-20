@@ -38,7 +38,7 @@ Starting checkout, creating a payment link, saving a card, creating a setup inte
 - `server/src/api/account.rs`
   - Added `PATCH /account/billing` so the account dashboard can turn Auto Reload on/off.
   - Enabling is rejected until the active billing provider has a saved off-session payment method.
-  - Reload amount and threshold are server-clamped to safe ranges.
+  - Reload amount and threshold are validated against the Bluey Auto Reload spec: default threshold `$5`, minimum reload `$15`, and reload amount must be greater than the threshold.
 
 - `server/src/api/billing.rs`
   - Added `POST /billing/square/card` to save a Square Web Payments card token through Square's Cards API.
@@ -52,6 +52,7 @@ Starting checkout, creating a payment link, saving a card, creating a setup inte
 - `web/index.html`, `web/assets/bluey-site.js`, and `web/assets/bluey-site.css`
   - Added an account-dashboard Auto Reload toggle.
   - New accounts show Auto Reload off by default.
+  - Users can choose the threshold and reload amount before enabling Auto Reload.
   - Square card setup appears only when needed and uses Square-hosted card entry.
 
 - `ops/Caddyfile.example`

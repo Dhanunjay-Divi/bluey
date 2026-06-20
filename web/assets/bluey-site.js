@@ -29,9 +29,17 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     let squareCard = null;
     let squareCardEnvironment = '';
     let squareCardSetupPromise = null;
+    const AUTO_RELOAD_MIN_CENTS = 1500;
+    const AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS = 500;
+    const AUTO_RELOAD_DEFAULT_AMOUNT_CENTS = 1500;
+    const MANUAL_RELOAD_AMOUNT_CENTS = 1500;
 
     function money(cents) {
       return `$${(Number(cents || 0) / 100).toFixed(2)}`;
+    }
+
+    function centsToDollars(cents) {
+      return String(Math.round(Number(cents || 0) / 100));
     }
 
     function accountToken() {
@@ -546,10 +554,15 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const toggle = document.getElementById('autoReloadToggle');
       const setup = document.getElementById('squareCardSetup');
       const saveButton = document.getElementById('saveSquareCardButton');
+      const thresholdInput = document.getElementById('autoReloadThreshold');
+      const amountInput = document.getElementById('autoReloadAmount');
+      const rule = document.getElementById('autoReloadRule');
       if (!card || !hint || !method || !toggle || !setup) return;
 
-      const amount = money(me?.auto_topup_amount_cents || 3000);
-      const threshold = money(me?.auto_topup_threshold_cents || 500);
+      const amountCents = Number(me?.auto_topup_amount_cents || AUTO_RELOAD_DEFAULT_AMOUNT_CENTS);
+      const thresholdCents = Number(me?.auto_topup_threshold_cents || AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS);
+      const amount = money(amountCents);
+      const threshold = money(thresholdCents);
       const canSaveSquareCard = me?.billing_provider === 'square'
         && Boolean(me.square_application_id)
         && Boolean(me.square_location_id);
@@ -564,11 +577,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         saveButton.disabled = !shouldShowSquareSetup;
         saveButton.textContent = 'Save card';
       }
+      if (thresholdInput) thresholdInput.value = centsToDollars(thresholdCents);
+      if (amountInput) amountInput.value = centsToDollars(amountCents);
+      if (rule) {
+        rule.textContent = `When your balance drops below ${threshold}, Bluey charges ${amount} and adds credits only after payment succeeds.`;
+      }
 
       if (me?.auto_topup_enabled) {
-        hint.textContent = `On. Bluey adds ${amount} before balance falls below ${threshold}.`;
+        hint.textContent = `On. Bluey charges ${amount} before balance falls below ${threshold}.`;
       } else if (hasSavedMethod) {
-        hint.textContent = `Off by default. Turn on to add ${amount} before balance reaches ${threshold}.`;
+        hint.textContent = `Off by default. Turn on to use this ${threshold} / ${amount} rule.`;
       } else if (shouldShowSquareSetup) {
         hint.textContent = 'Off by default. Save a card with Square to turn on Auto Reload.';
       } else {
@@ -586,14 +604,52 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
     }
 
+    function readAutoReloadSettings() {
+      const thresholdDollars = Number(document.getElementById('autoReloadThreshold')?.value || 5);
+      const amountDollars = Number(document.getElementById('autoReloadAmount')?.value || 15);
+      if (!Number.isFinite(thresholdDollars) || !Number.isFinite(amountDollars)) {
+        throw new Error('Enter valid Auto Reload dollar amounts.');
+      }
+      const threshold = Math.round(thresholdDollars * 100);
+      const amount = Math.round(amountDollars * 100);
+      if (amount < AUTO_RELOAD_MIN_CENTS) {
+        throw new Error('Auto Reload amount must be at least $15.');
+      }
+      if (threshold < 100) {
+        throw new Error('Auto Reload threshold must be at least $1.');
+      }
+      if (threshold >= amount) {
+        throw new Error('Auto Reload amount must be greater than the threshold.');
+      }
+      return {
+        auto_topup_threshold_cents: threshold,
+        auto_topup_amount_cents: amount,
+      };
+    }
+
+    function updateAutoReloadDraftCopy() {
+      const rule = document.getElementById('autoReloadRule');
+      if (!rule) return;
+      try {
+        const settings = readAutoReloadSettings();
+        rule.textContent = `When your balance drops below ${money(settings.auto_topup_threshold_cents)}, Bluey charges ${money(settings.auto_topup_amount_cents)} and adds credits only after payment succeeds.`;
+      } catch (error) {
+        rule.textContent = error.message;
+      }
+    }
+
     async function updateAutoReload(enabled) {
+      const settings = enabled ? readAutoReloadSettings() : null;
       const me = await apiJson('/account/billing', {
         method: 'PATCH',
-        body: JSON.stringify({ auto_topup_enabled: enabled }),
+        body: JSON.stringify({
+          auto_topup_enabled: enabled,
+          ...(settings || {}),
+        }),
       });
       renderAutoReload(me);
       accountMessage(enabled
-        ? 'Auto Reload is on. Bluey will reload before your balance reaches the limit.'
+        ? `Auto Reload is on. Bluey will charge ${money(settings.auto_topup_amount_cents)} when balance drops below ${money(settings.auto_topup_threshold_cents)}.`
         : 'Auto Reload is off. Bluey will ask you to reload manually.');
       return me;
     }
@@ -807,7 +863,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       try {
         const checkout = await apiJson('/billing/checkout', {
           method: 'POST',
-          body: JSON.stringify({ amount_cents: 3000 }),
+          body: JSON.stringify({ amount_cents: MANUAL_RELOAD_AMOUNT_CENTS }),
         });
         window.location.href = checkout.checkout_url;
       } catch (error) {
@@ -876,6 +932,18 @@ if (!window.__BLUEY_SITE_BOOTED__) {
           .finally(() => {
             loadAccount().catch((error) => accountMessage(error.message));
           });
+      });
+      ['autoReloadThreshold', 'autoReloadAmount'].forEach((id) => {
+        document.getElementById(id)?.addEventListener('change', () => {
+          const toggle = document.getElementById('autoReloadToggle');
+          if (!toggle?.checked) {
+            updateAutoReloadDraftCopy();
+            return;
+          }
+          updateAutoReload(true)
+            .catch((error) => accountMessage(error.message))
+            .finally(() => loadAccount().catch((error) => accountMessage(error.message)));
+        });
       });
       document.getElementById('saveSquareCardButton')?.addEventListener('click', () => {
         saveSquareCard().catch((error) => accountMessage(error.message));

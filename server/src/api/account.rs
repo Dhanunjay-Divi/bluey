@@ -7,7 +7,7 @@ use super::AppState;
 use crate::auth::AuthedAccount;
 use crate::config::BillingProvider;
 
-const MIN_AUTO_RELOAD_CENTS: i64 = 3000;
+const MIN_AUTO_RELOAD_CENTS: i64 = 1500;
 const MAX_AUTO_RELOAD_CENTS: i64 = 10_000;
 const MIN_AUTO_RELOAD_THRESHOLD_CENTS: i64 = 100;
 const MAX_AUTO_RELOAD_THRESHOLD_CENTS: i64 = 5_000;
@@ -58,12 +58,40 @@ pub async fn update_billing_settings(
     let amount = req
         .auto_topup_amount_cents
         .unwrap_or(account.auto_topup_amount_cents)
-        .clamp(MIN_AUTO_RELOAD_CENTS, MAX_AUTO_RELOAD_CENTS);
+        .clamp(0, MAX_AUTO_RELOAD_CENTS);
     let threshold = req
         .auto_topup_threshold_cents
         .unwrap_or(account.auto_topup_threshold_cents)
-        .clamp(MIN_AUTO_RELOAD_THRESHOLD_CENTS, MAX_AUTO_RELOAD_THRESHOLD_CENTS)
-        .min(amount - 100);
+        .clamp(0, MAX_AUTO_RELOAD_THRESHOLD_CENTS);
+
+    let settings_changed =
+        req.auto_topup_amount_cents.is_some() || req.auto_topup_threshold_cents.is_some();
+    if req.auto_topup_enabled || settings_changed {
+        if amount < MIN_AUTO_RELOAD_CENTS {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "Auto Reload amount must be at least $15.".to_string(),
+                }),
+            ));
+        }
+        if threshold < MIN_AUTO_RELOAD_THRESHOLD_CENTS {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "Auto Reload threshold must be at least $1.".to_string(),
+                }),
+            ));
+        }
+        if threshold >= amount {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ApiError {
+                    error: "Auto Reload amount must be greater than the threshold.".to_string(),
+                }),
+            ));
+        }
+    }
 
     if req.auto_topup_enabled {
         let (_, available, reason, _) = auto_topup_capability(&state, &account);
@@ -284,14 +312,14 @@ pub async fn usage(
     } else {
         2.2 // typical-tier default ~2.2 cents/cue
     };
-    let cues_per_30 = if avg_cost_per_cue_cents > 0.0 {
-        3000.0 / avg_cost_per_cue_cents
+    let cues_per_reload = if avg_cost_per_cue_cents > 0.0 {
+        1500.0 / avg_cost_per_cue_cents
     } else {
         f64::INFINITY
     };
-    let tier_label = if cues_per_30 >= 2200.0 {
+    let tier_label = if cues_per_reload >= 1100.0 {
         "Light"
-    } else if cues_per_30 >= 1100.0 {
+    } else if cues_per_reload >= 550.0 {
         "Typical tech"
     } else {
         "Heavy"

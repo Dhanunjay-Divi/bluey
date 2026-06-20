@@ -124,8 +124,8 @@ operating plan.
 - [ ] Webhook endpoint registered: `https://bluey.sh/billing/square/webhook`
 - [ ] Webhook events subscribed: `order.updated`, `payment.updated`
 - [ ] Matching `SQUARE_*_WEBHOOK_SIGNATURE_KEY` set in `/etc/bluey-api/bluey-api.env`
-- [ ] Sandbox test: $30 reload through Square hosted checkout → balance credited within 30s
-- [ ] Production test: real $30 reload through Square hosted checkout → balance credited within 30s
+- [ ] Sandbox test: $15 reload through Square hosted checkout → balance credited within 30s
+- [ ] Production test: real $15 reload through Square hosted checkout → balance credited within 30s
 - [ ] Square reload duplicate-webhook replay credits exactly once
 - [ ] Square failed/canceled payment webhook creates no spendable credit
 - [ ] `docs/deploy/ABUSE-FRAUD-CHARGEBACK-PLAYBOOK.md` reviewed by the operator who will handle Square notices
@@ -266,14 +266,14 @@ curl -fsS https://bluey.sh/account/me -H "Authorization: Bearer $TOKEN" | jq '.t
 # 3. Reload via Checkout.
 CHECKOUT_URL=$(curl -fsS -X POST https://bluey.sh/billing/checkout \
   -H "Authorization: Bearer $TOKEN" -H "content-type: application/json" \
-  -d '{"amount_cents":3000}' | jq -r .checkout_url)
+  -d '{"amount_cents":1500}' | jq -r .checkout_url)
 echo "Open $CHECKOUT_URL in browser, complete with Square sandbox card details..."
 read -p "Once paid, press Enter."
 
 # 4. Verify balance.
 BAL=$(curl -fsS https://bluey.sh/account/me -H "Authorization: Bearer $TOKEN" | jq '.balance_cents')
 echo "Balance: $BAL cents"
-[ "$BAL" -ge 3000 ] || { echo "FAIL: balance not credited"; exit 1; }
+[ "$BAL" -ge 1500 ] || { echo "FAIL: balance not credited"; exit 1; }
 
 # 5. Run a cue.
 curl -fsS -X POST https://bluey.sh/router/complete \

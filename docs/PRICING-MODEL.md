@@ -15,8 +15,8 @@
 
 | Field | Value | Why |
 |---|---|---|
-| First reload | $30 (flat) | clean entry; covers a typical month for many users |
-| Reload model | manual hosted checkout in v0.2 | customer chooses when to add credits; saved-card auto-reload is deferred |
+| First reload | $15 minimum | low-friction entry; enough for real testing without large chargeback exposure |
+| Reload model | manual hosted checkout + opt-in saved-card Auto Reload | customer controls threshold and amount; credits are created only after processor payment success |
 | Credit validity | **up to 12 months (365 days) from purchase** | per-batch, FIFO; balance carries forward across reloads as long as oldest batch is unexpired |
 | Markup floor | **150%** | user direction 2026-05-19 |
 | Markup tier — Easy/Medium | 200% | absolute cents are tiny; small markup absurd |
@@ -40,7 +40,7 @@
 > - An "Easy" cue with a raw cost of $0.0008 is billed as **1¢**.
 > - A "Medium code" cue with a raw cost of $0.0345 is billed as **4¢**
 >   (0.0345 → 0.04, rounded up).
-> - The Light tier projection (~3,000 cues per $30) reflects the
+> - The Light tier projection (~1,500 cues per $15) reflects the
 >   1¢ floor; under fractional-cent billing it would be ~10x higher.
 
 > **Provider price snapshot date:** 2026-06-20. List prices from
@@ -101,7 +101,7 @@ arithmetic without floats.
 
 These are realistic mixes used to project credit duration. The product
 UI shows the customer their current rolling-7-day mix and tells them
-which tier they're in, so the $30 → time projection makes sense.
+which tier they're in, so the $15 → time projection makes sense.
 
 ### Light — quick lookups, occasional medium
 
@@ -111,9 +111,9 @@ Mix:    55% Easy code · 15% Medium code · 3% Hard ·
         18% Easy general · 5% Medium general
 
 Avg per cue:        $0.011
-Cues per $30:       ~2,850
+Cues per $15:       ~1,500
 Hours focused work: ~60–95
-$30 lasts:          ~3 months at 30 min/day
+$15 lasts:          ~6 weeks at 30 min/day
 ```
 
 ### Typical tech user — real coding + occasional design + few screenshots
@@ -124,9 +124,9 @@ Mix:    35% Easy code · 22% Medium code · 8% Hard ·
         18% Easy general · 6% Medium general
 
 Avg per cue:        $0.022
-Cues per $30:       ~1,380
+Cues per $15:       ~690
 Hours focused work: ~25–45
-$30 lasts:          ~5 weeks at 1 hr/day → 1 reload/month
+$15 lasts:          ~2-3 weeks at 1 hr/day
 ```
 
 ### Heavy user — lots of Hard, vision attachments, design work
@@ -137,9 +137,9 @@ Mix:    18% Easy code · 28% Medium code · 18% Hard ·
         10% Easy general · 6% Medium general
 
 Avg per cue:        $0.036
-Cues per $30:       ~825
+Cues per $15:       ~410
 Hours focused work: ~15–25
-$30 lasts:          ~10 days at multi-hour daily use → 2–3 reloads/month
+$15 lasts:          ~5 days at multi-hour daily use
 ```
 
 ---
@@ -150,19 +150,19 @@ $30 lasts:          ~10 days at multi-hour daily use → 2–3 reloads/month
 customers should see what they're getting before they pay. Three
 surfaces:
 
-### 4.1 Onboarding screen (after first $30 reload)
+### 4.1 Onboarding screen (after first $15 reload)
 
 Bluey dashboard at `https://bluey.sh/onboarding/welcome` shows:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  Welcome to Bluey — your $30 is loaded.                         │
+│  Welcome to Bluey — your $15 is loaded.                         │
 │                                                                 │
-│  Here's roughly what $30 buys, depending on how you use Bluey:  │
+│  Here's roughly what $15 buys, depending on how you use Bluey:  │
 │                                                                 │
-│    💼  Light user        ~3,000 cues   ~3 months                │
-│    ⚙️   Typical tech     ~1,380 cues   ~5 weeks                  │
-│    🔥  Heavy user        ~825 cues     ~10 days                 │
+│    💼  Light user        ~1,500 cues   ~6 weeks                 │
+│    ⚙️   Typical tech     ~690 cues     ~2-3 weeks               │
+│    🔥  Heavy user        ~410 cues     ~5 days                  │
 │                                                                 │
 │  Reload when ready. Bluey is not a monthly subscription, and     │
 │  credits stop at zero so there is no surprise usage debt.        │
@@ -178,7 +178,7 @@ Bluey dashboard at `https://bluey.sh/onboarding/welcome` shows:
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│  Balance:  $27.43           Reload: $30 minimum                  │
+│  Balance:  $27.43           Reload: $15 minimum                  │
 │                                                                  │
 │  Your last 7 days:                                               │
 │    132 cues · $4.12 spent                                        │
@@ -196,12 +196,12 @@ Bluey dashboard at `https://bluey.sh/onboarding/welcome` shows:
 │  At your current rate, $27.43 lasts ~32 more days.               │
 │                                                                  │
 │  ┌────── Tier comparison ──────┐                                 │
-│  │ Light      ~3,000 cues / $30  ~3 months                      │
-│  │ Typical    ~1,380 cues / $30  ~5 weeks  ← you                │
-│  │ Heavy      ~825 cues / $30   ~10 days                        │
+│  │ Light      ~1,500 cues / $15  ~6 weeks                       │
+│  │ Typical    ~690 cues / $15    ~2-3 weeks  ← you              │
+│  │ Heavy      ~410 cues / $15    ~5 days                        │
 │  └─────────────────────────────┘                                 │
 │                                                                  │
-│  [ Add $30 now ]  [ View credit batches ]                        │
+│  [ Add $15 now ]  [ View credit batches ]                        │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -210,7 +210,7 @@ Bluey dashboard at `https://bluey.sh/onboarding/welcome` shows:
 ```
 $ bluey usage
 
-Balance         $27.43      ($30 minimum reload)
+Balance         $27.43      ($15 minimum reload)
 Last 7 days     132 cues, $4.12 spent
 Tier            Typical tech user
 Projection      $27.43 lasts ~32 days at your current rate

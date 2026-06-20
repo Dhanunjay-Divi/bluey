@@ -139,7 +139,7 @@ curl -fsS https://bluey.sh/admin/health
 # {"status":"ok","version":"...","commit":"..."}
 
 curl -fsS https://bluey.sh/pricing/tiers | jq .
-# {"reload_amount_cents":3000,"minimum_cue_cents":1,"tiers":[...]}
+# {"reload_amount_cents":1500,"minimum_cue_cents":1,"tiers":[...]}
 ```
 
 If both succeed, the server is reachable, TLS is live, and the public router responds.

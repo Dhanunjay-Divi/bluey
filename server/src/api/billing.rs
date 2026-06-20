@@ -29,7 +29,7 @@ use crate::db::balance;
 
 #[derive(Deserialize)]
 pub struct CheckoutRequest {
-    /// Reload amount in cents. Must be at least 3000 ($30 minimum).
+    /// Reload amount in cents. Must be at least 1500 ($15 minimum).
     pub amount_cents: i64,
 }
 
@@ -48,7 +48,7 @@ pub struct SaveSquareCardRequest {
     pub source_id: String,
 }
 
-const MINIMUM_RELOAD_CENTS: i64 = 3000;
+const MINIMUM_RELOAD_CENTS: i64 = 1500;
 const SQUARE_API_VERSION: &str = "2025-04-16";
 
 fn stripe_api_url(path: &str) -> String {

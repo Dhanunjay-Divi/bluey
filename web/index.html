@@ -23,7 +23,7 @@
   <link
     rel="stylesheet"
     href="/assets/bluey-site.css"
-    integrity="sha384-RKoFYt3k0UN0ybmNODy/01YOwq7aMMgzVEV3UCyKyDPHYCeXLMVzWDlpu0zzNr0P"
+    integrity="sha384-nPveWPwE3gw4cXQPAL7OLudxjLsmIsJbR6RZ7WkGAP6Gcz65SrBVOd5gnDpfEVTM"
     crossorigin="anonymous"
   >
 </head>
@@ -290,10 +290,10 @@
             <div class="reload-card">
               <div>
                 <h3>Add credits</h3>
-                <p>$30 minimum. Credits stay valid for 365 days, and paid requests stop at $0.</p>
+                <p>$15 minimum. Credits stay valid for 365 days, and paid requests stop at $0.</p>
               </div>
               <div class="account-actions-row reload-actions">
-                <div class="reload-price">$30</div>
+                <div class="reload-price">$15</div>
                 <button class="account-button primary" id="reloadButton" type="button">Add credits</button>
               </div>
             </div>
@@ -302,6 +302,17 @@
               <div>
                 <h3>Auto Reload</h3>
                 <p id="autoReloadHint">Off by default. Turn it on only after saving a payment method.</p>
+                <div class="auto-reload-fields" aria-label="Auto Reload rule">
+                  <label>
+                    <span>When below</span>
+                    <input id="autoReloadThreshold" type="number" min="1" max="50" step="1" value="5" inputmode="decimal" />
+                  </label>
+                  <label>
+                    <span>Add</span>
+                    <input id="autoReloadAmount" type="number" min="15" max="100" step="5" value="15" inputmode="decimal" />
+                  </label>
+                </div>
+                <p class="auto-reload-rule" id="autoReloadRule">When your balance drops below $5.00, charge $15.00 and add credits after payment succeeds.</p>
                 <div class="auto-reload-method" id="autoReloadMethod"></div>
                 <div class="square-card-setup" id="squareCardSetup" hidden>
                   <div id="squareCardContainer" class="square-card-container"></div>
@@ -577,7 +588,7 @@
             <div class="plan-name">Add credits</div>
             <div class="plan-detail">Pay only when Bluey uses AI models, speech, screen analysis, or saved sessions.</div>
           </div>
-          <div class="plan-price">$30</div>
+          <div class="plan-price">$15</div>
         </a>
       </div>
       <p class="pricing-note">Teams are concierge for now.</p>
@@ -589,7 +600,7 @@
 
   <script
     src="/assets/bluey-site.js"
-    integrity="sha384-YPDKZukP4CWkheOkWvar7tGdkboro2Mwqny8IPIqitN0ynvkTeqxhn5QCJUzYcbs"
+    integrity="sha384-Y9YHclA3bWsXhVvmEzgG7Nx7btD7MZ8rl5wlTQGGOYum0LqPu3KoAm1Ssgyy8lx8"
     crossorigin="anonymous"
   ></script>
 </body>

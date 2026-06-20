@@ -140,7 +140,7 @@ impl Account {
             trial_seconds_remaining: 600,
             auto_topup_enabled: false,
             auto_topup_threshold_cents: 500,
-            auto_topup_amount_cents: 3000,
+            auto_topup_amount_cents: 1500,
             is_admin,
             stripe_customer_id: None,
             stripe_payment_method_id: None,
