@@ -926,6 +926,8 @@ struct GeminiGenerateResp {
 #[derive(Deserialize)]
 struct GeminiCandidate {
     content: Option<GeminiRespContent>,
+    #[serde(rename = "finishReason")]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1069,6 +1071,7 @@ async fn gemini_complete_stream(
         let mut pending_utf8 = Vec::new();
         let mut final_usage: Option<GeminiUsage> = None;
         let mut seen_done = false;
+        let mut seen_terminal = false;
 
         while let Some(chunk) = bytes.next().await {
             let chunk = chunk.context("gemini stream read")?;
@@ -1082,7 +1085,7 @@ async fn gemini_complete_stream(
                     seen_done = true;
                     continue;
                 }
-                for delta in parse_gemini_stream_chunk(data, &mut final_usage)? {
+                for delta in parse_gemini_stream_chunk(data, &mut final_usage, &mut seen_terminal)? {
                     yield CompletionStreamEvent::Delta(delta);
                 }
             }
@@ -1100,9 +1103,12 @@ async fn gemini_complete_stream(
                 seen_done = true;
                 continue;
             }
-            for delta in parse_gemini_stream_chunk(data, &mut final_usage)? {
+            for delta in parse_gemini_stream_chunk(data, &mut final_usage, &mut seen_terminal)? {
                 yield CompletionStreamEvent::Delta(delta);
             }
+        }
+        if !seen_done && !seen_terminal {
+            Err::<(), anyhow::Error>(anyhow!("gemini stream ended before terminal marker"))?;
         }
         if seen_done && final_usage.is_none() {
             Err::<(), anyhow::Error>(anyhow!("gemini stream ended before final usage"))?;
@@ -1209,6 +1215,7 @@ fn gemini_url(model: &str, stream: bool) -> String {
 fn parse_gemini_stream_chunk(
     data: &str,
     final_usage: &mut Option<GeminiUsage>,
+    seen_terminal: &mut bool,
 ) -> Result<Vec<String>> {
     let parsed: GeminiGenerateResp =
         serde_json::from_str(data).with_context(|| format!("gemini stream json: {data}"))?;
@@ -1223,6 +1230,14 @@ fn parse_gemini_stream_chunk(
     }
     if let Some(usage) = parsed.usage_metadata.clone() {
         *final_usage = Some(usage);
+    }
+    if parsed.candidates.iter().any(|candidate| {
+        candidate
+            .finish_reason
+            .as_deref()
+            .is_some_and(|reason| !reason.is_empty())
+    }) {
+        *seen_terminal = true;
     }
     Ok(parsed
         .candidates
@@ -2069,27 +2084,33 @@ mod tests {
     #[test]
     fn gemini_stream_error_frame_is_not_treated_as_empty_success() {
         let mut usage = None;
+        let mut seen_terminal = false;
         let err = parse_gemini_stream_chunk(
             r#"{"error":{"message":"provider overloaded","status":"RESOURCE_EXHAUSTED"}}"#,
             &mut usage,
+            &mut seen_terminal,
         )
         .unwrap_err();
 
         assert!(err.to_string().contains("provider overloaded"));
         assert!(usage.is_none());
+        assert!(!seen_terminal);
     }
 
     #[test]
     fn gemini_stream_chunk_tracks_final_usage() {
         let mut usage = None;
+        let mut seen_terminal = false;
         let deltas = parse_gemini_stream_chunk(
-            r#"{"candidates":[{"content":{"parts":[{"text":"hello"}]}}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"totalTokenCount":10}}"#,
+            r#"{"candidates":[{"content":{"parts":[{"text":"hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"totalTokenCount":10}}"#,
             &mut usage,
+            &mut seen_terminal,
         )
         .unwrap();
 
         assert_eq!(deltas, vec!["hello"]);
         assert_eq!(usage.unwrap().token_counts(0), (7, 3));
+        assert!(seen_terminal);
     }
 
     #[test]

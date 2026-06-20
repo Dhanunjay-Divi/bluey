@@ -29,6 +29,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     let squareCard = null;
     let squareCardEnvironment = '';
     let squareCardSetupPromise = null;
+    let refreshAccountTokenPromise = null;
     const AUTO_RELOAD_MIN_CENTS = 1500;
     const AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS = 500;
     const AUTO_RELOAD_DEFAULT_AMOUNT_CENTS = 1500;
@@ -64,7 +65,27 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       syncAccountNav();
     }
 
-    function signOut() {
+    async function revokeBrowserSession() {
+      const previousRefreshToken = localStorage.getItem('bluey_refresh_token') || '';
+      if (previousRefreshToken) {
+        await refreshAccountToken();
+      }
+      const refreshToken = localStorage.getItem('bluey_refresh_token') || previousRefreshToken;
+      if (!accountToken() && !refreshToken) return;
+      try {
+        await apiJson('/auth/logout', {
+          method: 'POST',
+          body: JSON.stringify({ refresh_token: refreshToken || null }),
+          skipAuthRefresh: true,
+        });
+      } catch {
+        // Always let local sign-out complete. Stale or already-revoked server
+        // tokens are harmless once the browser copy is cleared.
+      }
+    }
+
+    async function signOut() {
+      await revokeBrowserSession();
       clearAccountToken();
       if (isAccountRoute) {
         loadAccount().catch((error) => accountMessage(error.message));
@@ -185,25 +206,33 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     async function refreshAccountToken() {
-      const refreshToken = localStorage.getItem('bluey_refresh_token') || '';
-      if (!refreshToken) return '';
-      const response = await fetch('/auth/refresh', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refresh_token: refreshToken }),
-      });
-      let body = null;
+      if (refreshAccountTokenPromise) return refreshAccountTokenPromise;
+      refreshAccountTokenPromise = (async () => {
+        const refreshToken = localStorage.getItem('bluey_refresh_token') || '';
+        if (!refreshToken) return '';
+        const response = await fetch('/auth/refresh', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refresh_token: refreshToken }),
+        });
+        let body = null;
+        try {
+          body = await response.json();
+        } catch {
+          body = null;
+        }
+        if (!response.ok || !body?.access_token) {
+          clearAccountToken();
+          return '';
+        }
+        setAccountToken(body);
+        return body.access_token;
+      })();
       try {
-        body = await response.json();
-      } catch {
-        body = null;
+        return await refreshAccountTokenPromise;
+      } finally {
+        refreshAccountTokenPromise = null;
       }
-      if (!response.ok || !body?.access_token) {
-        clearAccountToken();
-        return '';
-      }
-      setAccountToken(body);
-      return body.access_token;
     }
 
     async function apiJson(path, options = {}, hasRetriedAuth = false) {
@@ -341,8 +370,23 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       body.append('Code ');
       const codeEl = document.createElement('code');
       codeEl.textContent = code;
-      body.append(codeEl, '. Sign in or create an account here; Bluey will connect automatically.');
+      body.append(codeEl, accountToken()
+        ? '. Confirm before this browser links the desktop app.'
+        : '. Sign in or create an account here, then confirm the desktop link.');
       el.append(title, body);
+      if (accountToken() && sessionStorage.getItem(`bluey_device_approved_${code}`) !== '1') {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'account-button secondary compact';
+        button.textContent = 'Connect desktop';
+        button.addEventListener('click', () => {
+          sessionStorage.setItem(`bluey_device_confirmed_${code}`, '1');
+          approvePendingDevice()
+            .then(() => loadAccount())
+            .catch((error) => accountMessage(`Desktop link failed: ${error.message}`));
+        });
+        el.append(button);
+      }
     }
 
     async function approvePendingDevice() {
@@ -350,6 +394,10 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (!code || !accountToken()) return false;
       const storageKey = `bluey_device_approved_${code}`;
       if (sessionStorage.getItem(storageKey) === '1') return true;
+      if (sessionStorage.getItem(`bluey_device_confirmed_${code}`) !== '1') {
+        accountMessage('Confirm the desktop link before connecting this account.');
+        return false;
+      }
       accountMessage('Connecting this account to the desktop app...');
       await apiJson('/auth/device/approve', {
         method: 'POST',
@@ -822,6 +870,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
       const authed = Boolean(accountToken());
       setAccountChrome(authed);
+      renderDeviceLinkHint();
       document.getElementById('accountAuthCard').hidden = authed;
       document.getElementById('accountPreviewCard').hidden = true;
       document.getElementById('accountDashboard').hidden = !authed;
@@ -855,6 +904,14 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         if (!approved) await openDesktopDeepLinkIfNeeded();
       } catch (error) {
         accountMessage(`Account signed in, but desktop handoff failed: ${error.message}`);
+      }
+      const params = new URLSearchParams(location.search);
+      if (currentPath === '/reload' && params.get('checkout') === '1' && params.get('reload') !== 'success') {
+        const checkoutKey = `bluey_reload_checkout_started_${location.search}`;
+        if (sessionStorage.getItem(checkoutKey) !== '1') {
+          sessionStorage.setItem(checkoutKey, '1');
+          await startReload();
+        }
       }
     }
 
@@ -974,9 +1031,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         confirmPasswordReset(token, password).catch((error) => recoveryMessage(error.message));
       });
       loadAccount().catch((error) => {
-        clearAccountToken();
-        accountMessage('Session expired. Sign in again to reconnect Bluey.', true);
-        loadAccount();
+        accountMessage(`Could not load account: ${error.message}`);
       });
     }
 
@@ -1049,7 +1104,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const signOutButton = event.target.closest('[data-sign-out]');
       if (signOutButton) {
         event.preventDefault();
-        signOut();
+        await signOut();
         return;
       }
 

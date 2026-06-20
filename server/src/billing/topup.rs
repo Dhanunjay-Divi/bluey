@@ -69,6 +69,14 @@ fn square_reload_reference_id(account_id: &str) -> String {
     format!("br_{compact}")
 }
 
+fn square_topup_idempotency_key(account_id: &str) -> String {
+    format!(
+        "bst-{}-{}",
+        cue_core::account_id_hash_prefix(account_id),
+        chrono::Utc::now().format("%Y%m%d%H")
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Spawn an async auto top-up if conditions are met. Non-blocking.
 /// Returns immediately; the actual Stripe call runs on the executor.
@@ -286,10 +294,7 @@ async fn run_square_topup(
         .location_id
         .as_ref()
         .ok_or_else(|| anyhow!("SQUARE_LOCATION_ID not configured"))?;
-    let idempotency_key = format!(
-        "bluey-square-topup-{account_id}-{}",
-        chrono::Utc::now().format("%Y%m%d%H")
-    );
+    let idempotency_key = square_topup_idempotency_key(&account_id);
     let body = serde_json::json!({
         "idempotency_key": idempotency_key,
         "source_id": square_card_id,
@@ -499,5 +504,12 @@ mod tests {
             None,
             1500,
         );
+    }
+
+    #[test]
+    fn square_topup_idempotency_key_stays_within_square_limit() {
+        let key = square_topup_idempotency_key("833e66ac-0652-43c7-a55e-8d51d9ccc982");
+        assert!(key.len() <= 45, "{key}");
+        assert!(key.starts_with("bst-"));
     }
 }

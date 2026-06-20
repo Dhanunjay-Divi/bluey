@@ -51,6 +51,13 @@ pub struct SaveSquareCardRequest {
 const MINIMUM_RELOAD_CENTS: i64 = 1500;
 const SQUARE_API_VERSION: &str = "2025-04-16";
 
+fn square_idempotency_key(prefix: &str, account_id: &str, suffix: impl std::fmt::Display) -> String {
+    format!(
+        "{prefix}-{}-{suffix}",
+        cue_core::account_id_hash_prefix(account_id)
+    )
+}
+
 fn ensure_payment_setup_allowed(
     account: &crate::db::accounts::Account,
 ) -> Result<(), (StatusCode, Json<ApiError>)> {
@@ -354,7 +361,7 @@ async fn create_square_customer(
     account: &crate::db::accounts::Account,
 ) -> Result<String, (StatusCode, Json<ApiError>)> {
     let body = serde_json::json!({
-        "idempotency_key": format!("bluey-customer-{}", account.id),
+        "idempotency_key": square_idempotency_key("bcust", &account.id, "v1"),
         "email_address": account.email,
         "reference_id": account.id,
     });
@@ -415,8 +422,10 @@ async fn create_square_card(
     source_id: &str,
     account: &crate::db::accounts::Account,
 ) -> Result<SavedSquareCard, (StatusCode, Json<ApiError>)> {
+    let card_nonce = uuid::Uuid::new_v4().to_string();
+    let card_nonce = card_nonce.split('-').next().unwrap_or("card");
     let body = serde_json::json!({
-        "idempotency_key": format!("bluey-card-{}-{}", account.id, uuid::Uuid::new_v4()),
+        "idempotency_key": square_idempotency_key("bc", &account.id, card_nonce),
         "source_id": source_id,
         "card": {
             "customer_id": customer_id,
@@ -500,8 +509,10 @@ fn build_square_payment_link_body(
     customer_email: &str,
     amount_cents: i64,
 ) -> serde_json::Value {
+    let reload_nonce = uuid::Uuid::new_v4().to_string();
+    let reload_nonce = reload_nonce.split('-').next().unwrap_or("reload");
     serde_json::json!({
-        "idempotency_key": format!("bluey-reload-{account_id}-{amount_cents}-{}", uuid::Uuid::new_v4()),
+        "idempotency_key": square_idempotency_key("br", account_id, format!("{amount_cents}-{reload_nonce}")),
         "order": {
             "location_id": location_id,
             "reference_id": square_reload_reference_id(account_id),
@@ -1267,10 +1278,16 @@ fn extract_square_credit(event: &serde_json::Value) -> Result<Option<SquareCredi
         if status != "COMPLETED" {
             return Ok(None);
         }
-        let reference_id =
-            required_square_string(payment, "/reference_id", "payment reference_id")?;
-        let account_id = square_account_id_from_reference(reference_id)
-            .ok_or_else(|| anyhow!("Square payment reference_id is not a Bluey reload reference"))?;
+        let Some(reference_id) = payment
+            .pointer("/reference_id")
+            .and_then(|v| v.as_str())
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+        let Some(account_id) = square_account_id_from_reference(reference_id) else {
+            return Ok(None);
+        };
         if let Some(metadata_account_id) = payment
             .pointer("/metadata/bluey_account_id")
             .and_then(|v| v.as_str())
@@ -1559,6 +1576,28 @@ mod tests {
     }
 
     #[test]
+    fn square_idempotency_keys_stay_within_square_limit() {
+        let account_id = "833e66ac-0652-43c7-a55e-8d51d9ccc982";
+        let customer_key = square_idempotency_key("bcust", account_id, "v1");
+        let card_key = square_idempotency_key("bc", account_id, "abcd1234");
+        let reload_key = build_square_payment_link_body(
+            "https://bluey.sh",
+            "LOC_TEST",
+            account_id,
+            "user@example.com",
+            3000,
+        )
+        .pointer("/idempotency_key")
+        .and_then(|value| value.as_str())
+        .unwrap()
+        .to_string();
+
+        assert!(customer_key.len() <= 45, "{customer_key}");
+        assert!(card_key.len() <= 45, "{card_key}");
+        assert!(reload_key.len() <= 45, "{reload_key}");
+    }
+
+    #[test]
     fn square_reference_id_stays_within_square_limit() {
         let account_id = "833e66ac-0652-43c7-a55e-8d51d9ccc982";
         let reference_id = square_reload_reference_id(account_id);
@@ -1659,6 +1698,45 @@ mod tests {
         );
         assert_eq!(extracted.amount_cents, 3000);
         assert_eq!(extracted.payment_id, "payment_1");
+    }
+
+    #[test]
+    fn square_payment_ignores_completed_payment_without_bluey_reference() {
+        let event = serde_json::json!({
+            "event_id": "evt_payment",
+            "type": "payment.updated",
+            "data": {
+                "object": {
+                    "payment": {
+                        "id": "payment_external",
+                        "status": "COMPLETED",
+                        "amount_money": {"amount": 3000, "currency": "USD"}
+                    }
+                }
+            }
+        });
+
+        assert!(extract_square_credit(&event).unwrap().is_none());
+    }
+
+    #[test]
+    fn square_payment_ignores_completed_payment_with_non_bluey_reference() {
+        let event = serde_json::json!({
+            "event_id": "evt_payment",
+            "type": "payment.updated",
+            "data": {
+                "object": {
+                    "payment": {
+                        "id": "payment_external",
+                        "status": "COMPLETED",
+                        "reference_id": "external-order-123",
+                        "amount_money": {"amount": 3000, "currency": "USD"}
+                    }
+                }
+            }
+        });
+
+        assert!(extract_square_credit(&event).unwrap().is_none());
     }
 
     #[test]

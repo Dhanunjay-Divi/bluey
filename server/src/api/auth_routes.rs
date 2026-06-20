@@ -45,6 +45,12 @@ pub struct RefreshRequest {
     pub refresh_token: String,
 }
 
+#[derive(Deserialize)]
+pub struct LogoutRequest {
+    pub refresh_token: Option<String>,
+    pub revoke_all: Option<bool>,
+}
+
 #[derive(Serialize)]
 pub struct AuthResponse {
     pub access_token: String,
@@ -432,6 +438,31 @@ pub async fn refresh(
 
     // 3. Issue a new pair (the old token is already revoked atomically above).
     Ok(Json(auth_response(&state, &account)?))
+}
+
+pub async fn logout(
+    State(state): State<AppState>,
+    axum::Extension(crate::auth::AuthedAccount(account)): axum::Extension<
+        crate::auth::AuthedAccount,
+    >,
+    Json(req): Json<LogoutRequest>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    if req.revoke_all.unwrap_or(false) {
+        auth::refresh_store::revoke_all_for_account(&state.pool, &account.id)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
+        return Ok(StatusCode::OK);
+    }
+
+    if let Some(refresh_token) = req.refresh_token.as_deref().filter(|token| !token.is_empty()) {
+        if let Ok(claims) = auth::jwt::verify(&state.config.jwt_secret, refresh_token) {
+            if claims.kind == "refresh" && claims.sub == account.id {
+                auth::refresh_store::revoke(&state.pool, refresh_token)
+                    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
+            }
+        }
+    }
+
+    Ok(StatusCode::OK)
 }
 
 // ─── Device flow ────────────────────────────────────────────────────────
