@@ -1,0 +1,132 @@
+/* ───────────────────────────────────────────────────────────────
+   Bluey · Meeting frontend — "Aurora Glass" design system
+   Apple Liquid Glass language (macOS Tahoe 26 / visionOS):
+   Clarity · Deference · Depth. Light frosted material, a whisper-soft
+   aurora refracting through the glass, near-monochrome ink content,
+   ONE restrained indigo accent, ONE soft shadow, SF Pro, generous air.
+   This is the approved direction — distinct from the dark/cyan
+   interview overlay. Every component reads from these tokens.
+   ─────────────────────────────────────────────────────────────── */
+:root {
+  --ink: #1b1c1f;
+  --ink-2: #52555c;
+  --ink-3: #8a8e96;
+  --ink-4: #b6bac1;
+  --line: rgba(20, 22, 28, 0.08);
+  --line-2: rgba(20, 22, 28, 0.13);
+  --glass: rgba(255, 255, 255, 0.62);
+  --glass-2: rgba(255, 255, 255, 0.78);
+  --glass-solid: rgba(255, 255, 255, 0.92);
+  --tint: #6f6af0;
+  --tint-ink: #4b46c9;
+  --tint-wash: rgba(111, 106, 240, 0.1);
+  --violet: #a78bfa;
+  --blue: #7cb0ff;
+  --mint: #76e3c4;
+  --rose: #ff9aa9;
+  --amber: #ffcf8a;
+  --ok: #1f9d6b;
+  --r: 12px;
+  --r-lg: 18px;
+  --r-xl: 26px;
+  --r-pill: 999px;
+  --shadow: 0 24px 70px -18px rgba(40, 38, 90, 0.3),
+    0 2px 10px -2px rgba(30, 30, 60, 0.1);
+  --blur: saturate(180%) blur(30px);
+  --font: -apple-system, "SF Pro Text", "SF Pro Display", Inter, system-ui,
+    sans-serif;
+  --mono: "SF Mono", ui-monospace, monospace;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  font-family: var(--font);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  /* The aurora stage — a calm field so the glass has light to refract.
+     In the real overlay the window is transparent over the desktop; this
+     gradient is the dev/preview backdrop. */
+  background: radial-gradient(
+      900px 520px at 12% 0%,
+      rgba(167, 139, 250, 0.26),
+      transparent 60%
+    ),
+    radial-gradient(820px 520px at 88% 8%, rgba(124, 176, 255, 0.24), transparent 58%),
+    radial-gradient(760px 600px at 50% 108%, rgba(118, 227, 196, 0.22), transparent 60%),
+    linear-gradient(180deg, #f4f3fb, #eef0f7 55%, #f3f1f9);
+}
+
+/* The aurora wash that lives INSIDE every glass surface (the refraction). */
+.aurora {
+  position: absolute;
+  inset: -40% -20%;
+  z-index: 0;
+  pointer-events: none;
+  opacity: 0.5;
+  filter: blur(36px);
+  background: radial-gradient(40% 50% at 18% 10%, var(--violet), transparent 70%),
+    radial-gradient(42% 52% at 88% 6%, var(--blue), transparent 70%),
+    radial-gradient(46% 56% at 70% 104%, var(--mint), transparent 72%);
+}
+
+.glass {
+  position: relative;
+  background: var(--glass);
+  backdrop-filter: var(--blur);
+  -webkit-backdrop-filter: var(--blur);
+  border: 1px solid var(--line-2);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+.glass > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* shared keyframes */
+@keyframes aurora-wave {
+  0%,
+  100% {
+    transform: scaleY(0.45);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+@keyframes aurora-blink {
+  50% {
+    opacity: 0;
+  }
+}
+@keyframes aurora-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes aurora-shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+@keyframes aurora-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
