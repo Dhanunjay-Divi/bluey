@@ -248,6 +248,10 @@ impl SessionReader for VscdbReader {
         }
         Ok(Transcript { turns })
     }
+
+    fn health(&self, store: &SessionStore) -> super::ReaderHealth {
+        vscdb_health(store)
+    }
 }
 
 /// One per-workspace store: the `state.vscdb` path plus the project folder its
@@ -437,6 +441,99 @@ fn conversation_headers(composer: &Value) -> Vec<&Value> {
         .and_then(Value::as_array)
         .map(|a| a.iter().collect())
         .unwrap_or_default()
+}
+
+/// Drift health for the Cursor `cursorDiskKV` store. The raw unit is each
+/// `composerData:%` row (one conversation record); a row is "parsed" when it is
+/// valid JSON carrying at least one conversation header (i.e. understood as a
+/// real conversation, the same bar `list()` uses). Returns the
+/// [`ReaderHealth::Parsed`] ratio so the canary can tell "no conversations yet"
+/// (raw_total 0) from "the schema moved under us" (raw rows present, none parse
+/// — e.g. the historical `ItemTable`→`cursorDiskKV` migration, or headers field
+/// renamed). Read-only and bounded; never the full-bubble walk.
+fn vscdb_health(store: &SessionStore) -> super::ReaderHealth {
+    let Some(conn) = open_readonly_path(&store.path) else {
+        return super::ReaderHealth::EmptyStore;
+    };
+    // Cap the scan so a huge store stays cheap; this is a shape probe, not a
+    // full listing. 5000 comfortably covers real machines (≤220 composers).
+    const HEALTH_SCAN_CAP: i64 = 5000;
+    let Ok(mut stmt) =
+        conn.prepare("SELECT value FROM cursorDiskKV WHERE key LIKE 'composerData:%' LIMIT ?1")
+    else {
+        // The `cursorDiskKV` table is absent. If the DB has ANY other table the
+        // store is non-empty → this is the table-rename drift; otherwise it is a
+        // genuinely empty/new store.
+        let non_empty = any_table_nonempty(&conn);
+        return if non_empty {
+            super::ReaderHealth::Parsed {
+                parsed: 0,
+                raw_total: 1,
+            }
+        } else {
+            super::ReaderHealth::EmptyStore
+        };
+    };
+    let Ok(rows) = stmt.query_map([HEALTH_SCAN_CAP], |row| row.get::<_, String>(0)) else {
+        return super::ReaderHealth::EmptyStore;
+    };
+    // raw_total counts only CONTENT-CANDIDATE rows — composers that carry some
+    // conversation metadata (`name`/`subtitle`/`createdAt`/`lastUpdatedAt`), i.e.
+    // a real session the user had. Cursor auto-creates ~190-of-220 EMPTY drafts
+    // (`{}` / bookkeeping-only); those are legitimately empty, not drift, so they
+    // must NOT drag the ratio down (else every healthy store looks ~13% parsed).
+    // `parsed` is the subset that still has the conversation headers we decode.
+    // A headers-field RENAME leaves the metadata present (still a candidate) but
+    // zero headers (unparsed) → the drift the canary catches.
+    let mut raw_total = 0usize;
+    let mut parsed = 0usize;
+    for value in rows.flatten() {
+        let Ok(v) = serde_json::from_str::<Value>(&value) else {
+            // Invalid JSON in a composerData row is itself a candidate-and-broken
+            // signal (the value encoding changed): count it as a failed candidate.
+            raw_total += 1;
+            continue;
+        };
+        let is_candidate = ["name", "subtitle", "createdAt", "lastUpdatedAt"]
+            .iter()
+            .any(|k| v.get(k).is_some())
+            || !conversation_headers(&v).is_empty();
+        if !is_candidate {
+            continue; // empty auto-draft — neither raw nor parsed.
+        }
+        raw_total += 1;
+        if !conversation_headers(&v).is_empty() {
+            parsed += 1;
+        }
+    }
+    if raw_total == 0 {
+        super::ReaderHealth::EmptyStore
+    } else {
+        super::ReaderHealth::Parsed { parsed, raw_total }
+    }
+}
+
+/// Whether a vscdb connection has any user table holding at least one row — used
+/// only to distinguish "the `cursorDiskKV` table was renamed/dropped but the DB
+/// is otherwise populated" (drift) from "a fresh empty DB". Read-only, bounded:
+/// checks at most a handful of tables and short-circuits on the first non-empty.
+fn any_table_nonempty(conn: &Connection) -> bool {
+    let Ok(mut stmt) = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' LIMIT 32")
+    else {
+        return false;
+    };
+    let Ok(names) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+        return false;
+    };
+    for name in names.flatten() {
+        // Table names come from sqlite_master (not user input) but quote them
+        // defensively anyway; a count failure just skips this table.
+        let q = format!("SELECT 1 FROM \"{}\" LIMIT 1", name.replace('"', "\"\""));
+        if conn.query_row(&q, [], |_| Ok(())).is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Role from a header's numeric `type` (1 = user, 2 = assistant).
@@ -672,6 +769,67 @@ mod tests {
             !refs.iter().any(|r| r.id == "conv-bare"),
             "empty session must not appear"
         );
+    }
+
+    #[test]
+    fn health_counts_content_rows_and_is_not_drift_for_real_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("state.vscdb");
+        make_db(&db);
+
+        // raw_total = composerData rows WITH conversation headers (conv-new,
+        // conv-older); the empty draft (conv-bare) has no headers so it is not a
+        // content row and doesn't count against the ratio. Both content rows
+        // parse → ratio 1.0, not drift.
+        let h = VscdbReader.health(&store_at(db));
+        assert!(
+            !h.is_total_drift(),
+            "real store must not look like drift: {h:?}"
+        );
+        assert_eq!(h.parse_ratio(), 1.0);
+    }
+
+    #[test]
+    fn health_flags_drift_when_cursordiskkv_table_is_renamed() {
+        // Simulates the historical Cursor migration ItemTable -> cursorDiskKV: the
+        // DB is populated, but the table the reader expects is GONE. health() must
+        // report total drift (raw>0, parsed 0), not EmptyStore.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("state.vscdb");
+        let conn = Connection::open(&db).expect("open writable for setup");
+        conn.execute(
+            "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable VALUES ('composer.composerData', '{\"allComposers\":[]}')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let h = VscdbReader.health(&store_at(db));
+        assert!(h.is_total_drift(), "renamed table must flag drift: {h:?}");
+    }
+
+    #[test]
+    fn health_is_empty_store_for_fresh_empty_db() {
+        // A brand-new vscdb with the right table but no composers → genuinely
+        // empty, NOT drift (this is the false-positive the ratio design avoids).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("state.vscdb");
+        let conn = Connection::open(&db).expect("open writable for setup");
+        conn.execute(
+            "CREATE TABLE cursorDiskKV (key TEXT PRIMARY KEY, value TEXT)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let h = VscdbReader.health(&store_at(db));
+        assert_eq!(h, super::super::ReaderHealth::EmptyStore);
+        assert!(!h.is_total_drift());
     }
 
     #[test]

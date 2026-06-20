@@ -89,6 +89,13 @@ fn generic_vscode_fork_detector_finds_unknown_fork() {
     // but not in the registry. Must be detected as Other(name).
     let fork_dir = home_path.join("Library/Application Support/MysteryFork");
     build_synthetic_vscdb(&fork_dir.join("User/globalStorage/state.vscdb"));
+    // A real VS Code-family fork keeps its chats under `User/workspaceStorage/`
+    // (the global vscdb here has only `ItemTable`, NOT Cursor's `cursorDiskKV`).
+    // Discovery keys the reader off store SHAPE (C6): an `ItemTable`-only vscdb
+    // with a workspaceStorage dir is a `JsonFiles` store, not a `SqliteVscdb`
+    // one — so create the dir so the fork has a readable store to record.
+    fs::create_dir_all(fork_dir.join("User/workspaceStorage"))
+        .expect("create fork workspaceStorage");
     // Give it an mcp config too.
     fs::write(
         fork_dir.join("User/mcp.json"),
@@ -102,7 +109,10 @@ fn generic_vscode_fork_detector_finds_unknown_fork() {
         .find(|a| matches!(&a.kind, AgentKind::Other(n) if n == "MysteryFork"))
         .expect("unknown fork detected");
 
-    assert!(fork.session_store.is_some(), "fork should record its vscdb");
+    assert!(
+        fork.session_store.is_some(),
+        "fork should record its workspaceStorage chat store"
+    );
     assert!(
         fork.connector_config_path.is_some(),
         "fork should record its mcp config"

@@ -63,7 +63,9 @@ mod tests {
             "input length and max tokens exceed context length"
         ));
         // Real overflow phrasing captured live.
-        assert!(is_resume_recoverable_error("206453 tokens > 200000 maximum"));
+        assert!(is_resume_recoverable_error(
+            "206453 tokens > 200000 maximum"
+        ));
         // Not-resumable class.
         assert!(is_resume_recoverable_error("session not found"));
         assert!(is_resume_recoverable_error("invalid session id"));

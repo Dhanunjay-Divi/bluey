@@ -29,4 +29,7 @@ url.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["process", "io-util", "time", "rt", "macros", "rt-multi-thread"] }
+# Test-only: capture the structured `unrecognized_format` drift warning so the
+# format-drift canary is asserted, not just hoped for. Not a runtime dependency.
+tracing-subscriber.workspace = true
 wiremock.workspace = true

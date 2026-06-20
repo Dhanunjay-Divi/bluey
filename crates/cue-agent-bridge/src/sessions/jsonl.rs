@@ -51,6 +51,38 @@ impl SessionReader for JsonlReader {
         let file = resolve_file(&store.path, id, store);
         read_transcript_file(&file, max_turns)
     }
+
+    /// Drift health: the raw unit is each candidate `*.jsonl` (+ Gemini `chats/
+    /// *.json`) file; a file is "parsed" when it yields **at least one decodable
+    /// turn** (`read_transcript_file(file, 1)` is non-empty). This is the right
+    /// bar — `list()`/`session_ref_for` deliberately ALWAYS surface a row (id +
+    /// mtime are always available even when the body can't be read), so listing
+    /// success can't detect a body-format break. A store full of files whose
+    /// bodies no longer decode (`parsed 0 of N>0`) is exactly the Claude v2.1.128
+    /// break (the `messages` field nulled) or Codex's `RolloutLine`/`thread_source`
+    /// change. Bounded: only the FIRST turn of each file is decoded, and the scan
+    /// is capped so a directory of thousands of files stays a cheap probe.
+    fn health(&self, store: &SessionStore) -> super::ReaderHealth {
+        let files = enumerate_files(&store.path);
+        if files.is_empty() {
+            return super::ReaderHealth::EmptyStore;
+        }
+        // Cap the probe; a representative sample is enough to catch total drift.
+        const HEALTH_PROBE_CAP: usize = 256;
+        let sample: Vec<&PathBuf> = files.iter().take(HEALTH_PROBE_CAP).collect();
+        let parsed = sample
+            .iter()
+            .filter(|f| {
+                read_transcript_file(f, 1)
+                    .map(|t| !t.turns.is_empty())
+                    .unwrap_or(false)
+            })
+            .count();
+        super::ReaderHealth::Parsed {
+            parsed,
+            raw_total: sample.len(),
+        }
+    }
 }
 
 /// Stream a single Claude/Codex `*.jsonl` transcript file into a [`Transcript`],
@@ -744,6 +776,60 @@ mod tests {
     }
 
     #[test]
+    fn health_is_ok_for_a_well_formed_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("sess-1.jsonl");
+        let mut f = std::fs::File::create(&file).expect("create");
+        writeln!(
+            f,
+            r#"{{"type":"user","message":{{"role":"user","content":"hi"}}}}"#
+        )
+        .unwrap();
+        drop(f);
+
+        let h = JsonlReader.health(&store_at(dir.path().to_path_buf()));
+        assert_eq!(h.parse_ratio(), 1.0, "all files parsed");
+        assert!(!h.is_total_drift());
+    }
+
+    #[test]
+    fn health_flags_total_drift_when_bodies_no_longer_decode() {
+        // Simulates the Claude v2.1.128-class break: the session files are STILL
+        // on disk and STILL list (id + mtime are always available — the reader is
+        // deliberately resilient and surfaces a row even when the body can't be
+        // read), but their turn shape changed so no line decodes into a turn.
+        // list() therefore still returns rows (correct — the session exists), and
+        // health() is what catches the silent body-format break.
+        let dir = tempfile::tempdir().expect("tempdir");
+        for i in 0..3 {
+            let file = dir.path().join(format!("sess-{i}.jsonl"));
+            let mut f = std::fs::File::create(&file).expect("create");
+            // Valid JSON, but a shape the reader doesn't recognize as a turn.
+            writeln!(f, r#"{{"v":2,"unknownEnvelope":{{"noRoleNoText":true}}}}"#).unwrap();
+        }
+
+        let store = store_at(dir.path().to_path_buf());
+        // list() still surfaces the rows (the sessions DO exist on disk)...
+        assert_eq!(
+            JsonlReader.list(&store, 10).expect("list").len(),
+            3,
+            "rows still listed from id + mtime even when bodies don't decode"
+        );
+        // ...but health catches the drift: 3 files, 0 with a decodable body.
+        let h = JsonlReader.health(&store);
+        assert!(h.is_total_drift(), "got {h:?}");
+        assert_eq!(h.parse_ratio(), 0.0);
+    }
+
+    #[test]
+    fn health_is_empty_store_when_no_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let h = JsonlReader.health(&store_at(dir.path().to_path_buf()));
+        assert_eq!(h, super::super::ReaderHealth::EmptyStore);
+        assert!(!h.is_total_drift());
+    }
+
+    #[test]
     fn decode_project_recovers_hyphenated_dir_that_exists_on_disk() {
         // Build a real folder tree:  <tmp>/My-Project  (hyphen is part of name)
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1017,7 +1103,8 @@ mod tests {
         let day = dir.path().join("2026").join("06").join("19");
         std::fs::create_dir_all(&day).unwrap();
         let uuid = "019ee05c-e0bd-7ff1-9791-d412f9ae241a";
-        let file = day.join("rollout-2026-06-19T09-50-43-019ee05c-e0bd-7ff1-9791-d412f9ae241a.jsonl");
+        let file =
+            day.join("rollout-2026-06-19T09-50-43-019ee05c-e0bd-7ff1-9791-d412f9ae241a.jsonl");
         std::fs::write(
             &file,
             format!(

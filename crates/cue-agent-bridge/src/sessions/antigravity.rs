@@ -106,6 +106,22 @@ impl SessionReader for AntigravityReader {
         // readable body. Return empty rather than erroring.
         Ok(Transcript { turns: Vec::new() })
     }
+
+    /// Drift health for the protobuf conversation index. The raw unit is each
+    /// top-level `ConversationSummary` record; `parsed` is how many decoded into a
+    /// `Summary` with a uuid. A non-empty index that yields 0 records is the
+    /// Antigravity-2.0-style wire-format drift signal (`raw_total 1, parsed 0`).
+    fn health(&self, store: &SessionStore) -> super::ReaderHealth {
+        let index = &store.path;
+        if !index.exists() || std::fs::metadata(index).map(|m| m.len()).unwrap_or(0) == 0 {
+            return super::ReaderHealth::EmptyStore;
+        }
+        let parsed = parse_index(index).len();
+        // Tolerant raw count; if the wire format changed we still see the file is
+        // non-empty, so report a single unparsed record rather than EmptyStore.
+        let raw_total = count_index_records(index).max(if parsed == 0 { 1 } else { parsed });
+        super::ReaderHealth::Parsed { parsed, raw_total }
+    }
 }
 
 /// The on-disk body path for a conversation `uuid`, if any readable/known body
@@ -243,6 +259,40 @@ fn parse_index(path: &Path) -> Vec<Summary> {
         }
     }
     out
+}
+
+/// Count the raw top-level conversation records in the protobuf index, WITHOUT
+/// fully parsing each one — the drift-health denominator. A record is any
+/// top-level field-1/wire-2 length-delimited message (a `ConversationSummary`);
+/// `parse_index` is the numerator (records that yield a usable `Summary`). When
+/// the wire format changes under us (e.g. Antigravity 2.0), the top-level tags
+/// stop matching field 1 and this returns 0 on a non-empty file → the canary
+/// reads `parsed 0 of raw>0` only if raw is counted the SAME tolerant way, so we
+/// count by "non-empty file that yields no field-1 records" → raw_total 1.
+fn count_index_records(path: &Path) -> usize {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    if meta.len() == 0 || meta.len() > MAX_INDEX_BYTES {
+        return 0;
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return 0;
+    };
+    let mut buf = Buf::new(&bytes);
+    let mut n = 0usize;
+    while let Some((field, wire)) = buf.tag() {
+        if field == 1 && wire == 2 {
+            if buf.len_delim().is_some() {
+                n += 1;
+            } else {
+                break;
+            }
+        } else if !buf.skip(wire) {
+            break;
+        }
+    }
+    n
 }
 
 /// Parse one `ConversationSummary` message: field 1 = uuid, field 2 = Summary.

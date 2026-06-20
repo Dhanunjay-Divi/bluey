@@ -81,10 +81,12 @@ pub fn list_for_agent(
 /// than it should). Each id is a JSONL file stem shared across stores.
 fn claude_app_claimed_ids(all_agents: &[DiscoveredAgent], cap: usize) -> HashSet<String> {
     let mut claimed = HashSet::new();
-    for agent in all_agents
-        .iter()
-        .filter(|a| matches!(a.kind, AgentKind::ClaudeCodeApp | AgentKind::ClaudeCodeAgent))
-    {
+    for agent in all_agents.iter().filter(|a| {
+        matches!(
+            a.kind,
+            AgentKind::ClaudeCodeApp | AgentKind::ClaudeCodeAgent
+        )
+    }) {
         let Some(store) = agent.session_store.as_ref() else {
             continue;
         };

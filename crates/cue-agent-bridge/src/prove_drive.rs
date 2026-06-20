@@ -1492,7 +1492,10 @@ mod tests {
         // Plain answer text (even if it mentions tools) must NOT be a firing
         // signal — only our exact marker counts, so a 401'd connector's apology
         // text can't be mistaken for a real firing.
-        assert_eq!(tool_title_from_delta("I will use the perplexity tool now."), None);
+        assert_eq!(
+            tool_title_from_delta("I will use the perplexity tool now."),
+            None
+        );
         assert_eq!(tool_title_from_delta("see [tool: x] mid-sentence"), None);
         assert_eq!(tool_title_from_delta("[tool: ]"), None);
     }
@@ -1508,7 +1511,11 @@ mod tests {
         let cell = fired.cell();
         assert_eq!(cell.status, CellStatus::Pass);
         assert!(cell.detail.contains("FIRED"), "detail: {}", cell.detail);
-        assert!(cell.detail.contains("1 MCP tool call"), "detail: {}", cell.detail);
+        assert!(
+            cell.detail.contains("1 MCP tool call"),
+            "detail: {}",
+            cell.detail
+        );
         assert!(cell.detail.contains("perplexity_ask"));
         // Must NOT read as config-only / merely-available.
         assert!(!cell.detail.contains("config-only"));

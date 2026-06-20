@@ -44,7 +44,7 @@ pub use discover::{discover_agents, discover_in_home, probe_sqlite_store};
 // Local-CLI drive (unchanged surface) — local agents call this directly.
 pub use drive::{drive as drive_cli, AnswerChunk, AnswerStream, Question};
 pub use fix::{fix_apply_prompt, fix_proposal_prompt, parse_fix_proposal, FixProposal};
-pub use sessions::{reader_for, SessionReader};
+pub use sessions::{list_with_health_check, reader_for, ReaderHealth, SessionReader};
 
 /// Drive an agent for one question.
 ///
@@ -404,7 +404,10 @@ mod acp_gate_tests {
         // opt-in-true branch is exercised live via BLUEY_USE_ACP=1 e2e runs.
         // (If this test ever runs with BLUEY_USE_ACP=1 in the environment, skip
         // the assertion rather than fail spuriously.)
-        if std::env::var_os("BLUEY_USE_ACP").map(|v| v == "1").unwrap_or(false) {
+        if std::env::var_os("BLUEY_USE_ACP")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+        {
             return;
         }
         for agent in [

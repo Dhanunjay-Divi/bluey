@@ -89,6 +89,25 @@ impl SessionReader for ClaudeAppReader {
         }
         super::jsonl::read_transcript_file(&jsonl, max_turns)
     }
+
+    /// Drift health: the raw unit is each `local_*.json` index file; `parsed` is
+    /// how many deserialized into a usable [`SessionRef`]. If the app's index
+    /// schema changes so that none of N files deserialize (`parsed 0 of N>0`),
+    /// the canary flags it as drift.
+    fn health(&self, store: &SessionStore) -> super::ReaderHealth {
+        let files = enumerate_index_files(&store.path);
+        if files.is_empty() {
+            return super::ReaderHealth::EmptyStore;
+        }
+        let parsed = files
+            .iter()
+            .filter(|f| session_ref_for(f).is_some())
+            .count();
+        super::ReaderHealth::Parsed {
+            parsed,
+            raw_total: files.len(),
+        }
+    }
 }
 
 /// Enumerate `local_*.json` index files under `<store>/<account>/<workspace>/`.

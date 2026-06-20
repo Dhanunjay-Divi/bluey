@@ -91,6 +91,25 @@ impl SessionReader for JsonFilesReader {
         }
         Ok(Transcript { turns })
     }
+
+    /// Drift health: the raw unit is each `chatSessions/*.json` file; `parsed` is
+    /// how many yielded a usable [`SessionRef`]. A directory of chat files where
+    /// none parse (`parsed 0 of N>0`) is the drift signal — e.g. VS Code/Copilot
+    /// renaming the `requests`/`chatSessions` shape under us.
+    fn health(&self, store: &SessionStore) -> super::ReaderHealth {
+        let files = enumerate_files(&store.path);
+        if files.is_empty() {
+            return super::ReaderHealth::EmptyStore;
+        }
+        let parsed = files
+            .iter()
+            .filter(|f| session_ref_for(f).is_some())
+            .count();
+        super::ReaderHealth::Parsed {
+            parsed,
+            raw_total: files.len(),
+        }
+    }
 }
 
 /// Enumerate `*.json` chat-session files under a store path.

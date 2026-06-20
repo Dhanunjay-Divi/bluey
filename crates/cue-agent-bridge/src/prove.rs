@@ -18,7 +18,7 @@
 //! user's quota). It reports what *would* work and what is *proven present*.
 //! The live drive proof is a separate, explicit, consent-gated action.
 
-use crate::{discover_agents, read_connectors, reader_for, registry, AgentKind, DiscoveredAgent};
+use crate::{discover_agents, read_connectors, registry, AgentKind, DiscoveredAgent};
 
 /// The proof level achieved for one capability.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -366,11 +366,13 @@ fn prove_one(entry: &registry::AgentEntry, discovered: &[DiscoveredAgent]) -> Ag
         None => ProofLevel::Skipped("no connector config located".to_string()),
     };
 
-    // Sessions — actually list (bounded) if a store was found.
+    // Sessions — actually list (bounded) if a store was found. Use the
+    // health-checked wrapper so a silently-drifted store (0 parsed of N raw)
+    // emits one structured `unrecognized_format` warning instead of looking like
+    // an empty store.
     let sessions = match found.and_then(|d| d.session_store.as_ref()) {
         Some(store) => {
-            let reader = reader_for(store.format);
-            match reader.list(store, 100_000) {
+            match crate::sessions::list_with_health_check(store.format, store, 100_000) {
                 Ok(refs) => {
                     let titled = refs.iter().filter(|s| s.title.is_some()).count();
                     ProofLevel::Live(format!(

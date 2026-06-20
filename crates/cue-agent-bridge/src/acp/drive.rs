@@ -365,7 +365,10 @@ mod tests {
         }))
         .await;
 
-        assert!(!forked.load(Ordering::SeqCst), "committed resume must NOT fork");
+        assert!(
+            !forked.load(Ordering::SeqCst),
+            "committed resume must NOT fork"
+        );
         assert_eq!(
             out,
             vec![

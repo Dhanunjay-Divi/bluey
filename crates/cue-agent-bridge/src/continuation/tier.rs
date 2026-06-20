@@ -78,7 +78,9 @@ pub async fn resolve_session(
     // it for both — a bounded read, far cheaper than the drive itself, and
     // `apply_tier` only attaches it where actually needed.
     let _ = tier; // both tiers load it now; kept for call-site clarity
-    let transcript = reader.read(store, session_id, CONTINUATION_READ_MAX_TURNS).ok();
+    let transcript = reader
+        .read(store, session_id, CONTINUATION_READ_MAX_TURNS)
+        .ok();
 
     (project, transcript)
 }
@@ -113,7 +115,8 @@ pub async fn apply_tier<F, Fut>(
     };
 
     // Resolve the session's project (cwd) and — for Replay — its transcript.
-    let (project, transcript) = resolve_session(agent, session_id, entry.continuation, list_cap).await;
+    let (project, transcript) =
+        resolve_session(agent, session_id, entry.continuation, list_cap).await;
 
     // Will the project dir actually be usable as a cwd? (exists + non-empty —
     // mirrors the drive layer's guard). A missing/empty dir means a cwd-scoped
@@ -202,7 +205,11 @@ mod tests {
         // VS Code Copilot has no CLI of its own; its `continuation_via` sibling is
         // the Copilot CLI. When replaying, the drive kind bridges to the sibling.
         let bridged = continuation_bridge_kind(&AgentKind::VsCodeFork, true);
-        assert_eq!(bridged, AgentKind::Copilot, "replay bridges to the sibling CLI");
+        assert_eq!(
+            bridged,
+            AgentKind::Copilot,
+            "replay bridges to the sibling CLI"
+        );
 
         // Not replaying → unchanged (native drive of the same kind).
         assert_eq!(
