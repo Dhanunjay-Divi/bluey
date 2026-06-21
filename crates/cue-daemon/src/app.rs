@@ -533,7 +533,7 @@ const ANSWER_TRANSCRIPT_CHAR_BUDGET: usize = 8_000;
 const ANSWER_ATTACHMENT_PROMPT_PREVIEW_CHARS: usize = 1_200;
 const ANSWER_CONTEXT_ARTIFACT_LIMIT: usize = 8;
 const MAX_PROVIDER_IMAGE_DATA_URLS: usize = 4;
-const MAX_PROVIDER_IMAGE_DATA_URL_BYTES: usize = 12 * 1024 * 1024;
+const MAX_PROVIDER_IMAGE_DATA_URL_BYTES: usize = 4 * 1024 * 1024;
 
 impl OverlayProcess {
     fn send(&mut self, command: &OverlayCommand) -> Result<()> {
@@ -4448,10 +4448,7 @@ fn visible_question_for_source(question: &str, source: &str) -> (String, String)
             "Analyse Screen".to_string(),
             "Analyse the current browser page or screen context.".to_string(),
         ),
-        "overlay screenshot analyse" => (
-            "Analyse Screen".to_string(),
-            "Analyse the captured screenshot context.".to_string(),
-        ),
+        "overlay screenshot analyse" => ("Question".to_string(), question.to_string()),
         _ => ("Question".to_string(), question.to_string()),
     }
 }
@@ -5217,9 +5214,17 @@ fn compact_preserve_lines(text: &str, max_chars: usize) -> String {
 
 fn image_data_url_from_path(path: &Path) -> Result<String> {
     let mime = image_mime_for_path(path).context("unsupported image type for vision request")?;
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("failed to inspect image {}", path.display()))?;
+    if metadata.len() > MAX_PROVIDER_IMAGE_DATA_URL_BYTES as u64 {
+        return Err(anyhow!("image is too large for a managed vision request"));
+    }
     let bytes =
         std::fs::read(path).with_context(|| format!("failed to read image {}", path.display()))?;
     let encoded = BASE64_STANDARD.encode(bytes);
+    if encoded.len() + mime.len() + "data:;base64,".len() > MAX_PROVIDER_IMAGE_DATA_URL_BYTES {
+        return Err(anyhow!("image is too large for a managed vision request"));
+    }
     Ok(format!("data:{mime};base64,{encoded}"))
 }
 
@@ -5981,10 +5986,7 @@ async fn analyze_screen_with_screenshot_fallback(
         &daemon.paths,
         capture_path.display().to_string(),
         Some("Screen context".to_string()),
-        Some(format!(
-            "Captured after active browser page text failed: {}",
-            compact_snippet(&page_error_text, 220)
-        )),
+        Some("Captured screenshot fallback after page text was unavailable.".to_string()),
     )?;
     let meeting_snapshot = attach_context_artifacts(daemon, vec![artifact.clone()]).await?;
     update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
@@ -6008,11 +6010,15 @@ async fn analyze_screen_with_screenshot_fallback(
         CardKind::Warning,
         "Screen context ready",
         format!(
-            "Browser page text was unavailable, so Bluey captured a screenshot instead. {provider_hint}{context_hint}\n\nChrome page text tip: View > Developer > Allow JavaScript from Apple Events.\n\nDetail: {}",
-            compact_snippet(&page_error_text, 220)
+            "Page text was unavailable, so Bluey captured a screenshot instead. {provider_hint}{context_hint}"
         ),
     )
     .await;
+    tracing::debug!(
+        target: "bluey::screen",
+        reason = %compact_snippet(&page_error_text, 220),
+        "screen context used screenshot fallback"
+    );
     write_state(daemon).await?;
     Ok(())
 }
@@ -6058,7 +6064,11 @@ async fn capture_screen_to_file(paths: &AppPaths) -> Result<PathBuf> {
     tokio::fs::create_dir_all(&capture_dir)
         .await
         .with_context(|| format!("failed to create {}", capture_dir.display()))?;
-    let path = capture_dir.join(format!("eye-capture-{}.png", epoch_ms()?));
+    let path = capture_dir.join(format!(
+        "eye-capture-{}.{}",
+        epoch_ms()?,
+        capture_screen_file_extension()
+    ));
 
     let path_for_task = path.clone();
     tokio::task::spawn_blocking(move || capture_screen_platform(&path_for_task))
@@ -6070,6 +6080,16 @@ async fn capture_screen_to_file(paths: &AppPaths) -> Result<PathBuf> {
         return Err(anyhow!("screen capture was empty"));
     }
     Ok(path)
+}
+
+#[cfg(target_os = "macos")]
+fn capture_screen_file_extension() -> &'static str {
+    "jpg"
+}
+
+#[cfg(not(target_os = "macos"))]
+fn capture_screen_file_extension() -> &'static str {
+    "png"
 }
 
 #[cfg(target_os = "macos")]
@@ -6094,6 +6114,8 @@ fn ensure_screen_capture_supported() -> Result<()> {
 fn capture_screen_platform(path: &Path) -> Result<()> {
     let status = Command::new("screencapture")
         .arg("-x")
+        .arg("-t")
+        .arg("jpg")
         .arg(path)
         .status()
         .context("failed to launch macOS screencapture")?;
