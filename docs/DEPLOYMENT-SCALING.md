@@ -207,6 +207,7 @@ Worldwide release posture:
 
 Related production readiness docs:
 
+- `deploy/PRODUCTION-CLOUD-ARCHITECTURE.md`
 - `BACKEND-CONTRACTS.md`
 - `SETTINGS-UI-CONTRACT.md`
 - `INSTALLER-CHECKLIST.md`

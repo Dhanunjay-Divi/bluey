@@ -1,12 +1,32 @@
 # Bluey Cloud Infrastructure Skeleton
 
-This directory contains implementation contracts for the managed backend. It is intentionally provider-neutral so the first production pass can target a managed Postgres, object storage, Redis-compatible queue/cache, and container workers without binding the desktop code to one cloud vendor.
+This directory contains implementation contracts for the managed backend. It is
+intentionally provider-neutral so the production stack can target managed
+Postgres, object storage, Redis-compatible capacity state, and workers without
+binding the desktop code to one cloud vendor.
+
+Normal Bluey customers do not install anything from this directory. Their
+laptop gets Bluey, local SQLite files, and a local RAG cache only. Redis,
+Postgres, pgvector, R2/S3, provider keys, and billing secrets are server-side
+operator concerns.
+
+The current `bluey-server` binary is still SQLite-backed. The Postgres schema
+below is the target cutover contract; do not set `BLUEY_DATABASE_URL` for the
+current server until the SQL backend adapter and backfill have landed.
 
 Files:
 
 - `openapi.yaml`: public API and streaming contract.
 - `migrations/001_initial_cloud_schema.sql`: initial Postgres schema outline with `pgvector`.
 - `queues/workers.yaml`: queue names, retry budgets, payload shapes, and worker ownership.
+
+Primary architecture doc:
+
+- `../docs/deploy/PRODUCTION-CLOUD-ARCHITECTURE.md`
+
+Paid-alpha preflight:
+
+- `../scripts/bluey-cloud-preflight.sh`
 
 Suggested first deployment:
 
@@ -44,5 +64,5 @@ Backup/off-host object storage contract:
 - `AWS_SECRET_ACCESS_KEY`
 - `AWS_DEFAULT_REGION=auto`
 
-Do not put Redis, Postgres, pgvector, or object-store credentials on customer
-desktops. Those are server-side concerns only.
+Do not put Redis, Postgres, pgvector, object-store credentials, or provider keys
+on customer desktops. Those are server-side concerns only.

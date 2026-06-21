@@ -100,55 +100,32 @@ sudo chown root:root /opt/bluey/bluey-server
 ## 3.4 Provision env file + secrets
 
 ```bash
-sudo mkdir -p /etc/bluey /var/lib/bluey /var/log/bluey
-sudo chown bluey:bluey /var/lib/bluey /var/log/bluey
-sudo chmod 700 /var/lib/bluey
+sudo mkdir -p /etc/bluey-api /opt/bluey-api /var/log/bluey-api
+sudo chown bluey:bluey /opt/bluey-api /var/log/bluey-api
+sudo chmod 700 /opt/bluey-api
 
-sudo nano /etc/bluey/bluey-server.env
+sudo cp ops/bluey-api.env.example /etc/bluey-api/bluey-api.env
+sudo nano /etc/bluey-api/bluey-api.env
 ```
 
-Contents (replace placeholders):
-```
-# ── Bind ─────────────────────────────────────────────────────────
-BLUEY_BIND=127.0.0.1:8081
+Use the current contract in `ops/bluey-api.env.example`. Important names:
 
-# ── Database ────────────────────────────────────────────────────
-BLUEY_DB_URL=/var/lib/bluey/bluey.db
-BLUEY_DB_MIGRATE=true
-
-# ── Auth (CHANGE THESE!) ────────────────────────────────────────
-BLUEY_JWT_SECRET=<generate via: openssl rand -hex 64>
-BLUEY_PUBLIC_URL=https://api-test.bluey.dev
-
-# ── Square SANDBOX mode ────────────────────────────────────────
-BLUEY_BILLING_PROVIDER=square
-SQUARE_ENVIRONMENT=sandbox
-SQUARE_SANDBOX_APPLICATION_ID=sandbox-sq0idb_xxxxxxxxx
-SQUARE_SANDBOX_ACCESS_TOKEN=EAAA_sandbox_xxxxxxxxx
-SQUARE_SANDBOX_LOCATION_ID=<Square sandbox location id>
-SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY=<Square sandbox webhook signature key>
-
-# ── Upstream provider keys (TEST/STAGING ACCOUNTS) ─────────────
-BLUEY_OPENAI_API_KEY=sk-test-xxxxxxxxxxxxxx
-BLUEY_ANTHROPIC_API_KEY=sk-ant-test-xxxxxxxxxxxxxx
-BLUEY_DEEPGRAM_API_KEY=test_xxxxxxxxxxxxxx
-
-# ── SMTP (use Mailhog or test SMTP for staging) ─────────────────
-BLUEY_SMTP_URL=smtp://user:pass@smtp.test:587
-BLUEY_SMTP_FROM=hello@api-test.bluey.dev
-
-# ── Pricing markup (test values) ────────────────────────────────
-BLUEY_MARKUP_PCT=20
-BLUEY_FREE_TRIAL_SECONDS=300
-
-# ── Logging ─────────────────────────────────────────────────────
-RUST_LOG=info,bluey_server=debug,tower_http=info
-```
+- `BLUEY_PORT=8080`
+- `BLUEY_DB_PATH=/opt/bluey-api/bluey.db`
+- `BLUEY_PUBLIC_URL=https://bluey.sh` or staging origin
+- `BLUEY_JWT_SECRET=<openssl rand -hex 32>`
+- `OPENAI_API_KEYS`, `ANTHROPIC_API_KEYS`, `GEMINI_API_KEYS`,
+  `DEEPGRAM_API_KEYS`
+- `BLUEY_BILLING_PROVIDER=square`
+- `SQUARE_ENVIRONMENT=sandbox` for staging, `production` for prod
+- `BLUEY_REDIS_URL` only when using shared Valkey/Redis capacity state
+- `OFFSITE_DESTINATION` plus R2/S3 credentials before paid users
 
 Lock down:
 ```bash
-sudo chmod 600 /etc/bluey/bluey-server.env
-sudo chown root:root /etc/bluey/bluey-server.env
+sudo chmod 0640 /etc/bluey-api/bluey-api.env
+sudo chown root:bluey /etc/bluey-api/bluey-api.env
+scripts/bluey-cloud-preflight.sh /etc/bluey-api/bluey-api.env
 ```
 
 ---

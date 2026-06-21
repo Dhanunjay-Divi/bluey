@@ -77,6 +77,10 @@ model choices, rate/capacity policy, and billing stay controlled.
 
 These are upgrade steps, not launch blockers.
 
+Run Redis/Valkey earlier if we run more than one `bluey-server` process or one
+droplet plus a separate worker that dispatches provider calls. The "not needed"
+claim applies only to a single live server process.
+
 ## Latency Reality
 
 One droplet gives good controlled-alpha latency, not global ultra-low latency.
@@ -157,6 +161,7 @@ contract.
 ```bash
 bash scripts/release-hygiene-scan.sh
 git diff --check
+scripts/bluey-cloud-preflight.sh /etc/bluey-api/bluey-api.env
 scripts/observability-acceptance-smoke.sh
 curl -fsS https://bluey.sh/health
 curl -fsS https://bluey.sh/pricing/tiers

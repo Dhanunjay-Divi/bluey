@@ -51,13 +51,18 @@ Caddy routes the API paths to `bluey-server` and serves everything else from
    - `SQUARE_PRODUCTION_ACCESS_TOKEN`
    - `SQUARE_PRODUCTION_LOCATION_ID`
    - `SQUARE_PRODUCTION_WEBHOOK_SIGNATURE_KEY`
-   - `OPENAI_API_KEY`
-   - `ANTHROPIC_API_KEY`
-   - `DEEPGRAM_API_KEY`
+   - `OPENAI_API_KEYS`
+   - `ANTHROPIC_API_KEYS`
+   - `GEMINI_API_KEYS`
+   - `DEEPGRAM_API_KEYS`
    - SMTP credentials for `hello@bluey.sh`
+   - R2/S3 backup credentials before paid users
+   - `BLUEY_REDIS_URL` before running more than one server instance
 
    See `docs/deploy/SQUARE-BILLING.md` for the exact Square sandbox/production
-   switching contract.
+   switching contract, and
+   `docs/deploy/PRODUCTION-CLOUD-ARCHITECTURE.md` for the storage/capacity
+   contract.
 
 4. Release artifacts
    - `/var/www/bluey/install.sh`
@@ -79,6 +84,7 @@ Caddy routes the API paths to `bluey-server` and serves everything else from
 8. Verify:
 
 ```bash
+scripts/bluey-cloud-preflight.sh /etc/bluey-api/bluey-api.env
 curl -fsS https://bluey.sh/health
 curl -fsS https://bluey.sh/pricing/tiers | jq .
 curl -fsSL https://bluey.sh/install.sh | bash
