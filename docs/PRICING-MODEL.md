@@ -78,6 +78,19 @@
 | Deepgram `nova-3` | $0.0043/min | 150% | Primary chunked `/router/transcribe` route |
 | OpenAI `gpt-4o-mini-transcribe` | $0.0030/min | 150% | Cloud fallback when Deepgram is busy/unavailable |
 
+Deepgram is part of the same formula as GPT, Claude, Gemini, and any other
+paid provider. For STT/captions, `U` is measured in seconds instead of tokens:
+
+```text
+U_stt = captured_seconds * provider_price_per_second
+```
+
+The server must reserve enough wallet balance when a live STT session starts,
+then settle/refund from the actual elapsed seconds when the session closes. Mic
+and system audio count as separate active sources unless a later provider
+session can meter them as one aggregate stream. The desktop never receives the
+Deepgram API key.
+
 **Raw-cost formula:**
 
 ```

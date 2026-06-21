@@ -28,6 +28,10 @@ Bluey server
 OpenAI / Anthropic / Gemini / Deepgram
 ```
 
+Deepgram is part of the same paid provider surface as the LLMs. Live captions
+consume server-side STT quota, reserve/settle against the Bluey wallet, and must
+never require a customer-side Deepgram key.
+
 For the controlled first-100 paid alpha, one DigitalOcean droplet plus SQLite is
 acceptable only while the live smoke, off-host backups, provider funding, and
 Square webhook tests stay green. The architecture contract below is the path out
@@ -151,6 +155,7 @@ For the first 100 paid users, the controlled-alpha stack can be:
 Before wider paid alpha:
 
 - run `scripts/bluey-cloud-preflight.sh /etc/bluey-api/bluey-api.env`
+- run `scripts/bluey-scalable-readiness.sh /etc/bluey-api/bluey-api.env`
 - prove Square sandbox and low-dollar production webhooks return 2xx and credit
   only after processor payment success
 - prove Deepgram live captions from a clean Mac
@@ -222,6 +227,8 @@ cutover profile cannot pass while the deployed runtime is still SQLite-backed.
 - Postgres/pgvector server-runtime schema is tracked in
   `infra/postgres/server-runtime`.
 - Runtime server is still SQLite-backed until the SQL backend migration lands.
+- `scripts/bluey-scalable-readiness.sh` now checks this distinction explicitly
+  so infra provisioning cannot be mistaken for a completed runtime cutover.
 
 That last line matters. The architecture is ready to provision; the runtime DB
 cutover is a deliberate follow-up, not an environment-variable trick.
