@@ -14,6 +14,7 @@ pub mod auth_tokens;
 pub mod balance;
 pub mod idempotency;
 pub mod link_codes;
+pub mod refresh_tokens;
 pub mod sync;
 pub mod usage;
 

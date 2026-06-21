@@ -6,7 +6,10 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 use super::AppState;
-use crate::{auth, db::accounts::Account};
+use crate::{
+    auth,
+    db::{accounts::Account, refresh_tokens},
+};
 
 // ─── Request / response shapes ───────────────────────────────────────────
 
@@ -168,7 +171,7 @@ fn auth_response(
         )
     })?;
 
-    auth::refresh_store::store(&state.pool, &refresh, &account.id, None).map_err(|e| {
+    refresh_tokens::store(&state.pool, &refresh, &account.id, None).map_err(|e| {
         err(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("store refresh: {e}"),
@@ -421,7 +424,7 @@ pub async fn refresh(
     // 2. ATOMICALLY consume the refresh token: revoke if and only if we are
     // the unique caller to claim it. Race-free against concurrent /auth/refresh
     // calls. (Codex S2.3 blocker fix.)
-    let account_id = auth::refresh_store::consume(&state.pool, &req.refresh_token)
+    let account_id = refresh_tokens::consume(&state.pool, &req.refresh_token)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "refresh token revoked or expired"))?;
 
@@ -448,7 +451,7 @@ pub async fn logout(
     Json(req): Json<LogoutRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     if req.revoke_all.unwrap_or(false) {
-        auth::refresh_store::revoke_all_for_account(&state.pool, &account.id)
+        refresh_tokens::revoke_all_for_account(&state.pool, &account.id)
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
         return Ok(StatusCode::OK);
     }
@@ -456,7 +459,7 @@ pub async fn logout(
     if let Some(refresh_token) = req.refresh_token.as_deref().filter(|token| !token.is_empty()) {
         if let Ok(claims) = auth::jwt::verify(&state.config.jwt_secret, refresh_token) {
             if claims.kind == "refresh" && claims.sub == account.id {
-                auth::refresh_store::revoke(&state.pool, refresh_token)
+                refresh_tokens::revoke(&state.pool, refresh_token)
                     .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
             }
         }
@@ -845,7 +848,7 @@ pub async fn link_mint(
     State(state): State<AppState>,
     Extension(crate::auth::AuthedAccount(account)): Extension<crate::auth::AuthedAccount>,
 ) -> Result<Json<LinkMintResponse>, (StatusCode, Json<ApiError>)> {
-    use crate::auth::{jwt, refresh_store};
+    use crate::auth::jwt;
     use crate::db::link_codes;
 
     // Mint fresh tokens specifically for this device so the browser
@@ -872,7 +875,7 @@ pub async fn link_mint(
             &format!("issue refresh: {e}"),
         )
     })?;
-    refresh_store::store(&state.pool, &refresh_raw, &account.id, Some("device-link")).map_err(
+    refresh_tokens::store(&state.pool, &refresh_raw, &account.id, Some("device-link")).map_err(
         |e| {
             err(
                 StatusCode::INTERNAL_SERVER_ERROR,
