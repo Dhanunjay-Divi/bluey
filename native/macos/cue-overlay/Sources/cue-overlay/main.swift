@@ -4643,11 +4643,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     @objc private func analyzeClicked() {
         let raw = composer.string.trimmingCharacters(in: .whitespacesAndNewlines)
         let question = composedQuestionForAnswer(typed: raw)
-        if question != nil {
-            composer.clearText()
-        }
-        routeBadge.stringValue = "Vision · deep"
-        setHeaderSubtitle("Analyzing screen")
+        routeBadge.stringValue = "Screen · ready"
+        routeBadge.textColor = BlueyTheme.cyan
+        setHeaderSubtitle("Capturing screen")
         emitAnalyzeScreen(question: question)
         window?.makeFirstResponder(composer)
     }

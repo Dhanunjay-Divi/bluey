@@ -3140,6 +3140,12 @@ fn overlay_context_items(meeting: &MeetingRecord) -> Vec<OverlayContextItem> {
     meeting
         .context
         .iter()
+        .filter(|item| {
+            matches!(
+                item.kind,
+                ContextKind::Code | ContextKind::Document | ContextKind::Text | ContextKind::Other
+            )
+        })
         .map(|item| OverlayContextItem {
             id: item.id,
             title: item.title.clone(),
@@ -3940,6 +3946,7 @@ async fn answer_with_provider_runtime(
         request.context =
             answer_context_for_question(daemon, &meeting_snapshot, &request.question).await;
     }
+    promote_request_to_vision_for_screen_context(&daemon.paths, &mut request);
 
     let (visible_question_title, visible_question) =
         visible_question_for_source(&request.question, &source);
@@ -5699,6 +5706,23 @@ fn answer_context_from_meeting(meeting: &MeetingRecord) -> Vec<AnswerContext> {
     context
 }
 
+fn promote_request_to_vision_for_screen_context(paths: &AppPaths, request: &mut AnswerRequest) {
+    if request.route.privacy.allow_image_upload {
+        return;
+    }
+    if !request
+        .context
+        .iter()
+        .any(|context| context.kind == AnswerContextKind::Screenshot)
+    {
+        return;
+    }
+    let Some(provider) = select_vision_provider(paths) else {
+        return;
+    };
+    request.route = vision_answer_request(&request.question, provider).route;
+}
+
 fn answer_context_kind(kind: ContextKind) -> AnswerContextKind {
     match kind {
         ContextKind::Image | ContextKind::Diagram => AnswerContextKind::Screenshot,
@@ -5859,19 +5883,24 @@ async fn analyze_active_page_context(
 ) -> Result<()> {
     match capture_active_page_context(daemon, "overlay analyse").await {
         Ok(artifact) => {
-            let mut question = format!(
-                "Analyse the active browser page that was just attached as context: {}.",
-                artifact.title
-            );
-            if let Some(context) = question_context
+            let context_hint = if question_context
                 .map(str::trim)
-                .filter(|value| !value.is_empty())
+                .is_some_and(|value| !value.is_empty())
             {
-                question.push_str("\n\nUser and live-caption context:\n");
-                question.push_str(context);
-            }
-            question.push_str("\n\nAnswer the visible question or prompt if there is one, use the provided live-caption context when relevant, then give concise next steps.");
-            let _ = answer_question(daemon, question, "overlay analyse").await?;
+                " Your typed question and live captions stay ready for Answer."
+            } else {
+                ""
+            };
+            push_system_card(
+                daemon,
+                CardKind::Context,
+                "Screen context ready",
+                format!(
+                    "Captured readable page text from {}. Press Answer to use it with the current transcript and documents.{context_hint}",
+                    artifact.title
+                ),
+            )
+            .await;
         }
         Err(page_error) => {
             analyze_screen_with_screenshot_fallback(daemon, page_error, question_context).await?;
@@ -5886,36 +5915,11 @@ async fn analyze_screen_with_screenshot_fallback(
     question_context: Option<&str>,
 ) -> Result<()> {
     let page_error_text = format!("{page_error:#}");
-    let Some(provider) = select_vision_provider(&daemon.paths) else {
-        push_system_card(
-            daemon,
-            CardKind::Warning,
-            "Analyse needs vision",
-            format!(
-                "Bluey could not read browser page text. Sign in to Bluey for cloud screen analysis, then try again.\n\nBrowser text error: {}\n\nDeveloper direct vision providers require a debug/dev build with BLUEY_DEV_DIRECT_VISION=1.",
-                compact_snippet(&page_error_text, 520)
-            ),
-        )
-        .await;
-        return Ok(());
-    };
-
-    push_system_card(
-        daemon,
-        CardKind::Warning,
-        "Page text unavailable",
-        format!(
-            "Browser text was not available, so Bluey is capturing one screenshot and routing it to vision. Reason: {}",
-            compact_snippet(&page_error_text, 360)
-        ),
-    )
-    .await;
-
     let capture_path = capture_screen_to_file(&daemon.paths).await?;
     let artifact = build_context_artifact(
         &daemon.paths,
         capture_path.display().to_string(),
-        Some("Screen capture fallback".to_string()),
+        Some("Screen context".to_string()),
         Some(format!(
             "Captured after active browser page text failed: {}",
             compact_snippet(&page_error_text, 220)
@@ -5925,46 +5929,30 @@ async fn analyze_screen_with_screenshot_fallback(
     update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
     refresh_overlay_context_items(daemon, &meeting_snapshot).await;
 
-    let card = CueCard::new(
-        CardKind::Context,
-        "Screenshot fallback attached",
+    let provider_hint = if select_vision_provider(&daemon.paths).is_some() {
+        "Press Answer to use the screenshot with your typed question, live captions, and documents."
+    } else {
+        "Sign in before pressing Answer so Bluey can use cloud vision on this screenshot."
+    };
+    let context_hint = if question_context
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty())
+    {
+        " Your typed question and live captions stay ready for Answer."
+    } else {
+        ""
+    };
+    push_system_card(
+        daemon,
+        CardKind::Warning,
+        "Screen context ready",
         format!(
-            "{}\n{} bytes. Vision route: {}.",
-            artifact.title,
-            artifact.size_bytes.unwrap_or_default(),
-            provider.display_label()
+            "Browser page text was unavailable, so Bluey captured a screenshot instead. {provider_hint}{context_hint}\n\nChrome page text tip: View > Developer > Allow JavaScript from Apple Events.\n\nDetail: {}",
+            compact_snippet(&page_error_text, 220)
         ),
     )
-    .with_source(artifact.path.clone());
-    let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
+    .await;
     write_state(daemon).await?;
-
-    let mut question = format!(
-        "Browser page text was unavailable, so analyze the attached screenshot instead. If the screenshot contains a question, task, code, diagram, or UI, answer it directly and give concise next steps. Browser text error for context: {}",
-        compact_snippet(&page_error_text, 260)
-    );
-    if let Some(context) = question_context
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        question.push_str("\n\nUser and live-caption context:\n");
-        question.push_str(context);
-    }
-    let mut request = vision_answer_request(&question, provider);
-    request.context = answer_context_for_question(daemon, &meeting_snapshot, &question).await;
-    request.context.push(
-        AnswerContext::new(
-            AnswerContextKind::Screenshot,
-            format!(
-                "{} ({})\nCaptured as screenshot fallback after browser text extraction failed.",
-                artifact.title, artifact.kind
-            ),
-        )
-        .with_title(artifact.title)
-        .with_source(artifact.path),
-    );
-
-    let _ = answer_with_provider_runtime(daemon, request, "overlay screenshot analyse").await?;
     Ok(())
 }
 
@@ -8319,6 +8307,35 @@ mod tests {
         assert!(json.contains("omitted from provider upload because Bluey sends only the latest"));
 
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn overlay_context_items_show_documents_not_screen_captures() {
+        let mut meeting = MeetingRecord::new(Some("Screen QA".to_string()));
+        let screenshot = ContextArtifact::new(
+            ContextKind::Image,
+            "/tmp/bluey-screen.png",
+            "Screen context",
+            None,
+            Some(128),
+        )
+        .with_processing_status(ContextProcessingStatus::Ready);
+        let document = ContextArtifact::new(
+            ContextKind::Document,
+            "/tmp/notes.md",
+            "notes.md",
+            None,
+            Some(64),
+        )
+        .with_processing_status(ContextProcessingStatus::Ready);
+        meeting.context.push(screenshot);
+        meeting.context.push(document);
+
+        let items = overlay_context_items(&meeting);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "notes.md");
+        assert_eq!(items[0].kind, "document");
     }
 
     #[test]
