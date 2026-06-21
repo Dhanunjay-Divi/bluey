@@ -115,7 +115,7 @@ operating plan.
 - [x] Firewall/listeners: only 22, 80, 443 are publicly listening
 - [x] Backup script installed at `/usr/local/sbin/backup-bluey-db.sh`
 - [x] Backup cron entry verified
-- [ ] **At least one** off-host backup destination configured (Cloudflare R2/S3-compatible bucket or rsync target)
+- [x] **At least one** off-host backup destination configured (Cloudflare R2/S3-compatible bucket or rsync target)
 - [x] First backup completed successfully + checksum verified
 
 ### Square Billing

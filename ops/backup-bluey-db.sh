@@ -12,6 +12,16 @@
 
 set -euo pipefail
 
+# Cron runs this script with a minimal environment. Load the Bluey API env by
+# default so OFFSITE_DESTINATION and R2/S3 credentials are available there too.
+BLUEY_ENV_FILE="${BLUEY_ENV_FILE:-/etc/bluey-api/bluey-api.env}"
+if [ -r "$BLUEY_ENV_FILE" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$BLUEY_ENV_FILE"
+    set +a
+fi
+
 DB_PATH="${BLUEY_DB_PATH:-/opt/bluey-api/bluey.db}"
 BACKUP_DIR="${BLUEY_BACKUP_DIR:-/var/backups/bluey-api}"
 HOURLY_KEEP=14
