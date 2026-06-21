@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use super::AppState;
 use crate::auth::AuthedAccount;
 use crate::config::BillingProvider;
-use crate::db::balance;
+use crate::db::{accounts::Account, balance, webhook_events};
 
 #[derive(Deserialize)]
 pub struct CheckoutRequest {
@@ -743,25 +743,12 @@ async fn stripe_webhook_impl(
         .ok_or(StatusCode::BAD_REQUEST)?;
 
     // Idempotency: skip if we've already processed this event.
-    let conn = state
-        .pool
-        .get()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let already: Option<String> = conn
-        .query_row(
-            "SELECT processed_at FROM stripe_webhook_events WHERE event_id = ?1",
-            rusqlite::params![event_id],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten();
-    if already.is_some() {
+    if webhook_events::processed(&state.pool, event_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
         return Ok(StatusCode::OK);
     }
-    let _ = conn.execute(
-        "INSERT OR IGNORE INTO stripe_webhook_events (event_id, type, body) VALUES (?1, ?2, ?3)",
-        rusqlite::params![event_id, event_type, &body],
-    );
+    let _ = webhook_events::record_received(&state.pool, event_id, event_type, &body);
 
     if event_type == "checkout.session.completed" {
         if let Err(e) = handle_checkout_completed(&state, &event).await {
@@ -778,10 +765,7 @@ async fn stripe_webhook_impl(
         }
     }
 
-    let _ = conn.execute(
-        "UPDATE stripe_webhook_events SET processed_at = datetime('now') WHERE event_id = ?1",
-        rusqlite::params![event_id],
-    );
+    let _ = webhook_events::mark_processed(&state.pool, event_id);
 
     Ok(StatusCode::OK)
 }
@@ -853,26 +837,12 @@ async fn square_webhook_impl(
         "square webhook signature accepted"
     );
 
-    let conn = state
-        .pool
-        .get()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let already: Option<String> = conn
-        .query_row(
-            "SELECT processed_at FROM stripe_webhook_events WHERE event_id = ?1",
-            rusqlite::params![&stored_event_id],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .ok()
-        .flatten();
-    if already.is_some() {
+    if webhook_events::processed(&state.pool, &stored_event_id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
         return Ok(StatusCode::OK);
     }
-    let _ = conn.execute(
-        "INSERT OR IGNORE INTO stripe_webhook_events (event_id, type, body) VALUES (?1, ?2, ?3)",
-        rusqlite::params![&stored_event_id, event_type, &body],
-    );
-    drop(conn);
+    let _ = webhook_events::record_received(&state.pool, &stored_event_id, event_type, &body);
 
     if matches!(
         event_type,
@@ -893,12 +863,7 @@ async fn square_webhook_impl(
         }
     }
 
-    if let Ok(conn) = state.pool.get() {
-        let _ = conn.execute(
-            "UPDATE stripe_webhook_events SET processed_at = datetime('now') WHERE event_id = ?1",
-            rusqlite::params![&stored_event_id],
-        );
-    }
+    let _ = webhook_events::mark_processed(&state.pool, &stored_event_id);
 
     Ok(StatusCode::OK)
 }
@@ -1035,18 +1000,13 @@ async fn handle_checkout_completed(state: &AppState, event: &serde_json::Value) 
         }
     }
 
-    if let Ok(conn) = state.pool.get() {
-        let customer_id = session.get("customer").and_then(|v| v.as_str());
-        if customer_id.is_some() || payment_method_id.is_some() {
-            let _ = conn.execute(
-                "UPDATE accounts
-                    SET stripe_customer_id = COALESCE(?1, stripe_customer_id),
-                        stripe_payment_method_id = COALESCE(?2, stripe_payment_method_id)
-                  WHERE id = ?3",
-                rusqlite::params![customer_id, payment_method_id.as_deref(), &account_id],
-            );
-        }
-    }
+    let customer_id = session.get("customer").and_then(|v| v.as_str());
+    let _ = Account::save_stripe_checkout_refs(
+        &state.pool,
+        &account_id,
+        customer_id,
+        payment_method_id.as_deref(),
+    );
 
     if !credited {
         tracing::info!(

@@ -220,6 +220,25 @@ impl Account {
         Self::fetch_by_id(pool, id)
     }
 
+    pub fn save_stripe_checkout_refs(
+        pool: &DbPool,
+        id: &str,
+        customer_id: Option<&str>,
+        payment_method_id: Option<&str>,
+    ) -> Result<usize> {
+        if customer_id.is_none() && payment_method_id.is_none() {
+            return Ok(0);
+        }
+        let conn = pool.get()?;
+        Ok(conn.execute(
+            "UPDATE accounts
+                SET stripe_customer_id = COALESCE(?2, stripe_customer_id),
+                    stripe_payment_method_id = COALESCE(?3, stripe_payment_method_id)
+              WHERE id = ?1",
+            params![id, customer_id, payment_method_id],
+        )?)
+    }
+
     pub fn set_admin(pool: &DbPool, id: &str, is_admin: bool) -> Result<()> {
         let conn = pool.get()?;
         conn.execute(

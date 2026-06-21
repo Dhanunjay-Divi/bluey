@@ -21,6 +21,7 @@ pub mod signup_otps;
 pub mod stt_accounting;
 pub mod sync;
 pub mod usage;
+pub mod webhook_events;
 
 pub type DbPool = Pool<SqliteConnectionManager>;
 

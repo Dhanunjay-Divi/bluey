@@ -35,8 +35,12 @@ Already done:
   - STT reservation/claim/settlement moved to `server/src/db/stt_accounting.rs`
   - admin customer summary moved to `server/src/db/accounts.rs`
   - metrics read model moved to `server/src/db/metrics.rs`
+  - Stripe/Square webhook event idempotency moved to
+    `server/src/db/webhook_events.rs`
+  - Stripe checkout customer/payment-method persistence moved to
+    `server/src/db/accounts.rs`
   - boundary inventory dropped from 89 direct SQLite-bound lines outside
-    `server/src/db/**` to 37.
+    `server/src/db/**` to 28.
 
 Still missing:
 
@@ -46,7 +50,6 @@ Still missing:
 - Postgres-mode smoke tests for money/auth/STT/RAG paths.
 - Remaining direct SQLite islands:
   - account dashboard/export
-  - billing webhook/card metadata
 
 ## Why It Cannot Be Blindly Flipped
 
