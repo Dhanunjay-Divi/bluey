@@ -49,10 +49,18 @@ pub(crate) fn classify_context_path(path: &Path) -> ContextKind {
 }
 
 pub(crate) fn is_supported_context_file(path: &Path) -> bool {
-    matches!(
-        classify_context_path(path),
-        ContextKind::Code | ContextKind::Document | ContextKind::Text
-    )
+    match classify_context_path(path) {
+        ContextKind::Code | ContextKind::Document | ContextKind::Text => true,
+        ContextKind::Image | ContextKind::Diagram => matches!(
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp"
+        ),
+        ContextKind::Other => false,
+    }
 }
 
 pub(crate) fn convert_context_file_to_markdown(
@@ -492,6 +500,9 @@ mod tests {
         assert!(is_supported_context_file(Path::new("plan.md")));
         assert!(is_supported_context_file(Path::new("architecture.pdf")));
         assert!(is_supported_context_file(Path::new("main.rs")));
+        assert!(is_supported_context_file(Path::new("diagram.png")));
+        assert!(!is_supported_context_file(Path::new("iphone-photo.heic")));
+        assert!(!is_supported_context_file(Path::new("scan.tiff")));
         assert!(!is_supported_context_file(Path::new("clip.mp4")));
         assert!(!is_supported_context_file(Path::new("backup.p12")));
     }

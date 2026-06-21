@@ -509,6 +509,10 @@ enum AudioRuntimeConfigResolution {
 const DEFAULT_AUDIO_IDLE_STOP_SECS: u64 = 5 * 60;
 const ANSWER_TRANSCRIPT_TURN_LIMIT: usize = 32;
 const ANSWER_TRANSCRIPT_CHAR_BUDGET: usize = 8_000;
+const ANSWER_ATTACHMENT_PROMPT_PREVIEW_CHARS: usize = 1_200;
+const ANSWER_CONTEXT_ARTIFACT_LIMIT: usize = 8;
+const MAX_PROVIDER_IMAGE_DATA_URLS: usize = 4;
+const MAX_PROVIDER_IMAGE_DATA_URL_BYTES: usize = 12 * 1024 * 1024;
 
 impl OverlayProcess {
     fn send(&mut self, command: &OverlayCommand) -> Result<()> {
@@ -2560,11 +2564,66 @@ async fn real_audio_relay_loop(
     let idle_timeout = audio_idle_stop_timeout();
     let last_transcript_at = Arc::new(Mutex::new(Instant::now()));
     let mut handles = Vec::with_capacity(source_count);
+    let relay_cloud = match build_cloud_client(&daemon.paths, None) {
+        Ok(client) => {
+            if let Err(error) = client
+                .auth_get::<cue_cloud_client::AccountMe>("/account/me")
+                .await
+            {
+                let message = compact_snippet(
+                    &format!("Bluey account is not ready for live captions: {error:#}"),
+                    260,
+                );
+                {
+                    let mut audio = daemon.audio.lock().await;
+                    if audio.session_id.as_deref() == Some(session_id.as_str()) {
+                        audio.note = Some(message.clone());
+                        audio.updated_at = clock::now_epoch_ms_string();
+                    }
+                }
+                set_overlay_listening_state(&daemon, ListeningState::Paused).await;
+                push_system_card(
+                    &daemon,
+                    CardKind::Warning,
+                    "Live captions need sign in",
+                    message,
+                )
+                .await;
+                let _ = stop_audio_capture(&daemon).await;
+                return;
+            }
+            client
+        }
+        Err(error) => {
+            let message = compact_snippet(
+                &format!("failed to create Bluey cloud client for live captions: {error:#}"),
+                260,
+            );
+            {
+                let mut audio = daemon.audio.lock().await;
+                if audio.session_id.as_deref() == Some(session_id.as_str()) {
+                    audio.note = Some(message.clone());
+                    audio.updated_at = clock::now_epoch_ms_string();
+                }
+            }
+            set_overlay_listening_state(&daemon, ListeningState::Paused).await;
+            push_system_card(
+                &daemon,
+                CardKind::Warning,
+                "Live captions need sign in",
+                message,
+            )
+            .await;
+            let _ = stop_audio_capture(&daemon).await;
+            return;
+        }
+    };
 
     for source in runtime.sources.clone() {
         let daemon_for_source = Arc::clone(&daemon);
         let session_id_for_source = session_id.clone();
         let runtime_for_source = runtime.clone();
+        let cloud_for_source = relay_cloud.clone();
         let mut source_stop_rx = relay_stop_rx.clone();
         let done_tx = done_tx.clone();
         let last_transcript_at = Arc::clone(&last_transcript_at);
@@ -2575,6 +2634,7 @@ async fn real_audio_relay_loop(
                 session_id_for_source.clone(),
                 runtime_for_source,
                 source,
+                cloud_for_source,
                 &mut source_stop_rx,
                 last_transcript_at,
             )
@@ -2668,6 +2728,7 @@ async fn run_relay_audio_source(
     session_id: String,
     runtime: RealAudioRuntimeConfig,
     source: RealAudioSource,
+    cloud: cue_cloud_client::CloudClient,
     stop_rx: &mut watch::Receiver<bool>,
     last_transcript_at: Arc<Mutex<Instant>>,
 ) -> Result<()> {
@@ -2684,8 +2745,6 @@ async fn run_relay_audio_source(
         }
     };
 
-    let cloud = build_cloud_client(&daemon.paths, None)
-        .with_context(|| format!("failed to create Bluey cloud client for {}", source.source))?;
     let stt_session = cloud
         .create_stt_session(&cue_cloud_client::SttSessionRequest {
             session_id: session_id.clone(),
@@ -2739,6 +2798,7 @@ async fn run_relay_audio_source(
 
     let mut sequence = 0_u64;
     let mut start_ms = 0_u64;
+    let mut saw_audio_bytes = false;
     let mut buffer = vec![0_u8; 4096];
     loop {
         tokio::select! {
@@ -2750,8 +2810,15 @@ async fn run_relay_audio_source(
             read = stdout.read(&mut buffer) => {
                 let read = read.with_context(|| format!("failed to read live {} audio", source.source))?;
                 if read == 0 {
+                    if !saw_audio_bytes {
+                        return Err(anyhow!(
+                            "native live audio helper for {} exited before producing audio bytes",
+                            source.source
+                        ));
+                    }
                     break;
                 }
+                saw_audio_bytes = true;
                 sequence = sequence.saturating_add(1);
                 let duration_ms = pcm16_16k_duration_ms(read);
                 let chunk = AudioChunkMetadata::new(
@@ -3690,15 +3757,16 @@ async fn handle_attach_paths(daemon: &Arc<Daemon>, paths: Vec<PathBuf>) -> Resul
     let mut attached = Vec::new();
     for path in paths {
         if !is_supported_context_file(&path) {
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Selected file");
             push_system_card(
                 daemon,
                 CardKind::Warning,
                 "File skipped",
                 format!(
-                    "{} is not a readable Bluey context file. Attach text, Markdown, code, PDF, DOC/DOCX, CSV/TSV, JSON/YAML/TOML, HTML/CSS, shell/SQL, or RTF.",
-                    path.file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or("Selected file")
+                    "{file_name} is not readable context. Attach documents, code/data files, or png/jpg/webp/gif images."
                 ),
             )
             .await;
@@ -3745,7 +3813,7 @@ async fn handle_attach_paths(daemon: &Arc<Daemon>, paths: Vec<PathBuf>) -> Resul
 }
 
 async fn handle_remove_context_requested(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<()> {
-    let Some((meeting_snapshot, removed_title)) = ({
+    let Some((meeting_snapshot, removed)) = ({
         let mut meeting_guard = daemon.meeting.lock().await;
         let Some(meeting) = meeting_guard.as_mut() else {
             return Ok(());
@@ -3760,10 +3828,12 @@ async fn handle_remove_context_requested(daemon: &Arc<Daemon>, id: uuid::Uuid) -
         };
         let removed = meeting.context.remove(position);
         daemon.store.save_active(meeting)?;
-        Some((meeting.clone(), removed.title))
+        Some((meeting.clone(), removed))
     }) else {
         return Ok(());
     };
+    let removed_title = removed.title.clone();
+    remove_markdown_artifact_file(&daemon.paths, &removed);
 
     update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
     refresh_overlay_context_items(daemon, &meeting_snapshot).await;
@@ -4906,13 +4976,41 @@ fn provider_prompt_parts(payload: &ProviderRequestPayload) -> Result<ProviderPro
                 .filter(|path| image_mime_for_path(path).is_some())
             {
                 if payload.privacy.allow_image_upload {
-                    image_data_urls.push(image_data_url_from_path(path)?);
+                    let mut upload_note: Option<String> = None;
+                    if image_data_urls.len() < MAX_PROVIDER_IMAGE_DATA_URLS {
+                        match image_data_url_from_path(path) {
+                            Ok(data_url)
+                                if data_url.chars().count()
+                                    <= MAX_PROVIDER_IMAGE_DATA_URL_BYTES =>
+                            {
+                                image_data_urls.push(data_url);
+                            }
+                            Ok(_) => {
+                                upload_note = Some(
+                                    "omitted from provider upload because the image is too large."
+                                        .to_string(),
+                                );
+                            }
+                            Err(error) => {
+                                upload_note = Some(format!(
+                                    "omitted from provider upload because Bluey could not read it: {error:#}"
+                                ));
+                            }
+                        }
+                    } else {
+                        upload_note = Some(format!(
+                            "omitted from provider upload because Bluey sends only the latest {MAX_PROVIDER_IMAGE_DATA_URLS} images."
+                        ));
+                    }
+                    let content = upload_note
+                        .map(|note| format!("{}\n{note}", item.content))
+                        .unwrap_or_else(|| item.content.clone());
                     push_provider_context_item(
                         &mut text_context,
                         item.kind,
                         title,
                         source,
-                        &item.content,
+                        &content,
                     );
                     continue;
                 }
@@ -5069,7 +5167,6 @@ fn image_mime_for_path(path: &Path) -> Option<&'static str> {
         "jpg" | "jpeg" => Some("image/jpeg"),
         "webp" => Some("image/webp"),
         "gif" => Some("image/gif"),
-        "bmp" => Some("image/bmp"),
         _ => None,
     }
 }
@@ -5559,7 +5656,7 @@ fn answer_context_from_meeting(meeting: &MeetingRecord) -> Vec<AnswerContext> {
                     .as_ref()
                     .is_some_and(|note| !note.trim().is_empty())
         })
-        .take(12)
+        .take(ANSWER_CONTEXT_ARTIFACT_LIMIT)
     {
         let mut content = format!("{} ({})", artifact.title, artifact.kind);
         if artifact.processing_status != ContextProcessingStatus::Ready {
@@ -5587,7 +5684,10 @@ fn answer_context_from_meeting(meeting: &MeetingRecord) -> Vec<AnswerContext> {
             .filter(|preview| !preview.trim().is_empty())
         {
             content.push_str("\n");
-            content.push_str(preview);
+            content.push_str(&compact_preserve_lines(
+                preview,
+                ANSWER_ATTACHMENT_PROMPT_PREVIEW_CHARS,
+            ));
         }
         context.push(
             AnswerContext::new(answer_context_kind(artifact.kind), content)
@@ -6240,6 +6340,63 @@ async fn attach_context_artifacts(
     Ok(meeting_snapshot)
 }
 
+fn remove_markdown_artifact_files(paths: &AppPaths, artifacts: &[ContextArtifact]) {
+    for artifact in artifacts {
+        remove_markdown_artifact_file(paths, artifact);
+    }
+}
+
+fn remove_markdown_artifact_file(paths: &AppPaths, artifact: &ContextArtifact) {
+    let Some(markdown_path) = artifact
+        .markdown_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+    else {
+        return;
+    };
+
+    let path = PathBuf::from(markdown_path);
+    let expected_name = format!("{}.md", artifact.id);
+    if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+        warn!(
+            artifact_id = %artifact.id,
+            path = %path.display(),
+            "skipping unexpected Markdown artifact cleanup path"
+        );
+        return;
+    }
+
+    let allowed_dir = paths.data_dir.join("context-markdown");
+    let allowed = match allowed_dir.canonicalize() {
+        Ok(dir) => dir,
+        Err(_) => allowed_dir,
+    };
+    let candidate = match path.canonicalize() {
+        Ok(path) => path,
+        Err(_) => path,
+    };
+
+    if !candidate.starts_with(&allowed) {
+        warn!(
+            artifact_id = %artifact.id,
+            path = %candidate.display(),
+            allowed = %allowed.display(),
+            "skipping Markdown artifact outside Bluey context directory"
+        );
+        return;
+    }
+
+    if let Err(error) = std::fs::remove_file(&candidate) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                artifact_id = %artifact.id,
+                path = %candidate.display(),
+                "failed to remove converted Markdown artifact: {error}"
+            );
+        }
+    }
+}
+
 async fn continue_session(
     daemon: &Arc<Daemon>,
     source: impl Into<String>,
@@ -6383,6 +6540,7 @@ async fn rename_meeting_session(
 }
 
 async fn delete_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<()> {
+    let meeting_for_cleanup = daemon.store.load_by_id(id).ok().flatten();
     let is_active = {
         let meeting_guard = daemon.meeting.lock().await;
         meeting_guard
@@ -6411,6 +6569,9 @@ async fn delete_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<
     let deleted = daemon.store.delete(id)?;
     if !deleted {
         anyhow::bail!("session {id} not found");
+    }
+    if let Some(meeting) = meeting_for_cleanup.as_ref() {
+        remove_markdown_artifact_files(&daemon.paths, &meeting.context);
     }
 
     daemon.rag_indexer.delete_session(id.to_string());
@@ -7583,8 +7744,8 @@ fn choose_context_files_platform() -> Result<Vec<PathBuf>> {
 
     let script = r#"
 try
-  set allowedTypes to {"public.text", "public.source-code", "public.shell-script", "public.json", "public.yaml", "public.xml", "public.html", "public.css", "com.adobe.pdf", "com.microsoft.word.doc", "org.openxmlformats.wordprocessingml.document", "public.rtf", "net.daringfireball.markdown", "md", "markdown", "txt", "log", "csv", "tsv", "rst", "adoc", "rs", "swift", "c", "h", "cpp", "hpp", "js", "jsx", "ts", "tsx", "py", "go", "java", "kt", "kts", "cs", "rb", "php", "sql", "sh", "ps1", "toml", "yaml", "yml", "json", "html", "css", "scss", "pdf", "doc", "docx", "rtf"}
-  set pickedFiles to choose file with prompt "Choose readable text, code, PDF, DOC/DOCX, CSV/TSV, JSON/YAML/TOML, HTML/CSS, shell/SQL, or RTF files for this Bluey session. Video, audio, apps, and certificates are skipped." of type allowedTypes with multiple selections allowed
+  set allowedTypes to {"public.text", "public.source-code", "public.shell-script", "public.json", "public.yaml", "public.xml", "public.html", "public.css", "public.png", "public.jpeg", "com.compuserve.gif", "org.webmproject.webp", "com.adobe.pdf", "com.microsoft.word.doc", "org.openxmlformats.wordprocessingml.document", "public.rtf", "net.daringfireball.markdown", "md", "markdown", "txt", "log", "csv", "tsv", "rst", "adoc", "rs", "swift", "c", "h", "cpp", "hpp", "js", "jsx", "ts", "tsx", "py", "go", "java", "kt", "kts", "cs", "rb", "php", "sql", "sh", "ps1", "toml", "yaml", "yml", "json", "html", "css", "scss", "pdf", "doc", "docx", "rtf", "png", "jpg", "jpeg", "gif", "webp"}
+  set pickedFiles to choose file with prompt "Choose readable text, code, PDF, DOC/DOCX, CSV/TSV, JSON/YAML/TOML, HTML/CSS, shell/SQL, RTF, or image files for this Bluey session. Video, audio, apps, and certificates are skipped." of type allowedTypes with multiple selections allowed
   set output to ""
   repeat with pickedFile in pickedFiles
     set output to output & POSIX path of pickedFile & linefeed
@@ -7688,7 +7849,7 @@ fn choose_context_files_platform() -> Result<Vec<PathBuf>> {
 	Add-Type -AssemblyName System.Windows.Forms
 	$dialog = New-Object System.Windows.Forms.OpenFileDialog
 	$dialog.Title = "Choose readable files for this Bluey session"
-	$dialog.Filter = "Bluey context files|*.md;*.markdown;*.txt;*.log;*.csv;*.tsv;*.rst;*.adoc;*.rs;*.swift;*.c;*.h;*.cpp;*.hpp;*.js;*.jsx;*.ts;*.tsx;*.py;*.go;*.java;*.kt;*.kts;*.cs;*.rb;*.php;*.sql;*.sh;*.ps1;*.toml;*.yaml;*.yml;*.json;*.html;*.css;*.scss;*.pdf;*.doc;*.docx;*.rtf"
+	$dialog.Filter = "Bluey context files|*.md;*.markdown;*.txt;*.log;*.csv;*.tsv;*.rst;*.adoc;*.rs;*.swift;*.c;*.h;*.cpp;*.hpp;*.js;*.jsx;*.ts;*.tsx;*.py;*.go;*.java;*.kt;*.kts;*.cs;*.rb;*.php;*.sql;*.sh;*.ps1;*.toml;*.yaml;*.yml;*.json;*.html;*.css;*.scss;*.pdf;*.doc;*.docx;*.rtf;*.png;*.jpg;*.jpeg;*.gif;*.webp"
 	$dialog.Multiselect = $true
 if ($dialog.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
   $dialog.FileNames -join "`n"
@@ -8115,6 +8276,108 @@ mod tests {
         assert!(json.contains("data:image/png;base64,"));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn provider_messages_cap_image_upload_count() {
+        let base = env::temp_dir().join(format!(
+            "bluey-vision-payload-cap-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).expect("create temp image dir");
+
+        let route = ProviderRoute::direct(ProviderSelector::openai("gpt-4.1-mini"))
+            .with_privacy(PrivacyFlags::managed_commercial().with_image_upload());
+        let mut request = AnswerRequest::new("What changed?", route);
+        for index in 0..(MAX_PROVIDER_IMAGE_DATA_URLS + 2) {
+            let path = base.join(format!("screen-{index}.png"));
+            std::fs::write(&path, [0x89, b'P', b'N', b'G']).expect("write test image");
+            request.context.push(
+                AnswerContext::new(
+                    AnswerContextKind::Screenshot,
+                    format!("screen capture fallback {index}"),
+                )
+                .with_title(format!("Screen {index}"))
+                .with_source(path.display().to_string()),
+            );
+        }
+
+        let payload = ProviderRequestPayload::from_request(
+            &request,
+            ProviderSelector::openai("gpt-4.1-mini"),
+            Some("https://api.openai.com/v1/chat/completions".to_string()),
+            "fallback",
+            RouteBudget::realtime(),
+        );
+
+        let messages = provider_messages(&payload).expect("build provider messages");
+        let json = serde_json::to_string(&messages).expect("serialize messages");
+        assert_eq!(
+            json.matches(r#""type":"image_url""#).count(),
+            MAX_PROVIDER_IMAGE_DATA_URLS
+        );
+        assert!(json.contains("omitted from provider upload because Bluey sends only the latest"));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn meeting_context_uses_bounded_attachment_previews() {
+        let long_preview = "alpha beta gamma\n".repeat(300);
+        let artifact = ContextArtifact::new(
+            ContextKind::Document,
+            "/tmp/bluey-large-spec.pdf",
+            "Large spec",
+            None,
+            Some(2_000),
+        )
+        .with_text_preview(long_preview.clone());
+        let mut meeting = MeetingRecord::new(Some("Attachment test".to_string()));
+        meeting.context.push(artifact);
+
+        let context = answer_context_from_meeting(&meeting);
+        let document = context
+            .iter()
+            .find(|item| item.title.as_deref() == Some("Large spec"))
+            .expect("document context");
+        assert!(document.content.contains("[compacted]"));
+        assert!(document.content.chars().count() < long_preview.chars().count());
+    }
+
+    #[test]
+    fn removing_attachment_deletes_only_bluey_markdown_copy() {
+        let base = env::temp_dir().join(format!("bluey-md-cleanup-test-{}", uuid::Uuid::new_v4()));
+        let paths = AppPaths {
+            data_dir: base.join("data"),
+            config_dir: base.join("config"),
+            runtime_dir: base.join("runtime"),
+            state_file: base.join("runtime/state.json"),
+            account_file: base.join("config/account.json"),
+            settings_file: base.join("config/settings.json"),
+        };
+        let artifact_id = uuid::Uuid::new_v4();
+        let markdown_dir = paths.data_dir.join("context-markdown");
+        std::fs::create_dir_all(&markdown_dir).expect("create markdown dir");
+        let markdown_path = markdown_dir.join(format!("{artifact_id}.md"));
+        std::fs::write(&markdown_path, "private converted copy").expect("write markdown");
+        let artifact = ContextArtifact::new(
+            ContextKind::Document,
+            "/tmp/source.pdf",
+            "Source",
+            None,
+            Some(100),
+        )
+        .with_text_preview("private converted copy")
+        .with_markdown_path(markdown_path.display().to_string());
+        let artifact = ContextArtifact {
+            id: artifact_id,
+            ..artifact
+        };
+
+        remove_markdown_artifact_file(&paths, &artifact);
+        assert!(!markdown_path.exists());
+
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

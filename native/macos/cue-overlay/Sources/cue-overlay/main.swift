@@ -3107,7 +3107,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
             transcriptStateLabel.leadingAnchor.constraint(equalTo: transcriptActivityDot.trailingAnchor, constant: 6),
             transcriptStateLabel.centerYAnchor.constraint(equalTo: transcriptStrip.centerYAnchor),
-            transcriptStateLabel.widthAnchor.constraint(equalToConstant: 64),
+            transcriptStateLabel.widthAnchor.constraint(equalToConstant: 72),
 
             transcriptScroll.topAnchor.constraint(equalTo: transcriptStrip.topAnchor, constant: 2),
             transcriptScroll.leadingAnchor.constraint(equalTo: transcriptStateLabel.trailingAnchor, constant: 8),
@@ -4076,8 +4076,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         transcriptLabel.isBezeled = false
         transcriptLabel.drawsBackground = false
-        transcriptLabel.font = NSFont.systemFont(ofSize: 10.5, weight: .medium)
-        transcriptLabel.textColor = BlueyTheme.textDim
+        transcriptLabel.font = NSFont.systemFont(ofSize: 11.25, weight: .semibold)
+        transcriptLabel.textColor = BlueyTheme.text
         transcriptLabel.lineBreakMode = .byClipping
         transcriptLabel.maximumNumberOfLines = 1
         transcriptLabel.alignment = .left
@@ -4897,7 +4897,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func setTranscriptState(_ text: String, active: Bool) {
-        let display = text == "TRANSCRIBING" ? "LIVE" : text
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let upper = trimmed.uppercased()
+        let display = upper == "TRANSCRIBING" ? "LIVE" : upper
         transcriptStateLabel.stringValue = display
         transcriptStateLabel.textColor = active ? BlueyTheme.green : BlueyTheme.textDim
         transcriptActivityDot.layer?.backgroundColor = (active ? BlueyTheme.green : BlueyTheme.textDim.withAlphaComponent(0.55)).cgColor
@@ -5160,7 +5162,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func shouldRenderAsToast(_ card: RenderedCard) -> Bool {
         let kind = normalizedCardKind(card.kind)
-        guard (kind == "system" || kind == "warning"), actionableLoginURL(from: card) == nil else {
+        guard (kind == "system" || kind == "warning" || kind == "context"), actionableLoginURL(from: card) == nil else {
             return false
         }
         let title = card.title.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -5660,20 +5662,19 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     ) {
         let cleanBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
-        setTranscriptState(state, active: active)
+        let sourceChanged = cleanLabel != lastTranscriptStripSource
+        if sourceChanged {
+            lastTranscriptStripSource = cleanLabel
+            setTranscriptState(cleanLabel.isEmpty ? state : cleanLabel, active: active)
+        } else {
+            setTranscriptState(state, active: active)
+        }
         guard !cleanBody.isEmpty else {
             updateTranscriptStripText(cleanLabel.isEmpty ? "Listening" : "\(cleanLabel) audio is live", scrollToEnd: false)
             return
         }
 
-        let sourceChanged = cleanLabel != lastTranscriptStripSource
-        if sourceChanged {
-            lastTranscriptStripSource = cleanLabel
-        }
-        let line = sourceChanged && !cleanLabel.isEmpty
-            ? "\(cleanLabel) · \(cleanBody)"
-            : cleanBody
-        updateTranscriptStripText(line, scrollToEnd: scrollToEnd)
+        updateTranscriptStripText(cleanBody, scrollToEnd: scrollToEnd)
     }
 
     private func rememberTranscriptForAnswer(label: String, body: String, final: Bool) {
@@ -5895,7 +5896,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             string: text,
             attributes: [
                 .font: font,
-                .foregroundColor: BlueyTheme.textDim,
+                .foregroundColor: BlueyTheme.text,
             ])
         for label in ["Transcribing", "Captured", "Heard", "Starting", "Mic", "System", "Audio"]
             where attributed.string.hasPrefix(label) || attributed.string == label {

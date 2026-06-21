@@ -251,8 +251,13 @@ private final class MicrophoneCapture {
         try engine.start()
 
         if continuous {
-            // Run until killed
-            dispatchMain()
+            // Keep the AVAudioEngine instance and its tap alive until the
+            // daemon terminates the helper. Calling dispatchMain() from this
+            // worker task can return immediately on some macOS launches,
+            // leaving live microphone capture with zero bytes.
+            while true {
+                Thread.sleep(forTimeInterval: 1.0)
+            }
         } else {
             Thread.sleep(forTimeInterval: duration)
             engine.stop()
