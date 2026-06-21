@@ -39,17 +39,18 @@ Already done:
     `server/src/db/webhook_events.rs`
   - Stripe checkout customer/payment-method persistence moved to
     `server/src/db/accounts.rs`
+  - account usage, export, and hard-delete moved to
+    `server/src/db/account_data.rs`
   - boundary inventory dropped from 89 direct SQLite-bound lines outside
-    `server/src/db/**` to 28.
+    `server/src/db/**` to 0.
 
 Still missing:
 
-- A real database boundary in Rust.
 - A Postgres implementation for each server storage path.
 - Backfill/parity tooling.
 - Postgres-mode smoke tests for money/auth/STT/RAG paths.
-- Remaining direct SQLite islands:
-  - account dashboard/export
+- A backend trait/enum split so `server/src/db/**` can dispatch to SQLite or
+  Postgres implementations under `BLUEY_SERVER_DB_BACKEND=postgres`.
 
 ## Why It Cannot Be Blindly Flipped
 

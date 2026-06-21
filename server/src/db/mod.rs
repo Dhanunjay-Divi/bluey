@@ -9,6 +9,7 @@ use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use std::path::Path;
 
+pub mod account_data;
 pub mod accounts;
 pub mod auth_tokens;
 pub mod balance;
