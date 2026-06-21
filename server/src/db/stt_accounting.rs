@@ -14,7 +14,7 @@ use crate::{
 };
 
 #[derive(Debug, Clone)]
-pub(super) struct ReserveSessionInput<'a> {
+pub(crate) struct ReserveSessionInput<'a> {
     pub account_id: &'a str,
     pub bluey_session_id: &'a str,
     pub provider: &'a str,
@@ -28,7 +28,7 @@ pub(super) struct ReserveSessionInput<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ReservedSttSession {
+pub(crate) struct ReservedSttSession {
     pub reserved_cents: i64,
     pub reserved_trial_seconds: i64,
     pub reserved_billable_seconds: i64,
@@ -36,7 +36,7 @@ pub(super) struct ReservedSttSession {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct SettledSttSession {
+pub(crate) struct SettledSttSession {
     pub elapsed_ms: i64,
     pub elapsed_seconds: i64,
     pub billable_seconds: i64,
@@ -48,7 +48,7 @@ pub(super) struct SettledSttSession {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum SttAccountingError {
+pub(crate) enum SttAccountingError {
     #[error("unsupported Deepgram STT model")]
     UnsupportedModel,
     #[error("balance is required before starting this STT session")]
@@ -59,7 +59,7 @@ pub(super) enum SttAccountingError {
     Db(#[from] anyhow::Error),
 }
 
-pub(super) fn reserve_session(
+pub(crate) fn reserve_session(
     pool: &DbPool,
     input: ReserveSessionInput<'_>,
 ) -> Result<ReservedSttSession, SttAccountingError> {
@@ -142,7 +142,7 @@ pub(super) fn reserve_session(
     })
 }
 
-pub(super) fn settle_session(
+pub(crate) fn settle_session(
     pool: &DbPool,
     session_token: &str,
     account_id: &str,
@@ -258,32 +258,6 @@ pub(super) fn settle_session(
         refunded_cents,
         refunded_trial_seconds,
     })
-}
-
-pub(super) fn map_create_error(
-    error: SttAccountingError,
-) -> (axum::http::StatusCode, String) {
-    match error {
-        SttAccountingError::UnsupportedModel => (
-            axum::http::StatusCode::BAD_REQUEST,
-            "unsupported Deepgram STT model".to_string(),
-        ),
-        SttAccountingError::InsufficientBalance => (
-            axum::http::StatusCode::PAYMENT_REQUIRED,
-            "balance is required before starting this STT session".to_string(),
-        ),
-        SttAccountingError::AlreadySettled => (
-            axum::http::StatusCode::CONFLICT,
-            "STT session is already closed".to_string(),
-        ),
-        SttAccountingError::Db(err) => {
-            tracing::warn!(error = %err, "STT accounting failed");
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "stt session failed".to_string(),
-            )
-        }
-    }
 }
 
 #[cfg(test)]

@@ -25,9 +25,8 @@ use tokio_tungstenite::tungstenite::{
 };
 
 use super::AppState;
-use super::stt_accounting::{self, ReserveSessionInput};
 use crate::auth::AuthedAccount;
-use crate::db::usage;
+use crate::db::{stt_accounting::{self, ReserveSessionInput, SttAccountingError}, usage};
 use crate::pricing;
 
 const DEFAULT_MAX_SECONDS: i64 = 10 * 60;
@@ -134,7 +133,7 @@ pub async fn create_session(
             expires_at_ms: expires_at,
         },
     )
-    .map_err(stt_accounting::map_create_error)?;
+    .map_err(map_create_error)?;
 
     tracing::info!(
         account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
@@ -213,6 +212,30 @@ fn internal<E: std::fmt::Display>(e: E) -> (StatusCode, String) {
         StatusCode::INTERNAL_SERVER_ERROR,
         "stt session failed".to_string(),
     )
+}
+
+fn map_create_error(error: SttAccountingError) -> (StatusCode, String) {
+    match error {
+        SttAccountingError::UnsupportedModel => (
+            StatusCode::BAD_REQUEST,
+            "unsupported Deepgram STT model".to_string(),
+        ),
+        SttAccountingError::InsufficientBalance => (
+            StatusCode::PAYMENT_REQUIRED,
+            "balance is required before starting this STT session".to_string(),
+        ),
+        SttAccountingError::AlreadySettled => (
+            StatusCode::CONFLICT,
+            "STT session is already closed".to_string(),
+        ),
+        SttAccountingError::Db(err) => {
+            tracing::warn!(error = %err, "STT accounting failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "stt session failed".to_string(),
+            )
+        }
+    }
 }
 
 #[cfg(test)]

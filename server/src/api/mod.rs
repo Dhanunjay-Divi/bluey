@@ -14,7 +14,6 @@ pub mod middleware;
 pub mod pricing;
 pub mod router;
 pub mod stt;
-mod stt_accounting;
 pub mod sync;
 pub mod usage;
 

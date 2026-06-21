@@ -17,6 +17,7 @@ pub mod idempotency;
 pub mod link_codes;
 pub mod refresh_tokens;
 pub mod signup_otps;
+pub mod stt_accounting;
 pub mod sync;
 pub mod usage;
 
