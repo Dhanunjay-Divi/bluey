@@ -4,6 +4,7 @@ use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::Serialize;
 
 use super::AppState;
+use crate::db::accounts::Account;
 
 #[derive(Serialize)]
 pub struct Health {
@@ -35,39 +36,26 @@ pub struct CustomerSummary {
 }
 
 pub async fn customers(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = match state.pool.get() {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
-    };
-    let mut stmt = match conn
-        .prepare("SELECT id, email, balance_cents FROM accounts ORDER BY created_at DESC LIMIT 100")
-    {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
-    };
-    let rows: Vec<CustomerSummary> = stmt
-        .query_map([], |r| {
-            Ok(CustomerSummary {
-                id: r.get(0)?,
-                email: r.get(1)?,
-                balance_cents: r.get(2)?,
-            })
-        })
-        .map(|i| i.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default();
-    (StatusCode::OK, Json(rows)).into_response()
+    match Account::list_customer_summaries(&state.pool, 100) {
+        Ok(rows) => (
+            StatusCode::OK,
+            Json(
+                rows.into_iter()
+                    .map(|row| CustomerSummary {
+                        id: row.id,
+                        email: row.email,
+                        balance_cents: row.balance_cents,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 /// Codex S12-17 blocker 2 production-path proof: returns the

@@ -25,62 +25,32 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse};
 
 use super::AppState;
+use crate::db;
 
 pub async fn get_metrics(State(state): State<AppState>) -> impl IntoResponse {
-    let conn = match state.pool.get() {
-        Ok(c) => c,
+    let metrics = match db::metrics::snapshot(&state.pool) {
+        Ok(metrics) => metrics,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("# pool error: {e}"),
+                format!("# metrics error: {e}"),
             );
         }
     };
-
-    fn count_one(conn: &rusqlite::Connection, sql: &str) -> i64 {
-        conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap_or(0)
-    }
-
-    let accounts = count_one(&conn, "SELECT COUNT(*) FROM accounts");
-    let balance_sum: i64 = conn
-        .query_row(
-            "SELECT COALESCE(SUM(balance_cents), 0) FROM accounts",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap_or(0);
-    let trial_active = count_one(
-        &conn,
-        "SELECT COUNT(*) FROM accounts WHERE trial_seconds_remaining > 0",
-    );
-    let req_total = count_one(&conn, "SELECT COUNT(*) FROM request_idempotency");
-    let req_complete = count_one(
-        &conn,
-        "SELECT COUNT(*) FROM request_idempotency WHERE status = 'complete'",
-    );
-    let req_in_progress = count_one(
-        &conn,
-        "SELECT COUNT(*) FROM request_idempotency WHERE status = 'in_progress'",
-    );
-    let mark_complete_failed = count_one(
-        &conn,
-        "SELECT COUNT(*) FROM request_idempotency
-         WHERE status = 'in_progress'
-           AND created_at < datetime('now', '-5 minutes')",
-    );
-    let credit_batches = count_one(&conn, "SELECT COUNT(*) FROM credit_batches");
-    let usage_24h = count_one(
-        &conn,
-        "SELECT COUNT(*) FROM usage_events WHERE ts >= datetime('now', '-1 day')",
-    );
-    let webhook_processed = count_one(
-        &conn,
-        "SELECT COUNT(*) FROM stripe_webhook_events WHERE processed_at IS NOT NULL",
-    );
     let provider_health = state.provider_health.snapshot();
     let provider_key_cooldowns = provider_health.cooldowns_total;
     let provider_key_all_cooling = provider_health.all_keys_cooling_total;
     let provider_health_redis_errors = provider_health.redis_errors_total;
+    let accounts = metrics.accounts;
+    let balance_sum = metrics.balance_sum;
+    let trial_active = metrics.trial_active;
+    let req_total = metrics.request_idempotency_total;
+    let req_complete = metrics.request_idempotency_complete;
+    let req_in_progress = metrics.request_idempotency_in_progress;
+    let mark_complete_failed = metrics.mark_complete_failed;
+    let credit_batches = metrics.credit_batches;
+    let usage_24h = metrics.usage_24h;
+    let webhook_processed = metrics.webhook_processed;
 
     let body = format!(
         "# HELP bluey_accounts_total Total customer accounts.

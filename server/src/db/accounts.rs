@@ -49,6 +49,13 @@ pub struct Account {
     pub billing_restricted_at: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomerSummary {
+    pub id: String,
+    pub email: String,
+    pub balance_cents: i64,
+}
+
 impl Account {
     const SELECT_FIELDS: &'static str = "id, email, email_verified_at,
                     balance_cents, trial_seconds_remaining,
@@ -302,6 +309,25 @@ impl Account {
             .query_row(params![email], |r| r.get::<_, String>(0))
             .ok();
         Ok(hash)
+    }
+
+    pub fn list_customer_summaries(pool: &DbPool, limit: i64) -> Result<Vec<CustomerSummary>> {
+        let conn = pool.get()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, email, balance_cents
+               FROM accounts
+              ORDER BY created_at DESC
+              LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit.max(1)], |row| {
+            Ok(CustomerSummary {
+                id: row.get(0)?,
+                email: row.get(1)?,
+                balance_cents: row.get(2)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 }
 #[cfg(test)]

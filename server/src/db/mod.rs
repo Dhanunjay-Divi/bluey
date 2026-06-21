@@ -15,6 +15,7 @@ pub mod balance;
 pub mod device_codes;
 pub mod idempotency;
 pub mod link_codes;
+pub mod metrics;
 pub mod refresh_tokens;
 pub mod signup_otps;
 pub mod stt_accounting;

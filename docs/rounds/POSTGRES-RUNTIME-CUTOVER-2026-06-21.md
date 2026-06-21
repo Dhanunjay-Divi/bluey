@@ -33,8 +33,10 @@ Already done:
   - refresh-token storage moved to `server/src/db/refresh_tokens.rs`
   - signup OTP/device-code/account password updates moved to `server/src/db/**`
   - STT reservation/claim/settlement moved to `server/src/db/stt_accounting.rs`
+  - admin customer summary moved to `server/src/db/accounts.rs`
+  - metrics read model moved to `server/src/db/metrics.rs`
   - boundary inventory dropped from 89 direct SQLite-bound lines outside
-    `server/src/db/**` to 41.
+    `server/src/db/**` to 37.
 
 Still missing:
 
@@ -45,8 +47,6 @@ Still missing:
 - Remaining direct SQLite islands:
   - account dashboard/export
   - billing webhook/card metadata
-  - admin customer list
-  - metrics counters
 
 ## Why It Cannot Be Blindly Flipped
 
