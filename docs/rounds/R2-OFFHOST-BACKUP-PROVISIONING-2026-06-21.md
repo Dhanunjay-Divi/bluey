@@ -18,6 +18,15 @@ the current SQLite runtime.
     on the droplet.
 - Installed AWS CLI v2 on the droplet only as an S3-compatible upload client for
   Cloudflare R2. No AWS infrastructure was provisioned.
+- Installed and enabled `redis-server` on the droplet as the current
+  Valkey/Redis-compatible shared capacity ledger for the single-server alpha.
+  This is not a managed multi-server Redis deployment; it is the production
+  droplet-local ledger for provider cooldown/rate-limit state until we add a
+  second API server.
+- Set:
+  - `BLUEY_REDIS_URL=redis://127.0.0.1:6379`
+  - `BLUEY_REDIS_NAMESPACE=bluey-prod`
+  - `BLUEY_RATE_LIMIT_REDIS_STRICT=0`
 - Updated `ops/backup-bluey-db.sh` so cron runs load
   `/etc/bluey-api/bluey-api.env` by default. Without this, manual local backups
   worked but off-host upload variables were missing in the cron environment.
@@ -54,17 +63,18 @@ sqlite_master object count -> 56
 - Reran the production cloud preflight:
 
 ```text
+ok: BLUEY_REDIS_URL set (shared capacity ledger)
+ok: Redis/Valkey ping succeeded
 ok: OFFSITE_DESTINATION set
 ok: BLUEY_BACKUP_S3_ENDPOINT_URL set (R2/S3-compatible backup endpoint)
 ok: AWS_ACCESS_KEY_ID set (R2/S3 backup access key)
 ok: AWS_SECRET_ACCESS_KEY set (R2/S3 backup secret)
 ok: R2/S3 backup destination reachable
-preflight passed: 2 warning(s)
+preflight passed: 1 warning(s)
 ```
 
-The remaining warnings are expected for the current single-server alpha:
+The remaining warning is expected for the current single-server alpha:
 
-- `BLUEY_REDIS_URL` is unset.
 - Redis strict mode is disabled, so Redis failures fall back to local process
   state.
 
@@ -74,11 +84,12 @@ The remaining warnings are expected for the current single-server alpha:
 - The running API server is still SQLite-backed by design.
 - R2 is only blob/object storage. It is not the source of truth for auth,
   balances, usage, idempotency, sessions, or vector search.
-- Redis/Valkey is still pending until we run more than one server process or
-  instance.
+- Redis/Valkey-compatible state is enabled locally on the production droplet.
+  Before multi-server, replace this with managed Redis/Valkey reachable by every
+  API server instance.
 
 ## Next
 
-1. Keep `BLUEY_REDIS_URL` unset for one-server alpha, then enable managed
-   Valkey/Redis before multi-server capacity.
+1. Replace droplet-local Redis with managed Redis/Valkey before running more
+   than one API server instance.
 2. Add R2 object APIs later for support zips, exports, and synced raw artifacts.
