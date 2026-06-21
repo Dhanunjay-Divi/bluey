@@ -29,6 +29,12 @@ Already done:
   instead of pretending Postgres is active.
 - SQLite leakage inventory:
   `scripts/check-server-sqlite-boundary.sh`
+- Runtime boundary drain started:
+  - refresh-token storage moved to `server/src/db/refresh_tokens.rs`
+  - signup OTP/device-code/account password updates moved to `server/src/db/**`
+  - STT reservation/claim/settlement moved to `server/src/db/stt_accounting.rs`
+  - boundary inventory dropped from 89 direct SQLite-bound lines outside
+    `server/src/db/**` to 41.
 
 Still missing:
 
@@ -36,6 +42,11 @@ Still missing:
 - A Postgres implementation for each server storage path.
 - Backfill/parity tooling.
 - Postgres-mode smoke tests for money/auth/STT/RAG paths.
+- Remaining direct SQLite islands:
+  - account dashboard/export
+  - billing webhook/card metadata
+  - admin customer list
+  - metrics counters
 
 ## Why It Cannot Be Blindly Flipped
 

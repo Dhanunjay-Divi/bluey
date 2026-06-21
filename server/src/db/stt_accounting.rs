@@ -47,6 +47,20 @@ pub(crate) struct SettledSttSession {
     pub refunded_trial_seconds: i64,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ClaimedSttSession {
+    pub token: String,
+    pub account_id: String,
+    pub bluey_session_id: String,
+    pub provider: String,
+    pub model: String,
+    pub source: String,
+    pub max_seconds: i64,
+    pub expires_at_ms: i64,
+    pub reserved_cents: i64,
+    pub reserved_trial_seconds: i64,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SttAccountingError {
     #[error("unsupported Deepgram STT model")]
@@ -55,6 +69,20 @@ pub(crate) enum SttAccountingError {
     InsufficientBalance,
     #[error("STT session was already settled")]
     AlreadySettled,
+    #[error(transparent)]
+    Db(#[from] anyhow::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ClaimSttSessionError {
+    #[error("invalid STT session")]
+    InvalidSession,
+    #[error("STT session expired")]
+    Expired,
+    #[error("only deepgram STT relay is enabled")]
+    UnsupportedProvider,
+    #[error("STT session is already active or closed")]
+    AlreadyActiveOrClosed,
     #[error(transparent)]
     Db(#[from] anyhow::Error),
 }
@@ -140,6 +168,64 @@ pub(crate) fn reserve_session(
         reserved_billable_seconds,
         projected_bluey_cents,
     })
+}
+
+pub(crate) fn claim_relay_session(
+    pool: &DbPool,
+    account_id: &str,
+    token: &str,
+    now_ms: i64,
+) -> Result<ClaimedSttSession, ClaimSttSessionError> {
+    let conn = pool
+        .get()
+        .map_err(|err| ClaimSttSessionError::Db(err.into()))?;
+    let session = conn
+        .query_row(
+            "SELECT account_id, bluey_session_id, provider, model, source, max_seconds, expires_at_ms,
+                    reserved_cents, reserved_trial_seconds
+             FROM stt_sessions
+             WHERE session_token = ?1 AND account_id = ?2",
+            params![token, account_id],
+            |row| {
+                Ok(ClaimedSttSession {
+                    token: token.to_string(),
+                    account_id: row.get(0)?,
+                    bluey_session_id: row.get(1)?,
+                    provider: row.get(2)?,
+                    model: row.get(3)?,
+                    source: row.get(4)?,
+                    max_seconds: row.get(5)?,
+                    expires_at_ms: row.get(6)?,
+                    reserved_cents: row.get(7)?,
+                    reserved_trial_seconds: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|err| ClaimSttSessionError::Db(err.into()))?
+        .ok_or(ClaimSttSessionError::InvalidSession)?;
+    if session.expires_at_ms <= now_ms {
+        return Err(ClaimSttSessionError::Expired);
+    }
+    if session.provider != "deepgram" {
+        return Err(ClaimSttSessionError::UnsupportedProvider);
+    }
+    let updated = conn
+        .execute(
+            "UPDATE stt_sessions
+                SET started_at_ms = ?1
+              WHERE session_token = ?2
+                AND account_id = ?3
+                AND started_at_ms IS NULL
+                AND ended_at_ms IS NULL
+                AND expires_at_ms > ?1",
+            params![now_ms, token, account_id],
+        )
+        .map_err(|err| ClaimSttSessionError::Db(err.into()))?;
+    if updated != 1 {
+        return Err(ClaimSttSessionError::AlreadyActiveOrClosed);
+    }
+    Ok(session)
 }
 
 pub(crate) fn settle_session(
@@ -302,6 +388,32 @@ mod tests {
             created_at_ms: 1_000,
             expires_at_ms: 61_000,
         }
+    }
+
+    #[test]
+    fn claimed_relay_session_is_single_use() {
+        let pool = temp_pool();
+        let account = Account::create(&pool, "relay-single-use@example.com", "hash").unwrap();
+        reserve_session(&pool, input(&account.id, "single-use-token", 60)).unwrap();
+
+        assert!(claim_relay_session(&pool, &account.id, "single-use-token", 2_000).is_ok());
+        let second =
+            claim_relay_session(&pool, &account.id, "single-use-token", 2_000).unwrap_err();
+        assert!(matches!(
+            second,
+            ClaimSttSessionError::AlreadyActiveOrClosed
+        ));
+    }
+
+    #[test]
+    fn claimed_relay_session_requires_matching_account() {
+        let pool = temp_pool();
+        let account = Account::create(&pool, "relay-account-owner@example.com", "hash").unwrap();
+        reserve_session(&pool, input(&account.id, "account-bound-token", 60)).unwrap();
+
+        let err = claim_relay_session(&pool, "other-account", "account-bound-token", 2_000)
+            .unwrap_err();
+        assert!(matches!(err, ClaimSttSessionError::InvalidSession));
     }
 
     #[test]

@@ -17,7 +17,6 @@ use axum::{
 use base64::Engine;
 use futures_util::{SinkExt, StreamExt};
 use rand::RngCore;
-use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::{
@@ -26,7 +25,12 @@ use tokio_tungstenite::tungstenite::{
 
 use super::AppState;
 use crate::auth::AuthedAccount;
-use crate::db::{stt_accounting::{self, ReserveSessionInput, SttAccountingError}, usage};
+use crate::db::{
+    stt_accounting::{
+        self, ClaimSttSessionError, ClaimedSttSession, ReserveSessionInput, SttAccountingError,
+    },
+    usage,
+};
 use crate::pricing;
 
 const DEFAULT_MAX_SECONDS: i64 = 10 * 60;
@@ -62,20 +66,6 @@ pub struct SttSessionResponse {
 #[derive(Debug, Deserialize)]
 pub struct SttRelayQuery {
     pub session_token: String,
-}
-
-#[derive(Debug, Clone)]
-struct ClaimedSttSession {
-    token: String,
-    account_id: String,
-    bluey_session_id: String,
-    provider: String,
-    model: String,
-    source: String,
-    max_seconds: i64,
-    expires_at_ms: i64,
-    reserved_cents: i64,
-    reserved_trial_seconds: i64,
 }
 
 pub async fn create_session(
@@ -238,6 +228,24 @@ fn map_create_error(error: SttAccountingError) -> (StatusCode, String) {
     }
 }
 
+fn map_claim_error(error: ClaimSttSessionError) -> (StatusCode, String) {
+    match error {
+        ClaimSttSessionError::InvalidSession => {
+            (StatusCode::UNAUTHORIZED, "invalid STT session".to_string())
+        }
+        ClaimSttSessionError::Expired => (StatusCode::GONE, "STT session expired".to_string()),
+        ClaimSttSessionError::UnsupportedProvider => (
+            StatusCode::BAD_REQUEST,
+            "only deepgram STT relay is enabled".to_string(),
+        ),
+        ClaimSttSessionError::AlreadyActiveOrClosed => (
+            StatusCode::CONFLICT,
+            "STT session is already active or closed".to_string(),
+        ),
+        ClaimSttSessionError::Db(err) => internal(err),
+    }
+}
+
 #[cfg(test)]
 fn estimate_deepgram_cost_cents(model: &str, seconds: i64) -> Result<i64, (StatusCode, String)> {
     if seconds <= 0 {
@@ -310,61 +318,8 @@ fn claim_relay_session(
     if token.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "session_token is required".into()));
     }
-    let now = now_ms();
-    let conn = state.pool.get().map_err(internal)?;
-    let session = conn
-        .query_row(
-            "SELECT account_id, bluey_session_id, provider, model, source, max_seconds, expires_at_ms,
-                    reserved_cents, reserved_trial_seconds
-             FROM stt_sessions
-             WHERE session_token = ?1 AND account_id = ?2",
-            params![token, account_id],
-            |row| {
-                Ok(ClaimedSttSession {
-                    token: token.to_string(),
-                    account_id: row.get(0)?,
-                    bluey_session_id: row.get(1)?,
-                    provider: row.get(2)?,
-                    model: row.get(3)?,
-                    source: row.get(4)?,
-                    max_seconds: row.get(5)?,
-                    expires_at_ms: row.get(6)?,
-                    reserved_cents: row.get(7)?,
-                    reserved_trial_seconds: row.get(8)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(internal)?
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "invalid STT session".to_string()))?;
-    if session.expires_at_ms <= now {
-        return Err((StatusCode::GONE, "STT session expired".to_string()));
-    }
-    if session.provider != "deepgram" {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "only deepgram STT relay is enabled".to_string(),
-        ));
-    }
-    let updated = conn
-        .execute(
-            "UPDATE stt_sessions
-                SET started_at_ms = ?1
-              WHERE session_token = ?2
-                AND account_id = ?3
-                AND started_at_ms IS NULL
-                AND ended_at_ms IS NULL
-                AND expires_at_ms > ?1",
-            params![now, token, account_id],
-        )
-        .map_err(internal)?;
-    if updated != 1 {
-        return Err((
-            StatusCode::CONFLICT,
-            "STT session is already active or closed".to_string(),
-        ));
-    }
-    Ok(session)
+    stt_accounting::claim_relay_session(&state.pool, account_id, token, now_ms())
+        .map_err(map_claim_error)
 }
 
 async fn run_deepgram_relay(
@@ -523,8 +478,6 @@ fn finalize_relay_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{api::AppState, config::Config, db};
-    use std::{path::PathBuf, sync::Arc};
 
     #[test]
     fn random_token_is_url_safe_and_long() {
@@ -555,89 +508,9 @@ mod tests {
     }
 
     #[test]
-    fn claim_relay_session_is_single_use() {
-        let state = temp_state();
-        let account = crate::db::accounts::Account::create(
-            &state.pool,
-            "relay-single-use@example.com",
-            "hash",
-        )
-        .unwrap();
-        let token = "single-use-token";
-        state
-            .pool
-            .get()
-            .unwrap()
-            .execute(
-                "INSERT INTO stt_sessions (
-                    session_token, account_id, bluey_session_id, provider, model, source,
-                    mode, max_seconds, created_at_ms, expires_at_ms
-                 ) VALUES (?1, ?2, 'sess', 'deepgram', 'nova-3', 'microphone', 'server_relay', 60, ?3, ?4)",
-                params![token, account.id, now_ms(), now_ms() + 60_000],
-            )
-            .unwrap();
-        assert!(claim_relay_session(&state, &account.id, token).is_ok());
-        let second = claim_relay_session(&state, &account.id, token).unwrap_err();
-        assert_eq!(second.0, StatusCode::CONFLICT);
-    }
-
-    #[test]
-    fn claim_relay_session_requires_matching_account() {
-        let state = temp_state();
-        let account = crate::db::accounts::Account::create(
-            &state.pool,
-            "relay-account-owner@example.com",
-            "hash",
-        )
-        .unwrap();
-        let token = "account-bound-token";
-        state
-            .pool
-            .get()
-            .unwrap()
-            .execute(
-                "INSERT INTO stt_sessions (
-                    session_token, account_id, bluey_session_id, provider, model, source,
-                    mode, max_seconds, created_at_ms, expires_at_ms
-                 ) VALUES (?1, ?2, 'sess', 'deepgram', 'nova-3', 'microphone', 'server_relay', 60, ?3, ?4)",
-                params![token, account.id, now_ms(), now_ms() + 60_000],
-            )
-            .unwrap();
-        let err = claim_relay_session(&state, "other-account", token).unwrap_err();
-        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
-    }
-
-    #[test]
     fn estimate_cost_uses_deepgram_pricing() {
         assert_eq!(estimate_deepgram_cost_cents("nova-3", 0).unwrap(), 0);
         assert!(estimate_deepgram_cost_cents("nova-3", 60).unwrap() > 0);
         assert!(estimate_deepgram_bluey_cost_cents("nova-3", 60).unwrap() > 0);
-    }
-
-    fn temp_state() -> AppState {
-        let path = std::env::temp_dir().join(format!("bluey-stt-{}.db", uuid::Uuid::new_v4()));
-        let pool = db::open_pool(&path).unwrap();
-        db::run_migrations(&pool).unwrap();
-        AppState {
-            pool,
-            config: Arc::new(Config {
-                port: 8080,
-                db_path: PathBuf::from(":memory:"),
-                db_backend: crate::config::ServerDbBackend::Sqlite,
-                jwt_secret: "x".repeat(32),
-                public_url: "http://localhost:8080".into(),
-                stripe_secret_key: None,
-                stripe_webhook_secret: None,
-                upstream: crate::config::UpstreamKeys {
-                    deepgram_api_key: Some("dg-test".into()),
-                    ..Default::default()
-                },
-                upstream_spend_guard: None,
-                smtp: None,
-                admin_emails: vec![],
-            }),
-            rate_limiters: crate::rate_limit::RateLimiters::default(),
-            provider_health: crate::provider_health::ProviderHealth::default(),
-        }
     }
 }
