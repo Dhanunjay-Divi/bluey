@@ -7,7 +7,8 @@ Make the first customer path coherent from install to active paid use:
 1. User installs Bluey.
 2. User runs `bluey on` and can use local overlay/session features immediately.
 3. When managed cloud features are needed, the user signs in or creates an account in the browser.
-4. Desktop receives tokens through a one-time handoff and stores them in the OS keychain.
+4. Desktop receives tokens through a one-time handoff and stores them in
+   Bluey's private local account profile by default.
 5. Balance/account/billing/logout/delete actions work from the dashboard and CLI.
 
 ## What Changed

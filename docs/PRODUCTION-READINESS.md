@@ -117,7 +117,8 @@ were updated alongside this change to match the default-ON behaviour.
 
 - Local SQLite session storage, settings, FTS search, export, and session
   history are implemented.
-- API keys/settings use OS keyring-backed storage where wired.
+- Customer account tokens use Bluey's private account profile by default.
+  Developer-only API key settings still use keyring-backed storage where wired.
 - Local RAG exists with chunking, embeddings, SQLite persistence, and Rust
   cosine search.
 - The dashboard exists as a developer tool; it is not shipped in v0.1.0.

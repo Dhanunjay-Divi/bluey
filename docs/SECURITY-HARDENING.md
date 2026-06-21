@@ -48,7 +48,7 @@ not security boundaries.
 | Adversary | What they can do | Bluey posture |
 |---|---|---|
 | Curious customer with the installed binary | inspect strings, disassemble, patch local checks | no provider keys in client; server validates account credits, routing, STT session, and usage |
-| Local malware in the user's account | read local DB/JSON, screen, process memory | private local files, OS secure storage for desktop account tokens, capture-excluded overlay, short-lived server tokens |
+| Local malware in the user's account | read local DB/JSON, screen, process memory | private local files, short-lived desktop account tokens, capture-excluded overlay, server-side provider keys |
 | Co-process sending fake overlay events | attempt IPC injection | per-session overlay token, length caps, state-machine validation, install-dir binary verification |
 | Network attacker | observe or tamper with traffic | HTTPS/TLS via rustls; server-side auth; no static provider secrets on desktop |
 | Modified Bluey client | send malformed requests, replay tokens, claim fake usage | server owns billing, idempotency, credit hard stops, request validation, STT relay token claim |
@@ -61,7 +61,7 @@ not security boundaries.
 ### Server-owned provider access
 
 - Managed LLM/STT flow keeps upstream provider keys on `bluey-server`.
-- Desktop login stores Bluey account tokens in OS secure storage by default. The local account profile stores non-secret account metadata only.
+- Desktop login stores Bluey account tokens in Bluey's private local account profile by default. OS keychain/credential storage is opt-in or legacy fallback only.
 - Customer desktop no longer needs Deepgram/OpenAI/Anthropic keys in normal managed mode.
 - Direct BYOK/dev provider paths are gated behind explicit development flags
   such as `BLUEY_DEV_BYOK=1`, and release binaries ignore those flags.
@@ -100,8 +100,9 @@ not security boundaries.
 
 ### Local account secrets
 
-- Account tokens use `cue-cloud-client`'s secure account store by default, preserving account metadata such as saved `api_url` while storing access/refresh tokens in OS secure storage.
-- Legacy account-file tokens are migrated into the secure store on first load. Plaintext account-file token fallback is allowed only when `BLUEY_ALLOW_PLAINTEXT_TOKENS=1` or `BLUEY_DEV_PLAINTEXT_TOKENS=1` is explicitly set for local development.
+- Account tokens use `cue-cloud-client`'s account store by default, preserving account metadata such as saved `api_url` alongside access/refresh tokens in Bluey's private account profile.
+- Legacy keyring tokens are migrated into the account profile only when
+  `BLUEY_LEGACY_KEYRING_FALLBACK=1` is explicitly enabled.
 - STT API keys in developer paths use keyring-backed commands.
 - Dashboard settings rejects secret-shaped keys instead of storing them in normal settings.
 

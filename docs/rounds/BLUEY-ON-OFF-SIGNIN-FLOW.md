@@ -21,9 +21,9 @@ Smoke tests can set `BLUEY_SKIP_SIGNIN_OPEN=1` to suppress browser launch.
 `bluey login` remains as a visible/supportable account-linking command for now
 because it is the safest terminal-only way to complete the server device flow:
 it opens `https://bluey.sh/login?user_code=...`, polls the server, and stores
-tokens in the OS keyring. Dashboard onboarding can also open `/login` and
-receive tokens through the `bluey://link?code=...` deep-link handoff. `/link`
-remains a compatibility alias for older links.
+tokens in Bluey's private local account profile by default. Dashboard onboarding
+can also open `/login` and receive tokens through the `bluey://link?code=...`
+deep-link handoff. `/link` remains a compatibility alias for older links.
 
 Support/dev commands still exist for diagnostics, automation, and non-browser
 testing, but they are hidden from normal CLI help.
@@ -32,12 +32,12 @@ testing, but they are hidden from normal CLI help.
 
 - `crates/cue-cli/src/app.rs`
   - `on` / `off` are the only visible commands in `bluey --help`.
-  - `bluey on` checks keyring/legacy account config. If missing, it starts
-    locally, opens `/login`, and prints the same fallback URL if the browser
-    opener fails.
+  - `bluey on` checks the local account profile. If missing, it starts locally,
+    opens `/login`, and prints the same fallback URL if the browser opener
+    fails.
   - `bluey login` is the explicit browser/device-code path. It uses an
     in-memory token store while polling, then persists returned tokens to the
-    keyring.
+    account profile.
   - Boot-card copy reports managed-ready or sign-in-available states.
 - Smoke/install/docs now point users to first `bluey on` sign-in.
 

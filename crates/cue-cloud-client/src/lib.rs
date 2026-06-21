@@ -3,7 +3,8 @@
 //!
 //! Concerns:
 //!   - Auth flows: device login (preferred for the daemon), token
-//!     storage in OS keyring, automatic refresh on 401.
+//!     storage in Bluey's private account profile by default, automatic
+//!     refresh on 401.
 //!   - Managed Auto Router dispatch: `/router/complete`, `/router/embed`,
 //!     `/router/transcribe` — when wired into `BlueyManagedProvider` (R14.11).
 //!   - Account state: `/account/me` (balance, trial, auto-topup config).

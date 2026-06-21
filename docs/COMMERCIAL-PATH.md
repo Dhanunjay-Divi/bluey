@@ -47,7 +47,8 @@ Local storage should be a resilient cache, not the system of record:
 
 - SQLite for recent sessions, settings, pending sync queue, and offline reads.
 - Temporary artifact cache with cleanup policy.
-- OS credential store for Bluey auth tokens.
+- Bluey's private local account profile for Bluey auth tokens. OS credential
+  storage is opt-in or legacy fallback only.
 
 Cloud storage should own commercial durability and governance:
 
@@ -63,7 +64,7 @@ All storage reads must be workspace-scoped. Deletion and retention jobs need to 
 
 Provider keys belong server-side in production managed mode.
 
-The desktop should hold only Bluey auth tokens in the OS credential store. Bluey cloud should route requests to STT, vision, embedding, and LLM providers through a managed provider router with budgets, timeouts, fallbacks, and logging that excludes raw secrets.
+The desktop should hold only Bluey auth tokens in the private local account profile. Bluey cloud should route requests to STT, vision, embedding, and LLM providers through a managed provider router with budgets, timeouts, fallbacks, and logging that excludes raw secrets.
 
 Developer/local provider readiness commands can remain available, but they are not part of the paid customer setup path.
 

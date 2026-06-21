@@ -11,7 +11,8 @@ visible permissions onboarding, local resilience, and support diagnostics.
 - Code signing is deferred until signed installers/app bundles become the distribution model.
 - Include app version, build SHA, channel, and update URL in a readable manifest.
 - Create per-user config, data, runtime, and log directories on first launch.
-- Store refresh tokens only in Keychain or Credential Manager.
+- Store Bluey refresh tokens only in Bluey's private account profile by default;
+  Keychain/Credential Manager access is opt-in or legacy fallback only.
 - Register URL scheme for auth callback.
 - Provide uninstall path that can optionally delete local cache and tokens.
 - Include crash/log export command for support.

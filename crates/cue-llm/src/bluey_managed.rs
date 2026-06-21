@@ -1,7 +1,7 @@
 //! BlueyManagedProvider: implements `LlmProvider` by dispatching through
 //! `bluey-server` via `cue-cloud-client`.
 //!
-//! When a customer is logged in (the daemon has tokens in keyring), this
+//! When a customer is logged in (the daemon has Bluey account tokens), this
 //! provider replaces the direct OpenAI/Anthropic providers in the cue-llm
 //! stack. Bluey holds the upstream API keys; the customer pays Bluey.
 

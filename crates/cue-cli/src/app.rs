@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -894,6 +894,7 @@ async fn ensure_macos_bluey_on_permissions_ready() -> Result<()> {
     println!("Approve the missing items in System Settings; Bluey will continue automatically.");
     println!("Press Ctrl-C to stop waiting.\n");
     print_macos_permission_status(&missing);
+    request_macos_permission_prompts(&missing);
     open_macos_permission_panes(&missing);
 
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -971,6 +972,101 @@ fn print_macos_permission_status(missing: &[MacPermissionCheck]) {
         println!("  - {}: {}", check.name, check.status.label());
         if let Some(hint) = check.status.hint(check.name) {
             println!("    {hint}");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn request_macos_permission_prompts(missing: &[MacPermissionCheck]) {
+    use crate::macos_perms::PermissionStatus;
+
+    let needs_microphone = missing
+        .iter()
+        .any(|check| check.name == "Microphone" && check.status == PermissionStatus::NotDetermined);
+    let needs_screen_recording = missing.iter().any(|check| {
+        check.name == "Screen Recording" && check.status == PermissionStatus::NotDetermined
+    });
+
+    if !needs_microphone && !needs_screen_recording {
+        return;
+    }
+
+    let Some(helper) = find_macos_audio_permission_helper() else {
+        println!(
+            "Could not find Bluey's audio helper to trigger permission prompts; opening System Settings instead."
+        );
+        return;
+    };
+
+    if needs_microphone {
+        println!("Requesting Microphone permission prompt...");
+        run_macos_audio_permission_probe(&helper, "microphone");
+    }
+    if needs_screen_recording {
+        println!("Requesting System Audio / Screen Recording permission prompt...");
+        run_macos_audio_permission_probe(&helper, "system");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn find_macos_audio_permission_helper() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("bluey-audio-macos"));
+            candidates.push(parent.join("cue-audio-macos"));
+        }
+    }
+    if let Some(home) = env::var_os("HOME") {
+        let bluey_bin = PathBuf::from(home).join(".bluey/bin");
+        candidates.push(bluey_bin.join("bluey-audio-macos"));
+        candidates.push(bluey_bin.join("cue-audio-macos"));
+    }
+    candidates.push(PathBuf::from("./bluey-audio-macos"));
+    candidates.push(PathBuf::from("./cue-audio-macos"));
+
+    candidates.into_iter().find(|path| is_executable_file(path))
+}
+
+#[cfg(target_os = "macos")]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
+
+#[cfg(target_os = "macos")]
+fn run_macos_audio_permission_probe(helper: &Path, source: &str) {
+    let child = Command::new(helper)
+        .arg("--source")
+        .arg(source)
+        .arg("--duration-ms")
+        .arg("250")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    let Ok(mut child) = child else {
+        eprintln!(
+            "Could not start {} for {} permission prompt.",
+            helper.display(),
+            source
+        );
+        return;
+    };
+
+    let deadline = StdInstant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if StdInstant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            Err(_) => break,
         }
     }
 }
@@ -1096,7 +1192,7 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
         account.provider, account.api_url
     );
     if has_cloud_tokens {
-        println!("Cloud token saved in OS secure storage for this user profile.");
+        println!("Cloud token saved in Bluey's private local account profile.");
     } else {
         println!("Local account linked. Run `bluey on` later to sign in when the Bluey cloud endpoint is ready.");
     }

@@ -90,7 +90,7 @@ Bluey.app / dashboard ───────────────────�
                                             balance_cents,
                                             trial_seconds_remaining }
 
-  Bluey stores tokens in OS secure storage.
+  Bluey stores tokens in its private local account profile so normal use does not trigger OS keychain prompts.
   Daemon flips ProviderRegistry to ManagedProvider mode.
   Daemon shows balance + trial state in overlay top strip.
 ```

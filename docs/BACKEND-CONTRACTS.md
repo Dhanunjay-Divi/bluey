@@ -19,7 +19,8 @@ Bluey's production backend is a managed cloud control plane for auth, sync, RAG,
 2. User authenticates in web flow.
 3. Desktop exchanges device code through `POST /auth/token`.
 4. API returns short-lived access token and refresh token bound to `device_id`.
-5. Desktop stores refresh token in Keychain or Credential Manager.
+5. Desktop stores the Bluey refresh token in its private account profile by
+   default. Keychain/Credential Manager access is opt-in or legacy fallback only.
 6. Desktop registers capabilities with `POST /devices/register`.
 7. Every sync/answer request includes workspace id, device id, app version, and request id.
 
@@ -189,4 +190,3 @@ Minimum production signals:
 - RAG query latency and result count.
 - Retention/export/delete job completion.
 - Installer version adoption and crash-free sessions.
-

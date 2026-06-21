@@ -27,8 +27,9 @@ When Layer 2/3 are stood up, fill in their details below + in
 
 | Secret | Where it lives | Used by |
 |---|---|---|
-| User's Anthropic API key | macOS keyring under `llm_anthropic` | local daemon, `cue-llm` |
-| User's OpenAI API key | macOS keyring under `llm_openai` | local daemon, `cue-llm` |
+| User's Anthropic API key | developer/BYOK keyring path only | local daemon, `cue-llm` dev mode |
+| User's OpenAI API key | developer/BYOK keyring path only | local daemon, `cue-llm` dev mode |
+| Bluey account access/refresh token | private local account profile by default | desktop cloud auth |
 | `BLUEY_OVERLAY_SESSION_TOKEN` | env var, generated per-spawn | overlay IPC handshake |
 | `BLUEY_LOCAL_ONLY` | env var, opt-in | force Auto Router to Local lane |
 | `BLUEY_SPECULATIVE_ROUTING` | env var, default ON | toggle speculative draft+final |
@@ -39,7 +40,8 @@ When Layer 2/3 are stood up, fill in their details below + in
 | `BLUEY_SMTP_FROM` / `BLUEY_SMTP_STARTTLS` | server env file | SMTP sender + transport mode |
 
 **Rule:** never commit secret values to this repo. The `secrets`
-module reads from keyring for client-side, env files for server-side.
+module reads developer keys from keyring for client-side dev paths and env files
+for server-side provider keys.
 Only the names of secrets appear in code or docs.
 
 ---

@@ -34,7 +34,7 @@ Existing Windows pieces:
 - Audio helper uses WASAPI loopback/microphone capture and emits 16 kHz mono
   PCM for transcription.
 - CLI/daemon have Windows paths for helper discovery, detached daemon launch,
-  file picker, screen/page capture, and Credential Manager token storage.
+  file picker, screen/page capture, and account-file token storage.
 - `scripts/build-windows.ps1` builds Rust plus overlay/audio into a loose
   `dist/bluey-windows-x64` directory.
 - `infra/scoop/bluey.json` exists as a placeholder.

@@ -372,7 +372,7 @@ fn print_account_section() -> Result<()> {
                 cue_core::account_id_hash_prefix(&account.device_id)
             );
             println!("  linked_at     : {}", account.linked_at);
-            println!("  token storage : OS secure storage");
+            println!("  token storage : Bluey private account profile");
             let has_token = secure_tokens.is_some();
             println!(
                 "  access token  : {}",

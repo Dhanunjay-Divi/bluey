@@ -1,9 +1,9 @@
 //! Bluey account token storage.
 //!
-//! New installs store account tokens in OS secure storage. The local Bluey
-//! account profile keeps non-secret metadata such as API URL, workspace, and
-//! device identity. Account-file token storage is retained only as an explicit
-//! development fallback and as a one-time migration path for older installs.
+//! New installs store Bluey account tokens in the private local account
+//! profile so normal `bluey on` / Listen / Screen flows do not trigger OS
+//! keychain prompts. OS keychain / credential-store access is opt-in for
+//! operator builds and can be used as a legacy fallback for older installs.
 
 use crate::error::{Error, Result};
 
@@ -117,10 +117,10 @@ impl TokenStore for AccountFileStore {
 
 /// Default desktop token store.
 ///
-/// Tokens are stored in the OS credential store (macOS Keychain, Windows
-/// Credential Manager, or libsecret-compatible stores on Linux). If an older
-/// install still has tokens in `account.json`, the first successful load
-/// migrates them into the secure store and clears them from disk.
+/// Customer builds use the private local account profile by default. Set
+/// `BLUEY_USE_OS_KEYCHAIN=1` or `BLUEY_USE_SECURE_STORE=1` to opt into the OS
+/// credential store. Set `BLUEY_LEGACY_KEYRING_FALLBACK=1` only when migrating
+/// older installs that already have tokens in the previous keyring store.
 pub struct SecureAccountStore {
     account_file: AccountFileStore,
     keyring: KeyringStore,
@@ -137,28 +137,45 @@ impl SecureAccountStore {
 
 impl TokenStore for SecureAccountStore {
     fn save(&self, tokens: &Tokens) -> Result<()> {
-        self.account_file.save_profile_without_tokens(tokens)?;
-        if plaintext_token_fallback_enabled() {
-            tracing::warn!(
-                "using plaintext account-token fallback because BLUEY_ALLOW_PLAINTEXT_TOKENS is enabled"
-            );
-            self.account_file.save(tokens)?;
-            return Ok(());
+        if !os_secure_store_enabled() || plaintext_token_fallback_enabled() {
+            if plaintext_token_fallback_enabled() {
+                tracing::warn!(
+                    "using plaintext account-token fallback because BLUEY_ALLOW_PLAINTEXT_TOKENS is enabled"
+                );
+            }
+            return self.account_file.save(tokens);
         }
+
+        self.account_file.save_profile_without_tokens(tokens)?;
         match self.keyring.save(tokens) {
             Ok(()) => {
                 self.account_file.clear()?;
                 Ok(())
             }
             Err(error) => Err(Error::TokenStore(format!(
-                "secure token storage unavailable: {error}. Bluey will not write account tokens to disk; fix OS credential storage or set BLUEY_ALLOW_PLAINTEXT_TOKENS=1 for local development only."
+                "secure token storage unavailable: {error}. Set BLUEY_USE_OS_KEYCHAIN=0 to use Bluey's private account file instead."
             ))),
         }
     }
 
     fn load(&self) -> Result<Option<Tokens>> {
-        if plaintext_token_fallback_enabled() {
-            return self.account_file.load();
+        if !os_secure_store_enabled() || plaintext_token_fallback_enabled() {
+            if let Some(tokens) = self.account_file.load()? {
+                return Ok(Some(tokens));
+            }
+            if legacy_keyring_fallback_enabled() {
+                match self.keyring.load() {
+                    Ok(Some(tokens)) => {
+                        self.account_file.save(&tokens)?;
+                        return Ok(Some(tokens));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::debug!(error = %error, "legacy keyring fallback unavailable");
+                    }
+                }
+            }
+            return Ok(None);
         }
 
         let keyring_error = match self.keyring.load() {
@@ -185,10 +202,20 @@ impl TokenStore for SecureAccountStore {
     }
 
     fn clear(&self) -> Result<()> {
-        let keyring_result = self.keyring.clear();
         let file_result = self.account_file.clear();
-        keyring_result.and(file_result)
+        if os_secure_store_enabled() || legacy_keyring_fallback_enabled() {
+            return self.keyring.clear().and(file_result);
+        }
+        file_result
     }
+}
+
+fn os_secure_store_enabled() -> bool {
+    truthy_env("BLUEY_USE_OS_KEYCHAIN") || truthy_env("BLUEY_USE_SECURE_STORE")
+}
+
+fn legacy_keyring_fallback_enabled() -> bool {
+    truthy_env("BLUEY_LEGACY_KEYRING_FALLBACK")
 }
 
 pub fn save_account_profile_without_tokens(
@@ -250,7 +277,6 @@ fn plaintext_token_fallback_enabled() -> bool {
     truthy_env("BLUEY_ALLOW_PLAINTEXT_TOKENS") || truthy_env("BLUEY_DEV_PLAINTEXT_TOKENS")
 }
 
-#[cfg(not(test))]
 fn truthy_env(name: &str) -> bool {
     std::env::var(name).ok().is_some_and(|value| {
         matches!(
@@ -532,6 +558,54 @@ mod tests {
         assert_eq!(loaded.device_id, "device-1");
         assert!(loaded.access_token.is_none());
         assert!(loaded.refresh_token.is_none());
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn secure_account_store_defaults_to_account_file_tokens() {
+        let base = std::env::temp_dir().join(format!(
+            "bluey-secure-store-file-default-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let paths = cue_core::app_paths::AppPaths {
+            data_dir: base.join("data"),
+            config_dir: base.join("config"),
+            runtime_dir: base.join("run"),
+            state_file: base.join("run/daemon-state.json"),
+            account_file: base.join("config/account.json"),
+            settings_file: base.join("config/settings.json"),
+        };
+
+        let store = SecureAccountStore::new(paths.clone());
+        store
+            .save(&Tokens {
+                access: "access".into(),
+                refresh: "refresh".into(),
+                email: "user@example.com".into(),
+            })
+            .unwrap();
+
+        let loaded = store.load().unwrap().unwrap();
+        assert_eq!(loaded.access, "access");
+        assert_eq!(loaded.refresh, "refresh");
+        assert_eq!(loaded.email, "user@example.com");
+
+        let account = cue_core::load_account(&paths).unwrap().unwrap();
+        assert_eq!(account.provider, "bluey");
+        assert_eq!(account.user_id, "user@example.com");
+        assert_eq!(account.access_token.as_deref(), Some("access"));
+        assert_eq!(account.refresh_token.as_deref(), Some("refresh"));
+
+        store.clear().unwrap();
+        let cleared = cue_core::load_account(&paths).unwrap().unwrap();
+        assert_eq!(cleared.user_id, "user@example.com");
+        assert!(cleared.access_token.is_none());
+        assert!(cleared.refresh_token.is_none());
 
         let _ = std::fs::remove_dir_all(base);
     }
