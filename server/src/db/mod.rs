@@ -6,10 +6,11 @@
 //! flag alone is a cutover.
 
 use anyhow::{Context, Result};
+use native_tls::{Certificate, TlsConnector};
+use postgres_native_tls::MakeTlsConnector;
 use r2d2::{Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
 use r2d2_sqlite::SqliteConnectionManager;
-use postgres::NoTls;
 use std::path::Path;
 
 pub mod account_data;
@@ -28,9 +29,9 @@ pub mod usage;
 pub mod webhook_events;
 
 pub type SqliteDbPool = Pool<SqliteConnectionManager>;
-pub type PostgresDbPool = Pool<PostgresConnectionManager<NoTls>>;
+pub type PostgresDbPool = Pool<PostgresConnectionManager<MakeTlsConnector>>;
 pub type SqliteDbConn = PooledConnection<SqliteConnectionManager>;
-pub type PostgresDbConn = PooledConnection<PostgresConnectionManager<NoTls>>;
+pub type PostgresDbConn = PooledConnection<PostgresConnectionManager<MakeTlsConnector>>;
 
 #[derive(Clone)]
 pub enum DbPool {
@@ -90,7 +91,31 @@ pub fn open_postgres_pool(database_url: &str) -> Result<DbPool> {
     let pg_config = database_url
         .parse::<postgres::Config>()
         .context("parse BLUEY_DATABASE_URL")?;
-    let manager = PostgresConnectionManager::new(pg_config, NoTls);
+    let mut tls_builder = TlsConnector::builder();
+    if let Ok(ca_cert_path) = std::env::var("BLUEY_POSTGRES_CA_CERT_PATH") {
+        let ca_bytes = std::fs::read(&ca_cert_path)
+            .with_context(|| format!("read BLUEY_POSTGRES_CA_CERT_PATH {ca_cert_path}"))?;
+        let ca_cert = Certificate::from_pem(&ca_bytes)
+            .or_else(|_| Certificate::from_der(&ca_bytes))
+            .with_context(|| format!("parse postgres CA certificate {ca_cert_path}"))?;
+        tls_builder.add_root_certificate(ca_cert);
+    }
+    if std::env::var("BLUEY_POSTGRES_ACCEPT_INVALID_CERTS")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+    {
+        tls_builder.danger_accept_invalid_certs(true);
+    }
+    if std::env::var("BLUEY_POSTGRES_ACCEPT_INVALID_HOSTNAMES")
+        .map(|value| value == "1")
+        .unwrap_or(false)
+    {
+        tls_builder.danger_accept_invalid_hostnames(true);
+    }
+    let tls = tls_builder
+        .build()
+        .context("build postgres TLS connector")?;
+    let manager = PostgresConnectionManager::new(pg_config, MakeTlsConnector::new(tls));
     let pool = Pool::builder()
         .max_size(16)
         .build(manager)

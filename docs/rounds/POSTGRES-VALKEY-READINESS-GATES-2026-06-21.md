@@ -19,6 +19,12 @@ Update: the later runtime adapter foundation is documented in
 `docs/rounds/POSTGRES-RUNTIME-ADAPTER-FOUNDATION-2026-06-21.md`. This readiness
 round still defines the operational gates.
 
+Operational receipt: `docs/rounds/MANAGED-POSTGRES-VALKEY-PROVISIONING-2026-06-21.md`
+records the managed DigitalOcean Postgres/Valkey provisioning pass. Managed
+Valkey is live in production; managed Postgres is provisioned, migrated, and
+TLS-ready, but the production API remains SQLite-backed until the synchronous
+Postgres runtime path is replaced or isolated.
+
 ## What Changed
 
 - `scripts/bluey-cloud-preflight.sh`
@@ -61,6 +67,8 @@ round still defines the operational gates.
 Redis/Valkey:
 
 - Runtime support is already real through `BLUEY_REDIS_URL`.
+- Production now loads managed Valkey via
+  `/etc/bluey-api/bluey-valkey.env`.
 - Single-server alpha can use no Redis or local Redis.
 - More than one server process must use managed Redis/Valkey with:
 
@@ -74,10 +82,14 @@ BLUEY_PREFLIGHT_PROFILE=multi-server
 Postgres/pgvector:
 
 - The active server-runtime schema is provisionable and migratable now.
+- Managed Postgres has been provisioned and migrated, with the Project CA staged
+  at `/etc/bluey-api/postgres-ca.pem`.
 - The older normalized cloud schema remains tracked as a future target, not
   the default runtime track.
 - A Postgres runtime adapter foundation now exists for account/auth/billing,
   usage, idempotency, STT, sync/RAG, metrics, export, and delete paths.
+- Production is not flipped to Postgres yet because staging exposed a nested
+  runtime panic in the synchronous Postgres pool path.
 - Do not flip production merely because the adapter compiles. Production still
   needs managed Postgres provisioning, SQLite-to-Postgres backfill if data
   exists, parity checks, and paid live smoke.
