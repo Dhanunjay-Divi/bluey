@@ -9,6 +9,8 @@ pub struct Config {
     pub port: u16,
     /// SQLite DB path. Default /opt/bluey-api/bluey.db (or ./bluey-dev.db in dev).
     pub db_path: PathBuf,
+    /// Runtime database backend selector. Today only SQLite is implemented.
+    pub db_backend: ServerDbBackend,
     /// JWT signing secret. REQUIRED. Server refuses to boot without it.
     pub jwt_secret: String,
     /// Public URL used in templated install scripts and email links.
@@ -30,6 +32,25 @@ pub struct Config {
     /// Operator/admin accounts. Matching signup emails are created as admins;
     /// matching existing accounts are promoted on next login.
     pub admin_emails: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ServerDbBackend {
+    #[default]
+    Sqlite,
+    Postgres,
+}
+
+impl ServerDbBackend {
+    fn from_env_value(value: &str) -> anyhow::Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "" | "sqlite" => Ok(Self::Sqlite),
+            "postgres" | "postgresql" => Ok(Self::Postgres),
+            other => anyhow::bail!(
+                "BLUEY_SERVER_DB_BACKEND must be sqlite or postgres, got {other:?}"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,6 +193,9 @@ impl Config {
         let db_path = std::env::var("BLUEY_DB_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("./bluey-dev.db"));
+        let db_backend = ServerDbBackend::from_env_value(
+            &std::env::var("BLUEY_SERVER_DB_BACKEND").unwrap_or_else(|_| "sqlite".to_string()),
+        )?;
 
         let jwt_secret = std::env::var("BLUEY_JWT_SECRET")
             .map_err(|_| anyhow::anyhow!("BLUEY_JWT_SECRET is required"))?;
@@ -229,6 +253,7 @@ impl Config {
         Ok(Self {
             port,
             db_path,
+            db_backend,
             jwt_secret,
             public_url,
             stripe_secret_key,
@@ -581,6 +606,7 @@ mod tests {
         let cfg = Config {
             port: 0,
             db_path: PathBuf::from(":memory:"),
+            db_backend: ServerDbBackend::Sqlite,
             jwt_secret: "test_secret_at_least_32_chars_long_xx".to_string(),
             public_url: "https://bluey.sh".to_string(),
             stripe_secret_key: None,
@@ -637,6 +663,7 @@ mod tests {
         let cfg = Config {
             port: 0,
             db_path: PathBuf::from(":memory:"),
+            db_backend: ServerDbBackend::Sqlite,
             jwt_secret: "test-secret-at-least-32-chars-long".to_string(),
             public_url: "http://localhost".to_string(),
             stripe_secret_key: None,

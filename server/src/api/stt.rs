@@ -600,6 +600,7 @@ mod tests {
             config: Arc::new(Config {
                 port: 8080,
                 db_path: PathBuf::from(":memory:"),
+                db_backend: crate::config::ServerDbBackend::Sqlite,
                 jwt_secret: "x".repeat(32),
                 public_url: "http://localhost:8080".into(),
                 stripe_secret_key: None,

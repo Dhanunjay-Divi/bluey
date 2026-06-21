@@ -163,14 +163,16 @@ Before wider paid alpha:
 Do not flip a fake `BLUEY_DATABASE_URL` until the runtime SQL backend exists.
 
 1. Create managed Postgres 16+ with pgvector.
-2. Apply the Postgres-marked cloud migrations:
+2. Apply the server-runtime compatibility migrations:
    `scripts/bluey-postgres-migrate.sh /etc/bluey-api/bluey-api.env`.
-3. Write a SQLite -> Postgres backfill that preserves account ids, payment ids,
+3. Write or enable the server SQL backend adapter against the
+   `infra/postgres/server-runtime` schema.
+4. Write a SQLite -> Postgres backfill that preserves account ids, payment ids,
    idempotency keys, usage ids, cloud session ids, tombstones, and RAG chunk ids.
-4. Run dual-write or short maintenance-mode migration for billing/idempotency.
-5. Compare row counts and ledger totals.
-6. Run paid-alpha smoke against Postgres staging.
-7. Promote only after Square webhooks, STT reservations, managed answers, RAG,
+5. Run dual-write or short maintenance-mode migration for billing/idempotency.
+6. Compare row counts and ledger totals.
+7. Run paid-alpha smoke against Postgres staging.
+8. Promote only after Square webhooks, STT reservations, managed answers, RAG,
    export/delete, and admin support flows pass.
 
 ## Required Secrets And Services
@@ -217,7 +219,8 @@ cutover profile cannot pass while the deployed runtime is still SQLite-backed.
 - Managed `/router/embed` exists for local RAG embeddings through the server.
 - Server Redis/Valkey hooks exist through `BLUEY_REDIS_URL`.
 - Off-host backup script supports R2/S3-compatible destinations.
-- Postgres/pgvector schema is tracked in `infra/migrations`.
+- Postgres/pgvector server-runtime schema is tracked in
+  `infra/postgres/server-runtime`.
 - Runtime server is still SQLite-backed until the SQL backend migration lands.
 
 That last line matters. The architecture is ready to provision; the runtime DB

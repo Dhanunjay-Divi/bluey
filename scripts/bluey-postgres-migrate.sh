@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Apply Bluey's cloud Postgres/pgvector migrations.
+# Apply Bluey's Postgres/pgvector migrations.
 #
 # Usage:
 #   scripts/bluey-postgres-migrate.sh /etc/bluey-api/bluey-api.env
 #
-# This script intentionally applies only SQL files that declare
-# "Target: Postgres" in their header. The infra/migrations directory also
-# contains local SQLite migrations for the desktop/runtime cache.
+# By default this applies the server-runtime compatibility schema under
+# infra/postgres/server-runtime. That schema mirrors the current bluey-server
+# SQLite tables so a real Postgres cutover has an exact target. Future
+# normalized cloud schemas must be run by explicitly setting
+# BLUEY_POSTGRES_MIGRATIONS_DIR.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${1:-}"
-MIGRATIONS_DIR="${BLUEY_POSTGRES_MIGRATIONS_DIR:-$ROOT/infra/migrations}"
+MIGRATIONS_DIR="${BLUEY_POSTGRES_MIGRATIONS_DIR:-$ROOT/infra/postgres/server-runtime}"
 MIGRATION_TABLE="${BLUEY_POSTGRES_MIGRATION_TABLE:-bluey_schema_migrations}"
 
 if [ -n "$ENV_FILE" ]; then
@@ -83,14 +85,14 @@ if ! psql "$BLUEY_DATABASE_URL" -Atqc "select 1 from pg_extension where extname 
   exit 1
 fi
 
-if ! psql "$BLUEY_DATABASE_URL" -Atqc "select to_regclass('public.memory_chunks')" | grep -q memory_chunks; then
-  echo "fatal: memory_chunks table missing after migrations" >&2
+if ! psql "$BLUEY_DATABASE_URL" -Atqc "select coalesce(to_regclass('public.cloud_rag_chunks')::text, to_regclass('public.memory_chunks')::text, '')" | grep -Eq 'cloud_rag_chunks|memory_chunks'; then
+  echo "fatal: no pgvector-backed RAG table found after migrations" >&2
   exit 1
 fi
 
-embedding_type="$(psql "$BLUEY_DATABASE_URL" -Atqc "select udt_name from information_schema.columns where table_schema = 'public' and table_name = 'memory_chunks' and column_name = 'embedding'")"
+embedding_type="$(psql "$BLUEY_DATABASE_URL" -Atqc "select udt_name from information_schema.columns where table_schema = 'public' and table_name = 'cloud_rag_chunks' and column_name = 'embedding' union all select udt_name from information_schema.columns where table_schema = 'public' and table_name = 'memory_chunks' and column_name = 'embedding' limit 1")"
 if [ "$embedding_type" != "vector" ]; then
-  echo "fatal: memory_chunks.embedding is not pgvector (found: ${embedding_type:-missing})" >&2
+  echo "fatal: RAG embedding column is not pgvector (found: ${embedding_type:-missing})" >&2
   exit 1
 fi
 

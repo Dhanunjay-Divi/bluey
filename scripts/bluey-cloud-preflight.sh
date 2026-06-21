@@ -10,11 +10,6 @@ set -euo pipefail
 # unless BLUEY_PREFLIGHT_STRICT=1 is set.
 
 ENV_FILE="${1:-}"
-STRICT="${BLUEY_PREFLIGHT_STRICT:-0}"
-PROFILE="${BLUEY_PREFLIGHT_PROFILE:-single-server-alpha}"
-REQUIRE_POSTGRES="${BLUEY_REQUIRE_POSTGRES:-0}"
-REQUIRE_MANAGED_REDIS="${BLUEY_REQUIRE_MANAGED_REDIS:-0}"
-SERVER_DB_BACKEND="${BLUEY_SERVER_DB_BACKEND:-sqlite}"
 FAILURES=0
 WARNINGS=0
 
@@ -28,6 +23,12 @@ if [ -n "$ENV_FILE" ]; then
   . "$ENV_FILE"
   set +a
 fi
+
+STRICT="${BLUEY_PREFLIGHT_STRICT:-0}"
+PROFILE="${BLUEY_PREFLIGHT_PROFILE:-single-server-alpha}"
+REQUIRE_POSTGRES="${BLUEY_REQUIRE_POSTGRES:-0}"
+REQUIRE_MANAGED_REDIS="${BLUEY_REQUIRE_MANAGED_REDIS:-0}"
+SERVER_DB_BACKEND="${BLUEY_SERVER_DB_BACKEND:-sqlite}"
 
 ok() {
   printf 'ok: %s\n' "$1"
@@ -154,8 +155,15 @@ if [ -n "${BLUEY_DATABASE_URL:-}" ]; then
       else
         fail "pgvector extension missing"
       fi
-      if psql "$BLUEY_DATABASE_URL" -Atqc "select to_regclass('public.memory_chunks')" | grep -q memory_chunks; then
-        ok "cloud memory_chunks table present"
+      rag_table="$(psql "$BLUEY_DATABASE_URL" -Atqc "select coalesce(to_regclass('public.cloud_rag_chunks')::text, to_regclass('public.memory_chunks')::text, '')")"
+      if printf '%s' "$rag_table" | grep -Eq 'cloud_rag_chunks|memory_chunks'; then
+        ok "cloud RAG table present ($rag_table)"
+        embedding_type="$(psql "$BLUEY_DATABASE_URL" -Atqc "select udt_name from information_schema.columns where table_schema = 'public' and table_name = 'cloud_rag_chunks' and column_name = 'embedding' union all select udt_name from information_schema.columns where table_schema = 'public' and table_name = 'memory_chunks' and column_name = 'embedding' limit 1")"
+        if [ "$embedding_type" = "vector" ]; then
+          ok "cloud RAG embedding column uses pgvector"
+        else
+          fail "cloud RAG embedding column is not pgvector (found: ${embedding_type:-missing})"
+        fi
       else
         fail "cloud Postgres schema missing; run scripts/bluey-postgres-migrate.sh"
       fi

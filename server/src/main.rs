@@ -4,7 +4,7 @@
 //! starts the axum HTTP server. Graceful shutdown on SIGINT/SIGTERM.
 
 use anyhow::Context;
-use bluey_server::{api, config::Config, db};
+use bluey_server::{api, config::{Config, ServerDbBackend}, db};
 use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
 
@@ -22,11 +22,17 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env().context("load config")?;
     tracing::info!(
         port = config.port,
+        db_backend = ?config.db_backend,
         db_path = %config.db_path.display(),
         "bluey-server starting",
     );
 
     // DB
+    if config.db_backend == ServerDbBackend::Postgres {
+        anyhow::bail!(
+            "BLUEY_SERVER_DB_BACKEND=postgres is provisioned but this bluey-server build still uses the SQLite runtime adapter; deploy the Postgres adapter build before cutover"
+        );
+    }
     let pool = db::open_pool(&config.db_path).context("open db")?;
     db::run_migrations(&pool).context("run migrations")?;
 

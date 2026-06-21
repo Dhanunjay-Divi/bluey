@@ -31,10 +31,18 @@ one server.
 - `scripts/bluey-postgres-migrate.sh`
   - Loads the same env file style as the API service.
   - Requires `BLUEY_DATABASE_URL`.
-  - Applies only migrations with `Target: Postgres` in the header.
+  - Defaults to `infra/postgres/server-runtime`, not the future normalized
+    schema.
   - Records applied versions in `bluey_schema_migrations`.
-  - Verifies pgvector and `memory_chunks.embedding` after migration.
+  - Verifies pgvector plus the active RAG vector column after migration.
   - Never prints the database URL.
+
+- `infra/postgres/server-runtime/001_server_runtime_compat.sql`
+  - Adds the managed Postgres schema that mirrors today’s server tables:
+    accounts, credits, auth, idempotency, usage, cloud sessions, cloud RAG,
+    and STT sessions.
+  - Adds `cloud_rag_chunks.embedding vector(1536)` so pgvector is present
+    without pretending the runtime adapter is already using it.
 
 - `ops/bluey-api.env.example`
   - Documents preflight profiles.
@@ -61,7 +69,9 @@ BLUEY_PREFLIGHT_PROFILE=multi-server
 
 Postgres/pgvector:
 
-- The cloud schema is provisionable and migratable now.
+- The active server-runtime schema is provisionable and migratable now.
+- The older normalized cloud schema remains tracked as a future target, not
+  the default runtime track.
 - The current `bluey-server` runtime is still SQLite-backed.
 - Do not set `BLUEY_DATABASE_URL` expecting the current binary to switch
   database engines. Runtime Postgres needs the SQL backend adapter and backfill
