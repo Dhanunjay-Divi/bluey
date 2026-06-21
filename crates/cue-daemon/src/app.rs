@@ -910,7 +910,7 @@ async fn handle_request_inner(
             let Some((meeting_snapshot, cards, indexed_segment)) = ({
                 let mut meeting_guard = daemon.meeting.lock().await;
                 if meeting_guard.is_none() {
-                    *meeting_guard = Some(MeetingRecord::new(Some("Ad hoc meeting".to_string())));
+                    *meeting_guard = Some(MeetingRecord::new(Some("New recording".to_string())));
                 }
 
                 let meeting = meeting_guard.as_mut().expect("meeting exists");
@@ -3657,7 +3657,7 @@ async fn add_audio_transcript_segment_inner(
     let meeting_snapshot = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard.is_none() {
-            *meeting_guard = Some(MeetingRecord::new(Some("Ad hoc audio meeting".to_string())));
+            *meeting_guard = Some(MeetingRecord::new(Some("New recording".to_string())));
         }
 
         let meeting = meeting_guard.as_mut().expect("meeting exists");
@@ -3911,7 +3911,7 @@ async fn answer_with_provider_runtime(
     let (meeting_snapshot, answer_meeting) = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard.is_none() {
-            let meeting = MeetingRecord::new(Some("Ad hoc meeting".to_string()));
+            let meeting = MeetingRecord::new(Some("New recording".to_string()));
             daemon.store.save_active(&meeting)?;
             *meeting_guard = Some(meeting);
         }
@@ -6327,7 +6327,7 @@ async fn attach_context_artifacts(
     let meeting_snapshot = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard.is_none() {
-            *meeting_guard = Some(MeetingRecord::new(Some("Ad hoc meeting".to_string())));
+            *meeting_guard = Some(MeetingRecord::new(Some("New recording".to_string())));
         }
 
         let meeting = meeting_guard.as_mut().expect("meeting exists");
@@ -6641,7 +6641,7 @@ async fn set_answer_instructions(
 ) -> Result<MeetingRecord> {
     let mut meeting_guard = daemon.meeting.lock().await;
     if meeting_guard.is_none() {
-        *meeting_guard = Some(MeetingRecord::new(Some("Ad hoc meeting".to_string())));
+        *meeting_guard = Some(MeetingRecord::new(Some("New recording".to_string())));
     }
 
     let meeting = meeting_guard.as_mut().expect("meeting exists");

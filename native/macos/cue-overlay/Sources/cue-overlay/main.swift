@@ -2705,6 +2705,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var composerBarHeightConstraint: NSLayoutConstraint?
     private var composerTextHeightConstraint: NSLayoutConstraint?
     private var attachmentStripHeightConstraint: NSLayoutConstraint?
+    private var sessionDrawerTopConstraint: NSLayoutConstraint?
+    private var sessionDrawerLeadingConstraint: NSLayoutConstraint?
+    private var sessionDrawerWidthConstraint: NSLayoutConstraint?
+    private var sessionDrawerHeightConstraint: NSLayoutConstraint?
     private var toastHideWorkItem: DispatchWorkItem?
     private var knowledgeIndexTimer: Timer?
     private var knowledgeIndexFrame = 0
@@ -2763,8 +2767,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         navButton = NSButton(title: "", target: nil, action: nil)
         newSessionButton = NSButton(title: "", target: nil, action: nil)
         sessionDrawer = NSView()
-        drawerTitleLabel = NSTextField(labelWithString: "Recordings")
-        drawerSubtitleLabel = NSTextField(labelWithString: "Click to continue. Pencil to rename.")
+        drawerTitleLabel = NSTextField(labelWithString: "History")
+        drawerSubtitleLabel = NSTextField(labelWithString: "Continue, rename, or delete saved recordings.")
         drawerCloseButton = NSButton(title: "", target: nil, action: nil)
         latestSessionButton = NSButton(title: "Continue latest", target: nil, action: nil)
         sessionScroll = NSScrollView()
@@ -3009,9 +3013,17 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let composerTextHeight = composerSurface.heightAnchor.constraint(equalToConstant: ChromeMetrics.composerInputHeight)
         let composerBarHeight = composerBar.heightAnchor.constraint(equalToConstant: ChromeMetrics.composerBaseHeight)
         let attachmentStripHeight = attachmentStrip.heightAnchor.constraint(equalToConstant: 0)
+        let sessionDrawerTop = sessionDrawer.topAnchor.constraint(equalTo: topAnchor, constant: 72)
+        let sessionDrawerLeading = sessionDrawer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 18)
+        let sessionDrawerWidth = sessionDrawer.widthAnchor.constraint(equalToConstant: 360)
+        let sessionDrawerHeight = sessionDrawer.heightAnchor.constraint(equalToConstant: 420)
         composerTextHeightConstraint = composerTextHeight
         composerBarHeightConstraint = composerBarHeight
         attachmentStripHeightConstraint = attachmentStripHeight
+        sessionDrawerTopConstraint = sessionDrawerTop
+        sessionDrawerLeadingConstraint = sessionDrawerLeading
+        sessionDrawerWidthConstraint = sessionDrawerWidth
+        sessionDrawerHeightConstraint = sessionDrawerHeight
 
         NSLayoutConstraint.activate([
             headerWordmark.widthAnchor.constraint(equalToConstant: 62),
@@ -3042,10 +3054,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             toastBodyLabel.trailingAnchor.constraint(equalTo: toastTitleLabel.trailingAnchor),
             toastBodyLabel.bottomAnchor.constraint(equalTo: toastView.bottomAnchor, constant: -13),
 
-            sessionDrawer.topAnchor.constraint(equalTo: topAnchor, constant: 10),
-            sessionDrawer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            sessionDrawer.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            sessionDrawer.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
+            sessionDrawerTop,
+            sessionDrawerLeading,
+            sessionDrawerWidth,
+            sessionDrawerHeight,
+            sessionDrawer.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -18),
+            sessionDrawer.bottomAnchor.constraint(lessThanOrEqualTo: bottomAnchor, constant: -104),
 
             drawerTitleLabel.topAnchor.constraint(equalTo: sessionDrawer.topAnchor, constant: 14),
             drawerTitleLabel.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 14),
@@ -3841,6 +3855,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         feed.layer?.zPosition = 1
         canvasPane.layer?.zPosition = 1
         sessionDrawer.layer?.zPosition = 3_900
+        updateSessionDrawerGeometry(layoutWidth: layoutWidth, layoutHeight: layoutHeight)
         answerStyleOverlay.layer?.zPosition = 4_200
         closeConfirmOverlay.layer?.zPosition = 4_300
         toastView.layer?.zPosition = 4_100
@@ -4493,6 +4508,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     @objc private func toggleSessionsClicked() {
+        updateSessionDrawerGeometry(layoutWidth: bounds.width, layoutHeight: bounds.height)
         sessionDrawer.isHidden.toggle()
         setHeaderSubtitle()
     }
@@ -5099,6 +5115,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     func setSessions(_ sessions: [OverlaySessionItem]) {
         sessionItems = sessions
         renameField = nil
+        updateSessionDrawerGeometry(layoutWidth: bounds.width, layoutHeight: bounds.height)
         for view in sessionStack.arrangedSubviews {
             sessionStack.removeArrangedSubview(view)
             view.removeFromSuperview()
@@ -5120,6 +5137,27 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             sessionStack.addArrangedSubview(row)
             row.widthAnchor.constraint(equalTo: sessionStack.widthAnchor, constant: -2).isActive = true
         }
+        updateSessionDrawerGeometry(layoutWidth: bounds.width, layoutHeight: bounds.height)
+    }
+
+    private func updateSessionDrawerGeometry(layoutWidth: CGFloat, layoutHeight: CGFloat) {
+        guard layoutWidth > 0, layoutHeight > 0 else { return }
+        let sideInset: CGFloat = 18
+        let headerClearance = ChromeMetrics.headerTopInset + ChromeMetrics.headerBarHeight + 14
+        let bottomClearance = (composerBarHeightConstraint?.constant ?? ChromeMetrics.composerBaseHeight)
+            + ChromeMetrics.transcriptStripHeight
+            + 44
+        let availableWidth = max(260, layoutWidth - sideInset * 2)
+        let availableHeight = max(190, layoutHeight - headerClearance - bottomClearance)
+        let visibleRows = CGFloat(min(max(sessionItems.count, 1), 6))
+        let desiredHeight = 104 + visibleRows * 58
+        let drawerWidth = min(380, max(310, min(availableWidth, layoutWidth * 0.36)))
+        let drawerHeight = min(availableHeight, max(220, desiredHeight))
+
+        sessionDrawerTopConstraint?.constant = headerClearance
+        sessionDrawerLeadingConstraint?.constant = sideInset
+        sessionDrawerWidthConstraint?.constant = drawerWidth
+        sessionDrawerHeightConstraint?.constant = drawerHeight
     }
 
     func resetSessionSurface() {

@@ -277,7 +277,7 @@ impl MeetingRecord {
             id: Uuid::new_v4(),
             title: title
                 .filter(|value| !value.trim().is_empty())
-                .unwrap_or_else(|| "Ad hoc meeting".to_string()),
+                .unwrap_or_else(|| "New recording".to_string()),
             started_at: clock::now_epoch_ms_string(),
             ended_at: None,
             transcript: Vec::new(),
