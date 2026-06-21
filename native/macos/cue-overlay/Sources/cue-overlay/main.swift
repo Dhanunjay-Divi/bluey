@@ -1086,6 +1086,8 @@ private final class ModalBlockerView: NSView {
 }
 
 private final class HeaderDragView: NSView {
+    private var dragStartedInHeader = false
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
@@ -1099,10 +1101,25 @@ private final class HeaderDragView: NSView {
     override func mouseDown(with event: NSEvent) {
         let localPoint = convert(event.locationInWindow, from: nil)
         if let hit = interactiveHit(in: self, point: localPoint), hit !== self {
+            dragStartedInHeader = false
             super.mouseDown(with: event)
             return
         }
+        dragStartedInHeader = true
+        window?.makeKey()
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard dragStartedInHeader else {
+            super.mouseDragged(with: event)
+            return
+        }
         window?.performDrag(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        dragStartedInHeader = false
+        super.mouseUp(with: event)
     }
 
     private func interactiveHit(in view: NSView, point: NSPoint) -> NSView? {
@@ -1629,6 +1646,8 @@ private final class FeedView: NSView {
     private let stack = NSStackView()
     private let scroll = NSScrollView()
     private let emptyState = NSView()
+    private var userScrolledAwayFromLatest = false
+    private let autoScrollTolerance: CGFloat = 44
     var onTranscript: ((RenderedCard) -> Void)?
     var onOpenURL: ((URL) -> Void)?
 
@@ -1682,12 +1701,13 @@ private final class FeedView: NSView {
         if loginURL(from: card) != nil {
             removeAllCards()
         }
+        let shouldAutoScroll = shouldFollowIncomingContent()
         cards.append(card)
         emptyState.isHidden = true
         let view = makeCardView(card)
         stack.addArrangedSubview(view)
         view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        scrollToBottom()
+        scrollToBottomIfNeeded(shouldAutoScroll)
         emitCardRendered(id: card.id)
     }
 
@@ -1708,6 +1728,7 @@ private final class FeedView: NSView {
     @discardableResult
     func update(id: String, body: String, done: Bool, costLabel: String?, artifact: OverlayArtifact?) -> RenderedCard? {
         guard let idx = cards.firstIndex(where: { $0.id == id }) else { return nil }
+        let shouldAutoScroll = shouldFollowIncomingContent()
         cards[idx].body = body
         cards[idx].done = done
         if let costLabel {
@@ -1717,7 +1738,7 @@ private final class FeedView: NSView {
             cards[idx].artifact = artifact
         }
         replaceCardView(at: idx)
-        scrollToBottom()
+        scrollToBottomIfNeeded(shouldAutoScroll)
         return cards[idx]
     }
 
@@ -1728,10 +1749,12 @@ private final class FeedView: NSView {
 
     func forwardScrollWheel(_ event: NSEvent) {
         scroll.scrollWheel(with: event)
+        updateScrollPinAfterUserInput()
     }
 
     override func scrollWheel(with event: NSEvent) {
         scroll.scrollWheel(with: event)
+        updateScrollPinAfterUserInput()
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
@@ -1762,6 +1785,7 @@ private final class FeedView: NSView {
     }
 
     private func removeAllCards() {
+        userScrolledAwayFromLatest = false
         cards.removeAll()
         for view in stack.arrangedSubviews {
             stack.removeArrangedSubview(view)
@@ -1783,17 +1807,18 @@ private final class FeedView: NSView {
             artifact: input.artifact)
 
         emptyState.isHidden = true
+        let shouldAutoScroll = shouldFollowIncomingContent()
         if let lastIndex = cards.indices.last,
            normalizedCardKind(cards[lastIndex].kind) == "transcript",
            transcriptCardSource(cards[lastIndex]) == source {
             let merged = mergedTranscriptBody(cards[lastIndex].body, card.body)
             guard merged != cards[lastIndex].body else {
-                scrollToBottom()
+                scrollToBottomIfNeeded(shouldAutoScroll)
                 return
             }
             cards[lastIndex].body = merged
             replaceCardView(at: lastIndex)
-            scrollToBottom()
+            scrollToBottomIfNeeded(shouldAutoScroll)
             return
         }
 
@@ -1801,7 +1826,7 @@ private final class FeedView: NSView {
         let view = makeCardView(card)
         stack.addArrangedSubview(view)
         view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        scrollToBottom()
+        scrollToBottomIfNeeded(shouldAutoScroll)
     }
 
     private func replaceCardView(at idx: Int) {
@@ -2460,6 +2485,31 @@ private final class FeedView: NSView {
         return nil
     }
 
+    private func shouldFollowIncomingContent() -> Bool {
+        !userScrolledAwayFromLatest || isScrolledNearLatest()
+    }
+
+    private func scrollToBottomIfNeeded(_ shouldScroll: Bool) {
+        guard shouldScroll else { return }
+        scrollToBottom()
+    }
+
+    private func updateScrollPinAfterUserInput() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.userScrolledAwayFromLatest = !self.isScrolledNearLatest()
+        }
+    }
+
+    private func isScrolledNearLatest() -> Bool {
+        layoutSubtreeIfNeeded()
+        stack.layoutSubtreeIfNeeded()
+        scroll.layoutSubtreeIfNeeded()
+        let maxOffset = max(0, stack.bounds.height - scroll.contentView.bounds.height)
+        let latestY = stack.isFlipped ? maxOffset : 0
+        return abs(scroll.contentView.bounds.origin.y - latestY) <= autoScrollTolerance
+    }
+
     private func scrollToBottom() {
         DispatchQueue.main.async { [weak self] in
             guard let s = self else { return }
@@ -2468,6 +2518,7 @@ private final class FeedView: NSView {
             let bottom = NSPoint(x: 0, y: targetY)
             s.scroll.contentView.scroll(to: bottom)
             s.scroll.reflectScrolledClipView(s.scroll.contentView)
+            s.userScrolledAwayFromLatest = false
         }
     }
 }
@@ -2799,6 +2850,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var knowledgeBadgeContentVisible = false
     private var audioPulseTimer: Timer?
     private var audioPulseFrame = 0
+    private var attachPickerPending = false
+    private var attachPickerResetWorkItem: DispatchWorkItem?
     private let knowledgeIndexFrames = [
         "Indexing · ● 101",
         "Indexing · ● 010",
@@ -4735,6 +4788,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     @objc private func attachClicked() {
+        guard beginAttachPickerHandoff() else {
+            showKnowledgePlaceholder("File picker is already opening...")
+            return
+        }
         setKnowledgeBadge("Docs loading", accent: BlueyTheme.warning)
         showKnowledgePlaceholder("Indexing selected files...")
         emitSimple("attach_requested")
@@ -4762,6 +4819,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let paths = draggedFilePaths(from: sender)
         setDropHighlight(false)
         guard !paths.isEmpty else { return false }
+        endAttachPickerHandoff()
         setKnowledgeBadge("Docs loading", accent: BlueyTheme.warning)
         showKnowledgePlaceholder(paths.count == 1 ? "Indexing dropped document..." : "Indexing dropped documents...")
         emitAttachFiles(paths: paths)
@@ -4782,6 +4840,30 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         return urls
             .map(\.path)
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    @discardableResult
+    private func beginAttachPickerHandoff() -> Bool {
+        guard !attachPickerPending else { return false }
+        attachPickerPending = true
+        attachButton.alphaValue = 0.6
+        attachButton.toolTip = "Opening file picker..."
+
+        attachPickerResetWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.endAttachPickerHandoff()
+        }
+        attachPickerResetWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: workItem)
+        return true
+    }
+
+    private func endAttachPickerHandoff() {
+        attachPickerResetWorkItem?.cancel()
+        attachPickerResetWorkItem = nil
+        attachPickerPending = false
+        attachButton.alphaValue = attachButton.isEnabled ? 1.0 : 0.45
+        attachButton.toolTip = "Attach documents"
     }
 
     private func setDropHighlight(_ active: Bool) {
@@ -5171,6 +5253,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func setContextItems(_ items: [OverlayContextItem]) {
+        endAttachPickerHandoff()
         for view in attachmentStack.arrangedSubviews {
             attachmentStack.removeArrangedSubview(view)
             view.removeFromSuperview()

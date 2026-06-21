@@ -386,7 +386,7 @@
           <span class="download-card-action">Show terminal steps</span>
         </article>
 
-        <article class="download-card" data-platform-card="windows" role="button" tabindex="0" aria-label="Show Windows PowerShell install instructions" aria-controls="windowsInstallInstructions" aria-expanded="false">
+        <article class="download-card disabled" aria-disabled="true">
           <div class="download-card-head">
             <div class="platform-name">
               <span class="os-icon" aria-hidden="true">
@@ -396,10 +396,10 @@
               </span>
               <span>Windows</span>
             </div>
-            <span class="availability">Ready</span>
+            <span class="availability soon">Coming soon</span>
           </div>
-          <p>Windows 10/11 x64 installs from PowerShell. Bluey uses the same account, credits, and cloud answers as macOS.</p>
-          <span class="download-card-action">Show PowerShell steps</span>
+          <p>Windows 10/11 x64 is in native testing. The public installer will appear here after signed artifacts are published.</p>
+          <span class="download-card-action soon">Coming soon</span>
         </article>
 
         <article class="download-card disabled" aria-disabled="true">
@@ -416,7 +416,7 @@
             </div>
             <span class="availability soon">Later</span>
           </div>
-          <p>Linux follows after the desktop app is stable across Mac and Windows.</p>
+        <p>Linux follows after the desktop app is stable across macOS and Windows.</p>
           <span class="download-card-action soon">Coming soon</span>
         </article>
       </section>
@@ -451,30 +451,16 @@
 
       <section class="platform-instructions" id="windowsInstallInstructions" data-platform-instructions="windows" hidden>
         <h2>Windows setup</h2>
-        <p>Install once from PowerShell, then start Bluey with one command.</p>
+        <p>The Windows installer is not public yet. We are keeping this page macOS-ready until signed Windows artifacts are published.</p>
         <div class="instruction-steps">
           <div class="instruction-step">
             <span class="instruction-num">1</span>
             <div class="instruction-body">
-              <p>Open <strong>PowerShell</strong> and run:</p>
-              <div class="install-command">
-                <code>irm https://bluey.sh/install.ps1 | iex</code>
-                <button class="copy-command" type="button" data-copy="irm https://bluey.sh/install.ps1 | iex">Copy</button>
-              </div>
-            </div>
-          </div>
-          <div class="instruction-step">
-            <span class="instruction-num">2</span>
-            <div class="instruction-body">
-              <p>Then start Bluey:</p>
-              <div class="install-command">
-                <code>bluey on</code>
-                <button class="copy-command" type="button" data-copy="bluey on">Copy</button>
-              </div>
+              <p>Windows support is coming soon. Use macOS for the current alpha.</p>
             </div>
           </div>
         </div>
-        <div class="instruction-help">Bluey installs per-user under <code>%LOCALAPPDATA%\Bluey</code> and checks signed updates before starting.</div>
+        <div class="instruction-help">Windows will ship only after the signed installer, update manifest, and desktop smoke are green.</div>
       </section>
 
       <div class="download-note">
