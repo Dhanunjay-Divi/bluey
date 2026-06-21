@@ -88,3 +88,42 @@ preflight passed: 5 warning(s)
 
 The warnings were expected in the disposable test: no real Redis URL, no real
 R2 bucket, no local health server, and no hosted signed manifest check.
+
+## Manual Deploy
+
+After review, the server build containing the Postgres backend guard was
+manually deployed to the production droplet without GitHub Actions:
+
+```text
+commit: 4937a4c
+binary: /usr/local/bin/bluey-server
+service: bluey-api
+```
+
+Deployment checks:
+
+```text
+systemd: active
+local health: 200
+public health: 200
+health commit: 4937a4c
+```
+
+Production preflight after deploy:
+
+```text
+ok: BLUEY_REDIS_URL set
+ok: Redis/Valkey ping succeeded
+ok: R2/S3 backup destination reachable
+ok: health endpoint reachable
+ok: signed update manifest files reachable
+preflight passed: 3 warning(s)
+```
+
+The warnings are intentional for the current single-server alpha:
+
+- `BLUEY_DATABASE_URL` is unset because the deployed runtime is still
+  SQLite-backed until the Postgres adapter build exists.
+- Redis points to the droplet-local ledger, which is valid only for one server.
+- Redis strict mode is disabled so a local Redis outage does not take the
+  single-server alpha offline.
