@@ -120,6 +120,10 @@ The real server Postgres cutover is still a code project:
 This round closes the dangerous ambiguity. It does not pretend the runtime
 adapter is done.
 
+The next round should start from
+`docs/rounds/POSTGRES-RUNTIME-CUTOVER-2026-06-21.md`. That document treats the
+Postgres adapter as pre-paid-alpha work, not a vague future migration.
+
 ## Verification
 
 Run before committing this round:
