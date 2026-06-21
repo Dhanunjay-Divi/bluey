@@ -8,7 +8,7 @@ use sha2::Sha256;
 use super::AppState;
 use crate::{
     auth,
-    db::{accounts::Account, refresh_tokens},
+    db::{accounts::Account, device_codes, refresh_tokens, signup_otps},
 };
 
 // ─── Request / response shapes ───────────────────────────────────────────
@@ -214,24 +214,8 @@ pub async fn signup_start(
     let expires_at =
         (chrono::Utc::now() + chrono::Duration::seconds(SIGNUP_OTP_TTL_SECS)).to_rfc3339();
 
-    {
-        let conn = state
-            .pool
-            .get()
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
-        conn.execute(
-            "INSERT INTO signup_otps (email, otp_hash, password_hash, attempts, expires_at)
-             VALUES (?1, ?2, ?3, 0, ?4)
-             ON CONFLICT(email) DO UPDATE SET
-                otp_hash = excluded.otp_hash,
-                password_hash = excluded.password_hash,
-                attempts = 0,
-                created_at = datetime('now'),
-                expires_at = excluded.expires_at",
-            rusqlite::params![&email, &otp_hash, &password_hash, &expires_at],
-        )
+    signup_otps::upsert(&state.pool, &email, &otp_hash, &password_hash, &expires_at)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
-    }
 
     match crate::mail::send_signup_otp(&state.config, &email, &otp, SIGNUP_OTP_TTL_SECS / 60).await
     {
@@ -283,49 +267,26 @@ pub async fn signup_confirm(
         ));
     }
 
-    let (stored_hash, password_hash, expires_at, attempts): (String, String, String, i64) = {
-        let conn = state
-            .pool
-            .get()
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
-        conn.query_row(
-            "SELECT otp_hash, password_hash, expires_at, attempts
-             FROM signup_otps WHERE email = ?1",
-            rusqlite::params![&email],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )
-        .map_err(|_| err(StatusCode::NOT_FOUND, "verification code not requested"))?
-    };
+    let signup_otp = signup_otps::fetch(&state.pool, &email)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "verification code not requested"))?;
 
-    let exp: chrono::DateTime<chrono::Utc> = expires_at
+    let exp: chrono::DateTime<chrono::Utc> = signup_otp
+        .expires_at
         .parse()
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "bad expires_at"))?;
     if exp < chrono::Utc::now() {
-        let conn = state
-            .pool
-            .get()
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
-        let _ = conn.execute(
-            "DELETE FROM signup_otps WHERE email = ?1",
-            rusqlite::params![&email],
-        );
+        let _ = signup_otps::delete(&state.pool, &email);
         return Err(err(StatusCode::GONE, "verification code expired"));
     }
 
-    if attempts >= SIGNUP_OTP_MAX_ATTEMPTS {
+    if signup_otp.attempts >= SIGNUP_OTP_MAX_ATTEMPTS {
         return Err(err(StatusCode::TOO_MANY_REQUESTS, "too many attempts"));
     }
 
     let submitted_hash = signup_otp_hash(&state.config.jwt_secret, &email, otp);
-    if !constant_time_eq(&submitted_hash, &stored_hash) {
-        let conn = state
-            .pool
-            .get()
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
-        let _ = conn.execute(
-            "UPDATE signup_otps SET attempts = attempts + 1 WHERE email = ?1",
-            rusqlite::params![&email],
-        );
+    if !constant_time_eq(&submitted_hash, &signup_otp.otp_hash) {
+        let _ = signup_otps::increment_attempts(&state.pool, &email);
         return Err(err(StatusCode::UNAUTHORIZED, "invalid verification code"));
     }
 
@@ -337,7 +298,7 @@ pub async fn signup_confirm(
     }
 
     let is_admin = state.config.is_admin_email(&email);
-    let account = Account::create_with_admin(&state.pool, &email, &password_hash, is_admin)
+    let account = Account::create_with_admin(&state.pool, &email, &signup_otp.password_hash, is_admin)
         .map_err(|e| {
             if matches!(
                 e.downcast_ref::<crate::db::accounts::AccountCreateError>(),
@@ -348,20 +309,9 @@ pub async fn signup_confirm(
             err(StatusCode::INTERNAL_SERVER_ERROR, &format!("create: {e}"))
         })?;
 
-    {
-        let conn = state
-            .pool
-            .get()
-            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
-        let _ = conn.execute(
-            "DELETE FROM signup_otps WHERE email = ?1",
-            rusqlite::params![&email],
-        );
-        let _ = conn.execute(
-            "UPDATE accounts SET email_verified_at = datetime('now') WHERE id = ?1",
-            rusqlite::params![&account.id],
-        );
-    }
+    let _ = signup_otps::delete(&state.pool, &email);
+    Account::mark_email_verified(&state.pool, &account.id)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
 
     Ok(Json(auth_response(&state, &account)?))
 }
@@ -523,15 +473,8 @@ pub async fn device_start(
     let user_code = random_user_code();
     let expires_at =
         (chrono::Utc::now() + chrono::Duration::seconds(DEVICE_CODE_TTL_SECS)).to_rfc3339();
-    let conn = state
-        .pool
-        .get()
+    device_codes::insert(&state.pool, &device_code, &user_code, &expires_at)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
-    conn.execute(
-        "INSERT INTO device_codes (device_code, user_code, expires_at) VALUES (?1, ?2, ?3)",
-        rusqlite::params![&device_code, &user_code, &expires_at],
-    )
-    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
     Ok(Json(DeviceStartResponse {
         device_code,
         user_code,
@@ -545,37 +488,22 @@ pub async fn device_poll(
     State(state): State<AppState>,
     Json(req): Json<DevicePollRequest>,
 ) -> Result<Json<AuthResponse>, (StatusCode, Json<ApiError>)> {
-    let conn = state
-        .pool
-        .get()
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
-    let row: Option<(Option<String>, i64, String)> = conn
-        .query_row(
-            "SELECT account_id, approved, expires_at FROM device_codes WHERE device_code = ?1",
-            rusqlite::params![&req.device_code],
-            |r| {
-                Ok((
-                    r.get::<_, Option<String>>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .ok();
-
-    let Some((account_id_opt, approved, expires_at)) = row else {
+    let Some(row) = device_codes::fetch_by_device_code(&state.pool, &req.device_code)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?
+    else {
         return Err(err(StatusCode::NOT_FOUND, "unknown device_code"));
     };
-    let exp: chrono::DateTime<chrono::Utc> = expires_at
+    let exp: chrono::DateTime<chrono::Utc> = row
+        .expires_at
         .parse()
         .map_err(|_| err(StatusCode::INTERNAL_SERVER_ERROR, "bad expires_at"))?;
     if exp < chrono::Utc::now() {
         return Err(err(StatusCode::GONE, "device_code expired"));
     }
-    if approved == 0 {
+    if row.approved == 0 {
         return Err(err(StatusCode::ACCEPTED, "authorization_pending"));
     }
-    let Some(account_id) = account_id_opt else {
+    let Some(account_id) = row.account_id else {
         return Err(err(
             StatusCode::INTERNAL_SERVER_ERROR,
             "approved but no account",
@@ -585,14 +513,9 @@ pub async fn device_poll(
     // Consume the device code before issuing tokens. The conditional delete
     // closes the retry race where two pollers select the same approved row
     // before either one deletes it.
-    let deleted = conn
-        .execute(
-            "DELETE FROM device_codes
-             WHERE device_code = ?1 AND approved = 1 AND account_id = ?2",
-            rusqlite::params![&req.device_code, &account_id],
-        )
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
-    if deleted == 0 {
+    if !device_codes::consume_approved(&state.pool, &req.device_code, &account_id)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?
+    {
         return Err(err(StatusCode::GONE, "device_code already consumed"));
     }
 
@@ -610,22 +533,13 @@ pub async fn device_approve(
     >,
     Json(req): Json<DeviceApproveRequest>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
-    let conn = state
-        .pool
-        .get()
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
     // Bind the device_code to the *currently authenticated* customer's account.
     // The auth middleware has already verified the JWT and loaded the account;
     // we use that account_id to mark the device approved.
     let now = chrono::Utc::now().to_rfc3339();
-    let n = conn
-        .execute(
-            "UPDATE device_codes SET approved = 1, account_id = ?1
-             WHERE user_code = ?2 AND expires_at > ?3 AND approved = 0",
-            rusqlite::params![&account.id, &req.user_code, &now],
-        )
-        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
-    if n == 0 {
+    if !device_codes::approve_user_code(&state.pool, &account.id, &req.user_code, &now)
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?
+    {
         return Err(err(StatusCode::NOT_FOUND, "unknown or expired user_code"));
     }
     Ok(StatusCode::OK)
@@ -710,18 +624,14 @@ pub async fn verify_email_confirm(
             error: "invalid or expired verification token".into(),
         }),
     ))?;
-    let conn = state.pool.get().map_err(|e| {
+    Account::mark_email_verified(&state.pool, &account_id).map_err(|e| {
         (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiError {
-                error: format!("pool: {e}"),
+                error: format!("db: {e}"),
             }),
         )
     })?;
-    let _ = conn.execute(
-        "UPDATE accounts SET email_verified_at = datetime('now') WHERE id = ?1",
-        rusqlite::params![&account_id],
-    );
     Ok(axum::http::StatusCode::OK)
 }
 
@@ -815,18 +725,14 @@ pub async fn password_reset_confirm(
             error: "invalid or expired reset token".into(),
         }),
     ))?;
-    let conn = state.pool.get().map_err(|e| {
+    Account::update_password_hash(&state.pool, &account_id, &new_hash).map_err(|e| {
         (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiError {
-                error: format!("pool: {e}"),
+                error: format!("db: {e}"),
             }),
         )
     })?;
-    let _ = conn.execute(
-        "UPDATE accounts SET password_hash = ?1 WHERE id = ?2",
-        rusqlite::params![&new_hash, &account_id],
-    );
     Ok(axum::http::StatusCode::OK)
 }
 

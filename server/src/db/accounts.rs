@@ -222,6 +222,22 @@ impl Account {
         Ok(())
     }
 
+    pub fn mark_email_verified(pool: &DbPool, id: &str) -> Result<usize> {
+        let conn = pool.get()?;
+        Ok(conn.execute(
+            "UPDATE accounts SET email_verified_at = datetime('now') WHERE id = ?1",
+            params![id],
+        )?)
+    }
+
+    pub fn update_password_hash(pool: &DbPool, id: &str, password_hash: &str) -> Result<usize> {
+        let conn = pool.get()?;
+        Ok(conn.execute(
+            "UPDATE accounts SET password_hash = ?1 WHERE id = ?2",
+            params![password_hash, id],
+        )?)
+    }
+
     pub fn restrict_billing(
         pool: &DbPool,
         id: &str,
