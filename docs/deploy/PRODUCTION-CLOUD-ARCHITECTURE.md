@@ -163,7 +163,8 @@ Before wider paid alpha:
 Do not flip a fake `BLUEY_DATABASE_URL` until the runtime SQL backend exists.
 
 1. Create managed Postgres 16+ with pgvector.
-2. Apply `infra/migrations/001_initial_cloud_schema.sql`.
+2. Apply the Postgres-marked cloud migrations:
+   `scripts/bluey-postgres-migrate.sh /etc/bluey-api/bluey-api.env`.
 3. Write a SQLite -> Postgres backfill that preserves account ids, payment ids,
    idempotency keys, usage ids, cloud session ids, tombstones, and RAG chunk ids.
 4. Run dual-write or short maintenance-mode migration for billing/idempotency.
@@ -188,6 +189,27 @@ in repo or desktop builds:
 - `BLUEY_REDIS_URL`
 - `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` for R2 backup/object access
 - future `BLUEY_DATABASE_URL`
+
+## Preflight Profiles
+
+Use profiles so we do not confuse a one-server alpha with a scaled production
+shape:
+
+```bash
+BLUEY_PREFLIGHT_PROFILE=single-server-alpha \
+  scripts/bluey-cloud-preflight.sh /etc/bluey-api/bluey-api.env
+
+BLUEY_PREFLIGHT_PROFILE=multi-server \
+  scripts/bluey-cloud-preflight.sh /etc/bluey-api/bluey-api.env
+
+BLUEY_PREFLIGHT_PROFILE=postgres-cutover \
+  scripts/bluey-cloud-preflight.sh /etc/bluey-api/bluey-api.env
+```
+
+`multi-server` requires managed Redis/Valkey and strict Redis behavior.
+`postgres-cutover` additionally requires `BLUEY_DATABASE_URL` and a migrated
+pgvector schema. It also requires `BLUEY_SERVER_DB_BACKEND=postgres`, so the
+cutover profile cannot pass while the deployed runtime is still SQLite-backed.
 
 ## Current Repo State
 

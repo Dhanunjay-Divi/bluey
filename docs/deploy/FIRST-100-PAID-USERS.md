@@ -101,6 +101,8 @@ US-East droplet is acceptable.
 
 - `docs/deploy/PAID-ALPHA-SMOKE.md` passes on a clean Mac with a real linked
   account and real credits.
+- `BLUEY_PREFLIGHT_PROFILE=single-server-alpha scripts/bluey-cloud-preflight.sh
+  /etc/bluey-api/bluey-api.env` passes on the droplet.
 - Square sandbox and one low-dollar production reload credit the account
   balance within 30 seconds.
 - Square failed-webhook/dispute notification mailbox is monitored.
@@ -142,10 +144,14 @@ contract.
   Upgrade the droplet first.
 - **SQLite contention:** sustained database lock waits, DB size over 5-10 GB, or
   admin/usage queries slow down.
-  Move server state to managed Postgres.
+  Move server state to managed Postgres. Provision the schema with
+  `scripts/bluey-postgres-migrate.sh`, then use
+  `BLUEY_PREFLIGHT_PROFILE=postgres-cutover` after the runtime adapter lands.
 - **Provider capacity across more than one server:** more than one bluey-server
   instance needs shared key health/cooldown state.
-  Add Redis/Valkey for provider capacity state.
+  Add managed Redis/Valkey for provider capacity state and require
+  `BLUEY_PREFLIGHT_PROFILE=multi-server` plus
+  `BLUEY_RATE_LIMIT_REDIS_STRICT=1`.
 - **Cloud memory/search grows:** users expect cross-device/global memory search,
   or synced artifact retrieval becomes heavy.
   Add Postgres + pgvector for cloud memory while keeping desktop local RAG.
@@ -161,7 +167,7 @@ contract.
 ```bash
 bash scripts/release-hygiene-scan.sh
 git diff --check
-scripts/bluey-cloud-preflight.sh /etc/bluey-api/bluey-api.env
+BLUEY_PREFLIGHT_PROFILE=single-server-alpha scripts/bluey-cloud-preflight.sh /etc/bluey-api/bluey-api.env
 scripts/observability-acceptance-smoke.sh
 curl -fsS https://bluey.sh/health
 curl -fsS https://bluey.sh/pricing/tiers

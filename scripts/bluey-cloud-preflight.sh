@@ -11,6 +11,10 @@ set -euo pipefail
 
 ENV_FILE="${1:-}"
 STRICT="${BLUEY_PREFLIGHT_STRICT:-0}"
+PROFILE="${BLUEY_PREFLIGHT_PROFILE:-single-server-alpha}"
+REQUIRE_POSTGRES="${BLUEY_REQUIRE_POSTGRES:-0}"
+REQUIRE_MANAGED_REDIS="${BLUEY_REQUIRE_MANAGED_REDIS:-0}"
+SERVER_DB_BACKEND="${BLUEY_SERVER_DB_BACKEND:-sqlite}"
 FAILURES=0
 WARNINGS=0
 
@@ -87,8 +91,35 @@ key_count() {
   }'
 }
 
+is_local_redis_url() {
+  case "$1" in
+    redis://127.0.0.1:*|redis://localhost:*|rediss://127.0.0.1:*|rediss://localhost:*|unix:*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 echo "Bluey cloud preflight"
 echo "env: ${ENV_FILE:-current shell}"
+echo "profile: $PROFILE"
+
+case "$PROFILE" in
+  single-server-alpha)
+    ;;
+  multi-server)
+    REQUIRE_MANAGED_REDIS=1
+    ;;
+  postgres-cutover)
+    REQUIRE_MANAGED_REDIS=1
+    REQUIRE_POSTGRES=1
+    ;;
+  *)
+    warn "unknown BLUEY_PREFLIGHT_PROFILE=$PROFILE; use single-server-alpha, multi-server, or postgres-cutover"
+    ;;
+esac
 
 need_env BLUEY_PUBLIC_URL "public web/API origin"
 need_env BLUEY_JWT_SECRET "JWT signing"
@@ -108,7 +139,13 @@ else
 fi
 
 if [ -n "${BLUEY_DATABASE_URL:-}" ]; then
-  warn "BLUEY_DATABASE_URL is set. Current bluey-server is SQLite-backed; use this only with the Postgres backend cutover build."
+  if [ "$SERVER_DB_BACKEND" = "postgres" ]; then
+    ok "BLUEY_SERVER_DB_BACKEND=postgres"
+  elif [ "$REQUIRE_POSTGRES" = "1" ]; then
+    fail "BLUEY_SERVER_DB_BACKEND=postgres required for BLUEY_PREFLIGHT_PROFILE=$PROFILE"
+  else
+    warn "BLUEY_DATABASE_URL is set but BLUEY_SERVER_DB_BACKEND=${SERVER_DB_BACKEND}; current bluey-server is SQLite-backed unless a Postgres cutover build is deployed"
+  fi
   if command -v psql >/dev/null 2>&1; then
     if psql "$BLUEY_DATABASE_URL" -Atqc "select 1" >/dev/null 2>&1; then
       ok "Postgres connection succeeded"
@@ -117,12 +154,21 @@ if [ -n "${BLUEY_DATABASE_URL:-}" ]; then
       else
         fail "pgvector extension missing"
       fi
+      if psql "$BLUEY_DATABASE_URL" -Atqc "select to_regclass('public.memory_chunks')" | grep -q memory_chunks; then
+        ok "cloud memory_chunks table present"
+      else
+        fail "cloud Postgres schema missing; run scripts/bluey-postgres-migrate.sh"
+      fi
     else
       fail "Postgres connection failed"
     fi
   else
     warn "psql not installed; skipped Postgres connectivity check"
   fi
+elif [ "$REQUIRE_POSTGRES" = "1" ]; then
+  fail "BLUEY_DATABASE_URL missing; required for BLUEY_PREFLIGHT_PROFILE=$PROFILE"
+else
+  warn "BLUEY_DATABASE_URL unset; SQLite-backed server is acceptable only for single-server alpha"
 fi
 
 need_env BLUEY_BILLING_PROVIDER "billing provider"
@@ -155,6 +201,13 @@ optional_env BLUEY_SMTP_PASSWORD "transactional email secret"
 
 if [ -n "${BLUEY_REDIS_URL:-}" ]; then
   ok "BLUEY_REDIS_URL set (shared capacity ledger)"
+  if is_local_redis_url "$BLUEY_REDIS_URL"; then
+    if [ "$REQUIRE_MANAGED_REDIS" = "1" ]; then
+      fail "BLUEY_REDIS_URL points to local Redis/Valkey; managed Redis/Valkey is required for BLUEY_PREFLIGHT_PROFILE=$PROFILE"
+    else
+      warn "BLUEY_REDIS_URL points to local Redis/Valkey; safe only for one-server alpha"
+    fi
+  fi
   if command -v redis-cli >/dev/null 2>&1; then
     if redis-cli -u "$BLUEY_REDIS_URL" PING 2>/dev/null | grep -q PONG; then
       ok "Redis/Valkey ping succeeded"
@@ -165,11 +218,17 @@ if [ -n "${BLUEY_REDIS_URL:-}" ]; then
     warn "redis-cli not installed; skipped Redis/Valkey ping"
   fi
 else
-  warn "BLUEY_REDIS_URL unset; safe only for single-server alpha"
+  if [ "$REQUIRE_MANAGED_REDIS" = "1" ]; then
+    fail "BLUEY_REDIS_URL unset; managed Redis/Valkey is required for BLUEY_PREFLIGHT_PROFILE=$PROFILE"
+  else
+    warn "BLUEY_REDIS_URL unset; safe only for single-server alpha"
+  fi
 fi
 ok "BLUEY_REDIS_NAMESPACE=${BLUEY_REDIS_NAMESPACE:-bluey}"
 if [ "${BLUEY_RATE_LIMIT_REDIS_STRICT:-0}" = "1" ]; then
   ok "Redis strict mode enabled"
+elif [ "$REQUIRE_MANAGED_REDIS" = "1" ]; then
+  fail "BLUEY_RATE_LIMIT_REDIS_STRICT=1 required for BLUEY_PREFLIGHT_PROFILE=$PROFILE"
 else
   warn "Redis strict mode disabled; Redis failures fall back to local process state"
 fi
