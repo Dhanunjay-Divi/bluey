@@ -34,7 +34,7 @@ use cue_core::{
 };
 use cue_llm::{
     bluey_managed::{BlueyManagedProvider, ManagedLane},
-    LlmProvider as _, LlmRequest,
+    LlmArtifactMetadata, LlmProvider as _, LlmRequest,
 };
 use futures_util::{stream::FuturesUnordered, SinkExt, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -76,6 +76,7 @@ struct OverlayAnswerStream {
     card_id: uuid::Uuid,
     generation_id: u64,
     body: String,
+    artifact: Option<CueCardArtifact>,
 }
 
 impl OverlayAnswerStream {
@@ -85,6 +86,7 @@ impl OverlayAnswerStream {
             card_id,
             generation_id,
             body: String::new(),
+            artifact: None,
         }
     }
 
@@ -124,8 +126,21 @@ impl OverlayAnswerStream {
         final_body: &str,
         cost_label: Option<String>,
     ) -> Result<()> {
+        self.finish_with_cost_label_and_artifact(final_body, cost_label, None)
+            .await
+    }
+
+    async fn finish_with_cost_label_and_artifact(
+        &mut self,
+        final_body: &str,
+        cost_label: Option<String>,
+        artifact: Option<CueCardArtifact>,
+    ) -> Result<()> {
         if self.body != final_body {
             self.body = final_body.to_string();
+        }
+        if artifact.is_some() {
+            self.artifact = artifact;
         }
         self.flush_with_cost_label(true, cost_label).await
     }
@@ -145,7 +160,13 @@ impl OverlayAnswerStream {
                 body: self.body.clone(),
                 done,
                 cost_label,
-                artifact: answer_overlay_artifact(&self.body).filter(|_| done),
+                artifact: done
+                    .then(|| {
+                        self.artifact
+                            .clone()
+                            .or_else(|| answer_overlay_artifact(&self.body))
+                    })
+                    .flatten(),
             },
         )
         .await;
@@ -4230,6 +4251,35 @@ fn answer_overlay_artifact(answer: &str) -> Option<CueCardArtifact> {
     None
 }
 
+fn llm_overlay_artifact(artifact: &LlmArtifactMetadata) -> Option<CueCardArtifact> {
+    let body = artifact.body.trim();
+    if body.is_empty() {
+        return None;
+    }
+    let artifact_type = match artifact.artifact_type.trim().to_ascii_lowercase().as_str() {
+        "code" | "patch" | "diff" => CardArtifactType::Code,
+        "system_design" | "system-design" | "architecture" | "design" => {
+            CardArtifactType::SystemDesign
+        }
+        "screen" | "vision" | "screenshot" => CardArtifactType::Screen,
+        "document" | "docs" | "file" => CardArtifactType::Document,
+        _ => CardArtifactType::Structured,
+    };
+    let title = match artifact_type {
+        CardArtifactType::Code => "Code canvas",
+        CardArtifactType::SystemDesign => "System design canvas",
+        CardArtifactType::Screen => "Screen analysis",
+        CardArtifactType::Document => "Document notes",
+        CardArtifactType::Structured => "Workspace",
+    };
+    Some(CueCardArtifact {
+        artifact_type,
+        title: title.to_string(),
+        body: body.to_string(),
+        confidence: artifact.confidence.unwrap_or(0.88).clamp(0.0, 1.0),
+    })
+}
+
 fn extract_fenced_code_blocks(text: &str) -> Vec<String> {
     let mut blocks = Vec::new();
     let mut current = Vec::new();
@@ -4617,6 +4667,7 @@ async fn call_bluey_managed_provider(
         let mut answer = String::new();
         let mut token_usage = None;
         let mut cost_label = None;
+        let mut overlay_artifact = None;
         let mut saw_finished = false;
         while let Some(chunk) = chunks.next().await {
             let chunk = chunk.map_err(managed_llm_error)?;
@@ -4631,6 +4682,9 @@ async fn call_bluey_managed_provider(
             }
             if let Some(label) = chunk.cost_label {
                 cost_label = Some(label);
+            }
+            if let Some(artifact) = chunk.artifact.as_ref().and_then(llm_overlay_artifact) {
+                overlay_artifact = Some(artifact);
             }
             if chunk.finished {
                 saw_finished = true;
@@ -4648,7 +4702,7 @@ async fn call_bluey_managed_provider(
         }
         if let Some(stream) = stream.as_mut() {
             stream
-                .finish_with_cost_label(&answer, cost_label.clone())
+                .finish_with_cost_label_and_artifact(&answer, cost_label.clone(), overlay_artifact)
                 .await?;
         }
 
@@ -4668,10 +4722,15 @@ async fn call_bluey_managed_provider(
     if answer.is_empty() {
         return Err(anyhow!("managed provider returned no answer text"));
     }
+    let overlay_artifact = response.artifact.as_ref().and_then(llm_overlay_artifact);
     if let Some(stream) = stream.as_mut() {
         stream.replay_text(&answer).await?;
         stream
-            .finish_with_cost_label(&answer, response.cost_label.clone())
+            .finish_with_cost_label_and_artifact(
+                &answer,
+                response.cost_label.clone(),
+                overlay_artifact,
+            )
             .await?;
     }
     let token_usage = response.cost.as_ref().map(token_usage_from_llm_cost);
@@ -4949,7 +5008,9 @@ Human-speak contract:
 - Avoid AI-sounding filler such as \"genuinely\", \"honestly\", \"straightforward\", and \"it depends\" without a decision.
 - Do not sound like a polished memo or an AI explainer: avoid source labels, repeated headings, generic disclaimers, and long markdown checklists in the chat answer.
 - Include a concise rationale when it helps the user defend the answer, but do not expose hidden chain-of-thought.
-- If the topic needs depth, keep the chat answer speakable and put deeper code/design/detail in the structured sections or artifact.";
+- If the topic needs depth, keep the chat answer speakable and put deeper code/design/detail in the structured sections or artifact.
+- Treat the canvas as the workbench: for coding, keep explanation in chat and put code, patches, or changed blocks in the workbench; for system design, keep the recommendation in chat and put architecture, data flow, APIs, storage, scaling, and failure modes in the workbench.
+- On follow-ups to existing code or design, update only the affected block/section and explain the delta; do not replace the whole workbench unless the user asks for a full rewrite.";
 
 fn provider_prompt_parts(payload: &ProviderRequestPayload) -> Result<ProviderPromptParts> {
     let mut system = String::from(
@@ -4958,7 +5019,7 @@ fn provider_prompt_parts(payload: &ProviderRequestPayload) -> Result<ProviderPro
     system.push_str("\n\n");
     system.push_str(HUMAN_SPEAK_CONTRACT);
     system.push_str(
-        "\n\nOutput format:\n- Stream a clear, readable answer with short line breaks.\n- Put the direct, speakable answer first as one natural paragraph whenever possible.\n- Do not turn normal chat answers into a markdown outline. Use headings only when the task truly needs structure or when an artifact/canvas will render the deeper detail.\n- Auto-detect the task type. For coding, debugging, algorithms, API, or configuration questions, use this shape after the talk track when useful: Approach, Patch, Explanation, Complexity, Edge cases. Put code in fenced Markdown code blocks with a language tag when possible.\n- For code follow-ups or requested changes, prefer in-place edits: name the file/function, show only the changed block or unified diff, and explain where it lands. Do not replace the whole implementation unless the user explicitly asks, the file is new, or a full replacement is materially safer than a patch.\n- For system design questions, be clear and concrete: Architecture, Data flow, APIs/contracts, Storage, Scaling, Tradeoffs, Failure modes, Observability, and Rollout / next steps when useful.\n- For system design follow-ups, update only the affected design section and call out what changed so the canvas stays the current source of truth without rewriting unrelated sections.\n- For design/debug/product questions, use compact bullets with concrete next steps.\n- Avoid long paragraphs; make the overlay easy to scan while it streams.",
+        "\n\nOutput format:\n- Stream a clear, readable answer with short line breaks.\n- Put the direct, speakable answer first as one natural paragraph whenever possible.\n- Do not turn normal chat answers into a markdown outline. Use headings only when the task truly needs structure or when an artifact/canvas will render the deeper detail.\n- Use the canvas split: chat is the explanation/talk track; the workbench is code, patch, architecture, data flow, APIs, tables, or deeper detail.\n- Auto-detect the task type. For coding, debugging, algorithms, API, or configuration questions, use this shape after the talk track when useful: Approach, Patch, Explanation, Complexity, Edge cases. Put code in fenced Markdown code blocks with a language tag when possible.\n- For code follow-ups or requested changes, prefer in-place edits: name the file/function, show only the changed block or unified diff, and explain where it lands. Do not replace the whole implementation unless the user explicitly asks, the file is new, or a full replacement is materially safer than a patch.\n- For system design questions, be clear and concrete: Architecture, Data flow, APIs/contracts, Storage, Scaling, Tradeoffs, Failure modes, Observability, and Rollout / next steps when useful.\n- For system design follow-ups, update only the affected design section and call out what changed so the canvas stays the current source of truth without rewriting unrelated sections.\n- For design/debug/product questions, use compact bullets with concrete next steps.\n- Avoid long paragraphs; make the overlay easy to scan while it streams.",
     );
     if let Some(instructions) = payload
         .instructions
@@ -8739,6 +8800,21 @@ mod tests {
 
         assert_eq!(artifact.artifact_type, CardArtifactType::SystemDesign);
         assert!(artifact.confidence > 0.8);
+    }
+
+    #[test]
+    fn llm_overlay_artifact_preserves_managed_code_canvas() {
+        let artifact = llm_overlay_artifact(&LlmArtifactMetadata {
+            artifact_type: "diff".to_string(),
+            body: "@@ changed block @@".to_string(),
+            confidence: Some(0.91),
+        })
+        .expect("managed artifact");
+
+        assert_eq!(artifact.artifact_type, CardArtifactType::Code);
+        assert_eq!(artifact.title, "Code canvas");
+        assert_eq!(artifact.body, "@@ changed block @@");
+        assert_eq!(artifact.confidence, 0.91);
     }
 
     #[test]

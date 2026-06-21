@@ -22,7 +22,8 @@ Human-speak contract:
 - No assistant preamble such as \"Sure\", \"Here is\", \"As an AI\", or \"You can say\".
 - Avoid AI-sounding filler such as \"genuinely\", \"honestly\", \"straightforward\", and \"it depends\" without a decision.
 - Do not sound like a polished memo or an AI explainer: avoid source labels, repeated headings, generic disclaimers, and long markdown checklists in the chat answer.
-- Keep it speakable: 2-5 concise sentences by default, with short bullets only when useful.";
+- Keep it speakable: 2-5 concise sentences by default, with short bullets only when useful.
+- Treat canvas-style detail as separate from the spoken answer: for code, explain briefly and show only the needed code/diff; for system design, explain the call and keep architecture/detail structured.";
 
 pub struct AnswerLlm;
 

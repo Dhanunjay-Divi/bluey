@@ -2272,36 +2272,107 @@ private final class FeedView: NSView {
         guard normalizedCardKind(card.kind) == "answer" else { return rawBody }
 
         if let artifact = card.artifact {
+            let base: String
             if artifact.artifactType == "code" {
-                let notes = stripFencedCode(from: rawBody)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                return notes.isEmpty
-                    ? "I opened the code in the canvas."
-                    : notes + "\n\nCode opened in the canvas."
+                base = stripFencedCode(from: rawBody)
+            } else {
+                base = rawBody
             }
-            if rawBody.count > 1_100 {
-                let prefix = String(rawBody.prefix(720))
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                return prefix + "\n\nFull \(artifact.title.lowercased()) opened in the canvas."
-            }
+            return canvasBackedChatBody(
+                from: base,
+                fallback: artifactFallbackLine(for: artifact.artifactType),
+                suffix: artifactChatSuffix(for: artifact.artifactType))
         }
 
         if rawBody.contains("```") {
             let notes = stripFencedCode(from: rawBody)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if notes.isEmpty {
-                return "I opened the code in the canvas."
+                return "Code is in the canvas."
             }
-            return notes + "\n\nCode opened in the canvas."
+            return canvasBackedChatBody(
+                from: notes,
+                fallback: "Code is in the canvas.",
+                suffix: "Code is in the canvas.")
         }
 
         if rawBody.count > 1_100 && hasStructuredShape(rawBody) {
-            let prefix = String(rawBody.prefix(720))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            return prefix + "\n\nFull structured version opened in the canvas."
+            return canvasBackedChatBody(
+                from: rawBody,
+                fallback: "Details are in the canvas.",
+                suffix: "Details are in the canvas.")
         }
 
         return rawBody
+    }
+
+    private func canvasBackedChatBody(from text: String, fallback: String, suffix: String) -> String {
+        let summary = conciseChatSummary(from: text)
+        if summary.isEmpty {
+            return fallback
+        }
+        if summary == suffix || summary.hasSuffix(suffix) {
+            return summary
+        }
+        return summary + "\n\n" + suffix
+    }
+
+    private func artifactFallbackLine(for artifactType: String) -> String {
+        switch artifactType {
+        case "code":
+            return "Code is in the canvas."
+        case "system_design":
+            return "Architecture is in the canvas."
+        case "screen":
+            return "Screen details are in the canvas."
+        case "document":
+            return "Document details are in the canvas."
+        default:
+            return "Details are in the canvas."
+        }
+    }
+
+    private func artifactChatSuffix(for artifactType: String) -> String {
+        artifactFallbackLine(for: artifactType)
+    }
+
+    private func conciseChatSummary(from text: String) -> String {
+        let cleaned = stripFencedCode(from: text)
+            .components(separatedBy: .newlines)
+            .map { line -> String in
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.hasPrefix("#") {
+                    return trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "# "))
+                }
+                if trimmed == "---" || trimmed == "----" {
+                    return ""
+                }
+                return trimmed
+            }
+            .filter { !$0.isEmpty }
+
+        var kept: [String] = []
+        var total = 0
+        for line in cleaned {
+            if kept.count >= 5 { break }
+            let nextTotal = total + line.count + (kept.isEmpty ? 0 : 1)
+            if nextTotal > 520 {
+                let room = max(0, 520 - total - (kept.isEmpty ? 0 : 1))
+                if room > 32 {
+                    kept.append(trimLine(line, to: room))
+                }
+                break
+            }
+            kept.append(line)
+            total = nextTotal
+        }
+        return kept.joined(separator: "\n")
+    }
+
+    private func trimLine(_ line: String, to limit: Int) -> String {
+        guard line.count > limit, limit > 3 else { return line }
+        let index = line.index(line.startIndex, offsetBy: max(0, limit - 3))
+        return String(line[..<index]).trimmingCharacters(in: .whitespacesAndNewlines) + "..."
     }
 
     private func stripFencedCode(from text: String) -> String {
@@ -2475,17 +2546,17 @@ private final class CanvasPaneView: NSView {
         textView.textColor = BlueyTheme.text
         textView.font = NSFont.monospacedSystemFont(ofSize: 12.2, weight: .regular)
         textView.textContainerInset = NSSize(width: 12, height: 12)
-        textView.isHorizontallyResizable = true
+        textView.isHorizontallyResizable = false
         textView.isVerticallyResizable = true
         textView.autoresizingMask = [.width]
-        textView.textContainer?.widthTracksTextView = false
+        textView.textContainer?.widthTracksTextView = true
         textView.textContainer?.containerSize = NSSize(
-            width: CGFloat.greatestFiniteMagnitude,
+            width: 1,
             height: CGFloat.greatestFiniteMagnitude)
 
         scroll.drawsBackground = false
         scroll.hasVerticalScroller = true
-        scroll.hasHorizontalScroller = true
+        scroll.hasHorizontalScroller = false
         scroll.autohidesScrollers = true
         scroll.borderType = .noBorder
         scroll.documentView = textView
@@ -2534,6 +2605,11 @@ private final class CanvasPaneView: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    override func layout() {
+        super.layout()
+        updateTextWrapping()
+    }
+
     func applyBackgroundOpacity(_ opacity: CGFloat) {
         layer?.backgroundColor = NSColor(
             red: 0.020,
@@ -2552,6 +2628,7 @@ private final class CanvasPaneView: NSView {
             iconView.image = image
         }
         textView.string = artifact.content
+        updateTextWrapping()
         textView.scrollRangeToVisible(NSRange(location: 0, length: 0))
     }
 
@@ -2590,6 +2667,13 @@ private final class CanvasPaneView: NSView {
         }
         button.imageHugsTitle = true
         button.alignment = .center
+    }
+
+    private func updateTextWrapping() {
+        let width = max(1, scroll.contentSize.width)
+        textView.textContainer?.containerSize = NSSize(
+            width: width,
+            height: CGFloat.greatestFiniteMagnitude)
     }
 
     @objc private func copyClicked() {
@@ -5312,7 +5396,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func shouldAutoOpenCanvas(for card: RenderedCard, artifact: CanvasArtifact) -> Bool {
-        if card.artifact != nil { return true }
         guard card.kind == "answer" else { return false }
         switch artifact.kind {
         case .code, .systemDesign, .screen:
@@ -5466,9 +5549,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
         let available = max(0, bounds.width)
         if canvasFullWindow || windowFullSize {
-            canvasWidthConstraint?.constant = min(max(380, available * 0.44), 560)
+            canvasWidthConstraint?.constant = min(max(440, available * 0.42), 760)
         } else {
-            canvasWidthConstraint?.constant = 310
+            canvasWidthConstraint?.constant = 360
         }
     }
 
