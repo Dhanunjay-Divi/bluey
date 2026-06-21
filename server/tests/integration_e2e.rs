@@ -74,6 +74,8 @@ async fn boot_harness_with_options(
     let config = Config {
         port: 0,
         db_path: path,
+        db_backend: bluey_server::config::ServerDbBackend::Sqlite,
+        database_url: None,
         jwt_secret: "test-secret-at-least-32-chars-long-xxx".to_string(),
         public_url: "http://localhost:8080".to_string(),
         stripe_secret_key: Some("sk_test_e2e".to_string()),

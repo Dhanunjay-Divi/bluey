@@ -32,6 +32,8 @@ async fn real_serve_path_installs_connect_info_and_rate_limit_sees_peer_ip() {
     let config = Config {
         port: 0,
         db_path: path,
+        db_backend: bluey_server::config::ServerDbBackend::Sqlite,
+        database_url: None,
         jwt_secret: "test-secret-at-least-32-chars-long-xxx".into(),
         public_url: "http://localhost".into(),
         stripe_secret_key: None,

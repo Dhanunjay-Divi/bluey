@@ -30,54 +30,113 @@ pub fn record(pool: &DbPool, account_id: &str, event: &UsageEvent) -> Result<boo
     // already exists; we surface that as Ok(false) so callers can log
     // the dedup without treating it as an error.
     let id = uuid::Uuid::new_v4().to_string();
-    let conn = pool.get()?;
-    let inserted = conn.execute(
-        "INSERT OR IGNORE INTO usage_events
-            (id, account_id, request_id, kind, task_type, lane, provider, model,
-             input_tokens, output_tokens, latency_ms,
-             cost_cents_to_bluey, cost_cents_to_customer,
-             was_speculative, was_fallback)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-        params![
-            id,
-            account_id,
-            event.request_id,
-            event.kind,
-            event.task_type,
-            event.lane,
-            event.provider,
-            event.model,
-            event.input_tokens,
-            event.output_tokens,
-            event.latency_ms,
-            event.cost_cents_to_bluey,
-            event.cost_cents_to_customer,
-            event.was_speculative as i64,
-            event.was_fallback as i64,
-        ],
-    )?;
-    Ok(inserted == 1)
+    match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO usage_events
+                    (id, account_id, request_id, kind, task_type, lane, provider, model,
+                     input_tokens, output_tokens, latency_ms,
+                     cost_cents_to_bluey, cost_cents_to_customer,
+                     was_speculative, was_fallback)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    id,
+                    account_id,
+                    event.request_id,
+                    event.kind,
+                    event.task_type,
+                    event.lane,
+                    event.provider,
+                    event.model,
+                    event.input_tokens,
+                    event.output_tokens,
+                    event.latency_ms,
+                    event.cost_cents_to_bluey,
+                    event.cost_cents_to_customer,
+                    event.was_speculative as i64,
+                    event.was_fallback as i64,
+                ],
+            )?;
+            Ok(inserted == 1)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let was_speculative = event.was_speculative as i32;
+            let was_fallback = event.was_fallback as i32;
+            let inserted = conn.execute(
+                "INSERT INTO usage_events
+                    (id, account_id, request_id, kind, task_type, lane, provider, model,
+                     input_tokens, output_tokens, latency_ms,
+                     cost_cents_to_bluey, cost_cents_to_customer,
+                     was_speculative, was_fallback)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                 ON CONFLICT (account_id, request_id, kind) DO NOTHING",
+                &[
+                    &id,
+                    &account_id,
+                    &event.request_id,
+                    &event.kind,
+                    &event.task_type,
+                    &event.lane,
+                    &event.provider,
+                    &event.model,
+                    &event.input_tokens,
+                    &event.output_tokens,
+                    &event.latency_ms,
+                    &event.cost_cents_to_bluey,
+                    &event.cost_cents_to_customer,
+                    &was_speculative,
+                    &was_fallback,
+                ],
+            )?;
+            Ok(inserted == 1)
+        }
+    }
 }
 
 pub fn bluey_spend_cents_in_window(pool: &DbPool, window_hours: i64) -> Result<i64> {
-    let conn = pool.get()?;
-    let total = if window_hours > 0 {
-        let window = format!("-{window_hours} hours");
-        conn.query_row(
-            "SELECT COALESCE(SUM(cost_cents_to_bluey), 0)
-               FROM usage_events
-              WHERE ts >= datetime('now', ?1)",
-            params![window],
-            |row| row.get(0),
-        )?
-    } else {
-        conn.query_row(
-            "SELECT COALESCE(SUM(cost_cents_to_bluey), 0) FROM usage_events",
-            [],
-            |row| row.get(0),
-        )?
-    };
-    Ok(total)
+    match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let total = if window_hours > 0 {
+                let window = format!("-{window_hours} hours");
+                conn.query_row(
+                    "SELECT COALESCE(SUM(cost_cents_to_bluey), 0)
+                       FROM usage_events
+                      WHERE ts >= datetime('now', ?1)",
+                    params![window],
+                    |row| row.get(0),
+                )?
+            } else {
+                conn.query_row(
+                    "SELECT COALESCE(SUM(cost_cents_to_bluey), 0) FROM usage_events",
+                    [],
+                    |row| row.get(0),
+                )?
+            };
+            Ok(total)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let total: i64 = if window_hours > 0 {
+                conn.query_one(
+                    "SELECT COALESCE(SUM(cost_cents_to_bluey), 0)::bigint
+                       FROM usage_events
+                      WHERE ts >= now() - ($1 * interval '1 hour')",
+                    &[&window_hours],
+                )?
+                .try_get(0)?
+            } else {
+                conn.query_one(
+                    "SELECT COALESCE(SUM(cost_cents_to_bluey), 0)::bigint FROM usage_events",
+                    &[],
+                )?
+                .try_get(0)?
+            };
+            Ok(total)
+        }
+    }
 }
 
 #[cfg(test)]

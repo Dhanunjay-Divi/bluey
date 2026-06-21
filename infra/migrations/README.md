@@ -23,6 +23,8 @@ embedding column on the active RAG table.
 Only set `BLUEY_POSTGRES_MIGRATIONS_DIR=infra/migrations` when intentionally
 testing the future normalized schema in isolation.
 
-Current production note: `bluey-server` remains SQLite-backed until the runtime
-SQL backend adapter/backfill cutover lands. `BLUEY_DATABASE_URL` is a
-provisioning/cutover input, not a magic switch for the current binary.
+Current production note: `bluey-server` now has a Postgres runtime adapter
+foundation, but production should remain on its known database until managed
+Postgres provisioning, backfill, parity checks, and paid smoke pass.
+`BLUEY_DATABASE_URL` plus `BLUEY_SERVER_DB_BACKEND=postgres` are cutover inputs,
+not a substitute for those checks.

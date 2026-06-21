@@ -10,9 +10,10 @@ laptop gets Bluey, local SQLite files, and a local RAG cache only. Redis,
 Postgres, pgvector, R2/S3, provider keys, and billing secrets are server-side
 operator concerns.
 
-The current `bluey-server` binary is still SQLite-backed. The Postgres schema
-below is the target cutover contract; do not set `BLUEY_DATABASE_URL` for the
-current server until the SQL backend adapter and backfill have landed.
+The `bluey-server` codebase now has a Postgres runtime adapter foundation. The
+Postgres schema below is the cutover contract; do not set
+`BLUEY_SERVER_DB_BACKEND=postgres` in production until managed Postgres is
+provisioned, migrations/backfill have run, and live smoke has passed.
 
 Files:
 
@@ -31,9 +32,9 @@ Paid-alpha preflight:
 Suggested first deployment:
 
 - Alpha API: one DigitalOcean droplet running `bluey-server` behind Caddy.
-- Alpha database: SQLite on the droplet with hourly online backups.
-- Later database: managed Postgres with `pgvector` when multi-server or
-  cloud-memory scale requires it.
+- Alpha database: SQLite on the droplet with hourly online backups until the
+  Postgres cutover smoke passes.
+- Scaled database: managed Postgres with `pgvector`.
 - Later queue/cache: Redis-compatible managed service or cloud-native queue
   adapter before more than one server instance handles live traffic.
 - Objects: Cloudflare R2 or another S3-compatible bucket for release artifacts,

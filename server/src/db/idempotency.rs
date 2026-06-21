@@ -31,30 +31,59 @@ pub enum ReserveOutcome {
 }
 
 pub fn reserve(pool: &DbPool, account_id: &str, request_id: &str) -> Result<ReserveOutcome> {
-    let conn = pool.get()?;
+    let row: Option<(String, Option<String>)> = match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
 
-    // Try to INSERT a new in_progress row. If a row already exists for
-    // (account_id, request_id), the INSERT silently does nothing.
-    let inserted = conn.execute(
-        "INSERT OR IGNORE INTO request_idempotency
-            (account_id, request_id, status, created_at)
-         VALUES (?1, ?2, 'in_progress', datetime('now'))",
-        params![account_id, request_id],
-    )?;
+            // Try to INSERT a new in_progress row. If a row already exists for
+            // (account_id, request_id), the INSERT silently does nothing.
+            let inserted = conn.execute(
+                "INSERT OR IGNORE INTO request_idempotency
+                    (account_id, request_id, status, created_at)
+                 VALUES (?1, ?2, 'in_progress', datetime('now'))",
+                params![account_id, request_id],
+            )?;
 
-    if inserted == 1 {
-        return Ok(ReserveOutcome::FreshReservation);
-    }
+            if inserted == 1 {
+                return Ok(ReserveOutcome::FreshReservation);
+            }
 
-    // Existing row: read it.
-    let row: Option<(String, Option<String>)> = conn
-        .query_row(
-            "SELECT status, response_json FROM request_idempotency
-             WHERE account_id = ?1 AND request_id = ?2",
-            params![account_id, request_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .ok();
+            // Existing row: read it.
+            conn.query_row(
+                "SELECT status, response_json FROM request_idempotency
+                 WHERE account_id = ?1 AND request_id = ?2",
+                params![account_id, request_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok()
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let inserted = conn.execute(
+                "INSERT INTO request_idempotency
+                    (account_id, request_id, status, created_at)
+                 VALUES ($1, $2, 'in_progress', now())
+                 ON CONFLICT (account_id, request_id) DO NOTHING",
+                &[&account_id, &request_id],
+            )?;
+
+            if inserted == 1 {
+                return Ok(ReserveOutcome::FreshReservation);
+            }
+
+            conn.query_opt(
+                "SELECT status, response_json FROM request_idempotency
+                 WHERE account_id = $1 AND request_id = $2",
+                &[&account_id, &request_id],
+            )?
+            .map(|row| {
+                let status: String = row.try_get(0)?;
+                let response_json: Option<String> = row.try_get(1)?;
+                Ok::<(String, Option<String>), anyhow::Error>((status, response_json))
+            })
+            .transpose()?
+        }
+    };
 
     match row {
         Some((status, json)) if status == "complete" => {
@@ -76,27 +105,56 @@ pub fn mark_complete(
     request_id: &str,
     response_json: &str,
 ) -> Result<()> {
-    let conn = pool.get()?;
-    conn.execute(
-        "UPDATE request_idempotency
-            SET status = 'complete',
-                response_json = ?3,
-                http_status = 200,
-                completed_at = datetime('now')
-          WHERE account_id = ?1 AND request_id = ?2",
-        params![account_id, request_id, response_json],
-    )?;
+    match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            conn.execute(
+                "UPDATE request_idempotency
+                    SET status = 'complete',
+                        response_json = ?3,
+                        http_status = 200,
+                        completed_at = datetime('now')
+                  WHERE account_id = ?1 AND request_id = ?2",
+                params![account_id, request_id, response_json],
+            )?;
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            conn.execute(
+                "UPDATE request_idempotency
+                    SET status = 'complete',
+                        response_json = $3,
+                        http_status = 200,
+                        completed_at = now()
+                  WHERE account_id = $1 AND request_id = $2",
+                &[&account_id, &request_id, &response_json],
+            )?;
+        }
+    }
     Ok(())
 }
 
 pub fn mark_failed(pool: &DbPool, account_id: &str, request_id: &str) -> Result<()> {
-    let conn = pool.get()?;
-    conn.execute(
-        "UPDATE request_idempotency
-            SET status = 'failed', completed_at = datetime('now')
-          WHERE account_id = ?1 AND request_id = ?2",
-        params![account_id, request_id],
-    )?;
+    match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            conn.execute(
+                "UPDATE request_idempotency
+                    SET status = 'failed', completed_at = datetime('now')
+                  WHERE account_id = ?1 AND request_id = ?2",
+                params![account_id, request_id],
+            )?;
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            conn.execute(
+                "UPDATE request_idempotency
+                    SET status = 'failed', completed_at = now()
+                  WHERE account_id = $1 AND request_id = $2",
+                &[&account_id, &request_id],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -104,12 +162,24 @@ pub fn mark_failed(pool: &DbPool, account_id: &str, request_id: &str) -> Result<
 /// for transient upstream errors (502 etc) where the customer should
 /// not be forced to mint a new id.
 pub fn release(pool: &DbPool, account_id: &str, request_id: &str) -> Result<()> {
-    let conn = pool.get()?;
-    conn.execute(
-        "DELETE FROM request_idempotency
-          WHERE account_id = ?1 AND request_id = ?2 AND status = 'in_progress'",
-        params![account_id, request_id],
-    )?;
+    match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            conn.execute(
+                "DELETE FROM request_idempotency
+                  WHERE account_id = ?1 AND request_id = ?2 AND status = 'in_progress'",
+                params![account_id, request_id],
+            )?;
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            conn.execute(
+                "DELETE FROM request_idempotency
+                  WHERE account_id = $1 AND request_id = $2 AND status = 'in_progress'",
+                &[&account_id, &request_id],
+            )?;
+        }
+    }
     Ok(())
 }
 

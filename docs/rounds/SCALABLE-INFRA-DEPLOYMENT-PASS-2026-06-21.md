@@ -30,25 +30,26 @@ Checked from the Bluey droplet without printing secrets:
 - `BLUEY_DATABASE_URL` is not configured.
 - `BLUEY_SERVER_DB_BACKEND=postgres` is not configured.
 - `psql` is not installed on the droplet.
-- The current server build still intentionally refuses
-  `BLUEY_SERVER_DB_BACKEND=postgres` until the Postgres runtime adapter lands.
+- A later server build adds the Postgres runtime adapter foundation, but this
+  live-status snapshot predates a production Postgres env flip.
 
-This means the live system is good for single-server alpha readiness, but it is
-not yet a true Postgres-backed scalable runtime.
+This means the live system snapshot was good for single-server alpha readiness,
+but not yet a true Postgres-backed scalable runtime.
 
 ## What Is Deployable Now
 
 - Keep one API server on the DigitalOcean droplet.
 - Use existing Redis/Valkey support for local provider capacity and cooldowns.
 - Keep R2/off-host backup configuration active.
-- Keep SQLite runtime until the adapter/backfill cutover is implemented.
+- Keep SQLite runtime until the managed Postgres/backfill/smoke cutover is
+  completed.
 - Use `scripts/bluey-scalable-readiness.sh` to prevent declaring a Postgres
   cutover complete too early.
 
 ## Required Before Claiming Fully Scalable Runtime
 
-1. Implement the Postgres runtime adapter behind the existing DB boundary.
-2. Add SQLite-to-Postgres backfill/parity tooling.
+1. Finish/prove the Postgres runtime adapter behind the existing DB boundary.
+2. Add/run SQLite-to-Postgres backfill/parity tooling.
 3. Provision managed Postgres + pgvector.
 4. Provision managed Valkey/Redis before adding a second API server.
 5. Run migrations and preflight against the managed services.

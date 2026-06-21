@@ -81,7 +81,9 @@ The remaining warning is expected for the current single-server alpha:
 ## Current Truth
 
 - Bluey production backups now have a real off-host R2 destination.
-- The running API server is still SQLite-backed by design.
+- The running API server snapshot for this round was SQLite-backed by design.
+  A later Postgres adapter foundation exists, but production still needs a
+  managed Postgres cutover/backfill/smoke before changing the live database.
 - R2 is only blob/object storage. It is not the source of truth for auth,
   balances, usage, idempotency, sessions, or vector search.
 - Redis/Valkey-compatible state is enabled locally on the production droplet.

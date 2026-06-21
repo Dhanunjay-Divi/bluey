@@ -439,6 +439,7 @@ mod tests {
             port: 0,
             db_path: std::path::PathBuf::from(":memory:"),
             db_backend: crate::config::ServerDbBackend::Sqlite,
+            database_url: None,
             jwt_secret: "test_secret_at_least_32_chars_long_xx".to_string(),
             public_url: "http://localhost".to_string(),
             stripe_secret_key: None,

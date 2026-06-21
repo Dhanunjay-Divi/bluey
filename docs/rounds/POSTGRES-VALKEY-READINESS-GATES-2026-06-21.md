@@ -15,6 +15,10 @@ and a Postgres schema already existed, but there was no safe migration runner
 or preflight profile that forces the right managed services before we scale past
 one server.
 
+Update: the later runtime adapter foundation is documented in
+`docs/rounds/POSTGRES-RUNTIME-ADAPTER-FOUNDATION-2026-06-21.md`. This readiness
+round still defines the operational gates.
+
 ## What Changed
 
 - `scripts/bluey-cloud-preflight.sh`
@@ -72,12 +76,14 @@ Postgres/pgvector:
 - The active server-runtime schema is provisionable and migratable now.
 - The older normalized cloud schema remains tracked as a future target, not
   the default runtime track.
-- The current `bluey-server` runtime is still SQLite-backed.
-- Do not set `BLUEY_DATABASE_URL` expecting the current binary to switch
-  database engines. Runtime Postgres needs the SQL backend adapter and backfill
-  cutover.
-- Once that backend lands, set `BLUEY_SERVER_DB_BACKEND=postgres` and run the
-  `postgres-cutover` preflight profile before promotion.
+- A Postgres runtime adapter foundation now exists for account/auth/billing,
+  usage, idempotency, STT, sync/RAG, metrics, export, and delete paths.
+- Do not flip production merely because the adapter compiles. Production still
+  needs managed Postgres provisioning, SQLite-to-Postgres backfill if data
+  exists, parity checks, and paid live smoke.
+- Set `BLUEY_SERVER_DB_BACKEND=postgres` and `BLUEY_DATABASE_URL` only for a
+  deliberate cutover/staging smoke, then run the `postgres-cutover` preflight
+  profile before promotion.
 
 ## Operator Commands
 
@@ -107,22 +113,18 @@ BLUEY_PREFLIGHT_PROFILE=postgres-cutover \
 
 ## Remaining Follow-Up
 
-The real server Postgres cutover is still a code project:
+The real production cutover is still not a switch-flip:
 
-1. Add a database backend abstraction around account, auth, billing,
-   idempotency, STT, usage, sync, and RAG storage.
-2. Implement a Postgres backend using the tracked cloud schema.
-3. Backfill SQLite to Postgres while preserving account ids, processor payment
-   ids, request ids, usage ids, STT reservations, and tombstones.
-4. Smoke Square webhooks, managed streaming, STT reservations, RAG, exports, and
-   deletion on staging before production cutover.
+1. Provision managed Postgres + pgvector and run the tracked migrations.
+2. Backfill SQLite to Postgres while preserving account ids, processor payment
+   ids, request ids, usage ids, STT reservations, cloud session ids, RAG chunk
+   ids, and tombstones.
+3. Run parity and paid smoke for Square webhooks, managed streaming, STT
+   reservations, RAG, exports, and deletion on staging.
+4. Promote `BLUEY_SERVER_DB_BACKEND=postgres` only after the above checks pass.
 
-This round closes the dangerous ambiguity. It does not pretend the runtime
-adapter is done.
-
-The next round should start from
-`docs/rounds/POSTGRES-RUNTIME-CUTOVER-2026-06-21.md`. That document treats the
-Postgres adapter as pre-paid-alpha work, not a vague future migration.
+This round closes the dangerous ambiguity. The adapter foundation is now real;
+live cutover remains a controlled deployment project.
 
 ## Verification
 

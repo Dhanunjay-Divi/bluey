@@ -1,12 +1,15 @@
-//! Database access layer. SQLite via r2d2 connection pool.
+//! Database access layer.
 //!
-//! Schema migrations are inline strings (no external migrator) — small,
-//! linear, easy to read. Each migration is idempotent and runs on every
-//! server startup; new migrations append to MIGRATIONS.
+//! SQLite remains the default local/single-node backend. Postgres is the
+//! paid-server destination and now has a real pool/migration boundary so
+//! runtime adapter slices can move table-by-table without pretending an env
+//! flag alone is a cutover.
 
 use anyhow::{Context, Result};
-use r2d2::Pool;
+use r2d2::{Pool, PooledConnection};
+use r2d2_postgres::PostgresConnectionManager;
 use r2d2_sqlite::SqliteConnectionManager;
+use postgres::NoTls;
 use std::path::Path;
 
 pub mod account_data;
@@ -24,7 +27,44 @@ pub mod sync;
 pub mod usage;
 pub mod webhook_events;
 
-pub type DbPool = Pool<SqliteConnectionManager>;
+pub type SqliteDbPool = Pool<SqliteConnectionManager>;
+pub type PostgresDbPool = Pool<PostgresConnectionManager<NoTls>>;
+pub type SqliteDbConn = PooledConnection<SqliteConnectionManager>;
+pub type PostgresDbConn = PooledConnection<PostgresConnectionManager<NoTls>>;
+
+#[derive(Clone)]
+pub enum DbPool {
+    Sqlite(SqliteDbPool),
+    Postgres(PostgresDbPool),
+}
+
+impl DbPool {
+    pub fn backend_name(&self) -> &'static str {
+        match self {
+            Self::Sqlite(_) => "sqlite",
+            Self::Postgres(_) => "postgres",
+        }
+    }
+
+    /// Existing SQLite adapter callers use this while they are being moved.
+    /// In Postgres mode, reaching this method is an adapter coverage bug, not
+    /// a silent fallback to local SQLite.
+    pub fn get(&self) -> Result<SqliteDbConn> {
+        match self {
+            Self::Sqlite(pool) => pool.get().context("get sqlite conn"),
+            Self::Postgres(_) => anyhow::bail!(
+                "server DB adapter path still uses SQLite while BLUEY_SERVER_DB_BACKEND=postgres"
+            ),
+        }
+    }
+
+    pub fn get_pg(&self) -> Result<PostgresDbConn> {
+        match self {
+            Self::Postgres(pool) => pool.get().context("get postgres conn"),
+            Self::Sqlite(_) => anyhow::bail!("postgres connection requested from sqlite backend"),
+        }
+    }
+}
 
 /// Open or create the SQLite DB. Enables WAL + foreign keys.
 pub fn open_pool(path: &Path) -> Result<DbPool> {
@@ -43,7 +83,19 @@ pub fn open_pool(path: &Path) -> Result<DbPool> {
         .max_size(8)
         .build(manager)
         .context("build pool")?;
-    Ok(pool)
+    Ok(DbPool::Sqlite(pool))
+}
+
+pub fn open_postgres_pool(database_url: &str) -> Result<DbPool> {
+    let pg_config = database_url
+        .parse::<postgres::Config>()
+        .context("parse BLUEY_DATABASE_URL")?;
+    let manager = PostgresConnectionManager::new(pg_config, NoTls);
+    let pool = Pool::builder()
+        .max_size(16)
+        .build(manager)
+        .context("build postgres pool")?;
+    Ok(DbPool::Postgres(pool))
 }
 
 /// Migrations, run in order. Each one is idempotent (CREATE TABLE IF NOT
@@ -366,6 +418,13 @@ const MIGRATIONS: &[&str] = &[
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
+    match pool {
+        DbPool::Sqlite(_) => run_sqlite_migrations(pool),
+        DbPool::Postgres(_) => run_postgres_migrations(pool),
+    }
+}
+
+fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
     let conn = pool.get().context("get conn")?;
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         conn.execute_batch(sql)
@@ -428,7 +487,81 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
         "refunded_trial_seconds",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
-    tracing::info!(count = MIGRATIONS.len(), "migrations applied");
+    tracing::info!(
+        backend = pool.backend_name(),
+        count = MIGRATIONS.len(),
+        "migrations applied"
+    );
+    Ok(())
+}
+
+const POSTGRES_RUNTIME_SCHEMA: &str =
+    include_str!("../../../infra/postgres/server-runtime/001_server_runtime_compat.sql");
+
+fn run_postgres_migrations(pool: &DbPool) -> Result<()> {
+    let mut conn = pool.get_pg()?;
+    conn.batch_execute(
+        "CREATE TABLE IF NOT EXISTS bluey_schema_migrations (
+            version TEXT PRIMARY KEY,
+            applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );",
+    )
+    .context("ensure postgres migration ledger")?;
+
+    let version = "001_server_runtime_compat.sql";
+    let already = conn
+        .query_opt(
+            "SELECT 1 FROM bluey_schema_migrations WHERE version = $1",
+            &[&version],
+        )
+        .context("check postgres migration ledger")?
+        .is_some();
+    if !already {
+        conn.batch_execute(POSTGRES_RUNTIME_SCHEMA)
+            .context("apply postgres runtime compatibility schema")?;
+        conn.execute(
+            "INSERT INTO bluey_schema_migrations(version) VALUES ($1)
+             ON CONFLICT (version) DO NOTHING",
+            &[&version],
+        )
+        .context("record postgres migration")?;
+    } else {
+        // The schema is idempotent and should stay self-healing as columns
+        // are added before the full adapter lands.
+        conn.batch_execute(POSTGRES_RUNTIME_SCHEMA)
+            .context("refresh postgres runtime compatibility schema")?;
+    }
+
+    let vector_ready = conn
+        .query_opt(
+            "SELECT 1 FROM pg_extension WHERE extname = 'vector'",
+            &[],
+        )
+        .context("check pgvector extension")?
+        .is_some();
+    if !vector_ready {
+        anyhow::bail!("pgvector extension missing after postgres migrations");
+    }
+    let rag_ready = conn
+        .query_one(
+            "SELECT udt_name
+               FROM information_schema.columns
+              WHERE table_schema = 'public'
+                AND table_name = 'cloud_rag_chunks'
+                AND column_name = 'embedding'",
+            &[],
+        )
+        .context("check cloud_rag_chunks.embedding")?;
+    let embedding_type: String = rag_ready.get(0);
+    if embedding_type != "vector" {
+        anyhow::bail!("cloud_rag_chunks.embedding is {embedding_type}, expected vector");
+    }
+
+    tracing::info!(
+        backend = pool.backend_name(),
+        migration = version,
+        "migrations applied"
+    );
     Ok(())
 }
 

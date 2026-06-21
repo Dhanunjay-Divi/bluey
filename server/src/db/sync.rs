@@ -1,10 +1,10 @@
 //! Cloud sync + RAG persistence helpers.
 //!
-//! This module intentionally uses plain SQLite rows in the alpha server. The
-//! table shape mirrors the future Postgres/pgvector migration: account scoped
-//! ids, JSON metadata, and explicit embedding vectors.
+//! The SQLite path backs local/dev alpha installs, while the Postgres path is
+//! the server-side sync and cloud RAG runtime target.
 
 use anyhow::{Context, Result};
+use postgres::{Client, Row as PgRow};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
@@ -163,6 +163,37 @@ pub struct RagMatch {
 }
 
 pub fn upsert_batch(
+    pool: &DbPool,
+    account_id: &str,
+    sessions: &[SyncSessionRecord],
+    transcript_segments: &[SyncTranscriptSegment],
+    cue_responses: &[SyncCueResponseRecord],
+    context_artifacts: &[SyncContextArtifactRecord],
+    rag_chunks: &[SyncRagChunkRecord],
+) -> Result<SyncCounts> {
+    match pool {
+        DbPool::Sqlite(_) => upsert_batch_sqlite(
+            pool,
+            account_id,
+            sessions,
+            transcript_segments,
+            cue_responses,
+            context_artifacts,
+            rag_chunks,
+        ),
+        DbPool::Postgres(_) => upsert_batch_postgres(
+            pool,
+            account_id,
+            sessions,
+            transcript_segments,
+            cue_responses,
+            context_artifacts,
+            rag_chunks,
+        ),
+    }
+}
+
+fn upsert_batch_sqlite(
     pool: &DbPool,
     account_id: &str,
     sessions: &[SyncSessionRecord],
@@ -371,7 +402,232 @@ pub fn upsert_batch(
     })
 }
 
+fn upsert_batch_postgres(
+    pool: &DbPool,
+    account_id: &str,
+    sessions: &[SyncSessionRecord],
+    transcript_segments: &[SyncTranscriptSegment],
+    cue_responses: &[SyncCueResponseRecord],
+    context_artifacts: &[SyncContextArtifactRecord],
+    rag_chunks: &[SyncRagChunkRecord],
+) -> Result<SyncCounts> {
+    let mut conn = pool.get_pg().context("get postgres db conn")?;
+    let mut tx = conn.transaction().context("begin sync postgres tx")?;
+
+    for record in sessions {
+        let metadata = serde_json::to_string(&record.metadata)?;
+        tx.execute(
+            "INSERT INTO cloud_sessions (
+                account_id, session_id, title, status, created_at_ms, updated_at_ms,
+                last_active_at_ms, answer_style, metadata_json, deleted_at_ms
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             ON CONFLICT(account_id, session_id) DO UPDATE SET
+                title=excluded.title,
+                status=excluded.status,
+                updated_at_ms=GREATEST(cloud_sessions.updated_at_ms, excluded.updated_at_ms),
+                last_active_at_ms=excluded.last_active_at_ms,
+                answer_style=excluded.answer_style,
+                metadata_json=excluded.metadata_json,
+                deleted_at_ms=excluded.deleted_at_ms",
+            &[
+                &account_id,
+                &record.session_id,
+                &record.title,
+                &record.status,
+                &record.created_at_ms,
+                &record.updated_at_ms,
+                &record.last_active_at_ms,
+                &record.answer_style,
+                &metadata,
+                &record.deleted_at_ms,
+            ],
+        )?;
+    }
+
+    for record in transcript_segments {
+        let metadata = serde_json::to_string(&record.metadata)?;
+        let is_final = if record.is_final { 1_i32 } else { 0_i32 };
+        tx.execute(
+            "INSERT INTO cloud_transcript_segments (
+                account_id, segment_id, session_id, speaker, source, text,
+                start_ms, end_ms, ts_ms, is_final, metadata_json
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             ON CONFLICT(account_id, segment_id) DO UPDATE SET
+                session_id=excluded.session_id,
+                speaker=excluded.speaker,
+                source=excluded.source,
+                text=excluded.text,
+                start_ms=excluded.start_ms,
+                end_ms=excluded.end_ms,
+                ts_ms=excluded.ts_ms,
+                is_final=excluded.is_final,
+                metadata_json=excluded.metadata_json",
+            &[
+                &account_id,
+                &record.segment_id,
+                &record.session_id,
+                &record.speaker,
+                &record.source,
+                &record.text,
+                &record.start_ms,
+                &record.end_ms,
+                &record.ts_ms,
+                &is_final,
+                &metadata,
+            ],
+        )?;
+    }
+
+    for record in cue_responses {
+        let metadata = serde_json::to_string(&record.metadata)?;
+        let artifact_confidence = record.artifact_confidence.map(|v| v as f64);
+        tx.execute(
+            "INSERT INTO cloud_cue_responses (
+                account_id, response_id, session_id, kind, text, source_text, ts_ms,
+                provider, model, lane, task_type, cost_cents, balance_cents_after,
+                cost_label, artifact_type, artifact_body, artifact_confidence, metadata_json
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+             ON CONFLICT(account_id, response_id) DO UPDATE SET
+                session_id=excluded.session_id,
+                kind=excluded.kind,
+                text=excluded.text,
+                source_text=excluded.source_text,
+                ts_ms=excluded.ts_ms,
+                provider=excluded.provider,
+                model=excluded.model,
+                lane=excluded.lane,
+                task_type=excluded.task_type,
+                cost_cents=excluded.cost_cents,
+                balance_cents_after=excluded.balance_cents_after,
+                cost_label=excluded.cost_label,
+                artifact_type=excluded.artifact_type,
+                artifact_body=excluded.artifact_body,
+                artifact_confidence=excluded.artifact_confidence,
+                metadata_json=excluded.metadata_json",
+            &[
+                &account_id,
+                &record.response_id,
+                &record.session_id,
+                &record.kind,
+                &record.text,
+                &record.source_text,
+                &record.ts_ms,
+                &record.provider,
+                &record.model,
+                &record.lane,
+                &record.task_type,
+                &record.cost_cents,
+                &record.balance_cents_after,
+                &record.cost_label,
+                &record.artifact_type,
+                &record.artifact_body,
+                &artifact_confidence,
+                &metadata,
+            ],
+        )?;
+    }
+
+    for record in context_artifacts {
+        let metadata = serde_json::to_string(&record.metadata)?;
+        tx.execute(
+            "INSERT INTO cloud_context_artifacts (
+                account_id, artifact_id, session_id, kind, title, note, source_uri,
+                content_hash, text_preview, created_at_ms, metadata_json
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             ON CONFLICT(account_id, artifact_id) DO UPDATE SET
+                session_id=excluded.session_id,
+                kind=excluded.kind,
+                title=excluded.title,
+                note=excluded.note,
+                source_uri=excluded.source_uri,
+                content_hash=excluded.content_hash,
+                text_preview=excluded.text_preview,
+                created_at_ms=excluded.created_at_ms,
+                metadata_json=excluded.metadata_json",
+            &[
+                &account_id,
+                &record.artifact_id,
+                &record.session_id,
+                &record.kind,
+                &record.title,
+                &record.note,
+                &record.source_uri,
+                &record.content_hash,
+                &record.text_preview,
+                &record.created_at_ms,
+                &metadata,
+            ],
+        )?;
+    }
+
+    for record in rag_chunks {
+        let metadata = serde_json::to_string(&record.metadata)?;
+        let embedding_json = record
+            .embedding
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let embedding_vector = record.embedding.as_ref().and_then(vector_literal_1536);
+        tx.execute(
+            "INSERT INTO cloud_rag_chunks (
+                account_id, chunk_id, session_id, source_kind, source_id, chunk_index,
+                text, embedding_json, embedding, embedding_model, token_count, content_hash,
+                updated_at_ms, metadata_json
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::vector, $10, $11, $12, $13, $14)
+             ON CONFLICT(account_id, chunk_id) DO UPDATE SET
+                session_id=excluded.session_id,
+                source_kind=excluded.source_kind,
+                source_id=excluded.source_id,
+                chunk_index=excluded.chunk_index,
+                text=excluded.text,
+                embedding_json=excluded.embedding_json,
+                embedding=excluded.embedding,
+                embedding_model=excluded.embedding_model,
+                token_count=excluded.token_count,
+                content_hash=excluded.content_hash,
+                updated_at_ms=excluded.updated_at_ms,
+                metadata_json=excluded.metadata_json",
+            &[
+                &account_id,
+                &record.chunk_id,
+                &record.session_id,
+                &record.source_kind,
+                &record.source_id,
+                &record.chunk_index,
+                &record.text,
+                &embedding_json,
+                &embedding_vector,
+                &record.embedding_model,
+                &record.token_count,
+                &record.content_hash,
+                &record.updated_at_ms,
+                &metadata,
+            ],
+        )?;
+    }
+
+    tx.commit().context("commit sync postgres tx")?;
+    Ok(SyncCounts {
+        sessions: sessions.len(),
+        transcript_segments: transcript_segments.len(),
+        cue_responses: cue_responses.len(),
+        context_artifacts: context_artifacts.len(),
+        rag_chunks: rag_chunks.len(),
+    })
+}
+
 pub fn list_sessions(
+    pool: &DbPool,
+    account_id: &str,
+    limit: i64,
+) -> Result<Vec<CloudSessionSummary>> {
+    match pool {
+        DbPool::Sqlite(_) => list_sessions_sqlite(pool, account_id, limit),
+        DbPool::Postgres(_) => list_sessions_postgres(pool, account_id, limit),
+    }
+}
+
+fn list_sessions_sqlite(
     pool: &DbPool,
     account_id: &str,
     limit: i64,
@@ -408,7 +664,42 @@ pub fn list_sessions(
         .map_err(Into::into)
 }
 
+fn list_sessions_postgres(
+    pool: &DbPool,
+    account_id: &str,
+    limit: i64,
+) -> Result<Vec<CloudSessionSummary>> {
+    let mut conn = pool.get_pg().context("get postgres db conn")?;
+    let rows = conn.query(
+        "SELECT s.session_id, s.title, s.status, s.updated_at_ms, s.last_active_at_ms,
+                s.answer_style,
+                (SELECT COUNT(*)::bigint FROM cloud_transcript_segments t
+                    WHERE t.account_id = s.account_id AND t.session_id = s.session_id),
+                (SELECT COUNT(*)::bigint FROM cloud_cue_responses r
+                    WHERE r.account_id = s.account_id AND r.session_id = s.session_id),
+                (SELECT COUNT(*)::bigint FROM cloud_context_artifacts c
+                    WHERE c.account_id = s.account_id AND c.session_id = s.session_id)
+         FROM cloud_sessions s
+         WHERE s.account_id = $1 AND s.deleted_at_ms IS NULL
+         ORDER BY s.updated_at_ms DESC
+         LIMIT $2",
+        &[&account_id, &limit],
+    )?;
+    rows.into_iter().map(cloud_session_summary_from_pg).collect()
+}
+
 pub fn load_session(
+    pool: &DbPool,
+    account_id: &str,
+    session_id: &str,
+) -> Result<Option<CloudSessionBundle>> {
+    match pool {
+        DbPool::Sqlite(_) => load_session_sqlite(pool, account_id, session_id),
+        DbPool::Postgres(_) => load_session_postgres(pool, account_id, session_id),
+    }
+}
+
+fn load_session_sqlite(
     pool: &DbPool,
     account_id: &str,
     session_id: &str,
@@ -450,7 +741,49 @@ pub fn load_session(
     }))
 }
 
+fn load_session_postgres(
+    pool: &DbPool,
+    account_id: &str,
+    session_id: &str,
+) -> Result<Option<CloudSessionBundle>> {
+    let mut conn = pool.get_pg().context("get postgres db conn")?;
+    let session = conn
+        .query_opt(
+            "SELECT session_id, title, status, created_at_ms, updated_at_ms,
+                    last_active_at_ms, answer_style, metadata_json, deleted_at_ms
+             FROM cloud_sessions
+             WHERE account_id = $1 AND session_id = $2 AND deleted_at_ms IS NULL",
+            &[&account_id, &session_id],
+        )?
+        .map(sync_session_from_pg)
+        .transpose()?;
+
+    let Some(session) = session else {
+        return Ok(None);
+    };
+
+    Ok(Some(CloudSessionBundle {
+        transcript_segments: load_transcripts_pg(&mut conn, account_id, session_id)?,
+        cue_responses: load_responses_pg(&mut conn, account_id, session_id)?,
+        context_artifacts: load_context_pg(&mut conn, account_id, session_id)?,
+        session,
+    }))
+}
+
 pub fn query_rag(
+    pool: &DbPool,
+    account_id: &str,
+    query: &str,
+    embedding: Option<&[f32]>,
+    top_k: i64,
+) -> Result<Vec<RagMatch>> {
+    match pool {
+        DbPool::Sqlite(_) => query_rag_sqlite(pool, account_id, query, embedding, top_k),
+        DbPool::Postgres(_) => query_rag_postgres(pool, account_id, query, embedding, top_k),
+    }
+}
+
+fn query_rag_sqlite(
     pool: &DbPool,
     account_id: &str,
     query: &str,
@@ -461,9 +794,15 @@ pub fn query_rag(
     let mut stmt = conn.prepare(
         "SELECT chunk_id, session_id, source_kind, source_id, chunk_index,
                 text, embedding_json, embedding_model
-         FROM cloud_rag_chunks
-         WHERE account_id = ?1
-         ORDER BY updated_at_ms DESC
+         FROM cloud_rag_chunks c
+         WHERE c.account_id = ?1
+           AND NOT EXISTS (
+             SELECT 1 FROM cloud_sessions s
+              WHERE s.account_id = c.account_id
+                AND s.session_id = c.session_id
+                AND s.deleted_at_ms IS NOT NULL
+           )
+         ORDER BY c.updated_at_ms DESC
          LIMIT 2000",
     )?;
     let rows = stmt.query_map(params![account_id], |row| {
@@ -512,6 +851,72 @@ pub fn query_rag(
                 source_kind,
                 source_id,
                 chunk_index,
+                text,
+                score,
+                embedding_model,
+            });
+        }
+    }
+    scored.sort_by(|a, b| b.score.total_cmp(&a.score));
+    scored.truncate(top_k.clamp(1, 20) as usize);
+    Ok(scored)
+}
+
+fn query_rag_postgres(
+    pool: &DbPool,
+    account_id: &str,
+    query: &str,
+    embedding: Option<&[f32]>,
+    top_k: i64,
+) -> Result<Vec<RagMatch>> {
+    let mut conn = pool.get_pg().context("get postgres db conn")?;
+    let rows = conn.query(
+        "SELECT c.chunk_id, c.session_id, c.source_kind, c.source_id, c.chunk_index,
+                c.text, c.embedding_json, c.embedding_model
+         FROM cloud_rag_chunks c
+         WHERE c.account_id = $1
+           AND NOT EXISTS (
+             SELECT 1 FROM cloud_sessions s
+              WHERE s.account_id = c.account_id
+                AND s.session_id = c.session_id
+                AND s.deleted_at_ms IS NOT NULL
+           )
+         ORDER BY c.updated_at_ms DESC
+         LIMIT 2000",
+        &[&account_id],
+    )?;
+
+    let query_terms = terms(query);
+    let mut scored = Vec::new();
+    for row in rows {
+        let chunk_id: String = row.try_get(0)?;
+        let session_id: Option<String> = row.try_get(1)?;
+        let source_kind: String = row.try_get(2)?;
+        let source_id: String = row.try_get(3)?;
+        let chunk_index: i32 = row.try_get(4)?;
+        let text: String = row.try_get(5)?;
+        let embedding_json: Option<String> = row.try_get(6)?;
+        let embedding_model: Option<String> = row.try_get(7)?;
+        let vector_score = match (embedding, embedding_json.as_deref()) {
+            (Some(q), Some(json)) => serde_json::from_str::<Vec<f32>>(json)
+                .ok()
+                .and_then(|v| cosine(q, &v))
+                .unwrap_or(0.0),
+            _ => 0.0,
+        };
+        let lexical_score = lexical_overlap(&query_terms, &terms(&text));
+        let score = if embedding.is_some() {
+            (0.85 * vector_score) + (0.15 * lexical_score)
+        } else {
+            lexical_score
+        };
+        if score > 0.0 {
+            scored.push(RagMatch {
+                chunk_id,
+                session_id,
+                source_kind,
+                source_id,
+                chunk_index: i64::from(chunk_index),
                 text,
                 score,
                 embedding_model,
@@ -622,6 +1027,153 @@ fn load_context(
     })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
+}
+
+fn cloud_session_summary_from_pg(row: PgRow) -> Result<CloudSessionSummary> {
+    Ok(CloudSessionSummary {
+        session_id: row.try_get(0)?,
+        title: row.try_get(1)?,
+        status: row.try_get(2)?,
+        updated_at_ms: row.try_get(3)?,
+        last_active_at_ms: row.try_get(4)?,
+        answer_style: row.try_get(5)?,
+        transcript_count: row.try_get(6)?,
+        response_count: row.try_get(7)?,
+        context_count: row.try_get(8)?,
+    })
+}
+
+fn sync_session_from_pg(row: PgRow) -> Result<SyncSessionRecord> {
+    let metadata: String = row.try_get(7)?;
+    Ok(SyncSessionRecord {
+        session_id: row.try_get(0)?,
+        title: row.try_get(1)?,
+        status: row.try_get(2)?,
+        created_at_ms: row.try_get(3)?,
+        updated_at_ms: row.try_get(4)?,
+        last_active_at_ms: row.try_get(5)?,
+        answer_style: row.try_get(6)?,
+        metadata: parse_json(&metadata),
+        deleted_at_ms: row.try_get(8)?,
+    })
+}
+
+fn load_transcripts_pg(
+    conn: &mut Client,
+    account_id: &str,
+    session_id: &str,
+) -> Result<Vec<SyncTranscriptSegment>> {
+    let rows = conn.query(
+        "SELECT segment_id, session_id, speaker, source, text, start_ms, end_ms,
+                ts_ms, is_final, metadata_json
+         FROM cloud_transcript_segments
+         WHERE account_id = $1 AND session_id = $2
+         ORDER BY ts_ms ASC",
+        &[&account_id, &session_id],
+    )?;
+    rows.into_iter()
+        .map(|row| {
+            let metadata: String = row.try_get(9)?;
+            let is_final: i32 = row.try_get(8)?;
+            Ok(SyncTranscriptSegment {
+                segment_id: row.try_get(0)?,
+                session_id: row.try_get(1)?,
+                speaker: row.try_get(2)?,
+                source: row.try_get(3)?,
+                text: row.try_get(4)?,
+                start_ms: row.try_get(5)?,
+                end_ms: row.try_get(6)?,
+                ts_ms: row.try_get(7)?,
+                is_final: is_final != 0,
+                metadata: parse_json(&metadata),
+            })
+        })
+        .collect()
+}
+
+fn load_responses_pg(
+    conn: &mut Client,
+    account_id: &str,
+    session_id: &str,
+) -> Result<Vec<SyncCueResponseRecord>> {
+    let rows = conn.query(
+        "SELECT response_id, session_id, kind, text, source_text, ts_ms, provider,
+                model, lane, task_type, cost_cents, balance_cents_after,
+                cost_label, artifact_type, artifact_body, artifact_confidence, metadata_json
+         FROM cloud_cue_responses
+         WHERE account_id = $1 AND session_id = $2
+         ORDER BY ts_ms ASC",
+        &[&account_id, &session_id],
+    )?;
+    rows.into_iter()
+        .map(|row| {
+            let metadata: String = row.try_get(16)?;
+            let artifact_confidence: Option<f64> = row.try_get(15)?;
+            Ok(SyncCueResponseRecord {
+                response_id: row.try_get(0)?,
+                session_id: row.try_get(1)?,
+                kind: row.try_get(2)?,
+                text: row.try_get(3)?,
+                source_text: row.try_get(4)?,
+                ts_ms: row.try_get(5)?,
+                provider: row.try_get(6)?,
+                model: row.try_get(7)?,
+                lane: row.try_get(8)?,
+                task_type: row.try_get(9)?,
+                cost_cents: row.try_get(10)?,
+                balance_cents_after: row.try_get(11)?,
+                cost_label: row.try_get(12)?,
+                artifact_type: row.try_get(13)?,
+                artifact_body: row.try_get(14)?,
+                artifact_confidence: artifact_confidence.map(|v| v as f32),
+                metadata: parse_json(&metadata),
+            })
+        })
+        .collect()
+}
+
+fn load_context_pg(
+    conn: &mut Client,
+    account_id: &str,
+    session_id: &str,
+) -> Result<Vec<SyncContextArtifactRecord>> {
+    let rows = conn.query(
+        "SELECT artifact_id, session_id, kind, title, note, source_uri,
+                content_hash, text_preview, created_at_ms, metadata_json
+         FROM cloud_context_artifacts
+         WHERE account_id = $1 AND session_id = $2
+         ORDER BY created_at_ms ASC",
+        &[&account_id, &session_id],
+    )?;
+    rows.into_iter()
+        .map(|row| {
+            let metadata: String = row.try_get(9)?;
+            Ok(SyncContextArtifactRecord {
+                artifact_id: row.try_get(0)?,
+                session_id: row.try_get(1)?,
+                kind: row.try_get(2)?,
+                title: row.try_get(3)?,
+                note: row.try_get(4)?,
+                source_uri: row.try_get(5)?,
+                content_hash: row.try_get(6)?,
+                text_preview: row.try_get(7)?,
+                created_at_ms: row.try_get(8)?,
+                metadata: parse_json(&metadata),
+            })
+        })
+        .collect()
+}
+
+fn vector_literal_1536(values: &Vec<f32>) -> Option<String> {
+    if values.len() != 1536 {
+        return None;
+    }
+    let body = values
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!("[{body}]"))
 }
 
 fn parse_json(raw: &str) -> serde_json::Value {

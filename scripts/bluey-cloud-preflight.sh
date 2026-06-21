@@ -145,7 +145,7 @@ if [ -n "${BLUEY_DATABASE_URL:-}" ]; then
   elif [ "$REQUIRE_POSTGRES" = "1" ]; then
     fail "BLUEY_SERVER_DB_BACKEND=postgres required for BLUEY_PREFLIGHT_PROFILE=$PROFILE"
   else
-    warn "BLUEY_DATABASE_URL is set but BLUEY_SERVER_DB_BACKEND=${SERVER_DB_BACKEND}; current bluey-server is SQLite-backed unless a Postgres cutover build is deployed"
+    warn "BLUEY_DATABASE_URL is set but BLUEY_SERVER_DB_BACKEND=${SERVER_DB_BACKEND}; bluey-server will stay on SQLite unless postgres backend mode is explicitly enabled"
   fi
   if command -v psql >/dev/null 2>&1; then
     if psql "$BLUEY_DATABASE_URL" -Atqc "select 1" >/dev/null 2>&1; then

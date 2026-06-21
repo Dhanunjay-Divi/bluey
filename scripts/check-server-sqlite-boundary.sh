@@ -3,10 +3,10 @@ set -euo pipefail
 
 # Report bluey-server runtime code that still depends directly on rusqlite.
 #
-# This is intentionally informational by default because the current server is
-# still SQLite-backed. Use BLUEY_SQLITE_BOUNDARY_STRICT=1 once a Postgres
-# adapter slice starts, so new direct SQLite usage outside server/src/db fails
-# review/CI.
+# This is intentionally informational by default because SQLite remains the
+# default/local server backend until production cutover. Use
+# BLUEY_SQLITE_BOUNDARY_STRICT=1 only when a branch is meant to remove expected
+# direct SQLite-only runtime files outside server/src/db.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 STRICT="${BLUEY_SQLITE_BOUNDARY_STRICT:-0}"

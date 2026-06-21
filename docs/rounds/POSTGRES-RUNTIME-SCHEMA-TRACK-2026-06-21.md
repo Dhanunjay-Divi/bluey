@@ -5,10 +5,15 @@ Date: 2026-06-21
 ## Why This Round Exists
 
 The user asked to stop waiting on Postgres/Valkey because Bluey has no users yet.
-The important distinction was that provisioning Postgres is safe now, but the
-server code still uses the SQLite adapter. The previous schema in
+The important distinction at the start of this round was that provisioning
+Postgres was safe, but the server code still used the SQLite adapter. The
+previous schema in
 `infra/migrations/001_initial_cloud_schema.sql` was a future normalized model,
 not a compatible target for the current runtime tables.
+
+Update: the follow-up runtime adapter foundation is now tracked in
+`docs/rounds/POSTGRES-RUNTIME-ADAPTER-FOUNDATION-2026-06-21.md`. This document
+is the schema/readiness precursor.
 
 ## What Changed
 
@@ -30,9 +35,10 @@ not a compatible target for the current runtime tables.
   - Accepts the runtime `cloud_rag_chunks` vector table as a valid pgvector
     readiness signal.
 
-- Added a server fail-fast guard.
-  - If `BLUEY_SERVER_DB_BACKEND=postgres` is set on the current SQLite-backed
-    binary, startup fails loudly instead of silently opening SQLite.
+- Added an initial server fail-fast guard for the schema-only phase.
+  - This guard has since been replaced by the runtime adapter foundation: a
+    Postgres-capable build now requires `BLUEY_DATABASE_URL` and opens a
+    Postgres pool when `BLUEY_SERVER_DB_BACKEND=postgres`.
 
 ## What Is Now In Place
 
@@ -45,14 +51,16 @@ not a compatible target for the current runtime tables.
 
 ## What Is Still Not Done
 
-The actual Rust Postgres adapter is still a code project. That means:
+The actual Rust Postgres adapter foundation has since landed, but production is
+not cut over yet. Remaining work is now operational rather than schema-only:
 
-- current production server continues to run SQLite unless a Postgres adapter
-  build is deployed
-- no users are migrated yet
-- no dual-write/backfill is active yet
+- provision managed Postgres and run the server-runtime migrations there
+- backfill any existing SQLite data before flipping production
+- run parity/live smoke for billing, STT reservations, streaming answers,
+  cloud sync/RAG, export/delete, and Square webhooks
 
-This is intentional. The new fail-fast guard prevents accidental fake cutover.
+Until those pass, the deployed production service should continue on its known
+SQLite database.
 
 ## Verification
 
@@ -91,7 +99,7 @@ R2 bucket, no local health server, and no hosted signed manifest check.
 
 ## Manual Deploy
 
-After review, the server build containing the Postgres backend guard was
+After review, the server build containing the original Postgres backend guard was
 manually deployed to the production droplet without GitHub Actions:
 
 ```text
@@ -122,8 +130,9 @@ preflight passed: 3 warning(s)
 
 The warnings are intentional for the current single-server alpha:
 
-- `BLUEY_DATABASE_URL` is unset because the deployed runtime is still
-  SQLite-backed until the Postgres adapter build exists.
+- `BLUEY_DATABASE_URL` was unset because the deployed runtime at that moment used
+  SQLite. The later adapter foundation makes Postgres selectable, but production
+  still needs provisioning/backfill/smoke before the env flip.
 - Redis points to the droplet-local ledger, which is valid only for one server.
 - Redis strict mode is disabled so a local Redis outage does not take the
   single-server alpha offline.

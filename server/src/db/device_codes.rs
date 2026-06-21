@@ -19,40 +19,84 @@ pub fn insert(
     user_code: &str,
     expires_at: &str,
 ) -> Result<()> {
-    let conn = pool.get()?;
-    conn.execute(
-        "INSERT INTO device_codes (device_code, user_code, expires_at) VALUES (?1, ?2, ?3)",
-        params![device_code, user_code, expires_at],
-    )?;
+    match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            conn.execute(
+                "INSERT INTO device_codes (device_code, user_code, expires_at) VALUES (?1, ?2, ?3)",
+                params![device_code, user_code, expires_at],
+            )?;
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            conn.execute(
+                "INSERT INTO device_codes (device_code, user_code, expires_at) VALUES ($1, $2, $3::timestamptz)",
+                &[&device_code, &user_code, &expires_at],
+            )?;
+        }
+    }
     Ok(())
 }
 
 pub fn fetch_by_device_code(pool: &DbPool, device_code: &str) -> Result<Option<DeviceCodeRow>> {
-    let conn = pool.get()?;
-    let row = conn
-        .query_row(
-            "SELECT account_id, approved, expires_at FROM device_codes WHERE device_code = ?1",
-            params![device_code],
-            |r| {
+    match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let row = conn
+                .query_row(
+                    "SELECT account_id, approved, expires_at FROM device_codes WHERE device_code = ?1",
+                    params![device_code],
+                    |r| {
+                        Ok(DeviceCodeRow {
+                            account_id: r.get(0)?,
+                            approved: r.get(1)?,
+                            expires_at: r.get(2)?,
+                        })
+                    },
+                )
+                .ok();
+            Ok(row)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let row = conn.query_opt(
+                "SELECT account_id, approved, expires_at FROM device_codes WHERE device_code = $1",
+                &[&device_code],
+            )?;
+            row.map(|row| {
+                let expires_at: chrono::DateTime<chrono::Utc> = row.try_get(2)?;
                 Ok(DeviceCodeRow {
-                    account_id: r.get(0)?,
-                    approved: r.get(1)?,
-                    expires_at: r.get(2)?,
+                    account_id: row.try_get(0)?,
+                    approved: row.try_get::<_, i32>(1)? as i64,
+                    expires_at: expires_at.to_rfc3339(),
                 })
-            },
-        )
-        .ok();
-    Ok(row)
+            })
+            .transpose()
+        }
+    }
 }
 
 pub fn consume_approved(pool: &DbPool, device_code: &str, account_id: &str) -> Result<bool> {
-    let conn = pool.get()?;
-    let deleted = conn.execute(
-        "DELETE FROM device_codes
-         WHERE device_code = ?1 AND approved = 1 AND account_id = ?2",
-        params![device_code, account_id],
-    )?;
-    Ok(deleted > 0)
+    match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let deleted = conn.execute(
+                "DELETE FROM device_codes
+                 WHERE device_code = ?1 AND approved = 1 AND account_id = ?2",
+                params![device_code, account_id],
+            )?;
+            Ok(deleted > 0)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let deleted = conn.execute(
+                "DELETE FROM device_codes
+                 WHERE device_code = $1 AND approved = 1 AND account_id = $2",
+                &[&device_code, &account_id],
+            )?;
+            Ok(deleted > 0)
+        }
+    }
 }
 
 pub fn approve_user_code(
@@ -61,13 +105,26 @@ pub fn approve_user_code(
     user_code: &str,
     now: &str,
 ) -> Result<bool> {
-    let conn = pool.get()?;
-    let updated = conn.execute(
-        "UPDATE device_codes SET approved = 1, account_id = ?1
-         WHERE user_code = ?2 AND expires_at > ?3 AND approved = 0",
-        params![account_id, user_code, now],
-    )?;
-    Ok(updated > 0)
+    match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let updated = conn.execute(
+                "UPDATE device_codes SET approved = 1, account_id = ?1
+                 WHERE user_code = ?2 AND expires_at > ?3 AND approved = 0",
+                params![account_id, user_code, now],
+            )?;
+            Ok(updated > 0)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let updated = conn.execute(
+                "UPDATE device_codes SET approved = 1, account_id = $1
+                 WHERE user_code = $2 AND expires_at > $3::timestamptz AND approved = 0",
+                &[&account_id, &user_code, &now],
+            )?;
+            Ok(updated > 0)
+        }
+    }
 }
 
 #[cfg(test)]

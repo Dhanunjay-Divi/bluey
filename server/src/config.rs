@@ -11,6 +11,8 @@ pub struct Config {
     pub db_path: PathBuf,
     /// Runtime database backend selector. Today only SQLite is implemented.
     pub db_backend: ServerDbBackend,
+    /// Postgres connection string used when BLUEY_SERVER_DB_BACKEND=postgres.
+    pub database_url: Option<String>,
     /// JWT signing secret. REQUIRED. Server refuses to boot without it.
     pub jwt_secret: String,
     /// Public URL used in templated install scripts and email links.
@@ -196,6 +198,9 @@ impl Config {
         let db_backend = ServerDbBackend::from_env_value(
             &std::env::var("BLUEY_SERVER_DB_BACKEND").unwrap_or_else(|_| "sqlite".to_string()),
         )?;
+        let database_url = std::env::var("BLUEY_DATABASE_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
 
         let jwt_secret = std::env::var("BLUEY_JWT_SECRET")
             .map_err(|_| anyhow::anyhow!("BLUEY_JWT_SECRET is required"))?;
@@ -254,6 +259,7 @@ impl Config {
             port,
             db_path,
             db_backend,
+            database_url,
             jwt_secret,
             public_url,
             stripe_secret_key,
@@ -607,6 +613,7 @@ mod tests {
             port: 0,
             db_path: PathBuf::from(":memory:"),
             db_backend: ServerDbBackend::Sqlite,
+            database_url: None,
             jwt_secret: "test_secret_at_least_32_chars_long_xx".to_string(),
             public_url: "https://bluey.sh".to_string(),
             stripe_secret_key: None,
@@ -664,6 +671,7 @@ mod tests {
             port: 0,
             db_path: PathBuf::from(":memory:"),
             db_backend: ServerDbBackend::Sqlite,
+            database_url: None,
             jwt_secret: "test-secret-at-least-32-chars-long".to_string(),
             public_url: "http://localhost".to_string(),
             stripe_secret_key: None,

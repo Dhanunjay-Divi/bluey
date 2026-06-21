@@ -21,52 +21,113 @@ pub fn upsert(
     password_hash: &str,
     expires_at: &str,
 ) -> Result<()> {
-    let conn = pool.get()?;
-    conn.execute(
-        "INSERT INTO signup_otps (email, otp_hash, password_hash, attempts, expires_at)
-         VALUES (?1, ?2, ?3, 0, ?4)
-         ON CONFLICT(email) DO UPDATE SET
-            otp_hash = excluded.otp_hash,
-            password_hash = excluded.password_hash,
-            attempts = 0,
-            created_at = datetime('now'),
-            expires_at = excluded.expires_at",
-        params![email, otp_hash, password_hash, expires_at],
-    )?;
+    match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            conn.execute(
+                "INSERT INTO signup_otps (email, otp_hash, password_hash, attempts, expires_at)
+                 VALUES (?1, ?2, ?3, 0, ?4)
+                 ON CONFLICT(email) DO UPDATE SET
+                    otp_hash = excluded.otp_hash,
+                    password_hash = excluded.password_hash,
+                    attempts = 0,
+                    created_at = datetime('now'),
+                    expires_at = excluded.expires_at",
+                params![email, otp_hash, password_hash, expires_at],
+            )?;
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            conn.execute(
+                "INSERT INTO signup_otps (email, otp_hash, password_hash, attempts, expires_at)
+                 VALUES ($1, $2, $3, 0, $4::timestamptz)
+                 ON CONFLICT(email) DO UPDATE SET
+                    otp_hash = excluded.otp_hash,
+                    password_hash = excluded.password_hash,
+                    attempts = 0,
+                    created_at = now(),
+                    expires_at = excluded.expires_at",
+                &[&email, &otp_hash, &password_hash, &expires_at],
+            )?;
+        }
+    }
     Ok(())
 }
 
 pub fn fetch(pool: &DbPool, email: &str) -> Result<Option<SignupOtp>> {
-    let conn = pool.get()?;
-    let row = conn
-        .query_row(
-            "SELECT otp_hash, password_hash, expires_at, attempts
-             FROM signup_otps WHERE email = ?1",
-            params![email],
-            |r| {
+    match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let row = conn
+                .query_row(
+                    "SELECT otp_hash, password_hash, expires_at, attempts
+                     FROM signup_otps WHERE email = ?1",
+                    params![email],
+                    |r| {
+                        Ok(SignupOtp {
+                            otp_hash: r.get(0)?,
+                            password_hash: r.get(1)?,
+                            expires_at: r.get(2)?,
+                            attempts: r.get(3)?,
+                        })
+                    },
+                )
+                .ok();
+            Ok(row)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let row = conn.query_opt(
+                "SELECT otp_hash, password_hash, expires_at, attempts
+                 FROM signup_otps WHERE email = $1",
+                &[&email],
+            )?;
+            row.map(|row| {
+                let expires_at: chrono::DateTime<chrono::Utc> = row.try_get(2)?;
                 Ok(SignupOtp {
-                    otp_hash: r.get(0)?,
-                    password_hash: r.get(1)?,
-                    expires_at: r.get(2)?,
-                    attempts: r.get(3)?,
+                    otp_hash: row.try_get(0)?,
+                    password_hash: row.try_get(1)?,
+                    expires_at: expires_at.to_rfc3339(),
+                    attempts: row.try_get(3)?,
                 })
-            },
-        )
-        .ok();
-    Ok(row)
+            })
+            .transpose()
+        }
+    }
 }
 
 pub fn increment_attempts(pool: &DbPool, email: &str) -> Result<usize> {
-    let conn = pool.get()?;
-    Ok(conn.execute(
-        "UPDATE signup_otps SET attempts = attempts + 1 WHERE email = ?1",
-        params![email],
-    )?)
+    match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            Ok(conn.execute(
+                "UPDATE signup_otps SET attempts = attempts + 1 WHERE email = ?1",
+                params![email],
+            )?)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let affected = conn.execute(
+                "UPDATE signup_otps SET attempts = attempts + 1 WHERE email = $1",
+                &[&email],
+            )?;
+            Ok(usize::try_from(affected).unwrap_or(usize::MAX))
+        }
+    }
 }
 
 pub fn delete(pool: &DbPool, email: &str) -> Result<usize> {
-    let conn = pool.get()?;
-    Ok(conn.execute("DELETE FROM signup_otps WHERE email = ?1", params![email])?)
+    match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            Ok(conn.execute("DELETE FROM signup_otps WHERE email = ?1", params![email])?)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let affected = conn.execute("DELETE FROM signup_otps WHERE email = $1", &[&email])?;
+            Ok(usize::try_from(affected).unwrap_or(usize::MAX))
+        }
+    }
 }
 
 #[cfg(test)]

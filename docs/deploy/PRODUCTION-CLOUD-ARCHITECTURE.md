@@ -32,10 +32,11 @@ Deepgram is part of the same paid provider surface as the LLMs. Live captions
 consume server-side STT quota, reserve/settle against the Bluey wallet, and must
 never require a customer-side Deepgram key.
 
-For the controlled first-100 paid alpha, one DigitalOcean droplet plus SQLite is
-acceptable only while the live smoke, off-host backups, provider funding, and
-Square webhook tests stay green. The architecture contract below is the path out
-of that single-node shape; it does not change the desktop contract.
+For the controlled first-100 paid alpha, one DigitalOcean droplet plus SQLite
+can still run the first smoke if that is the active deployed database, but the
+server now has a real Postgres runtime adapter foundation. The architecture
+contract below is the path out of the single-node shape; it does not change the
+desktop contract.
 
 ## Customer Laptop Boundary
 
@@ -69,8 +70,7 @@ delete/export controls before wider launch.
 
 ## Server State
 
-Postgres + pgvector becomes the durable server source of truth when we move past
-single-node SQLite:
+Postgres + pgvector is the durable server source-of-truth target:
 
 - accounts, email verification, auth refresh tokens, link/device codes
 - wallet balances, reserved cents, credit batches, and expiration
@@ -148,7 +148,7 @@ For the first 100 paid users, the controlled-alpha stack can be:
 - one DigitalOcean droplet
 - Caddy
 - `bluey-server`
-- SQLite
+- SQLite until the Postgres cutover smoke passes, then managed Postgres
 - R2 off-host backups
 - Redis unset unless multiple server processes are used
 
@@ -165,14 +165,14 @@ Before wider paid alpha:
 
 ## Cutover Order To Postgres
 
-Do not flip a fake `BLUEY_DATABASE_URL` until the runtime SQL backend exists.
+The runtime SQL backend foundation exists now. Do not flip production until the
+managed service, migration/backfill, and smoke gates are done.
 
 1. Create managed Postgres 16+ with pgvector.
 2. Apply the server-runtime compatibility migrations:
    `scripts/bluey-postgres-migrate.sh /etc/bluey-api/bluey-api.env`.
-3. Write or enable the server SQL backend adapter against the
-   `infra/postgres/server-runtime` schema.
-4. Write a SQLite -> Postgres backfill that preserves account ids, payment ids,
+3. Deploy a server build with the Postgres runtime adapter enabled.
+4. Write/run a SQLite -> Postgres backfill that preserves account ids, payment ids,
    idempotency keys, usage ids, cloud session ids, tombstones, and RAG chunk ids.
 5. Run dual-write or short maintenance-mode migration for billing/idempotency.
 6. Compare row counts and ledger totals.
@@ -216,7 +216,8 @@ BLUEY_PREFLIGHT_PROFILE=postgres-cutover \
 `multi-server` requires managed Redis/Valkey and strict Redis behavior.
 `postgres-cutover` additionally requires `BLUEY_DATABASE_URL` and a migrated
 pgvector schema. It also requires `BLUEY_SERVER_DB_BACKEND=postgres`, so the
-cutover profile cannot pass while the deployed runtime is still SQLite-backed.
+cutover profile cannot pass unless the deployed runtime is intentionally using
+Postgres.
 
 ## Current Repo State
 
@@ -226,9 +227,11 @@ cutover profile cannot pass while the deployed runtime is still SQLite-backed.
 - Off-host backup script supports R2/S3-compatible destinations.
 - Postgres/pgvector server-runtime schema is tracked in
   `infra/postgres/server-runtime`.
-- Runtime server is still SQLite-backed until the SQL backend migration lands.
+- Postgres runtime adapter foundation exists for account/auth/billing, usage,
+  idempotency, STT, sync/RAG, metrics, export, and delete paths.
 - `scripts/bluey-scalable-readiness.sh` now checks this distinction explicitly
   so infra provisioning cannot be mistaken for a completed runtime cutover.
 
-That last line matters. The architecture is ready to provision; the runtime DB
-cutover is a deliberate follow-up, not an environment-variable trick.
+That last line matters. The architecture is ready to provision and smoke; the
+runtime DB cutover is a deliberate deployment step, not an environment-variable
+trick.

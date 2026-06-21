@@ -49,14 +49,28 @@ pub fn mint(pool: &DbPool, account_id: &str, kind: TokenKind) -> Result<String> 
     let raw = random_token();
     let hash = hash_token(&raw);
     let expires_at = (Utc::now() + Duration::hours(TOKEN_VALIDITY_HOURS)).to_rfc3339();
-    let conn = pool.get()?;
-    conn.execute(
-        &format!(
-            "INSERT INTO {} (token_hash, account_id, expires_at) VALUES (?1, ?2, ?3)",
-            kind.table()
-        ),
-        params![hash, account_id, expires_at],
-    )?;
+    match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            conn.execute(
+                &format!(
+                    "INSERT INTO {} (token_hash, account_id, expires_at) VALUES (?1, ?2, ?3)",
+                    kind.table()
+                ),
+                params![hash, account_id, expires_at],
+            )?;
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            conn.execute(
+                &format!(
+                    "INSERT INTO {} (token_hash, account_id, expires_at) VALUES ($1, $2, $3::timestamptz)",
+                    kind.table()
+                ),
+                &[&hash, &account_id, &expires_at],
+            )?;
+        }
+    }
     Ok(raw)
 }
 
@@ -66,23 +80,44 @@ pub fn mint(pool: &DbPool, account_id: &str, kind: TokenKind) -> Result<String> 
 pub fn consume(pool: &DbPool, raw: &str, kind: TokenKind) -> Result<Option<String>> {
     let hash = hash_token(raw);
     let now = Utc::now().to_rfc3339();
-    let conn = pool.get()?;
-    let row: Option<String> = conn
-        .query_row(
-            &format!(
-                "UPDATE {}
-                    SET consumed_at = datetime('now')
-                  WHERE token_hash = ?1
-                    AND consumed_at IS NULL
-                    AND expires_at > ?2
-                  RETURNING account_id",
-                kind.table()
-            ),
-            params![hash, now],
-            |r| r.get::<_, String>(0),
-        )
-        .ok();
-    Ok(row)
+    match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let row: Option<String> = conn
+                .query_row(
+                    &format!(
+                        "UPDATE {}
+                            SET consumed_at = datetime('now')
+                          WHERE token_hash = ?1
+                            AND consumed_at IS NULL
+                            AND expires_at > ?2
+                          RETURNING account_id",
+                        kind.table()
+                    ),
+                    params![hash, now],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok();
+            Ok(row)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let row = conn.query_opt(
+                &format!(
+                    "UPDATE {}
+                        SET consumed_at = now()
+                      WHERE token_hash = $1
+                        AND consumed_at IS NULL
+                        AND expires_at > $2::timestamptz
+                      RETURNING account_id",
+                    kind.table()
+                ),
+                &[&hash, &now],
+            )?;
+            row.map(|row| row.try_get(0).map_err(Into::into))
+                .transpose()
+        }
+    }
 }
 
 #[cfg(test)]

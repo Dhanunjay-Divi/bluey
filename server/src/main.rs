@@ -4,7 +4,11 @@
 //! starts the axum HTTP server. Graceful shutdown on SIGINT/SIGTERM.
 
 use anyhow::Context;
-use bluey_server::{api, config::{Config, ServerDbBackend}, db};
+use bluey_server::{
+    api,
+    config::{Config, ServerDbBackend},
+    db,
+};
 use std::net::SocketAddr;
 use tracing_subscriber::EnvFilter;
 
@@ -24,16 +28,20 @@ async fn main() -> anyhow::Result<()> {
         port = config.port,
         db_backend = ?config.db_backend,
         db_path = %config.db_path.display(),
+        database_url_configured = config.database_url.is_some(),
         "bluey-server starting",
     );
 
     // DB
-    if config.db_backend == ServerDbBackend::Postgres {
-        anyhow::bail!(
-            "BLUEY_SERVER_DB_BACKEND=postgres is provisioned but this bluey-server build still uses the SQLite runtime adapter; deploy the Postgres adapter build before cutover"
-        );
-    }
-    let pool = db::open_pool(&config.db_path).context("open db")?;
+    let pool = match config.db_backend {
+        ServerDbBackend::Sqlite => db::open_pool(&config.db_path).context("open sqlite db")?,
+        ServerDbBackend::Postgres => {
+            let database_url = config.database_url.as_deref().context(
+                "BLUEY_DATABASE_URL is required when BLUEY_SERVER_DB_BACKEND=postgres",
+            )?;
+            db::open_postgres_pool(database_url).context("open postgres db")?
+        }
+    };
     db::run_migrations(&pool).context("run migrations")?;
 
     // Router

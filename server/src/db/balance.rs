@@ -2,7 +2,8 @@
 
 use anyhow::Result;
 use chrono::{Duration, Utc};
-use rusqlite::{params, Transaction};
+use postgres::Transaction as PgTransaction;
+use rusqlite::{params, Transaction as SqliteTransaction};
 
 use crate::db::DbPool;
 
@@ -24,27 +25,50 @@ pub fn deduct(pool: &DbPool, account_id: &str, cost_cents: i64) -> Result<bool> 
     if cost_cents == 0 {
         return Ok(true);
     }
-    let mut conn = pool.get()?;
-    let tx = conn.transaction()?;
+    match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction()?;
 
-    // Atomic balance check + deduction.
-    let updated = tx.execute(
-        "UPDATE accounts SET balance_cents = balance_cents - ?1
-         WHERE id = ?2 AND balance_cents >= ?1",
-        params![cost_cents, account_id],
-    )?;
-    if updated == 0 {
-        return Ok(false);
+            // Atomic balance check + deduction.
+            let updated = tx.execute(
+                "UPDATE accounts SET balance_cents = balance_cents - ?1
+                 WHERE id = ?2 AND balance_cents >= ?1",
+                params![cost_cents, account_id],
+            )?;
+            if updated == 0 {
+                return Ok(false);
+            }
+
+            consume_credit_batches_tx(&tx, account_id, cost_cents)?;
+
+            tx.commit()?;
+            Ok(true)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+
+            let updated = tx.execute(
+                "UPDATE accounts SET balance_cents = balance_cents - $1
+                 WHERE id = $2 AND balance_cents >= $1",
+                &[&cost_cents, &account_id],
+            )?;
+            if updated == 0 {
+                tx.rollback()?;
+                return Ok(false);
+            }
+
+            consume_credit_batches_pg_tx(&mut tx, account_id, cost_cents)?;
+
+            tx.commit()?;
+            Ok(true)
+        }
     }
-
-    consume_credit_batches_tx(&tx, account_id, cost_cents)?;
-
-    tx.commit()?;
-    Ok(true)
 }
 
 pub(crate) fn consume_credit_batches_tx(
-    tx: &Transaction<'_>,
+    tx: &SqliteTransaction<'_>,
     account_id: &str,
     cost_cents: i64,
 ) -> Result<()> {
@@ -81,6 +105,39 @@ pub(crate) fn consume_credit_batches_tx(
     Ok(())
 }
 
+pub(crate) fn consume_credit_batches_pg_tx(
+    tx: &mut PgTransaction<'_>,
+    account_id: &str,
+    cost_cents: i64,
+) -> Result<()> {
+    if cost_cents < 0 {
+        anyhow::bail!("cost_cents must be non-negative");
+    }
+    let mut remaining = cost_cents;
+    while remaining > 0 {
+        let row = tx.query_opt(
+            "SELECT id, remaining_cents FROM credit_batches
+             WHERE account_id = $1 AND remaining_cents > 0
+               AND expires_at > now() AND expired_at IS NULL
+             ORDER BY purchased_at ASC LIMIT 1",
+            &[&account_id],
+        )?;
+        let Some(row) = row else {
+            break;
+        };
+        let batch_id: String = row.try_get(0)?;
+        let batch_remaining: i64 = row.try_get(1)?;
+        let take = remaining.min(batch_remaining);
+        tx.execute(
+            "UPDATE credit_batches SET remaining_cents = remaining_cents - $1
+             WHERE id = $2",
+            &[&take, &batch_id],
+        )?;
+        remaining -= take;
+    }
+    Ok(())
+}
+
 fn credit_with_source_id(
     pool: &DbPool,
     account_id: &str,
@@ -94,52 +151,95 @@ fn credit_with_source_id(
     if credit_source_id.is_empty() {
         anyhow::bail!("credit_source_id must be non-empty");
     }
-    let mut conn = pool.get()?;
-    let tx = conn.transaction()?;
+    match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction()?;
 
-    // Codex Stage 6 S6.1 + S6.2: dedupe-then-credit atomically.
-    // An existing credit_batches row with the same source id means we
-    // already credited this payment/internal grant.
-    // Return Ok(false) to signal "no-op already processed" so the
-    // webhook handler can mark the event processed without re-running
-    // anything else. The whole INSERT+UPDATE pair is wrapped in a
-    // transaction so a process crash between the two cannot leave the
-    // account ledger inconsistent.
-    let existing: Option<i64> = tx
-        .query_row(
-            "SELECT 1 FROM credit_batches WHERE stripe_charge_id = ?1",
-            params![credit_source_id],
-            |r| r.get(0),
-        )
-        .ok();
-    if existing.is_some() {
-        tx.commit()?;
-        return Ok(false);
+            // Codex Stage 6 S6.1 + S6.2: dedupe-then-credit atomically.
+            // An existing credit_batches row with the same source id means we
+            // already credited this payment/internal grant.
+            // Return Ok(false) to signal "no-op already processed" so the
+            // webhook handler can mark the event processed without re-running
+            // anything else. The whole INSERT+UPDATE pair is wrapped in a
+            // transaction so a process crash between the two cannot leave the
+            // account ledger inconsistent.
+            let existing: Option<i64> = tx
+                .query_row(
+                    "SELECT 1 FROM credit_batches WHERE stripe_charge_id = ?1",
+                    params![credit_source_id],
+                    |r| r.get(0),
+                )
+                .ok();
+            if existing.is_some() {
+                tx.commit()?;
+                return Ok(false);
+            }
+
+            let batch_id = uuid::Uuid::new_v4().to_string();
+            let expires_at = (Utc::now() + Duration::days(CREDIT_VALIDITY_DAYS)).to_rfc3339();
+
+            tx.execute(
+                "INSERT INTO credit_batches
+                    (id, account_id, amount_cents, remaining_cents, expires_at, stripe_charge_id)
+                 VALUES (?1, ?2, ?3, ?3, ?4, ?5)",
+                params![
+                    batch_id,
+                    account_id,
+                    amount_cents,
+                    expires_at,
+                    credit_source_id
+                ],
+            )?;
+
+            tx.execute(
+                "UPDATE accounts SET balance_cents = balance_cents + ?1 WHERE id = ?2",
+                params![amount_cents, account_id],
+            )?;
+
+            tx.commit()?;
+            Ok(true)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+
+            let existing = tx
+                .query_opt(
+                    "SELECT 1 FROM credit_batches WHERE stripe_charge_id = $1",
+                    &[&credit_source_id],
+                )?
+                .is_some();
+            if existing {
+                tx.commit()?;
+                return Ok(false);
+            }
+
+            let batch_id = uuid::Uuid::new_v4().to_string();
+            let expires_at = Utc::now() + Duration::days(CREDIT_VALIDITY_DAYS);
+
+            tx.execute(
+                "INSERT INTO credit_batches
+                    (id, account_id, amount_cents, remaining_cents, expires_at, stripe_charge_id)
+                 VALUES ($1, $2, $3, $3, $4, $5)",
+                &[
+                    &batch_id,
+                    &account_id,
+                    &amount_cents,
+                    &expires_at,
+                    &credit_source_id,
+                ],
+            )?;
+
+            tx.execute(
+                "UPDATE accounts SET balance_cents = balance_cents + $1 WHERE id = $2",
+                &[&amount_cents, &account_id],
+            )?;
+
+            tx.commit()?;
+            Ok(true)
+        }
     }
-
-    let batch_id = uuid::Uuid::new_v4().to_string();
-    let expires_at = (Utc::now() + Duration::days(CREDIT_VALIDITY_DAYS)).to_rfc3339();
-
-    tx.execute(
-        "INSERT INTO credit_batches
-            (id, account_id, amount_cents, remaining_cents, expires_at, stripe_charge_id)
-         VALUES (?1, ?2, ?3, ?3, ?4, ?5)",
-        params![
-            batch_id,
-            account_id,
-            amount_cents,
-            expires_at,
-            credit_source_id
-        ],
-    )?;
-
-    tx.execute(
-        "UPDATE accounts SET balance_cents = balance_cents + ?1 WHERE id = ?2",
-        params![amount_cents, account_id],
-    )?;
-
-    tx.commit()?;
-    Ok(true)
 }
 
 /// Credit spendable balance from a payment processor event.
@@ -199,40 +299,83 @@ pub fn revoke_processor_credit(
         return Ok(None);
     }
     let source_id = format!("{provider}:{processor_payment_id}");
-    let mut conn = pool.get()?;
-    let tx = conn.transaction()?;
+    let revoked = match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction()?;
 
-    let row: Option<(String, String, i64)> = tx
-        .query_row(
-            "SELECT id, account_id, remaining_cents
-               FROM credit_batches
-              WHERE stripe_charge_id = ?1
-              LIMIT 1",
-            params![source_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .ok();
-    let Some((batch_id, account_id, remaining_cents)) = row else {
-        tx.commit()?;
-        return Ok(None);
+            let row: Option<(String, String, i64)> = tx
+                .query_row(
+                    "SELECT id, account_id, remaining_cents
+                       FROM credit_batches
+                      WHERE stripe_charge_id = ?1
+                      LIMIT 1",
+                    params![source_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .ok();
+            let Some((batch_id, account_id, remaining_cents)) = row else {
+                tx.commit()?;
+                return Ok(None);
+            };
+
+            if remaining_cents > 0 {
+                tx.execute(
+                    "UPDATE accounts
+                        SET balance_cents = MAX(0, balance_cents - ?1)
+                      WHERE id = ?2",
+                    params![remaining_cents, &account_id],
+                )?;
+                tx.execute(
+                    "UPDATE credit_batches
+                        SET remaining_cents = 0,
+                            expired_at = COALESCE(expired_at, datetime('now'))
+                      WHERE id = ?1",
+                    params![batch_id],
+                )?;
+            }
+            tx.commit()?;
+            (account_id, remaining_cents)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+
+            let row = tx.query_opt(
+                "SELECT id, account_id, remaining_cents
+                   FROM credit_batches
+                  WHERE stripe_charge_id = $1
+                  LIMIT 1",
+                &[&source_id],
+            )?;
+            let Some(row) = row else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            let batch_id: String = row.try_get(0)?;
+            let account_id: String = row.try_get(1)?;
+            let remaining_cents: i64 = row.try_get(2)?;
+
+            if remaining_cents > 0 {
+                tx.execute(
+                    "UPDATE accounts
+                        SET balance_cents = GREATEST(0, balance_cents - $1)
+                      WHERE id = $2",
+                    &[&remaining_cents, &account_id],
+                )?;
+                tx.execute(
+                    "UPDATE credit_batches
+                        SET remaining_cents = 0,
+                            expired_at = COALESCE(expired_at, now())
+                      WHERE id = $1",
+                    &[&batch_id],
+                )?;
+            }
+            tx.commit()?;
+            (account_id, remaining_cents)
+        }
     };
-
-    if remaining_cents > 0 {
-        tx.execute(
-            "UPDATE accounts
-                SET balance_cents = MAX(0, balance_cents - ?1)
-              WHERE id = ?2",
-            params![remaining_cents, &account_id],
-        )?;
-        tx.execute(
-            "UPDATE credit_batches
-                SET remaining_cents = 0,
-                    expired_at = COALESCE(expired_at, datetime('now'))
-              WHERE id = ?1",
-            params![batch_id],
-        )?;
-    }
-    tx.commit()?;
+    let (account_id, remaining_cents) = revoked;
     tracing::warn!(
         account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
         provider = %provider,
@@ -245,22 +388,47 @@ pub fn revoke_processor_credit(
 }
 
 pub fn can_afford(pool: &DbPool, account_id: &str, estimated_cost_cents: i64) -> Result<bool> {
-    let conn = pool.get()?;
-    let balance: i64 = conn.query_row(
-        "SELECT balance_cents FROM accounts WHERE id = ?1",
-        params![account_id],
-        |r| r.get(0),
-    )?;
+    let balance: i64 = match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            conn.query_row(
+                "SELECT balance_cents FROM accounts WHERE id = ?1",
+                params![account_id],
+                |r| r.get(0),
+            )?
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            conn.query_one(
+                "SELECT balance_cents FROM accounts WHERE id = $1",
+                &[&account_id],
+            )?
+            .try_get(0)?
+        }
+    };
     Ok(balance >= estimated_cost_cents)
 }
 
 pub fn current_balance(pool: &DbPool, account_id: &str) -> Result<i64> {
-    let conn = pool.get()?;
-    Ok(conn.query_row(
-        "SELECT balance_cents FROM accounts WHERE id = ?1",
-        params![account_id],
-        |r| r.get(0),
-    )?)
+    match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            Ok(conn.query_row(
+                "SELECT balance_cents FROM accounts WHERE id = ?1",
+                params![account_id],
+                |r| r.get(0),
+            )?)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            Ok(conn
+                .query_one(
+                    "SELECT balance_cents FROM accounts WHERE id = $1",
+                    &[&account_id],
+                )?
+                .try_get(0)?)
+        }
+    }
 }
 
 /// Decrement trial seconds. Returns the remaining count.
@@ -273,58 +441,114 @@ pub fn consume_trial_seconds(pool: &DbPool, account_id: &str, ms: i64) -> Result
     } else {
         ((ms + 999) / 1000).max(1)
     };
-    let conn = pool.get()?;
-    conn.execute(
-        "UPDATE accounts
-            SET trial_seconds_remaining = MAX(0, trial_seconds_remaining - ?1)
-          WHERE id = ?2",
-        params![secs, account_id],
-    )?;
-    Ok(conn.query_row(
-        "SELECT trial_seconds_remaining FROM accounts WHERE id = ?1",
-        params![account_id],
-        |r| r.get(0),
-    )?)
+    match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            conn.execute(
+                "UPDATE accounts
+                    SET trial_seconds_remaining = MAX(0, trial_seconds_remaining - ?1)
+                  WHERE id = ?2",
+                params![secs, account_id],
+            )?;
+            Ok(conn.query_row(
+                "SELECT trial_seconds_remaining FROM accounts WHERE id = ?1",
+                params![account_id],
+                |r| r.get(0),
+            )?)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            conn.execute(
+                "UPDATE accounts
+                    SET trial_seconds_remaining = GREATEST(0, trial_seconds_remaining - $1)
+                  WHERE id = $2",
+                &[&secs, &account_id],
+            )?;
+            Ok(conn
+                .query_one(
+                    "SELECT trial_seconds_remaining FROM accounts WHERE id = $1",
+                    &[&account_id],
+                )?
+                .try_get(0)?)
+        }
+    }
 }
 
 pub fn sweep_expired(pool: &DbPool) -> Result<i64> {
-    let conn = pool.get()?;
-    let now = Utc::now().to_rfc3339();
-    let mut stmt = conn.prepare(
-        "SELECT id, account_id, remaining_cents
-         FROM credit_batches
-         WHERE expires_at < ?1 AND remaining_cents > 0 AND expired_at IS NULL",
-    )?;
-    let rows: Vec<(String, String, i64)> = stmt
-        .query_map(params![now], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, i64>(2)?,
-            ))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+    match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let now = Utc::now().to_rfc3339();
+            let mut stmt = conn.prepare(
+                "SELECT id, account_id, remaining_cents
+                 FROM credit_batches
+                 WHERE expires_at < ?1 AND remaining_cents > 0 AND expired_at IS NULL",
+            )?;
+            let rows: Vec<(String, String, i64)> = stmt
+                .query_map(params![now], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
 
-    let mut total: i64 = 0;
-    for (batch_id, account_id, remaining) in rows {
-        conn.execute(
-            "UPDATE accounts SET balance_cents = MAX(0, balance_cents - ?1) WHERE id = ?2",
-            params![remaining, account_id],
-        )?;
-        conn.execute(
-            "UPDATE credit_batches SET expired_at = ?1, remaining_cents = 0 WHERE id = ?2",
-            params![now, batch_id],
-        )?;
-        total += remaining;
-        tracing::info!(
-            account_id,
-            batch_id,
-            remaining_cents = remaining,
-            "credit batch expired"
-        );
+            let mut total: i64 = 0;
+            for (batch_id, account_id, remaining) in rows {
+                conn.execute(
+                    "UPDATE accounts SET balance_cents = MAX(0, balance_cents - ?1) WHERE id = ?2",
+                    params![remaining, account_id],
+                )?;
+                conn.execute(
+                    "UPDATE credit_batches SET expired_at = ?1, remaining_cents = 0 WHERE id = ?2",
+                    params![now, batch_id],
+                )?;
+                total += remaining;
+                tracing::info!(
+                    account_id,
+                    batch_id,
+                    remaining_cents = remaining,
+                    "credit batch expired"
+                );
+            }
+            Ok(total)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let rows: Vec<(String, String, i64)> = conn
+                .query(
+                    "SELECT id, account_id, remaining_cents
+                     FROM credit_batches
+                     WHERE expires_at < now() AND remaining_cents > 0 AND expired_at IS NULL",
+                    &[],
+                )?
+                .into_iter()
+                .map(|row| Ok((row.try_get(0)?, row.try_get(1)?, row.try_get(2)?)))
+                .collect::<Result<Vec<_>>>()?;
+
+            let mut total: i64 = 0;
+            for (batch_id, account_id, remaining) in rows {
+                conn.execute(
+                    "UPDATE accounts SET balance_cents = GREATEST(0, balance_cents - $1) WHERE id = $2",
+                    &[&remaining, &account_id],
+                )?;
+                conn.execute(
+                    "UPDATE credit_batches SET expired_at = now(), remaining_cents = 0 WHERE id = $1",
+                    &[&batch_id],
+                )?;
+                total += remaining;
+                tracing::info!(
+                    account_id,
+                    batch_id,
+                    remaining_cents = remaining,
+                    "credit batch expired"
+                );
+            }
+            Ok(total)
+        }
     }
-    Ok(total)
 }
 
 #[cfg(test)]

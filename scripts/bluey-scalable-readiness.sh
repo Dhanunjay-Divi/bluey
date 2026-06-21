@@ -61,7 +61,7 @@ else
 fi
 
 if grep -q 'BLUEY_SERVER_DB_BACKEND=postgres is provisioned but this bluey-server build still uses the SQLite runtime adapter' "${ROOT}/server/src/main.rs"; then
-  require_or_warn 0 "Postgres runtime adapter is not deployable yet; main.rs still refuses postgres mode"
+  require_or_warn 0 "Postgres runtime adapter refusal guard is still present; this build cannot run postgres mode"
 else
   ok "server binary no longer has the postgres-mode refusal guard"
 fi

@@ -93,75 +93,171 @@ pub(crate) fn reserve_session(
 ) -> Result<ReservedSttSession, SttAccountingError> {
     let pricing = pricing::lookup(input.provider, input.model)
         .ok_or(SttAccountingError::UnsupportedModel)?;
-    let mut conn = pool
-        .get()
-        .map_err(|err| SttAccountingError::Db(err.into()))?;
-    let tx = conn
-        .transaction()
-        .map_err(|err| SttAccountingError::Db(err.into()))?;
+    let (reserved_trial_seconds, reserved_billable_seconds, projected_bluey_cents, reserved_cents) =
+        match pool {
+            DbPool::Sqlite(_) => {
+                let mut conn = pool
+                    .get()
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                let tx = conn
+                    .transaction()
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
 
-    let (available_cents, trial_remaining): (i64, i64) = tx
-        .query_row(
-            "SELECT balance_cents, trial_seconds_remaining
-             FROM accounts
-             WHERE id = ?1",
-            params![input.account_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|err| SttAccountingError::Db(err.into()))?;
+                let (available_cents, trial_remaining): (i64, i64) = tx
+                    .query_row(
+                        "SELECT balance_cents, trial_seconds_remaining
+                         FROM accounts
+                         WHERE id = ?1",
+                        params![input.account_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
 
-    let reserved_trial_seconds = trial_remaining.max(0).min(input.max_seconds);
-    let reserved_billable_seconds = (input.max_seconds - reserved_trial_seconds).max(0);
-    let (projected_bluey_cents, reserved_cents) =
-        pricing::compute_cost(pricing, reserved_billable_seconds, 0);
-    if available_cents < reserved_cents {
-        return Err(SttAccountingError::InsufficientBalance);
-    }
+                let reserved_trial_seconds = trial_remaining.max(0).min(input.max_seconds);
+                let reserved_billable_seconds =
+                    (input.max_seconds - reserved_trial_seconds).max(0);
+                let (projected_bluey_cents, reserved_cents) =
+                    pricing::compute_cost(pricing, reserved_billable_seconds, 0);
+                if available_cents < reserved_cents {
+                    return Err(SttAccountingError::InsufficientBalance);
+                }
 
-    let updated = tx.execute(
-        "UPDATE accounts
-            SET balance_cents = balance_cents - ?1,
-                reserved_cents = reserved_cents + ?1,
-                trial_seconds_remaining = trial_seconds_remaining - ?2
-          WHERE id = ?3
-            AND balance_cents >= ?1
-            AND trial_seconds_remaining >= ?2",
-        params![
-            reserved_cents,
-            reserved_trial_seconds,
-            input.account_id
-        ],
-    )
-    .map_err(|err| SttAccountingError::Db(err.into()))?;
-    if updated != 1 {
-        return Err(SttAccountingError::InsufficientBalance);
-    }
+                let updated = tx.execute(
+                    "UPDATE accounts
+                        SET balance_cents = balance_cents - ?1,
+                            reserved_cents = reserved_cents + ?1,
+                            trial_seconds_remaining = trial_seconds_remaining - ?2
+                      WHERE id = ?3
+                        AND balance_cents >= ?1
+                        AND trial_seconds_remaining >= ?2",
+                    params![
+                        reserved_cents,
+                        reserved_trial_seconds,
+                        input.account_id
+                    ],
+                )
+                .map_err(|err| SttAccountingError::Db(err.into()))?;
+                if updated != 1 {
+                    return Err(SttAccountingError::InsufficientBalance);
+                }
 
-    tx.execute(
-        "INSERT INTO stt_sessions (
-            session_token, account_id, bluey_session_id, provider, model, source,
-            mode, max_seconds, created_at_ms, expires_at_ms,
-            reserved_cents, reserved_trial_seconds
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-        params![
-            input.token,
-            input.account_id,
-            input.bluey_session_id,
-            input.provider,
-            input.model,
-            input.source,
-            input.mode,
-            input.max_seconds,
-            input.created_at_ms,
-            input.expires_at_ms,
-            reserved_cents,
-            reserved_trial_seconds,
-        ],
-    )
-    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                tx.execute(
+                    "INSERT INTO stt_sessions (
+                        session_token, account_id, bluey_session_id, provider, model, source,
+                        mode, max_seconds, created_at_ms, expires_at_ms,
+                        reserved_cents, reserved_trial_seconds
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        input.token,
+                        input.account_id,
+                        input.bluey_session_id,
+                        input.provider,
+                        input.model,
+                        input.source,
+                        input.mode,
+                        input.max_seconds,
+                        input.created_at_ms,
+                        input.expires_at_ms,
+                        reserved_cents,
+                        reserved_trial_seconds,
+                    ],
+                )
+                .map_err(|err| SttAccountingError::Db(err.into()))?;
 
-    tx.commit()
-        .map_err(|err| SttAccountingError::Db(err.into()))?;
+                tx.commit()
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                (
+                    reserved_trial_seconds,
+                    reserved_billable_seconds,
+                    projected_bluey_cents,
+                    reserved_cents,
+                )
+            }
+            DbPool::Postgres(_) => {
+                let mut conn = pool
+                    .get_pg()
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                let mut tx = conn
+                    .transaction()
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+
+                let row = tx
+                    .query_one(
+                        "SELECT balance_cents, trial_seconds_remaining
+                         FROM accounts
+                         WHERE id = $1",
+                        &[&input.account_id],
+                    )
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                let available_cents: i64 = row
+                    .try_get(0)
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                let trial_remaining: i64 = row
+                    .try_get(1)
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+
+                let reserved_trial_seconds = trial_remaining.max(0).min(input.max_seconds);
+                let reserved_billable_seconds =
+                    (input.max_seconds - reserved_trial_seconds).max(0);
+                let (projected_bluey_cents, reserved_cents) =
+                    pricing::compute_cost(pricing, reserved_billable_seconds, 0);
+                if available_cents < reserved_cents {
+                    return Err(SttAccountingError::InsufficientBalance);
+                }
+
+                let updated = tx
+                    .execute(
+                        "UPDATE accounts
+                            SET balance_cents = balance_cents - $1,
+                                reserved_cents = reserved_cents + $1,
+                                trial_seconds_remaining = trial_seconds_remaining - $2
+                          WHERE id = $3
+                            AND balance_cents >= $1
+                            AND trial_seconds_remaining >= $2",
+                        &[
+                            &reserved_cents,
+                            &reserved_trial_seconds,
+                            &input.account_id,
+                        ],
+                    )
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                if updated != 1 {
+                    return Err(SttAccountingError::InsufficientBalance);
+                }
+
+                tx.execute(
+                    "INSERT INTO stt_sessions (
+                        session_token, account_id, bluey_session_id, provider, model, source,
+                        mode, max_seconds, created_at_ms, expires_at_ms,
+                        reserved_cents, reserved_trial_seconds
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                    &[
+                        &input.token,
+                        &input.account_id,
+                        &input.bluey_session_id,
+                        &input.provider,
+                        &input.model,
+                        &input.source,
+                        &input.mode,
+                        &input.max_seconds,
+                        &input.created_at_ms,
+                        &input.expires_at_ms,
+                        &reserved_cents,
+                        &reserved_trial_seconds,
+                    ],
+                )
+                .map_err(|err| SttAccountingError::Db(err.into()))?;
+
+                tx.commit()
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                (
+                    reserved_trial_seconds,
+                    reserved_billable_seconds,
+                    projected_bluey_cents,
+                    reserved_cents,
+                )
+            }
+        };
     Ok(ReservedSttSession {
         reserved_cents,
         reserved_trial_seconds,
@@ -176,52 +272,122 @@ pub(crate) fn claim_relay_session(
     token: &str,
     now_ms: i64,
 ) -> Result<ClaimedSttSession, ClaimSttSessionError> {
-    let conn = pool
-        .get()
-        .map_err(|err| ClaimSttSessionError::Db(err.into()))?;
-    let session = conn
-        .query_row(
-            "SELECT account_id, bluey_session_id, provider, model, source, max_seconds, expires_at_ms,
-                    reserved_cents, reserved_trial_seconds
-             FROM stt_sessions
-             WHERE session_token = ?1 AND account_id = ?2",
-            params![token, account_id],
-            |row| {
-                Ok(ClaimedSttSession {
-                    token: token.to_string(),
-                    account_id: row.get(0)?,
-                    bluey_session_id: row.get(1)?,
-                    provider: row.get(2)?,
-                    model: row.get(3)?,
-                    source: row.get(4)?,
-                    max_seconds: row.get(5)?,
-                    expires_at_ms: row.get(6)?,
-                    reserved_cents: row.get(7)?,
-                    reserved_trial_seconds: row.get(8)?,
-                })
-            },
-        )
-        .optional()
-        .map_err(|err| ClaimSttSessionError::Db(err.into()))?
-        .ok_or(ClaimSttSessionError::InvalidSession)?;
+    let session = match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool
+                .get()
+                .map_err(|err| ClaimSttSessionError::Db(err.into()))?;
+            conn.query_row(
+                "SELECT account_id, bluey_session_id, provider, model, source, max_seconds, expires_at_ms,
+                        reserved_cents, reserved_trial_seconds
+                 FROM stt_sessions
+                 WHERE session_token = ?1 AND account_id = ?2",
+                params![token, account_id],
+                |row| {
+                    Ok(ClaimedSttSession {
+                        token: token.to_string(),
+                        account_id: row.get(0)?,
+                        bluey_session_id: row.get(1)?,
+                        provider: row.get(2)?,
+                        model: row.get(3)?,
+                        source: row.get(4)?,
+                        max_seconds: row.get(5)?,
+                        expires_at_ms: row.get(6)?,
+                        reserved_cents: row.get(7)?,
+                        reserved_trial_seconds: row.get(8)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|err| ClaimSttSessionError::Db(err.into()))?
+            .ok_or(ClaimSttSessionError::InvalidSession)?
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool
+                .get_pg()
+                .map_err(|err| ClaimSttSessionError::Db(err.into()))?;
+            let row = conn
+                .query_opt(
+                    "SELECT account_id, bluey_session_id, provider, model, source, max_seconds, expires_at_ms,
+                            reserved_cents, reserved_trial_seconds
+                     FROM stt_sessions
+                     WHERE session_token = $1 AND account_id = $2",
+                    &[&token, &account_id],
+                )
+                .map_err(|err| ClaimSttSessionError::Db(err.into()))?
+                .ok_or(ClaimSttSessionError::InvalidSession)?;
+            ClaimedSttSession {
+                token: token.to_string(),
+                account_id: row
+                    .try_get(0)
+                    .map_err(|err| ClaimSttSessionError::Db(err.into()))?,
+                bluey_session_id: row
+                    .try_get(1)
+                    .map_err(|err| ClaimSttSessionError::Db(err.into()))?,
+                provider: row
+                    .try_get(2)
+                    .map_err(|err| ClaimSttSessionError::Db(err.into()))?,
+                model: row
+                    .try_get(3)
+                    .map_err(|err| ClaimSttSessionError::Db(err.into()))?,
+                source: row
+                    .try_get(4)
+                    .map_err(|err| ClaimSttSessionError::Db(err.into()))?,
+                max_seconds: row
+                    .try_get(5)
+                    .map_err(|err| ClaimSttSessionError::Db(err.into()))?,
+                expires_at_ms: row
+                    .try_get(6)
+                    .map_err(|err| ClaimSttSessionError::Db(err.into()))?,
+                reserved_cents: row
+                    .try_get(7)
+                    .map_err(|err| ClaimSttSessionError::Db(err.into()))?,
+                reserved_trial_seconds: row
+                    .try_get(8)
+                    .map_err(|err| ClaimSttSessionError::Db(err.into()))?,
+            }
+        }
+    };
     if session.expires_at_ms <= now_ms {
         return Err(ClaimSttSessionError::Expired);
     }
     if session.provider != "deepgram" {
         return Err(ClaimSttSessionError::UnsupportedProvider);
     }
-    let updated = conn
-        .execute(
-            "UPDATE stt_sessions
-                SET started_at_ms = ?1
-              WHERE session_token = ?2
-                AND account_id = ?3
-                AND started_at_ms IS NULL
-                AND ended_at_ms IS NULL
-                AND expires_at_ms > ?1",
-            params![now_ms, token, account_id],
-        )
-        .map_err(|err| ClaimSttSessionError::Db(err.into()))?;
+    let updated = match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool
+                .get()
+                .map_err(|err| ClaimSttSessionError::Db(err.into()))?;
+            conn.execute(
+                "UPDATE stt_sessions
+                    SET started_at_ms = ?1
+                  WHERE session_token = ?2
+                    AND account_id = ?3
+                    AND started_at_ms IS NULL
+                    AND ended_at_ms IS NULL
+                    AND expires_at_ms > ?1",
+                params![now_ms, token, account_id],
+            )
+            .map_err(|err| ClaimSttSessionError::Db(err.into()))?
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool
+                .get_pg()
+                .map_err(|err| ClaimSttSessionError::Db(err.into()))?;
+            conn.execute(
+                "UPDATE stt_sessions
+                    SET started_at_ms = $1
+                  WHERE session_token = $2
+                    AND account_id = $3
+                    AND started_at_ms IS NULL
+                    AND ended_at_ms IS NULL
+                    AND expires_at_ms > $1",
+                &[&now_ms, &token, &account_id],
+            )
+            .map_err(|err| ClaimSttSessionError::Db(err.into()))? as usize
+        }
+    };
     if updated != 1 {
         return Err(ClaimSttSessionError::AlreadyActiveOrClosed);
     }
@@ -240,99 +406,224 @@ pub(crate) fn settle_session(
     let pricing =
         pricing::lookup("deepgram", model).ok_or(SttAccountingError::UnsupportedModel)?;
     let elapsed_seconds = ((elapsed_ms.max(1) + 999) / 1000).max(1);
-    let mut conn = pool
-        .get()
-        .map_err(|err| SttAccountingError::Db(err.into()))?;
-    let tx = conn
-        .transaction()
-        .map_err(|err| SttAccountingError::Db(err.into()))?;
+    let (capped_seconds, billable_seconds, trial_seconds, customer_cents, bluey_cents, refunded_cents, refunded_trial_seconds) =
+        match pool {
+            DbPool::Sqlite(_) => {
+                let mut conn = pool
+                    .get()
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                let tx = conn
+                    .transaction()
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
 
-    let (max_seconds, reserved_cents, reserved_trial_seconds, ended_at_ms): (
-        i64,
-        i64,
-        i64,
-        Option<i64>,
-    ) = tx
-        .query_row(
-            "SELECT max_seconds, reserved_cents, reserved_trial_seconds, ended_at_ms
-             FROM stt_sessions
-             WHERE session_token = ?1 AND account_id = ?2",
-            params![session_token, account_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()
-        .map_err(|err| SttAccountingError::Db(err.into()))?
-        .ok_or_else(|| SttAccountingError::Db(anyhow::anyhow!("missing STT session")))?;
+                let (max_seconds, reserved_cents, reserved_trial_seconds, ended_at_ms): (
+                    i64,
+                    i64,
+                    i64,
+                    Option<i64>,
+                ) = tx
+                    .query_row(
+                        "SELECT max_seconds, reserved_cents, reserved_trial_seconds, ended_at_ms
+                         FROM stt_sessions
+                         WHERE session_token = ?1 AND account_id = ?2",
+                        params![session_token, account_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .optional()
+                    .map_err(|err| SttAccountingError::Db(err.into()))?
+                    .ok_or_else(|| SttAccountingError::Db(anyhow::anyhow!("missing STT session")))?;
 
-    if ended_at_ms.is_some() {
-        return Err(SttAccountingError::AlreadySettled);
-    }
+                if ended_at_ms.is_some() {
+                    return Err(SttAccountingError::AlreadySettled);
+                }
 
-    let capped_seconds = elapsed_seconds.min(max_seconds.max(1));
-    let trial_seconds = reserved_trial_seconds.min(capped_seconds);
-    let billable_seconds = capped_seconds - trial_seconds;
-    let (bluey_cents, customer_cents) = pricing::compute_cost(pricing, billable_seconds, 0);
-    let refunded_cents = (reserved_cents - customer_cents).max(0);
-    let extra_cents = (customer_cents - reserved_cents).max(0);
-    let refunded_trial_seconds = (reserved_trial_seconds - trial_seconds).max(0);
+                let capped_seconds = elapsed_seconds.min(max_seconds.max(1));
+                let trial_seconds = reserved_trial_seconds.min(capped_seconds);
+                let billable_seconds = capped_seconds - trial_seconds;
+                let (bluey_cents, customer_cents) =
+                    pricing::compute_cost(pricing, billable_seconds, 0);
+                let refunded_cents = (reserved_cents - customer_cents).max(0);
+                let extra_cents = (customer_cents - reserved_cents).max(0);
+                let refunded_trial_seconds = (reserved_trial_seconds - trial_seconds).max(0);
 
-    let updated = tx
-        .execute(
-            "UPDATE accounts
-                SET reserved_cents = reserved_cents - ?1,
-                    balance_cents = balance_cents + ?2 - ?3,
-                    trial_seconds_remaining = trial_seconds_remaining + ?4
-              WHERE id = ?5
-                AND reserved_cents >= ?1
-                AND balance_cents >= ?3",
-            params![
-                reserved_cents,
-                refunded_cents,
-                extra_cents,
-                refunded_trial_seconds,
-                account_id
-            ],
-        )
-        .map_err(|err| SttAccountingError::Db(err.into()))?;
-    if updated != 1 {
-        return Err(SttAccountingError::InsufficientBalance);
-    }
+                let updated = tx
+                    .execute(
+                        "UPDATE accounts
+                            SET reserved_cents = reserved_cents - ?1,
+                                balance_cents = balance_cents + ?2 - ?3,
+                                trial_seconds_remaining = trial_seconds_remaining + ?4
+                          WHERE id = ?5
+                            AND reserved_cents >= ?1
+                            AND balance_cents >= ?3",
+                        params![
+                            reserved_cents,
+                            refunded_cents,
+                            extra_cents,
+                            refunded_trial_seconds,
+                            account_id
+                        ],
+                    )
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                if updated != 1 {
+                    return Err(SttAccountingError::InsufficientBalance);
+                }
 
-    balance::consume_credit_batches_tx(&tx, account_id, customer_cents)
-        .map_err(SttAccountingError::Db)?;
+                balance::consume_credit_batches_tx(&tx, account_id, customer_cents)
+                    .map_err(SttAccountingError::Db)?;
 
-    let updated = tx
-        .execute(
-            "UPDATE stt_sessions
-                SET consumed_seconds = ?1,
-                    settled_cents = ?2,
-                    refunded_cents = ?3,
-                    settled_trial_seconds = ?4,
-                    refunded_trial_seconds = ?5,
-                    ended_at_ms = ?6,
-                    relay_close_reason = ?7
-              WHERE session_token = ?8
-                AND account_id = ?9
-                AND ended_at_ms IS NULL",
-            params![
-                capped_seconds,
-                customer_cents,
-                refunded_cents,
-                trial_seconds,
-                refunded_trial_seconds,
-                now_ms,
-                reason,
-                session_token,
-                account_id
-            ],
-        )
-        .map_err(|err| SttAccountingError::Db(err.into()))?;
-    if updated != 1 {
-        return Err(SttAccountingError::AlreadySettled);
-    }
+                let updated = tx
+                    .execute(
+                        "UPDATE stt_sessions
+                            SET consumed_seconds = ?1,
+                                settled_cents = ?2,
+                                refunded_cents = ?3,
+                                settled_trial_seconds = ?4,
+                                refunded_trial_seconds = ?5,
+                                ended_at_ms = ?6,
+                                relay_close_reason = ?7
+                          WHERE session_token = ?8
+                            AND account_id = ?9
+                            AND ended_at_ms IS NULL",
+                        params![
+                            capped_seconds,
+                            customer_cents,
+                            refunded_cents,
+                            trial_seconds,
+                            refunded_trial_seconds,
+                            now_ms,
+                            reason,
+                            session_token,
+                            account_id
+                        ],
+                    )
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                if updated != 1 {
+                    return Err(SttAccountingError::AlreadySettled);
+                }
 
-    tx.commit()
-        .map_err(|err| SttAccountingError::Db(err.into()))?;
+                tx.commit()
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                (
+                    capped_seconds,
+                    billable_seconds,
+                    trial_seconds,
+                    customer_cents,
+                    bluey_cents,
+                    refunded_cents,
+                    refunded_trial_seconds,
+                )
+            }
+            DbPool::Postgres(_) => {
+                let mut conn = pool
+                    .get_pg()
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                let mut tx = conn
+                    .transaction()
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+
+                let row = tx
+                    .query_opt(
+                        "SELECT max_seconds, reserved_cents, reserved_trial_seconds, ended_at_ms
+                         FROM stt_sessions
+                         WHERE session_token = $1 AND account_id = $2",
+                        &[&session_token, &account_id],
+                    )
+                    .map_err(|err| SttAccountingError::Db(err.into()))?
+                    .ok_or_else(|| SttAccountingError::Db(anyhow::anyhow!("missing STT session")))?;
+                let max_seconds: i64 = row
+                    .try_get(0)
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                let reserved_cents: i64 = row
+                    .try_get(1)
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                let reserved_trial_seconds: i64 = row
+                    .try_get(2)
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                let ended_at_ms: Option<i64> = row
+                    .try_get(3)
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+
+                if ended_at_ms.is_some() {
+                    return Err(SttAccountingError::AlreadySettled);
+                }
+
+                let capped_seconds = elapsed_seconds.min(max_seconds.max(1));
+                let trial_seconds = reserved_trial_seconds.min(capped_seconds);
+                let billable_seconds = capped_seconds - trial_seconds;
+                let (bluey_cents, customer_cents) =
+                    pricing::compute_cost(pricing, billable_seconds, 0);
+                let refunded_cents = (reserved_cents - customer_cents).max(0);
+                let extra_cents = (customer_cents - reserved_cents).max(0);
+                let refunded_trial_seconds = (reserved_trial_seconds - trial_seconds).max(0);
+
+                let updated = tx
+                    .execute(
+                        "UPDATE accounts
+                            SET reserved_cents = reserved_cents - $1,
+                                balance_cents = balance_cents + $2 - $3,
+                                trial_seconds_remaining = trial_seconds_remaining + $4
+                          WHERE id = $5
+                            AND reserved_cents >= $1
+                            AND balance_cents >= $3",
+                        &[
+                            &reserved_cents,
+                            &refunded_cents,
+                            &extra_cents,
+                            &refunded_trial_seconds,
+                            &account_id,
+                        ],
+                    )
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                if updated != 1 {
+                    return Err(SttAccountingError::InsufficientBalance);
+                }
+
+                balance::consume_credit_batches_pg_tx(&mut tx, account_id, customer_cents)
+                    .map_err(SttAccountingError::Db)?;
+
+                let updated = tx
+                    .execute(
+                        "UPDATE stt_sessions
+                            SET consumed_seconds = $1,
+                                settled_cents = $2,
+                                refunded_cents = $3,
+                                settled_trial_seconds = $4,
+                                refunded_trial_seconds = $5,
+                                ended_at_ms = $6,
+                                relay_close_reason = $7
+                          WHERE session_token = $8
+                            AND account_id = $9
+                            AND ended_at_ms IS NULL",
+                        &[
+                            &capped_seconds,
+                            &customer_cents,
+                            &refunded_cents,
+                            &trial_seconds,
+                            &refunded_trial_seconds,
+                            &now_ms,
+                            &reason,
+                            &session_token,
+                            &account_id,
+                        ],
+                    )
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                if updated != 1 {
+                    return Err(SttAccountingError::AlreadySettled);
+                }
+
+                tx.commit()
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                (
+                    capped_seconds,
+                    billable_seconds,
+                    trial_seconds,
+                    customer_cents,
+                    bluey_cents,
+                    refunded_cents,
+                    refunded_trial_seconds,
+                )
+            }
+        };
 
     Ok(SettledSttSession {
         elapsed_ms,
