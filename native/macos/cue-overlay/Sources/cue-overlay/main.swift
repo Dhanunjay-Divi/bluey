@@ -1615,7 +1615,7 @@ private struct RenderedCard {
     var artifact: OverlayArtifact?
 }
 
-private enum CanvasKind {
+private enum CanvasKind: Equatable {
     case code
     case systemDesign
     case screen
@@ -1638,6 +1638,16 @@ private enum CanvasKind {
         case .systemDesign: return "System design canvas"
         case .screen: return "Screen analysis"
         case .document: return "Document notes"
+        case .structured: return "Workspace"
+        }
+    }
+
+    var shortTitle: String {
+        switch self {
+        case .code: return "Coding"
+        case .systemDesign: return "System Design"
+        case .screen: return "Screen"
+        case .document: return "Docs"
         case .structured: return "Workspace"
         }
     }
@@ -1665,10 +1675,12 @@ private enum CanvasKind {
 
 private struct CanvasArtifact {
     let kind: CanvasKind
-    let title: String
-    let subtitle: String
-    let content: String
+    var title: String
+    var subtitle: String
+    var content: String
     let sourceCardId: String
+    var followupCount: Int = 0
+    var sourceQuestion: String? = nil
 }
 
 private final class FlippedStackView: NSStackView {
@@ -1829,6 +1841,16 @@ private final class FeedView: NSView {
             hit = view.superview
         }
         return false
+    }
+
+    func nearestQuestionBody(beforeCardId id: String) -> String? {
+        guard let idx = cards.firstIndex(where: { $0.id == id }), idx > 0 else { return nil }
+        for card in cards[..<idx].reversed() {
+            guard normalizedCardKind(card.kind) == "question" else { continue }
+            let body = card.body.trimmingCharacters(in: .whitespacesAndNewlines)
+            return body.isEmpty ? nil : body
+        }
+        return nil
     }
 
     func applyBackgroundOpacity(_ opacity: CGFloat) {
@@ -2583,6 +2605,9 @@ private final class CanvasPaneView: NSView {
     private let iconView = NSImageView()
     private let titleLabel = NSTextField(labelWithString: "Workspace")
     private let subtitleLabel = NSTextField(labelWithString: "Structured output appears here")
+    private let previousButton = NSButton(title: "", target: nil, action: nil)
+    private let nextButton = NSButton(title: "", target: nil, action: nil)
+    private let positionLabel = NSTextField(labelWithString: "")
     private let fullWindowButton = NSButton(title: "", target: nil, action: nil)
     private let copyButton = NSButton(title: "", target: nil, action: nil)
     private let closeButton = NSButton(title: "", target: nil, action: nil)
@@ -2593,6 +2618,8 @@ private final class CanvasPaneView: NSView {
 
     var onCollapse: (() -> Void)?
     var onToggleFullWindow: (() -> Void)?
+    var onPrevious: (() -> Void)?
+    var onNext: (() -> Void)?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -2606,6 +2633,9 @@ private final class CanvasPaneView: NSView {
         iconView.translatesAutoresizingMaskIntoConstraints = false
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         subtitleLabel.translatesAutoresizingMaskIntoConstraints = false
+        previousButton.translatesAutoresizingMaskIntoConstraints = false
+        nextButton.translatesAutoresizingMaskIntoConstraints = false
+        positionLabel.translatesAutoresizingMaskIntoConstraints = false
         fullWindowButton.translatesAutoresizingMaskIntoConstraints = false
         copyButton.translatesAutoresizingMaskIntoConstraints = false
         closeButton.translatesAutoresizingMaskIntoConstraints = false
@@ -2615,6 +2645,9 @@ private final class CanvasPaneView: NSView {
         header.addSubview(iconView)
         header.addSubview(titleLabel)
         header.addSubview(subtitleLabel)
+        header.addSubview(previousButton)
+        header.addSubview(positionLabel)
+        header.addSubview(nextButton)
         header.addSubview(fullWindowButton)
         header.addSubview(copyButton)
         header.addSubview(closeButton)
@@ -2628,6 +2661,20 @@ private final class CanvasPaneView: NSView {
         subtitleLabel.font = NSFont.systemFont(ofSize: 10.5, weight: .medium)
         subtitleLabel.textColor = BlueyTheme.textDim
         subtitleLabel.lineBreakMode = .byTruncatingTail
+        positionLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .semibold)
+        positionLabel.textColor = BlueyTheme.textDim
+        positionLabel.alignment = .center
+        positionLabel.lineBreakMode = .byClipping
+
+        styleCanvasHeaderButton(previousButton, symbol: "chevron.left", fallback: "<")
+        previousButton.toolTip = "Previous canvas"
+        previousButton.target = self
+        previousButton.action = #selector(previousClicked)
+
+        styleCanvasHeaderButton(nextButton, symbol: "chevron.right", fallback: ">")
+        nextButton.toolTip = "Next canvas"
+        nextButton.target = self
+        nextButton.action = #selector(nextClicked)
 
         styleCanvasHeaderButton(copyButton, symbol: "doc.on.doc", fallback: "C")
         copyButton.toolTip = "Copy canvas"
@@ -2692,9 +2739,23 @@ private final class CanvasPaneView: NSView {
             fullWindowButton.widthAnchor.constraint(equalToConstant: 26),
             fullWindowButton.heightAnchor.constraint(equalToConstant: 26),
 
+            nextButton.trailingAnchor.constraint(equalTo: fullWindowButton.leadingAnchor, constant: -6),
+            nextButton.topAnchor.constraint(equalTo: header.topAnchor),
+            nextButton.widthAnchor.constraint(equalToConstant: 26),
+            nextButton.heightAnchor.constraint(equalToConstant: 26),
+
+            positionLabel.trailingAnchor.constraint(equalTo: nextButton.leadingAnchor, constant: -5),
+            positionLabel.centerYAnchor.constraint(equalTo: nextButton.centerYAnchor),
+            positionLabel.widthAnchor.constraint(equalToConstant: 34),
+
+            previousButton.trailingAnchor.constraint(equalTo: positionLabel.leadingAnchor, constant: -5),
+            previousButton.topAnchor.constraint(equalTo: header.topAnchor),
+            previousButton.widthAnchor.constraint(equalToConstant: 26),
+            previousButton.heightAnchor.constraint(equalToConstant: 26),
+
             titleLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
             titleLabel.topAnchor.constraint(equalTo: header.topAnchor),
-            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: fullWindowButton.leadingAnchor, constant: -8),
+            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: previousButton.leadingAnchor, constant: -8),
 
             subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             subtitleLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 3),
@@ -2734,6 +2795,18 @@ private final class CanvasPaneView: NSView {
         textView.string = artifact.content
         updateTextWrapping()
         textView.scrollRangeToVisible(NSRange(location: 0, length: 0))
+    }
+
+    func setNavigation(index: Int, total: Int) {
+        let hasMultiple = total > 1
+        previousButton.isHidden = !hasMultiple
+        nextButton.isHidden = !hasMultiple
+        positionLabel.isHidden = !hasMultiple
+        previousButton.isEnabled = hasMultiple && index > 0
+        nextButton.isEnabled = hasMultiple && index < total - 1
+        positionLabel.stringValue = hasMultiple ? "\(index + 1)/\(total)" : ""
+        previousButton.contentTintColor = previousButton.isEnabled ? BlueyTheme.textDim : BlueyTheme.textDim.withAlphaComponent(0.35)
+        nextButton.contentTintColor = nextButton.isEnabled ? BlueyTheme.textDim : BlueyTheme.textDim.withAlphaComponent(0.35)
     }
 
     func setFullWindow(_ value: Bool) {
@@ -2789,6 +2862,14 @@ private final class CanvasPaneView: NSView {
 
     @objc private func fullWindowClicked() {
         onToggleFullWindow?()
+    }
+
+    @objc private func previousClicked() {
+        onPrevious?()
+    }
+
+    @objc private func nextClicked() {
+        onNext?()
     }
 
     @objc private func collapseClicked() {
@@ -2879,7 +2960,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     var onClose: (() -> Void)?
     var onOpacityChanged: ((Double) -> Void)?
     var onListeningStateChanged: ((PillRunState) -> Void)?
-    var onInteractionModeChanged: ((Bool) -> Void)?
     private var recordingActive = false
     private var transcriptSnippets: [String] = []
     private var latestLiveTranscriptLine: String?
@@ -2914,13 +2994,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         "Indexing · ● 111",
         "Indexing · ● 001",
     ]
-    private var latestCanvas: CanvasArtifact?
+    private var canvases: [CanvasArtifact] = []
+    private var activeCanvasIndex: Int?
+    private var canvasCardAssignments: [String: Int] = [:]
     private var canvasOpen = false
     private var canvasFullWindow = false
     private var preCanvasFullWindowFrame: NSRect?
     private var windowFullSize = false
     private var preWindowFullSizeFrame: NSRect?
-    private var passThroughMode = false
     private struct ResizeEdges: OptionSet {
         let rawValue: Int
         static let left = ResizeEdges(rawValue: 1 << 0)
@@ -3468,7 +3549,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         canvasToggleButton.isHidden = true
         canvasPane.onCollapse = { [weak self] in self?.setCanvasOpen(false) }
         canvasPane.onToggleFullWindow = { [weak self] in self?.toggleCanvasFullWindow() }
+        canvasPane.onPrevious = { [weak self] in self?.showPreviousCanvas() }
+        canvasPane.onNext = { [weak self] in self?.showNextCanvas() }
         canvasPane.setFullWindow(false)
+        canvasPane.setNavigation(index: 0, total: 0)
         styleHeaderIconButton(navButton, symbol: "sidebar.left", fallback: "[]")
         styleHeaderIconButton(drawerCloseButton, symbol: "xmark", fallback: "x")
         styleHeaderIconButton(canvasToggleButton, symbol: "sidebar.right", fallback: "|")
@@ -3691,9 +3775,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             let drawerPoint = sessionDrawer.convert(localPoint, from: self)
             return sessionDrawer.bounds.contains(drawerPoint)
         }
-        if passThroughMode {
-            return hitsPassThroughInteractiveRegion(at: localPoint, screenPoint: screenPoint)
-        }
         if !resizeEdges(at: localPoint).isEmpty {
             return true
         }
@@ -3705,14 +3786,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func shouldReceiveMouseEvents(at screenPoint: NSPoint) -> Bool {
-        if passThroughMode {
-            return isInteractiveAtScreenPoint(screenPoint)
-        }
-        return true
-    }
-
-    var isPassThroughModeActive: Bool {
-        passThroughMode
+        isInteractiveAtScreenPoint(screenPoint)
     }
 
     func manualButton(atWindowPoint point: NSPoint) -> NSButton? {
@@ -3794,9 +3868,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             opacityValueLabel,
             modelMenu,
             analyzeButton,
-            transcriptStrip,
-            transcriptLabel,
-            transcriptScroll,
         ]
         return controls.contains { view in
             guard !view.isHidden, view.alphaValue > 0.01 else { return false }
@@ -3804,38 +3875,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             let rect = view.convert(view.bounds, to: self).insetBy(dx: -padding, dy: -padding)
             return rect.contains(localPoint)
         }
-    }
-
-    private func hitsPassThroughInteractiveRegion(at localPoint: NSPoint, screenPoint: NSPoint) -> Bool {
-        let headerZone = rectForView(headerBar).insetBy(dx: -18, dy: -14)
-        if headerZone.contains(localPoint) {
-            return true
-        }
-        let composerZone = rectForView(composerBar).insetBy(dx: -18, dy: -18)
-        if composerZone.contains(localPoint) {
-            return true
-        }
-        let transcriptZone = rectForView(transcriptStrip).insetBy(dx: -8, dy: -8)
-        if transcriptZone.contains(localPoint) {
-            return true
-        }
-        if hitsExplicitInteractiveChrome(at: localPoint) {
-            return true
-        }
-        if feed.hasCopyControl(atScreenPoint: screenPoint) {
-            return true
-        }
-        for textRegion in [transcriptStrip] {
-            if hitsView(textRegion, at: localPoint, padding: 2) {
-                return true
-            }
-        }
-        return false
-    }
-
-    private func hitsView(_ view: NSView, at localPoint: NSPoint, padding: CGFloat) -> Bool {
-        guard !view.isHidden, view.alphaValue > 0.01 else { return false }
-        return rectForView(view).insetBy(dx: -padding, dy: -padding).contains(localPoint)
     }
 
     private func rectForView(_ view: NSView) -> NSRect {
@@ -4487,9 +4526,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         canvasToggleButton.toolTip = "Open or collapse the canvas"
         balanceLabel.toolTip = "Remaining Bluey balance"
         fullSizeButton.toolTip = windowFullSize ? "Restore Bluey size" : "Make Bluey full size"
-        interactionModeButton.toolTip = passThroughMode
-            ? "Click-through on. Click to make Bluey interactive."
-            : "Interactive on. Click to pass background clicks through."
+        interactionModeButton.toolTip = "Controls-only click-through. Captions and answers pass through."
         hideButton.toolTip = "Hide to pill"
         closeButton.toolTip = "Turn Bluey off. Run bluey on to start again."
         recordingButton.toolTip = "Start or stop listening"
@@ -4617,9 +4654,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     @objc private func interactionModeClicked() {
-        passThroughMode.toggle()
         updateInteractionModeChrome()
-        onInteractionModeChanged?(passThroughMode)
     }
 
     func showTurnOffConfirmation() {
@@ -4727,10 +4762,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     @objc private func toggleCanvasClicked() {
-        guard latestCanvas != nil else { return }
+        guard !canvases.isEmpty else { return }
         if canvasOpen {
             setCanvasOpen(false)
         } else {
+            renderActiveCanvas()
             setCanvasOpen(true)
         }
     }
@@ -5413,7 +5449,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         setTranscriptState("READY", active: false)
         routeBadge.stringValue = "● Ready"
         routeBadge.textColor = BlueyTheme.green
-        latestCanvas = nil
+        canvases.removeAll()
+        activeCanvasIndex = nil
+        canvasCardAssignments.removeAll()
+        canvasPane.setNavigation(index: 0, total: 0)
         setCanvasOpen(false)
         canvasToggleButton.isHidden = true
     }
@@ -5546,13 +5585,183 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func routeCanvasIfNeeded(_ card: RenderedCard) {
-        guard let artifact = makeCanvasArtifact(from: card) else { return }
-        latestCanvas = artifact
-        canvasPane.render(artifact)
+        guard card.done, var artifact = makeCanvasArtifact(from: card) else { return }
+        let question = feed.nearestQuestionBody(beforeCardId: card.id)
+        registerCanvasArtifact(&artifact, question: question)
         canvasToggleButton.isHidden = false
         if shouldAutoOpenCanvas(for: card, artifact: artifact) {
             setCanvasOpen(true)
+        } else if canvasOpen {
+            renderActiveCanvas()
         }
+    }
+
+    private func registerCanvasArtifact(_ artifact: inout CanvasArtifact, question: String?) {
+        if let existingIndex = canvasCardAssignments[artifact.sourceCardId],
+           canvases.indices.contains(existingIndex) {
+            let existing = canvases[existingIndex]
+            artifact.title = existing.title
+            artifact.subtitle = canvasSubtitle(base: artifact.subtitle, followups: existing.followupCount)
+            artifact.followupCount = existing.followupCount
+            artifact.sourceQuestion = existing.sourceQuestion
+            canvases[existingIndex] = artifact
+            activeCanvasIndex = existingIndex
+            renderActiveCanvas()
+            return
+        }
+
+        if shouldAppendCanvasFollowup(question: question, artifact: artifact),
+           let index = activeCanvasIndex,
+           canvases.indices.contains(index) {
+            let followupNumber = canvases[index].followupCount + 1
+            canvases[index].followupCount = followupNumber
+            canvases[index].subtitle = canvasSubtitle(
+                base: canvases[index].kind.subtitle,
+                followups: followupNumber)
+            canvases[index].content = appendCanvasFollowup(
+                to: canvases[index].content,
+                question: question,
+                artifact: artifact,
+                number: followupNumber)
+            canvasCardAssignments[artifact.sourceCardId] = index
+            activeCanvasIndex = index
+            renderActiveCanvas()
+            return
+        }
+
+        let questionNumber = canvases.count + 1
+        artifact.title = "Q\(questionNumber) \(artifact.kind.shortTitle)"
+        artifact.subtitle = canvasSubtitle(base: artifact.subtitle, followups: 0)
+        artifact.sourceQuestion = question
+        canvases.append(artifact)
+        activeCanvasIndex = canvases.count - 1
+        canvasCardAssignments[artifact.sourceCardId] = canvases.count - 1
+        renderActiveCanvas()
+    }
+
+    private func renderActiveCanvas() {
+        guard !canvases.isEmpty else {
+            canvasPane.setNavigation(index: 0, total: 0)
+            return
+        }
+        let index = min(max(activeCanvasIndex ?? canvases.count - 1, 0), canvases.count - 1)
+        activeCanvasIndex = index
+        canvasPane.render(canvases[index])
+        canvasPane.setNavigation(index: index, total: canvases.count)
+    }
+
+    private func showPreviousCanvas() {
+        guard let index = activeCanvasIndex, index > 0 else { return }
+        activeCanvasIndex = index - 1
+        renderActiveCanvas()
+        if !canvasOpen {
+            setCanvasOpen(true)
+        }
+    }
+
+    private func showNextCanvas() {
+        guard let index = activeCanvasIndex, index < canvases.count - 1 else { return }
+        activeCanvasIndex = index + 1
+        renderActiveCanvas()
+        if !canvasOpen {
+            setCanvasOpen(true)
+        }
+    }
+
+    private func canvasSubtitle(base: String, followups: Int) -> String {
+        guard followups > 0 else { return base }
+        let suffix = followups == 1 ? "1 follow-up" : "\(followups) follow-ups"
+        return "\(base) · \(suffix)"
+    }
+
+    private func shouldAppendCanvasFollowup(question: String?, artifact: CanvasArtifact) -> Bool {
+        guard
+            let index = activeCanvasIndex,
+            canvases.indices.contains(index),
+            canvases[index].kind == artifact.kind,
+            let question = question?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !question.isEmpty
+        else {
+            return false
+        }
+        let lower = question.lowercased()
+        if looksLikeNewCanvasQuestion(lower) {
+            return false
+        }
+        let followupSignals = [
+            "also",
+            "and ",
+            "now ",
+            "then ",
+            "make ",
+            "change ",
+            "update ",
+            "fix ",
+            "add ",
+            "remove ",
+            "instead",
+            "what about",
+            "can you",
+            "could you",
+            "continue",
+            "same ",
+            "for that",
+            "in this",
+            "with this",
+            "explain",
+            "why ",
+        ]
+        return followupSignals.contains { lower.hasPrefix($0) || lower.contains(" \($0)") }
+    }
+
+    private func looksLikeNewCanvasQuestion(_ lower: String) -> Bool {
+        let trimmed = lower.trimmingCharacters(in: .whitespacesAndNewlines)
+        let newQuestionSignals = [
+            "q2",
+            "q3",
+            "q4",
+            "question 2",
+            "question 3",
+            "question 4",
+            "next question",
+            "next coding",
+            "another question",
+            "different question",
+            "new question",
+            "separate question",
+            "write a ",
+            "build a ",
+            "implement ",
+            "create a ",
+            "design a ",
+            "solve ",
+        ]
+        return newQuestionSignals.contains { trimmed.hasPrefix($0) }
+    }
+
+    private func appendCanvasFollowup(
+        to existing: String,
+        question: String?,
+        artifact: CanvasArtifact,
+        number: Int
+    ) -> String {
+        var parts = [
+            existing.trimmingCharacters(in: .whitespacesAndNewlines),
+            "",
+            "---",
+            "",
+            "FOLLOW-UP \(number)",
+        ]
+        if let question = question?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !question.isEmpty {
+            parts.append("Question: \(question)")
+        }
+        let body = artifact.content.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !body.isEmpty {
+            parts.append("")
+            parts.append(body)
+        }
+        return parts.joined(separator: "\n")
     }
 
     private func shouldAutoOpenCanvas(for card: RenderedCard, artifact: CanvasArtifact) -> Bool {
@@ -5568,6 +5777,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func setCanvasOpen(_ open: Bool) {
         if !open, canvasFullWindow {
             restoreCanvasWindow()
+        }
+        if open {
+            renderActiveCanvas()
         }
         canvasOpen = open
         canvasPane.isHidden = !open
@@ -5603,19 +5815,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func updateInteractionModeChrome(showToast: Bool = true) {
-        let symbol = passThroughMode ? "cursorarrow.rays" : "hand.tap"
-        let fallback = passThroughMode ? "P" : "I"
-        styleHeaderIconButton(interactionModeButton, symbol: symbol, fallback: fallback)
-        interactionModeButton.contentTintColor = passThroughMode ? BlueyTheme.cyan : BlueyTheme.text
-        interactionModeButton.toolTip = passThroughMode
-            ? "Click-through on. Click to make Bluey interactive."
-            : "Interactive on. Click to pass background clicks through."
+        styleHeaderIconButton(interactionModeButton, symbol: "cursorarrow.rays", fallback: "P")
+        interactionModeButton.contentTintColor = BlueyTheme.cyan
+        interactionModeButton.toolTip = "Controls-only click-through. Captions and answers pass through."
         if showToast {
             showSystemToast(
-                title: passThroughMode ? "Click-through on" : "Interactive on",
-                body: passThroughMode
-                    ? "Empty space passes through. Bluey controls and text stay available."
-                    : "Buttons, composer, and window controls are clickable.",
+                title: "Controls-only click-through",
+                body: "Only buttons, composer, drawers, dialogs, and canvas controls catch clicks.",
                 duration: 2.0)
         }
     }
@@ -6929,17 +7135,9 @@ private final class OverlayApp {
                 return
             }
 
-            // Interactive mode keeps the whole panel clickable. Pass-through
-            // mode keeps Bluey chrome and visible text interactive while empty
-            // workspace/background regions pass clicks through to the host app.
-            if !expandedView.isPassThroughModeActive {
-                self.lastExpandedInteractiveMouseAt = CACurrentMediaTime()
-                if expandedWindow.ignoresMouseEvents {
-                    expandedWindow.ignoresMouseEvents = false
-                }
-                return
-            }
-
+            // Bluey only accepts pointer events over real controls. Generated
+            // answers, captions, screenshots, and empty panel regions pass
+            // through to the host app underneath.
             let wantsMouse = expandedView.shouldReceiveMouseEvents(at: NSEvent.mouseLocation)
             let now = CACurrentMediaTime()
             if wantsMouse {
@@ -6947,7 +7145,7 @@ private final class OverlayApp {
                 if expandedWindow.ignoresMouseEvents {
                     expandedWindow.ignoresMouseEvents = false
                 }
-            } else if now - self.lastExpandedInteractiveMouseAt > 1.10,
+            } else if now - self.lastExpandedInteractiveMouseAt > 0.08,
                       !expandedWindow.ignoresMouseEvents {
                 expandedWindow.ignoresMouseEvents = true
             }
@@ -7006,13 +7204,6 @@ private final class OverlayApp {
         view.onOpacityChanged = { [weak self] opacity in
             self?.overlayOpacity = opacity
             self?.pillView?.applyBackgroundOpacity(opacity)
-        }
-        view.onInteractionModeChanged = { [weak self] _ in
-            guard let self, let expandedWindow = self.expandedWindow else { return }
-            self.lastExpandedInteractiveMouseAt = CACurrentMediaTime()
-            expandedWindow.ignoresMouseEvents = false
-            expandedWindow.acceptsMouseMovedEvents = true
-            expandedWindow.makeKeyAndOrderFront(nil)
         }
         expandedWindow = window
         expandedView = view

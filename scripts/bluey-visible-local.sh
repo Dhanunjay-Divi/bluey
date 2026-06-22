@@ -19,15 +19,19 @@ if [ ! -x "$BLUEY_BIN" ]; then
     fi
 fi
 
+daemon_running() {
+    "$BLUEY_BIN" status 2>/dev/null | grep -q '"pid"'
+}
+
 "$BLUEY_BIN" off >/dev/null 2>&1 || true
 for _ in $(seq 1 40); do
-    if ! "$BLUEY_BIN" status >/dev/null 2>&1; then
+    if ! daemon_running; then
         break
     fi
     sleep 0.15
 done
 
-if "$BLUEY_BIN" status >/dev/null 2>&1; then
+if daemon_running; then
     echo "Bluey daemon did not stop cleanly before visible restart." >&2
     exit 1
 fi
