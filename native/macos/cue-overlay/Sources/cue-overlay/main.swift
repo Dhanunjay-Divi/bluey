@@ -1968,82 +1968,11 @@ private final class FeedView: NSView {
         emptyState.layer?.backgroundColor = NSColor.clear.cgColor
         addSubview(emptyState)
 
-        let badge = NSTextField(labelWithString: "READY")
-        badge.translatesAutoresizingMaskIntoConstraints = false
-        badge.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .bold)
-        badge.textColor = BlueyTheme.cyan
-
-        let title = NSTextField(labelWithString: "Ready")
-        title.translatesAutoresizingMaskIntoConstraints = false
-        title.font = NSFont.systemFont(ofSize: 18, weight: .bold)
-        title.textColor = BlueyTheme.text
-        title.alignment = .center
-
-        let subtitle = NSTextField(labelWithString: "Ask anything. Attach documents or analyse the screen when context helps.")
-        subtitle.translatesAutoresizingMaskIntoConstraints = false
-        subtitle.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
-        subtitle.textColor = BlueyTheme.textDim
-        subtitle.alignment = .center
-        subtitle.maximumNumberOfLines = 2
-        subtitle.lineBreakMode = .byWordWrapping
-
-        let dropTarget = NSView()
-        dropTarget.translatesAutoresizingMaskIntoConstraints = false
-        dropTarget.wantsLayer = true
-        dropTarget.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.035).cgColor
-        dropTarget.layer?.cornerRadius = 13
-        dropTarget.layer?.borderWidth = 1
-        dropTarget.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.24).cgColor
-
-        let dropTitle = NSTextField(labelWithString: "Drop documents here")
-        dropTitle.translatesAutoresizingMaskIntoConstraints = false
-        dropTitle.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
-        dropTitle.textColor = BlueyTheme.text
-        dropTitle.alignment = .center
-
-        let dropHint = NSTextField(labelWithString: "PDF, DOCX, TXT, MD, code")
-        dropHint.translatesAutoresizingMaskIntoConstraints = false
-        dropHint.font = NSFont.systemFont(ofSize: 10, weight: .medium)
-        dropHint.textColor = BlueyTheme.textDim
-        dropHint.alignment = .center
-
-        emptyState.addSubview(badge)
-        emptyState.addSubview(title)
-        emptyState.addSubview(subtitle)
-        emptyState.addSubview(dropTarget)
-        dropTarget.addSubview(dropTitle)
-        dropTarget.addSubview(dropHint)
-
         NSLayoutConstraint.activate([
             emptyState.centerXAnchor.constraint(equalTo: centerXAnchor),
-            emptyState.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -12),
-            emptyState.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.76),
-
-            badge.topAnchor.constraint(equalTo: emptyState.topAnchor),
-            badge.centerXAnchor.constraint(equalTo: emptyState.centerXAnchor),
-
-            title.topAnchor.constraint(equalTo: badge.bottomAnchor, constant: 7),
-            title.leadingAnchor.constraint(equalTo: emptyState.leadingAnchor),
-            title.trailingAnchor.constraint(equalTo: emptyState.trailingAnchor),
-
-            subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 6),
-            subtitle.leadingAnchor.constraint(equalTo: emptyState.leadingAnchor),
-            subtitle.trailingAnchor.constraint(equalTo: emptyState.trailingAnchor),
-
-            dropTarget.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 12),
-            dropTarget.centerXAnchor.constraint(equalTo: emptyState.centerXAnchor),
-            dropTarget.widthAnchor.constraint(lessThanOrEqualTo: emptyState.widthAnchor),
-            dropTarget.widthAnchor.constraint(greaterThanOrEqualToConstant: 252),
-            dropTarget.heightAnchor.constraint(equalToConstant: 50),
-            dropTarget.bottomAnchor.constraint(equalTo: emptyState.bottomAnchor),
-
-            dropTitle.topAnchor.constraint(equalTo: dropTarget.topAnchor, constant: 8),
-            dropTitle.leadingAnchor.constraint(equalTo: dropTarget.leadingAnchor, constant: 18),
-            dropTitle.trailingAnchor.constraint(equalTo: dropTarget.trailingAnchor, constant: -18),
-
-            dropHint.topAnchor.constraint(equalTo: dropTitle.bottomAnchor, constant: 2),
-            dropHint.leadingAnchor.constraint(equalTo: dropTarget.leadingAnchor, constant: 18),
-            dropHint.trailingAnchor.constraint(equalTo: dropTarget.trailingAnchor, constant: -18),
+            emptyState.centerYAnchor.constraint(equalTo: centerYAnchor),
+            emptyState.widthAnchor.constraint(equalToConstant: 1),
+            emptyState.heightAnchor.constraint(equalToConstant: 1),
         ])
     }
 
