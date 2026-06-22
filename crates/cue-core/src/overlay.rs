@@ -74,6 +74,11 @@ pub enum OverlayCommand {
         source: String,
         text: String,
     },
+    SetPassthrough {
+        enabled: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+    },
     PushCard {
         card: CueCard,
     },
@@ -225,6 +230,20 @@ mod tests {
         assert_eq!(
             json,
             r#"{"type":"listening_state_changed","state":"listening"}"#
+        );
+    }
+
+    #[test]
+    fn set_passthrough_serializes_as_overlay_command() {
+        let json = serde_json::to_string(&OverlayCommand::SetPassthrough {
+            enabled: true,
+            duration_ms: Some(900),
+        })
+        .expect("serialize overlay passthrough command");
+
+        assert_eq!(
+            json,
+            r#"{"type":"set_passthrough","enabled":true,"duration_ms":900}"#
         );
     }
 

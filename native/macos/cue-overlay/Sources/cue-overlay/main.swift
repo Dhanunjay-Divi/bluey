@@ -21,6 +21,7 @@
 // our events.
 
 import AppKit
+import ApplicationServices
 import Darwin
 import Foundation
 import QuartzCore
@@ -538,6 +539,12 @@ private struct OverlaySessionItem {
     let isActive: Bool
 }
 
+// Matches Pinky's trusted remote-control event source marker
+// (internal/input/input_darwin.go). When Pinky is controlling the host,
+// Bluey should not consume those injected clicks.
+private let pinkyTrustedRemoteInputEventSourceUserData: Int64 = 0x70696e6b797231
+private let remoteInputPassthroughDefaultMs = 900
+
 /// Inbound commands from the daemon.
 private enum OverlayCommand {
     case ping
@@ -554,6 +561,7 @@ private enum OverlayCommand {
     case listeningStateChanged(String)
     case transcriptPartial(source: String, text: String)
     case transcriptFinal(source: String, text: String)
+    case setPassthrough(enabled: Bool, durationMs: Int?)
     case pushCard(CueCard)
     case updateCard(id: String, body: String, done: Bool, costLabel: String?, artifact: OverlayArtifact?)
     case shutdown
@@ -619,6 +627,11 @@ private func parseCommand(_ line: String) -> OverlayCommand {
         return .transcriptFinal(
             source: obj["source"] as? String ?? "audio",
             text: obj["text"] as? String ?? "")
+    case "set_passthrough", "input_passthrough":
+        let durationMs = (obj["duration_ms"] as? Int) ?? (obj["durationMs"] as? Int)
+        return .setPassthrough(
+            enabled: obj["enabled"] as? Bool ?? true,
+            durationMs: durationMs)
     case "push_card":
         guard let cardObj = obj["card"] as? [String: Any],
               let cardData = try? JSONSerialization.data(withJSONObject: cardObj),
@@ -6621,6 +6634,10 @@ private final class OverlayApp {
     private var pillView: PillView!
     private var expandedView: ExpandedPanelView?
     private var expandedPassthroughTimer: Timer?
+    private var remoteInputPassthroughTimer: Timer?
+    private var trustedRemoteInputEventTap: CFMachPort?
+    private var trustedRemoteInputRunLoopSource: CFRunLoopSource?
+    private var remoteInputPassthroughUntil = 0.0
     private var lastExpandedInteractiveMouseAt = CACurrentMediaTime()
     private var currentRunState: PillRunState = .ready
     private var overlayOpacity = 0.94
@@ -6663,13 +6680,14 @@ private final class OverlayApp {
         emitLifecycle("started", detail: "capture_excluded=\(!captureVisibleForDebug)")
         startParentWatchdog()
         startExpandedPassthroughTracking()
+        startTrustedRemoteInputPassthroughMonitor()
         startIpcLoop()
     }
 
     private func bringPillToFront(force: Bool = false) {
         guard force || !expandedModeActive else { return }
         centerPillOnMainScreen()
-        pillWindow.ignoresMouseEvents = false
+        pillWindow.ignoresMouseEvents = isRemoteInputPassthroughActive
         pillWindow.acceptsMouseMovedEvents = true
         pillWindow.setIsVisible(true)
         pillWindow.orderFrontRegardless()
@@ -6700,6 +6718,104 @@ private final class OverlayApp {
         }
     }
 
+    private var isRemoteInputPassthroughActive: Bool {
+        CACurrentMediaTime() < remoteInputPassthroughUntil
+    }
+
+    @discardableResult
+    private func applyRemoteInputPassthroughIfActive() -> Bool {
+        guard isRemoteInputPassthroughActive else { return false }
+        expandedWindow?.ignoresMouseEvents = true
+        pillWindow?.ignoresMouseEvents = true
+        return true
+    }
+
+    private func allowRemoteInputPassthrough(durationMs: Int, reason: String) {
+        let clampedMs = min(max(durationMs, 80), 1_500)
+        let until = CACurrentMediaTime() + Double(clampedMs) / 1000.0
+        remoteInputPassthroughUntil = max(remoteInputPassthroughUntil, until)
+
+        expandedWindow?.ignoresMouseEvents = true
+        pillWindow?.ignoresMouseEvents = true
+        expandedWindow?.acceptsMouseMovedEvents = false
+        pillWindow?.acceptsMouseMovedEvents = false
+
+        remoteInputPassthroughTimer?.invalidate()
+        remoteInputPassthroughTimer = Timer(timeInterval: Double(clampedMs) / 1000.0, repeats: false) { [weak self] _ in
+            self?.restoreMousePolicyAfterRemoteInputPassthrough()
+        }
+        if let remoteInputPassthroughTimer {
+            RunLoop.main.add(remoteInputPassthroughTimer, forMode: .common)
+        }
+        emitLifecycle("remote_input_passthrough", status: "armed", detail: "\(reason):\(clampedMs)ms")
+    }
+
+    private func clearRemoteInputPassthrough() {
+        remoteInputPassthroughUntil = 0
+        remoteInputPassthroughTimer?.invalidate()
+        remoteInputPassthroughTimer = nil
+        restoreMousePolicyAfterRemoteInputPassthrough()
+    }
+
+    private func restoreMousePolicyAfterRemoteInputPassthrough() {
+        guard !isRemoteInputPassthroughActive else {
+            applyRemoteInputPassthroughIfActive()
+            return
+        }
+
+        expandedWindow?.acceptsMouseMovedEvents = true
+        pillWindow?.acceptsMouseMovedEvents = true
+        if expandedModeActive {
+            pillWindow?.ignoresMouseEvents = true
+            expandedWindow?.ignoresMouseEvents = false
+            lastExpandedInteractiveMouseAt = CACurrentMediaTime()
+        } else {
+            expandedWindow?.ignoresMouseEvents = true
+            pillWindow?.ignoresMouseEvents = false
+        }
+        emitLifecycle("remote_input_passthrough", status: "cleared")
+    }
+
+    private func startTrustedRemoteInputPassthroughMonitor() {
+        let mask = cgEventMask([
+            .leftMouseDown, .leftMouseUp, .leftMouseDragged,
+            .rightMouseDown, .rightMouseUp, .rightMouseDragged,
+            .otherMouseDown, .otherMouseUp, .otherMouseDragged,
+            .mouseMoved, .scrollWheel,
+        ])
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .listenOnly,
+            eventsOfInterest: mask,
+            callback: blueyTrustedRemoteInputEventTapCallback,
+            userInfo: Unmanaged.passUnretained(self).toOpaque())
+        else {
+            emitLifecycle(
+                "remote_input_passthrough_monitor",
+                status: "unavailable",
+                detail: "trusted remote input event tap was not granted")
+            return
+        }
+
+        trustedRemoteInputEventTap = tap
+        trustedRemoteInputRunLoopSource = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        if let trustedRemoteInputRunLoopSource {
+            CFRunLoopAddSource(CFRunLoopGetMain(), trustedRemoteInputRunLoopSource, .commonModes)
+        }
+        CGEvent.tapEnable(tap: tap, enable: true)
+        emitLifecycle("remote_input_passthrough_monitor", status: "ready")
+    }
+
+    fileprivate func trustedRemoteInputEventDetected() {
+        if remoteInputPassthroughUntil - CACurrentMediaTime() > 0.25 {
+            return
+        }
+        allowRemoteInputPassthrough(
+            durationMs: remoteInputPassthroughDefaultMs,
+            reason: "pinky-trusted-event")
+    }
+
     private func startExpandedPassthroughTracking() {
         expandedPassthroughTimer?.invalidate()
         expandedPassthroughTimer = Timer.scheduledTimer(withTimeInterval: 0.015, repeats: true) { [weak self] _ in
@@ -6709,6 +6825,10 @@ private final class OverlayApp {
                 expandedWindow.isVisible,
                 let expandedView = self.expandedView
             else { return }
+
+            if self.applyRemoteInputPassthroughIfActive() {
+                return
+            }
 
             // Interactive mode keeps the whole panel clickable. Pass-through
             // mode keeps Bluey chrome and visible text interactive while empty
@@ -6743,7 +6863,7 @@ private final class OverlayApp {
         lastExpandedInteractiveMouseAt = CACurrentMediaTime()
         hidePillWhileExpanded()
         NSApp.activate(ignoringOtherApps: true)
-        expandedWindow.ignoresMouseEvents = false
+        expandedWindow.ignoresMouseEvents = isRemoteInputPassthroughActive
         expandedWindow.acceptsMouseMovedEvents = true
         expandedWindow.orderFrontRegardless()
         expandedWindow.makeKeyAndOrderFront(nil)
@@ -6813,9 +6933,9 @@ private final class OverlayApp {
 
     private func collapse() {
         expandedModeActive = false
-        expandedWindow?.ignoresMouseEvents = false
+        expandedWindow?.ignoresMouseEvents = isRemoteInputPassthroughActive
         expandedWindow?.orderOut(nil)
-        pillWindow?.ignoresMouseEvents = false
+        pillWindow?.ignoresMouseEvents = isRemoteInputPassthroughActive
         bringPillToFront(force: true)
         emitSimple("hidden")
         emitLifecycle("collapsed")
@@ -6897,6 +7017,14 @@ private final class OverlayApp {
             expandedView?.appendLiveTranscript(source: source, text: text, final: false)
         case .transcriptFinal(let source, let text):
             expandedView?.appendLiveTranscript(source: source, text: text, final: true)
+        case .setPassthrough(let enabled, let durationMs):
+            if enabled {
+                allowRemoteInputPassthrough(
+                    durationMs: durationMs ?? remoteInputPassthroughDefaultMs,
+                    reason: "ipc")
+            } else {
+                clearRemoteInputPassthrough()
+            }
         case .pushCard(let card):
             ensureExpandedWindow()
             expandedView?.pushCard(RenderedCard(
@@ -7008,6 +7136,38 @@ private final class OverlayApp {
             }
         }
     }
+}
+
+private func cgEventMask(_ types: [CGEventType]) -> CGEventMask {
+    var mask = CGEventMask(0)
+    for type in types {
+        mask |= CGEventMask(1) << CGEventMask(type.rawValue)
+    }
+    return mask
+}
+
+private func blueyTrustedRemoteInputEventTapCallback(
+    proxy: CGEventTapProxy,
+    type: CGEventType,
+    event: CGEvent,
+    refcon: UnsafeMutableRawPointer?
+) -> Unmanaged<CGEvent>? {
+    guard
+        let refcon,
+        event.getIntegerValueField(.eventSourceUserData) == pinkyTrustedRemoteInputEventSourceUserData
+    else {
+        return Unmanaged.passUnretained(event)
+    }
+
+    let app = Unmanaged<OverlayApp>.fromOpaque(refcon).takeUnretainedValue()
+    if Thread.isMainThread {
+        app.trustedRemoteInputEventDetected()
+    } else {
+        DispatchQueue.main.sync {
+            app.trustedRemoteInputEventDetected()
+        }
+    }
+    return Unmanaged.passUnretained(event)
 }
 
 // MARK: - Entry point
