@@ -4254,8 +4254,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         attachmentStack.orientation = .horizontal
         attachmentStack.alignment = .centerY
-        attachmentStack.spacing = 6
-        attachmentStack.edgeInsets = NSEdgeInsets(top: 3, left: 4, bottom: 3, right: 4)
+        attachmentStack.spacing = 4
+        attachmentStack.edgeInsets = NSEdgeInsets(top: 2, left: 3, bottom: 2, right: 3)
 
         attachmentStrip.drawsBackground = false
         attachmentStrip.hasVerticalScroller = false
@@ -4265,6 +4265,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         attachmentStrip.documentView = attachmentStack
         attachmentStrip.scrollerStyle = .overlay
         attachmentStrip.isHidden = true
+        attachmentStrip.wantsLayer = true
+        attachmentStrip.layer?.cornerRadius = 13
+        attachmentStrip.layer?.masksToBounds = true
     }
 
     private func styleDrawer() {
@@ -5068,23 +5071,25 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             view.removeFromSuperview()
         }
         attachmentStrip.isHidden = false
-        attachmentStripHeightConstraint?.constant = 34
+        attachmentStripHeightConstraint?.constant = 28
 
         let chip = NSTextField(labelWithString: text)
         chip.translatesAutoresizingMaskIntoConstraints = false
-        chip.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+        chip.font = NSFont.systemFont(ofSize: 10.5, weight: .semibold)
         chip.textColor = BlueyTheme.textDim
         chip.alignment = .center
         chip.lineBreakMode = .byTruncatingTail
         chip.wantsLayer = true
         chip.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.035).cgColor
-        chip.layer?.cornerRadius = 12
+        chip.layer?.cornerRadius = 11
         chip.layer?.borderWidth = 1
         chip.layer?.borderColor = BlueyTheme.hairline.cgColor
+        chip.toolTip = text
         attachmentStack.addArrangedSubview(chip)
         NSLayoutConstraint.activate([
-            chip.heightAnchor.constraint(equalToConstant: 28),
-            chip.widthAnchor.constraint(greaterThanOrEqualToConstant: 210),
+            chip.heightAnchor.constraint(equalToConstant: 22),
+            chip.widthAnchor.constraint(greaterThanOrEqualToConstant: 132),
+            chip.widthAnchor.constraint(lessThanOrEqualToConstant: 220),
         ])
         layoutSubtreeIfNeeded()
     }
@@ -5282,7 +5287,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
 
         setKnowledgeBadge("Docs \(items.count) ready", accent: BlueyTheme.green)
-        attachmentStripHeightConstraint?.constant = 34
+        attachmentStripHeightConstraint?.constant = 28
 
         for item in items {
             attachmentStack.addArrangedSubview(makeAttachmentChip(item))
@@ -6166,10 +6171,22 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let chip = NSView()
         chip.translatesAutoresizingMaskIntoConstraints = false
         chip.wantsLayer = true
-        chip.layer?.backgroundColor = BlueyTheme.surfaceRaised.cgColor
+        chip.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.030).cgColor
         chip.layer?.cornerRadius = 12
         chip.layer?.borderWidth = 1
         chip.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.18).cgColor
+        let titleText = item.title.isEmpty ? "Attached file" : item.title
+        let tooltipParts = [
+            titleText,
+            item.kind.uppercased(),
+            item.path,
+        ].compactMap { value -> String? in
+            guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return nil
+            }
+            return value
+        }
+        chip.toolTip = tooltipParts.joined(separator: "\n")
 
         let icon = NSImageView()
         icon.translatesAutoresizingMaskIntoConstraints = false
@@ -6180,28 +6197,22 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             icon.image = image
         }
 
-        let title = NSTextField(labelWithString: item.title.isEmpty ? "Attached file" : item.title)
+        let title = NSTextField(labelWithString: titleText)
         title.translatesAutoresizingMaskIntoConstraints = false
-        title.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+        title.font = NSFont.systemFont(ofSize: 10.5, weight: .semibold)
         title.textColor = BlueyTheme.text
         title.lineBreakMode = .byTruncatingMiddle
         title.maximumNumberOfLines = 1
-
-        let kind = NSTextField(labelWithString: item.kind.uppercased())
-        kind.translatesAutoresizingMaskIntoConstraints = false
-        kind.font = NSFont.monospacedSystemFont(ofSize: 8.5, weight: .bold)
-        kind.textColor = BlueyTheme.textDim
-        kind.stringValue = "LOADED · \(item.kind.uppercased())"
+        title.toolTip = chip.toolTip
 
         let remove = RemoveAttachmentButton(title: "", target: self, action: #selector(removeAttachmentClicked(_:)))
         remove.translatesAutoresizingMaskIntoConstraints = false
         remove.contextId = item.id
         remove.isBordered = false
         remove.wantsLayer = true
-        remove.layer?.cornerRadius = 9
-        remove.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.04).cgColor
-        remove.layer?.borderWidth = 1
-        remove.layer?.borderColor = BlueyTheme.hairline.cgColor
+        remove.layer?.cornerRadius = 8
+        remove.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.025).cgColor
+        remove.layer?.borderWidth = 0
         remove.contentTintColor = BlueyTheme.textDim
         if let image = symbolImage("xmark") {
             image.isTemplate = true
@@ -6215,30 +6226,25 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         chip.addSubview(icon)
         chip.addSubview(title)
-        chip.addSubview(kind)
         chip.addSubview(remove)
         NSLayoutConstraint.activate([
-            chip.heightAnchor.constraint(equalToConstant: 28),
-            chip.widthAnchor.constraint(lessThanOrEqualToConstant: 214),
-            chip.widthAnchor.constraint(greaterThanOrEqualToConstant: 134),
+            chip.heightAnchor.constraint(equalToConstant: 24),
+            chip.widthAnchor.constraint(lessThanOrEqualToConstant: 176),
+            chip.widthAnchor.constraint(greaterThanOrEqualToConstant: 96),
 
-            icon.leadingAnchor.constraint(equalTo: chip.leadingAnchor, constant: 8),
+            icon.leadingAnchor.constraint(equalTo: chip.leadingAnchor, constant: 7),
             icon.centerYAnchor.constraint(equalTo: chip.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 16),
-            icon.heightAnchor.constraint(equalToConstant: 16),
+            icon.widthAnchor.constraint(equalToConstant: 14),
+            icon.heightAnchor.constraint(equalToConstant: 14),
 
-            title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 7),
-            title.topAnchor.constraint(equalTo: chip.topAnchor, constant: 4),
-            title.trailingAnchor.constraint(equalTo: remove.leadingAnchor, constant: -6),
+            title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 5),
+            title.centerYAnchor.constraint(equalTo: chip.centerYAnchor),
+            title.trailingAnchor.constraint(equalTo: remove.leadingAnchor, constant: -4),
 
-            kind.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            kind.topAnchor.constraint(equalTo: title.bottomAnchor, constant: -1),
-            kind.trailingAnchor.constraint(lessThanOrEqualTo: title.trailingAnchor),
-
-            remove.trailingAnchor.constraint(equalTo: chip.trailingAnchor, constant: -7),
+            remove.trailingAnchor.constraint(equalTo: chip.trailingAnchor, constant: -6),
             remove.centerYAnchor.constraint(equalTo: chip.centerYAnchor),
-            remove.widthAnchor.constraint(equalToConstant: 18),
-            remove.heightAnchor.constraint(equalToConstant: 18),
+            remove.widthAnchor.constraint(equalToConstant: 16),
+            remove.heightAnchor.constraint(equalToConstant: 16),
         ])
         return chip
     }
