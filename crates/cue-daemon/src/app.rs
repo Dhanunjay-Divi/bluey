@@ -3141,9 +3141,10 @@ fn overlay_session_items(
                 plural_s(meeting.conversation.len())
             ));
         }
+        let title = display_meeting_title(&meeting);
         items.push(OverlaySessionItem {
             id: meeting.id,
-            title: meeting.title,
+            title,
             subtitle: if bits.is_empty() {
                 "saved recording".to_string()
             } else {
@@ -3183,6 +3184,44 @@ fn maybe_autoname_meeting(meeting: &mut MeetingRecord, seed: &str) -> bool {
     };
     meeting.title = title;
     true
+}
+
+fn maybe_autoname_meeting_from_existing(meeting: &mut MeetingRecord) -> bool {
+    if !is_generic_meeting_title(&meeting.title) {
+        return false;
+    }
+    let Some(title) = suggested_meeting_title_from_existing(meeting) else {
+        return false;
+    };
+    meeting.title = title;
+    true
+}
+
+fn display_meeting_title(meeting: &MeetingRecord) -> String {
+    if !is_generic_meeting_title(&meeting.title) {
+        return meeting.title.clone();
+    }
+    suggested_meeting_title_from_existing(meeting).unwrap_or_else(|| meeting.title.clone())
+}
+
+fn suggested_meeting_title_from_existing(meeting: &MeetingRecord) -> Option<String> {
+    for turn in &meeting.conversation {
+        if let Some(title) = suggested_meeting_title(&turn.question) {
+            return Some(title);
+        }
+    }
+    for segment in &meeting.transcript {
+        if let Some(title) = suggested_meeting_title(&segment.text) {
+            return Some(title);
+        }
+    }
+    let context_seed = meeting
+        .context
+        .iter()
+        .map(|artifact| artifact.title.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    suggested_meeting_title(&context_seed)
 }
 
 fn suggested_meeting_title(seed: &str) -> Option<String> {
@@ -3282,6 +3321,7 @@ const SESSION_TITLE_STOP_WORDS: &[&str] = &[
     "hi",
     "help",
     "here",
+    "how",
     "just",
     "know",
     "like",
@@ -6779,6 +6819,7 @@ async fn continue_session(
         if let Some(meeting) = meeting_guard.as_ref() {
             ContinueOutcome::Active(meeting.clone())
         } else if let Some(mut meeting) = daemon.store.last_meeting()? {
+            maybe_autoname_meeting_from_existing(&mut meeting);
             meeting.ended_at = None;
             daemon.store.save_active(&meeting)?;
             *meeting_guard = Some(meeting.clone());
@@ -6853,6 +6894,7 @@ async fn open_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<Me
     };
 
     let mut selected = selected;
+    maybe_autoname_meeting_from_existing(&mut selected);
     selected.ended_at = None;
     daemon.store.save_active(&selected)?;
     {
@@ -8649,6 +8691,24 @@ mod tests {
             "replace with something else"
         ));
         assert_eq!(meeting.title, "Design Redis Postgres Architecture");
+    }
+
+    #[test]
+    fn display_title_names_existing_generic_sessions() {
+        let mut meeting = MeetingRecord::new(Some("New recording".to_string()));
+        meeting.push_conversation_turn(ConversationTurn::new(
+            "How should we handle Square disputes and refunds?",
+            "Cancel saved payment methods and restrict risky usage.",
+            Some("overlay ask".to_string()),
+            Some("OpenAI".to_string()),
+        ));
+
+        assert_eq!(
+            display_meeting_title(&meeting),
+            "Handle Square Disputes Refunds"
+        );
+        assert!(maybe_autoname_meeting_from_existing(&mut meeting));
+        assert_eq!(meeting.title, "Handle Square Disputes Refunds");
     }
 
     #[test]

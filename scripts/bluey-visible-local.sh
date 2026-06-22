@@ -20,6 +20,17 @@ if [ ! -x "$BLUEY_BIN" ]; then
 fi
 
 "$BLUEY_BIN" off >/dev/null 2>&1 || true
+for _ in $(seq 1 40); do
+    if ! "$BLUEY_BIN" status >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.15
+done
+
+if "$BLUEY_BIN" status >/dev/null 2>&1; then
+    echo "Bluey daemon did not stop cleanly before visible restart." >&2
+    exit 1
+fi
 
 BLUEY_DEV_OVERLAY=1 \
 BLUEY_LOCAL_VISIBLE_OVERLAY=1 \

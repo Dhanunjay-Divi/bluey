@@ -13,6 +13,7 @@ The drawer and main feed also had fragile scroll constraints, so larger historie
 - Rehydrate saved history when the overlay reconnects while an active session already has saved conversation/transcript content.
 - Generate short contextual titles for generic recordings from the first useful transcript, question, or attached document name.
   - Example: "Hi. So I wanna know about DDoS attacks." becomes `DDoS Attacks`.
+- Existing saved recordings with generic names display and persist a contextual name when listed or reopened.
 - Keep user-renamed recordings unchanged.
 - Make the main conversation feed and History drawer use flipped document stacks with explicit scroll-content constraints.
 - Track manual feed scrolling so new incoming content does not constantly pull the user away from older messages.
@@ -23,4 +24,3 @@ The drawer and main feed also had fragile scroll constraints, so larger historie
 - Focused daemon tests for contextual titles and history card replay.
 - `cargo fmt --all -- --check`.
 - `git diff --check`.
-
