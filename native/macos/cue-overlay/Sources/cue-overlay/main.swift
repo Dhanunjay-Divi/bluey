@@ -1117,6 +1117,7 @@ private final class ModalBlockerView: NSView {
 
 private final class HeaderDragView: NSView {
     private var dragStartedInHeader = false
+    var onDragStateChanged: ((Bool) -> Void)?
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
@@ -1132,10 +1133,12 @@ private final class HeaderDragView: NSView {
         let localPoint = convert(event.locationInWindow, from: nil)
         if let hit = interactiveHit(in: self, point: localPoint), hit !== self {
             dragStartedInHeader = false
+            onDragStateChanged?(false)
             super.mouseDown(with: event)
             return
         }
         dragStartedInHeader = true
+        onDragStateChanged?(true)
         window?.makeKey()
     }
 
@@ -1149,6 +1152,7 @@ private final class HeaderDragView: NSView {
 
     override func mouseUp(with event: NSEvent) {
         dragStartedInHeader = false
+        onDragStateChanged?(false)
         super.mouseUp(with: event)
     }
 
@@ -2931,6 +2935,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var preCanvasFullWindowFrame: NSRect?
     private var windowFullSize = false
     private var preWindowFullSizeFrame: NSRect?
+    private var headerDragInProgress = false
     private struct ResizeEdges: OptionSet {
         let rawValue: Int
         static let left = ResizeEdges(rawValue: 1 << 0)
@@ -3459,6 +3464,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         composer.onSubmit = { [weak self] in self?.askClicked() }
         composer.onMeasuredHeight = { [weak self] height in self?.setComposerTextHeight(height) }
         (composerSurface as? ComposerSurfaceView)?.composer = composer
+        headerBar.onDragStateChanged = { [weak self] active in
+            self?.headerDragInProgress = active
+        }
         recordingButton.target = self
         recordingButton.action = #selector(recordingClicked)
         askButton.target = self
@@ -3689,6 +3697,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func isInteractiveAtScreenPoint(_ screenPoint: NSPoint) -> Bool {
+        if headerDragInProgress {
+            if NSEvent.pressedMouseButtons != 0 {
+                return true
+            }
+            headerDragInProgress = false
+        }
         guard let window else { return false }
         let windowPoint = window.convertPoint(fromScreen: screenPoint)
         let localPoint = convert(windowPoint, from: nil)
