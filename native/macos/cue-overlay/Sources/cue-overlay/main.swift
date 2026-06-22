@@ -544,6 +544,24 @@ private struct OverlaySessionItem {
 // Bluey should not consume those injected clicks.
 private let pinkyTrustedRemoteInputEventSourceUserData: Int64 = 0x70696e6b797231
 private let remoteInputPassthroughDefaultMs = 900
+private let remoteInputPassthroughHeuristicMs = 1_200
+private let remoteControlAppNeedles = [
+    "anydesk",
+    "chrome remote desktop",
+    "jump desktop",
+    "logmein",
+    "microsoft remote desktop",
+    "parsec",
+    "realvnc",
+    "remote desktop",
+    "remotix",
+    "rustdesk",
+    "screen sharing",
+    "screensharing",
+    "splashtop",
+    "teamviewer",
+    "vnc viewer",
+]
 
 /// Inbound commands from the daemon.
 private enum OverlayCommand {
@@ -6653,6 +6671,7 @@ private final class OverlayApp {
     private var expandedView: ExpandedPanelView?
     private var expandedPassthroughTimer: Timer?
     private var remoteInputPassthroughTimer: Timer?
+    private var remoteControlHeuristicTimer: Timer?
     private var trustedRemoteInputEventTap: CFMachPort?
     private var trustedRemoteInputRunLoopSource: CFRunLoopSource?
     private var remoteInputPassthroughUntil = 0.0
@@ -6699,6 +6718,7 @@ private final class OverlayApp {
         startParentWatchdog()
         startExpandedPassthroughTracking()
         startTrustedRemoteInputPassthroughMonitor()
+        startRemoteControlHeuristicMonitor()
         startIpcLoop()
     }
 
@@ -6832,6 +6852,44 @@ private final class OverlayApp {
         allowRemoteInputPassthrough(
             durationMs: remoteInputPassthroughDefaultMs,
             reason: "pinky-trusted-event")
+    }
+
+    fileprivate func remoteControlInputEventDetected(sourcePid: pid_t?) {
+        guard
+            let sourcePid,
+            sourcePid > 0,
+            sourcePid != getpid(),
+            let app = NSRunningApplication(processIdentifier: sourcePid),
+            let label = remoteControlAppLabel(app)
+        else { return }
+
+        if remoteInputPassthroughUntil - CACurrentMediaTime() > 0.20 {
+            return
+        }
+        allowRemoteInputPassthrough(
+            durationMs: remoteInputPassthroughHeuristicMs,
+            reason: "remote-control-event:\(label)")
+    }
+
+    private func startRemoteControlHeuristicMonitor() {
+        remoteControlHeuristicTimer?.invalidate()
+        remoteControlHeuristicTimer = Timer.scheduledTimer(withTimeInterval: 0.75, repeats: true) { [weak self] _ in
+            self?.armPassthroughForVisibleRemoteControlAppIfNeeded()
+        }
+        if let remoteControlHeuristicTimer {
+            RunLoop.main.add(remoteControlHeuristicTimer, forMode: .common)
+        }
+        emitLifecycle("remote_input_passthrough_heuristic", status: "ready")
+    }
+
+    private func armPassthroughForVisibleRemoteControlAppIfNeeded() {
+        guard let label = activeRemoteControlAppLabel() else { return }
+        if remoteInputPassthroughUntil - CACurrentMediaTime() > 0.25 {
+            return
+        }
+        allowRemoteInputPassthrough(
+            durationMs: remoteInputPassthroughHeuristicMs,
+            reason: "remote-control-app:\(label)")
     }
 
     private func startExpandedPassthroughTracking() {
@@ -7164,25 +7222,80 @@ private func cgEventMask(_ types: [CGEventType]) -> CGEventMask {
     return mask
 }
 
+private func activeRemoteControlAppLabel() -> String? {
+    guard let app = NSWorkspace.shared.frontmostApplication else { return nil }
+    guard app.processIdentifier != getpid() else { return nil }
+    return remoteControlAppLabel(app)
+}
+
+private func remoteControlAppLabel(_ app: NSRunningApplication) -> String? {
+    let name = app.localizedName ?? ""
+    let bundle = app.bundleIdentifier ?? ""
+    let executable = app.executableURL?.lastPathComponent ?? ""
+    let haystack = [name, bundle, executable]
+        .joined(separator: " ")
+        .lowercased()
+    guard remoteControlAppNeedles.contains(where: { haystack.contains($0) }) else {
+        return nil
+    }
+    return compactRemoteControlLabel(name: name, bundle: bundle, executable: executable)
+}
+
+private func compactRemoteControlLabel(name: String, bundle: String, executable: String) -> String {
+    let raw = [name, bundle, executable]
+        .first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        ?? "remote-control"
+    let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
+    let compact = raw.unicodeScalars.map { scalar -> Character in
+        allowed.contains(scalar) ? Character(scalar) : "-"
+    }
+    let value = String(compact).trimmingCharacters(in: CharacterSet(charactersIn: "-._"))
+    return value.isEmpty ? "remote-control" : String(value.prefix(48))
+}
+
+private func sourcePidForRemoteInputEvent(type: CGEventType, event: CGEvent) -> pid_t? {
+    let mouseDownOrGesture: Set<CGEventType> = [
+        .leftMouseDown, .leftMouseDragged,
+        .rightMouseDown, .rightMouseDragged,
+        .otherMouseDown, .otherMouseDragged,
+        .scrollWheel,
+    ]
+    guard mouseDownOrGesture.contains(type) else { return nil }
+    let pid = event.getIntegerValueField(.eventSourceUnixProcessID)
+    guard pid > 0, pid <= Int64(Int32.max) else { return nil }
+    return pid_t(pid)
+}
+
 private func blueyTrustedRemoteInputEventTapCallback(
     proxy: CGEventTapProxy,
     type: CGEventType,
     event: CGEvent,
     refcon: UnsafeMutableRawPointer?
 ) -> Unmanaged<CGEvent>? {
-    guard
-        let refcon,
-        event.getIntegerValueField(.eventSourceUserData) == pinkyTrustedRemoteInputEventSourceUserData
-    else {
+    guard let refcon else {
         return Unmanaged.passUnretained(event)
     }
 
+    let trustedPinkyEvent =
+        event.getIntegerValueField(.eventSourceUserData) == pinkyTrustedRemoteInputEventSourceUserData
+    let sourcePid = sourcePidForRemoteInputEvent(type: type, event: event)
+    guard trustedPinkyEvent || sourcePid != nil else {
+        return Unmanaged.passUnretained(event)
+    }
     let app = Unmanaged<OverlayApp>.fromOpaque(refcon).takeUnretainedValue()
     if Thread.isMainThread {
-        app.trustedRemoteInputEventDetected()
+        if trustedPinkyEvent {
+            app.trustedRemoteInputEventDetected()
+        } else {
+            app.remoteControlInputEventDetected(sourcePid: sourcePid)
+        }
     } else {
         DispatchQueue.main.sync {
-            app.trustedRemoteInputEventDetected()
+            if trustedPinkyEvent {
+                app.trustedRemoteInputEventDetected()
+            } else {
+                app.remoteControlInputEventDetected(sourcePid: sourcePid)
+            }
         }
     }
     return Unmanaged.passUnretained(event)
