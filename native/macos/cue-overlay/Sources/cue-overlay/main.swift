@@ -439,6 +439,9 @@ private final class ComposerTextView: NSTextView {
     }
 
     override func keyDown(with event: NSEvent) {
+        if handleEditingShortcut(event) {
+            return
+        }
         let chars = event.charactersIgnoringModifiers ?? ""
         let isReturn = event.keyCode == 36 || event.keyCode == 76 || chars == "\r" || chars == "\n"
         if isReturn {
@@ -454,7 +457,15 @@ private final class ComposerTextView: NSTextView {
         super.keyDown(with: event)
     }
 
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if handleEditingShortcut(event) {
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
     override func mouseDown(with event: NSEvent) {
+        window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(self)
         super.mouseDown(with: event)
     }
@@ -477,6 +488,33 @@ private final class ComposerTextView: NSTextView {
         let measured = ceil(used.height + textContainerInset.height * 2 + 6)
         onMeasuredHeight?(measured)
     }
+
+    private func handleEditingShortcut(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.contains(.command),
+              !flags.contains(.control),
+              !flags.contains(.option)
+        else {
+            return false
+        }
+
+        switch (event.charactersIgnoringModifiers ?? "").lowercased() {
+        case "a":
+            selectAll(nil)
+            return true
+        case "c":
+            copy(nil)
+            return true
+        case "v":
+            paste(nil)
+            return true
+        case "x":
+            cut(nil)
+            return true
+        default:
+            return false
+        }
+    }
 }
 
 private final class ComposerSurfaceView: NSView {
@@ -486,6 +524,7 @@ private final class ComposerSurfaceView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         if let composer {
+            window?.makeKeyAndOrderFront(nil)
             window?.makeFirstResponder(composer)
         }
         super.mouseDown(with: event)
@@ -1120,6 +1159,11 @@ private final class HeaderDragView: NSView {
     var onDragStateChanged: ((Bool) -> Void)?
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .openHand)
+    }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard !isHidden, alphaValue > 0.01, bounds.contains(point) else { return nil }
@@ -2935,6 +2979,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var preCanvasFullWindowFrame: NSRect?
     private var windowFullSize = false
     private var preWindowFullSizeFrame: NSRect?
+    private var passThroughMode = true
     private var headerDragInProgress = false
     private struct ResizeEdges: OptionSet {
         let rawValue: Int
@@ -3729,7 +3774,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func shouldReceiveMouseEvents(at screenPoint: NSPoint) -> Bool {
-        isInteractiveAtScreenPoint(screenPoint)
+        passThroughMode ? isInteractiveAtScreenPoint(screenPoint) : true
     }
 
     func manualButton(atWindowPoint point: NSPoint) -> NSButton? {
@@ -4469,7 +4514,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         canvasToggleButton.toolTip = "Open or collapse the canvas"
         balanceLabel.toolTip = "Remaining Bluey balance"
         fullSizeButton.toolTip = windowFullSize ? "Restore Bluey size" : "Make Bluey full size"
-        interactionModeButton.toolTip = "Controls-only click-through. Captions and answers pass through."
+        interactionModeButton.toolTip = passThroughMode
+            ? "Click-through on. Click to make the whole panel interactive."
+            : "Interactive on. Click to pass answer text and captions through."
         hideButton.toolTip = "Hide to pill"
         closeButton.toolTip = "Turn Bluey off. Run bluey on to start again."
         recordingButton.toolTip = "Start or stop listening"
@@ -4597,6 +4644,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     @objc private func interactionModeClicked() {
+        passThroughMode.toggle()
         updateInteractionModeChrome()
     }
 
@@ -5758,13 +5806,19 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func updateInteractionModeChrome(showToast: Bool = true) {
-        styleHeaderIconButton(interactionModeButton, symbol: "cursorarrow.rays", fallback: "P")
-        interactionModeButton.contentTintColor = BlueyTheme.cyan
-        interactionModeButton.toolTip = "Controls-only click-through. Captions and answers pass through."
+        let symbol = passThroughMode ? "cursorarrow.rays" : "hand.tap"
+        let fallback = passThroughMode ? "P" : "I"
+        styleHeaderIconButton(interactionModeButton, symbol: symbol, fallback: fallback)
+        interactionModeButton.contentTintColor = passThroughMode ? BlueyTheme.cyan : BlueyTheme.text
+        interactionModeButton.toolTip = passThroughMode
+            ? "Click-through on. Click to make the whole panel interactive."
+            : "Interactive on. Click to pass answer text and captions through."
         if showToast {
             showSystemToast(
-                title: "Controls-only click-through",
-                body: "Only buttons, composer, drawers, dialogs, and canvas controls catch clicks.",
+                title: passThroughMode ? "Click-through on" : "Interactive on",
+                body: passThroughMode
+                    ? "Answer text, captions, and empty space pass through. Controls stay clickable."
+                    : "The whole panel receives clicks for selection, scrolling, and editing.",
                 duration: 2.0)
         }
     }

@@ -20,7 +20,10 @@ if [ ! -x "$BLUEY_BIN" ]; then
 fi
 
 daemon_running() {
-    "$BLUEY_BIN" status 2>/dev/null | grep -q '"pid"'
+    local status
+    status="$("$BLUEY_BIN" status 2>&1 || true)"
+    printf '%s\n' "$status" | grep -q '"pid"' \
+        && ! printf '%s\n' "$status" | grep -qi 'IPC is not reachable'
 }
 
 "$BLUEY_BIN" off >/dev/null 2>&1 || true
