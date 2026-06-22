@@ -3970,7 +3970,7 @@ async fn answer_with_provider_runtime(
     promote_request_to_vision_for_screen_context(&daemon.paths, &mut request);
 
     let (visible_question_title, visible_question) =
-        visible_question_for_source(&request.question, &source);
+        visible_question_for_source(&request.question, &source, &request.context);
     let question_card = CueCard::new(
         CardKind::Question,
         visible_question_title.clone(),
@@ -4442,15 +4442,79 @@ fn numbered_list_prefix(line: &str) -> bool {
         && matches!(chars.next(), Some(ch) if ch.is_whitespace())
 }
 
-fn visible_question_for_source(question: &str, source: &str) -> (String, String) {
-    match source {
+fn visible_question_for_source(
+    question: &str,
+    source: &str,
+    context: &[AnswerContext],
+) -> (String, String) {
+    let (title, body) = match source {
         "overlay analyse" => (
             "Analyse Screen".to_string(),
             "Analyse the current browser page or screen context.".to_string(),
         ),
         "overlay screenshot analyse" => ("Question".to_string(), question.to_string()),
         _ => ("Question".to_string(), question.to_string()),
+    };
+    (title, visible_question_with_attachments(body, context))
+}
+
+fn visible_question_with_attachments(question: String, context: &[AnswerContext]) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut attachments = Vec::new();
+    let mut total = 0usize;
+
+    for item in context {
+        let label = match item.kind {
+            AnswerContextKind::Document => "File",
+            AnswerContextKind::Screenshot => "Screen",
+            _ => continue,
+        };
+        let title = visible_context_title(item, label);
+        let key = format!(
+            "{label}:{title}:{}",
+            item.source.as_deref().unwrap_or_default()
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        total += 1;
+        if attachments.len() < 5 {
+            attachments.push(format!("{label}: {title}"));
+        }
     }
+
+    if attachments.is_empty() {
+        return question;
+    }
+
+    let mut body = question.trim().to_string();
+    if body.is_empty() {
+        body.push_str("Answer using the attached context.");
+    }
+    body.push_str("\n\nAttached to this answer:");
+    for attachment in attachments {
+        body.push_str("\n- ");
+        body.push_str(&attachment);
+    }
+    if total > 5 {
+        body.push_str(&format!("\n- +{} more", total - 5));
+    }
+    body
+}
+
+fn visible_context_title(item: &AnswerContext, fallback: &str) -> String {
+    item.title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+        .map(|title| title.trim().to_string())
+        .or_else(|| {
+            item.source
+                .as_deref()
+                .and_then(|source| Path::new(source).file_name())
+                .and_then(|name| name.to_str())
+                .map(|name| name.to_string())
+        })
+        .unwrap_or_else(|| fallback.to_string())
 }
 
 struct AnswerRouteOutcome {
@@ -8571,7 +8635,7 @@ mod tests {
 
     #[test]
     fn overlay_question_cards_are_titled_question() {
-        let (title, body) = visible_question_for_source("What changed?", "overlay ask");
+        let (title, body) = visible_question_for_source("What changed?", "overlay ask", &[]);
 
         assert_eq!(title, "Question");
         assert_eq!(body, "What changed?");
@@ -8579,10 +8643,35 @@ mod tests {
 
     #[test]
     fn overlay_screen_analysis_cards_keep_specific_title() {
-        let (title, body) = visible_question_for_source("Analyse everything", "overlay analyse");
+        let (title, body) =
+            visible_question_for_source("Analyse everything", "overlay analyse", &[]);
 
         assert_eq!(title, "Analyse Screen");
         assert_eq!(body, "Analyse the current browser page or screen context.");
+    }
+
+    #[test]
+    fn overlay_question_cards_show_sent_context_attachments() {
+        let context = vec![
+            AnswerContext::new(AnswerContextKind::Transcript, "latest caption")
+                .with_title("Meeting transcript"),
+            AnswerContext::new(AnswerContextKind::Document, "doc preview")
+                .with_title("Design brief.pdf")
+                .with_source("/tmp/Design brief.pdf"),
+            AnswerContext::new(AnswerContextKind::Screenshot, "screen preview")
+                .with_title("Screen context")
+                .with_source("/tmp/bluey-screen.png"),
+        ];
+
+        let (title, body) =
+            visible_question_for_source("What should I say?", "overlay ask", &context);
+
+        assert_eq!(title, "Question");
+        assert!(body.contains("What should I say?"));
+        assert!(body.contains("Attached to this answer:"));
+        assert!(body.contains("- File: Design brief.pdf"));
+        assert!(body.contains("- Screen: Screen context"));
+        assert!(!body.contains("Meeting transcript"));
     }
 
     #[test]

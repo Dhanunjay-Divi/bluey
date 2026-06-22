@@ -2862,6 +2862,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var knowledgeIndexTimer: Timer?
     private var knowledgeIndexFrame = 0
     private var knowledgeBadgeContentVisible = false
+    private var hasVisibleContextAttachments = false
+    private var screenContextReadyForAnswer = false
     private var audioPulseTimer: Timer?
     private var audioPulseFrame = 0
     private var attachPickerPending = false
@@ -4786,12 +4788,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     @objc private func askClicked() {
         let raw = composer.string.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let q = composedQuestionForAnswer(typed: raw) else {
+        guard let q = composedQuestionForAnswer(typed: raw) ?? fallbackQuestionForAttachedContext() else {
             showSystemToast(for: RenderedCard(
                 id: "empty-answer-\(UUID().uuidString)",
                 kind: "system",
                 title: "Nothing to answer yet",
-                body: "Type a question or start Listen so Bluey has transcript context.",
+                body: "Type a question, start Listen, attach a document, or capture the screen first.",
                 done: true,
                 costLabel: nil,
                 artifact: nil))
@@ -4803,6 +4805,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let route = selectedRoute()
         updateRouteBadge(for: q, selectedRoute: route)
         emitAsk(question: q, provider: route.provider, model: route.model, mode: route.mode)
+        screenContextReadyForAnswer = false
         window?.makeFirstResponder(composer)
     }
 
@@ -4812,6 +4815,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         routeBadge.stringValue = "Screen · ready"
         routeBadge.textColor = BlueyTheme.cyan
         setHeaderSubtitle("Capturing screen")
+        screenContextReadyForAnswer = true
         emitAnalyzeScreen(question: question)
         window?.makeFirstResponder(composer)
     }
@@ -5285,6 +5289,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     func setContextItems(_ items: [OverlayContextItem]) {
         endAttachPickerHandoff()
+        hasVisibleContextAttachments = !items.isEmpty
         for view in attachmentStack.arrangedSubviews {
             attachmentStack.removeArrangedSubview(view)
             view.removeFromSuperview()
@@ -5993,6 +5998,19 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         Live captions context:
         \(transcript)
         """
+    }
+
+    private func fallbackQuestionForAttachedContext() -> String? {
+        if screenContextReadyForAnswer && hasVisibleContextAttachments {
+            return "Answer using the attached screen capture, documents, and current session context."
+        }
+        if screenContextReadyForAnswer {
+            return "Analyse the attached screen capture and answer with the key details."
+        }
+        if hasVisibleContextAttachments {
+            return "Answer using the attached documents and current session context."
+        }
+        return nil
     }
 
     private func compactTranscriptQuestionLines(_ lines: [String]) -> [String] {
