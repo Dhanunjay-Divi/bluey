@@ -1671,9 +1671,13 @@ private struct CanvasArtifact {
     let sourceCardId: String
 }
 
+private final class FlippedStackView: NSStackView {
+    override var isFlipped: Bool { true }
+}
+
 private final class FeedView: NSView {
     private var cards: [RenderedCard] = []
-    private let stack = NSStackView()
+    private let stack = FlippedStackView()
     private let scroll = NSScrollView()
     private let emptyState = NSView()
     private var userScrolledAwayFromLatest = false
@@ -1699,6 +1703,7 @@ private final class FeedView: NSView {
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
         scroll.scrollerStyle = .overlay
+        scroll.verticalScrollElasticity = .allowed
         scroll.borderType = .noBorder
         scroll.drawsBackground = false
         scroll.contentInsets = NSEdgeInsets(top: 8, left: 0, bottom: 10, right: 0)
@@ -1708,6 +1713,12 @@ private final class FeedView: NSView {
         scroll.layer?.masksToBounds = true
         scroll.contentView.wantsLayer = true
         scroll.contentView.layer?.masksToBounds = true
+        scroll.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(scrollContentBoundsDidChange(_:)),
+            name: NSView.boundsDidChangeNotification,
+            object: scroll.contentView)
         addSubview(scroll)
         configureEmptyState()
         NSLayoutConstraint.activate([
@@ -1715,10 +1726,18 @@ private final class FeedView: NSView {
             scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
-            stack.widthAnchor.constraint(equalTo: scroll.widthAnchor),
+            stack.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            stack.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            stack.trailingAnchor.constraint(equalTo: scroll.contentView.trailingAnchor),
+            stack.bottomAnchor.constraint(greaterThanOrEqualTo: scroll.contentView.bottomAnchor),
+            stack.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
         ])
     }
     required init?(coder: NSCoder) { fatalError() }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
@@ -1785,6 +1804,10 @@ private final class FeedView: NSView {
     override func scrollWheel(with event: NSEvent) {
         scroll.scrollWheel(with: event)
         updateScrollPinAfterUserInput()
+    }
+
+    @objc private func scrollContentBoundsDidChange(_ notification: Notification) {
+        userScrolledAwayFromLatest = !isScrolledNearLatest()
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
@@ -2942,7 +2965,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         drawerCloseButton = NSButton(title: "", target: nil, action: nil)
         latestSessionButton = NSButton(title: "Continue latest", target: nil, action: nil)
         sessionScroll = NSScrollView()
-        sessionStack = NSStackView()
+        sessionStack = FlippedStackView()
         answerStyleOverlay = ModalBlockerView()
         answerStylePanel = NSView()
         answerStyleLabel = NSTextField(labelWithString: "How Bluey should answer")
@@ -3257,8 +3280,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             sessionStack.leadingAnchor.constraint(equalTo: sessionScroll.contentView.leadingAnchor),
             sessionStack.topAnchor.constraint(equalTo: sessionScroll.contentView.topAnchor),
             sessionStack.trailingAnchor.constraint(equalTo: sessionScroll.contentView.trailingAnchor),
-            sessionStack.bottomAnchor.constraint(lessThanOrEqualTo: sessionScroll.contentView.bottomAnchor),
-            sessionStack.widthAnchor.constraint(equalTo: sessionScroll.widthAnchor),
+            sessionStack.bottomAnchor.constraint(greaterThanOrEqualTo: sessionScroll.contentView.bottomAnchor),
+            sessionStack.widthAnchor.constraint(equalTo: sessionScroll.contentView.widthAnchor),
 
             answerStyleOverlay.topAnchor.constraint(equalTo: topAnchor),
             answerStyleOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -4345,6 +4368,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         sessionScroll.hasVerticalScroller = true
         sessionScroll.hasHorizontalScroller = false
         sessionScroll.autohidesScrollers = true
+        sessionScroll.verticalScrollElasticity = .allowed
         sessionScroll.borderType = .noBorder
         sessionScroll.documentView = sessionStack
         sessionScroll.scrollerStyle = .overlay

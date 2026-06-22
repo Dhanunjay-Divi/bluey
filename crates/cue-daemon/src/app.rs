@@ -940,6 +940,9 @@ async fn handle_request_inner(
                 } else {
                     let segment = TranscriptSegment::new(speaker, text, is_final);
                     meeting.transcript.push(segment.clone());
+                    if segment.is_final {
+                        maybe_autoname_meeting(meeting, &segment.text);
+                    }
 
                     let analysis = analyze_segment(&segment, meeting);
                     meeting.action_items.extend(analysis.action_items);
@@ -1389,6 +1392,9 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             daemon.state.lock().await.overlay_capture_excluded = Some(capture_excluded);
             write_state(daemon).await?;
             if let Some(meeting) = daemon.meeting.lock().await.clone() {
+                if meeting_has_overlay_history(&meeting) {
+                    hydrate_overlay_meeting_history(daemon, &meeting).await;
+                }
                 refresh_overlay_context_items(daemon, &meeting).await;
             }
             refresh_overlay_sessions(daemon).await;
@@ -3157,6 +3163,224 @@ fn plural_s(count: usize) -> &'static str {
     }
 }
 
+fn is_generic_meeting_title(title: &str) -> bool {
+    let normalized = title.trim().to_ascii_lowercase();
+    normalized.is_empty()
+        || matches!(
+            normalized.as_str(),
+            "new recording" | "bluey session" | "ad hoc meeting" | "ad hoc audio meeting"
+        )
+        || normalized.starts_with("new recording ")
+        || normalized.starts_with("ad hoc ")
+}
+
+fn maybe_autoname_meeting(meeting: &mut MeetingRecord, seed: &str) -> bool {
+    if !is_generic_meeting_title(&meeting.title) {
+        return false;
+    }
+    let Some(title) = suggested_meeting_title(seed) else {
+        return false;
+    };
+    meeting.title = title;
+    true
+}
+
+fn suggested_meeting_title(seed: &str) -> Option<String> {
+    let cleaned = seed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !line.eq_ignore_ascii_case("question"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cleaned.trim().is_empty() {
+        return None;
+    }
+
+    let mut meaningful = Vec::new();
+    let mut fallback = Vec::new();
+    for token in cleaned.split(|ch: char| {
+        !(ch.is_alphanumeric() || ch == '#' || ch == '+' || ch == '-' || ch == '_')
+    }) {
+        let token = token.trim_matches(|ch: char| ch == '-' || ch == '_');
+        if token.len() < 2 {
+            continue;
+        }
+        let lower = token.to_ascii_lowercase();
+        if !SESSION_TITLE_STOP_WORDS.contains(&lower.as_str()) {
+            meaningful.push(title_word(token));
+        }
+        fallback.push(title_word(token));
+        if meaningful.len() >= 6 {
+            break;
+        }
+    }
+
+    let words = if meaningful.is_empty() {
+        fallback.into_iter().take(5).collect::<Vec<_>>()
+    } else {
+        meaningful
+    };
+    let title = words.join(" ");
+    let title = title.trim();
+    if title.is_empty() {
+        None
+    } else {
+        Some(truncate_title(title, 54))
+    }
+}
+
+fn title_word(token: &str) -> String {
+    if token.chars().any(|ch| ch.is_ascii_uppercase())
+        || token.chars().any(|ch| ch.is_ascii_digit())
+    {
+        return token.to_string();
+    }
+    let mut chars = token.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    format!(
+        "{}{}",
+        first.to_uppercase(),
+        chars.as_str().to_ascii_lowercase()
+    )
+}
+
+fn truncate_title(title: &str, max_chars: usize) -> String {
+    if title.chars().count() <= max_chars {
+        return title.to_string();
+    }
+    let mut out = title
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    if let Some(last_space) = out.rfind(' ') {
+        if last_space >= 12 {
+            out.truncate(last_space);
+        }
+    }
+    out.trim_end_matches(['-', '_', ' ']).to_string()
+}
+
+const SESSION_TITLE_STOP_WORDS: &[&str] = &[
+    "about",
+    "after",
+    "again",
+    "and",
+    "answer",
+    "anything",
+    "because",
+    "can",
+    "could",
+    "explain",
+    "from",
+    "give",
+    "gonna",
+    "have",
+    "hello",
+    "hi",
+    "help",
+    "here",
+    "just",
+    "know",
+    "like",
+    "maybe",
+    "need",
+    "please",
+    "question",
+    "should",
+    "show",
+    "so",
+    "some",
+    "something",
+    "tell",
+    "that",
+    "their",
+    "there",
+    "these",
+    "this",
+    "those",
+    "today",
+    "tomorrow",
+    "want",
+    "wanna",
+    "we",
+    "what",
+    "when",
+    "where",
+    "which",
+    "with",
+    "would",
+    "yeah",
+    "your",
+];
+
+fn overlay_history_cards_for_meeting(meeting: &MeetingRecord) -> Vec<CueCard> {
+    let mut cards = Vec::new();
+    for turn in &meeting.conversation {
+        let question_source = turn
+            .source
+            .as_ref()
+            .filter(|source| !source.trim().is_empty())
+            .cloned()
+            .unwrap_or_else(|| "session history".to_string());
+        cards.push(
+            CueCard::new(CardKind::Question, "Question", turn.question.clone())
+                .with_source(question_source),
+        );
+
+        let answer_source = turn
+            .provider
+            .as_ref()
+            .filter(|provider| !provider.trim().is_empty())
+            .map(|provider| format!("session history ({provider})"))
+            .unwrap_or_else(|| "session history".to_string());
+        cards.push(
+            CueCard::new(CardKind::Answer, "Bluey", turn.answer.clone()).with_source(answer_source),
+        );
+    }
+
+    if cards.is_empty() {
+        let transcript = meeting.last_transcript_text_bounded(40, 6_000);
+        if !transcript.trim().is_empty() {
+            cards.push(
+                CueCard::new(CardKind::System, "Transcript", transcript)
+                    .with_source("session history"),
+            );
+        }
+    }
+
+    if cards.is_empty() {
+        let context_count = meeting.context.len();
+        let body = if context_count == 0 {
+            "This recording does not have saved messages yet.".to_string()
+        } else {
+            format!(
+                "This recording has {} attached file{} but no saved answer messages yet.",
+                context_count,
+                plural_s(context_count)
+            )
+        };
+        cards.push(
+            CueCard::new(CardKind::System, "Session loaded", body).with_source("session history"),
+        );
+    }
+
+    cards
+}
+
+fn meeting_has_overlay_history(meeting: &MeetingRecord) -> bool {
+    !meeting.conversation.is_empty() || !meeting.transcript.is_empty()
+}
+
+async fn hydrate_overlay_meeting_history(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
+    let _ = send_overlay(daemon, OverlayCommand::Clear).await;
+    for card in overlay_history_cards_for_meeting(meeting) {
+        let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
+    }
+}
+
 fn overlay_context_items(meeting: &MeetingRecord) -> Vec<OverlayContextItem> {
     meeting
         .context
@@ -4100,6 +4324,7 @@ async fn answer_with_provider_runtime(
                 Some(source.clone()),
                 Some(outcome.provider.display_label()),
             ));
+            maybe_autoname_meeting(meeting, &request.question);
             daemon.store.save_active(meeting)?;
             meeting.clone()
         } else {
@@ -6466,7 +6691,13 @@ async fn attach_context_artifacts(
         }
 
         let meeting = meeting_guard.as_mut().expect("meeting exists");
+        let title_seed = artifacts
+            .iter()
+            .map(|artifact| artifact.title.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
         meeting.context.extend(artifacts);
+        maybe_autoname_meeting(meeting, &title_seed);
         daemon.store.save_active(meeting)?;
         meeting.clone()
     };
@@ -6560,7 +6791,7 @@ async fn continue_session(
         }
     };
 
-    let (meeting, title, body, should_warm_memory) = match outcome {
+    let (meeting, title, body, should_warm_memory, should_hydrate_history) = match outcome {
         ContinueOutcome::Active(meeting) => {
             let body = format!(
                 "Continuing {} with {} transcript segment(s) and {} context item(s).",
@@ -6568,7 +6799,7 @@ async fn continue_session(
                 meeting.transcript.len(),
                 meeting.context.len()
             );
-            (meeting, "Session continued", body, true)
+            (meeting, "Session continued", body, true, false)
         }
         ContinueOutcome::Restored(meeting) => {
             let body = format!(
@@ -6577,13 +6808,13 @@ async fn continue_session(
                 meeting.transcript.len(),
                 meeting.context.len()
             );
-            (meeting, "Session loaded", body, true)
+            (meeting, "Session loaded", body, true, true)
         }
         ContinueOutcome::Created(meeting) => {
             let body = format!(
                 "Started a new session from {source}. Attach docs/page context when needed."
             );
-            (meeting, "Session started", body, false)
+            (meeting, "Session started", body, false, false)
         }
     };
 
@@ -6591,6 +6822,9 @@ async fn continue_session(
         reindex_meeting_for_rag(daemon, meeting.clone());
     }
     update_state_from_meeting(daemon, Some(&meeting)).await?;
+    if should_hydrate_history {
+        hydrate_overlay_meeting_history(daemon, &meeting).await;
+    }
     refresh_overlay_context_items(daemon, &meeting).await;
     refresh_overlay_sessions(daemon).await;
     push_system_card(daemon, CardKind::System, title, body).await;
@@ -6628,23 +6862,12 @@ async fn open_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<Me
 
     reindex_meeting_for_rag(daemon, selected.clone());
     update_state_from_meeting(daemon, Some(&selected)).await?;
+    hydrate_overlay_meeting_history(daemon, &selected).await;
     refresh_overlay_context_items(daemon, &selected).await;
     refresh_overlay_sessions(daemon).await;
-    push_system_card(
-        daemon,
-        CardKind::System,
-        "Session loaded",
-        format!(
-            "Continuing {}.\n{} transcript segment(s), {} context item(s).{}",
-            selected.title,
-            selected.transcript.len(),
-            selected.context.len(),
-            archived_summary
-                .map(|summary| format!("\n{summary}"))
-                .unwrap_or_default()
-        ),
-    )
-    .await;
+    if let Some(summary) = archived_summary {
+        debug!(summary = %summary, "active session archived while opening saved session");
+    }
     write_state(daemon).await?;
     Ok(selected)
 }
@@ -8400,6 +8623,51 @@ fn build_recap_llm_from_env() -> Option<Box<dyn cue_llm::LlmProvider>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suggested_meeting_title_uses_context_words() {
+        assert_eq!(
+            suggested_meeting_title("Hi. So I wanna know about DDoS attacks."),
+            Some("DDoS Attacks".to_string())
+        );
+        assert_eq!(
+            suggested_meeting_title("please explain PostgreSQL pgvector scaling"),
+            Some("PostgreSQL Pgvector Scaling".to_string())
+        );
+    }
+
+    #[test]
+    fn generic_meeting_titles_are_autonamed_once() {
+        let mut meeting = MeetingRecord::new(Some("New recording".to_string()));
+        assert!(maybe_autoname_meeting(
+            &mut meeting,
+            "can we design redis and postgres architecture"
+        ));
+        assert_eq!(meeting.title, "Design Redis Postgres Architecture");
+        assert!(!maybe_autoname_meeting(
+            &mut meeting,
+            "replace with something else"
+        ));
+        assert_eq!(meeting.title, "Design Redis Postgres Architecture");
+    }
+
+    #[test]
+    fn overlay_history_cards_replay_saved_conversation() {
+        let mut meeting = MeetingRecord::new(Some("DDoS Attacks".to_string()));
+        meeting.push_conversation_turn(ConversationTurn::new(
+            "What is a DDoS attack?",
+            "A DDoS floods a target from many sources.",
+            Some("overlay ask".to_string()),
+            Some("OpenAI".to_string()),
+        ));
+
+        let cards = overlay_history_cards_for_meeting(&meeting);
+        assert_eq!(cards.len(), 2);
+        assert!(matches!(cards[0].kind, CardKind::Question));
+        assert_eq!(cards[0].body, "What is a DDoS attack?");
+        assert!(matches!(cards[1].kind, CardKind::Answer));
+        assert!(cards[1].body.contains("DDoS floods"));
+    }
 
     #[test]
     fn provider_messages_include_image_parts_when_route_allows_upload() {
