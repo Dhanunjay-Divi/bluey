@@ -2830,6 +2830,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var recordingActive = false
     private var transcriptSnippets: [String] = []
     private var latestLiveTranscriptLine: String?
+    private var liveTranscriptPreviewBodies: [String: String] = [:]
     private var consumedTranscriptFingerprints: [String] = []
     private var lastTranscriptStripSource: String?
     private var sessionItems: [OverlaySessionItem] = []
@@ -3751,6 +3752,18 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func hitsPassThroughInteractiveRegion(at localPoint: NSPoint, screenPoint: NSPoint) -> Bool {
+        let headerZone = rectForView(headerBar).insetBy(dx: -18, dy: -14)
+        if headerZone.contains(localPoint) {
+            return true
+        }
+        let composerZone = rectForView(composerBar).insetBy(dx: -18, dy: -18)
+        if composerZone.contains(localPoint) {
+            return true
+        }
+        let transcriptZone = rectForView(transcriptStrip).insetBy(dx: -8, dy: -8)
+        if transcriptZone.contains(localPoint) {
+            return true
+        }
         if hitsExplicitInteractiveChrome(at: localPoint) {
             return true
         }
@@ -5823,10 +5836,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         guard !body.isEmpty else { return }
 
         let label = transcriptSourceLabel(title)
+        let preview = mergedLiveTranscriptPreview(label: label, body: body, final: true)
         rememberTranscriptForAnswer(label: label, body: body, final: true)
         updateLiveTranscriptStrip(
             label: label,
-            body: body,
+            body: preview,
             state: recordingActive ? "TRANSCRIBING" : "CAPTURED",
             active: recordingActive,
             scrollToEnd: true)
@@ -5846,13 +5860,25 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 scrollToEnd: false)
             return
         }
+        let preview = mergedLiveTranscriptPreview(label: label, body: body, final: final)
         rememberTranscriptForAnswer(label: label, body: body, final: final)
         updateLiveTranscriptStrip(
             label: label,
-            body: body,
+            body: preview,
             state: state,
             active: recordingActive,
             scrollToEnd: true)
+    }
+
+    private func mergedLiveTranscriptPreview(label: String, body: String, final: Bool) -> String {
+        let cleanLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanLabel.isEmpty, !cleanBody.isEmpty else { return cleanBody }
+        let existing = liveTranscriptPreviewBodies[cleanLabel]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let merged: String
+        merged = mergedTranscriptBody(existing, cleanBody)
+        liveTranscriptPreviewBodies[cleanLabel] = merged
+        return merged
     }
 
     private func updateLiveTranscriptStrip(
@@ -5864,19 +5890,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     ) {
         let cleanBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
-        let sourceChanged = cleanLabel != lastTranscriptStripSource
-        if sourceChanged {
-            lastTranscriptStripSource = cleanLabel
-            setTranscriptState(cleanLabel.isEmpty ? state : cleanLabel, active: active)
-        } else {
-            setTranscriptState(state, active: active)
-        }
+        lastTranscriptStripSource = cleanLabel
+        setTranscriptState(active ? "TRANSCRIBING" : state, active: active)
         guard !cleanBody.isEmpty else {
             updateTranscriptStripText(cleanLabel.isEmpty ? "Listening" : "\(cleanLabel) audio is live", scrollToEnd: false)
             return
         }
 
-        updateTranscriptStripText(cleanBody, scrollToEnd: scrollToEnd)
+        let display = cleanLabel.isEmpty ? cleanBody : "\(cleanLabel): \(cleanBody)"
+        updateTranscriptStripText(display, scrollToEnd: scrollToEnd)
     }
 
     private func rememberTranscriptForAnswer(label: String, body: String, final: Bool) {
@@ -5934,6 +5956,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
         transcriptSnippets.removeAll()
         latestLiveTranscriptLine = nil
+        liveTranscriptPreviewBodies.removeAll()
     }
 
     private func composedQuestionForAnswer(typed raw: String) -> String? {
@@ -6100,6 +6123,18 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 .font: font,
                 .foregroundColor: BlueyTheme.text,
             ])
+        if let colon = attributed.string.firstIndex(of: ":") {
+            let labelLength = attributed.string.distance(from: attributed.string.startIndex, to: colon)
+            if labelLength > 0, labelLength <= 24 {
+                attributed.addAttributes(
+                    [
+                        .font: sourceFont,
+                        .foregroundColor: BlueyTheme.green,
+                    ],
+                    range: NSRange(location: 0, length: labelLength))
+                return attributed
+            }
+        }
         for label in ["Transcribing", "Captured", "Heard", "Starting", "Mic", "System", "Audio"]
             where attributed.string.hasPrefix(label) || attributed.string == label {
             let range = NSRange(location: 0, length: label.count)
