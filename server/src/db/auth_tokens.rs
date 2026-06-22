@@ -49,7 +49,8 @@ pub fn mint(pool: &DbPool, account_id: &str, kind: TokenKind) -> Result<String> 
     crate::db::run_blocking_db(|| {
         let raw = random_token();
         let hash = hash_token(&raw);
-        let expires_at = (Utc::now() + Duration::hours(TOKEN_VALIDITY_HOURS)).to_rfc3339();
+        let expires_at = Utc::now() + Duration::hours(TOKEN_VALIDITY_HOURS);
+        let expires_at_text = expires_at.to_rfc3339();
         match pool {
             DbPool::Sqlite(_) => {
                 let conn = pool.get()?;
@@ -58,7 +59,7 @@ pub fn mint(pool: &DbPool, account_id: &str, kind: TokenKind) -> Result<String> 
                         "INSERT INTO {} (token_hash, account_id, expires_at) VALUES (?1, ?2, ?3)",
                         kind.table()
                     ),
-                    params![hash, account_id, expires_at],
+                    params![hash, account_id, expires_at_text],
                 )?;
             }
             DbPool::Postgres(_) => {
@@ -82,7 +83,8 @@ pub fn mint(pool: &DbPool, account_id: &str, kind: TokenKind) -> Result<String> 
 pub fn consume(pool: &DbPool, raw: &str, kind: TokenKind) -> Result<Option<String>> {
     crate::db::run_blocking_db(|| {
         let hash = hash_token(raw);
-        let now = Utc::now().to_rfc3339();
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
         match pool {
             DbPool::Sqlite(_) => {
                 let conn = pool.get()?;
@@ -97,7 +99,7 @@ pub fn consume(pool: &DbPool, raw: &str, kind: TokenKind) -> Result<Option<Strin
                           RETURNING account_id",
                             kind.table()
                         ),
-                        params![hash, now],
+                        params![hash, now_text],
                         |r| r.get::<_, String>(0),
                     )
                     .ok();
@@ -111,7 +113,7 @@ pub fn consume(pool: &DbPool, raw: &str, kind: TokenKind) -> Result<Option<Strin
                         SET consumed_at = now()
                       WHERE token_hash = $1
                         AND consumed_at IS NULL
-                        AND expires_at > $2::timestamptz
+                        AND expires_at > $2
                       RETURNING account_id",
                         kind.table()
                     ),

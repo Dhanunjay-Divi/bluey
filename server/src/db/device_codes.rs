@@ -25,8 +25,10 @@ pub fn insert(pool: &DbPool, device_code: &str, user_code: &str, expires_at: &st
             }
             DbPool::Postgres(_) => {
                 let mut conn = pool.get_pg()?;
+                let expires_at =
+                    chrono::DateTime::parse_from_rfc3339(expires_at)?.with_timezone(&chrono::Utc);
                 conn.execute(
-                "INSERT INTO device_codes (device_code, user_code, expires_at) VALUES ($1, $2, $3::timestamptz)",
+                "INSERT INTO device_codes (device_code, user_code, expires_at) VALUES ($1, $2, $3)",
                 &[&device_code, &user_code, &expires_at],
             )?;
             }
@@ -114,9 +116,10 @@ pub fn approve_user_code(
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
+            let now = chrono::DateTime::parse_from_rfc3339(now)?.with_timezone(&chrono::Utc);
             let updated = conn.execute(
                 "UPDATE device_codes SET approved = 1, account_id = $1
-                 WHERE user_code = $2 AND expires_at > $3::timestamptz AND approved = 0",
+                 WHERE user_code = $2 AND expires_at > $3 AND approved = 0",
                 &[&account_id, &user_code, &now],
             )?;
             Ok(updated > 0)

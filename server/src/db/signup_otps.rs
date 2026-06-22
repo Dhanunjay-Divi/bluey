@@ -39,9 +39,11 @@ pub fn upsert(
             }
             DbPool::Postgres(_) => {
                 let mut conn = pool.get_pg()?;
+                let expires_at =
+                    chrono::DateTime::parse_from_rfc3339(expires_at)?.with_timezone(&chrono::Utc);
                 conn.execute(
                     "INSERT INTO signup_otps (email, otp_hash, password_hash, attempts, expires_at)
-                 VALUES ($1, $2, $3, 0, $4::timestamptz)
+                 VALUES ($1, $2, $3, 0, $4)
                  ON CONFLICT(email) DO UPDATE SET
                     otp_hash = excluded.otp_hash,
                     password_hash = excluded.password_hash,

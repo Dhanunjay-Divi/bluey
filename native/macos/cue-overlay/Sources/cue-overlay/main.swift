@@ -2016,11 +2016,82 @@ private final class FeedView: NSView {
         emptyState.layer?.backgroundColor = NSColor.clear.cgColor
         addSubview(emptyState)
 
+        let badge = NSTextField(labelWithString: "READY")
+        badge.translatesAutoresizingMaskIntoConstraints = false
+        badge.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .bold)
+        badge.textColor = BlueyTheme.cyan
+
+        let title = NSTextField(labelWithString: "Ready")
+        title.translatesAutoresizingMaskIntoConstraints = false
+        title.font = NSFont.systemFont(ofSize: 18, weight: .bold)
+        title.textColor = BlueyTheme.text
+        title.alignment = .center
+
+        let subtitle = NSTextField(labelWithString: "Ask anything. Attach documents or analyse the screen when context helps.")
+        subtitle.translatesAutoresizingMaskIntoConstraints = false
+        subtitle.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        subtitle.textColor = BlueyTheme.textDim
+        subtitle.alignment = .center
+        subtitle.maximumNumberOfLines = 2
+        subtitle.lineBreakMode = .byWordWrapping
+
+        let dropTarget = NSView()
+        dropTarget.translatesAutoresizingMaskIntoConstraints = false
+        dropTarget.wantsLayer = true
+        dropTarget.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.035).cgColor
+        dropTarget.layer?.cornerRadius = 13
+        dropTarget.layer?.borderWidth = 1
+        dropTarget.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.24).cgColor
+
+        let dropTitle = NSTextField(labelWithString: "Drop documents here")
+        dropTitle.translatesAutoresizingMaskIntoConstraints = false
+        dropTitle.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
+        dropTitle.textColor = BlueyTheme.text
+        dropTitle.alignment = .center
+
+        let dropHint = NSTextField(labelWithString: "PDF, DOCX, TXT, MD, code")
+        dropHint.translatesAutoresizingMaskIntoConstraints = false
+        dropHint.font = NSFont.systemFont(ofSize: 10, weight: .medium)
+        dropHint.textColor = BlueyTheme.textDim
+        dropHint.alignment = .center
+
+        emptyState.addSubview(badge)
+        emptyState.addSubview(title)
+        emptyState.addSubview(subtitle)
+        emptyState.addSubview(dropTarget)
+        dropTarget.addSubview(dropTitle)
+        dropTarget.addSubview(dropHint)
+
         NSLayoutConstraint.activate([
             emptyState.centerXAnchor.constraint(equalTo: centerXAnchor),
-            emptyState.centerYAnchor.constraint(equalTo: centerYAnchor),
-            emptyState.widthAnchor.constraint(equalToConstant: 1),
-            emptyState.heightAnchor.constraint(equalToConstant: 1),
+            emptyState.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -12),
+            emptyState.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.76),
+
+            badge.topAnchor.constraint(equalTo: emptyState.topAnchor),
+            badge.centerXAnchor.constraint(equalTo: emptyState.centerXAnchor),
+
+            title.topAnchor.constraint(equalTo: badge.bottomAnchor, constant: 7),
+            title.leadingAnchor.constraint(equalTo: emptyState.leadingAnchor),
+            title.trailingAnchor.constraint(equalTo: emptyState.trailingAnchor),
+
+            subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 6),
+            subtitle.leadingAnchor.constraint(equalTo: emptyState.leadingAnchor),
+            subtitle.trailingAnchor.constraint(equalTo: emptyState.trailingAnchor),
+
+            dropTarget.topAnchor.constraint(equalTo: subtitle.bottomAnchor, constant: 12),
+            dropTarget.centerXAnchor.constraint(equalTo: emptyState.centerXAnchor),
+            dropTarget.widthAnchor.constraint(lessThanOrEqualTo: emptyState.widthAnchor),
+            dropTarget.widthAnchor.constraint(greaterThanOrEqualToConstant: 252),
+            dropTarget.heightAnchor.constraint(equalToConstant: 50),
+            dropTarget.bottomAnchor.constraint(equalTo: emptyState.bottomAnchor),
+
+            dropTitle.topAnchor.constraint(equalTo: dropTarget.topAnchor, constant: 8),
+            dropTitle.leadingAnchor.constraint(equalTo: dropTarget.leadingAnchor, constant: 18),
+            dropTitle.trailingAnchor.constraint(equalTo: dropTarget.trailingAnchor, constant: -18),
+
+            dropHint.topAnchor.constraint(equalTo: dropTitle.bottomAnchor, constant: 2),
+            dropHint.leadingAnchor.constraint(equalTo: dropTarget.leadingAnchor, constant: 18),
+            dropHint.trailingAnchor.constraint(equalTo: dropTarget.trailingAnchor, constant: -18),
         ])
     }
 
@@ -3673,6 +3744,50 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         super.scrollWheel(with: event)
     }
 
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, alphaValue > 0.01, bounds.contains(point) else {
+            return nil
+        }
+        guard passThroughMode else {
+            return super.hitTest(point)
+        }
+        if !closeConfirmOverlay.isHidden || !answerStyleOverlay.isHidden {
+            return super.hitTest(point) ?? self
+        }
+        if headerDragInProgress {
+            return super.hitTest(point) ?? self
+        }
+        if !sessionDrawer.isHidden, rectForView(sessionDrawer).contains(point) {
+            return super.hitTest(point) ?? sessionDrawer
+        }
+        if !resizeEdges(at: point).isEmpty {
+            return self
+        }
+        if rectForView(headerBar).insetBy(dx: -8, dy: -8).contains(point) {
+            return super.hitTest(point) ?? headerBar
+        }
+        if rectForView(composerBar).insetBy(dx: -8, dy: -8).contains(point) {
+            return super.hitTest(point) ?? composerBar
+        }
+        if !attachmentStrip.isHidden,
+           rectForView(attachmentStrip).insetBy(dx: -8, dy: -6).contains(point) {
+            return super.hitTest(point)
+        }
+        if !canvasPane.isHidden, rectForView(canvasPane).contains(point) {
+            return super.hitTest(point) ?? canvasPane
+        }
+
+        let windowPoint = convert(point, to: nil)
+        let screenPoint = window?.convertPoint(toScreen: windowPoint) ?? .zero
+        if feed.hasCopyControl(atScreenPoint: screenPoint) {
+            return super.hitTest(point)
+        }
+        guard let hit = super.hitTest(point) else {
+            return nil
+        }
+        return isExplicitInteractiveHit(hit) ? hit : nil
+    }
+
     override func mouseDown(with event: NSEvent) {
         let localPoint = convert(event.locationInWindow, from: nil)
         let edges = resizeEdges(at: localPoint)
@@ -3870,7 +3985,18 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func hasInteractiveView(at localPoint: NSPoint) -> Bool {
-        var hit: NSView? = hitTest(localPoint)
+        var hit: NSView? = super.hitTest(localPoint)
+        while let view = hit {
+            if isExplicitInteractiveHit(view) {
+                return true
+            }
+            hit = view.superview
+        }
+        return false
+    }
+
+    private func isExplicitInteractiveHit(_ hitView: NSView) -> Bool {
+        var hit: NSView? = hitView
         while let view = hit {
             if view === self || view === workspace || view === headerBar || view === headerChrome || view === composerBar {
                 hit = view.superview
@@ -7124,27 +7250,19 @@ private final class OverlayApp {
             guard
                 let self,
                 let expandedWindow = self.expandedWindow,
-                expandedWindow.isVisible,
-                let expandedView = self.expandedView
+                expandedWindow.isVisible
             else { return }
 
             if self.applyRemoteInputPassthroughIfActive() {
                 return
             }
 
-            // Bluey only accepts pointer events over real controls. Generated
-            // answers, captions, screenshots, and empty panel regions pass
-            // through to the host app underneath.
-            let wantsMouse = expandedView.shouldReceiveMouseEvents(at: NSEvent.mouseLocation)
-            let now = CACurrentMediaTime()
-            if wantsMouse {
-                self.lastExpandedInteractiveMouseAt = now
-                if expandedWindow.ignoresMouseEvents {
-                    expandedWindow.ignoresMouseEvents = false
-                }
-            } else if now - self.lastExpandedInteractiveMouseAt > 0.08,
-                      !expandedWindow.ignoresMouseEvents {
-                expandedWindow.ignoresMouseEvents = true
+            // Keep the window able to focus text fields and start header drags.
+            // Generated content still passes clicks through from ExpandedPanelView.hitTest.
+            self.lastExpandedInteractiveMouseAt = CACurrentMediaTime()
+            expandedWindow.acceptsMouseMovedEvents = true
+            if expandedWindow.ignoresMouseEvents {
+                expandedWindow.ignoresMouseEvents = false
             }
         }
     }

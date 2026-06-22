@@ -44,7 +44,8 @@ pub fn mint(
     crate::db::run_blocking_db(|| {
         let raw = random_code();
         let hash = hash_code(&raw);
-        let expires_at = (Utc::now() + Duration::minutes(CODE_VALIDITY_MINS)).to_rfc3339();
+        let expires_at = Utc::now() + Duration::minutes(CODE_VALIDITY_MINS);
+        let expires_at_text = expires_at.to_rfc3339();
         match pool {
             DbPool::Sqlite(_) => {
                 let conn = pool.get()?;
@@ -52,7 +53,13 @@ pub fn mint(
                     "INSERT INTO auth_link_codes
                     (code_hash, account_id, access_token, refresh_token, expires_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![hash, account_id, access_token, refresh_token, expires_at],
+                    params![
+                        hash,
+                        account_id,
+                        access_token,
+                        refresh_token,
+                        expires_at_text
+                    ],
                 )?;
             }
             DbPool::Postgres(_) => {
@@ -81,7 +88,8 @@ pub fn mint(
 pub fn exchange(pool: &DbPool, raw: &str) -> Result<Option<(String, String, String)>> {
     crate::db::run_blocking_db(|| {
         let hash = hash_code(raw);
-        let now = Utc::now().to_rfc3339();
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
         match pool {
             DbPool::Sqlite(_) => {
                 let conn = pool.get()?;
@@ -93,7 +101,7 @@ pub fn exchange(pool: &DbPool, raw: &str) -> Result<Option<(String, String, Stri
                         AND consumed_at IS NULL
                         AND expires_at > ?2
                       RETURNING account_id, access_token, refresh_token",
-                        params![hash, now],
+                        params![hash, now_text],
                         |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                     )
                     .optional()?;
@@ -106,7 +114,7 @@ pub fn exchange(pool: &DbPool, raw: &str) -> Result<Option<(String, String, Stri
                     SET consumed_at = now()
                   WHERE code_hash = $1
                     AND consumed_at IS NULL
-                    AND expires_at > $2::timestamptz
+                    AND expires_at > $2
                   RETURNING account_id, access_token, refresh_token",
                     &[&hash, &now],
                 )?;

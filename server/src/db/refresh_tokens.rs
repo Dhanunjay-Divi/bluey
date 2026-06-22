@@ -22,8 +22,8 @@ pub fn store(
     device_label: Option<&str>,
 ) -> Result<()> {
     crate::db::run_blocking_db(|| {
-        let expires_at =
-            (Utc::now() + Duration::seconds(crate::auth::jwt::REFRESH_TTL_SECS)).to_rfc3339();
+        let expires_at = Utc::now() + Duration::seconds(crate::auth::jwt::REFRESH_TTL_SECS);
+        let expires_at_text = expires_at.to_rfc3339();
         let token_hash = hash_token(token);
         match pool {
             DbPool::Sqlite(_) => {
@@ -31,7 +31,7 @@ pub fn store(
                 conn.execute(
                 "INSERT OR REPLACE INTO refresh_tokens (token_hash, account_id, device_label, expires_at)
                  VALUES (?1, ?2, ?3, ?4)",
-                params![token_hash, account_id, device_label, expires_at],
+                params![token_hash, account_id, device_label, expires_at_text],
             )?;
             }
             DbPool::Postgres(_) => {
@@ -129,7 +129,8 @@ pub fn validate_and_touch(pool: &DbPool, token: &str) -> Result<Option<String>> 
 ///   `Err(_)` for DB errors.
 pub fn consume(pool: &DbPool, token: &str) -> Result<Option<String>> {
     crate::db::run_blocking_db(|| {
-        let now = Utc::now().to_rfc3339();
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
         let token_hash = hash_token(token);
 
         match pool {
@@ -147,7 +148,7 @@ pub fn consume(pool: &DbPool, token: &str) -> Result<Option<String>> {
                     AND expires_at > ?1
                 RETURNING account_id",
                 )?;
-                let mut rows = stmt.query(params![&now, &token_hash])?;
+                let mut rows = stmt.query(params![&now_text, &token_hash])?;
                 if let Some(row) = rows.next()? {
                     let account_id: String = row.get(0)?;
                     Ok(Some(account_id))
@@ -159,10 +160,10 @@ pub fn consume(pool: &DbPool, token: &str) -> Result<Option<String>> {
                 let mut conn = pool.get_pg()?;
                 let row = conn.query_opt(
                     "UPDATE refresh_tokens
-                    SET revoked_at = $1::timestamptz, last_used_at = $1::timestamptz
+                    SET revoked_at = $1, last_used_at = $1
                   WHERE token_hash = $2
                     AND revoked_at IS NULL
-                    AND expires_at > $1::timestamptz
+                    AND expires_at > $1
                 RETURNING account_id",
                     &[&now, &token_hash],
                 )?;
@@ -176,20 +177,21 @@ pub fn consume(pool: &DbPool, token: &str) -> Result<Option<String>> {
 /// Revoke a single refresh token (logout).
 pub fn revoke(pool: &DbPool, token: &str) -> Result<()> {
     crate::db::run_blocking_db(|| {
-        let now = Utc::now().to_rfc3339();
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
         let token_hash = hash_token(token);
         match pool {
             DbPool::Sqlite(_) => {
                 let conn = pool.get()?;
                 conn.execute(
                     "UPDATE refresh_tokens SET revoked_at = ?1 WHERE token_hash = ?2",
-                    params![now, token_hash],
+                    params![now_text, token_hash],
                 )?;
             }
             DbPool::Postgres(_) => {
                 let mut conn = pool.get_pg()?;
                 conn.execute(
-                    "UPDATE refresh_tokens SET revoked_at = $1::timestamptz WHERE token_hash = $2",
+                    "UPDATE refresh_tokens SET revoked_at = $1 WHERE token_hash = $2",
                     &[&now, &token_hash],
                 )?;
             }
@@ -202,21 +204,22 @@ pub fn revoke(pool: &DbPool, token: &str) -> Result<()> {
 /// security event).
 pub fn revoke_all_for_account(pool: &DbPool, account_id: &str) -> Result<usize> {
     crate::db::run_blocking_db(|| {
-        let now = Utc::now().to_rfc3339();
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
         match pool {
             DbPool::Sqlite(_) => {
                 let conn = pool.get()?;
                 let n = conn.execute(
                     "UPDATE refresh_tokens SET revoked_at = ?1
                  WHERE account_id = ?2 AND revoked_at IS NULL",
-                    params![now, account_id],
+                    params![now_text, account_id],
                 )?;
                 Ok(n)
             }
             DbPool::Postgres(_) => {
                 let mut conn = pool.get_pg()?;
                 let affected = conn.execute(
-                    "UPDATE refresh_tokens SET revoked_at = $1::timestamptz
+                    "UPDATE refresh_tokens SET revoked_at = $1
                  WHERE account_id = $2 AND revoked_at IS NULL",
                     &[&now, &account_id],
                 )?;
