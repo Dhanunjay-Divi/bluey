@@ -88,7 +88,7 @@ not security boundaries.
 - Length caps on every variable field.
 - Event state machine prevents out-of-context attach/instructions events.
 - Overlay binary resolution verifies that the helper lives inside the install directory.
-- Developer overlay override and capture-visible debug mode are gated; `BLUEY_HOST_OVERLAY_CAPTURE_VISIBLE=1` is ignored unless the dev overlay gate is also enabled.
+- Developer overlay override and capture-visible debug mode are gated; local screenshot-visible overlay mode requires the dev gate, the capture-visible request, and the local-visible gate together.
 
 ### Local filesystem hardening
 

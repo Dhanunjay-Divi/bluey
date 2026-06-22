@@ -38,7 +38,10 @@ SECRET_PATTERNS = [
 ]
 
 PROD_UNSAFE_ASSIGNMENTS = [
+    re.compile(r"\bBLUEY_OVERLAY_CAPTURE_VISIBLE\s*=\s*1\b"),
     re.compile(r"\bBLUEY_HOST_OVERLAY_CAPTURE_VISIBLE\s*=\s*1\b"),
+    re.compile(r"\bBLUEY_LOCAL_VISIBLE_OVERLAY\s*=\s*1\b"),
+    re.compile(r"\bBLUEY_ALLOW_CAPTURE_VISIBLE_LOCAL\s*=\s*1\b"),
     re.compile(r"\bBLUEY_DEV_OVERLAY\s*=\s*1\b"),
     re.compile(r"\bBLUEY_DEV_BYOK\s*=\s*1\b"),
     re.compile(r"\bBLUEY_DEV_DIRECT_PROVIDERS\s*=\s*1\b"),
@@ -79,6 +82,7 @@ EXCLUDED_SUFFIXES = {
     ".tar",
 }
 DEV_SCRIPT_ALLOWLIST = {
+    "scripts/bluey-visible-local.sh",
     "scripts/macos-overlay-visual-smoke.sh",
 }
 LINE_ALLOWLIST = re.compile(

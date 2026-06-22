@@ -33,11 +33,11 @@ Optional dev-only guard for Steps 1-3:
 ```bash
 scripts/macos-overlay-visual-smoke.sh
 ```
-This script launches Bluey with `BLUEY_DEV_OVERLAY=1` and
-`BLUEY_HOST_OVERLAY_CAPTURE_VISIBLE=1` so it can screenshot the overlay,
-click the pill, start simulated audio, and assert the expanded window remains
-fixed-size while transcript text updates. Do not use those env vars in
-customer launch paths.
+This script launches Bluey with `BLUEY_DEV_OVERLAY=1`,
+`BLUEY_LOCAL_VISIBLE_OVERLAY=1`, and `BLUEY_HOST_OVERLAY_CAPTURE_VISIBLE=1`
+so it can screenshot the overlay, click the pill, start simulated audio, and
+assert the expanded window remains fixed-size while transcript text updates.
+Do not use those env vars in customer launch paths.
 
 ---
 

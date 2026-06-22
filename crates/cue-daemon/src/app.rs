@@ -7393,6 +7393,7 @@ fn macos_overlay_launch_command(
     command
         .env("BLUEY_OVERLAY_SESSION_TOKEN", expected_token)
         .env("BLUEY_OVERLAY_SOCKET", socket_path);
+    macos_overlay_add_capture_visible_args(&mut command);
     command
 }
 
@@ -7413,10 +7414,22 @@ fn macos_overlay_open_app_command(
         .arg("--bluey-overlay-session-token")
         .arg(expected_token);
     if macos_overlay_capture_visible_for_debug() {
-        command.arg("--bluey-dev-overlay");
-        command.arg("--bluey-overlay-capture-visible");
+        command
+            .arg("--bluey-dev-overlay")
+            .arg("--bluey-local-visible-overlay")
+            .arg("--bluey-overlay-capture-visible");
     }
     command
+}
+
+#[cfg(target_os = "macos")]
+fn macos_overlay_add_capture_visible_args(command: &mut Command) {
+    if macos_overlay_capture_visible_for_debug() {
+        command
+            .arg("--bluey-dev-overlay")
+            .arg("--bluey-local-visible-overlay")
+            .arg("--bluey-overlay-capture-visible");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -7450,12 +7463,20 @@ fn macos_overlay_capture_visible_for_debug() -> bool {
             "BLUEY_OVERLAY_CAPTURE_VISIBLE",
             "BLUEY_HOST_OVERLAY_CAPTURE_VISIBLE",
         ]),
+        env_truthy_any(&[
+            "BLUEY_LOCAL_VISIBLE_OVERLAY",
+            "BLUEY_ALLOW_CAPTURE_VISIBLE_LOCAL",
+        ]),
     )
 }
 
 #[cfg(target_os = "macos")]
-fn macos_overlay_capture_visible_allowed(dev_gate: bool, capture_requested: bool) -> bool {
-    dev_gate && capture_requested
+fn macos_overlay_capture_visible_allowed(
+    dev_gate: bool,
+    capture_requested: bool,
+    local_allowed: bool,
+) -> bool {
+    dev_gate && capture_requested && local_allowed
 }
 
 fn spawn_overlay_reader<R>(
@@ -8959,11 +8980,13 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
-    fn macos_overlay_capture_visible_requires_dev_gate() {
-        assert!(!macos_overlay_capture_visible_allowed(false, false));
-        assert!(!macos_overlay_capture_visible_allowed(false, true));
-        assert!(!macos_overlay_capture_visible_allowed(true, false));
-        assert!(macos_overlay_capture_visible_allowed(true, true));
+    fn macos_overlay_capture_visible_requires_dev_and_local_gates() {
+        assert!(!macos_overlay_capture_visible_allowed(false, false, false));
+        assert!(!macos_overlay_capture_visible_allowed(false, true, false));
+        assert!(!macos_overlay_capture_visible_allowed(false, true, true));
+        assert!(!macos_overlay_capture_visible_allowed(true, false, true));
+        assert!(!macos_overlay_capture_visible_allowed(true, true, false));
+        assert!(macos_overlay_capture_visible_allowed(true, true, true));
     }
 
     #[test]
