@@ -41,70 +41,80 @@ pub fn mint(
     access_token: &str,
     refresh_token: &str,
 ) -> Result<String> {
-    let raw = random_code();
-    let hash = hash_code(&raw);
-    let expires_at = (Utc::now() + Duration::minutes(CODE_VALIDITY_MINS)).to_rfc3339();
-    match pool {
-        DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            conn.execute(
-                "INSERT INTO auth_link_codes
+    crate::db::run_blocking_db(|| {
+        let raw = random_code();
+        let hash = hash_code(&raw);
+        let expires_at = (Utc::now() + Duration::minutes(CODE_VALIDITY_MINS)).to_rfc3339();
+        match pool {
+            DbPool::Sqlite(_) => {
+                let conn = pool.get()?;
+                conn.execute(
+                    "INSERT INTO auth_link_codes
                     (code_hash, account_id, access_token, refresh_token, expires_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![hash, account_id, access_token, refresh_token, expires_at],
-            )?;
-        }
-        DbPool::Postgres(_) => {
-            let mut conn = pool.get_pg()?;
-            conn.execute(
-                "INSERT INTO auth_link_codes
+                    params![hash, account_id, access_token, refresh_token, expires_at],
+                )?;
+            }
+            DbPool::Postgres(_) => {
+                let mut conn = pool.get_pg()?;
+                conn.execute(
+                    "INSERT INTO auth_link_codes
                     (code_hash, account_id, access_token, refresh_token, expires_at)
                  VALUES ($1, $2, $3, $4, $5::timestamptz)",
-                &[&hash, &account_id, &access_token, &refresh_token, &expires_at],
-            )?;
+                    &[
+                        &hash,
+                        &account_id,
+                        &access_token,
+                        &refresh_token,
+                        &expires_at,
+                    ],
+                )?;
+            }
         }
-    }
-    Ok(raw)
+        Ok(raw)
+    })
 }
 
 /// One-time atomic consume. Returns Some((account_id, access, refresh))
 /// when the code is valid + unexpired + unconsumed; None otherwise.
 /// Uses UPDATE...RETURNING so concurrent consumes only succeed once.
 pub fn exchange(pool: &DbPool, raw: &str) -> Result<Option<(String, String, String)>> {
-    let hash = hash_code(raw);
-    let now = Utc::now().to_rfc3339();
-    match pool {
-        DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            let row: Option<(String, String, String)> = conn
-                .query_row(
-                    "UPDATE auth_link_codes
+    crate::db::run_blocking_db(|| {
+        let hash = hash_code(raw);
+        let now = Utc::now().to_rfc3339();
+        match pool {
+            DbPool::Sqlite(_) => {
+                let conn = pool.get()?;
+                let row: Option<(String, String, String)> = conn
+                    .query_row(
+                        "UPDATE auth_link_codes
                         SET consumed_at = datetime('now')
                       WHERE code_hash = ?1
                         AND consumed_at IS NULL
                         AND expires_at > ?2
                       RETURNING account_id, access_token, refresh_token",
-                    params![hash, now],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .optional()?;
-            Ok(row)
-        }
-        DbPool::Postgres(_) => {
-            let mut conn = pool.get_pg()?;
-            let row = conn.query_opt(
-                "UPDATE auth_link_codes
+                        params![hash, now],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .optional()?;
+                Ok(row)
+            }
+            DbPool::Postgres(_) => {
+                let mut conn = pool.get_pg()?;
+                let row = conn.query_opt(
+                    "UPDATE auth_link_codes
                     SET consumed_at = now()
                   WHERE code_hash = $1
                     AND consumed_at IS NULL
                     AND expires_at > $2::timestamptz
                   RETURNING account_id, access_token, refresh_token",
-                &[&hash, &now],
-            )?;
-            row.map(|row| Ok((row.try_get(0)?, row.try_get(1)?, row.try_get(2)?)))
-                .transpose()
+                    &[&hash, &now],
+                )?;
+                row.map(|row| Ok((row.try_get(0)?, row.try_get(1)?, row.try_get(2)?)))
+                    .transpose()
+            }
         }
-    }
+    })
 }
 
 #[cfg(test)]

@@ -351,9 +351,14 @@ async fn run_square_topup(
         .ok_or_else(|| anyhow!("square payment response missing payment.id"))?;
 
     if payment_status == "COMPLETED" {
-        let credited =
-            balance::credit_processor_payment(&pool, &account_id, amount_cents, "square", payment_id)
-                .context("credit Square auto reload")?;
+        let credited = balance::credit_processor_payment(
+            &pool,
+            &account_id,
+            amount_cents,
+            "square",
+            payment_id,
+        )
+        .context("credit Square auto reload")?;
         tracing::info!(
             account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
             amount_cents,

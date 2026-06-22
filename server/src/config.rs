@@ -48,9 +48,9 @@ impl ServerDbBackend {
         match value.trim().to_ascii_lowercase().as_str() {
             "" | "sqlite" => Ok(Self::Sqlite),
             "postgres" | "postgresql" => Ok(Self::Postgres),
-            other => anyhow::bail!(
-                "BLUEY_SERVER_DB_BACKEND must be sqlite or postgres, got {other:?}"
-            ),
+            other => {
+                anyhow::bail!("BLUEY_SERVER_DB_BACKEND must be sqlite or postgres, got {other:?}")
+            }
         }
     }
 }

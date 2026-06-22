@@ -95,8 +95,7 @@ pub async fn create_session(
         .unwrap_or(DEFAULT_MAX_SECONDS)
         .clamp(30, MAX_SESSION_SECONDS);
 
-    let estimated_bluey_cost_cents =
-        estimate_deepgram_bluey_cost_cents(&model, max_seconds)?;
+    let estimated_bluey_cost_cents = estimate_deepgram_bluey_cost_cents(&model, max_seconds)?;
     check_upstream_spend_guard(
         &state,
         &account.id,

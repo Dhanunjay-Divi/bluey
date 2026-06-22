@@ -11,7 +11,9 @@ use postgres_native_tls::MakeTlsConnector;
 use r2d2::{Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
 use r2d2_sqlite::SqliteConnectionManager;
+use std::cell::Cell;
 use std::path::Path;
+use tokio::runtime::{Handle, RuntimeFlavor};
 
 pub mod account_data;
 pub mod accounts;
@@ -61,9 +63,81 @@ impl DbPool {
 
     pub fn get_pg(&self) -> Result<PostgresDbConn> {
         match self {
-            Self::Postgres(pool) => pool.get().context("get postgres conn"),
+            Self::Postgres(pool) => {
+                if in_tokio_multithread_runtime() && !in_db_blocking_context() {
+                    anyhow::bail!(
+                        "Postgres DB access must run inside db::run_blocking_db while on the Tokio runtime"
+                    );
+                }
+                pool.get().context("get postgres conn")
+            }
             Self::Sqlite(_) => anyhow::bail!("postgres connection requested from sqlite backend"),
         }
+    }
+}
+
+thread_local! {
+    static DB_BLOCKING_CONTEXT_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+fn in_db_blocking_context() -> bool {
+    DB_BLOCKING_CONTEXT_DEPTH.with(|depth| depth.get() > 0)
+}
+
+fn enter_db_blocking_context<R>(f: impl FnOnce() -> R) -> R {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            DB_BLOCKING_CONTEXT_DEPTH.with(|depth| {
+                depth.set(depth.get().saturating_sub(1));
+            });
+        }
+    }
+
+    DB_BLOCKING_CONTEXT_DEPTH.with(|depth| depth.set(depth.get() + 1));
+    let _guard = Guard;
+    f()
+}
+
+fn in_tokio_multithread_runtime() -> bool {
+    Handle::try_current()
+        .map(|handle| handle.runtime_flavor() == RuntimeFlavor::MultiThread)
+        .unwrap_or(false)
+}
+
+/// Run a synchronous DB operation behind Tokio's blocking boundary.
+///
+/// The server DB adapter is intentionally still sync-shaped while SQLite and
+/// Postgres parity stabilizes. Postgres calls must enter this helper before
+/// touching `postgres::Client`; `DbPool::get_pg` enforces that at runtime so a
+/// missed path fails loudly instead of blocking async worker threads.
+pub fn run_blocking_db<R>(f: impl FnOnce() -> R) -> R {
+    if in_db_blocking_context() {
+        return f();
+    }
+    if in_tokio_multithread_runtime() {
+        tokio::task::block_in_place(|| enter_db_blocking_context(f))
+    } else {
+        enter_db_blocking_context(f)
+    }
+}
+
+#[cfg(test)]
+mod blocking_boundary_tests {
+    use super::{in_db_blocking_context, run_blocking_db};
+
+    #[test]
+    fn run_blocking_db_marks_sync_context() {
+        assert!(!in_db_blocking_context());
+        assert!(run_blocking_db(in_db_blocking_context));
+        assert!(!in_db_blocking_context());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_blocking_db_marks_tokio_context() {
+        assert!(!in_db_blocking_context());
+        assert!(run_blocking_db(in_db_blocking_context));
+        assert!(!in_db_blocking_context());
     }
 }
 
@@ -524,6 +598,10 @@ const POSTGRES_RUNTIME_SCHEMA: &str =
     include_str!("../../../infra/postgres/server-runtime/001_server_runtime_compat.sql");
 
 fn run_postgres_migrations(pool: &DbPool) -> Result<()> {
+    run_blocking_db(|| run_postgres_migrations_inner(pool))
+}
+
+fn run_postgres_migrations_inner(pool: &DbPool) -> Result<()> {
     let mut conn = pool.get_pg()?;
     conn.batch_execute(
         "CREATE TABLE IF NOT EXISTS bluey_schema_migrations (
@@ -558,10 +636,7 @@ fn run_postgres_migrations(pool: &DbPool) -> Result<()> {
     }
 
     let vector_ready = conn
-        .query_opt(
-            "SELECT 1 FROM pg_extension WHERE extname = 'vector'",
-            &[],
-        )
+        .query_opt("SELECT 1 FROM pg_extension WHERE extname = 'vector'", &[])
         .context("check pgvector extension")?
         .is_some();
     if !vector_ready {

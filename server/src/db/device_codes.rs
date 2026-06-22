@@ -13,33 +13,30 @@ pub struct DeviceCodeRow {
     pub expires_at: String,
 }
 
-pub fn insert(
-    pool: &DbPool,
-    device_code: &str,
-    user_code: &str,
-    expires_at: &str,
-) -> Result<()> {
-    match pool {
-        DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            conn.execute(
+pub fn insert(pool: &DbPool, device_code: &str, user_code: &str, expires_at: &str) -> Result<()> {
+    crate::db::run_blocking_db(|| {
+        match pool {
+            DbPool::Sqlite(_) => {
+                let conn = pool.get()?;
+                conn.execute(
                 "INSERT INTO device_codes (device_code, user_code, expires_at) VALUES (?1, ?2, ?3)",
                 params![device_code, user_code, expires_at],
             )?;
-        }
-        DbPool::Postgres(_) => {
-            let mut conn = pool.get_pg()?;
-            conn.execute(
+            }
+            DbPool::Postgres(_) => {
+                let mut conn = pool.get_pg()?;
+                conn.execute(
                 "INSERT INTO device_codes (device_code, user_code, expires_at) VALUES ($1, $2, $3::timestamptz)",
                 &[&device_code, &user_code, &expires_at],
             )?;
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 pub fn fetch_by_device_code(pool: &DbPool, device_code: &str) -> Result<Option<DeviceCodeRow>> {
-    match pool {
+    crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let conn = pool.get()?;
             let row = conn
@@ -73,11 +70,11 @@ pub fn fetch_by_device_code(pool: &DbPool, device_code: &str) -> Result<Option<D
             })
             .transpose()
         }
-    }
+    })
 }
 
 pub fn consume_approved(pool: &DbPool, device_code: &str, account_id: &str) -> Result<bool> {
-    match pool {
+    crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let conn = pool.get()?;
             let deleted = conn.execute(
@@ -96,7 +93,7 @@ pub fn consume_approved(pool: &DbPool, device_code: &str, account_id: &str) -> R
             )?;
             Ok(deleted > 0)
         }
-    }
+    })
 }
 
 pub fn approve_user_code(
@@ -105,7 +102,7 @@ pub fn approve_user_code(
     user_code: &str,
     now: &str,
 ) -> Result<bool> {
-    match pool {
+    crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let conn = pool.get()?;
             let updated = conn.execute(
@@ -124,7 +121,7 @@ pub fn approve_user_code(
             )?;
             Ok(updated > 0)
         }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -150,9 +147,7 @@ mod tests {
         let pool = temp_pool();
         let account_id = make_account(&pool);
         insert(&pool, "device-1", "USER-123", "2099-01-01T00:00:00Z").unwrap();
-        assert!(
-            approve_user_code(&pool, &account_id, "USER-123", "2026-01-01T00:00:00Z").unwrap()
-        );
+        assert!(approve_user_code(&pool, &account_id, "USER-123", "2026-01-01T00:00:00Z").unwrap());
         let row = fetch_by_device_code(&pool, "device-1").unwrap().unwrap();
         assert_eq!(row.account_id.as_deref(), Some(account_id.as_str()));
         assert!(consume_approved(&pool, "device-1", &account_id).unwrap());

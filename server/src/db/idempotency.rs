@@ -31,72 +31,74 @@ pub enum ReserveOutcome {
 }
 
 pub fn reserve(pool: &DbPool, account_id: &str, request_id: &str) -> Result<ReserveOutcome> {
-    let row: Option<(String, Option<String>)> = match pool {
-        DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
+    crate::db::run_blocking_db(|| {
+        let row: Option<(String, Option<String>)> = match pool {
+            DbPool::Sqlite(_) => {
+                let conn = pool.get()?;
 
-            // Try to INSERT a new in_progress row. If a row already exists for
-            // (account_id, request_id), the INSERT silently does nothing.
-            let inserted = conn.execute(
-                "INSERT OR IGNORE INTO request_idempotency
+                // Try to INSERT a new in_progress row. If a row already exists for
+                // (account_id, request_id), the INSERT silently does nothing.
+                let inserted = conn.execute(
+                    "INSERT OR IGNORE INTO request_idempotency
                     (account_id, request_id, status, created_at)
                  VALUES (?1, ?2, 'in_progress', datetime('now'))",
-                params![account_id, request_id],
-            )?;
+                    params![account_id, request_id],
+                )?;
 
-            if inserted == 1 {
-                return Ok(ReserveOutcome::FreshReservation);
-            }
+                if inserted == 1 {
+                    return Ok(ReserveOutcome::FreshReservation);
+                }
 
-            // Existing row: read it.
-            conn.query_row(
-                "SELECT status, response_json FROM request_idempotency
+                // Existing row: read it.
+                conn.query_row(
+                    "SELECT status, response_json FROM request_idempotency
                  WHERE account_id = ?1 AND request_id = ?2",
-                params![account_id, request_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .ok()
-        }
-        DbPool::Postgres(_) => {
-            let mut conn = pool.get_pg()?;
-            let inserted = conn.execute(
-                "INSERT INTO request_idempotency
+                    params![account_id, request_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok()
+            }
+            DbPool::Postgres(_) => {
+                let mut conn = pool.get_pg()?;
+                let inserted = conn.execute(
+                    "INSERT INTO request_idempotency
                     (account_id, request_id, status, created_at)
                  VALUES ($1, $2, 'in_progress', now())
                  ON CONFLICT (account_id, request_id) DO NOTHING",
-                &[&account_id, &request_id],
-            )?;
+                    &[&account_id, &request_id],
+                )?;
 
-            if inserted == 1 {
-                return Ok(ReserveOutcome::FreshReservation);
-            }
+                if inserted == 1 {
+                    return Ok(ReserveOutcome::FreshReservation);
+                }
 
-            conn.query_opt(
-                "SELECT status, response_json FROM request_idempotency
+                conn.query_opt(
+                    "SELECT status, response_json FROM request_idempotency
                  WHERE account_id = $1 AND request_id = $2",
-                &[&account_id, &request_id],
-            )?
-            .map(|row| {
-                let status: String = row.try_get(0)?;
-                let response_json: Option<String> = row.try_get(1)?;
-                Ok::<(String, Option<String>), anyhow::Error>((status, response_json))
-            })
-            .transpose()?
-        }
-    };
-
-    match row {
-        Some((status, json)) if status == "complete" => {
-            if let Some(j) = json {
-                Ok(ReserveOutcome::CachedComplete(j))
-            } else {
-                // Shouldn't happen — complete rows should have json.
-                Ok(ReserveOutcome::CachedFailed)
+                    &[&account_id, &request_id],
+                )?
+                .map(|row| {
+                    let status: String = row.try_get(0)?;
+                    let response_json: Option<String> = row.try_get(1)?;
+                    Ok::<(String, Option<String>), anyhow::Error>((status, response_json))
+                })
+                .transpose()?
             }
+        };
+
+        match row {
+            Some((status, json)) if status == "complete" => {
+                if let Some(j) = json {
+                    Ok(ReserveOutcome::CachedComplete(j))
+                } else {
+                    // Shouldn't happen — complete rows should have json.
+                    Ok(ReserveOutcome::CachedFailed)
+                }
+            }
+            Some((status, _)) if status == "failed" => Ok(ReserveOutcome::CachedFailed),
+            _ => Ok(ReserveOutcome::InProgress),
         }
-        Some((status, _)) if status == "failed" => Ok(ReserveOutcome::CachedFailed),
-        _ => Ok(ReserveOutcome::InProgress),
-    }
+    })
 }
 
 pub fn mark_complete(
@@ -105,82 +107,88 @@ pub fn mark_complete(
     request_id: &str,
     response_json: &str,
 ) -> Result<()> {
-    match pool {
-        DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            conn.execute(
-                "UPDATE request_idempotency
+    crate::db::run_blocking_db(|| {
+        match pool {
+            DbPool::Sqlite(_) => {
+                let conn = pool.get()?;
+                conn.execute(
+                    "UPDATE request_idempotency
                     SET status = 'complete',
                         response_json = ?3,
                         http_status = 200,
                         completed_at = datetime('now')
                   WHERE account_id = ?1 AND request_id = ?2",
-                params![account_id, request_id, response_json],
-            )?;
-        }
-        DbPool::Postgres(_) => {
-            let mut conn = pool.get_pg()?;
-            conn.execute(
-                "UPDATE request_idempotency
+                    params![account_id, request_id, response_json],
+                )?;
+            }
+            DbPool::Postgres(_) => {
+                let mut conn = pool.get_pg()?;
+                conn.execute(
+                    "UPDATE request_idempotency
                     SET status = 'complete',
                         response_json = $3,
                         http_status = 200,
                         completed_at = now()
                   WHERE account_id = $1 AND request_id = $2",
-                &[&account_id, &request_id, &response_json],
-            )?;
+                    &[&account_id, &request_id, &response_json],
+                )?;
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 pub fn mark_failed(pool: &DbPool, account_id: &str, request_id: &str) -> Result<()> {
-    match pool {
-        DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            conn.execute(
-                "UPDATE request_idempotency
+    crate::db::run_blocking_db(|| {
+        match pool {
+            DbPool::Sqlite(_) => {
+                let conn = pool.get()?;
+                conn.execute(
+                    "UPDATE request_idempotency
                     SET status = 'failed', completed_at = datetime('now')
                   WHERE account_id = ?1 AND request_id = ?2",
-                params![account_id, request_id],
-            )?;
-        }
-        DbPool::Postgres(_) => {
-            let mut conn = pool.get_pg()?;
-            conn.execute(
-                "UPDATE request_idempotency
+                    params![account_id, request_id],
+                )?;
+            }
+            DbPool::Postgres(_) => {
+                let mut conn = pool.get_pg()?;
+                conn.execute(
+                    "UPDATE request_idempotency
                     SET status = 'failed', completed_at = now()
                   WHERE account_id = $1 AND request_id = $2",
-                &[&account_id, &request_id],
-            )?;
+                    &[&account_id, &request_id],
+                )?;
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Release the reservation so the same request_id is retryable. Used
 /// for transient upstream errors (502 etc) where the customer should
 /// not be forced to mint a new id.
 pub fn release(pool: &DbPool, account_id: &str, request_id: &str) -> Result<()> {
-    match pool {
-        DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            conn.execute(
-                "DELETE FROM request_idempotency
+    crate::db::run_blocking_db(|| {
+        match pool {
+            DbPool::Sqlite(_) => {
+                let conn = pool.get()?;
+                conn.execute(
+                    "DELETE FROM request_idempotency
                   WHERE account_id = ?1 AND request_id = ?2 AND status = 'in_progress'",
-                params![account_id, request_id],
-            )?;
-        }
-        DbPool::Postgres(_) => {
-            let mut conn = pool.get_pg()?;
-            conn.execute(
-                "DELETE FROM request_idempotency
+                    params![account_id, request_id],
+                )?;
+            }
+            DbPool::Postgres(_) => {
+                let mut conn = pool.get_pg()?;
+                conn.execute(
+                    "DELETE FROM request_idempotency
                   WHERE account_id = $1 AND request_id = $2 AND status = 'in_progress'",
-                &[&account_id, &request_id],
-            )?;
+                    &[&account_id, &request_id],
+                )?;
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 #[cfg(test)]

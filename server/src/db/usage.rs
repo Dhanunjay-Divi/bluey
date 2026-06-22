@@ -25,78 +25,80 @@ pub struct UsageEvent {
 }
 
 pub fn record(pool: &DbPool, account_id: &str, event: &UsageEvent) -> Result<bool> {
-    // Codex Stage 7 S7.1: idempotent ingestion. INSERT OR IGNORE
-    // returns 0 affected rows when (account_id, request_id, kind)
-    // already exists; we surface that as Ok(false) so callers can log
-    // the dedup without treating it as an error.
-    let id = uuid::Uuid::new_v4().to_string();
-    match pool {
-        DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            let inserted = conn.execute(
-                "INSERT OR IGNORE INTO usage_events
+    crate::db::run_blocking_db(|| {
+        // Codex Stage 7 S7.1: idempotent ingestion. INSERT OR IGNORE
+        // returns 0 affected rows when (account_id, request_id, kind)
+        // already exists; we surface that as Ok(false) so callers can log
+        // the dedup without treating it as an error.
+        let id = uuid::Uuid::new_v4().to_string();
+        match pool {
+            DbPool::Sqlite(_) => {
+                let conn = pool.get()?;
+                let inserted = conn.execute(
+                    "INSERT OR IGNORE INTO usage_events
                     (id, account_id, request_id, kind, task_type, lane, provider, model,
                      input_tokens, output_tokens, latency_ms,
                      cost_cents_to_bluey, cost_cents_to_customer,
                      was_speculative, was_fallback)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
-                params![
-                    id,
-                    account_id,
-                    event.request_id,
-                    event.kind,
-                    event.task_type,
-                    event.lane,
-                    event.provider,
-                    event.model,
-                    event.input_tokens,
-                    event.output_tokens,
-                    event.latency_ms,
-                    event.cost_cents_to_bluey,
-                    event.cost_cents_to_customer,
-                    event.was_speculative as i64,
-                    event.was_fallback as i64,
-                ],
-            )?;
-            Ok(inserted == 1)
-        }
-        DbPool::Postgres(_) => {
-            let mut conn = pool.get_pg()?;
-            let was_speculative = event.was_speculative as i32;
-            let was_fallback = event.was_fallback as i32;
-            let inserted = conn.execute(
-                "INSERT INTO usage_events
+                    params![
+                        id,
+                        account_id,
+                        event.request_id,
+                        event.kind,
+                        event.task_type,
+                        event.lane,
+                        event.provider,
+                        event.model,
+                        event.input_tokens,
+                        event.output_tokens,
+                        event.latency_ms,
+                        event.cost_cents_to_bluey,
+                        event.cost_cents_to_customer,
+                        event.was_speculative as i64,
+                        event.was_fallback as i64,
+                    ],
+                )?;
+                Ok(inserted == 1)
+            }
+            DbPool::Postgres(_) => {
+                let mut conn = pool.get_pg()?;
+                let was_speculative = event.was_speculative as i32;
+                let was_fallback = event.was_fallback as i32;
+                let inserted = conn.execute(
+                    "INSERT INTO usage_events
                     (id, account_id, request_id, kind, task_type, lane, provider, model,
                      input_tokens, output_tokens, latency_ms,
                      cost_cents_to_bluey, cost_cents_to_customer,
                      was_speculative, was_fallback)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                  ON CONFLICT (account_id, request_id, kind) DO NOTHING",
-                &[
-                    &id,
-                    &account_id,
-                    &event.request_id,
-                    &event.kind,
-                    &event.task_type,
-                    &event.lane,
-                    &event.provider,
-                    &event.model,
-                    &event.input_tokens,
-                    &event.output_tokens,
-                    &event.latency_ms,
-                    &event.cost_cents_to_bluey,
-                    &event.cost_cents_to_customer,
-                    &was_speculative,
-                    &was_fallback,
-                ],
-            )?;
-            Ok(inserted == 1)
+                    &[
+                        &id,
+                        &account_id,
+                        &event.request_id,
+                        &event.kind,
+                        &event.task_type,
+                        &event.lane,
+                        &event.provider,
+                        &event.model,
+                        &event.input_tokens,
+                        &event.output_tokens,
+                        &event.latency_ms,
+                        &event.cost_cents_to_bluey,
+                        &event.cost_cents_to_customer,
+                        &was_speculative,
+                        &was_fallback,
+                    ],
+                )?;
+                Ok(inserted == 1)
+            }
         }
-    }
+    })
 }
 
 pub fn bluey_spend_cents_in_window(pool: &DbPool, window_hours: i64) -> Result<i64> {
-    match pool {
+    crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let conn = pool.get()?;
             let total = if window_hours > 0 {
@@ -136,7 +138,7 @@ pub fn bluey_spend_cents_in_window(pool: &DbPool, window_hours: i64) -> Result<i
             };
             Ok(total)
         }
-    }
+    })
 }
 
 #[cfg(test)]

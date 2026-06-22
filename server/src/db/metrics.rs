@@ -19,7 +19,7 @@ pub struct MetricsSnapshot {
 }
 
 pub fn snapshot(pool: &DbPool) -> Result<MetricsSnapshot> {
-    match pool {
+    crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let conn = pool.get()?;
             Ok(MetricsSnapshot {
@@ -105,7 +105,7 @@ pub fn snapshot(pool: &DbPool) -> Result<MetricsSnapshot> {
                 )?,
             })
         }
-    }
+    })
 }
 
 fn count_one_sqlite(conn: &rusqlite::Connection, sql: &str) -> Result<i64> {

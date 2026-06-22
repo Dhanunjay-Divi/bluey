@@ -36,9 +36,10 @@ async fn main() -> anyhow::Result<()> {
     let pool = match config.db_backend {
         ServerDbBackend::Sqlite => db::open_pool(&config.db_path).context("open sqlite db")?,
         ServerDbBackend::Postgres => {
-            let database_url = config.database_url.as_deref().context(
-                "BLUEY_DATABASE_URL is required when BLUEY_SERVER_DB_BACKEND=postgres",
-            )?;
+            let database_url = config
+                .database_url
+                .as_deref()
+                .context("BLUEY_DATABASE_URL is required when BLUEY_SERVER_DB_BACKEND=postgres")?;
             db::open_postgres_pool(database_url).context("open postgres db")?
         }
     };

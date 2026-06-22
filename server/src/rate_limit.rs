@@ -421,14 +421,15 @@ impl RateLimiters {
                     retry_after_secs: retry,
                     reason: "provider_anthropic_llm_busy",
                 }),
-            "gemini" => self
-                .provider_gemini_llm
-                .check(&key)
-                .await
-                .map_err(|retry| CapacityDenied {
-                    retry_after_secs: retry,
-                    reason: "provider_gemini_llm_busy",
-                }),
+            "gemini" => {
+                self.provider_gemini_llm
+                    .check(&key)
+                    .await
+                    .map_err(|retry| CapacityDenied {
+                        retry_after_secs: retry,
+                        reason: "provider_gemini_llm_busy",
+                    })
+            }
             _ => Ok(()),
         }
     }
@@ -747,10 +748,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(denied.reason, "provider_gemini_llm_busy");
-        assert!(limits
-            .check_provider_llm("openai", "gpt-5.5")
-            .await
-            .is_ok());
+        assert!(limits.check_provider_llm("openai", "gpt-5.5").await.is_ok());
     }
 
     #[test]

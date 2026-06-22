@@ -556,7 +556,10 @@ fn openai_effective_token_limit_fields(
     max_tokens: Option<u32>,
     thinking: ThinkingBudget,
 ) -> (Option<u32>, Option<u32>) {
-    openai_token_limit_fields(model, Some(effective_max_output_tokens(max_tokens, thinking)))
+    openai_token_limit_fields(
+        model,
+        Some(effective_max_output_tokens(max_tokens, thinking)),
+    )
 }
 
 #[derive(Serialize)]
@@ -996,7 +999,14 @@ async fn gemini_complete(
     fallback_input_tokens: Option<i64>,
     image_data_urls: &[String],
 ) -> Result<Completion> {
-    let req = gemini_generate_req(system, user, max_tokens, temperature, thinking, image_data_urls)?;
+    let req = gemini_generate_req(
+        system,
+        user,
+        max_tokens,
+        temperature,
+        thinking,
+        image_data_urls,
+    )?;
     let resp = reqwest::Client::new()
         .post(gemini_url(model, false))
         .query(&[("key", key)])
@@ -1047,7 +1057,14 @@ async fn gemini_complete_stream(
     fallback_input_tokens: Option<i64>,
     image_data_urls: &[String],
 ) -> Result<StreamingCompletion> {
-    let req = gemini_generate_req(system, user, max_tokens, temperature, thinking, image_data_urls)?;
+    let req = gemini_generate_req(
+        system,
+        user,
+        max_tokens,
+        temperature,
+        thinking,
+        image_data_urls,
+    )?;
     let resp = reqwest::Client::new()
         .post(gemini_url(model, true))
         .query(&[("key", key), ("alt", "sse")])
@@ -1957,10 +1974,7 @@ mod tests {
         assert_eq!(resolve_route("vision"), ("openai", "gpt-5.5"));
         assert_eq!(resolve_route("local"), ("unsupported", "local"));
         // Unknown → balanced default.
-        assert_eq!(
-            resolve_route("???"),
-            ("anthropic", "claude-sonnet-4-6"),
-        );
+        assert_eq!(resolve_route("???"), ("anthropic", "claude-sonnet-4-6"),);
     }
 
     #[test]
@@ -2071,9 +2085,15 @@ mod tests {
         .unwrap();
         let value = serde_json::to_value(req).unwrap();
 
-        assert_eq!(value["systemInstruction"]["parts"][0]["text"], "answer clearly");
+        assert_eq!(
+            value["systemInstruction"]["parts"][0]["text"],
+            "answer clearly"
+        );
         assert_eq!(value["contents"][0]["role"], "user");
-        assert_eq!(value["contents"][0]["parts"][0]["text"], "What is on screen?");
+        assert_eq!(
+            value["contents"][0]["parts"][0]["text"],
+            "What is on screen?"
+        );
         assert_eq!(
             value["contents"][0]["parts"][1]["inlineData"]["mimeType"],
             "image/png"

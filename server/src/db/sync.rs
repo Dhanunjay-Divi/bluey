@@ -171,7 +171,7 @@ pub fn upsert_batch(
     context_artifacts: &[SyncContextArtifactRecord],
     rag_chunks: &[SyncRagChunkRecord],
 ) -> Result<SyncCounts> {
-    match pool {
+    crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => upsert_batch_sqlite(
             pool,
             account_id,
@@ -190,7 +190,7 @@ pub fn upsert_batch(
             context_artifacts,
             rag_chunks,
         ),
-    }
+    })
 }
 
 fn upsert_batch_sqlite(
@@ -621,10 +621,10 @@ pub fn list_sessions(
     account_id: &str,
     limit: i64,
 ) -> Result<Vec<CloudSessionSummary>> {
-    match pool {
+    crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => list_sessions_sqlite(pool, account_id, limit),
         DbPool::Postgres(_) => list_sessions_postgres(pool, account_id, limit),
-    }
+    })
 }
 
 fn list_sessions_sqlite(
@@ -685,7 +685,9 @@ fn list_sessions_postgres(
          LIMIT $2",
         &[&account_id, &limit],
     )?;
-    rows.into_iter().map(cloud_session_summary_from_pg).collect()
+    rows.into_iter()
+        .map(cloud_session_summary_from_pg)
+        .collect()
 }
 
 pub fn load_session(
@@ -693,10 +695,10 @@ pub fn load_session(
     account_id: &str,
     session_id: &str,
 ) -> Result<Option<CloudSessionBundle>> {
-    match pool {
+    crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => load_session_sqlite(pool, account_id, session_id),
         DbPool::Postgres(_) => load_session_postgres(pool, account_id, session_id),
-    }
+    })
 }
 
 fn load_session_sqlite(
@@ -777,10 +779,10 @@ pub fn query_rag(
     embedding: Option<&[f32]>,
     top_k: i64,
 ) -> Result<Vec<RagMatch>> {
-    match pool {
+    crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => query_rag_sqlite(pool, account_id, query, embedding, top_k),
         DbPool::Postgres(_) => query_rag_postgres(pool, account_id, query, embedding, top_k),
-    }
+    })
 }
 
 fn query_rag_sqlite(

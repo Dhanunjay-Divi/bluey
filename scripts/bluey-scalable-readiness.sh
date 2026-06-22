@@ -72,6 +72,13 @@ else
   require_or_warn 0 "server has no Postgres runtime dependency yet"
 fi
 
+if grep -q 'pub fn run_blocking_db' "${ROOT}/server/src/db/mod.rs" \
+  && grep -q 'Postgres DB access must run inside db::run_blocking_db' "${ROOT}/server/src/db/mod.rs"; then
+  ok "Postgres adapter has an enforced Tokio blocking boundary"
+else
+  require_or_warn 0 "Postgres adapter blocking boundary is missing"
+fi
+
 if [[ "${BLUEY_SERVER_DB_BACKEND:-}" == "postgres" && -n "${BLUEY_DATABASE_URL:-}" ]]; then
   ok "Postgres backend env is configured"
   if command -v psql >/dev/null 2>&1; then

@@ -52,24 +52,24 @@ pub struct ExportAccount {
 }
 
 pub fn usage_summary(pool: &DbPool, account_id: &str) -> Result<UsageSummary> {
-    match pool {
+    crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => usage_summary_sqlite(pool, account_id),
         DbPool::Postgres(_) => usage_summary_postgres(pool, account_id),
-    }
+    })
 }
 
 pub fn export_bundle(pool: &DbPool, account_id: &str) -> Result<Option<ExportBundle>> {
-    match pool {
+    crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => export_bundle_sqlite(pool, account_id),
         DbPool::Postgres(_) => export_bundle_postgres(pool, account_id),
-    }
+    })
 }
 
 pub fn hard_delete_account(pool: &DbPool, account_id: &str) -> Result<bool> {
-    match pool {
+    crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => hard_delete_account_sqlite(pool, account_id),
         DbPool::Postgres(_) => hard_delete_account_postgres(pool, account_id),
-    }
+    })
 }
 
 fn usage_summary_sqlite(pool: &DbPool, account_id: &str) -> Result<UsageSummary> {
@@ -503,9 +503,8 @@ fn export_rows_pg(
     sql: &str,
     account_id: &str,
 ) -> Result<Vec<serde_json::Value>> {
-    let wrapped = format!(
-        "SELECT COALESCE(jsonb_agg(to_jsonb(rows)), '[]'::jsonb)::text FROM ({sql}) rows"
-    );
+    let wrapped =
+        format!("SELECT COALESCE(jsonb_agg(to_jsonb(rows)), '[]'::jsonb)::text FROM ({sql}) rows");
     let raw: String = conn
         .query_one(&wrapped, &[&account_id])
         .with_context(|| format!("export postgres rows for query: {sql}"))?

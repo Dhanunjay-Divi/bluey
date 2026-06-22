@@ -21,11 +21,12 @@ pub fn upsert(
     password_hash: &str,
     expires_at: &str,
 ) -> Result<()> {
-    match pool {
-        DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            conn.execute(
-                "INSERT INTO signup_otps (email, otp_hash, password_hash, attempts, expires_at)
+    crate::db::run_blocking_db(|| {
+        match pool {
+            DbPool::Sqlite(_) => {
+                let conn = pool.get()?;
+                conn.execute(
+                    "INSERT INTO signup_otps (email, otp_hash, password_hash, attempts, expires_at)
                  VALUES (?1, ?2, ?3, 0, ?4)
                  ON CONFLICT(email) DO UPDATE SET
                     otp_hash = excluded.otp_hash,
@@ -33,13 +34,13 @@ pub fn upsert(
                     attempts = 0,
                     created_at = datetime('now'),
                     expires_at = excluded.expires_at",
-                params![email, otp_hash, password_hash, expires_at],
-            )?;
-        }
-        DbPool::Postgres(_) => {
-            let mut conn = pool.get_pg()?;
-            conn.execute(
-                "INSERT INTO signup_otps (email, otp_hash, password_hash, attempts, expires_at)
+                    params![email, otp_hash, password_hash, expires_at],
+                )?;
+            }
+            DbPool::Postgres(_) => {
+                let mut conn = pool.get_pg()?;
+                conn.execute(
+                    "INSERT INTO signup_otps (email, otp_hash, password_hash, attempts, expires_at)
                  VALUES ($1, $2, $3, 0, $4::timestamptz)
                  ON CONFLICT(email) DO UPDATE SET
                     otp_hash = excluded.otp_hash,
@@ -47,15 +48,16 @@ pub fn upsert(
                     attempts = 0,
                     created_at = now(),
                     expires_at = excluded.expires_at",
-                &[&email, &otp_hash, &password_hash, &expires_at],
-            )?;
+                    &[&email, &otp_hash, &password_hash, &expires_at],
+                )?;
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 pub fn fetch(pool: &DbPool, email: &str) -> Result<Option<SignupOtp>> {
-    match pool {
+    crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let conn = pool.get()?;
             let row = conn
@@ -93,11 +95,11 @@ pub fn fetch(pool: &DbPool, email: &str) -> Result<Option<SignupOtp>> {
             })
             .transpose()
         }
-    }
+    })
 }
 
 pub fn increment_attempts(pool: &DbPool, email: &str) -> Result<usize> {
-    match pool {
+    crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let conn = pool.get()?;
             Ok(conn.execute(
@@ -113,11 +115,11 @@ pub fn increment_attempts(pool: &DbPool, email: &str) -> Result<usize> {
             )?;
             Ok(usize::try_from(affected).unwrap_or(usize::MAX))
         }
-    }
+    })
 }
 
 pub fn delete(pool: &DbPool, email: &str) -> Result<usize> {
-    match pool {
+    crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let conn = pool.get()?;
             Ok(conn.execute("DELETE FROM signup_otps WHERE email = ?1", params![email])?)
@@ -127,7 +129,7 @@ pub fn delete(pool: &DbPool, email: &str) -> Result<usize> {
             let affected = conn.execute("DELETE FROM signup_otps WHERE email = $1", &[&email])?;
             Ok(usize::try_from(affected).unwrap_or(usize::MAX))
         }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -145,9 +147,23 @@ mod tests {
     #[test]
     fn upsert_resets_attempts_and_updates_hashes() {
         let pool = temp_pool();
-        upsert(&pool, "a@example.com", "otp1", "pw1", "2099-01-01T00:00:00Z").unwrap();
+        upsert(
+            &pool,
+            "a@example.com",
+            "otp1",
+            "pw1",
+            "2099-01-01T00:00:00Z",
+        )
+        .unwrap();
         increment_attempts(&pool, "a@example.com").unwrap();
-        upsert(&pool, "a@example.com", "otp2", "pw2", "2099-01-02T00:00:00Z").unwrap();
+        upsert(
+            &pool,
+            "a@example.com",
+            "otp2",
+            "pw2",
+            "2099-01-02T00:00:00Z",
+        )
+        .unwrap();
 
         let row = fetch(&pool, "a@example.com").unwrap().unwrap();
         assert_eq!(row.otp_hash, "otp2");

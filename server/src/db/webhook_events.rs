@@ -6,7 +6,7 @@ use rusqlite::params;
 use crate::db::DbPool;
 
 pub fn processed(pool: &DbPool, event_id: &str) -> Result<bool> {
-    match pool {
+    crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let conn = pool.get()?;
             let processed_at: Option<String> = conn
@@ -31,34 +31,36 @@ pub fn processed(pool: &DbPool, event_id: &str) -> Result<bool> {
                 .unwrap_or(false);
             Ok(processed)
         }
-    }
+    })
 }
 
 pub fn record_received(pool: &DbPool, event_id: &str, event_type: &str, body: &str) -> Result<()> {
-    match pool {
-        DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            conn.execute(
-                "INSERT OR IGNORE INTO stripe_webhook_events (event_id, type, body)
+    crate::db::run_blocking_db(|| {
+        match pool {
+            DbPool::Sqlite(_) => {
+                let conn = pool.get()?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO stripe_webhook_events (event_id, type, body)
                  VALUES (?1, ?2, ?3)",
-                params![event_id, event_type, body],
-            )?;
-        }
-        DbPool::Postgres(_) => {
-            let mut conn = pool.get_pg()?;
-            conn.execute(
-                "INSERT INTO stripe_webhook_events (event_id, type, body)
+                    params![event_id, event_type, body],
+                )?;
+            }
+            DbPool::Postgres(_) => {
+                let mut conn = pool.get_pg()?;
+                conn.execute(
+                    "INSERT INTO stripe_webhook_events (event_id, type, body)
                  VALUES ($1, $2, $3)
                  ON CONFLICT (event_id) DO NOTHING",
-                &[&event_id, &event_type, &body],
-            )?;
+                    &[&event_id, &event_type, &body],
+                )?;
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 pub fn mark_processed(pool: &DbPool, event_id: &str) -> Result<usize> {
-    match pool {
+    crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let conn = pool.get()?;
             Ok(conn.execute(
@@ -74,5 +76,5 @@ pub fn mark_processed(pool: &DbPool, event_id: &str) -> Result<usize> {
             )?;
             Ok(usize::try_from(affected).unwrap_or(usize::MAX))
         }
-    }
+    })
 }

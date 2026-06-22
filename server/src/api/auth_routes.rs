@@ -298,16 +298,17 @@ pub async fn signup_confirm(
     }
 
     let is_admin = state.config.is_admin_email(&email);
-    let account = Account::create_with_admin(&state.pool, &email, &signup_otp.password_hash, is_admin)
-        .map_err(|e| {
-            if matches!(
-                e.downcast_ref::<crate::db::accounts::AccountCreateError>(),
-                Some(crate::db::accounts::AccountCreateError::DuplicateEmail)
-            ) {
-                return err(StatusCode::CONFLICT, "email already registered");
-            }
-            err(StatusCode::INTERNAL_SERVER_ERROR, &format!("create: {e}"))
-        })?;
+    let account =
+        Account::create_with_admin(&state.pool, &email, &signup_otp.password_hash, is_admin)
+            .map_err(|e| {
+                if matches!(
+                    e.downcast_ref::<crate::db::accounts::AccountCreateError>(),
+                    Some(crate::db::accounts::AccountCreateError::DuplicateEmail)
+                ) {
+                    return err(StatusCode::CONFLICT, "email already registered");
+                }
+                err(StatusCode::INTERNAL_SERVER_ERROR, &format!("create: {e}"))
+            })?;
 
     let _ = signup_otps::delete(&state.pool, &email);
     Account::mark_email_verified(&state.pool, &account.id)
@@ -406,7 +407,11 @@ pub async fn logout(
         return Ok(StatusCode::OK);
     }
 
-    if let Some(refresh_token) = req.refresh_token.as_deref().filter(|token| !token.is_empty()) {
+    if let Some(refresh_token) = req
+        .refresh_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+    {
         if let Ok(claims) = auth::jwt::verify(&state.config.jwt_secret, refresh_token) {
             if claims.kind == "refresh" && claims.sub == account.id {
                 refresh_tokens::revoke(&state.pool, refresh_token)

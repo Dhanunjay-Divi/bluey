@@ -51,7 +51,11 @@ pub struct SaveSquareCardRequest {
 const MINIMUM_RELOAD_CENTS: i64 = 1500;
 const SQUARE_API_VERSION: &str = "2025-04-16";
 
-fn square_idempotency_key(prefix: &str, account_id: &str, suffix: impl std::fmt::Display) -> String {
+fn square_idempotency_key(
+    prefix: &str,
+    account_id: &str,
+    suffix: impl std::fmt::Display,
+) -> String {
     format!(
         "{prefix}-{}-{suffix}",
         cue_core::account_id_hash_prefix(account_id)
@@ -961,8 +965,9 @@ async fn handle_checkout_completed(state: &AppState, event: &serde_json::Value) 
     // AND expanded-object shapes so credit idempotency always gets the
     // PI id (defending against duplicate-charge replay) regardless of
     // which webhook expansion mode Stripe is using.
-    let payment_intent_id = extract_payment_intent_id(session)
-        .ok_or_else(|| anyhow!("Stripe checkout completed without payment_intent; refusing credit"))?;
+    let payment_intent_id = extract_payment_intent_id(session).ok_or_else(|| {
+        anyhow!("Stripe checkout completed without payment_intent; refusing credit")
+    })?;
 
     let credited = balance::credit_processor_payment(
         &state.pool,
@@ -1187,23 +1192,24 @@ fn extract_square_credit(event: &serde_json::Value) -> Result<Option<SquareCredi
             return Ok(None);
         }
 
-        let account_id = required_square_string(order, "/metadata/bluey_account_id", "account metadata")?
-            .to_string();
-        let reference_id =
-            required_square_string(order, "/reference_id", "order reference_id")?;
+        let account_id =
+            required_square_string(order, "/metadata/bluey_account_id", "account metadata")?
+                .to_string();
+        let reference_id = required_square_string(order, "/reference_id", "order reference_id")?;
         let reference_account_id = square_account_id_from_reference(reference_id)
             .ok_or_else(|| anyhow!("Square order reference_id is not a Bluey reload reference"))?;
         ensure_square_account_match(&account_id, &reference_account_id, "order reference_id")?;
 
-        let amount_cents =
-            required_square_metadata_amount(order, "/metadata/bluey_amount_cents")?;
+        let amount_cents = required_square_metadata_amount(order, "/metadata/bluey_amount_cents")?;
         ensure_square_reload_amount(amount_cents, "order metadata amount")?;
         let total_amount =
             required_square_money_amount(order, "/total_money", "order total_money")?;
         ensure_square_amount_match(amount_cents, total_amount, "order total_money")?;
-        if let Some(line_amount) =
-            optional_square_money_amount(order, "/line_items/0/base_price_money", "line item price")?
-        {
+        if let Some(line_amount) = optional_square_money_amount(
+            order,
+            "/line_items/0/base_price_money",
+            "line item price",
+        )? {
             ensure_square_amount_match(amount_cents, line_amount, "line item price")?;
         }
 
@@ -1223,8 +1229,8 @@ fn extract_square_credit(event: &serde_json::Value) -> Result<Option<SquareCredi
         {
             ensure_square_amount_match(amount_cents, tender_amount, "tender amount")?;
         }
-        let payment_id = required_square_string(tender, "/payment_id", "tender payment_id")?
-            .to_string();
+        let payment_id =
+            required_square_string(tender, "/payment_id", "tender payment_id")?.to_string();
 
         return Ok(Some(SquareCreditCandidate {
             account_id,
@@ -1263,8 +1269,7 @@ fn extract_square_credit(event: &serde_json::Value) -> Result<Option<SquareCredi
         {
             ensure_square_amount_match(metadata_amount, amount_cents, "payment metadata amount")?;
         }
-        let payment_id = required_square_string(payment, "/id", "payment id")?
-            .to_string();
+        let payment_id = required_square_string(payment, "/id", "payment id")?.to_string();
         return Ok(Some(SquareCreditCandidate {
             account_id,
             amount_cents,
@@ -1652,10 +1657,7 @@ mod tests {
         });
 
         let extracted = extract_square_credit(&event).unwrap().unwrap();
-        assert_eq!(
-            extracted.account_id,
-            "833e66ac-0652-43c7-a55e-8d51d9ccc982"
-        );
+        assert_eq!(extracted.account_id, "833e66ac-0652-43c7-a55e-8d51d9ccc982");
         assert_eq!(extracted.amount_cents, 3000);
         assert_eq!(extracted.payment_id, "payment_1");
     }

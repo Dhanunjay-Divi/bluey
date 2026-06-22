@@ -1650,10 +1650,7 @@ async fn billing_checkout_requires_verified_email_before_first_payment() {
         .await
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(v["error"]
-        .as_str()
-        .unwrap()
-        .contains("Verify your email"));
+    assert!(v["error"].as_str().unwrap().contains("Verify your email"));
 
     clear_square_billing_env();
 }
