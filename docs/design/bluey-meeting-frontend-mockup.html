@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Bluey — Meeting frontend (aurora glass)</title>
+<style>
+  /* ───────────────────────────────────────────────────────────────
+     Bluey · Meeting frontend — "Aurora Glass"
+     Design language: Apple Liquid Glass (macOS Tahoe 26 / visionOS) —
+     Clarity · Deference · Depth. Light frosted material, a whisper-soft
+     aurora wash (violet→blue→mint) refracting through the glass, near-
+     monochrome ink content, ONE soft shadow, SF Pro, generous air.
+     Deliberately NOT the dark/cyan interview overlay — its own identity.
+     ─────────────────────────────────────────────────────────────── */
+  :root{
+    --ink:#1b1c1f; --ink-2:#52555c; --ink-3:#8a8e96; --ink-4:#b6bac1;
+    --line:rgba(20,22,28,.08); --line-2:rgba(20,22,28,.13);
+    --glass:rgba(255,255,255,.62); --glass-2:rgba(255,255,255,.78); --glass-solid:rgba(255,255,255,.92);
+    --tint:#6f6af0;            /* the single restrained accent — soft indigo */
+    --tint-ink:#4b46c9; --tint-wash:rgba(111,106,240,.10);
+    --violet:#a78bfa; --blue:#7cb0ff; --mint:#76e3c4; --rose:#ff9aa9; --amber:#ffcf8a;
+    --r:12px; --r-lg:18px; --r-xl:26px; --r-pill:999px;
+    --shadow:0 24px 70px -18px rgba(40,38,90,.30), 0 2px 10px -2px rgba(30,30,60,.10);
+    --blur:saturate(180%) blur(30px);
+    font-family:-apple-system,"SF Pro Text","SF Pro Display",Inter,system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  /* the stage — a calm aurora field so the glass has light to refract */
+  body{min-height:100vh;color:var(--ink);padding:48px 24px 90px;display:flex;flex-direction:column;align-items:center;gap:46px;
+    background:
+      radial-gradient(900px 520px at 12% 0%, rgba(167,139,250,.26), transparent 60%),
+      radial-gradient(820px 520px at 88% 8%, rgba(124,176,255,.24), transparent 58%),
+      radial-gradient(760px 600px at 50% 108%, rgba(118,227,196,.22), transparent 60%),
+      linear-gradient(180deg,#f4f3fb,#eef0f7 55%,#f3f1f9);
+  }
+  .legend{max-width:940px;width:100%;color:var(--ink-2);font-size:13.5px;line-height:1.65}
+  .legend h1{font-size:21px;font-weight:600;color:var(--ink);letter-spacing:-.02em;margin-bottom:7px}
+  .legend b{color:var(--ink);font-weight:560}
+  .legend code{font:500 11.5px/1 "SF Mono",ui-monospace,monospace;color:var(--tint-ink);background:var(--tint-wash);padding:2px 6px;border-radius:6px}
+  .row{display:flex;gap:34px;flex-wrap:wrap;justify-content:center;align-items:flex-start;width:100%;max-width:1000px}
+  .stack{display:flex;flex-direction:column;gap:14px;align-items:center}
+  .caption{font-size:11px;color:var(--ink-3);letter-spacing:.09em;text-transform:uppercase;font-weight:600}
+
+  /* the aurora wash that lives INSIDE every glass surface (the refraction) */
+  .aurora{position:absolute;inset:-40% -20%;z-index:0;pointer-events:none;opacity:.5;filter:blur(36px);
+    background:
+      radial-gradient(40% 50% at 18% 10%, var(--violet), transparent 70%),
+      radial-gradient(42% 52% at 88% 6%, var(--blue), transparent 70%),
+      radial-gradient(46% 56% at 70% 104%, var(--mint), transparent 72%);}
+  .glass{position:relative;background:var(--glass);backdrop-filter:var(--blur);-webkit-backdrop-filter:var(--blur);
+    border:1px solid var(--line-2);box-shadow:var(--shadow);overflow:hidden}
+  .glass > *{position:relative;z-index:1}
+
+  /* ── Collapsed pill ── */
+  .pill{display:inline-flex;align-items:center;gap:10px;border-radius:var(--r-pill);padding:8px 10px 8px 15px}
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--mint);box-shadow:0 0 0 4px rgba(118,227,196,.22)}
+  .wave{display:inline-flex;align-items:flex-end;gap:2.5px;height:13px}
+  .wave i{width:2.5px;background:linear-gradient(var(--violet),var(--blue));border-radius:2px;animation:w 1.1s ease-in-out infinite}
+  .wave i:nth-child(1){height:5px}.wave i:nth-child(2){height:12px;animation-delay:.18s}.wave i:nth-child(3){height:8px;animation-delay:.34s}
+  @keyframes w{0%,100%{transform:scaleY(.45)}50%{transform:scaleY(1)}}
+  .pill .nm{font-size:13.5px;font-weight:560;letter-spacing:-.01em}
+  .pill .bal{font-size:12px;color:var(--ink-3)}
+  .pbtn{width:28px;height:28px;border-radius:50%;border:none;background:transparent;color:var(--ink-2);cursor:pointer;
+    display:inline-flex;align-items:center;justify-content:center;font-size:14px;transition:.15s}
+  .pbtn:hover{background:rgba(20,22,28,.06);color:var(--ink)}
+  .pbtn.acc{background:var(--tint-wash);color:var(--tint-ink)}
+
+  /* ── Expanded panel ── */
+  .panel{width:482px;border-radius:var(--r-xl)}
+  .hdr{display:flex;align-items:center;justify-content:space-between;padding:13px 15px}
+  .hdr .l{display:flex;align-items:center;gap:9px}
+  .brand{display:inline-flex;align-items:center;gap:8px}
+  .mark{width:22px;height:22px;border-radius:7px;background:linear-gradient(140deg,var(--violet),var(--blue) 55%,var(--mint));
+    box-shadow:inset 0 0 0 1px rgba(255,255,255,.5)}
+  .hdr .nm{font-size:14px;font-weight:600;letter-spacing:-.01em}
+  .via{font-size:12.5px;color:var(--ink-3)} .via b{color:var(--tint-ink);font-weight:540}
+  .ic{width:28px;height:28px;border-radius:8px;border:none;background:transparent;color:var(--ink-3);cursor:pointer;
+    display:inline-flex;align-items:center;justify-content:center;font-size:15px}
+  .ic:hover{background:rgba(20,22,28,.06);color:var(--ink)}
+
+  .seg{display:flex;gap:2px;background:rgba(20,22,28,.05);border-radius:11px;padding:3px}
+  .seg button{border:none;background:transparent;color:var(--ink-2);font-size:12px;font-weight:540;padding:5px 13px;border-radius:8px;cursor:pointer;letter-spacing:-.01em}
+  .seg button.on{background:var(--glass-solid);color:var(--ink);box-shadow:0 1px 3px rgba(30,30,60,.12)}
+
+  /* agent + MCP bar */
+  .agentbar{display:flex;align-items:center;justify-content:space-between;padding:11px 15px;margin:0 12px 4px;border-radius:var(--r-lg);
+    background:var(--glass-2);border:1px solid var(--line)}
+  .agentbar .l{display:flex;align-items:center;gap:10px}
+  .badge-ic{width:30px;height:30px;border-radius:9px;background:linear-gradient(150deg,#eef0ff,#e7f6f1);color:var(--tint-ink);
+    display:inline-flex;align-items:center;justify-content:center;font-size:15px;box-shadow:inset 0 0 0 1px rgba(255,255,255,.6)}
+  .a-nm{font-size:13px;font-weight:560} .a-sub{font-size:11px;color:var(--ink-3);margin-top:1px}
+  .conns{display:flex;gap:6px}
+  .chip{font-size:11px;color:var(--ink-2);background:var(--glass-solid);border:1px solid var(--line);padding:3px 9px;border-radius:var(--r-pill);
+    display:inline-flex;align-items:center;gap:5px}
+  .chip .g{width:5px;height:5px;border-radius:50%;background:var(--mint)}
+
+  /* feed */
+  .feed{padding:6px 0 2px;max-height:440px;overflow-y:auto}
+  .feed::-webkit-scrollbar{width:9px}.feed::-webkit-scrollbar-thumb{background:rgba(20,22,28,.14);border-radius:5px;border:3px solid transparent;background-clip:content-box}
+  .turn{padding:9px 16px}
+  .role{font-size:10px;font-weight:680;letter-spacing:.1em;color:var(--ink-3);margin-bottom:5px;display:flex;align-items:center;gap:8px}
+  .role .meta{font-weight:430;letter-spacing:0;text-transform:none;color:var(--ink-4)}
+  .body{font-size:14px;line-height:1.62;color:var(--ink);word-wrap:break-word}
+  .body.muted{color:var(--ink-2);font-size:13.5px}
+  .body code{font:500 12.5px/1 "SF Mono",ui-monospace,monospace;background:rgba(111,106,240,.09);color:var(--tint-ink);padding:2px 6px;border-radius:6px}
+  .cur{display:inline-block;width:2px;height:15px;background:var(--tint);vertical-align:-3px;margin-left:3px;border-radius:1px;animation:bl 1.1s step-end infinite}
+  @keyframes bl{50%{opacity:0}}
+
+  /* the answer is the hero — soft elevated glass card, no hard border */
+  .answer{margin:4px 12px;padding:15px 16px 13px;border-radius:var(--r-lg);background:var(--glass-2);
+    box-shadow:0 10px 36px -16px rgba(60,50,140,.3), inset 0 0 0 1px rgba(255,255,255,.5)}
+  .answer .role{color:var(--tint-ink)}
+
+  /* MCP source rows — the grounding, shown as quiet provenance */
+  .srcs{display:flex;flex-direction:column;gap:6px;margin-top:11px}
+  .src{display:flex;align-items:center;gap:9px;font-size:12px;color:var(--ink-2);background:var(--glass-solid);
+    border:1px solid var(--line);border-radius:10px;padding:7px 10px}
+  .src .sd{width:7px;height:7px;border-radius:50%;flex:none}
+  .src b{color:var(--ink);font-weight:560}
+  .src .ok{color:#1f9d6b}
+
+  .acts{display:flex;align-items:center;gap:7px;margin-top:12px}
+  .mini{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--ink-2);background:var(--glass-solid);
+    border:1px solid var(--line);border-radius:9px;padding:6px 11px;cursor:pointer;transition:.15s}
+  .mini:hover{background:#fff;border-color:var(--line-2);color:var(--ink)}
+  .mini.acc{color:var(--tint-ink);background:var(--tint-wash);border-color:transparent}
+  .acts .spacer{flex:1} .cost{font-size:10.5px;color:var(--ink-4)}
+
+  /* question-detection trigger */
+  .trig{display:flex;align-items:center;gap:10px;padding:5px 16px}
+  .trig .ln{flex:1;height:1px;background:var(--line-2)}
+  .trig .lbl{font-size:10.5px;color:var(--tint-ink);font-weight:540;display:inline-flex;align-items:center;gap:6px;
+    background:var(--tint-wash);padding:3px 10px;border-radius:var(--r-pill)}
+
+  /* slow-answer progress (the honest seconds-long agent drive) */
+  .think{display:flex;align-items:center;gap:10px;margin:4px 12px;padding:13px 15px;border-radius:var(--r-lg);
+    background:var(--glass-2);box-shadow:inset 0 0 0 1px rgba(255,255,255,.5)}
+  .think .orb{width:18px;height:18px;border-radius:50%;background:conic-gradient(var(--violet),var(--blue),var(--mint),var(--violet));animation:sp 1.4s linear infinite}
+  @keyframes sp{to{transform:rotate(360deg)}}
+  .think .tx{font-size:12.5px;color:var(--ink-2)} .think .tx b{color:var(--ink);font-weight:540}
+  .sk{height:9px;border-radius:5px;background:linear-gradient(90deg,rgba(20,22,28,.06),rgba(20,22,28,.11),rgba(20,22,28,.06));
+    background-size:200% 100%;animation:sh 1.4s linear infinite}
+  @keyframes sh{to{background-position:-200% 0}}
+
+  /* composer */
+  .compose{padding:11px 14px 13px}
+  .ctx{display:inline-flex;align-items:center;gap:7px;font-size:10.5px;color:var(--ink-2);background:var(--glass-solid);
+    border:1px solid var(--line);border-radius:var(--r-pill);padding:4px 11px;margin-bottom:10px}
+  .cbar{display:flex;align-items:center;gap:9px;background:var(--glass-solid);border:1px solid var(--line-2);border-radius:15px;padding:8px 9px 8px 13px;
+    box-shadow:inset 0 1px 2px rgba(30,30,60,.04)}
+  .cbar .txt{flex:1;font-size:13.5px;color:var(--ink-3)}
+  .cbtn{width:31px;height:31px;border-radius:9px;border:none;background:transparent;color:var(--ink-2);cursor:pointer;
+    display:inline-flex;align-items:center;justify-content:center;font-size:16px;transition:.15s}
+  .cbtn:hover{background:rgba(20,22,28,.06);color:var(--ink)}
+  .cbtn.send{background:linear-gradient(140deg,var(--tint),#8f7af5);color:#fff;box-shadow:0 4px 12px -2px rgba(111,106,240,.5)}
+  .kbd{font:500 10px/1 "SF Mono",monospace;color:var(--ink-3);border:1px solid var(--line-2);border-radius:6px;padding:3px 6px}
+
+  /* footer */
+  .ftr{display:flex;align-items:center;justify-content:space-between;padding:9px 16px;border-top:1px solid var(--line)}
+  .ftr span{font-size:10.5px;color:var(--ink-4)} .ftr .acc{color:var(--tint-ink)}
+
+  /* + menu */
+  .menu{width:236px;border-radius:var(--r-lg);padding:6px}
+  .mi{display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:10px;font-size:13.5px;color:var(--ink);cursor:pointer}
+  .mi:hover{background:rgba(20,22,28,.05)} .mi i{font-size:16px;color:var(--ink-3);width:18px;text-align:center}
+  .mi .kbd{margin-left:auto} .msep{height:1px;background:var(--line);margin:5px 8px}
+
+  /* fix flow */
+  .fix{width:312px;border-radius:var(--r-lg)}
+  .fix-sec{padding:11px 14px;border-bottom:1px solid var(--line)}
+  .fix-sec .k{font-size:9.5px;font-weight:680;letter-spacing:.09em;color:var(--ink-3);margin-bottom:4px}
+  .fix-sec .v{font-size:12.5px;line-height:1.5;color:var(--ink)}
+  .fix-code{font:500 11.5px/1.65 "SF Mono",monospace;background:rgba(20,22,28,.035);border-radius:10px;padding:11px 12px;white-space:pre;overflow-x:auto;color:var(--ink-2)}
+  .fix-code .add{color:#1f9d6b}.fix-code .del{color:#d6536a}
+  .fix-act{display:flex;align-items:center;gap:9px;padding:12px 14px}
+  .btn{border:1px solid var(--line-2);background:var(--glass-solid);color:var(--ink);font-size:12.5px;font-weight:540;padding:7px 14px;border-radius:10px;cursor:pointer}
+  .btn:hover{border-color:var(--ink-4)}
+  .btn.primary{background:linear-gradient(140deg,var(--tint),#8f7af5);color:#fff;border-color:transparent;box-shadow:0 5px 14px -3px rgba(111,106,240,.5)}
+  .fix-act .st{margin-left:auto;font-size:10px;color:var(--ink-4)}
+
+  /* settings / state strip */
+  .scard{width:368px;border-radius:var(--r-xl);overflow:hidden}
+  .stt{padding:13px 16px;display:flex;align-items:center;gap:11px;border-bottom:1px solid var(--line);font-size:13px}
+  .stt:last-child{border-bottom:none}
+  .stt .ic2{width:30px;height:30px;border-radius:9px;display:inline-flex;align-items:center;justify-content:center;font-size:14px;box-shadow:inset 0 0 0 1px rgba(255,255,255,.55)}
+  .stt .d{flex:1} .stt .d .t{font-size:13px;color:var(--ink);font-weight:500} .stt .d .s{font-size:11.5px;color:var(--ink-3);margin-top:1px}
+  .toggle{width:38px;height:23px;border-radius:var(--r-pill);background:linear-gradient(140deg,var(--tint),#8f7af5);position:relative;flex:none;box-shadow:0 2px 6px -1px rgba(111,106,240,.4)}
+  .toggle.off{background:rgba(20,22,28,.12);box-shadow:none}
+  .toggle i{position:absolute;top:2.5px;left:17.5px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.25)}
+  .toggle.off i{left:2.5px}
+  .tag{font-size:10px;font-weight:560;padding:3px 9px;border-radius:var(--r-pill)}
+  .gi{font-family:-apple-system,system-ui}
+</style>
+</head>
+<body>
+
+  <div class="legend">
+    <h1>Bluey — meeting frontend · “Aurora Glass”</h1>
+    A NEW surface, distinct from the interview overlay. Design language: Apple <b>Liquid Glass</b> (macOS Tahoe 26 / visionOS) —
+    <b>clarity · deference · depth</b>. A light frosted panel with a whisper-soft aurora refracting through it, near-monochrome ink
+    content, one restrained indigo accent, a single soft shadow, SF Pro, generous air. The grounded answer is the hero; chrome
+    recedes. One local spine — your own agent + its MCP — <code>no data retention</code>.
+  </div>
+
+  <!-- COLLAPSED PILL — run states -->
+  <div class="stack" style="align-items:stretch">
+    <div class="caption" style="text-align:center">collapsed pill · run states</div>
+    <div class="row" style="gap:14px">
+      <div class="pill glass"><div class="aurora"></div><span class="dot"></span><span class="nm">Bluey</span><span class="bal">$4.98</span>
+        <button class="pbtn acc gi">✎</button><button class="pbtn gi">▢</button><button class="pbtn gi">⏻</button></div>
+      <div class="pill glass"><div class="aurora"></div><span class="wave"><i></i><i></i><i></i></span><span class="nm">listening</span>
+        <button class="pbtn acc gi">✎</button><button class="pbtn gi">⏸</button><button class="pbtn gi">⏻</button></div>
+      <div class="pill glass"><div class="aurora"></div><span class="dot" style="background:var(--amber);box-shadow:0 0 0 4px rgba(255,207,138,.25)"></span><span class="nm">connecting</span>
+        <button class="pbtn gi">✎</button><button class="pbtn gi">▢</button><button class="pbtn gi">⏻</button></div>
+      <div class="pill glass"><div class="aurora"></div><span class="dot" style="background:var(--ink-4);box-shadow:none"></span><span class="nm">paused</span>
+        <button class="pbtn gi">✎</button><button class="pbtn gi">▶</button><button class="pbtn gi">⏻</button></div>
+      <div class="pill glass"><div class="aurora"></div><span class="dot" style="background:var(--rose);box-shadow:0 0 0 4px rgba(255,154,169,.25)"></span><span class="nm">no provider</span>
+        <button class="pbtn gi">!</button><button class="pbtn gi">▢</button><button class="pbtn gi">⏻</button></div>
+    </div>
+  </div>
+
+  <!-- EXPANDED PANEL + side column -->
+  <div class="row">
+    <div class="stack">
+      <div class="caption">expanded · ask tab · live answer</div>
+      <div class="panel glass"><div class="aurora"></div>
+        <div class="hdr">
+          <div class="l"><span class="brand"><span class="mark"></span><span class="nm">Bluey</span></span><span class="via">· <b>Claude Code</b></span></div>
+          <div class="seg"><button class="on">Ask</button><button>History</button><button>Agents</button></div>
+          <button class="ic gi">×</button>
+        </div>
+        <div class="agentbar">
+          <div class="l"><span class="badge-ic gi">⌘</span>
+            <div><div class="a-nm">Claude Code <span style="color:var(--ink-3);font-weight:430">· your session</span></div>
+            <div class="a-sub">acme/payments-api · resumed in place</div></div></div>
+          <div class="conns"><span class="chip"><span class="g"></span>Jira</span><span class="chip"><span class="g"></span>GitHub</span><span class="chip">+2</span></div>
+        </div>
+        <div class="feed">
+          <div class="turn">
+            <div class="role">TRANSCRIPT<span class="meta">Priya · heard · 12:04</span></div>
+            <div class="body muted">…before we lock the launch date — why did the auth migration break staging last week, and is it actually fixed?</div>
+          </div>
+          <div class="trig"><div class="ln"></div><span class="lbl gi">✦ question detected · asking your agent</span><div class="ln"></div></div>
+          <div class="answer">
+            <div class="role">CLAUDE CODE<span class="meta">grounded in your repo &amp; tickets</span></div>
+            <div class="body"><b style="font-weight:600">Yes — it’s fixed.</b> <code>PR #482</code> renamed the <code>auth.sessions</code> column but the migration ran before deploy — a 12-min window of stale reads. The backfill guard since makes it backward-compatible.
+              <div class="srcs">
+                <div class="src"><span class="sd" style="background:var(--blue)"></span><b>Jira</b>&nbsp;CUE-1423 “Staging auth 500s” · <span class="ok">resolved 3d ago</span></div>
+                <div class="src"><span class="sd" style="background:var(--violet)"></span><b>GitHub</b>&nbsp;#488 backfill guard · merged → staging green 3 days</div>
+              </div>
+            </div>
+            <div class="acts">
+              <button class="mini gi">⧉ Copy</button>
+              <button class="mini acc gi">✦ Fix this</button>
+              <button class="mini gi">⤴ Send to chat</button>
+              <span class="spacer"></span><span class="cost">2.5k tok · $0.02</span>
+            </div>
+          </div>
+        </div>
+        <div class="compose">
+          <span class="ctx gi">✓ in context · transcript · 1 screen · 6 turns</span>
+          <div class="cbar"><button class="cbtn gi">＋</button><span class="txt">Ask a follow-up while Bluey listens…</span>
+            <button class="cbtn gi">🎙</button><span class="kbd">⌘↵</span><button class="cbtn send gi">↑</button></div>
+        </div>
+        <div class="ftr"><span>Claude Code · <span class="acc">runs on your machine</span></span><span>Jira · GitHub · Supabase</span><span>⌘↵ ask · ⌥ hide</span></div>
+      </div>
+    </div>
+
+    <div class="stack" style="gap:26px">
+      <div class="stack">
+        <div class="caption">slow answer · progress</div>
+        <div class="panel glass" style="width:300px"><div class="aurora"></div>
+          <div style="padding:6px 0">
+            <div class="trig"><div class="ln"></div><span class="lbl gi">✦ question detected</span><div class="ln"></div></div>
+            <div class="think"><span class="orb"></span><span class="tx"><b>Thinking with your repo…</b><br><span style="font-size:11px">reading auth migration · querying Jira</span></span></div>
+            <div style="padding:4px 16px 12px;display:flex;flex-direction:column;gap:8px">
+              <div class="sk" style="width:92%"></div><div class="sk" style="width:78%"></div><div class="sk" style="width:60%"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="stack">
+        <div class="caption">＋ menu</div>
+        <div class="menu glass"><div class="aurora"></div>
+          <div class="mi gi">📎 Attach files</div>
+          <div class="mi gi">🌐 Capture page<span class="kbd">⌥S</span></div>
+          <div class="mi gi">＋ New session</div>
+          <div class="msep"></div>
+          <div class="mi gi">≣ Recap</div>
+          <div class="mi gi">✎ Answer style</div>
+          <div class="mi gi">⚙ Settings</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- FIX FLOW + STATE STRIP -->
+  <div class="row">
+    <div class="stack">
+      <div class="caption">fix flow · propose → approve</div>
+      <div class="fix glass"><div class="aurora"></div>
+        <div class="fix-sec"><div class="k">DIAGNOSIS</div><div class="v">Migration runs before deploy → stale column read.</div></div>
+        <div class="fix-sec"><div class="k">PROPOSED CHANGE</div>
+          <div class="fix-code"><span class="del">- ALTER TABLE auth RENAME sessions</span>
+<span class="add">+ ALTER TABLE auth ADD sessions_v2</span>
+<span class="add">+ -- backfill guard, then drop old</span></div></div>
+        <div class="fix-act"><button class="btn primary">Approve &amp; apply</button><button class="btn">Reject</button><span class="st">via your agent · never pushes</span></div>
+      </div>
+    </div>
+
+    <div class="stack">
+      <div class="caption">privacy · consent · states</div>
+      <div class="scard glass"><div class="aurora"></div>
+        <div class="stt"><span class="ic2 gi" style="background:linear-gradient(150deg,#eef0ff,#e7f6f1);color:var(--tint-ink)">🔒</span>
+          <div class="d"><div class="t">Answer stays on your machine</div><div class="s">private until you choose “send to chat”</div></div>
+          <span class="tag" style="background:var(--tint-wash);color:var(--tint-ink)">default</span></div>
+        <div class="stt"><span class="ic2 gi" style="background:#eaf1ff;color:#3f6fd1">📂</span>
+          <div class="d"><div class="t">Read agent session history</div><div class="s">consent-gated · off shows a prompt, not silence</div></div>
+          <div class="toggle"><i></i></div></div>
+        <div class="stt"><span class="ic2 gi" style="background:#e7f8f1;color:#1f9d6b">🎙</span>
+          <div class="d"><div class="t">Local system audio</div><div class="s">hears the call here — nothing uploaded</div></div>
+          <div class="toggle"><i></i></div></div>
+        <div class="stt"><span class="ic2 gi" style="background:#fff3e3;color:#c8841f">◐</span>
+          <div class="d"><div class="t">Auto-disguise in meeting apps</div><div class="s">overlay hidden from screen-share</div></div>
+          <div class="toggle"><i></i></div></div>
+        <div class="stt"><span class="ic2 gi" style="background:#ffeef0;color:#d6536a">!</span>
+          <div class="d"><div class="t">Perplexity connector</div><div class="s">key 401 — re-auth in the agent’s own login</div></div>
+          <span class="tag" style="background:#ffeef0;color:#d6536a">needs reauth</span></div>
+      </div>
+    </div>
+  </div>
+
+</body>
+</html>
