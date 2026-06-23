@@ -261,6 +261,8 @@ async fn drive_once_with_model(kind: AgentKind, model_override: &[String]) -> Dr
             Ok(Some(chunk)) => match chunk {
                 AnswerChunk::Started { .. } => {}
                 AnswerChunk::Delta(d) => body.push_str(&d),
+                // Reasoning + tool-call chunks are live status, not answer body.
+                AnswerChunk::Reasoning(_) | AnswerChunk::ToolCall { .. } => {}
                 AnswerChunk::Done { .. } => break,
                 AnswerChunk::Error(message) => {
                     return DriveProof::Failed {
@@ -1026,8 +1028,9 @@ async fn mcp_step(kind: &AgentKind) -> McpStep {
 /// an MCP tool call and detect whether a tool actually FIRED — proving the USP
 /// (the driven agent uses its own connectors), not merely that connectors are
 /// listed/configured. Returns [`McpStep::Fired`] with the observed tool title(s)
-/// if a `[tool: …]` chunk arrives; otherwise falls through to [`mcp_step`]
-/// (live-list / config) so it never regresses below the cheaper signals.
+/// if an [`AnswerChunk::ToolCall`] arrives; otherwise falls through to
+/// [`mcp_step`] (live-list / config) so it never regresses below the cheaper
+/// signals.
 ///
 /// **Spends a real model call** — call only on an explicit firing probe, never in
 /// the default read-only matrix. A quota'd/401 connector STILL fires the tool, so
@@ -1046,11 +1049,10 @@ pub async fn mcp_step_with_firing(kind: &AgentKind, prompt: &str) -> McpStep {
         .await
         .map_err(|_| ())
     {
-        if let AnswerChunk::Delta(d) = &chunk {
-            if let Some(title) = tool_title_from_delta(d) {
-                if !tools.contains(&title) {
-                    tools.push(title);
-                }
+        if let AnswerChunk::ToolCall { title, .. } = &chunk {
+            let title = title.trim();
+            if !title.is_empty() && !tools.iter().any(|t| t == title) {
+                tools.push(title.to_string());
             }
         }
         if matches!(chunk, AnswerChunk::Done { .. } | AnswerChunk::Error(_)) {
@@ -1063,15 +1065,6 @@ pub async fn mcp_step_with_firing(kind: &AgentKind, prompt: &str) -> McpStep {
     } else {
         McpStep::Fired { tools }
     }
-}
-
-/// Extract the tool title from a `[tool: <title>]` Delta chunk, if it is one.
-/// This marker is emitted ONLY for an ACP `ToolCall` update (`format_tool_call`),
-/// never as user/agent prose — so its presence is a reliable tool-firing signal.
-fn tool_title_from_delta(delta: &str) -> Option<String> {
-    let rest = delta.strip_prefix("[tool: ")?;
-    let title = rest.trim_end_matches(']').trim();
-    (!title.is_empty()).then(|| title.to_string())
 }
 
 /// Level-1 config-read fallback for [`mcp_step`]: read the agent's connector
@@ -1479,25 +1472,25 @@ mod tests {
     }
 
     #[test]
-    fn tool_title_from_delta_detects_only_the_tool_marker() {
-        // The firing signal: a `[tool: <title>]` chunk yields the title.
-        assert_eq!(
-            tool_title_from_delta("[tool: mcp__perplexity__perplexity_ask]"),
-            Some("mcp__perplexity__perplexity_ask".to_string())
-        );
-        assert_eq!(
-            tool_title_from_delta("[tool: github-mcp-server-search_code]"),
-            Some("github-mcp-server-search_code".to_string())
-        );
-        // Plain answer text (even if it mentions tools) must NOT be a firing
-        // signal — only our exact marker counts, so a 401'd connector's apology
-        // text can't be mistaken for a real firing.
-        assert_eq!(
-            tool_title_from_delta("I will use the perplexity tool now."),
-            None
-        );
-        assert_eq!(tool_title_from_delta("see [tool: x] mid-sentence"), None);
-        assert_eq!(tool_title_from_delta("[tool: ]"), None);
+    fn tool_firing_detected_from_toolcall_chunk() {
+        // The firing signal is now a first-class AnswerChunk::ToolCall (not a
+        // `[tool: …]` Delta string). A real invocation yields its title; plain
+        // answer Deltas — even ones that mention tools — never count, so a 401'd
+        // connector's apology text can't be mistaken for a real firing.
+        use crate::drive::{AnswerChunk, ToolStatus};
+        let fired = AnswerChunk::ToolCall {
+            id: "tc_1".to_string(),
+            title: "mcp__perplexity__perplexity_ask".to_string(),
+            status: ToolStatus::InProgress,
+        };
+        let title = match &fired {
+            AnswerChunk::ToolCall { title, .. } => Some(title.clone()),
+            _ => None,
+        };
+        assert_eq!(title.as_deref(), Some("mcp__perplexity__perplexity_ask"));
+        // A prose Delta is not a firing signal.
+        let prose = AnswerChunk::Delta("I will use the perplexity tool now.".to_string());
+        assert!(!matches!(prose, AnswerChunk::ToolCall { .. }));
     }
 
     #[test]

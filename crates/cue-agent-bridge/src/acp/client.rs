@@ -36,13 +36,13 @@ use std::pin::Pin;
 use agent_client_protocol::schema::{
     ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionResponse, ProtocolVersion,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, ToolCall,
+    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason,
 };
 use agent_client_protocol::{AcpAgent, Client, Responder};
 use futures::channel::mpsc;
 use futures::Stream;
 
-use crate::drive::{AnswerChunk, AnswerStream};
+use crate::drive::{AnswerChunk, AnswerStream, ToolStatus};
 
 /// How to launch an agent as an ACP subprocess: the executable plus its args.
 ///
@@ -420,17 +420,50 @@ fn session_update_to_chunk(update: SessionUpdate) -> Option<AnswerChunk> {
     match update {
         // The agent's visible answer text — the primary Delta stream.
         SessionUpdate::AgentMessageChunk(chunk) => text_of(&chunk.content).map(AnswerChunk::Delta),
-        // A tool call started. Bluey's AnswerChunk has no dedicated tool
-        // variant, so we surface it as a Delta with a compact, human-readable
-        // marker. PHASE 2 may introduce a richer event (see mod-level note).
-        SessionUpdate::ToolCall(tool_call) => {
-            Some(AnswerChunk::Delta(format_tool_call(&tool_call)))
+        // The agent's reasoning/thinking — surfaced as a dedicated chunk so the
+        // UI can show it in the live status area, NOT inline in the answer.
+        SessionUpdate::AgentThoughtChunk(chunk) => {
+            text_of(&chunk.content).map(AnswerChunk::Reasoning)
         }
-        // Everything else (user echo, agent thoughts, plans, mode/usage/info
-        // updates, tool-call *progress* updates, and any future variants) is
-        // not part of the linear answer text, so it is dropped here. Cost is
-        // taken from the StopReason path instead.
+        // A tool call STARTED — a real MCP/connector round-trip or built-in
+        // (read/edit/search/…). Surfaced as a first-class ToolCall chunk (no
+        // longer flattened into the answer body) so it appears in the live
+        // status feed with its own running/done state.
+        SessionUpdate::ToolCall(tool_call) => Some(AnswerChunk::ToolCall {
+            id: tool_call.tool_call_id.0.to_string(),
+            title: tool_call.title.clone(),
+            status: tool_status_of(tool_call.status),
+        }),
+        // A tool call PROGRESS update — same tool-call id, new status (and
+        // sometimes a refined title). Collapses onto the existing status row.
+        SessionUpdate::ToolCallUpdate(update) => Some(AnswerChunk::ToolCall {
+            id: update.tool_call_id.0.to_string(),
+            // Title may be absent on a progress update; empty string lets the
+            // UI keep the title it already has for this id.
+            title: update.fields.title.clone().unwrap_or_default(),
+            status: update
+                .fields
+                .status
+                .map(tool_status_of)
+                .unwrap_or(ToolStatus::InProgress),
+        }),
+        // Everything else (user echo, plans, mode/usage/info updates, and any
+        // future variants) is not part of the answer or status, so it is
+        // dropped. Cost is taken from the StopReason path instead.
         _ => None,
+    }
+}
+
+/// Map ACP `ToolCallStatus` onto our transport-neutral [`ToolStatus`].
+fn tool_status_of(status: agent_client_protocol::schema::ToolCallStatus) -> ToolStatus {
+    use agent_client_protocol::schema::ToolCallStatus as S;
+    match status {
+        S::Pending => ToolStatus::Pending,
+        S::InProgress => ToolStatus::InProgress,
+        S::Completed => ToolStatus::Completed,
+        S::Failed => ToolStatus::Failed,
+        // `ToolCallStatus` is #[non_exhaustive]; treat unknowns as in-progress.
+        _ => ToolStatus::InProgress,
     }
 }
 
@@ -443,12 +476,6 @@ fn text_of(block: &ContentBlock) -> Option<String> {
         ContentBlock::Text(text) => Some(text.text.clone()),
         _ => None,
     }
-}
-
-/// Render a tool-call announcement into a one-line marker for the answer
-/// stream. Kept terse and prefixed so a consumer/UI can recognize it.
-fn format_tool_call(tool_call: &ToolCall) -> String {
-    format!("[tool: {}]", tool_call.title)
 }
 
 /// Map an ACP turn [`StopReason`] to the terminal [`AnswerChunk`].
@@ -524,12 +551,31 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_maps_to_marker_delta() {
+    fn tool_call_maps_to_toolcall_chunk() {
+        use agent_client_protocol::schema::ToolCall;
         let tc = ToolCall::new("tool-1", "Read file");
         let update = SessionUpdate::ToolCall(tc);
+        // A tool call is now a first-class status chunk (no longer flattened
+        // into the answer body as a `[tool: …]` Delta), carrying its id, title,
+        // and run state for the live status feed.
         assert_eq!(
             session_update_to_chunk(update),
-            Some(AnswerChunk::Delta("[tool: Read file]".to_string()))
+            Some(AnswerChunk::ToolCall {
+                id: "tool-1".to_string(),
+                title: "Read file".to_string(),
+                status: ToolStatus::Pending,
+            })
+        );
+    }
+
+    #[test]
+    fn agent_thought_maps_to_reasoning_chunk() {
+        let update = SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+            TextContent::new("let me check the schema"),
+        )));
+        assert_eq!(
+            session_update_to_chunk(update),
+            Some(AnswerChunk::Reasoning("let me check the schema".to_string()))
         );
     }
 

@@ -168,6 +168,21 @@ impl Question {
     }
 }
 
+/// The lifecycle state of an agent tool call, mirrored from ACP
+/// `ToolCallStatus`. Carried on [`AnswerChunk::ToolCall`] so the UI can show a
+/// running spinner vs a finished check, like Claude's live status feed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolStatus {
+    /// Announced but not started yet.
+    Pending,
+    /// Currently executing.
+    InProgress,
+    /// Finished successfully.
+    Completed,
+    /// Finished with an error.
+    Failed,
+}
+
 /// One streamed piece of an agent's answer.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AnswerChunk {
@@ -176,6 +191,20 @@ pub enum AnswerChunk {
     Started { session_id: Option<String> },
     /// A piece of answer text, in order.
     Delta(String),
+    /// The agent's reasoning/thinking text (ACP `AgentThoughtChunk`). This is
+    /// the model's own chain-of-thought, NOT part of the linear answer — the UI
+    /// surfaces it in the live status area, never inside the answer body.
+    Reasoning(String),
+    /// The agent invoked (or updated the state of) a tool — an MCP/connector
+    /// round-trip or a built-in like read/edit/search (ACP `ToolCall` /
+    /// `ToolCallUpdate`). `id` is the ACP tool-call id so repeated updates
+    /// collapse onto one status row. This is real agent activity, surfaced live
+    /// in the status feed — never fabricated.
+    ToolCall {
+        id: String,
+        title: String,
+        status: ToolStatus,
+    },
     /// The run finished cleanly; carries the reported cost when available.
     Done { cost_usd: Option<f64> },
     /// The run failed (spawn error, non-zero exit, timeout, output cap, parse
@@ -186,6 +215,66 @@ pub enum AnswerChunk {
 /// An ordered, owned stream of [`AnswerChunk`]s. The underlying subprocess is
 /// killed when this stream is dropped (see [`DriveOptions`] / kill-on-drop).
 pub type AnswerStream = Pin<Box<dyn Stream<Item = AnswerChunk> + Send>>;
+
+/// Classify a raw drive-failure string as a TRANSIENT network/backend fault
+/// (the agent is installed + signed in, but couldn't reach its backend right
+/// now) vs a permanent one (missing binary, signed-out, model-blocked).
+///
+/// Used so the daemon can show an honest "installed but offline — retry" card
+/// (and optionally re-drive the SAME agent) instead of the misleading "install
+/// it and sign in" guidance, and so it never retries a deterministic failure.
+///
+/// Conservative by design: substring matching on a local CLI's free-text
+/// stderr, defaulting to `false` (non-transient) for anything unrecognized so
+/// we never auto-retry a failure that would just repeat. Auth/"sign in"
+/// signatures are explicitly excluded — those are permanent, not transient.
+pub fn is_transient_network_error(raw: &str) -> bool {
+    let s = raw.to_ascii_lowercase();
+    // Never treat an auth/eligibility/quota failure as transient — retrying
+    // those just repeats the failure; the user must act (sign in / connect key).
+    const PERMANENT: &[&str] = &[
+        "sign in",
+        "signed out",
+        "log in",
+        "logged out",
+        "unauthorized",
+        "unauthenticated",
+        "not authenticated",
+        "permission denied",
+        "forbidden",
+        "api key",
+        "not installed",
+        "command not found",
+        "no such file",
+    ];
+    if PERMANENT.iter().any(|p| s.contains(p)) {
+        return false;
+    }
+    const TRANSIENT: &[&str] = &[
+        "connection reset",
+        "connection refused",
+        "connection closed",
+        "broken pipe",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "network is unreachable",
+        "no route to host",
+        "dns",
+        "tls",
+        "ssl",
+        "handshake",
+        "eof",
+        "503",
+        "502",
+        "504",
+        "429",
+        "googleapis.com",
+        "cloudcode",
+        "produced no output", // exit-0 + empty stdout: almost always a backend reach failure
+    ];
+    TRANSIENT.iter().any(|t| s.contains(t))
+}
 
 /// Drive an agent: turn a [`Question`] into a streamed answer.
 ///
@@ -210,6 +299,26 @@ mod tests {
             resume: None,
             cwd: None,
         }
+    }
+
+    #[test]
+    fn transient_classifier_matches_network_and_excludes_auth() {
+        // The exact agy connection-reset string is transient.
+        assert!(is_transient_network_error(
+            "agent produced no output: Error: Eligibility check failed: Post \"https://daily-cloudcode-pa.googleapis.com/...\": read: connection reset by peer"
+        ));
+        // Bare empty-output is treated as transient (backend-reach failure).
+        assert!(is_transient_network_error(
+            "agent exited successfully but produced no output"
+        ));
+        assert!(is_transient_network_error("request timed out"));
+        assert!(is_transient_network_error("provider returned 503"));
+        // Auth / missing-binary are PERMANENT — never auto-retried.
+        assert!(!is_transient_network_error("Please sign in to continue"));
+        assert!(!is_transient_network_error("agent exited with status 127: command not found"));
+        assert!(!is_transient_network_error("401 Unauthorized: invalid api key"));
+        // Unknown text defaults to non-transient.
+        assert!(!is_transient_network_error("some unexpected parse error"));
     }
 
     #[test]

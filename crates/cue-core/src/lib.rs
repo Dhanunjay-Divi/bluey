@@ -59,7 +59,8 @@ pub use observability::{
     BLUEY_TRACE_ID_HEADER,
 };
 pub use overlay::{
-    OverlayCommand, OverlayContextItem, OverlayEvent, OverlayPosition, OverlaySessionItem,
+    AnswerStatusState, AnswerStatusStep, OverlayCommand, OverlayContextItem, OverlayEvent,
+    OverlayPosition, OverlaySessionItem,
 };
 pub use state::{DaemonState, MeetingState};
 

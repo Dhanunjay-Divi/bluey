@@ -18,7 +18,8 @@ use cue_agent_bridge::{
     fix::{extract_diff, fix_apply_prompt, fix_proposal_prompt, parse_fix_proposal, FixProposal},
     read_connectors, reader_for,
     registry::{fix_profile_for, KindTag},
-    AgentKind, AnswerChunk, AuthTier, Capability, DiscoveredAgent, Question as AgentQuestion,
+    is_transient_network_error, AgentKind, AnswerChunk, AuthTier, Capability, DiscoveredAgent,
+    Question as AgentQuestion, ToolStatus,
 };
 use cue_core::ai::{
     AnswerFinishReason, AnswerRequest, AnswerResponse, AnswerResponseMetadata, AnswerStreamEvent,
@@ -33,6 +34,7 @@ use cue_core::{
     analyze_segment, clock, generate_recap, load_account, load_settings, local_answer,
     new_trace_id, sanitize_observability_id, save_settings, trace_id_from_env, AgentConnectorInfo,
     AgentSessionSummary, AgentSummary, AiCapabilities, AiProviderId, AiProviderKind,
+    AnswerStatusState, AnswerStatusStep,
     AiRuntimeStatus, AnswerContext, AnswerContextKind, AudioBackend, AudioCaptureConfig,
     AudioCaptureStatus, AudioChunkMetadata, AudioDeviceDescriptor, AudioDeviceRole,
     AudioPipelineStatus, AudioSourceKind, CardArtifactType, CardKind, CloudEndpointConfig,
@@ -67,6 +69,10 @@ struct OverlayAnswerStream {
     card_id: uuid::Uuid,
     generation_id: u64,
     body: String,
+    /// Ordered live-status steps (the agent's real reasoning + tool calls) for
+    /// this answer. The whole list is re-sent on every change so the UI replaces
+    /// rather than appends; tool updates collapse onto the row with the same id.
+    status_steps: Vec<AnswerStatusStep>,
 }
 
 impl OverlayAnswerStream {
@@ -76,7 +82,74 @@ impl OverlayAnswerStream {
             card_id,
             generation_id,
             body: String::new(),
+            status_steps: Vec::new(),
         }
+    }
+
+    /// Record a reasoning step from the agent and push the updated status feed.
+    async fn push_reasoning(&mut self, text: &str) -> Result<()> {
+        if text.trim().is_empty() {
+            return Ok(());
+        }
+        // Coalesce consecutive reasoning into the trailing reasoning row so the
+        // feed shows one growing thought, not a row per token.
+        match self.status_steps.last_mut() {
+            Some(AnswerStatusStep::Reasoning { text: existing }) => existing.push_str(text),
+            _ => self.status_steps.push(AnswerStatusStep::Reasoning {
+                text: text.to_string(),
+            }),
+        }
+        self.flush_status(false).await
+    }
+
+    /// Record (or update) a tool-call step from the agent and push the feed.
+    /// Repeated updates with the same `id` collapse onto the existing row; an
+    /// empty `title` on an update keeps the title already shown for that id.
+    async fn push_tool(&mut self, id: &str, title: &str, status: ToolStatus) -> Result<()> {
+        let state = match status {
+            ToolStatus::Pending => AnswerStatusState::Pending,
+            ToolStatus::InProgress => AnswerStatusState::Running,
+            ToolStatus::Completed => AnswerStatusState::Done,
+            ToolStatus::Failed => AnswerStatusState::Failed,
+        };
+        if let Some(existing) = self.status_steps.iter_mut().find_map(|s| match s {
+            AnswerStatusStep::Tool {
+                id: sid,
+                title: stitle,
+                state: sstate,
+            } if sid == id => Some((stitle, sstate)),
+            _ => None,
+        }) {
+            let (stitle, sstate) = existing;
+            if !title.trim().is_empty() {
+                *stitle = title.to_string();
+            }
+            *sstate = state;
+        } else {
+            self.status_steps.push(AnswerStatusStep::Tool {
+                id: id.to_string(),
+                title: title.to_string(),
+                state,
+            });
+        }
+        self.flush_status(false).await
+    }
+
+    /// Send the current status feed to the UI. `done` collapses the feed.
+    async fn flush_status(&self, done: bool) -> Result<()> {
+        if !is_answer_generation_current(&self.daemon, self.generation_id) {
+            return Ok(());
+        }
+        let _ = send_overlay(
+            &self.daemon,
+            OverlayCommand::SetAnswerStatus {
+                id: self.card_id,
+                steps: self.status_steps.clone(),
+                done,
+            },
+        )
+        .await;
+        Ok(())
     }
 
     fn has_text(&self) -> bool {
@@ -628,6 +701,10 @@ enum RealSttTransport {
     OpenAiMultipart,
     BlueyManagedRaw,
     BlueyManagedRelay,
+    /// Fully on-device transcription via the local whisper helper (no key, no
+    /// network). Chunks are transcribed through the STT factory's
+    /// `LocalWhisperProvider` rather than an HTTP endpoint.
+    LocalWhisper,
 }
 
 #[derive(Debug, Clone)]
@@ -2644,6 +2721,8 @@ async fn drive_and_collect(
         match chunk {
             AnswerChunk::Started { .. } | AnswerChunk::Done { .. } => {}
             AnswerChunk::Delta(delta) => body.push_str(&delta),
+            // Reasoning + tool-call chunks are live status, not Fix output body.
+            AnswerChunk::Reasoning(_) | AnswerChunk::ToolCall { .. } => {}
             AnswerChunk::Error(message) => return Err(message),
         }
     }
@@ -3083,9 +3162,26 @@ async fn build_real_audio_runtime_config(
                     )
                 }
             }
+            _ if crate::stt::router::is_local_whisper_enabled() => {
+                // Keyless, fully-local fallback: BLUEY_STT_LOCAL_WHISPER=1 routes
+                // transcription through the on-device whisper helper (no key, no
+                // account, nothing leaves the machine). The actual provider is
+                // built lazily by the STT factory; if the `cue-whisper` helper
+                // binary isn't installed, the failure surfaces there with a clear
+                // "whisper helper not found" message — NOT the misleading
+                // "sign in" gate this used to hit.
+                let stt_model = env_first(&["BLUEY_STT_MODEL"]).unwrap_or_else(|| "local".into());
+                (
+                    String::new(),
+                    String::new(),
+                    stt_model.clone(),
+                    format!("local-whisper:{stt_model}"),
+                    RealSttTransport::LocalWhisper,
+                )
+            }
             _ => {
                 return Ok(AudioRuntimeConfigResolution::Unavailable(
-                    "Sign in to Bluey before using cloud speech-to-text. Local recording is ready, but Listen needs a linked account to transcribe real audio.".to_string(),
+                    "Listen needs speech-to-text: sign in to Bluey for managed transcription, set an STT API key, or enable on-device transcription with BLUEY_STT_LOCAL_WHISPER=1.".to_string(),
                 ))
             }
         }
@@ -4804,6 +4900,19 @@ async fn transcribe_audio_file(
                 "live STT relay cannot transcribe a saved audio chunk"
             ));
         }
+        RealSttTransport::LocalWhisper => {
+            // On-device transcription: no HTTP. The local whisper helper is
+            // resolved + run by the STT factory; if the `cue-whisper` binary
+            // isn't installed this returns a clear "whisper helper not found"
+            // error (NOT a network/auth error), which is the honest failure.
+            return transcribe_chunk_local_whisper(
+                &audio,
+                source,
+                sequence,
+                runtime.chunk_duration_ms,
+            )
+            .await;
+        }
     }
     .with_context(|| format!("failed to call STT endpoint {}", runtime.stt_endpoint))?;
     let status = response.status();
@@ -4847,6 +4956,42 @@ async fn transcribe_audio_file(
         segment = segment.with_language(language);
     }
     Ok(Some(segment))
+}
+
+/// Transcribe one saved audio chunk fully on-device via the local whisper
+/// helper (the keyless `BLUEY_STT_LOCAL_WHISPER=1` path).
+///
+/// Scope note: this wires the ROUTE correctly and fails HONESTLY. It connects
+/// the [`LocalWhisperProvider`] (which resolves the native `cue-whisper` helper
+/// binary); if that binary isn't installed, the user gets a precise "whisper
+/// helper not found" message instead of the old misleading "sign in" gate.
+/// Streaming the chunk's PCM through the helper and reading the transcript back
+/// is the remaining "binary later" work — until the helper exists there is
+/// nothing to stream to, so we surface the connect error.
+async fn transcribe_chunk_local_whisper(
+    pcm_wav: &[u8],
+    source: AudioSourceKind,
+    _sequence: u64,
+    _chunk_duration_ms: u32,
+) -> Result<Option<cue_core::audio::SttSegmentMetadata>> {
+    let _ = pcm_wav;
+    let pcm_source = match source {
+        AudioSourceKind::System => cue_core::pcm::AudioSource::System,
+        AudioSourceKind::Microphone => cue_core::pcm::AudioSource::Microphone,
+    };
+    let stt_cfg = cue_core::stt::SttConfig {
+        source: pcm_source,
+        ..Default::default()
+    };
+    // Connecting resolves + spawns the native helper; a missing binary surfaces
+    // here as a clear, honest error (not a network/auth error).
+    crate::stt::whisper::LocalWhisperProvider::connect(stt_cfg)
+        .map_err(|e| anyhow!("on-device whisper unavailable: {e}"))?;
+    // Helper connected but the chunk→helper→transcript streaming bridge for the
+    // saved-chunk path is not implemented yet (the "binary later" milestone).
+    Err(anyhow!(
+        "on-device whisper helper is installed but chunk transcription is not wired yet"
+    ))
 }
 
 async fn stop_audio_capture(daemon: &Arc<Daemon>) -> AudioPipelineStatus {
@@ -5767,12 +5912,12 @@ async fn resolve_answer_route(
 
     for (fallback_depth, step) in request.route.steps().enumerate() {
         if let Some(stream) = stream.as_mut() {
-            stream
-                .set_body(
-                    format!("Thinking with {}...", step.provider.display_label()),
-                    false,
-                )
-                .await?;
+            // Empty placeholder body, NOT prose. The overlay renders its own
+            // "thinking" affordance (a spinner + "asking <agent>…") while the
+            // body is empty; a human-readable placeholder here (e.g. the raw
+            // "Thinking with agent/antigravity...") would leak the provider id
+            // into the answer card and linger if the first delta is slow.
+            stream.set_body(String::new(), false).await?;
         }
 
         let config = provider_client_config(&step.provider);
@@ -6137,6 +6282,20 @@ async fn drive_answer_attempt(
                     let _ = stream.push_delta(&delta).await;
                 }
             }
+            // The agent's real reasoning — surfaced in the live status feed,
+            // never inside the answer body.
+            AnswerChunk::Reasoning(text) => {
+                if let Some(stream) = stream.as_mut() {
+                    let _ = stream.push_reasoning(&text).await;
+                }
+            }
+            // A real tool/connector call (MCP round-trip or built-in) — surfaced
+            // live in the status feed so the user sees what the agent is doing.
+            AnswerChunk::ToolCall { id, title, status } => {
+                if let Some(stream) = stream.as_mut() {
+                    let _ = stream.push_tool(&id, &title, status).await;
+                }
+            }
             AnswerChunk::Done { cost_usd: cost } => {
                 cost_usd = cost;
             }
@@ -6162,6 +6321,11 @@ async fn drive_answer_attempt(
                 });
             }
         }
+    }
+
+    // The agent finished: collapse the live status feed (the answer is in).
+    if let Some(stream) = stream.as_mut() {
+        let _ = stream.flush_status(true).await;
     }
 
     Ok(DriveOutcome { body, cost_usd })
@@ -6255,6 +6419,11 @@ async fn answer_with_agent(
     // advances through the fallback list and then to BYOT — bounded, never a loop.
     let mut model_override: Vec<String> = Vec::new();
     let mut tried_models: Vec<String> = Vec::new();
+    // Bounded same-agent retry for TRANSIENT backend faults (network reset,
+    // empty-but-clean exit). The agent is the user's own — re-driving it is the
+    // most USP-faithful recovery. Capped low so a live meeting never stalls.
+    const MAX_TRANSIENT_RETRIES: u32 = 2;
+    let mut transient_retries: u32 = 0;
     let (body, cost_usd) = loop {
         match drive_answer_attempt(
             &kind,
@@ -6279,6 +6448,31 @@ async fn answer_with_agent(
                     );
                     attempt_resume = None;
                     continue;
+                }
+
+                // Transient backend fault (network reset, or a clean exit with
+                // no output — the agent is installed + signed in but couldn't
+                // reach its backend)? Re-drive the SAME user agent a bounded
+                // number of times (USP-faithful: still their own agent). Gated
+                // on transient classification + low cap so a live meeting never
+                // stalls; never retries auth/missing/model-block (those repeat).
+                if let Some(raw) = failure.raw_error.as_deref() {
+                    if is_transient_network_error(raw) && transient_retries < MAX_TRANSIENT_RETRIES {
+                        transient_retries += 1;
+                        warn!(
+                            agent = %label,
+                            attempt = transient_retries,
+                            "agent backend unreachable (transient); re-driving the same agent"
+                        );
+                        if let Some(stream) = stream.as_mut() {
+                            let _ = stream
+                                .push_reasoning(&format!(
+                                    "{label} couldn't reach its backend — retrying ({transient_retries}/{MAX_TRANSIENT_RETRIES})…"
+                                ))
+                                .await;
+                        }
+                        continue;
+                    }
                 }
 
                 // Model-policy block? Only a terminal agent error carries the raw
@@ -6323,6 +6517,20 @@ async fn answer_with_agent(
                     }
                 }
 
+                // A transient fault that survived every retry → the agent is
+                // installed + signed in but its backend is unreachable. Show the
+                // HONEST offline card (with a retry hint), NOT "install and sign
+                // in" — that would be a lie when the CLI is clearly working.
+                let is_offline = failure
+                    .raw_error
+                    .as_deref()
+                    .is_some_and(is_transient_network_error);
+                if is_offline {
+                    return Ok(
+                        agent_offline(provider, &mut stream, fallback_depth, &label).await,
+                    );
+                }
+
                 return Ok(agent_not_ready(
                     provider,
                     &mut stream,
@@ -6336,14 +6544,11 @@ async fn answer_with_agent(
     };
 
     if body.trim().is_empty() {
-        return Ok(agent_not_ready(
-            provider,
-            &mut stream,
-            fallback_depth,
-            &label,
-            "returned no answer",
-        )
-        .await);
+        // The CLI path now surfaces empty output as a typed Error (handled
+        // above), so this is a defensive guard only. Treat it as offline — a
+        // clean run that produced nothing is a backend-reach failure, not a
+        // missing/signed-out CLI.
+        return Ok(agent_offline(provider, &mut stream, fallback_depth, &label).await);
     }
 
     if let Some(stream) = stream.as_mut() {
@@ -6401,6 +6606,46 @@ Bluey answers live through your agent and never on your behalf."
         attempts: vec![
             RouteAttemptMetadata::started(provider.clone(), fallback_depth)
                 .failed(format!("agent not ready: {label} {reason}")),
+        ],
+    }
+}
+
+/// Push an honest guidance card for a **transient backend outage**: the agent
+/// CLI is installed and signed in and ran fine, but couldn't reach its backend
+/// right now (network reset, DNS/TLS, a clean exit with no output). Distinct
+/// from [`agent_not_ready`] — telling a working, signed-in CLI to "install and
+/// sign in" is a lie. We already re-drove the same agent a bounded number of
+/// times before showing this, so the message invites a manual retry.
+async fn agent_offline(
+    provider: &ProviderSelector,
+    stream: &mut Option<&mut OverlayAnswerStream>,
+    fallback_depth: usize,
+    label: &str,
+) -> AgentRouteOutcome {
+    let body = format!(
+        "Your {label} CLI is installed and signed in, but couldn't reach its \
+backend just now (it returned no response — likely a network or connection \
+issue). Check your connection and ask again — Bluey answers live through your \
+agent and never on your behalf."
+    );
+    if let Some(stream) = stream.as_mut() {
+        let _ = push_system_card(
+            &stream.daemon,
+            CardKind::Warning,
+            "Agent offline — try again",
+            body.clone(),
+        )
+        .await;
+        let _ = stream.finish(&body).await;
+    }
+    let safety = SafetyOutcome::pass()
+        .with_notice(format!("attached agent ({label}) backend unreachable; offline guidance shown"));
+    AgentRouteOutcome {
+        answer: body,
+        safety,
+        attempts: vec![
+            RouteAttemptMetadata::started(provider.clone(), fallback_depth)
+                .failed(format!("agent backend unreachable: {label}")),
         ],
     }
 }
@@ -8784,7 +9029,13 @@ fn spawn_macos_socket_overlay(
         .spawn()
         .with_context(|| format!("failed to spawn overlay {}", resolved.display()))?;
 
-    let deadline = Instant::now() + std::time::Duration::from_secs(3);
+    // A Tauri overlay is a full WebView app: a cold debug build (V8 + the React
+    // bundle) routinely takes 4-6s to boot and bind the socket. A 3s deadline
+    // raced that cold start and killed the overlay before it connected, leaving
+    // the daemon with no transport (no cards ever reach the UI). Give the cold
+    // boot real headroom — the loop still breaks the instant accept() succeeds,
+    // so a warm start pays nothing for the larger ceiling.
+    let deadline = Instant::now() + std::time::Duration::from_secs(15);
     let stream = loop {
         match listener.accept() {
             Ok((stream, _addr)) => break stream,

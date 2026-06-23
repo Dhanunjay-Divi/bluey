@@ -126,6 +126,16 @@ where
                     }
                     yield chunk;
                 }
+                // Reasoning + tool-call status: forward through (it's real live
+                // activity the consumer shows in the status feed), but do NOT
+                // treat it as answer content and do NOT flush the held `Started`.
+                // A resume that emits only status and never an answer Delta is
+                // still the empty-turn trap below — keeping `produced_content`
+                // false and `pending_started` held lets the fork fallback fire
+                // cleanly (it emits its own `Started`, so we must not pre-flush).
+                AnswerChunk::Reasoning(_) | AnswerChunk::ToolCall { .. } => {
+                    yield chunk;
+                }
                 AnswerChunk::Done { .. } if produced_content => {
                     // Real resume: content arrived (the `committed` line already
                     // logged on the first Delta), now a clean finish. Pass it through.

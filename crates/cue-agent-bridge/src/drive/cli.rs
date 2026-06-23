@@ -677,6 +677,12 @@ fn run_stream(
         // For plain-text agents we accumulate the whole stdout, then emit one
         // Delta at the end. For stream-json we emit incrementally.
         let mut plain_buf = String::new();
+        // Did the turn yield ANY answer text? An agent can exit 0 with no output
+        // (e.g. agy when it can't reach its backend — connection reset — prints
+        // nothing and exits clean). That is NOT success: we must surface it as a
+        // typed Error (with the stderr cause) so the daemon can classify it and
+        // recover, instead of returning a silent empty "answer".
+        let mut saw_text = false;
 
         let deadline = tokio::time::Instant::now() + opts.timeout;
 
@@ -709,19 +715,32 @@ fn run_stream(
                         let _ = child.start_kill();
                         break;
                     }
+                    // A parser that emits a Delta (answer text) OR a terminal
+                    // Error has "handled" the turn — only a clean run that
+                    // emitted NEITHER is the silent-empty failure we synthesize
+                    // an Error for below.
                     match parser {
                         OutputParser::ClaudeStreamJson => {
                             for chunk in state.push_claude_line(&line) {
+                                if matches!(chunk, AnswerChunk::Delta(_) | AnswerChunk::Error(_)) {
+                                    saw_text = true;
+                                }
                                 yield chunk;
                             }
                         }
                         OutputParser::CursorJson => {
                             for chunk in state.push_cursor_line(&line) {
+                                if matches!(chunk, AnswerChunk::Delta(_) | AnswerChunk::Error(_)) {
+                                    saw_text = true;
+                                }
                                 yield chunk;
                             }
                         }
                         OutputParser::CodexJsonl => {
                             for chunk in state.push_codex_line(&line) {
+                                if matches!(chunk, AnswerChunk::Delta(_) | AnswerChunk::Error(_)) {
+                                    saw_text = true;
+                                }
                                 yield chunk;
                             }
                         }
@@ -776,7 +795,29 @@ fn run_stream(
             return;
         }
 
-        // Successful exit: flush parser-specific terminal chunks.
+        // Successful exit (status 0), but a clean exit with NO answer text is a
+        // failure, not an empty answer — the CLI ran but its backend gave it
+        // nothing (network reset, silent auth lapse, quota). Drain stderr (still
+        // unread on the success path) so the REAL cause is preserved as a typed
+        // Error the daemon can classify (offline vs signed-out) and recover from,
+        // instead of a misleading empty "answer".
+        let plain_has_text = !plain_buf.trim().is_empty();
+        let produced_text = match parser {
+            OutputParser::PlainText => plain_has_text,
+            _ => saw_text,
+        };
+        if !produced_text {
+            let stderr_msg = read_stderr(stderr, opts.max_output_bytes).await;
+            let detail = if stderr_msg.is_empty() {
+                "agent exited successfully but produced no output".to_string()
+            } else {
+                format!("agent produced no output: {stderr_msg}")
+            };
+            yield AnswerChunk::Error(detail);
+            return;
+        }
+
+        // Real answer: flush parser-specific terminal chunks.
         match parser {
             OutputParser::ClaudeStreamJson
             | OutputParser::CursorJson
@@ -789,9 +830,7 @@ fn run_stream(
                 // Plain agents do not announce a session id; emit a bare start
                 // so consumers always see a Started before any Delta.
                 yield AnswerChunk::Started { session_id: None };
-                if !plain_buf.is_empty() {
-                    yield AnswerChunk::Delta(plain_buf);
-                }
+                yield AnswerChunk::Delta(plain_buf);
                 yield AnswerChunk::Done { cost_usd: None };
             }
         }

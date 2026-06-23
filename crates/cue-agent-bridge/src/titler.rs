@@ -407,6 +407,8 @@ pub async fn ai_title_via_agent(agent: &AgentKind, first_turns: &[String]) -> Op
             Ok(Some(chunk)) => match chunk {
                 AnswerChunk::Started { .. } => {}
                 AnswerChunk::Delta(d) => body.push_str(&d),
+                // Reasoning + tool-call chunks are live status, not title text.
+                AnswerChunk::Reasoning(_) | AnswerChunk::ToolCall { .. } => {}
                 AnswerChunk::Done { .. } => break,
                 AnswerChunk::Error(_) => return None, // fail soft on agent error
             },

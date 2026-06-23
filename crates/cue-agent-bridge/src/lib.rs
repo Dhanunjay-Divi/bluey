@@ -42,7 +42,9 @@ pub use capability::compute_capability;
 pub use connectors::read_connectors;
 pub use discover::{discover_agents, discover_in_home, probe_sqlite_store};
 // Local-CLI drive (unchanged surface) — local agents call this directly.
-pub use drive::{drive as drive_cli, AnswerChunk, AnswerStream, Question};
+pub use drive::{
+    drive as drive_cli, is_transient_network_error, AnswerChunk, AnswerStream, Question, ToolStatus,
+};
 pub use fix::{fix_apply_prompt, fix_proposal_prompt, parse_fix_proposal, FixProposal};
 pub use sessions::{list_with_health_check, reader_for, ReaderHealth, SessionReader};
 

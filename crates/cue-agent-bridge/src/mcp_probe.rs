@@ -417,6 +417,8 @@ pub async fn run_picked_probe(agent: AgentKind, probe: McpProbe) -> McpProbeResu
             Ok(Some(chunk)) => match chunk {
                 AnswerChunk::Started { .. } => {}
                 AnswerChunk::Delta(d) => body.push_str(&d),
+                // Reasoning + tool-call chunks are live status, not answer body.
+                AnswerChunk::Reasoning(_) | AnswerChunk::ToolCall { .. } => {}
                 AnswerChunk::Done { .. } => break,
                 AnswerChunk::Error(message) => {
                     return McpProbeResult::Failed {

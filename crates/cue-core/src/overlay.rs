@@ -52,6 +52,35 @@ pub struct OverlaySessionItem {
     pub pinned: bool,
 }
 
+/// The lifecycle state of a tool-call step in the live answer status feed.
+/// Mirrors the agent's real ACP tool-call status — never fabricated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerStatusState {
+    Pending,
+    Running,
+    Done,
+    Failed,
+}
+
+/// One row in the live status feed shown while the agent works an answer: either
+/// the agent's reasoning, or a tool/connector call with its run state. These are
+/// real ACP events the driven agent emits (thoughts + tool calls) — surfaced
+/// live like Claude's status feed, never invented.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AnswerStatusStep {
+    /// The agent's reasoning/thinking text (ACP `AgentThoughtChunk`).
+    Reasoning { text: String },
+    /// A tool/connector invocation (ACP `ToolCall`/`ToolCallUpdate`). `id` is the
+    /// ACP tool-call id so repeated updates collapse onto one row.
+    Tool {
+        id: String,
+        title: String,
+        state: AnswerStatusState,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OverlayCommand {
@@ -121,6 +150,19 @@ pub enum OverlayCommand {
         cost_label: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         artifact: Option<CueCardArtifact>,
+    },
+    /// The live status feed for an in-flight answer: the agent's real reasoning
+    /// and tool/connector calls, keyed to the answer card `id`. Emitted as the
+    /// agent works (before/while the answer streams) so the UI shows what the
+    /// agent is actually doing (e.g. "Reading App.tsx", "Querying Jira"), like
+    /// Claude's status feed. `steps` is the full ordered list each time (the UI
+    /// replaces, not appends); `done` marks the work complete so the UI can
+    /// collapse the feed once the answer is in.
+    SetAnswerStatus {
+        id: uuid::Uuid,
+        steps: Vec<AnswerStatusStep>,
+        #[serde(default)]
+        done: bool,
     },
     /// Push the discovered-agent list to the UI (agent-bridge Slice 5a).
     SetAgents {
