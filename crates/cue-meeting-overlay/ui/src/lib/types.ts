@@ -32,6 +32,9 @@ export interface AgentSessionSummary {
   project: string | null;
 }
 
+/** Coarse listening-pipeline state, mirrored from the daemon's ListeningState. */
+export type ListeningState = "idle" | "connecting" | "listening" | "paused" | "failed";
+
 /** A normalized transcript line surfaced during a live meeting. */
 export interface TranscriptLine {
   /** "system" | "mic" — who Bluey heard. */
@@ -43,6 +46,16 @@ export interface TranscriptLine {
   final: boolean;
 }
 
+/** The run state of a tool step in the live status feed (mirrors the agent's
+ *  real ACP tool-call status — never fabricated). */
+export type AnswerStatusState = "pending" | "running" | "done" | "failed";
+
+/** One row in the live status feed shown while the agent works: either its
+ *  reasoning, or a tool/connector call with run state. Real ACP events. */
+export type AnswerStatusStep =
+  | { kind: "reasoning"; text: string }
+  | { kind: "tool"; id: string; title: string; state: AnswerStatusState };
+
 /** One streamed chunk of an agent answer. */
 export interface AnswerChunk {
   /** plain text delta. */
@@ -51,6 +64,11 @@ export interface AnswerChunk {
   tool?: string;
   /** a resolved source the answer is grounded in (Jira/GitHub/etc.). */
   source?: AnswerSource;
+  /** the full live status feed for this answer (replaces, not appends) — the
+   *  agent's real reasoning + tool calls as it works. */
+  status?: AnswerStatusStep[];
+  /** true once the status feed is complete (the work is done). */
+  statusDone?: boolean;
   /** true on the terminal chunk. */
   done?: boolean;
 }

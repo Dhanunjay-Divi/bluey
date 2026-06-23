@@ -12,6 +12,7 @@ import type {
   AgentSessionSummary,
   AgentSummary,
   AnswerChunk,
+  ListeningState,
   TranscriptLine,
 } from "./types";
 
@@ -39,4 +40,21 @@ export interface MeetingClient {
    * until the first chunk arrives.
    */
   ask(question: string, onChunk: (chunk: AnswerChunk) => void): AskHandle;
+
+  // ---- listening (mic / system audio capture) ----
+  /** Subscribe to the daemon's listening state; returns an unsubscribe fn.
+   *  State mirrors the daemon: idle | connecting | listening | paused | failed. */
+  onListeningState(cb: (state: ListeningState) => void): () => void;
+  /** Start audio capture (the mic/listen toggle). */
+  startListening(): void;
+  /** Stop audio capture. */
+  stopListening(): void;
+
+  // ---- context (the "+" menu: capture page / attach files / screenshot) ----
+  /** Capture the active browser page's text as a context artifact. */
+  capturePage(): void;
+  /** Attach the given local files as context artifacts. */
+  attachFiles(paths: string[]): void;
+  /** Capture a screenshot of the screen and route it to context/vision. */
+  captureScreenshot(): void;
 }

@@ -14,9 +14,15 @@
   --ink-4: #b6bac1;
   --line: rgba(20, 22, 28, 0.08);
   --line-2: rgba(20, 22, 28, 0.13);
-  --glass: rgba(255, 255, 255, 0.62);
-  --glass-2: rgba(255, 255, 255, 0.78);
-  --glass-solid: rgba(255, 255, 255, 0.92);
+  /* The overlay window is TRANSPARENT (so it floats + is capture-invisible), so
+     the panel itself must paint a near-opaque surface — otherwise there is
+     nothing behind a low-opacity glass for the user to see. These are
+     deliberately high-alpha (the interview overlay uses a ~72%-opaque panel for
+     the same reason). The frosted look comes from the layered aurora + blur on
+     top of this solid-ish base, not from seeing the desktop through it. */
+  --glass: rgba(248, 249, 253, 0.97);
+  --glass-2: rgba(255, 255, 255, 0.82);
+  --glass-solid: rgba(255, 255, 255, 0.95);
   --tint: #6f6af0;
   --tint-ink: #4b46c9;
   --tint-wash: rgba(111, 106, 240, 0.1);
@@ -44,10 +50,14 @@
   padding: 0;
 }
 
+/* The panel FILLS the window (like the interview overlay): html/body/#root all
+   100%, and the App's panel is pinned to all four edges so there's never empty
+   space around it — content scrolls inside the panel, not the window. */
 html,
 body,
 #root {
   height: 100%;
+  width: 100%;
 }
 
 body {
@@ -55,9 +65,15 @@ body {
   color: var(--ink);
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
-  /* The aurora stage — a calm field so the glass has light to refract.
-     In the real overlay the window is transparent over the desktop; this
-     gradient is the dev/preview backdrop. */
+  /* TRANSPARENT by default — the real overlay window must paint ONLY the glass
+     panel over the desktop, never a filled box behind it. The aurora-field
+     backdrop is added ONLY for browser/preview dev (the `.dev-backdrop` class,
+     applied by main.tsx when not running inside Tauri). */
+  background: transparent;
+}
+
+body.dev-backdrop {
+  /* Dev/preview only — a calm aurora field so the glass has light to refract. */
   background: radial-gradient(
       900px 520px at 12% 0%,
       rgba(167, 139, 250, 0.26),
@@ -68,14 +84,16 @@ body {
     linear-gradient(180deg, #f4f3fb, #eef0f7 55%, #f3f1f9);
 }
 
-/* The aurora wash that lives INSIDE every glass surface (the refraction). */
+/* The aurora wash that lives INSIDE every glass surface (the refraction). On a
+   near-opaque panel this IS the color the user sees, so it carries a touch more
+   presence than it would over a lit backdrop. */
 .aurora {
   position: absolute;
   inset: -40% -20%;
   z-index: 0;
   pointer-events: none;
-  opacity: 0.5;
-  filter: blur(36px);
+  opacity: 0.65;
+  filter: blur(34px);
   background: radial-gradient(40% 50% at 18% 10%, var(--violet), transparent 70%),
     radial-gradient(42% 52% at 88% 6%, var(--blue), transparent 70%),
     radial-gradient(46% 56% at 70% 104%, var(--mint), transparent 72%);
@@ -83,7 +101,11 @@ body {
 
 .glass {
   position: relative;
-  background: var(--glass);
+  /* A near-opaque light base so the panel actually paints over the desktop on a
+     transparent window, with a faint top-down sheen for depth. backdrop-filter
+     still frosts whatever IS behind it, but visibility no longer depends on it. */
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.5), transparent 40%),
+    var(--glass);
   backdrop-filter: var(--blur);
   -webkit-backdrop-filter: var(--blur);
   border: 1px solid var(--line-2);
@@ -129,4 +151,168 @@ body {
     opacity: 1;
     transform: translateY(0);
   }
+}
+
+/* ==========================================================================
+ * Rendered markdown inside an answer (.md-body). Tight, compact spacing — this
+ * is an overlay panel, not a document. Everything reads from the design tokens.
+ * ======================================================================== */
+.md-body .md-h1,
+.md-body .md-h2,
+.md-body .md-h3 {
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  line-height: 1.3;
+  margin: 12px 0 5px;
+}
+.md-body .md-h1:first-child,
+.md-body .md-h2:first-child,
+.md-body .md-h3:first-child {
+  margin-top: 0;
+}
+.md-body .md-h1 {
+  font-size: 16px;
+}
+.md-body .md-h2 {
+  font-size: 14.5px;
+}
+.md-body .md-h3 {
+  font-size: 13px;
+  color: var(--ink-2);
+}
+.md-body .md-p {
+  margin: 0 0 8px;
+}
+.md-body .md-p:last-child {
+  margin-bottom: 0;
+}
+.md-body .md-ul,
+.md-body .md-ol {
+  margin: 4px 0 8px;
+  padding-left: 19px;
+}
+.md-body .md-ul li,
+.md-body .md-ol li {
+  margin: 2px 0;
+}
+.md-body .md-ul {
+  list-style: disc;
+}
+.md-body .md-ol {
+  list-style: decimal;
+}
+.md-body strong {
+  font-weight: 640;
+  color: var(--ink);
+}
+.md-body em {
+  font-style: italic;
+}
+.md-body a {
+  color: var(--tint-ink);
+  text-decoration: none;
+  border-bottom: 1px solid rgba(75, 70, 201, 0.3);
+}
+.md-body a:hover {
+  border-bottom-color: var(--tint-ink);
+}
+.md-body .md-hr {
+  border: none;
+  border-top: 1px solid var(--line-2);
+  margin: 11px 0;
+}
+.md-body .md-quote {
+  margin: 6px 0;
+  padding: 4px 11px;
+  border-left: 2.5px solid var(--tint);
+  background: var(--tint-wash);
+  border-radius: 0 6px 6px 0;
+  color: var(--ink-2);
+}
+/* inline code */
+.md-body .md-code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 0.86em;
+  background: rgba(20, 22, 28, 0.06);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 1px 5px;
+  color: var(--tint-ink);
+}
+/* fenced code card */
+.md-body .md-codecard {
+  margin: 8px 0;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  overflow: hidden;
+  background: rgba(20, 22, 28, 0.035);
+}
+.md-body .md-cc-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(20, 22, 28, 0.03);
+}
+.md-body .md-cc-lang {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.md-body .md-cc-copy {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--ink-3);
+  padding: 2px 6px;
+  border-radius: 6px;
+  transition: 0.15s;
+}
+.md-body .md-cc-copy:hover {
+  color: var(--tint-ink);
+  background: var(--tint-wash);
+}
+.md-body .md-pre {
+  margin: 0;
+  padding: 10px 12px;
+  overflow-x: auto;
+}
+.md-body .md-pre code {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--ink);
+  white-space: pre;
+}
+/* tables */
+.md-body .md-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0;
+  font-size: 12.5px;
+}
+.md-body .md-table th,
+.md-body .md-table td {
+  text-align: left;
+  padding: 5px 9px;
+  border: 1px solid var(--line-2);
+}
+.md-body .md-table th {
+  font-weight: 620;
+  color: var(--ink);
+  background: rgba(20, 22, 28, 0.04);
+}
+.md-body .md-table td {
+  color: var(--ink-2);
+}
+/* A file:// reference from the agent — readable but inert (see Markdown.tsx). */
+.md-body .md-filelink {
+  color: var(--ink-2);
+  border-bottom: 1px dotted var(--ink-4);
+  cursor: default;
 }

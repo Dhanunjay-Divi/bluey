@@ -1,0 +1,20 @@
+{
+  "identifier": "default",
+  "description": "Meeting overlay window capabilities — invoke commands, event listen/emit (the daemon→UI command bus), and window control (auto-size to content).",
+  "windows": ["meeting"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:event:allow-listen",
+    "core:event:allow-emit",
+    "core:window:default",
+    "core:window:allow-set-size",
+    "core:window:allow-set-position",
+    "core:window:allow-start-resize-dragging",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
+    "core:window:allow-start-dragging",
+    "core:webview:default",
+    "dialog:allow-open"
+  ]
+}

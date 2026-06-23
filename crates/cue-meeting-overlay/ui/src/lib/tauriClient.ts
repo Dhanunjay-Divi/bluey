@@ -32,6 +32,8 @@ import type {
   AgentSessionSummary,
   AgentSummary,
   AnswerChunk,
+  AnswerStatusStep,
+  ListeningState,
   TranscriptLine,
 } from "./types";
 
@@ -90,7 +92,20 @@ type OverlayCommand =
       done?: boolean;
       cost_label?: string | null;
     }
+  | {
+      type: "set_answer_status";
+      id: string;
+      steps: WireAnswerStatusStep[];
+      done?: boolean;
+    }
   | { type: string; [k: string]: unknown };
+
+// The daemon's AnswerStatusStep wire shape (serde: `kind` tag, snake_case
+// fields + states) — identical to the UI's AnswerStatusStep, so it passes
+// through. Typed here so the adapter validates the shape.
+type WireAnswerStatusStep =
+  | { kind: "reasoning"; text: string }
+  | { kind: "tool"; id: string; title: string; state: string };
 
 // ---------------------------------------------------------------------------
 // Wire → UI translation.
@@ -138,7 +153,11 @@ export function createTauriClient(): MeetingClient {
   // currently waiting (a pending request promise, a stream, a subscriber).
   const handlers = new Set<(cmd: OverlayCommand) => void>();
   let unlistenBus: UnlistenFn | null = null;
-  void listen<string>("overlay://command", (e) => {
+  // The bus must be LISTENING before we send any event — otherwise a fast daemon
+  // response (the agent list comes back in ~20ms) arrives before listen() is
+  // registered and is lost, hanging the UI on "Discovering agents…" forever.
+  // `busReady` resolves once the listener is active; every send awaits it.
+  const busReady: Promise<void> = listen<string>("overlay://command", (e) => {
     let cmd: OverlayCommand;
     try {
       // The payload is the daemon's NDJSON line, forwarded verbatim as a string.
@@ -174,7 +193,9 @@ export function createTauriClient(): MeetingClient {
         }
       };
       handlers.add(handler);
-      sendEvent(event);
+      // Wait until the bus is actually listening before firing the event, so the
+      // daemon's (fast) response can never arrive before we're ready to catch it.
+      void busReady.then(() => sendEvent(event));
     });
   }
 
@@ -237,6 +258,57 @@ export function createTauriClient(): MeetingClient {
       return Promise.resolve();
     },
 
+    onListeningState(cb) {
+      // The daemon pushes listening_state_changed with the full pipeline state
+      // (idle | connecting | listening | paused | failed). Pass it through so
+      // the UI can show connecting/failed, not just on/off — otherwise a failed
+      // start silently snaps the mic button back and looks dead.
+      const handler = (cmd: OverlayCommand) => {
+        if (cmd.type !== "listening_state_changed") return;
+        const c = cmd as Extract<OverlayCommand, { type: "listening_state_changed" }>;
+        const s = c.state;
+        const known: ListeningState =
+          s === "connecting" || s === "listening" || s === "paused" || s === "failed"
+            ? s
+            : "idle";
+        cb(known);
+      };
+      handlers.add(handler);
+      return () => handlers.delete(handler);
+    },
+
+    startListening() {
+      // The mic: start AUDIO capture (mic + system audio). The daemon replies
+      // with listening_state_changed, which onListeningState reflects.
+      // (recording_* = audio; capture_* = the screen "eye" — different feature.)
+      sendEvent({ type: "recording_start_requested" });
+    },
+
+    stopListening() {
+      sendEvent({ type: "recording_stop_requested" });
+    },
+
+    capturePage() {
+      // "+" → Capture page: grab the active BROWSER page's text as a context
+      // artifact (daemon "overlay page" path). Needs a browser frontmost; the
+      // daemon pushes an honest warning card if no readable page is found.
+      sendEvent({ type: "active_page_capture_requested" });
+    },
+
+    attachFiles(paths) {
+      // "+" → Attach files: the UI picks local files (native dialog) and hands
+      // their paths to the daemon, which attaches them as context artifacts.
+      if (paths.length === 0) return;
+      sendEvent({ type: "attach_files_requested", paths });
+    },
+
+    captureScreenshot() {
+      // "+" → Take a screenshot: the daemon captures the screen and routes it to
+      // vision/context (AnalyzeScreenRequested). Shows an honest "needs vision"
+      // card if no vision provider is configured.
+      sendEvent({ type: "analyze_screen_requested" });
+    },
+
     onTranscript(cb) {
       // Transcript lines arrive as push_card with kind "transcript".
       const handler = (cmd: OverlayCommand) => {
@@ -292,6 +364,32 @@ export function createTauriClient(): MeetingClient {
           return;
         }
 
+        if (cmd.type === "set_answer_status") {
+          const s = cmd as Extract<OverlayCommand, { type: "set_answer_status" }>;
+          if (answerId === null || s.id !== answerId) return;
+          // The agent's REAL reasoning + tool calls, surfaced live. Map the wire
+          // steps (already the same shape) into typed UI steps; the daemon
+          // re-sends the whole list each change, so we replace, not append.
+          const steps: AnswerStatusStep[] = s.steps.map((w) =>
+            w.kind === "reasoning"
+              ? { kind: "reasoning", text: w.text }
+              : {
+                  kind: "tool",
+                  id: w.id,
+                  title: w.title,
+                  state:
+                    w.state === "pending" ||
+                    w.state === "running" ||
+                    w.state === "done" ||
+                    w.state === "failed"
+                      ? w.state
+                      : "running",
+                },
+          );
+          onChunk({ status: steps, statusDone: s.done ?? false });
+          return;
+        }
+
         if (cmd.type === "update_card") {
           const u = cmd as Extract<OverlayCommand, { type: "update_card" }>;
           if (answerId === null || u.id !== answerId) return;
@@ -301,6 +399,7 @@ export function createTauriClient(): MeetingClient {
           const body = u.body ?? "";
           const delta = body.startsWith(lastBody) ? body.slice(lastBody.length) : body;
           lastBody = body;
+          console.log(`[ask] update_card body.len=${body.length} delta.len=${delta.length} done=${u.done}`);
           if (delta.length > 0) {
             const chunk: AnswerChunk = { text: delta };
             onChunk(chunk);

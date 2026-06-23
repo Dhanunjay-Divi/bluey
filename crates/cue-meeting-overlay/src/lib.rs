@@ -96,34 +96,6 @@ mod macos {
         }
     }
 
-    /// Capture-visible TEST mode only: give the window an OPAQUE light backing so
-    /// the glass panel renders on a solid surface a screenshot can grab (no
-    /// see-through-to-desktop). The opposite of clear_window_chrome.
-    pub fn set_opaque_light_background(app: &tauri::AppHandle) {
-        use objc2::msg_send;
-        use objc2::runtime::{AnyClass, AnyObject};
-        for (_label, window) in app.webview_windows() {
-            if let Ok(ptr) = window.ns_window() {
-                let ns = ptr as *mut AnyObject;
-                if ns.is_null() {
-                    continue;
-                }
-                unsafe {
-                    if let Some(nscolor) = AnyClass::get("NSColor") {
-                        // A soft off-white, matching the dev backdrop tone.
-                        let bg: *mut AnyObject = msg_send![
-                            nscolor,
-                            colorWithSRGBRed: 0.957f64, green: 0.953f64, blue: 0.984f64, alpha: 1.0f64];
-                        if !bg.is_null() {
-                            let _: () = msg_send![ns, setBackgroundColor: bg];
-                        }
-                    }
-                    let _: () = msg_send![ns, setOpaque: true];
-                    let _: () = msg_send![ns, setHasShadow: true];
-                }
-            }
-        }
-    }
 
     /// Recursively disable any WKWebView's opaque backing so only the HTML paints
     /// (the documented transparent-macOS-webview fix). Safe no-op for other views.
@@ -178,6 +150,7 @@ mod macos {
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(ipc::DaemonLink::default())
         .manage(ipc::EventSender(tokio::sync::Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
@@ -213,37 +186,29 @@ pub fn run() {
             });
 
             let win = app.get_webview_window("meeting").expect("meeting window");
+            // The overlay is ALWAYS the same frameless, transparent, floating
+            // panel — NO titlebar, NO window chrome, NO box (just like the
+            // interview overlay). The ONLY difference in capture-visible test mode
+            // is that screen-share invisibility is left OFF so a screenshot can
+            // see it. Everything else (NSPanel, transparency, no decorations) is
+            // identical, so what you test looks exactly like what ships.
+            #[cfg(target_os = "macos")]
+            {
+                macos::setup_panel(app)?;
+                macos::clear_window_chrome(app.handle());
+            }
             if !capture_visible {
-                // Capture exclusion — invisible to screen recording/sharing.
+                // Real mode: invisible to screen recording/sharing.
                 let _ = win.set_content_protected(true);
                 #[cfg(target_os = "macos")]
-                {
-                    macos::setup_panel(app)?;
-                    macos::set_sharing_none(app.handle());
-                    macos::clear_window_chrome(app.handle());
-                }
+                macos::set_sharing_none(app.handle());
             } else {
                 eprintln!(
                     "[meeting-overlay] BLUEY_MEETING_CAPTURE_VISIBLE=1 — overlay is \
                      VISIBLE to screen capture (LOCAL TEST ONLY, never ship)"
                 );
-                // Local screenshot test: do NOT run the NSPanel / transparent /
-                // sharingType machinery — that makes a non-activating, hidden-ish
-                // panel. Instead present a NORMAL, opaque, shown + focused window
-                // so it actually appears on screen and is easy to grab. (The
-                // transparent aurora look needs the panel path; for a screenshot
-                // of the layout an opaque window is fine + reliable.)
-                let _ = win.set_decorations(true);
-                let _ = win.set_always_on_top(true);
-                let _ = win.center();
-                #[cfg(target_os = "macos")]
-                macos::set_opaque_light_background(app.handle());
-                // Tell the UI it's in capture-visible mode so it paints the aurora
-                // backdrop + skips the hug-the-window auto-resize (which is for the
-                // real transparent overlay).
-                let _ = win.eval("window.__BLUEY_CAPTURE_VISIBLE__ = true;");
-                let _ = win.show();
-                let _ = win.set_focus();
+                #[cfg(debug_assertions)]
+                win.open_devtools();
             }
 
             // Connect to the daemon's Unix socket (when launched by the daemon)

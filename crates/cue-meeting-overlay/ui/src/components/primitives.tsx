@@ -2,7 +2,8 @@
 // composes. Styles live in aurora.css (tokens) + inline style for layout. No
 // component invents a color; everything reads from the design tokens.
 
-import type { CSSProperties, ReactNode } from "react";
+import type { CSSProperties, MouseEvent as ReactMouseEvent, ReactNode } from "react";
+import { useEffect, useRef, useState } from "react";
 
 /** A frosted glass surface with the aurora wash refracting inside it. */
 export function Glass({
@@ -185,8 +186,42 @@ export function SourceRow({ kind, label, note }: { kind: string; label: string; 
   );
 }
 
-/** The honest slow-answer state — the agent is driving + doing MCP round-trips. */
+/** The honest slow-answer state — the agent is driving + doing MCP round-trips.
+ *
+ *  Mirrors what production AI chat UIs (ChatGPT, Claude) show before the first
+ *  token: a LIVE ELAPSED TIMER (the one genuinely-true signal — time really did
+ *  pass) plus a short, gently-rotating honest hint. The UX guidance is explicit
+ *  — animate + hint + timer, never an indefinite loader, and NEVER invent fake
+ *  tool names you can't substantiate. Our daemon emits no real tool-step events
+ *  during an ask, so we show truthful generic phases, not fabricated steps. */
 export function ThinkingState({ detail }: { detail: string }) {
+  // Honest, generic phases — these describe what is genuinely happening (the
+  // agent is driving its session + connectors), not specific tool calls we'd
+  // be making up. They rotate to feel alive, like "Planning steps…".
+  const phases = [detail, "Working in your session…", "Pulling context…", "Composing the answer…"];
+  const [elapsed, setElapsed] = useState(0);
+  const [phaseIdx, setPhaseIdx] = useState(0);
+  const startRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    startRef.current = performance.now();
+    const tick = window.setInterval(() => {
+      if (startRef.current != null) {
+        setElapsed((performance.now() - startRef.current) / 1000);
+      }
+    }, 100);
+    // Advance the hint every ~2.2s, capped at the last (most honest) phase.
+    const rot = window.setInterval(() => {
+      setPhaseIdx((i) => Math.min(i + 1, phases.length - 1));
+    }, 2200);
+    return () => {
+      window.clearInterval(tick);
+      window.clearInterval(rot);
+    };
+    // phases is derived from `detail`; re-run only when detail changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detail]);
+
   return (
     <div
       style={{
@@ -210,11 +245,61 @@ export function ThinkingState({ detail }: { detail: string }) {
           animation: "aurora-spin 1.4s linear infinite",
         }}
       />
-      <span style={{ fontSize: 12.5, color: "var(--ink-2)", lineHeight: 1.4 }}>
-        <b style={{ color: "var(--ink)", fontWeight: 540 }}>Thinking with your repo…</b>
+      <span style={{ fontSize: 12.5, color: "var(--ink-2)", lineHeight: 1.4, flex: 1 }}>
+        <b style={{ color: "var(--ink)", fontWeight: 540 }}>Thinking</b>
+        <span style={{ color: "var(--ink-4)", fontVariantNumeric: "tabular-nums" }}>
+          {" · "}
+          {elapsed.toFixed(1)}s
+        </span>
         <br />
-        <span style={{ fontSize: 11 }}>{detail}</span>
+        <span
+          key={phaseIdx}
+          style={{ fontSize: 11, animation: "aurora-fade-in .3s ease both", display: "inline-block" }}
+        >
+          {phases[phaseIdx]}
+        </span>
       </span>
+    </div>
+  );
+}
+
+/** Bottom-right resize grip for the frameless panel — drag to resize the native
+ *  window (Tauri `startResizeDragging`). No-op in the browser. */
+export function ResizeGrip() {
+  const onDown = (ev: ReactMouseEvent) => {
+    if (ev.button !== 0) return;
+    if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    console.log("[resize] grip mousedown → startResizeDragging SouthEast");
+    void import("@tauri-apps/api/window").then(({ getCurrentWindow }) => {
+      getCurrentWindow()
+        .startResizeDragging("SouthEast" as never)
+        .then(() => console.log("[resize] ok"))
+        .catch((e) => console.log("[resize] FAILED", e));
+    });
+  };
+  return (
+    <div
+      onMouseDown={onDown}
+      aria-label="Resize"
+      style={{
+        position: "absolute",
+        right: 2,
+        bottom: 2,
+        width: 18,
+        height: 18,
+        cursor: "nwse-resize",
+        color: "var(--ink-4)",
+        display: "flex",
+        alignItems: "flex-end",
+        justifyContent: "flex-end",
+        zIndex: 5,
+      }}
+    >
+      <svg viewBox="0 0 14 14" width="13" height="13" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+        <path d="M13 4L4 13M13 8L8 13M13 12L12 13" />
+      </svg>
     </div>
   );
 }

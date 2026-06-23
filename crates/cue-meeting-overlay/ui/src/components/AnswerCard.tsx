@@ -4,6 +4,8 @@
 
 import type { AnswerSource } from "../lib/types";
 import { SourceRow } from "./primitives";
+import { Markdown } from "./Markdown";
+import { repairStreamingMarkdown } from "./repairStreamingMarkdown";
 
 export interface AnswerState {
   agentLabel: string;
@@ -54,8 +56,14 @@ export function AnswerCard({
         </span>
       </div>
 
-      <div style={{ fontSize: 14, lineHeight: 1.62, color: "var(--ink)" }}>
-        {answer.text}
+      <div className="md-body" style={{ fontSize: 14, lineHeight: 1.62, color: "var(--ink)" }}>
+        {/* Streaming UX, the ChatGPT/Claude way: render FORMATTED markdown on
+            EVERY frame, not just at the end. `repairStreamingMarkdown` closes the
+            single unterminated construct on the live tail (an open ``` fence, a
+            half-typed **bold**, a dangling [link) on a COPY, so the parser always
+            sees well-formed markdown and no raw `##`/`**`/`[](…)` ever flashes.
+            Once `done`, the text is already complete so the repair is a no-op. */}
+        <Markdown source={repairStreamingMarkdown(answer.text)} />
         {!answer.done && (
           <span
             style={{
@@ -83,8 +91,10 @@ export function AnswerCard({
       {answer.done && (
         <div style={{ display: "flex", alignItems: "center", gap: 7, marginTop: 12 }}>
           <CardAction glyph="⧉" label="Copy" onClick={onCopy} />
-          <CardAction glyph="✦" label="Fix this" accent onClick={onFix} />
-          <CardAction glyph="⤴" label="Send to chat" onClick={onSendToChat} />
+          {/* "Fix this" only when the answer is actually a fixable diagnosis (a
+              real fix handler is wired) — not on a plain conversational answer. */}
+          {onFix && <CardAction glyph="✦" label="Fix this" accent onClick={onFix} />}
+          {onSendToChat && <CardAction glyph="⤴" label="Send to chat" onClick={onSendToChat} />}
           <span style={{ flex: 1 }} />
           {answer.cost && <span style={{ fontSize: 10.5, color: "var(--ink-4)" }}>{answer.cost}</span>}
         </div>

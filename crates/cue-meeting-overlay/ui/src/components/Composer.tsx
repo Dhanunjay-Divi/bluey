@@ -2,21 +2,26 @@
 // ⌘↵ hint, send. Submits on Enter (⌘↵ or plain Enter) when there's text.
 
 import { useState } from "react";
+import type { ListeningState } from "../lib/types";
+import { PlusMenu } from "./PlusMenu";
 
 export function Composer({
   placeholder,
   contextLabel,
   onSubmit,
-  onPlus,
   onMic,
+  listenState = "idle",
 }: {
   placeholder: string;
   contextLabel?: string;
   onSubmit: (text: string) => void;
-  onPlus?: () => void;
   onMic?: () => void;
+  /** Daemon listening-pipeline state — drives the mic button's visual state so a
+   *  connecting/failed start is never silently swallowed. */
+  listenState?: ListeningState;
 }) {
   const [text, setText] = useState("");
+  const [plusOpen, setPlusOpen] = useState(false);
   const submit = () => {
     const t = text.trim();
     if (!t) return;
@@ -24,7 +29,8 @@ export function Composer({
     setText("");
   };
   return (
-    <div style={{ padding: "11px 14px 13px" }}>
+    <div style={{ padding: "11px 14px 13px", position: "relative" }}>
+      {plusOpen && <PlusMenu onClose={() => setPlusOpen(false)} />}
       {contextLabel && (
         <span
           style={{
@@ -55,7 +61,19 @@ export function Composer({
           boxShadow: "inset 0 1px 2px rgba(30,30,60,.04)",
         }}
       >
-        <button onClick={onPlus} aria-label="Add context" style={iconBtn}>＋</button>
+        <button
+          onClick={() => setPlusOpen((v) => !v)}
+          aria-label="Add context"
+          aria-haspopup="menu"
+          aria-expanded={plusOpen}
+          style={{
+            ...iconBtn,
+            background: plusOpen ? "var(--tint-wash)" : "transparent",
+            color: plusOpen ? "var(--tint-ink)" : "var(--ink-2)",
+          }}
+        >
+          ＋
+        </button>
         <input
           value={text}
           onChange={(e) => setText(e.target.value)}
@@ -76,7 +94,20 @@ export function Composer({
             fontFamily: "var(--font)",
           }}
         />
-        <button onClick={onMic} aria-label="Listen" style={iconBtn}>🎙</button>
+        <button
+          onClick={onMic}
+          aria-label={micMeta(listenState).label}
+          aria-pressed={listenState === "listening"}
+          aria-busy={listenState === "connecting"}
+          title={micMeta(listenState).title}
+          style={{
+            ...iconBtn,
+            background: micMeta(listenState).bg,
+            color: micMeta(listenState).fg,
+          }}
+        >
+          {micMeta(listenState).glyph}
+        </button>
         <span
           style={{
             fontSize: 10,
@@ -124,3 +155,50 @@ const iconBtn = {
   justifyContent: "center",
   fontSize: 16,
 } as const;
+
+// Per-state visual for the mic button, so a connecting/failed start is visible
+// (the bug before: any non-"listening" state silently snapped back to off).
+function micMeta(state: ListeningState): {
+  glyph: string;
+  label: string;
+  title: string;
+  bg: string;
+  fg: string;
+} {
+  switch (state) {
+    case "listening":
+      return {
+        glyph: "🎙",
+        label: "Stop listening",
+        title: "Listening — click to stop",
+        bg: "rgba(229,72,77,.12)",
+        fg: "#e5484d",
+      };
+    case "connecting":
+      return {
+        glyph: "◌",
+        label: "Connecting",
+        title: "Starting audio…",
+        bg: "rgba(180,140,40,.12)",
+        fg: "#b8860b",
+      };
+    case "failed":
+      return {
+        glyph: "⚠",
+        label: "Audio failed — click to retry",
+        title: "Audio couldn't start (setup needed) — click to retry",
+        bg: "rgba(229,72,77,.12)",
+        fg: "#e5484d",
+      };
+    case "paused":
+    case "idle":
+    default:
+      return {
+        glyph: "🎙",
+        label: "Listen",
+        title: "Listen",
+        bg: "transparent",
+        fg: "var(--ink-2)",
+      };
+  }
+}

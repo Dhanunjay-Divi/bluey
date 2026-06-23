@@ -4,11 +4,18 @@
 
 import { useEffect, useRef, useState } from "react";
 import { getClient } from "../lib";
-import type { AgentSummary, AnswerSource, TranscriptLine } from "../lib/types";
+import type {
+  AgentSummary,
+  AnswerSource,
+  AnswerStatusStep,
+  ListeningState,
+  TranscriptLine,
+} from "../lib/types";
 import { AgentBar } from "../components/AgentBar";
 import { AnswerCard, type AnswerState } from "../components/AnswerCard";
 import { Composer } from "../components/Composer";
 import { ThinkingState } from "../components/primitives";
+import { StatusFeed } from "../components/StatusFeed";
 
 type Phase = "idle" | "detected" | "thinking" | "answering";
 
@@ -17,14 +24,42 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
   const [transcript, setTranscript] = useState<TranscriptLine | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
   const [answer, setAnswer] = useState<AnswerState | null>(null);
+  const [statusSteps, setStatusSteps] = useState<AnswerStatusStep[]>([]);
+  const [statusDone, setStatusDone] = useState(false);
+  const [connectors, setConnectors] = useState<string[]>([]);
+  const [listenState, setListenState] = useState<ListeningState>("idle");
   const askRef = useRef<{ cancel(): void } | null>(null);
 
   useEffect(() => client.onTranscript((l) => l.final && setTranscript(l)), [client]);
+  useEffect(() => client.onListeningState(setListenState), [client]);
+
+  // Real connectors for the attached agent — replaces the old hardcoded
+  // "Jira / GitHub / +2" demo chips. Empty when no agent is attached.
+  useEffect(() => {
+    let live = true;
+    if (!agent) {
+      setConnectors([]);
+      return;
+    }
+    client
+      .connectors(agent.kind)
+      .then((cs) => live && setConnectors(cs.filter((c) => c.ready).map((c) => c.name)))
+      .catch(() => live && setConnectors([]));
+    return () => {
+      live = false;
+    };
+  }, [client, agent]);
+
+  // Show the first 2 connector chips inline; the rest collapse into "+N".
+  const connectorNames = connectors.slice(0, 2);
+  const extraConnectors = Math.max(0, connectors.length - 2);
 
   const runAsk = (question: string) => {
     askRef.current?.cancel();
     setPhase("thinking");
     setAnswer(null);
+    setStatusSteps([]);
+    setStatusDone(false);
     const draft: AnswerState = {
       agentLabel: agent?.displayName ?? "Bluey",
       text: "",
@@ -34,6 +69,10 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
       cost: undefined,
     };
     askRef.current = client.ask(question, (c) => {
+      // The agent's real reasoning + tool calls, surfaced live (the daemon
+      // re-sends the whole list each change, so we replace, not append).
+      if (c.status) setStatusSteps(c.status);
+      if (c.statusDone !== undefined) setStatusDone(c.statusDone);
       if (c.text) {
         draft.text += c.text;
         setPhase("answering");
@@ -42,7 +81,6 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
       if (c.source) draft.sources = [...draft.sources, c.source as AnswerSource];
       if (c.done) {
         draft.done = true;
-        draft.cost = "2.5k tok · $0.02";
       }
       setAnswer({ ...draft });
     });
@@ -51,10 +89,10 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
   const askDetected = () => transcript && runAsk(transcript.text);
 
   return (
-    <>
-      <AgentBar agent={agent} connectorNames={["Jira", "GitHub"]} extraCount={2} />
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}>
+      <AgentBar agent={agent} connectorNames={connectorNames} extraCount={extraConnectors} />
 
-      <div style={{ padding: "6px 0 2px", maxHeight: 440, overflowY: "auto" }}>
+      <div style={{ flex: 1, minHeight: 0, padding: "6px 0 2px", overflowY: "auto" }}>
         {transcript && (
           <div style={{ padding: "9px 16px" }}>
             <div style={role}>
@@ -80,14 +118,22 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
           </div>
         )}
 
-        {phase === "thinking" && <ThinkingState detail="reading auth migration · querying Jira" />}
+        {/* Show the timer-based thinking affordance only until the agent emits
+            its first real status step or answer token — then the live status
+            feed (real reasoning + tool calls) takes over. */}
+        {phase === "thinking" && statusSteps.length === 0 && (
+          <ThinkingState detail={`asking ${agent?.displayName ?? "your agent"}…`} />
+        )}
+
+        {/* The agent's REAL live activity — reasoning + tool/connector calls. */}
+        {(phase === "thinking" || phase === "answering") && (
+          <StatusFeed steps={statusSteps} done={statusDone} />
+        )}
 
         {answer && (phase === "answering" || answer.done) && (
           <AnswerCard
             answer={answer}
             onCopy={() => navigator.clipboard?.writeText(answer.text)}
-            onFix={() => {}}
-            onSendToChat={() => {}}
           />
         )}
 
@@ -100,10 +146,18 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
 
       <Composer
         placeholder="Ask a follow-up while Bluey listens…"
-        contextLabel="in context · transcript · 1 screen · 6 turns"
+        contextLabel={transcript ? "in context · live transcript" : undefined}
         onSubmit={runAsk}
+        onMic={() => {
+          // Debounce: ignore clicks while a start is mid-flight (connecting),
+          // so a non-responsive moment doesn't fire a burst of start events.
+          if (listenState === "connecting") return;
+          if (listenState === "listening") client.stopListening();
+          else client.startListening();
+        }}
+        listenState={listenState}
       />
-    </>
+    </div>
   );
 }
 

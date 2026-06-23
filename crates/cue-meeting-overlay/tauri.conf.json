@@ -4,10 +4,7 @@
   "version": "0.1.0",
   "identifier": "sh.bluey.meeting",
   "build": {
-    "frontendDist": "ui/dist",
-    "devUrl": "http://localhost:5174",
-    "beforeDevCommand": "npm run dev --prefix ui",
-    "beforeBuildCommand": "npm run build --prefix ui"
+    "frontendDist": "ui/dist"
   },
   "app": {
     "windows": [
@@ -32,7 +29,8 @@
     "withGlobalTauri": true
   },
   "bundle": {
-    "active": false,
+    "active": true,
+    "targets": ["app"],
     "icon": ["icons/icon.png"]
   }
 }

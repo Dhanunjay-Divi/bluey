@@ -2,10 +2,11 @@
 // tabs · close) over the active tab. First run shows onboarding; after that the
 // live Ask loop. One window, state-driven views (no router) — lean by design.
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { getClient } from "./lib";
+import { useDragHeader } from "./lib/useDragHeader";
 import type { AgentSummary } from "./lib/types";
-import { Glass, Mark, SegmentedTabs, Waveform } from "./components/primitives";
+import { Glass, Mark, ResizeGrip, SegmentedTabs, Waveform } from "./components/primitives";
 import { AskScreen } from "./screens/AskScreen";
 import { HistoryScreen } from "./screens/HistoryScreen";
 import { AgentsScreen } from "./screens/AgentsScreen";
@@ -19,6 +20,10 @@ export function App() {
   const [onboarding, setOnboarding] = useState(() => !localStorage.getItem("bluey.onboarded"));
   const [tab, setTab] = useState<Tab>("Ask");
   const [agents, setAgents] = useState<AgentSummary[] | null>(null);
+  const [connectors, setConnectors] = useState<string[]>([]);
+  // Drag the frameless panel by its header (no titlebar to grab).
+  const headerRef = useRef<HTMLDivElement>(null);
+  useDragHeader(headerRef);
 
   useEffect(() => {
     let live = true;
@@ -27,6 +32,23 @@ export function App() {
   }, [client]);
 
   const attached = useMemo(() => agents?.find((a) => a.attached) ?? null, [agents]);
+
+  // Real connectors for the attached agent — the footer lists the actual ready
+  // ones, never hardcoded brand names.
+  useEffect(() => {
+    let live = true;
+    if (!attached) {
+      setConnectors([]);
+      return;
+    }
+    client
+      .connectors(attached.kind)
+      .then((cs) => live && setConnectors(cs.filter((c) => c.ready).map((c) => c.name)))
+      .catch(() => live && setConnectors([]));
+    return () => {
+      live = false;
+    };
+  }, [client, attached]);
 
   const attach = (kind: string, sessionId?: string) =>
     client.attach(kind, sessionId).then(setAgents);
@@ -46,10 +68,16 @@ export function App() {
   }
 
   return (
-    <div style={{ minHeight: "100%", display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
-      <Glass radius="var(--r-xl)" style={{ width: 482 }}>
-        {/* header */}
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "13px 15px" }}>
+    // The panel FILLS the window (pinned to all edges with a small margin for the
+    // soft shadow) — like the interview overlay — so there's no empty space
+    // around it. The middle tab content flexes + scrolls inside.
+    <div style={{ position: "fixed", inset: 7, display: "flex" }}>
+      <Glass
+        radius="var(--r-xl)"
+        style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}
+      >
+        {/* header — drag region for the frameless panel (drag to move) */}
+        <div ref={headerRef} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "13px 15px", cursor: "grab" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
             <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
               {attached ? <Waveform /> : <Mark />}
@@ -63,21 +91,27 @@ export function App() {
           <button aria-label="Collapse" style={closeBtn}>×</button>
         </div>
 
-        {tab === "Ask" && <AskScreen agent={attached} />}
-        {tab === "History" && (
-          <HistoryScreen
-            kind={attached?.kind ?? null}
-            onResume={(sid) => attached && attach(attached.kind, sid).then(() => setTab("Ask"))}
-          />
-        )}
-        {tab === "Agents" && <AgentsScreen agents={agents} onAttach={(k) => void attach(k)} onDetach={() => void detach()} />}
+        {/* Middle: the active tab flexes to fill between header + footer and
+            scrolls internally (so the panel fills the window, no empty space). */}
+        <div style={{ flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column" }}>
+          {tab === "Ask" && <AskScreen agent={attached} />}
+          {tab === "History" && (
+            <HistoryScreen
+              kind={attached?.kind ?? null}
+              onResume={(sid) => attached && attach(attached.kind, sid).then(() => setTab("Ask"))}
+            />
+          )}
+          {tab === "Agents" && <AgentsScreen agents={agents} onAttach={(k) => void attach(k)} onDetach={() => void detach()} />}
+        </div>
 
         {/* footer */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "9px 16px", borderTop: "1px solid var(--line)" }}>
           <span style={ftr}>{attached?.displayName ?? "Bluey"} · <span style={{ color: "var(--tint-ink)" }}>runs on your machine</span></span>
-          <span style={ftr}>Jira · GitHub · Supabase</span>
+          <span style={ftr}>{connectors.length > 0 ? connectors.join(" · ") : "no connectors"}</span>
           <span style={ftr}>⌘↵ ask · ⌥ hide</span>
         </div>
+
+        <ResizeGrip />
       </Glass>
     </div>
   );

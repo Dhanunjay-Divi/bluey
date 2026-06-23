@@ -48,7 +48,9 @@ export function AgentBar({
             {agent && <span style={{ color: "var(--ink-3)", fontWeight: 430 }}> · your session</span>}
           </div>
           <div style={{ fontSize: 11, color: "var(--ink-3)", marginTop: 1 }}>
-            {agent ? "acme/payments-api · resumed in place" : "attach one to answer from your own agent"}
+            {agent
+              ? `${agent.readyConnectorCount}/${agent.connectorCount} connectors${agent.sessionCount != null ? ` · ${agent.sessionCount} sessions` : ""}`
+              : "attach one to answer from your own agent"}
           </div>
         </div>
       </div>

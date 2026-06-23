@@ -1346,6 +1346,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-nspanel",
+ "tauri-plugin-dialog",
  "tokio",
 ]
 

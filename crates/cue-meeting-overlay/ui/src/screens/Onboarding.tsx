@@ -24,8 +24,10 @@ export function Onboarding({
   const next = () => setStep(ORDER[Math.min(idx + 1, ORDER.length - 1)]);
 
   return (
-    <div style={{ minHeight: "100%", display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
-      <Glass radius="var(--r-xl)" style={{ width: 420 }}>
+    // Fill the window and center the card — the panel IS the window (no empty
+    // box around it), matching the main shell + the interview overlay.
+    <div style={{ position: "fixed", inset: 7, display: "flex" }}>
+      <Glass radius="var(--r-xl)" style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "center" }}>
         <div style={{ padding: "26px 26px 22px" }}>
           {/* progress dots */}
           <div style={{ display: "flex", gap: 6, marginBottom: 22 }}>
@@ -38,7 +40,7 @@ export function Onboarding({
             <Body
               icon={<Mark size={40} />}
               title="Bluey for meetings"
-              text="Answers come from your own coding agent and its connectors — grounded in your real repo, Jira and GitHub. Everything runs on this machine. Nothing leaves."
+              text="Answers come from your own coding agent and its connectors — grounded in your real repo, tickets and tools. Everything runs on this machine. Nothing leaves."
               cta="Get started"
               onCta={next}
             />
