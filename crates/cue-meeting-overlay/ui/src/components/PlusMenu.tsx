@@ -29,17 +29,13 @@ export function PlusMenu({ onClose }: { onClose: () => void }) {
     };
   }, [onClose]);
 
-  const pickFiles = async () => {
+  const pickFiles = () => {
     onClose();
-    try {
-      const { open } = await import("@tauri-apps/plugin-dialog");
-      const picked = await open({ multiple: true, directory: false });
-      if (!picked) return;
-      const paths = Array.isArray(picked) ? picked : [picked];
-      client.attachFiles(paths);
-    } catch (e) {
-      console.error("[PlusMenu] file pick failed", e);
-    }
+    // Use the DAEMON-owned file picker (it runs as a normal app and can open a
+    // native dialog). We must NOT open NSOpenPanel from the overlay's webview:
+    // the overlay is an ActivationPolicy::Accessory app, so +[NSOpenPanel
+    // openPanel] returns NULL and the dialog plugin panics, killing the overlay.
+    client.openAttachPicker();
   };
 
   const capturePage = () => {

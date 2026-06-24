@@ -53,8 +53,9 @@ export interface MeetingClient {
   // ---- context (the "+" menu: capture page / attach files / screenshot) ----
   /** Capture the active browser page's text as a context artifact. */
   capturePage(): void;
-  /** Attach the given local files as context artifacts. */
-  attachFiles(paths: string[]): void;
+  /** Open the DAEMON-owned native file picker to attach files as context.
+   *  (The overlay is an accessory app and cannot open NSOpenPanel itself.) */
+  openAttachPicker(): void;
   /** Capture a screenshot of the screen and route it to context/vision. */
   captureScreenshot(): void;
 }

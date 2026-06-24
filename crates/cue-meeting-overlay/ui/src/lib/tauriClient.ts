@@ -295,11 +295,12 @@ export function createTauriClient(): MeetingClient {
       sendEvent({ type: "active_page_capture_requested" });
     },
 
-    attachFiles(paths) {
-      // "+" → Attach files: the UI picks local files (native dialog) and hands
-      // their paths to the daemon, which attaches them as context artifacts.
-      if (paths.length === 0) return;
-      sendEvent({ type: "attach_files_requested", paths });
+    openAttachPicker() {
+      // "+" → Attach files: ask the DAEMON to open its own native file picker
+      // (osascript / picker helper) and attach the chosen files as context. The
+      // overlay can't open NSOpenPanel itself (accessory app → NULL panel →
+      // crash), so the picker must run daemon-side.
+      sendEvent({ type: "attach_requested" });
     },
 
     captureScreenshot() {

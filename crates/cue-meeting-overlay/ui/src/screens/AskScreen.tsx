@@ -19,19 +19,36 @@ import { StatusFeed } from "../components/StatusFeed";
 
 type Phase = "idle" | "detected" | "thinking" | "answering";
 
+/** One Q&A exchange in the conversation feed: the question asked + the streamed
+ *  answer + the live status steps for that turn. Past turns stay on screen so
+ *  the meeting builds a scrollable history instead of each ask replacing the
+ *  last. */
+interface Turn {
+  id: number;
+  question: string;
+  answer: AnswerState;
+  statusSteps: AnswerStatusStep[];
+  statusDone: boolean;
+}
+
 export function AskScreen({ agent }: { agent: AgentSummary | null }) {
   const client = getClient();
   const [transcript, setTranscript] = useState<TranscriptLine | null>(null);
   const [phase, setPhase] = useState<Phase>("idle");
-  const [answer, setAnswer] = useState<AnswerState | null>(null);
-  const [statusSteps, setStatusSteps] = useState<AnswerStatusStep[]>([]);
-  const [statusDone, setStatusDone] = useState(false);
+  // The conversation feed — every asked question + its answer, in order.
+  const [turns, setTurns] = useState<Turn[]>([]);
   const [connectors, setConnectors] = useState<string[]>([]);
   const [listenState, setListenState] = useState<ListeningState>("idle");
   const askRef = useRef<{ cancel(): void } | null>(null);
+  const turnSeq = useRef(0);
+  const feedEndRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => client.onTranscript((l) => l.final && setTranscript(l)), [client]);
   useEffect(() => client.onListeningState(setListenState), [client]);
+  // Keep the newest turn / streaming text in view as the feed grows.
+  useEffect(() => {
+    feedEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [turns]);
 
   // Real connectors for the attached agent — replaces the old hardcoded
   // "Jira / GitHub / +2" demo chips. Empty when no agent is attached.
@@ -57,9 +74,10 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
   const runAsk = (question: string) => {
     askRef.current?.cancel();
     setPhase("thinking");
-    setAnswer(null);
-    setStatusSteps([]);
-    setStatusDone(false);
+
+    // Append a NEW turn (don't wipe prior ones). We mutate this turn's draft as
+    // chunks stream, and patch the matching turn by id so earlier answers stay.
+    const id = ++turnSeq.current;
     const draft: AnswerState = {
       agentLabel: agent?.displayName ?? "Bluey",
       text: "",
@@ -68,21 +86,33 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
       done: false,
       cost: undefined,
     };
+    let steps: AnswerStatusStep[] = [];
+    let statusDone = false;
+    setTurns((prev) => [
+      ...prev,
+      { id, question, answer: { ...draft }, statusSteps: steps, statusDone },
+    ]);
+
+    const patch = () =>
+      setTurns((prev) =>
+        prev.map((t) =>
+          t.id === id
+            ? { ...t, answer: { ...draft }, statusSteps: steps, statusDone }
+            : t,
+        ),
+      );
+
     askRef.current = client.ask(question, (c) => {
-      // The agent's real reasoning + tool calls, surfaced live (the daemon
-      // re-sends the whole list each change, so we replace, not append).
-      if (c.status) setStatusSteps(c.status);
-      if (c.statusDone !== undefined) setStatusDone(c.statusDone);
+      if (c.status) steps = c.status;
+      if (c.statusDone !== undefined) statusDone = c.statusDone;
       if (c.text) {
         draft.text += c.text;
         setPhase("answering");
       }
       if (c.tool) draft.tools = [...draft.tools, c.tool];
       if (c.source) draft.sources = [...draft.sources, c.source as AnswerSource];
-      if (c.done) {
-        draft.done = true;
-      }
-      setAnswer({ ...draft });
+      if (c.done) draft.done = true;
+      patch();
     });
   };
 
@@ -110,38 +140,46 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
           </div>
         )}
 
-        {(phase === "detected" || phase === "thinking" || phase === "answering") && (
-          <div style={trig}>
-            <div style={ln} />
-            <span style={trigLbl}>✦ question detected · asking your agent</span>
-            <div style={ln} />
-          </div>
-        )}
+        {/* The conversation feed: every asked question + its answer, oldest at
+            the top. Past turns stay on screen — a new ask appends, never wipes. */}
+        {turns.map((turn) => {
+          const live = turn.id === turnSeq.current && !turn.answer.done;
+          return (
+            <div key={turn.id}>
+              <div style={trig}>
+                <div style={ln} />
+                <span style={trigLbl}>✦ {turn.question}</span>
+                <div style={ln} />
+              </div>
 
-        {/* Show the timer-based thinking affordance only until the agent emits
-            its first real status step or answer token — then the live status
-            feed (real reasoning + tool calls) takes over. */}
-        {phase === "thinking" && statusSteps.length === 0 && (
-          <ThinkingState detail={`asking ${agent?.displayName ?? "your agent"}…`} />
-        )}
+              {/* Timer affordance only for the live turn, until its first real
+                  status step / answer token arrives. */}
+              {live && turn.statusSteps.length === 0 && turn.answer.text === "" && (
+                <ThinkingState detail={`asking ${agent?.displayName ?? "your agent"}…`} />
+              )}
 
-        {/* The agent's REAL live activity — reasoning + tool/connector calls. */}
-        {(phase === "thinking" || phase === "answering") && (
-          <StatusFeed steps={statusSteps} done={statusDone} />
-        )}
+              {/* The agent's real reasoning + tool calls for this turn. */}
+              {turn.statusSteps.length > 0 && (
+                <StatusFeed steps={turn.statusSteps} done={turn.statusDone} />
+              )}
 
-        {answer && (phase === "answering" || answer.done) && (
-          <AnswerCard
-            answer={answer}
-            onCopy={() => navigator.clipboard?.writeText(answer.text)}
-          />
-        )}
+              {(turn.answer.text !== "" || turn.answer.done) && (
+                <AnswerCard
+                  answer={turn.answer}
+                  onCopy={() => navigator.clipboard?.writeText(turn.answer.text)}
+                />
+              )}
+            </div>
+          );
+        })}
 
-        {!transcript && (
+        {turns.length === 0 && !transcript && (
           <div style={{ padding: "28px 16px", textAlign: "center", color: "var(--ink-3)", fontSize: 13 }}>
             Listening — ask a question, or one will be detected from the call.
           </div>
         )}
+
+        <div ref={feedEndRef} />
       </div>
 
       <Composer

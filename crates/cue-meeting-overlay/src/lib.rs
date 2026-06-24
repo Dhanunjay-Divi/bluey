@@ -150,7 +150,6 @@ mod macos {
 
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
         .manage(ipc::DaemonLink::default())
         .manage(ipc::EventSender(tokio::sync::Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
