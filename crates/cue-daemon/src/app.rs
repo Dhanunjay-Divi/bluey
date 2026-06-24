@@ -339,6 +339,22 @@ fn agent_apply_supported(agent: &AgentKind) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `agent` chains its conversation by RESUMING a session id (the
+/// `NativeResume` tier — Claude, Codex, Cursor-CLI, Copilot). For these, the id
+/// the agent returns each turn is the resume key for the next turn, so Bluey
+/// persists it to keep the conversation going. `Replay`-tier agents (Cursor IDE,
+/// Gemini, Antigravity IDE) do NOT resume by id — their ids are not resumable,
+/// so persisting one as a resume target would mis-resolve; for them this returns
+/// `false` and Bluey keeps continuing via transcript replay instead.
+/// Data-driven off the registry — no agent is named here.
+fn agent_chains_by_session_id(agent: &AgentKind) -> bool {
+    use cue_agent_bridge::registry::{entry_for, ContinuationTier};
+    KindTag::from_agent_kind(agent)
+        .and_then(entry_for)
+        .map(|entry| entry.continuation == ContinuationTier::NativeResume)
+        .unwrap_or(false)
+}
+
 /// Build the [`OverlayCommand::PushFixProposal`] for a proposed fix: copies the
 /// three contract sections, extracts a renderable diff from the FIX section (if
 /// any), and stamps whether the producing agent can apply. Pure mapping, so the
@@ -6150,6 +6166,13 @@ async fn apply_continuation_tier(
 struct DriveOutcome {
     body: String,
     cost_usd: Option<f64>,
+    /// The agent's session id for THIS turn, captured from `AnswerChunk::Started`
+    /// (Claude `system/init`, Codex `thread.started`, the ACP session id, …).
+    /// `None` when the agent reports no id. The caller persists this as the
+    /// resume target for the NEXT ask so the conversation chains forward — the
+    /// fix for "turn 2 forgets turn 1". Only meaningful for NativeResume/ACP
+    /// tiers; ignored for Replay agents.
+    session_id: Option<String>,
 }
 
 /// A failed single drive attempt. `reason` is a human phrase appended after
@@ -6273,9 +6296,17 @@ async fn drive_answer_attempt(
         }
     }
 
+    // The agent's session id for this turn — captured so the caller can persist
+    // it as the resume target for the next ask (conversation chaining). Keep the
+    // LAST non-empty id seen: some agents rotate the id mid-turn.
+    let mut latest_session: Option<String> = None;
     while let Some(chunk) = futures_util::StreamExt::next(&mut answer_stream).await {
         match chunk {
-            AnswerChunk::Started { .. } => {}
+            AnswerChunk::Started { session_id } => {
+                if let Some(id) = session_id.filter(|s| !s.trim().is_empty()) {
+                    latest_session = Some(id);
+                }
+            }
             AnswerChunk::Delta(delta) => {
                 body.push_str(&delta);
                 if let Some(stream) = stream.as_mut() {
@@ -6328,7 +6359,11 @@ async fn drive_answer_attempt(
         let _ = stream.flush_status(true).await;
     }
 
-    Ok(DriveOutcome { body, cost_usd })
+    Ok(DriveOutcome {
+        body,
+        cost_usd,
+        session_id: latest_session,
+    })
 }
 
 /// Trim a raw agent error to a short, single-line phrase for the guidance card.
@@ -6424,7 +6459,7 @@ async fn answer_with_agent(
     // most USP-faithful recovery. Capped low so a live meeting never stalls.
     const MAX_TRANSIENT_RETRIES: u32 = 2;
     let mut transient_retries: u32 = 0;
-    let (body, cost_usd) = loop {
+    let (body, cost_usd, session_id) = loop {
         match drive_answer_attempt(
             &kind,
             &label,
@@ -6435,7 +6470,7 @@ async fn answer_with_agent(
         )
         .await
         {
-            Ok(outcome) => break (outcome.body, outcome.cost_usd),
+            Ok(outcome) => break (outcome.body, outcome.cost_usd, outcome.session_id),
             Err(failure) => {
                 // Recoverable resume failures (session too large OR not found)
                 // retry once without resume — a fresh session in the project dir
@@ -6549,6 +6584,43 @@ async fn answer_with_agent(
         // clean run that produced nothing is a backend-reach failure, not a
         // missing/signed-out CLI.
         return Ok(agent_offline(provider, &mut stream, fallback_depth, &label).await);
+    }
+
+    // CONVERSATION CHAINING: persist the session id this turn returned as the
+    // resume target for the NEXT ask, so the conversation continues in the same
+    // thread (turn 2 remembers turn 1) — the fix for asks being orphaned.
+    //   - Only NativeResume agents chain by id (Replay agents' ids aren't
+    //     resumable; persisting one would mis-resolve, so we skip them).
+    //   - Only on a real answer (body non-empty, reached here) and a non-empty
+    //     id, so a failed/empty turn never pins a dead thread.
+    //   - We keep the agent attachment unchanged; only the session id advances.
+    // The daemon handle lives on the overlay stream (the overlay ask path always
+    // has one); without it there's nothing to persist into, which is fine.
+    if let (Some(new_id), Some(daemon)) = (
+        session_id.filter(|s| !s.trim().is_empty()),
+        stream.as_ref().map(|s| s.daemon.clone()),
+    ) {
+        if agent_chains_by_session_id(&kind) {
+            if let Ok(settings) = load_settings(&daemon.paths) {
+                // Only update if it actually changed, and only while THIS agent
+                // is still the attached one (don't resurrect a detached agent).
+                let still_attached =
+                    parse_attached_agent(settings.attached_agent.as_deref()) == Some(kind.clone());
+                if still_attached && settings.attached_session.as_deref() != Some(new_id.as_str()) {
+                    if let Err(error) = persist_attached_agent(
+                        &daemon,
+                        settings.attached_agent.clone(),
+                        Some(new_id.clone()),
+                    )
+                    .await
+                    {
+                        warn!(agent = %label, error = %error, "failed to persist chained session id");
+                    } else {
+                        debug!(agent = %label, session = %new_id, "chained conversation: persisted new session id");
+                    }
+                }
+            }
+        }
     }
 
     if let Some(stream) = stream.as_mut() {

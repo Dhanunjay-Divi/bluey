@@ -134,11 +134,13 @@ pub async fn apply_tier<F, Fut>(
         // ACP path. The on-disk session id IS the SDK's resume key — `session/load`
         // resolves `~/.claude/projects/<encoded-cwd>/<id>.jsonl` and the CWD is part
         // of that path (platform.claude.com/docs/en/agent-sdk/sessions). So:
-        //   - cwd usable  → attempt TRUE resume (set `resume` + the session's project
-        //     cwd) AND keep the transcript in `context` as a fork fallback. The ACP
-        //     drive tries `session/load` first; if it yields no prior context it
-        //     retries as fresh + replayed context (fork). Best of both: exact
-        //     in-place resume when it works, non-destructive fork when it doesn't.
+        //   - cwd usable  → TRUE resume (set `resume` + the session's project cwd)
+        //     and DO NOT also replay the transcript. `session/load` already gives
+        //     the agent its full history; replaying the transcript on top makes the
+        //     agent see every prior turn twice and echo old answers back into the
+        //     new one (the "doubling" bug). The ACP drive has its own fork fallback
+        //     (fresh session + replayed `render_prompt` context) when `session/load`
+        //     fails, so we don't need to pre-load `context` here.
         //   - cwd missing → resume can't resolve the path (would silently start
         //     fresh), so go straight to fork: drop `resume`, replay the transcript.
         ContinuationTier::NativeResume if via_acp => {
@@ -146,19 +148,21 @@ pub async fn apply_tier<F, Fut>(
                 tracing::info!(
                     session = %session_id,
                     cwd = project.as_deref().unwrap_or(""),
-                    "ACP continuation: TRUE resume (session/load) with fork fallback"
+                    "ACP continuation: TRUE resume (session/load), no transcript replay"
                 );
                 question.cwd = project;
                 question.resume = Some(session_id.to_string());
+                // NOTE: intentionally leave `question.context` unset — resume
+                // already carries the history; replaying it duplicates the turns.
             } else {
                 question.resume = None;
                 tracing::info!(
                     session = %session_id,
                     "ACP continuation: cwd unusable → FORK (replay context, no resume)"
                 );
-            }
-            if let Some(t) = transcript {
-                question.context = Some(super::maybe_compact(t, &summarize).await);
+                if let Some(t) = transcript {
+                    question.context = Some(super::maybe_compact(t, &summarize).await);
+                }
             }
         }
         ContinuationTier::NativeResume if cwd_usable => {
