@@ -119,6 +119,23 @@ pub async fn build_stt_chain(
         }
     }
 
+    // Fallback: on-device Parakeet (English STT + on-demand diarization).
+    // Gated by BOTH the `parakeet-stt` build feature AND BLUEY_STT_PARAKEET=1 at
+    // runtime, so it never engages unless explicitly enabled and built in.
+    #[cfg(feature = "parakeet-stt")]
+    if is_parakeet_enabled() {
+        match parakeet_paths_from_env() {
+            Some(paths) => {
+                let p = super::parakeet::ParakeetProvider::connect(paths, source);
+                providers.push(Box::new(p));
+            }
+            None => tracing::warn!(
+                provider = "parakeet",
+                "BLUEY_STT_PARAKEET=1 but no model dir (set BLUEY_PARAKEET_MODEL_DIR); skipping"
+            ),
+        }
+    }
+
     if providers.is_empty() {
         return Err(SttError::NotActive);
     }
@@ -135,6 +152,26 @@ fn use_mock_stt() -> bool {
     std::env::var("BLUEY_USE_MOCK_STT")
         .map(|v| v == "1")
         .unwrap_or(false)
+}
+
+/// Runtime switch for the on-device Parakeet provider (build-feature-gated too).
+#[cfg(feature = "parakeet-stt")]
+fn is_parakeet_enabled() -> bool {
+    env_bool("BLUEY_STT_PARAKEET").unwrap_or(false)
+}
+
+/// Resolve Parakeet model paths from env. `BLUEY_PARAKEET_MODEL_DIR` points at
+/// the directory holding the Nemotron English ONNX model + tokenizer; an
+/// optional `BLUEY_PARAKEET_SORTFORMER` enables diarization. Returns `None` when
+/// the model dir is unset (provider is skipped rather than failing the chain).
+#[cfg(feature = "parakeet-stt")]
+fn parakeet_paths_from_env() -> Option<super::parakeet::ParakeetPaths> {
+    let nemotron_dir = env_value("BLUEY_PARAKEET_MODEL_DIR")?.into();
+    let sortformer_model = env_value("BLUEY_PARAKEET_SORTFORMER").map(Into::into);
+    Some(super::parakeet::ParakeetPaths {
+        nemotron_dir,
+        sortformer_model,
+    })
 }
 
 fn env_stt_key() -> Option<String> {
