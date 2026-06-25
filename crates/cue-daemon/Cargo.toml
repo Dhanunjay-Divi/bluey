@@ -48,9 +48,34 @@ rusqlite.workspace = true
 hex = "0.4"
 sha2 = "0.10"
 
+# On-device English STT + on-demand diarization (NVIDIA Parakeet/Nemotron +
+# Sortformer via ONNX Runtime). CPU-capable; the `ort` native lib bundles into
+# the binary, model weights are fetched on first run. Behind the `parakeet-stt`
+# feature so the heavy ONNX dependency is opt-in and the default build is
+# unaffected. See docs/DECISION-VOICE-STT-STACK.md.
+parakeet-rs = { version = "0.3", optional = true, default-features = false }
+
 futures-util.workspace = true
 tokio-tungstenite.workspace = true
 url.workspace = true
+
+# Intel macOS has NO prebuilt ONNX Runtime binary in `ort`, so on that target we
+# load ONNX Runtime dynamically at runtime (`load-dynamic`) instead of linking a
+# prebuilt. All OTHER targets (Apple Silicon, Windows, Linux) use the native
+# prebuilt binaries via `ort-defaults`. See docs/DECISION-VOICE-STT-STACK.md.
+[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))'.dependencies]
+parakeet-rs = { version = "0.3", optional = true, default-features = false, features = [
+    "load-dynamic",
+    "sortformer",
+] }
+
+[features]
+# Opt-in on-device STT/diarization backend. Off by default (heavy ONNX dep).
+# `sortformer` enables on-demand speaker diarization. The native ONNX Runtime
+# (prebuilt binaries) is the default backend; Intel macOS overrides to
+# load-dynamic via the per-target dependency above.
+parakeet-stt = ["dep:parakeet-rs", "parakeet-rs/ort-defaults", "parakeet-rs/sortformer"]
+
 [lints.clippy]
 needless_return = "allow"
 filter_next = "allow"
