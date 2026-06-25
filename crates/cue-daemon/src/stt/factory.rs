@@ -124,14 +124,27 @@ pub async fn build_stt_chain(
     // runtime, so it never engages unless explicitly enabled and built in.
     #[cfg(feature = "parakeet-stt")]
     if is_parakeet_enabled() {
-        match parakeet_paths_from_env() {
-            Some(paths) => {
-                let p = super::parakeet::ParakeetProvider::connect(paths, source);
-                providers.push(Box::new(p));
+        // First-run provisioning: resolve the model dir (default under the app
+        // data dir; env-overridable) and download the model once if absent, so
+        // "install it and it just works". A fully-present dir skips the network.
+        match cue_core::app_paths::AppPaths::discover() {
+            Ok(app_paths) => {
+                match super::model_setup::ensure_parakeet_model(&app_paths).await {
+                    Ok(paths) => {
+                        let p = super::parakeet::ParakeetProvider::connect(paths, source);
+                        providers.push(Box::new(p));
+                    }
+                    Err(e) => tracing::warn!(
+                        provider = "parakeet",
+                        error = %e,
+                        "parakeet model unavailable (download/setup failed); skipping"
+                    ),
+                }
             }
-            None => tracing::warn!(
+            Err(e) => tracing::warn!(
                 provider = "parakeet",
-                "BLUEY_STT_PARAKEET=1 but no model dir (set BLUEY_PARAKEET_MODEL_DIR); skipping"
+                error = %e,
+                "could not resolve app paths for parakeet model; skipping"
             ),
         }
     }
@@ -158,20 +171,6 @@ fn use_mock_stt() -> bool {
 #[cfg(feature = "parakeet-stt")]
 fn is_parakeet_enabled() -> bool {
     env_bool("BLUEY_STT_PARAKEET").unwrap_or(false)
-}
-
-/// Resolve Parakeet model paths from env. `BLUEY_PARAKEET_MODEL_DIR` points at
-/// the directory holding the Nemotron English ONNX model + tokenizer; an
-/// optional `BLUEY_PARAKEET_SORTFORMER` enables diarization. Returns `None` when
-/// the model dir is unset (provider is skipped rather than failing the chain).
-#[cfg(feature = "parakeet-stt")]
-fn parakeet_paths_from_env() -> Option<super::parakeet::ParakeetPaths> {
-    let nemotron_dir = env_value("BLUEY_PARAKEET_MODEL_DIR")?.into();
-    let sortformer_model = env_value("BLUEY_PARAKEET_SORTFORMER").map(Into::into);
-    Some(super::parakeet::ParakeetPaths {
-        nemotron_dir,
-        sortformer_model,
-    })
 }
 
 fn env_stt_key() -> Option<String> {
