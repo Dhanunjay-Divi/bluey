@@ -8896,6 +8896,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         guard !body.isEmpty else { return }
 
         let label = transcriptSourceLabel(title)
+        if shouldSuppressCrossSourceTranscriptPreview(label: label, body: body) { return }
         let preview = mergedLiveTranscriptPreview(label: label, body: body, final: true)
         rememberTranscriptForAnswer(label: label, body: body, final: true)
         updateLiveTranscriptStrip(
@@ -8920,6 +8921,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 scrollToEnd: false)
             return
         }
+        if shouldSuppressCrossSourceTranscriptPreview(label: label, body: body) { return }
         let preview = mergedLiveTranscriptPreview(label: label, body: body, final: final)
         rememberTranscriptForAnswer(label: label, body: body, final: final)
         updateLiveTranscriptStrip(
@@ -8939,6 +8941,24 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         merged = mergedTranscriptBody(existing, cleanBody)
         liveTranscriptPreviewBodies[cleanLabel] = merged
         return merged
+    }
+
+    private func shouldSuppressCrossSourceTranscriptPreview(label: String, body: String) -> Bool {
+        let cleanLabel = transcriptSourceLabel(label)
+        guard cleanLabel == "Mic" || cleanLabel == "System" else { return false }
+        let normalized = normalizeTranscriptMemoryLine(body)
+        guard !normalized.isEmpty else { return false }
+        let otherLabel = cleanLabel == "Mic" ? "System" : "Mic"
+        guard let existing = liveTranscriptPreviewBodies[otherLabel] else { return false }
+        let existingNormalized = normalizeTranscriptMemoryLine(existing)
+        guard isSameTranscriptMemoryBody(existingNormalized, normalized) else { return false }
+        if cleanLabel == "Mic" {
+            liveTranscriptPreviewBodies.removeValue(forKey: otherLabel)
+            latestLiveTranscriptLinesBySource.removeValue(forKey: otherLabel)
+            autoSendTranscriptLinesBySource.removeValue(forKey: otherLabel)
+            return false
+        }
+        return true
     }
 
     private func updateLiveTranscriptStrip(

@@ -500,10 +500,15 @@ fn is_near_duplicate_transcript(
 
     let now_ms = clock::now_epoch_ms_string().parse::<u64>().unwrap_or(0);
     meeting.transcript.iter().rev().take(8).any(|segment| {
-        segment.is_final
-            && segment.speaker == speaker
-            && normalize_transcript_text(&segment.text) == normalized
-            && transcript_age_ms(&segment.created_at, now_ms) <= 8_000
+        if !segment.is_final || normalize_transcript_text(&segment.text) != normalized {
+            return false;
+        }
+        let age_ms = transcript_age_ms(&segment.created_at, now_ms);
+        if segment.speaker == speaker {
+            return age_ms <= SAME_SPEAKER_TRANSCRIPT_DUP_MS;
+        }
+        is_mic_system_echo_pair(segment.speaker, speaker)
+            && age_ms <= CROSS_SOURCE_TRANSCRIPT_ECHO_DUP_MS
     })
 }
 
@@ -512,6 +517,13 @@ pub fn normalize_transcript_text(text: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+fn is_mic_system_echo_pair(existing: Speaker, incoming: Speaker) -> bool {
+    matches!(
+        (existing, incoming),
+        (Speaker::User, Speaker::System) | (Speaker::System, Speaker::User)
+    )
 }
 
 fn transcript_age_ms(created_at: &str, now_ms: u64) -> u64 {
@@ -786,6 +798,8 @@ const MAX_PROVIDER_IMAGE_DATA_URLS: usize = 4;
 const MAX_PROVIDER_IMAGE_DATA_URL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROVIDER_IMAGE_DATA_URL_TOTAL_BYTES: usize = 12 * 1024 * 1024;
 const RETAINED_SCREEN_THUMBNAIL_MAX_EDGE: u32 = 1_800;
+const SAME_SPEAKER_TRANSCRIPT_DUP_MS: u64 = 8_000;
+const CROSS_SOURCE_TRANSCRIPT_ECHO_DUP_MS: u64 = 2_500;
 
 impl OverlayProcess {
     fn send(&mut self, command: &OverlayCommand) -> Result<()> {
@@ -12610,7 +12624,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_transcript_detection_ignores_recent_retries() {
+    fn duplicate_transcript_detection_skips_same_speaker_and_cross_source_echoes() {
         let mut meeting = MeetingRecord::new(Some("Audio".to_string()));
         meeting.transcript.push(TranscriptSegment::new(
             Speaker::System,
@@ -12624,7 +12638,7 @@ mod tests {
             "we should   cache the answer.",
             true,
         ));
-        assert!(!is_near_duplicate_transcript(
+        assert!(is_near_duplicate_transcript(
             &meeting,
             Speaker::User,
             "we should cache the answer.",
@@ -12634,6 +12648,25 @@ mod tests {
             &meeting,
             Speaker::System,
             "we should cache a different answer.",
+            true,
+        ));
+    }
+
+    #[test]
+    fn duplicate_transcript_detection_keeps_old_cross_source_repeats() {
+        let mut meeting = MeetingRecord::new(Some("Audio".to_string()));
+        let mut segment =
+            TranscriptSegment::new(Speaker::System, "We should cache the answer.", true);
+        let now_ms = clock::now_epoch_ms_string().parse::<u64>().unwrap_or(0);
+        segment.created_at = now_ms
+            .saturating_sub(CROSS_SOURCE_TRANSCRIPT_ECHO_DUP_MS + 1)
+            .to_string();
+        meeting.transcript.push(segment);
+
+        assert!(!is_near_duplicate_transcript(
+            &meeting,
+            Speaker::User,
+            "we should cache the answer.",
             true,
         ));
     }

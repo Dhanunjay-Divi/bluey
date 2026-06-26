@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-26 15:17 EDT
+Latest checkpoint: 2026-06-26 15:31 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,28 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-196-SCREEN-CONTEXT-PAYLOAD-GUARD.md`; the next canonical Bluey round doc should start at `ROUND-197-...`.
+- Latest assigned Bluey round doc is `ROUND-197-LIVE-CAPTION-ECHO-DEDUP.md`; the next canonical Bluey round doc should start at `ROUND-198-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-routing-hardening`.
+- Round 197 fixed the likely doubled-caption path when Mic + System both hear the same utterance.
+- The daemon now treats exact final-caption repeats from the same speaker within 8 seconds as duplicates, and exact Mic/System echo repeats within 2.5 seconds as duplicates.
+- The macOS overlay now suppresses identical cross-source live-caption preview echoes; when Mic and System have the same caption body, Mic wins for preview and pending answer context.
+- Windows overlay did not need a platform-specific patch because it has one global transcript final/partial buffer rather than separate per-source preview buffers; the daemon dedup applies to Windows too.
+- Round 197 verification passed:
+  - `cargo test -p cue-daemon duplicate_transcript_detection -- --nocapture`
+  - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+  - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+  - `cargo build --release -p cue-cli -p cue-daemon`
+  - `native/macos/cue-overlay/build.sh`
+- Local install was refreshed after Round 197, then `bluey on` succeeded:
+  - daemon pid `44710`
+  - overlay visible `true`
+  - overlay capture excluded `true`
+  - active meeting id `e5645fad-8644-4b7c-80e5-26587b488bb3`
+- Remaining Round 197 QA gate: live Mic + System smoke with spoken audio to confirm the bottom caption strip and sent Answer question do not contain duplicate caption lines.
 - Round 196 diagnosed the owner's generic overlay failure card as a managed vision request-size failure: the matching Bluey log showed `/router/complete/stream` returning HTTP `413 Payload Too Large` with `Failed to buffer the request body: length limit exceeded`.
 - The failure happened with two attached screen-context chips; it was not a model-answering or canvas-routing bug.
 - The daemon now classifies `413`, `payload too large`, `length limit exceeded`, and screen-image validation phrases into a clear user-facing message: the attached screen context is too large for one request.
