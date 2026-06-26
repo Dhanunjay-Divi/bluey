@@ -43,6 +43,32 @@ Each environment needs:
 payments/UI flows. The server-side Checkout API call requires `ACCESS_TOKEN` and
 `LOCATION_ID`.
 
+## Hosted Checkout Branding
+
+Square hosted checkout uses Square location-level branding. A stale Square
+location logo can appear even when Bluey sends a correct `Bluey credits` line
+item. Keep the active Square location named `Bluey` and configure online
+checkout to use business-name branding instead of a framed logo unless the
+Square Dashboard logo is already verified as Bluey.
+
+Apply or verify the expected branding with:
+
+```bash
+scripts/bluey-square-branding.sh /etc/bluey-api/bluey-api.env
+scripts/bluey-square-branding.sh /etc/bluey-api/bluey-api.env --check
+```
+
+Expected production checkout branding:
+
+- Location name: `Bluey`
+- Location business name: `Bluey`
+- Location website: `https://bluey.sh`
+- Checkout header: `BUSINESS_NAME`
+- Checkout button color: `#20c7ff`
+- Checkout button shape: `ROUNDED`
+
+The cloud preflight runs this check when Square is the active billing provider.
+
 ## Webhook
 
 Register this endpoint in Square:

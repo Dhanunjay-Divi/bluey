@@ -87,6 +87,8 @@ fn parse_sse_chunks(buffer: &mut String) -> Vec<Result<LlmChunk, LlmError>> {
                                     cost: None,
                                     cost_label: None,
                                     artifact: None,
+                                    status: None,
+                                    sources: Vec::new(),
                                 }));
                             }
                         }
@@ -97,6 +99,8 @@ fn parse_sse_chunks(buffer: &mut String) -> Vec<Result<LlmChunk, LlmError>> {
                                 cost: None,
                                 cost_label: None,
                                 artifact: None,
+                                status: None,
+                                sources: Vec::new(),
                             }));
                         }
                         _ => {}
@@ -173,6 +177,7 @@ impl LlmProvider for AnthropicProvider {
             cost: None,
             cost_label: None,
             artifact: None,
+            sources: Vec::new(),
         })
     }
 

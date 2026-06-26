@@ -26,6 +26,7 @@ impl LlmProvider for MockLlm {
             cost: None,
             cost_label: None,
             artifact: None,
+            sources: Vec::new(),
         })
     }
 }

@@ -250,6 +250,7 @@ async fn stripe_checkout(
     // Form-urlencoded as Stripe's API requires.
     let success_url = format!("{}/account?reload=success", state.config.public_url);
     let cancel_url = format!("{}/account?reload=cancel", state.config.public_url);
+    let checkout_logo_url = format!("{}/assets/bluey-checkout-logo.png", state.config.public_url);
     let form = [
         ("mode", "payment"),
         ("payment_method_types[]", "card"),
@@ -267,6 +268,9 @@ async fn stripe_checkout(
         ("customer_email", &account.email),
         ("success_url", &success_url),
         ("cancel_url", &cancel_url),
+        ("branding_settings[display_name]", "Bluey"),
+        ("branding_settings[logo][type]", "url"),
+        ("branding_settings[logo][url]", &checkout_logo_url),
         // Save the PaymentMethod for auto top-up.
         ("payment_intent_data[setup_future_usage]", "off_session"),
         ("metadata[bluey_account_id]", &account.id),

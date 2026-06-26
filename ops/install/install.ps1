@@ -126,6 +126,66 @@ function Stop-BlueyForInstall {
         Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
+function Install-BlueyLocalDocTools {
+    param([string]$Root)
+
+    if ($env:BLUEY_SKIP_LOCAL_TOOLS -eq "1") {
+        Write-Warn "Skipping Bluey-local document tools because BLUEY_SKIP_LOCAL_TOOLS=1"
+        return
+    }
+
+    $pythonCommand = Get-Command python3 -ErrorAction SilentlyContinue
+    $pythonArgs = @()
+    if (-not $pythonCommand) {
+        $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+    }
+    if (-not $pythonCommand) {
+        $pythonCommand = Get-Command py -ErrorAction SilentlyContinue
+        if ($pythonCommand) {
+            $pythonArgs = @("-3")
+        }
+    }
+    if (-not $pythonCommand) {
+        Write-Warn "Python was not found; document conversion will use built-in fallbacks only"
+        return
+    }
+
+    Write-Step "Installing Bluey-local document tools..."
+    $toolsDir = Join-Path $Root "tools\doc-converter"
+    $venvDir = Join-Path $toolsDir ".venv"
+    $wrapper = Join-Path (Join-Path $Root "bin") "bluey-doc-converter.cmd"
+    New-Item -ItemType Directory -Force -Path $toolsDir, (Split-Path -Parent $wrapper) | Out-Null
+
+    try {
+        & $pythonCommand.Source @pythonArgs -m venv $venvDir | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn "Could not create Bluey-local Python venv; document conversion will use built-in fallbacks only"
+            return
+        }
+
+        $venvPython = Join-Path $venvDir "Scripts\python.exe"
+        & $venvPython -m pip install --disable-pip-version-check --upgrade pip | Out-Null
+        & $venvPython -m pip install --disable-pip-version-check "markitdown[all]" | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            & $venvPython -m pip install --disable-pip-version-check markitdown | Out-Null
+        }
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warn "Could not install MarkItDown into Bluey's local tools venv; document conversion will use built-in fallbacks only"
+            return
+        }
+
+        $wrapperLines = @(
+            "@echo off",
+            "set `"ROOT=%~dp0..`"",
+            "`"%ROOT%\tools\doc-converter\.venv\Scripts\markitdown.exe`" %*"
+        )
+        Set-Content -Path $wrapper -Encoding ASCII -Value $wrapperLines
+        Write-Ok "Bluey-local document tools installed"
+    } catch {
+        Write-Warn "Could not install Bluey-local document tools: $($_.Exception.Message)"
+    }
+}
+
 function Get-RemoteText {
     param([string]$Uri)
     return (Invoke-WebRequest -Uri $Uri -UseBasicParsing).Content
@@ -215,6 +275,7 @@ try {
     Copy-Item -Path $ExtractedBin -Destination $BinDir -Recurse -Force
     Get-ChildItem -Path $BinDir -Filter "*.exe" -Recurse -ErrorAction SilentlyContinue |
         ForEach-Object { Unblock-File -Path $_.FullName -ErrorAction SilentlyContinue }
+    Install-BlueyLocalDocTools -Root $InstallRoot
 
     Ensure-UserPathEntry -Dir $BinDir
 

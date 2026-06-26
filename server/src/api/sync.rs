@@ -5,8 +5,10 @@
 //! acknowledges them.
 
 use axum::{
+    body::{Body, Bytes},
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::Response,
     Extension, Json,
 };
 use serde::{Deserialize, Serialize};
@@ -17,6 +19,7 @@ use crate::db::sync::{
     self, CloudSessionBundle, CloudSessionSummary, RagMatch, SyncContextArtifactRecord, SyncCounts,
     SyncCueResponseRecord, SyncRagChunkRecord, SyncSessionRecord, SyncTranscriptSegment,
 };
+use crate::object_storage::{sha256_hex, ObjectStorage};
 
 #[derive(Debug, Deserialize)]
 pub struct SyncBatchRequest {
@@ -61,6 +64,16 @@ pub struct RagQueryRequest {
 #[derive(Debug, Serialize)]
 pub struct RagQueryResponse {
     pub matches: Vec<RagMatch>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ArtifactObjectResponse {
+    pub artifact_id: String,
+    pub object_key: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub content_type: String,
+    pub expires_at_ms: i64,
 }
 
 pub async fn batch(
@@ -136,6 +149,123 @@ pub async fn rag_query(
     Ok(Json(RagQueryResponse { matches }))
 }
 
+pub async fn upload_artifact_object(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(artifact_id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<ArtifactObjectResponse>, (StatusCode, String)> {
+    validate_object_id(&artifact_id)?;
+    let storage_config = state.config.object_storage.clone().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "object sync is not configured".into(),
+        )
+    })?;
+    if body.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "object body is empty".into()));
+    }
+    if body.len() > storage_config.max_object_bytes {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "object is too large".to_string(),
+        ));
+    }
+
+    let storage = ObjectStorage::new(storage_config);
+    let key = storage.artifact_key(&account.id, &artifact_id);
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let hash = sha256_hex(&body);
+    storage
+        .put(&key, body.clone(), &content_type)
+        .await
+        .map_err(internal)?;
+
+    Ok(Json(ArtifactObjectResponse {
+        artifact_id,
+        object_key: key,
+        size_bytes: body.len() as u64,
+        sha256: hash,
+        content_type,
+        expires_at_ms: now_ms() + storage.retention_days().saturating_mul(86_400_000),
+    }))
+}
+
+pub async fn download_artifact_object(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(artifact_id): Path<String>,
+) -> Result<Response, (StatusCode, String)> {
+    validate_object_id(&artifact_id)?;
+    let storage_config = state.config.object_storage.clone().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "object sync is not configured".into(),
+        )
+    })?;
+    let record = sync::load_context_artifact(&state.pool, &account.id, &artifact_id)
+        .map_err(internal)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "artifact not found".to_string()))?;
+    let key = record
+        .metadata
+        .get("object_key")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "artifact object not found".to_string(),
+            )
+        })?;
+    let storage = ObjectStorage::new(storage_config);
+    if !storage.key_belongs_to_account(key, &account.id) {
+        tracing::warn!(
+            account_id = %account.id,
+            artifact_id = %artifact_id,
+            object_key = %key,
+            "rejecting cross-account artifact object key"
+        );
+        return Err((
+            StatusCode::FORBIDDEN,
+            "artifact object not available".into(),
+        ));
+    }
+    if record
+        .metadata
+        .get("object_expires_at_ms")
+        .and_then(|value| value.as_i64())
+        .is_some_and(|expires_at_ms| expires_at_ms <= now_ms())
+    {
+        if let Err(error) = storage.delete(key).await {
+            tracing::warn!(
+                error = %error,
+                artifact_id = %artifact_id,
+                "lazy object delete failed"
+            );
+        }
+        return Err((StatusCode::GONE, "artifact object expired".into()));
+    }
+
+    let object = storage.get(key).await.map_err(internal)?;
+    let mut response = Response::new(Body::from(object.bytes));
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&object.content_type)
+            .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+    );
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, max-age=60"),
+    );
+    Ok(response)
+}
+
 fn validate_batch(req: &SyncBatchRequest) -> Result<(), (StatusCode, String)> {
     let total = req.sessions.len()
         + req.transcript_segments.len()
@@ -182,6 +312,13 @@ fn validate_batch(req: &SyncBatchRequest) -> Result<(), (StatusCode, String)> {
         }
     }
     Ok(())
+}
+
+fn validate_object_id(artifact_id: &str) -> Result<(), (StatusCode, String)> {
+    if uuid::Uuid::parse_str(artifact_id).is_ok() {
+        return Ok(());
+    }
+    Err((StatusCode::BAD_REQUEST, "invalid artifact id".to_string()))
 }
 
 fn internal(e: anyhow::Error) -> (StatusCode, String) {

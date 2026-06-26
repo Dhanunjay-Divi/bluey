@@ -5,9 +5,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 cd "$SCRIPT_DIR"
-swift build -c release
+swift_args=(-c release)
+if [[ -n "${BLUEY_SWIFT_ARCH:-}" ]]; then
+  swift_args+=(--arch "$BLUEY_SWIFT_ARCH")
+fi
+swift build "${swift_args[@]}"
 mkdir -p .build
-BIN="$(swift build -c release --show-bin-path)/cue-picker"
+BIN="$(swift build "${swift_args[@]}" --show-bin-path)/cue-picker"
 cp "$BIN" .build/bluey-file-picker-macos
 cp "$BIN" .build/cue-file-picker-macos
 

@@ -8,6 +8,9 @@ use rusqlite::params;
 
 use crate::db::DbPool;
 
+const DEFAULT_AUTO_TOPUP_THRESHOLD_CENTS: i64 = 1000;
+const DEFAULT_AUTO_TOPUP_AMOUNT_CENTS: i64 = 3000;
+
 /// Codex Stage 10 round-2 typed-error nit: signup needs to distinguish
 /// "this email already exists" from generic DB errors without
 /// string-matching error messages. AccountCreateError is the typed
@@ -184,9 +187,17 @@ impl Account {
                     let conn = pool.get()?;
                     match conn.execute(
                         "INSERT INTO accounts
-                        (id, email, password_hash, is_admin, auto_topup_enabled)
-                     VALUES (?1, ?2, ?3, ?4, 0)",
-                        params![id, email, password_hash, if is_admin { 1 } else { 0 }],
+                        (id, email, password_hash, is_admin, auto_topup_enabled,
+                         auto_topup_threshold_cents, auto_topup_amount_cents)
+                     VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+                        params![
+                            id,
+                            email,
+                            password_hash,
+                            if is_admin { 1 } else { 0 },
+                            DEFAULT_AUTO_TOPUP_THRESHOLD_CENTS,
+                            DEFAULT_AUTO_TOPUP_AMOUNT_CENTS
+                        ],
                     ) {
                         Ok(_) => {}
                         Err(e) => {
@@ -213,9 +224,17 @@ impl Account {
                     let is_admin_i32 = if is_admin { 1i32 } else { 0i32 };
                     if let Err(e) = conn.execute(
                         "INSERT INTO accounts
-                        (id, email, password_hash, is_admin, auto_topup_enabled)
-                     VALUES ($1, $2, $3, $4, 0)",
-                        &[&id, &email, &password_hash, &is_admin_i32],
+                        (id, email, password_hash, is_admin, auto_topup_enabled,
+                         auto_topup_threshold_cents, auto_topup_amount_cents)
+                     VALUES ($1, $2, $3, $4, 0, $5, $6)",
+                        &[
+                            &id,
+                            &email,
+                            &password_hash,
+                            &is_admin_i32,
+                            &DEFAULT_AUTO_TOPUP_THRESHOLD_CENTS,
+                            &DEFAULT_AUTO_TOPUP_AMOUNT_CENTS,
+                        ],
                     ) {
                         if e.code() == Some(&SqlState::UNIQUE_VIOLATION) {
                             return Err(AccountCreateError::DuplicateEmail.into());
@@ -231,8 +250,8 @@ impl Account {
                 balance_cents: 0,
                 trial_seconds_remaining: 600,
                 auto_topup_enabled: false,
-                auto_topup_threshold_cents: 500,
-                auto_topup_amount_cents: 1500,
+                auto_topup_threshold_cents: 1000,
+                auto_topup_amount_cents: 3000,
                 is_admin,
                 stripe_customer_id: None,
                 stripe_payment_method_id: None,

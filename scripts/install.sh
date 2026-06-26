@@ -10,6 +10,48 @@ need() {
   command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
 }
 
+warn() {
+  printf 'bluey install warning: %s\n' "$*" >&2
+}
+
+install_local_doc_tools() {
+  local root="$1"
+  local tools_dir="$root/tools/doc-converter"
+  local wrapper="$root/bin/bluey-doc-converter"
+
+  if [[ "${BLUEY_SKIP_LOCAL_TOOLS:-0}" == "1" ]]; then
+    warn "Skipping Bluey-local document tools because BLUEY_SKIP_LOCAL_TOOLS=1"
+    return 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "python3 was not found; document conversion will use built-in fallbacks only"
+    return 0
+  fi
+
+  mkdir -p "$tools_dir" "$root/bin"
+  if ! python3 -m venv "$tools_dir/.venv" >/dev/null 2>&1; then
+    warn "could not create Bluey-local Python venv; document conversion will use built-in fallbacks only"
+    return 0
+  fi
+
+  local py="$tools_dir/.venv/bin/python"
+  "$py" -m pip install --disable-pip-version-check --upgrade pip >/dev/null 2>&1 || true
+  if ! "$py" -m pip install --disable-pip-version-check "markitdown[all]" >/dev/null 2>&1; then
+    if ! "$py" -m pip install --disable-pip-version-check markitdown >/dev/null 2>&1; then
+      warn "could not install MarkItDown into Bluey's local tools venv; document conversion will use built-in fallbacks only"
+      return 0
+    fi
+  fi
+
+  cat > "$wrapper" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+exec "$ROOT/tools/doc-converter/.venv/bin/markitdown" "$@"
+SH
+  chmod +x "$wrapper"
+}
+
 usage() {
   cat <<'EOF'
 Install Bluey from a release tarball.
@@ -46,8 +88,11 @@ case "$(uname -s)-$(uname -m)" in
   Darwin-arm64|Darwin-aarch64)
     platform="darwin-arm64"
     ;;
+  Darwin-x86_64|Darwin-amd64)
+    platform="darwin-x86_64"
+    ;;
   *)
-    die "v${version} installer supports macOS arm64 only; current platform is $(uname -s)-$(uname -m)"
+    die "v${version} installer supports macOS arm64 and x86_64 only; current platform is $(uname -s)-$(uname -m)"
     ;;
 esac
 
@@ -101,6 +146,7 @@ if [[ -f "$target_tmp/bin/cue-file-picker-macos" ]]; then chmod +x "$target_tmp/
 if [[ -f "$target_tmp/bin/BlueyFilePicker.app/Contents/MacOS/bluey-file-picker-macos" ]]; then
   chmod +x "$target_tmp/bin/BlueyFilePicker.app/Contents/MacOS/bluey-file-picker-macos"
 fi
+install_local_doc_tools "$target_tmp"
 
 rm -rf "$target"
 mv "$target_tmp" "$target"

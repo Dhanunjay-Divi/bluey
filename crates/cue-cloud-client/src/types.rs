@@ -115,6 +115,20 @@ pub struct CompleteResponse {
     pub cost_label: Option<String>,
     #[serde(default)]
     pub confidence: Option<f32>,
+    #[serde(default)]
+    pub sources: Vec<CompleteSource>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CompleteSource {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub snippet: Option<String>,
+    #[serde(default)]
+    pub source_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -125,9 +139,27 @@ pub struct EmbedRequest {
     pub model: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct EmbedBatchRequest {
+    pub request_id: String,
+    pub inputs: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct EmbedResponse {
     pub vector: Vec<f32>,
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: i64,
+    pub cost_cents: i64,
+    pub balance_cents_after: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct EmbedBatchResponse {
+    pub vectors: Vec<Vec<f32>>,
     pub provider: String,
     pub model: String,
     pub input_tokens: i64,
@@ -272,6 +304,16 @@ pub struct SyncCounts {
 pub struct SyncBatchResponse {
     pub accepted: SyncCounts,
     pub server_time_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactObjectResponse {
+    pub artifact_id: String,
+    pub object_key: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub content_type: String,
+    pub expires_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

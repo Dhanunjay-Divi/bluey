@@ -42,6 +42,11 @@ async fn real_serve_path_installs_connect_info_and_rate_limit_sees_peer_ip() {
         upstream: UpstreamKeys::default(),
         upstream_spend_guard: None,
         admin_emails: vec![],
+        trial_abuse: bluey_server::config::TrialAbuseConfig::default(),
+        turnstile_site_key: None,
+        turnstile_secret_key: None,
+        require_turnstile: false,
+        object_storage: None,
     };
 
     let app = build_router(pool.clone(), config.clone());

@@ -1,9 +1,13 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")"
-swift build -c release
+swift_args=(-c release)
+if [[ -n "${BLUEY_SWIFT_ARCH:-}" ]]; then
+  swift_args+=(--arch "$BLUEY_SWIFT_ARCH")
+fi
+swift build "${swift_args[@]}"
 mkdir -p .build
-BIN="$(swift build -c release --show-bin-path)/CueWhisper"
+BIN="$(swift build "${swift_args[@]}" --show-bin-path)/CueWhisper"
 cp "$BIN" .build/cue-whisper
 cp "$BIN" .build/bluey-whisper-macos
 echo ".build/cue-whisper"

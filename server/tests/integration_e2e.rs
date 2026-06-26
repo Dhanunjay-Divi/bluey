@@ -60,6 +60,15 @@ async fn boot_harness_with_options(
     admin_emails: Vec<String>,
     upstream_spend_guard: Option<UpstreamSpendGuard>,
 ) -> Harness {
+    boot_harness_with_config(upstream, admin_emails, upstream_spend_guard, |_| {}).await
+}
+
+async fn boot_harness_with_config(
+    upstream: UpstreamKeys,
+    admin_emails: Vec<String>,
+    upstream_spend_guard: Option<UpstreamSpendGuard>,
+    configure: impl FnOnce(&mut Config),
+) -> Harness {
     let openai = MockServer::start().await;
     let anthropic = MockServer::start().await;
     let stripe = MockServer::start().await;
@@ -71,7 +80,7 @@ async fn boot_harness_with_options(
     let pool = open_pool(&path).unwrap();
     run_migrations(&pool).unwrap();
 
-    let config = Config {
+    let mut config = Config {
         port: 0,
         db_path: path,
         db_backend: bluey_server::config::ServerDbBackend::Sqlite,
@@ -91,7 +100,13 @@ async fn boot_harness_with_options(
         upstream,
         upstream_spend_guard,
         admin_emails,
+        trial_abuse: bluey_server::config::TrialAbuseConfig::default(),
+        turnstile_site_key: None,
+        turnstile_secret_key: None,
+        require_turnstile: false,
+        object_storage: None,
     };
+    configure(&mut config);
 
     // Override upstream URLs by env. The dispatcher reads from
     // hard-coded URLs today; for the wiremock harness we need the
@@ -318,6 +333,38 @@ async fn signup_otp_email_confirms_and_marks_email_verified() {
 
 #[tokio::test]
 #[serial]
+async fn signup_start_requires_turnstile_when_flagged() {
+    let h = boot_harness_with_config(UpstreamKeys::default(), vec![], None, |config| {
+        config.require_turnstile = true;
+        config.turnstile_site_key = Some("test-site-key".to_string());
+        config.turnstile_secret_key = None;
+    })
+    .await;
+
+    let req = Request::post("/auth/signup/start")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "email": "captcha-required@example.com",
+                "password": "longenoughpw"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        parsed["error"].as_str(),
+        Some("captcha verification is required but not configured")
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn configured_admin_email_signup_gets_admin_access() {
     let h = boot_harness_with_upstream_and_admin_emails(
         UpstreamKeys::default(),
@@ -412,6 +459,66 @@ async fn router_complete_happy_path_with_mocked_openai() {
         .unwrap();
     let resp = h.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+#[serial]
+async fn router_embed_consumes_trial_seconds_and_records_bluey_cost() {
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "trial-embed@example.com", "longenoughpw").await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/embeddings"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": [
+                { "embedding": [0.1, 0.2, 0.3] },
+                { "embedding": [0.4, 0.5, 0.6] }
+            ],
+            "usage": { "prompt_tokens": 1500 }
+        })))
+        .expect(1)
+        .mount(&h.openai)
+        .await;
+
+    let req = Request::post("/router/embed/batch")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "request_id": "trial-embed-1",
+                "inputs": [
+                    "resume summary chunk",
+                    "interview transcript chunk"
+                ]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let embed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(embed["cost_cents"], 0);
+    assert_eq!(embed["input_tokens"], 1500);
+
+    let conn = h.pool.get().unwrap();
+    let (trial_remaining, bluey_cost, customer_cost): (i64, i64, i64) = conn
+        .query_row(
+            "SELECT a.trial_seconds_remaining,
+                    u.cost_cents_to_bluey,
+                    u.cost_cents_to_customer
+               FROM accounts a
+               JOIN usage_events u ON u.account_id = a.id
+              WHERE a.email = ?1 AND u.request_id = ?2 AND u.kind = 'embed'",
+            rusqlite::params!["trial-embed@example.com", "trial-embed-1"],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(trial_remaining, 598);
+    assert!(bluey_cost > 0);
+    assert_eq!(customer_cost, 0);
 }
 
 #[tokio::test]
@@ -2104,8 +2211,8 @@ async fn square_auto_reload_requires_saved_card_then_enables() {
     let me: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(me["billing_provider"], "square");
     assert_eq!(me["auto_topup_enabled"], false);
-    assert_eq!(me["auto_topup_threshold_cents"], 500);
-    assert_eq!(me["auto_topup_amount_cents"], 1500);
+    assert_eq!(me["auto_topup_threshold_cents"], 1000);
+    assert_eq!(me["auto_topup_amount_cents"], 3000);
     assert_eq!(me["auto_topup_available"], false);
     assert_eq!(me["square_application_id"], "sandbox-app");
     assert_eq!(me["square_location_id"], "sandbox-location");

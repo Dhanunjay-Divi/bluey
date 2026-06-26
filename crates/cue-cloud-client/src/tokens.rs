@@ -241,6 +241,7 @@ pub fn save_account_profile_and_tokens(
 
 pub fn tokens_available(paths: &cue_core::app_paths::AppPaths) -> bool {
     std::env::var_os("BLUEY_CLOUD_TOKEN")
+        .or_else(|| std::env::var_os("BLUEY_CLOUD_API_TOKEN"))
         .or_else(|| std::env::var_os("BLUEY_API_TOKEN"))
         .or_else(|| std::env::var_os("CUE_CLOUD_TOKEN"))
         .or_else(|| std::env::var_os("CUE_API_TOKEN"))

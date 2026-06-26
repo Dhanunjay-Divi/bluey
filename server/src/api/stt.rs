@@ -509,7 +509,7 @@ mod tests {
     #[test]
     fn estimate_cost_uses_deepgram_pricing() {
         assert_eq!(estimate_deepgram_cost_cents("nova-3", 0).unwrap(), 0);
-        assert!(estimate_deepgram_cost_cents("nova-3", 60).unwrap() > 0);
-        assert!(estimate_deepgram_bluey_cost_cents("nova-3", 60).unwrap() > 0);
+        assert_eq!(estimate_deepgram_cost_cents("nova-3", 60).unwrap(), 3);
+        assert_eq!(estimate_deepgram_bluey_cost_cents("nova-3", 60).unwrap(), 2);
     }
 }

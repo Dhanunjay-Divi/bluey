@@ -6,9 +6,13 @@ ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
 cd "$SCRIPT_DIR"
 CONFIGURATION="${BLUEY_OVERLAY_SWIFT_CONFIGURATION:-release}"
-swift build -c "$CONFIGURATION"
+swift_args=(-c "$CONFIGURATION")
+if [[ -n "${BLUEY_SWIFT_ARCH:-}" ]]; then
+  swift_args+=(--arch "$BLUEY_SWIFT_ARCH")
+fi
+swift build "${swift_args[@]}"
 mkdir -p .build
-BIN="$(swift build -c "$CONFIGURATION" --show-bin-path)/cue-overlay"
+BIN="$(swift build "${swift_args[@]}" --show-bin-path)/cue-overlay"
 cp "$BIN" .build/bluey-overlay-macos
 cp "$BIN" .build/cue-overlay-macos
 

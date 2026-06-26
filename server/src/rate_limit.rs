@@ -27,14 +27,14 @@
 //! is the LB's, so v0.2.x will need to honor X-Forwarded-For when
 //! behind Caddy/Cloudflare.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use axum::{
     body::Body,
     extract::{ConnectInfo, Request, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     middleware::Next,
     response::Response,
 };
@@ -570,43 +570,48 @@ fn trusted_proxies() -> &'static std::collections::HashSet<std::net::IpAddr> {
     })
 }
 
-/// Extract a stable client identifier.
+/// Extract the trusted end-user IP from proxy headers and the immediate peer.
 ///
-/// Codex Stage 11 round-2 Blocker 5: XFF is only honored when the
-/// CONNECTION comes from a trusted-proxy IP (per `BLUEY_TRUSTED_PROXIES`
-/// env var). When the env var is unset OR the immediate peer is not in
-/// the trusted set, we fall back to ConnectInfo's SocketAddr. This
-/// closes the spoofing bypass: a direct internet attacker cannot mint a
-/// fresh per-request XFF to evade per-IP limits.
+/// Forwarded client headers are only honored when the connection comes from a
+/// trusted-proxy IP (per `BLUEY_TRUSTED_PROXIES`). When the env var is unset or
+/// the immediate peer is not trusted, callers get attributed to the peer
+/// address from `ConnectInfo`. This closes the spoofing bypass: a direct
+/// internet caller cannot mint a fresh `X-Forwarded-For` to evade per-IP limits
+/// or trial-abuse accounting.
 ///
 /// Order:
-///   1. If immediate peer is a trusted proxy: first IP in
-///      X-Forwarded-For (rightmost-from-customer).
-///   2. SocketAddr from ConnectInfo.
+///   1. If immediate peer is a trusted proxy: first non-empty value from
+///      Cloudflare/Fly/Caddy-style client IP headers.
+///   2. Immediate peer IP from `ConnectInfo`.
+pub fn trusted_client_ip_from_headers(peer_ip: Option<IpAddr>, headers: &HeaderMap) -> Option<String> {
+    if let Some(peer) = peer_ip {
+        if trusted_proxies().contains(&peer) {
+            for name in [
+                "cf-connecting-ip",
+                "x-real-ip",
+                "x-forwarded-for",
+                "fly-client-ip",
+                "x-client-ip",
+            ] {
+                if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
+                    if let Some(first) = value.split(',').map(str::trim).find(|part| !part.is_empty()) {
+                        return Some(first.to_string());
+                    }
+                }
+            }
+        }
+        return Some(peer.to_string());
+    }
+    None
+}
+
+/// Extract a stable client identifier.
 fn client_key(req: &Request<Body>) -> String {
     let peer_ip = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip());
-
-    if let Some(peer) = peer_ip {
-        if trusted_proxies().contains(&peer) {
-            if let Some(xff) = req.headers().get("x-forwarded-for") {
-                if let Ok(s) = xff.to_str() {
-                    if let Some(first) = s.split(',').next() {
-                        let first = first.trim();
-                        if !first.is_empty() {
-                            return first.to_string();
-                        }
-                    }
-                }
-            }
-        }
-    }
-    if let Some(peer) = peer_ip {
-        return peer.to_string();
-    }
-    "unknown".to_string()
+    trusted_client_ip_from_headers(peer_ip, req.headers()).unwrap_or_else(|| "unknown".to_string())
 }
 
 macro_rules! make_middleware {

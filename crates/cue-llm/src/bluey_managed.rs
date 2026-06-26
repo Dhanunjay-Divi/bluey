@@ -14,7 +14,7 @@ use futures_util::StreamExt;
 
 use crate::{
     LlmArtifactMetadata, LlmChunk, LlmChunkStream, LlmCostMetadata, LlmError, LlmProvider,
-    LlmRequest, LlmResponse,
+    LlmRequest, LlmResponse, LlmSourceMetadata, LlmStatusMetadata,
 };
 
 /// Codex Stage 9a (S5 round-2 nit): make managed local lane
@@ -101,11 +101,13 @@ impl LlmProvider for BlueyManagedProvider {
             .map_err(map_err)?;
         let cost = cost_from_response(&resp);
         let artifact = artifact_from_response(&resp);
+        let sources = sources_from_response(&resp);
         Ok(LlmResponse {
             text: resp.text,
             cost: Some(cost),
-            cost_label: resp.cost_label,
+            cost_label: resp.cost_label.clone(),
             artifact,
+            sources,
         })
     }
 
@@ -345,6 +347,17 @@ fn parse_managed_json_event(
         return;
     }
 
+    if let Some(status) = status_metadata_from_value(event, parsed) {
+        chunks.push(Ok(status_chunk(status)));
+        return;
+    }
+
+    let sources = sources_from_value(parsed);
+    if !sources.is_empty() {
+        chunks.push(Ok(sources_chunk(sources)));
+        return;
+    }
+
     if let Some(delta) = extract_delta_text(parsed) {
         chunks.push(Ok(text_chunk(delta, false)));
         return;
@@ -415,6 +428,8 @@ fn final_chunk_from_value(event: &str, value: &serde_json::Value) -> LlmChunk {
             cost: Some(cost_from_response(&resp)),
             cost_label,
             artifact: artifact_from_response(&resp),
+            status: None,
+            sources: sources_from_response(&resp),
         };
     }
 
@@ -431,6 +446,8 @@ fn final_chunk_from_value(event: &str, value: &serde_json::Value) -> LlmChunk {
         cost: cost_metadata_from_value(value),
         cost_label: find_string_in_sources(value, &["cost_label", "label"]),
         artifact: artifact_from_value(value),
+        status: None,
+        sources: sources_from_value(value),
     }
 }
 
@@ -441,6 +458,8 @@ fn done_chunk() -> LlmChunk {
         cost: None,
         cost_label: None,
         artifact: None,
+        status: None,
+        sources: Vec::new(),
     }
 }
 
@@ -451,6 +470,32 @@ fn text_chunk(text: String, finished: bool) -> LlmChunk {
         cost: None,
         cost_label: None,
         artifact: None,
+        status: None,
+        sources: Vec::new(),
+    }
+}
+
+fn status_chunk(status: LlmStatusMetadata) -> LlmChunk {
+    LlmChunk {
+        text: String::new(),
+        finished: false,
+        cost: None,
+        cost_label: None,
+        artifact: None,
+        status: Some(status),
+        sources: Vec::new(),
+    }
+}
+
+fn sources_chunk(sources: Vec<LlmSourceMetadata>) -> LlmChunk {
+    LlmChunk {
+        text: String::new(),
+        finished: false,
+        cost: None,
+        cost_label: None,
+        artifact: None,
+        status: None,
+        sources,
     }
 }
 
@@ -637,6 +682,94 @@ fn artifact_from_response(resp: &CloudCompleteResponse) -> Option<LlmArtifactMet
     })
 }
 
+fn status_metadata_from_value(event: &str, value: &serde_json::Value) -> Option<LlmStatusMetadata> {
+    let kind = stream_kind(value);
+    let event_is_status = event.eq_ignore_ascii_case("status")
+        || matches!(kind.as_deref(), Some("status" | "retrieval_status"));
+    if !event_is_status {
+        return None;
+    }
+    let stage = find_string_in_sources(value, &["stage"])
+        .or(kind)
+        .unwrap_or_else(|| "status".to_string());
+    let message = find_string_in_sources(value, &["message", "label", "text"])
+        .unwrap_or_else(|| stage.replace('_', " "));
+    Some(LlmStatusMetadata { stage, message })
+}
+
+fn sources_from_response(resp: &CloudCompleteResponse) -> Vec<LlmSourceMetadata> {
+    resp.sources
+        .iter()
+        .map(|source| LlmSourceMetadata {
+            id: source.id.clone(),
+            title: source.title.clone(),
+            url: source.url.clone(),
+            snippet: source.snippet.clone(),
+            source_type: source.source_type.clone(),
+        })
+        .collect()
+}
+
+fn sources_from_value(value: &serde_json::Value) -> Vec<LlmSourceMetadata> {
+    let candidates = value
+        .get("sources")
+        .or_else(|| value.get("citations"))
+        .or_else(|| value.pointer("/metadata/sources"))
+        .or_else(|| value.pointer("/response/sources"))
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    candidates
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, source)| {
+            let title = source
+                .get("title")
+                .or_else(|| source.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Source")
+                .trim()
+                .to_string();
+            if title.is_empty() {
+                return None;
+            }
+            let id = source
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("S{}", idx + 1));
+            let url = source
+                .get("url")
+                .or_else(|| source.get("link"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let snippet = source
+                .get("snippet")
+                .or_else(|| source.get("description"))
+                .or_else(|| source.get("content"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let source_type = source
+                .get("source_type")
+                .or_else(|| source.get("type"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            Some(LlmSourceMetadata {
+                id,
+                title,
+                url,
+                snippet,
+                source_type,
+            })
+        })
+        .collect()
+}
+
 fn map_err(e: CloudError) -> LlmError {
     match e {
         // Codex S5.2: managed billing failures terminal (no failover).
@@ -762,6 +895,39 @@ mod tests {
         assert_eq!(artifact.body, "# Done");
         assert_eq!(artifact.confidence, Some(0.8));
         assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn parses_status_and_source_events() {
+        let mut buffer = concat!(
+            "event: status\n",
+            "data: {\"type\":\"status\",\"stage\":\"searching_web\",\"message\":\"Searching web\"}\n\n",
+            "event: sources\n",
+            "data: {\"type\":\"sources\",\"sources\":[{\"id\":\"W1\",\"title\":\"Bluey docs\",\"url\":\"https://example.com/bluey\",\"snippet\":\"A useful source\",\"source_type\":\"web\"}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Answer\"}}]}\n\n",
+            "event: billing\n",
+            "data: {\"text\":\"Answer\",\"provider\":\"openai\",\"model\":\"gpt-4o-mini\",\"input_tokens\":5,\"output_tokens\":1,\"cost_cents\":1,\"balance_cents_after\":999,\"trial_seconds_remaining\":0,\"sources\":[{\"id\":\"W1\",\"title\":\"Bluey docs\",\"url\":\"https://example.com/bluey\",\"snippet\":\"A useful source\",\"source_type\":\"web\"}]}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string();
+
+        let chunks = parse_managed_sse_chunks(&mut buffer)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(
+            chunks[0]
+                .status
+                .as_ref()
+                .map(|status| status.stage.as_str()),
+            Some("searching_web")
+        );
+        assert_eq!(chunks[1].sources.len(), 1);
+        assert_eq!(chunks[1].sources[0].id, "W1");
+        assert_eq!(chunks[2].text, "Answer");
+        assert!(chunks[3].finished);
+        assert_eq!(chunks[3].sources.len(), 1);
     }
 
     #[test]

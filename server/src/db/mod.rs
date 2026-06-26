@@ -27,6 +27,7 @@ pub mod refresh_tokens;
 pub mod signup_otps;
 pub mod stt_accounting;
 pub mod sync;
+pub mod trial_abuse;
 pub mod usage;
 pub mod webhook_events;
 
@@ -122,25 +123,6 @@ pub fn run_blocking_db<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
-#[cfg(test)]
-mod blocking_boundary_tests {
-    use super::{in_db_blocking_context, run_blocking_db};
-
-    #[test]
-    fn run_blocking_db_marks_sync_context() {
-        assert!(!in_db_blocking_context());
-        assert!(run_blocking_db(in_db_blocking_context));
-        assert!(!in_db_blocking_context());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn run_blocking_db_marks_tokio_context() {
-        assert!(!in_db_blocking_context());
-        assert!(run_blocking_db(in_db_blocking_context));
-        assert!(!in_db_blocking_context());
-    }
-}
-
 /// Open or create the SQLite DB. Enables WAL + foreign keys.
 pub fn open_pool(path: &Path) -> Result<DbPool> {
     if let Some(parent) = path.parent() {
@@ -212,8 +194,8 @@ const MIGRATIONS: &[&str] = &[
         balance_cents               INTEGER NOT NULL DEFAULT 0,
         trial_seconds_remaining     INTEGER NOT NULL DEFAULT 600,      -- 10 min free trial
         auto_topup_enabled          INTEGER NOT NULL DEFAULT 0,
-        auto_topup_threshold_cents  INTEGER NOT NULL DEFAULT 500,      -- $5
-        auto_topup_amount_cents     INTEGER NOT NULL DEFAULT 1500,     -- $15
+        auto_topup_threshold_cents  INTEGER NOT NULL DEFAULT 1000,     -- $10
+        auto_topup_amount_cents     INTEGER NOT NULL DEFAULT 3000,     -- $30
         stripe_customer_id          TEXT,
         stripe_payment_method_id    TEXT,
         is_admin                    INTEGER NOT NULL DEFAULT 0
@@ -514,6 +496,58 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_signup_otps_expires_at
         ON signup_otps(expires_at);
     "#,
+    // 0014 — trial grants + abuse ledger.
+    //
+    // The ledger intentionally stores hashed signals only. It lets us block
+    // repeated trial abuse and inspect suspicious patterns without retaining
+    // raw IP addresses, device identifiers, or user agents.
+    r#"
+    CREATE TABLE IF NOT EXISTS trial_grants (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT REFERENCES accounts(id) ON DELETE SET NULL,
+        email_hash            TEXT NOT NULL,
+        email_domain_hash     TEXT,
+        ip_hash               TEXT,
+        device_hash           TEXT,
+        user_agent_hash       TEXT,
+        ip_user_agent_hash    TEXT,
+        granted_seconds       INTEGER NOT NULL DEFAULT 600,
+        decision              TEXT NOT NULL,
+        reason                TEXT,
+        created_at            DATETIME NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_trial_grants_email
+        ON trial_grants(email_hash, created_at);
+    CREATE INDEX IF NOT EXISTS idx_trial_grants_ip
+        ON trial_grants(ip_hash, created_at);
+    CREATE INDEX IF NOT EXISTS idx_trial_grants_device
+        ON trial_grants(device_hash, created_at);
+    CREATE INDEX IF NOT EXISTS idx_trial_grants_ip_ua
+        ON trial_grants(ip_user_agent_hash, created_at);
+
+    CREATE TABLE IF NOT EXISTS trial_abuse_events (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT REFERENCES accounts(id) ON DELETE SET NULL,
+        email_hash            TEXT,
+        email_domain_hash     TEXT,
+        ip_hash               TEXT,
+        device_hash           TEXT,
+        user_agent_hash       TEXT,
+        ip_user_agent_hash    TEXT,
+        event_type            TEXT NOT NULL,
+        severity              INTEGER NOT NULL DEFAULT 1,
+        reason                TEXT,
+        created_at            DATETIME NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_trial_abuse_events_created
+        ON trial_abuse_events(created_at);
+    CREATE INDEX IF NOT EXISTS idx_trial_abuse_events_email
+        ON trial_abuse_events(email_hash, created_at);
+    CREATE INDEX IF NOT EXISTS idx_trial_abuse_events_ip
+        ON trial_abuse_events(ip_hash, created_at);
+    CREATE INDEX IF NOT EXISTS idx_trial_abuse_events_device
+        ON trial_abuse_events(device_hash, created_at);
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -585,6 +619,16 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
         "stt_sessions",
         "refunded_trial_seconds",
         "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(&conn, "trial_grants", "email_domain_hash", "TEXT")?;
+    ensure_column(&conn, "trial_abuse_events", "email_domain_hash", "TEXT")?;
+    conn.execute_batch(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_trial_grants_email_domain
+            ON trial_grants(email_domain_hash, created_at);
+        CREATE INDEX IF NOT EXISTS idx_trial_abuse_events_email_domain
+            ON trial_abuse_events(email_domain_hash, created_at);
+        "#,
     )?;
     tracing::info!(
         backend = pool.backend_name(),
@@ -682,4 +726,23 @@ fn ensure_column(
         ))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod blocking_boundary_tests {
+    use super::{in_db_blocking_context, run_blocking_db};
+
+    #[test]
+    fn run_blocking_db_marks_sync_context() {
+        assert!(!in_db_blocking_context());
+        assert!(run_blocking_db(in_db_blocking_context));
+        assert!(!in_db_blocking_context());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_blocking_db_marks_tokio_context() {
+        assert!(!in_db_blocking_context());
+        assert!(run_blocking_db(in_db_blocking_context));
+        assert!(!in_db_blocking_context());
+    }
 }

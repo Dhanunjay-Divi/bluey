@@ -49,7 +49,7 @@ package-darwin-arm64: build-darwin-arm64 build-helpers-release
 	cp native/macos/cue-picker/.build/bluey-file-picker-macos staging-arm64/bin/ 2>/dev/null || true
 	cp native/macos/cue-picker/.build/cue-file-picker-macos staging-arm64/bin/ 2>/dev/null || true
 	cp -R native/macos/cue-picker/.build/BlueyFilePicker.app staging-arm64/bin/ 2>/dev/null || true
-	tar -czf dist/bluey-$(VERSION)-darwin-arm64.tar.gz -C staging-arm64 .
+	COPYFILE_DISABLE=1 tar -czf dist/bluey-$(VERSION)-darwin-arm64.tar.gz -C staging-arm64 .
 	shasum -a 256 dist/bluey-$(VERSION)-darwin-arm64.tar.gz \
 	  > dist/bluey-$(VERSION)-darwin-arm64.tar.gz.sha256
 	rm -rf staging-arm64
@@ -60,7 +60,7 @@ package-darwin-x86_64: build-darwin-x86_64
 		cp target/x86_64-apple-darwin/release/cue-daemon staging-x86/bin/bluey-daemon
 	cp target/x86_64-apple-darwin/release/bluey staging-x86/bin/ 2>/dev/null || \
 		cp target/x86_64-apple-darwin/release/cue staging-x86/bin/bluey
-	tar -czf dist/bluey-$(VERSION)-darwin-x86_64.tar.gz -C staging-x86 .
+	COPYFILE_DISABLE=1 tar -czf dist/bluey-$(VERSION)-darwin-x86_64.tar.gz -C staging-x86 .
 	rm -rf staging-x86
 
 build-darwin-universal: build-darwin-arm64 build-darwin-x86_64
@@ -75,7 +75,7 @@ package-darwin-universal: build-darwin-universal
 	cp dist/bluey-macos-universal/bluey-whisper-macos staging-universal/bin/bluey-whisper-macos 2>/dev/null || true
 	cp dist/bluey-macos-universal/bluey-file-picker-macos staging-universal/bin/bluey-file-picker-macos 2>/dev/null || true
 	cp -R dist/bluey-macos-universal/BlueyFilePicker.app staging-universal/bin/ 2>/dev/null || true
-	tar -czf dist/bluey-$(VERSION)-darwin-universal.tar.gz -C staging-universal .
+	COPYFILE_DISABLE=1 tar -czf dist/bluey-$(VERSION)-darwin-universal.tar.gz -C staging-universal .
 	shasum -a 256 dist/bluey-$(VERSION)-darwin-universal.tar.gz \
 	  > dist/bluey-$(VERSION)-darwin-universal.tar.gz.sha256
 	rm -rf staging-universal

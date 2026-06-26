@@ -1,14 +1,19 @@
 //! Auth endpoints — real implementations.
 
-use axum::{extract::State, http::StatusCode, Extension, Json};
+use axum::{
+    extract::{ConnectInfo, State},
+    http::{HeaderMap, StatusCode},
+    Extension, Json,
+};
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use std::net::{IpAddr, SocketAddr};
 
 use super::AppState;
 use crate::{
     auth,
-    db::{accounts::Account, device_codes, refresh_tokens, signup_otps},
+    db::{accounts::Account, device_codes, refresh_tokens, signup_otps, trial_abuse},
 };
 
 // ─── Request / response shapes ───────────────────────────────────────────
@@ -23,6 +28,10 @@ pub struct SignupRequest {
 pub struct SignupStartRequest {
     pub email: String,
     pub password: String,
+    #[serde(default)]
+    pub turnstile_token: Option<String>,
+    #[serde(default)]
+    pub device_fingerprint: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -35,6 +44,8 @@ pub struct SignupStartResponse {
 pub struct SignupConfirmRequest {
     pub email: String,
     pub otp: String,
+    #[serde(default)]
+    pub device_fingerprint: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +85,19 @@ pub struct AuthAccountSummary {
 #[derive(Serialize)]
 pub struct ApiError {
     pub error: String,
+}
+
+#[derive(Serialize)]
+pub struct CaptchaConfigResponse {
+    pub provider: Option<&'static str>,
+    pub site_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct TurnstileVerifyResponse {
+    success: bool,
+    #[serde(default, rename = "error-codes")]
+    error_codes: Vec<String>,
 }
 
 fn err(status: StatusCode, msg: &str) -> (StatusCode, Json<ApiError>) {
@@ -144,6 +168,124 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+fn header_first(headers: &HeaderMap, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .find(|part| !part.is_empty())
+                    .map(str::to_string)
+            })
+    })
+}
+
+fn request_ip(headers: &HeaderMap, peer_ip: Option<IpAddr>) -> Option<String> {
+    crate::rate_limit::trusted_client_ip_from_headers(peer_ip, headers)
+}
+
+fn request_user_agent(headers: &HeaderMap) -> Option<String> {
+    header_first(headers, &["user-agent"])
+}
+
+fn request_device_fingerprint(headers: &HeaderMap, body_value: Option<&str>) -> Option<String> {
+    body_value
+        .and_then(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        })
+        .or_else(|| {
+            header_first(
+                headers,
+                &["x-bluey-device-id", "x-bluey-device-fingerprint"],
+            )
+        })
+}
+
+fn signup_signals(
+    email: &str,
+    headers: &HeaderMap,
+    peer_ip: Option<IpAddr>,
+    device_fingerprint: Option<&str>,
+) -> trial_abuse::TrialAbuseSignals {
+    trial_abuse::TrialAbuseSignals::from_raw(
+        email,
+        request_ip(headers, peer_ip).as_deref(),
+        request_device_fingerprint(headers, device_fingerprint).as_deref(),
+        request_user_agent(headers).as_deref(),
+    )
+}
+
+async fn verify_turnstile_if_needed(
+    state: &AppState,
+    headers: &HeaderMap,
+    peer_ip: Option<IpAddr>,
+    token: Option<&str>,
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    let Some(secret) = state.config.turnstile_secret_key.as_deref() else {
+        if state.config.require_turnstile {
+            return Err(err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "captcha verification is required but not configured",
+            ));
+        }
+        return Ok(());
+    };
+    if state.config.require_turnstile && state.config.turnstile_site_key.is_none() {
+        return Err(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "captcha verification is required but the site key is not configured",
+        ));
+    }
+    let token = token
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            err(
+                StatusCode::FORBIDDEN,
+                "captcha verification is required to create an account",
+            )
+        })?;
+
+    let mut form = vec![
+        ("secret".to_string(), secret.to_string()),
+        ("response".to_string(), token.to_string()),
+    ];
+    if let Some(ip) = request_ip(headers, peer_ip) {
+        form.push(("remoteip".to_string(), ip));
+    }
+    let response = reqwest::Client::new()
+        .post("https://challenges.cloudflare.com/turnstile/v0/siteverify")
+        .form(&form)
+        .send()
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "turnstile verification request failed");
+            err(StatusCode::BAD_GATEWAY, "captcha verification unavailable")
+        })?;
+    let status = response.status();
+    let parsed = response
+        .json::<TurnstileVerifyResponse>()
+        .await
+        .map_err(|error| {
+            tracing::warn!(%status, %error, "turnstile verification response was invalid");
+            err(StatusCode::BAD_GATEWAY, "captcha verification unavailable")
+        })?;
+    if parsed.success {
+        Ok(())
+    } else {
+        tracing::warn!(errors = ?parsed.error_codes, "turnstile rejected signup");
+        Err(err(StatusCode::FORBIDDEN, "captcha verification failed"))
+    }
+}
+
 fn auth_response(
     state: &AppState,
     account: &Account,
@@ -194,17 +336,58 @@ fn auth_response(
 
 // ─── Endpoint handlers ──────────────────────────────────────────────────
 
+pub async fn captcha_config(State(state): State<AppState>) -> Json<CaptchaConfigResponse> {
+    let site_key = state.config.turnstile_site_key.clone();
+    Json(CaptchaConfigResponse {
+        provider: site_key.as_ref().map(|_| "turnstile"),
+        site_key,
+    })
+}
+
 pub async fn signup_start(
     State(state): State<AppState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(req): Json<SignupStartRequest>,
 ) -> Result<Json<SignupStartResponse>, (StatusCode, Json<ApiError>)> {
     let email = normalize_signup_email(&req.email)?;
+    let peer_ip = connect_info.map(|ConnectInfo(addr)| addr.ip());
 
     if Account::fetch_by_email(&state.pool, &email)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?
         .is_some()
     {
         return Err(err(StatusCode::CONFLICT, "email already registered"));
+    }
+
+    let signals = signup_signals(&email, &headers, peer_ip, req.device_fingerprint.as_deref());
+    if let Err(error) =
+        verify_turnstile_if_needed(&state, &headers, peer_ip, req.turnstile_token.as_deref()).await
+    {
+        let _ = trial_abuse::record_event(
+            &state.pool,
+            None,
+            &signals,
+            "turnstile_failed",
+            2,
+            Some("captcha_failed"),
+        );
+        return Err(error);
+    }
+
+    let decision =
+        trial_abuse::evaluate_trial_grant(&state.pool, state.config.trial_abuse, &signals)
+            .map_err(|e| {
+                err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("trial abuse: {e}"),
+                )
+            })?;
+    if !decision.allowed {
+        return Err(err(
+            StatusCode::TOO_MANY_REQUESTS,
+            decision.reason.as_deref().unwrap_or("trial limit reached"),
+        ));
     }
 
     let password_hash = auth::password::hash_password(&req.password)
@@ -256,9 +439,12 @@ pub async fn signup_start(
 
 pub async fn signup_confirm(
     State(state): State<AppState>,
+    connect_info: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(req): Json<SignupConfirmRequest>,
 ) -> Result<Json<AuthResponse>, (StatusCode, Json<ApiError>)> {
     let email = normalize_signup_email(&req.email)?;
+    let peer_ip = connect_info.map(|ConnectInfo(addr)| addr.ip());
     let otp = req.otp.trim();
     if otp.len() != 6 || !otp.bytes().all(|b| b.is_ascii_digit()) {
         return Err(err(
@@ -297,6 +483,22 @@ pub async fn signup_confirm(
         return Err(err(StatusCode::CONFLICT, "email already registered"));
     }
 
+    let signals = signup_signals(&email, &headers, peer_ip, req.device_fingerprint.as_deref());
+    let decision =
+        trial_abuse::evaluate_trial_grant(&state.pool, state.config.trial_abuse, &signals)
+            .map_err(|e| {
+                err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("trial abuse: {e}"),
+                )
+            })?;
+    if !decision.allowed {
+        return Err(err(
+            StatusCode::TOO_MANY_REQUESTS,
+            decision.reason.as_deref().unwrap_or("trial limit reached"),
+        ));
+    }
+
     let is_admin = state.config.is_admin_email(&email);
     let account =
         Account::create_with_admin(&state.pool, &email, &signup_otp.password_hash, is_admin)
@@ -313,6 +515,18 @@ pub async fn signup_confirm(
     let _ = signup_otps::delete(&state.pool, &email);
     Account::mark_email_verified(&state.pool, &account.id)
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &format!("db: {e}")))?;
+    if let Err(error) = trial_abuse::record_grant(
+        &state.pool,
+        &account.id,
+        &signals,
+        account.trial_seconds_remaining,
+    ) {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            %error,
+            "failed to record trial grant"
+        );
+    }
 
     Ok(Json(auth_response(&state, &account)?))
 }
@@ -844,4 +1058,24 @@ pub async fn link_exchange(
             is_admin: account.is_admin,
         },
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn signup_signals_do_not_trust_forwarded_headers_without_peer_info() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("203.0.113.9, 198.51.100.7"),
+        );
+        headers.insert("cf-connecting-ip", HeaderValue::from_static("203.0.113.10"));
+
+        let signals = signup_signals("user@example.com", &headers, None, None);
+
+        assert_eq!(signals.ip_hash, None);
+    }
 }

@@ -44,6 +44,13 @@ impl MeetingStore {
         Ok(path)
     }
 
+    pub fn save_archived(&self, meeting: &MeetingRecord) -> Result<PathBuf> {
+        let filename = format!("{}-{}.json", meeting.started_at, meeting.id);
+        let path = self.archive_dir.join(filename);
+        write_private_json(&path, meeting)?;
+        Ok(path)
+    }
+
     pub fn last_meeting(&self) -> Result<Option<MeetingRecord>> {
         if let Some(active) = self.load_active()? {
             return Ok(Some(active));

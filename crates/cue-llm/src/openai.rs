@@ -85,6 +85,8 @@ fn parse_openai_sse_chunks(buffer: &mut String) -> Vec<Result<LlmChunk, LlmError
                         cost: None,
                         cost_label: None,
                         artifact: None,
+                        status: None,
+                        sources: Vec::new(),
                     }));
                     continue;
                 }
@@ -103,6 +105,8 @@ fn parse_openai_sse_chunks(buffer: &mut String) -> Vec<Result<LlmChunk, LlmError
                                 cost: None,
                                 cost_label: None,
                                 artifact: None,
+                                status: None,
+                                sources: Vec::new(),
                             }));
                         }
                     }
@@ -181,6 +185,7 @@ impl LlmProvider for OpenAiProvider {
             cost: None,
             cost_label: None,
             artifact: None,
+            sources: Vec::new(),
         })
     }
 

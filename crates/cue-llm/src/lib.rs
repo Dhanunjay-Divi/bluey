@@ -52,6 +52,8 @@ pub struct LlmResponse {
     pub cost_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<LlmArtifactMetadata>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<LlmSourceMetadata>,
 }
 
 /// A single chunk from a streaming LLM completion.
@@ -62,6 +64,8 @@ pub struct LlmChunk {
     pub cost: Option<LlmCostMetadata>,
     pub cost_label: Option<String>,
     pub artifact: Option<LlmArtifactMetadata>,
+    pub status: Option<LlmStatusMetadata>,
+    pub sources: Vec<LlmSourceMetadata>,
 }
 
 /// Billing/provider metadata returned by managed Bluey requests.
@@ -91,6 +95,30 @@ pub struct LlmArtifactMetadata {
     pub body: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f32>,
+}
+
+/// Provider/retrieval status metadata for managed streams.
+///
+/// Direct providers normally leave this empty. Managed Bluey can emit these
+/// chunks before answer text so overlays show useful progress such as
+/// "Checking saved memory" or "Searching web".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmStatusMetadata {
+    pub stage: String,
+    pub message: String,
+}
+
+/// Source/citation metadata returned by managed retrieval.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LlmSourceMetadata {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_type: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -147,6 +175,8 @@ pub trait LlmProvider: Send + Sync {
                 cost: resp.cost,
                 cost_label: resp.cost_label,
                 artifact: resp.artifact,
+                status: None,
+                sources: resp.sources,
             })
         })))
     }

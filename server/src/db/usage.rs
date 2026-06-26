@@ -125,7 +125,7 @@ pub fn bluey_spend_cents_in_window(pool: &DbPool, window_hours: i64) -> Result<i
                 conn.query_one(
                     "SELECT COALESCE(SUM(cost_cents_to_bluey), 0)::bigint
                        FROM usage_events
-                      WHERE ts >= now() - ($1 * interval '1 hour')",
+                      WHERE ts >= now() - ($1::bigint * interval '1 hour')",
                     &[&window_hours],
                 )?
                 .try_get(0)?

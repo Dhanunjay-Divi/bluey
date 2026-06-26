@@ -34,6 +34,16 @@ pub struct Config {
     /// Operator/admin accounts. Matching signup emails are created as admins;
     /// matching existing accounts are promoted on next login.
     pub admin_emails: Vec<String>,
+    /// Trial and signup abuse controls.
+    pub trial_abuse: TrialAbuseConfig,
+    /// Cloudflare Turnstile public site key exposed to the browser when set.
+    pub turnstile_site_key: Option<String>,
+    /// Cloudflare Turnstile secret. When set, signup/start requires a valid token.
+    pub turnstile_secret_key: Option<String>,
+    /// Fail signup closed when Turnstile is required but not fully configured.
+    pub require_turnstile: bool,
+    /// Optional S3-compatible object storage for synced document/image bytes.
+    pub object_storage: Option<ObjectStorageConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -138,6 +148,39 @@ pub struct UpstreamKeys {
 pub struct UpstreamSpendGuard {
     pub limit_cents: i64,
     pub window_hours: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrialAbuseConfig {
+    pub max_trials_per_email: i64,
+    pub max_trials_per_email_domain_per_day: i64,
+    pub max_trials_per_device: i64,
+    pub max_trials_per_ip_per_day: i64,
+    pub max_trials_per_ip_user_agent_per_day: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObjectStorageConfig {
+    pub endpoint_url: String,
+    pub bucket: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub region: String,
+    pub key_prefix: String,
+    pub retention_days: i64,
+    pub max_object_bytes: usize,
+}
+
+impl Default for TrialAbuseConfig {
+    fn default() -> Self {
+        Self {
+            max_trials_per_email: 1,
+            max_trials_per_email_domain_per_day: 25,
+            max_trials_per_device: 1,
+            max_trials_per_ip_per_day: 3,
+            max_trials_per_ip_user_agent_per_day: 5,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,6 +297,24 @@ impl Config {
                 starttls: env_bool("BLUEY_SMTP_STARTTLS").unwrap_or(true),
             });
         let admin_emails = parse_email_list(std::env::var("BLUEY_ADMIN_EMAILS").ok());
+        let trial_abuse = TrialAbuseConfig {
+            max_trials_per_email: env_positive_i64("BLUEY_TRIAL_MAX_PER_EMAIL").unwrap_or(1),
+            max_trials_per_email_domain_per_day: env_positive_i64(
+                "BLUEY_TRIAL_MAX_PER_EMAIL_DOMAIN_PER_DAY",
+            )
+            .unwrap_or(25),
+            max_trials_per_device: env_positive_i64("BLUEY_TRIAL_MAX_PER_DEVICE").unwrap_or(1),
+            max_trials_per_ip_per_day: env_positive_i64("BLUEY_TRIAL_MAX_PER_IP_PER_DAY")
+                .unwrap_or(3),
+            max_trials_per_ip_user_agent_per_day: env_positive_i64(
+                "BLUEY_TRIAL_MAX_PER_IP_USER_AGENT_PER_DAY",
+            )
+            .unwrap_or(5),
+        };
+        let turnstile_site_key = env_any(&["BLUEY_TURNSTILE_SITE_KEY", "TURNSTILE_SITE_KEY"]);
+        let turnstile_secret_key = env_any(&["BLUEY_TURNSTILE_SECRET_KEY", "TURNSTILE_SECRET_KEY"]);
+        let require_turnstile = env_bool("BLUEY_REQUIRE_TURNSTILE").unwrap_or(false);
+        let object_storage = object_storage_from_env();
 
         Ok(Self {
             port,
@@ -268,6 +329,11 @@ impl Config {
             upstream_spend_guard,
             smtp,
             admin_emails,
+            trial_abuse,
+            turnstile_site_key,
+            turnstile_secret_key,
+            require_turnstile,
+            object_storage,
         })
     }
 
@@ -362,6 +428,50 @@ impl Config {
     }
 }
 
+fn object_storage_from_env() -> Option<ObjectStorageConfig> {
+    let endpoint_url = env_any(&[
+        "BLUEY_OBJECT_ENDPOINT_URL",
+        "BLUEY_R2_ENDPOINT_URL",
+        "AWS_ENDPOINT_URL_S3",
+    ])?;
+    let bucket = env_any(&["BLUEY_OBJECT_BUCKET", "BLUEY_R2_BUCKET", "AWS_S3_BUCKET"])?;
+    let access_key_id = env_any(&[
+        "BLUEY_OBJECT_ACCESS_KEY_ID",
+        "BLUEY_R2_ACCESS_KEY_ID",
+        "AWS_ACCESS_KEY_ID",
+    ])?;
+    let secret_access_key = env_any(&[
+        "BLUEY_OBJECT_SECRET_ACCESS_KEY",
+        "BLUEY_R2_SECRET_ACCESS_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+    ])?;
+    let region = std::env::var("BLUEY_OBJECT_REGION")
+        .or_else(|_| std::env::var("BLUEY_R2_REGION"))
+        .or_else(|_| std::env::var("AWS_REGION"))
+        .unwrap_or_else(|_| "auto".to_string());
+    let key_prefix = std::env::var("BLUEY_OBJECT_KEY_PREFIX")
+        .unwrap_or_else(|_| "bluey-cloud".to_string())
+        .trim_matches('/')
+        .to_string();
+    let retention_days = env_positive_i64("BLUEY_OBJECT_RETENTION_DAYS").unwrap_or(365);
+    let max_object_bytes = std::env::var("BLUEY_OBJECT_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(25 * 1024 * 1024);
+
+    Some(ObjectStorageConfig {
+        endpoint_url,
+        bucket,
+        access_key_id,
+        secret_access_key,
+        region,
+        key_prefix,
+        retention_days,
+        max_object_bytes,
+    })
+}
+
 fn upstream_spend_guard_from_env() -> Option<UpstreamSpendGuard> {
     let limit_cents = std::env::var("BLUEY_UPSTREAM_SPEND_LIMIT_CENTS")
         .ok()
@@ -391,6 +501,13 @@ fn env_bool(name: &str) -> Option<bool> {
             "0" | "false" | "off" | "no"
         )
     })
+}
+
+fn env_positive_i64(name: &str) -> Option<i64> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value > 0)
 }
 
 fn normalize_email(email: &str) -> String {
@@ -622,6 +739,11 @@ mod tests {
             upstream_spend_guard: None,
             smtp: None,
             admin_emails: vec![],
+            trial_abuse: TrialAbuseConfig::default(),
+            turnstile_site_key: None,
+            turnstile_secret_key: None,
+            require_turnstile: false,
+            object_storage: None,
         };
 
         let square = cfg.square_config();
@@ -680,6 +802,11 @@ mod tests {
             upstream_spend_guard: None,
             smtp: None,
             admin_emails: parse_email_list(Some(" Owner@Bluey.SH , bad,ops@bluey.sh ".into())),
+            trial_abuse: TrialAbuseConfig::default(),
+            turnstile_site_key: None,
+            turnstile_secret_key: None,
+            require_turnstile: false,
+            object_storage: None,
         };
 
         assert!(cfg.is_admin_email("owner@bluey.sh"));

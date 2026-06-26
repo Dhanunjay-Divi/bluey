@@ -18,8 +18,8 @@ CREATE TABLE IF NOT EXISTS accounts (
   reserved_cents BIGINT NOT NULL DEFAULT 0,
   trial_seconds_remaining BIGINT NOT NULL DEFAULT 600,
   auto_topup_enabled INTEGER NOT NULL DEFAULT 0,
-  auto_topup_threshold_cents BIGINT NOT NULL DEFAULT 500,
-  auto_topup_amount_cents BIGINT NOT NULL DEFAULT 1500,
+  auto_topup_threshold_cents BIGINT NOT NULL DEFAULT 1000,
+  auto_topup_amount_cents BIGINT NOT NULL DEFAULT 3000,
   stripe_customer_id TEXT,
   stripe_payment_method_id TEXT,
   square_customer_id TEXT,
@@ -294,3 +294,57 @@ CREATE TABLE IF NOT EXISTS signup_otps (
 );
 CREATE INDEX IF NOT EXISTS idx_signup_otps_expires_at
   ON signup_otps(expires_at);
+
+CREATE TABLE IF NOT EXISTS trial_grants (
+  id TEXT PRIMARY KEY,
+  account_id TEXT REFERENCES accounts(id) ON DELETE SET NULL,
+  email_hash TEXT NOT NULL,
+  email_domain_hash TEXT,
+  ip_hash TEXT,
+  device_hash TEXT,
+  user_agent_hash TEXT,
+  ip_user_agent_hash TEXT,
+  granted_seconds BIGINT NOT NULL DEFAULT 600,
+  decision TEXT NOT NULL,
+  reason TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE trial_grants
+  ADD COLUMN IF NOT EXISTS email_domain_hash TEXT;
+CREATE INDEX IF NOT EXISTS idx_trial_grants_email
+  ON trial_grants(email_hash, created_at);
+CREATE INDEX IF NOT EXISTS idx_trial_grants_email_domain
+  ON trial_grants(email_domain_hash, created_at);
+CREATE INDEX IF NOT EXISTS idx_trial_grants_ip
+  ON trial_grants(ip_hash, created_at);
+CREATE INDEX IF NOT EXISTS idx_trial_grants_device
+  ON trial_grants(device_hash, created_at);
+CREATE INDEX IF NOT EXISTS idx_trial_grants_ip_ua
+  ON trial_grants(ip_user_agent_hash, created_at);
+
+CREATE TABLE IF NOT EXISTS trial_abuse_events (
+  id TEXT PRIMARY KEY,
+  account_id TEXT REFERENCES accounts(id) ON DELETE SET NULL,
+  email_hash TEXT,
+  email_domain_hash TEXT,
+  ip_hash TEXT,
+  device_hash TEXT,
+  user_agent_hash TEXT,
+  ip_user_agent_hash TEXT,
+  event_type TEXT NOT NULL,
+  severity BIGINT NOT NULL DEFAULT 1,
+  reason TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+ALTER TABLE trial_abuse_events
+  ADD COLUMN IF NOT EXISTS email_domain_hash TEXT;
+CREATE INDEX IF NOT EXISTS idx_trial_abuse_events_created
+  ON trial_abuse_events(created_at);
+CREATE INDEX IF NOT EXISTS idx_trial_abuse_events_email
+  ON trial_abuse_events(email_hash, created_at);
+CREATE INDEX IF NOT EXISTS idx_trial_abuse_events_email_domain
+  ON trial_abuse_events(email_domain_hash, created_at);
+CREATE INDEX IF NOT EXISTS idx_trial_abuse_events_ip
+  ON trial_abuse_events(ip_hash, created_at);
+CREATE INDEX IF NOT EXISTS idx_trial_abuse_events_device
+  ON trial_abuse_events(device_hash, created_at);

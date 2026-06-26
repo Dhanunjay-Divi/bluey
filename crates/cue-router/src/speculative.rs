@@ -250,6 +250,8 @@ fn spawn_lane(
                                 cost: chunk_cost,
                                 cost_label,
                                 artifact,
+                                status: _,
+                                sources: _,
                             }) => match role {
                                 LaneRole::Draft => {
                                     let _ = tx.send(SpeculativeChunk::Draft {
@@ -371,6 +373,7 @@ mod tests {
                 cost: None,
                 cost_label: None,
                 artifact: None,
+                sources: Vec::new(),
             })
         }
         async fn complete_stream(&self, _req: &LlmRequest) -> Result<LlmChunkStream, LlmError> {
@@ -386,6 +389,8 @@ mod tests {
                         cost: None,
                         cost_label: None,
                         artifact: None,
+                        status: None,
+                        sources: Vec::new(),
                     })
                 })
                 .collect();
@@ -636,6 +641,7 @@ mod tests {
                     cost: None,
                     cost_label: None,
                     artifact: None,
+                    sources: Vec::new(),
                 })
             }
             async fn complete_stream(&self, req: &LlmRequest) -> Result<LlmChunkStream, LlmError> {
@@ -646,6 +652,8 @@ mod tests {
                     cost: None,
                     cost_label: None,
                     artifact: None,
+                    status: None,
+                    sources: Vec::new(),
                 });
                 Ok(Box::pin(futures_util::stream::once(async move { chunk })))
             }

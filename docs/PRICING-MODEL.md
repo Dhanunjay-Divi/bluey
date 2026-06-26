@@ -7,7 +7,7 @@
 > per-decision sections. Cross-referenced from `DECISIONS.md`,
 > `docs/HOW-IT-WORKS.md`, `FUTURE-IMPLEMENTATIONS.md` R14.13.
 >
-> Last updated: 2026-06-20.
+> Last updated: 2026-06-23.
 
 ---
 
@@ -22,6 +22,7 @@
 | Markup tier — Easy/Medium | 200% | absolute cents are tiny; small markup absurd |
 | Markup tier — Deep speculative | 150% | absolute cost is more visible to customer |
 | Markup tier — Vision | 150% | GPT-5.5 vision-capable route pricing already high |
+| Markup tier — Live STT/captions | 200% | simple usage pricing; customer pays 3x the active STT provider cost |
 | Hard stop | balance < estimated cost → 402 | no debt, no surprise charges |
 | Mid-stream cut | running cost > balance → cut + Bluey eats overrun | customer never sees overrun deduction |
 | Free trial | 10 minutes of active session time | mirrors Pinky |
@@ -75,8 +76,8 @@
 
 | Provider/model | Upstream list price | Customer markup | Notes |
 |---|---:|---:|---|
-| Deepgram `nova-3` | $0.0043/min | 150% | Primary chunked `/router/transcribe` route |
-| OpenAI `gpt-4o-mini-transcribe` | $0.0030/min | 150% | Cloud fallback when Deepgram is busy/unavailable |
+| Deepgram `nova-3` | $0.0092/min | 200% | Primary live relay and chunked `/router/transcribe` route |
+| OpenAI `gpt-4o-mini-transcribe` | $0.0030/min | 200% | Cloud fallback when Deepgram is busy/unavailable |
 
 Deepgram is part of the same formula as GPT, Claude, Gemini, and any other
 paid provider. For STT/captions, `U` is measured in seconds instead of tokens:
@@ -100,9 +101,9 @@ LLM cost  = (input_tokens  / 1_000_000) * provider_input_price_per_1M
 Vision    = (n_tiles * 85 + 85) tokens at the model's input price
           + output_tokens at the model's output price
 
-Customer = LLM cost * (1 + markup_percent / 100)
+Customer = provider cost * (1 + markup_percent / 100)
 
-Markup tiers: 200% Easy/Medium, 150% Deep speculative, 150% Vision.
+Markup tiers: 200% Easy/Medium/STT, 150% Deep speculative, 150% Vision.
 ```
 
 The table above is a rounded view; the running implementation in
@@ -122,7 +123,7 @@ changes land.
 | Symbol | Meaning |
 |---|---|
 | `U` | Upstream provider cost for the request: LLM tokens, STT seconds, vision tokens, embeddings, or RAG calls |
-| `M` | Bluey usage markup for the lane: 200% easy/balanced, 150% deep/vision/STT by current policy |
+| `M` | Bluey usage markup for the lane: 200% easy/balanced/STT, 150% deep/vision by current policy |
 | `P` | Payment processor fee allocation. Usually handled at reload time, not per request |
 | `R` | Risk reserve for refunds/disputes/provider variance. Recommended starting value: 5-10% of `U * (1 + M)` |
 | `F` | Customer-facing minimum billable request floor. Current implementation: 1 cent |
@@ -154,7 +155,7 @@ against gross margin.
 | Balanced text/code | 200% | 5% | 1 cent |
 | Deep/system design | 150% | 7.5% | 1 cent |
 | Vision/screen analysis | 150% | 7.5% | 1 cent |
-| Live STT/captions | 150% | 10% | aggregate per session, not per tiny chunk |
+| Live STT/captions | 200% | 10% | aggregate per session, not per tiny chunk |
 | Embeddings/RAG | 200% | 5% | bundled into answer/session action unless surfaced separately |
 
 ### Guardrails

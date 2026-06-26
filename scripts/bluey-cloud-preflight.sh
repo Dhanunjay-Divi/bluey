@@ -5,29 +5,52 @@ set -euo pipefail
 #
 # Usage:
 #   scripts/bluey-cloud-preflight.sh /etc/bluey-api/bluey-api.env
+#   scripts/bluey-cloud-preflight.sh /etc/bluey-api/bluey-api.env /etc/bluey-api/bluey-postgres.env /etc/bluey-api/bluey-valkey.env
 #
 # The script never prints secret values. Missing optional CLIs are warnings
 # unless BLUEY_PREFLIGHT_STRICT=1 is set.
 
-ENV_FILE="${1:-}"
+ENV_FILES=("$@")
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FAILURES=0
 WARNINGS=0
 
-if [ -n "$ENV_FILE" ]; then
-  if [ ! -f "$ENV_FILE" ]; then
-    echo "fatal: env file not found: $ENV_FILE" >&2
-    exit 2
-  fi
-  set -a
-  # shellcheck disable=SC1090
-  . "$ENV_FILE"
-  set +a
+if [ "${#ENV_FILES[@]}" -gt 0 ]; then
+  for env_file in "${ENV_FILES[@]}"; do
+    if [ ! -f "$env_file" ]; then
+      echo "fatal: env file not found: $env_file" >&2
+      exit 2
+    fi
+    set -a
+    # shellcheck disable=SC1090
+    . "$env_file"
+    set +a
+  done
 fi
+
+primary_env_file="${ENV_FILES[0]:-}"
+
+env_label() {
+  if [ "${#ENV_FILES[@]}" -eq 0 ]; then
+    printf 'current shell'
+  else
+    local joined=""
+    local env_file
+    for env_file in "${ENV_FILES[@]}"; do
+      if [ -n "$joined" ]; then
+        joined="${joined}, "
+      fi
+      joined="${joined}${env_file}"
+    done
+    printf '%s' "$joined"
+  fi
+}
 
 STRICT="${BLUEY_PREFLIGHT_STRICT:-0}"
 PROFILE="${BLUEY_PREFLIGHT_PROFILE:-single-server-alpha}"
 REQUIRE_POSTGRES="${BLUEY_REQUIRE_POSTGRES:-0}"
 REQUIRE_MANAGED_REDIS="${BLUEY_REQUIRE_MANAGED_REDIS:-0}"
+REQUIRE_OBJECT_STORAGE="${BLUEY_REQUIRE_OBJECT_STORAGE:-0}"
 SERVER_DB_BACKEND="${BLUEY_SERVER_DB_BACKEND:-sqlite}"
 
 ok() {
@@ -104,7 +127,7 @@ is_local_redis_url() {
 }
 
 echo "Bluey cloud preflight"
-echo "env: ${ENV_FILE:-current shell}"
+echo "env: $(env_label)"
 echo "profile: $PROFILE"
 
 case "$PROFILE" in
@@ -116,6 +139,7 @@ case "$PROFILE" in
   postgres-cutover)
     REQUIRE_MANAGED_REDIS=1
     REQUIRE_POSTGRES=1
+    REQUIRE_OBJECT_STORAGE=1
     ;;
   *)
     warn "unknown BLUEY_PREFLIGHT_PROFILE=$PROFILE; use single-server-alpha, multi-server, or postgres-cutover"
@@ -128,7 +152,32 @@ if [ -n "${BLUEY_JWT_SECRET:-}" ] && [ "${#BLUEY_JWT_SECRET}" -lt 32 ]; then
   fail "BLUEY_JWT_SECRET must be at least 32 characters"
 fi
 
-if [ -n "${BLUEY_DB_PATH:-}" ]; then
+turnstile_site="${BLUEY_TURNSTILE_SITE_KEY:-${TURNSTILE_SITE_KEY:-}}"
+turnstile_secret="${BLUEY_TURNSTILE_SECRET_KEY:-${TURNSTILE_SECRET_KEY:-}}"
+require_turnstile="${BLUEY_REQUIRE_TURNSTILE:-0}"
+if [ "${SQUARE_ENVIRONMENT:-sandbox}" = "production" ] || [ "$require_turnstile" = "1" ]; then
+  require_turnstile=1
+fi
+if [ -n "$turnstile_site" ] || [ -n "$turnstile_secret" ]; then
+  if [ -n "$turnstile_site" ] && ! is_placeholder "$turnstile_site"; then
+    ok "Turnstile site key set"
+  else
+    fail "Turnstile site key missing or placeholder while captcha is partly configured"
+  fi
+  if [ -n "$turnstile_secret" ] && ! is_placeholder "$turnstile_secret"; then
+    ok "Turnstile secret set"
+  else
+    fail "Turnstile secret missing or placeholder while captcha is partly configured"
+  fi
+elif [ "$require_turnstile" = "1" ]; then
+  fail "Turnstile keys required for production signup abuse protection"
+else
+  warn "Turnstile keys unset; signup CAPTCHA is disabled"
+fi
+
+if [ "$SERVER_DB_BACKEND" = "postgres" ]; then
+  ok "SQLite path check skipped in Postgres backend mode"
+elif [ -n "${BLUEY_DB_PATH:-}" ]; then
   db_parent="$(dirname "$BLUEY_DB_PATH")"
   if [ -d "$db_parent" ] && [ -w "$db_parent" ]; then
     ok "SQLite DB parent writable: $db_parent"
@@ -183,13 +232,29 @@ need_env BLUEY_BILLING_PROVIDER "billing provider"
 if [ "${BLUEY_BILLING_PROVIDER:-}" = "square" ]; then
   need_env SQUARE_ENVIRONMENT "Square sandbox/production selector"
   if [ "${SQUARE_ENVIRONMENT:-sandbox}" = "production" ]; then
+    need_env SQUARE_PRODUCTION_APPLICATION_ID "Square production application"
     need_env SQUARE_PRODUCTION_ACCESS_TOKEN "Square production API"
     need_env SQUARE_PRODUCTION_LOCATION_ID "Square production location"
     need_env SQUARE_PRODUCTION_WEBHOOK_SIGNATURE_KEY "Square production webhook verification"
   else
+    need_env SQUARE_SANDBOX_APPLICATION_ID "Square sandbox application"
     need_env SQUARE_SANDBOX_ACCESS_TOKEN "Square sandbox API"
     need_env SQUARE_SANDBOX_LOCATION_ID "Square sandbox location"
     need_env SQUARE_SANDBOX_WEBHOOK_SIGNATURE_KEY "Square sandbox webhook verification"
+  fi
+  if [ -x "$ROOT/scripts/bluey-square-branding.sh" ]; then
+    brand_cmd=("$ROOT/scripts/bluey-square-branding.sh")
+    if [ -n "$primary_env_file" ]; then
+      brand_cmd+=("$primary_env_file")
+    fi
+    brand_cmd+=("--check")
+    if brand_output="$("${brand_cmd[@]}" 2>&1)"; then
+      ok "$brand_output"
+    else
+      fail "Square checkout branding is not Bluey: $brand_output"
+    fi
+  else
+    warn "Square checkout branding check unavailable; missing scripts/bluey-square-branding.sh"
   fi
 fi
 
@@ -239,6 +304,52 @@ elif [ "$REQUIRE_MANAGED_REDIS" = "1" ]; then
   fail "BLUEY_RATE_LIMIT_REDIS_STRICT=1 required for BLUEY_PREFLIGHT_PROFILE=$PROFILE"
 else
   warn "Redis strict mode disabled; Redis failures fall back to local process state"
+fi
+
+object_endpoint="${BLUEY_OBJECT_ENDPOINT_URL:-${BLUEY_R2_ENDPOINT_URL:-${AWS_ENDPOINT_URL_S3:-}}}"
+object_bucket="${BLUEY_OBJECT_BUCKET:-${BLUEY_R2_BUCKET:-${AWS_S3_BUCKET:-}}}"
+object_access_key="${BLUEY_OBJECT_ACCESS_KEY_ID:-${BLUEY_R2_ACCESS_KEY_ID:-${AWS_ACCESS_KEY_ID:-}}}"
+object_secret_key="${BLUEY_OBJECT_SECRET_ACCESS_KEY:-${BLUEY_R2_SECRET_ACCESS_KEY:-${AWS_SECRET_ACCESS_KEY:-}}}"
+object_region="${BLUEY_OBJECT_REGION:-${BLUEY_R2_REGION:-${AWS_REGION:-auto}}}"
+
+object_missing=0
+if [ -n "$object_endpoint" ] && ! is_placeholder "$object_endpoint"; then
+  ok "object storage endpoint set"
+else
+  object_missing=1
+fi
+if [ -n "$object_bucket" ] && ! is_placeholder "$object_bucket"; then
+  ok "object storage bucket set"
+else
+  object_missing=1
+fi
+if [ -n "$object_access_key" ] && ! is_placeholder "$object_access_key"; then
+  ok "object storage access key set"
+else
+  object_missing=1
+fi
+if [ -n "$object_secret_key" ] && ! is_placeholder "$object_secret_key"; then
+  ok "object storage secret key set"
+else
+  object_missing=1
+fi
+if [ "$object_missing" = "1" ]; then
+  if [ "$REQUIRE_OBJECT_STORAGE" = "1" ]; then
+    fail "R2/S3 object storage env is incomplete; original document/image restore requires it"
+  else
+    warn "R2/S3 object storage env incomplete; cloud restore will fall back to text previews"
+  fi
+elif command -v aws >/dev/null 2>&1; then
+  if AWS_ACCESS_KEY_ID="$object_access_key" \
+     AWS_SECRET_ACCESS_KEY="$object_secret_key" \
+     AWS_REGION="$object_region" \
+     aws --endpoint-url "$object_endpoint" s3api head-bucket --bucket "$object_bucket" >/dev/null 2>&1; then
+    ok "object storage bucket reachable"
+  else
+    warn "object storage bucket not reachable from this machine; verify endpoint, bucket, and key policy"
+  fi
+else
+  warn "aws CLI not installed; skipped object storage bucket reachability check"
 fi
 
 if [ -n "${OFFSITE_DESTINATION:-}" ]; then

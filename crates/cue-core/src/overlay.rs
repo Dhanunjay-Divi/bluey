@@ -18,6 +18,10 @@ impl Default for OverlayPosition {
     }
 }
 
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OverlayContextItem {
     pub id: uuid::Uuid,
@@ -32,6 +36,10 @@ pub struct OverlaySessionItem {
     pub id: uuid::Uuid,
     pub title: String,
     pub subtitle: String,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub context_count: usize,
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub image_count: usize,
     #[serde(default)]
     pub is_active: bool,
 }
@@ -116,6 +124,8 @@ pub enum OverlayEvent {
         model: Option<String>,
         #[serde(default)]
         mode: Option<String>,
+        #[serde(default)]
+        visible_context_ids: Vec<uuid::Uuid>,
     },
     AttachRequested,
     AttachFilesRequested {
@@ -127,6 +137,11 @@ pub enum OverlayEvent {
     InstructionsRequested,
     InstructionsUpdated {
         text: String,
+    },
+    PasteTextRequested {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_bundle_id: Option<String>,
     },
     SessionOpenRequested {
         id: uuid::Uuid,
@@ -151,6 +166,7 @@ pub enum OverlayEvent {
     CaptureStopRequested,
     RecordingStartRequested,
     RecordingStopRequested,
+    TranscriptClearRequested,
     CloseRequested,
     CardRendered {
         id: uuid::Uuid,
@@ -209,6 +225,8 @@ mod tests {
                 id,
                 title: "System design prep".to_string(),
                 subtitle: "3 transcripts · 2 files".to_string(),
+                context_count: 2,
+                image_count: 1,
                 is_active: true,
             }],
         })
@@ -216,7 +234,7 @@ mod tests {
 
         assert_eq!(
             json,
-            r#"{"type":"set_sessions","sessions":[{"id":"00000000-0000-0000-0000-000000000000","title":"System design prep","subtitle":"3 transcripts · 2 files","is_active":true}]}"#
+            r#"{"type":"set_sessions","sessions":[{"id":"00000000-0000-0000-0000-000000000000","title":"System design prep","subtitle":"3 transcripts · 2 files","context_count":2,"image_count":1,"is_active":true}]}"#
         );
     }
 
@@ -272,6 +290,20 @@ mod tests {
         assert_eq!(
             json,
             r#"{"type":"session_delete_requested","id":"00000000-0000-0000-0000-000000000000"}"#
+        );
+    }
+
+    #[test]
+    fn paste_text_event_serializes_with_target_bundle() {
+        let json = serde_json::to_string(&OverlayEvent::PasteTextRequested {
+            text: "hello".to_string(),
+            target_bundle_id: Some("com.apple.TextEdit".to_string()),
+        })
+        .expect("serialize paste text event");
+
+        assert_eq!(
+            json,
+            r#"{"type":"paste_text_requested","text":"hello","target_bundle_id":"com.apple.TextEdit"}"#
         );
     }
 }

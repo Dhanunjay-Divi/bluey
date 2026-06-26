@@ -222,31 +222,45 @@ private final class MicrophoneCapture {
         self.continuous = continuous
     }
 
+    private func ensureMicrophoneAccess() throws {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            return
+        case .notDetermined:
+            let semaphore = DispatchSemaphore(value: 0)
+            var granted = false
+            AVCaptureDevice.requestAccess(for: .audio) { allowed in
+                granted = allowed
+                semaphore.signal()
+            }
+            semaphore.wait()
+            if granted {
+                return
+            }
+            fallthrough
+        case .denied, .restricted:
+            throw NSError(domain: "BlueyAudio", code: 4, userInfo: [NSLocalizedDescriptionKey: "microphone permission is not granted for Bluey audio capture"])
+        @unknown default:
+            throw NSError(domain: "BlueyAudio", code: 5, userInfo: [NSLocalizedDescriptionKey: "microphone permission status is unknown"])
+        }
+    }
+
     func run() throws {
+        try ensureMicrophoneAccess()
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
         guard inputFormat.channelCount > 0 else {
             throw NSError(domain: "BlueyAudio", code: 2, userInfo: [NSLocalizedDescriptionKey: "no microphone input format available"])
         }
-        guard let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 1, interleaved: false) else {
-            throw NSError(domain: "BlueyAudio", code: 3, userInfo: [NSLocalizedDescriptionKey: "failed to create target format"])
-        }
-        let converter = AVAudioConverter(from: inputFormat, to: targetFormat)
 
         input.installTap(onBus: 0, bufferSize: 1_024, format: inputFormat) { [weak self] buffer, _ in
             guard let self else { return }
-            let ratio = targetFormat.sampleRate / buffer.format.sampleRate
-            let capacity = AVAudioFrameCount(max(1, Int(Double(buffer.frameLength) * ratio) + 8))
-            guard let converted = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return }
-            var consumed = false
-            converter?.convert(to: converted, error: nil) { _, status in
-                if consumed { status.pointee = .noDataNow; return nil }
-                consumed = true
-                status.pointee = .haveData
-                return buffer
-            }
-            guard converted.frameLength > 0, let channel = converted.floatChannelData?[0] else { return }
-            self.writer.write48kFloat(channel, frameCount: Int(converted.frameLength))
+            let streamDescription = buffer.format.streamDescription.pointee
+            self.writer.writePCM(
+                UnsafeMutableAudioBufferListPointer(buffer.mutableAudioBufferList),
+                frameCount: Int(buffer.frameLength),
+                format: streamDescription
+            )
         }
         try engine.start()
 

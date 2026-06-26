@@ -49,6 +49,83 @@ private func displayTranscriptText(_ text: String) -> String {
         .trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
+private let privateInstructionRefusal = "I can’t share Bluey’s private instructions, prompts, guardrails, tokens, or internal configuration. Ask me what you want to do, and I’ll help with the answer itself."
+
+private func sanitizeOverlayOutput(kind: String, body: String) -> String {
+    let normalizedKind = normalizedCardKind(kind)
+    guard normalizedKind != "question", normalizedKind != "transcript" else { return body }
+    guard !looksLikePrivateInstructionDisclosure(body) else { return privateInstructionRefusal }
+    return formatOverlayAnswerText(body)
+}
+
+private func formatOverlayAnswerText(_ body: String) -> String {
+    body
+        .replacingOccurrences(
+            of: #"(?<=[\:\.\!\?\*\)])\s*(-\s+[A-Z])"#,
+            with: "\n$1",
+            options: .regularExpression)
+        .replacingOccurrences(
+            of: #"\.\s+(Recommended ratings:|Rationale:|Approach|Patch|Explanation|Complexity|Edge cases)"#,
+            with: ".\n\n$1",
+            options: .regularExpression)
+        .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
+}
+
+private func sanitizeOverlayArtifact(_ artifact: OverlayArtifact?) -> OverlayArtifact? {
+    guard let artifact else { return nil }
+    if artifact.artifactType != "code" && artifact.artifactType != "system_design" {
+        return nil
+    }
+    if looksLikePrivateInstructionDisclosure(artifact.body)
+        || looksLikePrivateInstructionDisclosure(artifact.title)
+    {
+        return nil
+    }
+    return artifact
+}
+
+private func looksLikePrivateInstructionDisclosure(_ text: String) -> Bool {
+    let normalized = normalizePrivateInstructionText(text)
+    guard !normalized.isEmpty else { return false }
+    let directLeaks = [
+        "the prompts that define how i work",
+        "embedded in my system instructions",
+        "plain summary of the key rules i follow",
+        "identity and scope",
+        "talk track rule",
+        "question type detection",
+        "voice and person",
+        "depth matching",
+        "canvas and workbench split",
+        "style restrictions",
+        "output shape",
+        "human speak contract",
+        "answer rules"
+    ]
+    if directLeaks.contains(where: { normalized.contains($0) }) {
+        return true
+    }
+    return normalized.contains("system instructions")
+        && (normalized.contains("i follow")
+            || normalized.contains("how i work")
+            || normalized.contains("bluey"))
+}
+
+private func normalizePrivateInstructionText(_ text: String) -> String {
+    var output = ""
+    var lastWasSpace = false
+    for scalar in text.lowercased().unicodeScalars {
+        if CharacterSet.alphanumerics.contains(scalar) {
+            output.unicodeScalars.append(scalar)
+            lastWasSpace = false
+        } else if !lastWasSpace {
+            output.append(" ")
+            lastWasSpace = true
+        }
+    }
+    return output.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
 private enum BlueyTheme {
     static let cyan = NSColor(red: 0.35, green: 0.82, blue: 1.0, alpha: 1.0)
     static let cyanSoft = NSColor(red: 0.35, green: 0.82, blue: 1.0, alpha: 0.14)
@@ -77,10 +154,186 @@ private enum BlueyTheme {
     }
 }
 
+private enum BlueyLightTheme {
+    static let panel = NSColor(red: 0.565, green: 0.610, blue: 0.638, alpha: 1.0)
+    static let content = NSColor(red: 0.720, green: 0.748, blue: 0.765, alpha: 1.0)
+    static let contentHigh = NSColor(red: 0.790, green: 0.810, blue: 0.822, alpha: 1.0)
+    static let contentLow = NSColor(red: 0.632, green: 0.678, blue: 0.708, alpha: 1.0)
+    static let bar = NSColor(red: 0.405, green: 0.455, blue: 0.488, alpha: 1.0)
+    static let barChrome = NSColor(red: 0.625, green: 0.672, blue: 0.700, alpha: 1.0)
+    static let chrome = NSColor(red: 0.618, green: 0.662, blue: 0.688, alpha: 1.0)
+    static let chromeGuard = NSColor(red: 0.390, green: 0.448, blue: 0.486, alpha: 1.0)
+    static let surface = NSColor(red: 0.812, green: 0.832, blue: 0.842, alpha: 1.0)
+    static let surfaceRaised = NSColor(red: 0.875, green: 0.890, blue: 0.898, alpha: 1.0)
+    static let text = NSColor(red: 0.050, green: 0.064, blue: 0.078, alpha: 1.0)
+    static let textDim = NSColor(red: 0.205, green: 0.262, blue: 0.305, alpha: 1.0)
+    static let border = NSColor(red: 0.030, green: 0.055, blue: 0.075, alpha: 0.34)
+    static let shadow = NSColor.black.withAlphaComponent(0.28)
+}
+
 private let minimumOverlayBackgroundOpacity: CGFloat = 0.18
+private let supportedDropFormatsMessage =
+    "Supported: PDF, DOC/DOCX, Excel/ODS, CSV/TSV, text, Markdown, code/data files, and PNG/JPEG/WebP/GIF/HEIC/BMP/TIFF images."
+private let supportedDropExtensions: Set<String> = [
+    "md", "markdown", "txt", "log", "csv", "tsv", "rst", "adoc",
+    "rs", "swift", "c", "h", "cpp", "hpp", "js", "jsx", "ts", "tsx",
+    "py", "go", "java", "kt", "kts", "cs", "rb", "php", "sql", "sh",
+    "ps1", "toml", "yaml", "yml", "json", "html", "css", "scss",
+    "pdf", "doc", "docx", "rtf", "xls", "xlsx", "xlsm", "xlsb", "ods",
+    "png", "jpg", "jpeg", "gif", "webp", "heic", "heif", "bmp", "tiff", "tif",
+]
+private let overlayLightThemeDefaultsKey = "bluey.overlay.lightTheme"
+private let overlayAutoSendStopModeDefaultsKey = "bluey.overlay.autoSendStopMode"
+private let overlayAutoSendStopModeVersionDefaultsKey = "bluey.overlay.autoSendStopModeVersion"
+private let overlayAutoSendStopModeCurrentVersion = 2
 
 private func blueyMaterialAlpha(_ base: CGFloat, opacity: CGFloat, floor: CGFloat = 0.02) -> CGFloat {
     min(1.0, max(floor, base * min(max(opacity, minimumOverlayBackgroundOpacity), 1.0)))
+}
+
+private func blueyLightMaterialAlpha(_ base: CGFloat, opacity: CGFloat, floor: CGFloat = 0.10) -> CGFloat {
+    let material = min(max(opacity, 0.02), 1.0)
+    let shaped = 0.12 + material * 0.88
+    return min(0.96, max(floor, base * shaped))
+}
+
+private enum OverlayPlacementStore {
+    private static let pillFrameKey = "bluey.overlay.pill.frame.v2"
+    private static let expandedFrameKey = "bluey.overlay.expanded.frame.v2"
+
+    static func loadPillFrame(in visibleFrame: NSRect) -> NSRect? {
+        loadFrame(key: pillFrameKey).map { clampedPillFrame($0, in: visibleFrame) }
+    }
+
+    static func savePillFrame(_ frame: NSRect, in visibleFrame: NSRect) {
+        saveFrame(clampedPillFrame(frame, in: visibleFrame), key: pillFrameKey)
+    }
+
+    static func clearPillFrame() {
+        UserDefaults.standard.removeObject(forKey: pillFrameKey)
+    }
+
+    static func loadExpandedFrame(in visibleFrame: NSRect) -> NSRect? {
+        loadFrame(key: expandedFrameKey).map {
+            ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen($0, visibleFrame: visibleFrame)
+        }
+    }
+
+    static func saveExpandedFrame(_ frame: NSRect, in visibleFrame: NSRect) {
+        saveFrame(
+            ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(frame, visibleFrame: visibleFrame),
+            key: expandedFrameKey)
+    }
+
+    private static func loadFrame(key: String) -> NSRect? {
+        guard let raw = UserDefaults.standard.string(forKey: key), !raw.isEmpty else {
+            return nil
+        }
+        let frame = NSRectFromString(raw)
+        guard frame.width > 20, frame.height > 20 else {
+            return nil
+        }
+        return frame
+    }
+
+    private static func saveFrame(_ frame: NSRect, key: String) {
+        UserDefaults.standard.set(NSStringFromRect(frame), forKey: key)
+    }
+
+    private static func clampedPillFrame(_ frame: NSRect, in visibleFrame: NSRect) -> NSRect {
+        let inset: CGFloat = 8
+        var clamped = frame
+        clamped.size = PillMetrics.size
+        clamped.origin.x = min(
+            max(visibleFrame.minX + inset, clamped.origin.x),
+            visibleFrame.maxX - clamped.size.width - inset)
+        clamped.origin.y = min(
+            max(visibleFrame.minY + inset, clamped.origin.y),
+            visibleFrame.maxY - clamped.size.height - inset)
+        return clamped
+    }
+}
+
+private func drawBlueyGlassPanel(
+    in rect: NSRect,
+    radius: CGFloat,
+    opacity: CGFloat
+) {
+    guard rect.width > 1, rect.height > 1 else { return }
+    let material = min(max(opacity, minimumOverlayBackgroundOpacity), 1.0)
+    let path = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
+
+    NSGraphicsContext.saveGraphicsState()
+    let shadow = NSShadow()
+    shadow.shadowColor = NSColor.black.withAlphaComponent(blueyMaterialAlpha(0.34, opacity: material, floor: 0.10))
+    shadow.shadowBlurRadius = 22
+    shadow.shadowOffset = .zero
+    shadow.set()
+
+    NSGradient(colors: [
+        NSColor(red: 0.007, green: 0.011, blue: 0.017, alpha: blueyMaterialAlpha(0.98, opacity: material)),
+        NSColor(red: 0.014, green: 0.026, blue: 0.032, alpha: blueyMaterialAlpha(0.95, opacity: material)),
+        NSColor(red: 0.007, green: 0.010, blue: 0.015, alpha: blueyMaterialAlpha(0.99, opacity: material)),
+    ])?.draw(in: path, angle: -18)
+    NSGraphicsContext.restoreGraphicsState()
+
+    BlueyTheme.cyan.withAlphaComponent(blueyMaterialAlpha(0.38, opacity: material)).setStroke()
+    path.lineWidth = 1.0
+    path.stroke()
+
+    let inner = rect.insetBy(dx: 1.5, dy: 1.5)
+    let innerPath = NSBezierPath(roundedRect: inner, xRadius: max(0, radius - 1.5), yRadius: max(0, radius - 1.5))
+    NSColor.white.withAlphaComponent(blueyMaterialAlpha(0.050, opacity: material)).setStroke()
+    innerPath.lineWidth = 0.8
+    innerPath.stroke()
+
+    let glossPath = NSBezierPath(roundedRect: rect.insetBy(dx: 2.0, dy: 2.0), xRadius: max(0, radius - 2.0), yRadius: max(0, radius - 2.0))
+    NSGradient(colors: [
+        NSColor.white.withAlphaComponent(blueyMaterialAlpha(0.08, opacity: material)),
+        NSColor.white.withAlphaComponent(0.0),
+    ])?.draw(in: glossPath, angle: 90)
+}
+
+private func drawBlueyLightPanel(
+    in rect: NSRect,
+    radius: CGFloat,
+    opacity: CGFloat
+) {
+    guard rect.width > 1, rect.height > 1 else { return }
+    let path = NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius)
+    let fillAlpha = blueyLightMaterialAlpha(0.98, opacity: opacity, floor: 0.18)
+
+    NSGraphicsContext.saveGraphicsState()
+    let shadow = NSShadow()
+    shadow.shadowColor = BlueyLightTheme.shadow
+        .withAlphaComponent(blueyLightMaterialAlpha(0.30, opacity: opacity, floor: 0.08))
+    shadow.shadowBlurRadius = 26
+    shadow.shadowOffset = .zero
+    shadow.set()
+
+    NSGradient(colors: [
+        BlueyLightTheme.barChrome.withAlphaComponent(fillAlpha),
+        BlueyLightTheme.panel.withAlphaComponent(fillAlpha),
+        BlueyLightTheme.chromeGuard.withAlphaComponent(fillAlpha),
+    ])?.draw(in: path, angle: -16)
+    NSGraphicsContext.restoreGraphicsState()
+
+    BlueyTheme.cyan.withAlphaComponent(blueyLightMaterialAlpha(0.34, opacity: opacity, floor: 0.10)).setStroke()
+    path.lineWidth = 1.0
+    path.stroke()
+
+    let inner = rect.insetBy(dx: 1.5, dy: 1.5)
+    let innerPath = NSBezierPath(roundedRect: inner, xRadius: max(0, radius - 1.5), yRadius: max(0, radius - 1.5))
+    NSColor.white.withAlphaComponent(blueyLightMaterialAlpha(0.22, opacity: opacity, floor: 0.06)).setStroke()
+    innerPath.lineWidth = 0.8
+    innerPath.stroke()
+
+    let gloss = rect.insetBy(dx: 2.0, dy: 2.0)
+    let glossPath = NSBezierPath(roundedRect: gloss, xRadius: max(0, radius - 2.0), yRadius: max(0, radius - 2.0))
+    NSGradient(colors: [
+        NSColor.white.withAlphaComponent(blueyLightMaterialAlpha(0.12, opacity: opacity, floor: 0.02)),
+        NSColor.white.withAlphaComponent(0.02),
+    ])?.draw(in: glossPath, angle: 92)
 }
 
 private final class VerticallyCenteredTextFieldCell: NSTextFieldCell {
@@ -181,12 +434,16 @@ private final class OpacityScrubberView: NSControl {
 }
 
 private enum ExpandedPanelMetrics {
-    static let maxCompactWidth: CGFloat = 820
-    static let minCompactWidth: CGFloat = 680
-    static let maxCanvasWidth: CGFloat = 960
-    static let height: CGFloat = 520
-    static let minHeight: CGFloat = 440
+    static let maxCompactWidth: CGFloat = 960
+    static let minCompactWidth: CGFloat = 760
+    static let maxCanvasWidth: CGFloat = 1120
+    static let maxFocusWidth: CGFloat = 1040
+    static let focusHeight: CGFloat = 620
+    static let height: CGFloat = 640
+    static let minHeight: CGFloat = 500
     static let screenInset: CGFloat = 32
+    static let focusInset: CGFloat = 48
+    static let cameraSafeTopInset: CGFloat = 64
     static let cornerRadius: CGFloat = 28
 
     static func fittingWidth(for screen: NSRect, preferred: CGFloat) -> CGFloat {
@@ -199,18 +456,28 @@ private enum ExpandedPanelMetrics {
         return min(preferred, available)
     }
 
+    static func fittingFocusWidth(for screen: NSRect, preferred: CGFloat) -> CGFloat {
+        let available = max(360, screen.width - focusInset * 2)
+        return min(preferred, available)
+    }
+
+    static func fittingFocusHeight(for screen: NSRect, preferred: CGFloat = focusHeight) -> CGFloat {
+        let available = max(minHeight, screen.height - focusInset * 2)
+        return min(preferred, available)
+    }
+
     static func fittingMinimumWidth(for screen: NSRect, targetWidth: CGFloat) -> CGFloat {
         let available = max(360, screen.width - screenInset * 2)
         return min(minCompactWidth, targetWidth, available)
     }
 
     static func compactFrame(in visibleFrame: NSRect) -> NSRect {
-        let width = fittingWidth(for: visibleFrame, preferred: maxCompactWidth)
-        let height = fittingHeight(for: visibleFrame)
+        let width = fittingWidth(for: visibleFrame, preferred: minCompactWidth)
+        let height = fittingHeight(for: visibleFrame, preferred: minHeight)
         return fitExpandedFrameToVisibleScreen(
             NSRect(
                 x: visibleFrame.midX - width / 2,
-                y: visibleFrame.midY - height / 2,
+                y: visibleFrame.maxY - height - cameraSafeTopInset,
                 width: width,
                 height: height),
             visibleFrame: visibleFrame)
@@ -229,6 +496,18 @@ private enum ExpandedPanelMetrics {
             max(visibleFrame.minY + screenInset, fitted.origin.y),
             visibleFrame.maxY - fitted.size.height - screenInset)
         return fitted
+    }
+
+    static func focusFrame(in visibleFrame: NSRect, preferredWidth: CGFloat, preferredHeight: CGFloat = focusHeight) -> NSRect {
+        let width = fittingFocusWidth(for: visibleFrame, preferred: preferredWidth)
+        let height = fittingFocusHeight(for: visibleFrame, preferred: preferredHeight)
+        return fitExpandedFrameToVisibleScreen(
+            NSRect(
+                x: visibleFrame.midX - width / 2,
+                y: visibleFrame.midY - height / 2,
+                width: width,
+                height: height),
+            visibleFrame: visibleFrame)
     }
 
     static func fillVisibleScreenFrame(_ frame: NSRect, visibleFrame: NSRect) -> NSRect {
@@ -384,7 +663,13 @@ private func symbolImage(_ name: String) -> NSImage? {
 }
 
 private final class ComposerTextView: NSTextView {
+    private let ownedTextStorage: NSTextStorage?
+    private let ownedLayoutManager: NSLayoutManager?
+
     var placeholder = "Ask anything..." {
+        didSet { needsDisplay = true }
+    }
+    var placeholderColor = BlueyTheme.textDim.withAlphaComponent(0.78) {
         didSet { needsDisplay = true }
     }
     var onSubmit: (() -> Void)?
@@ -393,7 +678,25 @@ private final class ComposerTextView: NSTextView {
     override var acceptsFirstResponder: Bool { true }
 
     override init(frame frameRect: NSRect, textContainer container: NSTextContainer?) {
-        super.init(frame: frameRect, textContainer: container)
+        if let container {
+            ownedTextStorage = nil
+            ownedLayoutManager = nil
+            super.init(frame: frameRect, textContainer: container)
+        } else {
+            let storage = NSTextStorage()
+            let manager = NSLayoutManager()
+            let container = NSTextContainer(size: NSSize(
+                width: max(frameRect.width, 80),
+                height: CGFloat.greatestFiniteMagnitude))
+            container.lineFragmentPadding = 0
+            container.widthTracksTextView = true
+            container.heightTracksTextView = false
+            storage.addLayoutManager(manager)
+            manager.addTextContainer(container)
+            ownedTextStorage = storage
+            ownedLayoutManager = manager
+            super.init(frame: frameRect, textContainer: container)
+        }
         drawsBackground = false
         isRichText = false
         isAutomaticQuoteSubstitutionEnabled = false
@@ -403,6 +706,7 @@ private final class ComposerTextView: NSTextView {
         textColor = BlueyTheme.text
         insertionPointColor = BlueyTheme.cyan
         font = NSFont.systemFont(ofSize: 14.5, weight: .medium)
+        typingAttributes = composerTextAttributes
         textContainerInset = NSSize(width: 2, height: 7)
         textContainer?.lineFragmentPadding = 0
         textContainer?.widthTracksTextView = true
@@ -421,7 +725,7 @@ private final class ComposerTextView: NSTextView {
         guard string.isEmpty else { return }
         let attributes: [NSAttributedString.Key: Any] = [
             .font: font ?? NSFont.systemFont(ofSize: 14.5, weight: .medium),
-            .foregroundColor: BlueyTheme.textDim.withAlphaComponent(0.78),
+            .foregroundColor: placeholderColor,
         ]
         let rect = NSRect(x: 0, y: textContainerInset.height + 1, width: bounds.width, height: 22)
         placeholder.draw(in: rect, withAttributes: attributes)
@@ -465,9 +769,10 @@ private final class ComposerTextView: NSTextView {
     }
 
     override func mouseDown(with event: NSEvent) {
+        NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(self)
-        super.mouseDown(with: event)
+        handleMouseGesture(atWindowPoint: event.locationInWindow, clickCount: event.clickCount)
     }
 
     func clearText() {
@@ -475,6 +780,136 @@ private final class ComposerTextView: NSTextView {
         selectedRange = NSRange(location: 0, length: 0)
         needsDisplay = true
         notifyMeasuredHeight()
+    }
+
+    func insertPlainText(_ text: String) {
+        guard !text.isEmpty else { return }
+        replacePlainText(in: selectedRange(), with: text)
+    }
+
+    func deleteBackwardPlainText() {
+        let range = selectedRange()
+        if range.length > 0 {
+            replacePlainText(in: range, with: "")
+            return
+        }
+        guard range.location > 0 else { return }
+        replacePlainText(in: NSRange(location: range.location - 1, length: 1), with: "")
+    }
+
+    func handleMouseGesture(atWindowPoint windowPoint: NSPoint, clickCount: Int) {
+        window?.makeFirstResponder(self)
+        let index = insertionIndex(atWindowPoint: windowPoint)
+        let length = (string as NSString).length
+        guard length > 0 else {
+            setSelectedRange(NSRange(location: 0, length: 0))
+            needsDisplay = true
+            return
+        }
+
+        switch clickCount {
+        case 3...:
+            setSelectedRange(sentenceRange(containing: index))
+        case 2:
+            setSelectedRange(wordRange(containing: index))
+        default:
+            setSelectedRange(NSRange(location: min(index, length), length: 0))
+        }
+        scrollRangeToVisible(selectedRange())
+        needsDisplay = true
+    }
+
+    private func replacePlainText(in range: NSRange, with replacement: String) {
+        let currentLength = (string as NSString).length
+        let location = min(max(range.location, 0), currentLength)
+        let maxLength = max(0, currentLength - location)
+        let clampedRange = NSRange(location: location, length: min(max(range.length, 0), maxLength))
+        guard shouldChangeText(in: clampedRange, replacementString: replacement) else { return }
+        let attributed = NSAttributedString(string: replacement, attributes: composerTextAttributes)
+        textStorage?.replaceCharacters(in: clampedRange, with: attributed)
+        let newLocation = location + (replacement as NSString).length
+        setSelectedRange(NSRange(location: newLocation, length: 0))
+        didChangeText()
+        scrollRangeToVisible(selectedRange())
+    }
+
+    private var composerTextAttributes: [NSAttributedString.Key: Any] {
+        [
+            .font: font ?? NSFont.systemFont(ofSize: 14.5, weight: .medium),
+            .foregroundColor: textColor ?? BlueyTheme.text,
+        ]
+    }
+
+    private func insertionIndex(atWindowPoint windowPoint: NSPoint) -> Int {
+        let localPoint = convert(windowPoint, from: nil)
+        guard let manager = layoutManager, let container = textContainer else {
+            return min(max(0, string.count), (string as NSString).length)
+        }
+        container.containerSize = NSSize(width: max(80, bounds.width), height: CGFloat.greatestFiniteMagnitude)
+        manager.ensureLayout(for: container)
+        let containerPoint = NSPoint(
+            x: localPoint.x - textContainerOrigin.x,
+            y: localPoint.y - textContainerOrigin.y)
+        let index = manager.characterIndex(
+            for: containerPoint,
+            in: container,
+            fractionOfDistanceBetweenInsertionPoints: nil)
+        return min(max(index, 0), (string as NSString).length)
+    }
+
+    private func wordRange(containing index: Int) -> NSRange {
+        let nsString = string as NSString
+        let length = nsString.length
+        guard length > 0 else { return NSRange(location: 0, length: 0) }
+        let seed = min(max(index, 0), length - 1)
+        let wordCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_'"))
+        if !character(at: seed, in: nsString, isIn: wordCharacters) {
+            return NSRange(location: seed, length: min(1, length - seed))
+        }
+
+        var start = seed
+        while start > 0, character(at: start - 1, in: nsString, isIn: wordCharacters) {
+            start -= 1
+        }
+        var end = seed + 1
+        while end < length, character(at: end, in: nsString, isIn: wordCharacters) {
+            end += 1
+        }
+        return NSRange(location: start, length: end - start)
+    }
+
+    private func sentenceRange(containing index: Int) -> NSRange {
+        let nsString = string as NSString
+        let length = nsString.length
+        guard length > 0 else { return NSRange(location: 0, length: 0) }
+        let seed = min(max(index, 0), length - 1)
+        let terminators = CharacterSet(charactersIn: ".!?\n")
+
+        var start = seed
+        while start > 0, !character(at: start - 1, in: nsString, isIn: terminators) {
+            start -= 1
+        }
+        while start < length, character(at: start, in: nsString, isIn: .whitespacesAndNewlines) {
+            start += 1
+        }
+
+        var end = seed
+        while end < length, !character(at: end, in: nsString, isIn: terminators) {
+            end += 1
+        }
+        if end < length, character(at: end, in: nsString, isIn: terminators) {
+            end += 1
+        }
+        return NSRange(location: min(start, length), length: max(0, end - start))
+    }
+
+    private func character(at index: Int, in string: NSString, isIn set: CharacterSet) -> Bool {
+        guard index >= 0, index < string.length,
+              let scalar = UnicodeScalar(string.character(at: index))
+        else {
+            return false
+        }
+        return set.contains(scalar)
     }
 
     private func notifyMeasuredHeight() {
@@ -524,10 +959,23 @@ private final class ComposerSurfaceView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         if let composer {
+            NSApp.activate(ignoringOtherApps: true)
             window?.makeKeyAndOrderFront(nil)
             window?.makeFirstResponder(composer)
         }
         super.mouseDown(with: event)
+    }
+}
+
+private final class SessionDrawerView: NSView {
+    weak var scrollView: NSScrollView?
+
+    override func scrollWheel(with event: NSEvent) {
+        guard let scrollView else {
+            super.scrollWheel(with: event)
+            return
+        }
+        scrollView.scrollWheel(with: event)
     }
 }
 
@@ -542,6 +990,7 @@ private struct CueCard: Decodable {
     let source: String?
     let costLabel: String?
     let artifact: OverlayArtifact?
+    let attachments: [OverlayContextItem]?
 
     enum CodingKeys: String, CodingKey {
         case id, kind, title, body
@@ -549,6 +998,7 @@ private struct CueCard: Decodable {
         case source
         case costLabel = "cost_label"
         case artifact
+        case attachments
     }
 }
 
@@ -564,7 +1014,7 @@ private struct OverlayArtifact: Decodable {
     }
 }
 
-private struct OverlayContextItem {
+private struct OverlayContextItem: Decodable {
     let id: String
     let title: String
     let kind: String
@@ -575,13 +1025,14 @@ private struct OverlaySessionItem {
     let id: String
     let title: String
     let subtitle: String
+    let contextCount: Int
+    let imageCount: Int
     let isActive: Bool
 }
 
-// Matches Pinky's trusted remote-control event source marker
-// (internal/input/input_darwin.go). When Pinky is controlling the host,
-// Bluey should not consume those injected clicks.
-private let pinkyTrustedRemoteInputEventSourceUserData: Int64 = 0x70696e6b797231
+// Matches the trusted remote-control event source marker used by the host
+// remote-input bridge. Bluey should not consume those injected clicks.
+private let blueyTrustedRemoteInputEventSourceUserData: Int64 = 0x70696e6b797231
 private let remoteInputPassthroughDefaultMs = 900
 private let remoteInputPassthroughHeuristicMs = 1_200
 private let remoteControlAppNeedles = [
@@ -670,6 +1121,8 @@ private func parseCommand(_ line: String) -> OverlayCommand {
                 id: item["id"] as? String ?? "",
                 title: item["title"] as? String ?? "Bluey session",
                 subtitle: item["subtitle"] as? String ?? "",
+                contextCount: item["context_count"] as? Int ?? 0,
+                imageCount: item["image_count"] as? Int ?? 0,
                 isActive: item["is_active"] as? Bool ?? false
             )
         }.filter { !$0.id.isEmpty }
@@ -748,6 +1201,7 @@ private var ipcInputHandle: FileHandle?
 private var ipcOutputHandle: FileHandle = FileHandle.standardOutput
 
 private let captureVisibleForDebug: Bool = {
+#if DEBUG
     let devEnabled = argumentFlag("--bluey-dev-overlay") || envFlag("BLUEY_DEV_OVERLAY")
     let localAllowed = argumentFlag("--bluey-local-visible-overlay")
         || envFlag("BLUEY_LOCAL_VISIBLE_OVERLAY")
@@ -756,6 +1210,20 @@ private let captureVisibleForDebug: Bool = {
         || envFlag("BLUEY_OVERLAY_CAPTURE_VISIBLE")
         || envFlag("BLUEY_HOST_OVERLAY_CAPTURE_VISIBLE")
     return devEnabled && localAllowed && captureRequested
+#else
+    return false
+#endif
+}()
+
+private let trustedRemoteInputTapEnabled: Bool = {
+#if DEBUG
+    let devEnabled = argumentFlag("--bluey-dev-overlay") || envFlag("BLUEY_DEV_OVERLAY")
+    let tapRequested = argumentFlag("--bluey-trusted-remote-input-tap")
+        || envFlag("BLUEY_TRUSTED_REMOTE_INPUT_TAP")
+    return devEnabled && tapRequested
+#else
+    return false
+#endif
 }()
 
 private func connectUnixSocket(path: String) -> Int32? {
@@ -851,11 +1319,14 @@ private func emitLifecycle(_ stage: String, status: String = "ok", detail: Strin
     emitEvent(payload)
 }
 
-private func emitAsk(question: String, provider: String?, model: String?, mode: String?) {
+private func emitAsk(question: String, provider: String?, model: String?, mode: String?, visibleContextIds: [String] = []) {
     var p: [String: Any] = ["type": "ask_requested", "question": question]
     if let provider = provider { p["provider"] = provider }
     if let model = model       { p["model"]    = model }
     if let mode = mode         { p["mode"]     = mode }
+    if !visibleContextIds.isEmpty {
+        p["visible_context_ids"] = visibleContextIds
+    }
     emitEvent(p)
 }
 
@@ -877,6 +1348,15 @@ private func emitRemoveContext(id: String) {
 
 private func emitInstructions(text: String) {
     emitEvent(["type": "instructions_updated", "text": text])
+}
+
+private func emitPasteText(text: String, targetBundleId: String?) {
+    var payload: [String: Any] = ["type": "paste_text_requested", "text": text]
+    if let targetBundleId,
+       !targetBundleId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        payload["target_bundle_id"] = targetBundleId
+    }
+    emitEvent(payload)
 }
 
 private func emitSessionOpen(id: String) {
@@ -992,10 +1472,23 @@ private final class OverlayWindow: NSWindow {
                 button.highlight(false)
                 pendingManualButton = nil
             }
+        case .keyDown:
+            if let panel = contentView as? ExpandedPanelView,
+               panel.routeKeyDownToComposer(event) {
+                return
+            }
         default:
             break
         }
         super.sendEvent(event)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if let panel = contentView as? ExpandedPanelView,
+           panel.routeKeyDownToComposer(event) {
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
     }
 
     private func applyContentCornerMask() {
@@ -1157,6 +1650,7 @@ private final class ModalBlockerView: NSView {
 private final class HeaderDragView: NSView {
     private var dragStartedInHeader = false
     var onDragStateChanged: ((Bool) -> Void)?
+    var onWindowFrameChanged: ((NSRect) -> Void)?
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
@@ -1184,6 +1678,14 @@ private final class HeaderDragView: NSView {
         dragStartedInHeader = true
         onDragStateChanged?(true)
         window?.makeKey()
+        defer {
+            dragStartedInHeader = false
+            onDragStateChanged?(false)
+        }
+        window?.performDrag(with: event)
+        if let window {
+            onWindowFrameChanged?(window.frame)
+        }
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -1191,7 +1693,6 @@ private final class HeaderDragView: NSView {
             super.mouseDragged(with: event)
             return
         }
-        window?.performDrag(with: event)
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -1223,10 +1724,12 @@ private final class HeaderDragView: NSView {
                 || candidate is NSSlider
                 || candidate is NSScroller
                 || candidate is NSTextView
+                || candidate is ClickableHeaderBadge
             {
                 return true
             }
-            if let textField = candidate as? NSTextField, textField.isEditable {
+            if let textField = candidate as? NSTextField,
+               textField.isEditable || textField.isSelectable {
                 return true
             }
             current = candidate.superview
@@ -1240,12 +1743,42 @@ private final class HeaderShieldView: NSView {
     override var acceptsFirstResponder: Bool { false }
 }
 
+private final class ClickableHeaderBadge: NSTextField {
+    var onClick: (() -> Void)?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, alphaValue > 0.01, bounds.contains(point) else { return nil }
+        return self
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onClick?()
+    }
+}
+
 private final class CopyCardButton: NSButton {
     var copyText = ""
+    var resetWorkItem: DispatchWorkItem?
+}
+
+private final class PasteCardButton: NSButton {
+    var pasteText = ""
+    var resetWorkItem: DispatchWorkItem?
 }
 
 private final class RemoveAttachmentButton: NSButton {
     var contextId = ""
+}
+
+private final class AttachmentOpenButton: NSButton {
+    var filePath: String?
 }
 
 // MARK: - Pill view
@@ -1331,6 +1864,12 @@ private enum PillRunState: Equatable {
     }
 }
 
+private enum PillHealthState: Equatable {
+    case unknown
+    case ready
+    case needsAttention
+}
+
 private final class PillView: NSView {
     var statusText: String = "Bluey" {
         didSet {
@@ -1353,7 +1892,14 @@ private final class PillView: NSView {
         setAccessibilityLabel(statusText)
     }
     func setBalanceLabel(_ label: String) {
-        balanceText = label
+        let clean = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        balanceText = clean
+        let lower = clean.lowercased()
+        if lower.contains("login") || lower.contains("sign in") || lower.contains("low") {
+            setHealthState(.needsAttention)
+        } else if clean.hasPrefix("$") && !lower.contains("--") {
+            setHealthState(.ready)
+        }
     }
     var dotColor: NSColor = NSColor.systemGreen {
         didSet {
@@ -1366,8 +1912,12 @@ private final class PillView: NSView {
     var onRunToggle: (() -> Void)?
     var onAsk: (() -> Void)?
     var onEnd: (() -> Void)?
+    var onMoved: ((NSRect) -> Void)?
     private var runState: PillRunState = .ready
+    private var healthState: PillHealthState = .unknown
     private var mouseDownLocation: NSPoint?
+    private var mouseDownScreenLocation: NSPoint?
+    private var dragStartWindowFrame: NSRect?
     private var didDragFromMouseDown = false
 
     private let logoMark = BlueyLogoView()
@@ -1480,8 +2030,40 @@ private final class PillView: NSView {
 
     func setRunState(_ state: PillRunState) {
         runState = state
-        dotColor = state.dotColor
+        dotColor = resolvedDotColor
         updateRunStateDisplay()
+    }
+
+    func setHealthState(_ state: PillHealthState) {
+        healthState = state
+        dotColor = resolvedDotColor
+        updateRunStateDisplay()
+    }
+
+    private var resolvedDotColor: NSColor {
+        if runState == .failed || healthState == .needsAttention {
+            return BlueyTheme.danger
+        }
+        if runState == .connecting {
+            return BlueyTheme.warning
+        }
+        if runState == .listening || healthState == .ready {
+            return BlueyTheme.green
+        }
+        return BlueyTheme.textDim.withAlphaComponent(0.72)
+    }
+
+    private var resolvedAccessibilityLabel: String {
+        if runState == .failed || healthState == .needsAttention {
+            return "Bluey needs attention"
+        }
+        if runState == .connecting || runState == .listening {
+            return runState.accessibilityLabel
+        }
+        if healthState == .ready {
+            return "Bluey ready"
+        }
+        return "Bluey starting"
     }
 
     private func updateRunStateDisplay() {
@@ -1494,7 +2076,7 @@ private final class PillView: NSView {
         runButton.layer?.shadowRadius = runState == .listening ? 7 : 0
         runButton.layer?.shadowOffset = .zero
         updateRunPulseAnimation()
-        setAccessibilityLabel(runState.accessibilityLabel)
+        setAccessibilityLabel(resolvedAccessibilityLabel)
         needsLayout = true
     }
 
@@ -1567,6 +2149,10 @@ private final class PillView: NSView {
         blueyMaterialAlpha(base, opacity: backgroundOpacity, floor: floor)
     }
 
+    private func lightMaterialAlpha(_ base: CGFloat, floor: CGFloat = 0.24) -> CGFloat {
+        blueyLightMaterialAlpha(base, opacity: backgroundOpacity, floor: floor)
+    }
+
     func applyBackgroundOpacity(_ opacity: Double) {
         backgroundOpacity = min(max(CGFloat(opacity), minimumOverlayBackgroundOpacity), 1.0)
         controlRail.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.040)).cgColor
@@ -1584,70 +2170,71 @@ private final class PillView: NSView {
     @objc private func endClicked() { onEnd?() }
 
     override func draw(_ dirtyRect: NSRect) {
-        NSGraphicsContext.saveGraphicsState()
-
         let outer = bounds.insetBy(dx: 0.85, dy: 0.85)
         let radius = outer.height / 2
-        let path = NSBezierPath(roundedRect: outer, xRadius: radius, yRadius: radius)
-        let shadow = NSShadow()
-        shadow.shadowColor = NSColor.black.withAlphaComponent(materialAlpha(0.34, floor: 0.10))
-        shadow.shadowBlurRadius = 9
-        shadow.shadowOffset = .zero
-        shadow.set()
-
-        let bg = NSGradient(colors: [
-            NSColor(red: 0.007, green: 0.011, blue: 0.017, alpha: materialAlpha(0.98)),
-            NSColor(red: 0.014, green: 0.026, blue: 0.032, alpha: materialAlpha(0.95)),
-            NSColor(red: 0.007, green: 0.010, blue: 0.015, alpha: materialAlpha(0.99)),
-        ])
-        bg?.draw(in: path, angle: -12)
-
-        NSGraphicsContext.restoreGraphicsState()
-
-        NSColor(red: 0.26, green: 0.74, blue: 0.96, alpha: materialAlpha(0.38)).setStroke()
-        path.lineWidth = 1.0
-        path.stroke()
-
-        let inner = outer.insetBy(dx: 1.5, dy: 1.5)
-        let innerPath = NSBezierPath(roundedRect: inner, xRadius: inner.height / 2, yRadius: inner.height / 2)
-        NSColor.white.withAlphaComponent(materialAlpha(0.050)).setStroke()
-        innerPath.lineWidth = 0.7
-        innerPath.stroke()
-
-        let gloss = NSBezierPath(roundedRect: outer.insetBy(dx: 2, dy: 2), xRadius: radius - 2, yRadius: radius - 2)
-        NSGradient(colors: [
-            NSColor.white.withAlphaComponent(materialAlpha(0.08)),
-            NSColor.white.withAlphaComponent(0.00),
-        ])?.draw(in: gloss, angle: 90)
+        drawBlueyGlassPanel(in: outer, radius: radius, opacity: backgroundOpacity)
     }
 
     override func mouseDown(with event: NSEvent) {
         window?.makeKey()
         mouseDownLocation = event.locationInWindow
+        mouseDownScreenLocation = NSEvent.mouseLocation
+        dragStartWindowFrame = window?.frame
         didDragFromMouseDown = false
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard let start = mouseDownLocation else {
+        guard
+            mouseDownLocation != nil,
+            let startScreen = mouseDownScreenLocation,
+            let startFrame = dragStartWindowFrame,
+            let window
+        else {
             super.mouseDragged(with: event)
             return
         }
-        let dx = event.locationInWindow.x - start.x
-        let dy = event.locationInWindow.y - start.y
-        guard abs(dx) > 4 || abs(dy) > 4 else { return }
+
+        let currentScreen = NSEvent.mouseLocation
+        let dx = currentScreen.x - startScreen.x
+        let dy = currentScreen.y - startScreen.y
+        guard didDragFromMouseDown || abs(dx) > 4 || abs(dy) > 4 else { return }
+
         didDragFromMouseDown = true
-        mouseDownLocation = nil
-        window?.performDrag(with: event)
+        var nextFrame = startFrame
+        nextFrame.origin.x += dx
+        nextFrame.origin.y += dy
+        nextFrame = clampedPillDragFrame(nextFrame)
+        window.setFrame(nextFrame, display: true)
     }
 
     override func mouseUp(with event: NSEvent) {
+        let dragged = didDragFromMouseDown
+        if dragged, let window {
+            onMoved?(window.frame)
+        }
         defer {
             mouseDownLocation = nil
+            mouseDownScreenLocation = nil
+            dragStartWindowFrame = nil
             didDragFromMouseDown = false
         }
-        if !didDragFromMouseDown {
+        if !dragged {
             onClick?()
         }
+    }
+
+    private func clampedPillDragFrame(_ frame: NSRect) -> NSRect {
+        let visibleFrame = OverlayScreenPlacement.activeVisibleFrame()
+        let inset: CGFloat = 8
+        var clamped = frame
+        clamped.size = PillMetrics.size
+        clamped.origin.x = min(
+            max(visibleFrame.minX + inset, clamped.origin.x),
+            visibleFrame.maxX - clamped.size.width - inset)
+        clamped.origin.y = min(
+            max(visibleFrame.minY + inset, clamped.origin.y),
+            visibleFrame.maxY - clamped.size.height - inset)
+        return clamped
     }
 }
 
@@ -1661,6 +2248,7 @@ private struct RenderedCard {
     var done: Bool
     var costLabel: String?
     var artifact: OverlayArtifact?
+    var attachments: [OverlayContextItem]
 }
 
 private enum CanvasKind: Equatable {
@@ -1702,7 +2290,7 @@ private enum CanvasKind: Equatable {
 
     var subtitle: String {
         switch self {
-        case .code: return "Code, tests, complexity"
+        case .code: return "Code and complexity"
         case .systemDesign: return "Architecture, tradeoffs, scale"
         case .screen: return "Screen context and answer"
         case .document: return "Attached context notes"
@@ -1742,8 +2330,35 @@ private final class FeedView: NSView {
     private let emptyState = NSView()
     private var userScrolledAwayFromLatest = false
     private let autoScrollTolerance: CGFloat = 44
+    private var lightThemeEnabled = false
+    private var currentOpacity: CGFloat = 0.94
     var onTranscript: ((RenderedCard) -> Void)?
     var onOpenURL: ((URL) -> Void)?
+    var onPasteText: ((String) -> Void)?
+
+    private var panelColor: NSColor {
+        lightThemeEnabled
+            ? BlueyLightTheme.content
+            : BlueyTheme.panel
+    }
+
+    private var surfaceColor: NSColor {
+        lightThemeEnabled
+            ? BlueyLightTheme.surface
+            : BlueyTheme.surface
+    }
+
+    private var textColor: NSColor {
+        lightThemeEnabled
+            ? BlueyLightTheme.text
+            : BlueyTheme.text
+    }
+
+    private var dimTextColor: NSColor {
+        lightThemeEnabled
+            ? BlueyLightTheme.textDim
+            : BlueyTheme.textDim
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -1801,7 +2416,45 @@ private final class FeedView: NSView {
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
+    override func draw(_ dirtyRect: NSRect) {
+        let rect = bounds.insetBy(dx: 0.5, dy: 0.5)
+        let path = NSBezierPath(roundedRect: rect, xRadius: 16, yRadius: 16)
+
+        guard lightThemeEnabled else {
+            BlueyTheme.panel
+                .withAlphaComponent(blueyMaterialAlpha(0.95, opacity: currentOpacity))
+                .setFill()
+            path.fill()
+            BlueyTheme.hairline.setStroke()
+            path.lineWidth = 0.8
+            path.stroke()
+            return
+        }
+
+        let alpha = blueyLightMaterialAlpha(0.98, opacity: currentOpacity, floor: 0.16)
+        NSGraphicsContext.saveGraphicsState()
+        path.addClip()
+        NSGradient(colors: [
+            BlueyLightTheme.contentHigh.withAlphaComponent(alpha),
+            BlueyLightTheme.content.withAlphaComponent(alpha),
+            BlueyLightTheme.contentLow.withAlphaComponent(alpha),
+        ])?.draw(in: path, angle: 88)
+        NSGraphicsContext.restoreGraphicsState()
+
+        BlueyLightTheme.border.withAlphaComponent(0.62).setStroke()
+        path.lineWidth = 0.8
+        path.stroke()
+
+        let highlight = NSBezierPath(roundedRect: rect.insetBy(dx: 1.2, dy: 1.2), xRadius: 14.8, yRadius: 14.8)
+        NSColor.white.withAlphaComponent(blueyLightMaterialAlpha(0.16, opacity: currentOpacity, floor: 0.025)).setStroke()
+        highlight.lineWidth = 0.8
+        highlight.stroke()
+    }
+
     func push(_ card: RenderedCard) {
+        var card = card
+        card.body = sanitizeOverlayOutput(kind: card.kind, body: card.body)
+        card.artifact = sanitizeOverlayArtifact(card.artifact)
         if normalizedCardKind(card.kind) == "transcript" {
             onTranscript?(card)
             emitCardRendered(id: card.id)
@@ -1830,7 +2483,8 @@ private final class FeedView: NSView {
             body: cleanBody,
             done: true,
             costLabel: nil,
-            artifact: nil)
+            artifact: nil,
+            attachments: [])
         pushTranscriptCard(card)
     }
 
@@ -1838,13 +2492,13 @@ private final class FeedView: NSView {
     func update(id: String, body: String, done: Bool, costLabel: String?, artifact: OverlayArtifact?) -> RenderedCard? {
         guard let idx = cards.firstIndex(where: { $0.id == id }) else { return nil }
         let shouldAutoScroll = shouldFollowIncomingContent()
-        cards[idx].body = body
+        cards[idx].body = sanitizeOverlayOutput(kind: cards[idx].kind, body: body)
         cards[idx].done = done
         if let costLabel {
             cards[idx].costLabel = costLabel
         }
-        if let artifact {
-            cards[idx].artifact = artifact
+        if artifact != nil {
+            cards[idx].artifact = sanitizeOverlayArtifact(artifact)
         }
         replaceCardView(at: idx)
         scrollToBottomIfNeeded(shouldAutoScroll)
@@ -1859,6 +2513,18 @@ private final class FeedView: NSView {
     func forwardScrollWheel(_ event: NSEvent) {
         scroll.scrollWheel(with: event)
         updateScrollPinAfterUserInput()
+    }
+
+    func latestCopyableCardText() -> String? {
+        for card in cards.reversed() {
+            let kind = normalizedCardKind(card.kind)
+            guard kind == "answer" || kind == "context" || kind == "warning" else { continue }
+            let text = chatBody(for: card, rawBody: card.body)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty, text != "Thinking..." else { continue }
+            return text
+        }
+        return nil
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -1883,7 +2549,7 @@ private final class FeedView: NSView {
 
         var hit: NSView? = hitTest(localPoint)
         while let view = hit {
-            if view is CopyCardButton {
+            if view is CopyCardButton || view is PasteCardButton {
                 return true
             }
             hit = view.superview
@@ -1901,10 +2567,47 @@ private final class FeedView: NSView {
         return nil
     }
 
+    var hasVisibleCards: Bool {
+        !cards.isEmpty
+    }
+
+    func setLightTheme(_ enabled: Bool, opacity: CGFloat) {
+        let changed = lightThemeEnabled != enabled
+        lightThemeEnabled = enabled
+        applyBackgroundOpacity(opacity)
+        refreshEmptyStateTheme()
+        needsDisplay = true
+        scroll.needsDisplay = true
+        scroll.contentView.needsDisplay = true
+        emptyState.needsDisplay = true
+        guard changed else { return }
+        let shouldAutoScroll = shouldFollowIncomingContent()
+        for view in stack.arrangedSubviews {
+            stack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        for card in cards {
+            let view = makeCardView(card)
+            stack.addArrangedSubview(view)
+            view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+        scrollToBottomIfNeeded(shouldAutoScroll)
+    }
+
     func applyBackgroundOpacity(_ opacity: CGFloat) {
-        layer?.backgroundColor = BlueyTheme.panel
+        currentOpacity = opacity
+        if lightThemeEnabled {
+            layer?.backgroundColor = NSColor.clear.cgColor
+            layer?.borderColor = BlueyLightTheme.border.cgColor
+            needsDisplay = true
+            return
+        }
+        layer?.contents = nil
+        layer?.backgroundColor = panelColor
             .withAlphaComponent(blueyMaterialAlpha(0.95, opacity: opacity))
             .cgColor
+        layer?.borderColor = BlueyTheme.hairline.cgColor
+        needsDisplay = true
     }
 
     private func removeAllCards() {
@@ -1927,7 +2630,8 @@ private final class FeedView: NSView {
             body: cleanBody,
             done: input.done,
             costLabel: input.costLabel,
-            artifact: input.artifact)
+            artifact: input.artifact,
+            attachments: input.attachments)
 
         emptyState.isHidden = true
         let shouldAutoScroll = shouldFollowIncomingContent()
@@ -2016,18 +2720,13 @@ private final class FeedView: NSView {
         emptyState.layer?.backgroundColor = NSColor.clear.cgColor
         addSubview(emptyState)
 
-        let badge = NSTextField(labelWithString: "READY")
-        badge.translatesAutoresizingMaskIntoConstraints = false
-        badge.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .bold)
-        badge.textColor = BlueyTheme.cyan
-
-        let title = NSTextField(labelWithString: "Ready")
+        let title = NSTextField(labelWithString: "Ready when you are")
         title.translatesAutoresizingMaskIntoConstraints = false
-        title.font = NSFont.systemFont(ofSize: 18, weight: .bold)
+        title.font = NSFont.systemFont(ofSize: 19, weight: .bold)
         title.textColor = BlueyTheme.text
         title.alignment = .center
 
-        let subtitle = NSTextField(labelWithString: "Ask anything. Attach documents or analyse the screen when context helps.")
+        let subtitle = NSTextField(labelWithString: "Ask a question, attach what you have, or capture the screen.")
         subtitle.translatesAutoresizingMaskIntoConstraints = false
         subtitle.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
         subtitle.textColor = BlueyTheme.textDim
@@ -2043,19 +2742,18 @@ private final class FeedView: NSView {
         dropTarget.layer?.borderWidth = 1
         dropTarget.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.24).cgColor
 
-        let dropTitle = NSTextField(labelWithString: "Drop documents here")
+        let dropTitle = NSTextField(labelWithString: "Drop files for this conversation")
         dropTitle.translatesAutoresizingMaskIntoConstraints = false
         dropTitle.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
         dropTitle.textColor = BlueyTheme.text
         dropTitle.alignment = .center
 
-        let dropHint = NSTextField(labelWithString: "PDF, DOCX, TXT, MD, code")
+        let dropHint = NSTextField(labelWithString: "Docs, images, code, notes")
         dropHint.translatesAutoresizingMaskIntoConstraints = false
         dropHint.font = NSFont.systemFont(ofSize: 10, weight: .medium)
         dropHint.textColor = BlueyTheme.textDim
         dropHint.alignment = .center
 
-        emptyState.addSubview(badge)
         emptyState.addSubview(title)
         emptyState.addSubview(subtitle)
         emptyState.addSubview(dropTarget)
@@ -2067,10 +2765,7 @@ private final class FeedView: NSView {
             emptyState.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -12),
             emptyState.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.76),
 
-            badge.topAnchor.constraint(equalTo: emptyState.topAnchor),
-            badge.centerXAnchor.constraint(equalTo: emptyState.centerXAnchor),
-
-            title.topAnchor.constraint(equalTo: badge.bottomAnchor, constant: 7),
+            title.topAnchor.constraint(equalTo: emptyState.topAnchor),
             title.leadingAnchor.constraint(equalTo: emptyState.leadingAnchor),
             title.trailingAnchor.constraint(equalTo: emptyState.trailingAnchor),
 
@@ -2093,6 +2788,36 @@ private final class FeedView: NSView {
             dropHint.leadingAnchor.constraint(equalTo: dropTarget.leadingAnchor, constant: 18),
             dropHint.trailingAnchor.constraint(equalTo: dropTarget.trailingAnchor, constant: -18),
         ])
+        refreshEmptyStateTheme()
+    }
+
+    private func refreshEmptyStateTheme() {
+        func visit(_ view: NSView) {
+            if let label = view as? NSTextField {
+                let size = label.font?.pointSize ?? 0
+                label.textColor = size >= 12 ? textColor : dimTextColor
+            } else if view !== emptyState, view.subviews.contains(where: { $0 is NSTextField }) {
+                view.wantsLayer = true
+                if lightThemeEnabled {
+                    view.layer?.backgroundColor = BlueyLightTheme.surfaceRaised
+                        .withAlphaComponent(blueyLightMaterialAlpha(0.92, opacity: currentOpacity, floor: 0.18))
+                        .cgColor
+                    view.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.28).cgColor
+                    view.layer?.shadowColor = NSColor.black.cgColor
+                    view.layer?.shadowOpacity = 0.12
+                    view.layer?.shadowRadius = 16
+                    view.layer?.shadowOffset = NSSize(width: 0, height: -5)
+                } else {
+                    view.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.035).cgColor
+                    view.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.24).cgColor
+                    view.layer?.shadowOpacity = 0
+                }
+            }
+            for child in view.subviews {
+                visit(child)
+            }
+        }
+        visit(emptyState)
     }
 
     private func makeCardView(_ card: RenderedCard) -> NSView {
@@ -2106,17 +2831,21 @@ private final class FeedView: NSView {
 
         let bubble = NSView()
         bubble.wantsLayer = true
-        bubble.layer?.backgroundColor = rightAligned
-            ? NSColor(red: 0.90, green: 0.93, blue: 0.95, alpha: 0.96).cgColor
-            : (answerLike ? NSColor.clear : BlueyTheme.surface).cgColor
+        if rightAligned {
+            bubble.layer?.backgroundColor = (lightThemeEnabled
+                ? BlueyLightTheme.surfaceRaised.withAlphaComponent(blueyLightMaterialAlpha(0.90, opacity: currentOpacity, floor: 0.20))
+                : NSColor(red: 0.90, green: 0.93, blue: 0.95, alpha: 0.96)).cgColor
+        } else {
+            bubble.layer?.backgroundColor = (answerLike ? NSColor.clear : surfaceColor).cgColor
+        }
         bubble.layer?.cornerRadius = rightAligned ? 16 : 12
         bubble.layer?.borderWidth = answerLike ? 0 : 1
         bubble.layer?.borderColor = rightAligned
-            ? NSColor.white.withAlphaComponent(0.20).cgColor
+            ? (lightThemeEnabled ? BlueyLightTheme.border : NSColor.white.withAlphaComponent(0.20)).cgColor
             : accent.withAlphaComponent(answerLike ? 0.24 : 0.14).cgColor
         bubble.layer?.shadowColor = NSColor.black.cgColor
-        bubble.layer?.shadowOpacity = answerLike ? 0 : 0.14
-        bubble.layer?.shadowRadius = 10
+        bubble.layer?.shadowOpacity = answerLike ? 0 : (lightThemeEnabled ? 0.07 : 0.14)
+        bubble.layer?.shadowRadius = lightThemeEnabled ? 8 : 10
         bubble.layer?.shadowOffset = NSSize(width: 0, height: -4)
         bubble.translatesAutoresizingMaskIntoConstraints = false
 
@@ -2128,7 +2857,7 @@ private final class FeedView: NSView {
         let titleText = displayTitle(for: card)
         let titleLabel = NSTextField(labelWithString: titleText)
         titleLabel.font = NSFont.systemFont(ofSize: 12.5, weight: .semibold)
-        titleLabel.textColor = rightAligned ? NSColor.black.withAlphaComponent(0.74) : BlueyTheme.text
+        titleLabel.textColor = rightAligned ? NSColor.black.withAlphaComponent(0.74) : textColor
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
         titleLabel.lineBreakMode = .byTruncatingTail
 
@@ -2139,20 +2868,25 @@ private final class FeedView: NSView {
             : signInBody(from: rawBody)
         let bodyLabel = NSTextField(wrappingLabelWithString: bodyText)
         bodyLabel.font = bodyFont(for: card)
-        bodyLabel.textColor = rightAligned ? NSColor.black : BlueyTheme.text
+        bodyLabel.textColor = rightAligned ? NSColor.black : textColor
         bodyLabel.alignment = signInURL == nil ? .left : .center
         bodyLabel.translatesAutoresizingMaskIntoConstraints = false
         bodyLabel.preferredMaxLayoutWidth = signInURL == nil ? (rightAligned ? 360 : 480) : 430
+        bodyLabel.isSelectable = signInURL == nil
+        bodyLabel.allowsEditingTextAttributes = false
         if let attributedBody = attributedChatBody(for: card, text: bodyText, rightAligned: rightAligned) {
             bodyLabel.attributedStringValue = attributedBody
         }
 
         let statusLabel = NSTextField(labelWithString: statusText(for: card))
         statusLabel.font = NSFont.monospacedSystemFont(ofSize: 9.5, weight: .semibold)
-        statusLabel.textColor = rightAligned ? NSColor.black.withAlphaComponent(0.46) : BlueyTheme.textDim
+        statusLabel.textColor = rightAligned ? NSColor.black.withAlphaComponent(0.46) : dimTextColor
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         let copyButton = shouldShowCopyButton(for: card, rightAligned: rightAligned, signInURL: signInURL)
             ? makeCopyCardButton(text: rawBody.isEmpty ? bodyText : rawBody, rightAligned: rightAligned)
+            : nil
+        let pasteButton = shouldShowPasteButton(for: card, rightAligned: rightAligned, signInURL: signInURL)
+            ? makePasteCardButton(text: bodyText, rightAligned: rightAligned)
             : nil
 
         let signInButton: NSButton? = signInURL.map { url in
@@ -2172,14 +2906,23 @@ private final class FeedView: NSView {
             titleLabel.alignment = .center
             bodyLabel.preferredMaxLayoutWidth = 360
         }
+        let sentAttachmentStrip = (!signInLike && rightAligned && !card.attachments.isEmpty)
+            ? makeSentAttachmentStrip(card.attachments)
+            : nil
 
         row.addSubview(bubble)
         bubble.addSubview(metaLabel)
         bubble.addSubview(titleLabel)
         bubble.addSubview(bodyLabel)
         bubble.addSubview(statusLabel)
+        if let sentAttachmentStrip {
+            bubble.addSubview(sentAttachmentStrip)
+        }
         if let copyButton {
             bubble.addSubview(copyButton)
+        }
+        if let pasteButton {
+            bubble.addSubview(pasteButton)
         }
         if let signInButton {
             bubble.addSubview(signInButton)
@@ -2233,13 +2976,34 @@ private final class FeedView: NSView {
                 bodyLabel.leadingAnchor.constraint(equalTo: metaLabel.leadingAnchor),
                 bodyLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
             ])
-            if let copyButton {
+            if let copyButton, let pasteButton {
+                constraints.append(contentsOf: [
+                    statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: copyButton.leadingAnchor, constant: -6),
+                    copyButton.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
+                    copyButton.trailingAnchor.constraint(equalTo: pasteButton.leadingAnchor, constant: -6),
+                    copyButton.widthAnchor.constraint(equalToConstant: 22),
+                    copyButton.heightAnchor.constraint(equalToConstant: 22),
+
+                    pasteButton.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
+                    pasteButton.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -10),
+                    pasteButton.widthAnchor.constraint(equalToConstant: 24),
+                    pasteButton.heightAnchor.constraint(equalToConstant: 22),
+                ])
+            } else if let copyButton {
                 constraints.append(contentsOf: [
                     statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: copyButton.leadingAnchor, constant: -6),
                     copyButton.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
                     copyButton.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -10),
                     copyButton.widthAnchor.constraint(equalToConstant: 22),
                     copyButton.heightAnchor.constraint(equalToConstant: 22),
+                ])
+            } else if let pasteButton {
+                constraints.append(contentsOf: [
+                    statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: pasteButton.leadingAnchor, constant: -6),
+                    pasteButton.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
+                    pasteButton.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -10),
+                    pasteButton.widthAnchor.constraint(equalToConstant: 24),
+                    pasteButton.heightAnchor.constraint(equalToConstant: 22),
                 ])
             } else {
                 constraints.append(statusLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14))
@@ -2253,11 +3017,167 @@ private final class FeedView: NSView {
                 signInButton.widthAnchor.constraint(equalToConstant: 150),
                 signInButton.heightAnchor.constraint(equalToConstant: 38),
             ])
+        } else if let sentAttachmentStrip {
+            constraints.append(contentsOf: [
+                bodyLabel.bottomAnchor.constraint(equalTo: sentAttachmentStrip.topAnchor, constant: -8),
+                sentAttachmentStrip.leadingAnchor.constraint(equalTo: bodyLabel.leadingAnchor),
+                sentAttachmentStrip.trailingAnchor.constraint(equalTo: bodyLabel.trailingAnchor),
+                sentAttachmentStrip.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -12),
+                sentAttachmentStrip.heightAnchor.constraint(equalToConstant: 32),
+            ])
         } else {
             constraints.append(bodyLabel.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -12))
         }
         NSLayoutConstraint.activate(constraints)
         return row
+    }
+
+    private func makeSentAttachmentStrip(_ items: [OverlayContextItem]) -> NSScrollView {
+        let scroll = NSScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.drawsBackground = false
+        scroll.borderType = .noBorder
+        scroll.hasVerticalScroller = false
+        scroll.hasHorizontalScroller = true
+        scroll.autohidesScrollers = false
+        scroll.scrollerStyle = .overlay
+        scroll.horizontalScrollElasticity = .allowed
+        scroll.usesPredominantAxisScrolling = false
+
+        let stack = NSStackView()
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 6
+        stack.edgeInsets = NSEdgeInsets(top: 1, left: 0, bottom: 1, right: 0)
+        for item in items {
+            stack.addArrangedSubview(makeSentAttachmentChip(item))
+        }
+
+        scroll.documentView = stack
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            stack.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: scroll.contentView.bottomAnchor),
+            stack.heightAnchor.constraint(equalTo: scroll.contentView.heightAnchor),
+            stack.trailingAnchor.constraint(greaterThanOrEqualTo: scroll.contentView.trailingAnchor),
+        ])
+        return scroll
+    }
+
+    private func makeSentAttachmentChip(_ item: OverlayContextItem) -> NSView {
+        let isImage = feedAttachmentIsImage(item.kind)
+        let chip = NSView()
+        chip.translatesAutoresizingMaskIntoConstraints = false
+        chip.wantsLayer = true
+        chip.layer?.backgroundColor = isImage
+            ? NSColor(red: 0.78, green: 0.90, blue: 0.98, alpha: 0.34).cgColor
+            : NSColor.black.withAlphaComponent(0.045).cgColor
+        chip.layer?.cornerRadius = 12
+        chip.layer?.borderWidth = 1
+        chip.layer?.borderColor = isImage
+            ? BlueyTheme.cyan.withAlphaComponent(0.34).cgColor
+            : NSColor.black.withAlphaComponent(0.10).cgColor
+        let titleText = item.title.isEmpty ? (isImage ? "Screen" : "Attached file") : item.title
+        chip.toolTip = (["Sent with this question", titleText, item.kind.uppercased(), item.path]
+            .compactMap { value -> String? in
+                guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                    return nil
+                }
+                return value
+            }
+            .joined(separator: "\n"))
+
+        let icon = NSImageView()
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        icon.imageScaling = isImage ? .scaleProportionallyUpOrDown : .scaleProportionallyDown
+        icon.wantsLayer = true
+        icon.layer?.cornerRadius = isImage ? 5 : 0
+        icon.layer?.masksToBounds = isImage
+        icon.layer?.borderWidth = isImage ? 1 : 0
+        icon.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.20).cgColor
+        if isImage, let path = item.path, let image = NSImage(contentsOfFile: path) {
+            image.isTemplate = false
+            icon.image = image
+            icon.contentTintColor = nil
+        } else if let image = symbolImage(feedAttachmentSymbol(for: item.kind)) {
+            image.isTemplate = true
+            icon.image = image
+            icon.contentTintColor = feedAttachmentAccent(for: item.kind)
+        }
+
+        let title = NSTextField(labelWithString: titleText)
+        title.translatesAutoresizingMaskIntoConstraints = false
+        title.font = NSFont.systemFont(ofSize: 10.5, weight: .semibold)
+        title.textColor = NSColor.black.withAlphaComponent(0.72)
+        title.lineBreakMode = .byTruncatingMiddle
+        title.maximumNumberOfLines = 1
+        title.toolTip = chip.toolTip
+
+        let open = AttachmentOpenButton(title: "", target: self, action: #selector(openSentAttachmentClicked(_:)))
+        open.translatesAutoresizingMaskIntoConstraints = false
+        open.filePath = item.path
+        open.isBordered = false
+        open.toolTip = item.path == nil ? chip.toolTip : "Open \(titleText)"
+
+        chip.addSubview(icon)
+        chip.addSubview(title)
+        chip.addSubview(open)
+        NSLayoutConstraint.activate([
+            chip.heightAnchor.constraint(equalToConstant: 28),
+            chip.widthAnchor.constraint(greaterThanOrEqualToConstant: isImage ? 104 : 96),
+            chip.widthAnchor.constraint(lessThanOrEqualToConstant: isImage ? 170 : 184),
+
+            icon.leadingAnchor.constraint(equalTo: chip.leadingAnchor, constant: 7),
+            icon.centerYAnchor.constraint(equalTo: chip.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: isImage ? 22 : 14),
+            icon.heightAnchor.constraint(equalToConstant: isImage ? 22 : 14),
+
+            title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: isImage ? 6 : 5),
+            title.centerYAnchor.constraint(equalTo: chip.centerYAnchor),
+            title.trailingAnchor.constraint(equalTo: chip.trailingAnchor, constant: -9),
+
+            open.topAnchor.constraint(equalTo: chip.topAnchor),
+            open.leadingAnchor.constraint(equalTo: chip.leadingAnchor),
+            open.bottomAnchor.constraint(equalTo: chip.bottomAnchor),
+            open.trailingAnchor.constraint(equalTo: chip.trailingAnchor),
+        ])
+        return chip
+    }
+
+    @objc private func openSentAttachmentClicked(_ sender: AttachmentOpenButton) {
+        guard let path = sender.filePath?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !path.isEmpty else { return }
+        onOpenURL?(URL(fileURLWithPath: path))
+    }
+
+    private func feedAttachmentSymbol(for kind: String) -> String {
+        switch kind {
+        case "image", "diagram", "screen", "screenshot": return "photo"
+        case "code": return "curlybraces"
+        case "text": return "doc.plaintext"
+        case "document": return "doc.text"
+        default: return "doc"
+        }
+    }
+
+    private func feedAttachmentIsImage(_ kind: String) -> Bool {
+        kind == "image" || kind == "diagram" || kind == "screen" || kind == "screenshot"
+    }
+
+    private func feedAttachmentAccent(for kind: String) -> NSColor {
+        switch kind {
+        case "image", "diagram", "screen", "screenshot":
+            return NSColor(red: 0.58, green: 0.74, blue: 1.0, alpha: 1.0)
+        case "code":
+            return NSColor(red: 0.58, green: 1.0, blue: 0.74, alpha: 1.0)
+        case "text":
+            return NSColor(red: 1.0, green: 0.82, blue: 0.42, alpha: 1.0)
+        case "document":
+            return NSColor(red: 1.0, green: 0.43, blue: 0.34, alpha: 1.0)
+        default:
+            return BlueyTheme.cyan
+        }
     }
 
     private func makeCopyCardButton(text: String, rightAligned: Bool) -> CopyCardButton {
@@ -2289,10 +3209,48 @@ private final class FeedView: NSView {
         return button
     }
 
+    private func makePasteCardButton(text: String, rightAligned: Bool) -> PasteCardButton {
+        let button = PasteCardButton(title: "", target: self, action: #selector(pasteCardClicked(_:)))
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.pasteText = text
+        button.isBordered = false
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 10
+        button.layer?.backgroundColor = rightAligned
+            ? NSColor.black.withAlphaComponent(0.06).cgColor
+            : BlueyTheme.cyan.withAlphaComponent(0.08).cgColor
+        button.layer?.borderWidth = 1
+        button.layer?.borderColor = rightAligned
+            ? NSColor.black.withAlphaComponent(0.10).cgColor
+            : BlueyTheme.cyan.withAlphaComponent(0.22).cgColor
+        button.contentTintColor = rightAligned
+            ? NSColor.black.withAlphaComponent(0.58)
+            : BlueyTheme.cyan.withAlphaComponent(0.92)
+        if let image = symbolImage("arrow.down.doc") {
+            image.isTemplate = true
+            button.image = image
+            button.imagePosition = .imageOnly
+            button.imageScaling = .scaleProportionallyDown
+        } else {
+            button.title = "P"
+        }
+        button.toolTip = "Paste this answer into the app behind Bluey"
+        return button
+    }
+
     private func shouldShowCopyButton(for card: RenderedCard, rightAligned: Bool, signInURL: URL?) -> Bool {
-        guard signInURL == nil, !rightAligned, let artifact = card.artifact else { return false }
-        let type = artifact.artifactType.lowercased()
-        return type == "code" || type == "system_design"
+        guard signInURL == nil, !rightAligned else { return false }
+        let body = card.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty, body != "Thinking..." else { return false }
+        let kind = normalizedCardKind(card.kind)
+        return kind == "answer" || kind == "context" || kind == "warning" || card.artifact != nil
+    }
+
+    private func shouldShowPasteButton(for card: RenderedCard, rightAligned: Bool, signInURL: URL?) -> Bool {
+        guard signInURL == nil, !rightAligned else { return false }
+        let body = card.body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty, body != "Thinking..." else { return false }
+        return normalizedCardKind(card.kind) == "answer"
     }
 
     @objc private func copyCardClicked(_ sender: CopyCardButton) {
@@ -2300,6 +3258,72 @@ private final class FeedView: NSView {
         guard !text.isEmpty else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+        flashCopySuccess(sender)
+    }
+
+    @objc private func pasteCardClicked(_ sender: PasteCardButton) {
+        let text = sender.pasteText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, text != "Thinking..." else { return }
+        onPasteText?(text)
+        flashPasteSuccess(sender)
+    }
+
+    private func flashCopySuccess(_ button: CopyCardButton) {
+        button.resetWorkItem?.cancel()
+        let originalImage = button.image
+        let originalTitle = button.title
+        let originalTint = button.contentTintColor
+        if let image = symbolImage("checkmark") {
+            image.isTemplate = true
+            button.image = image
+            button.imagePosition = .imageOnly
+            button.title = ""
+        } else {
+            button.image = nil
+            button.title = "✓"
+        }
+        button.contentTintColor = BlueyTheme.green
+        button.toolTip = "Copied"
+
+        let reset = DispatchWorkItem { [weak button] in
+            guard let button else { return }
+            button.image = originalImage
+            button.title = originalTitle
+            button.contentTintColor = originalTint
+            button.toolTip = "Copy this message"
+            button.resetWorkItem = nil
+        }
+        button.resetWorkItem = reset
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.1, execute: reset)
+    }
+
+    private func flashPasteSuccess(_ button: PasteCardButton) {
+        button.resetWorkItem?.cancel()
+        let originalImage = button.image
+        let originalTitle = button.title
+        let originalTint = button.contentTintColor
+        if let image = symbolImage("checkmark") {
+            image.isTemplate = true
+            button.image = image
+            button.imagePosition = .imageOnly
+            button.title = ""
+        } else {
+            button.image = nil
+            button.title = "OK"
+        }
+        button.contentTintColor = BlueyTheme.green
+        button.toolTip = "Sent to app"
+
+        let reset = DispatchWorkItem { [weak button] in
+            guard let button else { return }
+            button.image = originalImage
+            button.title = originalTitle
+            button.contentTintColor = originalTint
+            button.toolTip = "Paste this answer into the app behind Bluey"
+            button.resetWorkItem = nil
+        }
+        button.resetWorkItem = reset
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.1, execute: reset)
     }
 
     private func styleSignInButton(_ button: NSButton) {
@@ -2389,7 +3413,7 @@ private final class FeedView: NSView {
             string: text,
             attributes: [
                 .font: font,
-                .foregroundColor: rightAligned ? NSColor.black : BlueyTheme.text,
+                .foregroundColor: rightAligned ? NSColor.black : textColor,
             ])
         let sourceFont = NSFont.systemFont(ofSize: font.pointSize, weight: .bold)
         let sourceColor = sourceMarkerColor(rightAligned: rightAligned)
@@ -2417,7 +3441,11 @@ private final class FeedView: NSView {
     }
 
     private func chatBody(for card: RenderedCard, rawBody: String) -> String {
-        guard normalizedCardKind(card.kind) == "answer" else { return rawBody }
+        let kind = normalizedCardKind(card.kind)
+        if kind == "question", !card.attachments.isEmpty {
+            return stripVisibleAttachmentFallback(from: rawBody)
+        }
+        guard kind == "answer" else { return rawBody }
 
         if let artifact = card.artifact {
             let base: String
@@ -2436,47 +3464,45 @@ private final class FeedView: NSView {
             let notes = stripFencedCode(from: rawBody)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if notes.isEmpty {
-                return "Code is in the canvas."
+                return ""
             }
             return canvasBackedChatBody(
                 from: notes,
-                fallback: "Code is in the canvas.",
-                suffix: "Code is in the canvas.")
-        }
-
-        if rawBody.count > 1_100 && hasStructuredShape(rawBody) {
-            return canvasBackedChatBody(
-                from: rawBody,
-                fallback: "Details are in the canvas.",
-                suffix: "Details are in the canvas.")
+                fallback: "",
+                suffix: "")
         }
 
         return rawBody
     }
 
+    private func stripVisibleAttachmentFallback(from text: String) -> String {
+        let marker = "\n\nAttached to this answer:"
+        if let range = text.range(of: marker) {
+            return text[..<range.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return text
+    }
+
     private func canvasBackedChatBody(from text: String, fallback: String, suffix: String) -> String {
-        let summary = conciseChatSummary(from: text)
-        if summary.isEmpty {
+        let body = cleanedCanvasChatBody(from: text)
+        if body.isEmpty {
             return fallback
         }
-        if summary == suffix || summary.hasSuffix(suffix) {
-            return summary
-        }
-        return summary + "\n\n" + suffix
+        return body
     }
 
     private func artifactFallbackLine(for artifactType: String) -> String {
         switch artifactType {
         case "code":
-            return "Code is in the canvas."
+            return ""
         case "system_design":
-            return "Architecture is in the canvas."
+            return ""
         case "screen":
-            return "Screen details are in the canvas."
+            return ""
         case "document":
-            return "Document details are in the canvas."
+            return ""
         default:
-            return "Details are in the canvas."
+            return ""
         }
     }
 
@@ -2484,8 +3510,8 @@ private final class FeedView: NSView {
         artifactFallbackLine(for: artifactType)
     }
 
-    private func conciseChatSummary(from text: String) -> String {
-        let cleaned = stripFencedCode(from: text)
+    private func cleanedCanvasChatBody(from text: String) -> String {
+        stripFencedCode(from: text)
             .components(separatedBy: .newlines)
             .map { line -> String in
                 let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2498,29 +3524,8 @@ private final class FeedView: NSView {
                 return trimmed
             }
             .filter { !$0.isEmpty }
-
-        var kept: [String] = []
-        var total = 0
-        for line in cleaned {
-            if kept.count >= 5 { break }
-            let nextTotal = total + line.count + (kept.isEmpty ? 0 : 1)
-            if nextTotal > 520 {
-                let room = max(0, 520 - total - (kept.isEmpty ? 0 : 1))
-                if room > 32 {
-                    kept.append(trimLine(line, to: room))
-                }
-                break
-            }
-            kept.append(line)
-            total = nextTotal
-        }
-        return kept.joined(separator: "\n")
-    }
-
-    private func trimLine(_ line: String, to limit: Int) -> String {
-        guard line.count > limit, limit > 3 else { return line }
-        let index = line.index(line.startIndex, offsetBy: max(0, limit - 3))
-        return String(line[..<index]).trimmingCharacters(in: .whitespacesAndNewlines) + "..."
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func stripFencedCode(from text: String) -> String {
@@ -2906,6 +3911,31 @@ private final class CanvasPaneView: NSView {
         guard !text.isEmpty else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
+        flashCanvasCopySuccess()
+    }
+
+    private func flashCanvasCopySuccess() {
+        let originalImage = copyButton.image
+        let originalTitle = copyButton.title
+        let originalTint = copyButton.contentTintColor
+        if let image = symbolImage("checkmark") {
+            image.isTemplate = true
+            copyButton.image = image
+            copyButton.imagePosition = .imageOnly
+            copyButton.title = ""
+        } else {
+            copyButton.image = nil
+            copyButton.title = "✓"
+        }
+        copyButton.contentTintColor = BlueyTheme.green
+        copyButton.toolTip = "Copied"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.1) { [weak self] in
+            guard let self else { return }
+            self.copyButton.image = originalImage
+            self.copyButton.title = originalTitle
+            self.copyButton.contentTintColor = originalTint
+            self.copyButton.toolTip = "Copy canvas"
+        }
     }
 
     @objc private func fullWindowClicked() {
@@ -2929,6 +3959,50 @@ private final class CanvasPaneView: NSView {
 
 private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    private enum AutoSendStopMode: Int, CaseIterable {
+        case off = 0
+        case mic = 1
+        case system = 2
+        case micAndSystem = 3
+
+        var title: String {
+            switch self {
+            case .off: return "Don't auto-send"
+            case .mic: return "Auto-send when mic stops"
+            case .system: return "Auto-send when system stops"
+            case .micAndSystem: return "Auto-send when mic or system stops"
+            }
+        }
+
+        var menuTitle: String {
+            switch self {
+            case .off: return "Don't auto-send"
+            case .mic: return "Auto-send when mic stops"
+            case .system: return "Auto-send when system stops"
+            case .micAndSystem: return "Auto-send when mic or system stops"
+            }
+        }
+
+        var compactTitle: String {
+            isEnabled ? "✓ Auto-send" : "Auto-send"
+        }
+
+        var tooltip: String {
+            switch self {
+            case .off:
+                return "Stop only pauses listening"
+            case .mic:
+                return "When Stop is clicked, send only if mic captions are ready"
+            case .system:
+                return "When Stop is clicked, send only if system audio captions are ready"
+            case .micAndSystem:
+                return "When Stop is clicked, send if mic or system captions are ready"
+            }
+        }
+
+        var isEnabled: Bool { self != .off }
+    }
 
     private enum ChromeMetrics {
         static let headerGuardHeight: CGFloat = 86
@@ -2958,7 +4032,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     let statusLabel: NSTextField
     let modelMenu: NSPopUpButton
     let routeBadge: NSTextField
-    let knowledgeBadge: NSTextField
+    let knowledgeBadge: ClickableHeaderBadge
+    let themeButton: NSButton
     let balanceLabel: NSTextField
     let fullSizeButton: NSButton
     let interactionModeButton: NSButton
@@ -2982,13 +4057,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     let transcriptStateLabel: NSTextField
     let transcriptScroll: NSScrollView
     let transcriptLabel: NSTextField
+    let transcriptClearButton: NSButton
     let attachmentStrip: NSScrollView
     let attachmentStack: NSStackView
     let composerBar: NSView
     let composerSurface: NSView
+    let composerScroll: NSScrollView
     let composer: ComposerTextView
     let recordingButton: NSButton
     let askButton: NSButton
+    let autoSendModeMenu: NSPopUpButton
     let analyzeButton: NSButton
     let attachButton: NSButton
     let instructionsButton: NSButton
@@ -3008,9 +4086,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     var onClose: (() -> Void)?
     var onOpacityChanged: ((Double) -> Void)?
     var onListeningStateChanged: ((PillRunState) -> Void)?
+    var onWindowFrameChanged: ((NSRect) -> Void)?
+    var onPasteText: ((String) -> Void)?
     private var recordingActive = false
     private var transcriptSnippets: [String] = []
     private var latestLiveTranscriptLine: String?
+    private var latestLiveTranscriptLinesBySource: [String: String] = [:]
+    private var autoSendListenCaptureActive = false
+    private var autoSendTranscriptLinesBySource: [String: String] = [:]
     private var liveTranscriptPreviewBodies: [String: String] = [:]
     private var consumedTranscriptFingerprints: [String] = []
     private var lastTranscriptStripSource: String?
@@ -3021,6 +4104,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var canvasWidthConstraint: NSLayoutConstraint?
     private var composerBarHeightConstraint: NSLayoutConstraint?
     private var composerTextHeightConstraint: NSLayoutConstraint?
+    private var composerDocumentHeightConstraint: NSLayoutConstraint?
+    private var composerMeasuredHeight: CGFloat = ChromeMetrics.composerInputHeight
     private var attachmentStripHeightConstraint: NSLayoutConstraint?
     private var sessionDrawerTopConstraint: NSLayoutConstraint?
     private var sessionDrawerLeadingConstraint: NSLayoutConstraint?
@@ -3028,10 +4113,29 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var sessionDrawerHeightConstraint: NSLayoutConstraint?
     private var toastHideWorkItem: DispatchWorkItem?
     private var knowledgeIndexTimer: Timer?
+    private var knowledgeIndexSafetyWorkItem: DispatchWorkItem?
     private var knowledgeIndexFrame = 0
     private var knowledgeBadgeContentVisible = false
+    private var contextItems: [OverlayContextItem] = []
+    private var pendingContextItemIds: Set<String> = []
+    private var showingSavedContextItems = false
+    private var contextMutationExpectedUntil: Date?
     private var hasVisibleContextAttachments = false
     private var screenContextReadyForAnswer = false
+    private var autoSendStopMode: AutoSendStopMode = {
+        let version = UserDefaults.standard.integer(forKey: overlayAutoSendStopModeVersionDefaultsKey)
+        guard version >= overlayAutoSendStopModeCurrentVersion else {
+            return .off
+        }
+        guard let stored = UserDefaults.standard.object(forKey: overlayAutoSendStopModeDefaultsKey) as? Int,
+              let mode = AutoSendStopMode(rawValue: stored) else {
+            return .off
+        }
+        return mode
+    }()
+    private var autoSendAfterStopWorkItem: DispatchWorkItem?
+    private var lastSubmittedAskFingerprint: String?
+    private var lastSubmittedAskAt: CFTimeInterval = 0
     private var audioPulseTimer: Timer?
     private var audioPulseFrame = 0
     private var attachPickerPending = false
@@ -3059,12 +4163,17 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         static let top = ResizeEdges(rawValue: 1 << 2)
         static let bottom = ResizeEdges(rawValue: 1 << 3)
     }
+    private static let resizeNorthwestSoutheastCursor = makeDiagonalResizeCursor(northwestSoutheast: true)
+    private static let resizeNortheastSouthwestCursor = makeDiagonalResizeCursor(northwestSoutheast: false)
     private var activeResizeEdges: ResizeEdges = []
     private var resizeStartMouse = NSPoint.zero
     private var resizeStartFrame = NSRect.zero
-    private let resizeHitSize: CGFloat = 10
+    private var resizeCursorActive = false
+    private var composerInputArmedUntil: TimeInterval = 0
+    private let resizeHitSize: CGFloat = 14
     private var backgroundOpacity: CGFloat = 0.94
     private var dropHighlightActive = false
+    private var lightThemeEnabled = UserDefaults.standard.bool(forKey: overlayLightThemeDefaultsKey)
 
     override init(frame frameRect: NSRect) {
         feed = FeedView(frame: .zero)
@@ -3083,14 +4192,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         statusLabel = NSTextField(labelWithString: "")
         modelMenu = NSPopUpButton(frame: .zero, pullsDown: false)
         routeBadge = NSTextField(labelWithString: "● Ready")
-        knowledgeBadge = NSTextField(labelWithString: "")
+        knowledgeBadge = ClickableHeaderBadge(labelWithString: "")
+        themeButton = NSButton(title: "", target: nil, action: nil)
         balanceLabel = NSTextField(labelWithString: "Balance --")
         fullSizeButton = NSButton(title: "", target: nil, action: nil)
         interactionModeButton = NSButton(title: "", target: nil, action: nil)
         canvasToggleButton = NSButton(title: "", target: nil, action: nil)
         navButton = NSButton(title: "", target: nil, action: nil)
         newSessionButton = NSButton(title: "", target: nil, action: nil)
-        sessionDrawer = NSView()
+        sessionDrawer = SessionDrawerView()
         drawerTitleLabel = NSTextField(labelWithString: "History")
         drawerSubtitleLabel = NSTextField(labelWithString: "Continue, rename, or delete saved recordings.")
         drawerCloseButton = NSButton(title: "", target: nil, action: nil)
@@ -3107,13 +4217,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         transcriptStateLabel = NSTextField(labelWithString: "IDLE")
         transcriptScroll = NSScrollView()
         transcriptLabel = NSTextField(labelWithString: "Live captions preview")
+        transcriptClearButton = NSButton(title: "", target: nil, action: nil)
         attachmentStrip = NSScrollView()
         attachmentStack = NSStackView()
         composerBar = NSView()
         composerSurface = ComposerSurfaceView()
+        composerScroll = NSScrollView()
         composer = ComposerTextView(frame: .zero, textContainer: nil)
         recordingButton = NSButton(title: "Listen", target: nil, action: nil)
         askButton = NSButton(title: "Answer", target: nil, action: nil)
+        autoSendModeMenu = NSPopUpButton(frame: .zero, pullsDown: true)
         analyzeButton = NSButton(title: "Screen", target: nil, action: nil)
         attachButton = NSButton(title: "", target: nil, action: nil)
         instructionsButton = NSButton(title: "Tone", target: nil, action: nil)
@@ -3132,6 +4245,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         super.init(frame: frameRect)
 
+        (sessionDrawer as? SessionDrawerView)?.scrollView = sessionScroll
+
+        migrateAutoSendStopModeDefaultsIfNeeded()
         registerForDraggedTypes([.fileURL])
 
         (answerStyleOverlay as? ModalBlockerView)?.onEscape = { [weak self] in
@@ -3167,6 +4283,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         feed.onOpenURL = { url in
             NSWorkspace.shared.open(url)
         }
+        feed.onPasteText = { [weak self] text in
+            self?.onPasteText?(text)
+        }
 
         for view in [
             headerBar,
@@ -3180,6 +4299,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             modelMenu,
             routeBadge,
             knowledgeBadge,
+            themeButton,
             balanceLabel,
             fullSizeButton,
             interactionModeButton,
@@ -3209,13 +4329,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             transcriptStateLabel,
             transcriptScroll,
             transcriptLabel,
+            transcriptClearButton,
             attachmentStrip,
             attachmentStack,
             composerBar,
             composerSurface,
+            composerScroll,
             composer,
             recordingButton,
             askButton,
+            autoSendModeMenu,
             analyzeButton,
             attachButton,
             instructionsButton,
@@ -3273,12 +4396,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         transcriptStrip.addSubview(transcriptActivityDot)
         transcriptStrip.addSubview(transcriptStateLabel)
         transcriptStrip.addSubview(transcriptScroll)
+        transcriptStrip.addSubview(transcriptClearButton)
         transcriptScroll.documentView = transcriptLabel
         transcriptLabel.translatesAutoresizingMaskIntoConstraints = true
         addSubview(attachmentStrip)
         addSubview(composerBar)
         composerBar.addSubview(composerSurface)
-        composerSurface.addSubview(composer)
+        composerSurface.addSubview(composerScroll)
+        composerScroll.documentView = composer
         composerSurface.addSubview(recordingButton)
         composerSurface.addSubview(askButton)
         composerBar.addSubview(attachButton)
@@ -3288,6 +4413,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         opacityControl.addSubview(opacitySlider)
         opacityControl.addSubview(opacityValueLabel)
         composerBar.addSubview(modelMenu)
+        composerBar.addSubview(autoSendModeMenu)
         composerBar.addSubview(analyzeButton)
         // Add a non-content top shield below the interactive header. It masks
         // any scroll-view overshoot during resize/restore while keeping the
@@ -3302,6 +4428,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             routeBadge,
             knowledgeBadge,
             canvasToggleButton,
+            themeButton,
             balanceLabel,
             fullSizeButton,
             interactionModeButton,
@@ -3335,6 +4462,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let canvasWidth = canvasPane.widthAnchor.constraint(equalToConstant: 0)
         canvasWidthConstraint = canvasWidth
         let composerTextHeight = composerSurface.heightAnchor.constraint(equalToConstant: ChromeMetrics.composerInputHeight)
+        let composerDocumentHeight = composer.heightAnchor.constraint(equalToConstant: ChromeMetrics.composerInputHeight)
         let composerBarHeight = composerBar.heightAnchor.constraint(equalToConstant: ChromeMetrics.composerBaseHeight)
         let attachmentStripHeight = attachmentStrip.heightAnchor.constraint(equalToConstant: 0)
         let sessionDrawerTop = sessionDrawer.topAnchor.constraint(equalTo: topAnchor, constant: 72)
@@ -3342,6 +4470,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let sessionDrawerWidth = sessionDrawer.widthAnchor.constraint(equalToConstant: 360)
         let sessionDrawerHeight = sessionDrawer.heightAnchor.constraint(equalToConstant: 420)
         composerTextHeightConstraint = composerTextHeight
+        composerDocumentHeightConstraint = composerDocumentHeight
         composerBarHeightConstraint = composerBarHeight
         attachmentStripHeightConstraint = attachmentStripHeight
         sessionDrawerTopConstraint = sessionDrawerTop
@@ -3449,8 +4578,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
             transcriptScroll.topAnchor.constraint(equalTo: transcriptStrip.topAnchor, constant: 2),
             transcriptScroll.leadingAnchor.constraint(equalTo: transcriptStateLabel.trailingAnchor, constant: 8),
-            transcriptScroll.trailingAnchor.constraint(equalTo: transcriptStrip.trailingAnchor, constant: -10),
+            transcriptScroll.trailingAnchor.constraint(equalTo: transcriptClearButton.leadingAnchor, constant: -6),
             transcriptScroll.bottomAnchor.constraint(equalTo: transcriptStrip.bottomAnchor, constant: -2),
+
+            transcriptClearButton.trailingAnchor.constraint(equalTo: transcriptStrip.trailingAnchor, constant: -6),
+            transcriptClearButton.centerYAnchor.constraint(equalTo: transcriptStrip.centerYAnchor),
+            transcriptClearButton.widthAnchor.constraint(equalToConstant: 18),
+            transcriptClearButton.heightAnchor.constraint(equalToConstant: 18),
 
             attachmentStack.leadingAnchor.constraint(equalTo: attachmentStrip.contentView.leadingAnchor),
             attachmentStack.topAnchor.constraint(equalTo: attachmentStrip.contentView.topAnchor),
@@ -3462,10 +4596,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             composerSurface.trailingAnchor.constraint(equalTo: composerBar.trailingAnchor, constant: -8),
             composerTextHeight,
 
-            composer.topAnchor.constraint(equalTo: composerSurface.topAnchor, constant: 1),
-            composer.leadingAnchor.constraint(equalTo: composerSurface.leadingAnchor, constant: 9),
-            composer.trailingAnchor.constraint(equalTo: recordingButton.leadingAnchor, constant: -6),
-            composer.bottomAnchor.constraint(equalTo: composerSurface.bottomAnchor, constant: -1),
+            composerScroll.topAnchor.constraint(equalTo: composerSurface.topAnchor, constant: 1),
+            composerScroll.leadingAnchor.constraint(equalTo: composerSurface.leadingAnchor, constant: 9),
+            composerScroll.trailingAnchor.constraint(equalTo: recordingButton.leadingAnchor, constant: -6),
+            composerScroll.bottomAnchor.constraint(equalTo: composerSurface.bottomAnchor, constant: -1),
+
+            composer.leadingAnchor.constraint(equalTo: composerScroll.contentView.leadingAnchor),
+            composer.topAnchor.constraint(equalTo: composerScroll.contentView.topAnchor),
+            composer.widthAnchor.constraint(equalTo: composerScroll.contentView.widthAnchor),
+            composer.heightAnchor.constraint(greaterThanOrEqualTo: composerScroll.contentView.heightAnchor),
+            composerDocumentHeight,
 
             recordingButton.trailingAnchor.constraint(equalTo: askButton.leadingAnchor, constant: -4),
             recordingButton.centerYAnchor.constraint(equalTo: composerSurface.centerYAnchor),
@@ -3512,11 +4652,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
             modelMenu.trailingAnchor.constraint(equalTo: analyzeButton.leadingAnchor, constant: -6),
             modelMenu.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
-            modelMenu.widthAnchor.constraint(greaterThanOrEqualToConstant: 98),
-            modelMenu.widthAnchor.constraint(lessThanOrEqualToConstant: 126),
+            modelMenu.widthAnchor.constraint(greaterThanOrEqualToConstant: 86),
+            modelMenu.widthAnchor.constraint(lessThanOrEqualToConstant: 118),
             modelMenu.heightAnchor.constraint(equalToConstant: 22),
 
-            opacityControl.trailingAnchor.constraint(lessThanOrEqualTo: modelMenu.leadingAnchor, constant: -10),
+            autoSendModeMenu.leadingAnchor.constraint(equalTo: opacityControl.trailingAnchor, constant: 6),
+            autoSendModeMenu.centerYAnchor.constraint(equalTo: attachButton.centerYAnchor),
+            autoSendModeMenu.widthAnchor.constraint(equalToConstant: 118),
+            autoSendModeMenu.heightAnchor.constraint(equalToConstant: 22),
+
+            modelMenu.leadingAnchor.constraint(greaterThanOrEqualTo: autoSendModeMenu.trailingAnchor, constant: 6),
 
             closeConfirmOverlay.topAnchor.constraint(equalTo: topAnchor),
             closeConfirmOverlay.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -3566,6 +4711,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         fullSizeButton.action = #selector(fullSizeClicked)
         interactionModeButton.target = self
         interactionModeButton.action = #selector(interactionModeClicked)
+        themeButton.target = self
+        themeButton.action = #selector(themeClicked)
         closeButton.target = self
         closeButton.action = #selector(closeClicked)
         closeConfirmCancelButton.target = self
@@ -3583,18 +4730,25 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         headerBar.onDragStateChanged = { [weak self] active in
             self?.headerDragInProgress = active
         }
+        headerBar.onWindowFrameChanged = { [weak self] frame in
+            self?.onWindowFrameChanged?(frame)
+        }
         recordingButton.target = self
         recordingButton.action = #selector(recordingClicked)
         askButton.target = self
         askButton.action = #selector(askClicked)
         askButton.keyEquivalent = "\r"
         askButton.keyEquivalentModifierMask = [.command]
+        autoSendModeMenu.target = self
+        autoSendModeMenu.action = #selector(autoSendModeChanged)
         analyzeButton.target = self
         analyzeButton.action = #selector(analyzeClicked)
         attachButton.target = self
         attachButton.action = #selector(attachClicked)
         instructionsButton.target = self
         instructionsButton.action = #selector(instructionsClicked)
+        transcriptClearButton.target = self
+        transcriptClearButton.action = #selector(clearTranscriptClicked)
 
         sessionDrawer.isHidden = true
         answerStyleOverlay.isHidden = true
@@ -3614,6 +4768,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         styleControlButton(answerStyleSaveButton, symbol: "checkmark", accent: true)
         styleControlButton(recordingButton, symbol: "waveform", accent: false)
         styleControlButton(instructionsButton, symbol: "text.bubble", accent: false)
+        styleIconButton(transcriptClearButton, symbol: "xmark", fallback: "x")
         styleIconButton(attachButton, symbol: "plus", fallback: "+")
         styleControlButton(analyzeButton, symbol: "sparkle.magnifyingglass", accent: false)
         styleControlButton(askButton, symbol: "arrow.up", accent: true)
@@ -3622,6 +4777,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         updateFullSizeButtonChrome()
         updateInteractionModeChrome(showToast: false)
         configureTooltips()
+        updateTranscriptClearButtonVisibility()
         setContextItems([])
         setTranscriptState("READY", active: false)
         applyOpacity(opacitySlider.doubleValue)
@@ -3632,6 +4788,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         audioPulseTimer?.invalidate()
         knowledgeIndexTimer?.invalidate()
         toastHideWorkItem?.cancel()
+        autoSendAfterStopWorkItem?.cancel()
     }
 
     override func layout() {
@@ -3647,14 +4804,29 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     override func resetCursorRects() {
         super.resetCursorRects()
         guard closeConfirmOverlay.isHidden, answerStyleOverlay.isHidden else { return }
-        addCursorRect(NSRect(x: bounds.width - resizeHitSize, y: 0, width: resizeHitSize, height: bounds.height), cursor: .resizeLeftRight)
-        addCursorRect(NSRect(x: 0, y: 0, width: bounds.width, height: resizeHitSize), cursor: .resizeUpDown)
+        addCursorRect(NSRect(x: 0, y: 0, width: resizeHitSize, height: resizeHitSize), cursor: Self.resizeNortheastSouthwestCursor)
+        addCursorRect(NSRect(x: bounds.width - resizeHitSize, y: bounds.height - resizeHitSize, width: resizeHitSize, height: resizeHitSize), cursor: Self.resizeNortheastSouthwestCursor)
+        addCursorRect(NSRect(x: 0, y: bounds.height - resizeHitSize, width: resizeHitSize, height: resizeHitSize), cursor: Self.resizeNorthwestSoutheastCursor)
+        addCursorRect(NSRect(x: bounds.width - resizeHitSize, y: 0, width: resizeHitSize, height: resizeHitSize), cursor: Self.resizeNorthwestSoutheastCursor)
+        addCursorRect(NSRect(x: 0, y: resizeHitSize, width: resizeHitSize, height: max(0, bounds.height - (resizeHitSize * 2))), cursor: .resizeLeftRight)
+        addCursorRect(NSRect(x: bounds.width - resizeHitSize, y: resizeHitSize, width: resizeHitSize, height: max(0, bounds.height - (resizeHitSize * 2))), cursor: .resizeLeftRight)
+        addCursorRect(NSRect(x: resizeHitSize, y: bounds.height - resizeHitSize, width: max(0, bounds.width - (resizeHitSize * 2)), height: resizeHitSize), cursor: .resizeUpDown)
+        addCursorRect(NSRect(x: resizeHitSize, y: 0, width: max(0, bounds.width - (resizeHitSize * 2)), height: resizeHitSize), cursor: .resizeUpDown)
     }
 
     private func applyShellChrome() {
         wantsLayer = true
         layer?.cornerRadius = ExpandedPanelMetrics.cornerRadius
         layer?.masksToBounds = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+        layer?.borderWidth = 1
+        layer?.borderColor = (lightThemeEnabled
+            ? BlueyTheme.cyan.withAlphaComponent(0.30)
+            : BlueyTheme.cyan.withAlphaComponent(materialAlpha(0.24, floor: 0.06))).cgColor
+        layer?.shadowColor = NSColor.black.cgColor
+        layer?.shadowOpacity = lightThemeEnabled ? Float(lightMaterialAlpha(0.20, floor: 0.06)) : Float(materialAlpha(0.30, floor: 0.10))
+        layer?.shadowRadius = lightThemeEnabled ? 22 : 28
+        layer?.shadowOffset = .zero
         if #available(macOS 10.15, *) {
             layer?.cornerCurve = .continuous
         }
@@ -3664,60 +4836,142 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         blueyMaterialAlpha(base, opacity: backgroundOpacity, floor: floor)
     }
 
+    private func lightMaterialAlpha(_ base: CGFloat, floor: CGFloat = 0.24) -> CGFloat {
+        blueyLightMaterialAlpha(base, opacity: backgroundOpacity, floor: floor)
+    }
+
+    private var themedTextColor: NSColor {
+        lightThemeEnabled
+            ? BlueyLightTheme.text
+            : BlueyTheme.text
+    }
+
+    private var themedDimTextColor: NSColor {
+        lightThemeEnabled
+            ? BlueyLightTheme.textDim
+            : BlueyTheme.textDim
+    }
+
+    private var themedHeaderColor: NSColor {
+        lightThemeEnabled
+            ? BlueyLightTheme.bar.withAlphaComponent(lightMaterialAlpha(0.92, floor: 0.18))
+            : NSColor(red: 0.018, green: 0.022, blue: 0.030, alpha: materialAlpha(0.58, floor: 0.20))
+    }
+
+    private var themedHeaderChromeColor: NSColor {
+        lightThemeEnabled
+            ? BlueyLightTheme.barChrome.withAlphaComponent(lightMaterialAlpha(0.88, floor: 0.20))
+            : NSColor(red: 0.008, green: 0.011, blue: 0.016, alpha: materialAlpha(0.46, floor: 0.16))
+    }
+
+    private var themedComposerColor: NSColor {
+        lightThemeEnabled
+            ? BlueyLightTheme.bar.withAlphaComponent(lightMaterialAlpha(0.92, floor: 0.18))
+            : NSColor(red: 0.014, green: 0.016, blue: 0.022, alpha: materialAlpha(0.94))
+    }
+
+    private var themedSurfaceColor: NSColor {
+        lightThemeEnabled
+            ? BlueyLightTheme.surfaceRaised.withAlphaComponent(lightMaterialAlpha(0.88, floor: 0.18))
+            : NSColor.white.withAlphaComponent(materialAlpha(0.045))
+    }
+
     private func refreshBackgroundChrome() {
-        layer?.backgroundColor = NSColor(
-            red: 0.010,
-            green: 0.012,
-            blue: 0.016,
-            alpha: backgroundOpacity
-        ).cgColor
-        headerBar.layer?.backgroundColor = NSColor(
-            red: 0.018,
-            green: 0.022,
-            blue: 0.030,
-            alpha: 1.0
-        ).cgColor
-        headerChrome.layer?.backgroundColor = NSColor(
-            red: 0.008,
-            green: 0.011,
-            blue: 0.016,
-            alpha: 1.0
-        ).cgColor
-        modelMenu.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.075)).cgColor
-        modelMenu.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.12)).cgColor
+        layer?.backgroundColor = NSColor.clear.cgColor
+        layer?.borderColor = (lightThemeEnabled
+            ? BlueyTheme.cyan.withAlphaComponent(0.30)
+            : BlueyTheme.cyan.withAlphaComponent(materialAlpha(0.26, floor: 0.06))).cgColor
+        layer?.shadowOpacity = lightThemeEnabled ? Float(lightMaterialAlpha(0.20, floor: 0.06)) : Float(materialAlpha(0.30, floor: 0.10))
+        headerBar.layer?.backgroundColor = themedHeaderColor.cgColor
+        headerBar.layer?.borderColor = (lightThemeEnabled
+            ? BlueyTheme.cyan.withAlphaComponent(0.24)
+            : BlueyTheme.cyan.withAlphaComponent(0.18)).cgColor
+        headerBar.layer?.shadowOpacity = lightThemeEnabled ? 0.12 : 0.18
+        headerChrome.layer?.backgroundColor = themedHeaderChromeColor.cgColor
+        modelMenu.layer?.backgroundColor = themedSurfaceColor.cgColor
+        modelMenu.layer?.borderColor = (lightThemeEnabled
+            ? BlueyLightTheme.border
+            : NSColor.white.withAlphaComponent(materialAlpha(0.12))).cgColor
+        modelMenu.contentTintColor = themedTextColor
+        updateAutoSendModeChrome()
+        refreshControlChromeForTheme()
+        updateThemeButtonChrome()
+        statusLabel.textColor = themedDimTextColor
+        balanceLabel.textColor = themedTextColor
+        transcriptStateLabel.textColor = transcriptStateLabel.stringValue == "LIVE" ? BlueyTheme.green : themedDimTextColor
+        transcriptLabel.textColor = themedTextColor
+        opacityLabel.textColor = themedDimTextColor
+        opacityValueLabel.textColor = themedDimTextColor
+        composer.textColor = themedTextColor
+        composer.insertionPointColor = themedTextColor
+        composer.placeholderColor = themedDimTextColor.withAlphaComponent(lightThemeEnabled ? 0.82 : 0.78)
+        composer.typingAttributes = [
+            .font: composer.font ?? NSFont.systemFont(ofSize: 13.5, weight: .semibold),
+            .foregroundColor: themedTextColor,
+        ]
         balanceLabel.layer?.backgroundColor = NSColor.clear.cgColor
         balanceLabel.layer?.borderColor = NSColor.clear.cgColor
         toastView.layer?.backgroundColor = NSColor(
-            red: 0.018,
-            green: 0.023,
-            blue: 0.030,
-            alpha: materialAlpha(0.96)
+            red: lightThemeEnabled ? 0.805 : 0.018,
+            green: lightThemeEnabled ? 0.842 : 0.023,
+            blue: lightThemeEnabled ? 0.862 : 0.030,
+            alpha: lightThemeEnabled ? lightMaterialAlpha(0.88, floor: 0.18) : materialAlpha(0.96)
         ).cgColor
-        transcriptStrip.layer?.backgroundColor = NSColor.black.withAlphaComponent(materialAlpha(0.16)).cgColor
+        toastView.layer?.borderColor = (lightThemeEnabled
+            ? BlueyTheme.cyan.withAlphaComponent(0.26)
+            : BlueyTheme.cyan.withAlphaComponent(0.28)).cgColor
+        toastTitleLabel.textColor = themedTextColor
+        toastBodyLabel.textColor = themedDimTextColor
+        transcriptStrip.layer?.backgroundColor = (lightThemeEnabled
+            ? BlueyLightTheme.surface.withAlphaComponent(lightMaterialAlpha(0.80, floor: 0.16))
+            : NSColor.black.withAlphaComponent(materialAlpha(0.16))).cgColor
+        transcriptStrip.layer?.borderColor = (lightThemeEnabled
+            ? BlueyLightTheme.border
+            : BlueyTheme.hairline).cgColor
+        transcriptLabel.attributedStringValue = attributedTranscriptStripText(transcriptLabel.stringValue)
         sessionDrawer.layer?.backgroundColor = NSColor(
-            red: 0.035,
-            green: 0.040,
-            blue: 0.050,
-            alpha: materialAlpha(0.98)
+            red: lightThemeEnabled ? 0.750 : 0.035,
+            green: lightThemeEnabled ? 0.790 : 0.040,
+            blue: lightThemeEnabled ? 0.812 : 0.050,
+            alpha: lightThemeEnabled ? lightMaterialAlpha(0.88, floor: 0.18) : materialAlpha(0.98)
         ).cgColor
+        sessionDrawer.layer?.borderColor = (lightThemeEnabled
+            ? BlueyLightTheme.border
+            : BlueyTheme.hairline).cgColor
+        drawerTitleLabel.textColor = themedTextColor
+        drawerSubtitleLabel.textColor = themedDimTextColor
         answerStylePanel.layer?.backgroundColor = BlueyTheme.panelDeep
             .withAlphaComponent(materialAlpha(0.97))
             .cgColor
-        composerBar.layer?.backgroundColor = NSColor(
-            red: 0.014,
-            green: 0.016,
-            blue: 0.022,
-            alpha: materialAlpha(0.94)
-        ).cgColor
-        composerSurface.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.045)).cgColor
-        composerSurface.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.105)).cgColor
+        composerBar.layer?.backgroundColor = themedComposerColor.cgColor
+        composerBar.layer?.borderColor = (lightThemeEnabled
+            ? BlueyTheme.cyan.withAlphaComponent(0.22)
+            : BlueyTheme.cyan.withAlphaComponent(0.22)).cgColor
+        composerBar.layer?.shadowOpacity = lightThemeEnabled ? 0.10 : 0.18
+        composerSurface.layer?.backgroundColor = themedSurfaceColor.cgColor
+        composerSurface.layer?.borderColor = (lightThemeEnabled
+            ? BlueyLightTheme.border
+            : NSColor.white.withAlphaComponent(materialAlpha(0.105))).cgColor
         opacityControl.layer?.backgroundColor = NSColor.clear.cgColor
         opacityControl.layer?.borderColor = NSColor.clear.cgColor
         closeConfirmPanel.layer?.backgroundColor = BlueyTheme.panelDeep
             .withAlphaComponent(materialAlpha(0.97))
             .cgColor
-        feed.applyBackgroundOpacity(backgroundOpacity)
+        feed.setLightTheme(lightThemeEnabled, opacity: backgroundOpacity)
         canvasPane.applyBackgroundOpacity(backgroundOpacity)
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let outer = bounds.insetBy(dx: 0.75, dy: 0.75)
+        if lightThemeEnabled {
+            drawBlueyLightPanel(in: outer, radius: ExpandedPanelMetrics.cornerRadius, opacity: backgroundOpacity)
+        } else {
+            drawBlueyGlassPanel(
+                in: outer,
+                radius: ExpandedPanelMetrics.cornerRadius,
+                opacity: backgroundOpacity)
+        }
     }
 
     override func keyDown(with event: NSEvent) {
@@ -3729,16 +4983,32 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     override func scrollWheel(with event: NSEvent) {
         let localPoint = convert(event.locationInWindow, from: nil)
+        if !sessionDrawer.isHidden, rectForView(sessionDrawer).contains(localPoint) {
+            sessionScroll.scrollWheel(with: event)
+            return
+        }
+        if rectForView(composerSurface).contains(localPoint) {
+            composerScroll.scrollWheel(with: event)
+            return
+        }
+        if passThroughMode {
+            if rectForView(feed).contains(localPoint) {
+                feed.forwardScrollWheel(event)
+                return
+            }
+            if rectForView(canvasPane).contains(localPoint) {
+                canvasPane.scrollWheel(with: event)
+                return
+            }
+            super.scrollWheel(with: event)
+            return
+        }
         if rectForView(feed).contains(localPoint) {
             feed.forwardScrollWheel(event)
             return
         }
         if rectForView(canvasPane).contains(localPoint) {
             canvasPane.scrollWheel(with: event)
-            return
-        }
-        if !sessionDrawer.isHidden, rectForView(sessionScroll).contains(localPoint) {
-            sessionScroll.scrollWheel(with: event)
             return
         }
         super.scrollWheel(with: event)
@@ -3748,56 +5018,221 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         guard !isHidden, alphaValue > 0.01, bounds.contains(point) else {
             return nil
         }
-        guard passThroughMode else {
-            return super.hitTest(point)
-        }
         if !closeConfirmOverlay.isHidden || !answerStyleOverlay.isHidden {
             return super.hitTest(point) ?? self
         }
         if headerDragInProgress {
             return super.hitTest(point) ?? self
         }
-        if !sessionDrawer.isHidden, rectForView(sessionDrawer).contains(point) {
-            return super.hitTest(point) ?? sessionDrawer
-        }
-        if !resizeEdges(at: point).isEmpty {
+        if isKnowledgeBadgeHit(at: point) {
             return self
         }
-        if rectForView(headerBar).insetBy(dx: -8, dy: -8).contains(point) {
-            return super.hitTest(point) ?? headerBar
-        }
-        if rectForView(composerBar).insetBy(dx: -8, dy: -8).contains(point) {
-            return super.hitTest(point) ?? composerBar
-        }
-        if !attachmentStrip.isHidden,
-           rectForView(attachmentStrip).insetBy(dx: -8, dy: -6).contains(point) {
-            return super.hitTest(point)
-        }
-        if !canvasPane.isHidden, rectForView(canvasPane).contains(point) {
-            return super.hitTest(point) ?? canvasPane
-        }
-
-        let windowPoint = convert(point, to: nil)
-        let screenPoint = window?.convertPoint(toScreen: windowPoint) ?? .zero
-        if feed.hasCopyControl(atScreenPoint: screenPoint) {
-            return super.hitTest(point)
-        }
-        guard let hit = super.hitTest(point) else {
+        if passThroughMode {
+            if isHeaderMoveHandleHit(at: point) {
+                return self
+            }
+            if let hit = super.hitTest(point), isExplicitInteractiveHit(hit) {
+                return hit
+            }
             return nil
         }
-        return isExplicitInteractiveHit(hit) ? hit : nil
+        if let hit = super.hitTest(point), isExplicitInteractiveHit(hit) {
+            return hit
+        }
+        return self
     }
 
     override func mouseDown(with event: NSEvent) {
         let localPoint = convert(event.locationInWindow, from: nil)
+        if isKnowledgeBadgeHit(at: localPoint) {
+            toggleSavedContextItems()
+            return
+        }
+        if passThroughMode, isHeaderMoveHandleHit(at: localPoint) {
+            beginHeaderDrag(with: event)
+            return
+        }
+        if rectForView(composerBar).insetBy(dx: -8, dy: -8).contains(localPoint) {
+            if let hit = super.hitTest(localPoint),
+               isView(hit, inside: composer) || isView(hit, inside: composerScroll) {
+                focusComposerForInput()
+                composer.handleMouseGesture(
+                    atWindowPoint: event.locationInWindow,
+                    clickCount: event.clickCount)
+                return
+            }
+        }
+        if passThroughMode {
+            super.mouseDown(with: event)
+            return
+        }
+        if !passThroughMode, shouldStartHeaderDrag(at: localPoint) {
+            beginHeaderDrag(with: event)
+            return
+        }
         let edges = resizeEdges(at: localPoint)
-        if !edges.isEmpty, let window {
+        if !passThroughMode, !edges.isEmpty, let window {
             activeResizeEdges = edges
+            setResizeCursor(for: edges)
             resizeStartMouse = NSEvent.mouseLocation
             resizeStartFrame = window.frame
             return
         }
+        if !hasInteractiveView(at: localPoint) {
+            beginHeaderDrag(with: event)
+            return
+        }
         super.mouseDown(with: event)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        updateResizeCursor(at: convert(event.locationInWindow, from: nil))
+        super.mouseMoved(with: event)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        clearResizeCursorIfNeeded()
+        super.mouseExited(with: event)
+    }
+
+    func routeKeyDownToComposer(_ event: NSEvent) -> Bool {
+        guard closeConfirmOverlay.isHidden, answerStyleOverlay.isHidden else {
+            return false
+        }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let key = (event.charactersIgnoringModifiers ?? "").lowercased()
+        if let firstResponder = window?.firstResponder, firstResponder !== composer {
+            if routeTextResponderShortcut(key: key, flags: flags, firstResponder: firstResponder) {
+                return true
+            }
+            let renameEditor = renameField?.currentEditor()
+            if let renameEditor, firstResponder === renameEditor {
+                return false
+            }
+            if let renameField, firstResponder === renameField {
+                return false
+            }
+            if firstResponder is NSTextView {
+                return false
+            }
+            if let textField = firstResponder as? NSTextField,
+               textField.isEditable || textField.isSelectable {
+                return false
+            }
+        }
+        if flags.contains(.command),
+           !["a", "c", "v", "x"].contains(key) {
+            return false
+        }
+        if flags.contains(.control) || flags.contains(.option) {
+            return false
+        }
+        focusComposerForInput()
+        if flags.contains(.command) {
+            switch key {
+            case "a":
+                composer.selectAll(nil)
+            case "c":
+                if composer.selectedRange().length > 0 {
+                    composer.copy(nil)
+                } else if let text = feed.latestCopyableCardText() {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(text, forType: .string)
+                    showSystemToast(title: "Copied", body: "Latest Bluey answer copied.", duration: 1.2)
+                } else {
+                    composer.copy(nil)
+                }
+            case "v":
+                if let text = NSPasteboard.general.string(forType: .string), !text.isEmpty {
+                    composer.insertPlainText(text)
+                }
+            case "x":
+                composer.cut(nil)
+            default:
+                return false
+            }
+            return true
+        }
+
+        if event.keyCode == 51 {
+            composer.deleteBackwardPlainText()
+            return true
+        }
+
+        if event.keyCode == 36 || event.keyCode == 76 {
+            composer.keyDown(with: event)
+            return true
+        }
+
+        if let characters = event.characters, !characters.isEmpty {
+            composer.insertPlainText(characters)
+            return true
+        }
+
+        composer.keyDown(with: event)
+        return true
+    }
+
+    private func routeTextResponderShortcut(
+        key: String,
+        flags: NSEvent.ModifierFlags,
+        firstResponder: NSResponder
+    ) -> Bool {
+        guard flags.contains(.command),
+              !flags.contains(.control),
+              !flags.contains(.option),
+              ["a", "c", "v", "x"].contains(key)
+        else {
+            return false
+        }
+
+        if let textView = firstResponder as? NSTextView, textView !== composer {
+            return routeTextViewShortcut(key: key, textView: textView)
+        }
+
+        if let textField = firstResponder as? NSTextField,
+           textField.isEditable || textField.isSelectable,
+           let editor = textField.currentEditor() as? NSTextView,
+           editor !== composer {
+            return routeTextViewShortcut(key: key, textView: editor)
+        }
+
+        if let editor = window?.fieldEditor(false, for: nil) as? NSTextView,
+           editor !== composer,
+           editor.selectedRange().length > 0 {
+            return routeTextViewShortcut(key: key, textView: editor)
+        }
+
+        return false
+    }
+
+    private func routeTextViewShortcut(key: String, textView: NSTextView) -> Bool {
+        switch key {
+        case "a":
+            textView.selectAll(nil)
+            return true
+        case "c":
+            guard textView.selectedRange().length > 0 else { return false }
+            textView.copy(nil)
+            return true
+        case "v":
+            guard textView.isEditable else { return false }
+            textView.paste(nil)
+            return true
+        case "x":
+            guard textView.isEditable else { return false }
+            textView.cut(nil)
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func focusComposerForInput() {
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+        window?.makeFirstResponder(composer)
+        composerInputArmedUntil = CACurrentMediaTime() + 1.5
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -3841,7 +5276,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     override func mouseUp(with event: NSEvent) {
         if !activeResizeEdges.isEmpty {
             (window as? OverlayWindow)?.lockedFrameHeight = nil
+            if let window {
+                onWindowFrameChanged?(window.frame)
+            }
             activeResizeEdges = []
+            updateResizeCursor(at: convert(event.locationInWindow, from: nil))
             return
         }
         super.mouseUp(with: event)
@@ -3857,16 +5296,39 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func isInteractiveAtScreenPoint(_ screenPoint: NSPoint) -> Bool {
+        guard let window else { return false }
+        let windowPoint = window.convertPoint(fromScreen: screenPoint)
+        return shouldReceiveMouseEvents(atWindowPoint: windowPoint)
+    }
+
+    func shouldReceiveMouseEvents(at screenPoint: NSPoint) -> Bool {
+        passThroughMode ? isInteractiveAtScreenPoint(screenPoint) : true
+    }
+
+    func shouldReceiveMouseEvents(atWindowPoint windowPoint: NSPoint) -> Bool {
+        guard passThroughMode else { return true }
+        if dropHighlightActive {
+            return true
+        }
+        let localPoint = convert(windowPoint, from: nil)
+        if CACurrentMediaTime() < composerInputArmedUntil,
+           hitsExplicitInteractiveChrome(at: localPoint) {
+            return true
+        }
+        return isInteractiveAtLocalPoint(localPoint, windowPoint: windowPoint)
+    }
+
+    private func isInteractiveAtLocalPoint(_ localPoint: NSPoint, windowPoint _: NSPoint) -> Bool {
         if headerDragInProgress {
             if NSEvent.pressedMouseButtons != 0 {
                 return true
             }
             headerDragInProgress = false
         }
-        guard let window else { return false }
-        let windowPoint = window.convertPoint(fromScreen: screenPoint)
-        let localPoint = convert(windowPoint, from: nil)
-        guard bounds.contains(localPoint) else { return false }
+        guard bounds.contains(localPoint) else {
+            clearResizeCursorIfNeeded()
+            return false
+        }
 
         if !closeConfirmOverlay.isHidden {
             return true
@@ -3874,22 +5336,17 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if !answerStyleOverlay.isHidden {
             return true
         }
-        if !sessionDrawer.isHidden {
-            let drawerPoint = sessionDrawer.convert(localPoint, from: self)
-            return sessionDrawer.bounds.contains(drawerPoint)
-        }
-        if !resizeEdges(at: localPoint).isEmpty {
+        if isKnowledgeBadgeHit(at: localPoint) {
             return true
         }
-        if hitsExplicitInteractiveChrome(at: localPoint) {
+        if isHeaderMoveHandleHit(at: localPoint) {
             return true
         }
-        return hasInteractiveView(at: localPoint)
-            || feed.hasCopyControl(atScreenPoint: screenPoint)
-    }
-
-    func shouldReceiveMouseEvents(at screenPoint: NSPoint) -> Bool {
-        passThroughMode ? isInteractiveAtScreenPoint(screenPoint) : true
+        if hasInteractiveView(at: localPoint) {
+            return true
+        }
+        clearResizeCursorIfNeeded()
+        return false
     }
 
     func manualButton(atWindowPoint point: NSPoint) -> NSButton? {
@@ -3945,12 +5402,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func hitsExplicitInteractiveChrome(at localPoint: NSPoint) -> Bool {
         let controls: [NSView] = [
-            headerBar,
-            headerLogo,
-            brandStack,
-            routeBadge,
             knowledgeBadge,
-            balanceLabel,
+            themeButton,
             navButton,
             newSessionButton,
             canvasToggleButton,
@@ -3958,9 +5411,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             interactionModeButton,
             hideButton,
             closeButton,
-            composerBar,
-            composerSurface,
+            composerScroll,
             composer,
+            transcriptClearButton,
             recordingButton,
             askButton,
             attachButton,
@@ -3970,6 +5423,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             opacitySlider,
             opacityValueLabel,
             modelMenu,
+            autoSendModeMenu,
             analyzeButton,
         ]
         return controls.contains { view in
@@ -3982,6 +5436,75 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func rectForView(_ view: NSView) -> NSRect {
         view.convert(view.bounds, to: self)
+    }
+
+    private func isTranscriptStripPoint(_ localPoint: NSPoint) -> Bool {
+        guard !transcriptStrip.isHidden, transcriptStrip.alphaValue > 0.01 else { return false }
+        return rectForView(transcriptStrip).insetBy(dx: -4, dy: -4).contains(localPoint)
+    }
+
+    private func transcriptClearHit(at localPoint: NSPoint) -> Bool {
+        guard !transcriptClearButton.isHidden,
+              transcriptClearButton.isEnabled,
+              transcriptClearButton.alphaValue > 0.01
+        else {
+            return false
+        }
+        return rectForView(transcriptClearButton).insetBy(dx: -10, dy: -10).contains(localPoint)
+    }
+
+    private func isKnowledgeBadgeHit(at localPoint: NSPoint) -> Bool {
+        guard !knowledgeBadge.isHidden,
+              knowledgeBadge.alphaValue > 0.01,
+              knowledgeBadgeContentVisible,
+              !contextItems.isEmpty
+        else {
+            return false
+        }
+        return rectForView(knowledgeBadge).insetBy(dx: -12, dy: -10).contains(localPoint)
+    }
+
+    private func isHeaderMoveHandleHit(at localPoint: NSPoint) -> Bool {
+        guard !headerBar.isHidden, headerBar.alphaValue > 0.01 else { return false }
+        let handles = [headerLogo, brandStack]
+        return handles.contains { view in
+            guard !view.isHidden, view.alphaValue > 0.01 else { return false }
+            return rectForView(view).insetBy(dx: -8, dy: -8).contains(localPoint)
+        }
+    }
+
+    private func headerHitView(at localPoint: NSPoint) -> NSView? {
+        let headerPoint = headerBar.convert(localPoint, from: self)
+        guard headerBar.bounds.insetBy(dx: -8, dy: -8).contains(headerPoint) else { return nil }
+        return headerBar.hitTest(headerPoint)
+    }
+
+    private func shouldStartHeaderDrag(at localPoint: NSPoint) -> Bool {
+        guard rectForView(headerBar).insetBy(dx: -8, dy: -8).contains(localPoint),
+              !resizeShouldWinOverHeaderDrag(at: localPoint)
+        else {
+            return false
+        }
+        guard let hit = headerHitView(at: localPoint) else {
+            return true
+        }
+        return !isExplicitInteractiveHit(hit)
+    }
+
+    private func resizeShouldWinOverHeaderDrag(at point: NSPoint) -> Bool {
+        point.x <= resizeHitSize || point.x >= bounds.width - resizeHitSize || point.y <= resizeHitSize
+    }
+
+    private func beginHeaderDrag(with event: NSEvent) {
+        headerDragInProgress = true
+        window?.makeKey()
+        defer {
+            headerDragInProgress = false
+        }
+        window?.performDrag(with: event)
+        if let window {
+            onWindowFrameChanged?(window.frame)
+        }
     }
 
     private func hasInteractiveView(at localPoint: NSPoint) -> Bool {
@@ -4006,15 +5529,40 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 || view is NSPopUpButton
                 || view is NSSlider
                 || view is OpacityScrubberView
-                || view is NSScroller
-                || view is NSTextView
+                || view is ClickableHeaderBadge
             {
                 return true
             }
-            if let textField = view as? NSTextField, textField.isEditable {
+            if view is NSScroller {
+                return isView(view, inside: composerScroll)
+                    || isView(view, inside: sessionScroll)
+                    || isView(view, inside: canvasPane)
+            }
+            if view is NSTextView {
+                return isView(view, inside: composer)
+                    || isView(view, inside: composerScroll)
+                    || isView(view, inside: sessionDrawer)
+                    || isView(view, inside: canvasPane)
+            }
+            if view is NSSecureTextField {
+                return true
+            }
+            if let textField = view as? NSTextField,
+               textField.isEditable || textField.isSelectable {
                 return true
             }
             hit = view.superview
+        }
+        return false
+    }
+
+    private func isView(_ view: NSView, inside ancestor: NSView) -> Bool {
+        var current: NSView? = view
+        while let candidate = current {
+            if candidate === ancestor {
+                return true
+            }
+            current = candidate.superview
         }
         return false
     }
@@ -4028,8 +5576,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return []
         }
         var edges: ResizeEdges = []
+        if point.x <= resizeHitSize {
+            edges.insert(.left)
+        }
         if point.x >= bounds.width - resizeHitSize {
             edges.insert(.right)
+        }
+        if point.y >= bounds.height - resizeHitSize {
+            edges.insert(.top)
         }
         if point.y <= resizeHitSize {
             edges.insert(.bottom)
@@ -4038,28 +5592,102 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func canStartResize(at point: NSPoint) -> Bool {
-        if headerBar.frame.insetBy(dx: -4, dy: -4).contains(point) {
-            return false
+        return point.x <= resizeHitSize
+            || point.x >= bounds.width - resizeHitSize
+            || point.y >= bounds.height - resizeHitSize
+            || point.y <= resizeHitSize
+    }
+
+    private func updateResizeCursor(at localPoint: NSPoint) {
+        let edges = resizeEdges(at: localPoint)
+        guard !edges.isEmpty else {
+            clearResizeCursorIfNeeded()
+            return
         }
-        if composerBar.frame.insetBy(dx: -4, dy: -4).contains(point) {
-            return false
+        setResizeCursor(for: edges)
+    }
+
+    private func setResizeCursor(for edges: ResizeEdges) {
+        resizeCursor(for: edges)?.set()
+        resizeCursorActive = true
+    }
+
+    private func clearResizeCursorIfNeeded() {
+        if resizeCursorActive {
+            NSCursor.arrow.set()
+            resizeCursorActive = false
         }
-        if transcriptStrip.frame.insetBy(dx: -4, dy: -4).contains(point) {
-            return false
-        }
-        if !sessionDrawer.isHidden {
-            let drawerPoint = sessionDrawer.convert(point, from: self)
-            if sessionDrawer.bounds.contains(drawerPoint) {
-                return false
+    }
+
+    private func resizeCursor(for edges: ResizeEdges) -> NSCursor? {
+        let horizontal = edges.contains(.left) || edges.contains(.right)
+        let vertical = edges.contains(.top) || edges.contains(.bottom)
+        if horizontal && vertical {
+            if (edges.contains(.left) && edges.contains(.top))
+                || (edges.contains(.right) && edges.contains(.bottom)) {
+                return Self.resizeNorthwestSoutheastCursor
             }
+            return Self.resizeNortheastSouthwestCursor
         }
-        if !canvasPane.isHidden {
-            let canvasPoint = canvasPane.convert(point, from: self)
-            if canvasPane.bounds.contains(canvasPoint) {
-                return false
-            }
+        if horizontal {
+            return .resizeLeftRight
         }
-        return point.x >= bounds.width - resizeHitSize || point.y <= resizeHitSize
+        if vertical {
+            return .resizeUpDown
+        }
+        return nil
+    }
+
+    private static func makeDiagonalResizeCursor(northwestSoutheast: Bool) -> NSCursor {
+        let size = NSSize(width: 24, height: 24)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        NSColor.clear.setFill()
+        NSRect(origin: .zero, size: size).fill()
+
+        let start = northwestSoutheast ? NSPoint(x: 5, y: 19) : NSPoint(x: 5, y: 5)
+        let end = northwestSoutheast ? NSPoint(x: 19, y: 5) : NSPoint(x: 19, y: 19)
+        drawResizeCursorLine(from: start, to: end, color: NSColor.black.withAlphaComponent(0.55), width: 4.2)
+        drawResizeCursorLine(from: start, to: end, color: NSColor.white, width: 2.2)
+        drawResizeCursorArrowHead(at: start, toward: end, color: NSColor.black.withAlphaComponent(0.55), width: 4.2)
+        drawResizeCursorArrowHead(at: end, toward: start, color: NSColor.black.withAlphaComponent(0.55), width: 4.2)
+        drawResizeCursorArrowHead(at: start, toward: end, color: NSColor.white, width: 2.2)
+        drawResizeCursorArrowHead(at: end, toward: start, color: NSColor.white, width: 2.2)
+
+        image.unlockFocus()
+        return NSCursor(image: image, hotSpot: NSPoint(x: 12, y: 12))
+    }
+
+    private static func drawResizeCursorLine(from start: NSPoint, to end: NSPoint, color: NSColor, width: CGFloat) {
+        let path = NSBezierPath()
+        path.move(to: start)
+        path.line(to: end)
+        path.lineWidth = width
+        path.lineCapStyle = .round
+        color.setStroke()
+        path.stroke()
+    }
+
+    private static func drawResizeCursorArrowHead(at point: NSPoint, toward target: NSPoint, color: NSColor, width: CGFloat) {
+        let dx = target.x - point.x
+        let dy = target.y - point.y
+        let length = max(1, hypot(dx, dy))
+        let ux = dx / length
+        let uy = dy / length
+        let px = -uy
+        let py = ux
+        let base = NSPoint(x: point.x + ux * 5.2, y: point.y + uy * 5.2)
+        let wing: CGFloat = 4.2
+
+        let path = NSBezierPath()
+        path.move(to: NSPoint(x: base.x + px * wing, y: base.y + py * wing))
+        path.line(to: point)
+        path.line(to: NSPoint(x: base.x - px * wing, y: base.y - py * wing))
+        path.lineWidth = width
+        path.lineCapStyle = .round
+        path.lineJoinStyle = .round
+        color.setStroke()
+        path.stroke()
     }
 
     private func clampedResizeFrame(
@@ -4171,6 +5799,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             y: transcriptStrip.frame.maxY + attachmentGap,
             width: max(0, layoutWidth - horizontalInset * 2),
             height: attachmentHeight)
+        if attachmentHeight > 0 {
+            updateAttachmentStripDocumentWidth()
+        }
         let workspaceBottom = (attachmentHeight > 0 ? attachmentStrip.frame.maxY : transcriptStrip.frame.maxY) + workspaceGap
         let workspaceTop = headerChrome.frame.minY - workspaceGap
         workspace.frame = NSRect(
@@ -4195,6 +5826,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             routeBadge,
             knowledgeBadge,
             canvasToggleButton,
+            themeButton,
             balanceLabel,
             fullSizeButton,
             interactionModeButton,
@@ -4221,7 +5853,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         attachmentStrip.layer?.zPosition = 3_000
         composerBar.layer?.zPosition = 4_000
 
-        canvasToggleButton.isHidden = !canvasOpen
+        canvasToggleButton.isHidden = canvases.isEmpty
 
         workspace.layer?.masksToBounds = true
         feed.layer?.masksToBounds = true
@@ -4272,8 +5904,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let yBadge = (frame.height - 22) / 2
 
         var left = CGFloat(11)
-        navButton.frame = NSRect(x: left, y: yButton, width: buttonSize, height: buttonSize)
-        left += buttonSize + 8
+        let showHistoryLabel = frame.width >= 760
+        let historyWidth: CGFloat = showHistoryLabel ? 86 : buttonSize
+        styleHistoryHeaderButton(navButton, compact: !showHistoryLabel)
+        navButton.frame = NSRect(x: left, y: yButton, width: historyWidth, height: buttonSize)
+        left += historyWidth + 8
         newSessionButton.frame = NSRect(x: left, y: yButton, width: buttonSize, height: buttonSize)
         left += buttonSize + 10
         headerLogo.frame = NSRect(x: left, y: yIcon, width: iconSize, height: iconSize)
@@ -4298,9 +5933,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         balanceLabel.frame = NSRect(x: right - balanceWidth, y: yBadge, width: balanceWidth, height: 22)
         right -= balanceWidth + 8
 
-        if canvasOpen {
+        themeButton.frame = NSRect(x: right - 26, y: yButton + 1, width: 26, height: 26)
+        right -= 33
+
+        if !canvases.isEmpty {
             canvasToggleButton.isHidden = false
             canvasToggleButton.frame = NSRect(x: right - 26, y: yButton + 1, width: 26, height: 26)
+            canvasToggleButton.toolTip = canvasOpen ? "Collapse canvas" : "Open canvas"
             right -= 33
         } else {
             canvasToggleButton.isHidden = true
@@ -4373,11 +6012,26 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         modelMenu.setContentHuggingPriority(.defaultLow, for: .horizontal)
         modelMenu.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        configureAutoSendModeMenuItems()
+        autoSendModeMenu.isBordered = false
+        autoSendModeMenu.wantsLayer = true
+        autoSendModeMenu.font = NSFont.systemFont(ofSize: 12, weight: .bold)
+        autoSendModeMenu.contentTintColor = BlueyTheme.text
+        autoSendModeMenu.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        autoSendModeMenu.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        updateAutoSendModeChrome()
+        updateThemeButtonChrome()
+
         styleHeaderBadge(routeBadge, textColor: BlueyTheme.green)
         routeBadge.toolTip = "Auto Router classification and selected lane"
 
         styleHeaderBadge(knowledgeBadge, textColor: BlueyTheme.text)
-        knowledgeBadge.toolTip = "Attached document status"
+        knowledgeBadge.toolTip = "Show or hide attached files"
+        knowledgeBadge.isSelectable = false
+        knowledgeBadge.focusRingType = .none
+        knowledgeBadge.onClick = { [weak self] in
+            self?.toggleSavedContextItems()
+        }
 
         balanceLabel.font = NSFont.monospacedSystemFont(ofSize: 10.5, weight: .bold)
         balanceLabel.textColor = BlueyTheme.text
@@ -4462,13 +6116,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         attachmentStack.orientation = .horizontal
         attachmentStack.alignment = .centerY
-        attachmentStack.spacing = 4
-        attachmentStack.edgeInsets = NSEdgeInsets(top: 2, left: 3, bottom: 2, right: 3)
+        attachmentStack.spacing = 6
+        attachmentStack.edgeInsets = NSEdgeInsets(top: 3, left: 4, bottom: 3, right: 8)
 
         attachmentStrip.drawsBackground = false
         attachmentStrip.hasVerticalScroller = false
         attachmentStrip.hasHorizontalScroller = true
-        attachmentStrip.autohidesScrollers = true
+        attachmentStrip.autohidesScrollers = false
+        attachmentStrip.horizontalScrollElasticity = .allowed
+        attachmentStrip.usesPredominantAxisScrolling = false
         attachmentStrip.borderType = .noBorder
         attachmentStrip.documentView = attachmentStack
         attachmentStrip.scrollerStyle = .overlay
@@ -4566,6 +6222,18 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         composerSurface.layer?.borderWidth = 1
         composerSurface.layer?.borderColor = NSColor.white.withAlphaComponent(0.105).cgColor
 
+        composerScroll.drawsBackground = false
+        composerScroll.borderType = .noBorder
+        composerScroll.hasHorizontalScroller = false
+        composerScroll.hasVerticalScroller = true
+        composerScroll.autohidesScrollers = true
+        composerScroll.horizontalScrollElasticity = .none
+        composerScroll.verticalScrollElasticity = .allowed
+        composerScroll.contentView.drawsBackground = false
+        composerScroll.contentView.postsBoundsChangedNotifications = true
+        composerScroll.wantsLayer = true
+        composerScroll.layer?.backgroundColor = NSColor.clear.cgColor
+
         opacityControl.wantsLayer = true
         opacityControl.layer?.backgroundColor = NSColor.clear.cgColor
         opacityControl.layer?.cornerRadius = 13
@@ -4591,6 +6259,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         for control in [
             recordingButton,
+            autoSendModeMenu,
             opacityControl,
             instructionsButton,
             attachButton,
@@ -4633,44 +6302,89 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func configureTooltips() {
-        navButton.toolTip = "Show recordings"
-        drawerCloseButton.toolTip = "Close recordings"
+        headerBar.toolTip = "Drag this bar to move Bluey"
+        headerChrome.toolTip = "Drag this bar to move Bluey"
+        headerLogo.toolTip = "Bluey"
+        headerWordmark.toolTip = "Bluey"
+        navButton.toolTip = "Open or close conversation history"
+        drawerCloseButton.toolTip = "Close conversation history"
         newSessionButton.toolTip = "Start a new recording"
-        modelMenu.toolTip = "Choose routing lane"
+        modelMenu.toolTip = "Choose Auto, Instant, Balanced, or Deep"
+        autoSendModeMenu.toolTip = autoSendStopMode.tooltip
         canvasToggleButton.toolTip = "Open or collapse the canvas"
-        balanceLabel.toolTip = "Remaining Bluey balance"
-        fullSizeButton.toolTip = windowFullSize ? "Restore Bluey size" : "Make Bluey full size"
+        themeButton.toolTip = lightThemeEnabled ? "Switch to dark theme" : "Switch to light theme"
+        balanceLabel.toolTip = "Remaining Bluey credits"
+        fullSizeButton.toolTip = windowFullSize ? "Restore Bluey size" : "Open focus size"
         interactionModeButton.toolTip = passThroughMode
-            ? "Click-through on. Click to make the whole panel interactive."
-            : "Interactive on. Click to pass answer text and captions through."
-        hideButton.toolTip = "Hide to pill"
-        closeButton.toolTip = "Turn Bluey off. Run bluey on to start again."
+            ? "Click-through on: blank Bluey space passes to the app behind it. Drag the Bluey logo to move."
+            : "Interactive on: blank Bluey space moves/resizes the panel, and the whole panel receives clicks."
+        hideButton.toolTip = "Minimize Bluey to the small pill"
+        closeButton.toolTip = "Turn Bluey off"
         recordingButton.toolTip = "Start or stop listening"
-        instructionsButton.toolTip = "How Bluey should answer"
-        attachButton.toolTip = "Attach files"
-        analyzeButton.toolTip = "Analyse screen"
-        askButton.toolTip = "Answer with Cmd+Enter. Enter also answers; Shift+Enter adds a new line."
+        instructionsButton.toolTip = "Set how Bluey should answer"
+        attachButton.toolTip = "Attach documents or images"
+        analyzeButton.toolTip = "Capture the screen as context"
+        askButton.toolTip = "Send the question. Enter answers; Shift+Enter adds a new line."
+        composer.toolTip = "Type or paste a question for Bluey"
+        transcriptStrip.toolTip = "Live captions preview"
+        transcriptClearButton.toolTip = "Clear current captions from the next answer"
+        attachmentStrip.toolTip = "Attached documents and images. Scroll horizontally to see more."
+        opacityControl.toolTip = "Adjust Bluey opacity"
+        opacitySlider.toolTip = "Adjust Bluey opacity"
+        headerLogo.toolTip = "Drag Bluey"
+        headerWordmark.toolTip = "Drag Bluey"
+        brandStack.toolTip = "Drag Bluey"
         latestSessionButton.toolTip = "Continue the latest recording"
         answerStyleSaveButton.toolTip = "Save answer style for this session"
+    }
+
+    private func refreshControlChromeForTheme() {
+        styleHeaderIconButton(drawerCloseButton, symbol: "xmark", fallback: "x")
+        styleHeaderIconButton(canvasToggleButton, symbol: "sidebar.right", fallback: "|")
+        styleHeaderIconButton(newSessionButton, symbol: "square.and.pencil", fallback: "+")
+        styleHeaderIconButton(hideButton, symbol: "eye.slash", fallback: "-")
+        styleHeaderIconButton(closeButton, symbol: "xmark", fallback: "x")
+        styleIconButton(transcriptClearButton, symbol: "xmark", fallback: "x")
+        styleIconButton(attachButton, symbol: "plus", fallback: "+")
+        styleControlButton(latestSessionButton, symbol: "clock.arrow.circlepath", accent: false)
+        styleControlButton(answerStyleSaveButton, symbol: "checkmark", accent: true)
+        styleControlButton(instructionsButton, symbol: "text.bubble", accent: false)
+        styleControlButton(analyzeButton, symbol: "sparkle.magnifyingglass", accent: false)
+        styleControlButton(askButton, symbol: "arrow.up", accent: true)
+        let recordingSymbol = recordingActive ? "stop.fill" : "waveform"
+        styleControlButton(recordingButton, symbol: recordingSymbol, accent: recordingActive)
+        updateFullSizeButtonChrome()
+        updateInteractionModeChrome(showToast: false)
     }
 
     private func styleControlButton(_ button: NSButton, symbol: String, accent: Bool) {
         button.isBordered = false
         button.wantsLayer = true
         button.layer?.cornerRadius = 11
-        button.layer?.backgroundColor = accent
-            ? NSColor(red: 0.045, green: 0.145, blue: 0.190, alpha: 0.94).cgColor
-            : NSColor.white.withAlphaComponent(0.042).cgColor
+        let titleColor = lightThemeEnabled ? BlueyLightTheme.text : BlueyTheme.text
+        if lightThemeEnabled {
+            button.layer?.backgroundColor = (accent
+                ? BlueyTheme.cyan.withAlphaComponent(lightMaterialAlpha(0.24, floor: 0.10))
+                : BlueyLightTheme.surface.withAlphaComponent(lightMaterialAlpha(0.82, floor: 0.16))).cgColor
+            button.layer?.borderColor = (accent
+                ? BlueyTheme.cyan.withAlphaComponent(0.44)
+                : BlueyLightTheme.border).cgColor
+        } else {
+            button.layer?.backgroundColor = accent
+                ? NSColor(red: 0.045, green: 0.145, blue: 0.190, alpha: 0.94).cgColor
+                : NSColor.white.withAlphaComponent(0.042).cgColor
+            button.layer?.borderColor = (accent ? BlueyTheme.cyan.withAlphaComponent(0.42) : NSColor.white.withAlphaComponent(0.075)).cgColor
+        }
         button.layer?.borderWidth = accent ? 0.8 : 0.6
-        button.layer?.borderColor = (accent ? BlueyTheme.cyan.withAlphaComponent(0.42) : NSColor.white.withAlphaComponent(0.075)).cgColor
         button.font = NSFont.systemFont(ofSize: 10.6, weight: .bold)
         button.attributedTitle = NSAttributedString(
             string: button.title,
             attributes: [
                 .font: button.font ?? NSFont.systemFont(ofSize: 10.6, weight: .bold),
-                .foregroundColor: BlueyTheme.text,
+                .foregroundColor: titleColor,
             ])
-        button.contentTintColor = BlueyTheme.cyan
+        button.contentTintColor = accent ? BlueyTheme.cyan : (lightThemeEnabled ? BlueyLightTheme.textDim : BlueyTheme.cyan)
+        button.image = nil
         if let image = symbolImage(symbol) {
             image.isTemplate = true
             button.image = image
@@ -4712,7 +6426,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         button.layer?.borderWidth = 0
         button.layer?.borderColor = NSColor.clear.cgColor
         button.font = NSFont.systemFont(ofSize: 12, weight: .bold)
-        button.contentTintColor = BlueyTheme.text
+        button.contentTintColor = lightThemeEnabled ? BlueyLightTheme.text : BlueyTheme.text
         if let image = symbolImage(symbol) {
             image.isTemplate = true
             button.title = ""
@@ -4724,10 +6438,44 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 string: fallback,
                 attributes: [
                     .font: button.font ?? NSFont.systemFont(ofSize: 12, weight: .bold),
-                    .foregroundColor: BlueyTheme.textDim,
+                    .foregroundColor: lightThemeEnabled ? BlueyLightTheme.textDim : BlueyTheme.textDim,
                 ])
         }
         button.imageHugsTitle = true
+        button.alignment = .center
+    }
+
+    private func styleHistoryHeaderButton(_ button: NSButton, compact: Bool) {
+        if compact {
+            styleHeaderIconButton(button, symbol: "sidebar.left", fallback: "[]")
+            return
+        }
+
+        button.title = "History"
+        button.isBordered = false
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 14
+        button.layer?.backgroundColor = (lightThemeEnabled
+            ? BlueyLightTheme.surface.withAlphaComponent(lightMaterialAlpha(0.82, floor: 0.16))
+            : NSColor.white.withAlphaComponent(0.045)).cgColor
+        button.layer?.borderWidth = 0.7
+        button.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(lightThemeEnabled ? 0.26 : 0.18).cgColor
+        button.font = NSFont.systemFont(ofSize: 10.5, weight: .bold)
+        button.attributedTitle = NSAttributedString(
+            string: "History",
+            attributes: [
+                .font: button.font ?? NSFont.systemFont(ofSize: 10.5, weight: .bold),
+                .foregroundColor: lightThemeEnabled ? BlueyLightTheme.text : BlueyTheme.text,
+            ])
+        button.contentTintColor = BlueyTheme.cyan
+        button.image = nil
+        if let image = symbolImage("sidebar.left") {
+            image.isTemplate = true
+            button.image = image
+        }
+        button.imagePosition = .imageLeading
+        button.imageHugsTitle = true
+        button.imageScaling = .scaleProportionallyDown
         button.alignment = .center
     }
 
@@ -4740,7 +6488,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         button.layer?.borderWidth = 0
         button.layer?.borderColor = NSColor.clear.cgColor
         button.font = NSFont.systemFont(ofSize: 12, weight: .bold)
-        button.contentTintColor = accent ? BlueyTheme.text : BlueyTheme.cyan
+        button.contentTintColor = accent ? (lightThemeEnabled ? BlueyLightTheme.text : BlueyTheme.text) : BlueyTheme.cyan
         if let image = symbolImage(symbol) {
             image.isTemplate = true
             button.title = ""
@@ -4752,7 +6500,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 string: fallback,
                 attributes: [
                     .font: button.font ?? NSFont.systemFont(ofSize: 12, weight: .bold),
-                    .foregroundColor: BlueyTheme.text,
+                    .foregroundColor: lightThemeEnabled ? BlueyLightTheme.text : BlueyTheme.text,
                 ])
         }
         button.imageHugsTitle = true
@@ -4760,6 +6508,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     @objc private func hideClicked() { onClose?() }
+
+    @objc private func themeClicked() {
+        lightThemeEnabled.toggle()
+        UserDefaults.standard.set(lightThemeEnabled, forKey: overlayLightThemeDefaultsKey)
+        refreshBackgroundChrome()
+        configureTooltips()
+        needsDisplay = true
+    }
 
     @objc private func closeClicked() {
         showTurnOffConfirmation()
@@ -4860,17 +6616,29 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func setComposerTextHeight(_ rawHeight: CGFloat) {
-        let textHeight = min(max(rawHeight, ChromeMetrics.composerInputHeight), 68)
-        guard abs((composerTextHeightConstraint?.constant ?? 0) - textHeight) > 0.5 else { return }
+        composerMeasuredHeight = max(rawHeight, ChromeMetrics.composerInputHeight)
+        let textHeight = min(composerMeasuredHeight, 68)
+        let previousTextHeight = composerTextHeightConstraint?.constant ?? 0
+        let previousDocumentHeight = composerDocumentHeightConstraint?.constant ?? 0
+        composerDocumentHeightConstraint?.constant = composerMeasuredHeight
+        let textHeightChanged = abs(previousTextHeight - textHeight) > 0.5
+        let documentHeightChanged = abs(previousDocumentHeight - composerMeasuredHeight) > 0.5
+        guard textHeightChanged || documentHeightChanged else { return }
         composerTextHeightConstraint?.constant = textHeight
         composerBarHeightConstraint?.constant = textHeight + ChromeMetrics.composerExtraChromeHeight
         needsLayout = true
         layoutSubtreeIfNeeded()
+        composer.scrollRangeToVisible(composer.selectedRange())
     }
 
     @objc private func toggleSessionsClicked() {
+        if !sessionDrawer.isHidden {
+            sessionDrawer.isHidden = true
+            setHeaderSubtitle()
+            return
+        }
         updateSessionDrawerGeometry(layoutWidth: bounds.width, layoutHeight: bounds.height)
-        sessionDrawer.isHidden.toggle()
+        sessionDrawer.isHidden = false
         setHeaderSubtitle()
     }
 
@@ -4898,6 +6666,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     @objc private func newSessionClicked() {
+        guard !isCurrentSessionSurfaceEmpty else {
+            showSystemToast(title: "Ready", body: "This recording is already empty.", duration: 1.8)
+            return
+        }
         let preserveFrame = !canvasOpen
         let previousFrame = preserveFrame ? window?.frame : nil
         resetSessionSurface()
@@ -4909,6 +6681,17 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             window?.setFrame(previousFrame, display: true)
         }
         emitSimple("session_new_requested")
+    }
+
+    private var isCurrentSessionSurfaceEmpty: Bool {
+        !feed.hasVisibleCards
+            && transcriptSnippets.isEmpty
+            && latestLiveTranscriptLine == nil
+            && latestLiveTranscriptLinesBySource.isEmpty
+            && !hasVisibleContextAttachments
+            && !screenContextReadyForAnswer
+            && canvases.isEmpty
+            && composer.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     @objc private func continueSessionClicked() {
@@ -4967,7 +6750,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             updateAudioRouteBadge("● Ready", accent: BlueyTheme.green)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
             setTranscriptState("READY", active: false)
+            scheduleAutoSendAfterExplicitStop()
         } else {
+            prepareAutoSendListenCapture()
             emitSimple("recording_start_requested")
             recordingActive = false
             onListeningStateChanged?(.connecting)
@@ -4976,21 +6761,247 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             composer.placeholder = "Starting audio..."
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
             setTranscriptState("STARTING", active: true)
-            seedTranscriptPreviewIfEmpty("Starting mic + system audio...")
+            seedTranscriptPreviewIfEmpty("Mic + System: starting audio...")
         }
     }
 
+    @objc private func autoSendModeChanged() {
+        let tag = autoSendModeMenu.selectedItem?.tag ?? -1
+        if tag >= 0 {
+            setAutoSendStopMode(AutoSendStopMode(rawValue: tag) ?? .off)
+        }
+    }
+
+    @objc private func autoSendModeMenuItemSelected(_ sender: NSMenuItem) {
+        guard let mode = AutoSendStopMode(rawValue: sender.tag) else {
+            updateAutoSendModeChrome()
+            return
+        }
+        setAutoSendStopMode(mode)
+    }
+
+    private func migrateAutoSendStopModeDefaultsIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard defaults.integer(forKey: overlayAutoSendStopModeVersionDefaultsKey) < overlayAutoSendStopModeCurrentVersion else {
+            return
+        }
+        autoSendStopMode = .off
+        defaults.set(autoSendStopMode.rawValue, forKey: overlayAutoSendStopModeDefaultsKey)
+        defaults.set(overlayAutoSendStopModeCurrentVersion, forKey: overlayAutoSendStopModeVersionDefaultsKey)
+    }
+
+    private func setAutoSendStopMode(_ mode: AutoSendStopMode) {
+        autoSendStopMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: overlayAutoSendStopModeDefaultsKey)
+        UserDefaults.standard.set(overlayAutoSendStopModeCurrentVersion, forKey: overlayAutoSendStopModeVersionDefaultsKey)
+        autoSendAfterStopWorkItem?.cancel()
+        autoSendAfterStopWorkItem = nil
+        updateAutoSendModeChrome()
+    }
+
+    private func configureAutoSendModeMenuItems() {
+        autoSendModeMenu.removeAllItems()
+        autoSendModeMenu.addItem(withTitle: autoSendStopMode.compactTitle)
+        autoSendModeMenu.item(at: 0)?.tag = -1
+        autoSendModeMenu.menu?.minimumWidth = 270
+        autoSendModeMenu.menu?.addItem(.separator())
+        for mode in AutoSendStopMode.allCases {
+            autoSendModeMenu.addItem(withTitle: mode.menuTitle)
+            let item = autoSendModeMenu.item(at: autoSendModeMenu.numberOfItems - 1)
+            item?.tag = mode.rawValue
+            item?.state = mode == autoSendStopMode ? .on : .off
+            item?.target = self
+            item?.action = #selector(autoSendModeMenuItemSelected(_:))
+        }
+        autoSendModeMenu.selectItem(at: 0)
+    }
+
+    private func updateAutoSendModeChrome() {
+        let enabled = autoSendStopMode.isEnabled
+        configureAutoSendModeMenuItems()
+        autoSendModeMenu.toolTip = autoSendStopMode.tooltip
+        autoSendModeMenu.contentTintColor = enabled ? BlueyTheme.green : themedTextColor
+        autoSendModeMenu.layer?.cornerRadius = 12
+        autoSendModeMenu.layer?.borderWidth = 1
+        autoSendModeMenu.layer?.backgroundColor = (enabled
+            ? BlueyTheme.green.withAlphaComponent(materialAlpha(0.14, floor: 0.05))
+            : themedSurfaceColor).cgColor
+        autoSendModeMenu.layer?.borderColor = (enabled
+            ? BlueyTheme.green.withAlphaComponent(materialAlpha(0.42, floor: 0.14))
+            : (lightThemeEnabled
+                ? NSColor.black.withAlphaComponent(0.10)
+                : NSColor.white.withAlphaComponent(materialAlpha(0.12)))).cgColor
+    }
+
+    private func hasAutoSendStopContext() -> Bool {
+        switch autoSendStopMode {
+        case .off:
+            return false
+        case .mic:
+            return hasAutoSendTranscriptContext(forSource: "Mic")
+        case .system:
+            return hasAutoSendTranscriptContext(forSource: "System")
+        case .micAndSystem:
+            return hasAutoSendTranscriptContext(forSource: "Mic") || hasAutoSendTranscriptContext(forSource: "System")
+        }
+    }
+
+    private func hasAutoSendTranscriptContext(forSource source: String) -> Bool {
+        autoSendTranscriptLinesBySource[source]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    private func hasTranscriptQuestionContext() -> Bool {
+        transcriptQuestionForAnswer()?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    private func shouldBlockSilentListenAnswer(raw: String) -> Bool {
+        guard raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        guard autoSendListenCaptureActive || recordingActive else { return false }
+        guard !hasTranscriptQuestionContext() else { return false }
+
+        if !recordingActive {
+            autoSendAfterStopWorkItem?.cancel()
+            autoSendAfterStopWorkItem = nil
+            autoSendListenCaptureActive = false
+            autoSendTranscriptLinesBySource.removeAll()
+        }
+        showSystemToast(
+            title: "No captions yet",
+            body: recordingActive
+                ? "Speak first, type a question, or stop Listen before using attached context."
+                : "Nothing was transcribed from that Listen run.",
+            duration: 2.8)
+        return true
+    }
+
+    private func shouldSuppressDuplicateAsk(question: String, visibleContextIds: [String]) -> Bool {
+        let normalizedQuestion = normalizeTranscriptMemoryLine(question)
+        let normalizedContext = visibleContextIds.sorted().joined(separator: ",")
+        let fingerprint = "\(normalizedQuestion)|\(normalizedContext)"
+        guard !fingerprint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return false
+        }
+        let now = CACurrentMediaTime()
+        if fingerprint == lastSubmittedAskFingerprint, now - lastSubmittedAskAt < 8.0 {
+            return true
+        }
+        lastSubmittedAskFingerprint = fingerprint
+        lastSubmittedAskAt = now
+        return false
+    }
+
+    private func scheduleAutoSendAfterExplicitStop() {
+        autoSendAfterStopWorkItem?.cancel()
+        autoSendAfterStopWorkItem = nil
+        guard autoSendStopMode.isEnabled else { return }
+        scheduleAutoSendAfterStopAttempt(mode: autoSendStopMode, attempt: 0)
+    }
+
+    private func scheduleAutoSendAfterStopAttempt(mode: AutoSendStopMode, attempt: Int) {
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.autoSendAfterStopWorkItem = nil
+            guard self.autoSendStopMode == mode else { return }
+            guard !self.recordingActive else { return }
+            guard self.hasAutoSendStopContext() else {
+                if attempt < 4 {
+                    self.scheduleAutoSendAfterStopAttempt(mode: mode, attempt: attempt + 1)
+                } else {
+                    self.autoSendListenCaptureActive = false
+                    self.autoSendTranscriptLinesBySource.removeAll()
+                }
+                return
+            }
+            self.sendAutoStopAnswer(mode: mode)
+        }
+        autoSendAfterStopWorkItem = work
+        let delay = attempt == 0 ? 1.2 : 0.75
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    private func sendAutoStopAnswer(mode: AutoSendStopMode) {
+        guard let q = autoSendQuestionForStopMode(mode) else {
+            autoSendListenCaptureActive = false
+            autoSendTranscriptLinesBySource.removeAll()
+            return
+        }
+        consumeTranscriptBufferForAnswer()
+        let route = selectedRoute()
+        updateRouteBadge(for: q, selectedRoute: route)
+        let sentContextIds = Array(pendingContextItemIds)
+        guard !shouldSuppressDuplicateAsk(question: q, visibleContextIds: sentContextIds) else {
+            autoSendListenCaptureActive = false
+            autoSendTranscriptLinesBySource.removeAll()
+            return
+        }
+        emitAsk(
+            question: q,
+            provider: route.provider,
+            model: route.model,
+            mode: route.mode,
+            visibleContextIds: sentContextIds
+        )
+        consumeSentPendingContextAttachments()
+        screenContextReadyForAnswer = false
+        window?.makeFirstResponder(composer)
+    }
+
+    private func autoSendQuestionForStopMode(_ mode: AutoSendStopMode) -> String? {
+        let allowedSources: [String]
+        switch mode {
+        case .off:
+            return nil
+        case .mic:
+            allowedSources = ["Mic"]
+        case .system:
+            allowedSources = ["System"]
+        case .micAndSystem:
+            allowedSources = ["Mic", "System"]
+        }
+        let lines = allowedSources.compactMap { source -> String? in
+            guard let body = autoSendTranscriptLinesBySource[source]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !body.isEmpty else {
+                return nil
+            }
+            return "\(source): \(body)"
+        }
+        let joined = compactTranscriptQuestionLines(lines)
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return joined.isEmpty ? nil : joined
+    }
+
+    func prepareAutoSendListenCapture() {
+        autoSendAfterStopWorkItem?.cancel()
+        autoSendAfterStopWorkItem = nil
+        autoSendListenCaptureActive = true
+        autoSendTranscriptLinesBySource.removeAll()
+    }
+
     @objc private func askClicked() {
+        autoSendAfterStopWorkItem?.cancel()
+        autoSendAfterStopWorkItem = nil
         let raw = composer.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !shouldBlockSilentListenAnswer(raw: raw) else {
+            window?.makeFirstResponder(composer)
+            return
+        }
         guard let q = composedQuestionForAnswer(typed: raw) ?? fallbackQuestionForAttachedContext() else {
             showSystemToast(for: RenderedCard(
                 id: "empty-answer-\(UUID().uuidString)",
                 kind: "system",
                 title: "Nothing to answer yet",
-                body: "Type a question, start Listen, attach a document, or capture the screen first.",
+                body: "Ask a question, start Listen, attach what you have, or capture the screen first.",
                 done: true,
                 costLabel: nil,
-                artifact: nil))
+                artifact: nil,
+                attachments: []))
+            window?.makeFirstResponder(composer)
+            return
+        }
+        let sentContextIds = Array(pendingContextItemIds)
+        guard !shouldSuppressDuplicateAsk(question: q, visibleContextIds: sentContextIds) else {
+            showSystemToast(title: "Already sent", body: "Bluey is already answering that request.", duration: 1.8)
             window?.makeFirstResponder(composer)
             return
         }
@@ -4998,7 +7009,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         consumeTranscriptBufferForAnswer()
         let route = selectedRoute()
         updateRouteBadge(for: q, selectedRoute: route)
-        emitAsk(question: q, provider: route.provider, model: route.model, mode: route.mode)
+        emitAsk(
+            question: q,
+            provider: route.provider,
+            model: route.model,
+            mode: route.mode,
+            visibleContextIds: sentContextIds
+        )
+        consumeSentPendingContextAttachments()
         screenContextReadyForAnswer = false
         window?.makeFirstResponder(composer)
     }
@@ -5008,8 +7026,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let question = composedQuestionForAnswer(typed: raw)
         routeBadge.stringValue = "Screen · ready"
         routeBadge.textColor = BlueyTheme.cyan
+        routeBadge.toolTip = "Screen capture is ready for the next answer"
         setHeaderSubtitle("Capturing screen")
         screenContextReadyForAnswer = true
+        expectContextMutationForPendingSend()
         emitAnalyzeScreen(question: question)
         window?.makeFirstResponder(composer)
     }
@@ -5021,6 +7041,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
         setKnowledgeBadge("Docs loading", accent: BlueyTheme.warning)
         showKnowledgePlaceholder("Indexing selected files...")
+        expectContextMutationForPendingSend()
         emitSimple("attach_requested")
     }
 
@@ -5047,9 +7068,20 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         setDropHighlight(false)
         guard !paths.isEmpty else { return false }
         endAttachPickerHandoff()
+        let supportedPaths = paths.filter(isSupportedDropPath)
+        let skippedCount = paths.count - supportedPaths.count
+        if skippedCount > 0 {
+            showUnsupportedDropMessage(skippedCount: skippedCount, totalCount: paths.count)
+        }
+        guard !supportedPaths.isEmpty else {
+            setKnowledgeBadge("Unsupported file", accent: BlueyTheme.warning)
+            showKnowledgePlaceholder(supportedDropFormatsMessage)
+            return true
+        }
         setKnowledgeBadge("Docs loading", accent: BlueyTheme.warning)
-        showKnowledgePlaceholder(paths.count == 1 ? "Indexing dropped document..." : "Indexing dropped documents...")
-        emitAttachFiles(paths: paths)
+        showKnowledgePlaceholder(supportedPaths.count == 1 ? "Indexing dropped document..." : "Indexing dropped documents...")
+        expectContextMutationForPendingSend()
+        emitAttachFiles(paths: supportedPaths)
         return true
     }
 
@@ -5067,6 +7099,34 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         return urls
             .map(\.path)
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
+
+    private func isSupportedDropPath(_ path: String) -> Bool {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+              !isDirectory.boolValue
+        else {
+            return false
+        }
+        let ext = URL(fileURLWithPath: path).pathExtension.lowercased()
+        return supportedDropExtensions.contains(ext)
+    }
+
+    private func showUnsupportedDropMessage(skippedCount: Int, totalCount: Int) {
+        let title = skippedCount == totalCount ? "File type not supported" : "Some files were skipped"
+        let skippedText = skippedCount == 1 ? "1 file" : "\(skippedCount) files"
+        let intro = skippedCount == totalCount
+            ? "Bluey cannot use that file type as context yet."
+            : "Bluey skipped \(skippedText) that are not readable context."
+        showSystemToast(for: RenderedCard(
+            id: "unsupported-drop-\(UUID().uuidString)",
+            kind: "warning",
+            title: title,
+            body: "\(intro) \(supportedDropFormatsMessage)",
+            done: true,
+            costLabel: nil,
+            artifact: nil,
+            attachments: []))
     }
 
     @discardableResult
@@ -5111,7 +7171,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 body: "Release to attach them to this Bluey session.",
                 done: true,
                 costLabel: nil,
-                artifact: nil))
+                artifact: nil,
+                attachments: []))
         }
     }
 
@@ -5120,6 +7181,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         guard !id.isEmpty else { return }
         setKnowledgeBadge("Docs updating", accent: BlueyTheme.warning)
         emitRemoveContext(id: id)
+    }
+
+    @objc private func clearTranscriptClicked() {
+        clearLocalTranscriptContext(replacementText: "Captions cleared")
+        emitSimple("transcript_clear_requested")
     }
 
     @objc private func instructionsClicked() {
@@ -5159,10 +7225,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             latestSessionButton,
             canvasToggleButton,
             modelMenu,
+            autoSendModeMenu,
             fullSizeButton,
             recordingButton,
             askButton,
             analyzeButton,
+            transcriptClearButton,
             attachButton,
             instructionsButton,
             opacityControl,
@@ -5194,6 +7262,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         setHeaderSubtitle("Local ready")
         routeBadge.stringValue = "Sign in"
         routeBadge.textColor = BlueyTheme.warning
+        routeBadge.toolTip = "Sign in to use managed answers and balance"
         routeBadge.layer?.borderColor = NSColor.clear.cgColor
         routeBadge.layer?.backgroundColor = NSColor.clear.cgColor
         balanceLabel.stringValue = "Login"
@@ -5207,6 +7276,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         statusLabel.toolTip = nil
         routeBadge.stringValue = "● Ready"
         routeBadge.textColor = BlueyTheme.green
+        routeBadge.toolTip = "Ready"
         routeBadge.layer?.borderColor = NSColor.clear.cgColor
         routeBadge.layer?.backgroundColor = NSColor.clear.cgColor
         if balanceLabel.stringValue == "Login" {
@@ -5242,12 +7312,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         knowledgeBadge.textColor = accent
         knowledgeBadge.layer?.borderColor = NSColor.clear.cgColor
         knowledgeBadge.layer?.backgroundColor = NSColor.clear.cgColor
-        knowledgeBadge.toolTip = "Attached document status"
+        knowledgeBadge.toolTip = contextItems.isEmpty
+            ? "Attached document status"
+            : savedContextBadgeTooltip(for: contextItems.count, showing: showingSavedContextItems)
         layoutHeaderChromeControls()
     }
 
     private func startKnowledgeIndexing() {
         knowledgeIndexTimer?.invalidate()
+        knowledgeIndexSafetyWorkItem?.cancel()
         knowledgeBadgeContentVisible = true
         knowledgeBadge.isHidden = false
         knowledgeIndexFrame = 0
@@ -5257,6 +7330,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             self.knowledgeIndexFrame = (self.knowledgeIndexFrame + 1) % self.knowledgeIndexFrames.count
             self.applyKnowledgeIndexFrame()
         }
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.finishKnowledgeIndexingIfStale()
+        }
+        knowledgeIndexSafetyWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4.0, execute: workItem)
     }
 
     private func applyKnowledgeIndexFrame() {
@@ -5273,7 +7351,32 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func stopKnowledgeIndexing() {
         knowledgeIndexTimer?.invalidate()
         knowledgeIndexTimer = nil
-        knowledgeBadge.toolTip = "Attached document status"
+        knowledgeIndexSafetyWorkItem?.cancel()
+        knowledgeIndexSafetyWorkItem = nil
+        knowledgeBadge.toolTip = "Show or hide attached files"
+    }
+
+    private func finishKnowledgeIndexingIfStale() {
+        guard knowledgeIndexTimer != nil else { return }
+        knowledgeIndexTimer?.invalidate()
+        knowledgeIndexTimer = nil
+        knowledgeIndexSafetyWorkItem = nil
+
+        if hasVisibleContextAttachments {
+            knowledgeBadgeContentVisible = true
+            knowledgeBadge.isHidden = false
+            knowledgeBadge.stringValue = savedContextBadgeTitle(for: contextItems.count, showing: showingSavedContextItems)
+            knowledgeBadge.textColor = BlueyTheme.green
+            knowledgeBadge.toolTip = savedContextBadgeTooltip(for: contextItems.count, showing: showingSavedContextItems)
+        } else {
+            knowledgeBadgeContentVisible = false
+            knowledgeBadge.stringValue = ""
+            knowledgeBadge.isHidden = true
+            knowledgeBadge.toolTip = nil
+            renderAttachmentStrip([])
+        }
+        layoutHeaderChromeControls()
+        layoutSubtreeIfNeeded()
     }
 
     private func showKnowledgePlaceholder(_ text: String) {
@@ -5310,10 +7413,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let upper = trimmed.uppercased()
         let display = upper == "TRANSCRIBING" ? "LIVE" : upper
         transcriptStateLabel.stringValue = display
-        transcriptStateLabel.textColor = active ? BlueyTheme.green : BlueyTheme.textDim
-        transcriptActivityDot.layer?.backgroundColor = (active ? BlueyTheme.green : BlueyTheme.textDim.withAlphaComponent(0.55)).cgColor
+        transcriptStateLabel.textColor = active ? BlueyTheme.green : themedDimTextColor
+        transcriptActivityDot.layer?.backgroundColor = (active
+            ? BlueyTheme.green
+            : themedDimTextColor.withAlphaComponent(0.55)).cgColor
         transcriptActivityDot.layer?.shadowOpacity = active ? 0.45 : 0
-        transcriptStrip.layer?.borderColor = (active ? BlueyTheme.green.withAlphaComponent(0.26) : BlueyTheme.hairline).cgColor
+        transcriptStrip.layer?.borderColor = (active
+            ? BlueyTheme.green.withAlphaComponent(0.26)
+            : (lightThemeEnabled ? BlueyLightTheme.border : BlueyTheme.hairline)).cgColor
         setAudioPulseActive(active)
     }
 
@@ -5340,7 +7447,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func applyAudioPulseFrame(active: Bool) {
         guard active else {
-            transcriptStrip.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.16).cgColor
+            transcriptStrip.layer?.backgroundColor = (lightThemeEnabled
+                ? BlueyLightTheme.surfaceRaised.withAlphaComponent(lightMaterialAlpha(0.78, floor: 0.16))
+                : NSColor.black.withAlphaComponent(0.16)).cgColor
+            transcriptStrip.layer?.borderColor = (lightThemeEnabled
+                ? BlueyLightTheme.border
+                : BlueyTheme.hairline).cgColor
             transcriptActivityDot.layer?.shadowOpacity = 0
             transcriptActivityDot.layer?.shadowRadius = 7
             recordingButton.layer?.shadowOpacity = 0
@@ -5383,7 +7495,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             updateAudioRouteBadge("● Starting", accent: BlueyTheme.green)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
             setTranscriptState("STARTING", active: true)
-            seedTranscriptPreviewIfEmpty("Starting mic + system audio...")
+            seedTranscriptPreviewIfEmpty("Mic + System: starting audio...")
         case .listening:
             recordingActive = true
             lastTranscriptStripSource = nil
@@ -5393,7 +7505,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             updateAudioRouteBadge("● Listening", accent: BlueyTheme.green)
             styleControlButton(recordingButton, symbol: "stop.fill", accent: true)
             setTranscriptState("LISTENING", active: true)
-            seedTranscriptPreviewIfEmpty("Mic + System live. Captions appear here.")
+            seedTranscriptPreviewIfEmpty("Mic + System: captions appear here.")
         case .paused:
             recordingActive = false
             lastTranscriptStripSource = nil
@@ -5406,6 +7518,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             seedTranscriptPreviewIfEmpty("Live captions preview")
         case .failed:
             recordingActive = false
+            autoSendAfterStopWorkItem?.cancel()
+            autoSendAfterStopWorkItem = nil
+            autoSendListenCaptureActive = false
+            autoSendTranscriptLinesBySource.removeAll()
             lastTranscriptStripSource = nil
             recordingButton.title = "Listen"
             setHeaderSubtitle("Audio issue")
@@ -5415,6 +7531,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             setTranscriptState("FAILED", active: false)
         case .ready:
             recordingActive = false
+            autoSendAfterStopWorkItem?.cancel()
+            autoSendAfterStopWorkItem = nil
+            autoSendListenCaptureActive = false
+            autoSendTranscriptLinesBySource.removeAll()
             lastTranscriptStripSource = nil
             recordingButton.title = "Listen"
             setHeaderSubtitle()
@@ -5426,9 +7546,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
     }
 
+    func scheduleAutoSendAfterExternalStop() {
+        scheduleAutoSendAfterExplicitStop()
+    }
+
     private func updateAudioRouteBadge(_ text: String, accent: NSColor) {
         routeBadge.stringValue = text
         routeBadge.textColor = accent
+        routeBadge.toolTip = text.replacingOccurrences(of: "● ", with: "")
         routeBadge.layer?.borderColor = NSColor.clear.cgColor
         routeBadge.layer?.backgroundColor = NSColor.clear.cgColor
     }
@@ -5439,36 +7564,32 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     ) {
         let manual = (selectedRoute.provider ?? "auto").lowercased() != "auto"
         if manual {
-            switch selectedRoute.model ?? selectedRoute.provider ?? "Manual" {
-            case let value where value.contains("mini"):
-                routeBadge.stringValue = "Instant · manual"
-            case let value where value.contains("sonnet"):
-                routeBadge.stringValue = "Deep · manual"
+            switch (selectedRoute.mode ?? selectedRoute.model ?? selectedRoute.provider ?? "Manual").lowercased() {
+            case let value where value.contains("instant"):
+                routeBadge.stringValue = "Instant"
+            case let value where value.contains("deep"):
+                routeBadge.stringValue = "Deep"
+            case let value where value.contains("balanced"):
+                routeBadge.stringValue = "Balanced"
             default:
-                routeBadge.stringValue = "Manual lane"
+                routeBadge.stringValue = "Manual"
             }
             routeBadge.textColor = BlueyTheme.text
+            routeBadge.toolTip = "Selected answer lane"
             return
         }
 
         let lower = question.lowercased()
-        let words = lower.split { $0.isWhitespace || $0.isNewline }.count
         let vision = lower.contains("screen") || lower.contains("screenshot") || lower.contains("image")
-        let code = looksLikeCode(lower) || lower.contains("leetcode") || lower.contains("debug")
-        let design = looksLikeSystemDesign(lower) || lower.contains("architecture")
-        let hard = words > 80 || design || lower.contains("tradeoff") || lower.contains("scale")
-        let label: String
         if vision {
-            label = "Vision · deep"
-        } else if hard {
-            label = "Auto · hard"
-        } else if code {
-            label = "Auto · medium"
+            routeBadge.stringValue = "Auto · Vision"
+            routeBadge.textColor = BlueyTheme.warning
+            routeBadge.toolTip = "Bluey is using the screen/image lane"
         } else {
-            label = "Auto · easy"
+            routeBadge.stringValue = "Auto · Balanced"
+            routeBadge.textColor = BlueyTheme.cyan
+            routeBadge.toolTip = "Bluey is answering with the balanced auto lane"
         }
-        routeBadge.stringValue = label
-        routeBadge.textColor = hard || vision ? BlueyTheme.warning : BlueyTheme.cyan
     }
 
     private func routeBadgeText(for artifact: OverlayArtifact) -> String {
@@ -5483,28 +7604,129 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     func setContextItems(_ items: [OverlayContextItem]) {
         endAttachPickerHandoff()
+        let previousIds = Set(contextItems.map(\.id))
+        let currentIds = Set(items.map(\.id))
+        let newlyAddedIds = currentIds.subtracting(previousIds)
+        contextItems = items
         hasVisibleContextAttachments = !items.isEmpty
+        pendingContextItemIds.formIntersection(currentIds)
+        if !newlyAddedIds.isEmpty, isExpectingContextMutationForPendingSend() {
+            pendingContextItemIds.formUnion(newlyAddedIds)
+            showingSavedContextItems = false
+        }
+        guard !items.isEmpty else {
+            pendingContextItemIds.removeAll()
+            showingSavedContextItems = false
+            setKnowledgeBadge("Docs empty", accent: BlueyTheme.textDim)
+            renderAttachmentStrip([])
+            refreshAttachmentStripLayout()
+            return
+        }
+
+        setKnowledgeBadge(savedContextBadgeTitle(for: items.count, showing: showingSavedContextItems), accent: BlueyTheme.green)
+        renderAttachmentStrip(itemsForVisibleAttachmentStrip())
+        refreshAttachmentStripLayout()
+    }
+
+    private func expectContextMutationForPendingSend() {
+        contextMutationExpectedUntil = Date().addingTimeInterval(45)
+    }
+
+    private func isExpectingContextMutationForPendingSend() -> Bool {
+        guard let deadline = contextMutationExpectedUntil else { return false }
+        if deadline >= Date() {
+            return true
+        }
+        contextMutationExpectedUntil = nil
+        return false
+    }
+
+    private func toggleSavedContextItems() {
+        guard !contextItems.isEmpty else { return }
+        showingSavedContextItems.toggle()
+        setKnowledgeBadge(savedContextBadgeTitle(for: contextItems.count, showing: showingSavedContextItems), accent: BlueyTheme.green)
+        renderAttachmentStrip(itemsForVisibleAttachmentStrip())
+        refreshAttachmentStripLayout()
+    }
+
+    private func refreshAttachmentStripLayout() {
+        needsLayout = true
+        layoutSubtreeIfNeeded()
+        keepFixedChromeInBounds()
+        layoutSubtreeIfNeeded()
+    }
+
+    private func savedContextBadgeTitle(for count: Int, showing: Bool = false) -> String {
+        let noun = count == 1 ? "file" : "files"
+        return showing ? "Hide \(count) \(noun)" : "Show \(count) \(noun)"
+    }
+
+    private func savedContextBadgeTooltip(for count: Int, showing: Bool = false) -> String {
+        let noun = count == 1 ? "file" : "files"
+        return showing
+            ? "Hide the \(count) \(noun) attached to this conversation"
+            : "Show every file attached to this conversation"
+    }
+
+    private func itemsForVisibleAttachmentStrip() -> [OverlayContextItem] {
+        if showingSavedContextItems {
+            return contextItems
+        }
+        return contextItems.filter { pendingContextItemIds.contains($0.id) }
+    }
+
+    private func isScreenContextItem(_ item: OverlayContextItem) -> Bool {
+        item.kind.caseInsensitiveCompare("image") == .orderedSame
+            && item.title.localizedCaseInsensitiveContains("screen")
+    }
+
+    private func renderAttachmentStrip(_ items: [OverlayContextItem]) {
         for view in attachmentStack.arrangedSubviews {
             attachmentStack.removeArrangedSubview(view)
             view.removeFromSuperview()
         }
 
-        attachmentStrip.isHidden = false
         guard !items.isEmpty else {
-            setKnowledgeBadge("Docs empty", accent: BlueyTheme.textDim)
             attachmentStrip.isHidden = true
             attachmentStripHeightConstraint?.constant = 0
-            layoutSubtreeIfNeeded()
+            attachmentStrip.toolTip = "Attached documents and images"
             return
         }
 
-        setKnowledgeBadge("Docs \(items.count) ready", accent: BlueyTheme.green)
-        attachmentStripHeightConstraint?.constant = 28
-
+        attachmentStrip.isHidden = false
+        attachmentStrip.toolTip = showingSavedContextItems
+            ? "All files in this conversation. Scroll horizontally to see more."
+            : "Files that will be sent with the next answer. Scroll horizontally to see more."
+        attachmentStripHeightConstraint?.constant = 34
         for item in items {
             attachmentStack.addArrangedSubview(makeAttachmentChip(item))
         }
-        layoutSubtreeIfNeeded()
+        updateAttachmentStripDocumentWidth()
+        attachmentStrip.contentView.scroll(to: .zero)
+        attachmentStrip.reflectScrolledClipView(attachmentStrip.contentView)
+    }
+
+    private func updateAttachmentStripDocumentWidth() {
+        attachmentStack.layoutSubtreeIfNeeded()
+        let fitting = attachmentStack.fittingSize
+        let viewportWidth = max(0, attachmentStrip.contentView.bounds.width)
+        attachmentStack.frame = NSRect(
+            x: 0,
+            y: 0,
+            width: max(viewportWidth + 1, fitting.width),
+            height: max(attachmentStrip.bounds.height, fitting.height)
+        )
+    }
+
+    private func consumeSentPendingContextAttachments() {
+        guard !pendingContextItemIds.isEmpty || showingSavedContextItems else { return }
+        pendingContextItemIds.removeAll()
+        showingSavedContextItems = false
+        contextMutationExpectedUntil = nil
+        if !contextItems.isEmpty {
+            setKnowledgeBadge(savedContextBadgeTitle(for: contextItems.count), accent: BlueyTheme.green)
+        }
+        renderAttachmentStrip([])
     }
 
     func setSessions(_ sessions: [OverlaySessionItem]) {
@@ -5556,13 +7778,25 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func resetSessionSurface() {
+        autoSendAfterStopWorkItem?.cancel()
+        autoSendAfterStopWorkItem = nil
         feed.clear()
         hideSystemToast(immediately: true)
         setContextItems([])
         transcriptSnippets.removeAll()
         latestLiveTranscriptLine = nil
+        latestLiveTranscriptLinesBySource.removeAll()
+        autoSendListenCaptureActive = false
+        autoSendTranscriptLinesBySource.removeAll()
+        autoSendAfterStopWorkItem?.cancel()
+        autoSendAfterStopWorkItem = nil
+        lastSubmittedAskFingerprint = nil
+        lastSubmittedAskAt = 0
+        liveTranscriptPreviewBodies.removeAll()
+        consumedTranscriptFingerprints.removeAll()
         lastTranscriptStripSource = nil
         updateTranscriptStripText("Live captions preview", scrollToEnd: false)
+        updateTranscriptClearButtonVisibility()
         setTranscriptState("READY", active: false)
         routeBadge.stringValue = "● Ready"
         routeBadge.textColor = BlueyTheme.green
@@ -5589,9 +7823,32 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return
         }
         if let artifact {
-            routeBadge.stringValue = routeBadgeText(for: artifact)
+            let question = feed.nearestQuestionBody(beforeCardId: id)
+            let artifactKind = CanvasKind.fromArtifactType(artifact.artifactType)
+            if shouldPreserveCanvasForExplanatoryFollowup(question: question, artifactKind: artifactKind) {
+                if !done {
+                    setHeaderSubtitle("Answer streaming")
+                } else {
+                    routeBadge.stringValue = "● Ready"
+                    routeBadge.textColor = BlueyTheme.green
+                    routeBadge.toolTip = "Ready"
+                }
+            } else {
+                routeBadge.stringValue = routeBadgeText(for: artifact)
+                routeBadge.toolTip = "Answer opened a \(routeBadgeText(for: artifact).lowercased()) workbench"
+            }
         } else if !done {
             setHeaderSubtitle("Answer streaming")
+        } else {
+            routeBadge.stringValue = "● Ready"
+            routeBadge.textColor = BlueyTheme.green
+            routeBadge.toolTip = "Ready"
+            if card.kind == "answer" {
+                let question = feed.nearestQuestionBody(beforeCardId: id)
+                if shouldCloseCanvasForPlainAnswer(question: question) {
+                    setCanvasOpen(false)
+                }
+            }
         }
         routeCanvasIfNeeded(card)
     }
@@ -5702,8 +7959,32 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func routeCanvasIfNeeded(_ card: RenderedCard) {
-        guard card.done, var artifact = makeCanvasArtifact(from: card) else { return }
         let question = feed.nearestQuestionBody(beforeCardId: card.id)
+        guard var artifact = makeCanvasArtifact(from: card) else {
+            if card.done, card.kind == "answer", canvasOpen, activeCanvasIndex != nil {
+                let shouldClose = shouldCloseCanvasForPlainAnswer(question: question)
+                emitLifecycle(
+                    shouldClose ? "canvas_close_plain_answer" : "canvas_preserve_plain_answer",
+                    detail: canvasLogDetail(card: card, question: question))
+                if shouldClose {
+                    setCanvasOpen(false)
+                }
+            }
+            return
+        }
+        if !card.done && card.artifact == nil {
+            emitLifecycle("canvas_waiting_for_artifact", detail: canvasLogDetail(card: card, question: question))
+            return
+        }
+        if shouldPreserveCanvasForExplanatoryFollowup(question: question, artifact: artifact) {
+            emitLifecycle(
+                "canvas_preserve_followup",
+                detail: canvasLogDetail(card: card, question: question, artifact: artifact))
+            if canvasOpen {
+                renderActiveCanvas()
+            }
+            return
+        }
         registerCanvasArtifact(&artifact, question: question)
         canvasToggleButton.isHidden = false
         if shouldAutoOpenCanvas(for: card, artifact: artifact) {
@@ -5711,6 +7992,36 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         } else if canvasOpen {
             renderActiveCanvas()
         }
+    }
+
+    private func canvasLogDetail(
+        card: RenderedCard,
+        question: String?,
+        artifact: CanvasArtifact? = nil
+    ) -> String {
+        var parts = [
+            "card=\(card.id)",
+            "kind=\(card.kind)",
+            "done=\(card.done)",
+            "question=\"\(compactLogSnippet(question))\"",
+        ]
+        if let artifact {
+            parts.append("artifact_kind=\(artifact.kind.shortTitle)")
+            parts.append("artifact_title=\"\(compactLogSnippet(artifact.title))\"")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    private func compactLogSnippet(_ text: String?, maxLength: Int = 72) -> String {
+        let compact = (text ?? "")
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard !compact.isEmpty else { return "empty" }
+        if compact.count <= maxLength {
+            return compact
+        }
+        return String(compact.prefix(maxLength)) + "..."
     }
 
     private func registerCanvasArtifact(_ artifact: inout CanvasArtifact, question: String?) {
@@ -5724,6 +8035,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             canvases[existingIndex] = artifact
             activeCanvasIndex = existingIndex
             renderActiveCanvas()
+            emitLifecycle(
+                "canvas_replace",
+                detail: "source_card=\(artifact.sourceCardId) index=\(existingIndex) kind=\(artifact.kind.shortTitle) title=\"\(compactLogSnippet(artifact.title))\"")
             return
         }
 
@@ -5743,6 +8057,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             canvasCardAssignments[artifact.sourceCardId] = index
             activeCanvasIndex = index
             renderActiveCanvas()
+            emitLifecycle(
+                "canvas_append_followup",
+                detail: "source_card=\(artifact.sourceCardId) index=\(index) followups=\(followupNumber) kind=\(artifact.kind.shortTitle) question=\"\(compactLogSnippet(question))\"")
             return
         }
 
@@ -5754,6 +8071,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         activeCanvasIndex = canvases.count - 1
         canvasCardAssignments[artifact.sourceCardId] = canvases.count - 1
         renderActiveCanvas()
+        emitLifecycle(
+            "canvas_new",
+            detail: "source_card=\(artifact.sourceCardId) index=\(canvases.count - 1) kind=\(artifact.kind.shortTitle) title=\"\(compactLogSnippet(artifact.title))\"")
     }
 
     private func renderActiveCanvas() {
@@ -5791,6 +8111,26 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         return "\(base) · \(suffix)"
     }
 
+    private func shouldCloseCanvasForPlainAnswer(question: String?) -> Bool {
+        guard
+            canvasOpen,
+            let index = activeCanvasIndex,
+            canvases.indices.contains(index)
+        else { return false }
+        let lower = question?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        guard !lower.isEmpty else { return true }
+        if isCanvasRelatedFollowup(
+            lower,
+            artifactKind: canvases[index].kind,
+            sourceQuestion: canvases[index].sourceQuestion)
+        {
+            return false
+        }
+        return true
+    }
+
     private func shouldAppendCanvasFollowup(question: String?, artifact: CanvasArtifact) -> Bool {
         guard
             let index = activeCanvasIndex,
@@ -5805,30 +8145,305 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if looksLikeNewCanvasQuestion(lower) {
             return false
         }
-        let followupSignals = [
-            "also",
-            "and ",
-            "now ",
-            "then ",
-            "make ",
+        if looksLikeCanvasExplanationFollowup(lower) && !looksLikeCanvasMutationFollowup(lower) {
+            return false
+        }
+        return looksLikeCanvasMutationFollowup(lower)
+    }
+
+    private func shouldPreserveCanvasForExplanatoryFollowup(
+        question: String?,
+        artifact: CanvasArtifact
+    ) -> Bool {
+        shouldPreserveCanvasForExplanatoryFollowup(question: question, artifactKind: artifact.kind)
+    }
+
+    private func shouldPreserveCanvasForExplanatoryFollowup(
+        question: String?,
+        artifactKind: CanvasKind
+    ) -> Bool {
+        guard
+            let index = activeCanvasIndex,
+            canvases.indices.contains(index),
+            canvases[index].kind == artifactKind,
+            let question = question?.trimmingCharacters(in: .whitespacesAndNewlines),
+            !question.isEmpty
+        else {
+            return false
+        }
+        let lower = question.lowercased()
+        if looksLikeNewCanvasQuestion(lower) || looksLikeCanvasMutationFollowup(lower) {
+            return false
+        }
+        return isCanvasRelatedFollowup(
+            lower,
+            artifactKind: artifactKind,
+            sourceQuestion: canvases[index].sourceQuestion)
+    }
+
+    private func isCanvasRelatedFollowup(
+        _ lower: String,
+        artifactKind: CanvasKind,
+        sourceQuestion: String?
+    ) -> Bool {
+        if looksLikeNewCanvasQuestion(lower) {
+            return false
+        }
+        if looksLikeDirectCanvasReference(lower) {
+            return true
+        }
+        if sharesCanvasQuestionTerm(lower, sourceQuestion: sourceQuestion) {
+            return true
+        }
+        switch artifactKind {
+        case .code:
+            return looksLikeCodeCanvasFollowup(lower)
+        case .systemDesign:
+            return looksLikeSystemDesignCanvasFollowup(lower)
+        case .screen:
+            return lower.contains("screenshot")
+                || lower.contains("screen")
+                || lower.contains("image")
+                || lower.contains("visible")
+                || lower.contains("shown")
+                || lower.contains("expected output")
+        case .document:
+            return lower.contains("document")
+                || lower.contains("resume")
+                || lower.contains("file")
+                || lower.contains("attached")
+        case .structured:
+            return false
+        }
+    }
+
+    private func looksLikeDirectCanvasReference(_ lower: String) -> Bool {
+        let directSignals = [
+            "this code",
+            "that code",
+            "same code",
+            "above code",
+            "current code",
+            "previous code",
+            "existing code",
+            "this solution",
+            "that solution",
+            "same solution",
+            "above solution",
+            "current solution",
+            "previous solution",
+            "this approach",
+            "that approach",
+            "same approach",
+            "above approach",
+            "current approach",
+            "previous approach",
+            "this design",
+            "that design",
+            "same design",
+            "above design",
+            "current design",
+            "previous design",
+            "canvas",
+            "workbench",
+            "why did you use",
+            "why are you using",
+            "why can't we do",
+            "why cant we do",
+            "walk me through this",
+            "explain this",
+            "explain that",
+            "make it",
+            "change it",
+        ]
+        return directSignals.contains { lower.contains($0) }
+    }
+
+    private func looksLikeCodeCanvasFollowup(_ lower: String) -> Bool {
+        let codeSignals = [
+            "algorithm",
+            "complexity",
+            "runtime",
+            "space",
+            "edge case",
+            "test case",
+            "failing test",
+            "unit test",
+            "pointer",
+            "pointers",
+            "vector",
+            "array",
+            "list",
+            "hash",
+            "map",
+            "set",
+            "tree",
+            "graph",
+            "heap",
+            "stack",
+            "queue",
+            "dp",
+            "dynamic programming",
+            "memo",
+            "recursion",
+            "recursive",
+            "loop",
+            "iteration",
+            "index",
+            "indices",
+            "function",
+            "method",
+            "class",
+            "variable",
+            "query",
+            "sql",
+            "schema",
+            "api",
+        ]
+        return looksLikeCanvasExplanationFollowup(lower)
+            && codeSignals.contains { lower.contains($0) }
+    }
+
+    private func looksLikeSystemDesignCanvasFollowup(_ lower: String) -> Bool {
+        let designSignals = [
+            "architecture",
+            "design",
+            "scale",
+            "scaling",
+            "latency",
+            "throughput",
+            "cache",
+            "queue",
+            "database",
+            "storage",
+            "api",
+            "contract",
+            "load balancer",
+            "region",
+            "replica",
+            "shard",
+            "partition",
+            "tradeoff",
+            "failure",
+            "observability",
+            "rollout",
+            "vpc",
+            "subnet",
+        ]
+        return looksLikeCanvasExplanationFollowup(lower)
+            && designSignals.contains { lower.contains($0) }
+    }
+
+    private func sharesCanvasQuestionTerm(_ lower: String, sourceQuestion: String?) -> Bool {
+        let questionTokens = meaningfulCanvasTokens(lower)
+        guard !questionTokens.isEmpty else { return false }
+        let sourceTokens = meaningfulCanvasTokens(sourceQuestion?.lowercased() ?? "")
+        guard !sourceTokens.isEmpty else { return false }
+        return !questionTokens.isDisjoint(with: sourceTokens)
+    }
+
+    private func meaningfulCanvasTokens(_ text: String) -> Set<String> {
+        let stopWords: Set<String> = [
+            "about", "above", "after", "again", "answer", "anything", "because",
+            "before", "being", "below", "better", "between", "can", "cannot",
+            "could", "current", "does", "done", "explain", "from", "have",
+            "into", "just", "like", "make", "more", "need", "other", "please",
+            "previous", "question", "should", "show", "solution", "tell", "that",
+            "their", "there", "these", "thing", "this", "those", "through",
+            "using", "what", "when", "where", "which", "while", "with", "would",
+            "your",
+        ]
+        let tokens = text
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { token in
+                token.count >= 4
+                    && !stopWords.contains(token)
+                    && !token.allSatisfy(\.isNumber)
+            }
+        return Set(tokens)
+    }
+
+    private func looksLikeCanvasExplanationFollowup(_ lower: String) -> Bool {
+        let explanationSignals = [
+            "explain",
+            "why ",
+            "why are",
+            "why is",
+            "why do",
+            "why does",
+            "why can",
+            "why can't",
+            "why cant",
+            "how does",
+            "how do",
+            "how is",
+            "what does",
+            "what is",
+            "what's",
+            "this code",
+            "that code",
+            "same code",
+            "above code",
+            "current code",
+            "previous code",
+            "existing code",
+            "this solution",
+            "that solution",
+            "same solution",
+            "current solution",
+            "previous solution",
+            "above solution",
+            "walk me through",
+            "help me understand",
+            "reason",
+            "clarify",
+        ]
+        return explanationSignals.contains { lower.hasPrefix($0) || lower.contains(" \($0)") }
+    }
+
+    private func looksLikeCanvasMutationFollowup(_ lower: String) -> Bool {
+        let mutationSignals = [
             "change ",
             "update ",
             "fix ",
             "add ",
             "remove ",
-            "instead",
-            "what about",
-            "can you",
-            "could you",
-            "continue",
-            "same ",
-            "for that",
-            "in this",
-            "with this",
-            "explain",
-            "why ",
+            "replace ",
+            "rewrite ",
+            "refactor ",
+            "optimize ",
+            "optimise ",
+            "convert ",
+            "patch ",
+            "edit ",
+            "modify ",
+            "delete ",
+            "insert ",
+            "rename ",
+            "move ",
+            "make it",
+            "make this",
+            "make the",
+            "switch ",
+            "turn this",
+            "turn it",
+            "use a different",
+            "use another",
+            "show the code",
+            "show complete code",
+            "complete code",
+            "continue the code",
         ]
-        return followupSignals.contains { lower.hasPrefix($0) || lower.contains(" \($0)") }
+        if mutationSignals.contains(where: { lower.hasPrefix($0) || lower.contains(" \($0)") }) {
+            return true
+        }
+        return lower.contains(" instead") && (
+            lower.contains(" use ")
+                || lower.contains(" switch ")
+                || lower.contains(" replace ")
+                || lower.contains(" change ")
+        )
     }
 
     private func looksLikeNewCanvasQuestion(_ lower: String) -> Bool {
@@ -5837,13 +8452,28 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             "q2",
             "q3",
             "q4",
+            "q5",
+            "q6",
+            "q7",
             "question 2",
             "question 3",
             "question 4",
+            "question 5",
+            "question 6",
+            "question 7",
             "next question",
+            "next problem",
             "next coding",
+            "new problem",
+            "new coding question",
+            "new screen",
+            "new screenshot",
+            "new image",
             "another question",
+            "another coding",
+            "another problem",
             "different question",
+            "different problem",
             "new question",
             "separate question",
             "write a ",
@@ -5892,6 +8522,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func setCanvasOpen(_ open: Bool) {
+        let previousOpen = canvasOpen
         if !open, canvasFullWindow {
             restoreCanvasWindow()
         }
@@ -5901,11 +8532,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         canvasOpen = open
         canvasPane.isHidden = !open
         updateCanvasWidth()
-        canvasToggleButton.contentTintColor = open ? BlueyTheme.cyan : BlueyTheme.textDim
+        canvasToggleButton.isHidden = canvases.isEmpty
+        canvasToggleButton.contentTintColor = open ? BlueyTheme.cyan : themedDimTextColor
+        canvasToggleButton.toolTip = open ? "Collapse canvas" : "Open canvas"
         if open {
             ensureRoomForCanvas()
         } else {
             restoreCompactWidth()
+        }
+        if previousOpen != open {
+            emitLifecycle("canvas_open_state", detail: "open=\(open) count=\(canvases.count) active=\(activeCanvasIndex ?? -1)")
         }
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.16
@@ -5928,23 +8564,33 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             : "arrow.up.left.and.arrow.down.right"
         let fallback = windowFullSize ? "↙" : "↗"
         styleHeaderIconButton(fullSizeButton, symbol: symbol, fallback: fallback)
-        fullSizeButton.toolTip = windowFullSize ? "Restore Bluey size" : "Make Bluey full size"
+        fullSizeButton.toolTip = windowFullSize
+            ? "Restore compact expanded Bluey"
+            : "Open focus size"
+    }
+
+    private func updateThemeButtonChrome() {
+        let symbol = lightThemeEnabled ? "moon.fill" : "sun.max.fill"
+        let fallback = lightThemeEnabled ? "☾" : "☼"
+        styleHeaderIconButton(themeButton, symbol: symbol, fallback: fallback)
+        themeButton.contentTintColor = lightThemeEnabled ? NSColor.black.withAlphaComponent(0.68) : BlueyTheme.cyan
+        themeButton.toolTip = lightThemeEnabled ? "Switch to dark theme" : "Switch to light theme"
     }
 
     private func updateInteractionModeChrome(showToast: Bool = true) {
         let symbol = passThroughMode ? "cursorarrow.rays" : "hand.tap"
         let fallback = passThroughMode ? "P" : "I"
         styleHeaderIconButton(interactionModeButton, symbol: symbol, fallback: fallback)
-        interactionModeButton.contentTintColor = passThroughMode ? BlueyTheme.cyan : BlueyTheme.text
+        interactionModeButton.contentTintColor = passThroughMode ? BlueyTheme.cyan : themedTextColor
         interactionModeButton.toolTip = passThroughMode
-            ? "Click-through on. Click to make the whole panel interactive."
-            : "Interactive on. Click to pass answer text and captions through."
+            ? "Click-through on: blank Bluey space passes to the app behind it. Drag the Bluey logo to move."
+            : "Interactive on: blank Bluey space moves/resizes the panel, and the whole panel receives clicks."
         if showToast {
             showSystemToast(
                 title: passThroughMode ? "Click-through on" : "Interactive on",
                 body: passThroughMode
-                    ? "Answer text, captions, and empty space pass through. Controls stay clickable."
-                    : "The whole panel receives clicks for selection, scrolling, and editing.",
+                    ? "Blank Bluey space now clicks the app behind it. Drag the logo or wordmark to move Bluey."
+                    : "Blank Bluey space now moves/resizes Bluey. Controls and text remain clickable.",
                 duration: 2.0)
         }
     }
@@ -5957,13 +8603,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         windowFullSize = true
         updateFullSizeButtonChrome()
 
-        let screen = window.screen?.frame
-            ?? NSScreen.main?.frame
+        let screen = window.screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let maxWidth = max(ExpandedPanelMetrics.minCompactWidth, screen.width)
-        let maxHeight = max(ExpandedPanelMetrics.minHeight, screen.height)
+        let maxWidth = ExpandedPanelMetrics.fittingFocusWidth(
+            for: screen,
+            preferred: ExpandedPanelMetrics.maxFocusWidth)
+        let maxHeight = ExpandedPanelMetrics.fittingFocusHeight(for: screen)
         if let overlayWindow = window as? OverlayWindow {
-            overlayWindow.fillsVisibleFrame = true
+            overlayWindow.fillsVisibleFrame = false
             overlayWindow.preserveProgrammaticFrameHeight = false
             overlayWindow.minimumFrameWidth = min(ExpandedPanelMetrics.minCompactWidth, maxWidth)
             overlayWindow.maximumFrameWidth = maxWidth
@@ -5975,9 +8623,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         window.maxSize = NSSize(width: maxWidth, height: maxHeight)
         window.contentMaxSize = window.maxSize
 
-        let frame = ExpandedPanelMetrics.fillVisibleScreenFrame(
-            NSRect(x: screen.minX, y: screen.minY, width: maxWidth, height: maxHeight),
-            visibleFrame: screen)
+        let frame = ExpandedPanelMetrics.focusFrame(
+            in: screen,
+            preferredWidth: ExpandedPanelMetrics.maxFocusWidth)
         updateCanvasWidth()
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.16
@@ -6003,8 +8651,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             overlayWindow.preserveProgrammaticFrameHeight = false
             overlayWindow.lockedFrameHeight = targetFrame.height
         }
-        let screen = window.screen?.frame
-            ?? NSScreen.main?.frame
+        let screen = window.screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let fittedFrame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(targetFrame, visibleFrame: screen)
         if let overlayWindow = window as? OverlayWindow {
@@ -6028,6 +8676,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             }
             self.layoutSubtreeIfNeeded()
             self.keepFixedChromeInBounds()
+            self.onWindowFrameChanged?(window.frame)
         }
     }
 
@@ -6037,11 +8686,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return
         }
         let available = max(0, bounds.width)
-        if canvasFullWindow || windowFullSize {
-            canvasWidthConstraint?.constant = min(max(440, available * 0.42), 760)
-        } else {
-            canvasWidthConstraint?.constant = 360
-        }
+        let width = min(max(520, available * 0.42), 760)
+        canvasWidthConstraint?.constant = min(width, max(360, available - 420))
     }
 
     private func expandCanvasWindow() {
@@ -6052,13 +8698,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         canvasFullWindow = true
         canvasPane.setFullWindow(true)
 
-        let screen = window.screen?.frame
-            ?? NSScreen.main?.frame
+        let screen = window.screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let maxWidth = max(360, screen.width)
-        let maxHeight = max(ExpandedPanelMetrics.minHeight, screen.height)
+        let maxWidth = ExpandedPanelMetrics.fittingFocusWidth(
+            for: screen,
+            preferred: ExpandedPanelMetrics.maxCanvasWidth)
+        let maxHeight = ExpandedPanelMetrics.fittingFocusHeight(for: screen)
         if let overlayWindow = window as? OverlayWindow {
-            overlayWindow.fillsVisibleFrame = true
+            overlayWindow.fillsVisibleFrame = false
             overlayWindow.minimumFrameWidth = min(ExpandedPanelMetrics.minCompactWidth, maxWidth)
             overlayWindow.maximumFrameWidth = maxWidth
             overlayWindow.minimumFrameHeight = ExpandedPanelMetrics.minHeight
@@ -6068,9 +8716,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         window.contentMinSize = window.minSize
         window.maxSize = NSSize(width: maxWidth, height: maxHeight)
         window.contentMaxSize = window.maxSize
-        let frame = ExpandedPanelMetrics.fillVisibleScreenFrame(
-            NSRect(x: screen.minX, y: screen.minY, width: maxWidth, height: maxHeight),
-            visibleFrame: screen)
+        let frame = ExpandedPanelMetrics.focusFrame(
+            in: screen,
+            preferredWidth: ExpandedPanelMetrics.maxCanvasWidth)
         updateCanvasWidth()
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.16
@@ -6092,10 +8740,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             overlayWindow.fillsVisibleFrame = false
         }
         if let targetFrame {
+            let screen = window.screen?.visibleFrame
+                ?? NSScreen.main?.visibleFrame
+                ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+            let fittedFrame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(targetFrame, visibleFrame: screen)
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0.16
                 context.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                window.animator().setFrame(targetFrame, display: true)
+                window.animator().setFrame(fittedFrame, display: true)
                 self.layoutSubtreeIfNeeded()
             }
         }
@@ -6109,8 +8761,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let clampedTargetWidth = ExpandedPanelMetrics.fittingWidth(for: screen, preferred: targetWidth)
         let minimumWidth = ExpandedPanelMetrics.fittingMinimumWidth(for: screen, targetWidth: clampedTargetWidth)
-        let maximumWidth = max(clampedTargetWidth, screen.width - ExpandedPanelMetrics.screenInset * 2)
-        let maximumHeight = max(ExpandedPanelMetrics.minHeight, screen.height - ExpandedPanelMetrics.screenInset * 2)
+        let maximumWidth = clampedTargetWidth
+        let maximumHeight = ExpandedPanelMetrics.fittingHeight(for: screen)
         if let overlayWindow = window as? OverlayWindow {
             overlayWindow.minimumFrameWidth = minimumWidth
             overlayWindow.maximumFrameWidth = maximumWidth
@@ -6138,8 +8790,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             for: screen,
             preferred: ExpandedPanelMetrics.maxCompactWidth)
         let minimumWidth = ExpandedPanelMetrics.fittingMinimumWidth(for: screen, targetWidth: compactWidth)
-        let maximumWidth = max(compactWidth, screen.width - ExpandedPanelMetrics.screenInset * 2)
-        let maximumHeight = max(ExpandedPanelMetrics.minHeight, screen.height - ExpandedPanelMetrics.screenInset * 2)
+        let maximumWidth = ExpandedPanelMetrics.fittingWidth(
+            for: screen,
+            preferred: ExpandedPanelMetrics.maxCanvasWidth)
+        let maximumHeight = ExpandedPanelMetrics.fittingHeight(for: screen)
         if let overlayWindow = window as? OverlayWindow {
             overlayWindow.fillsVisibleFrame = false
             overlayWindow.minimumFrameWidth = minimumWidth
@@ -6159,32 +8813,54 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
         let body = card.body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty else { return nil }
+        guard !looksLikePrivateInstructionDisclosure(body) else { return nil }
 
         if let artifact = card.artifact {
+            guard !looksLikePrivateInstructionDisclosure(artifact.body) else { return nil }
             let kind = CanvasKind.fromArtifactType(artifact.artifactType)
+            if card.kind == "answer", kind != .code, kind != .systemDesign {
+                emitLifecycle(
+                    "canvas_ignore_answer_artifact",
+                    detail: "card=\(card.id) kind=\(kind.shortTitle) title=\"\(compactLogSnippet(artifact.title))\"")
+                return nil
+            }
             let confidence = artifact.confidence.map { "Confidence \(Int(($0 * 100).rounded()))%" }
+            let artifactBody = artifact.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? body
+                : artifact.body
+            let content: String
+            if kind == .code {
+                content = formatCodeCanvas(body: artifactBody, codeBlocks: extractCodeBlocks(from: artifactBody))
+                guard canvasCodeHasRealCode(content) else { return nil }
+            } else {
+                content = artifactBody
+            }
             return CanvasArtifact(
                 kind: kind,
                 title: artifact.title.isEmpty ? kind.title : artifact.title,
                 subtitle: confidence ?? kind.subtitle,
-                content: artifact.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    ? body
-                    : artifact.body,
+                content: content,
                 sourceCardId: card.id)
+        }
+
+        if card.kind == "answer" {
+            return nil
         }
 
         let lower = body.lowercased()
         let codeBlocks = extractCodeBlocks(from: body)
         if !codeBlocks.isEmpty || looksLikeCode(lower) {
+            let content = formatCodeCanvas(body: body, codeBlocks: codeBlocks)
+            guard canvasCodeHasRealCode(content) else { return nil }
             return CanvasArtifact(
                 kind: .code,
                 title: "Code canvas",
-                subtitle: "Code, tests, complexity, and implementation notes",
-                content: formatCodeCanvas(body: body, codeBlocks: codeBlocks),
+                subtitle: CanvasKind.code.subtitle,
+                content: content,
                 sourceCardId: card.id)
         }
 
-        if looksLikeSystemDesign(lower) {
+        if looksLikeSystemDesign(lower) && hasStructuredShape(body) {
             return CanvasArtifact(
                 kind: .systemDesign,
                 title: "System design canvas",
@@ -6208,15 +8884,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 title: "Document notes",
                 subtitle: "Attached context distilled for this session",
                 content: formatStructuredCanvas(body, fallbackHeading: "Document Context"),
-                sourceCardId: card.id)
-        }
-
-        if body.count > 950 && hasStructuredShape(body) {
-            return CanvasArtifact(
-                kind: .structured,
-                title: "Workspace",
-                subtitle: "Long-form answer kept beside the chat",
-                content: formatStructuredCanvas(body, fallbackHeading: "Details"),
                 sourceCardId: card.id)
         }
 
@@ -6287,29 +8954,34 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         setTranscriptState(active ? "TRANSCRIBING" : state, active: active)
         guard !cleanBody.isEmpty else {
             updateTranscriptStripText(cleanLabel.isEmpty ? "Listening" : "\(cleanLabel) audio is live", scrollToEnd: false)
+            updateTranscriptClearButtonVisibility()
             return
         }
 
         let display = cleanLabel.isEmpty ? cleanBody : "\(cleanLabel): \(cleanBody)"
         updateTranscriptStripText(display, scrollToEnd: scrollToEnd)
+        updateTranscriptClearButtonVisibility()
     }
 
     private func rememberTranscriptForAnswer(label: String, body: String, final: Bool) {
+        let cleanLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanBody.isEmpty else { return }
-        let line = "\(label): \(cleanBody)"
+        let key = cleanLabel.isEmpty ? "Audio" : cleanLabel
+        let line = cleanLabel.isEmpty ? cleanBody : "\(cleanLabel): \(cleanBody)"
         if transcriptLineWasJustConsumed(line) {
             if !final {
                 latestLiveTranscriptLine = nil
+                latestLiveTranscriptLinesBySource.removeValue(forKey: key)
             }
+            updateTranscriptClearButtonVisibility()
             return
         }
+        rememberAutoSendTranscriptLine(source: key, body: cleanBody)
         if final {
             latestLiveTranscriptLine = nil
-            if let last = transcriptSnippets.last,
-               shouldReplaceTranscriptMemoryLine(last, with: line) {
-                transcriptSnippets[transcriptSnippets.count - 1] = longerTranscriptMemoryLine(last, line)
-            } else if transcriptSnippets.last != line {
+            latestLiveTranscriptLinesBySource.removeValue(forKey: key)
+            if !replaceExistingTranscriptSnippetIfNeeded(with: line) && transcriptSnippets.last != line {
                 transcriptSnippets.append(line)
             }
             if transcriptSnippets.count > 12 {
@@ -6317,14 +8989,82 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             }
         } else {
             latestLiveTranscriptLine = line
+            latestLiveTranscriptLinesBySource[key] = line
+        }
+        updateTranscriptClearButtonVisibility()
+    }
+
+    private func replaceExistingTranscriptSnippetIfNeeded(with line: String) -> Bool {
+        guard !transcriptSnippets.isEmpty else { return false }
+        let parsed = parsedTranscriptMemoryLine(line)
+        let incomingLabel = parsed.label
+        for index in transcriptSnippets.indices.reversed() {
+            let existing = transcriptSnippets[index]
+            let existingLabel = parsedTranscriptMemoryLine(existing).label
+            guard existingLabel == incomingLabel else { continue }
+            if shouldReplaceTranscriptMemoryLine(existing, with: line) {
+                transcriptSnippets[index] = longerTranscriptMemoryLine(existing, line)
+                return true
+            }
+        }
+        return false
+    }
+
+    private func rememberAutoSendTranscriptLine(source: String, body: String) {
+        guard autoSendListenCaptureActive else { return }
+        let key = transcriptSourceLabel(source)
+        guard key == "Mic" || key == "System" else { return }
+        let cleanBody = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanBody.isEmpty else { return }
+        let existing = autoSendTranscriptLinesBySource[key] ?? ""
+        autoSendTranscriptLinesBySource[key] = mergedTranscriptBody(existing, cleanBody)
+    }
+
+    private func clearLocalTranscriptContext(replacementText: String) {
+        transcriptSnippets.removeAll()
+        latestLiveTranscriptLine = nil
+        latestLiveTranscriptLinesBySource.removeAll()
+        autoSendListenCaptureActive = false
+        autoSendTranscriptLinesBySource.removeAll()
+        liveTranscriptPreviewBodies.removeAll()
+        consumedTranscriptFingerprints.removeAll()
+        lastTranscriptStripSource = nil
+        updateTranscriptStripText(replacementText, scrollToEnd: false)
+        updateTranscriptClearButtonVisibility()
+    }
+
+    private func hasTranscriptContextToClear() -> Bool {
+        !transcriptSnippets.isEmpty || latestLiveTranscriptLine != nil || !latestLiveTranscriptLinesBySource.isEmpty || !liveTranscriptPreviewBodies.isEmpty
+    }
+
+    private func updateTranscriptClearButtonVisibility() {
+        transcriptClearButton.isHidden = !hasTranscriptContextToClear()
+    }
+
+    private func appendLiveTranscriptLines(to lines: inout [String]) {
+        if latestLiveTranscriptLinesBySource.isEmpty {
+            if let live = latestLiveTranscriptLine, lines.last != live {
+                lines.append(live)
+            }
+            return
+        }
+
+        for key in ["Mic", "System", "Audio"] {
+            if let live = latestLiveTranscriptLinesBySource[key], lines.last != live {
+                lines.append(live)
+            }
+        }
+        for key in latestLiveTranscriptLinesBySource.keys.sorted()
+            where key != "Mic" && key != "System" && key != "Audio" {
+            if let live = latestLiveTranscriptLinesBySource[key], lines.last != live {
+                lines.append(live)
+            }
         }
     }
 
     private func transcriptQuestionForAnswer() -> String? {
         var lines = transcriptSnippets
-        if let live = latestLiveTranscriptLine, lines.last != live {
-            lines.append(live)
-        }
+        appendLiveTranscriptLines(to: &lines)
         let joined = compactTranscriptQuestionLines(Array(lines.suffix(12)))
             .joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -6334,9 +9074,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func consumeTranscriptBufferForAnswer() {
         var lines = transcriptSnippets
-        if let live = latestLiveTranscriptLine, lines.last != live {
-            lines.append(live)
-        }
+        appendLiveTranscriptLines(to: &lines)
         for line in lines {
             let fingerprint = transcriptMemoryFingerprint(line)
             guard !fingerprint.isEmpty else { continue }
@@ -6349,7 +9087,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
         transcriptSnippets.removeAll()
         latestLiveTranscriptLine = nil
+        latestLiveTranscriptLinesBySource.removeAll()
+        autoSendListenCaptureActive = false
+        autoSendTranscriptLinesBySource.removeAll()
         liveTranscriptPreviewBodies.removeAll()
+        updateTranscriptClearButtonVisibility()
     }
 
     private func composedQuestionForAnswer(typed raw: String) -> String? {
@@ -6371,13 +9113,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func fallbackQuestionForAttachedContext() -> String? {
-        if screenContextReadyForAnswer && hasVisibleContextAttachments {
+        let hasPendingAttachments = !pendingContextItemIds.isEmpty
+        if screenContextReadyForAnswer && hasPendingAttachments {
             return "Answer using the attached screen capture, documents, and current session context."
         }
         if screenContextReadyForAnswer {
             return "Analyse the attached screen capture and answer with the key details."
         }
-        if hasVisibleContextAttachments {
+        if hasPendingAttachments {
             return "Answer using the attached documents and current session context."
         }
         return nil
@@ -6398,12 +9141,26 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 bodies[label] = mergedTranscriptBody(existing, body)
             }
         }
-        return order.compactMap { label in
+        var accepted: [(label: String, body: String, normalized: String)] = []
+        for label in order {
             guard let body = bodies[label]?.trimmingCharacters(in: .whitespacesAndNewlines), !body.isEmpty else {
-                return nil
+                continue
             }
-            return "\(label): \(body)"
+            let normalized = normalizeTranscriptMemoryLine(body)
+            guard !normalized.isEmpty else { continue }
+            if let duplicateIndex = accepted.firstIndex(where: { isSameTranscriptMemoryBody($0.normalized, normalized) }) {
+                if transcriptLabelPriority(label) < transcriptLabelPriority(accepted[duplicateIndex].label) {
+                    accepted[duplicateIndex] = (label, body, normalized)
+                }
+                continue
+            }
+            accepted.append((label, body, normalized))
         }
+        let compacted = accepted.map { "\($0.label): \($0.body)" }
+        if compacted.count == 1, let only = compacted.first {
+            return [parsedTranscriptMemoryLine(only).body]
+        }
+        return compacted
     }
 
     private func parsedTranscriptMemoryLine(_ line: String) -> (label: String, body: String) {
@@ -6461,6 +9218,28 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func transcriptMemoryFingerprint(_ line: String) -> String {
         normalizeTranscriptMemoryLine(parsedTranscriptMemoryLine(line).body)
+    }
+
+    private func transcriptLabelPriority(_ label: String) -> Int {
+        switch transcriptSourceLabel(label) {
+        case "Mic": return 0
+        case "System": return 1
+        case "Audio": return 2
+        default: return 3
+        }
+    }
+
+    private func isSameTranscriptMemoryBody(_ first: String, _ second: String) -> Bool {
+        guard !first.isEmpty, !second.isEmpty else { return false }
+        if first == second || first.contains(second) || second.contains(first) {
+            return true
+        }
+        let firstSet = Set(first.split(separator: " ").map(String.init))
+        let secondSet = Set(second.split(separator: " ").map(String.init))
+        let shorter = min(firstSet.count, secondSet.count)
+        let longer = max(firstSet.count, secondSet.count)
+        let overlap = firstSet.intersection(secondSet).count
+        return shorter >= 4 && longer <= shorter + 4 && overlap >= max(1, shorter - 1)
     }
 
     private func transcriptLineWasJustConsumed(_ line: String) -> Bool {
@@ -6527,7 +9306,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             string: text,
             attributes: [
                 .font: font,
-                .foregroundColor: BlueyTheme.text,
+                .foregroundColor: themedTextColor,
             ])
         if let colon = attributed.string.firstIndex(of: ":") {
             let labelLength = attributed.string.distance(from: attributed.string.startIndex, to: colon)
@@ -6569,6 +9348,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func makeAttachmentChip(_ item: OverlayContextItem) -> NSView {
+        let isImage = isAttachmentImageKind(item.kind)
+        let chipHeight: CGFloat = isImage ? 28 : 26
+        let iconSize: CGFloat = isImage ? 22 : 14
         let chip = NSView()
         chip.translatesAutoresizingMaskIntoConstraints = false
         chip.wantsLayer = true
@@ -6591,11 +9373,20 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         let icon = NSImageView()
         icon.translatesAutoresizingMaskIntoConstraints = false
-        icon.imageScaling = .scaleProportionallyDown
-        icon.contentTintColor = fileAccent(for: item.kind)
-        if let image = symbolImage(fileSymbol(for: item.kind)) {
+        icon.imageScaling = isImage ? .scaleProportionallyUpOrDown : .scaleProportionallyDown
+        icon.wantsLayer = true
+        icon.layer?.cornerRadius = isImage ? 5 : 0
+        icon.layer?.masksToBounds = isImage
+        icon.layer?.borderWidth = isImage ? 1 : 0
+        icon.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.16).cgColor
+        if isImage, let path = item.path, let image = NSImage(contentsOfFile: path) {
+            image.isTemplate = false
+            icon.image = image
+            icon.contentTintColor = nil
+        } else if let image = symbolImage(fileSymbol(for: item.kind)) {
             image.isTemplate = true
             icon.image = image
+            icon.contentTintColor = fileAccent(for: item.kind)
         }
 
         let title = NSTextField(labelWithString: titleText)
@@ -6623,24 +9414,36 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         } else {
             remove.title = "x"
         }
-        remove.toolTip = "Remove this document"
+        remove.toolTip = "Remove this file from future answers"
+
+        let open = AttachmentOpenButton(title: "", target: self, action: #selector(openAttachmentClicked(_:)))
+        open.translatesAutoresizingMaskIntoConstraints = false
+        open.filePath = item.path
+        open.isBordered = false
+        open.toolTip = item.path == nil ? chip.toolTip : "Open \(titleText)"
 
         chip.addSubview(icon)
         chip.addSubview(title)
+        chip.addSubview(open)
         chip.addSubview(remove)
         NSLayoutConstraint.activate([
-            chip.heightAnchor.constraint(equalToConstant: 24),
-            chip.widthAnchor.constraint(lessThanOrEqualToConstant: 176),
-            chip.widthAnchor.constraint(greaterThanOrEqualToConstant: 96),
+            chip.heightAnchor.constraint(equalToConstant: chipHeight),
+            chip.widthAnchor.constraint(lessThanOrEqualToConstant: isImage ? 162 : 176),
+            chip.widthAnchor.constraint(greaterThanOrEqualToConstant: isImage ? 104 : 96),
 
             icon.leadingAnchor.constraint(equalTo: chip.leadingAnchor, constant: 7),
             icon.centerYAnchor.constraint(equalTo: chip.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 14),
-            icon.heightAnchor.constraint(equalToConstant: 14),
+            icon.widthAnchor.constraint(equalToConstant: iconSize),
+            icon.heightAnchor.constraint(equalToConstant: iconSize),
 
-            title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 5),
+            title.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: isImage ? 6 : 5),
             title.centerYAnchor.constraint(equalTo: chip.centerYAnchor),
             title.trailingAnchor.constraint(equalTo: remove.leadingAnchor, constant: -4),
+
+            open.topAnchor.constraint(equalTo: chip.topAnchor),
+            open.leadingAnchor.constraint(equalTo: chip.leadingAnchor),
+            open.bottomAnchor.constraint(equalTo: chip.bottomAnchor),
+            open.trailingAnchor.constraint(equalTo: remove.leadingAnchor, constant: -2),
 
             remove.trailingAnchor.constraint(equalTo: chip.trailingAnchor, constant: -6),
             remove.centerYAnchor.constraint(equalTo: chip.centerYAnchor),
@@ -6648,6 +9451,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             remove.heightAnchor.constraint(equalToConstant: 16),
         ])
         return chip
+    }
+
+    @objc private func openAttachmentClicked(_ sender: AttachmentOpenButton) {
+        guard let path = sender.filePath?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !path.isEmpty else { return }
+        NSWorkspace.shared.open(URL(fileURLWithPath: path))
     }
 
     private func makeSessionRow(_ session: OverlaySessionItem) -> NSView {
@@ -6684,6 +9493,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         subtitle.textColor = BlueyTheme.textDim
         subtitle.lineBreakMode = .byTruncatingTail
 
+        let contextBadge = makeSessionContextBadge(session)
+
         let rename = NSButton(title: "", target: self, action: #selector(renameSessionClicked(_:)))
         rename.translatesAutoresizingMaskIntoConstraints = false
         rename.isBordered = false
@@ -6719,6 +9530,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         row.addSubview(openButton)
         row.addSubview(title)
         row.addSubview(subtitle)
+        row.addSubview(contextBadge)
         row.addSubview(rename)
         row.addSubview(delete)
         NSLayoutConstraint.activate([
@@ -6731,11 +9543,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
             title.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
             title.topAnchor.constraint(equalTo: row.topAnchor, constant: 8),
-            title.trailingAnchor.constraint(equalTo: rename.leadingAnchor, constant: -6),
+            title.trailingAnchor.constraint(equalTo: contextBadge.leadingAnchor, constant: -6),
+
+            contextBadge.trailingAnchor.constraint(equalTo: rename.leadingAnchor, constant: -6),
+            contextBadge.centerYAnchor.constraint(equalTo: title.centerYAnchor),
+            contextBadge.widthAnchor.constraint(equalToConstant: session.contextCount > 0 ? 58 : 0),
+            contextBadge.heightAnchor.constraint(equalToConstant: 20),
 
             subtitle.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             subtitle.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 2),
-            subtitle.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            subtitle.trailingAnchor.constraint(equalTo: rename.leadingAnchor, constant: -6),
 
             rename.centerYAnchor.constraint(equalTo: row.centerYAnchor),
             rename.widthAnchor.constraint(equalToConstant: 28),
@@ -6749,6 +9566,33 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             rename.trailingAnchor.constraint(equalTo: delete.leadingAnchor, constant: -2),
         ])
         return row
+    }
+
+    private func makeSessionContextBadge(_ session: OverlaySessionItem) -> NSTextField {
+        let count = max(0, session.contextCount)
+        let imageCount = max(0, session.imageCount)
+        let label = NSTextField(labelWithString: count > 0 ? "\(count) \(imageCount > 0 ? "items" : "docs")" : "")
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = NSFont.systemFont(ofSize: 9.5, weight: .bold)
+        label.textColor = imageCount > 0 ? BlueyTheme.cyan : BlueyTheme.text
+        label.alignment = .center
+        label.lineBreakMode = .byTruncatingTail
+        label.maximumNumberOfLines = 1
+        label.isHidden = count == 0
+        label.wantsLayer = true
+        label.layer?.cornerRadius = 10
+        label.layer?.backgroundColor = (imageCount > 0 ? BlueyTheme.cyan : NSColor.white)
+            .withAlphaComponent(imageCount > 0 ? 0.12 : 0.055)
+            .cgColor
+        label.layer?.borderWidth = count > 0 ? 1 : 0
+        label.layer?.borderColor = (imageCount > 0 ? BlueyTheme.cyan : BlueyTheme.hairline)
+            .withAlphaComponent(imageCount > 0 ? 0.34 : 1.0)
+            .cgColor
+        label.toolTip = count > 0
+            ? "\(count) attached context item\(count == 1 ? "" : "s") in this recording"
+            : nil
+        useCenteredSingleLineCell(label)
+        return label
     }
 
     private func configureRenameRow(_ row: NSView, session: OverlaySessionItem) -> NSView {
@@ -6846,6 +9690,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             id: session.id,
             title: title,
             subtitle: session.subtitle,
+            contextCount: session.contextCount,
+            imageCount: session.imageCount,
             isActive: session.isActive)
         editingSessionId = nil
         emitSessionRename(id: session.id, title: title)
@@ -6854,7 +9700,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func fileSymbol(for kind: String) -> String {
         switch kind {
-        case "image", "diagram": return "photo"
+        case "image", "diagram", "screen", "screenshot": return "photo"
         case "code": return "curlybraces"
         case "text": return "doc.plaintext"
         case "document": return "doc.text"
@@ -6862,9 +9708,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
     }
 
+    private func isAttachmentImageKind(_ kind: String) -> Bool {
+        kind == "image" || kind == "diagram" || kind == "screen" || kind == "screenshot"
+    }
+
     private func fileAccent(for kind: String) -> NSColor {
         switch kind {
-        case "image", "diagram": return NSColor(red: 0.58, green: 0.74, blue: 1.0, alpha: 1.0)
+        case "image", "diagram", "screen", "screenshot": return NSColor(red: 0.58, green: 0.74, blue: 1.0, alpha: 1.0)
         case "code": return NSColor(red: 0.58, green: 1.0, blue: 0.74, alpha: 1.0)
         case "text": return NSColor(red: 1.0, green: 0.82, blue: 0.42, alpha: 1.0)
         case "document": return NSColor(red: 1.0, green: 0.43, blue: 0.34, alpha: 1.0)
@@ -6895,24 +9745,50 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func looksLikeCode(_ lower: String) -> Bool {
-        let signals = [
+        let syntaxSignals = [
             "class solution",
             "def ",
+            "fn ",
             "function ",
             "const ",
             "let ",
-            "public ",
-            "private ",
+            "var ",
+            "return ",
+            "=>",
+            "import ",
+            "#include",
+            "console.",
+            "println!",
+            "select ",
+            "insert into ",
+            "delete from ",
+            "update ",
+        ]
+        let codingContextSignals = [
+            "algorithm",
+            "bug",
+            "compile",
+            "diff",
+            "edge case",
+            "implementation",
+            "leetcode",
+            "patch",
+            "runtime",
+            "sql query",
+            "unit test",
             "time complexity",
             "space complexity",
             "test case",
-            "edge case",
-            "sql",
         ]
-        return signals.filter { lower.contains($0) }.count >= 2
+        let syntaxCount = syntaxSignals.filter { lower.contains($0) }.count
+        let contextCount = codingContextSignals.filter { lower.contains($0) }.count
+        return syntaxCount >= 2 || (syntaxCount >= 1 && contextCount >= 1)
     }
 
     private func looksLikeSystemDesign(_ lower: String) -> Bool {
+        if looksLikeInterviewProfileAnswer(lower) {
+            return false
+        }
         let signals = [
             "system design",
             "architecture",
@@ -6930,6 +9806,41 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             "event-driven",
         ]
         return signals.filter { lower.contains($0) }.count >= 3
+    }
+
+    private func looksLikeInterviewProfileAnswer(_ lower: String) -> Bool {
+        if lower.contains("tell me about yourself") || lower.contains("tell me about myself") {
+            return true
+        }
+        let profileSignals = [
+            "i'm ",
+            "i am ",
+            "i've ",
+            "i’ve ",
+            "i was at ",
+            "before that i",
+            "where i worked",
+            "what drew me",
+            "this role",
+            "my background",
+            "my experience",
+            "senior software engineer",
+            "master's",
+            "masters",
+        ]
+        let behavioralSignals = [
+            "tell me about a time",
+            "describe a time",
+            "give me an example",
+            "situation",
+            "task",
+            "action",
+            "result",
+            "stakeholder",
+            "conflict",
+        ]
+        return profileSignals.filter { lower.contains($0) }.count >= 3
+            || behavioralSignals.filter { lower.contains($0) }.count >= 4
     }
 
     private func looksLikeScreenAnalysis(_ lower: String) -> Bool {
@@ -6961,19 +9872,314 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func formatCodeCanvas(body: String, codeBlocks: [String]) -> String {
-        let notes = stripCodeFences(from: body)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let codeText = codeBlocks.isEmpty
+            ? extractInlineImplementationCode(from: body)
+            : codeBlocks.joined(separator: "\n\n// ---\n\n")
+        let complexity = extractComplexitySummary(from: body)
         var sections: [String] = []
 
-        if !codeBlocks.isEmpty {
-            sections.append("CODE\n----\n" + codeBlocks.joined(separator: "\n\n// ---\n\n"))
+        if !codeText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            sections.append("CODE\n----\n" + codeText.trimmingCharacters(in: .whitespacesAndNewlines))
         }
 
-        if !notes.isEmpty {
-            sections.append("NOTES\n-----\n" + notes)
+        if !complexity.isEmpty {
+            sections.append("COMPLEXITY\n----------\n" + complexity)
         }
 
-        return sections.isEmpty ? body : sections.joined(separator: "\n\n")
+        return sections.joined(separator: "\n\n")
+    }
+
+    private func canvasCodeHasRealCode(_ body: String) -> Bool {
+        let code = extractCanvasCodeSection(from: body)
+        let trimmed = code.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        let lower = trimmed.lowercased()
+        let nonEmptyLines = trimmed
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let signals = [
+            "def ",
+            "fn ",
+            "func ",
+            "function ",
+            "class ",
+            "struct ",
+            "enum ",
+            "return ",
+            "select ",
+            " from ",
+            " where ",
+            " group by",
+            " order by",
+            " join ",
+            "insert ",
+            "update ",
+            "delete ",
+            "for ",
+            "while ",
+            "if ",
+            "else",
+            "try",
+            "catch ",
+            "import ",
+            "#include",
+            "let ",
+            "var ",
+            "const ",
+            "public ",
+            "private ",
+            "static ",
+            "=>",
+            "->",
+            "==",
+            "!=",
+            "<=",
+            ">=",
+            "+=",
+            "-=",
+            "dp[",
+            "graph[",
+            ".append(",
+            ".sort(",
+            "@@",
+            "diff --git",
+        ]
+        let hasSignal = signals.contains { lower.contains($0) }
+        let hasPunctuation = trimmed.contains("{")
+            || trimmed.contains("}")
+            || trimmed.contains(";")
+            || trimmed.contains("=")
+            || (trimmed.contains("(") && trimmed.contains(")"))
+            || (trimmed.contains("[") && trimmed.contains("]"))
+        return hasSignal || (nonEmptyLines.count >= 2 && hasPunctuation)
+    }
+
+    private func extractCanvasCodeSection(from body: String) -> String {
+        let normalized = body.replacingOccurrences(of: "\r\n", with: "\n")
+        var lines: [String] = []
+        var inCode = false
+        var sawHeader = false
+        for line in normalized.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let header = trimmed.uppercased()
+            if ["CODE", "PATCH", "DIFF"].contains(header) {
+                inCode = true
+                sawHeader = true
+                continue
+            }
+            if ["COMPLEXITY", "TIME", "SPACE", "NOTES", "EXPLANATION", "APPROACH"].contains(header) {
+                if inCode {
+                    break
+                }
+                sawHeader = true
+                continue
+            }
+            if !trimmed.isEmpty && trimmed.allSatisfy({ $0 == "-" || $0 == "=" }) {
+                continue
+            }
+            if inCode {
+                lines.append(line)
+            }
+        }
+        return sawHeader ? lines.joined(separator: "\n") : normalized
+    }
+
+    private func extractInlineImplementationCode(from text: String) -> String {
+        let lines = text.components(separatedBy: .newlines)
+        var best: [String] = []
+        var current: [String] = []
+        var inFence = false
+
+        func finishCurrent() {
+            let trimmed = current
+                .drop { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                .reversed()
+                .drop { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                .reversed()
+            let candidate = Array(trimmed)
+            if candidate.joined(separator: "\n").count > best.joined(separator: "\n").count {
+                best = candidate
+            }
+            current.removeAll()
+        }
+
+        for rawLine in lines {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.hasPrefix("```") {
+                inFence.toggle()
+                continue
+            }
+            guard !inFence else { continue }
+
+            if isCanvasProseSectionHeading(trimmed) {
+                finishCurrent()
+                continue
+            }
+
+            if isLikelyImplementationLine(rawLine) {
+                current.append(rawLine)
+                continue
+            }
+
+            if !current.isEmpty, isCodeContinuationLine(rawLine) {
+                current.append(rawLine)
+                continue
+            }
+
+            finishCurrent()
+        }
+        finishCurrent()
+        return best.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func isCanvasProseSectionHeading(_ line: String) -> Bool {
+        let normalized = line
+            .trimmingCharacters(in: CharacterSet(charactersIn: "#*-_ "))
+            .lowercased()
+        guard !normalized.isEmpty else { return false }
+        return [
+            "notes",
+            "note",
+            "approach",
+            "explanation",
+            "details",
+            "why it works",
+            "walkthrough",
+            "intuition",
+            "complexity",
+            "time complexity",
+            "space complexity",
+        ].contains(normalized)
+    }
+
+    private func isLikelyImplementationLine(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !isCanvasProseSectionHeading(trimmed) else { return false }
+        let lower = trimmed.lowercased()
+        let starters = [
+            "class ",
+            "def ",
+            "fn ",
+            "func ",
+            "function ",
+            "public ",
+            "private ",
+            "static ",
+            "struct ",
+            "enum ",
+            "import ",
+            "from ",
+            "#include",
+            "return ",
+            "if ",
+            "elif ",
+            "else",
+            "for ",
+            "while ",
+            "try",
+            "except",
+            "catch ",
+            "switch ",
+            "case ",
+            "let ",
+            "var ",
+            "const ",
+        ]
+        if starters.contains(where: { lower.hasPrefix($0) }) {
+            return true
+        }
+        let syntaxSignals = [
+            " = ",
+            "==",
+            "!=",
+            "<=",
+            ">=",
+            "+=",
+            "-=",
+            "->",
+            "=>",
+            "):",
+            "{",
+            "}",
+            "];",
+            "self.",
+            "dp[",
+            "graph[",
+            "range(",
+            ".append(",
+            ".sort(",
+            "len(",
+            "list[",
+            "dict[",
+        ]
+        return syntaxSignals.contains { lower.contains($0) }
+    }
+
+    private func isCodeContinuationLine(_ line: String) -> Bool {
+        if line.hasPrefix(" ") || line.hasPrefix("\t") {
+            return true
+        }
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed == "}" || trimmed == "};" || trimmed == ")" || trimmed == "];"
+    }
+
+    private func extractComplexitySummary(from text: String) -> String {
+        var lines: [String] = []
+        var seen = Set<String>()
+        var inComplexity = false
+
+        for rawLine in text.components(separatedBy: .newlines) {
+            let cleaned = cleanComplexityLine(rawLine)
+            let lower = cleaned.lowercased()
+            if lower.isEmpty {
+                if inComplexity, !lines.isEmpty { break }
+                continue
+            }
+
+            if lower == "complexity" || lower == "complexity:" {
+                inComplexity = true
+                continue
+            }
+            if lower.contains("time complexity") || lower.hasPrefix("time:") || lower.hasPrefix("time ") {
+                addComplexityLine(cleaned, to: &lines, seen: &seen)
+                inComplexity = true
+                continue
+            }
+            if lower.contains("space complexity") || lower.hasPrefix("space:") || lower.hasPrefix("space ") {
+                addComplexityLine(cleaned, to: &lines, seen: &seen)
+                inComplexity = true
+                continue
+            }
+            if inComplexity, lower.contains("o(") {
+                addComplexityLine(cleaned, to: &lines, seen: &seen)
+            } else if inComplexity, !lines.isEmpty {
+                break
+            }
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
+    private func cleanComplexityLine(_ line: String) -> String {
+        var output = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        while output.hasPrefix("- ") || output.hasPrefix("* ") {
+            output = String(output.dropFirst(2)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        while output.hasPrefix("#") {
+            output = String(output.dropFirst()).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return output
+            .replacingOccurrences(of: "**", with: "")
+            .replacingOccurrences(of: "`", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func addComplexityLine(_ line: String, to lines: inout [String], seen: inout Set<String>) {
+        let key = line.lowercased()
+        guard !line.isEmpty, !seen.contains(key) else { return }
+        seen.insert(key)
+        lines.append(line)
     }
 
     private func stripCodeFences(from text: String) -> String {
@@ -7024,23 +10230,48 @@ private final class OverlayApp {
     private var expandedPassthroughTimer: Timer?
     private var remoteInputPassthroughTimer: Timer?
     private var remoteControlHeuristicTimer: Timer?
+    private var localKeyMonitor: Any?
+    private var externalFileDragMonitor: Any?
+    private var activeAppObserver: NSObjectProtocol?
     private var trustedRemoteInputEventTap: CFMachPort?
     private var trustedRemoteInputRunLoopSource: CFRunLoopSource?
     private var remoteInputPassthroughUntil = 0.0
+    private var externalFileDragCaptureUntil = 0.0
     private var lastExpandedInteractiveMouseAt = CACurrentMediaTime()
     private var currentRunState: PillRunState = .ready
     private var overlayOpacity = 0.94
     private var expandedModeActive = false
+    private var stickyPillFrame: NSRect?
+    private var stickyExpandedFrame: NSRect?
+    private var lastTargetBundleIdentifier: String?
 
     /// Pending boot card, if a Boot command arrived before windows materialised.
     private var pendingBoot: (title: String, lines: [String])?
 
+    deinit {
+        if let activeAppObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(activeAppObserver)
+        }
+    }
+
     func start() {
+        rememberTargetApplication(NSWorkspace.shared.frontmostApplication)
+        activeAppObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            self?.rememberTargetApplication(app)
+        }
+
         // Pill window: compact launcher, centered by default.
         let pillSize = PillMetrics.size
         let screen = OverlayScreenPlacement.activeVisibleFrame()
+        stickyPillFrame = OverlayPlacementStore.loadPillFrame(in: screen)
+        stickyExpandedFrame = OverlayPlacementStore.loadExpandedFrame(in: screen)
         pillWindow = OverlayWindow(
-            contentRect: PillMetrics.centeredFrame(in: screen),
+            contentRect: stickyPillFrame ?? PillMetrics.centeredFrame(in: screen),
             draggable: false)
         pillWindow.contentCornerRadius = pillSize.height / 2
 
@@ -7053,6 +10284,7 @@ private final class OverlayApp {
         pillView.onRunToggle = { [weak self] in self?.toggleListeningFromPill() }
         pillView.onAsk = { [weak self] in self?.expandAndFocusQuestion() }
         pillView.onEnd = { [weak self] in self?.expandAndConfirmTurnOff() }
+        pillView.onMoved = { [weak self] frame in self?.rememberPillFrame(frame) }
 
         if captureVisibleForDebug {
             NSApp.activate(ignoringOtherApps: true)
@@ -7069,14 +10301,47 @@ private final class OverlayApp {
         emitLifecycle("started", detail: "capture_excluded=\(!captureVisibleForDebug)")
         startParentWatchdog()
         startExpandedPassthroughTracking()
-        startTrustedRemoteInputPassthroughMonitor()
+        startLocalKeyRouting()
+        startExternalFileDragCaptureMonitor()
+        if trustedRemoteInputTapEnabled {
+            startTrustedRemoteInputPassthroughMonitor()
+        } else {
+            emitLifecycle(
+                "remote_input_passthrough_monitor",
+                status: "disabled",
+                detail: "trusted event tap is opt-in to avoid input monitoring prompts")
+        }
         startRemoteControlHeuristicMonitor()
         startIpcLoop()
     }
 
+    private func rememberTargetApplication(_ app: NSRunningApplication?) {
+        guard let app,
+              app.processIdentifier != getpid(),
+              let bundle = app.bundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !bundle.isEmpty
+        else { return }
+        lastTargetBundleIdentifier = bundle
+    }
+
+    private func startLocalKeyRouting() {
+        guard localKeyMonitor == nil else { return }
+        localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard
+                let self,
+                self.expandedWindow?.isVisible == true,
+                let expandedView = self.expandedView,
+                expandedView.routeKeyDownToComposer(event)
+            else {
+                return event
+            }
+            return nil
+        }
+    }
+
     private func bringPillToFront(force: Bool = false) {
         guard force || !expandedModeActive else { return }
-        centerPillOnMainScreen()
+        placePillForDisplay()
         pillWindow.ignoresMouseEvents = isRemoteInputPassthroughActive
         pillWindow.acceptsMouseMovedEvents = true
         pillWindow.setIsVisible(true)
@@ -7089,9 +10354,32 @@ private final class OverlayApp {
         pillWindow.displayIfNeeded()
     }
 
-    private func centerPillOnMainScreen() {
+    private func placePillForDisplay() {
         let screen = OverlayScreenPlacement.activeVisibleFrame()
-        pillWindow.setFrame(PillMetrics.centeredFrame(in: screen), display: true)
+        let frame = stickyPillFrame.map { clampedPillFrame($0, in: screen) }
+            ?? PillMetrics.centeredFrame(in: screen)
+        pillWindow.setFrame(frame, display: true)
+    }
+
+    private func rememberPillFrame(_ frame: NSRect) {
+        let screen = OverlayScreenPlacement.activeVisibleFrame()
+        stickyPillFrame = clampedPillFrame(frame, in: screen)
+        if let stickyPillFrame {
+            OverlayPlacementStore.savePillFrame(stickyPillFrame, in: screen)
+        }
+    }
+
+    private func clampedPillFrame(_ frame: NSRect, in visibleFrame: NSRect) -> NSRect {
+        let inset: CGFloat = 8
+        var clamped = frame
+        clamped.size = PillMetrics.size
+        clamped.origin.x = min(
+            max(visibleFrame.minX + inset, clamped.origin.x),
+            visibleFrame.maxX - clamped.size.width - inset)
+        clamped.origin.y = min(
+            max(visibleFrame.minY + inset, clamped.origin.y),
+            visibleFrame.maxY - clamped.size.height - inset)
+        return clamped
     }
 
     private func startParentWatchdog() {
@@ -7112,11 +10400,23 @@ private final class OverlayApp {
         CACurrentMediaTime() < remoteInputPassthroughUntil
     }
 
+    private var isExternalFileDragCaptureActive: Bool {
+        CACurrentMediaTime() < externalFileDragCaptureUntil
+    }
+
     @discardableResult
     private func applyRemoteInputPassthroughIfActive() -> Bool {
         guard isRemoteInputPassthroughActive else { return false }
         expandedWindow?.ignoresMouseEvents = true
         pillWindow?.ignoresMouseEvents = true
+        return true
+    }
+
+    @discardableResult
+    private func applyExternalFileDragCaptureIfActive() -> Bool {
+        guard isExternalFileDragCaptureActive else { return false }
+        expandedWindow?.acceptsMouseMovedEvents = true
+        expandedWindow?.ignoresMouseEvents = false
         return true
     }
 
@@ -7157,8 +10457,7 @@ private final class OverlayApp {
         pillWindow?.acceptsMouseMovedEvents = true
         if expandedModeActive {
             pillWindow?.ignoresMouseEvents = true
-            expandedWindow?.ignoresMouseEvents = false
-            lastExpandedInteractiveMouseAt = CACurrentMediaTime()
+            updateExpandedMousePolicy()
         } else {
             expandedWindow?.ignoresMouseEvents = true
             pillWindow?.ignoresMouseEvents = false
@@ -7203,7 +10502,7 @@ private final class OverlayApp {
         }
         allowRemoteInputPassthrough(
             durationMs: remoteInputPassthroughDefaultMs,
-            reason: "pinky-trusted-event")
+            reason: "bluey-trusted-event")
     }
 
     fileprivate func remoteControlInputEventDetected(sourcePid: pid_t?) {
@@ -7247,23 +10546,81 @@ private final class OverlayApp {
     private func startExpandedPassthroughTracking() {
         expandedPassthroughTimer?.invalidate()
         expandedPassthroughTimer = Timer.scheduledTimer(withTimeInterval: 0.015, repeats: true) { [weak self] _ in
-            guard
-                let self,
-                let expandedWindow = self.expandedWindow,
-                expandedWindow.isVisible
-            else { return }
+            self?.updateExpandedMousePolicy()
+        }
+    }
 
-            if self.applyRemoteInputPassthroughIfActive() {
-                return
+    private func startExternalFileDragCaptureMonitor() {
+        externalFileDragMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDragged, .leftMouseUp]
+        ) { [weak self] event in
+            DispatchQueue.main.async {
+                self?.handleExternalFileDragProbe(event)
             }
+        }
+        emitLifecycle("external_file_drag_capture", status: "ready")
+    }
 
-            // Keep the window able to focus text fields and start header drags.
-            // Generated content still passes clicks through from ExpandedPanelView.hitTest.
-            self.lastExpandedInteractiveMouseAt = CACurrentMediaTime()
-            expandedWindow.acceptsMouseMovedEvents = true
-            if expandedWindow.ignoresMouseEvents {
-                expandedWindow.ignoresMouseEvents = false
-            }
+    private func handleExternalFileDragProbe(_ event: NSEvent) {
+        guard
+            expandedModeActive,
+            let expandedWindow,
+            expandedWindow.isVisible
+        else {
+            externalFileDragCaptureUntil = 0
+            return
+        }
+
+        if event.type == .leftMouseUp {
+            externalFileDragCaptureUntil = 0
+            updateExpandedMousePolicy()
+            return
+        }
+
+        let point = NSEvent.mouseLocation
+        guard expandedWindow.frame.insetBy(dx: -24, dy: -24).contains(point) else {
+            return
+        }
+
+        let captureWindow = dragPasteboardContainsFileURLs() ? 0.75 : 0.25
+        externalFileDragCaptureUntil = CACurrentMediaTime() + captureWindow
+        applyExternalFileDragCaptureIfActive()
+    }
+
+    private func dragPasteboardContainsFileURLs() -> Bool {
+        let pasteboard = NSPasteboard(name: .drag)
+        if pasteboard.canReadObject(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) {
+            return true
+        }
+        let types = pasteboard.types ?? []
+        return types.contains(.fileURL)
+            || types.contains(NSPasteboard.PasteboardType("public.file-url"))
+            || types.contains(NSPasteboard.PasteboardType("NSFilenamesPboardType"))
+    }
+
+    private func updateExpandedMousePolicy() {
+        guard
+            let expandedWindow,
+            expandedWindow.isVisible,
+            let expandedView
+        else { return }
+
+        if applyRemoteInputPassthroughIfActive() {
+            return
+        }
+        if applyExternalFileDragCaptureIfActive() {
+            return
+        }
+
+        expandedWindow.acceptsMouseMovedEvents = true
+        let shouldReceiveMouse = expandedView.shouldReceiveMouseEvents(
+            atWindowPoint: expandedWindow.mouseLocationOutsideOfEventStream)
+        expandedWindow.ignoresMouseEvents = !shouldReceiveMouse
+        if shouldReceiveMouse {
+            lastExpandedInteractiveMouseAt = CACurrentMediaTime()
         }
     }
 
@@ -7279,9 +10636,11 @@ private final class OverlayApp {
         expandedWindow.acceptsMouseMovedEvents = true
         expandedWindow.orderFrontRegardless()
         expandedWindow.makeKeyAndOrderFront(nil)
+        updateExpandedMousePolicy()
         DispatchQueue.main.async { [weak self] in
             self?.placeExpandedWindowForOpen()
             self?.hidePillWhileExpanded()
+            self?.updateExpandedMousePolicy()
         }
         emitSimple("shown")
         emitLifecycle("expanded")
@@ -7299,8 +10658,10 @@ private final class OverlayApp {
             resizable: false)
         window.contentCornerRadius = ExpandedPanelMetrics.cornerRadius
         window.preserveProgrammaticFrameHeight = true
-        let maxExpandedWidth = max(minimumWidth, screen.width - ExpandedPanelMetrics.screenInset * 2)
-        let maxExpandedHeight = max(ExpandedPanelMetrics.minHeight, screen.height - ExpandedPanelMetrics.screenInset * 2)
+        let maxExpandedWidth = ExpandedPanelMetrics.fittingWidth(
+            for: screen,
+            preferred: ExpandedPanelMetrics.maxCanvasWidth)
+        let maxExpandedHeight = ExpandedPanelMetrics.fittingHeight(for: screen)
         window.minimumFrameWidth = minimumWidth
         window.maximumFrameWidth = maxExpandedWidth
         window.minimumFrameHeight = ExpandedPanelMetrics.minHeight
@@ -7320,6 +10681,12 @@ private final class OverlayApp {
             self?.overlayOpacity = opacity
             self?.pillView?.applyBackgroundOpacity(opacity)
         }
+        view.onWindowFrameChanged = { [weak self] frame in
+            self?.rememberExpandedFrame(frame)
+        }
+        view.onPasteText = { [weak self] text in
+            self?.pasteAnswerToTarget(text)
+        }
         expandedWindow = window
         expandedView = view
         view.setListeningState(currentRunState)
@@ -7330,13 +10697,35 @@ private final class OverlayApp {
         }
     }
 
+    private func pasteAnswerToTarget(_ text: String) {
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+        emitPasteText(text: clean, targetBundleId: lastTargetBundleIdentifier)
+    }
+
     private func placeExpandedWindowForOpen() {
         guard let expandedWindow else { return }
         let screen = OverlayScreenPlacement.activeVisibleFrame()
-        expandedWindow.setFrame(ExpandedPanelMetrics.compactFrame(in: screen), display: true)
+        let frame = stickyExpandedFrame.map {
+            ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen($0, visibleFrame: screen)
+        } ?? ExpandedPanelMetrics.compactFrame(in: screen)
+        expandedWindow.setFrame(frame, display: true)
+        stickyExpandedFrame = expandedWindow.frame
+    }
+
+    private func rememberExpandedFrame(_ frame: NSRect) {
+        guard !frame.isEmpty else { return }
+        let screen = OverlayScreenPlacement.activeVisibleFrame()
+        stickyExpandedFrame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(frame, visibleFrame: screen)
+        if let stickyExpandedFrame {
+            OverlayPlacementStore.saveExpandedFrame(stickyExpandedFrame, in: screen)
+        }
     }
 
     private func collapse() {
+        if let expandedWindow, expandedWindow.isVisible {
+            rememberExpandedFrame(expandedWindow.frame)
+        }
         expandedModeActive = false
         expandedWindow?.ignoresMouseEvents = isRemoteInputPassthroughActive
         expandedWindow?.orderOut(nil)
@@ -7354,16 +10743,24 @@ private final class OverlayApp {
     }
 
     private func setRunState(_ state: PillRunState) {
+        let wasCapturing = currentRunState == .listening || currentRunState == .connecting
+        let isCapturing = state == .listening || state == .connecting
         currentRunState = state
+        if isCapturing && !wasCapturing {
+            expandedView?.prepareAutoSendListenCapture()
+        }
         pillView?.setRunState(state)
         expandedView?.setListeningState(state)
     }
 
     private func toggleListeningFromPill() {
+        expand()
         if currentRunState == .listening || currentRunState == .connecting {
             emitSimple("recording_stop_requested")
             setRunState(.paused)
+            expandedView?.scheduleAutoSendAfterExternalStop()
         } else {
+            expandedView?.prepareAutoSendListenCapture()
             emitSimple("recording_start_requested")
             setRunState(.listening)
         }
@@ -7435,7 +10832,7 @@ private final class OverlayApp {
             expandedView?.pushCard(RenderedCard(
                 id: card.id, kind: card.kind, title: card.title,
                 body: card.body, done: true, costLabel: card.costLabel,
-                artifact: card.artifact))
+                artifact: card.artifact, attachments: card.attachments ?? []))
         case .updateCard(let id, let body, let done, let costLabel, let artifact):
             ensureExpandedWindow()
             expandedView?.updateCard(id: id, body: body, done: done, costLabel: costLabel, artifact: artifact)
@@ -7461,17 +10858,16 @@ private final class OverlayApp {
             body: body,
             done: true,
             costLabel: nil,
-            artifact: nil)
+            artifact: nil,
+            attachments: [])
         if signInURL != nil || title.localizedCaseInsensitiveContains("sign in") {
             view.showSignedOutLogin(url: signInURL)
-            pillView?.dotColor = BlueyTheme.warning
+            pillView?.setHealthState(.needsAttention)
         } else {
             view.showSignedInReady()
+            pillView?.setHealthState(.ready)
         }
         view.pushCard(card)
-        if signInURL == nil {
-            pillView?.dotColor = NSColor.systemGreen
-        }
     }
 
     private func loginURL(from lines: [String]) -> URL? {
@@ -7511,7 +10907,15 @@ private final class OverlayApp {
         case "center":       origin = NSPoint(x: screen.midX - pillSize.width / 2,     y: screen.midY - pillSize.height / 2)
         default:             origin = PillMetrics.centeredFrame(in: screen).origin
         }
-        pillWindow.setFrameOrigin(origin)
+        let frame = clampedPillFrame(NSRect(origin: origin, size: PillMetrics.size), in: screen)
+        pillWindow.setFrame(frame, display: true)
+        if pos == "center" {
+            stickyPillFrame = nil
+            OverlayPlacementStore.clearPillFrame()
+        } else {
+            stickyPillFrame = frame
+            OverlayPlacementStore.savePillFrame(frame, in: screen)
+        }
     }
 
     private func startIpcLoop() {
@@ -7605,22 +11009,22 @@ private func blueyTrustedRemoteInputEventTapCallback(
         return Unmanaged.passUnretained(event)
     }
 
-    let trustedPinkyEvent =
-        event.getIntegerValueField(.eventSourceUserData) == pinkyTrustedRemoteInputEventSourceUserData
+    let trustedRemoteBridgeEvent =
+        event.getIntegerValueField(.eventSourceUserData) == blueyTrustedRemoteInputEventSourceUserData
     let sourcePid = sourcePidForRemoteInputEvent(type: type, event: event)
-    guard trustedPinkyEvent || sourcePid != nil else {
+    guard trustedRemoteBridgeEvent || sourcePid != nil else {
         return Unmanaged.passUnretained(event)
     }
     let app = Unmanaged<OverlayApp>.fromOpaque(refcon).takeUnretainedValue()
     if Thread.isMainThread {
-        if trustedPinkyEvent {
+        if trustedRemoteBridgeEvent {
             app.trustedRemoteInputEventDetected()
         } else {
             app.remoteControlInputEventDetected(sourcePid: sourcePid)
         }
     } else {
         DispatchQueue.main.sync {
-            if trustedPinkyEvent {
+            if trustedRemoteBridgeEvent {
                 app.trustedRemoteInputEventDetected()
             } else {
                 app.remoteControlInputEventDetected(sourcePid: sourcePid)

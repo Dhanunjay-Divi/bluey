@@ -14,11 +14,17 @@
 #define _WIN32_WINNT 0x0601
 #endif
 
+#ifndef _WIN32_IE
+#define _WIN32_IE 0x0600
+#endif
+
 #ifndef __cplusplus
 #define COBJMACROS
 #endif
 #include <windows.h>
 #include <windowsx.h>
+#include <shellapi.h>
+#include <commctrl.h>
 
 #ifdef DrawText
 #undef DrawText
@@ -46,6 +52,9 @@ static HWND g_hwnd;
 static HWND g_ask_edit;
 static HWND g_send_button;
 static HWND g_record_button;
+static HWND g_auto_send_combo;
+static HWND g_transcript_clear_button;
+static HWND g_paste_answer_button;
 static HWND g_help_button;
 static HWND g_session_button;
 static HWND g_page_button;
@@ -54,6 +63,7 @@ static HWND g_recap_button;
 static HWND g_note_button;
 static HWND g_theme_button;
 static HWND g_close_button;
+static HWND g_tooltip;
 static wchar_t g_title[256] = L"bluey";
 static wchar_t g_body[2048] = L"Waiting for meeting intelligence...";
 static wchar_t g_kind[64] = L"system";
@@ -62,9 +72,11 @@ static wchar_t g_card_id[80] = L"";
 static bool g_visible = true;
 static bool g_collapsed = false;
 static bool g_recording = false;
+static int g_auto_send_mode = 2;
 static bool g_light_theme = false;
 static double g_opacity = 0.92;
 static RECT g_expanded_rect = {0, 0, 0, 0};
+static RECT g_collapsed_rect = {0, 0, 0, 0};
 static HHOOK g_popup_hook = NULL;
 static RECT g_popup_avoid_rect = {0, 0, 0, 0};
 static HBRUSH g_edit_brush = NULL;
@@ -85,8 +97,27 @@ static IDWriteTextFormat *g_fmt_body = NULL;
 static IDWriteTextFormat *g_fmt_partial = NULL;
 static wchar_t g_transcript_partial[1024] = L"";
 static wchar_t g_transcript_final[1024] = L"";
+static wchar_t g_transcript_source[64] = L"";
 static wchar_t g_session_banner[256] = L"";
 static ULONGLONG g_session_banner_tick = 0;
+static WNDPROC g_ask_edit_proc = NULL;
+
+static void send_current_question(void);
+static void show_full_overlay(bool emit_event);
+static void update_paste_answer_button(void);
+
+#define MAX_CONTEXT_CHIPS 16
+typedef struct OverlayContextChip {
+    wchar_t title[260];
+    wchar_t kind[64];
+    wchar_t path[520];
+} OverlayContextChip;
+
+static OverlayContextChip g_context_chips[MAX_CONTEXT_CHIPS];
+static int g_context_chip_count = 0;
+static OverlayContextChip g_sent_chips[MAX_CONTEXT_CHIPS];
+static int g_sent_chip_count = 0;
+static void consume_sent_context_chips(void);
 
 #ifdef __cplusplus
 #define BLUEY_COM_RELEASE(ptr) (ptr)->Release()
@@ -133,6 +164,9 @@ static ULONGLONG g_session_banner_tick = 0;
 #define ID_ASK_EDIT 1001
 #define ID_SEND_BUTTON 1002
 #define ID_RECORD_BUTTON 1003
+#define ID_PASTE_ANSWER_BUTTON 1015
+#define ID_AUTO_SEND_BUTTON 1014
+#define ID_TRANSCRIPT_CLEAR_BUTTON 1013
 #define ID_HELP_BUTTON 1004
 #define ID_SESSION_BUTTON 1005
 #define ID_PAGE_BUTTON 1007
@@ -141,6 +175,7 @@ static ULONGLONG g_session_banner_tick = 0;
 #define ID_CLOSE_BUTTON 1010
 #define ID_RECAP_BUTTON 1011
 #define ID_THEME_BUTTON 1012
+#define COLLAPSED_DRAG_THRESHOLD 4
 
 /* Stealth: hide overlay from screen recording, screenshots, and screen-share.
  * WDA_EXCLUDEFROMCAPTURE (Windows 10 2004+ / build 19041) makes the window
@@ -158,6 +193,8 @@ static void apply_capture_exclusion(HWND hwnd) {
 // Embedded in every emitted JSON event. Daemon validates + drops events
 // whose token does not match its own per-session value.
 static char g_session_token[129] = {0}; // 128-char max + NUL
+static const wchar_t *g_supported_drop_formats =
+    L"Supported: PDF, DOC/DOCX, Excel/ODS, CSV/TSV, text, Markdown, code/data files, and PNG/JPEG/WebP/GIF/HEIC/BMP/TIFF images.";
 
 static void load_session_token(void) {
     DWORD n = GetEnvironmentVariableA(
@@ -167,6 +204,74 @@ static void load_session_token(void) {
     if (n == 0 || n >= sizeof(g_session_token)) {
         g_session_token[0] = '\0';
     }
+}
+
+static void ensure_tooltip_window(void) {
+    if (g_tooltip) return;
+
+    INITCOMMONCONTROLSEX icc;
+    ZeroMemory(&icc, sizeof(icc));
+    icc.dwSize = sizeof(icc);
+    icc.dwICC = ICC_WIN95_CLASSES;
+    InitCommonControlsEx(&icc);
+
+    g_tooltip = CreateWindowExW(
+        WS_EX_TOPMOST,
+        TOOLTIPS_CLASSW,
+        NULL,
+        WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        g_hwnd,
+        NULL,
+        GetModuleHandleW(NULL),
+        NULL);
+    if (!g_tooltip) return;
+
+    SetWindowPos(
+        g_tooltip,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SendMessageW(g_tooltip, TTM_SETDELAYTIME, TTDT_INITIAL, 450);
+    SendMessageW(g_tooltip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 9000);
+}
+
+static void add_control_tooltip(HWND control, LPCWSTR text) {
+    if (!control || !text || !text[0]) return;
+    ensure_tooltip_window();
+    if (!g_tooltip) return;
+
+    TOOLINFOW tool;
+    ZeroMemory(&tool, sizeof(tool));
+    tool.cbSize = sizeof(tool);
+    tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+    tool.hwnd = g_hwnd;
+    tool.uId = (UINT_PTR)control;
+    tool.lpszText = (LPWSTR)text;
+    SendMessageW(g_tooltip, TTM_ADDTOOLW, 0, (LPARAM)&tool);
+}
+
+static void configure_tooltips(void) {
+    add_control_tooltip(g_ask_edit, L"Type or paste a question for Bluey");
+    add_control_tooltip(g_send_button, L"Send the question");
+    add_control_tooltip(g_record_button, L"Start or stop listening");
+    add_control_tooltip(g_auto_send_combo, L"Choose which audio source should auto-send when listening stops.");
+    add_control_tooltip(g_transcript_clear_button, L"Clear current captions from the next answer");
+    add_control_tooltip(g_paste_answer_button, L"Paste this answer into the app behind Bluey");
+    add_control_tooltip(g_help_button, L"Show Bluey help");
+    add_control_tooltip(g_session_button, L"Open conversation history");
+    add_control_tooltip(g_page_button, L"Capture the screen as context");
+    add_control_tooltip(g_attach_button, L"Attach documents or images");
+    add_control_tooltip(g_recap_button, L"Create a recap for this recording");
+    add_control_tooltip(g_note_button, L"Set how Bluey should answer");
+    add_control_tooltip(g_theme_button, L"Toggle light or dark theme");
+    add_control_tooltip(g_close_button, L"Turn Bluey off");
 }
 
 // Print `,"token":"..."` if a token is set, else nothing.
@@ -202,6 +307,18 @@ static void json_print_escaped(const char *text) {
     }
 }
 
+static char *wide_to_utf8_alloc(const wchar_t *text) {
+    int bytes = WideCharToMultiByte(CP_UTF8, 0, text, -1, NULL, 0, NULL, NULL);
+    if (bytes <= 0) return NULL;
+    char *utf8 = (char *)malloc((size_t)bytes);
+    if (!utf8) return NULL;
+    if (WideCharToMultiByte(CP_UTF8, 0, text, -1, utf8, bytes, NULL, NULL) <= 0) {
+        free(utf8);
+        return NULL;
+    }
+    return utf8;
+}
+
 static void emit_simple_event(const char *type) {
     printf("{\"type\":\"%s\"", type);
     emit_token_field();
@@ -210,15 +327,148 @@ static void emit_simple_event(const char *type) {
 }
 
 static void emit_ask_event(const wchar_t *question) {
-    char utf8[4096];
-    int written = WideCharToMultiByte(CP_UTF8, 0, question, -1, utf8, sizeof(utf8), NULL, NULL);
-    if (written <= 0) return;
+    char *utf8 = wide_to_utf8_alloc(question);
+    if (!utf8) return;
 
     fputs("{\"type\":\"ask_requested\",\"question\":\"", stdout);
     json_print_escaped(utf8);
+    free(utf8);
     // Close `question`, emit fixed fields, append `,"token":"..."` if set,
     // then close the JSON object.
     fputs("\",\"provider\":\"auto\",\"model\":\"\",\"mode\":\"General\"", stdout);
+    emit_token_field();
+    fputs("}\n", stdout);
+    fflush(stdout);
+}
+
+static void emit_paste_text_event(const wchar_t *text) {
+    char *utf8 = wide_to_utf8_alloc(text);
+    if (!utf8) return;
+
+    fputs("{\"type\":\"paste_text_requested\",\"text\":\"", stdout);
+    json_print_escaped(utf8);
+    free(utf8);
+    fputc('"', stdout);
+    emit_token_field();
+    fputs("}\n", stdout);
+    fflush(stdout);
+}
+
+static wchar_t *drag_query_path_alloc(HDROP drop, UINT index) {
+    UINT len = DragQueryFileW(drop, index, NULL, 0);
+    if (len == 0) return NULL;
+    wchar_t *path = (wchar_t *)calloc((size_t)len + 1, sizeof(wchar_t));
+    if (!path) return NULL;
+    if (DragQueryFileW(drop, index, path, len + 1) == 0) {
+        free(path);
+        return NULL;
+    }
+    return path;
+}
+
+static bool supported_drop_extension(const wchar_t *ext) {
+    static const wchar_t *supported[] = {
+        L"md", L"markdown", L"txt", L"log", L"csv", L"tsv", L"rst", L"adoc",
+        L"rs", L"swift", L"c", L"h", L"cpp", L"hpp", L"js", L"jsx", L"ts", L"tsx",
+        L"py", L"go", L"java", L"kt", L"kts", L"cs", L"rb", L"php", L"sql", L"sh",
+        L"ps1", L"toml", L"yaml", L"yml", L"json", L"html", L"css", L"scss",
+        L"pdf", L"doc", L"docx", L"rtf", L"xls", L"xlsx", L"xlsm", L"xlsb", L"ods",
+        L"png", L"jpg", L"jpeg", L"gif", L"webp", L"heic", L"heif", L"bmp", L"tiff", L"tif",
+    };
+    for (size_t i = 0; i < sizeof(supported) / sizeof(supported[0]); i++) {
+        if (_wcsicmp(ext, supported[i]) == 0) return true;
+    }
+    return false;
+}
+
+static bool is_supported_drop_path(const wchar_t *path) {
+    DWORD attrs = GetFileAttributesW(path);
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) return false;
+
+    const wchar_t *name = wcsrchr(path, L'\\');
+    const wchar_t *slash = wcsrchr(path, L'/');
+    if (!name || (slash && slash > name)) name = slash;
+    name = name ? name + 1 : path;
+
+    const wchar_t *dot = wcsrchr(name, L'.');
+    if (!dot || dot[1] == L'\0') return false;
+    return supported_drop_extension(dot + 1);
+}
+
+static void show_unsupported_drop_message(UINT skipped, UINT total) {
+    wcscpy_s(g_title, 256, skipped == total ? L"File type not supported" : L"Some files were skipped");
+    if (skipped == total) {
+        swprintf_s(g_body, 2048, L"Bluey cannot use that file type as context yet. %ls", g_supported_drop_formats);
+    } else {
+        swprintf_s(
+            g_body,
+            2048,
+            L"Bluey skipped %u file%ls that are not readable context. %ls",
+            skipped,
+            skipped == 1 ? L"" : L"s",
+            g_supported_drop_formats);
+    }
+    wcscpy_s(g_kind, 64, L"warning");
+    wcscpy_s(g_source, 256, L"");
+    wcscpy_s(g_card_id, 80, L"");
+    if (g_visible && !g_collapsed) show_full_overlay(false);
+    InvalidateRect(g_hwnd, NULL, TRUE);
+}
+
+static void show_supported_drop_loading(UINT count) {
+    wcscpy_s(g_title, 256, L"Docs loading");
+    wcscpy_s(
+        g_body,
+        2048,
+        count == 1 ? L"Indexing dropped document..." : L"Indexing dropped documents...");
+    wcscpy_s(g_kind, 64, L"context");
+    wcscpy_s(g_source, 256, L"");
+    wcscpy_s(g_card_id, 80, L"");
+    if (g_visible && !g_collapsed) show_full_overlay(false);
+    InvalidateRect(g_hwnd, NULL, TRUE);
+}
+
+static void emit_attach_files_event_from_drop(HDROP drop) {
+    UINT count = DragQueryFileW(drop, 0xFFFFFFFFu, NULL, 0);
+    if (count == 0) return;
+    if (count > 64) count = 64;
+
+    UINT supported_count = 0;
+    UINT skipped_count = 0;
+    for (UINT i = 0; i < count; i++) {
+        wchar_t *path = drag_query_path_alloc(drop, i);
+        if (!path) continue;
+        if (is_supported_drop_path(path)) supported_count++;
+        else skipped_count++;
+        free(path);
+    }
+
+    if (skipped_count > 0) show_unsupported_drop_message(skipped_count, supported_count + skipped_count);
+    if (supported_count == 0) return;
+    if (skipped_count == 0) show_supported_drop_loading(supported_count);
+
+    fputs("{\"type\":\"attach_files_requested\",\"paths\":[", stdout);
+    bool emitted = false;
+    for (UINT i = 0; i < count; i++) {
+        wchar_t *path = drag_query_path_alloc(drop, i);
+        if (!path) continue;
+        if (!is_supported_drop_path(path)) {
+            free(path);
+            continue;
+        }
+
+        char *utf8 = wide_to_utf8_alloc(path);
+        free(path);
+        if (!utf8) continue;
+
+        if (emitted) fputc(',', stdout);
+        fputc('"', stdout);
+        json_print_escaped(utf8);
+        fputc('"', stdout);
+        free(utf8);
+        emitted = true;
+    }
+    fputc(']', stdout);
     emit_token_field();
     fputs("}\n", stdout);
     fflush(stdout);
@@ -229,6 +479,68 @@ static void update_record_button(void) {
         SetWindowTextW(g_record_button, g_recording ? L"Stop" : L"Mic");
         InvalidateRect(g_record_button, NULL, TRUE);
     }
+}
+
+static void update_auto_send_control(void) {
+    if (g_auto_send_combo) {
+        SendMessageW(g_auto_send_combo, CB_SETCURSEL, (WPARAM)g_auto_send_mode, 0);
+        InvalidateRect(g_auto_send_combo, NULL, TRUE);
+    }
+}
+
+static bool has_transcript_context(void) {
+    return g_transcript_final[0] != L'\0' || g_transcript_partial[0] != L'\0';
+}
+
+static bool transcript_text_has_prefix(const wchar_t *prefix) {
+    size_t prefix_len = wcslen(prefix);
+    if (wcsncmp(g_transcript_final, prefix, prefix_len) == 0) return true;
+    if (wcsncmp(g_transcript_partial, prefix, prefix_len) == 0) return true;
+    return false;
+}
+
+static bool transcript_source_matches_auto_send_mode(void) {
+    if (!has_transcript_context()) return false;
+    if (g_auto_send_mode == 3) return true;
+    if (g_auto_send_mode == 1) {
+        return wcsstr(g_transcript_source, L"microphone") != NULL
+            || wcsstr(g_transcript_source, L"user") != NULL
+            || wcsstr(g_transcript_source, L"Mic") != NULL
+            || transcript_text_has_prefix(L"Mic:");
+    }
+    if (g_auto_send_mode == 2) {
+        return wcsstr(g_transcript_source, L"system") != NULL
+            || wcsstr(g_transcript_source, L"System") != NULL
+            || transcript_text_has_prefix(L"System:");
+    }
+    return false;
+}
+
+static bool has_auto_send_context(void) {
+    if (g_auto_send_mode == 0) return false;
+    return transcript_source_matches_auto_send_mode();
+}
+
+static void update_transcript_clear_button(void) {
+    if (!g_transcript_clear_button) return;
+    ShowWindow(
+        g_transcript_clear_button,
+        (!g_collapsed && has_transcript_context()) ? SW_SHOW : SW_HIDE
+    );
+}
+
+static bool has_pasteable_answer(void) {
+    return !g_collapsed
+        && _wcsicmp(g_kind, L"answer") == 0
+        && g_body[0] != L'\0'
+        && _wcsicmp(g_body, L"Thinking...") != 0;
+}
+
+static void update_paste_answer_button(void) {
+    if (!g_paste_answer_button) return;
+    ShowWindow(g_paste_answer_button, has_pasteable_answer() ? SW_SHOW : SW_HIDE);
+    EnableWindow(g_paste_answer_button, has_pasteable_answer());
+    InvalidateRect(g_paste_answer_button, NULL, TRUE);
 }
 
 static void draw_dark_button(const DRAWITEMSTRUCT *item) {
@@ -348,11 +660,18 @@ static void draw_resize_affordance(HDC hdc, RECT rect) {
 static void set_controls_visible(bool visible) {
     int state = visible ? SW_SHOW : SW_HIDE;
     HWND controls[] = {
-        g_ask_edit, g_send_button, g_record_button, g_help_button, g_session_button,
+        g_ask_edit, g_send_button, g_record_button, g_auto_send_combo, g_paste_answer_button, g_help_button, g_session_button,
         g_page_button, g_attach_button, g_recap_button, g_note_button, g_theme_button, g_close_button
     };
     for (int i = 0; i < (int)(sizeof(controls) / sizeof(controls[0])); i++) {
         if (controls[i]) ShowWindow(controls[i], state);
+    }
+    if (visible) {
+        update_transcript_clear_button();
+        update_paste_answer_button();
+    } else if (g_transcript_clear_button) {
+        ShowWindow(g_transcript_clear_button, SW_HIDE);
+        if (g_paste_answer_button) ShowWindow(g_paste_answer_button, SW_HIDE);
     }
 }
 
@@ -362,12 +681,110 @@ static int clamp_int(int value, int min_value, int max_value) {
     return value;
 }
 
+static bool rect_is_valid(RECT rect) {
+    return rect.right > rect.left && rect.bottom > rect.top;
+}
+
+static RECT work_area_for_rect(RECT rect) {
+    RECT work = {0, 0, 0, 0};
+    MONITORINFO monitor = {0};
+    monitor.cbSize = sizeof(monitor);
+    HMONITOR hmonitor = MonitorFromRect(&rect, MONITOR_DEFAULTTONEAREST);
+    if (GetMonitorInfoW(hmonitor, &monitor)) {
+        work = monitor.rcWork;
+    } else {
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    }
+    return work;
+}
+
+static RECT clamp_rect_to_work_area(RECT rect, int margin) {
+    RECT work = work_area_for_rect(rect);
+    int width = rect.right - rect.left;
+    int height = rect.bottom - rect.top;
+    RECT clamped = rect;
+    clamped.left = clamp_int(rect.left, work.left + margin, work.right - width - margin);
+    clamped.top = clamp_int(rect.top, work.top + margin, work.bottom - height - margin);
+    clamped.right = clamped.left + width;
+    clamped.bottom = clamped.top + height;
+    return clamped;
+}
+
+static RECT clamp_expanded_rect_to_focus_area(RECT rect, int margin) {
+    RECT work = work_area_for_rect(rect);
+    int work_w = work.right - work.left;
+    int work_h = work.bottom - work.top;
+    int max_w = clamp_int(1040, 520, work_w - margin * 2);
+    int max_h = clamp_int(620, 360, work_h - margin * 2);
+    int width = rect.right - rect.left;
+    int height = rect.bottom - rect.top;
+    if (width > max_w) width = max_w;
+    if (height > max_h) height = max_h;
+    if (width < 520) width = 520;
+    if (height < 360) height = 360;
+
+    RECT clamped = rect;
+    clamped.right = clamped.left + width;
+    clamped.bottom = clamped.top + height;
+    return clamp_rect_to_work_area(clamped, margin);
+}
+
+static void save_overlay_rect(const wchar_t *name, RECT rect) {
+    if (!rect_is_valid(rect)) return;
+    HKEY key;
+    if (RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            L"Software\\Bluey\\Overlay",
+            0,
+            NULL,
+            0,
+            KEY_SET_VALUE,
+            NULL,
+            &key,
+            NULL) != ERROR_SUCCESS) {
+        return;
+    }
+    RegSetValueExW(key, name, 0, REG_BINARY, (const BYTE *)&rect, sizeof(rect));
+    RegCloseKey(key);
+}
+
+static bool load_overlay_rect(const wchar_t *name, RECT *rect) {
+    HKEY key;
+    if (RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            L"Software\\Bluey\\Overlay",
+            0,
+            KEY_QUERY_VALUE,
+            &key) != ERROR_SUCCESS) {
+        return false;
+    }
+    DWORD type = 0;
+    DWORD size = sizeof(*rect);
+    LONG status = RegQueryValueExW(key, name, NULL, &type, (BYTE *)rect, &size);
+    RegCloseKey(key);
+    return status == ERROR_SUCCESS
+        && type == REG_BINARY
+        && size == sizeof(*rect)
+        && rect_is_valid(*rect);
+}
+
+static void load_overlay_placement(void) {
+    RECT loaded;
+    if (load_overlay_rect(L"expanded_rect", &loaded)) {
+        g_expanded_rect = clamp_expanded_rect_to_focus_area(loaded, 12);
+    }
+    if (load_overlay_rect(L"collapsed_rect", &loaded)) {
+        g_collapsed_rect = clamp_rect_to_work_area(loaded, 8);
+    }
+}
+
 static void show_full_overlay(bool emit_event) {
     g_collapsed = false;
     set_controls_visible(true);
     apply_capture_exclusion(g_hwnd);
 
-    if (g_expanded_rect.right > g_expanded_rect.left && g_expanded_rect.bottom > g_expanded_rect.top) {
+    if (rect_is_valid(g_expanded_rect)) {
+        g_expanded_rect = clamp_expanded_rect_to_focus_area(g_expanded_rect, 12);
         SetWindowPos(
             g_hwnd,
             HWND_TOPMOST,
@@ -389,28 +806,33 @@ static void show_full_overlay(bool emit_event) {
 static void collapse_to_pill(HWND hwnd, bool emit_event) {
     if (!g_collapsed) {
         GetWindowRect(hwnd, &g_expanded_rect);
-    }
-
-    RECT work = {0, 0, 0, 0};
-    MONITORINFO monitor = {0};
-    monitor.cbSize = sizeof(monitor);
-    HMONITOR hmonitor = MonitorFromRect(&g_expanded_rect, MONITOR_DEFAULTTONEAREST);
-    if (GetMonitorInfoW(hmonitor, &monitor)) {
-        work = monitor.rcWork;
-    } else {
-        SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+        g_expanded_rect = clamp_expanded_rect_to_focus_area(g_expanded_rect, 12);
+        save_overlay_rect(L"expanded_rect", g_expanded_rect);
     }
 
     int width = 96;
     int height = 42;
-    int margin = 14;
-    int x = clamp_int(g_expanded_rect.right - width, work.left + margin, work.right - width - margin);
-    int y = clamp_int(g_expanded_rect.top, work.top + margin, work.bottom - height - margin);
+    RECT target = {0, 0, 0, 0};
+    if (rect_is_valid(g_collapsed_rect)) {
+        target = g_collapsed_rect;
+        target.right = target.left + width;
+        target.bottom = target.top + height;
+    } else {
+        RECT work = work_area_for_rect(g_expanded_rect);
+        int margin = 14;
+        target.left = clamp_int(g_expanded_rect.right - width, work.left + margin, work.right - width - margin);
+        target.top = clamp_int(g_expanded_rect.top, work.top + margin, work.bottom - height - margin);
+        target.right = target.left + width;
+        target.bottom = target.top + height;
+    }
+    target = clamp_rect_to_work_area(target, 8);
+    g_collapsed_rect = target;
+    save_overlay_rect(L"collapsed_rect", g_collapsed_rect);
 
     g_collapsed = true;
     g_visible = false;
     set_controls_visible(false);
-    SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+    SetWindowPos(hwnd, HWND_TOPMOST, target.left, target.top, width, height, SWP_SHOWWINDOW | SWP_NOACTIVATE);
     InvalidateRect(hwnd, NULL, TRUE);
     if (emit_event) emit_simple_event("hidden");
 }
@@ -572,16 +994,20 @@ static void layout_controls(void) {
     int composer_w = clamp_int((rect.right * 72) / 100, 560, 760);
     int composer_left = (rect.right - composer_w) / 2;
     int bottom = rect.bottom - 16;
-    int row_h = 34;
-    int input_y = bottom - 72;
+    int button_h = 34;
+    int input_h = 50;
+    int input_y = bottom - 86;
+    int button_y = input_y + ((input_h - button_h) / 2);
     int chip_y = bottom - 30;
     int button_w = 72;
     int send_w = 78;
+    int auto_w = 220;
     int gap = 10;
 
-    MoveWindow(g_record_button, composer_left + 12, input_y, button_w, row_h, TRUE);
-    MoveWindow(g_send_button, composer_left + composer_w - 12 - send_w, input_y, send_w, row_h, TRUE);
-    MoveWindow(g_ask_edit, composer_left + 12 + button_w + gap, input_y, composer_w - 24 - button_w - send_w - (gap * 2), row_h, TRUE);
+    MoveWindow(g_record_button, composer_left + 12, button_y, button_w, button_h, TRUE);
+    MoveWindow(g_send_button, composer_left + composer_w - 12 - send_w, button_y, send_w, button_h, TRUE);
+    MoveWindow(g_auto_send_combo, composer_left + composer_w - 12 - send_w - gap - auto_w, button_y, auto_w, button_h + 100, TRUE);
+    MoveWindow(g_ask_edit, composer_left + 12 + button_w + gap, input_y, composer_w - 24 - button_w - send_w - auto_w - (gap * 3), input_h, TRUE);
 
     int chip_w = (composer_w - 34) / 2;
     MoveWindow(g_recap_button, composer_left + 12, chip_y, chip_w, 30, TRUE);
@@ -601,6 +1027,73 @@ static void layout_controls(void) {
     MoveWindow(g_attach_button, header_right - margin - 62 - (small_w + 8) * 3, header_y + 4, small_w, header_h, TRUE);
     MoveWindow(g_session_button, header_right - margin - 62 - (small_w + 8) * 4, header_y + 4, small_w, header_h, TRUE);
     MoveWindow(g_help_button, header_right - margin - 62 - (small_w + 8) * 5, header_y + 4, small_w, header_h, TRUE);
+
+    int transcript_right = rect.right - 18;
+    int transcript_bottom = rect.bottom - 132;
+    MoveWindow(g_transcript_clear_button, transcript_right - 64, transcript_bottom - 30, 58, 24, TRUE);
+    update_transcript_clear_button();
+
+    MoveWindow(g_paste_answer_button, rect.right - 124, 58, 106, 28, TRUE);
+    update_paste_answer_button();
+}
+
+static bool point_hits_visible_child(HWND child, POINT point, int padding) {
+    if (!child || !IsWindowVisible(child)) return false;
+    RECT child_rect;
+    if (!GetWindowRect(child, &child_rect)) return false;
+    InflateRect(&child_rect, padding, padding);
+    return PtInRect(&child_rect, point) != 0;
+}
+
+static bool point_hits_overlay_control(POINT point) {
+    HWND controls[] = {
+        g_ask_edit,
+        g_send_button,
+        g_record_button,
+        g_auto_send_combo,
+        g_transcript_clear_button,
+        g_paste_answer_button,
+        g_help_button,
+        g_session_button,
+        g_page_button,
+        g_attach_button,
+        g_recap_button,
+        g_note_button,
+        g_theme_button,
+        g_close_button,
+    };
+    for (size_t i = 0; i < sizeof(controls) / sizeof(controls[0]); i++) {
+        if (point_hits_visible_child(controls[i], point, 8)) return true;
+    }
+    return false;
+}
+
+static bool point_hits_brand_move_handle(POINT point) {
+    if (!g_hwnd || g_collapsed) return false;
+    RECT rect;
+    if (!GetClientRect(g_hwnd, &rect)) return false;
+    POINT local = point;
+    if (!ScreenToClient(g_hwnd, &local)) return false;
+
+    int header_w = clamp_int((rect.right * 84) / 100, 520, 780);
+    if (header_w > rect.right - 28) header_w = rect.right - 28;
+    int header_left = (rect.right - header_w) / 2;
+    RECT handle = {header_left + 8, 8, header_left + 132, 54};
+    return PtInRect(&handle, local) != 0;
+}
+
+static LRESULT CALLBACK ask_edit_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    if (msg == WM_KEYDOWN && wparam == VK_RETURN && (GetKeyState(VK_SHIFT) & 0x8000) == 0) {
+        send_current_question();
+        return 0;
+    }
+    if (msg == WM_GETDLGCODE) {
+        LRESULT code = g_ask_edit_proc ? CallWindowProcW(g_ask_edit_proc, hwnd, msg, wparam, lparam) : 0;
+        return code | DLGC_WANTCHARS | DLGC_WANTARROWS;
+    }
+    return g_ask_edit_proc
+        ? CallWindowProcW(g_ask_edit_proc, hwnd, msg, wparam, lparam)
+        : DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
 static void create_controls(HWND hwnd) {
@@ -608,13 +1101,27 @@ static void create_controls(HWND hwnd) {
     if (!g_edit_brush) refresh_edit_brush();
     g_ask_edit = CreateWindowExW(
         0, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-        0, 0, 100, 30, hwnd, (HMENU)ID_ASK_EDIT, GetModuleHandleW(NULL), NULL
+        WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | ES_NOHIDESEL,
+        0, 0, 100, 50, hwnd, (HMENU)ID_ASK_EDIT, GetModuleHandleW(NULL), NULL
     );
     g_send_button = CreateWindowW(L"BUTTON", L"Answer", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
         0, 0, 60, 30, hwnd, (HMENU)ID_SEND_BUTTON, GetModuleHandleW(NULL), NULL);
     g_record_button = CreateWindowW(L"BUTTON", L"Mic", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
         0, 0, 60, 30, hwnd, (HMENU)ID_RECORD_BUTTON, GetModuleHandleW(NULL), NULL);
+    g_auto_send_combo = CreateWindowW(
+        L"COMBOBOX", L"",
+        WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | CBS_HASSTRINGS,
+        0, 0, 220, 150, hwnd, (HMENU)ID_AUTO_SEND_BUTTON, GetModuleHandleW(NULL), NULL);
+    SendMessageW(g_auto_send_combo, CB_ADDSTRING, 0, (LPARAM)L"Don't auto-send");
+    SendMessageW(g_auto_send_combo, CB_ADDSTRING, 0, (LPARAM)L"Auto-send when mic stops");
+    SendMessageW(g_auto_send_combo, CB_ADDSTRING, 0, (LPARAM)L"Auto-send when system stops");
+    SendMessageW(g_auto_send_combo, CB_ADDSTRING, 0, (LPARAM)L"Auto-send when mic or system stops");
+    SendMessageW(g_auto_send_combo, CB_SETDROPPEDWIDTH, 280, 0);
+    SendMessageW(g_auto_send_combo, CB_SETCURSEL, g_auto_send_mode, 0);
+    g_transcript_clear_button = CreateWindowW(L"BUTTON", L"Clear", WS_CHILD | BS_OWNERDRAW,
+        0, 0, 60, 24, hwnd, (HMENU)ID_TRANSCRIPT_CLEAR_BUTTON, GetModuleHandleW(NULL), NULL);
+    g_paste_answer_button = CreateWindowW(L"BUTTON", L"Paste answer", WS_CHILD | BS_OWNERDRAW,
+        0, 0, 106, 28, hwnd, (HMENU)ID_PASTE_ANSWER_BUTTON, GetModuleHandleW(NULL), NULL);
     g_help_button = CreateWindowW(L"BUTTON", L"Help", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
         0, 0, 60, 30, hwnd, (HMENU)ID_HELP_BUTTON, GetModuleHandleW(NULL), NULL);
     g_session_button = CreateWindowW(L"BUTTON", L"Session", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
@@ -633,24 +1140,39 @@ static void create_controls(HWND hwnd) {
         0, 0, 60, 30, hwnd, (HMENU)ID_CLOSE_BUTTON, GetModuleHandleW(NULL), NULL);
 
     HWND controls[] = {
-        g_ask_edit, g_send_button, g_record_button, g_help_button, g_session_button,
+        g_ask_edit, g_send_button, g_record_button, g_auto_send_combo, g_transcript_clear_button, g_paste_answer_button, g_help_button, g_session_button,
         g_page_button, g_attach_button, g_recap_button, g_note_button, g_theme_button, g_close_button
     };
     for (int i = 0; i < (int)(sizeof(controls) / sizeof(controls[0])); i++) {
         SendMessageW(controls[i], WM_SETFONT, (WPARAM)font, TRUE);
     }
+    SendMessageW(g_ask_edit, EM_SETLIMITTEXT, 32768, 0);
     SendMessageW(g_ask_edit, EM_SETCUEBANNER, FALSE, (LPARAM)L"Ask me anything...");
+    g_ask_edit_proc = (WNDPROC)SetWindowLongPtrW(g_ask_edit, GWLP_WNDPROC, (LONG_PTR)ask_edit_proc);
+    update_auto_send_control();
+    configure_tooltips();
     layout_controls();
 }
 
+static void consume_sent_context_chips(void) {
+    g_context_chip_count = 0;
+}
+
 static void send_current_question(void) {
-    wchar_t question[2048];
-    GetWindowTextW(g_ask_edit, question, 2048);
-    if (wcslen(question) == 0) {
-        wcscpy_s(question, 2048, L"Answer the latest clear question from the current transcript, screen context, and attached files. If there is no clear question yet, summarize what Bluey needs next.");
+    static const wchar_t *fallback = L"Answer the latest clear question from the current transcript, screen context, and attached files. If there is no clear question yet, summarize what Bluey needs next.";
+    int length = GetWindowTextLengthW(g_ask_edit);
+    if (length <= 0) {
+        emit_ask_event(fallback);
+    } else {
+        wchar_t *question = (wchar_t *)calloc((size_t)length + 1, sizeof(wchar_t));
+        if (!question) return;
+        GetWindowTextW(g_ask_edit, question, length + 1);
+        emit_ask_event(question);
+        free(question);
     }
-    emit_ask_event(question);
     SetWindowTextW(g_ask_edit, L"");
+    consume_sent_context_chips();
+    InvalidateRect(g_hwnd, NULL, TRUE);
     SetFocus(g_ask_edit);
 }
 
@@ -673,6 +1195,62 @@ static bool safe_extract_json_number(const char *line, size_t line_len, const ch
     }
     /* Fallback: try the naive number extractor for non-string numbers */
     return naive_extract_json_number(line, key, dest);
+}
+
+static void set_chips_from_json_key(
+    const char *line,
+    size_t line_len,
+    const char *array_key,
+    OverlayContextChip *chips,
+    int *chip_count
+) {
+    *chip_count = 0;
+    const char *end = line + line_len;
+    char needle[96];
+    snprintf(needle, sizeof(needle), "\"%s\"", array_key);
+    const char *items = strstr(line, needle);
+    if (!items) return;
+
+    const char *p = strchr(items, '[');
+    if (!p || p >= end) return;
+    p++;
+
+    while (p < end && *chip_count < MAX_CONTEXT_CHIPS) {
+        p = json_skip_ws(p, end);
+        if (p >= end || *p == ']') break;
+        if (*p == ',') {
+            p++;
+            continue;
+        }
+        if (*p != '{') break;
+
+        const char *object_start = p;
+        const char *object_end = json_skip_value(p, end);
+        if (!object_end || object_end <= object_start) break;
+        size_t object_len = (size_t)(object_end - object_start);
+
+        char title[JSON_MAX_FIELD_LEN];
+        char kind[128];
+        char path[JSON_MAX_FIELD_LEN];
+        bool has_title = json_extract_string(object_start, object_len, "title", title, sizeof(title));
+        bool has_kind = json_extract_string(object_start, object_len, "kind", kind, sizeof(kind));
+        bool has_path = json_extract_string(object_start, object_len, "path", path, sizeof(path));
+
+        OverlayContextChip *chip = &chips[*chip_count];
+        set_utf8_text(chip->title, sizeof(chip->title) / sizeof(chip->title[0]), has_title ? title : "Attached file");
+        set_utf8_text(chip->kind, sizeof(chip->kind) / sizeof(chip->kind[0]), has_kind ? kind : "document");
+        set_utf8_text(chip->path, sizeof(chip->path) / sizeof(chip->path[0]), has_path ? path : "");
+        (*chip_count)++;
+        p = object_end;
+    }
+}
+
+static void set_context_chips_from_json(const char *line, size_t line_len) {
+    set_chips_from_json_key(line, line_len, "items", g_context_chips, &g_context_chip_count);
+}
+
+static void set_sent_chips_from_json(const char *line, size_t line_len) {
+    set_chips_from_json_key(line, line_len, "attachments", g_sent_chips, &g_sent_chip_count);
 }
 
 static DWORD WINAPI stdin_thread(LPVOID unused) {
@@ -705,6 +1283,8 @@ static DWORD WINAPI stdin_thread(LPVOID unused) {
             wcscpy_s(g_kind, 64, L"system");
             wcscpy_s(g_source, 256, L"");
             wcscpy_s(g_card_id, 80, L"");
+            g_sent_chip_count = 0;
+            update_paste_answer_button();
             InvalidateRect(g_hwnd, NULL, TRUE);
         } else if (strcmp(msg_type, "boot") == 0) {
             wcscpy_s(g_title, 256, L"bluey online");
@@ -714,6 +1294,7 @@ static DWORD WINAPI stdin_thread(LPVOID unused) {
             wcscpy_s(g_card_id, 80, L"");
             safe_extract_json_to_wide(line, line_len, "title", g_title, 256);
             show_full_overlay(false);
+            update_paste_answer_button();
             InvalidateRect(g_hwnd, NULL, TRUE);
         } else if (strcmp(msg_type, "set_position") == 0) {
             char pos[32];
@@ -727,21 +1308,27 @@ static DWORD WINAPI stdin_thread(LPVOID unused) {
             if (safe_extract_json_number(line, line_len, "opacity", &opacity)) {
                 set_window_opacity(opacity);
             }
+        } else if (strcmp(msg_type, "set_context_items") == 0) {
+            set_context_chips_from_json(line, line_len);
+            InvalidateRect(g_hwnd, NULL, TRUE);
         } else if (strcmp(msg_type, "push_card") == 0) {
             safe_extract_json_to_wide(line, line_len, "title", g_title, 256);
             safe_extract_json_to_wide(line, line_len, "body", g_body, 2048);
             safe_extract_json_to_wide(line, line_len, "kind", g_kind, 64);
             safe_extract_json_to_wide(line, line_len, "source", g_source, 256);
             safe_extract_json_to_wide(line, line_len, "id", g_card_id, 80);
+            set_sent_chips_from_json(line, line_len);
             if (g_visible && !g_collapsed) {
                 show_full_overlay(false);
             }
+            update_paste_answer_button();
             InvalidateRect(g_hwnd, NULL, TRUE);
         } else if (strcmp(msg_type, "update_card") == 0) {
             wchar_t id[80] = L"";
             safe_extract_json_to_wide(line, line_len, "id", id, 80);
             if (wcslen(g_card_id) == 0 || wcscmp(id, g_card_id) == 0) {
                 safe_extract_json_to_wide(line, line_len, "body", g_body, 2048);
+                update_paste_answer_button();
                 InvalidateRect(g_hwnd, NULL, TRUE);
             }
         } else if (strcmp(msg_type, "shutdown") == 0) {
@@ -749,10 +1336,16 @@ static DWORD WINAPI stdin_thread(LPVOID unused) {
             break;
         } else if (strcmp(msg_type, "transcript_partial") == 0) {
             safe_extract_json_to_wide(line, line_len, "text", g_transcript_partial, 1024);
+            safe_extract_json_to_wide(line, line_len, "source", g_transcript_source, 64);
+            update_transcript_clear_button();
+            update_paste_answer_button();
             InvalidateRect(g_hwnd, NULL, TRUE);
         } else if (strcmp(msg_type, "transcript_final") == 0) {
             safe_extract_json_to_wide(line, line_len, "text", g_transcript_final, 1024);
+            safe_extract_json_to_wide(line, line_len, "source", g_transcript_source, 64);
             g_transcript_partial[0] = L'\0';
+            update_transcript_clear_button();
+            update_paste_answer_button();
             InvalidateRect(g_hwnd, NULL, TRUE);
         } else if (strcmp(msg_type, "session_switched") == 0) {
             safe_extract_json_to_wide(line, line_len, "title", g_session_banner, 256);
@@ -760,6 +1353,9 @@ static DWORD WINAPI stdin_thread(LPVOID unused) {
             g_session_banner_tick = GetTickCount64();
             g_transcript_partial[0] = L'\0';
             g_transcript_final[0] = L'\0';
+            g_transcript_source[0] = L'\0';
+            update_transcript_clear_button();
+            update_paste_answer_button();
             InvalidateRect(g_hwnd, NULL, TRUE);
         } else if (strcmp(msg_type, "ping") == 0) {
             emit_simple_event("pong");
@@ -919,6 +1515,150 @@ static HRESULT create_text_format(float size, DWRITE_FONT_WEIGHT weight, DWRITE_
     BLUEY_SET_PARAGRAPH_ALIGNMENT(*out, paragraph);
     BLUEY_SET_WORD_WRAPPING(*out, DWRITE_WORD_WRAPPING_WRAP);
     return S_OK;
+}
+
+static bool context_kind_is_image(const wchar_t *kind) {
+    return _wcsicmp(kind, L"image") == 0
+        || _wcsicmp(kind, L"diagram") == 0
+        || _wcsicmp(kind, L"screen") == 0
+        || _wcsicmp(kind, L"screenshot") == 0;
+}
+
+static void context_chip_label(const OverlayContextChip *chip, wchar_t *dest, size_t dest_len) {
+    const wchar_t *title = chip->title[0] ? chip->title : L"Attached file";
+    const wchar_t *prefix = context_kind_is_image(chip->kind) ? L"IMG" : L"DOC";
+    swprintf(dest, dest_len, L"%ls %ls", prefix, title);
+    dest[dest_len - 1] = L'\0';
+}
+
+static float context_chip_width(const wchar_t *label) {
+    size_t len = wcslen(label);
+    float width = 42.0f + (float)len * 6.3f;
+    if (width < 96.0f) width = 96.0f;
+    if (width > 164.0f) width = 164.0f;
+    return width;
+}
+
+static void draw_context_chips_d2d(RECT rect) {
+    if (g_context_chip_count <= 0) return;
+
+    int composer_w = clamp_int((rect.right * 72) / 100, 560, 760);
+    int composer_left = (rect.right - composer_w) / 2;
+    float x = (float)composer_left + 8.0f;
+    float y = (float)rect.bottom - 145.0f;
+    float max_right = (float)(composer_left + composer_w - 8);
+
+    for (int i = 0; i < g_context_chip_count && x < max_right - 50.0f; i++) {
+        wchar_t label[360];
+        context_chip_label(&g_context_chips[i], label, sizeof(label) / sizeof(label[0]));
+        float width = context_chip_width(label);
+        if (x + width > max_right) width = max_right - x;
+        bool is_image = context_kind_is_image(g_context_chips[i].kind);
+        d2d_fill_round(x, y, x + width, y + 26.0f, 13.0f, is_image ? 18 : 20, is_image ? 35 : 24, is_image ? 58 : 34, 0.92f);
+        d2d_stroke_round(x + 0.5f, y + 0.5f, x + width - 0.5f, y + 25.5f, 13.0f, is_image ? 76 : 48, is_image ? 180 : 126, is_image ? 220 : 150, 0.42f, 1.0f);
+        d2d_text(label, g_fmt_partial, d2d_rectf(x + 10.0f, y + 3.0f, x + width - 8.0f, y + 24.0f), is_image ? 150 : 230, is_image ? 220 : 240, is_image ? 255 : 245, 1.0f);
+        x += width + 6.0f;
+    }
+}
+
+static void draw_sent_chips_d2d(RECT rect, float context_reserved) {
+    if (g_sent_chip_count <= 0 || _wcsicmp(g_kind, L"question") != 0) return;
+
+    float x = 18.0f;
+    float y = (float)rect.bottom - 158.0f - context_reserved;
+    float max_right = (float)rect.right - 18.0f;
+
+    for (int i = 0; i < g_sent_chip_count && x < max_right - 50.0f; i++) {
+        wchar_t label[360];
+        context_chip_label(&g_sent_chips[i], label, sizeof(label) / sizeof(label[0]));
+        float width = context_chip_width(label);
+        if (x + width > max_right) width = max_right - x;
+        bool is_image = context_kind_is_image(g_sent_chips[i].kind);
+        d2d_fill_round(x, y, x + width, y + 26.0f, 13.0f, is_image ? 205 : 226, is_image ? 232 : 237, is_image ? 248 : 242, 0.96f);
+        d2d_stroke_round(x + 0.5f, y + 0.5f, x + width - 0.5f, y + 25.5f, 13.0f, is_image ? 68 : 24, is_image ? 180 : 70, is_image ? 220 : 82, 0.36f, 1.0f);
+        d2d_text(label, g_fmt_partial, d2d_rectf(x + 10.0f, y + 3.0f, x + width - 8.0f, y + 24.0f), 20, 42, 54, 1.0f);
+        x += width + 6.0f;
+    }
+}
+
+static void draw_context_chips_gdi(HDC hdc, RECT rect) {
+    if (g_context_chip_count <= 0) return;
+
+    int composer_w = clamp_int((rect.right * 72) / 100, 560, 760);
+    int composer_left = (rect.right - composer_w) / 2;
+    int x = composer_left + 8;
+    int y = rect.bottom - 145;
+    int max_right = composer_left + composer_w - 8;
+
+    HFONT font = CreateFontW(12, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    HGDIOBJ old_font = SelectObject(hdc, font);
+    SetBkMode(hdc, TRANSPARENT);
+
+    for (int i = 0; i < g_context_chip_count && x < max_right - 50; i++) {
+        wchar_t label[360];
+        context_chip_label(&g_context_chips[i], label, sizeof(label) / sizeof(label[0]));
+        int width = (int)context_chip_width(label);
+        if (x + width > max_right) width = max_right - x;
+        bool is_image = context_kind_is_image(g_context_chips[i].kind);
+        HBRUSH bg = CreateSolidBrush(is_image ? RGB(18, 35, 58) : RGB(20, 24, 34));
+        HPEN border = CreatePen(PS_SOLID, 1, is_image ? RGB(76, 180, 220) : RGB(48, 126, 150));
+        HGDIOBJ old_brush = SelectObject(hdc, bg);
+        HGDIOBJ old_pen = SelectObject(hdc, border);
+        RoundRect(hdc, x, y, x + width, y + 26, 18, 18);
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        DeleteObject(bg);
+        DeleteObject(border);
+
+        SetTextColor(hdc, is_image ? RGB(150, 220, 255) : RGB(230, 240, 245));
+        RECT label_rect = {x + 10, y + 4, x + width - 8, y + 24};
+        DrawTextW(hdc, label, -1, &label_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        x += width + 6;
+    }
+
+    SelectObject(hdc, old_font);
+    DeleteObject(font);
+}
+
+static void draw_sent_chips_gdi(HDC hdc, RECT rect, int context_reserved) {
+    if (g_sent_chip_count <= 0 || _wcsicmp(g_kind, L"question") != 0) return;
+
+    int x = 18;
+    int y = rect.bottom - 158 - context_reserved;
+    int max_right = rect.right - 18;
+
+    HFONT font = CreateFontW(12, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+        DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    HGDIOBJ old_font = SelectObject(hdc, font);
+    SetBkMode(hdc, TRANSPARENT);
+
+    for (int i = 0; i < g_sent_chip_count && x < max_right - 50; i++) {
+        wchar_t label[360];
+        context_chip_label(&g_sent_chips[i], label, sizeof(label) / sizeof(label[0]));
+        int width = (int)context_chip_width(label);
+        if (x + width > max_right) width = max_right - x;
+        bool is_image = context_kind_is_image(g_sent_chips[i].kind);
+        HBRUSH bg = CreateSolidBrush(is_image ? RGB(205, 232, 248) : RGB(226, 237, 242));
+        HPEN border = CreatePen(PS_SOLID, 1, is_image ? RGB(68, 180, 220) : RGB(24, 70, 82));
+        HGDIOBJ old_brush = SelectObject(hdc, bg);
+        HGDIOBJ old_pen = SelectObject(hdc, border);
+        RoundRect(hdc, x, y, x + width, y + 26, 18, 18);
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        DeleteObject(bg);
+        DeleteObject(border);
+
+        SetTextColor(hdc, RGB(20, 42, 54));
+        RECT label_rect = {x + 10, y + 4, x + width - 8, y + 24};
+        DrawTextW(hdc, label, -1, &label_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        x += width + 6;
+    }
+
+    SelectObject(hdc, old_font);
+    DeleteObject(font);
 }
 
 static bool init_d2d_resources(void) {
@@ -1100,12 +1840,15 @@ static bool paint_with_d2d(HWND hwnd) {
         if (show_title) {
             d2d_text(g_title, g_fmt_title, d2d_rectf(18.0f, 82.0f, (float)rect.right - 18.0f, 108.0f), g_light_theme ? 8 : 230, g_light_theme ? 22 : 240, g_light_theme ? 32 : 245, 1.0f);
         }
-        d2d_text(g_body, g_fmt_body, d2d_rectf(18.0f, (float)body_top, (float)rect.right - 18.0f, (float)rect.bottom - 124.0f), g_light_theme ? 22 : 230, g_light_theme ? 43 : 240, g_light_theme ? 56 : 245, 1.0f);
+        float context_reserved = g_context_chip_count > 0 ? 34.0f : 0.0f;
+        float sent_reserved = (_wcsicmp(g_kind, L"question") == 0 && g_sent_chip_count > 0) ? 34.0f : 0.0f;
+        d2d_text(g_body, g_fmt_body, d2d_rectf(18.0f, (float)body_top, (float)rect.right - 18.0f, (float)rect.bottom - 124.0f - context_reserved - sent_reserved), g_light_theme ? 22 : 230, g_light_theme ? 43 : 240, g_light_theme ? 56 : 245, 1.0f);
+        draw_sent_chips_d2d(rect, context_reserved);
 
         /* Transcript overlay: bottom-right floating banner (~400x80) */
         {
             float tx_right = (float)rect.right - 12.0f;
-            float tx_bottom = (float)rect.bottom - 126.0f;
+            float tx_bottom = (float)rect.bottom - 126.0f - context_reserved;
             float tx_left = tx_right - 400.0f;
             if (tx_left < 12.0f) tx_left = 12.0f;
             float tx_top = tx_bottom - 80.0f;
@@ -1126,6 +1869,8 @@ static bool paint_with_d2d(HWND hwnd) {
                 }
             }
         }
+
+        draw_context_chips_d2d(rect);
     }
 
     HRESULT hr = BLUEY_END_DRAW(g_d2d_target, NULL, NULL);
@@ -1175,16 +1920,44 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             send_current_question();
             return 0;
         }
+        if (id == ID_AUTO_SEND_BUTTON) {
+            if (HIWORD(wparam) == CBN_SELCHANGE) {
+                int selected = (int)SendMessageW(g_auto_send_combo, CB_GETCURSEL, 0, 0);
+                g_auto_send_mode = selected < 0 ? 0 : selected;
+                update_auto_send_control();
+            }
+            return 0;
+        }
         if (id == ID_RECORD_BUTTON) {
+            bool was_recording = g_recording;
             g_recording = !g_recording;
             update_record_button();
             InvalidateRect(hwnd, NULL, TRUE);
             emit_simple_event(g_recording ? "recording_start_requested" : "recording_stop_requested");
+            if (was_recording && has_auto_send_context()) {
+                send_current_question();
+            }
+            return 0;
+        }
+        if (id == ID_TRANSCRIPT_CLEAR_BUTTON) {
+            g_transcript_partial[0] = L'\0';
+            g_transcript_final[0] = L'\0';
+            g_transcript_source[0] = L'\0';
+            update_transcript_clear_button();
+            InvalidateRect(hwnd, NULL, TRUE);
+            emit_simple_event("transcript_clear_requested");
+            return 0;
+        }
+        if (id == ID_PASTE_ANSWER_BUTTON) {
+            if (has_pasteable_answer()) {
+                emit_paste_text_event(g_body);
+                collapse_to_pill(hwnd, true);
+            }
             return 0;
         }
         if (id == ID_HELP_BUTTON) {
             overlay_message_box(
-                L"Green dot: Bluey is connected.\nHelp: show this guide.\nSession: continue or start clean.\nAttach: add files or show attached docs.\nTheme: switch black/white background while keeping Bluey borders.\nStyle: answer rules.\nAnalyse Screen: search/read the active browser page or available screen context and generate an answer.\nRecap: summarize the active session from the bottom bar.\nQuit: stop Bluey completely. Hide/collapse behavior becomes a small Bluey button.\nMic: start/stop audio capture.\nMic dot: dim off, bright green recording.\nAnswer: ask Bluey.\nMiddle cards: readable but click-through.",
+                L"Green dot: Bluey is connected.\nHelp: show this guide.\nSession: continue or start clean.\nAttach: add files or show attached docs.\nTheme: switch black/white background while keeping Bluey borders.\nStyle: answer rules.\nAnalyse Screen: search/read the active browser page or available screen context and generate an answer.\nRecap: summarize the active session from the bottom bar.\nPaste answer: place the current Bluey answer into the app behind the overlay.\nQuit: stop Bluey completely. Hide/collapse behavior becomes a small Bluey button.\nMic: start/stop audio capture.\nMic dot: dim off, bright green recording.\nAnswer: ask Bluey.\nBlank Bluey space clicks the app behind it. Drag the Bluey logo/wordmark to move it. Controls stay clickable.",
                 L"Bluey controls",
                 MB_OK | MB_ICONINFORMATION
             );
@@ -1261,7 +2034,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             GetCursorPos(&current);
             int dx = current.x - g_collapsed_drag_start.x;
             int dy = current.y - g_collapsed_drag_start.y;
-            if (abs(dx) > 2 || abs(dy) > 2) g_collapsed_drag_moved = true;
+            if (abs(dx) > COLLAPSED_DRAG_THRESHOLD || abs(dy) > COLLAPSED_DRAG_THRESHOLD) {
+                g_collapsed_drag_moved = true;
+            }
 
             RECT work = {0, 0, 0, 0};
             MONITORINFO monitor = {0};
@@ -1284,9 +2059,19 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
     case WM_LBUTTONUP:
         if (g_collapsed) {
             if (g_collapsed_dragging) {
+                POINT current;
+                GetCursorPos(&current);
+                int dx = current.x - g_collapsed_drag_start.x;
+                int dy = current.y - g_collapsed_drag_start.y;
+                if (abs(dx) > COLLAPSED_DRAG_THRESHOLD || abs(dy) > COLLAPSED_DRAG_THRESHOLD) {
+                    g_collapsed_drag_moved = true;
+                }
                 ReleaseCapture();
                 g_collapsed_dragging = false;
                 if (g_collapsed_drag_moved) {
+                    GetWindowRect(hwnd, &g_collapsed_rect);
+                    g_collapsed_rect = clamp_rect_to_work_area(g_collapsed_rect, 8);
+                    save_overlay_rect(L"collapsed_rect", g_collapsed_rect);
                     return 0;
                 }
             }
@@ -1300,34 +2085,51 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             return 0;
         }
         break;
+    case WM_DROPFILES: {
+        HDROP drop = (HDROP)wparam;
+        emit_attach_files_event_from_drop(drop);
+        DragFinish(drop);
+        return 0;
+    }
     case WM_NCHITTEST: {
         if (g_collapsed) return HTCLIENT;
         POINT point = { GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) };
-        RECT rect;
-        GetWindowRect(hwnd, &rect);
-        int border = 10;
-        int header_h = 62;
-        int composer_h = 118;
-        bool left = point.x < rect.left + border;
-        bool right = point.x >= rect.right - border;
-        bool top = point.y < rect.top + border;
-        bool bottom = point.y >= rect.bottom - border;
-
-        if (top && left) return HTTOPLEFT;
-        if (top && right) return HTTOPRIGHT;
-        if (bottom && left) return HTBOTTOMLEFT;
-        if (bottom && right) return HTBOTTOMRIGHT;
-        if (left) return HTLEFT;
-        if (right) return HTRIGHT;
-        if (top) return HTTOP;
-        if (bottom) return HTBOTTOM;
-        if (point.y < rect.top + header_h) {
-            if (point.x < rect.right - 526) return HTCAPTION;
-            return HTCLIENT;
-        }
-        if (point.y >= rect.bottom - composer_h) return HTCLIENT;
+        if (point_hits_overlay_control(point)) return HTCLIENT;
+        if (point_hits_brand_move_handle(point)) return HTCAPTION;
         return HTTRANSPARENT;
     }
+    case WM_SETCURSOR: {
+        if ((HWND)wparam == hwnd) {
+            switch (LOWORD(lparam)) {
+            case HTLEFT:
+            case HTRIGHT:
+                SetCursor(LoadCursorW(NULL, IDC_SIZEWE));
+                return TRUE;
+            case HTTOP:
+            case HTBOTTOM:
+                SetCursor(LoadCursorW(NULL, IDC_SIZENS));
+                return TRUE;
+            case HTTOPLEFT:
+            case HTBOTTOMRIGHT:
+                SetCursor(LoadCursorW(NULL, IDC_SIZENWSE));
+                return TRUE;
+            case HTTOPRIGHT:
+            case HTBOTTOMLEFT:
+                SetCursor(LoadCursorW(NULL, IDC_SIZENESW));
+                return TRUE;
+            default:
+                break;
+            }
+        }
+        break;
+    }
+    case WM_EXITSIZEMOVE:
+        if (!g_collapsed) {
+            GetWindowRect(hwnd, &g_expanded_rect);
+            g_expanded_rect = clamp_expanded_rect_to_focus_area(g_expanded_rect, 12);
+            save_overlay_rect(L"expanded_rect", g_expanded_rect);
+        }
+        return 0;
     case WM_PAINT: {
         if (paint_with_d2d(hwnd)) {
             ValidateRect(hwnd, NULL);
@@ -1440,10 +2242,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             DrawTextW(hdc, g_title, -1, &title_rect, DT_LEFT | DT_TOP | DT_WORDBREAK);
         }
 
-        RECT body_rect = {18, body_top, rect.right - 18, rect.bottom - 124};
+        int context_reserved = g_context_chip_count > 0 ? 34 : 0;
+        int sent_reserved = (_wcsicmp(g_kind, L"question") == 0 && g_sent_chip_count > 0) ? 34 : 0;
+        RECT body_rect = {18, body_top, rect.right - 18, rect.bottom - 124 - context_reserved - sent_reserved};
         SelectObject(hdc, body_font);
         SetTextColor(hdc, g_light_theme ? RGB(22, 43, 56) : RGB(230, 240, 245));
         DrawTextW(hdc, g_body, -1, &body_rect, DT_LEFT | DT_TOP | DT_WORDBREAK);
+        draw_sent_chips_gdi(hdc, rect, context_reserved);
+        draw_context_chips_gdi(hdc, rect);
 
         DeleteObject(label_font);
         DeleteObject(title_font);
@@ -1479,20 +2285,33 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     RegisterClassW(&wc);
 
+    load_overlay_placement();
+
     /* Stealth: WS_EX_TOOLWINDOW removes the window from Alt+Tab and the
      * taskbar, making it invisible in the task switcher. Combined with
      * WDA_EXCLUDEFROMCAPTURE this ensures the overlay leaves no trace in
      * screen recordings or window lists. */
     DWORD ex_style = WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TOOLWINDOW;
+    int initial_x = 80;
+    int initial_y = 80;
+    int initial_w = 860;
+    int initial_h = 460;
+    if (rect_is_valid(g_expanded_rect)) {
+        g_expanded_rect = clamp_expanded_rect_to_focus_area(g_expanded_rect, 12);
+        initial_x = g_expanded_rect.left;
+        initial_y = g_expanded_rect.top;
+        initial_w = g_expanded_rect.right - g_expanded_rect.left;
+        initial_h = g_expanded_rect.bottom - g_expanded_rect.top;
+    }
     g_hwnd = CreateWindowExW(
         ex_style,
         class_name,
         L"Bluey Overlay",
         WS_POPUP | WS_THICKFRAME,
-        80,
-        80,
-        860,
-        460,
+        initial_x,
+        initial_y,
+        initial_w,
+        initial_h,
         NULL,
         NULL,
         instance,
@@ -1500,6 +2319,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     );
 
     create_controls(g_hwnd);
+    DragAcceptFiles(g_hwnd, TRUE);
     set_window_opacity(g_opacity);
     apply_capture_exclusion(g_hwnd);
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);

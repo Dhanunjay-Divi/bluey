@@ -607,7 +607,9 @@ struct OpenAiResponseMessage {
 
 #[derive(Deserialize)]
 struct OpenAiUsage {
+    #[serde(default)]
     prompt_tokens: i64,
+    #[serde(default)]
     completion_tokens: i64,
 }
 
@@ -1703,6 +1705,20 @@ pub async fn embed_with_key(
     }
 }
 
+pub async fn embed_batch_with_key(
+    api_key: &str,
+    provider: &str,
+    model: &str,
+    inputs: &[String],
+) -> Result<EmbedBatchCompletion> {
+    match provider {
+        "openai" => openai_embed_batch(api_key, model, inputs).await,
+        other => Err(anyhow!(
+            "unsupported embedding provider for managed dispatch: {other}"
+        )),
+    }
+}
+
 /// One embedding response. `vector` is float32, length depends on model
 /// (text-embedding-3-small returns 1536-dim by default).
 #[derive(Debug, Clone)]
@@ -1713,10 +1729,12 @@ pub struct EmbedCompletion {
     pub input_tokens: i64,
 }
 
-#[derive(serde::Serialize)]
-struct OpenAiEmbedReq<'a> {
-    model: &'a str,
-    input: &'a str,
+#[derive(Debug, Clone)]
+pub struct EmbedBatchCompletion {
+    pub vectors: Vec<Vec<f32>>,
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: i64,
 }
 
 #[derive(Deserialize)]
@@ -1731,7 +1749,32 @@ struct OpenAiEmbedData {
 }
 
 async fn openai_embed(key: &str, model: &str, input: &str) -> Result<EmbedCompletion> {
-    let req = OpenAiEmbedReq { model, input };
+    let batch = openai_embed_batch(key, model, &[input.to_string()]).await?;
+    let vector = batch
+        .vectors
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("openai embed: no data returned"))?;
+    Ok(EmbedCompletion {
+        vector,
+        provider: batch.provider,
+        model: batch.model,
+        input_tokens: batch.input_tokens,
+    })
+}
+
+async fn openai_embed_batch(
+    key: &str,
+    model: &str,
+    inputs: &[String],
+) -> Result<EmbedBatchCompletion> {
+    if inputs.is_empty() {
+        return Err(anyhow!("openai embed: no input returned"));
+    }
+    let req = serde_json::json!({
+        "model": model,
+        "input": inputs,
+    });
     let resp = reqwest::Client::new()
         .post(
             override_url(
@@ -1752,18 +1795,24 @@ async fn openai_embed(key: &str, model: &str, input: &str) -> Result<EmbedComple
         return Err(error);
     }
     let parsed: OpenAiEmbedResp = resp.json().await.context("openai embed json")?;
-    let vector = parsed
+    if parsed.data.len() != inputs.len() {
+        return Err(anyhow!(
+            "openai embed: expected {} vectors, got {}",
+            inputs.len(),
+            parsed.data.len()
+        ));
+    }
+    let vectors = parsed
         .data
         .into_iter()
-        .next()
-        .ok_or_else(|| anyhow!("openai embed: no data returned"))?
-        .embedding;
+        .map(|item| item.embedding)
+        .collect::<Vec<_>>();
     let input_tokens = parsed
         .usage
         .map(|u| u.prompt_tokens)
-        .unwrap_or((input.len() as i64) / 4);
-    Ok(EmbedCompletion {
-        vector,
+        .unwrap_or_else(|| inputs.iter().map(|input| (input.len() as i64) / 4).sum());
+    Ok(EmbedBatchCompletion {
+        vectors,
         provider: "openai".to_string(),
         model: model.to_string(),
         input_tokens,

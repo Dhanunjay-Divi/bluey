@@ -229,6 +229,8 @@ pub struct ConversationTurn {
     pub question: String,
     pub answer: String,
     #[serde(default)]
+    pub attachment_ids: Vec<Uuid>,
+    #[serde(default)]
     pub source: Option<String>,
     #[serde(default)]
     pub provider: Option<String>,
@@ -246,10 +248,16 @@ impl ConversationTurn {
             id: Uuid::new_v4(),
             question: question.into(),
             answer: answer.into(),
+            attachment_ids: Vec::new(),
             source,
             provider,
             created_at: clock::now_epoch_ms_string(),
         }
+    }
+
+    pub fn with_attachment_ids(mut self, attachment_ids: Vec<Uuid>) -> Self {
+        self.attachment_ids = attachment_ids;
+        self
     }
 }
 

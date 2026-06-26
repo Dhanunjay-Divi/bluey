@@ -35,6 +35,46 @@ ok()   { printf "%s✓%s %s\n" "$GREEN" "$RESET" "$1"; }
 warn() { printf "%s⚠%s %s\n" "$RED" "$RESET" "$1" >&2; }
 fail() { warn "$1"; exit 1; }
 
+install_local_doc_tools() {
+    local root="$1"
+    local tools_dir="$root/tools/doc-converter"
+    local wrapper="$root/bin/bluey-doc-converter"
+
+    if [ "${BLUEY_SKIP_LOCAL_TOOLS:-0}" = "1" ]; then
+        warn "Skipping Bluey-local document tools because BLUEY_SKIP_LOCAL_TOOLS=1"
+        return 0
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn "python3 was not found; document conversion will use built-in fallbacks only"
+        return 0
+    fi
+
+    say "Installing Bluey-local document tools..."
+    mkdir -p "$tools_dir" "$root/bin"
+    if ! python3 -m venv "$tools_dir/.venv" >/dev/null 2>&1; then
+        warn "Could not create Bluey-local Python venv; document conversion will use built-in fallbacks only"
+        return 0
+    fi
+
+    local py="$tools_dir/.venv/bin/python"
+    "$py" -m pip install --disable-pip-version-check --upgrade pip >/dev/null 2>&1 || true
+    if ! "$py" -m pip install --disable-pip-version-check "markitdown[all]" >/dev/null 2>&1; then
+        if ! "$py" -m pip install --disable-pip-version-check markitdown >/dev/null 2>&1; then
+            warn "Could not install MarkItDown into Bluey's local tools venv; document conversion will use built-in fallbacks only"
+            return 0
+        fi
+    fi
+
+    cat > "$wrapper" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+exec "$ROOT/tools/doc-converter/.venv/bin/markitdown" "$@"
+SH
+    chmod +x "$wrapper"
+    ok "Bluey-local document tools installed"
+}
+
 # ── Pre-flight ───────────────────────────────────────────────────────
 case "$(uname -s)" in
     Darwin) ;;
@@ -44,7 +84,7 @@ esac
 ARCH="$(uname -m)"
 case "$ARCH" in
     arm64|aarch64) PLATFORM=darwin-arm64 ;;
-    x86_64|amd64)  fail "Bluey v0.2 alpha installer currently supports Apple Silicon Macs only." ;;
+    x86_64|amd64)  PLATFORM=darwin-x86_64 ;;
     *) fail "Unsupported architecture: $ARCH" ;;
 esac
 
@@ -91,7 +131,8 @@ if ! curl -fsSL --retry 3 -o "$TARBALL" "$URL"; then
 fi
 ok "Downloaded $(stat -f%z "$TARBALL" 2>/dev/null || stat -c%s "$TARBALL") bytes"
 
-if [ "${BLUEY_SKIP_CHECKSUM:-0}" != "1" ] && command -v shasum >/dev/null; then
+if [ "${BLUEY_SKIP_CHECKSUM:-0}" != "1" ]; then
+    command -v shasum >/dev/null || fail "shasum is required to verify the Bluey download; install it or set BLUEY_SKIP_CHECKSUM=1 for local testing only"
     CHECKSUMS="$DOWNLOAD_TMP/SHA256SUMS.txt"
     if [ -n "${BLUEY_ARTIFACT_SHA256:-}" ]; then
         printf "%s  %s\n" "$BLUEY_ARTIFACT_SHA256" "$ARTIFACT" > "$CHECKSUMS.one"
@@ -105,8 +146,10 @@ if [ "${BLUEY_SKIP_CHECKSUM:-0}" != "1" ] && command -v shasum >/dev/null; then
             fail "Checksum for $ARTIFACT not found in SHA256SUMS.txt"
         fi
     else
-        warn "Checksum manifest unavailable; relying on HTTPS download."
+        fail "Checksum manifest unavailable for $ARTIFACT; refusing unverified download"
     fi
+else
+    warn "Skipping checksum because BLUEY_SKIP_CHECKSUM=1"
 fi
 
 # ── Extract ──────────────────────────────────────────────────────────
@@ -126,6 +169,8 @@ rm -rf "$INSTALL_ROOT/bin"
 cp -R "$WORKDIR/bin" "$INSTALL_ROOT/bin"
 chmod +x "$INSTALL_ROOT/bin/"*
 ok "Installed helper bundle"
+
+install_local_doc_tools "$INSTALL_ROOT"
 
 # ── Ad-hoc sign ──────────────────────────────────────────────────────
 say "Ad-hoc signing native binaries..."

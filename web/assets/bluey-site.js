@@ -30,10 +30,18 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     let squareCardEnvironment = '';
     let squareCardSetupPromise = null;
     let refreshAccountTokenPromise = null;
+    let currentAccountEmail = '';
     const AUTO_RELOAD_MIN_CENTS = 1500;
-    const AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS = 500;
-    const AUTO_RELOAD_DEFAULT_AMOUNT_CENTS = 1500;
-    const MANUAL_RELOAD_AMOUNT_CENTS = 1500;
+    const AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS = 1000;
+    const AUTO_RELOAD_DEFAULT_AMOUNT_CENTS = 3000;
+    const LEGACY_AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS = 500;
+    const LEGACY_AUTO_RELOAD_DEFAULT_AMOUNT_CENTS = 1500;
+    const MANUAL_RELOAD_MIN_CENTS = 1500;
+    const MANUAL_RELOAD_AMOUNT_CENTS = 3000;
+    let captchaConfigPromise = null;
+    let captchaConfig = { provider: null, site_key: null };
+    let signupTurnstileWidgetId = null;
+    let signupTurnstileToken = '';
 
     function money(cents) {
       return `$${(Number(cents || 0) / 100).toFixed(2)}`;
@@ -41,6 +49,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     function centsToDollars(cents) {
       return String(Math.round(Number(cents || 0) / 100));
+    }
+
+    function dollarsToCents(value) {
+      const dollars = Number(value);
+      if (!Number.isFinite(dollars)) return NaN;
+      return Math.round(dollars * 100);
     }
 
     function accountToken() {
@@ -62,13 +76,31 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     function clearAccountToken() {
       localStorage.removeItem('bluey_access_token');
       localStorage.removeItem('bluey_refresh_token');
+      currentAccountEmail = '';
       syncAccountNav();
+    }
+
+    function browserTrialDeviceId() {
+      const key = 'bluey_trial_device_id';
+      let id = localStorage.getItem(key) || '';
+      if (!id) {
+        id = (window.crypto && window.crypto.randomUUID)
+          ? window.crypto.randomUUID()
+          : `browser-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        localStorage.setItem(key, id);
+      }
+      return id;
     }
 
     async function revokeBrowserSession() {
       const previousRefreshToken = localStorage.getItem('bluey_refresh_token') || '';
-      if (previousRefreshToken) {
-        await refreshAccountToken();
+      try {
+        if (previousRefreshToken) {
+          await refreshAccountToken();
+        }
+      } catch {
+        // Sign-out should always clear the local browser, even if refresh is
+        // unavailable during a deploy or network blip.
       }
       const refreshToken = localStorage.getItem('bluey_refresh_token') || previousRefreshToken;
       if (!accountToken() && !refreshToken) return;
@@ -100,6 +132,25 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.querySelectorAll('[data-auth-only]').forEach((el) => {
         el.hidden = !authed;
       });
+      if (!authed) {
+        closeProfileMenu();
+      }
+    }
+
+    function closeProfileMenu() {
+      const button = document.getElementById('accountProfileButton');
+      const menu = document.getElementById('accountProfileMenu');
+      if (button) button.setAttribute('aria-expanded', 'false');
+      if (menu) menu.hidden = true;
+    }
+
+    function toggleProfileMenu() {
+      const button = document.getElementById('accountProfileButton');
+      const menu = document.getElementById('accountProfileMenu');
+      if (!button || !menu) return;
+      const open = menu.hidden;
+      menu.hidden = !open;
+      button.setAttribute('aria-expanded', open ? 'true' : 'false');
     }
 
     function filePreviewHref(route) {
@@ -273,6 +324,73 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       return false;
     }
 
+    async function loadCaptchaConfig() {
+      if (!captchaConfigPromise) {
+        captchaConfigPromise = fetch('/auth/captcha/config')
+          .then((response) => response.ok ? response.json() : { provider: null, site_key: null })
+          .then((config) => {
+            captchaConfig = config || { provider: null, site_key: null };
+            return captchaConfig;
+          })
+          .catch(() => {
+            captchaConfig = { provider: null, site_key: null };
+            return captchaConfig;
+          });
+      }
+      return captchaConfigPromise;
+    }
+
+    function loadTurnstileScript() {
+      if (window.turnstile) return Promise.resolve();
+      if (window.__blueyTurnstileScriptPromise) return window.__blueyTurnstileScriptPromise;
+      window.__blueyTurnstileScriptPromise = new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit';
+        script.async = true;
+        script.defer = true;
+        script.onload = () => resolve();
+        script.onerror = () => reject(new Error('Could not load captcha.'));
+        document.head.appendChild(script);
+      });
+      return window.__blueyTurnstileScriptPromise;
+    }
+
+    async function refreshSignupCaptcha() {
+      const el = document.getElementById('signupCaptcha');
+      if (!el) return;
+      const config = await loadCaptchaConfig();
+      const enabled = accountAuthMode === 'signup' && config.provider === 'turnstile' && config.site_key;
+      el.hidden = !enabled;
+      if (!enabled) {
+        signupTurnstileToken = '';
+        return;
+      }
+      await loadTurnstileScript();
+      if (signupTurnstileWidgetId !== null && window.turnstile) {
+        window.turnstile.reset(signupTurnstileWidgetId);
+        signupTurnstileToken = '';
+        return;
+      }
+      signupTurnstileWidgetId = window.turnstile.render(el, {
+        sitekey: config.site_key,
+        theme: 'dark',
+        callback: (token) => {
+          signupTurnstileToken = token || '';
+        },
+        'expired-callback': () => {
+          signupTurnstileToken = '';
+        },
+        'error-callback': () => {
+          signupTurnstileToken = '';
+        },
+      });
+    }
+
+    function signupTurnstilePayload() {
+      if (captchaConfig.provider !== 'turnstile' || !captchaConfig.site_key) return null;
+      return signupTurnstileToken || null;
+    }
+
     function setAccountAuthMode(mode) {
       accountAuthMode = mode === 'signup' ? 'signup' : 'login';
       const title = document.getElementById('accountAuthTitle');
@@ -297,6 +415,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (accountAuthMode !== 'signup') {
         setSignupOtpMode(false);
       }
+      refreshSignupCaptcha().catch((error) => accountMessage(error.message, true));
       accountMessage('', true);
     }
 
@@ -329,7 +448,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
       if (authed) {
         title.textContent = 'Bluey account';
-        copy.innerHTML = 'Manage credits, saved sessions, and your desktop connection. Credits are used only when Bluey uses cloud help.';
+        copy.innerHTML = 'Check balance, add credits, view saved sessions, and manage your desktop connection. $30 becomes $30 Bluey credits; Auto Reload is optional.';
       } else {
         title.textContent = 'Try Bluey';
         copy.innerHTML = 'Start from Terminal, sign in when needed, and keep your work available from the overlay.';
@@ -448,10 +567,22 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         return;
       }
       if (!requireSignupTerms()) return;
+      await loadCaptchaConfig();
+      const turnstileToken = signupTurnstilePayload();
+      if (captchaConfig.provider === 'turnstile' && captchaConfig.site_key && !turnstileToken) {
+        accountMessage('Complete the security check to create an account.', true);
+        refreshSignupCaptcha().catch(() => {});
+        return;
+      }
       accountMessage('Sending verification code...', true);
       const result = await apiJson('/auth/signup/start', {
         method: 'POST',
-        body: JSON.stringify({ email, password }),
+        body: JSON.stringify({
+          email,
+          password,
+          turnstile_token: turnstileToken,
+          device_fingerprint: browserTrialDeviceId(),
+        }),
       });
       setSignupOtpMode(true, result.email || email);
       accountMessage(`Code sent to ${result.email || email}. Enter it below to finish creating the account.`, true);
@@ -469,7 +600,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       accountMessage('Verifying code...', true);
       const auth = await apiJson('/auth/signup/confirm', {
         method: 'POST',
-        body: JSON.stringify({ email, otp }),
+        body: JSON.stringify({ email, otp, device_fingerprint: browserTrialDeviceId() }),
       });
       setAccountToken(auth);
       setSignupOtpMode(false);
@@ -493,6 +624,20 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         body: JSON.stringify({ token, new_password: newPassword }),
       });
       recoveryMessage('Password updated. You can sign in now.');
+    }
+
+    async function deleteAccount() {
+      const email = currentAccountEmail || 'this Bluey account';
+      if (!window.confirm(`Delete ${email}? This permanently removes the account and cannot be undone.`)) {
+        return;
+      }
+      accountMessage('Deleting account...');
+      await apiJson('/account/delete', {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+      clearAccountToken();
+      await loadAccount();
     }
 
     async function confirmEmailVerification(token) {
@@ -607,8 +752,14 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const rule = document.getElementById('autoReloadRule');
       if (!card || !hint || !method || !toggle || !setup) return;
 
-      const amountCents = Number(me?.auto_topup_amount_cents || AUTO_RELOAD_DEFAULT_AMOUNT_CENTS);
-      const thresholdCents = Number(me?.auto_topup_threshold_cents || AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS);
+      let amountCents = Number(me?.auto_topup_amount_cents || AUTO_RELOAD_DEFAULT_AMOUNT_CENTS);
+      let thresholdCents = Number(me?.auto_topup_threshold_cents || AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS);
+      if (!me?.auto_topup_enabled
+        && amountCents === LEGACY_AUTO_RELOAD_DEFAULT_AMOUNT_CENTS
+        && thresholdCents === LEGACY_AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS) {
+        amountCents = AUTO_RELOAD_DEFAULT_AMOUNT_CENTS;
+        thresholdCents = AUTO_RELOAD_DEFAULT_THRESHOLD_CENTS;
+      }
       const amount = money(amountCents);
       const threshold = money(thresholdCents);
       const canSaveSquareCard = me?.billing_provider === 'square'
@@ -628,23 +779,23 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (thresholdInput) thresholdInput.value = centsToDollars(thresholdCents);
       if (amountInput) amountInput.value = centsToDollars(amountCents);
       if (rule) {
-        rule.textContent = `When your balance drops below ${threshold}, Bluey charges ${amount} and adds credits only after payment succeeds.`;
+        rule.textContent = `Optional backup: below ${threshold}, charge ${amount} and add ${amount} credits after payment succeeds.`;
       }
 
       if (me?.auto_topup_enabled) {
-        hint.textContent = `On. Bluey charges ${amount} before balance falls below ${threshold}.`;
+        hint.textContent = `On. Bluey adds ${amount} credits when your balance drops below ${threshold}.`;
       } else if (hasSavedMethod) {
-        hint.textContent = `Off by default. Turn on to use this ${threshold} / ${amount} rule.`;
+        hint.textContent = `Off. Turn on only if you want Bluey to add ${amount} credits below ${threshold}.`;
       } else if (shouldShowSquareSetup) {
-        hint.textContent = 'Off by default. Save a card with Square to turn on Auto Reload.';
+        hint.textContent = 'Off by default. Save a card only if you want Bluey to reload automatically.';
       } else {
-        hint.textContent = me?.auto_topup_unavailable_reason || 'Add credits once to save a payment method.';
+        hint.textContent = me?.auto_topup_unavailable_reason || 'Add credits manually any time. Auto Reload is optional.';
       }
 
       method.textContent = me?.saved_payment_method_label
-        ? `Payment method: ${me.saved_payment_method_label}`
+        ? `Saved card: ${me.saved_payment_method_label}`
         : shouldShowSquareSetup
-          ? 'Payment method: not saved yet'
+          ? 'No saved card yet'
           : '';
 
       if (shouldShowSquareSetup) {
@@ -653,13 +804,11 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     function readAutoReloadSettings() {
-      const thresholdDollars = Number(document.getElementById('autoReloadThreshold')?.value || 5);
-      const amountDollars = Number(document.getElementById('autoReloadAmount')?.value || 15);
-      if (!Number.isFinite(thresholdDollars) || !Number.isFinite(amountDollars)) {
+      const threshold = dollarsToCents(document.getElementById('autoReloadThreshold')?.value || 10);
+      const amount = dollarsToCents(document.getElementById('autoReloadAmount')?.value || 30);
+      if (!Number.isFinite(threshold) || !Number.isFinite(amount)) {
         throw new Error('Enter valid Auto Reload dollar amounts.');
       }
-      const threshold = Math.round(thresholdDollars * 100);
-      const amount = Math.round(amountDollars * 100);
       if (amount < AUTO_RELOAD_MIN_CENTS) {
         throw new Error('Auto Reload amount must be at least $15.');
       }
@@ -680,7 +829,32 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (!rule) return;
       try {
         const settings = readAutoReloadSettings();
-        rule.textContent = `When your balance drops below ${money(settings.auto_topup_threshold_cents)}, Bluey charges ${money(settings.auto_topup_amount_cents)} and adds credits only after payment succeeds.`;
+        rule.textContent = `Optional backup: below ${money(settings.auto_topup_threshold_cents)}, charge ${money(settings.auto_topup_amount_cents)} and add ${money(settings.auto_topup_amount_cents)} credits after payment succeeds.`;
+      } catch (error) {
+        rule.textContent = error.message;
+      }
+    }
+
+    function readManualReloadCents() {
+      const input = document.getElementById('manualReloadAmount');
+      const amount = dollarsToCents(input?.value || centsToDollars(MANUAL_RELOAD_AMOUNT_CENTS));
+      if (!Number.isFinite(amount)) {
+        input?.focus();
+        throw new Error('Enter a reload amount.');
+      }
+      if (amount < MANUAL_RELOAD_MIN_CENTS) {
+        input?.focus();
+        throw new Error('Minimum reload is $15.');
+      }
+      return amount;
+    }
+
+    function updateManualReloadDraftCopy() {
+      const rule = document.getElementById('manualReloadRule');
+      if (!rule) return;
+      try {
+        const amount = readManualReloadCents();
+        rule.textContent = `${money(amount)} reload gives ${money(amount)} Bluey credits. Checkout opens in a new tab; press Refresh balance here after payment succeeds.`;
       } catch (error) {
         rule.textContent = error.message;
       }
@@ -697,8 +871,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
       renderAutoReload(me);
       accountMessage(enabled
-        ? `Auto Reload is on. Bluey will charge ${money(settings.auto_topup_amount_cents)} when balance drops below ${money(settings.auto_topup_threshold_cents)}.`
-        : 'Auto Reload is off. Bluey will ask you to reload manually.');
+        ? `Auto Reload is on. Bluey will add ${money(settings.auto_topup_amount_cents)} when balance drops below ${money(settings.auto_topup_threshold_cents)}.`
+        : 'Auto Reload is off. You can add credits manually whenever you need them.');
       return me;
     }
 
@@ -749,6 +923,126 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         hour: 'numeric',
         minute: '2-digit',
       });
+    }
+
+    function formatDeviceTime(value) {
+      if (!value) return 'never used';
+      let text = String(value).trim();
+      if (!text) return 'never used';
+      if (!/[zZ]|[+-]\d{2}:?\d{2}$/.test(text)) {
+        text = text.includes('T') ? `${text}Z` : `${text.replace(' ', 'T')}Z`;
+      }
+      const date = new Date(text);
+      if (Number.isNaN(date.getTime())) return 'unknown time';
+      return date.toLocaleString([], {
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+      });
+    }
+
+    function deviceIconLabel(kind) {
+      const value = String(kind || '').toLowerCase();
+      if (value.includes('desktop') || value.includes('device')) return 'Bluey';
+      if (value.includes('browser')) return 'Host';
+      return 'Host';
+    }
+
+    function deviceStatus(device) {
+      const lastValue = device.last_used_at || device.created_at || '';
+      const lastTime = lastValue ? new Date(String(lastValue).replace(' ', 'T')).getTime() : 0;
+      const isRecent = lastTime && Date.now() - lastTime < 1000 * 60 * 60 * 24;
+      return isRecent ? 'Active' : 'Linked';
+    }
+
+    function renderLinkedDevices(payload, message = '') {
+      const list = document.getElementById('linkedDevicesList');
+      if (!list) return;
+      list.replaceChildren();
+      const devices = Array.isArray(payload?.devices) ? payload.devices : [];
+      const countLabel = document.getElementById('linkedDeviceCount');
+      const removeAllButton = document.getElementById('removeAllDevicesButton');
+      if (countLabel) {
+        countLabel.textContent = devices.length === 0
+          ? 'No host activity'
+          : devices.length === 1
+          ? '1 active host session'
+          : `${devices.length} active host sessions`;
+      }
+      if (removeAllButton) {
+        removeAllButton.disabled = devices.length === 0;
+      }
+      if (!devices.length) {
+        const empty = document.createElement('div');
+        empty.className = 'session-empty';
+        empty.textContent = message || 'No host login activity yet. Sign in from Bluey desktop to add this machine.';
+        list.append(empty);
+        return;
+      }
+
+      for (const device of devices) {
+        const row = document.createElement('article');
+        row.className = 'device-row';
+
+        const body = document.createElement('div');
+        body.className = 'device-main';
+        const icon = document.createElement('div');
+        icon.className = 'device-icon';
+        icon.textContent = deviceIconLabel(device.kind);
+        const copy = document.createElement('div');
+        const title = document.createElement('strong');
+        title.className = 'device-title';
+        const name = document.createElement('span');
+        name.textContent = device.label || 'Linked device';
+        const kind = document.createElement('span');
+        kind.className = 'device-kind';
+        kind.textContent = deviceStatus(device);
+        title.append(name, kind);
+
+        const meta = document.createElement('span');
+        meta.className = 'device-meta';
+        const lastSeen = device.last_used_at
+          ? `Last active ${formatDeviceTime(device.last_used_at)}`
+          : `Linked ${formatDeviceTime(device.created_at)}`;
+        meta.textContent = lastSeen;
+        copy.append(title, meta);
+        body.append(icon, copy);
+
+        const button = document.createElement('button');
+        button.className = 'account-button danger compact';
+        button.type = 'button';
+        button.dataset.deviceId = device.id || '';
+        button.dataset.deviceLabel = device.label || 'Linked device';
+        button.textContent = 'Remove';
+        row.append(body, button);
+        list.append(row);
+      }
+    }
+
+    async function loadLinkedDevices() {
+      const devices = await apiJson('/account/devices');
+      renderLinkedDevices(devices);
+      return devices;
+    }
+
+    async function revokeLinkedDevice(deviceId, label) {
+      if (!deviceId) return;
+      const devices = await apiJson(`/account/devices/${encodeURIComponent(deviceId)}`, {
+        method: 'DELETE',
+      });
+      renderLinkedDevices(devices);
+      accountMessage(`${label || 'Device'} removed.`);
+      return devices;
+    }
+
+    async function revokeAllLinkedDevices() {
+      const devices = await apiJson('/account/devices', {
+        method: 'DELETE',
+      });
+      renderLinkedDevices(devices);
+      accountMessage('Host access removed.');
+      return devices;
     }
 
     function renderCloudSessions(payload) {
@@ -863,6 +1157,70 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
     }
 
+    function renderAdminAbuse(payload, message = '') {
+      const section = document.getElementById('adminAbuseSection');
+      const summary = document.getElementById('adminAbuseSummary');
+      const events = document.getElementById('adminAbuseEvents');
+      if (!section || !summary || !events) return;
+      section.hidden = false;
+      summary.replaceChildren();
+      events.replaceChildren();
+      const stats = [
+        ['Trial grants', payload?.trial_grants_24h ?? '--'],
+        ['Denied', payload?.trial_denials_24h ?? '--'],
+        ['Events', payload?.abuse_events_24h ?? '--'],
+      ];
+      for (const [label, value] of stats) {
+        const item = document.createElement('div');
+        item.className = 'abuse-summary-item';
+        const strong = document.createElement('strong');
+        strong.textContent = String(value);
+        const span = document.createElement('span');
+        span.textContent = `${label} in 24h`;
+        item.append(strong, span);
+        summary.append(item);
+      }
+      if (message) {
+        const empty = document.createElement('div');
+        empty.className = 'session-empty';
+        empty.textContent = message;
+        events.append(empty);
+        return;
+      }
+      const recent = Array.isArray(payload?.recent_events) ? payload.recent_events : [];
+      if (!recent.length) {
+        const empty = document.createElement('div');
+        empty.className = 'session-empty';
+        empty.textContent = 'No recent abuse events.';
+        events.append(empty);
+        return;
+      }
+      for (const event of recent.slice(0, 8)) {
+        const row = document.createElement('article');
+        row.className = 'abuse-event-row';
+        const title = document.createElement('strong');
+        title.textContent = event.reason || event.event_type || 'event';
+        const meta = document.createElement('span');
+        meta.textContent = [
+          event.created_at ? formatDeviceTime(event.created_at) : '',
+          event.email_hash ? `email ${event.email_hash.slice(0, 10)}` : '',
+          event.ip_hash ? `ip ${event.ip_hash.slice(0, 10)}` : '',
+          event.device_hash ? `device ${event.device_hash.slice(0, 10)}` : '',
+        ].filter(Boolean).join(' - ');
+        row.append(title, meta);
+        events.append(row);
+      }
+    }
+
+    async function loadAdminAbuse() {
+      const section = document.getElementById('adminAbuseSection');
+      if (!section) return null;
+      renderAdminAbuse({}, 'Loading trial abuse events...');
+      const summary = await apiJson('/admin/trial-abuse');
+      renderAdminAbuse(summary);
+      return summary;
+    }
+
     async function loadAccount() {
       if (currentPath === '/verify-email' || currentPath === '/password-reset') {
         renderRecoveryRoute();
@@ -875,54 +1233,79 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('accountPreviewCard').hidden = true;
       document.getElementById('accountDashboard').hidden = !authed;
       document.getElementById('accountRecoveryCard').hidden = true;
-      document.getElementById('accountSignOut').hidden = !authed;
+      document.getElementById('accountSignOut').hidden = true;
       if (!authed) return;
+      const refreshButton = document.getElementById('refreshAccountButton');
+      if (refreshButton) refreshButton.disabled = true;
       accountMessage('Loading account...');
-      const [me, usage, sessions] = await Promise.all([
-        apiJson('/account/me'),
-        apiJson('/account/usage'),
-        loadCloudSessions().catch((error) => {
-          renderCloudSessions({ sessions: [] });
-          setCloudSessionDetail(`Could not load saved sessions: ${error.message}`);
-          return null;
-        }),
-      ]);
-      document.getElementById('accountEmailLabel').textContent = me.email || 'Bluey account';
-      setRailCommand(true, me.email || '');
-      document.getElementById('balanceValue').textContent = money(me.balance_cents);
-      document.getElementById('balanceHint').textContent = me.trial_seconds_remaining > 0
-        ? `${Math.round(me.trial_seconds_remaining / 60)} trial minutes remaining.`
-        : 'Paid cloud requests stop at $0. Add credits when ready.';
-      renderUsage(usage);
-      renderAutoReload(me);
-      if (sessions) setCloudSessionDetail('');
-      accountMessage(new URLSearchParams(location.search).get('reload') === 'success'
-        ? 'Credits added. If the balance has not updated yet, checkout is still finishing.'
-        : '');
       try {
-        const approved = await approvePendingDevice();
-        if (!approved) await openDesktopDeepLinkIfNeeded();
-      } catch (error) {
-        accountMessage(`Account signed in, but desktop handoff failed: ${error.message}`);
-      }
-      const params = new URLSearchParams(location.search);
-      if (currentPath === '/reload' && params.get('checkout') === '1' && params.get('reload') !== 'success') {
-        const checkoutKey = `bluey_reload_checkout_started_${location.search}`;
-        if (sessionStorage.getItem(checkoutKey) !== '1') {
-          sessionStorage.setItem(checkoutKey, '1');
-          await startReload();
+        const [me, usage, , sessions] = await Promise.all([
+          apiJson('/account/me'),
+          apiJson('/account/usage'),
+          loadLinkedDevices().catch((error) => {
+            renderLinkedDevices({ devices: [] }, `Could not load host activity: ${error.message}`);
+            return null;
+          }),
+          loadCloudSessions().catch((error) => {
+            renderCloudSessions({ sessions: [] });
+            setCloudSessionDetail(`Could not load saved sessions: ${error.message}`);
+            return null;
+          }),
+        ]);
+        currentAccountEmail = me.email || '';
+        document.getElementById('accountEmailLabel').textContent = me.email || 'Bluey account';
+        const profileEmailLabel = document.getElementById('profileEmailLabel');
+        if (profileEmailLabel) profileEmailLabel.textContent = me.email || 'Bluey account';
+        setRailCommand(true, me.email || '');
+        document.getElementById('balanceValue').textContent = money(me.balance_cents);
+        document.getElementById('balanceHint').textContent = me.trial_seconds_remaining > 0
+          ? `${Math.round(me.trial_seconds_remaining / 60)} trial minutes left. Credits are used after the trial when paid cloud work is needed.`
+          : 'When balance reaches $0, paid cloud work pauses until you add credits.';
+        renderUsage(usage);
+        renderAutoReload(me);
+        updateManualReloadDraftCopy();
+        const adminSection = document.getElementById('adminAbuseSection');
+        if (adminSection) adminSection.hidden = !me.is_admin;
+        if (me.is_admin) {
+          loadAdminAbuse().catch((error) => {
+            renderAdminAbuse({}, `Could not load trial abuse events: ${error.message}`);
+          });
         }
+        if (sessions) setCloudSessionDetail('');
+        accountMessage(new URLSearchParams(location.search).get('reload') === 'success'
+          ? 'Credits added. If the balance still looks old, checkout is finishing; press Refresh balance in a moment.'
+          : '');
+        try {
+          const approved = await approvePendingDevice();
+          if (!approved) await openDesktopDeepLinkIfNeeded();
+        } catch (error) {
+          accountMessage(`Account signed in, but desktop handoff failed: ${error.message}`);
+        }
+      } finally {
+        if (refreshButton) refreshButton.disabled = false;
       }
     }
 
     async function startReload() {
-      accountMessage('Opening secure checkout...');
+      let amountCents;
+      try {
+        amountCents = readManualReloadCents();
+      } catch (error) {
+        accountMessage(error.message, true);
+        return;
+      }
+      accountMessage(`Opening ${money(amountCents)} checkout...`);
       try {
         const checkout = await apiJson('/billing/checkout', {
           method: 'POST',
-          body: JSON.stringify({ amount_cents: MANUAL_RELOAD_AMOUNT_CENTS }),
+          body: JSON.stringify({ amount_cents: amountCents }),
         });
-        window.location.href = checkout.checkout_url;
+        const opened = window.open(checkout.checkout_url, '_blank', 'noopener,noreferrer');
+        if (!opened) {
+          accountMessage('Checkout was blocked by the browser. Allow popups for bluey.sh, then click Add credits again.');
+          return;
+        }
+        accountMessage('Checkout opened in a new tab. Complete payment there, then return here and press Refresh balance.');
       } catch (error) {
         accountMessage(`${error.message}. Billing may not be fully configured yet.`);
       }
@@ -951,6 +1334,9 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       accountApp.hidden = false;
       downloadApp.hidden = true;
       renderDeviceLinkHint();
+      loadCaptchaConfig()
+        .then(() => refreshSignupCaptcha())
+        .catch(() => {});
 
       document.getElementById('accountForm').addEventListener('submit', (event) => {
         event.preventDefault();
@@ -978,6 +1364,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('reloadButton').addEventListener('click', () => {
         startReload();
       });
+      document.getElementById('refreshAccountButton')?.addEventListener('click', () => {
+        loadAccount().catch((error) => accountMessage(error.message));
+      });
+      document.getElementById('manualReloadAmount')?.addEventListener('input', () => {
+        updateManualReloadDraftCopy();
+      });
       document.getElementById('autoReloadToggle')?.addEventListener('change', (event) => {
         const enabled = Boolean(event.target.checked);
         event.target.disabled = true;
@@ -1004,6 +1396,60 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
       document.getElementById('saveSquareCardButton')?.addEventListener('click', () => {
         saveSquareCard().catch((error) => accountMessage(error.message));
+      });
+      document.getElementById('refreshDevicesButton')?.addEventListener('click', () => {
+        renderLinkedDevices({ devices: [] }, 'Loading host activity...');
+        loadLinkedDevices().catch((error) => {
+          renderLinkedDevices({ devices: [] }, `Could not load host activity: ${error.message}`);
+        });
+      });
+      document.getElementById('refreshAdminAbuseButton')?.addEventListener('click', () => {
+        loadAdminAbuse().catch((error) => {
+          renderAdminAbuse({}, `Could not load trial abuse events: ${error.message}`);
+        });
+      });
+      document.getElementById('removeAllDevicesButton')?.addEventListener('click', () => {
+        const button = document.getElementById('removeAllDevicesButton');
+        if (!button || button.disabled) return;
+        if (!window.confirm('Remove all host access for this account?')) return;
+        const previous = button.textContent;
+        button.disabled = true;
+        button.textContent = 'Removing...';
+        let removed = false;
+        revokeAllLinkedDevices()
+          .then(() => {
+            removed = true;
+          })
+          .catch((error) => accountMessage(error.message))
+          .finally(() => {
+            if (!removed) button.disabled = false;
+            button.textContent = previous;
+          });
+      });
+      document.getElementById('linkedDevicesList')?.addEventListener('click', (event) => {
+        const button = event.target.closest('button[data-device-id]');
+        if (!button) return;
+        const previous = button.textContent;
+        button.disabled = true;
+        button.textContent = 'Removing...';
+        revokeLinkedDevice(button.dataset.deviceId, button.dataset.deviceLabel)
+          .catch((error) => accountMessage(error.message))
+          .finally(() => {
+            button.disabled = false;
+            button.textContent = previous;
+          });
+      });
+      document.getElementById('accountProfileButton')?.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        toggleProfileMenu();
+      });
+      document.getElementById('accountProfileMenu')?.addEventListener('click', (event) => {
+        event.stopPropagation();
+      });
+      document.getElementById('deleteAccountButton')?.addEventListener('click', () => {
+        closeProfileMenu();
+        deleteAccount().catch((error) => accountMessage(error.message));
       });
       document.getElementById('refreshSessionsButton').addEventListener('click', () => {
         setCloudSessionDetail('');
@@ -1042,6 +1488,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       document.getElementById('accountDashboard').hidden = true;
       document.getElementById('accountRecoveryCard').hidden = false;
       document.getElementById('accountSignOut').hidden = true;
+      closeProfileMenu();
 
       const params = new URLSearchParams(location.search);
       const token = params.get('token') || '';
@@ -1101,9 +1548,14 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     }
 
     document.addEventListener('click', async (event) => {
+      if (!event.target.closest('#accountProfile')) {
+        closeProfileMenu();
+      }
+
       const signOutButton = event.target.closest('[data-sign-out]');
       if (signOutButton) {
         event.preventDefault();
+        closeProfileMenu();
         await signOut();
         return;
       }
@@ -1121,6 +1573,12 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         }, 1200);
       } catch {
         button.textContent = 'Copy failed';
+      }
+    });
+
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        closeProfileMenu();
       }
     });
 

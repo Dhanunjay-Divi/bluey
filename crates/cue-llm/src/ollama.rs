@@ -101,6 +101,8 @@ fn parse_ndjson_chunks(buffer: &mut String) -> Vec<Result<LlmChunk, LlmError>> {
                     cost: None,
                     cost_label: None,
                     artifact: None,
+                    status: None,
+                    sources: Vec::new(),
                 }));
             }
             Err(e) => {
@@ -174,6 +176,7 @@ impl LlmProvider for OllamaProvider {
             cost: None,
             cost_label: None,
             artifact: None,
+            sources: Vec::new(),
         })
     }
 

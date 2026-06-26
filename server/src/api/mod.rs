@@ -1,6 +1,11 @@
 //! HTTP API. Builds the axum router with all routes wired in.
 
-use axum::{middleware::from_fn, routing::get, Router};
+use axum::{
+    extract::DefaultBodyLimit,
+    middleware::from_fn,
+    routing::{delete, get},
+    Router,
+};
 use std::sync::Arc;
 
 use crate::{auth, config::Config, db::DbPool};
@@ -70,6 +75,7 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
                 ),
             ),
         )
+        .route("/auth/captcha/config", get(auth_routes::captcha_config))
         .route(
             "/auth/login",
             axum::routing::post(auth_routes::login).route_layer(
@@ -129,11 +135,20 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         .route("/admin/customers", get(admin::customers))
         .route("/admin/echo-peer", get(admin::echo_peer_key))
         .route("/admin/metrics", get(metrics::get_metrics))
+        .route("/admin/trial-abuse", get(admin::trial_abuse))
         .route_layer(axum::middleware::from_fn(auth::require_admin));
 
     // ---- Authenticated (Bearer JWT) -----------------------------------------
     let protected = Router::new()
         .route("/account/me", get(account::me))
+        .route(
+            "/account/devices",
+            get(account::devices).delete(account::revoke_all_devices),
+        )
+        .route(
+            "/account/devices/:device_id",
+            delete(account::revoke_device),
+        )
         .route(
             "/account/billing",
             axum::routing::patch(account::update_billing_settings),
@@ -165,6 +180,15 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
             )),
         )
         .route(
+            "/router/embed/batch",
+            axum::routing::post(router::embed_batch).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_router_embed,
+                ),
+            ),
+        )
+        .route(
             "/router/transcribe",
             axum::routing::post(router::transcribe).route_layer(
                 axum::middleware::from_fn_with_state(
@@ -176,6 +200,12 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         .route("/stt/session", axum::routing::post(stt::create_session))
         .route("/stt/relay", axum::routing::get(stt::relay))
         .route("/sync/batch", axum::routing::post(sync::batch))
+        .route(
+            "/sync/artifacts/:artifact_id/object",
+            axum::routing::post(sync::upload_artifact_object)
+                .get(sync::download_artifact_object)
+                .route_layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
         .route("/sync/sessions", get(sync::list_sessions))
         .route("/sync/sessions/:session_id", get(sync::get_session))
         .route("/rag/query", axum::routing::post(sync::rag_query))

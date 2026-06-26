@@ -33,32 +33,81 @@ impl EmbeddingProvider for ManagedBlueyEmbedder {
     }
 
     async fn embed(&self, text: &str) -> std::result::Result<Vec<f32>, EmbeddingError> {
-        let input = bounded_embed_input(text);
-        if input.trim().is_empty() {
+        let mut vectors = self.embed_batch(&[text.to_string()]).await?;
+        vectors
+            .pop()
+            .ok_or_else(|| EmbeddingError::InvalidResponse("missing embedding".to_string()))
+    }
+
+    async fn embed_batch(
+        &self,
+        texts: &[String],
+    ) -> std::result::Result<Vec<Vec<f32>>, EmbeddingError> {
+        let inputs = texts
+            .iter()
+            .map(|text| bounded_embed_input(text))
+            .filter(|input| !input.trim().is_empty())
+            .collect::<Vec<_>>();
+        if inputs.is_empty() {
             return Err(EmbeddingError::InvalidResponse(
                 "empty embedding input".to_string(),
             ));
         }
 
-        let response = self
+        let response = match self
             .client
-            .embed(&cue_cloud_client::EmbedRequest {
+            .embed_batch(&cue_cloud_client::EmbedBatchRequest {
                 request_id: new_request_id(),
-                input,
+                inputs: inputs.clone(),
                 model: None,
             })
             .await
-            .map_err(map_cloud_embed_error)?;
+        {
+            Ok(response) => response,
+            Err(cue_cloud_client::Error::Server { status }) if status == 404 || status == 405 => {
+                let mut vectors = Vec::with_capacity(inputs.len());
+                for input in inputs {
+                    let response = self
+                        .client
+                        .embed(&cue_cloud_client::EmbedRequest {
+                            request_id: new_request_id(),
+                            input,
+                            model: None,
+                        })
+                        .await
+                        .map_err(map_cloud_embed_error)?;
+                    vectors.push(response.vector);
+                }
+                return validate_managed_vectors(vectors, texts.len());
+            }
+            Err(error) => return Err(map_cloud_embed_error(error)),
+        };
 
-        if response.vector.len() != MANAGED_EMBED_DIM {
-            return Err(EmbeddingError::InvalidResponse(format!(
-                "managed embedding returned {} dimensions, expected {MANAGED_EMBED_DIM}",
-                response.vector.len()
-            )));
-        }
-
-        Ok(response.vector)
+        validate_managed_vectors(response.vectors, texts.len())
     }
+}
+
+fn validate_managed_vectors(
+    vectors: Vec<Vec<f32>>,
+    expected_count: usize,
+) -> std::result::Result<Vec<Vec<f32>>, EmbeddingError> {
+    if vectors.len() != expected_count {
+        return Err(EmbeddingError::InvalidResponse(format!(
+            "managed embedding returned {} vectors, expected {}",
+            vectors.len(),
+            expected_count
+        )));
+    }
+    if let Some(bad) = vectors
+        .iter()
+        .find(|vector| vector.len() != MANAGED_EMBED_DIM)
+    {
+        return Err(EmbeddingError::InvalidResponse(format!(
+            "managed embedding returned {} dimensions, expected {MANAGED_EMBED_DIM}",
+            bad.len()
+        )));
+    }
+    Ok(vectors)
 }
 
 #[derive(Clone)]
@@ -164,16 +213,18 @@ impl RagIndexCoordinator {
         });
     }
 
-    pub(crate) async fn query(
+    pub(crate) async fn query_current_and_global(
         &self,
         query_text: &str,
-        limit: usize,
-        session_id: Option<&str>,
-    ) -> Result<Vec<cue_rag::RagHit>> {
+        current_limit: usize,
+        current_session_id: &str,
+        global_limit: usize,
+    ) -> Result<(Vec<cue_rag::RagHit>, Vec<cue_rag::RagHit>)> {
         let Some(rag) = self.pipeline() else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         };
-        rag.query(query_text, limit, session_id).await
+        rag.query_current_and_global(query_text, current_limit, current_session_id, global_limit)
+            .await
     }
 
     fn pipeline(&self) -> Option<Arc<crate::db::rag::RagPipeline>> {

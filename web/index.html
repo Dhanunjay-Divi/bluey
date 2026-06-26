@@ -3,29 +3,90 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Bluey | Stay Present, Stay Unseen</title>
-  <meta name="description" content="Stay Present, stay unseen. Ask Bluey from meetings, code, docs, your screen, and saved session context from one small desktop layer.">
+  <title>Bluey | AI Meeting Context Copilot</title>
+  <meta name="description" content="Bluey is a private desktop AI copilot for engineering meetings. Ask from live conversation, screen context, files, docs, code, and saved project memory.">
   <meta name="theme-color" content="#020405">
+  <meta name="robots" content="index,follow">
+  <link rel="canonical" href="https://bluey.sh/">
+  <link rel="alternate" type="text/plain" href="/llms.txt" title="Bluey llms.txt">
+  <link rel="sitemap" type="application/xml" href="/sitemap.xml">
   <link rel="icon" type="image/svg+xml" href="/assets/bluey-logo.svg">
   <link rel="icon" type="image/png" sizes="512x512" href="/assets/favicon-512.png">
   <link rel="apple-touch-icon" href="/assets/apple-touch-icon.png">
-  <meta property="og:title" content="Bluey | Stay Present, Stay Unseen">
-  <meta property="og:description" content="Stay Present, stay unseen. Ask from meetings, files, your screen, and saved session context without switching apps.">
+  <meta property="og:title" content="Bluey | AI Meeting Context Copilot">
+  <meta property="og:description" content="Ask from live meetings, files, your screen, code, docs, and saved project memory without switching apps.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://bluey.sh/">
   <meta property="og:image" content="https://bluey.sh/assets/bluey-og.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Bluey | Stay Present, Stay Unseen">
-  <meta name="twitter:description" content="Stay Present, stay unseen. Ask from meetings, files, your screen, and saved session context without switching apps.">
+  <meta name="twitter:title" content="Bluey | AI Meeting Context Copilot">
+  <meta name="twitter:description" content="Ask from live meetings, files, your screen, code, docs, and saved project memory without switching apps.">
   <meta name="twitter:image" content="https://bluey.sh/assets/bluey-og.png">
   <link
     rel="stylesheet"
-    href="/assets/bluey-site.css"
-    integrity="sha384-nPveWPwE3gw4cXQPAL7OLudxjLsmIsJbR6RZ7WkGAP6Gcz65SrBVOd5gnDpfEVTM"
-    crossorigin="anonymous"
+    href="/assets/bluey-site.css?v=2026062301"
   >
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "Organization",
+        "@id": "https://bluey.sh/#organization",
+        "name": "Bluey",
+        "url": "https://bluey.sh/",
+        "logo": "https://bluey.sh/assets/bluey-logo.svg",
+        "sameAs": []
+      },
+      {
+        "@type": "WebSite",
+        "@id": "https://bluey.sh/#website",
+        "name": "Bluey",
+        "url": "https://bluey.sh/",
+        "publisher": { "@id": "https://bluey.sh/#organization" },
+        "inLanguage": "en"
+      },
+      {
+        "@type": "SoftwareApplication",
+        "@id": "https://bluey.sh/#software",
+        "name": "Bluey",
+        "url": "https://bluey.sh/",
+        "applicationCategory": "BusinessApplication",
+        "operatingSystem": "macOS, Windows",
+        "description": "Private desktop AI copilot for engineering meetings, screen context, files, code, docs, and saved project memory.",
+        "image": "https://bluey.sh/assets/bluey-og.png",
+        "softwareHelp": "https://bluey.sh/how-bluey-works/",
+        "downloadUrl": "https://bluey.sh/download",
+        "publisher": { "@id": "https://bluey.sh/#organization" },
+        "offers": {
+          "@type": "Offer",
+          "price": "0",
+          "priceCurrency": "USD",
+          "description": "Start free, then add account credits for paid AI models, speech transcription, screen analysis, and saved-session search."
+        }
+      },
+      {
+        "@type": "Product",
+        "@id": "https://bluey.sh/#product",
+        "name": "Bluey",
+        "description": "A private desktop copilot that brings live meeting context, screen context, files, code, docs, and saved project memory into one answer surface.",
+        "brand": { "@id": "https://bluey.sh/#organization" },
+        "image": "https://bluey.sh/assets/bluey-og.png",
+        "url": "https://bluey.sh/",
+        "offers": {
+          "@type": "Offer",
+          "url": "https://bluey.sh/download",
+          "price": "0",
+          "priceCurrency": "USD",
+          "availability": "https://schema.org/InStock",
+          "description": "Start free, then add account credits for paid AI models, speech transcription, screen analysis, and saved-session search."
+        }
+      }
+    ]
+  }
+  </script>
 </head>
 <body>
   <section class="policy-app" id="policyApp" hidden>
@@ -48,7 +109,7 @@
       </nav>
 
       <article class="policy-card" id="privacyPolicy" hidden>
-        <div class="policy-updated">Last updated June 1, 2026</div>
+        <div class="policy-updated">Last updated June 24, 2026</div>
         <h1>Privacy Policy</h1>
         <p>Bluey is an AI work assistant that runs a desktop overlay and optional cloud services. We collect only what is needed for account login, credit reloads, AI answers, saved sessions, support, and abuse prevention.</p>
 
@@ -67,13 +128,13 @@
         <p>When a request needs an AI model, Bluey sends only the context needed for that request: your prompt, selected transcript snippets, attached document text, screen-analysis output, saved session memory, and routing metadata such as task type and cost estimate. Speech transcription, image understanding, embedding, and answer generation may use separate providers.</p>
 
         <h2>Files, Sessions, and Memory</h2>
-        <p>Documents you attach are parsed into readable text where supported and are tied to the active Bluey session. If you choose cloud sync or saved sessions, Bluey may store searchable session records so later questions can find the relevant transcript, file, screen note, or answer. You can keep using local sessions without cloud sync.</p>
+        <p>Documents, images, screenshots, and other files you attach are parsed into readable text where supported and are tied to the active Bluey session. If you choose cloud sync or saved sessions, Bluey may store the original synced file bytes, lightweight previews, extracted text, summaries, and search indexes so another signed-in device can restore the session and answer from the same context. You can keep using local sessions without cloud sync.</p>
 
         <h2>Your Controls</h2>
         <p>Desktop capture starts only through visible user controls. You can stop listening, hide the overlay, attach or remove documents, export account data, delete your account, and clear local state.</p>
 
         <h2>Retention</h2>
-        <p>Account-credit batches remain in the ledger for accounting and expire up to 12 months (365 days) after purchase. Session, transcript, document, and saved-history retention follows account/workspace settings and the export/delete controls described in the product.</p>
+        <p>Account-credit batches remain in the ledger for accounting and expire up to 12 months (365 days) after purchase. Cloud-synced session records, transcripts, document bytes, screenshots, extracted text, summaries, and search indexes are kept for up to 12 months (365 days) from their last sync or use unless you delete them earlier. Cleanup is lazy, so expired objects may remain briefly until a sweeper, restore attempt, or maintenance pass removes them, but they are no longer intended for active product use.</p>
 
         <h2>Security</h2>
         <p>Desktop account tokens are stored in Bluey's private local account profile so the app can reconnect without operating-system keychain prompts. Provider API keys stay server-side for managed cloud requests. Logs are designed for debugging and support, not for storing raw secrets or full user content.</p>
@@ -86,7 +147,7 @@
       </article>
 
       <article class="policy-card" id="termsPolicy" hidden>
-        <div class="policy-updated">Last updated June 1, 2026</div>
+        <div class="policy-updated">Last updated June 24, 2026</div>
         <h1>Terms of Use</h1>
         <p>These terms cover the Bluey alpha service. By creating an account, installing Bluey, or using Bluey Cloud, you agree to use the product responsibly and only where you have the right to capture, upload, or analyze the context you provide.</p>
 
@@ -103,6 +164,9 @@
 
         <h2>User-Controlled Context</h2>
         <p>You are responsible for the documents, transcripts, screenshots, repositories, and other context you attach or ask Bluey to analyze. Bluey should be used with consent where required, and it should not be used for hidden capture of people or information you are not allowed to process.</p>
+
+        <h2>Cloud Sync and Retention</h2>
+        <p>If you enable cloud sync or saved sessions, you authorize Bluey to store synced session metadata, transcripts, generated answers, original file or screenshot bytes, extracted text, summaries, and search indexes for restoration and answer context. These synced objects are retained for up to 12 months (365 days) from last sync or use unless you delete them earlier. Expired objects are removed lazily during cleanup, restore attempts, or maintenance passes.</p>
 
         <h2>AI Output</h2>
         <p>Bluey can help draft answers, summarize sessions, explain code, reason about systems, and organize context. AI output may be incomplete or wrong. You are responsible for reviewing generated output before relying on it, sending it, submitting it, or using it to make decisions.</p>
@@ -138,7 +202,7 @@
       </article>
 
       <div class="page-footer-links">
-        Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Stay Present, stay unseen</span><span class="dot">&middot;</span><a href="/docs/terms">Terms</a><span class="dot">&middot;</span><a href="/docs/privacy">Privacy</a><span class="dot">&middot;</span><a href="/docs/disguise">Controls</a>
+        Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Private context for live work</span><span class="dot">&middot;</span><a href="/how-bluey-works/">How it works</a><span class="dot">&middot;</span><a href="/bluey-faq/">FAQ</a><span class="dot">&middot;</span><a href="/docs/terms">Terms</a><span class="dot">&middot;</span><a href="/docs/privacy">Privacy</a><span class="dot">&middot;</span><a href="/docs/disguise">Controls</a>
       </div>
     </div>
   </section>
@@ -179,6 +243,17 @@
           <a class="account-link nav-cta" href="/login" data-guest-only>Login</a>
           <a class="account-link" href="/account" data-auth-only hidden>Dashboard</a>
           <button class="account-link" id="accountSignOut" type="button" data-sign-out hidden>Sign out</button>
+          <div class="account-profile" id="accountProfile" data-auth-only hidden>
+            <button class="profile-button" id="accountProfileButton" type="button" aria-haspopup="menu" aria-expanded="false" aria-label="Account menu">
+              <span class="profile-glyph" aria-hidden="true"></span>
+            </button>
+            <div class="account-profile-menu" id="accountProfileMenu" role="menu" hidden>
+              <div class="profile-email" id="profileEmailLabel">Bluey account</div>
+              <a href="/password-reset" role="menuitem">Change password</a>
+              <button type="button" role="menuitem" data-sign-out>Sign out</button>
+              <button class="danger" id="deleteAccountButton" type="button" role="menuitem">Delete account</button>
+            </div>
+          </div>
         </div>
       </header>
 
@@ -210,6 +285,7 @@
                 <input type="checkbox" id="signupTerms">
                 <span>I agree to the <a href="/docs/terms" target="_blank" rel="noopener noreferrer">Terms</a> &amp; <a href="/docs/privacy" target="_blank" rel="noopener noreferrer">Privacy</a>.</span>
               </label>
+              <div class="signup-captcha" id="signupCaptcha" hidden></div>
               <div class="account-actions-row">
                 <button class="account-button primary" id="accountPrimaryButton" type="submit">Sign in</button>
                 <button class="account-button" id="createAccountButton" type="button">Create account</button>
@@ -264,14 +340,17 @@
             <div class="dashboard-head">
               <div>
                 <h2 id="accountEmailLabel">Bluey account</h2>
-                <p>Credits cover AI models, live speech, screen analysis, and saved sessions. Desktop history stays available from the overlay.</p>
+                <p>Check your balance, add credits, and keep the desktop app connected.</p>
               </div>
-              <span class="pill-muted" id="billingProviderLabel">Secure checkout</span>
+              <div class="dashboard-actions">
+                <span class="pill-muted" id="billingProviderLabel">No subscription</span>
+                <button class="account-button ghost compact" id="refreshAccountButton" type="button">Refresh balance</button>
+              </div>
             </div>
 
             <div class="account-kpis">
-              <div class="account-kpi">
-                <span>Balance</span>
+              <div class="account-kpi balance-kpi">
+                <span>Current balance</span>
                 <strong id="balanceValue">$--</strong>
                 <em id="balanceHint">Refreshes after each paid answer.</em>
               </div>
@@ -287,44 +366,103 @@
               </div>
             </div>
 
-            <div class="reload-card">
-              <div>
-                <h3>Add credits</h3>
-                <p>$15 minimum. Credits stay valid for 365 days, and paid requests stop at $0.</p>
+            <section class="dashboard-section billing-section" aria-label="Credits and reload">
+              <div class="section-head">
+                <div>
+                  <h3>Add credits</h3>
+                  <p>Credits are stored balance for paid Bluey work. Trial minutes are used first when available.</p>
+                </div>
               </div>
-              <div class="account-actions-row reload-actions">
-                <div class="reload-price">$15</div>
-                <button class="account-button primary" id="reloadButton" type="button">Add credits</button>
-              </div>
-            </div>
+              <div class="billing-grid">
+                <div class="reload-card billing-primary-card">
+                  <div>
+                    <h3>Manual reload</h3>
+                    <p>Most people start with $30. It becomes $30 in Bluey credits after checkout succeeds.</p>
+                    <div class="credit-equation" aria-label="$30 reload gives $30 Bluey credits">
+                      <strong>$30 reload</strong>
+                      <span>= $30 Bluey credits</span>
+                    </div>
+                    <ul class="reload-breakdown" aria-label="What credits cover">
+                      <li>Used for AI answers, speech transcription, screen analysis, and saved-session search.</li>
+                      <li>Each paid answer shows its cost and your remaining balance.</li>
+                      <li>Checkout opens in a new tab. Return here and press Refresh balance if it is still processing.</li>
+                      <li>Paid cloud work pauses at $0 unless you turn Auto Reload on.</li>
+                    </ul>
+                  </div>
+                  <div class="manual-reload-panel" aria-label="Manual credit reload">
+                    <label class="manual-reload-field" for="manualReloadAmount">
+                      <span>Credits to add</span>
+                      <span class="manual-reload-input">
+                        <span>$</span>
+                        <input id="manualReloadAmount" type="number" min="15" max="500" step="5" value="30" inputmode="decimal" />
+                      </span>
+                    </label>
+                    <button class="account-button primary" id="reloadButton" type="button">Add credits</button>
+                  </div>
+                  <p class="manual-reload-rule" id="manualReloadRule">$30 recommended. $15 minimum. Checkout opens in a new tab; credits appear after payment succeeds.</p>
+                </div>
 
-            <div class="reload-card auto-reload-card" id="autoReloadCard">
-              <div>
-                <h3>Auto Reload</h3>
-                <p id="autoReloadHint">Off by default. Turn it on only after saving a payment method.</p>
-                <div class="auto-reload-fields" aria-label="Auto Reload rule">
-                  <label>
-                    <span>When below</span>
-                    <input id="autoReloadThreshold" type="number" min="1" max="50" step="1" value="5" inputmode="decimal" />
+                <div class="reload-card auto-reload-card" id="autoReloadCard">
+                  <div>
+                    <h3>Auto Reload (optional)</h3>
+                    <p id="autoReloadHint">Off by default. Keep it off if you want to add credits by hand.</p>
+                    <div class="auto-reload-fields" aria-label="Auto Reload rule">
+                      <label>
+                        <span>When below</span>
+                        <input id="autoReloadThreshold" type="number" min="1" max="50" step="1" value="10" inputmode="decimal" />
+                      </label>
+                      <label>
+                        <span>Add</span>
+                        <input id="autoReloadAmount" type="number" min="15" max="100" step="5" value="30" inputmode="decimal" />
+                      </label>
+                    </div>
+                    <p class="auto-reload-rule" id="autoReloadRule">Optional backup: below $10.00, charge $30.00 and add $30.00 credits after payment succeeds.</p>
+                    <div class="auto-reload-method" id="autoReloadMethod"></div>
+                    <div class="square-card-setup" id="squareCardSetup" hidden>
+                      <div class="square-card-copy">
+                        <strong>Save a card for Auto Reload</strong>
+                        <span>Square handles the card details. Bluey keeps only the saved card reference.</span>
+                      </div>
+                      <div id="squareCardContainer" class="square-card-container"></div>
+                      <button class="account-button ghost" id="saveSquareCardButton" type="button">Save card</button>
+                    </div>
+                  </div>
+                  <label class="auto-reload-toggle" for="autoReloadToggle">
+                    <input id="autoReloadToggle" type="checkbox" />
+                    <span></span>
                   </label>
-                  <label>
-                    <span>Add</span>
-                    <input id="autoReloadAmount" type="number" min="15" max="100" step="5" value="15" inputmode="decimal" />
-                  </label>
-                </div>
-                <p class="auto-reload-rule" id="autoReloadRule">When your balance drops below $5.00, charge $15.00 and add credits after payment succeeds.</p>
-                <div class="auto-reload-method" id="autoReloadMethod"></div>
-                <div class="square-card-setup" id="squareCardSetup" hidden>
-                  <div id="squareCardContainer" class="square-card-container"></div>
-                  <button class="account-button ghost" id="saveSquareCardButton" type="button">Save card</button>
-                  <p class="form-note">Card details are handled by Square. Bluey stores only the saved-card id.</p>
                 </div>
               </div>
-              <label class="auto-reload-toggle" for="autoReloadToggle">
-                <input id="autoReloadToggle" type="checkbox" />
-                <span></span>
-              </label>
-            </div>
+            </section>
+
+            <section class="dashboard-section device-section" aria-label="Host login activity">
+              <div class="section-head">
+                <div>
+                  <h3>Host login activity</h3>
+                  <p>Places where you are signed in. Remove anything you do not recognize.</p>
+                </div>
+              </div>
+              <div class="device-summary-bar">
+                <span id="linkedDeviceCount">No host activity</span>
+                <div class="account-actions-row">
+                  <button class="account-button ghost compact" id="refreshDevicesButton" type="button">Refresh</button>
+                  <button class="account-button danger compact" id="removeAllDevicesButton" type="button" disabled>Remove all</button>
+                </div>
+              </div>
+              <div class="device-list" id="linkedDevicesList"></div>
+            </section>
+
+            <section class="dashboard-section admin-abuse-section" id="adminAbuseSection" aria-label="Trial abuse" hidden>
+              <div class="section-head">
+                <div>
+                  <h3>Trial abuse</h3>
+                  <p>Recent trial grants, denials, and signup protection events.</p>
+                </div>
+                <button class="account-button ghost compact" id="refreshAdminAbuseButton" type="button">Refresh</button>
+              </div>
+              <div class="abuse-summary-grid" id="adminAbuseSummary"></div>
+              <div class="abuse-event-list" id="adminAbuseEvents"></div>
+            </section>
 
             <div class="account-message" id="accountMessage"></div>
             <div class="usage-list" id="usageList"></div>
@@ -343,7 +481,7 @@
         </section>
       </main>
       <div class="page-footer-links">
-        Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Stay Present, stay unseen</span><span class="dot">&middot;</span><a href="/docs/terms">Terms</a><span class="dot">&middot;</span><a href="/docs/privacy">Privacy</a><span class="dot">&middot;</span><a href="/docs/disguise">Controls</a>
+        Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Private context for live work</span><span class="dot">&middot;</span><a href="/how-bluey-works/">How it works</a><span class="dot">&middot;</span><a href="/bluey-faq/">FAQ</a><span class="dot">&middot;</span><a href="/docs/terms">Terms</a><span class="dot">&middot;</span><a href="/docs/privacy">Privacy</a><span class="dot">&middot;</span><a href="/docs/disguise">Controls</a>
       </div>
     </div>
   </section>
@@ -506,7 +644,7 @@
       </div>
 
       <div class="page-footer-links">
-        Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Stay Present, stay unseen</span><span class="dot">&middot;</span><a href="/docs/terms">Terms</a><span class="dot">&middot;</span><a href="/docs/privacy">Privacy</a><span class="dot">&middot;</span><a href="/docs/disguise">Controls</a>
+        Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Private context for live work</span><span class="dot">&middot;</span><a href="/how-bluey-works/">How it works</a><span class="dot">&middot;</span><a href="/bluey-faq/">FAQ</a><span class="dot">&middot;</span><a href="/docs/terms">Terms</a><span class="dot">&middot;</span><a href="/docs/privacy">Privacy</a><span class="dot">&middot;</span><a href="/docs/disguise">Controls</a>
       </div>
     </div>
   </section>
@@ -528,9 +666,9 @@
     <div class="main">
       <div class="content">
         <section class="hero">
-          <h1 aria-label="Stay Present, stay unseen.">Stay Present,<br><span class="accent">stay unseen.</span></h1>
-          <p class="hero-lede">Native AI chat for meetings, code, docs, research, and screen work from your terminal. Keep Bluey in the background and ask from the work already on your machine.</p>
-          <p class="hero-proof"><span>One pill keeps the context together.</span> Ask with your transcript, screen, files, and notes without switching apps.</p>
+          <h1 aria-label="Bring context, stay present.">Bring context,<br><span class="accent">stay present.</span></h1>
+          <p class="hero-lede">Private AI chat for engineering meetings, code, docs, research, and screen work from your terminal. Ask from the work already on your machine.</p>
+          <p class="hero-proof"><span>One pill keeps the context together.</span> Ask with your transcript, screen, files, code, docs, and saved session notes without switching apps.</p>
           <div class="hero-actions">
             <a class="btn btn-primary" href="/download">Get Started</a>
             <a class="btn btn-ghost" href="/login">Try Bluey</a>
@@ -565,29 +703,27 @@
         <a href="/download" class="plan featured">
           <div>
             <div class="plan-name">Start free</div>
-            <div class="plan-detail">Install Bluey, run <code>bluey on</code>, and use the included trial minutes.</div>
+            <div class="plan-detail">Download Bluey, run <code>bluey on</code>, and use the included trial before adding credits.</div>
           </div>
           <div class="plan-price">Download</div>
         </a>
-        <a href="/reload?checkout=1" class="plan">
+        <a href="/reload" class="plan">
           <div>
             <div class="plan-name">Add credits</div>
-            <div class="plan-detail">Pay only when Bluey uses AI models, speech, screen analysis, or saved sessions.</div>
+            <div class="plan-detail">$30 becomes $30 Bluey credits for AI answers, speech, screen analysis, and saved-session search. $15 minimum, no subscription.</div>
           </div>
-          <div class="plan-price">$15</div>
+          <div class="plan-price"><strong>$30</strong><span>credits</span></div>
         </a>
       </div>
       <p class="pricing-note">Teams are concierge for now.</p>
       <div class="footer-meta">
-        Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Stay Present, stay unseen</span><span class="dot">&middot;</span><a href="/docs/terms">Terms</a><span class="dot">&middot;</span><a href="/docs/privacy">Privacy</a><span class="dot">&middot;</span><a href="/docs/disguise">Controls</a>
+        Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Private context for live work</span><span class="dot">&middot;</span><a href="/how-bluey-works/">How it works</a><span class="dot">&middot;</span><a href="/bluey-faq/">FAQ</a><span class="dot">&middot;</span><a href="/docs/terms">Terms</a><span class="dot">&middot;</span><a href="/docs/privacy">Privacy</a><span class="dot">&middot;</span><a href="/docs/disguise">Controls</a>
       </div>
     </footer>
   </main>
 
   <script
-    src="/assets/bluey-site.js"
-    integrity="sha384-vMCEeyJi2Wcd8RUDxf+1KqM9WZaKg1tKXQQCLMqqIk84ffTjXjfxbQ2Fo+fxUSss"
-    crossorigin="anonymous"
+    src="/assets/bluey-site.js?v=2026062301"
   ></script>
 </body>
 </html>

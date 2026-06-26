@@ -15,6 +15,10 @@ const MAX_MARKITDOWN_OUTPUT_BYTES: u64 = 2_000_000;
 const MARKITDOWN_TIMEOUT: Duration = Duration::from_secs(20);
 const PREVIEW_CHARS: usize = 16_000;
 
+pub(crate) fn supported_context_formats_message() -> &'static str {
+    "Supported formats: PDF, DOC/DOCX, Excel/ODS, CSV/TSV, text, Markdown, code/data files, and PNG/JPEG/WebP/GIF/HEIC/BMP/TIFF images."
+}
+
 #[derive(Debug, Clone)]
 struct ConverterCommand {
     program: PathBuf,
@@ -28,7 +32,7 @@ pub(crate) fn classify_context_path(path: &Path) -> ContextKind {
         .to_ascii_lowercase();
 
     match extension.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "bmp" | "tiff" => {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "heif" | "bmp" | "tiff" | "tif" => {
             if path
                 .file_stem()
                 .and_then(|stem| stem.to_str())
@@ -42,7 +46,9 @@ pub(crate) fn classify_context_path(path: &Path) -> ContextKind {
         "rs" | "swift" | "c" | "h" | "cpp" | "hpp" | "js" | "jsx" | "ts" | "tsx" | "py" | "go"
         | "java" | "kt" | "kts" | "cs" | "rb" | "php" | "sql" | "sh" | "ps1" | "toml" | "yaml"
         | "yml" | "json" | "html" | "css" | "scss" => ContextKind::Code,
-        "pdf" | "doc" | "docx" | "rtf" => ContextKind::Document,
+        "pdf" | "doc" | "docx" | "rtf" | "xls" | "xlsx" | "xlsm" | "xlsb" | "ods" => {
+            ContextKind::Document
+        }
         "txt" | "log" | "csv" | "tsv" | "md" | "markdown" | "rst" | "adoc" => ContextKind::Text,
         _ => ContextKind::Other,
     }
@@ -57,7 +63,7 @@ pub(crate) fn is_supported_context_file(path: &Path) -> bool {
                 .unwrap_or_default()
                 .to_ascii_lowercase()
                 .as_str(),
-            "png" | "jpg" | "jpeg" | "gif" | "webp"
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "heif" | "bmp" | "tiff" | "tif"
         ),
         ContextKind::Other => false,
     }
@@ -75,7 +81,8 @@ pub(crate) fn convert_context_file_to_markdown(
         }
         ContextKind::Other => {
             return Err(anyhow!(
-                "unsupported context file type; attach readable text, Markdown, code, PDF, DOC, or DOCX"
+                "unsupported context file type. {}",
+                supported_context_formats_message()
             ));
         }
     }
@@ -134,12 +141,7 @@ fn discover_markitdown_commands() -> Vec<ConverterCommand> {
 
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() {
-            for candidate in [
-                dir.join("bluey-doc-converter"),
-                dir.join("markitdown"),
-                dir.join("bin/bluey-doc-converter"),
-                dir.join("bin/markitdown"),
-            ] {
+            for candidate in bluey_local_doc_converter_candidates(dir) {
                 if candidate.is_file() {
                     push(candidate);
                 }
@@ -153,6 +155,39 @@ fn discover_markitdown_commands() -> Vec<ConverterCommand> {
     push(PathBuf::from("markitdown"));
 
     commands
+}
+
+fn bluey_local_doc_converter_candidates(exe_dir: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    candidates.extend([
+        exe_dir.join("bluey-doc-converter"),
+        exe_dir.join("markitdown"),
+        exe_dir.join("bin/bluey-doc-converter"),
+        exe_dir.join("bin/markitdown"),
+    ]);
+
+    #[cfg(target_os = "windows")]
+    candidates.extend([
+        exe_dir.join("bluey-doc-converter.cmd"),
+        exe_dir.join("markitdown.exe"),
+        exe_dir.join("bin/bluey-doc-converter.cmd"),
+        exe_dir.join("bin/markitdown.exe"),
+    ]);
+
+    if let Some(install_root) = exe_dir.parent() {
+        candidates.extend([
+            install_root.join("tools/doc-converter/bin/bluey-doc-converter"),
+            install_root.join("tools/doc-converter/.venv/bin/markitdown"),
+        ]);
+
+        #[cfg(target_os = "windows")]
+        candidates.extend([
+            install_root.join("tools/doc-converter/bin/bluey-doc-converter.cmd"),
+            install_root.join("tools/doc-converter/.venv/Scripts/markitdown.exe"),
+        ]);
+    }
+
+    candidates
 }
 
 fn run_markitdown(converter: &ConverterCommand, path: &Path) -> Result<String> {
@@ -252,11 +287,16 @@ fn extract_document_text_preview(path: &Path, size_bytes: u64) -> Result<String>
     let text = match extension.as_str() {
         "pdf" => extract_pdf_text(path)?,
         "doc" | "docx" | "rtf" => extract_word_text(path)?,
+        "xls" | "xlsx" | "xlsm" | "xlsb" | "ods" => {
+            return Err(anyhow!(
+                "spreadsheet conversion needs the bundled MarkItDown converter"
+            ));
+        }
         _ => {
             return Err(anyhow!(
                 "no parser is registered for .{} documents",
                 extension
-            ))
+            ));
         }
     };
 
@@ -499,10 +539,12 @@ mod tests {
     fn picker_context_filter_rejects_video_and_key_material() {
         assert!(is_supported_context_file(Path::new("plan.md")));
         assert!(is_supported_context_file(Path::new("architecture.pdf")));
+        assert!(is_supported_context_file(Path::new("budget.xlsx")));
+        assert!(is_supported_context_file(Path::new("forecast.xlsm")));
         assert!(is_supported_context_file(Path::new("main.rs")));
         assert!(is_supported_context_file(Path::new("diagram.png")));
-        assert!(!is_supported_context_file(Path::new("iphone-photo.heic")));
-        assert!(!is_supported_context_file(Path::new("scan.tiff")));
+        assert!(is_supported_context_file(Path::new("iphone-photo.heic")));
+        assert!(is_supported_context_file(Path::new("scan.tiff")));
         assert!(!is_supported_context_file(Path::new("clip.mp4")));
         assert!(!is_supported_context_file(Path::new("backup.p12")));
     }

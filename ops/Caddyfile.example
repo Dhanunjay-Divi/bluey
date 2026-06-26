@@ -7,7 +7,8 @@
 bluey.sh, www.bluey.sh {
     encode gzip zstd
 
-    @bluey_api path /health /admin/* /auth/* /billing/* /pricing/* /router/* /stt/* /sync/* /rag/* /usage/* /account/me /account/usage /account/billing /account/export /account/delete
+    @bluey_api path /health /admin/* /auth/* /billing/* /pricing/* /router/* /stt/* /sync/* /rag/* /usage/* /account/me /account/usage /account/billing /account/devices /account/devices/* /account/export /account/delete
+    @bluey_html path / /login /download /install /account /reload /link /device /verify-email /password-reset /docs/* /llms.txt /robots.txt /sitemap.xml /how-bluey-works* /bluey-faq* /ai-meeting-context-copilot* /engineering-meeting-copilot* /ai-copilot-for-design-reviews* /screen-context-ai-assistant* /meeting-memory-and-project-context* /auto-model-router* /private-desktop-ai-overlay* /bluey-vs-ai-meeting-notetakers* /bluey-vs-coding-agents* /context-coverage*
 
     handle @bluey_api {
         reverse_proxy 127.0.0.1:8080 {
@@ -24,7 +25,7 @@ bluey.sh, www.bluey.sh {
 
     handle {
         root * /var/www/bluey
-        try_files {path} {path}/ /index.html
+        try_files {path} {path}/index.html {path}/ /index.html
         file_server
     }
 
@@ -35,9 +36,10 @@ bluey.sh, www.bluey.sh {
         X-Frame-Options "DENY"
         Referrer-Policy "strict-origin-when-cross-origin"
         Permissions-Policy "interest-cohort=()"
-        # Public web uses bundled CSS/JS with SRI, so no inline-script policy is needed.
+        # Public web uses bundled same-origin CSS/JS with versioned asset URLs.
         Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self' https://web.squarecdn.com https://sandbox.web.squarecdn.com; connect-src 'self' https://connect.squareup.com https://connect.squareupsandbox.com https://web.squarecdn.com https://sandbox.web.squarecdn.com; frame-src https://web.squarecdn.com https://sandbox.web.squarecdn.com; frame-ancestors 'none'"
     }
+    header @bluey_html Cache-Control "no-cache"
 
     # Standard log to syslog so journalctl shows access patterns.
     log {

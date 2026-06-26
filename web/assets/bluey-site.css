@@ -938,16 +938,20 @@
 
     #productSite .plan {
       display: flex;
-      align-items: center;
+      align-items: flex-start;
       justify-content: space-between;
-      gap: .8rem;
-      min-height: 76px;
+      gap: 1rem;
+      min-height: 98px;
       padding: .78rem 1.15rem;
       border: 1px solid #1a1a1a;
       border-radius: 8px;
       color: #e0e0e0;
       text-decoration: none;
       transition: border-color .2s;
+    }
+
+    #productSite .plan > div:first-child {
+      min-width: 0;
     }
 
     #productSite .plan:hover {
@@ -965,9 +969,27 @@
     }
 
     #productSite .plan-price {
+      display: grid;
+      justify-items: end;
+      gap: .12rem;
       color: var(--bluey-accent);
       font-size: .85rem;
+      font-weight: 700;
+      line-height: 1.1;
+      text-align: right;
       white-space: nowrap;
+    }
+
+    #productSite .plan-price strong {
+      color: var(--bluey-accent);
+      font-size: 1rem;
+      line-height: 1;
+    }
+
+    #productSite .plan-price span {
+      color: #6e7780;
+      font-size: .68rem;
+      line-height: 1.15;
     }
 
     #productSite .plan-detail {
@@ -1285,6 +1307,31 @@
       border-color: #333;
     }
 
+    #accountApp .account-button.compact {
+      min-height: 36px;
+      padding: .45rem .7rem;
+      font-size: .8rem;
+      font-weight: 800;
+    }
+
+    #accountApp .account-button.danger {
+      border-color: rgba(255, 96, 111, .38);
+      background: rgba(255, 82, 99, .12);
+      color: #ff747d;
+      font-weight: 800;
+    }
+
+    #accountApp .account-button.danger:hover:not(:disabled) {
+      border-color: rgba(255, 96, 111, .72);
+      background: #ef2732;
+      color: #fff;
+    }
+
+    #accountApp .account-button:disabled {
+      cursor: not-allowed;
+      opacity: .45;
+    }
+
     #accountApp .account-rail {
       display: none !important;
     }
@@ -1452,6 +1499,11 @@
       text-decoration: underline;
     }
 
+    #accountApp .signup-captcha {
+      min-height: 65px;
+      overflow: hidden;
+    }
+
     #accountApp .account-form input:-webkit-autofill,
     #accountApp .account-form input:-webkit-autofill:hover,
     #accountApp .account-form input:-webkit-autofill:focus {
@@ -1533,6 +1585,7 @@
     #accountApp .dashboard-section,
     #accountApp .account-kpi,
     #accountApp .usage-row,
+    #accountApp .device-row,
     #accountApp .session-row,
     #accountApp .session-detail {
       border: 1px solid var(--bluey-line);
@@ -1559,6 +1612,14 @@
       align-items: center;
       padding-bottom: 1rem;
       border-bottom: 1px solid #151515;
+    }
+
+    #accountApp .dashboard-actions {
+      display: inline-flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: .65rem;
+      flex-wrap: wrap;
     }
 
     #accountApp .dashboard-head h2,
@@ -1592,13 +1653,18 @@
 
     #accountApp .account-kpis {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: minmax(15rem, 1.15fr) repeat(2, minmax(0, .85fr));
       gap: 1rem;
       margin: 1rem 0;
     }
 
     #accountApp .account-kpi {
       padding: 1rem;
+    }
+
+    #accountApp .balance-kpi {
+      border-color: rgba(99, 216, 255, .30);
+      background: linear-gradient(135deg, rgba(99, 216, 255, .08), #0a0a0a 48%);
     }
 
     #accountApp .account-kpi span {
@@ -1636,16 +1702,142 @@
       margin: 1rem 0;
     }
 
-    #accountApp .reload-price {
-      color: var(--bluey-accent);
-      font-size: 1.1rem;
-      font-weight: 800;
+    #accountApp .billing-section {
+      border-color: rgba(99, 216, 255, .16);
+      background: linear-gradient(180deg, rgba(99, 216, 255, .035), #0a0a0a 38%);
     }
 
-    #accountApp .auto-reload-card {
-      align-items: flex-start;
-      border-color: rgba(99, 216, 255, .18);
+    #accountApp .billing-grid {
+      display: grid;
+      grid-template-columns: minmax(18rem, 1.12fr) minmax(18rem, .88fr);
+      gap: .75rem;
     }
+
+    #accountApp .billing-grid .reload-card {
+      margin: 0;
+      height: 100%;
+    }
+
+    #accountApp .billing-primary-card {
+      align-items: flex-start;
+      flex-direction: column;
+      border-color: rgba(99, 216, 255, .24);
+    }
+
+    #accountApp .credit-equation {
+      display: inline-flex;
+      align-items: center;
+      gap: .5rem;
+      flex-wrap: wrap;
+      margin-top: .78rem;
+      padding: .6rem .75rem;
+      border: 1px solid rgba(99, 216, 255, .20);
+      border-radius: 8px;
+      background: rgba(99, 216, 255, .06);
+    }
+
+    #accountApp .credit-equation strong {
+      color: #f2f2f2;
+      font-size: .88rem;
+    }
+
+    #accountApp .credit-equation span {
+      color: var(--bluey-accent);
+      font-size: .82rem;
+      font-weight: 900;
+    }
+
+    #accountApp .manual-reload-panel {
+      display: grid;
+      grid-template-columns: minmax(9rem, 1fr) auto;
+      align-items: end;
+      gap: .65rem;
+      width: 100%;
+    }
+
+    #accountApp .reload-breakdown {
+      display: grid;
+      gap: .42rem;
+      margin: .82rem 0 0;
+      padding: 0;
+      list-style: none;
+    }
+
+    #accountApp .reload-breakdown li {
+      position: relative;
+      padding-left: .95rem;
+      color: #96a2aa;
+      font-size: .78rem;
+      line-height: 1.45;
+    }
+
+    #accountApp .reload-breakdown li::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: .55em;
+      width: .34rem;
+      height: .34rem;
+      border-radius: 50%;
+      background: var(--bluey-accent);
+      opacity: .75;
+    }
+
+    #accountApp .manual-reload-field {
+      display: grid;
+      gap: .35rem;
+      min-width: 0;
+      color: #6f7b84;
+      font-size: .68rem;
+      font-weight: 900;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+
+    #accountApp .manual-reload-input {
+      display: flex;
+      align-items: center;
+      gap: .35rem;
+      min-height: 42px;
+      border: 1px solid rgba(99, 216, 255, .26);
+      border-radius: 12px;
+      background: #101010;
+      color: var(--bluey-accent);
+      padding: 0 .72rem;
+      font-size: 1rem;
+      font-weight: 900;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+
+    #accountApp .manual-reload-input input {
+      width: 100%;
+      min-width: 0;
+      border: 0;
+      background: transparent;
+      color: #f2f2f2;
+      font: inherit;
+      outline: none;
+      padding: .45rem 0;
+    }
+
+    #accountApp .manual-reload-input:focus-within {
+      border-color: rgba(99, 216, 255, .62);
+      box-shadow: 0 0 0 3px rgba(99, 216, 255, .11);
+    }
+
+    #accountApp .manual-reload-rule {
+      margin-top: -.15rem;
+      color: #7f8b92;
+      font-size: .76rem;
+      line-height: 1.4;
+    }
+
+	    #accountApp .auto-reload-card {
+	      align-items: flex-start;
+	      border-color: rgba(99, 216, 255, .18);
+	      background: #080808;
+	    }
 
     #accountApp .auto-reload-card.is-on {
       border-color: rgba(115, 247, 186, .34);
@@ -1757,27 +1949,43 @@
 
     #accountApp .square-card-setup {
       display: grid;
-      grid-template-columns: minmax(14rem, 1fr) auto;
-      gap: .7rem;
-      align-items: start;
+      grid-template-columns: minmax(0, 1fr);
+      gap: .65rem;
+      align-items: stretch;
       margin-top: .85rem;
       max-width: 35rem;
+      padding: .85rem;
+      border: 1px solid rgba(255, 255, 255, .10);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, .035);
+    }
+
+    #accountApp .square-card-copy {
+      display: grid;
+      gap: .2rem;
+    }
+
+    #accountApp .square-card-copy strong {
+      color: #f2f2f2;
+      font-size: .88rem;
+    }
+
+    #accountApp .square-card-copy span {
+      color: #777;
+      font-size: .76rem;
+      line-height: 1.4;
     }
 
     #accountApp .square-card-container {
-      min-height: 2.9rem;
+      min-height: 3rem;
       border: 1px solid rgba(255, 255, 255, .14);
       border-radius: 10px;
-      background: #111;
+      background: #0e0e0e;
       padding: .65rem .75rem;
     }
 
-    #accountApp .square-card-setup .form-note {
-      grid-column: 1 / -1;
-      margin: -.15rem 0 0;
-      color: #666;
-      font-size: .72rem;
-      line-height: 1.35;
+    #accountApp .square-card-setup .account-button {
+      justify-self: start;
     }
 
     #accountApp .usage-list {
@@ -1787,6 +1995,7 @@
     }
 
     #accountApp .usage-row,
+    #accountApp .device-row,
     #accountApp .session-row {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto auto;
@@ -1799,6 +2008,148 @@
 
     #accountApp .usage-row:first-child {
       border-color: rgba(99, 216, 255, .22);
+    }
+
+    #accountApp .device-section {
+      border-color: rgba(255, 255, 255, .12);
+    }
+
+    #accountApp .device-summary-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      min-height: 58px;
+      margin-bottom: .9rem;
+      padding: .8rem 1rem;
+      border: 1px solid var(--bluey-line);
+      border-radius: 12px;
+      background: #0b0b0b;
+      color: #9a9a9a;
+      font-size: .95rem;
+      font-weight: 800;
+    }
+
+    #accountApp .device-summary-bar .account-actions-row {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: .5rem;
+    }
+
+    #accountApp .device-list {
+      display: grid;
+      gap: .75rem;
+    }
+
+    #accountApp .abuse-summary-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: .65rem;
+      margin-bottom: .8rem;
+    }
+
+    #accountApp .abuse-summary-item,
+    #accountApp .abuse-event-row {
+      padding: .85rem;
+      border: 1px solid rgba(255, 255, 255, .08);
+      border-radius: 8px;
+      background: #101010;
+    }
+
+    #accountApp .abuse-summary-item strong,
+    #accountApp .abuse-summary-item span,
+    #accountApp .abuse-event-row strong,
+    #accountApp .abuse-event-row span {
+      display: block;
+    }
+
+    #accountApp .abuse-summary-item strong {
+      color: var(--bluey-text);
+      font-size: 1.35rem;
+    }
+
+    #accountApp .abuse-summary-item span,
+    #accountApp .abuse-event-row span {
+      margin-top: .2rem;
+      color: var(--bluey-muted);
+      font-size: .82rem;
+    }
+
+    #accountApp .abuse-event-list {
+      display: grid;
+      gap: .55rem;
+    }
+
+    #accountApp .device-row {
+      grid-template-columns: minmax(0, 1fr) auto;
+      min-height: 86px;
+      padding: .95rem 1rem;
+      background: #101010;
+      border-color: rgba(255, 255, 255, .08);
+    }
+
+    #accountApp .device-main {
+      display: grid;
+      grid-template-columns: 46px minmax(0, 1fr);
+      gap: .85rem;
+      align-items: center;
+      min-width: 0;
+    }
+
+    #accountApp .device-icon {
+      display: inline-grid;
+      place-items: center;
+      width: 46px;
+      height: 46px;
+      border-radius: 10px;
+      background: #1b1b1b;
+      color: #f2f2f2;
+      font-size: .72rem;
+      font-weight: 900;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+
+    #accountApp .device-title {
+      display: flex;
+      align-items: center;
+      gap: .45rem;
+      min-width: 0;
+      color: #e0e0e0;
+      font-weight: 800;
+      font-size: 1rem;
+    }
+
+    #accountApp .device-kind {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      background: rgba(115, 247, 186, .10);
+      color: #73f7ba;
+      padding: .12rem .45rem;
+      font-size: .66rem;
+      font-weight: 900;
+      line-height: 1.1;
+      text-transform: uppercase;
+    }
+
+    #accountApp .device-meta {
+      display: block;
+      margin-top: .22rem;
+      color: #666;
+      font-size: .75rem;
+      line-height: 1.4;
+    }
+
+    #accountApp .device-meta strong {
+      color: #aab5bc;
+      font-weight: 800;
+    }
+
+    #accountApp .device-meta .device-stale {
+      color: #ff747d;
+      font-weight: 900;
     }
 
     #accountApp .dashboard-section {
@@ -2393,6 +2744,14 @@
         grid-template-columns: 1fr;
       }
 
+      #accountApp .billing-grid {
+        grid-template-columns: 1fr;
+      }
+
+      #accountApp .manual-reload-panel {
+        grid-template-columns: 1fr;
+      }
+
       #downloadApp .download-hero,
       #downloadApp .platform-grid,
       #downloadApp .commands {
@@ -2445,6 +2804,20 @@
       #accountApp .section-head {
         flex-direction: column;
         align-items: flex-start;
+      }
+
+      #accountApp .device-row {
+        grid-template-columns: 1fr;
+      }
+
+      #accountApp .device-summary-bar {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      #accountApp .device-summary-bar .account-actions-row {
+        width: 100%;
+        justify-content: flex-start;
       }
     }
 
@@ -2546,6 +2919,116 @@
     #accountApp .account-top .nav-cta:hover {
       color: #061114;
       background: #8ff5ff;
+    }
+
+    #accountApp .account-profile {
+      position: relative;
+      display: inline-flex;
+      align-items: center;
+    }
+
+    #accountApp .profile-button {
+      position: relative;
+      display: inline-grid;
+      place-items: center;
+      width: 38px;
+      height: 38px;
+      border: 1px solid rgba(99, 216, 255, .48);
+      border-radius: 50%;
+      background: rgba(99, 216, 255, .06);
+      color: var(--bluey-accent);
+      cursor: pointer;
+      transition: border-color .18s ease, background .18s ease, box-shadow .18s ease;
+    }
+
+    #accountApp .profile-button:hover,
+    #accountApp .profile-button[aria-expanded="true"] {
+      border-color: rgba(99, 216, 255, .82);
+      background: rgba(99, 216, 255, .12);
+      box-shadow: 0 0 20px rgba(99, 216, 255, .16);
+    }
+
+    #accountApp .profile-glyph {
+      position: relative;
+      width: 18px;
+      height: 18px;
+    }
+
+    #accountApp .profile-glyph::before,
+    #accountApp .profile-glyph::after {
+      content: "";
+      position: absolute;
+      left: 50%;
+      transform: translateX(-50%);
+      border: 2px solid currentColor;
+    }
+
+    #accountApp .profile-glyph::before {
+      top: 1px;
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: transparent;
+    }
+
+    #accountApp .profile-glyph::after {
+      bottom: 1px;
+      width: 15px;
+      height: 8px;
+      border-bottom: 0;
+      border-radius: 12px 12px 0 0;
+    }
+
+    #accountApp .account-profile-menu {
+      position: absolute;
+      top: calc(100% + .7rem);
+      right: 0;
+      z-index: 100;
+      min-width: 260px;
+      overflow: hidden;
+      border: 1px solid #242424;
+      border-radius: 12px;
+      background: #0d0d0d;
+      box-shadow: 0 18px 42px rgba(0, 0, 0, .42);
+    }
+
+    #accountApp .profile-email {
+      padding: 1rem 1.1rem;
+      border-bottom: 1px solid #1d1d1d;
+      color: #777;
+      font-size: .9rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    #accountApp .account-profile-menu a,
+    #accountApp .account-profile-menu button {
+      display: flex;
+      width: 100%;
+      min-height: 46px;
+      align-items: center;
+      padding: 0 1.1rem;
+      border: 0;
+      border-bottom: 1px solid #1d1d1d;
+      background: transparent;
+      color: #e0e0e0;
+      cursor: pointer;
+      font: inherit;
+      font-size: .95rem;
+      text-align: left;
+      text-decoration: none;
+    }
+
+    #accountApp .account-profile-menu a:hover,
+    #accountApp .account-profile-menu button:hover {
+      background: #141414;
+      color: var(--bluey-accent);
+    }
+
+    #accountApp .account-profile-menu .danger {
+      border-bottom: 0;
+      color: #ff747d;
     }
 
     #accountApp.is-guest .account-top {

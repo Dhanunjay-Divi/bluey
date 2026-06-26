@@ -567,7 +567,7 @@ fn upsert_batch_postgres(
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
-        let embedding_vector = record.embedding.as_ref().and_then(vector_literal_1536);
+        let embedding_vector = record.embedding.as_deref().and_then(vector_literal_1536);
         tx.execute(
             "INSERT INTO cloud_rag_chunks (
                 account_id, chunk_id, session_id, source_kind, source_id, chunk_index,
@@ -701,6 +701,17 @@ pub fn load_session(
     })
 }
 
+pub fn load_context_artifact(
+    pool: &DbPool,
+    account_id: &str,
+    artifact_id: &str,
+) -> Result<Option<SyncContextArtifactRecord>> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => load_context_artifact_sqlite(pool, account_id, artifact_id),
+        DbPool::Postgres(_) => load_context_artifact_postgres(pool, account_id, artifact_id),
+    })
+}
+
 fn load_session_sqlite(
     pool: &DbPool,
     account_id: &str,
@@ -770,6 +781,69 @@ fn load_session_postgres(
         context_artifacts: load_context_pg(&mut conn, account_id, session_id)?,
         session,
     }))
+}
+
+fn load_context_artifact_sqlite(
+    pool: &DbPool,
+    account_id: &str,
+    artifact_id: &str,
+) -> Result<Option<SyncContextArtifactRecord>> {
+    let conn = pool.get().context("get db conn")?;
+    conn.query_row(
+        "SELECT artifact_id, session_id, kind, title, note, source_uri,
+                content_hash, text_preview, created_at_ms, metadata_json
+         FROM cloud_context_artifacts
+         WHERE account_id = ?1 AND artifact_id = ?2",
+        params![account_id, artifact_id],
+        |row| {
+            let metadata: String = row.get(9)?;
+            Ok(SyncContextArtifactRecord {
+                artifact_id: row.get(0)?,
+                session_id: row.get(1)?,
+                kind: row.get(2)?,
+                title: row.get(3)?,
+                note: row.get(4)?,
+                source_uri: row.get(5)?,
+                content_hash: row.get(6)?,
+                text_preview: row.get(7)?,
+                created_at_ms: row.get(8)?,
+                metadata: parse_json(&metadata),
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn load_context_artifact_postgres(
+    pool: &DbPool,
+    account_id: &str,
+    artifact_id: &str,
+) -> Result<Option<SyncContextArtifactRecord>> {
+    let mut conn = pool.get_pg().context("get postgres db conn")?;
+    let row = conn.query_opt(
+        "SELECT artifact_id, session_id, kind, title, note, source_uri,
+                content_hash, text_preview, created_at_ms, metadata_json
+         FROM cloud_context_artifacts
+         WHERE account_id = $1 AND artifact_id = $2",
+        &[&account_id, &artifact_id],
+    )?;
+    row.map(|row| {
+        let metadata: String = row.try_get(9)?;
+        Ok(SyncContextArtifactRecord {
+            artifact_id: row.try_get(0)?,
+            session_id: row.try_get(1)?,
+            kind: row.try_get(2)?,
+            title: row.try_get(3)?,
+            note: row.try_get(4)?,
+            source_uri: row.try_get(5)?,
+            content_hash: row.try_get(6)?,
+            text_preview: row.try_get(7)?,
+            created_at_ms: row.try_get(8)?,
+            metadata: parse_json(&metadata),
+        })
+    })
+    .transpose()
 }
 
 pub fn query_rag(
@@ -1166,7 +1240,7 @@ fn load_context_pg(
         .collect()
 }
 
-fn vector_literal_1536(values: &Vec<f32>) -> Option<String> {
+fn vector_literal_1536(values: &[f32]) -> Option<String> {
     if values.len() != 1536 {
         return None;
     }

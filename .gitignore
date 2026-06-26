@@ -19,3 +19,9 @@ server/*.db
 server/*.db-journal
 server/*.db-shm
 server/*.db-wal
+
+# Local daemon/server development databases.
+bluey-dev.db
+bluey-dev.db-journal
+bluey-dev.db-shm
+bluey-dev.db-wal

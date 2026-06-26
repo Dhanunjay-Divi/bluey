@@ -182,6 +182,11 @@ mod tests {
             upstream_spend_guard: None,
             smtp: None,
             admin_emails: vec![],
+            trial_abuse: crate::config::TrialAbuseConfig::default(),
+            turnstile_site_key: None,
+            turnstile_secret_key: None,
+            require_turnstile: false,
+            object_storage: None,
         }
     }
 

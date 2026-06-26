@@ -58,10 +58,23 @@ pub enum ListeningState {
 pub enum OverlayIpcCommand {
     Pong,
     RequestSync,
-    Echo { payload: String },
-    AskRequested { question: String },
-    AttachFilesRequested { paths: Vec<String> },
-    InstructionsUpdated { instructions: String },
+    Echo {
+        payload: String,
+    },
+    AskRequested {
+        question: String,
+    },
+    AttachFilesRequested {
+        paths: Vec<String>,
+    },
+    InstructionsUpdated {
+        instructions: String,
+    },
+    PasteTextRequested {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_bundle_id: Option<String>,
+    },
 }
 
 /// Wrapper for overlay events that includes the session token for validation.
@@ -102,6 +115,7 @@ pub enum OverlayEventKind {
     AskRequested,
     AttachFilesRequested,
     InstructionsUpdated,
+    PasteTextRequested,
 }
 
 impl OverlayEventKind {
@@ -113,13 +127,18 @@ impl OverlayEventKind {
             OverlayIpcCommand::AskRequested { .. } => Self::AskRequested,
             OverlayIpcCommand::AttachFilesRequested { .. } => Self::AttachFilesRequested,
             OverlayIpcCommand::InstructionsUpdated { .. } => Self::InstructionsUpdated,
+            OverlayIpcCommand::PasteTextRequested { .. } => Self::PasteTextRequested,
         }
     }
 
     /// Returns true if this event kind is allowed in the given UI state.
     pub fn is_allowed_in(self, state: OverlayUiState) -> bool {
         match self {
-            Self::Pong | Self::RequestSync | Self::Echo | Self::AskRequested => true,
+            Self::Pong
+            | Self::RequestSync
+            | Self::Echo
+            | Self::AskRequested
+            | Self::PasteTextRequested => true,
             Self::AttachFilesRequested => {
                 state == OverlayUiState::Idle || state == OverlayUiState::AttachOpen
             }
@@ -167,6 +186,27 @@ pub fn validate_command_lengths(cmd: &OverlayIpcCommand) -> Result<(), String> {
                     instructions.len(),
                     MAX_INSTRUCTIONS_LEN
                 ));
+            }
+        }
+        OverlayIpcCommand::PasteTextRequested {
+            text,
+            target_bundle_id,
+        } => {
+            if text.len() > MAX_TEXT_LEN {
+                return Err(format!(
+                    "text field exceeds max length ({} > {})",
+                    text.len(),
+                    MAX_TEXT_LEN
+                ));
+            }
+            if let Some(target_bundle_id) = target_bundle_id {
+                if target_bundle_id.len() > MAX_QUESTION_LEN {
+                    return Err(format!(
+                        "target_bundle_id field exceeds max length ({} > {})",
+                        target_bundle_id.len(),
+                        MAX_QUESTION_LEN
+                    ));
+                }
             }
         }
         OverlayIpcCommand::Echo { payload } => {
@@ -316,6 +356,15 @@ mod tests {
     }
 
     #[test]
+    fn paste_text_requested_allowed_in_all_states() {
+        assert!(OverlayEventKind::PasteTextRequested.is_allowed_in(OverlayUiState::Idle));
+        assert!(OverlayEventKind::PasteTextRequested.is_allowed_in(OverlayUiState::AttachOpen));
+        assert!(
+            OverlayEventKind::PasteTextRequested.is_allowed_in(OverlayUiState::InstructionsOpen)
+        );
+    }
+
+    #[test]
     fn attach_files_allowed_from_idle_or_attach_open() {
         assert!(OverlayEventKind::AttachFilesRequested.is_allowed_in(OverlayUiState::Idle));
         assert!(OverlayEventKind::AttachFilesRequested.is_allowed_in(OverlayUiState::AttachOpen));
@@ -353,6 +402,15 @@ mod tests {
     fn overlong_instructions_rejected() {
         let cmd = OverlayIpcCommand::InstructionsUpdated {
             instructions: "y".repeat(MAX_INSTRUCTIONS_LEN + 1),
+        };
+        assert!(validate_command_lengths(&cmd).is_err());
+    }
+
+    #[test]
+    fn overlong_paste_text_rejected() {
+        let cmd = OverlayIpcCommand::PasteTextRequested {
+            text: "p".repeat(MAX_TEXT_LEN + 1),
+            target_bundle_id: None,
         };
         assert!(validate_command_lengths(&cmd).is_err());
     }

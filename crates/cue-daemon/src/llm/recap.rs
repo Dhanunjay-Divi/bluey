@@ -103,6 +103,7 @@ mod tests {
                 cost: None,
                 cost_label: None,
                 artifact: None,
+                sources: Vec::new(),
             })
         }
     }

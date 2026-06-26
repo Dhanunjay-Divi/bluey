@@ -26,6 +26,7 @@ impl LlmProvider for MockStreamingLlm {
             cost: None,
             cost_label: None,
             artifact: None,
+            sources: Vec::new(),
         })
     }
 
@@ -37,6 +38,8 @@ impl LlmProvider for MockStreamingLlm {
                 cost: None,
                 cost_label: None,
                 artifact: None,
+                status: None,
+                sources: Vec::new(),
             }),
             Ok(LlmChunk {
                 text: " world".into(),
@@ -44,6 +47,8 @@ impl LlmProvider for MockStreamingLlm {
                 cost: None,
                 cost_label: None,
                 artifact: None,
+                status: None,
+                sources: Vec::new(),
             }),
             Ok(LlmChunk {
                 text: "!".into(),
@@ -51,6 +56,8 @@ impl LlmProvider for MockStreamingLlm {
                 cost: None,
                 cost_label: None,
                 artifact: None,
+                status: None,
+                sources: Vec::new(),
             }),
         ];
         Ok(Box::pin(futures_util::stream::iter(chunks)))
@@ -210,6 +217,7 @@ async fn non_streaming_provider_still_calls_callback() {
                 cost: None,
                 cost_label: None,
                 artifact: None,
+                sources: Vec::new(),
             })
         }
     }

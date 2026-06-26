@@ -101,9 +101,7 @@ pub(crate) fn reserve_session(
             reserved_cents,
         ) = match pool {
             DbPool::Sqlite(_) => {
-                let mut conn = pool
-                    .get()
-                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                let mut conn = pool.get().map_err(SttAccountingError::Db)?;
                 let tx = conn
                     .transaction()
                     .map_err(|err| SttAccountingError::Db(err.into()))?;
@@ -175,9 +173,7 @@ pub(crate) fn reserve_session(
                 )
             }
             DbPool::Postgres(_) => {
-                let mut conn = pool
-                    .get_pg()
-                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                let mut conn = pool.get_pg().map_err(SttAccountingError::Db)?;
                 let mut tx = conn
                     .transaction()
                     .map_err(|err| SttAccountingError::Db(err.into()))?;
@@ -272,9 +268,7 @@ pub(crate) fn claim_relay_session(
     crate::db::run_blocking_db(|| {
         let session = match pool {
             DbPool::Sqlite(_) => {
-                let conn = pool
-                    .get()
-                    .map_err(|err| ClaimSttSessionError::Db(err.into()))?;
+                let conn = pool.get().map_err(ClaimSttSessionError::Db)?;
                 conn.query_row(
                 "SELECT account_id, bluey_session_id, provider, model, source, max_seconds, expires_at_ms,
                         reserved_cents, reserved_trial_seconds
@@ -301,9 +295,7 @@ pub(crate) fn claim_relay_session(
             .ok_or(ClaimSttSessionError::InvalidSession)?
             }
             DbPool::Postgres(_) => {
-                let mut conn = pool
-                    .get_pg()
-                    .map_err(|err| ClaimSttSessionError::Db(err.into()))?;
+                let mut conn = pool.get_pg().map_err(ClaimSttSessionError::Db)?;
                 let row = conn
                 .query_opt(
                     "SELECT account_id, bluey_session_id, provider, model, source, max_seconds, expires_at_ms,
@@ -354,9 +346,7 @@ pub(crate) fn claim_relay_session(
         }
         let updated = match pool {
             DbPool::Sqlite(_) => {
-                let conn = pool
-                    .get()
-                    .map_err(|err| ClaimSttSessionError::Db(err.into()))?;
+                let conn = pool.get().map_err(ClaimSttSessionError::Db)?;
                 conn.execute(
                     "UPDATE stt_sessions
                     SET started_at_ms = ?1
@@ -370,9 +360,7 @@ pub(crate) fn claim_relay_session(
                 .map_err(|err| ClaimSttSessionError::Db(err.into()))?
             }
             DbPool::Postgres(_) => {
-                let mut conn = pool
-                    .get_pg()
-                    .map_err(|err| ClaimSttSessionError::Db(err.into()))?;
+                let mut conn = pool.get_pg().map_err(ClaimSttSessionError::Db)?;
                 conn.execute(
                     "UPDATE stt_sessions
                     SET started_at_ms = $1
@@ -417,9 +405,7 @@ pub(crate) fn settle_session(
         ) =
             match pool {
                 DbPool::Sqlite(_) => {
-                    let mut conn = pool
-                        .get()
-                        .map_err(|err| SttAccountingError::Db(err.into()))?;
+                    let mut conn = pool.get().map_err(SttAccountingError::Db)?;
                     let tx = conn
                         .transaction()
                         .map_err(|err| SttAccountingError::Db(err.into()))?;
@@ -522,9 +508,7 @@ pub(crate) fn settle_session(
                     )
                 }
                 DbPool::Postgres(_) => {
-                    let mut conn = pool
-                        .get_pg()
-                        .map_err(|err| SttAccountingError::Db(err.into()))?;
+                    let mut conn = pool.get_pg().map_err(SttAccountingError::Db)?;
                     let mut tx = conn
                         .transaction()
                         .map_err(|err| SttAccountingError::Db(err.into()))?;
@@ -715,9 +699,9 @@ mod tests {
     #[test]
     fn reserving_one_stt_source_blocks_second_when_balance_only_covers_one() {
         let pool = temp_pool();
-        let account_id = create_paid_account(&pool, "one-source@example.com", 11);
+        let account_id = create_paid_account(&pool, "one-source@example.com", 28);
         let first = reserve_session(&pool, input(&account_id, "stt-1", 600)).unwrap();
-        assert_eq!(first.reserved_cents, 11);
+        assert_eq!(first.reserved_cents, 28);
 
         let second = reserve_session(&pool, input(&account_id, "stt-2", 600)).unwrap_err();
         assert!(matches!(second, SttAccountingError::InsufficientBalance));
@@ -731,7 +715,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(balance_cents, 0);
-        assert_eq!(reserved_cents, 11);
+        assert_eq!(reserved_cents, 28);
     }
 
     #[test]
@@ -739,7 +723,7 @@ mod tests {
         let pool = temp_pool();
         let account_id = create_paid_account(&pool, "refund@example.com", 1000);
         let reserved = reserve_session(&pool, input(&account_id, "stt-refund", 600)).unwrap();
-        assert_eq!(reserved.reserved_cents, 11);
+        assert_eq!(reserved.reserved_cents, 28);
 
         let settled = settle_session(
             &pool,
@@ -751,8 +735,8 @@ mod tests {
             70_000,
         )
         .unwrap();
-        assert_eq!(settled.customer_cents, 2);
-        assert_eq!(settled.refunded_cents, 9);
+        assert_eq!(settled.customer_cents, 3);
+        assert_eq!(settled.refunded_cents, 25);
 
         let conn = pool.get().unwrap();
         let (balance_cents, reserved_cents): (i64, i64) = conn
@@ -769,9 +753,9 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(balance_cents, 998);
+        assert_eq!(balance_cents, 997);
         assert_eq!(reserved_cents, 0);
-        assert_eq!(batch_remaining, 998);
+        assert_eq!(batch_remaining, 997);
     }
 
     #[test]

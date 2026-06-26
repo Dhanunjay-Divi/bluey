@@ -64,3 +64,15 @@ pub async fn echo_peer_key(req: axum::extract::Request) -> impl IntoResponse {
     let key = crate::rate_limit::client_key_for_test(&req);
     (StatusCode::OK, Json(serde_json::json!({"peer_key": key})))
 }
+
+/// Admin-only trial abuse summary. Returns hashed signals only.
+pub async fn trial_abuse(State(state): State<AppState>) -> impl IntoResponse {
+    match crate::db::trial_abuse::admin_summary(&state.pool, 100) {
+        Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+            .into_response(),
+    }
+}

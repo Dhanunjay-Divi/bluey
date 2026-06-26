@@ -23,6 +23,14 @@ pub trait EmbeddingProvider: Send + Sync {
     fn name(&self) -> &'static str;
     fn dim(&self) -> usize;
     async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError>;
+
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        let mut vectors = Vec::with_capacity(texts.len());
+        for text in texts {
+            vectors.push(self.embed(text).await?);
+        }
+        Ok(vectors)
+    }
 }
 
 /// OpenAI text-embedding-3-small (1536 dimensions).
@@ -54,9 +62,19 @@ impl EmbeddingProvider for OpenAiEmbedder {
     }
 
     async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        let mut vectors = self.embed_batch(&[text.to_string()]).await?;
+        vectors
+            .pop()
+            .ok_or_else(|| EmbeddingError::InvalidResponse("missing embedding".into()))
+    }
+
+    async fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
         let body = serde_json::json!({
             "model": Self::MODEL,
-            "input": text,
+            "input": texts,
         });
         let resp = self
             .client
@@ -78,22 +96,37 @@ impl EmbeddingProvider for OpenAiEmbedder {
             .await
             .map_err(|e| EmbeddingError::InvalidResponse(e.to_string()))?;
 
-        let embedding = json["data"][0]["embedding"]
+        let data = json["data"]
             .as_array()
-            .ok_or_else(|| EmbeddingError::InvalidResponse("missing data[0].embedding".into()))?
-            .iter()
-            .map(|v| v.as_f64().unwrap_or(0.0) as f32)
-            .collect::<Vec<f32>>();
-
-        if embedding.len() != Self::DIM {
+            .ok_or_else(|| EmbeddingError::InvalidResponse("missing data".into()))?;
+        if data.len() != texts.len() {
             return Err(EmbeddingError::InvalidResponse(format!(
-                "expected {} dims, got {}",
-                Self::DIM,
-                embedding.len()
+                "expected {} embeddings, got {}",
+                texts.len(),
+                data.len()
             )));
         }
 
-        Ok(embedding)
+        let mut embeddings = Vec::with_capacity(data.len());
+        for item in data {
+            let embedding = item["embedding"]
+                .as_array()
+                .ok_or_else(|| EmbeddingError::InvalidResponse("missing embedding".into()))?
+                .iter()
+                .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                .collect::<Vec<f32>>();
+
+            if embedding.len() != Self::DIM {
+                return Err(EmbeddingError::InvalidResponse(format!(
+                    "expected {} dims, got {}",
+                    Self::DIM,
+                    embedding.len()
+                )));
+            }
+            embeddings.push(embedding);
+        }
+
+        Ok(embeddings)
     }
 }
 

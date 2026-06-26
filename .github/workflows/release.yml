@@ -31,11 +31,14 @@ jobs:
     strategy:
       matrix:
         include:
-          # v0.1.0 GA scope is macOS arm64 only. Re-enable the other
-          # platforms after R13.5 expands the tested support matrix.
-          - os: macos-latest
+          - os: macos-14
             target: aarch64-apple-darwin
             platform: darwin-arm64
+            swift_arch: arm64
+          - os: macos-13
+            target: x86_64-apple-darwin
+            platform: darwin-x86_64
+            swift_arch: x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -59,7 +62,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Setup Node.js
-        if: matrix.os == 'macos-latest'
+        if: startsWith(matrix.os, 'macos-')
         uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -94,7 +97,7 @@ jobs:
           cargo build --release --target ${{ matrix.target }} -p cue-daemon -p cue-cli
 
       - name: Build macOS dashboard app
-        if: matrix.os == 'macos-latest'
+        if: startsWith(matrix.os, 'macos-')
         shell: bash
         run: |
           cd crates/cue-dashboard/ui
@@ -104,7 +107,9 @@ jobs:
           cargo tauri build --release --target ${{ matrix.target }} --bundles app
 
       - name: Build macOS native helpers
-        if: matrix.os == 'macos-latest'
+        if: startsWith(matrix.os, 'macos-')
+        env:
+          BLUEY_SWIFT_ARCH: ${{ matrix.swift_arch }}
         run: |
           shopt -s nullglob
           for helper in native/macos/*/build.sh; do
@@ -138,7 +143,10 @@ jobs:
               cp "$f" staging/bin/ 2>/dev/null || true
             fi
           done
-          if [ "${{ matrix.os }}" = "macos-latest" ]; then
+          if [ -d "target/release/BlueyFilePicker.app" ]; then
+            cp -R "target/release/BlueyFilePicker.app" staging/bin/BlueyFilePicker.app
+          fi
+          if [[ "${{ matrix.os }}" == macos-* ]]; then
             APP_SRC=""
             for app_dir in "target/${{ matrix.target }}/release/bundle/macos" "target/release/bundle/macos"; do
               if [ -d "$app_dir" ]; then
@@ -169,6 +177,10 @@ jobs:
             if [ -d "target/release/BlueyOverlay.app" ]; then
               cp -R "target/release/BlueyOverlay.app" \
                 staging/Bluey.app/Contents/Resources/BlueyOverlay.app
+            fi
+            if [ -d "target/release/BlueyFilePicker.app" ]; then
+              cp -R "target/release/BlueyFilePicker.app" \
+                staging/Bluey.app/Contents/Resources/BlueyFilePicker.app
             fi
           fi
           tar -czf "bluey-${VERSION}-${{ matrix.platform }}.tar.gz" -C staging .

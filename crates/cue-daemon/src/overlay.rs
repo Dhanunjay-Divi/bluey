@@ -61,9 +61,8 @@ impl OverlaySpawnOptions {
 // ─── Item 1: Production overlay-bin override gate ───────────────────────────
 
 /// Resolve the overlay binary path. In production (release) builds, env var
-/// overrides (BLUEY_OVERLAY_BIN / CUE_OVERLAY_BIN) are IGNORED unless
-/// BLUEY_DEV_OVERLAY=1 is also set. In debug builds the override is always
-/// accepted.
+/// overrides are ignored. In debug builds the override is accepted so local QA
+/// can point at an uninstalled helper.
 pub fn resolve_overlay_path(default: &Path) -> PathBuf {
     let dev_mode = is_dev_mode();
     if dev_mode {
@@ -74,8 +73,7 @@ pub fn resolve_overlay_path(default: &Path) -> PathBuf {
     } else if let Some(p) = env_overlay_bin() {
         tracing::warn!(
             path = %p.display(),
-            "BLUEY_OVERLAY_BIN/CUE_OVERLAY_BIN set but IGNORED in production build \
-             (set BLUEY_DEV_OVERLAY=1 to enable)"
+            "overlay binary override set but ignored in production build"
         );
     }
     default.to_path_buf()
@@ -89,12 +87,7 @@ pub fn is_dev_overlay_enabled() -> bool {
 
 /// Returns true when we should allow env-var overrides.
 fn is_dev_mode() -> bool {
-    if cfg!(debug_assertions) {
-        return true;
-    }
-    std::env::var("BLUEY_DEV_OVERLAY")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    cfg!(debug_assertions)
 }
 
 fn env_overlay_bin() -> Option<PathBuf> {
@@ -450,6 +443,16 @@ async fn run_one_child(
                                 let _ =
                                     recv_tx_reader.send(OverlayIpcCommand::InstructionsUpdated {
                                         instructions: instructions.clone(),
+                                    });
+                            }
+                            OverlayIpcCommand::PasteTextRequested {
+                                text,
+                                target_bundle_id,
+                            } => {
+                                let _ =
+                                    recv_tx_reader.send(OverlayIpcCommand::PasteTextRequested {
+                                        text: text.clone(),
+                                        target_bundle_id: target_bundle_id.clone(),
                                     });
                             }
                         }

@@ -35,7 +35,17 @@ impl RagPipeline {
     /// Index a transcript segment. Chunks the text, embeds each chunk, and stores.
     /// Errors are logged but never propagated (fire-and-forget for live indexing).
     pub async fn index_transcript(&self, session_id: &str, text: &str) {
-        self.index_text(session_id, text).await;
+        self.index_text(
+            session_id,
+            text,
+            RagIndexSource {
+                kind: "transcript",
+                id: "",
+                title: "",
+                path: "",
+            },
+        )
+        .await;
     }
 
     /// Index a user-approved context artifact such as a document, page capture,
@@ -48,7 +58,7 @@ impl RagPipeline {
         if artifact.processing_status != ContextProcessingStatus::Ready {
             return;
         }
-        let Some(body) = artifact_context_text(artifact) else {
+        let Some(body) = artifact_context_text(session_id, artifact) else {
             return;
         };
 
@@ -67,26 +77,78 @@ impl RagPipeline {
         text.push_str("\n\n");
         text.push_str(body.trim());
 
-        self.index_text(session_id, &text).await;
+        let artifact_kind = artifact.kind.to_string();
+        let artifact_id = artifact.id.to_string();
+        self.index_text(
+            session_id,
+            &text,
+            RagIndexSource {
+                kind: &artifact_kind,
+                id: &artifact_id,
+                title: &artifact.title,
+                path: &artifact.path,
+            },
+        )
+        .await;
     }
 
-    async fn index_text(&self, session_id: &str, text: &str) {
+    async fn index_text(&self, session_id: &str, text: &str, source: RagIndexSource<'_>) {
         let chunks = self.chunker.chunk(text);
         if chunks.is_empty() {
             return;
         }
+        let chunk_count = chunks.len();
+        let text_chars = text.chars().count();
 
-        for chunk in &chunks {
-            match self.embedder.embed(&chunk.text).await {
-                Ok(embedding) => {
+        let texts = chunks
+            .iter()
+            .map(|chunk| chunk.text.clone())
+            .collect::<Vec<_>>();
+        match self.embedder.embed_batch(&texts).await {
+            Ok(embeddings) => {
+                if embeddings.len() != chunks.len() {
+                    warn!(
+                        session_id,
+                        source_kind = source.kind,
+                        source_id = source.id,
+                        source_title = source.title,
+                        source_path = source.path,
+                        chunks = chunk_count,
+                        text_chars,
+                        expected = chunks.len(),
+                        actual = embeddings.len(),
+                        "RAG embedding batch returned the wrong number of vectors"
+                    );
+                    return;
+                }
+                for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
                     let store = self.store.lock().await;
-                    if let Err(e) = store.index(session_id, chunk, &embedding) {
-                        warn!("RAG index store error: {e}");
+                    if let Err(e) = store.index(session_id, chunk, embedding) {
+                        warn!(
+                            session_id,
+                            source_kind = source.kind,
+                            source_id = source.id,
+                            source_title = source.title,
+                            source_path = source.path,
+                            chunk_start = chunk.start_char,
+                            chunks = chunk_count,
+                            text_chars,
+                            "RAG index store error: {e}"
+                        );
                     }
                 }
-                Err(e) => {
-                    warn!("RAG embedding error: {e}");
-                }
+            }
+            Err(e) => {
+                warn!(
+                    session_id,
+                    source_kind = source.kind,
+                    source_id = source.id,
+                    source_title = source.title,
+                    source_path = source.path,
+                    chunks = chunk_count,
+                    text_chars,
+                    "RAG embedding error: {e}"
+                );
             }
         }
     }
@@ -107,6 +169,25 @@ impl RagPipeline {
         store.query(&query_embedding, limit, session_id)
     }
 
+    /// Query current-session and global memory using one embedding request.
+    pub async fn query_current_and_global(
+        &self,
+        query_text: &str,
+        current_limit: usize,
+        current_session_id: &str,
+        global_limit: usize,
+    ) -> Result<(Vec<RagHit>, Vec<RagHit>)> {
+        let query_embedding = self
+            .embedder
+            .embed(query_text)
+            .await
+            .map_err(|e| anyhow::anyhow!("embedding query failed: {e}"))?;
+        let store = self.store.lock().await;
+        let current = store.query(&query_embedding, current_limit, Some(current_session_id))?;
+        let global = store.query(&query_embedding, global_limit, None)?;
+        Ok((current, global))
+    }
+
     /// Delete all indexed data for a session.
     pub async fn delete_session(&self, session_id: &str) -> Result<usize> {
         let store = self.store.lock().await;
@@ -114,7 +195,14 @@ impl RagPipeline {
     }
 }
 
-fn artifact_context_text(artifact: &ContextArtifact) -> Option<String> {
+struct RagIndexSource<'a> {
+    kind: &'a str,
+    id: &'a str,
+    title: &'a str,
+    path: &'a str,
+}
+
+fn artifact_context_text(session_id: &str, artifact: &ContextArtifact) -> Option<String> {
     if let Some(path) = artifact
         .markdown_path
         .as_deref()
@@ -124,7 +212,11 @@ fn artifact_context_text(artifact: &ContextArtifact) -> Option<String> {
             Ok(markdown) if !markdown.trim().is_empty() => return Some(markdown),
             Ok(_) => {}
             Err(error) => warn!(
+                session_id,
                 artifact_id = %artifact.id,
+                artifact_kind = %artifact.kind,
+                artifact_title = %artifact.title,
+                source_path = %artifact.path,
                 path,
                 "failed to read local Markdown artifact for RAG indexing: {error:#}"
             ),

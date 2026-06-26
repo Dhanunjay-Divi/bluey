@@ -12,6 +12,16 @@ cd "$ROOT"
 
 PUBLISH_HOST="${PUBLISH_HOST:-root@165.227.77.152}"
 PUBLISH_PATH="${PUBLISH_PATH:-/var/www/bluey}"
+CURL_BIN="${CURL_BIN:-curl}"
+
+if ! command -v "$CURL_BIN" >/dev/null 2>&1; then
+    if [ -x /usr/bin/curl ]; then
+        CURL_BIN="/usr/bin/curl"
+    else
+        echo "[manual-deploy] curl not found; set CURL_BIN=/path/to/curl" >&2
+        exit 1
+    fi
+fi
 
 echo "[manual-deploy] host=$PUBLISH_HOST path=$PUBLISH_PATH"
 
@@ -36,9 +46,19 @@ PUBLISH_PATH="$PUBLISH_PATH" \
 scripts/publish-bluey-release.sh
 
 echo "[manual-deploy] live checks"
-curl -fsS "https://bluey.sh/health" >/dev/null
-curl -fsS "https://bluey.sh/latest.json" >/dev/null
-curl -fsS "https://bluey.sh/install.sh" >/dev/null
-curl -fsS "https://bluey.sh/install.ps1" >/dev/null
+"$CURL_BIN" -fsS "https://bluey.sh/health" >/dev/null
+"$CURL_BIN" -fsS "https://bluey.sh/latest.json" >/dev/null
+"$CURL_BIN" -fsS "https://bluey.sh/install.sh" >/dev/null
+"$CURL_BIN" -fsS "https://bluey.sh/install.ps1" >/dev/null
+for path in \
+    "/llms.txt" \
+    "/robots.txt" \
+    "/sitemap.xml" \
+    "/how-bluey-works/" \
+    "/bluey-faq/" \
+    "/engineering-meeting-copilot/"
+do
+    "$CURL_BIN" -fsS "https://bluey.sh${path}" >/dev/null
+done
 
 echo "[manual-deploy] done"

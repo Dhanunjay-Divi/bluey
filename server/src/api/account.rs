@@ -1,6 +1,10 @@
 //! Account endpoints — real implementations.
 
-use axum::{extract::State, http::StatusCode, Extension, Json};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    Extension, Json,
+};
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
@@ -39,6 +43,21 @@ pub struct ApiError {
     pub error: String,
 }
 
+#[derive(Serialize)]
+pub struct AccountDevice {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+    pub expires_at: String,
+}
+
+#[derive(Serialize)]
+pub struct AccountDevicesResponse {
+    pub devices: Vec<AccountDevice>,
+}
+
 #[derive(Deserialize)]
 pub struct BillingSettingsRequest {
     pub auto_topup_enabled: bool,
@@ -51,6 +70,54 @@ pub async fn me(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
 ) -> Json<AccountMe> {
     Json(account_me_payload(&state, account))
+}
+
+pub async fn devices(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+) -> Result<Json<AccountDevicesResponse>, (StatusCode, Json<ApiError>)> {
+    account_devices_payload(&state, &account.id).map(Json)
+}
+
+pub async fn revoke_device(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(device_id): Path<String>,
+) -> Result<Json<AccountDevicesResponse>, (StatusCode, Json<ApiError>)> {
+    let removed =
+        crate::db::refresh_tokens::revoke_hash_for_account(&state.pool, &account.id, &device_id)
+            .map_err(|e| {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    error = %e,
+                    "failed to revoke linked device"
+                );
+                internal_error("Could not remove that device.")
+            })?;
+    if !removed {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiError {
+                error: "That linked device was not found.".to_string(),
+            }),
+        ));
+    }
+    account_devices_payload(&state, &account.id).map(Json)
+}
+
+pub async fn revoke_all_devices(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+) -> Result<Json<AccountDevicesResponse>, (StatusCode, Json<ApiError>)> {
+    crate::db::refresh_tokens::revoke_all_for_account(&state.pool, &account.id).map_err(|e| {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            error = %e,
+            "failed to revoke linked devices"
+        );
+        internal_error("Could not remove linked devices.")
+    })?;
+    account_devices_payload(&state, &account.id).map(Json)
 }
 
 pub async fn update_billing_settings(
@@ -148,6 +215,54 @@ pub async fn update_billing_settings(
     })?;
 
     Ok(Json(account_me_payload(&state, updated)))
+}
+
+fn account_devices_payload(
+    state: &AppState,
+    account_id: &str,
+) -> Result<AccountDevicesResponse, (StatusCode, Json<ApiError>)> {
+    let sessions = crate::db::refresh_tokens::list_active_for_account(&state.pool, account_id)
+        .map_err(|e| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                error = %e,
+                "failed to list linked devices"
+            );
+            internal_error("Could not load linked devices.")
+        })?;
+    Ok(AccountDevicesResponse {
+        devices: sessions
+            .into_iter()
+            .map(|session| {
+                let (label, kind) = device_label_and_kind(session.device_label.as_deref());
+                AccountDevice {
+                    id: session.token_hash,
+                    label,
+                    kind,
+                    created_at: session.created_at,
+                    last_used_at: session.last_used_at,
+                    expires_at: session.expires_at,
+                }
+            })
+            .collect(),
+    })
+}
+
+fn device_label_and_kind(device_label: Option<&str>) -> (String, String) {
+    match device_label {
+        Some("device-link") => ("Bluey desktop".to_string(), "Desktop".to_string()),
+        Some(label) if !label.trim().is_empty() => (label.trim().to_string(), "Device".to_string()),
+        _ => ("Browser session".to_string(), "Browser".to_string()),
+    }
+}
+
+fn internal_error(message: &str) -> (StatusCode, Json<ApiError>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiError {
+            error: message.to_string(),
+        }),
+    )
 }
 
 pub(crate) fn account_me_payload(

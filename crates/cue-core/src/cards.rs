@@ -35,6 +35,15 @@ pub struct CueCardArtifact {
     pub confidence: f32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CueCardAttachment {
+    pub id: String,
+    pub title: String,
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CueCard {
     pub id: Uuid,
@@ -47,6 +56,8 @@ pub struct CueCard {
     pub cost_label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact: Option<CueCardArtifact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<CueCardAttachment>,
 }
 
 impl CueCard {
@@ -60,6 +71,7 @@ impl CueCard {
             source: None,
             cost_label: None,
             artifact: None,
+            attachments: Vec::new(),
         }
     }
 
@@ -75,6 +87,11 @@ impl CueCard {
 
     pub fn with_artifact(mut self, artifact: CueCardArtifact) -> Self {
         self.artifact = Some(artifact);
+        self
+    }
+
+    pub fn with_attachments(mut self, attachments: Vec<CueCardAttachment>) -> Self {
+        self.attachments = attachments;
         self
     }
 }

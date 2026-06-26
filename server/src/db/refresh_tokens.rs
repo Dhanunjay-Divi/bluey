@@ -8,6 +8,15 @@ use sha2::{Digest, Sha256};
 
 use crate::db::DbPool;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefreshTokenSession {
+    pub token_hash: String,
+    pub device_label: Option<String>,
+    pub created_at: String,
+    pub last_used_at: Option<String>,
+    pub expires_at: String,
+}
+
 pub fn hash_token(token: &str) -> String {
     let mut h = Sha256::new();
     h.update(token.as_bytes());
@@ -49,6 +58,103 @@ pub fn store(
             }
         }
         Ok(())
+    })
+}
+
+/// List active, non-expired refresh sessions for an account. The token hash is
+/// used only as an opaque session id for revocation; the raw token is never
+/// returned.
+pub fn list_active_for_account(
+    pool: &DbPool,
+    account_id: &str,
+) -> Result<Vec<RefreshTokenSession>> {
+    crate::db::run_blocking_db(|| {
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        match pool {
+            DbPool::Sqlite(_) => {
+                let conn = pool.get()?;
+                let mut stmt = conn.prepare(
+                    "SELECT token_hash, device_label, created_at, last_used_at, expires_at
+                       FROM refresh_tokens
+                      WHERE account_id = ?1
+                        AND revoked_at IS NULL
+                        AND expires_at > ?2
+                      ORDER BY COALESCE(last_used_at, created_at) DESC, created_at DESC",
+                )?;
+                let rows = stmt.query_map(params![account_id, now_text], |row| {
+                    Ok(RefreshTokenSession {
+                        token_hash: row.get(0)?,
+                        device_label: row.get(1)?,
+                        created_at: row.get(2)?,
+                        last_used_at: row.get(3)?,
+                        expires_at: row.get(4)?,
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Into::into)
+            }
+            DbPool::Postgres(_) => {
+                let mut conn = pool.get_pg()?;
+                let rows = conn.query(
+                    "SELECT token_hash, device_label, created_at, last_used_at, expires_at
+                       FROM refresh_tokens
+                      WHERE account_id = $1
+                        AND revoked_at IS NULL
+                        AND expires_at > $2
+                      ORDER BY COALESCE(last_used_at, created_at) DESC, created_at DESC",
+                    &[&account_id, &now],
+                )?;
+                rows.into_iter()
+                    .map(|row| {
+                        let created_at: DateTime<Utc> = row.try_get(2)?;
+                        let last_used_at: Option<DateTime<Utc>> = row.try_get(3)?;
+                        let expires_at: DateTime<Utc> = row.try_get(4)?;
+                        Ok(RefreshTokenSession {
+                            token_hash: row.try_get(0)?,
+                            device_label: row.try_get(1)?,
+                            created_at: created_at.to_rfc3339(),
+                            last_used_at: last_used_at.map(|value| value.to_rfc3339()),
+                            expires_at: expires_at.to_rfc3339(),
+                        })
+                    })
+                    .collect()
+            }
+        }
+    })
+}
+
+/// Revoke one active refresh session by its opaque id for the owning account.
+pub fn revoke_hash_for_account(pool: &DbPool, account_id: &str, token_hash: &str) -> Result<bool> {
+    crate::db::run_blocking_db(|| {
+        let now = Utc::now();
+        let now_text = now.to_rfc3339();
+        match pool {
+            DbPool::Sqlite(_) => {
+                let conn = pool.get()?;
+                let changed = conn.execute(
+                    "UPDATE refresh_tokens
+                        SET revoked_at = ?1
+                      WHERE account_id = ?2
+                        AND token_hash = ?3
+                        AND revoked_at IS NULL",
+                    params![now_text, account_id, token_hash],
+                )?;
+                Ok(changed > 0)
+            }
+            DbPool::Postgres(_) => {
+                let mut conn = pool.get_pg()?;
+                let changed = conn.execute(
+                    "UPDATE refresh_tokens
+                        SET revoked_at = $1
+                      WHERE account_id = $2
+                        AND token_hash = $3
+                        AND revoked_at IS NULL",
+                    &[&now, &account_id, &token_hash],
+                )?;
+                Ok(changed > 0)
+            }
+        }
     })
 }
 
@@ -282,6 +388,40 @@ mod tests {
         assert_eq!(n, 2);
         assert!(validate_and_touch(&pool, "tok-a").unwrap().is_none());
         assert!(validate_and_touch(&pool, "tok-b").unwrap().is_none());
+    }
+
+    #[test]
+    fn list_active_sessions_skips_revoked_tokens() {
+        let pool = temp_pool();
+        let account_id = make_account(&pool);
+        store(&pool, "active-tok", &account_id, Some("desktop")).unwrap();
+        store(&pool, "revoked-tok", &account_id, Some("browser")).unwrap();
+        revoke(&pool, "revoked-tok").unwrap();
+
+        let sessions = list_active_for_account(&pool, &account_id).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].token_hash, hash_token("active-tok"));
+        assert_eq!(sessions[0].device_label.as_deref(), Some("desktop"));
+    }
+
+    #[test]
+    fn revoke_hash_for_account_scopes_to_account() {
+        let pool = temp_pool();
+        let account_id = make_account(&pool);
+        let other_account_id =
+            crate::db::accounts::Account::create(&pool, "other-rt@example.com", "stub")
+                .unwrap()
+                .id;
+        store(&pool, "tok-owned", &account_id, None).unwrap();
+        let token_hash = hash_token("tok-owned");
+
+        assert!(!revoke_hash_for_account(&pool, &other_account_id, &token_hash).unwrap());
+        assert_eq!(
+            validate_and_touch(&pool, "tok-owned").unwrap(),
+            Some(account_id.clone())
+        );
+        assert!(revoke_hash_for_account(&pool, &account_id, &token_hash).unwrap());
+        assert_eq!(validate_and_touch(&pool, "tok-owned").unwrap(), None);
     }
 
     #[test]

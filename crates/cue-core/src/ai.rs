@@ -735,6 +735,8 @@ pub struct AnswerRequestMetadata {
     pub stream: bool,
     #[serde(default)]
     pub required_capabilities: Vec<AiCapability>,
+    #[serde(default)]
+    pub visible_context_ids: Vec<Uuid>,
 }
 
 impl AnswerRequestMetadata {
@@ -746,6 +748,7 @@ impl AnswerRequestMetadata {
             correlation_id: None,
             stream: false,
             required_capabilities: vec![AiCapability::Chat],
+            visible_context_ids: Vec::new(),
         }
     }
 
@@ -766,6 +769,11 @@ impl AnswerRequestMetadata {
 
     pub fn require(mut self, capability: AiCapability) -> Self {
         push_unique(&mut self.required_capabilities, capability);
+        self
+    }
+
+    pub fn with_visible_context_ids(mut self, ids: Vec<Uuid>) -> Self {
+        self.visible_context_ids = ids;
         self
     }
 }
@@ -1093,6 +1101,8 @@ pub struct AnswerResponseMetadata {
     pub finish_reason: Option<AnswerFinishReason>,
     #[serde(default)]
     pub safety: SafetyOutcome,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<AnswerSourceMetadata>,
 }
 
 impl AnswerResponseMetadata {
@@ -1109,6 +1119,7 @@ impl AnswerResponseMetadata {
             cost_estimate: None,
             finish_reason: None,
             safety: SafetyOutcome::default(),
+            sources: Vec::new(),
         }
     }
 
@@ -1146,6 +1157,29 @@ impl AnswerResponseMetadata {
         self.safety = safety;
         self
     }
+
+    pub fn with_sources(mut self, sources: Vec<AnswerSourceMetadata>) -> Self {
+        self.sources = sources;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnswerSourceMetadata {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_type: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnswerRetrievalStatus {
+    pub stage: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1178,6 +1212,14 @@ pub enum AnswerStreamEvent {
     Delta {
         request_id: Uuid,
         text: String,
+    },
+    RetrievalStatus {
+        request_id: Uuid,
+        status: AnswerRetrievalStatus,
+    },
+    Sources {
+        request_id: Uuid,
+        sources: Vec<AnswerSourceMetadata>,
     },
     ProviderSwitch {
         request_id: Uuid,
@@ -1215,6 +1257,27 @@ impl AnswerStreamEvent {
         Self::Delta {
             request_id,
             text: text.into(),
+        }
+    }
+
+    pub fn retrieval_status(
+        request_id: Uuid,
+        stage: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::RetrievalStatus {
+            request_id,
+            status: AnswerRetrievalStatus {
+                stage: stage.into(),
+                message: message.into(),
+            },
+        }
+    }
+
+    pub fn sources(request_id: Uuid, sources: Vec<AnswerSourceMetadata>) -> Self {
+        Self::Sources {
+            request_id,
+            sources,
         }
     }
 
@@ -1450,6 +1513,15 @@ mod tests {
 
         assert!(event_json.contains(r#""type":"delta""#));
         assert!(event_json.contains("The launch moved."));
+
+        let status = AnswerStreamEvent::retrieval_status(
+            request.metadata.request_id,
+            "checking_memory",
+            "Checking saved Bluey memory",
+        );
+        let status_json = serde_json::to_string(&status).expect("serialize status event");
+        assert!(status_json.contains(r#""type":"retrieval_status""#));
+        assert!(status_json.contains("Checking saved Bluey memory"));
     }
 
     #[test]

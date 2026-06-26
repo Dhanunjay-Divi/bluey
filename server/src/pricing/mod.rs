@@ -113,16 +113,17 @@ pub const PRICING: &[ModelPricing] = &[
         markup_percent: 200,
     },
     ModelPricing {
-        // Deepgram nova-3: \$0.0043/minute = 0.43 cents/minute = 4_300
-        // microcents/minute. With 1 minute = 60 seconds, microcents per
-        // 1M seconds = 4_300 * 1_000_000 / 60 = 71_666_667 (rounded).
+        // Deepgram nova-3 accuracy-first streaming: $0.0092/minute =
+        // 0.92 cents/minute = 9_200 microcents/minute.
+        // With 1 minute = 60 seconds, microcents per 1M seconds =
+        // 9_200 * 1_000_000 / 60 = 153_333_333 (rounded down).
         // We use seconds as the input_tokens unit so the existing
         // pricing::compute_cost flow works unchanged.
         provider: "deepgram",
         model: "nova-3",
-        upstream_in_microcents_per_1m: 71_666_667,
+        upstream_in_microcents_per_1m: 153_333_333,
         upstream_out_microcents_per_1m: 0,
-        markup_percent: 150,
+        markup_percent: 200,
     },
     ModelPricing {
         // OpenAI gpt-4o-mini-transcribe: $0.003/minute = 0.3 cents/minute =
@@ -132,7 +133,7 @@ pub const PRICING: &[ModelPricing] = &[
         model: "gpt-4o-mini-transcribe",
         upstream_in_microcents_per_1m: 50_000_000,
         upstream_out_microcents_per_1m: 0,
-        markup_percent: 150,
+        markup_percent: 200,
     },
 ];
 
@@ -299,11 +300,22 @@ mod tests {
 
     #[test]
     fn deepgram_pricing_dollar_per_minute_to_microcents_per_1m_seconds() {
-        // Deepgram nova-3: $0.0043/minute = 0.43 cents/minute = 4_300 microcents/minute.
-        // microcents per second = 4_300 / 60 ≈ 71.667
-        // microcents per 1M seconds = 71.667 * 1_000_000 ≈ 71_666_667.
+        // Deepgram nova-3 accuracy-first streaming: $0.0092/minute =
+        // 0.92 cents/minute = 9_200 microcents/minute.
+        // microcents per second = 9_200 / 60 ≈ 153.333
+        // microcents per 1M seconds = 153.333 * 1_000_000 ≈ 153_333_333.
         let pricing = lookup("deepgram", "nova-3").unwrap();
-        assert_eq!(pricing.upstream_in_microcents_per_1m, 71_666_667);
+        assert_eq!(pricing.upstream_in_microcents_per_1m, 153_333_333);
+        assert_eq!(pricing.markup_percent, 200);
+    }
+
+    #[test]
+    fn deepgram_two_hour_dual_source_uses_200_percent_markup() {
+        let pricing = lookup("deepgram", "nova-3").unwrap();
+        let two_hours_two_sources_seconds = 2 * 60 * 60 * 2;
+        let (bluey, customer) = compute_cost(pricing, two_hours_two_sources_seconds, 0);
+        assert_eq!(bluey, 221);
+        assert_eq!(customer, 663);
     }
 
     #[test]
@@ -313,6 +325,7 @@ mod tests {
         // 3_000 * 1_000_000 / 60 = 50_000_000.
         let pricing = lookup("openai", "gpt-4o-mini-transcribe").unwrap();
         assert_eq!(pricing.upstream_in_microcents_per_1m, 50_000_000);
+        assert_eq!(pricing.markup_percent, 200);
     }
 
     #[test]

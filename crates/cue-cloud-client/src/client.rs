@@ -17,9 +17,10 @@ use crate::{
     error::{Error, Result},
     tokens::{TokenStore, Tokens},
     types::{
-        AuthResponse, CloudSessionBundle, EmbedRequest, EmbedResponse, InsufficientBalanceBody,
-        RagQueryRequest, RagQueryResponse, SessionListResponse, SttSessionRequest,
-        SttSessionResponse, SyncBatchRequest, SyncBatchResponse,
+        ArtifactObjectResponse, AuthResponse, CloudSessionBundle, EmbedBatchRequest,
+        EmbedBatchResponse, EmbedRequest, EmbedResponse, InsufficientBalanceBody, RagQueryRequest,
+        RagQueryResponse, SessionListResponse, SttSessionRequest, SttSessionResponse,
+        SyncBatchRequest, SyncBatchResponse,
     },
 };
 
@@ -232,12 +233,42 @@ impl CloudClient {
         self.auth_get(&format!("/sync/sessions/{session_id}")).await
     }
 
+    pub async fn upload_artifact_object(
+        &self,
+        artifact_id: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> Result<ArtifactObjectResponse> {
+        let path = format!("/sync/artifacts/{artifact_id}/object");
+        let resp = self
+            .send_bytes_with_auth(Method::POST, &path, bytes, content_type)
+            .await?;
+        Self::parse_or_err(resp).await
+    }
+
+    pub async fn download_artifact_object(&self, artifact_id: &str) -> Result<Vec<u8>> {
+        let path = format!("/sync/artifacts/{artifact_id}/object");
+        let mut resp = self.send_with_auth(Method::GET, &path, None::<&()>).await?;
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            if !self.refresh_tokens().await? {
+                return Err(Error::Unauthorized);
+            }
+            resp = self.send_with_auth(Method::GET, &path, None::<&()>).await?;
+        }
+        let resp = Self::stream_or_err(resp).await?;
+        Ok(resp.bytes().await?.to_vec())
+    }
+
     pub async fn query_rag(&self, request: &RagQueryRequest) -> Result<RagQueryResponse> {
         self.auth_post("/rag/query", request).await
     }
 
     pub async fn embed(&self, request: &EmbedRequest) -> Result<EmbedResponse> {
         self.auth_post("/router/embed", request).await
+    }
+
+    pub async fn embed_batch(&self, request: &EmbedBatchRequest) -> Result<EmbedBatchResponse> {
+        self.auth_post("/router/embed/batch", request).await
     }
 
     pub async fn create_stt_session(
@@ -306,6 +337,37 @@ impl CloudClient {
             req = req.json(b);
         }
         Ok(req.send().await?)
+    }
+
+    async fn send_bytes_with_auth(
+        &self,
+        method: Method,
+        path: &str,
+        bytes: Vec<u8>,
+        content_type: &str,
+    ) -> Result<Response> {
+        let access = self.current_tokens().ok_or(Error::Unauthorized)?.access;
+        let resp = self
+            .request_builder(method.clone(), path)
+            .header(header::AUTHORIZATION, format!("Bearer {access}"))
+            .header(header::CONTENT_TYPE, content_type)
+            .body(bytes.clone())
+            .send()
+            .await?;
+        if resp.status() != StatusCode::UNAUTHORIZED {
+            return Ok(resp);
+        }
+        if !self.refresh_tokens().await? {
+            return Err(Error::Unauthorized);
+        }
+        let access = self.current_tokens().ok_or(Error::Unauthorized)?.access;
+        Ok(self
+            .request_builder(method, path)
+            .header(header::AUTHORIZATION, format!("Bearer {access}"))
+            .header(header::CONTENT_TYPE, content_type)
+            .body(bytes)
+            .send()
+            .await?)
     }
 
     fn request_builder(&self, method: Method, path: &str) -> reqwest::RequestBuilder {

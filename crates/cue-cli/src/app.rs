@@ -1162,6 +1162,7 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
 
     let env_token = env::var("BLUEY_CLOUD_TOKEN")
         .ok()
+        .or_else(|| env::var("BLUEY_CLOUD_API_TOKEN").ok())
         .or_else(|| env::var("BLUEY_API_TOKEN").ok())
         .or_else(|| env::var("CUE_CLOUD_TOKEN").ok())
         .or_else(|| env::var("CUE_API_TOKEN").ok());
@@ -2977,6 +2978,7 @@ fn cloud_client_or_message() -> Result<Option<cue_cloud_client::CloudClient>> {
 fn cloud_access_token_from_env() -> Option<String> {
     env::var("BLUEY_CLOUD_TOKEN")
         .ok()
+        .or_else(|| env::var("BLUEY_CLOUD_API_TOKEN").ok())
         .or_else(|| env::var("BLUEY_API_TOKEN").ok())
         .or_else(|| env::var("CUE_CLOUD_TOKEN").ok())
         .or_else(|| env::var("CUE_API_TOKEN").ok())

@@ -760,3 +760,224 @@ the earlier native transcript overlay and the Pinky/Natively/Pluely references:
   useful session context instead of doing nothing.
 - Added a parent-process watchdog so future orphaned macOS overlay helpers exit
   if the daemon disappears unexpectedly.
+
+## Round 63: Overlay Context Visibility And Round-Doc Discipline
+
+Closed the misunderstanding around "round docs" and captured the current overlay
+context pass as a Pinky-style engineering note:
+
+- Re-established that every meaningful coding, architecture, deployment, or
+  product/UX round must add or update a `docs/rounds/` implementation/handoff
+  doc before final response.
+- Added `docs/rounds/OVERLAY-CONTEXT-VISIBILITY-AND-ROUND-DOCS-2026-06-22.md`
+  with the concrete code changes, architecture notes, verification, rollout
+  state, and follow-ups from this round.
+- Added context/image count metadata to overlay session list payloads.
+- Made active overlay context include documents, images, diagrams, and screen
+  captures so users can see what will be sent with Answer.
+- Added macOS session/history context badges and Windows read-only context chips
+  for cross-platform parity.
+- Verified the focused Rust tests, macOS Swift build, Windows overlay compile,
+  and local release build before reinstalling the local visible test binary.
+
+## Round 64: Live Listen STT Postgres Spend Guard Fix
+
+Fixed the production cause of Listen starting and then auto-stopping:
+
+- Reproduced local Listen startup reaching the managed Deepgram path and then
+  stopping after `/stt/session` returned `500`.
+- Found production logs showing `error serializing parameter 0` in the STT
+  session endpoint.
+- Patched the Postgres spend-window query in `server/src/db/usage.rs` to cast
+  the interval multiplier as `bigint`.
+- Ran focused local and remote tests plus `cargo check`.
+- Rebuilt and restarted the production `bluey-api` service.
+- Verified local Listen stayed in `Capturing`, emitted transcript segments, and
+  production logs showed `/stt/session` `200` plus `/stt/relay` `101`.
+- Added `docs/rounds/LIVE-LISTEN-STT-POSTGRES-SPEND-GUARD-FIX-2026-06-22.md`
+  with the root cause, deployment, verification, and follow-ups.
+
+## Round 65: Excel Attachment Indexing Timeout
+
+Fixed the attachment path that made dropped spreadsheets look stuck:
+
+- Found that Excel/ODS files were missing from the daemon classifier and native
+  picker filters even though the bundled converter can handle them.
+- Added spreadsheet extensions to the daemon, macOS picker, macOS fallback, and
+  Windows picker filter.
+- Added a macOS overlay safety timeout so the indexing chip clears or becomes
+  `Files ready` after a few seconds instead of spinning indefinitely.
+- Added immediate unsupported-drop feedback so Bluey shows supported formats
+  instead of starting a fake indexing state for unusable files.
+- Added the same unsupported-drop filtering to the Windows overlay drag/drop
+  path.
+- Centralized the daemon supported-format message for picker, drag/drop, and CLI
+  attach paths.
+- Fixed production OpenAI embedding parsing so valid embedding responses no
+  longer fail with `openai embed json` and surface as `/router/embed` `502`.
+- Reinstalled the local visible Bluey binaries and verified the dropped Excel
+  file becomes `document:ready` with `context_items: 1`.
+- Verified an unsupported `.mp4` attach fails fast with the supported-format
+  list.
+- Rebuilt and restarted production `bluey-api`, then verified a live managed
+  embedding request returned `HTTP 200` and a 1536-dimension vector.
+- Added `docs/rounds/EXCEL-ATTACHMENT-INDEXING-TIMEOUT-2026-06-22.md` with the
+  root cause, code changes, verification, and product rule.
+
+## Round 66: Windows/Mac Attachment Parity
+
+Closed the Windows parity gap for the latest attachment behavior:
+
+- Audited Windows against macOS for drag/drop, context chips, ask input, header
+  move, edge resize, click-through reading area, capture exclusion, and local
+  document converter installation.
+- Added Windows `WM_DROPFILES` pre-filtering for the same supported formats used
+  by macOS and the daemon.
+- Made fully unsupported Windows drops show the supported-format message without
+  starting a fake indexing state.
+- Made fully supported Windows drops show a `Docs loading` state immediately,
+  matching macOS.
+- Rebuilt the Windows overlay with `x86_64-w64-mingw32-gcc` and kept the
+  generated build artifact out of the working tree.
+- Added `docs/rounds/WINDOWS-MAC-ATTACHMENT-PARITY-2026-06-22.md` with the
+  parity audit and platform-specific notes.
+
+## Round 67: Canvas Trigger And Answer Timing Polish
+
+Fixed the canvas behavior that made ordinary answers feel over-routed:
+
+- Confirmed live overlay output where a normal AWS VPC explanation opened a
+  Code canvas and replaced chat copy with `Code is in the canvas`.
+- Tightened daemon and macOS fallback code detection so networking/cloud
+  explanations with words like public/private no longer count as coding tasks.
+- Removed the generic long-answer canvas fallback so normal explanations stay in
+  chat unless they are code, system design, screen analysis, or document work.
+- Kept the header canvas button visible whenever a canvas exists, so closing the
+  canvas does not hide the reopen control.
+- Changed the answer metadata badge to prefer first streamed answer latency
+  (`started in ...`) instead of total completion duration; total duration is
+  labeled as `finished in ...` only when first-answer timing is unavailable.
+- Removed customer-facing input-token counts from the overlay badge. It now
+  shows answer/output tokens only, plus timing.
+- Added `docs/rounds/CANVAS-TRIGGER-AND-TIMING-POLISH-2026-06-22.md` with the
+  implementation notes, UX contract, and verification checklist.
+
+## Round 68: Copy Selection And Caption Label Cleanup
+
+Smoothed the everyday reading/copying path in the macOS overlay:
+
+- Made rendered message body text selectable so normal drag selection and
+  `Cmd+A` / `Cmd+C` can work on answer text instead of being stolen by the
+  composer.
+- Changed card copy buttons and canvas copy to flash a checkmark after copying.
+- Showed copy buttons on normal answer/context/warning cards, not only code and
+  system-design artifacts.
+- Kept `Mic:`/`System:` labels in the live captions preview because they help
+  users understand what Bluey is hearing, while trimming those prefixes from
+  simple user-facing question cards where they are noise.
+- Added `docs/rounds/COPY-SELECTION-AND-CAPTION-LABEL-CLEANUP-2026-06-22.md`
+  with the behavior contract and verification checklist.
+
+## Round 69: Answer Style And Route Badge Polish
+
+Made normal answers feel less like generic AI copy and made the active answer
+lane visible while Bluey is working:
+
+- Tightened the daemon answer contract so simple "what is" / explanation
+  questions start with a compact spoken answer instead of a reference-note
+  outline.
+- Added explicit prompt/style/interview-guide handling so user-provided answer
+  rules shape tone and format without turning ordinary attached docs into hidden
+  instructions.
+- Changed the macOS route badge to show user-friendly lane state while answering:
+  `Auto · Balanced`, `Auto · Vision`, `Instant`, `Balanced`, or `Deep`.
+- Reset the badge to `Ready` after plain answers finish, while preserving
+  workbench labels for code/design/screen artifacts.
+- Added `docs/rounds/ANSWER-STYLE-AND-ROUTE-BADGE-POLISH-2026-06-22.md` with
+  the behavior contract and verification checklist.
+
+## Round 70: Overlay Icon Tooltips
+
+Made the icon-only overlay controls explain themselves on hover:
+
+- Expanded macOS tooltip copy for history, new recording, canvas, resize,
+  click-through, minimize, close, listen, tone, attach, screen, answer, balance,
+  captions, and attachments.
+- Added a tooltip to the draggable top bar so users know they can drag it to
+  move Bluey.
+- Added native Win32 tooltip support for the Windows overlay and attached tips
+  to its visible controls.
+- Updated the Windows overlay build script to link `comctl32.lib`.
+- Added `docs/rounds/OVERLAY-ICON-TOOLTIPS-2026-06-22.md` with the behavior
+  contract and platform notes.
+
+## Round 71: Listen Billing And Transcript Clear
+
+Clarified and implemented the Listen lifecycle around STT billing and reusable
+caption context:
+
+- Confirmed the server reserves STT session credit/trial time when Listen starts
+  and settles on relay close using actual elapsed seconds.
+- Verified unused reserved credit and unused trial seconds are refunded by the
+  STT accounting tests.
+- Added an overlay `transcript_clear_requested` event so clearing captions is a
+  real daemon action, not just a local UI hide.
+- Made the daemon clear active transcript-derived context and rebuild local RAG
+  from the remaining session data.
+- Added a small macOS caption-row clear control that appears only when captions
+  exist.
+- Added a matching Windows native clear control and verified the Windows overlay
+  cross-compiles with MinGW.
+- Added
+  `docs/rounds/LISTEN-BILLING-AND-TRANSCRIPT-CLEAR-2026-06-22.md` with the
+  behavior contract and verification checklist.
+
+## Round 72: Square Checkout Bluey Branding
+
+Removed stale Pinky branding from the production Square hosted checkout path:
+
+- Confirmed live Square production checkout settings had
+  `branding.header_type=FRAMED_LOGO` and Pinky pink button color.
+- Confirmed the live Square production location name/business name were still
+  `Pinky`.
+- Updated the live Square production location to `Bluey` and
+  `https://bluey.sh`.
+- Updated live Square hosted checkout branding to `BUSINESS_NAME`,
+  `#20c7ff`, and `ROUNDED`.
+- Added `scripts/bluey-square-branding.sh` to apply or verify checkout branding
+  from the server env file without printing secrets.
+- Wired `scripts/bluey-cloud-preflight.sh` to fail if Square checkout branding
+  drifts away from Bluey.
+- Documented the requirement in `docs/deploy/SQUARE-BILLING.md`.
+- Added `docs/rounds/SQUARE-CHECKOUT-BLUEY-BRANDING-2026-06-22.md` with the
+  live fix and verification record.
+
+## Round 73: Account Dashboard Credits And Devices
+
+Cleaned up the web account dashboard around the actions users need first:
+
+- Moved Add credits and Auto Reload into the top dashboard control area.
+- Added a linked devices panel showing active desktop/browser refresh sessions.
+- Added authenticated `/account/devices` list and remove endpoints backed by
+  the refresh-token store.
+- Kept device labels rendered with DOM text nodes instead of HTML injection.
+- Added scoped token-session tests covering list and revoke behavior.
+- Added `docs/rounds/ACCOUNT-DASHBOARD-CREDITS-DEVICES-2026-06-22.md` with the
+  behavior contract and verification record.
+
+## Round 74: Account Profile Menu And Device Cards
+
+Made the web account surface feel closer to the Pinky account management flow:
+
+- Added a top-right profile icon with account email, Change password, Sign out,
+  and Delete account actions.
+- Added a device summary bar with linked-device count, Refresh, and Remove all.
+- Restyled linked devices as larger machine-style rows with status and red
+  remove controls.
+- Added `DELETE /account/devices` to revoke all refresh sessions for the
+  authenticated account.
+- Made browser sign-out clear local tokens even if refresh/logout is temporarily
+  unavailable.
+- Added
+  `docs/rounds/ACCOUNT-PROFILE-MENU-AND-DEVICE-CARDS-2026-06-22.md` with the
+  behavior contract and verification record.
