@@ -2,9 +2,11 @@
 //! Protocol, returning the same [`AnswerStream`] the legacy CLI/cloud paths do.
 //!
 //! This is PHASE-2 plug-in point #2 from the [`crate::acp`] module docs: it
-//! turns an [`AgentKind`] + [`Question`] into a live [`AcpClient`] drive. It is
-//! deliberately opt-in (gated by `BLUEY_USE_ACP=1` in [`crate::drive`]) so the
-//! migration is reversible and the default path is untouched.
+//! turns an [`AgentKind`] + [`Question`] into a live [`AcpClient`] drive. ACP is
+//! now ON by default for ACP-capable agents (gated by [`crate::should_use_acp`],
+//! with `BLUEY_USE_ACP=0` as the escape hatch); the top-level dispatcher wraps
+//! the attempt in a transparent CLI fallback so a pre-output ACP failure can
+//! never become a hard answer failure, keeping the migration reversible.
 
 use crate::acp::client::{AcpAgentSpec, AcpClient};
 use crate::drive::{AnswerChunk, AnswerStream, Question};

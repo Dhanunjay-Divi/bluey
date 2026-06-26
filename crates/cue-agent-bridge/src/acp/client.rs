@@ -514,7 +514,7 @@ fn text_prompt(prompt: impl Into<String>) -> Vec<ContentBlock> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::{ContentChunk, TextContent, ToolCall};
+    use agent_client_protocol::schema::{ContentChunk, TextContent};
 
     #[test]
     fn spec_builds_argv_with_program_first() {
@@ -575,7 +575,9 @@ mod tests {
         )));
         assert_eq!(
             session_update_to_chunk(update),
-            Some(AnswerChunk::Reasoning("let me check the schema".to_string()))
+            Some(AnswerChunk::Reasoning(
+                "let me check the schema".to_string()
+            ))
         );
     }
 

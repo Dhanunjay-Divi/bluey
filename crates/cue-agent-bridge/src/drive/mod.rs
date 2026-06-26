@@ -315,8 +315,12 @@ mod tests {
         assert!(is_transient_network_error("provider returned 503"));
         // Auth / missing-binary are PERMANENT — never auto-retried.
         assert!(!is_transient_network_error("Please sign in to continue"));
-        assert!(!is_transient_network_error("agent exited with status 127: command not found"));
-        assert!(!is_transient_network_error("401 Unauthorized: invalid api key"));
+        assert!(!is_transient_network_error(
+            "agent exited with status 127: command not found"
+        ));
+        assert!(!is_transient_network_error(
+            "401 Unauthorized: invalid api key"
+        ));
         // Unknown text defaults to non-transient.
         assert!(!is_transient_network_error("some unexpected parse error"));
     }

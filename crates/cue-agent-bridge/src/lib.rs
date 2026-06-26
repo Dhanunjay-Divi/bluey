@@ -60,12 +60,20 @@ pub use sessions::{list_with_health_check, reader_for, ReaderHealth, SessionRead
 /// cloud vendors flow through the same overlay stream contract (Started +
 /// Delta + Done, or terminal Error).
 pub async fn drive(agent: AgentKind, question: Question) -> anyhow::Result<AnswerStream> {
-    // Opt-in ACP path (PHASE 2, reversible): only when `BLUEY_USE_ACP=1` AND the
-    // agent has an ACP entrypoint. Default builds never take this branch, so the
-    // CLI/cloud routing below is byte-for-byte unchanged. Read is defensive
-    // (`var_os`, no panic).
+    // ACP path (default-ON for ACP-capable agents; `BLUEY_USE_ACP=0` opts out —
+    // see [`should_use_acp`]). Safe to default on because the attempt is wrapped
+    // in a transparent CLI fallback: a pre-first-output ACP failure (spawn /
+    // transport / handshake / adapter death before any chunk) silently re-drives
+    // the SAME agent+question over the legacy CLI, so an ACP-only fault never
+    // becomes a hard answer failure. Non-ACP agents skip this entirely and the
+    // cloud/CLI routing below is unchanged.
     if should_use_acp(&agent) {
-        return acp::drive_acp(agent, question).await;
+        let cli_question = question.clone();
+        let cli_agent = agent.clone();
+        let acp = acp::drive_acp(agent, question).await;
+        return Ok(acp_with_cli_fallback(acp, move || {
+            drive_cli(cli_agent, cli_question)
+        }));
     }
 
     // Cloud row wins when present: the same `KindTag` can appear in both
@@ -97,7 +105,21 @@ pub async fn drive_with_overrides(
     model_override: Vec<String>,
 ) -> anyhow::Result<AnswerStream> {
     if should_use_acp(&agent) {
-        return acp::drive_acp(agent, question).await;
+        // ACP ignores the per-run model override (it has no `--model` flag), but
+        // the CLI fallback must still honor it: a pre-first-output ACP failure
+        // re-drives the SAME agent+question over the CLI WITH the override, so the
+        // model-block self-resolver's re-drive is preserved end to end.
+        let cli_question = question.clone();
+        let cli_agent = agent.clone();
+        let cli_override = model_override;
+        let acp = acp::drive_acp(agent, question).await;
+        return Ok(acp_with_cli_fallback(acp, move || {
+            let opts = drive::DriveOptions {
+                model_override: cli_override,
+                ..Default::default()
+            };
+            drive::drive_with_options(cli_agent, cli_question, opts)
+        }));
     }
     if let Some(tag) = registry::KindTag::from_agent_kind(&agent) {
         if cloud::cloud_entry_for(tag).is_some() {
@@ -111,20 +133,114 @@ pub async fn drive_with_overrides(
     drive::drive_with_options(agent, question, opts).await
 }
 
+/// Wrap an ACP [`AnswerStream`] so a failure **before any output** transparently
+/// falls back to the legacy CLI drive for the same agent+question.
+///
+/// This is what makes the ACP route safe to default on (see [`should_use_acp`]).
+/// Because [`acp::drive_acp`] returns its stream eagerly and runs the whole turn
+/// on a spawned task, EVERY pre-token fault — subprocess spawn failure, transport
+/// setup, the `initialize` handshake, or an adapter that dies before emitting a
+/// chunk — surfaces as a terminal [`AnswerChunk::Error`] as the stream's FIRST
+/// item, never as an `Err` from `drive_acp`. (The only `Err` `drive_acp` returns
+/// is "no ACP entrypoint", which [`should_use_acp`] already gates out; we still
+/// fall back on it defensively.)
+///
+/// Policy, mirroring the proven `resume_with_fork_fallback` peek pattern:
+/// - The stream's FIRST chunk is an [`AnswerChunk::Error`] → the ACP attempt
+///   never produced output, so discard it and stream `make_cli()` instead. The
+///   consumer sees a single clean CLI stream and never the failed ACP attempt.
+/// - The first chunk is ANYTHING else ([`Started`](AnswerChunk::Started),
+///   [`Delta`](AnswerChunk::Delta), [`Reasoning`](AnswerChunk::Reasoning),
+///   [`ToolCall`](AnswerChunk::ToolCall), [`Done`](AnswerChunk::Done)) → ACP has
+///   committed; we yield it and pass the rest of the stream through unchanged. A
+///   later mid-stream error is surfaced as-is (we cannot un-emit already-streamed
+///   output, so re-driving over CLI would double the answer).
+///
+/// `make_cli` is a `FnOnce` returning the CLI drive future, so the CLI subprocess
+/// is spawned ONLY on actual fallback (the common case — ACP succeeding — never
+/// touches the CLI). If `acp` is itself an `Err`, we skip the peek and go straight
+/// to the CLI.
+fn acp_with_cli_fallback<F, Fut>(acp: anyhow::Result<AnswerStream>, make_cli: F) -> AnswerStream
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<AnswerStream>> + Send,
+{
+    use futures_util::StreamExt;
+    Box::pin(async_stream::stream! {
+        // `drive_acp` only `Err`s when the agent has no ACP entrypoint — already
+        // gated by `should_use_acp`, but if it ever happens, fall straight to CLI.
+        let mut acp_stream = match acp {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "ACP drive could not start — falling back to CLI");
+                match make_cli().await {
+                    Ok(mut cli) => { while let Some(c) = cli.next().await { yield c; } }
+                    Err(e) => yield AnswerChunk::Error(format!("CLI fallback failed: {e}")),
+                }
+                return;
+            }
+        };
+
+        // Peek the first item. A leading `Error` means ACP failed before any
+        // output (handshake/spawn/adapter), so fall back; anything else commits.
+        match acp_stream.next().await {
+            None => {
+                // Empty ACP stream (no chunk at all): treat like a pre-output
+                // failure and fall back rather than hand the user silence.
+                tracing::warn!("ACP drive produced no chunks — falling back to CLI");
+                match make_cli().await {
+                    Ok(mut cli) => { while let Some(c) = cli.next().await { yield c; } }
+                    Err(e) => yield AnswerChunk::Error(format!("CLI fallback failed: {e}")),
+                }
+            }
+            Some(AnswerChunk::Error(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    "ACP drive failed before any output — falling back to CLI"
+                );
+                match make_cli().await {
+                    Ok(mut cli) => { while let Some(c) = cli.next().await { yield c; } }
+                    Err(e) => yield AnswerChunk::Error(format!("CLI fallback failed: {e}")),
+                }
+            }
+            Some(first) => {
+                // ACP committed (real output started). Yield the first chunk and
+                // pass everything else through unchanged — no fallback possible.
+                yield first;
+                while let Some(c) = acp_stream.next().await {
+                    yield c;
+                }
+            }
+        }
+    })
+}
+
 /// Whether [`drive`] (and the daemon's continuation-tier decision) should route
 /// `agent` through the ACP path. **The single source of truth** — the daemon
 /// MUST call this rather than re-implement it, so the route choice and the
 /// `via_acp` continuation choice can never desync.
 ///
-/// Two gates, both required: (1) the opt-in env var `BLUEY_USE_ACP=1` is set
-/// (read defensively via `var_os`, never panics; any other value keeps ACP
-/// off), and (2) the agent actually has an ACP entrypoint. Factored out so the
+/// **ACP is now ON by default** for every agent that has an ACP entrypoint. This
+/// is safe because [`drive`] wraps the ACP attempt in a transparent CLI fallback
+/// ([`acp_with_cli_fallback`]): a failure before any output silently re-drives
+/// the same agent+question over the legacy CLI, so flipping the default cannot
+/// turn an adapter/handshake fault into a hard answer failure.
+///
+/// Two gates: (1) the **escape hatch** — `BLUEY_USE_ACP` set to a falsey value
+/// (`0`, `false`, `off`, `no`, case-insensitive) DISABLES ACP (read defensively
+/// via `var_os`, never panics); any other value (or unset) leaves it on; and
+/// (2) the agent actually has an ACP entrypoint (the per-agent capability gate —
+/// agents with no ACP spec are never routed through ACP). Factored out so the
 /// routing decision is unit-testable without spawning a subprocess.
 pub fn should_use_acp(agent: &AgentKind) -> bool {
-    let opted_in = std::env::var_os("BLUEY_USE_ACP")
-        .map(|v| v == "1")
+    let disabled = std::env::var_os("BLUEY_USE_ACP")
+        .map(|v| {
+            let s = v.to_string_lossy();
+            let s = s.trim().to_ascii_lowercase();
+            matches!(s.as_str(), "0" | "false" | "off" | "no")
+        })
         .unwrap_or(false);
-    opted_in && acp::drive::has_acp_spec(agent)
+    !disabled && acp::drive::has_acp_spec(agent)
 }
 
 /// A known (or generically detected) coding agent.
@@ -417,35 +533,185 @@ pub enum BridgeError {
 #[cfg(test)]
 mod acp_gate_tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes the env-mutating test below against any other test in this
+    /// module that reads/writes `BLUEY_USE_ACP` (the var is process-global).
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn should_use_acp_is_off_by_default_for_every_agent() {
-        // C9: the SINGLE ACP-route gate. With BLUEY_USE_ACP unset (the production
-        // default — and the default test env), it must be false for EVERY agent,
-        // ACP-capable or not. This proves the opt-in gate and pins the invariant
-        // the daemon now delegates to (so route + via_acp can't desync). We do NOT
-        // mutate the global env var here (that would race other tests); the
-        // opt-in-true branch is exercised live via BLUEY_USE_ACP=1 e2e runs.
-        // (If this test ever runs with BLUEY_USE_ACP=1 in the environment, skip
-        // the assertion rather than fail spuriously.)
-        if std::env::var_os("BLUEY_USE_ACP")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-        {
+    fn should_use_acp_is_on_by_default_for_acp_capable_agents() {
+        // C9: the SINGLE ACP-route gate. ACP is now ON by default (the CLI
+        // fallback in `drive` makes it safe), so with BLUEY_USE_ACP UNSET it must
+        // be TRUE for every ACP-capable agent and FALSE for agents with no ACP
+        // entrypoint (the per-agent capability gate still holds). We do NOT mutate
+        // the global env var here (that would race other tests); the disable
+        // branch is exercised by the serialized test below. If this test ever runs
+        // with BLUEY_USE_ACP already set to a falsey value, skip rather than fail
+        // spuriously.
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let disabled = std::env::var_os("BLUEY_USE_ACP")
+            .map(|v| {
+                let s = v.to_string_lossy().trim().to_ascii_lowercase();
+                matches!(s.as_str(), "0" | "false" | "off" | "no")
+            })
+            .unwrap_or(false);
+        if disabled {
             return;
         }
+        // ACP-capable agents: ON by default.
         for agent in [
-            AgentKind::ClaudeCode, // ACP-capable
-            AgentKind::Codex,      // ACP-capable
-            AgentKind::Cursor,     // ACP-capable
-            AgentKind::Gemini,     // ACP-capable
-            AgentKind::Aider,      // no ACP spec
-            AgentKind::Unknown,    // no ACP spec
+            AgentKind::ClaudeCode,
+            AgentKind::Codex,
+            AgentKind::Cursor,
+            AgentKind::Gemini,
         ] {
             assert!(
-                !should_use_acp(&agent),
-                "{agent:?}: ACP must be OFF when BLUEY_USE_ACP is unset"
+                should_use_acp(&agent),
+                "{agent:?}: ACP must be ON by default (BLUEY_USE_ACP unset)"
             );
         }
+        // No ACP entrypoint: capability gate keeps these OFF regardless.
+        for agent in [AgentKind::Aider, AgentKind::Unknown] {
+            assert!(
+                !should_use_acp(&agent),
+                "{agent:?}: no ACP spec — must stay OFF even with the default on"
+            );
+        }
+    }
+
+    #[test]
+    fn bluey_use_acp_falsey_disables_acp() {
+        // The escape hatch: setting BLUEY_USE_ACP to a falsey value turns ACP OFF
+        // even for ACP-capable agents. Serialized + restored because the var is
+        // process-global.
+        let _g = ENV_GUARD.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var_os("BLUEY_USE_ACP");
+        for falsey in ["0", "false", "off", "no", "OFF", "False"] {
+            std::env::set_var("BLUEY_USE_ACP", falsey);
+            for agent in [
+                AgentKind::ClaudeCode,
+                AgentKind::Codex,
+                AgentKind::Cursor,
+                AgentKind::Gemini,
+            ] {
+                assert!(
+                    !should_use_acp(&agent),
+                    "{agent:?}: BLUEY_USE_ACP={falsey} must DISABLE ACP"
+                );
+            }
+        }
+        // Restore the prior value so we don't leak into other tests.
+        match prev {
+            Some(v) => std::env::set_var("BLUEY_USE_ACP", v),
+            None => std::env::remove_var("BLUEY_USE_ACP"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod acp_fallback_tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    fn canned(chunks: Vec<AnswerChunk>) -> AnswerStream {
+        Box::pin(futures_util::stream::iter(chunks))
+    }
+
+    async fn collect(stream: AnswerStream) -> Vec<AnswerChunk> {
+        let mut s = stream;
+        let mut out = Vec::new();
+        while let Some(c) = s.next().await {
+            out.push(c);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn leading_error_falls_back_to_cli() {
+        // ACP failed before any output (handshake/spawn/adapter): the consumer
+        // must see ONLY the CLI stream, never the ACP error.
+        let acp = Ok(canned(vec![AnswerChunk::Error(
+            "acp connection: failed to spawn".into(),
+        )]));
+        let out = collect(acp_with_cli_fallback(acp, || async {
+            Ok(canned(vec![
+                AnswerChunk::Started {
+                    session_id: Some("cli".into()),
+                },
+                AnswerChunk::Delta("cli answer".into()),
+                AnswerChunk::Done { cost_usd: None },
+            ]))
+        }))
+        .await;
+        assert_eq!(
+            out,
+            vec![
+                AnswerChunk::Started {
+                    session_id: Some("cli".into())
+                },
+                AnswerChunk::Delta("cli answer".into()),
+                AnswerChunk::Done { cost_usd: None },
+            ],
+            "leading ACP error must transparently become the CLI stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_content_commits_and_never_falls_back() {
+        // Once ACP emits a non-error chunk (here Started), it is committed: pass
+        // through unchanged and NEVER touch the CLI — even if ACP later errors.
+        let ran_cli = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran_cli.clone();
+        let acp = Ok(canned(vec![
+            AnswerChunk::Started {
+                session_id: Some("acp".into()),
+            },
+            AnswerChunk::Delta("acp answer".into()),
+            AnswerChunk::Error("died mid-turn".into()),
+        ]));
+        let out = collect(acp_with_cli_fallback(acp, move || {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            async { Ok(canned(vec![])) }
+        }))
+        .await;
+        assert!(
+            !ran_cli.load(std::sync::atomic::Ordering::SeqCst),
+            "committed ACP stream must NOT fall back (would double the answer)"
+        );
+        assert_eq!(
+            out,
+            vec![
+                AnswerChunk::Started {
+                    session_id: Some("acp".into())
+                },
+                AnswerChunk::Delta("acp answer".into()),
+                AnswerChunk::Error("died mid-turn".into()),
+            ],
+            "a mid-stream error after content is surfaced as-is"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_acp_stream_falls_back_to_cli() {
+        // No chunk at all from ACP → fall back rather than hand the user silence.
+        let acp = Ok(canned(vec![]));
+        let out = collect(acp_with_cli_fallback(acp, || async {
+            Ok(canned(vec![AnswerChunk::Delta("cli".into())]))
+        }))
+        .await;
+        assert_eq!(out, vec![AnswerChunk::Delta("cli".into())]);
+    }
+
+    #[tokio::test]
+    async fn acp_err_result_falls_back_to_cli() {
+        // `drive_acp` returning Err (defensive — should_use_acp gates this out):
+        // skip the peek and go straight to CLI.
+        let acp: anyhow::Result<AnswerStream> = Err(anyhow::anyhow!("no ACP entrypoint"));
+        let out = collect(acp_with_cli_fallback(acp, || async {
+            Ok(canned(vec![AnswerChunk::Delta("cli".into())]))
+        }))
+        .await;
+        assert_eq!(out, vec![AnswerChunk::Delta("cli".into())]);
     }
 }
