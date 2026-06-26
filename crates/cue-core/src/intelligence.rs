@@ -257,7 +257,7 @@ fn recent_transcript_highlights(meeting: &MeetingRecord, count: usize) -> String
         .iter()
         .rev()
         .take(count)
-        .map(|segment| format!("{}: {}", segment.speaker, segment.text))
+        .map(|segment| format!("{}: {}", segment.speaker.display_label(), segment.text))
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -285,6 +285,99 @@ fn is_question(text: &str) -> bool {
         ]
         .iter()
         .any(|prefix| lower.starts_with(prefix))
+}
+
+/// Why a spoken line was flagged as "this is for me" (master doc §6). Carried
+/// back to the daemon so it can decide to suggest vs auto-fire and label the
+/// surfaced card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForMeQuestion {
+    /// The question text, trimmed.
+    pub question: String,
+    /// The name that matched (the user's own name that was spoken). `None` when
+    /// `my_names` is empty but the line is still question-shaped from another
+    /// speaker — kept `None` so the daemon can apply a lower-precision policy.
+    pub matched_name: Option<String>,
+}
+
+/// High-precision "this question is for me" detector (master doc §6).
+///
+/// A line triggers when ALL hold:
+/// 1. It was spoken by *someone other than the local user* (`!speaker.is_me()`)
+///    — you don't trigger on your own speech.
+/// 2. It is question-shaped (`is_question`).
+/// 3. If `my_names` is non-empty, the line mentions one of those names
+///    (word-boundary, case-insensitive). When `my_names` is empty this name
+///    check is skipped, so the detector falls back to "any question from
+///    another speaker" — lower precision, which the daemon gates behind
+///    explicit opt-in.
+///
+/// Pure and side-effect free so it is cheap to unit test; the daemon owns the
+/// action (suggest card vs drive the agent).
+pub fn detect_for_me_question(
+    segment: &TranscriptSegment,
+    my_names: &[String],
+) -> Option<ForMeQuestion> {
+    if segment.speaker.is_me() {
+        return None;
+    }
+    let text = segment.text.trim();
+    if text.is_empty() || !is_question(text) {
+        return None;
+    }
+
+    let matched_name = if my_names.is_empty() {
+        None
+    } else {
+        let matched = my_names
+            .iter()
+            .map(|name| name.trim())
+            .filter(|name| !name.is_empty())
+            .find(|name| text_mentions_name(text, name))
+            .map(|name| name.to_string());
+        // Names configured but none mentioned → not addressed to me.
+        matched.as_ref()?;
+        matched
+    };
+
+    Some(ForMeQuestion {
+        question: text.to_string(),
+        matched_name,
+    })
+}
+
+/// Case-insensitive, word-boundary name match. Avoids firing on "Alexander"
+/// for the name "Alex" by requiring the surrounding characters to be
+/// non-alphanumeric.
+fn text_mentions_name(text: &str, name: &str) -> bool {
+    let haystack = text.to_lowercase();
+    let needle = name.to_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(&needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let before_ok = start == 0
+            || !haystack[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric());
+        let after_ok = end >= haystack.len()
+            || !haystack[end..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric());
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + needle.len();
+        if from >= haystack.len() {
+            break;
+        }
+    }
+    false
 }
 
 fn question_title(text: &str) -> String {
@@ -385,9 +478,54 @@ fn compact_context(meeting: &MeetingRecord, count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use crate::{
-        analyze_segment, local_answer, ContextArtifact, ContextKind, MeetingRecord, Speaker,
-        TranscriptSegment,
+        analyze_segment, detect_for_me_question, local_answer, ContextArtifact, ContextKind,
+        MeetingRecord, Speaker, TranscriptSegment,
     };
+
+    fn names(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
+
+    #[test]
+    fn for_me_question_fires_on_name_and_question_from_other() {
+        let seg = TranscriptSegment::new(Speaker::System, "Alex, what's the status on auth?", true);
+        let hit = detect_for_me_question(&seg, &names(&["Alex"])).expect("should fire");
+        assert_eq!(hit.matched_name.as_deref(), Some("Alex"));
+        assert!(hit.question.contains("status on auth"));
+    }
+
+    #[test]
+    fn for_me_question_ignores_my_own_speech() {
+        // Even if I say my own name in a question, it's not "for me".
+        let seg = TranscriptSegment::new(Speaker::User, "Alex, should we ship?", true);
+        assert!(detect_for_me_question(&seg, &names(&["Alex"])).is_none());
+    }
+
+    #[test]
+    fn for_me_question_requires_question_shape() {
+        let seg = TranscriptSegment::new(Speaker::System, "Alex is handling the deploy.", true);
+        assert!(detect_for_me_question(&seg, &names(&["Alex"])).is_none());
+    }
+
+    #[test]
+    fn for_me_question_name_match_is_word_bounded() {
+        // "Alexander" must NOT match the name "Alex".
+        let seg = TranscriptSegment::new(Speaker::System, "Is Alexander joining the call?", true);
+        assert!(detect_for_me_question(&seg, &names(&["Alex"])).is_none());
+    }
+
+    #[test]
+    fn for_me_question_without_configured_names_falls_back_to_any_other_question() {
+        let seg = TranscriptSegment::new(Speaker::System, "How do we handle retries?", true);
+        let hit = detect_for_me_question(&seg, &[]).expect("fallback should fire");
+        assert!(hit.matched_name.is_none());
+    }
+
+    #[test]
+    fn for_me_question_with_names_set_but_unmentioned_does_not_fire() {
+        let seg = TranscriptSegment::new(Speaker::System, "How do we handle retries?", true);
+        assert!(detect_for_me_question(&seg, &names(&["Alex"])).is_none());
+    }
 
     #[test]
     fn detects_question_action_and_decision_cards() {

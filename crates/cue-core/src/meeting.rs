@@ -18,6 +18,28 @@ impl Default for Speaker {
     }
 }
 
+impl Speaker {
+    /// Human, conversational label for transcript rendering and the
+    /// question→trigger heuristic ("did *They* address *You*?"). The mic is the
+    /// local user ("You"); system audio is the remote side of the call
+    /// ("They"). Distinct from [`Display`], which emits the lowercase technical
+    /// tag used for serialization and logs.
+    pub fn display_label(self) -> &'static str {
+        match self {
+            Self::User => "You",
+            Self::System => "They",
+            Self::Other => "Other",
+            Self::Unknown => "Speaker",
+        }
+    }
+
+    /// Whether this speaker is the local user (the mic / "me"). The trigger in
+    /// the daemon uses this to only fire on lines spoken by *others*.
+    pub fn is_me(self) -> bool {
+        matches!(self, Self::User)
+    }
+}
+
 impl std::fmt::Display for Speaker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -300,7 +322,7 @@ impl MeetingRecord {
         let start = self.transcript.len().saturating_sub(count);
         self.transcript[start..]
             .iter()
-            .map(|segment| format!("{}: {}", segment.speaker, segment.text))
+            .map(|segment| format!("{}: {}", segment.speaker.display_label(), segment.text))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -315,7 +337,11 @@ impl MeetingRecord {
         let mut used_chars = 0usize;
 
         for segment in self.transcript[start..].iter().rev() {
-            let line = format!("{}: {}", segment.speaker, segment.text.trim());
+            let line = format!(
+                "{}: {}",
+                segment.speaker.display_label(),
+                segment.text.trim()
+            );
             if line.trim().is_empty() {
                 continue;
             }
@@ -372,10 +398,11 @@ impl MeetingRecord {
 }
 
 fn truncate_transcript_line_tail(speaker: Speaker, text: &str, max_chars: usize) -> String {
-    let prefix = format!("{speaker}: ...");
+    let label = speaker.display_label();
+    let prefix = format!("{label}: ...");
     let prefix_chars = prefix.chars().count();
     if max_chars <= prefix_chars {
-        return tail_chars(&format!("{speaker}: {}", text.trim()), max_chars);
+        return tail_chars(&format!("{label}: {}", text.trim()), max_chars);
     }
 
     let tail_budget = max_chars - prefix_chars;
@@ -470,7 +497,17 @@ mod tests {
 
         let text = meeting.last_transcript_text_bounded(4, 80);
         assert!(text.chars().count() <= 80);
-        assert!(text.starts_with("system: ..."));
+        // System audio renders with the conversational "They" label.
+        assert!(text.starts_with("They: ..."));
         assert!(text.contains("important ending"));
+    }
+
+    #[test]
+    fn speaker_display_label_distinguishes_me_from_them() {
+        assert_eq!(Speaker::User.display_label(), "You");
+        assert_eq!(Speaker::System.display_label(), "They");
+        assert!(Speaker::User.is_me());
+        assert!(!Speaker::System.is_me());
+        assert!(!Speaker::Other.is_me());
     }
 }

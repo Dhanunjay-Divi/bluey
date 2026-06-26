@@ -99,6 +99,21 @@ pub struct CueSettings {
     /// query sorts pinned-first. Empty by default; persists across restarts.
     #[serde(default)]
     pub pinned_overlay_sessions: Vec<uuid::Uuid>,
+
+    /// Question→trigger (master doc §6): names that mark a spoken line as
+    /// addressed to the local user (e.g. `["Alex", "AJ"]`). When *someone else*
+    /// asks a question that mentions one of these, Bluey treats it as "this is
+    /// for me" and surfaces an answer from the attached agent. Empty disables
+    /// name-gated triggering (the loop still works via the manual ask path).
+    #[serde(default)]
+    pub my_names: Vec<String>,
+
+    /// Question→trigger: when `true`, a detected for-me question fires the
+    /// attached agent automatically; when `false` (default), Bluey only
+    /// *suggests* (surfaces the detected question as a card) and the user taps
+    /// to ask. Opt-in auto mode per the master doc's "suggest by default".
+    #[serde(default)]
+    pub auto_trigger_enabled: bool,
 }
 
 impl Default for CueSettings {
@@ -121,6 +136,8 @@ impl Default for CueSettings {
             attached_session: None,
             accepted_byot_vendors: Vec::new(),
             pinned_overlay_sessions: Vec::new(),
+            my_names: Vec::new(),
+            auto_trigger_enabled: false,
         }
     }
 }

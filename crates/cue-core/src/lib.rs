@@ -12,6 +12,7 @@ pub mod logging;
 pub mod meeting;
 pub mod observability;
 pub mod overlay;
+pub mod prestage;
 pub mod session;
 pub mod state;
 
@@ -44,7 +45,10 @@ pub use cloud::{
 pub use config::{
     load_account, load_settings, save_account, save_settings, AccountConfig, CueSettings,
 };
-pub use intelligence::{analyze_segment, generate_recap, local_answer, SegmentAnalysis};
+pub use intelligence::{
+    analyze_segment, detect_for_me_question, generate_recap, local_answer, ForMeQuestion,
+    SegmentAnalysis,
+};
 pub use ipc::{DaemonRequest, DaemonResponse};
 pub use logging::{
     init_local_json_logging, local_log_dir, log_file_prefix, retain_recent_log_files, LocalLogGuard,
@@ -62,6 +66,7 @@ pub use overlay::{
     AnswerStatusState, AnswerStatusStep, OverlayCommand, OverlayContextItem, OverlayEvent,
     OverlayPosition, OverlaySessionItem,
 };
+pub use prestage::{build_prestage_brief, PrestageInput};
 pub use state::{DaemonState, MeetingState};
 
 #[macro_export]
