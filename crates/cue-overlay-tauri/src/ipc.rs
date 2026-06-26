@@ -45,7 +45,9 @@ impl IpcArgs {
         // CLI args take precedence; fall back to env vars (the daemon's direct-exec
         // launch path passes BLUEY_OVERLAY_SOCKET / BLUEY_OVERLAY_SESSION_TOKEN as
         // env, while the test harness uses --bluey-overlay-socket flags).
-        let mut socket = std::env::var("BLUEY_OVERLAY_SOCKET").ok().filter(|s| !s.is_empty());
+        let mut socket = std::env::var("BLUEY_OVERLAY_SOCKET")
+            .ok()
+            .filter(|s| !s.is_empty());
         let mut token = std::env::var("BLUEY_OVERLAY_SESSION_TOKEN").unwrap_or_default();
         let args: Vec<String> = std::env::args().collect();
         let mut i = 0;

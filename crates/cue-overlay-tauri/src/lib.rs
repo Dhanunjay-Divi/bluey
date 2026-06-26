@@ -13,6 +13,13 @@ use tauri::Manager;
 mod ipc;
 
 #[cfg(target_os = "macos")]
+// `tauri_nspanel::cocoa::appkit::NSWindowCollectionBehavior` is deprecated in
+// favour of the objc2-app-kit crate, but tauri-nspanel's panel API still takes
+// the cocoa enum. Migrating would mean adding objc2-app-kit and converting types
+// across the nspanel boundary; the cocoa binding is still functional and the
+// behaviour is verified (screen-share invisibility). Scope the allow to this
+// module so the deprecation stays surfaced everywhere else.
+#[allow(deprecated)]
 mod macos {
     use tauri::Manager;
     use tauri_nspanel::{cocoa::appkit::NSWindowCollectionBehavior, WebviewWindowExt as PanelExt};
@@ -52,7 +59,9 @@ mod macos {
             if let Ok(ptr) = window.ns_window() {
                 let ns = ptr as *mut AnyObject;
                 if !ns.is_null() {
-                    unsafe { let _: () = msg_send![ns, setSharingType: 0u64 as NSUInteger]; }
+                    unsafe {
+                        let _: () = msg_send![ns, setSharingType: 0u64 as NSUInteger];
+                    }
                 }
             }
         }
@@ -66,7 +75,9 @@ mod macos {
         for (_label, window) in app.webview_windows() {
             if let Ok(ptr) = window.ns_window() {
                 let ns = ptr as *mut AnyObject;
-                if ns.is_null() { continue; }
+                if ns.is_null() {
+                    continue;
+                }
                 unsafe {
                     let nscolor = objc2::runtime::AnyClass::get("NSColor").unwrap();
 
@@ -82,7 +93,11 @@ mod macos {
                     let clear: *mut AnyObject = msg_send![nscolor, clearColor];
                     let zero_alpha: *mut AnyObject = msg_send![
                         nscolor, colorWithSRGBRed: 0.0f64, green: 0.0f64, blue: 0.0f64, alpha: 0.0f64];
-                    let bg = if zero_alpha.is_null() { clear } else { zero_alpha };
+                    let bg = if zero_alpha.is_null() {
+                        clear
+                    } else {
+                        zero_alpha
+                    };
                     let _: () = msg_send![ns, setBackgroundColor: bg];
                     let _: () = msg_send![ns, setOpaque: false];
                     let _: () = msg_send![ns, setHasShadow: false];
@@ -150,8 +165,7 @@ mod macos {
                 // (NSColor arg, not CGColor — the safe msg_send path.)
                 if let Some(nscolor) = AnyClass::get("NSColor") {
                     let clear: *mut AnyObject = msg_send![nscolor, clearColor];
-                    let responds: bool =
-                        msg_send![view, respondsToSelector: objc2::sel!(setUnderPageBackgroundColor:)];
+                    let responds: bool = msg_send![view, respondsToSelector: objc2::sel!(setUnderPageBackgroundColor:)];
                     if responds {
                         let _: () = msg_send![view, setUnderPageBackgroundColor: clear];
                     }
@@ -183,7 +197,11 @@ const OVERLAY_FRAME_MARGIN: f64 = 4.0;
 fn set_overlay_mode(window: tauri::WebviewWindow, expanded: bool) {
     use tauri::{LogicalPosition, LogicalSize};
     // Content size + a transparent margin on every side.
-    let (cw, ch) = if expanded { (600.0, 720.0) } else { (288.0, 48.0) };
+    let (cw, ch) = if expanded {
+        (600.0, 720.0)
+    } else {
+        (288.0, 48.0)
+    };
     let m = OVERLAY_FRAME_MARGIN;
     let (w, h) = (cw + m * 2.0, ch + m * 2.0);
     let _ = window.set_size(LogicalSize::new(w, h));
@@ -199,7 +217,10 @@ fn set_overlay_mode(window: tauri::WebviewWindow, expanded: bool) {
 pub fn run() {
     tauri::Builder::default()
         .manage(ipc::EventSender(tokio::sync::Mutex::new(None)))
-        .invoke_handler(tauri::generate_handler![set_overlay_mode, ipc::overlay_send])
+        .invoke_handler(tauri::generate_handler![
+            set_overlay_mode,
+            ipc::overlay_send
+        ])
         .setup(|app| {
             // No Dock icon — the overlay is a background/accessory app (like a
             // menu-bar utility). Without this it shows in the Dock, which an

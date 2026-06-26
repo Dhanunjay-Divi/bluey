@@ -20,6 +20,13 @@ mod commands;
 mod ipc;
 
 #[cfg(target_os = "macos")]
+// `tauri_nspanel::cocoa::appkit::NSWindowCollectionBehavior` is deprecated in
+// favour of the objc2-app-kit crate, but tauri-nspanel's panel API still takes
+// the cocoa enum. Migrating would mean adding objc2-app-kit and converting types
+// across the nspanel boundary; the cocoa binding is still functional and the
+// behaviour is verified (screen-share invisibility). Scope the allow to this
+// module so the deprecation stays surfaced everywhere else.
+#[allow(deprecated)]
 mod macos {
     use tauri::Manager;
     use tauri_nspanel::{cocoa::appkit::NSWindowCollectionBehavior, WebviewWindowExt as PanelExt};
@@ -95,7 +102,6 @@ mod macos {
             }
         }
     }
-
 
     /// Recursively disable any WKWebView's opaque backing so only the HTML paints
     /// (the documented transparent-macOS-webview fix). Safe no-op for other views.
