@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- On-device English STT via Parakeet (Nemotron, `parakeet-rs`/ONNX): the mic +
+  chunk capture loop now runs through the streaming `SttProvider` trait
+  (`BLUEY_STT_PARAKEET=1`), unifying it with the system-audio path. First-run
+  model auto-download (atomic, resumable) from a public int8 mirror, env-
+  overridable via `BLUEY_PARAKEET_MODEL_URL` / `BLUEY_PARAKEET_MODEL_DIR`. Real
+  inference verified end-to-end on native arm64 (`parakeet_real_inference` test +
+  an in-module daemon-path test).
+- Speaker labels: transcript renders conversational `You` / `They` (mic vs
+  system) for both the agent context and the recap (`Speaker::display_label`).
+- Question→trigger (master doc §6): a final line from another speaker that is
+  question-shaped and (if `my_names` is set) mentions the user is surfaced as a
+  for-me question — suggest card by default, or auto-drive the attached agent
+  (`auto_trigger_enabled`). Fires on both the live-audio and `TranscriptAdd` IPC
+  paths. New `detect_for_me_question` in cue-core; `my_names` /
+  `auto_trigger_enabled` settings.
+- Pinned context blocks always sent ahead of the recency transcript: a decisions
+  ledger (decisions + open commitments) and a pre-meeting brief (new
+  `cue_core::prestage` module) so a minute-5 constraint still reaches the agent
+  at minute 40.
+- Overlay answer-speed picker (fast / balanced / deep) wired UI → daemon, now
+  producing genuinely distinct answer instructions (was previously cosmetic).
+- `BLUEY_OVERLAY_BIN` env override to point the daemon at a specific overlay
+  binary / `.app`.
 - `bluey agent prove` — a capability matrix that probes EVERY known agent on the
   machine and reports, per agent, what genuinely works at the highest honest
   level: LIVE (exercised against the real installed agent), FIXTURE (reserved
@@ -45,6 +68,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same validation gate. Design: docs/work/PLAN-ADAPTIVE-RESOLVER.md.
 
 ### Changed
+- ACP agent driving is now ON by default for ACP-capable agents (was opt-in
+  `BLUEY_USE_ACP=1`), made safe by a CLI fallback: a pre-first-token ACP failure
+  (spawn/handshake/adapter) transparently falls back to the CLI driver, so the
+  default flip can't turn setup faults into hard answer failures. Disable with
+  `BLUEY_USE_ACP=0`.
+- The daemon now discovers and launches the real meeting overlay
+  (`cue-meeting-overlay`) ahead of the older overlays, and the macOS package
+  builds + ships it (UI + arm64 binary, staged into the release).
+- Semantic transcript recall (embedding RAG) is now documented and logged as a
+  cloud-optional enhancement, not a faux-"local" default — the local core loop
+  (transcript buffer + decisions ledger + pre-meeting brief) needs no embeddings,
+  and keyword `bluey memory search` is unaffected.
 - Corrected the per-agent CLI drive command map against official 2025-2026 docs
   (we had guessed wrong before): Cursor now uses `--output-format json` (a new
   `CursorJson` parser captures the answer + session id) and `--resume=<id>`;
