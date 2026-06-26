@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-26 14:57 EDT
+Latest checkpoint: 2026-06-26 15:17 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,23 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-195-SELF-INTRO-CANVAS-ROUTING-GUARD.md`; the next canonical Bluey round doc should start at `ROUND-196-...`.
+- Latest assigned Bluey round doc is `ROUND-196-SCREEN-CONTEXT-PAYLOAD-GUARD.md`; the next canonical Bluey round doc should start at `ROUND-197-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-routing-hardening`.
+- Round 196 diagnosed the owner's generic overlay failure card as a managed vision request-size failure: the matching Bluey log showed `/router/complete/stream` returning HTTP `413 Payload Too Large` with `Failed to buffer the request body: length limit exceeded`.
+- The failure happened with two attached screen-context chips; it was not a model-answering or canvas-routing bug.
+- The daemon now classifies `413`, `payload too large`, `length limit exceeded`, and screen-image validation phrases into a clear user-facing message: the attached screen context is too large for one request.
+- The daemon now enforces a 12 MB total per-answer screen-image upload budget. Extra screenshots over that budget are omitted from provider image upload while their saved text previews remain in the prompt.
+- The managed server now applies an explicit 20 MB body limit to `/router/complete` and `/router/complete/stream`, and its image validation matches the desktop budget: 4 MB per image, 12 MB total image payload.
+- Round 196 verification passed:
+  - `cargo test -p cue-daemon upload_budget -- --nocapture`
+  - `cargo test -p cue-daemon oversized_screen_context -- --nocapture`
+  - `cargo test --manifest-path server/Cargo.toml complete_image_validation_rejects -- --nocapture`
+- Round 196 was diagnosed from `~/Library/Logs/Bluey/daemon-log.2026-06-26.log`; the local daemon was not running when checked, so no live overlay replay was performed in this round.
+- Remaining Round 196 QA gate: deploy the server change, then run a live managed-vision smoke with two normal screen captures and an oversized multi-capture request.
 - Round 195 fixed a managed/server artifact-routing bug where "tell me about yourself" style answers could be labeled `Q1 System Design` because the answer mentioned APIs, throughput, distributed systems, and architecture.
 - Managed server artifact detection now blocks self-intro and behavioral interview answers before promoting technical keyword matches into `system_design` artifacts.
 - Local daemon artifact detection has the same self-intro/behavioral guard.

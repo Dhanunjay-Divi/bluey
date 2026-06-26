@@ -784,6 +784,7 @@ const ANSWER_CONTEXT_ARTIFACT_LIMIT: usize = 8;
 const ANSWER_RAG_LOOKUP_TIMEOUT_MS_DEFAULT: u64 = 120;
 const MAX_PROVIDER_IMAGE_DATA_URLS: usize = 4;
 const MAX_PROVIDER_IMAGE_DATA_URL_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PROVIDER_IMAGE_DATA_URL_TOTAL_BYTES: usize = 12 * 1024 * 1024;
 const RETAINED_SCREEN_THUMBNAIL_MAX_EDGE: u32 = 1_800;
 
 impl OverlayProcess {
@@ -5019,6 +5020,9 @@ fn user_facing_answer_error(error: &anyhow::Error) -> String {
     if is_incomplete_stream_error(&lower) {
         return "Bluey's connection dropped before the answer finished. It was not saved as a completed answer. Please retry; if this keeps happening, check Bluey status and server logs.".to_string();
     }
+    if is_payload_too_large_error(&lower) {
+        return "That answer had too much attached screen context for one request. Remove one screenshot or retry with a smaller capture; Bluey will still use any saved text previews it has.".to_string();
+    }
     if lower.contains("insufficient_quota")
         || lower.contains("quota")
         || lower.contains("credit balance")
@@ -5059,6 +5063,17 @@ fn is_incomplete_stream_error(lower_error: &str) -> bool {
         || lower_error.contains("stream interrupted")
         || lower_error.contains("upstream_stream_error")
         || lower_error.contains("upstream_stream_incomplete")
+}
+
+fn is_payload_too_large_error(lower_error: &str) -> bool {
+    lower_error.contains("payload too large")
+        || lower_error.contains("server error: 413")
+        || lower_error.contains("server error 413")
+        || lower_error.contains("request entity too large")
+        || lower_error.contains("length limit exceeded")
+        || lower_error.contains("image_too_large")
+        || lower_error.contains("too many screen images")
+        || lower_error.contains("screen image is too large")
 }
 
 fn retry_after_hint(raw: &str) -> Option<String> {
@@ -6529,6 +6544,7 @@ fn provider_prompt_parts(payload: &ProviderRequestPayload) -> Result<ProviderPro
     }
 
     let mut image_data_urls = Vec::new();
+    let mut image_data_url_bytes = 0usize;
     let mut text_context = Vec::new();
     for item in &payload.context {
         let title = item.title.as_deref().unwrap_or("Context");
@@ -6545,11 +6561,20 @@ fn provider_prompt_parts(payload: &ProviderRequestPayload) -> Result<ProviderPro
                     let mut upload_note: Option<String> = None;
                     if image_data_urls.len() < MAX_PROVIDER_IMAGE_DATA_URLS {
                         match image_data_url_from_path(path) {
-                            Ok(data_url)
-                                if data_url.chars().count()
-                                    <= MAX_PROVIDER_IMAGE_DATA_URL_BYTES =>
-                            {
-                                image_data_urls.push(data_url);
+                            Ok(data_url) if data_url.len() <= MAX_PROVIDER_IMAGE_DATA_URL_BYTES => {
+                                let data_url_bytes = data_url.len();
+                                if image_data_url_bytes.saturating_add(data_url_bytes)
+                                    > MAX_PROVIDER_IMAGE_DATA_URL_TOTAL_BYTES
+                                {
+                                    upload_note = Some(
+                                        "omitted from provider upload because the attached screenshots are over Bluey's per-answer upload budget, so Bluey will use the saved text preview instead."
+                                            .to_string(),
+                                    );
+                                } else {
+                                    image_data_url_bytes =
+                                        image_data_url_bytes.saturating_add(data_url_bytes);
+                                    image_data_urls.push(data_url);
+                                }
                             }
                             Ok(_) => {
                                 upload_note = Some(
@@ -10978,6 +11003,12 @@ mod tests {
         std::fs::write(path, png).expect("write test image");
     }
 
+    fn write_sized_test_png(path: &Path, byte_len: usize) {
+        let mut png = vec![0; byte_len.max(8)];
+        png[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        std::fs::write(path, png).expect("write sized test image");
+    }
+
     #[test]
     fn suggested_meeting_title_uses_context_words() {
         assert_eq!(
@@ -11135,6 +11166,46 @@ mod tests {
             MAX_PROVIDER_IMAGE_DATA_URLS
         );
         assert!(json.contains("omitted from provider upload because Bluey sends only the latest"));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn provider_prompt_parts_omits_images_over_total_upload_budget() {
+        let base = env::temp_dir().join(format!(
+            "bluey-vision-payload-total-cap-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&base).expect("create temp image dir");
+
+        let route = ProviderRoute::direct(ProviderSelector::openai("gpt-4.1-mini"))
+            .with_privacy(PrivacyFlags::managed_commercial().with_image_upload());
+        let mut request = AnswerRequest::new("Compare these screenshots.", route);
+        for index in 0..4 {
+            let path = base.join(format!("screen-{index}.png"));
+            write_sized_test_png(&path, 2_950_000);
+            request.context.push(
+                AnswerContext::new(
+                    AnswerContextKind::Screenshot,
+                    format!("screen capture fallback {index}"),
+                )
+                .with_title(format!("Screen {index}"))
+                .with_source(path.display().to_string()),
+            );
+        }
+
+        let payload = ProviderRequestPayload::from_request(
+            &request,
+            ProviderSelector::openai("gpt-4.1-mini"),
+            Some("https://api.openai.com/v1/chat/completions".to_string()),
+            "fallback",
+            RouteBudget::realtime(),
+        );
+
+        let parts = provider_prompt_parts(&payload).expect("build provider prompt parts");
+
+        assert_eq!(parts.image_data_urls.len(), 3);
+        assert!(parts.user.contains("over Bluey's per-answer upload budget"));
 
         let _ = std::fs::remove_dir_all(base);
     }
@@ -12240,6 +12311,18 @@ mod tests {
         assert!(message.contains("connection dropped"));
         assert!(message.contains("retry"));
         assert!(!message.contains("billing/quota"));
+    }
+
+    #[test]
+    fn user_facing_answer_error_explains_oversized_screen_context() {
+        let error =
+            anyhow!("bluey_managed/vision request failed: provider error: server error: 413");
+
+        let message = user_facing_answer_error(&error);
+
+        assert!(message.contains("too much attached screen context"));
+        assert!(message.contains("Remove one screenshot"));
+        assert!(!message.contains("server logs"));
     }
 
     #[test]

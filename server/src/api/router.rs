@@ -572,7 +572,8 @@ fn missing_provider_key_error(provider: &str) -> anyhow::Error {
 }
 
 const MAX_COMPLETE_IMAGE_DATA_URLS: usize = 4;
-const MAX_COMPLETE_IMAGE_DATA_URL_BYTES: usize = 12 * 1024 * 1024;
+const MAX_COMPLETE_IMAGE_DATA_URL_BYTES: usize = 4 * 1024 * 1024;
+const MAX_COMPLETE_IMAGE_DATA_URL_TOTAL_BYTES: usize = 12 * 1024 * 1024;
 const ESTIMATED_TOKENS_PER_IMAGE: i64 = 1_500;
 
 fn image_validation_error(
@@ -598,11 +599,20 @@ fn validate_complete_images(image_data_urls: &[String]) -> Result<(), ApiError> 
         });
     }
 
+    let mut total_image_bytes = 0usize;
     for data_url in image_data_urls {
         if data_url.len() > MAX_COMPLETE_IMAGE_DATA_URL_BYTES {
             return Err(ApiError {
                 error: "screen image is too large".into(),
                 reason: Some("image_too_large".into()),
+                ..Default::default()
+            });
+        }
+        total_image_bytes = total_image_bytes.saturating_add(data_url.len());
+        if total_image_bytes > MAX_COMPLETE_IMAGE_DATA_URL_TOTAL_BYTES {
+            return Err(ApiError {
+                error: "screen images are too large for one answer".into(),
+                reason: Some("image_payload_too_large".into()),
                 ..Default::default()
             });
         }
@@ -4291,6 +4301,29 @@ mod tests {
         let images = vec!["data:image/png;base64,aGVsbG8=".to_string(); 5];
         let error = validate_complete_images(&images).unwrap_err();
         assert_eq!(error.reason.as_deref(), Some("too_many_images"));
+    }
+
+    #[test]
+    fn complete_image_validation_rejects_single_oversized_image() {
+        let images = vec![format!(
+            "data:image/png;base64,{}",
+            "a".repeat(MAX_COMPLETE_IMAGE_DATA_URL_BYTES)
+        )];
+        let error = validate_complete_images(&images).unwrap_err();
+        assert_eq!(error.reason.as_deref(), Some("image_too_large"));
+    }
+
+    #[test]
+    fn complete_image_validation_rejects_oversized_total_payload() {
+        let image_payload = "a".repeat((MAX_COMPLETE_IMAGE_DATA_URL_TOTAL_BYTES / 4) + 1);
+        let images = vec![
+            format!("data:image/png;base64,{image_payload}"),
+            format!("data:image/png;base64,{image_payload}"),
+            format!("data:image/png;base64,{image_payload}"),
+            format!("data:image/png;base64,{image_payload}"),
+        ];
+        let error = validate_complete_images(&images).unwrap_err();
+        assert_eq!(error.reason.as_deref(), Some("image_payload_too_large"));
     }
 
     #[test]
