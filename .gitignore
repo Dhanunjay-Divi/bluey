@@ -9,6 +9,15 @@ _refs/
 # Build and release output.
 dist/
 
+# Local on-device model weights (ONNX/tokenizer). Large binaries, never committed —
+# fetched on first run or staged locally. See crates/cue-daemon/src/stt/model_setup.rs.
+/models/
+*.onnx
+*.onnx.data
+
+# Local audio fixtures used only for on-device STT smoke tests (not product source).
+crates/cue-daemon/tests/fixtures/
+
 # Local visual QA screenshots.
 tmp-*.png
 

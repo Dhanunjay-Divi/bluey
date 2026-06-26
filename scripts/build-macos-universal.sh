@@ -2,16 +2,22 @@
 # build-macos-universal.sh
 #
 # Combines arm64 + x86_64 builds via `lipo -create` into universal binaries.
+# This script does NOT compile: it lipo's the per-target release binaries built
+# by `make build-darwin-arm64` / `make build-darwin-x86_64`, which already pass
+# `--features cue-daemon/parakeet-stt`. So on-device STT is inherited here with
+# no extra flag. (Intel-mac caveat: the x86_64 half links parakeet via
+# load-dynamic and needs a libonnxruntime dylib at runtime — not staged; arm64
+# is the MVP target.)
 # Inputs:
-#   target/aarch64-apple-darwin/release/{bluey,bluey-daemon}
-#   target/x86_64-apple-darwin/release/{bluey,bluey-daemon}
+#   target/aarch64-apple-darwin/release/{bluey,bluey-daemon,cue-meeting-overlay}
+#   target/x86_64-apple-darwin/release/{bluey,bluey-daemon,cue-meeting-overlay}
 #   native/macos/cue-overlay/.build/{arm64,x86_64}-apple-macosx/release/cue-overlay
 #   native/macos/cue-audio/.build/{arm64,x86_64}-apple-macosx/release/cue-audio
 #   native/macos/cue-whisper/.build/{arm64,x86_64}-apple-macosx/release/CueWhisper
 #   native/macos/cue-picker/.build/{arm64,x86_64}-apple-macosx/release/cue-picker
 #
 # Output:
-#   dist/bluey-macos-universal/{bluey,bluey-daemon,bluey-overlay-macos,bluey-audio-macos,bluey-whisper-macos,bluey-file-picker-macos}
+#   dist/bluey-macos-universal/{bluey,bluey-daemon,cue-meeting-overlay,bluey-overlay-macos,bluey-audio-macos,bluey-whisper-macos,bluey-file-picker-macos}
 
 set -euo pipefail
 
@@ -32,6 +38,18 @@ lipo -create \
     "target/aarch64-apple-darwin/release/bluey-daemon" \
     "target/x86_64-apple-darwin/release/bluey-daemon" \
     -output "$OUT/bluey-daemon"
+
+# Meeting overlay (cue-meeting-overlay): the real Tauri 2 meeting overlay the
+# daemon spawns. Built per-arch by `make build-meeting-overlay-darwin-{arm64,
+# x86_64}`; lipo'd here. The daemon launches the binary directly, so no .app
+# wrapper is needed in the package.
+ARM_MEETING="target/aarch64-apple-darwin/release/cue-meeting-overlay"
+X86_MEETING="target/x86_64-apple-darwin/release/cue-meeting-overlay"
+if [[ -f "$ARM_MEETING" && -f "$X86_MEETING" ]]; then
+    lipo -create "$ARM_MEETING" "$X86_MEETING" -output "$OUT/cue-meeting-overlay"
+else
+    echo "warn: meeting-overlay arch builds not both present; skipping meeting overlay in universal" >&2
+fi
 
 # Swift overlay.
 ARM_OVERLAY="native/macos/cue-overlay/.build/arm64-apple-macosx/release/cue-overlay"
