@@ -316,3 +316,95 @@ recent raw and the ledger intact.
 Decisions ledger (the trust layer — stops confident-wrong answers). (3)
 Say-what's-missing in the prompt (free, big trust win). (4) v2: retrieval-on-miss
 + overflow summary (long/deep-meeting polish).
+
+---
+
+## LATENCY — "instant something real to say, then the deep answer"
+
+**The problem.** When a question lands on you in a meeting, the agent's grounded
+answer (Claude Code / Cursor → MCP → repo/Jira) takes *seconds*. But you need
+words in ~300ms or the moment passes and you're sitting there silent. The naive
+fix — show "thinking…" or filler ("good question…") — is *worse* than silence;
+it's visibly stalling. The instant layer must be **real, grounded content** that
+just happens to be cheap to produce.
+
+### The two-layer answer: fork, don't fall back
+
+One answer card, two writes — a **fork-and-merge**, not a fallback chain:
+
+```
+t=0ms     question detected (the §6 trigger already fires this)
+t~50-100ms  FAST layer → push_card with a REAL first line from LOCAL context
+t~2-8s      DEEP layer → same card, update_card streams the agent's grounded answer
+                         (extended BELOW the fast line — never yanked away)
+```
+
+The card is never empty, and the first thing shown is *true* — not "thinking…".
+This reuses what already exists: the pipeline streams (`AnswerStreamEvent`,
+`replay_text`, `UpdateCard`), there's a local-answer path (`AiProviderKind::Local`
+→ `local_answer`), and generation-IDs (`answer_generation`) already cancel stale
+answers. The change is: write the fast card **synchronously**, then `tokio::spawn`
+the agent drive into the *same* card id instead of awaiting it inline (today
+`OverlayEvent::AskRequested` awaits `answer_with_provider_runtime`).
+
+**Important:** the existing `ProviderRoute` is a *fallback* chain (try A, if A
+**fails** try B). That is the wrong shape — we don't want "local only if the agent
+dies." We want both, in parallel, racing to the same card. The fork is new control
+flow in the daemon, not a new route.
+
+### Where the fast layer's content comes from (it is NOT filler)
+
+Three local, fast tiers — adopt in order:
+
+- **Tier A — extractive (~10ms, zero model):** the single most-relevant *grounded*
+  line from what Bluey already holds — decisions ledger, the matched pre-staged
+  ticket, recent transcript. This is `local_answer` reorganized to lead with one
+  real line. **Ship this first** — real content in <100ms, no new dependency.
+- **Tier B — tiny local LLM (~300-700ms):** a 1-3B instruct model (rides the `ort`
+  runtime we already ship for Parakeet) writes one grounded sentence. Better prose,
+  still local. A drop-in upgrade behind the same seam; only worth it if Tier A's
+  phrasing feels templated.
+- **Tier C — the agent (seconds):** the real grounded answer (repo/PR/MCP). Already
+  built; it *extends* the fast layer.
+
+### The discipline that makes the fast layer safe: state provenance, not fact
+
+The deep risk: if the fast layer says "we decided Friday" and the agent returns
+"the PR slipped to Tuesday," **you've already said the wrong thing out loud.** The
+fix is structural — the fast layer reports *what Bluey is the authority on*: the
+**meeting** ("*From the meeting: the plan was Friday*"), which is true regardless
+of repo state. The agent then adds *repo*-truth ("*and the PR merged this
+morning*"). Two layers, both true, no contradiction. This is the §0/§3 split
+(transcript is Bluey's, repo is the agent's) reappearing as a *latency* strategy.
+When local context is thin (cold-start, first ~10 meetings), Tier A must hedge
+*honestly* ("*pulling up the auth PR — last I have is it was in review*") rather
+than invent. So the instant layer's quality **rides on the ledger + pre-staging
+being populated** — the latency feature and the context features reinforce each
+other.
+
+### Researched-technology verdict (RAG/KAG/CAG/GraphRAG/Mem0/Zep/LangGraph)
+
+Evaluated against what Bluey actually does. The pattern: *retrieval/caching*
+techniques (about latency + prompt shape) help; *memory-store* techniques don't,
+because Bluey **deliberately does not own the memory** — the agent owns
+work-knowledge (via MCP), the transcript store owns meeting-knowledge.
+
+| Technique | Verdict | What to actually do |
+|---|---|---|
+| **CAG / KV-cache / prompt caching** | ✅ **Real win** | We don't run the model (the agent does), so we can't touch its KV cache directly. But its **provider** (Anthropic/OpenAI) caches on a stable prompt **prefix**. So: order the package **stable-first** (system prompt + pre-staged brief + ledger), **volatile-last** (recent transcript + the question). Every follow-up in a meeting then reuses the cached prefix → faster + cheaper. Pure prompt-ordering discipline, no new infra. |
+| **Agentic RAG (retrieve-decide-rewrite)** | 🟡 Mostly already have it | For *work data* the agent already does this natively (deciding what to grep IS agentic retrieval). For *transcript*, add only "**RAG on miss**" — a conditional, not a framework (already planned as v2 above). |
+| **Zep/Graphiti "validity periods"** | 🟡 One idea only | Steal the idea, not the engine: make ledger decisions **supersede-able with timestamps** (~20 lines on the existing ledger) so "decided X, then changed to Y" keeps both as historical truth. Skip the graph DB. |
+| **Mem0** | ❌ No | Its job (be the persistent memory store) overlaps both MCP and `cue-rag`; adds a third, drifting shadow store + a Python dep. The technique is fine; it solves a problem we architected away. |
+| **GraphRAG / HippoRAG** | ❌ No | Entity-graph multi-hop over a corpus — Bluey has no corpus that needs it (transcript is recency-bounded; the repo the agent traverses live). |
+| **LangGraph** | ❌ No | Multi-agent stateful orchestration for a flow that is one agent, linear. Breaks the no-vendor-SDK / one-binary constraint; wraps a flow already in `cue-agent-bridge`. |
+
+### Build order (latency)
+
+(1) **Fork** — write Tier-A fast card synchronously, spawn the agent into the same
+card. Biggest perceived-latency win, no new deps. (2) **Prompt-ordering for
+caching** — stable-first/volatile-last in the assembled package (pairs with §
+pre-staging). (3) **Provenance framing** in the fast layer (the trust guard). (4)
+Later: Tier-B local LLM; ledger validity-periods; pre-warm the agent session so the
+*deep* layer's first token is faster too. **Skip** speculative pre-fetch (firing the
+agent on *predicted* questions) — expensive guesswork; the fork already gets ~90%
+of the feel.
