@@ -4,9 +4,9 @@ pub mod deepgram;
 pub mod echo;
 pub mod factory;
 pub mod mock;
-pub mod openai;
 #[cfg(feature = "parakeet-stt")]
 pub mod model_setup;
+pub mod openai;
 #[cfg(feature = "parakeet-stt")]
 pub mod parakeet;
 pub mod router;

@@ -128,19 +128,17 @@ pub async fn build_stt_chain(
         // data dir; env-overridable) and download the model once if absent, so
         // "install it and it just works". A fully-present dir skips the network.
         match cue_core::app_paths::AppPaths::discover() {
-            Ok(app_paths) => {
-                match super::model_setup::ensure_parakeet_model(&app_paths).await {
-                    Ok(paths) => {
-                        let p = super::parakeet::ParakeetProvider::connect(paths, source);
-                        providers.push(Box::new(p));
-                    }
-                    Err(e) => tracing::warn!(
-                        provider = "parakeet",
-                        error = %e,
-                        "parakeet model unavailable (download/setup failed); skipping"
-                    ),
+            Ok(app_paths) => match super::model_setup::ensure_parakeet_model(&app_paths).await {
+                Ok(paths) => {
+                    let p = super::parakeet::ParakeetProvider::connect(paths, source);
+                    providers.push(Box::new(p));
                 }
-            }
+                Err(e) => tracing::warn!(
+                    provider = "parakeet",
+                    error = %e,
+                    "parakeet model unavailable (download/setup failed); skipping"
+                ),
+            },
             Err(e) => tracing::warn!(
                 provider = "parakeet",
                 error = %e,

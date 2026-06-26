@@ -101,15 +101,16 @@ fn run_worker(
     // Optional on-demand diarization. Loaded lazily so transcription works even
     // when no diarization model is present.
     #[cfg(feature = "parakeet-stt")]
-    let mut sortformer = paths.sortformer_model.as_ref().and_then(|p| {
-        match parakeet_rs::sortformer::Sortformer::new(p) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                warn!("parakeet: diarization disabled (sortformer load failed): {e}");
-                None
-            }
-        }
-    });
+    let mut sortformer =
+        paths.sortformer_model.as_ref().and_then(
+            |p| match parakeet_rs::sortformer::Sortformer::new(p) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn!("parakeet: diarization disabled (sortformer load failed): {e}");
+                    None
+                }
+            },
+        );
 
     // `blocking_recv` is correct here: this is a dedicated OS thread, not an
     // async task. The loop ends when the provider drops `audio_tx`.
@@ -175,11 +176,7 @@ impl SttProvider for ParakeetProvider {
         // parakeet-rs wants 16kHz mono f32 in [-1.0, 1.0]; our AudioChunk carries
         // PCM16 (`i16`) mono. Convert here (i16 / 32768.0). Resampling to 16k, if
         // the source rate differs, is handled upstream in the capture pipeline.
-        let samples: Vec<f32> = chunk
-            .samples
-            .iter()
-            .map(|&s| s as f32 / 32768.0)
-            .collect();
+        let samples: Vec<f32> = chunk.samples.iter().map(|&s| s as f32 / 32768.0).collect();
         match self.audio_tx.as_ref() {
             Some(tx) => tx
                 .send(samples)

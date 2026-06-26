@@ -30,8 +30,16 @@ const NEMOTRON_FILES: &[&str] = &["encoder.onnx", "decoder_joint.onnx", "tokeniz
 
 /// Base URL of the Nemotron English ONNX model on Hugging Face. Overridable via
 /// `BLUEY_PARAKEET_MODEL_URL` for mirrors / internal artifact stores (enterprise).
+///
+/// Points at the **int8** export (`lokkju/nemotron-speech-streaming-en-0.6b-int8`),
+/// the public source the `parakeet-rs` README lists for the English-only model.
+/// int8 is chosen deliberately: it is self-contained (no external
+/// `encoder.onnx.data` sidecar, unlike the fp16 export), ~660MB total, and
+/// `parakeet-rs` `Nemotron::from_pretrained` loads it directly. The previous
+/// default (`altunenes/parakeet_nemotron_en_onnx`) is gated and returns HTTP 401,
+/// so first-run auto-download failed; this repo serves the three files publicly.
 const DEFAULT_MODEL_BASE_URL: &str =
-    "https://huggingface.co/altunenes/parakeet_nemotron_en_onnx/resolve/main";
+    "https://huggingface.co/lokkju/nemotron-speech-streaming-en-0.6b-int8/resolve/main";
 
 /// Resolve the model directory: env override, else `<data_dir>/models/parakeet-en`.
 pub fn resolve_model_dir(paths: &AppPaths) -> PathBuf {

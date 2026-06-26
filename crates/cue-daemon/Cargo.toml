@@ -76,6 +76,11 @@ parakeet-rs = { version = "0.3", optional = true, default-features = false, feat
 # load-dynamic via the per-target dependency above.
 parakeet-stt = ["dep:parakeet-rs", "parakeet-rs/ort-defaults", "parakeet-rs/sortformer"]
 
+[dev-dependencies]
+# WAV reader for the on-device Parakeet inference smoke test + debug example
+# (already in the dependency tree via parakeet-rs; pinned here for test use).
+hound = "3.5"
+
 [lints.clippy]
 needless_return = "allow"
 filter_next = "allow"

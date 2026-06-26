@@ -16,10 +16,10 @@ use cue_agent_bridge::{
     discover_agents,
     drive::{drive_with_mode, DriveMode},
     fix::{extract_diff, fix_apply_prompt, fix_proposal_prompt, parse_fix_proposal, FixProposal},
-    read_connectors, reader_for,
+    is_transient_network_error, read_connectors, reader_for,
     registry::{fix_profile_for, KindTag},
-    is_transient_network_error, AgentKind, AnswerChunk, AuthTier, Capability, DiscoveredAgent,
-    Question as AgentQuestion, ToolStatus,
+    AgentKind, AnswerChunk, AuthTier, Capability, DiscoveredAgent, Question as AgentQuestion,
+    ToolStatus,
 };
 use cue_core::ai::{
     AnswerFinishReason, AnswerRequest, AnswerResponse, AnswerResponseMetadata, AnswerStreamEvent,
@@ -34,15 +34,14 @@ use cue_core::{
     analyze_segment, clock, generate_recap, load_account, load_settings, local_answer,
     new_trace_id, sanitize_observability_id, save_settings, trace_id_from_env, AgentConnectorInfo,
     AgentSessionSummary, AgentSummary, AiCapabilities, AiProviderId, AiProviderKind,
-    AnswerStatusState, AnswerStatusStep,
-    AiRuntimeStatus, AnswerContext, AnswerContextKind, AudioBackend, AudioCaptureConfig,
-    AudioCaptureStatus, AudioChunkMetadata, AudioDeviceDescriptor, AudioDeviceRole,
-    AudioPipelineStatus, AudioSourceKind, CardArtifactType, CardKind, CloudEndpointConfig,
-    CloudEnvironment, CloudSyncState, CloudSyncStatus, ContextArtifact, ContextKind,
-    ContextProcessingStatus, ConversationTurn, CueCard, CueCardArtifact, DaemonState,
-    MeetingRecord, MeetingState, MemoryHit, OverlayCommand, OverlayContextItem, OverlayEvent,
-    OverlaySessionItem, PrivacyFlags, ProviderRoute, ProviderSelector, ProviderStatus, RouteBudget,
-    Speaker, TranscriptSegment,
+    AiRuntimeStatus, AnswerContext, AnswerContextKind, AnswerStatusState, AnswerStatusStep,
+    AudioBackend, AudioCaptureConfig, AudioCaptureStatus, AudioChunkMetadata,
+    AudioDeviceDescriptor, AudioDeviceRole, AudioPipelineStatus, AudioSourceKind, CardArtifactType,
+    CardKind, CloudEndpointConfig, CloudEnvironment, CloudSyncState, CloudSyncStatus,
+    ContextArtifact, ContextKind, ContextProcessingStatus, ConversationTurn, CueCard,
+    CueCardArtifact, DaemonState, MeetingRecord, MeetingState, MemoryHit, OverlayCommand,
+    OverlayContextItem, OverlayEvent, OverlaySessionItem, PrivacyFlags, ProviderRoute,
+    ProviderSelector, ProviderStatus, RouteBudget, Speaker, TranscriptSegment,
 };
 use futures_util::{future::join_all, SinkExt, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -721,6 +720,13 @@ enum RealSttTransport {
     /// network). Chunks are transcribed through the STT factory's
     /// `LocalWhisperProvider` rather than an HTTP endpoint.
     LocalWhisper,
+    /// Fully on-device transcription via the on-device Parakeet (Nemotron)
+    /// model. This is the path that unifies the mic + chunk loop onto the
+    /// streaming [`SttProvider`] trait: chunks are decoded back to PCM16 and
+    /// driven through a provider built by `build_stt_chain` (no HTTP, nothing
+    /// leaves the machine). Gated by `BLUEY_STT_PARAKEET=1` + the
+    /// `parakeet-stt` build feature.
+    Parakeet,
 }
 
 #[derive(Debug, Clone)]
@@ -1300,7 +1306,7 @@ async fn handle_request_inner(
             text,
             is_final,
         } => {
-            let Some((meeting_snapshot, cards, indexed_segment)) = ({
+            let Some((meeting_snapshot, cards, indexed_segment, committed_segment)) = ({
                 let mut meeting_guard = daemon.meeting.lock().await;
                 if meeting_guard.is_none() {
                     // Title from the first transcript line (mechanical, no LLM).
@@ -1321,7 +1327,7 @@ async fn handle_request_inner(
                     let indexed_segment = segment
                         .is_final
                         .then(|| (meeting.id.to_string(), segment.text.clone()));
-                    Some((meeting.clone(), analysis.cards, indexed_segment))
+                    Some((meeting.clone(), analysis.cards, indexed_segment, segment))
                 }
             }) else {
                 return Ok(DaemonResponse::Text {
@@ -1340,6 +1346,14 @@ async fn handle_request_inner(
             }
             if has_cards {
                 write_state(daemon).await?;
+            }
+
+            // Question→trigger (master doc §6): fire on the IPC transcript path
+            // too, so the trigger works whether a line arrives from live audio or
+            // from `bluey listen` / a connected transcription source — parity with
+            // the audio capture path.
+            if committed_segment.is_final {
+                maybe_trigger_for_me_question(daemon, &committed_segment).await;
             }
 
             Ok(DaemonResponse::Text {
@@ -3178,6 +3192,25 @@ async fn build_real_audio_runtime_config(
                     )
                 }
             }
+            _ if is_parakeet_chunk_enabled() => {
+                // Keyless, fully-local, on-device English STT: BLUEY_STT_PARAKEET=1
+                // routes the mic + chunk loop through the Parakeet (Nemotron)
+                // provider built by `build_stt_chain` — unifying the chunk path
+                // onto the streaming `SttProvider` trait. Nothing leaves the
+                // machine. If the model can't be provisioned, the failure surfaces
+                // honestly at transcribe time (not as a sign-in gate). Checked
+                // before whisper so the preferred on-device engine wins when both
+                // are enabled.
+                let stt_model =
+                    env_first(&["BLUEY_STT_MODEL"]).unwrap_or_else(|| "parakeet-en".into());
+                (
+                    String::new(),
+                    String::new(),
+                    stt_model.clone(),
+                    format!("parakeet:{stt_model}"),
+                    RealSttTransport::Parakeet,
+                )
+            }
             _ if crate::stt::router::is_local_whisper_enabled() => {
                 // Keyless, fully-local fallback: BLUEY_STT_LOCAL_WHISPER=1 routes
                 // transcription through the on-device whisper helper (no key, no
@@ -3197,7 +3230,7 @@ async fn build_real_audio_runtime_config(
             }
             _ => {
                 return Ok(AudioRuntimeConfigResolution::Unavailable(
-                    "Listen needs speech-to-text: sign in to Bluey for managed transcription, set an STT API key, or enable on-device transcription with BLUEY_STT_LOCAL_WHISPER=1.".to_string(),
+                    "Listen needs speech-to-text: sign in to Bluey for managed transcription, set an STT API key, or enable on-device transcription with BLUEY_STT_PARAKEET=1 (English, on-device) or BLUEY_STT_LOCAL_WHISPER=1.".to_string(),
                 ))
             }
         }
@@ -3766,40 +3799,86 @@ async fn real_audio_loop(
     let idle_timeout = audio_idle_stop_timeout();
     let mut last_transcript_at = Instant::now();
 
-    loop {
-        let mut source_jobs = Vec::with_capacity(runtime.sources.len());
-        for source in &runtime.sources {
-            let sequence = match source.source {
-                AudioSourceKind::System => {
-                    system_sequence = system_sequence.saturating_add(1);
-                    system_sequence
-                }
-                AudioSourceKind::Microphone => {
-                    microphone_sequence = microphone_sequence.saturating_add(1);
-                    microphone_sequence
-                }
-            };
+    // On-device transports drive a single, stateful `SttProvider` (one model in
+    // memory). It is built lazily on the first chunk and reused for the life of
+    // the capture session. A shared `&mut` provider cannot be split across the
+    // concurrent `join_all` jobs, so when on-device we process sources
+    // sequentially through this one provider; the REST transports keep their
+    // concurrent fan-out.
+    let on_device = runtime.stt_transport == RealSttTransport::Parakeet;
+    let mut on_device_provider: Option<Box<dyn cue_core::stt::SttProvider>> = None;
 
-            let daemon_ref = &daemon;
-            let session_id_ref = &session_id;
-            let runtime_ref = &runtime;
-            let client_ref = &client;
-            source_jobs.push(async move {
-                let source_kind = source.source;
+    loop {
+        // Collect this round's results either sequentially (on-device, shared
+        // provider) or concurrently (REST), then handle them identically below.
+        let mut round_results: Vec<(
+            AudioSourceKind,
+            Result<Option<cue_core::audio::SttSegmentMetadata>>,
+        )> = Vec::with_capacity(runtime.sources.len());
+
+        if on_device {
+            for source in &runtime.sources {
+                let sequence = match source.source {
+                    AudioSourceKind::System => {
+                        system_sequence = system_sequence.saturating_add(1);
+                        system_sequence
+                    }
+                    AudioSourceKind::Microphone => {
+                        microphone_sequence = microphone_sequence.saturating_add(1);
+                        microphone_sequence
+                    }
+                };
                 let result = capture_transcribe_audio_chunk(
-                    daemon_ref,
-                    session_id_ref,
-                    runtime_ref,
+                    &daemon,
+                    &session_id,
+                    &runtime,
                     source,
                     sequence,
-                    client_ref,
+                    &client,
+                    &mut on_device_provider,
                 )
                 .await;
-                (source_kind, result)
-            });
+                round_results.push((source.source, result));
+            }
+        } else {
+            let mut source_jobs = Vec::with_capacity(runtime.sources.len());
+            for source in &runtime.sources {
+                let sequence = match source.source {
+                    AudioSourceKind::System => {
+                        system_sequence = system_sequence.saturating_add(1);
+                        system_sequence
+                    }
+                    AudioSourceKind::Microphone => {
+                        microphone_sequence = microphone_sequence.saturating_add(1);
+                        microphone_sequence
+                    }
+                };
+
+                let daemon_ref = &daemon;
+                let session_id_ref = &session_id;
+                let runtime_ref = &runtime;
+                let client_ref = &client;
+                source_jobs.push(async move {
+                    let source_kind = source.source;
+                    // REST transports never touch the on-device provider holder.
+                    let mut no_provider: Option<Box<dyn cue_core::stt::SttProvider>> = None;
+                    let result = capture_transcribe_audio_chunk(
+                        daemon_ref,
+                        session_id_ref,
+                        runtime_ref,
+                        source,
+                        sequence,
+                        client_ref,
+                        &mut no_provider,
+                    )
+                    .await;
+                    (source_kind, result)
+                });
+            }
+            round_results = join_all(source_jobs).await;
         }
 
-        for (source_kind, result) in join_all(source_jobs).await {
+        for (source_kind, result) in round_results {
             match result {
                 Ok(Some(segment)) => {
                     last_transcript_at = Instant::now();
@@ -4180,6 +4259,24 @@ fn pcm_source_for_audio_source(source: AudioSourceKind) -> cue_core::pcm::AudioS
     match source {
         AudioSourceKind::System => cue_core::pcm::AudioSource::System,
         AudioSourceKind::Microphone => cue_core::pcm::AudioSource::Microphone,
+    }
+}
+
+/// Whether the on-device Parakeet chunk path is both built in (the
+/// `parakeet-stt` feature) AND enabled at runtime (`BLUEY_STT_PARAKEET=1`).
+///
+/// Returns `false` in builds without the feature so the chunk loop never
+/// selects the Parakeet transport when the engine isn't compiled in — the
+/// resolver then falls through to whisper / managed / the honest "no STT"
+/// error, exactly as before.
+fn is_parakeet_chunk_enabled() -> bool {
+    #[cfg(feature = "parakeet-stt")]
+    {
+        env_truthy_any(&["BLUEY_STT_PARAKEET"])
+    }
+    #[cfg(not(feature = "parakeet-stt"))]
+    {
+        false
     }
 }
 
@@ -4649,6 +4746,7 @@ async fn capture_transcribe_audio_chunk(
     source: &RealAudioSource,
     sequence: u64,
     client: &reqwest::Client,
+    on_device_provider: &mut Option<Box<dyn cue_core::stt::SttProvider>>,
 ) -> Result<Option<cue_core::audio::SttSegmentMetadata>> {
     let audio_dir = daemon.paths.runtime_dir.join("audio");
     tokio::fs::create_dir_all(&audio_dir)
@@ -4687,10 +4785,16 @@ async fn capture_transcribe_audio_chunk(
         return Ok(None);
     }
 
-    let transcript_result =
-        transcribe_audio_file(runtime, source.source, sequence, &chunk_path, client)
-            .await
-            .with_context(|| format!("failed to transcribe {}", source.source));
+    let transcript_result = transcribe_audio_file(
+        runtime,
+        source.source,
+        sequence,
+        &chunk_path,
+        client,
+        on_device_provider,
+    )
+    .await
+    .with_context(|| format!("failed to transcribe {}", source.source));
     let _ = tokio::fs::remove_file(&chunk_path).await;
     Ok(transcript_result?)
 }
@@ -4856,6 +4960,7 @@ async fn transcribe_audio_file(
     sequence: u64,
     chunk_path: &Path,
     client: &reqwest::Client,
+    on_device_provider: &mut Option<Box<dyn cue_core::stt::SttProvider>>,
 ) -> Result<Option<cue_core::audio::SttSegmentMetadata>> {
     let audio = tokio::fs::read(chunk_path)
         .await
@@ -4926,6 +5031,20 @@ async fn transcribe_audio_file(
                 source,
                 sequence,
                 runtime.chunk_duration_ms,
+            )
+            .await;
+        }
+        RealSttTransport::Parakeet => {
+            // On-device transcription through the streaming `SttProvider` trait:
+            // this is the path that unifies the mic + chunk loop with the same
+            // factory the continuous system-audio path uses. No HTTP, nothing
+            // leaves the machine.
+            return transcribe_chunk_on_device(
+                &audio,
+                source,
+                sequence,
+                runtime.chunk_duration_ms,
+                on_device_provider,
             )
             .await;
         }
@@ -5010,6 +5129,211 @@ async fn transcribe_chunk_local_whisper(
     ))
 }
 
+/// Transcribe one saved audio chunk fully on-device by driving the streaming
+/// [`SttProvider`] built from the STT factory (the `BLUEY_STT_PARAKEET=1`
+/// path). This is the unification point: the mic + chunk loop now consumes the
+/// exact same provider trait the continuous system-audio path uses.
+///
+/// The provider is built lazily on first call and reused across chunks via
+/// `provider_slot` (one model instance for the session). We decode the saved
+/// WAV back to PCM16, push it through `send_audio` + `finalize`, then drain the
+/// provider's events for a brief window — collecting the finalized text and any
+/// diarization speaker label.
+async fn transcribe_chunk_on_device(
+    pcm_wav: &[u8],
+    source: AudioSourceKind,
+    sequence: u64,
+    chunk_duration_ms: u32,
+    provider_slot: &mut Option<Box<dyn cue_core::stt::SttProvider>>,
+) -> Result<Option<cue_core::audio::SttSegmentMetadata>> {
+    use cue_core::pcm::{AudioChunk, SampleRate};
+    use cue_core::stt::{SttConfig, TranscriptEvent};
+
+    let pcm_source = pcm_source_for_audio_source(source);
+
+    // Build the provider once, on the first chunk of the session.
+    if provider_slot.is_none() {
+        let stt_cfg = SttConfig {
+            source: pcm_source,
+            ..Default::default()
+        };
+        let provider = crate::stt::factory::build_stt_chain(&stt_cfg, pcm_source)
+            .await
+            .map_err(|e| anyhow!("on-device STT unavailable: {e}"))?;
+        *provider_slot = Some(provider);
+    }
+    let provider = provider_slot
+        .as_mut()
+        .expect("on-device provider built above");
+
+    // Decode the WAV `data` section back to 16 kHz mono PCM16, locating the
+    // `data` chunk properly (the capture path may prepend a metadata chunk).
+    let samples = decode_pcm16_16k_mono_wav(pcm_wav);
+    if samples.is_empty() {
+        return Ok(None);
+    }
+
+    // Feed the audio to the streaming model in ~1s windows rather than one giant
+    // `send_audio`. The on-device Nemotron processes ~0.5s blocks per call and
+    // buffers the rest; handing it a single multi-second chunk (a configured
+    // `chunk_duration_ms` can be up to 15s) starves the worker of incremental
+    // calls and — observed on the int8 model — yields no output and can crash
+    // the ONNX session. Windowing keeps each `transcribe_chunk` near the model's
+    // native block size, matching what the live capture cadence would produce.
+    const FEED_WINDOW_SAMPLES: usize = 16_000; // 1s @ 16 kHz
+    let captured_at_ms = sequence
+        .saturating_sub(1)
+        .saturating_mul(chunk_duration_ms as u64);
+    for window in samples.chunks(FEED_WINDOW_SAMPLES) {
+        let chunk = AudioChunk {
+            source: pcm_source,
+            sample_rate: SampleRate::SR_16K,
+            samples: window.to_vec(),
+            captured_at_ms,
+        };
+        provider
+            .send_audio(&chunk)
+            .await
+            .map_err(|e| anyhow!("on-device STT send failed: {e}"))?;
+    }
+
+    // Drain this chunk's output, then any extra events that are immediately
+    // ready — without blocking for diarization.
+    //
+    // The on-device model is streaming and stateful: it buffers audio internally
+    // and commits a finalized block whenever enough has accumulated, so a given
+    // `send_audio` may emit zero, one, or (after a backlog) more than one
+    // `Final`, and the boundary need not line up with our fixed chunk size.
+    //
+    // Two budgets, deliberately different:
+    //   * `first_budget` — generous, scaled to the chunk duration. The FIRST
+    //     inference after model load is cold (mel + encoder + decode can exceed
+    //     a second), and a Final dropped here is lost (the worker emits it into
+    //     the channel after we stop, with nothing to re-collect it). So we wait
+    //     up to roughly one chunk's worth for the first event rather than racing
+    //     the worker and losing the text.
+    //   * `poll_budget` — short. Once we've seen activity we only sweep up
+    //     whatever else is already queued, then stop, so the capture loop is
+    //     never parked for the full chunk (the old ~2s/chunk diarization-wait
+    //     bug). Diarization labels are taken opportunistically, never waited on.
+    let mut texts: Vec<String> = Vec::new();
+    let mut confidence: Option<f32> = None;
+    let mut speaker_id: Option<u32> = None;
+    let first_budget = Duration::from_millis((chunk_duration_ms as u64).clamp(1_000, 5_000));
+    let poll_budget = Duration::from_millis(50);
+    let mut seen_any = false;
+    loop {
+        let budget = if seen_any { poll_budget } else { first_budget };
+        match tokio::time::timeout(budget, provider.next_event()).await {
+            Ok(Some(Ok(event))) => {
+                seen_any = true;
+                match event {
+                    TranscriptEvent::Final {
+                        text: t,
+                        confidence: c,
+                        ..
+                    } => {
+                        let trimmed = t.trim();
+                        if !trimmed.is_empty() {
+                            texts.push(trimmed.to_string());
+                            confidence = c.or(confidence);
+                        }
+                    }
+                    TranscriptEvent::SpeakerLabel { speaker, .. } => {
+                        speaker_id = Some(speaker);
+                    }
+                    TranscriptEvent::Partial { .. } => {}
+                }
+            }
+            Ok(Some(Err(e))) => {
+                return Err(anyhow!("on-device STT error: {e}"));
+            }
+            // Provider closed, or nothing more is ready within the budget — stop.
+            Ok(None) | Err(_) => break,
+        }
+    }
+
+    if texts.is_empty() {
+        return Ok(None);
+    }
+    let text = texts.join(" ");
+
+    let label = source.default_label();
+    let speaker_label = match speaker_id {
+        Some(id) => format!("{label} (speaker {id})"),
+        None => label.to_string(),
+    };
+    let mut segment = cue_core::audio::SttSegmentMetadata::new(
+        text,
+        sequence
+            .saturating_sub(1)
+            .saturating_mul(chunk_duration_ms as u64),
+        chunk_duration_ms,
+        true,
+    )
+    .with_provider_segment_id(format!("{label}-{sequence}"))
+    .with_source(source)
+    .with_speaker_label(speaker_label)
+    .with_source_sequence_range(sequence, sequence);
+    if let Some(confidence) = confidence {
+        segment = segment.with_confidence(confidence);
+    }
+    Ok(Some(segment))
+}
+
+/// Decode a 16 kHz mono PCM16 WAV into `i16` samples by locating the `data`
+/// chunk via RIFF chunk-walking — NOT by assuming a fixed 44-byte header.
+///
+/// Both producers in this daemon feed here: our own [`wav_from_i16le_16k_mono`]
+/// writes a canonical 44-byte header, but the direct-ffmpeg capture path
+/// (AVFoundation / dshow / WASAPI loopback) inserts a `LIST`/`INFO` metadata
+/// chunk between `fmt ` and `data`, pushing the samples past byte 44. A
+/// hardcoded 44-byte skip there decodes ~17 metadata bytes as leading samples
+/// and corrupts the start of every chunk. Walking the chunk table is correct
+/// for both. Returns empty for non-RIFF / malformed / dataless input.
+fn decode_pcm16_16k_mono_wav(wav: &[u8]) -> Vec<i16> {
+    let Some(pcm) = find_wav_data_chunk(wav) else {
+        return Vec::new();
+    };
+    pcm.chunks_exact(2)
+        .map(|b| i16::from_le_bytes([b[0], b[1]]))
+        .collect()
+}
+
+/// Return the bytes of the WAV `data` chunk, or `None` if the input is not a
+/// valid RIFF/WAVE container or has no `data` chunk. Walks the standard chunk
+/// table: 12-byte RIFF header (`RIFF` + size + `WAVE`), then a sequence of
+/// `<4-byte id><4-byte LE size><payload>` chunks (payloads are word-aligned, so
+/// an odd size is padded by one byte).
+fn find_wav_data_chunk(wav: &[u8]) -> Option<&[u8]> {
+    const RIFF_HEADER_LEN: usize = 12;
+    if wav.len() < RIFF_HEADER_LEN || &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut offset = RIFF_HEADER_LEN;
+    while offset + 8 <= wav.len() {
+        let id = &wav[offset..offset + 4];
+        let size = u32::from_le_bytes([
+            wav[offset + 4],
+            wav[offset + 5],
+            wav[offset + 6],
+            wav[offset + 7],
+        ]) as usize;
+        let body_start = offset + 8;
+        let body_end = body_start.saturating_add(size).min(wav.len());
+        if id == b"data" {
+            return Some(&wav[body_start..body_end]);
+        }
+        // Chunks are word-aligned: a chunk of odd size carries a 1-byte pad.
+        let advance = 8 + size + (size & 1);
+        offset = match offset.checked_add(advance) {
+            Some(next) => next,
+            None => break,
+        };
+    }
+    None
+}
+
 async fn stop_audio_capture(daemon: &Arc<Daemon>) -> AudioPipelineStatus {
     if let Some(stop) = daemon.audio_runtime.lock().await.stop.take() {
         let _ = stop.send(());
@@ -5057,7 +5381,7 @@ async fn add_audio_transcript_segment_inner(
         return Ok(());
     }
 
-    let meeting_snapshot = {
+    let (meeting_snapshot, committed_segment) = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard.is_none() {
             *meeting_guard = Some(MeetingRecord::new(Some("Ad hoc audio meeting".to_string())));
@@ -5077,7 +5401,7 @@ async fn add_audio_transcript_segment_inner(
         meeting.action_items.extend(analysis.action_items);
         meeting.decisions.extend(analysis.decisions);
         daemon.store.save_active(meeting)?;
-        meeting.clone()
+        (meeting.clone(), transcript_segment)
     };
 
     update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
@@ -5118,8 +5442,66 @@ async fn add_audio_transcript_segment_inner(
 
     if segment.is_final {
         index_transcript_for_rag(daemon, meeting_snapshot.id.to_string(), text.to_string());
+        // Question→trigger (master doc §6): a final line spoken by someone other
+        // than me, question-shaped, and (if names are configured) mentioning my
+        // name, is treated as "this is for me".
+        maybe_trigger_for_me_question(daemon, &committed_segment).await;
     }
     Ok(())
+}
+
+/// Inspect a freshly-committed final transcript segment for a "this is for me"
+/// question and either surface a tap-to-ask suggestion card (default) or drive
+/// the attached agent automatically (opt-in `auto_trigger_enabled`).
+///
+/// Best-effort and non-fatal: a missing settings file, no attached agent, or a
+/// detection miss simply means no trigger. Never blocks the transcript path.
+async fn maybe_trigger_for_me_question(daemon: &Arc<Daemon>, segment: &TranscriptSegment) {
+    let settings = match load_settings(&daemon.paths) {
+        Ok(settings) => settings,
+        Err(_) => return,
+    };
+
+    let Some(detected) = cue_core::detect_for_me_question(segment, &settings.my_names) else {
+        return;
+    };
+
+    info!(
+        matched_name = detected.matched_name.as_deref().unwrap_or("(any)"),
+        auto = settings.auto_trigger_enabled,
+        "for-me question detected; {}",
+        if settings.auto_trigger_enabled {
+            "auto-driving agent"
+        } else {
+            "surfacing suggestion card"
+        }
+    );
+
+    if settings.auto_trigger_enabled {
+        // Auto mode: drive the attached agent now, reusing the overlay ask path
+        // so context assembly, model selection, and session chaining all apply.
+        let request = answer_request_from_overlay(
+            &detected.question,
+            None,
+            None,
+            Some(settings.default_mode.clone()),
+        );
+        if let Err(error) =
+            answer_with_provider_runtime(daemon, request, "auto-trigger (for-me question)").await
+        {
+            warn!("auto-trigger answer failed: {error:#}");
+        }
+    } else {
+        // Suggest mode (default): surface the detected question as a card the
+        // user can tap to ask. No agent call until they opt in.
+        let title = match detected.matched_name.as_deref() {
+            Some(name) => format!("{name}, this looks like a question for you"),
+            None => "Question detected — ask your agent?".to_string(),
+        };
+        let card = CueCard::new(CardKind::Question, title, detected.question)
+            .with_source("question trigger");
+        let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
+    }
 }
 
 fn index_transcript_for_rag(daemon: &Arc<Daemon>, session_id: String, text: String) {
@@ -6200,12 +6582,14 @@ struct DriveFailure {
 /// whether to retry (e.g. fresh session) or surface the failure. A
 /// context-overflow error arrives as a result event with no prior deltas, so the
 /// body is empty on that failure and there is nothing rendered to roll back.
-/// Whether to drive `kind` over ACP for the answer: opt-in `BLUEY_USE_ACP=1` AND
-/// the agent has an ACP entrypoint. Delegates to the spine's
-/// [`cue_agent_bridge::should_use_acp`] — the SINGLE source of truth — so the
-/// daemon's `via_acp` continuation decision can never desync from the spine's
-/// route decision (C9). Default builds (flag unset) return false, so the answer
-/// path is unchanged. PHASE 0 — see PLAN-AGENT-MEETING-ORACLE.
+/// Whether to drive `kind` over ACP for the answer: ON by default for any agent
+/// with an ACP entrypoint, disabled only with `BLUEY_USE_ACP=0` (or false/off/no).
+/// Delegates to the spine's [`cue_agent_bridge::should_use_acp`] — the SINGLE
+/// source of truth — so the daemon's `via_acp` continuation decision can never
+/// desync from the spine's route decision (C9). The spine wraps ACP with a CLI
+/// fallback (`acp_with_cli_fallback`): a pre-first-token ACP failure transparently
+/// falls back to the CLI driver, so defaulting ACP on cannot turn handshake/spawn
+/// faults into hard answer failures. See PLAN-AGENT-MEETING-ORACLE.
 fn acp_answer_enabled(kind: &AgentKind) -> bool {
     cue_agent_bridge::should_use_acp(kind)
 }
@@ -6492,7 +6876,8 @@ async fn answer_with_agent(
                 // on transient classification + low cap so a live meeting never
                 // stalls; never retries auth/missing/model-block (those repeat).
                 if let Some(raw) = failure.raw_error.as_deref() {
-                    if is_transient_network_error(raw) && transient_retries < MAX_TRANSIENT_RETRIES {
+                    if is_transient_network_error(raw) && transient_retries < MAX_TRANSIENT_RETRIES
+                    {
                         transient_retries += 1;
                         warn!(
                             agent = %label,
@@ -6561,9 +6946,7 @@ async fn answer_with_agent(
                     .as_deref()
                     .is_some_and(is_transient_network_error);
                 if is_offline {
-                    return Ok(
-                        agent_offline(provider, &mut stream, fallback_depth, &label).await,
-                    );
+                    return Ok(agent_offline(provider, &mut stream, fallback_depth, &label).await);
                 }
 
                 return Ok(agent_not_ready(
@@ -6710,8 +7093,9 @@ agent and never on your behalf."
         .await;
         let _ = stream.finish(&body).await;
     }
-    let safety = SafetyOutcome::pass()
-        .with_notice(format!("attached agent ({label}) backend unreachable; offline guidance shown"));
+    let safety = SafetyOutcome::pass().with_notice(format!(
+        "attached agent ({label}) backend unreachable; offline guidance shown"
+    ));
     AgentRouteOutcome {
         answer: body,
         safety,
@@ -7373,6 +7757,18 @@ fn mode_instructions(mode: &str) -> String {
         "writing" => {
             "Answer in Writing mode. Produce polished copy first, then a short `### Notes` section explaining tone, edits, and optional variants. Keep the draft easy to reuse.".to_string()
         }
+        // Speed dimensions from the overlay picker (fast / balanced / deep). These
+        // are about answer DEPTH + latency, not output format, so they shape how
+        // much the agent should say rather than the section layout.
+        "fast" => {
+            "Answer in Fast mode. Optimize for speed: give the single most useful answer in 1-3 sentences or a few tight bullets. No preamble, no section headers, no caveats unless critical. The user needs something to say in the meeting right now.".to_string()
+        }
+        "balanced" => {
+            "Answer in Balanced mode. Lead with a direct one-line answer, then a few concise supporting bullets (context, reasoning, next step). Keep it scannable in a small overlay; don't pad.".to_string()
+        }
+        "deep" => {
+            "Answer in Deep mode. Be thorough and well-structured: direct answer first, then the relevant reasoning, evidence, edge cases, tradeoffs, and concrete next steps. Use headers and fenced code where they aid scanning. Prefer completeness over brevity.".to_string()
+        }
         _ => {
             "Answer in General mode. Auto-detect the task type. Put the direct answer first, then concise bullets for context, reasoning, and next steps. If the question is about code, debugging, algorithms, APIs, config, or terminal commands, still use `### Approach`, `### Code`, `### Explanation`, `### Complexity`, and `### Edge cases`, with fenced code blocks where useful. Keep it practical and easy to scan in a small overlay.".to_string()
         }
@@ -7550,8 +7946,140 @@ fn rag_hit_to_answer_context(
     )
 }
 
+/// Map a [`MeetingRecord`] to a pre-meeting brief (master doc §4) from the
+/// signals available locally today: a real (non-default) meeting title and the
+/// titles of any context artifacts the user pre-loaded as "expect questions
+/// about these" references. Returns `None` when nothing is worth staging.
+///
+/// This is the lean seam: a future calendar connector fills the same
+/// [`cue_core::PrestageInput`] (attendees, agenda, linked tickets) and the
+/// brief grows automatically — no change here or downstream.
+fn prestage_brief_for_meeting(meeting: &MeetingRecord) -> Option<String> {
+    const MAX_REFS: usize = 30;
+
+    // The generic placeholder titles carry no signal — treat them as "no title".
+    let title = {
+        let trimmed = meeting.title.trim();
+        let is_placeholder = trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("Ad hoc meeting")
+            || trimmed.eq_ignore_ascii_case("Ad hoc audio meeting");
+        if is_placeholder {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    };
+
+    let linked_refs: Vec<String> = meeting
+        .context
+        .iter()
+        .map(|artifact| artifact.title.trim().to_string())
+        .filter(|title| !title.is_empty())
+        .take(MAX_REFS)
+        .collect();
+
+    let input = cue_core::PrestageInput {
+        title,
+        attendees: Vec::new(),
+        agenda: Vec::new(),
+        linked_refs,
+    };
+    cue_core::build_prestage_brief(&input)
+}
+
+/// Build the pinned "decisions ledger" block (master doc §5) from the
+/// meeting's extracted decisions and still-open action items. Returns `None`
+/// when there is nothing pinned yet. Bounded to the most recent entries so the
+/// pinned block never crowds out the rest of the context package.
+fn decisions_ledger_block(meeting: &MeetingRecord) -> Option<String> {
+    const MAX_DECISIONS: usize = 12;
+    const MAX_ACTION_ITEMS: usize = 12;
+
+    let decisions: Vec<&str> = meeting
+        .decisions
+        .iter()
+        .rev()
+        .take(MAX_DECISIONS)
+        .map(|decision| decision.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect();
+
+    let action_items: Vec<&cue_core::ActionItem> = meeting
+        .action_items
+        .iter()
+        .rev()
+        .filter(|item| !item.done)
+        .take(MAX_ACTION_ITEMS)
+        .collect();
+
+    if decisions.is_empty() && action_items.is_empty() {
+        return None;
+    }
+
+    let mut block = String::new();
+    if !decisions.is_empty() {
+        block.push_str("Decisions made so far (always honor these):\n");
+        // `rev()` above gave newest-first; flip back to chronological for reading.
+        for decision in decisions.iter().rev() {
+            block.push_str("- ");
+            block.push_str(decision);
+            block.push('\n');
+        }
+    }
+    if !action_items.is_empty() {
+        if !block.is_empty() {
+            block.push('\n');
+        }
+        block.push_str("Open commitments:\n");
+        for item in action_items.iter().rev() {
+            block.push_str("- ");
+            block.push_str(item.text.trim());
+            if let Some(owner) = item.owner.as_ref().filter(|owner| !owner.trim().is_empty()) {
+                block.push_str(" (owner: ");
+                block.push_str(owner.trim());
+                block.push(')');
+            }
+            block.push('\n');
+        }
+    }
+
+    Some(block.trim_end().to_string())
+}
+
 fn answer_context_from_meeting(meeting: &MeetingRecord) -> Vec<AnswerContext> {
     let mut context = Vec::new();
+
+    // Pre-meeting brief (master doc §4): a staged block that warms the package
+    // with what was known before the call — title and pre-loaded references —
+    // so the first answer is instant and even a mangled "AUTH-12" resolves
+    // because the agent already knows it is in play. Lean: built from local
+    // signals; a calendar connector later fills the same `PrestageInput`.
+    if let Some(brief) = prestage_brief_for_meeting(meeting) {
+        context.push(
+            AnswerContext::new(AnswerContextKind::MeetingMemory, brief)
+                .with_title("Pre-meeting brief")
+                .with_source("pre-staged meeting context"),
+        );
+    }
+
+    // Pinned decisions ledger (master doc §5): decisions + open commitments are
+    // ALWAYS sent, ahead of the recency-bounded transcript, so a constraint
+    // agreed at minute 5 still reaches the agent at minute 40 even after it has
+    // scrolled out of the last-N transcript window.
+    //
+    // Protection mechanism (important — do not reorder these pushes): context
+    // compaction (`compact_provider_context`) drops items in INSERTION ORDER
+    // when over the char budget, not by kind/priority. The pinned brief + ledger
+    // survive because they are pushed FIRST, before the transcript. The
+    // `before-the-transcript` regression test guards this contract.
+    if let Some(ledger) = decisions_ledger_block(meeting) {
+        context.push(
+            AnswerContext::new(AnswerContextKind::MeetingMemory, ledger)
+                .with_title("Pinned decisions & commitments")
+                .with_source("meeting decisions ledger"),
+        );
+    }
+
     if let Some(summary) = meeting
         .summary
         .as_ref()
@@ -9492,10 +10020,34 @@ pub fn validate_and_decode_overlay_line(
 }
 
 fn discover_overlay_bin() -> Result<PathBuf> {
+    // Explicit override always wins (dev / packaging / testing): point it at the
+    // exact overlay binary or .app to launch.
+    if let Some(over) = env::var_os("BLUEY_OVERLAY_BIN") {
+        let p = PathBuf::from(over);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+
     let cwd = env::current_dir()?;
     #[cfg(target_os = "macos")]
     {
         let mut candidates = Vec::new();
+        // The MEETING overlay (cue-meeting-overlay) is the real product surface —
+        // the Ask/answer feed + screen-share invisibility. Prefer it above the
+        // older interview overlay (cue-overlay-tauri) and the legacy Swift one.
+        // Both a plain binary and a bundled `.app` (Contents/MacOS/<name>) are
+        // accepted so packaged installs resolve too.
+        candidates.extend([
+            cwd.join("target/debug/cue-meeting-overlay"),
+            cwd.join("target/release/cue-meeting-overlay"),
+            cwd.join(
+                "target/debug/bundle/macos/Bluey Meeting.app/Contents/MacOS/cue-meeting-overlay",
+            ),
+            cwd.join(
+                "target/release/bundle/macos/Bluey Meeting.app/Contents/MacOS/cue-meeting-overlay",
+            ),
+        ]);
         // Tauri overlay (the new HTML/Tauri overlay that replaces the Swift one).
         // Preferred when present; falls through to the legacy Swift overlay paths.
         candidates.extend([
@@ -9520,6 +10072,14 @@ fn discover_overlay_bin() -> Result<PathBuf> {
             }
             for dir in dirs {
                 candidates.extend([
+                    // Meeting overlay first (the real product surface), as a plain
+                    // binary, a `bin/` sibling, or a bundled `.app` next to the daemon.
+                    dir.join("cue-meeting-overlay"),
+                    dir.join("bin/cue-meeting-overlay"),
+                    dir.join("Bluey Meeting.app/Contents/MacOS/cue-meeting-overlay"),
+                    dir.join("../Bluey Meeting.app/Contents/MacOS/cue-meeting-overlay"),
+                    dir.join("cue-overlay-tauri"),
+                    dir.join("bin/cue-overlay-tauri"),
                     dir.join("bluey-overlay-macos"),
                     dir.join("cue-overlay-macos"),
                     dir.join("bin/bluey-overlay-macos"),
@@ -10310,8 +10870,19 @@ async fn update_state_from_meeting(
     write_state(daemon).await
 }
 
-/// Initialize the RAG pipeline if an OpenAI API key is available.
-/// Returns None (with a log) if no key is configured — RAG is optional.
+/// Initialize the optional semantic-recall pipeline (embedding-based search over
+/// past transcripts).
+///
+/// HONEST SCOPE (local-first): this is **not** part of the local core loop and is
+/// **not** required for it. The live meeting answer is grounded by the recency
+/// transcript buffer + the decisions ledger + the pre-meeting brief — all local,
+/// no embeddings. This pipeline adds *semantic* recall over older transcript text,
+/// and the only embedder wired today (`OpenAiEmbedder`) calls a cloud API. So it
+/// is a **cloud-optional enhancement**, enabled only when a key is present; with
+/// no key it stays off and the product remains fully local (keyword
+/// `bluey memory search` still works, since it does not use this pipeline).
+///
+/// Returns `None` (with an honest log) when no embedding key is configured.
 fn init_rag_pipeline(paths: &AppPaths) -> Option<Arc<crate::db::rag::RagPipeline>> {
     let api_key = std::env::var("OPENAI_API_KEY")
         .ok()
@@ -10322,7 +10893,11 @@ fn init_rag_pipeline(paths: &AppPaths) -> Option<Arc<crate::db::rag::RagPipeline
                 .flatten()
         });
     let Some(api_key) = api_key else {
-        info!("RAG pipeline disabled: no OpenAI API key configured");
+        info!(
+            "semantic transcript recall is off (no embedding key); the local core loop \
+             does not need it — live answers use the transcript buffer + decisions \
+             ledger + pre-meeting brief, and `bluey memory search` keyword search still works"
+        );
         return None;
     };
     let embedder = Arc::new(cue_rag::embedder::OpenAiEmbedder::new(api_key));
@@ -10416,6 +10991,203 @@ fn build_recap_llm_from_env() -> Option<Box<dyn cue_llm::LlmProvider>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- REAL Parakeet through the DAEMON path (not the provider in isolation) ----
+    //
+    // Exercises `transcribe_audio_file` with `RealSttTransport::Parakeet` — the
+    // exact function the audio capture loop calls — so the WAV decode + on-device
+    // transport arm + provider drive are proven together. Gated on the
+    // `parakeet-stt` feature AND `BLUEY_PARAKEET_MODEL_DIR`; skips cleanly
+    // otherwise so normal/CI runs are unaffected.
+    #[cfg(feature = "parakeet-stt")]
+    #[tokio::test]
+    async fn daemon_transcribe_audio_file_parakeet_real() {
+        let Ok(model_dir) = std::env::var("BLUEY_PARAKEET_MODEL_DIR") else {
+            eprintln!("SKIP: set BLUEY_PARAKEET_MODEL_DIR to run the real daemon-path test");
+            return;
+        };
+        let model_dir = std::path::PathBuf::from(model_dir.trim());
+        if !["encoder.onnx", "decoder_joint.onnx", "tokenizer.model"]
+            .iter()
+            .all(|f| model_dir.join(f).is_file())
+        {
+            eprintln!("SKIP: model dir incomplete: {}", model_dir.display());
+            return;
+        }
+        // A real WAV fixture (16k mono PCM16). Same fixtures the integration test uses.
+        let wav_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("clip8s.wav");
+        if !wav_path.is_file() {
+            eprintln!("SKIP: no fixture at {}", wav_path.display());
+            return;
+        }
+
+        // Minimal runtime config selecting the on-device Parakeet transport.
+        let runtime = RealAudioRuntimeConfig {
+            ffmpeg_path: None,
+            stt_endpoint: String::new(),
+            stt_api_key: String::new(),
+            stt_model: "parakeet-en".to_string(),
+            stt_provider_label: "parakeet:test".to_string(),
+            stt_transport: RealSttTransport::Parakeet,
+            chunk_duration_ms: 1_000,
+            sources: Vec::new(),
+        };
+
+        // Drive the REAL daemon function the way the capture loop does: feed the
+        // clip, then keep calling with silence "chunk files" so the streaming
+        // model's buffered tail flushes and any backlog (the cold first inference
+        // can lag the first call) is collected on later iterations. The provider
+        // is built once and reused via the `&mut provider` slot — same as the loop.
+        // `build_stt_chain` gates the Parakeet provider on BLUEY_STT_PARAKEET=1
+        // (the same runtime switch the daemon uses).
+        std::env::set_var("BLUEY_PARAKEET_MODEL_DIR", &model_dir);
+        std::env::set_var("BLUEY_STT_PARAKEET", "1");
+        let client = reqwest::Client::new();
+        let mut provider: Option<Box<dyn cue_core::stt::SttProvider>> = None;
+
+        let silence_wav = wav_from_i16le_16k_mono(&vec![0u8; 16_000 * 2]);
+        let silence_path = std::env::temp_dir().join("bluey-parakeet-silence.wav");
+        std::fs::write(&silence_path, &silence_wav).expect("write silence wav");
+
+        let mut collected: Vec<String> = Vec::new();
+        // Iteration 1 = the real clip; iterations 2.. = silence to drain backlog.
+        for seq in 1..=6u64 {
+            let path = if seq == 1 { &wav_path } else { &silence_path };
+            let seg = transcribe_audio_file(
+                &runtime,
+                AudioSourceKind::Microphone,
+                seq,
+                path,
+                &client,
+                &mut provider,
+            )
+            .await
+            .expect("transcribe_audio_file should not error");
+            if let Some(seg) = seg {
+                if !seg.text.trim().is_empty() {
+                    collected.push(seg.text);
+                }
+            }
+        }
+        let _ = std::fs::remove_file(&silence_path);
+
+        let text = collected.join(" ");
+        eprintln!("=== DAEMON-PATH REAL PARAKEET TRANSCRIPT ===\n{text}\n===========================================");
+        assert!(
+            !text.trim().is_empty(),
+            "daemon Parakeet path produced no transcript"
+        );
+        assert!(
+            text.split_whitespace().count() >= 3,
+            "transcript suspiciously short: {text:?}"
+        );
+    }
+
+    // ---- On-device WAV decode (regression for the hardcoded-44 header bug) ----
+
+    fn riff_wav(extra_chunks: &[(&[u8; 4], &[u8])], pcm: &[i16]) -> Vec<u8> {
+        // Build a minimal RIFF/WAVE: header + `fmt ` + any extra chunks + `data`.
+        let mut body = Vec::new();
+        // fmt chunk (16 bytes, PCM mono 16k 16-bit).
+        body.extend_from_slice(b"fmt ");
+        body.extend_from_slice(&16u32.to_le_bytes());
+        body.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        body.extend_from_slice(&1u16.to_le_bytes()); // mono
+        body.extend_from_slice(&16_000u32.to_le_bytes());
+        body.extend_from_slice(&32_000u32.to_le_bytes());
+        body.extend_from_slice(&2u16.to_le_bytes());
+        body.extend_from_slice(&16u16.to_le_bytes());
+        for (id, payload) in extra_chunks {
+            body.extend_from_slice(*id);
+            body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            body.extend_from_slice(payload);
+            if payload.len() % 2 == 1 {
+                body.push(0); // word-align pad
+            }
+        }
+        let mut data = Vec::new();
+        for &s in pcm {
+            data.extend_from_slice(&s.to_le_bytes());
+        }
+        body.extend_from_slice(b"data");
+        body.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        body.extend_from_slice(&data);
+
+        let mut wav = Vec::new();
+        wav.extend_from_slice(b"RIFF");
+        wav.extend_from_slice(&((4 + body.len()) as u32).to_le_bytes());
+        wav.extend_from_slice(b"WAVE");
+        wav.extend_from_slice(&body);
+        wav
+    }
+
+    #[test]
+    fn decode_wav_handles_canonical_44_byte_header() {
+        let pcm = [1i16, -2, 3, -4, 5];
+        let wav = riff_wav(&[], &pcm);
+        assert_eq!(decode_pcm16_16k_mono_wav(&wav), pcm);
+    }
+
+    #[test]
+    fn decode_wav_handles_ffmpeg_metadata_chunk_before_data() {
+        // ffmpeg inserts a LIST/INFO chunk between `fmt ` and `data`; a hardcoded
+        // 44-byte skip would read metadata bytes as leading samples. The walker
+        // must still return exactly the PCM samples.
+        let pcm = [100i16, 200, -300, 400];
+        let wav = riff_wav(&[(b"LIST", b"INFOISFTLavf60.0\0")], &pcm);
+        assert_eq!(decode_pcm16_16k_mono_wav(&wav), pcm);
+    }
+
+    #[test]
+    fn decode_wav_rejects_non_riff_input() {
+        assert!(decode_pcm16_16k_mono_wav(b"not a wav file at all").is_empty());
+        assert!(decode_pcm16_16k_mono_wav(&[]).is_empty());
+    }
+
+    // ---- Pinned context survives compaction by being emitted first (#4/#5) ----
+
+    #[test]
+    fn pinned_brief_and_ledger_precede_the_transcript() {
+        // The pinned blocks are protected by INSERTION ORDER under order-based
+        // compaction — they must appear before the transcript in the assembled
+        // context. This guards the documented contract in answer_context_from_meeting.
+        let mut meeting = MeetingRecord::new(Some("Auth flow review".to_string()));
+        meeting.decisions.push(cue_core::Decision::new(
+            "We decided to use the parakeet engine.",
+            None,
+        ));
+        meeting.transcript.push(TranscriptSegment::new(
+            Speaker::System,
+            "Some spoken line of transcript.",
+            true,
+        ));
+
+        let ctx = answer_context_from_meeting(&meeting);
+        let ledger_idx = ctx
+            .iter()
+            .position(|c| c.source.as_deref() == Some("meeting decisions ledger"))
+            .expect("ledger block present");
+        let brief_idx = ctx
+            .iter()
+            .position(|c| c.source.as_deref() == Some("pre-staged meeting context"))
+            .expect("pre-meeting brief present");
+        let transcript_idx = ctx
+            .iter()
+            .position(|c| c.kind == cue_core::ai::AnswerContextKind::Transcript)
+            .expect("transcript present");
+
+        assert!(
+            brief_idx < transcript_idx,
+            "pre-meeting brief must precede the transcript"
+        );
+        assert!(
+            ledger_idx < transcript_idx,
+            "decisions ledger must precede the transcript"
+        );
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
