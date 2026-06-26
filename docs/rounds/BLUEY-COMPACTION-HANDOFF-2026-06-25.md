@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-26 16:56 EDT
+Latest checkpoint: 2026-06-26 18:25 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,23 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-203-DROPLET-BINARY-DEPLOY.md`; the next canonical Bluey round doc should start at `ROUND-204-...`.
+- Latest assigned Bluey round doc is `ROUND-204-OVERLAY-CLICKABILITY-RESTORE.md`; the next canonical Bluey round doc should start at `ROUND-205-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-routing-hardening`.
+- Round 204 immediately fixed the owner's post-deploy report that the overlay felt dead: buttons were not clickable and blank panel space could not be dragged.
+  - Root cause: expanded macOS click-through default plus `expandedWindow.ignoresMouseEvents` point-gating could make the whole overlay stop receiving clicks; Windows blank surface returned `HTTRANSPARENT`.
+  - macOS expanded overlay now defaults to interactive, keeps normal expanded windows mouse-active, and treats blank panel surface as draggable while preserving real controls as clickable.
+  - Windows expanded overlay now returns `HTCLIENT` for controls and `HTCAPTION` for blank surface, so blank space moves the panel instead of passing through.
+  - Local `~/.bluey/bin` macOS overlay binaries and `BlueyOverlay.app` were rebuilt/installed.
+  - The old overlay child process was killed and relaunched with `bluey overlay show`; the refreshed child PID was `25160`.
+  - Public desktop release was bumped and deployed to `0.1.16`.
+  - Live artifact is `https://bluey.sh/releases/v0.1.16/bluey-0.1.16-darwin-arm64.tar.gz`.
+  - Live artifact SHA256 is `c88e6d7faa32c0242f249076d4bf39c43ba61a557460368702d9a0ef62f3a5b1`.
+  - Live `latest.json.sig`, artifact checksum, temp-home installer smoke, archive string scan, and release hygiene scan all passed.
+  - No API server redeploy was needed for Round 204; live `/health` remained OK on the Round 203 server.
 - Round 203 deployed the current Bluey branch snapshot to the droplet and release host:
   - workspace desktop artifact version bumped to `0.1.15`
   - `docs/release/RELEASE-v0.1.15.md` added

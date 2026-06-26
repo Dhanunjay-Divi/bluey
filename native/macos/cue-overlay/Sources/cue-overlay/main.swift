@@ -4154,7 +4154,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var preCanvasFullWindowFrame: NSRect?
     private var windowFullSize = false
     private var preWindowFullSizeFrame: NSRect?
-    private var passThroughMode = true
+    private var passThroughMode = false
     private var headerDragInProgress = false
     private struct ResizeEdges: OptionSet {
         let rawValue: Int
@@ -5028,13 +5028,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return self
         }
         if passThroughMode {
-            if isHeaderMoveHandleHit(at: point) {
-                return self
-            }
             if let hit = super.hitTest(point), isExplicitInteractiveHit(hit) {
                 return hit
             }
-            return nil
+            return self
         }
         if let hit = super.hitTest(point), isExplicitInteractiveHit(hit) {
             return hit
@@ -5048,10 +5045,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             toggleSavedContextItems()
             return
         }
-        if passThroughMode, isHeaderMoveHandleHit(at: localPoint) {
-            beginHeaderDrag(with: event)
-            return
-        }
         if rectForView(composerBar).insetBy(dx: -8, dy: -8).contains(localPoint) {
             if let hit = super.hitTest(localPoint),
                isView(hit, inside: composer) || isView(hit, inside: composerScroll) {
@@ -5063,6 +5056,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             }
         }
         if passThroughMode {
+            if !hasInteractiveView(at: localPoint) {
+                beginHeaderDrag(with: event)
+                return
+            }
             super.mouseDown(with: event)
             return
         }
@@ -5302,20 +5299,17 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func shouldReceiveMouseEvents(at screenPoint: NSPoint) -> Bool {
-        passThroughMode ? isInteractiveAtScreenPoint(screenPoint) : true
+        guard let window else { return false }
+        let windowPoint = window.convertPoint(fromScreen: screenPoint)
+        return shouldReceiveMouseEvents(atWindowPoint: windowPoint)
     }
 
     func shouldReceiveMouseEvents(atWindowPoint windowPoint: NSPoint) -> Bool {
-        guard passThroughMode else { return true }
         if dropHighlightActive {
             return true
         }
         let localPoint = convert(windowPoint, from: nil)
-        if CACurrentMediaTime() < composerInputArmedUntil,
-           hitsExplicitInteractiveChrome(at: localPoint) {
-            return true
-        }
-        return isInteractiveAtLocalPoint(localPoint, windowPoint: windowPoint)
+        return bounds.contains(localPoint)
     }
 
     private func isInteractiveAtLocalPoint(_ localPoint: NSPoint, windowPoint _: NSPoint) -> Bool {
@@ -8583,13 +8577,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         styleHeaderIconButton(interactionModeButton, symbol: symbol, fallback: fallback)
         interactionModeButton.contentTintColor = passThroughMode ? BlueyTheme.cyan : themedTextColor
         interactionModeButton.toolTip = passThroughMode
-            ? "Click-through on: blank Bluey space passes to the app behind it. Drag the Bluey logo to move."
-            : "Interactive on: blank Bluey space moves/resizes the panel, and the whole panel receives clicks."
+            ? "Move-anywhere on: controls click normally, and blank Bluey space drags the panel."
+            : "Interactive on: controls click normally, and blank Bluey space moves/resizes the panel."
         if showToast {
             showSystemToast(
-                title: passThroughMode ? "Click-through on" : "Interactive on",
+                title: passThroughMode ? "Move-anywhere on" : "Interactive on",
                 body: passThroughMode
-                    ? "Blank Bluey space now clicks the app behind it. Drag the logo or wordmark to move Bluey."
+                    ? "Buttons stay clickable. Hold blank Bluey space to move the panel."
                     : "Blank Bluey space now moves/resizes Bluey. Controls and text remain clickable.",
                 duration: 2.0)
         }
@@ -10624,8 +10618,7 @@ private final class OverlayApp {
     private func updateExpandedMousePolicy() {
         guard
             let expandedWindow,
-            expandedWindow.isVisible,
-            let expandedView
+            expandedWindow.isVisible
         else { return }
 
         if applyRemoteInputPassthroughIfActive() {
@@ -10636,12 +10629,8 @@ private final class OverlayApp {
         }
 
         expandedWindow.acceptsMouseMovedEvents = true
-        let shouldReceiveMouse = expandedView.shouldReceiveMouseEvents(
-            atWindowPoint: expandedWindow.mouseLocationOutsideOfEventStream)
-        expandedWindow.ignoresMouseEvents = !shouldReceiveMouse
-        if shouldReceiveMouse {
-            lastExpandedInteractiveMouseAt = CACurrentMediaTime()
-        }
+        expandedWindow.ignoresMouseEvents = false
+        lastExpandedInteractiveMouseAt = CACurrentMediaTime()
     }
 
     private func expand() {
