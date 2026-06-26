@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-26 18:25 EDT
+Latest checkpoint: 2026-06-26 18:31 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,19 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-204-OVERLAY-CLICKABILITY-RESTORE.md`; the next canonical Bluey round doc should start at `ROUND-205-...`.
+- Latest assigned Bluey round doc is `ROUND-205-LOCAL-VISIBLE-MODE-RUN.md`; the next canonical Bluey round doc should start at `ROUND-206-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-routing-hardening`.
+- Round 205 ran Bluey in actual local visible mode for QA:
+  - The installed release `scripts/bluey-visible-local.sh` restart printed visible-mode success but release builds intentionally compile out the capture-visible path, so no visible args appeared.
+  - Rebuilt debug desktop stack with `cargo build -p cue-cli -p cue-daemon` and `BLUEY_OVERLAY_SWIFT_CONFIGURATION=debug native/macos/cue-overlay/build.sh`.
+  - Restarted with `BLUEY_BIN="$PWD/target/debug/bluey" scripts/bluey-visible-local.sh`.
+  - Verified running daemon is `/Users/uno/Downloads/cue/target/debug/bluey-daemon`.
+  - Verified overlay command includes `--bluey-dev-overlay --bluey-local-visible-overlay --bluey-overlay-capture-visible`.
+  - Current mode is QA visible/debug mode. Return to normal with `target/debug/bluey off` then `bluey on`.
 - Round 204 immediately fixed the owner's post-deploy report that the overlay felt dead: buttons were not clickable and blank panel space could not be dragged.
   - Root cause: expanded macOS click-through default plus `expandedWindow.ignoresMouseEvents` point-gating could make the whole overlay stop receiving clicks; Windows blank surface returned `HTTRANSPARENT`.
   - macOS expanded overlay now defaults to interactive, keeps normal expanded windows mouse-active, and treats blank panel surface as draggable while preserving real controls as clickable.
