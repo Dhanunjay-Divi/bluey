@@ -101,6 +101,12 @@ pub async fn set_agent_session_history(
 /// before the daemon wires the push feed), we fall back to the daemon's
 /// request/response `Answer` IPC and emit the full text as `meeting://answer/<id>`
 /// chunks so the UI still renders the thinking → answer flow.
+// Tauri injects each argument by name from the JS `invoke` call, so the
+// argument list IS the command's wire contract — collapsing them into a struct
+// would change that contract. The three trailing fields are optional
+// answer-shaping hints; exceeding clippy's 7-arg guard is expected for an IPC
+// command and grouping them would not improve the call site.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn meeting_ask(
     app: AppHandle,
@@ -108,14 +114,33 @@ pub async fn meeting_ask(
     sender: State<'_, EventSender>,
     id: String,
     question: String,
+    // Optional answer-shaping fields, mirroring the daemon's
+    // OverlayEvent::AskRequested { provider, model, mode }. Forwarded verbatim
+    // when present; absent fields keep the daemon's own defaults.
+    mode: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
 ) -> Result<(), String> {
     // Socket path: forward an `ask_requested` OverlayEvent; the answer streams
     // back over `overlay://command` (push_card → update_card*). No TCP round-trip.
     {
         let guard = sender.0.lock().await;
         if let Some(tx) = guard.as_ref() {
-            let event = json!({ "type": "ask_requested", "question": question }).to_string();
-            let _ = tx.send(event);
+            // Build the event, including only the optional fields that are set so
+            // an unpinned ask carries exactly { type, question } as before.
+            let mut event = json!({ "type": "ask_requested", "question": question });
+            if let Value::Object(map) = &mut event {
+                if let Some(mode) = &mode {
+                    map.insert("mode".into(), json!(mode));
+                }
+                if let Some(provider) = &provider {
+                    map.insert("provider".into(), json!(provider));
+                }
+                if let Some(model) = &model {
+                    map.insert("model".into(), json!(model));
+                }
+            }
+            let _ = tx.send(event.to_string());
             return Ok(());
         }
     }

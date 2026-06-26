@@ -12,6 +12,7 @@ import type {
   AgentSessionSummary,
   AgentSummary,
   AnswerChunk,
+  AskOptions,
   ListeningState,
   TranscriptLine,
 } from "./types";
@@ -38,8 +39,16 @@ export interface MeetingClient {
    * source / done) to `onChunk`. The agent answer is SLOW by nature (driving a
    * real CLI/ACP agent + MCP round-trips) — callers render a thinking state
    * until the first chunk arrives.
+   *
+   * `opts` carries optional answer-shaping fields (mode / provider / model)
+   * forwarded verbatim to the daemon's AskRequested. Omitted fields let the
+   * daemon keep its own defaults.
    */
-  ask(question: string, onChunk: (chunk: AnswerChunk) => void): AskHandle;
+  ask(
+    question: string,
+    onChunk: (chunk: AnswerChunk) => void,
+    opts?: AskOptions,
+  ): AskHandle;
 
   // ---- listening (mic / system audio capture) ----
   /** Subscribe to the daemon's listening state; returns an unsubscribe fn.

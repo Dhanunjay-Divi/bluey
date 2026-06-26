@@ -2,8 +2,21 @@
 // ⌘↵ hint, send. Submits on Enter (⌘↵ or plain Enter) when there's text.
 
 import { useState } from "react";
-import type { ListeningState } from "../lib/types";
+import type { AskMode, ListeningState } from "../lib/types";
 import { PlusMenu } from "./PlusMenu";
+
+/** The three answer-speed presets, ordered fast → deep. `hint` is the title
+ *  tooltip; the label is what the pill shows. Data-driven so adding/removing a
+ *  preset is a one-line edit. */
+const MODES: ReadonlyArray<{ id: AskMode; label: string; hint: string }> = [
+  { id: "fast", label: "Fast", hint: "Quickest reply, less depth" },
+  {
+    id: "balanced",
+    label: "Balanced",
+    hint: "Default — balance speed and depth",
+  },
+  { id: "deep", label: "Deep", hint: "Most thorough, slower" },
+];
 
 export function Composer({
   placeholder,
@@ -11,6 +24,8 @@ export function Composer({
   onSubmit,
   onMic,
   listenState = "idle",
+  mode,
+  onModeChange,
 }: {
   placeholder: string;
   contextLabel?: string;
@@ -19,6 +34,10 @@ export function Composer({
   /** Daemon listening-pipeline state — drives the mic button's visual state so a
    *  connecting/failed start is never silently swallowed. */
   listenState?: ListeningState;
+  /** Currently selected answer-speed preset (forwarded to the daemon's `mode`). */
+  mode?: AskMode;
+  /** Called when the user picks a different speed preset. */
+  onModeChange?: (mode: AskMode) => void;
 }) {
   const [text, setText] = useState("");
   const [plusOpen, setPlusOpen] = useState(false);
@@ -48,6 +67,48 @@ export function Composer({
         >
           ✓ {contextLabel}
         </span>
+      )}
+      {onModeChange && (
+        <div
+          role="radiogroup"
+          aria-label="Answer speed"
+          style={{
+            display: "inline-flex",
+            gap: 2,
+            marginBottom: 10,
+            padding: 2,
+            background: "var(--glass-solid)",
+            border: "1px solid var(--line-2)",
+            borderRadius: "var(--r-pill)",
+          }}
+        >
+          {MODES.map((m) => {
+            const active = (mode ?? "balanced") === m.id;
+            return (
+              <button
+                key={m.id}
+                role="radio"
+                aria-checked={active}
+                title={m.hint}
+                onClick={() => onModeChange(m.id)}
+                style={{
+                  border: "none",
+                  cursor: "pointer",
+                  fontSize: 10.5,
+                  fontWeight: active ? 580 : 460,
+                  lineHeight: 1,
+                  padding: "5px 11px",
+                  borderRadius: "var(--r-pill)",
+                  background: active ? "var(--tint-wash)" : "transparent",
+                  color: active ? "var(--tint-ink)" : "var(--ink-3)",
+                  transition: "color .12s ease, background .12s ease",
+                }}
+              >
+                {m.label}
+              </button>
+            );
+          })}
+        </div>
       )}
       <div
         style={{

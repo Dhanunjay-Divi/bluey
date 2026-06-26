@@ -81,8 +81,16 @@ interface WireCueCard {
 // serde tag; remaining fields are per-variant. Unhandled variants fall through.
 type OverlayCommand =
   | { type: "set_agents"; agents: WireAgentSummary[] }
-  | { type: "set_agent_sessions"; kind: string; sessions: WireAgentSessionSummary[] }
-  | { type: "set_agent_connectors"; kind: string; connectors: WireAgentConnectorInfo[] }
+  | {
+      type: "set_agent_sessions";
+      kind: string;
+      sessions: WireAgentSessionSummary[];
+    }
+  | {
+      type: "set_agent_connectors";
+      kind: string;
+      connectors: WireAgentConnectorInfo[];
+    }
   | { type: "listening_state_changed"; state: string }
   | { type: "push_card"; card: WireCueCard }
   | {
@@ -123,7 +131,9 @@ function toAgentSummary(w: WireAgentSummary): AgentSummary {
   };
 }
 
-function toAgentSessionSummary(w: WireAgentSessionSummary): AgentSessionSummary {
+function toAgentSessionSummary(
+  w: WireAgentSessionSummary,
+): AgentSessionSummary {
   return {
     id: w.id,
     title: w.title ?? null,
@@ -141,10 +151,12 @@ function toAgentConnectorInfo(w: WireAgentConnectorInfo): AgentConnectorInfo {
 // ---------------------------------------------------------------------------
 
 function sendEvent(event: Record<string, unknown>): void {
-  void invoke<void>("overlay_send", { event: JSON.stringify(event) }).catch((e) => {
-    // Surface, never silently swallow — but don't crash the UI loop.
-    console.error("[tauriClient] overlay_send failed", event.type, e);
-  });
+  void invoke<void>("overlay_send", { event: JSON.stringify(event) }).catch(
+    (e) => {
+      // Surface, never silently swallow — but don't crash the UI loop.
+      console.error("[tauriClient] overlay_send failed", event.type, e);
+    },
+  );
 }
 
 export function createTauriClient(): MeetingClient {
@@ -203,7 +215,9 @@ export function createTauriClient(): MeetingClient {
     listAgents: () =>
       request<AgentSummary[]>({ type: "agent_list_requested" }, (cmd) =>
         cmd.type === "set_agents"
-          ? (cmd as Extract<OverlayCommand, { type: "set_agents" }>).agents.map(toAgentSummary)
+          ? (cmd as Extract<OverlayCommand, { type: "set_agents" }>).agents.map(
+              toAgentSummary,
+            )
           : undefined,
       ),
 
@@ -217,14 +231,18 @@ export function createTauriClient(): MeetingClient {
         },
         (cmd) =>
           cmd.type === "set_agents"
-            ? (cmd as Extract<OverlayCommand, { type: "set_agents" }>).agents.map(toAgentSummary)
+            ? (
+                cmd as Extract<OverlayCommand, { type: "set_agents" }>
+              ).agents.map(toAgentSummary)
             : undefined,
       ),
 
     detach: () =>
       request<AgentSummary[]>({ type: "agent_detach_requested" }, (cmd) =>
         cmd.type === "set_agents"
-          ? (cmd as Extract<OverlayCommand, { type: "set_agents" }>).agents.map(toAgentSummary)
+          ? (cmd as Extract<OverlayCommand, { type: "set_agents" }>).agents.map(
+              toAgentSummary,
+            )
           : undefined,
       ),
 
@@ -233,7 +251,10 @@ export function createTauriClient(): MeetingClient {
         { type: "agent_sessions_requested", kind },
         (cmd) => {
           if (cmd.type !== "set_agent_sessions") return undefined;
-          const c = cmd as Extract<OverlayCommand, { type: "set_agent_sessions" }>;
+          const c = cmd as Extract<
+            OverlayCommand,
+            { type: "set_agent_sessions" }
+          >;
           // Guard against a reply for a different agent on the shared bus.
           if (c.kind !== kind) return undefined;
           return c.sessions.map(toAgentSessionSummary);
@@ -245,7 +266,10 @@ export function createTauriClient(): MeetingClient {
         { type: "agent_connectors_requested", kind },
         (cmd) => {
           if (cmd.type !== "set_agent_connectors") return undefined;
-          const c = cmd as Extract<OverlayCommand, { type: "set_agent_connectors" }>;
+          const c = cmd as Extract<
+            OverlayCommand,
+            { type: "set_agent_connectors" }
+          >;
           if (c.kind !== kind) return undefined;
           return c.connectors.map(toAgentConnectorInfo);
         },
@@ -265,10 +289,16 @@ export function createTauriClient(): MeetingClient {
       // start silently snaps the mic button back and looks dead.
       const handler = (cmd: OverlayCommand) => {
         if (cmd.type !== "listening_state_changed") return;
-        const c = cmd as Extract<OverlayCommand, { type: "listening_state_changed" }>;
+        const c = cmd as Extract<
+          OverlayCommand,
+          { type: "listening_state_changed" }
+        >;
         const s = c.state;
         const known: ListeningState =
-          s === "connecting" || s === "listening" || s === "paused" || s === "failed"
+          s === "connecting" ||
+          s === "listening" ||
+          s === "paused" ||
+          s === "failed"
             ? s
             : "idle";
         cb(known);
@@ -314,7 +344,8 @@ export function createTauriClient(): MeetingClient {
       // Transcript lines arrive as push_card with kind "transcript".
       const handler = (cmd: OverlayCommand) => {
         if (cmd.type !== "push_card") return;
-        const card = (cmd as Extract<OverlayCommand, { type: "push_card" }>).card;
+        const card = (cmd as Extract<OverlayCommand, { type: "push_card" }>)
+          .card;
         if (card.kind !== "transcript") return;
         const line: TranscriptLine = {
           // The daemon tags transcript origin in `source` ("system" | "mic"…);
@@ -331,7 +362,7 @@ export function createTauriClient(): MeetingClient {
       return () => handlers.delete(handler);
     },
 
-    ask(question, onChunk): AskHandle {
+    ask(question, onChunk, opts): AskHandle {
       // The answer stream (app.rs:5277-5394):
       //   push_card(question) → push_card(answer placeholder "Thinking…")
       //   → update_card(same id, growing body, done:false) × N
@@ -353,7 +384,8 @@ export function createTauriClient(): MeetingClient {
         if (finished) return;
 
         if (cmd.type === "push_card") {
-          const card = (cmd as Extract<OverlayCommand, { type: "push_card" }>).card;
+          const card = (cmd as Extract<OverlayCommand, { type: "push_card" }>)
+            .card;
           // Bind to the first answer card that appears after we asked. The
           // question card (kind "question") is skipped.
           if (answerId === null && card.kind === "answer") {
@@ -366,7 +398,10 @@ export function createTauriClient(): MeetingClient {
         }
 
         if (cmd.type === "set_answer_status") {
-          const s = cmd as Extract<OverlayCommand, { type: "set_answer_status" }>;
+          const s = cmd as Extract<
+            OverlayCommand,
+            { type: "set_answer_status" }
+          >;
           if (answerId === null || s.id !== answerId) return;
           // The agent's REAL reasoning + tool calls, surfaced live. Map the wire
           // steps (already the same shape) into typed UI steps; the daemon
@@ -398,9 +433,13 @@ export function createTauriClient(): MeetingClient {
           // Emit the incremental text. Bodies are cumulative; if the new body
           // doesn't extend the old (rare reset), emit it whole.
           const body = u.body ?? "";
-          const delta = body.startsWith(lastBody) ? body.slice(lastBody.length) : body;
+          const delta = body.startsWith(lastBody)
+            ? body.slice(lastBody.length)
+            : body;
           lastBody = body;
-          console.log(`[ask] update_card body.len=${body.length} delta.len=${delta.length} done=${u.done}`);
+          console.log(
+            `[ask] update_card body.len=${body.length} delta.len=${delta.length} done=${u.done}`,
+          );
           if (delta.length > 0) {
             const chunk: AnswerChunk = { text: delta };
             onChunk(chunk);
@@ -419,7 +458,17 @@ export function createTauriClient(): MeetingClient {
       };
 
       handlers.add(handler);
-      sendEvent({ type: "ask_requested", question });
+      // Forward the optional answer-shaping fields verbatim under the daemon's
+      // wire names (mode / provider / model). Only include keys that are set so
+      // an unpinned ask carries exactly { type, question } as before and the
+      // daemon's serde defaults (Option::None) kick in.
+      sendEvent({
+        type: "ask_requested",
+        question,
+        ...(opts?.mode ? { mode: opts.mode } : {}),
+        ...(opts?.provider ? { provider: opts.provider } : {}),
+        ...(opts?.model ? { model: opts.model } : {}),
+      });
 
       return {
         cancel: () => {

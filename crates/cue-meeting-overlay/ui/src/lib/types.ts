@@ -33,7 +33,12 @@ export interface AgentSessionSummary {
 }
 
 /** Coarse listening-pipeline state, mirrored from the daemon's ListeningState. */
-export type ListeningState = "idle" | "connecting" | "listening" | "paused" | "failed";
+export type ListeningState =
+  | "idle"
+  | "connecting"
+  | "listening"
+  | "paused"
+  | "failed";
 
 /** A normalized transcript line surfaced during a live meeting. */
 export interface TranscriptLine {
@@ -71,6 +76,23 @@ export interface AnswerChunk {
   statusDone?: boolean;
   /** true on the terminal chunk. */
   done?: boolean;
+}
+
+/** Answer speed/depth, mapped 1:1 to the daemon's optional `mode` field on
+ *  AskRequested. "fast" trades depth for latency; "deep" the reverse. The wire
+ *  carries it as a lowercase string; an unset value lets the daemon pick. */
+export type AskMode = "fast" | "balanced" | "deep";
+
+/** Optional answer-shaping fields forwarded with an ask. All optional so the
+ *  daemon falls back to its own defaults when the UI doesn't pin them. Mirrors
+ *  the daemon's OverlayEvent::AskRequested { provider, model, mode } fields. */
+export interface AskOptions {
+  /** Coarse speed/depth selector. */
+  mode?: AskMode;
+  /** Override the answering provider (e.g. an agent kind), when chosen. */
+  provider?: string;
+  /** Override the specific model, when chosen. */
+  model?: string;
 }
 
 /** A grounding source row shown under an answer. */
