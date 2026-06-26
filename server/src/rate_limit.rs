@@ -583,7 +583,10 @@ fn trusted_proxies() -> &'static std::collections::HashSet<std::net::IpAddr> {
 ///   1. If immediate peer is a trusted proxy: first non-empty value from
 ///      Cloudflare/Fly/Caddy-style client IP headers.
 ///   2. Immediate peer IP from `ConnectInfo`.
-pub fn trusted_client_ip_from_headers(peer_ip: Option<IpAddr>, headers: &HeaderMap) -> Option<String> {
+pub fn trusted_client_ip_from_headers(
+    peer_ip: Option<IpAddr>,
+    headers: &HeaderMap,
+) -> Option<String> {
     if let Some(peer) = peer_ip {
         if trusted_proxies().contains(&peer) {
             for name in [
@@ -594,7 +597,11 @@ pub fn trusted_client_ip_from_headers(peer_ip: Option<IpAddr>, headers: &HeaderM
                 "x-client-ip",
             ] {
                 if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
-                    if let Some(first) = value.split(',').map(str::trim).find(|part| !part.is_empty()) {
+                    if let Some(first) = value
+                        .split(',')
+                        .map(str::trim)
+                        .find(|part| !part.is_empty())
+                    {
                         return Some(first.to_string());
                     }
                 }

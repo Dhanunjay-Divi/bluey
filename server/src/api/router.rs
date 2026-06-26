@@ -8,9 +8,12 @@ use axum::{
 };
 use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::convert::Infallible;
+use std::hash::{Hash, Hasher};
 use std::pin::Pin;
-use std::time::Instant;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use super::AppState;
 use crate::auth::AuthedAccount;
@@ -912,15 +915,7 @@ fn answer_plan_for_request(
     let follow_up = short_question
         && contains_any(
             &normalized,
-            &[
-                "that",
-                "this",
-                "those",
-                "same",
-                "above",
-                "previous",
-                "next",
-            ],
+            &["that", "this", "those", "same", "above", "previous", "next"],
         );
 
     let intent = if coding {
@@ -1038,7 +1033,15 @@ fn prompt_with_web_context(
 const DEFAULT_WEB_SEARCH_BUDGET_MS: u64 = 1_200;
 const DEFAULT_WEB_SEARCH_MAX_RESULTS: usize = 3;
 const MAX_WEB_SEARCH_RESULTS: usize = 5;
+const MAX_WEB_SEARCHES_PER_ANSWER: i64 = 3;
 const MAX_WEB_SEARCH_QUERY_CHARS: usize = 160;
+const DEFAULT_WEB_SEARCH_CUSTOMER_COST_CENTS: i64 = 2;
+const DEFAULT_WEB_SEARCH_BLUEY_COST_CENTS: i64 = 1;
+const DEFAULT_TRIAL_WEB_SEARCHES_PER_DAY: i64 = 5;
+const DEFAULT_WEB_SEARCH_REPEAT_WINDOW_SECS: u64 = 600;
+const WEB_SEARCH_USAGE_KIND: &str = "web_search";
+const WEB_SEARCH_TASK_TYPE: &str = "web_search";
+const WEB_SEARCH_USAGE_MODEL: &str = "managed-web-search";
 
 #[derive(Debug, Clone)]
 struct WebSearchConfig {
@@ -1047,6 +1050,20 @@ struct WebSearchConfig {
     api_key: Option<String>,
     max_results: usize,
     budget: std::time::Duration,
+    customer_cost_cents: i64,
+    bluey_cost_cents: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct WebSearchOutcome {
+    sources: Vec<CompleteSource>,
+    attempted: bool,
+    searches_used: i64,
+    provider: Option<String>,
+    latency_ms: i64,
+    customer_cost_cents: i64,
+    bluey_cost_cents: i64,
+    skipped_reason: Option<&'static str>,
 }
 
 fn web_search_config() -> Option<WebSearchConfig> {
@@ -1085,14 +1102,36 @@ fn web_search_config() -> Option<WebSearchConfig> {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_WEB_SEARCH_BUDGET_MS);
+    let customer_cost_cents = web_search_env_i64(
+        "BLUEY_WEB_SEARCH_CUSTOMER_COST_CENTS",
+        DEFAULT_WEB_SEARCH_CUSTOMER_COST_CENTS,
+        0,
+        100,
+    );
+    let bluey_cost_cents = web_search_env_i64(
+        "BLUEY_WEB_SEARCH_BLUEY_COST_CENTS",
+        DEFAULT_WEB_SEARCH_BLUEY_COST_CENTS,
+        0,
+        100,
+    );
 
     Some(WebSearchConfig {
         provider,
         endpoint,
         api_key,
         max_results,
-        budget: std::time::Duration::from_millis(budget_ms),
+        budget: Duration::from_millis(budget_ms),
+        customer_cost_cents,
+        bluey_cost_cents,
     })
+}
+
+fn web_search_env_i64(key: &str, default: i64, min: i64, max: i64) -> i64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(default)
+        .clamp(min, max)
 }
 
 fn env_flag_is_true(key: &str) -> bool {
@@ -1120,65 +1159,195 @@ fn env_flag_is_false(key: &str) -> bool {
 }
 
 async fn completion_web_search_budgeted(
-    account_id: &str,
+    pool: &crate::db::DbPool,
+    account: &Account,
     request_id: &str,
     query_text: &str,
     plan: &AnswerPlan,
-) -> (Vec<CompleteSource>, bool) {
+) -> WebSearchOutcome {
     if !plan.needs_web_search {
-        return (Vec::new(), false);
+        return WebSearchOutcome::default();
     }
     let Some(config) = web_search_config() else {
         tracing::debug!(
-            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
             request_id,
             "managed web search skipped; provider not configured"
         );
-        return (Vec::new(), false);
+        return WebSearchOutcome {
+            attempted: true,
+            skipped_reason: Some("provider_not_configured"),
+            ..Default::default()
+        };
     };
     let Some(query) = sanitized_web_search_query(query_text) else {
         tracing::warn!(
-            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
             request_id,
             "managed web search skipped; query was empty or sensitive after sanitization"
         );
-        return (Vec::new(), false);
+        return WebSearchOutcome {
+            attempted: true,
+            provider: Some(config.provider.clone()),
+            skipped_reason: Some("query_sanitized_empty_or_sensitive"),
+            ..Default::default()
+        };
     };
+    if let Some(searches_used) = trial_web_searches_used_today(pool, account, request_id) {
+        let trial_limit = web_search_env_i64(
+            "BLUEY_TRIAL_WEB_SEARCHES_PER_DAY",
+            DEFAULT_TRIAL_WEB_SEARCHES_PER_DAY,
+            0,
+            100,
+        );
+        if account.trial_seconds_remaining > 0 && searches_used >= trial_limit {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                request_id,
+                searches_used,
+                trial_limit,
+                "managed web search skipped; trial daily search quota reached"
+            );
+            return WebSearchOutcome {
+                attempted: true,
+                provider: Some(config.provider.clone()),
+                skipped_reason: Some("trial_web_search_quota_reached"),
+                ..Default::default()
+            };
+        }
+    }
+    let repeat_window = Duration::from_secs(web_search_env_i64(
+        "BLUEY_WEB_SEARCH_REPEAT_WINDOW_SECS",
+        DEFAULT_WEB_SEARCH_REPEAT_WINDOW_SECS as i64,
+        0,
+        86_400,
+    ) as u64);
+    if !allow_web_search_repeat(&account.id, &query, repeat_window) {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            request_id,
+            repeat_window_secs = repeat_window.as_secs(),
+            "managed web search skipped; repeated identical query inside guard window"
+        );
+        return WebSearchOutcome {
+            attempted: true,
+            provider: Some(config.provider.clone()),
+            skipped_reason: Some("repeated_query_guard"),
+            ..Default::default()
+        };
+    }
     let provider = config.provider.clone();
     let budget = config.budget;
+    let started = Instant::now();
     match tokio::time::timeout(budget, perform_web_search(&config, &query)).await {
         Ok(Ok(sources)) => {
+            let latency_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
+            let searches_used = 1_i64.min(MAX_WEB_SEARCHES_PER_ANSWER);
             tracing::debug!(
-                account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 request_id,
                 provider = %provider,
                 source_count = sources.len(),
+                searches_used,
+                cost_cents_to_customer = config.customer_cost_cents,
                 "managed web search completed"
             );
-            (sources, true)
+            WebSearchOutcome {
+                sources,
+                attempted: true,
+                searches_used,
+                provider: Some(provider),
+                latency_ms,
+                customer_cost_cents: config.customer_cost_cents.saturating_mul(searches_used),
+                bluey_cost_cents: config.bluey_cost_cents.saturating_mul(searches_used),
+                skipped_reason: None,
+            }
         }
         Ok(Err(error)) => {
             tracing::warn!(
-                account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 request_id,
                 provider = %provider,
                 error = %error,
                 "managed web search failed; continuing without web context"
             );
-            (Vec::new(), true)
+            WebSearchOutcome {
+                attempted: true,
+                provider: Some(provider),
+                latency_ms: started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+                skipped_reason: Some("provider_error"),
+                ..Default::default()
+            }
         }
         Err(_) => {
             tracing::warn!(
-                account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 request_id,
                 provider = %provider,
                 budget_ms = budget.as_millis() as u64,
                 "managed web search exceeded budget; continuing without web context"
             );
-            (Vec::new(), true)
+            WebSearchOutcome {
+                attempted: true,
+                provider: Some(provider),
+                latency_ms: started.elapsed().as_millis().min(i64::MAX as u128) as i64,
+                skipped_reason: Some("provider_timeout"),
+                ..Default::default()
+            }
         }
     }
 }
+
+fn trial_web_searches_used_today(
+    pool: &crate::db::DbPool,
+    account: &Account,
+    request_id: &str,
+) -> Option<i64> {
+    if account.trial_seconds_remaining <= 0 {
+        return Some(0);
+    }
+    match usage::count_task_events_in_window(pool, &account.id, WEB_SEARCH_TASK_TYPE, 24) {
+        Ok(count) => Some(count),
+        Err(error) => {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                request_id,
+                error = %error,
+                "managed web search quota lookup failed; allowing request"
+            );
+            None
+        }
+    }
+}
+
+fn allow_web_search_repeat(account_id: &str, query: &str, window: Duration) -> bool {
+    if window.is_zero() {
+        return true;
+    }
+    let now = Instant::now();
+    let key = web_search_repeat_guard_key(account_id, query);
+    let guard = WEB_SEARCH_REPEAT_GUARD.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut entries) = guard.lock() else {
+        return true;
+    };
+    entries.retain(|_, seen_at| now.duration_since(*seen_at) <= window);
+    if entries.contains_key(&key) {
+        return false;
+    }
+    entries.insert(key, now);
+    true
+}
+
+fn web_search_repeat_guard_key(account_id: &str, query: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    account_id.hash(&mut hasher);
+    collapse_spaces(query)
+        .to_ascii_lowercase()
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+static WEB_SEARCH_REPEAT_GUARD: OnceLock<Mutex<HashMap<u64, Instant>>> = OnceLock::new();
 
 async fn perform_web_search(
     config: &WebSearchConfig,
@@ -1367,13 +1536,7 @@ fn sanitized_web_search_query(user_text: &str) -> Option<String> {
         if lower_word.starts_with("http://") || lower_word.starts_with("https://") {
             continue;
         }
-        if word.len() > 40
-            && word
-                .chars()
-                .filter(|ch| ch.is_ascii_alphanumeric())
-                .count()
-                > 32
-        {
+        if word.len() > 40 && word.chars().filter(|ch| ch.is_ascii_alphanumeric()).count() > 32 {
             continue;
         }
         if !cleaned.is_empty() {
@@ -1382,7 +1545,10 @@ fn sanitized_web_search_query(user_text: &str) -> Option<String> {
         for ch in word.chars() {
             if ch.is_ascii_alphanumeric()
                 || ch.is_ascii_whitespace()
-                || matches!(ch, '\'' | '"' | '-' | '_' | '.' | ',' | '?' | '&' | '/' | '(' | ')')
+                || matches!(
+                    ch,
+                    '\'' | '"' | '-' | '_' | '.' | ',' | '?' | '&' | '/' | '(' | ')'
+                )
             {
                 cleaned.push(ch);
             }
@@ -1434,24 +1600,51 @@ fn collapse_spaces(text: &str) -> String {
 fn retrieval_status_events(
     plan: &AnswerPlan,
     rag_count: usize,
-    web_search_attempted: bool,
-    web_source_count: usize,
+    web_search: &WebSearchOutcome,
 ) -> Vec<Event> {
-    let mut statuses = Vec::new();
+    let mut statuses: Vec<(String, String)> = Vec::new();
     if plan.needs_screen {
-        statuses.push(("reading_screen", "Reading screen context"));
+        statuses.push((
+            "reading_screen".to_string(),
+            "Reading screen context...".to_string(),
+        ));
     }
     if plan.needs_docs {
-        statuses.push(("reading_docs", "Reading attached documents"));
+        statuses.push((
+            "reading_docs".to_string(),
+            "Reading attached documents...".to_string(),
+        ));
     }
     if plan.needs_memory {
-        statuses.push(("checking_memory", "Checking saved Bluey memory"));
+        statuses.push((
+            "checking_memory".to_string(),
+            "Checking saved context...".to_string(),
+        ));
     }
-    if web_search_attempted {
-        statuses.push(("searching_web", "Searching web"));
+    if web_search.attempted {
+        statuses.push(("searching_web".to_string(), "Searching web...".to_string()));
     }
-    if rag_count > 0 || web_source_count > 0 {
-        statuses.push(("found_sources", "Found relevant sources"));
+    if web_search.sources.len() > 0 {
+        statuses.push((
+            "reading_web_sources".to_string(),
+            format!("Reading {} sources...", web_search.sources.len()),
+        ));
+    } else if rag_count > 0 {
+        statuses.push((
+            "found_saved_context".to_string(),
+            "Found relevant saved context.".to_string(),
+        ));
+    }
+    if web_search.searches_used > 0 {
+        statuses.push((
+            "web_search_used".to_string(),
+            web_search_usage_label(web_search.searches_used, web_search.sources.len()),
+        ));
+    } else if let Some(reason) = web_search.skipped_reason {
+        statuses.push((
+            "web_search_skipped".to_string(),
+            web_search_skipped_label(reason).to_string(),
+        ));
     }
 
     statuses
@@ -1469,17 +1662,107 @@ fn retrieval_status_events(
         .collect()
 }
 
+fn web_search_usage_label(searches_used: i64, source_count: usize) -> String {
+    format!(
+        "Web search used: {} {}, {} {}",
+        searches_used,
+        pluralize(searches_used, "search", "searches"),
+        source_count,
+        pluralize(source_count as i64, "source", "sources")
+    )
+}
+
+fn web_search_skipped_label(reason: &str) -> &'static str {
+    match reason {
+        "provider_not_configured" => "Web search is not configured yet.",
+        "query_sanitized_empty_or_sensitive" => "Web search skipped for private or unsafe text.",
+        "trial_web_search_quota_reached" => "Trial web search limit reached today.",
+        "repeated_query_guard" => "Web search skipped because this exact search just ran.",
+        "provider_timeout" => "Web search timed out.",
+        "provider_error" => "Web search provider failed.",
+        _ => "Web search skipped.",
+    }
+}
+
+fn pluralize(count: i64, singular: &'static str, plural: &'static str) -> &'static str {
+    if count == 1 {
+        singular
+    } else {
+        plural
+    }
+}
+
 fn sources_sse_event(sources: &[CompleteSource]) -> Option<Event> {
     if sources.is_empty() {
         return None;
     }
-    Some(Event::default().event("sources").data(
-        serde_json::json!({
-            "type": "sources",
-            "sources": sources,
-        })
-        .to_string(),
-    ))
+    Some(
+        Event::default().event("sources").data(
+            serde_json::json!({
+                "type": "sources",
+                "sources": sources,
+            })
+            .to_string(),
+        ),
+    )
+}
+
+fn web_search_usage_event(request_id: &str, outcome: &WebSearchOutcome) -> Option<UsageEvent> {
+    if outcome.searches_used <= 0 {
+        return None;
+    }
+    Some(UsageEvent {
+        request_id: format!("{request_id}:web-search"),
+        kind: WEB_SEARCH_USAGE_KIND.to_string(),
+        task_type: Some(WEB_SEARCH_TASK_TYPE.to_string()),
+        lane: Some("web_search".to_string()),
+        provider: outcome.provider.clone(),
+        model: Some(WEB_SEARCH_USAGE_MODEL.to_string()),
+        input_tokens: outcome.searches_used,
+        output_tokens: outcome.sources.len() as i64,
+        latency_ms: outcome.latency_ms,
+        cost_cents_to_bluey: outcome.bluey_cost_cents,
+        cost_cents_to_customer: outcome.customer_cost_cents,
+        was_speculative: false,
+        was_fallback: false,
+    })
+}
+
+fn record_web_search_usage(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    request_id: &str,
+    outcome: &WebSearchOutcome,
+    streaming: bool,
+) {
+    let Some(event) = web_search_usage_event(request_id, outcome) else {
+        return;
+    };
+    match usage::record(pool, account_id, &event) {
+        Ok(true) => tracing::info!(
+            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+            request_id,
+            provider = event.provider.as_deref().unwrap_or("unknown"),
+            searches_used = outcome.searches_used,
+            source_count = outcome.sources.len(),
+            cost_cents = outcome.customer_cost_cents,
+            streaming,
+            "managed web search usage event recorded"
+        ),
+        Ok(false) => tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+            request_id,
+            streaming,
+            "managed web search usage event deduplicated"
+        ),
+        Err(e) => tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+            request_id,
+            error = %e,
+            streaming,
+            "failed to record managed web search usage event"
+        ),
+    }
 }
 
 pub async fn complete(
@@ -1671,9 +1954,15 @@ async fn complete_stream_inner(
         "managed chat memory context prepared"
     );
     let answer_plan = answer_plan_for_request(&req, effective_lane, &rag_matches);
-    let (web_sources, web_search_attempted) =
-        completion_web_search_budgeted(&account.id, &req.request_id, &req.user, &answer_plan)
-            .await;
+    let web_search = completion_web_search_budgeted(
+        &state.pool,
+        &account,
+        &req.request_id,
+        &req.user,
+        &answer_plan,
+    )
+    .await;
+    let web_sources = web_search.sources.clone();
     let (provider_system, provider_user) =
         prompt_with_rag_context(&req.system, &req.user, &rag_matches);
     let (provider_system, provider_user) =
@@ -1710,12 +1999,14 @@ async fn complete_stream_inner(
         .iter()
         .map(|route| route.estimated_cost_cents)
         .max()
-        .unwrap_or(1);
+        .unwrap_or(1)
+        .saturating_add(web_search.customer_cost_cents);
     let est_bluey_cost = routes
         .iter()
         .map(|route| route.estimated_bluey_cost_cents)
         .max()
-        .unwrap_or(1);
+        .unwrap_or(1)
+        .saturating_add(web_search.bluey_cost_cents);
     if let Some(err) = release_and_upstream_spend_guard_check(
         &state,
         &account.id,
@@ -1965,12 +2256,8 @@ async fn complete_stream_inner(
         account.id.clone(),
         req.request_id.clone(),
     );
-    let stream_status_events = retrieval_status_events(
-        &answer_plan,
-        rag_matches.len(),
-        web_search_attempted,
-        web_sources.len(),
-    );
+    let stream_status_events =
+        retrieval_status_events(&answer_plan, rag_matches.len(), &web_search);
     let stream_sources = web_sources.clone();
     let event_stream = async_stream::stream! {
         let mut idempotency_guard = idempotency_guard;
@@ -2074,11 +2361,13 @@ async fn complete_stream_inner(
             return;
         };
         let elapsed_ms = started.elapsed().as_millis() as i64;
-        let (bluey_cost, customer_cost) = pricing::compute_cost(
+        let (llm_bluey_cost, llm_customer_cost) = pricing::compute_cost(
             &selected_route.pricing,
             input_tokens,
             output_tokens,
         );
+        let bluey_cost = llm_bluey_cost.saturating_add(web_search.bluey_cost_cents);
+        let customer_cost = llm_customer_cost.saturating_add(web_search.customer_cost_cents);
 
         let trial_remaining = if on_trial {
             match balance::consume_trial_seconds(&state.pool, &account.id, elapsed_ms) {
@@ -2159,8 +2448,8 @@ async fn complete_stream_inner(
             input_tokens,
             output_tokens,
             latency_ms: elapsed_ms,
-            cost_cents_to_bluey: bluey_cost,
-            cost_cents_to_customer: customer_cost,
+            cost_cents_to_bluey: llm_bluey_cost,
+            cost_cents_to_customer: llm_customer_cost,
             was_speculative: false,
             was_fallback: selected_route_idx > 0,
         };
@@ -2172,7 +2461,7 @@ async fn complete_stream_inner(
                 session_id = %session_id_log,
                 provider = %streaming.provider,
                 model = %streaming.model,
-                cost_cents = customer_cost,
+                cost_cents = llm_customer_cost,
                 balance_cents_after = balance_after,
                 latency_ms = elapsed_ms,
                 streaming = true,
@@ -2200,6 +2489,13 @@ async fn complete_stream_inner(
                 "failed to record managed chat usage event"
             ),
         }
+        record_web_search_usage(
+            &state.pool,
+            &account.id,
+            &req.request_id,
+            &web_search,
+            true,
+        );
 
         tracing::info!(
             account_id_hash = %account_id_hash,
@@ -2212,6 +2508,9 @@ async fn complete_stream_inner(
             input_tokens,
             output_tokens,
             cost_cents = customer_cost,
+            bluey_cost_cents = bluey_cost,
+            llm_cost_cents = llm_customer_cost,
+            web_search_cost_cents = web_search.customer_cost_cents,
             balance_cents_after = balance_after,
             trial_seconds_remaining = trial_remaining,
             latency_ms = elapsed_ms,
@@ -2234,7 +2533,11 @@ async fn complete_stream_inner(
                 .as_ref()
                 .map(|artifact| artifact.artifact_type.to_string()),
             artifact_body: artifact.as_ref().map(|artifact| artifact.body.clone()),
-            cost_label: Some(router_cost_label(customer_cost, balance_after)),
+            cost_label: Some(router_cost_label_with_web_search(
+                customer_cost,
+                balance_after,
+                &web_search,
+            )),
             confidence: artifact.as_ref().map(|artifact| artifact.confidence),
             sources: stream_sources.clone(),
         };
@@ -2434,9 +2737,15 @@ async fn complete_inner(
         "managed chat memory context prepared"
     );
     let answer_plan = answer_plan_for_request(&req, effective_lane, &rag_matches);
-    let (web_sources, _web_search_attempted) =
-        completion_web_search_budgeted(&account.id, &req.request_id, &req.user, &answer_plan)
-            .await;
+    let web_search = completion_web_search_budgeted(
+        &state.pool,
+        &account,
+        &req.request_id,
+        &req.user,
+        &answer_plan,
+    )
+    .await;
+    let web_sources = web_search.sources.clone();
     let (provider_system, provider_user) =
         prompt_with_rag_context(&req.system, &req.user, &rag_matches);
     let (provider_system, provider_user) =
@@ -2475,12 +2784,14 @@ async fn complete_inner(
         .iter()
         .map(|route| route.estimated_cost_cents)
         .max()
-        .unwrap_or(1);
+        .unwrap_or(1)
+        .saturating_add(web_search.customer_cost_cents);
     let est_bluey_cost = routes
         .iter()
         .map(|route| route.estimated_bluey_cost_cents)
         .max()
-        .unwrap_or(1);
+        .unwrap_or(1)
+        .saturating_add(web_search.bluey_cost_cents);
     if let Some(err) = release_and_upstream_spend_guard_check(
         &state,
         &account.id,
@@ -2702,11 +3013,13 @@ async fn complete_inner(
     };
 
     // 6. Compute actual cost from real token counts.
-    let (bluey_cost, customer_cost) = pricing::compute_cost(
+    let (llm_bluey_cost, llm_customer_cost) = pricing::compute_cost(
         &selected_route.pricing,
         comp.input_tokens,
         comp.output_tokens,
     );
+    let bluey_cost = llm_bluey_cost.saturating_add(web_search.bluey_cost_cents);
+    let customer_cost = llm_customer_cost.saturating_add(web_search.customer_cost_cents);
 
     // 7. Charge: trial decrement OR balance deduction.
     let trial_remaining = if on_trial {
@@ -2779,8 +3092,8 @@ async fn complete_inner(
         input_tokens: comp.input_tokens,
         output_tokens: comp.output_tokens,
         latency_ms: elapsed_ms,
-        cost_cents_to_bluey: bluey_cost,
-        cost_cents_to_customer: customer_cost,
+        cost_cents_to_bluey: llm_bluey_cost,
+        cost_cents_to_customer: llm_customer_cost,
         was_speculative: false,
         was_fallback: selected_route_idx > 0,
     };
@@ -2792,7 +3105,7 @@ async fn complete_inner(
             session_id = %session_id_log,
             provider = %comp.provider,
             model = %comp.model,
-            cost_cents = customer_cost,
+            cost_cents = llm_customer_cost,
             balance_cents_after = balance_after,
             latency_ms = elapsed_ms,
             streaming = false,
@@ -2820,6 +3133,13 @@ async fn complete_inner(
             "failed to record managed chat usage event"
         ),
     }
+    record_web_search_usage(
+        &state.pool,
+        &account.id,
+        &req.request_id,
+        &web_search,
+        false,
+    );
 
     tracing::info!(
         account_id_hash = %account_id_hash,
@@ -2832,6 +3152,9 @@ async fn complete_inner(
         input_tokens = comp.input_tokens,
         output_tokens = comp.output_tokens,
         cost_cents = customer_cost,
+        bluey_cost_cents = bluey_cost,
+        llm_cost_cents = llm_customer_cost,
+        web_search_cost_cents = web_search.customer_cost_cents,
         balance_cents_after = balance_after,
         trial_seconds_remaining = trial_remaining,
         latency_ms = elapsed_ms,
@@ -2859,7 +3182,11 @@ async fn complete_inner(
             .as_ref()
             .map(|artifact| artifact.artifact_type.to_string()),
         artifact_body: artifact.as_ref().map(|artifact| artifact.body.clone()),
-        cost_label: Some(router_cost_label(customer_cost, balance_after)),
+        cost_label: Some(router_cost_label_with_web_search(
+            customer_cost,
+            balance_after,
+            &web_search,
+        )),
         confidence: artifact.as_ref().map(|artifact| artifact.confidence),
         sources: web_sources,
     };
@@ -2923,8 +3250,7 @@ fn response_artifact(text: &str) -> Option<ResponseArtifact> {
             confidence: if code_blocks.is_empty() { 0.74 } else { 0.95 },
         });
     }
-    if looks_like_system_design_artifact(body, &lower)
-    {
+    if looks_like_system_design_artifact(body, &lower) {
         return Some(ResponseArtifact {
             artifact_type: "system_design",
             body: format_structured_artifact(body, "System Design"),
@@ -2970,6 +3296,21 @@ fn router_cost_label(cost_cents: i64, balance_cents_after: i64) -> String {
         "${:.2} · balance ${:.2}",
         cost_cents as f64 / 100.0,
         balance_cents_after as f64 / 100.0
+    )
+}
+
+fn router_cost_label_with_web_search(
+    cost_cents: i64,
+    balance_cents_after: i64,
+    web_search: &WebSearchOutcome,
+) -> String {
+    let base = router_cost_label(cost_cents, balance_cents_after);
+    if web_search.searches_used <= 0 {
+        return base;
+    }
+    format!(
+        "{base} · {}",
+        web_search_usage_label(web_search.searches_used, web_search.sources.len())
     )
 }
 
@@ -4260,6 +4601,73 @@ mod tests {
     }
 
     #[test]
+    fn router_cost_label_includes_web_search_usage() {
+        let web_search = WebSearchOutcome {
+            sources: vec![
+                CompleteSource {
+                    id: "W1".into(),
+                    title: "One".into(),
+                    url: Some("https://example.com/one".into()),
+                    snippet: None,
+                    source_type: Some("web".into()),
+                },
+                CompleteSource {
+                    id: "W2".into(),
+                    title: "Two".into(),
+                    url: Some("https://example.com/two".into()),
+                    snippet: None,
+                    source_type: Some("web".into()),
+                },
+                CompleteSource {
+                    id: "W3".into(),
+                    title: "Three".into(),
+                    url: Some("https://example.com/three".into()),
+                    snippet: None,
+                    source_type: Some("web".into()),
+                },
+            ],
+            searches_used: 1,
+            customer_cost_cents: 2,
+            bluey_cost_cents: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            router_cost_label_with_web_search(9, 2991, &web_search),
+            "$0.09 · balance $29.91 · Web search used: 1 search, 3 sources"
+        );
+    }
+
+    #[test]
+    fn web_search_usage_event_records_separate_search_cost() {
+        let web_search = WebSearchOutcome {
+            sources: vec![CompleteSource {
+                id: "W1".into(),
+                title: "One".into(),
+                url: Some("https://example.com/one".into()),
+                snippet: None,
+                source_type: Some("web".into()),
+            }],
+            searches_used: 1,
+            provider: Some("brave".into()),
+            latency_ms: 88,
+            customer_cost_cents: 2,
+            bluey_cost_cents: 1,
+            ..Default::default()
+        };
+        let event = web_search_usage_event("req-1", &web_search).expect("usage event");
+
+        assert_eq!(event.request_id, "req-1:web-search");
+        assert_eq!(event.kind, "web_search");
+        assert_eq!(event.task_type.as_deref(), Some("web_search"));
+        assert_eq!(event.provider.as_deref(), Some("brave"));
+        assert_eq!(event.input_tokens, 1);
+        assert_eq!(event.output_tokens, 1);
+        assert_eq!(event.cost_cents_to_customer, 2);
+        assert_eq!(event.cost_cents_to_bluey, 1);
+    }
+
+    #[test]
     fn local_lane_has_no_managed_priced_routes() {
         assert!(
             priced_routes_for("local", 100, 100).is_empty(),
@@ -4385,8 +4793,7 @@ mod tests {
         let req = CompleteRequest {
             request_id: "plan-1".into(),
             system: "You are Bluey.".into(),
-            user: "Question:\nCan you tell me about the secret passage ranch in Virginia?"
-                .into(),
+            user: "Question:\nCan you tell me about the secret passage ranch in Virginia?".into(),
             session_id: None,
             max_tokens: None,
             temperature: None,

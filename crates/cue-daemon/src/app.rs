@@ -34,7 +34,7 @@ use cue_core::{
 };
 use cue_llm::{
     bluey_managed::{BlueyManagedProvider, ManagedLane},
-    LlmArtifactMetadata, LlmProvider as _, LlmRequest,
+    LlmArtifactMetadata, LlmProvider as _, LlmRequest, LlmSourceMetadata,
 };
 use futures_util::{stream::FuturesUnordered, SinkExt, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -63,6 +63,7 @@ struct LiveProviderAnswer {
     answer: String,
     token_usage: Option<TokenUsage>,
     latency_ms: u64,
+    sources: Vec<LlmSourceMetadata>,
 }
 
 struct ProviderPromptParts {
@@ -4986,6 +4987,9 @@ async fn answer_with_provider_runtime(
     if !still_current {
         return Ok((response, events));
     }
+    if let Some(source_card) = source_card_for_managed_sources(&outcome.sources) {
+        let _ = send_overlay(daemon, OverlayCommand::PushCard { card: source_card }).await;
+    }
 
     let meeting_snapshot = {
         let mut meeting_guard = daemon.meeting.lock().await;
@@ -5869,6 +5873,99 @@ fn visible_context_title(item: &AnswerContext, fallback: &str) -> String {
         .unwrap_or_else(|| fallback.to_string())
 }
 
+fn merge_llm_sources(target: &mut Vec<LlmSourceMetadata>, incoming: Vec<LlmSourceMetadata>) {
+    for source in incoming {
+        let key = source
+            .url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+            .map(|url| url.trim().to_ascii_lowercase())
+            .unwrap_or_else(|| format!("{}:{}", source.id, source.title).to_ascii_lowercase());
+        if target.iter().any(|existing| {
+            existing
+                .url
+                .as_deref()
+                .filter(|url| !url.trim().is_empty())
+                .map(|url| url.trim().eq_ignore_ascii_case(&key))
+                .unwrap_or_else(|| {
+                    format!("{}:{}", existing.id, existing.title).eq_ignore_ascii_case(&key)
+                })
+        }) {
+            continue;
+        }
+        target.push(source);
+    }
+}
+
+fn source_card_for_managed_sources(sources: &[LlmSourceMetadata]) -> Option<CueCard> {
+    if sources.is_empty() {
+        return None;
+    }
+    let mut body = format!(
+        "Web sources used: {} {}.",
+        sources.len(),
+        if sources.len() == 1 {
+            "source"
+        } else {
+            "sources"
+        }
+    );
+    for source in sources.iter().take(5) {
+        body.push('\n');
+        body.push_str(&source_line_for_overlay(source));
+    }
+    if sources.len() > 5 {
+        body.push_str(&format!("\n+{} more sources", sources.len() - 5));
+    }
+    let attachments = sources
+        .iter()
+        .take(5)
+        .enumerate()
+        .map(|(idx, source)| CueCardAttachment {
+            id: format!("web-source-{}", source.id),
+            title: source_attachment_title(source, idx),
+            kind: "web".to_string(),
+            path: source.url.clone(),
+        })
+        .collect();
+    Some(
+        CueCard::new(CardKind::Context, "Sources", body)
+            .with_source("managed web search")
+            .with_attachments(attachments),
+    )
+}
+
+fn source_line_for_overlay(source: &LlmSourceMetadata) -> String {
+    let title = source.title.trim();
+    let title = if title.is_empty() {
+        "Web source"
+    } else {
+        title
+    };
+    let mut line = format!("{} {}", source.id, compact_snippet(title, 90));
+    if let Some(url) = source.url.as_deref().filter(|url| !url.trim().is_empty()) {
+        line.push_str(&format!(" - {}", compact_snippet(url.trim(), 120)));
+    }
+    if let Some(snippet) = source
+        .snippet
+        .as_deref()
+        .map(str::trim)
+        .filter(|snippet| !snippet.is_empty())
+    {
+        line.push_str(&format!("\n  {}", compact_snippet(snippet, 180)));
+    }
+    line
+}
+
+fn source_attachment_title(source: &LlmSourceMetadata, idx: usize) -> String {
+    let title = source.title.trim();
+    if title.is_empty() || title.eq_ignore_ascii_case("web result") {
+        format!("Source {}", idx + 1)
+    } else {
+        compact_snippet(title, 42)
+    }
+}
+
 struct AnswerRouteOutcome {
     provider: ProviderSelector,
     answer: String,
@@ -5876,6 +5973,7 @@ struct AnswerRouteOutcome {
     latency_ms: u64,
     token_usage: Option<TokenUsage>,
     safety: SafetyOutcome,
+    sources: Vec<LlmSourceMetadata>,
 }
 
 async fn resolve_answer_route(
@@ -5900,6 +5998,7 @@ async fn resolve_answer_route(
             latency_ms,
             token_usage: None,
             safety,
+            sources: Vec::new(),
         });
     }
 
@@ -5964,6 +6063,7 @@ async fn resolve_answer_route(
                 latency_ms,
                 token_usage: None,
                 safety,
+                sources: Vec::new(),
             });
         }
 
@@ -5988,6 +6088,7 @@ async fn resolve_answer_route(
                         latency_ms: answer.latency_ms,
                         token_usage: answer.token_usage,
                         safety,
+                        sources: answer.sources,
                     });
                 }
                 Err(error) => {
@@ -6032,6 +6133,7 @@ async fn resolve_answer_route(
                     latency_ms: answer.latency_ms,
                     token_usage: answer.token_usage,
                     safety,
+                    sources: answer.sources,
                 });
             }
             Err(error) => {
@@ -6098,6 +6200,7 @@ async fn call_bluey_managed_provider(
         let mut token_usage = None;
         let mut cost_label = None;
         let mut overlay_artifact = None;
+        let mut sources = Vec::new();
         let mut saw_finished = false;
         let mut blocked_internal_output = false;
         while let Some(chunk) = chunks.next().await {
@@ -6108,6 +6211,7 @@ async fn call_bluey_managed_provider(
                 }
             }
             if !chunk.sources.is_empty() {
+                merge_llm_sources(&mut sources, chunk.sources.clone());
                 if let Some(stream) = stream.as_mut() {
                     stream
                         .push_status(&format!("Found {} sources", chunk.sources.len()))
@@ -6165,6 +6269,7 @@ async fn call_bluey_managed_provider(
             answer,
             token_usage,
             latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            sources,
         });
     }
 
@@ -6200,6 +6305,7 @@ async fn call_bluey_managed_provider(
         answer,
         token_usage,
         latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        sources: response.sources,
     })
 }
 
@@ -6332,6 +6438,7 @@ async fn call_chat_provider(
         answer,
         token_usage,
         latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        sources: Vec::new(),
     })
 }
 
@@ -6450,6 +6557,7 @@ async fn read_streaming_chat_response(
         answer,
         token_usage,
         latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        sources: Vec::new(),
     })
 }
 
@@ -12276,6 +12384,41 @@ mod tests {
     fn streaming_word_chunks_preserve_spacing() {
         let chunks = streaming_word_chunks("one two\nthree");
         assert_eq!(chunks, vec!["one ", "two\n", "three"]);
+    }
+
+    #[test]
+    fn managed_sources_render_as_context_card_with_web_attachments() {
+        let sources = vec![
+            LlmSourceMetadata {
+                id: "W1".to_string(),
+                title: "Official Bluey".to_string(),
+                url: Some("https://bluey.example".to_string()),
+                snippet: Some("Primary source".to_string()),
+                source_type: Some("web".to_string()),
+            },
+            LlmSourceMetadata {
+                id: "W2".to_string(),
+                title: "Directory Listing".to_string(),
+                url: Some("https://directory.example/bluey".to_string()),
+                snippet: Some("Directory source".to_string()),
+                source_type: Some("web".to_string()),
+            },
+        ];
+
+        let card = source_card_for_managed_sources(&sources).expect("source card");
+
+        assert!(matches!(card.kind, CardKind::Context));
+        assert_eq!(card.title, "Sources");
+        assert!(card.body.contains("Web sources used: 2 sources."));
+        assert!(card.body.contains("W1 Official Bluey"));
+        assert_eq!(card.source.as_deref(), Some("managed web search"));
+        assert_eq!(card.attachments.len(), 2);
+        assert_eq!(card.attachments[0].kind, "web");
+        assert_eq!(card.attachments[0].title, "Official Bluey");
+        assert_eq!(
+            card.attachments[0].path.as_deref(),
+            Some("https://bluey.example")
+        );
     }
 
     #[test]

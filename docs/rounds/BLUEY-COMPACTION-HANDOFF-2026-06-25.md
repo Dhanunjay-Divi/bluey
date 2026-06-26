@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-26 15:34 EDT
+Latest checkpoint: 2026-06-26 16:00 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,50 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-198-WEB-SEARCH-PAID-QUOTA-POLICY.md`; the next canonical Bluey round doc should start at `ROUND-199-...`.
+- Latest assigned Bluey round doc is `ROUND-199-WEB-SEARCH-CREDIT-METERING-SOURCES.md`; the next canonical Bluey round doc should start at `ROUND-200-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-routing-hardening`.
+- Round 199 implemented the first production-shaped managed web-search lane:
+  - server-side search remains provider/API based with Brave, Tavily, or generic endpoint configuration
+  - default web-search pricing is `2` customer cents and `1` Bluey cost cent per successful managed search call, overridable by env
+  - trial accounts default to `5` searches/day via durable `usage_events` counting
+  - paid accounts are credit-metered and not blocked by a low `50/day` cap
+  - repeated identical searches are blocked for a short in-memory hashed-query window, default `600` seconds
+  - status SSE copy now includes `Checking saved context...`, `Searching web...`, `Reading N sources...`, and `Web search used: 1 search, N sources`
+  - combined paid deduction happens once after completion, while answer and search are recorded as separate usage events
+  - failed/unconfigured/timeout/privacy-blocked searches show status and do not charge the user
+- Round 199 daemon changes carry managed source metadata through the answer route and emit a shared `Sources` context card with web attachments. This gives Mac and Windows a common source-chip foundation without native UI forks.
+- Round 199 local install refreshed `~/.bluey/bin/bluey` and `~/.bluey/bin/bluey-daemon`, then restarted Bluey. Latest local status:
+  - pid `69465`
+  - active meeting id `89a72895-1931-4990-bc8e-8a6a18dccdba`
+  - overlay visible `true`
+  - overlay capture excluded `true`
+  - overlay opacity `0.92`
+  - screen capture active `false`
+- Round 199 verification passed:
+  - `cargo fmt --check --manifest-path server/Cargo.toml`
+  - `cargo fmt --check -p cue-daemon`
+  - `git diff --check`
+  - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+  - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+  - `cargo test --manifest-path server/Cargo.toml router -- --nocapture`
+  - `cargo test --manifest-path server/Cargo.toml usage -- --nocapture`
+  - `cargo test --manifest-path server/Cargo.toml router_cost_label_includes_web_search_usage -- --nocapture`
+  - `cargo test --manifest-path server/Cargo.toml web_search_usage_event_records_separate_search_cost -- --nocapture`
+  - `cargo test --manifest-path server/Cargo.toml count_task_events_in_window_counts_recent_matching_task_type -- --nocapture`
+  - `cargo test -p cue-daemon managed_sources_render_as_context_card_with_web_attachments -- --nocapture`
+  - `cargo test -p cue-daemon response_artifact_does_not_route_self_intro_to_system_design -- --nocapture`
+  - `cargo test -p cue-daemon answer_overlay_cost_label -- --nocapture`
+  - `cargo build --manifest-path server/Cargo.toml`
+  - `cargo build --release -p cue-cli -p cue-daemon`
+- Remaining Round 199 gates:
+  - configure real search provider env vars in staging/production
+  - deploy server before expecting live cloud web search
+  - run live provider smoke confirming statuses, citations, source card, separate `llm` and `web_search` usage events, and one combined balance deduction
+  - build a polished native source drawer later; current source-card path is the cross-platform foundation
 - Round 198 clarified web-search quota policy after the owner questioned `Paid account: 50 searches/day`.
 - `50 searches/day` is not currently enforced in product code and should not become the normal paid-user product cap.
 - Paid web search should be credit-metered and abuse-guarded: charge/reserve credits for search provider cost, fetched-page processing, and answer tokens; keep short-window rate limits and high fraud circuit breakers; allow user/workspace daily search spend controls.

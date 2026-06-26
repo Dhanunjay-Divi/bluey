@@ -141,6 +141,65 @@ pub fn bluey_spend_cents_in_window(pool: &DbPool, window_hours: i64) -> Result<i
     })
 }
 
+pub fn count_task_events_in_window(
+    pool: &DbPool,
+    account_id: &str,
+    task_type: &str,
+    window_hours: i64,
+) -> Result<i64> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let total = if window_hours > 0 {
+                let window = format!("-{window_hours} hours");
+                conn.query_row(
+                    "SELECT COUNT(*)
+                       FROM usage_events
+                      WHERE account_id = ?1
+                        AND task_type = ?2
+                        AND ts >= datetime('now', ?3)",
+                    params![account_id, task_type, window],
+                    |row| row.get(0),
+                )?
+            } else {
+                conn.query_row(
+                    "SELECT COUNT(*)
+                       FROM usage_events
+                      WHERE account_id = ?1
+                        AND task_type = ?2",
+                    params![account_id, task_type],
+                    |row| row.get(0),
+                )?
+            };
+            Ok(total)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let total: i64 = if window_hours > 0 {
+                conn.query_one(
+                    "SELECT COUNT(*)::bigint
+                       FROM usage_events
+                      WHERE account_id = $1
+                        AND task_type = $2
+                        AND ts >= now() - ($3::bigint * interval '1 hour')",
+                    &[&account_id, &task_type, &window_hours],
+                )?
+                .try_get(0)?
+            } else {
+                conn.query_one(
+                    "SELECT COUNT(*)::bigint
+                       FROM usage_events
+                      WHERE account_id = $1
+                        AND task_type = $2",
+                    &[&account_id, &task_type],
+                )?
+                .try_get(0)?
+            };
+            Ok(total)
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,5 +290,39 @@ mod tests {
 
         assert_eq!(bluey_spend_cents_in_window(&pool, 24).unwrap(), 7);
         assert_eq!(bluey_spend_cents_in_window(&pool, 0).unwrap(), 18);
+    }
+
+    #[test]
+    fn count_task_events_in_window_counts_recent_matching_task_type() {
+        let pool = temp_pool();
+        let id = make_account(&pool);
+        let mut recent_search = sample_event("search-recent");
+        recent_search.kind = "web_search".into();
+        recent_search.task_type = Some("web_search".into());
+        let mut old_search = sample_event("search-old");
+        old_search.kind = "web_search".into();
+        old_search.task_type = Some("web_search".into());
+        let mut llm = sample_event("llm-recent");
+        llm.task_type = None;
+
+        assert!(record(&pool, &id, &recent_search).unwrap());
+        assert!(record(&pool, &id, &old_search).unwrap());
+        assert!(record(&pool, &id, &llm).unwrap());
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE usage_events SET ts = datetime('now', '-2 days') WHERE request_id = ?1",
+                params!["search-old"],
+            )
+            .unwrap();
+
+        assert_eq!(
+            count_task_events_in_window(&pool, &id, "web_search", 24).unwrap(),
+            1
+        );
+        assert_eq!(
+            count_task_events_in_window(&pool, &id, "web_search", 0).unwrap(),
+            2
+        );
     }
 }
