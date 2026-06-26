@@ -441,7 +441,7 @@ private enum ExpandedPanelMetrics {
     static let focusHeight: CGFloat = 620
     static let height: CGFloat = 640
     static let minHeight: CGFloat = 500
-    static let screenInset: CGFloat = 32
+    static let screenInset: CGFloat = 12
     static let focusInset: CGFloat = 48
     static let cameraSafeTopInset: CGFloat = 64
     static let cornerRadius: CGFloat = 28
@@ -4087,6 +4087,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     var onOpacityChanged: ((Double) -> Void)?
     var onListeningStateChanged: ((PillRunState) -> Void)?
     var onWindowFrameChanged: ((NSRect) -> Void)?
+    var onInteractionModeChanged: (() -> Void)?
     var onPasteText: ((String) -> Void)?
     private var recordingActive = false
     private var transcriptSnippets: [String] = []
@@ -4964,12 +4965,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     override func draw(_ dirtyRect: NSRect) {
         let outer = bounds.insetBy(dx: 0.75, dy: 0.75)
+        let radius = windowFullSize ? 0 : ExpandedPanelMetrics.cornerRadius
         if lightThemeEnabled {
-            drawBlueyLightPanel(in: outer, radius: ExpandedPanelMetrics.cornerRadius, opacity: backgroundOpacity)
+            drawBlueyLightPanel(in: outer, radius: radius, opacity: backgroundOpacity)
         } else {
             drawBlueyGlassPanel(
                 in: outer,
-                radius: ExpandedPanelMetrics.cornerRadius,
+                radius: radius,
                 opacity: backgroundOpacity)
         }
     }
@@ -5031,7 +5033,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             if let hit = super.hitTest(point), isExplicitInteractiveHit(hit) {
                 return hit
             }
-            return self
+            if isHeaderMoveHandleHit(at: point) {
+                return self
+            }
+            return nil
         }
         if let hit = super.hitTest(point), isExplicitInteractiveHit(hit) {
             return hit
@@ -5056,11 +5061,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             }
         }
         if passThroughMode {
-            if !hasInteractiveView(at: localPoint) {
+            if isHeaderMoveHandleHit(at: localPoint) {
                 beginHeaderDrag(with: event)
                 return
             }
-            super.mouseDown(with: event)
+            if hasInteractiveView(at: localPoint) {
+                super.mouseDown(with: event)
+            }
             return
         }
         if !passThroughMode, shouldStartHeaderDrag(at: localPoint) {
@@ -5309,7 +5316,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return true
         }
         let localPoint = convert(windowPoint, from: nil)
-        return bounds.contains(localPoint)
+        guard bounds.contains(localPoint) else {
+            clearResizeCursorIfNeeded()
+            return false
+        }
+        guard passThroughMode else {
+            return true
+        }
+        return isInteractiveAtLocalPoint(localPoint, windowPoint: windowPoint)
     }
 
     private func isInteractiveAtLocalPoint(_ localPoint: NSPoint, windowPoint _: NSPoint) -> Bool {
@@ -5331,6 +5345,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return true
         }
         if isKnowledgeBadgeHit(at: localPoint) {
+            return true
+        }
+        if !sessionDrawer.isHidden, rectForView(sessionDrawer).contains(localPoint) {
+            return true
+        }
+        if canvasOpen, rectForView(canvasPane).contains(localPoint) {
             return true
         }
         if isHeaderMoveHandleHit(at: localPoint) {
@@ -5761,10 +5781,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let composerHeight = composerBarHeightConstraint?.constant ?? ChromeMetrics.composerBaseHeight
         let attachmentHeight = attachmentStripHeightConstraint?.constant ?? 0
         let transcriptHeight: CGFloat = ChromeMetrics.transcriptStripHeight
-        let horizontalInset: CGFloat = 10
-        let bottomInset: CGFloat = 10
-        let chromeGap: CGFloat = 6
-        let workspaceGap: CGFloat = 8
+        let horizontalInset: CGFloat = windowFullSize ? 0 : 8
+        let bottomInset: CGFloat = windowFullSize ? 0 : 8
+        let chromeGap: CGFloat = 5
+        let workspaceGap: CGFloat = 6
 
         headerChrome.frame = NSRect(
             x: 0,
@@ -6308,7 +6328,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         canvasToggleButton.toolTip = "Open or collapse the canvas"
         themeButton.toolTip = lightThemeEnabled ? "Switch to dark theme" : "Switch to light theme"
         balanceLabel.toolTip = "Remaining Bluey credits"
-        fullSizeButton.toolTip = windowFullSize ? "Restore Bluey size" : "Open focus size"
+        fullSizeButton.toolTip = windowFullSize ? "Restore compact Bluey" : "Fill this screen"
         interactionModeButton.toolTip = passThroughMode
             ? "Click-through on: blank Bluey space passes to the app behind it. Drag the Bluey logo to move."
             : "Interactive on: blank Bluey space moves/resizes the panel, and the whole panel receives clicks."
@@ -6522,6 +6542,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     @objc private func interactionModeClicked() {
         passThroughMode.toggle()
         updateInteractionModeChrome()
+        onInteractionModeChanged?()
     }
 
     func showTurnOffConfirmation() {
@@ -8559,8 +8580,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let fallback = windowFullSize ? "↙" : "↗"
         styleHeaderIconButton(fullSizeButton, symbol: symbol, fallback: fallback)
         fullSizeButton.toolTip = windowFullSize
-            ? "Restore compact expanded Bluey"
-            : "Open focus size"
+            ? "Restore compact Bluey"
+            : "Fill this screen"
     }
 
     private func updateThemeButtonChrome() {
@@ -8577,13 +8598,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         styleHeaderIconButton(interactionModeButton, symbol: symbol, fallback: fallback)
         interactionModeButton.contentTintColor = passThroughMode ? BlueyTheme.cyan : themedTextColor
         interactionModeButton.toolTip = passThroughMode
-            ? "Move-anywhere on: controls click normally, and blank Bluey space drags the panel."
+            ? "Click-through on: blank Bluey space clicks the app behind it. Drag the Bluey logo to move."
             : "Interactive on: controls click normally, and blank Bluey space moves/resizes the panel."
         if showToast {
             showSystemToast(
-                title: passThroughMode ? "Move-anywhere on" : "Interactive on",
+                title: passThroughMode ? "Click-through on" : "Interactive on",
                 body: passThroughMode
-                    ? "Buttons stay clickable. Hold blank Bluey space to move the panel."
+                    ? "Blank spaces pass through. Drag the Bluey logo or wordmark to move the panel."
                     : "Blank Bluey space now moves/resizes Bluey. Controls and text remain clickable.",
                 duration: 2.0)
         }
@@ -8596,30 +8617,31 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
         windowFullSize = true
         updateFullSizeButtonChrome()
+        needsDisplay = true
 
-        let screen = window.screen?.visibleFrame
+        let visibleScreen = window.screen?.visibleFrame
             ?? NSScreen.main?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let maxWidth = ExpandedPanelMetrics.fittingFocusWidth(
-            for: screen,
-            preferred: ExpandedPanelMetrics.maxFocusWidth)
-        let maxHeight = ExpandedPanelMetrics.fittingFocusHeight(for: screen)
+        let fullScreen = window.screen?.frame
+            ?? NSScreen.main?.frame
+            ?? visibleScreen
+        let maxWidth = fullScreen.width
+        let maxHeight = fullScreen.height
         if let overlayWindow = window as? OverlayWindow {
-            overlayWindow.fillsVisibleFrame = false
+            overlayWindow.fillsVisibleFrame = true
             overlayWindow.preserveProgrammaticFrameHeight = false
-            overlayWindow.minimumFrameWidth = min(ExpandedPanelMetrics.minCompactWidth, maxWidth)
+            overlayWindow.contentCornerRadius = 0
+            overlayWindow.minimumFrameWidth = min(360, maxWidth)
             overlayWindow.maximumFrameWidth = maxWidth
-            overlayWindow.minimumFrameHeight = ExpandedPanelMetrics.minHeight
+            overlayWindow.minimumFrameHeight = min(360, maxHeight)
             overlayWindow.maximumFrameHeight = maxHeight
         }
-        window.minSize = NSSize(width: min(ExpandedPanelMetrics.minCompactWidth, maxWidth), height: ExpandedPanelMetrics.minHeight)
+        window.minSize = NSSize(width: min(360, maxWidth), height: min(360, maxHeight))
         window.contentMinSize = window.minSize
         window.maxSize = NSSize(width: maxWidth, height: maxHeight)
         window.contentMaxSize = window.maxSize
 
-        let frame = ExpandedPanelMetrics.focusFrame(
-            in: screen,
-            preferredWidth: ExpandedPanelMetrics.maxFocusWidth)
+        let frame = fullScreen
         updateCanvasWidth()
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.16
@@ -8632,24 +8654,22 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func restoreWindowFromFullSize() {
         guard let window else { return }
         windowFullSize = false
-        let targetFrame = preWindowFullSizeFrame
         preWindowFullSizeFrame = nil
         restoreCompactWidth()
         updateCanvasWidth()
         updateFullSizeButtonChrome()
+        needsDisplay = true
         if let overlayWindow = window as? OverlayWindow {
             overlayWindow.fillsVisibleFrame = false
-        }
-        guard let targetFrame else { return }
-        if let overlayWindow = window as? OverlayWindow {
-            overlayWindow.preserveProgrammaticFrameHeight = false
-            overlayWindow.lockedFrameHeight = targetFrame.height
+            overlayWindow.contentCornerRadius = ExpandedPanelMetrics.cornerRadius
         }
         let screen = window.screen?.visibleFrame
             ?? NSScreen.main?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let fittedFrame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(targetFrame, visibleFrame: screen)
+        let compactFrame = ExpandedPanelMetrics.compactFrame(in: screen)
+        let fittedFrame = compactFrame
         if let overlayWindow = window as? OverlayWindow {
+            overlayWindow.preserveProgrammaticFrameHeight = false
             overlayWindow.lockedFrameHeight = fittedFrame.height
         }
         NSAnimationContext.runAnimationGroup { context in
@@ -10629,8 +10649,12 @@ private final class OverlayApp {
         }
 
         expandedWindow.acceptsMouseMovedEvents = true
-        expandedWindow.ignoresMouseEvents = false
-        lastExpandedInteractiveMouseAt = CACurrentMediaTime()
+        let point = NSEvent.mouseLocation
+        let shouldReceiveMouse = expandedView?.isInteractiveAtScreenPoint(point) ?? true
+        expandedWindow.ignoresMouseEvents = !shouldReceiveMouse
+        if shouldReceiveMouse {
+            lastExpandedInteractiveMouseAt = CACurrentMediaTime()
+        }
     }
 
     private func expand() {
@@ -10692,6 +10716,9 @@ private final class OverlayApp {
         }
         view.onWindowFrameChanged = { [weak self] frame in
             self?.rememberExpandedFrame(frame)
+        }
+        view.onInteractionModeChanged = { [weak self] in
+            self?.updateExpandedMousePolicy()
         }
         view.onPasteText = { [weak self] text in
             self?.pasteAnswerToTarget(text)

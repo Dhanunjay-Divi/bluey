@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-26 18:31 EDT
+Latest checkpoint: 2026-06-26 18:58 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,33 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-205-LOCAL-VISIBLE-MODE-RUN.md`; the next canonical Bluey round doc should start at `ROUND-206-...`.
+- Latest assigned Bluey round doc is `ROUND-206-CLICKTHROUGH-FULLSCREEN-LISTEN-QA.md`; the next canonical Bluey round doc should start at `ROUND-207-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-routing-hardening`.
+- Round 206 fixed the owner's visible-QA report about click-through, full-screen, spacing, and Listen/doubled captions:
+  - Restored true macOS mode split:
+    - Interactive mode keeps blank Bluey space draggable/resizable.
+    - Click-through mode lets blank Bluey space click the app behind it.
+    - The Bluey logo/wordmark remains the explicit move handle in click-through mode.
+  - Added immediate window-policy refresh when the interaction-mode button is toggled.
+  - Kept History drawer and open canvas interactive in click-through mode so their scroll/clicks do not leak through.
+  - Changed macOS full-screen to use the actual screen frame, flatten corners while full-screen, and restore to Bluey's compact default frame.
+  - Reduced macOS expanded-panel screen inset from 32px to 12px and tightened fixed chrome gaps/insets.
+  - Mirrored Windows blank-space behavior to match its help text: controls are clickable, logo/wordmark moves, blank expanded space passes through.
+  - Widened cross-source live-caption echo dedupe from 2.5s to 6s.
+  - Local visible/debug overlay was rebuilt and relaunched with the patched debug binaries.
+  - Audio status after relaunch is idle/ready with native helper installed.
+  - Round doc: `docs/rounds/ROUND-206-CLICKTHROUGH-FULLSCREEN-LISTEN-QA.md`.
+  - Verification passed:
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `cargo test -p cue-daemon duplicate_transcript_detection -- --nocapture`
+    - `cargo build -p cue-cli -p cue-daemon`
+    - `BLUEY_OVERLAY_SWIFT_CONFIGURATION=debug native/macos/cue-overlay/build.sh`
+    - `BLUEY_BIN="$PWD/target/debug/bluey" scripts/bluey-visible-local.sh`
 - Round 205 ran Bluey in actual local visible mode for QA:
   - The installed release `scripts/bluey-visible-local.sh` restart printed visible-mode success but release builds intentionally compile out the capture-visible path, so no visible args appeared.
   - Rebuilt debug desktop stack with `cargo build -p cue-cli -p cue-daemon` and `BLUEY_OVERLAY_SWIFT_CONFIGURATION=debug native/macos/cue-overlay/build.sh`.

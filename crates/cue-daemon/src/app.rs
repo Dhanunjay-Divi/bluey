@@ -800,7 +800,7 @@ const MAX_PROVIDER_IMAGE_DATA_URL_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PROVIDER_IMAGE_DATA_URL_TOTAL_BYTES: usize = 12 * 1024 * 1024;
 const RETAINED_SCREEN_THUMBNAIL_MAX_EDGE: u32 = 1_800;
 const SAME_SPEAKER_TRANSCRIPT_DUP_MS: u64 = 8_000;
-const CROSS_SOURCE_TRANSCRIPT_ECHO_DUP_MS: u64 = 2_500;
+const CROSS_SOURCE_TRANSCRIPT_ECHO_DUP_MS: u64 = 6_000;
 
 impl OverlayProcess {
     fn send(&mut self, command: &OverlayCommand) -> Result<()> {

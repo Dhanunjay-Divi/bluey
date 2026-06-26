@@ -2095,7 +2095,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         if (g_collapsed) return HTCLIENT;
         POINT point = { GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) };
         if (point_hits_overlay_control(point)) return HTCLIENT;
-        return HTCAPTION;
+        if (point_hits_brand_move_handle(point)) return HTCAPTION;
+        return HTTRANSPARENT;
     }
     case WM_SETCURSOR: {
         if ((HWND)wparam == hwnd) {
