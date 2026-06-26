@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-26 15:31 EDT
+Latest checkpoint: 2026-06-26 15:34 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,17 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-197-LIVE-CAPTION-ECHO-DEDUP.md`; the next canonical Bluey round doc should start at `ROUND-198-...`.
+- Latest assigned Bluey round doc is `ROUND-198-WEB-SEARCH-PAID-QUOTA-POLICY.md`; the next canonical Bluey round doc should start at `ROUND-199-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-routing-hardening`.
+- Round 198 clarified web-search quota policy after the owner questioned `Paid account: 50 searches/day`.
+- `50 searches/day` is not currently enforced in product code and should not become the normal paid-user product cap.
+- Paid web search should be credit-metered and abuse-guarded: charge/reserve credits for search provider cost, fetched-page processing, and answer tokens; keep short-window rate limits and high fraud circuit breakers; allow user/workspace daily search spend controls.
+- Free/trial web search can have a small hard daily cap. Paid accounts should not feel blocked by a low fixed count when they have credits.
+- Future implementation should add durable account/day search accounting, idempotency, paid daily spend guard, query/source caching, and clear UI copy.
 - Round 197 fixed the likely doubled-caption path when Mic + System both hear the same utterance.
 - The daemon now treats exact final-caption repeats from the same speaker within 8 seconds as duplicates, and exact Mic/System echo repeats within 2.5 seconds as duplicates.
 - The macOS overlay now suppresses identical cross-source live-caption preview echoes; when Mic and System have the same caption body, Mic wins for preview and pending answer context.
