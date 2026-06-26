@@ -1098,7 +1098,7 @@ checksum = "52560adf09603e58c9a7ee1fe1dcb95a16927b17c127f0ac02d6e768a0e25bc1"
 
 [[package]]
 name = "cue-cli"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1124,7 +1124,7 @@ dependencies = [
 
 [[package]]
 name = "cue-cloud-client"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "async-trait",
  "cue-core",
@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "cue-core"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1158,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "cue-daemon"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "cue-dashboard"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "async-trait",
  "cpal",
@@ -1232,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "cue-llm"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -1251,7 +1251,7 @@ dependencies = [
 
 [[package]]
 name = "cue-rag"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1266,7 +1266,7 @@ dependencies = [
 
 [[package]]
 name = "cue-router"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "async-trait",
  "cue-llm",
@@ -1280,7 +1280,7 @@ dependencies = [
 
 [[package]]
 name = "cue-stealth"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "libc",
  "serde",

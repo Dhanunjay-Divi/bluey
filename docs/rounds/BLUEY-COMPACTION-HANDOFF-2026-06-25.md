@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-26 16:12 EDT
+Latest checkpoint: 2026-06-26 16:56 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,27 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-201-MAC-INSTALLER-PATH-AUTOSETUP.md`; the next canonical Bluey round doc should start at `ROUND-202-...`.
+- Latest assigned Bluey round doc is `ROUND-203-DROPLET-BINARY-DEPLOY.md`; the next canonical Bluey round doc should start at `ROUND-204-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-routing-hardening`.
+- Round 203 deployed the current Bluey branch snapshot to the droplet and release host:
+  - workspace desktop artifact version bumped to `0.1.15`
+  - `docs/release/RELEASE-v0.1.15.md` added
+  - macOS arm64 artifact published to `https://bluey.sh/releases/v0.1.15/bluey-0.1.15-darwin-arm64.tar.gz`
+  - live `latest.json` reports `0.1.15`
+  - live artifact SHA256 is `71ab873543a173c95020ff21f1fd9a9b10a0c8b8b9c6efbca45f79d8522573c1`
+  - live `latest.json.sig` verified against the release key
+  - temp-home install smoke from `https://bluey.sh/install.sh` installed `bluey 0.1.15`
+  - shipped macOS binaries were scanned and did not contain capture-visible/dev overlay flag strings
+  - release hygiene scan passed with only allowed local-QA/docs warnings
+  - API server was built on the droplet from `/opt/bluey-build-codex-0.1.15`
+  - `/usr/local/bin/bluey-server` was swapped with rollback backup `/usr/local/bin/bluey-server.bak-20260626T205440Z`
+  - `bluey-api.service` restarted successfully and live `/health` reports commit `3d6bc5f-v0.1.15`
+  - Postgres check confirmed `balance_ledger_entries` plus `accounts` billing restriction columns exist
+  - Windows remains preview-gated in `install.ps1`; `latest.json` does not advertise a public Windows artifact yet
 - Round 201 fixed the macOS installer PATH gap shown in the owner's screenshot:
   - `ops/install/install.sh` now asks for sudo to create `/usr/local/bin/bluey` and `/usr/local/bin/bluey-daemon` when `/usr/local/bin` is not writable
   - sudo is only for command symlinks; the Bluey install root stays user-owned
