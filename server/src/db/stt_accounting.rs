@@ -140,6 +140,36 @@ pub(crate) fn reserve_session(
                     return Err(SttAccountingError::InsufficientBalance);
                 }
 
+                if reserved_cents > 0 {
+                    let metadata = serde_json::json!({
+                        "bluey_session_id": input.bluey_session_id,
+                        "source": input.source,
+                        "mode": input.mode,
+                        "max_seconds": input.max_seconds,
+                        "reserved_billable_seconds": reserved_billable_seconds,
+                        "reserved_trial_seconds": reserved_trial_seconds
+                    })
+                    .to_string();
+                    balance::insert_balance_ledger_sqlite_tx(
+                        &tx,
+                        balance::BalanceLedgerEntry {
+                            account_id: input.account_id,
+                            event_type: "stt_reserve",
+                            amount_cents: -reserved_cents,
+                            balance_cents_before: available_cents,
+                            balance_cents_after: available_cents - reserved_cents,
+                            reason: Some(input.source),
+                            provider: Some(input.provider),
+                            processor_payment_id: None,
+                            source_id: Some(input.token),
+                            idempotency_key: Some(input.token),
+                            request_id: Some(input.bluey_session_id),
+                            metadata_json: Some(&metadata),
+                        },
+                    )
+                    .map_err(SttAccountingError::Db)?;
+                }
+
                 tx.execute(
                     "INSERT INTO stt_sessions (
                         session_token, account_id, bluey_session_id, provider, model, source,
@@ -215,6 +245,36 @@ pub(crate) fn reserve_session(
                     .map_err(|err| SttAccountingError::Db(err.into()))?;
                 if updated != 1 {
                     return Err(SttAccountingError::InsufficientBalance);
+                }
+
+                if reserved_cents > 0 {
+                    let metadata = serde_json::json!({
+                        "bluey_session_id": input.bluey_session_id,
+                        "source": input.source,
+                        "mode": input.mode,
+                        "max_seconds": input.max_seconds,
+                        "reserved_billable_seconds": reserved_billable_seconds,
+                        "reserved_trial_seconds": reserved_trial_seconds
+                    })
+                    .to_string();
+                    balance::insert_balance_ledger_pg_tx(
+                        &mut tx,
+                        balance::BalanceLedgerEntry {
+                            account_id: input.account_id,
+                            event_type: "stt_reserve",
+                            amount_cents: -reserved_cents,
+                            balance_cents_before: available_cents,
+                            balance_cents_after: available_cents - reserved_cents,
+                            reason: Some(input.source),
+                            provider: Some(input.provider),
+                            processor_payment_id: None,
+                            source_id: Some(input.token),
+                            idempotency_key: Some(input.token),
+                            request_id: Some(input.bluey_session_id),
+                            metadata_json: Some(&metadata),
+                        },
+                    )
+                    .map_err(SttAccountingError::Db)?;
                 }
 
                 tx.execute(
@@ -402,72 +462,118 @@ pub(crate) fn settle_session(
             bluey_cents,
             refunded_cents,
             refunded_trial_seconds,
-        ) =
-            match pool {
-                DbPool::Sqlite(_) => {
-                    let mut conn = pool.get().map_err(SttAccountingError::Db)?;
-                    let tx = conn
-                        .transaction()
-                        .map_err(|err| SttAccountingError::Db(err.into()))?;
+        ) = match pool {
+            DbPool::Sqlite(_) => {
+                let mut conn = pool.get().map_err(SttAccountingError::Db)?;
+                let tx = conn
+                    .transaction()
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
 
-                    let (max_seconds, reserved_cents, reserved_trial_seconds, ended_at_ms): (
-                    i64,
-                    i64,
-                    i64,
-                    Option<i64>,
-                ) = tx
+                let (
+                        max_seconds,
+                        reserved_cents,
+                        reserved_trial_seconds,
+                        ended_at_ms,
+                        bluey_session_id,
+                    ): (i64, i64, i64, Option<i64>, String) = tx
                     .query_row(
-                        "SELECT max_seconds, reserved_cents, reserved_trial_seconds, ended_at_ms
+                        "SELECT max_seconds, reserved_cents, reserved_trial_seconds, ended_at_ms, bluey_session_id
                          FROM stt_sessions
                          WHERE session_token = ?1 AND account_id = ?2",
                         params![session_token, account_id],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
                     )
                     .optional()
                     .map_err(|err| SttAccountingError::Db(err.into()))?
                     .ok_or_else(|| SttAccountingError::Db(anyhow::anyhow!("missing STT session")))?;
 
-                    if ended_at_ms.is_some() {
-                        return Err(SttAccountingError::AlreadySettled);
-                    }
+                if ended_at_ms.is_some() {
+                    return Err(SttAccountingError::AlreadySettled);
+                }
 
-                    let capped_seconds = elapsed_seconds.min(max_seconds.max(1));
-                    let trial_seconds = reserved_trial_seconds.min(capped_seconds);
-                    let billable_seconds = capped_seconds - trial_seconds;
-                    let (bluey_cents, customer_cents) =
-                        pricing::compute_cost(pricing, billable_seconds, 0);
-                    let refunded_cents = (reserved_cents - customer_cents).max(0);
-                    let extra_cents = (customer_cents - reserved_cents).max(0);
-                    let refunded_trial_seconds = (reserved_trial_seconds - trial_seconds).max(0);
+                let capped_seconds = elapsed_seconds.min(max_seconds.max(1));
+                let trial_seconds = reserved_trial_seconds.min(capped_seconds);
+                let billable_seconds = capped_seconds - trial_seconds;
+                let (bluey_cents, customer_cents) =
+                    pricing::compute_cost(pricing, billable_seconds, 0);
+                let refunded_cents = (reserved_cents - customer_cents).max(0);
+                let extra_cents = (customer_cents - reserved_cents).max(0);
+                let refunded_trial_seconds = (reserved_trial_seconds - trial_seconds).max(0);
+                let balance_before: i64 = tx
+                    .query_row(
+                        "SELECT balance_cents FROM accounts WHERE id = ?1",
+                        params![account_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
 
-                    let updated = tx
-                        .execute(
-                            "UPDATE accounts
+                let updated = tx
+                    .execute(
+                        "UPDATE accounts
                             SET reserved_cents = reserved_cents - ?1,
                                 balance_cents = balance_cents + ?2 - ?3,
                                 trial_seconds_remaining = trial_seconds_remaining + ?4
                           WHERE id = ?5
                             AND reserved_cents >= ?1
                             AND balance_cents >= ?3",
-                            params![
-                                reserved_cents,
-                                refunded_cents,
-                                extra_cents,
-                                refunded_trial_seconds,
-                                account_id
-                            ],
-                        )
-                        .map_err(|err| SttAccountingError::Db(err.into()))?;
-                    if updated != 1 {
-                        return Err(SttAccountingError::InsufficientBalance);
-                    }
+                        params![
+                            reserved_cents,
+                            refunded_cents,
+                            extra_cents,
+                            refunded_trial_seconds,
+                            account_id
+                        ],
+                    )
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                if updated != 1 {
+                    return Err(SttAccountingError::InsufficientBalance);
+                }
 
-                    balance::consume_credit_batches_tx(&tx, account_id, customer_cents)
-                        .map_err(SttAccountingError::Db)?;
+                balance::consume_credit_batches_tx(&tx, account_id, customer_cents)
+                    .map_err(SttAccountingError::Db)?;
+                let balance_after: i64 = tx
+                    .query_row(
+                        "SELECT balance_cents FROM accounts WHERE id = ?1",
+                        params![account_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                if balance_after != balance_before {
+                    let metadata = serde_json::json!({
+                        "session_token": session_token,
+                        "bluey_session_id": bluey_session_id,
+                        "reason": reason,
+                        "elapsed_ms": elapsed_ms,
+                        "capped_seconds": capped_seconds,
+                        "customer_cents": customer_cents,
+                        "refunded_cents": refunded_cents,
+                        "extra_cents": extra_cents,
+                        "trial_seconds": trial_seconds
+                    })
+                    .to_string();
+                    balance::insert_balance_ledger_sqlite_tx(
+                        &tx,
+                        balance::BalanceLedgerEntry {
+                            account_id,
+                            event_type: "stt_settle",
+                            amount_cents: balance_after - balance_before,
+                            balance_cents_before: balance_before,
+                            balance_cents_after: balance_after,
+                            reason: Some(reason),
+                            provider: Some("deepgram"),
+                            processor_payment_id: None,
+                            source_id: Some(session_token),
+                            idempotency_key: Some(session_token),
+                            request_id: Some(&bluey_session_id),
+                            metadata_json: Some(&metadata),
+                        },
+                    )
+                    .map_err(SttAccountingError::Db)?;
+                }
 
-                    let updated = tx
-                        .execute(
-                            "UPDATE stt_sessions
+                let updated = tx
+                    .execute(
+                        "UPDATE stt_sessions
                             SET consumed_seconds = ?1,
                                 settled_cents = ?2,
                                 refunded_cents = ?3,
@@ -478,104 +584,155 @@ pub(crate) fn settle_session(
                           WHERE session_token = ?8
                             AND account_id = ?9
                             AND ended_at_ms IS NULL",
-                            params![
-                                capped_seconds,
-                                customer_cents,
-                                refunded_cents,
-                                trial_seconds,
-                                refunded_trial_seconds,
-                                now_ms,
-                                reason,
-                                session_token,
-                                account_id
-                            ],
-                        )
-                        .map_err(|err| SttAccountingError::Db(err.into()))?;
-                    if updated != 1 {
-                        return Err(SttAccountingError::AlreadySettled);
-                    }
-
-                    tx.commit()
-                        .map_err(|err| SttAccountingError::Db(err.into()))?;
-                    (
-                        capped_seconds,
-                        billable_seconds,
-                        trial_seconds,
-                        customer_cents,
-                        bluey_cents,
-                        refunded_cents,
-                        refunded_trial_seconds,
+                        params![
+                            capped_seconds,
+                            customer_cents,
+                            refunded_cents,
+                            trial_seconds,
+                            refunded_trial_seconds,
+                            now_ms,
+                            reason,
+                            session_token,
+                            account_id
+                        ],
                     )
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                if updated != 1 {
+                    return Err(SttAccountingError::AlreadySettled);
                 }
-                DbPool::Postgres(_) => {
-                    let mut conn = pool.get_pg().map_err(SttAccountingError::Db)?;
-                    let mut tx = conn
-                        .transaction()
-                        .map_err(|err| SttAccountingError::Db(err.into()))?;
 
-                    let row = tx
+                tx.commit()
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                (
+                    capped_seconds,
+                    billable_seconds,
+                    trial_seconds,
+                    customer_cents,
+                    bluey_cents,
+                    refunded_cents,
+                    refunded_trial_seconds,
+                )
+            }
+            DbPool::Postgres(_) => {
+                let mut conn = pool.get_pg().map_err(SttAccountingError::Db)?;
+                let mut tx = conn
+                    .transaction()
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+
+                let row = tx
                     .query_opt(
-                        "SELECT max_seconds, reserved_cents, reserved_trial_seconds, ended_at_ms
+                        "SELECT max_seconds, reserved_cents, reserved_trial_seconds, ended_at_ms, bluey_session_id
                          FROM stt_sessions
                          WHERE session_token = $1 AND account_id = $2",
                         &[&session_token, &account_id],
                     )
                     .map_err(|err| SttAccountingError::Db(err.into()))?
                     .ok_or_else(|| SttAccountingError::Db(anyhow::anyhow!("missing STT session")))?;
-                    let max_seconds: i64 = row
-                        .try_get(0)
-                        .map_err(|err| SttAccountingError::Db(err.into()))?;
-                    let reserved_cents: i64 = row
-                        .try_get(1)
-                        .map_err(|err| SttAccountingError::Db(err.into()))?;
-                    let reserved_trial_seconds: i64 = row
-                        .try_get(2)
-                        .map_err(|err| SttAccountingError::Db(err.into()))?;
-                    let ended_at_ms: Option<i64> = row
-                        .try_get(3)
-                        .map_err(|err| SttAccountingError::Db(err.into()))?;
+                let max_seconds: i64 = row
+                    .try_get(0)
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                let reserved_cents: i64 = row
+                    .try_get(1)
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                let reserved_trial_seconds: i64 = row
+                    .try_get(2)
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                let ended_at_ms: Option<i64> = row
+                    .try_get(3)
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                let bluey_session_id: String = row
+                    .try_get(4)
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
 
-                    if ended_at_ms.is_some() {
-                        return Err(SttAccountingError::AlreadySettled);
-                    }
+                if ended_at_ms.is_some() {
+                    return Err(SttAccountingError::AlreadySettled);
+                }
 
-                    let capped_seconds = elapsed_seconds.min(max_seconds.max(1));
-                    let trial_seconds = reserved_trial_seconds.min(capped_seconds);
-                    let billable_seconds = capped_seconds - trial_seconds;
-                    let (bluey_cents, customer_cents) =
-                        pricing::compute_cost(pricing, billable_seconds, 0);
-                    let refunded_cents = (reserved_cents - customer_cents).max(0);
-                    let extra_cents = (customer_cents - reserved_cents).max(0);
-                    let refunded_trial_seconds = (reserved_trial_seconds - trial_seconds).max(0);
+                let capped_seconds = elapsed_seconds.min(max_seconds.max(1));
+                let trial_seconds = reserved_trial_seconds.min(capped_seconds);
+                let billable_seconds = capped_seconds - trial_seconds;
+                let (bluey_cents, customer_cents) =
+                    pricing::compute_cost(pricing, billable_seconds, 0);
+                let refunded_cents = (reserved_cents - customer_cents).max(0);
+                let extra_cents = (customer_cents - reserved_cents).max(0);
+                let refunded_trial_seconds = (reserved_trial_seconds - trial_seconds).max(0);
+                let balance_before: i64 = tx
+                    .query_one(
+                        "SELECT balance_cents FROM accounts WHERE id = $1",
+                        &[&account_id],
+                    )
+                    .map_err(|err| SttAccountingError::Db(err.into()))?
+                    .try_get(0)
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
 
-                    let updated = tx
-                        .execute(
-                            "UPDATE accounts
+                let updated = tx
+                    .execute(
+                        "UPDATE accounts
                             SET reserved_cents = reserved_cents - $1,
                                 balance_cents = balance_cents + $2 - $3,
                                 trial_seconds_remaining = trial_seconds_remaining + $4
                           WHERE id = $5
                             AND reserved_cents >= $1
                             AND balance_cents >= $3",
-                            &[
-                                &reserved_cents,
-                                &refunded_cents,
-                                &extra_cents,
-                                &refunded_trial_seconds,
-                                &account_id,
-                            ],
-                        )
-                        .map_err(|err| SttAccountingError::Db(err.into()))?;
-                    if updated != 1 {
-                        return Err(SttAccountingError::InsufficientBalance);
-                    }
+                        &[
+                            &reserved_cents,
+                            &refunded_cents,
+                            &extra_cents,
+                            &refunded_trial_seconds,
+                            &account_id,
+                        ],
+                    )
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                if updated != 1 {
+                    return Err(SttAccountingError::InsufficientBalance);
+                }
 
-                    balance::consume_credit_batches_pg_tx(&mut tx, account_id, customer_cents)
-                        .map_err(SttAccountingError::Db)?;
+                balance::consume_credit_batches_pg_tx(&mut tx, account_id, customer_cents)
+                    .map_err(SttAccountingError::Db)?;
+                let balance_after: i64 = tx
+                    .query_one(
+                        "SELECT balance_cents FROM accounts WHERE id = $1",
+                        &[&account_id],
+                    )
+                    .map_err(|err| SttAccountingError::Db(err.into()))?
+                    .try_get(0)
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                if balance_after != balance_before {
+                    let metadata = serde_json::json!({
+                        "session_token": session_token,
+                        "bluey_session_id": bluey_session_id,
+                        "reason": reason,
+                        "elapsed_ms": elapsed_ms,
+                        "capped_seconds": capped_seconds,
+                        "customer_cents": customer_cents,
+                        "refunded_cents": refunded_cents,
+                        "extra_cents": extra_cents,
+                        "trial_seconds": trial_seconds
+                    })
+                    .to_string();
+                    balance::insert_balance_ledger_pg_tx(
+                        &mut tx,
+                        balance::BalanceLedgerEntry {
+                            account_id,
+                            event_type: "stt_settle",
+                            amount_cents: balance_after - balance_before,
+                            balance_cents_before: balance_before,
+                            balance_cents_after: balance_after,
+                            reason: Some(reason),
+                            provider: Some("deepgram"),
+                            processor_payment_id: None,
+                            source_id: Some(session_token),
+                            idempotency_key: Some(session_token),
+                            request_id: Some(&bluey_session_id),
+                            metadata_json: Some(&metadata),
+                        },
+                    )
+                    .map_err(SttAccountingError::Db)?;
+                }
 
-                    let updated = tx
-                        .execute(
-                            "UPDATE stt_sessions
+                let updated = tx
+                    .execute(
+                        "UPDATE stt_sessions
                             SET consumed_seconds = $1,
                                 settled_cents = $2,
                                 refunded_cents = $3,
@@ -586,36 +743,36 @@ pub(crate) fn settle_session(
                           WHERE session_token = $8
                             AND account_id = $9
                             AND ended_at_ms IS NULL",
-                            &[
-                                &capped_seconds,
-                                &customer_cents,
-                                &refunded_cents,
-                                &trial_seconds,
-                                &refunded_trial_seconds,
-                                &now_ms,
-                                &reason,
-                                &session_token,
-                                &account_id,
-                            ],
-                        )
-                        .map_err(|err| SttAccountingError::Db(err.into()))?;
-                    if updated != 1 {
-                        return Err(SttAccountingError::AlreadySettled);
-                    }
-
-                    tx.commit()
-                        .map_err(|err| SttAccountingError::Db(err.into()))?;
-                    (
-                        capped_seconds,
-                        billable_seconds,
-                        trial_seconds,
-                        customer_cents,
-                        bluey_cents,
-                        refunded_cents,
-                        refunded_trial_seconds,
+                        &[
+                            &capped_seconds,
+                            &customer_cents,
+                            &refunded_cents,
+                            &trial_seconds,
+                            &refunded_trial_seconds,
+                            &now_ms,
+                            &reason,
+                            &session_token,
+                            &account_id,
+                        ],
                     )
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                if updated != 1 {
+                    return Err(SttAccountingError::AlreadySettled);
                 }
-            };
+
+                tx.commit()
+                    .map_err(|err| SttAccountingError::Db(err.into()))?;
+                (
+                    capped_seconds,
+                    billable_seconds,
+                    trial_seconds,
+                    customer_cents,
+                    bluey_cents,
+                    refunded_cents,
+                    refunded_trial_seconds,
+                )
+            }
+        };
 
         Ok(SettledSttSession {
             elapsed_ms,
@@ -756,6 +913,28 @@ mod tests {
         assert_eq!(balance_cents, 997);
         assert_eq!(reserved_cents, 0);
         assert_eq!(batch_remaining, 997);
+
+        let ledger: Vec<(String, i64, i64, i64)> = conn
+            .prepare(
+                "SELECT event_type, amount_cents, balance_cents_before, balance_cents_after
+                   FROM balance_ledger_entries
+                  WHERE account_id = ?1 AND event_type LIKE 'stt_%'
+                  ORDER BY created_at ASC",
+            )
+            .unwrap()
+            .query_map(params![account_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            ledger,
+            vec![
+                ("stt_reserve".to_string(), -28, 1000, 972),
+                ("stt_settle".to_string(), 25, 972, 997),
+            ]
+        );
     }
 
     #[test]

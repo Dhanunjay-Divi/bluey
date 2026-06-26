@@ -1571,6 +1571,67 @@ swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift
 native/macos/cue-overlay/build.sh
 ```
 
+## Latest Round After Handoff: 202
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-routing-hardening
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-202-BILLING-RISK-LEDGER-SYNC-GUARDS.md`
+
+Round 202 copied the important Pinky billing/dispute posture into Bluey code where gaps were found:
+
+- Added `balance_ledger_entries` to SQLite and Postgres runtime schemas.
+- Wrote balance movement evidence rows transactionally for:
+  - processor credits
+  - internal credits
+  - paid usage deductions
+  - request-specific LLM/web-search/embed/transcribe deductions
+  - processor credit revocation
+  - credit expiry
+  - STT reserve and settle movement
+- Routed router deductions through `deduct_for_request` so spend can be tied to the request id.
+- Blocked billing-restricted accounts from cloud write/compute paths:
+  - `POST /sync/batch`
+  - `POST /rag/query`
+  - `POST /sync/artifacts/:artifact_id/object`
+  - `GET /sync/artifacts/:artifact_id/object`
+  - `POST /usage/event`
+- Added admin-only `GET /admin/billing-risk` with restricted accounts and latest balance-ledger evidence.
+
+Verification:
+
+```bash
+cargo fmt --manifest-path server/Cargo.toml
+cargo test --manifest-path server/Cargo.toml db::balance::tests -- --nocapture
+cargo test --manifest-path server/Cargo.toml db::stt_accounting::tests -- --nocapture
+cargo test --manifest-path server/Cargo.toml api::sync::tests -- --nocapture
+cargo test --manifest-path server/Cargo.toml db::accounts::create_dup_tests -- --nocapture
+cargo test --manifest-path server/Cargo.toml billing_ -- --nocapture
+cargo test --manifest-path server/Cargo.toml router_complete_rejects_billing_restricted_account -- --nocapture
+cargo test --manifest-path server/Cargo.toml
+```
+
+Full server suite passed:
+
+- `172` unit tests
+- `41` integration tests
+- doc-tests
+
+Remaining billing/security follow-ups:
+
+- build a polished admin abuse/dispute UI on top of `/admin/billing-risk`
+- store explicit checkout/reload terms version, IP, user agent, threshold, selected amount, and consent snapshots
+- add durable auto-reload attempt rows with idempotency, spend guard, and receipt state
+- add manual unblock/reinstate path for won disputes or benign refunds
+- include `balance_ledger_entries` in account export if owner wants customer-visible evidence
+
 ## Next Best Step
 
 Start the fresh chat from the starter prompt above. In that chat:

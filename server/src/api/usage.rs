@@ -26,6 +26,17 @@ pub async fn ingest(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Json(event): Json<UsageEvent>,
 ) -> StatusCode {
+    if account.billing_restricted {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            reason = account
+                .billing_restriction_reason
+                .as_deref()
+                .unwrap_or("billing_restricted"),
+            "billing-restricted account blocked from usage ingestion"
+        );
+        return StatusCode::FORBIDDEN;
+    }
     match usage::record(&state.pool, &account.id, &event) {
         Ok(true) => StatusCode::ACCEPTED,
         // Codex Stage 7 S7.1: replay -> 200 OK. The caller knows the

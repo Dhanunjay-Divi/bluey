@@ -58,6 +58,29 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_credit_batches_stripe_charge
   ON credit_batches(stripe_charge_id)
   WHERE stripe_charge_id IS NOT NULL;
 
+CREATE TABLE IF NOT EXISTS balance_ledger_entries (
+  id TEXT PRIMARY KEY,
+  account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL,
+  amount_cents BIGINT NOT NULL,
+  balance_cents_before BIGINT NOT NULL,
+  balance_cents_after BIGINT NOT NULL,
+  reason TEXT,
+  provider TEXT,
+  processor_payment_id TEXT,
+  source_id TEXT,
+  idempotency_key TEXT,
+  request_id TEXT,
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_balance_ledger_account_created
+  ON balance_ledger_entries(account_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_balance_ledger_provider_payment
+  ON balance_ledger_entries(provider, processor_payment_id);
+CREATE INDEX IF NOT EXISTS idx_balance_ledger_request
+  ON balance_ledger_entries(account_id, request_id);
+
 CREATE TABLE IF NOT EXISTS refresh_tokens (
   token_hash TEXT PRIMARY KEY,
   account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,

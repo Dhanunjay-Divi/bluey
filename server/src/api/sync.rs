@@ -81,6 +81,7 @@ pub async fn batch(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Json(req): Json<SyncBatchRequest>,
 ) -> Result<Json<SyncBatchResponse>, (StatusCode, String)> {
+    ensure_sync_usage_allowed(&account, "sync_batch")?;
     validate_batch(&req)?;
     let accepted = sync::upsert_batch(
         &state.pool,
@@ -124,6 +125,7 @@ pub async fn rag_query(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Json(req): Json<RagQueryRequest>,
 ) -> Result<Json<RagQueryResponse>, (StatusCode, String)> {
+    ensure_sync_usage_allowed(&account, "rag_query")?;
     if req.query.trim().is_empty() && req.embedding.as_ref().is_none_or(Vec::is_empty) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -156,6 +158,7 @@ pub async fn upload_artifact_object(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<ArtifactObjectResponse>, (StatusCode, String)> {
+    ensure_sync_usage_allowed(&account, "artifact_upload")?;
     validate_object_id(&artifact_id)?;
     let storage_config = state.config.object_storage.clone().ok_or_else(|| {
         (
@@ -202,6 +205,7 @@ pub async fn download_artifact_object(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Path(artifact_id): Path<String>,
 ) -> Result<Response, (StatusCode, String)> {
+    ensure_sync_usage_allowed(&account, "artifact_download")?;
     validate_object_id(&artifact_id)?;
     let storage_config = state.config.object_storage.clone().ok_or_else(|| {
         (
@@ -333,9 +337,51 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+fn ensure_sync_usage_allowed(
+    account: &crate::db::accounts::Account,
+    surface: &str,
+) -> Result<(), (StatusCode, String)> {
+    if !account.billing_restricted {
+        return Ok(());
+    }
+    tracing::warn!(
+        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+        surface,
+        reason = account.billing_restriction_reason.as_deref().unwrap_or("billing_restricted"),
+        "billing-restricted account blocked from cloud sync/RAG usage"
+    );
+    Err((
+        StatusCode::FORBIDDEN,
+        "Account usage is paused while billing is under review.".to_string(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_account(billing_restricted: bool) -> crate::db::accounts::Account {
+        crate::db::accounts::Account {
+            id: "acct-sync-test".to_string(),
+            email: "sync@example.com".to_string(),
+            email_verified_at: None,
+            balance_cents: 0,
+            trial_seconds_remaining: 0,
+            auto_topup_enabled: false,
+            auto_topup_threshold_cents: 1000,
+            auto_topup_amount_cents: 3000,
+            is_admin: false,
+            stripe_customer_id: None,
+            stripe_payment_method_id: None,
+            square_customer_id: None,
+            square_card_id: None,
+            square_card_brand: None,
+            square_card_last4: None,
+            billing_restricted,
+            billing_restriction_reason: billing_restricted.then(|| "refund.created".to_string()),
+            billing_restricted_at: billing_restricted.then(|| "2026-06-26T00:00:00Z".to_string()),
+        }
+    }
 
     #[test]
     fn validate_rejects_empty_or_huge_batches() {
@@ -368,5 +414,13 @@ mod tests {
             rag_chunks: vec![],
         };
         assert!(validate_batch(&huge).is_err());
+    }
+
+    #[test]
+    fn billing_restricted_account_cannot_use_sync_compute_surfaces() {
+        assert!(ensure_sync_usage_allowed(&test_account(false), "rag_query").is_ok());
+        let err = ensure_sync_usage_allowed(&test_account(true), "rag_query").unwrap_err();
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert!(err.1.contains("billing is under review"));
     }
 }

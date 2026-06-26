@@ -64,6 +64,18 @@ pub struct CustomerSummary {
     pub balance_cents: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BillingRiskAccountSummary {
+    pub id: String,
+    pub email: String,
+    pub balance_cents: i64,
+    pub billing_restriction_reason: Option<String>,
+    pub billing_restricted_at: Option<String>,
+    pub latest_ledger_event_type: Option<String>,
+    pub latest_ledger_amount_cents: Option<i64>,
+    pub latest_ledger_created_at: Option<String>,
+}
+
 impl Account {
     const SELECT_FIELDS: &'static str = "id, email, email_verified_at,
                     balance_cents, trial_seconds_remaining,
@@ -604,6 +616,108 @@ impl Account {
             }
         })
     }
+
+    pub fn list_billing_risk_summaries(
+        pool: &DbPool,
+        limit: i64,
+    ) -> Result<Vec<BillingRiskAccountSummary>> {
+        crate::db::run_blocking_db(|| match pool {
+            DbPool::Sqlite(_) => {
+                let conn = pool.get()?;
+                let mut stmt = conn.prepare(
+                    "SELECT
+                        a.id,
+                        a.email,
+                        a.balance_cents,
+                        a.billing_restriction_reason,
+                        a.billing_restricted_at,
+                        (
+                            SELECT b.event_type
+                              FROM balance_ledger_entries b
+                             WHERE b.account_id = a.id
+                             ORDER BY b.created_at DESC
+                             LIMIT 1
+                        ) AS latest_event_type,
+                        (
+                            SELECT b.amount_cents
+                              FROM balance_ledger_entries b
+                             WHERE b.account_id = a.id
+                             ORDER BY b.created_at DESC
+                             LIMIT 1
+                        ) AS latest_amount_cents,
+                        (
+                            SELECT b.created_at
+                              FROM balance_ledger_entries b
+                             WHERE b.account_id = a.id
+                             ORDER BY b.created_at DESC
+                             LIMIT 1
+                        ) AS latest_created_at
+                       FROM accounts a
+                      WHERE a.billing_restricted = 1
+                      ORDER BY a.billing_restricted_at DESC
+                      LIMIT ?1",
+                )?;
+                let rows = stmt.query_map(params![limit.max(1)], |row| {
+                    Ok(BillingRiskAccountSummary {
+                        id: row.get(0)?,
+                        email: row.get(1)?,
+                        balance_cents: row.get(2)?,
+                        billing_restriction_reason: row.get(3)?,
+                        billing_restricted_at: row.get(4)?,
+                        latest_ledger_event_type: row.get(5)?,
+                        latest_ledger_amount_cents: row.get(6)?,
+                        latest_ledger_created_at: row.get(7)?,
+                    })
+                })?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .map_err(Into::into)
+            }
+            DbPool::Postgres(_) => {
+                let mut conn = pool.get_pg()?;
+                let limit = limit.max(1);
+                conn.query(
+                    "SELECT
+                        a.id,
+                        a.email,
+                        a.balance_cents,
+                        a.billing_restriction_reason,
+                        a.billing_restricted_at,
+                        latest.event_type,
+                        latest.amount_cents,
+                        latest.created_at
+                       FROM accounts a
+                       LEFT JOIN LATERAL (
+                            SELECT event_type, amount_cents, created_at
+                              FROM balance_ledger_entries
+                             WHERE account_id = a.id
+                             ORDER BY created_at DESC
+                             LIMIT 1
+                       ) latest ON TRUE
+                      WHERE a.billing_restricted != 0
+                      ORDER BY a.billing_restricted_at DESC
+                      LIMIT $1",
+                    &[&limit],
+                )?
+                .into_iter()
+                .map(|row| {
+                    let billing_restricted_at: Option<DateTime<Utc>> = row.try_get(4)?;
+                    let latest_created_at: Option<DateTime<Utc>> = row.try_get(7)?;
+                    Ok(BillingRiskAccountSummary {
+                        id: row.try_get(0)?,
+                        email: row.try_get(1)?,
+                        balance_cents: row.try_get(2)?,
+                        billing_restriction_reason: row.try_get(3)?,
+                        billing_restricted_at: billing_restricted_at
+                            .map(|value| value.to_rfc3339()),
+                        latest_ledger_event_type: row.try_get(5)?,
+                        latest_ledger_amount_cents: row.try_get(6)?,
+                        latest_ledger_created_at: latest_created_at.map(|value| value.to_rfc3339()),
+                    })
+                })
+                .collect()
+            }
+        })
+    }
 }
 #[cfg(test)]
 mod create_dup_tests {
@@ -631,5 +745,34 @@ mod create_dup_tests {
             ),
             "expected AccountCreateError::DuplicateEmail, got: {err}"
         );
+    }
+
+    #[test]
+    fn billing_risk_summary_includes_latest_balance_ledger_event() {
+        let pool = temp_pool();
+        let account = Account::create(&pool, "risk@example.com", "hash").unwrap();
+        crate::db::balance::credit_processor_payment(
+            &pool,
+            &account.id,
+            3000,
+            "square",
+            "pay_risk",
+        )
+        .unwrap();
+        Account::restrict_billing(&pool, &account.id, "refund.created", Some("square:evt_1"))
+            .unwrap();
+
+        let rows = Account::list_billing_risk_summaries(&pool, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].email, "risk@example.com");
+        assert_eq!(
+            rows[0].billing_restriction_reason.as_deref(),
+            Some("refund.created:square:evt_1")
+        );
+        assert_eq!(
+            rows[0].latest_ledger_event_type.as_deref(),
+            Some("processor_payment_credit")
+        );
+        assert_eq!(rows[0].latest_ledger_amount_cents, Some(3000));
     }
 }

@@ -548,6 +548,35 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_trial_abuse_events_device
         ON trial_abuse_events(device_hash, created_at);
     "#,
+    // 0015 — balance movement ledger.
+    //
+    // credit_batches remains the spendable FIFO ledger, while this table is
+    // the audit/evidence ledger: every balance_cents movement records the
+    // before/after value and the processor/request evidence that caused it.
+    r#"
+    CREATE TABLE IF NOT EXISTS balance_ledger_entries (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        event_type            TEXT NOT NULL,
+        amount_cents          INTEGER NOT NULL,
+        balance_cents_before  INTEGER NOT NULL,
+        balance_cents_after   INTEGER NOT NULL,
+        reason                TEXT,
+        provider              TEXT,
+        processor_payment_id  TEXT,
+        source_id             TEXT,
+        idempotency_key       TEXT,
+        request_id            TEXT,
+        metadata_json         TEXT NOT NULL DEFAULT '{}',
+        created_at            DATETIME NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_balance_ledger_account_created
+        ON balance_ledger_entries(account_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_balance_ledger_provider_payment
+        ON balance_ledger_entries(provider, processor_payment_id);
+    CREATE INDEX IF NOT EXISTS idx_balance_ledger_request
+        ON balance_ledger_entries(account_id, request_id);
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {

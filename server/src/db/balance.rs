@@ -13,12 +13,121 @@ use crate::db::DbPool;
 /// expiry timestamp and FIFO consumption can compare timestamps directly.
 pub const CREDIT_VALIDITY_DAYS: i64 = 365;
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BalanceLedgerEntry<'a> {
+    pub account_id: &'a str,
+    pub event_type: &'a str,
+    pub amount_cents: i64,
+    pub balance_cents_before: i64,
+    pub balance_cents_after: i64,
+    pub reason: Option<&'a str>,
+    pub provider: Option<&'a str>,
+    pub processor_payment_id: Option<&'a str>,
+    pub source_id: Option<&'a str>,
+    pub idempotency_key: Option<&'a str>,
+    pub request_id: Option<&'a str>,
+    pub metadata_json: Option<&'a str>,
+}
+
+pub(crate) fn insert_balance_ledger_sqlite_tx(
+    tx: &SqliteTransaction<'_>,
+    entry: BalanceLedgerEntry<'_>,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO balance_ledger_entries
+            (id, account_id, event_type, amount_cents, balance_cents_before,
+             balance_cents_after, reason, provider, processor_payment_id,
+             source_id, idempotency_key, request_id, metadata_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            uuid::Uuid::new_v4().to_string(),
+            entry.account_id,
+            entry.event_type,
+            entry.amount_cents,
+            entry.balance_cents_before,
+            entry.balance_cents_after,
+            entry.reason,
+            entry.provider,
+            entry.processor_payment_id,
+            entry.source_id,
+            entry.idempotency_key,
+            entry.request_id,
+            entry.metadata_json.unwrap_or("{}"),
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn insert_balance_ledger_pg_tx(
+    tx: &mut PgTransaction<'_>,
+    entry: BalanceLedgerEntry<'_>,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO balance_ledger_entries
+            (id, account_id, event_type, amount_cents, balance_cents_before,
+             balance_cents_after, reason, provider, processor_payment_id,
+             source_id, idempotency_key, request_id, metadata_json)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+        &[
+            &uuid::Uuid::new_v4().to_string(),
+            &entry.account_id,
+            &entry.event_type,
+            &entry.amount_cents,
+            &entry.balance_cents_before,
+            &entry.balance_cents_after,
+            &entry.reason,
+            &entry.provider,
+            &entry.processor_payment_id,
+            &entry.source_id,
+            &entry.idempotency_key,
+            &entry.request_id,
+            &entry.metadata_json.unwrap_or("{}"),
+        ],
+    )?;
+    Ok(())
+}
+
 /// Atomically deduct `cost_cents` from the account's balance AND from
 /// the oldest non-expired credit batch (FIFO consumption).
 ///
 /// Returns Ok(true) on success, Ok(false) on insufficient balance or
 /// race-loss to a concurrent deduction.
 pub fn deduct(pool: &DbPool, account_id: &str, cost_cents: i64) -> Result<bool> {
+    deduct_with_evidence(
+        pool,
+        account_id,
+        cost_cents,
+        "usage_deduction",
+        Some("paid_usage"),
+        None,
+    )
+}
+
+pub fn deduct_for_request(
+    pool: &DbPool,
+    account_id: &str,
+    cost_cents: i64,
+    reason: &str,
+    request_id: &str,
+) -> Result<bool> {
+    deduct_with_evidence(
+        pool,
+        account_id,
+        cost_cents,
+        "usage_deduction",
+        Some(reason),
+        Some(request_id),
+    )
+}
+
+fn deduct_with_evidence(
+    pool: &DbPool,
+    account_id: &str,
+    cost_cents: i64,
+    event_type: &str,
+    reason: Option<&str>,
+    request_id: Option<&str>,
+) -> Result<bool> {
     crate::db::run_blocking_db(|| {
         if cost_cents < 0 {
             anyhow::bail!("cost_cents must be non-negative");
@@ -30,6 +139,11 @@ pub fn deduct(pool: &DbPool, account_id: &str, cost_cents: i64) -> Result<bool> 
             DbPool::Sqlite(_) => {
                 let mut conn = pool.get()?;
                 let tx = conn.transaction()?;
+                let balance_before: i64 = tx.query_row(
+                    "SELECT balance_cents FROM accounts WHERE id = ?1",
+                    params![account_id],
+                    |r| r.get(0),
+                )?;
 
                 // Atomic balance check + deduction.
                 let updated = tx.execute(
@@ -42,6 +156,23 @@ pub fn deduct(pool: &DbPool, account_id: &str, cost_cents: i64) -> Result<bool> 
                 }
 
                 consume_credit_batches_tx(&tx, account_id, cost_cents)?;
+                insert_balance_ledger_sqlite_tx(
+                    &tx,
+                    BalanceLedgerEntry {
+                        account_id,
+                        event_type,
+                        amount_cents: -cost_cents,
+                        balance_cents_before: balance_before,
+                        balance_cents_after: balance_before - cost_cents,
+                        reason,
+                        provider: None,
+                        processor_payment_id: None,
+                        source_id: None,
+                        idempotency_key: request_id,
+                        request_id,
+                        metadata_json: None,
+                    },
+                )?;
 
                 tx.commit()?;
                 Ok(true)
@@ -49,6 +180,12 @@ pub fn deduct(pool: &DbPool, account_id: &str, cost_cents: i64) -> Result<bool> 
             DbPool::Postgres(_) => {
                 let mut conn = pool.get_pg()?;
                 let mut tx = conn.transaction()?;
+                let balance_before: i64 = tx
+                    .query_one(
+                        "SELECT balance_cents FROM accounts WHERE id = $1",
+                        &[&account_id],
+                    )?
+                    .try_get(0)?;
 
                 let updated = tx.execute(
                     "UPDATE accounts SET balance_cents = balance_cents - $1
@@ -61,6 +198,23 @@ pub fn deduct(pool: &DbPool, account_id: &str, cost_cents: i64) -> Result<bool> 
                 }
 
                 consume_credit_batches_pg_tx(&mut tx, account_id, cost_cents)?;
+                insert_balance_ledger_pg_tx(
+                    &mut tx,
+                    BalanceLedgerEntry {
+                        account_id,
+                        event_type,
+                        amount_cents: -cost_cents,
+                        balance_cents_before: balance_before,
+                        balance_cents_after: balance_before - cost_cents,
+                        reason,
+                        provider: None,
+                        processor_payment_id: None,
+                        source_id: None,
+                        idempotency_key: request_id,
+                        request_id,
+                        metadata_json: None,
+                    },
+                )?;
 
                 tx.commit()?;
                 Ok(true)
@@ -145,6 +299,10 @@ fn credit_with_source_id(
     account_id: &str,
     amount_cents: i64,
     credit_source_id: &str,
+    event_type: &str,
+    reason: Option<&str>,
+    provider: Option<&str>,
+    processor_payment_id: Option<&str>,
 ) -> Result<bool> {
     if amount_cents <= 0 {
         anyhow::bail!("amount_cents must be positive");
@@ -157,6 +315,11 @@ fn credit_with_source_id(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction()?;
+            let balance_before: i64 = tx.query_row(
+                "SELECT balance_cents FROM accounts WHERE id = ?1",
+                params![account_id],
+                |r| r.get(0),
+            )?;
 
             // Codex Stage 6 S6.1 + S6.2: dedupe-then-credit atomically.
             // An existing credit_batches row with the same source id means we
@@ -198,6 +361,23 @@ fn credit_with_source_id(
                 "UPDATE accounts SET balance_cents = balance_cents + ?1 WHERE id = ?2",
                 params![amount_cents, account_id],
             )?;
+            insert_balance_ledger_sqlite_tx(
+                &tx,
+                BalanceLedgerEntry {
+                    account_id,
+                    event_type,
+                    amount_cents,
+                    balance_cents_before: balance_before,
+                    balance_cents_after: balance_before + amount_cents,
+                    reason,
+                    provider,
+                    processor_payment_id,
+                    source_id: Some(credit_source_id),
+                    idempotency_key: Some(credit_source_id),
+                    request_id: None,
+                    metadata_json: None,
+                },
+            )?;
 
             tx.commit()?;
             Ok(true)
@@ -205,6 +385,12 @@ fn credit_with_source_id(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            let balance_before: i64 = tx
+                .query_one(
+                    "SELECT balance_cents FROM accounts WHERE id = $1",
+                    &[&account_id],
+                )?
+                .try_get(0)?;
 
             let existing = tx
                 .query_opt(
@@ -237,6 +423,23 @@ fn credit_with_source_id(
                 "UPDATE accounts SET balance_cents = balance_cents + $1 WHERE id = $2",
                 &[&amount_cents, &account_id],
             )?;
+            insert_balance_ledger_pg_tx(
+                &mut tx,
+                BalanceLedgerEntry {
+                    account_id,
+                    event_type,
+                    amount_cents,
+                    balance_cents_before: balance_before,
+                    balance_cents_after: balance_before + amount_cents,
+                    reason,
+                    provider,
+                    processor_payment_id,
+                    source_id: Some(credit_source_id),
+                    idempotency_key: Some(credit_source_id),
+                    request_id: None,
+                    metadata_json: None,
+                },
+            )?;
 
             tx.commit()?;
             Ok(true)
@@ -264,7 +467,16 @@ pub fn credit_processor_payment(
             anyhow::bail!("processor credit requires provider and payment id");
         }
         let source_id = format!("{provider}:{processor_payment_id}");
-        credit_with_source_id(pool, account_id, amount_cents, &source_id)
+        credit_with_source_id(
+            pool,
+            account_id,
+            amount_cents,
+            &source_id,
+            "processor_payment_credit",
+            Some("processor_confirmed_payment"),
+            Some(&provider),
+            Some(processor_payment_id),
+        )
     })
 }
 
@@ -284,7 +496,16 @@ pub fn credit_internal(
             anyhow::bail!("internal credit requires a reason");
         }
         let source_id = format!("internal:{reason}:{}", uuid::Uuid::new_v4());
-        credit_with_source_id(pool, account_id, amount_cents, &source_id)
+        credit_with_source_id(
+            pool,
+            account_id,
+            amount_cents,
+            &source_id,
+            "internal_credit",
+            Some(reason),
+            None,
+            None,
+        )
     })
 }
 
@@ -327,6 +548,11 @@ pub fn revoke_processor_credit(
                 };
 
                 if remaining_cents > 0 {
+                    let balance_before: i64 = tx.query_row(
+                        "SELECT balance_cents FROM accounts WHERE id = ?1",
+                        params![&account_id],
+                        |r| r.get(0),
+                    )?;
                     tx.execute(
                         "UPDATE accounts
                         SET balance_cents = MAX(0, balance_cents - ?1)
@@ -339,6 +565,28 @@ pub fn revoke_processor_credit(
                             expired_at = COALESCE(expired_at, datetime('now'))
                       WHERE id = ?1",
                         params![batch_id],
+                    )?;
+                    let balance_after: i64 = tx.query_row(
+                        "SELECT balance_cents FROM accounts WHERE id = ?1",
+                        params![&account_id],
+                        |r| r.get(0),
+                    )?;
+                    insert_balance_ledger_sqlite_tx(
+                        &tx,
+                        BalanceLedgerEntry {
+                            account_id: &account_id,
+                            event_type: "processor_credit_revoked",
+                            amount_cents: balance_after - balance_before,
+                            balance_cents_before: balance_before,
+                            balance_cents_after: balance_after,
+                            reason: Some(reason),
+                            provider: Some(&provider),
+                            processor_payment_id: Some(processor_payment_id),
+                            source_id: Some(&source_id),
+                            idempotency_key: Some(&source_id),
+                            request_id: None,
+                            metadata_json: None,
+                        },
                     )?;
                 }
                 tx.commit()?;
@@ -364,6 +612,12 @@ pub fn revoke_processor_credit(
                 let remaining_cents: i64 = row.try_get(2)?;
 
                 if remaining_cents > 0 {
+                    let balance_before: i64 = tx
+                        .query_one(
+                            "SELECT balance_cents FROM accounts WHERE id = $1",
+                            &[&account_id],
+                        )?
+                        .try_get(0)?;
                     tx.execute(
                         "UPDATE accounts
                         SET balance_cents = GREATEST(0, balance_cents - $1)
@@ -376,6 +630,29 @@ pub fn revoke_processor_credit(
                             expired_at = COALESCE(expired_at, now())
                       WHERE id = $1",
                         &[&batch_id],
+                    )?;
+                    let balance_after: i64 = tx
+                        .query_one(
+                            "SELECT balance_cents FROM accounts WHERE id = $1",
+                            &[&account_id],
+                        )?
+                        .try_get(0)?;
+                    insert_balance_ledger_pg_tx(
+                        &mut tx,
+                        BalanceLedgerEntry {
+                            account_id: &account_id,
+                            event_type: "processor_credit_revoked",
+                            amount_cents: balance_after - balance_before,
+                            balance_cents_before: balance_before,
+                            balance_cents_after: balance_after,
+                            reason: Some(reason),
+                            provider: Some(&provider),
+                            processor_payment_id: Some(processor_payment_id),
+                            source_id: Some(&source_id),
+                            idempotency_key: Some(&source_id),
+                            request_id: None,
+                            metadata_json: None,
+                        },
                     )?;
                 }
                 tx.commit()?;
@@ -489,34 +766,66 @@ pub fn consume_trial_seconds(pool: &DbPool, account_id: &str, ms: i64) -> Result
 pub fn sweep_expired(pool: &DbPool) -> Result<i64> {
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
+            let mut conn = pool.get()?;
             let now = Utc::now().to_rfc3339();
-            let mut stmt = conn.prepare(
-                "SELECT id, account_id, remaining_cents
-                 FROM credit_batches
-                 WHERE expires_at < ?1 AND remaining_cents > 0 AND expired_at IS NULL",
-            )?;
-            let rows: Vec<(String, String, i64)> = stmt
-                .query_map(params![now], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, i64>(2)?,
-                    ))
-                })?
-                .filter_map(|r| r.ok())
-                .collect();
+            let rows: Vec<(String, String, i64)> = {
+                let mut stmt = conn.prepare(
+                    "SELECT id, account_id, remaining_cents
+                     FROM credit_batches
+                     WHERE expires_at < ?1 AND remaining_cents > 0 AND expired_at IS NULL",
+                )?;
+                let rows = stmt
+                    .query_map(params![now], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                rows
+            };
 
             let mut total: i64 = 0;
             for (batch_id, account_id, remaining) in rows {
-                conn.execute(
+                let tx = conn.transaction()?;
+                let balance_before: i64 = tx.query_row(
+                    "SELECT balance_cents FROM accounts WHERE id = ?1",
+                    params![&account_id],
+                    |r| r.get(0),
+                )?;
+                tx.execute(
                     "UPDATE accounts SET balance_cents = MAX(0, balance_cents - ?1) WHERE id = ?2",
                     params![remaining, account_id],
                 )?;
-                conn.execute(
+                tx.execute(
                     "UPDATE credit_batches SET expired_at = ?1, remaining_cents = 0 WHERE id = ?2",
                     params![now, batch_id],
                 )?;
+                let balance_after: i64 = tx.query_row(
+                    "SELECT balance_cents FROM accounts WHERE id = ?1",
+                    params![&account_id],
+                    |r| r.get(0),
+                )?;
+                insert_balance_ledger_sqlite_tx(
+                    &tx,
+                    BalanceLedgerEntry {
+                        account_id: &account_id,
+                        event_type: "credit_expired",
+                        amount_cents: balance_after - balance_before,
+                        balance_cents_before: balance_before,
+                        balance_cents_after: balance_after,
+                        reason: Some("credit_batch_expired"),
+                        provider: None,
+                        processor_payment_id: None,
+                        source_id: Some(&batch_id),
+                        idempotency_key: Some(&batch_id),
+                        request_id: None,
+                        metadata_json: None,
+                    },
+                )?;
+                tx.commit()?;
                 total += remaining;
                 tracing::info!(
                     account_id,
@@ -542,14 +851,45 @@ pub fn sweep_expired(pool: &DbPool) -> Result<i64> {
 
             let mut total: i64 = 0;
             for (batch_id, account_id, remaining) in rows {
-                conn.execute(
+                let mut tx = conn.transaction()?;
+                let balance_before: i64 = tx
+                    .query_one(
+                        "SELECT balance_cents FROM accounts WHERE id = $1",
+                        &[&account_id],
+                    )?
+                    .try_get(0)?;
+                tx.execute(
                     "UPDATE accounts SET balance_cents = GREATEST(0, balance_cents - $1) WHERE id = $2",
                     &[&remaining, &account_id],
                 )?;
-                conn.execute(
+                tx.execute(
                     "UPDATE credit_batches SET expired_at = now(), remaining_cents = 0 WHERE id = $1",
                     &[&batch_id],
                 )?;
+                let balance_after: i64 = tx
+                    .query_one(
+                        "SELECT balance_cents FROM accounts WHERE id = $1",
+                        &[&account_id],
+                    )?
+                    .try_get(0)?;
+                insert_balance_ledger_pg_tx(
+                    &mut tx,
+                    BalanceLedgerEntry {
+                        account_id: &account_id,
+                        event_type: "credit_expired",
+                        amount_cents: balance_after - balance_before,
+                        balance_cents_before: balance_before,
+                        balance_cents_after: balance_after,
+                        reason: Some("credit_batch_expired"),
+                        provider: None,
+                        processor_payment_id: None,
+                        source_id: Some(&batch_id),
+                        idempotency_key: Some(&batch_id),
+                        request_id: None,
+                        metadata_json: None,
+                    },
+                )?;
+                tx.commit()?;
                 total += remaining;
                 tracing::info!(
                     account_id,
@@ -687,6 +1027,99 @@ mod tests {
                           // Balance reflects single credit.
         let bal = current_balance(&pool, &id).unwrap();
         assert_eq!(bal, 3000);
+    }
+
+    #[test]
+    fn balance_ledger_records_credit_debit_and_request_evidence() {
+        let pool = temp_pool();
+        let id = make_account(&pool, "ledger@example.com");
+        assert!(credit_processor_payment(&pool, &id, 3000, "square", "pay_ledger").unwrap());
+        assert!(deduct_for_request(&pool, &id, 175, "llm", "req-ledger").unwrap());
+
+        let conn = pool.get().unwrap();
+        let rows: Vec<(
+            String,
+            i64,
+            i64,
+            i64,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        )> = conn
+            .prepare(
+                "SELECT event_type, amount_cents, balance_cents_before,
+                        balance_cents_after, provider, processor_payment_id,
+                        idempotency_key, request_id
+                   FROM balance_ledger_entries
+                  WHERE account_id = ?1
+                  ORDER BY created_at ASC",
+            )
+            .unwrap()
+            .query_map(params![&id], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "processor_payment_credit");
+        assert_eq!(rows[0].1, 3000);
+        assert_eq!(rows[0].2, 0);
+        assert_eq!(rows[0].3, 3000);
+        assert_eq!(rows[0].4.as_deref(), Some("square"));
+        assert_eq!(rows[0].5.as_deref(), Some("pay_ledger"));
+        assert_eq!(rows[0].6.as_deref(), Some("square:pay_ledger"));
+
+        assert_eq!(rows[1].0, "usage_deduction");
+        assert_eq!(rows[1].1, -175);
+        assert_eq!(rows[1].2, 3000);
+        assert_eq!(rows[1].3, 2825);
+        assert_eq!(rows[1].7.as_deref(), Some("req-ledger"));
+    }
+
+    #[test]
+    fn revoke_processor_credit_records_actual_balance_delta() {
+        let pool = temp_pool();
+        let id = make_account(&pool, "revoke-ledger@example.com");
+        credit_processor_payment(&pool, &id, 3000, "square", "pay_ledger_revoke").unwrap();
+        assert!(deduct(&pool, &id, 1000).unwrap());
+        revoke_processor_credit(&pool, "square", "pay_ledger_revoke", "refund.created").unwrap();
+
+        let conn = pool.get().unwrap();
+        let row: (i64, i64, i64, String, String) = conn
+            .query_row(
+                "SELECT amount_cents, balance_cents_before, balance_cents_after,
+                        provider, processor_payment_id
+                   FROM balance_ledger_entries
+                  WHERE account_id = ?1 AND event_type = 'processor_credit_revoked'",
+                params![&id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(row.0, -2000);
+        assert_eq!(row.1, 2000);
+        assert_eq!(row.2, 0);
+        assert_eq!(row.3, "square");
+        assert_eq!(row.4, "pay_ledger_revoke");
     }
 
     #[test]

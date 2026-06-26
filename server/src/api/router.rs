@@ -2385,7 +2385,13 @@ async fn complete_stream_inner(
                 }
             }
         } else {
-            match balance::deduct(&state.pool, &account.id, customer_cost) {
+            match balance::deduct_for_request(
+                &state.pool,
+                &account.id,
+                customer_cost,
+                "llm_stream",
+                &req.request_id,
+            ) {
                 Ok(ok) => {
                     if ok {
                         account.trial_seconds_remaining
@@ -3034,7 +3040,14 @@ async fn complete_inner(
             )
         })?
     } else {
-        let ok = balance::deduct(&state.pool, &account.id, customer_cost).map_err(|e| {
+        let ok = balance::deduct_for_request(
+            &state.pool,
+            &account.id,
+            customer_cost,
+            "llm",
+            &req.request_id,
+        )
+        .map_err(|e| {
             let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -3928,7 +3941,14 @@ async fn embed_batch_inner(
             ));
         }
     } else {
-        let ok = balance::deduct(&state.pool, &account.id, customer_cost).map_err(|e| {
+        let ok = balance::deduct_for_request(
+            &state.pool,
+            &account.id,
+            customer_cost,
+            "embed",
+            &req.request_id,
+        )
+        .map_err(|e| {
             let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -4350,7 +4370,14 @@ pub async fn transcribe(
             ));
         }
     } else {
-        let ok = balance::deduct(&state.pool, &account.id, customer_cost).map_err(|e| {
+        let ok = balance::deduct_for_request(
+            &state.pool,
+            &account.id,
+            customer_cost,
+            "transcribe",
+            &q.request_id,
+        )
+        .map_err(|e| {
             let _ = idempotency::mark_failed(&state.pool, &account.id, &q.request_id);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,

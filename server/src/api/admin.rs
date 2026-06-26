@@ -35,6 +35,18 @@ pub struct CustomerSummary {
     pub balance_cents: i64,
 }
 
+#[derive(Serialize)]
+pub struct BillingRiskSummary {
+    pub id: String,
+    pub email: String,
+    pub balance_cents: i64,
+    pub billing_restriction_reason: Option<String>,
+    pub billing_restricted_at: Option<String>,
+    pub latest_ledger_event_type: Option<String>,
+    pub latest_ledger_amount_cents: Option<i64>,
+    pub latest_ledger_created_at: Option<String>,
+}
+
 pub async fn customers(State(state): State<AppState>) -> impl IntoResponse {
     match Account::list_customer_summaries(&state.pool, 100) {
         Ok(rows) => (
@@ -45,6 +57,34 @@ pub async fn customers(State(state): State<AppState>) -> impl IntoResponse {
                         id: row.id,
                         email: row.email,
                         balance_cents: row.balance_cents,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn billing_risk(State(state): State<AppState>) -> impl IntoResponse {
+    match Account::list_billing_risk_summaries(&state.pool, 100) {
+        Ok(rows) => (
+            StatusCode::OK,
+            Json(
+                rows.into_iter()
+                    .map(|row| BillingRiskSummary {
+                        id: row.id,
+                        email: row.email,
+                        balance_cents: row.balance_cents,
+                        billing_restriction_reason: row.billing_restriction_reason,
+                        billing_restricted_at: row.billing_restricted_at,
+                        latest_ledger_event_type: row.latest_ledger_event_type,
+                        latest_ledger_amount_cents: row.latest_ledger_amount_cents,
+                        latest_ledger_created_at: row.latest_ledger_created_at,
                     })
                     .collect::<Vec<_>>(),
             ),

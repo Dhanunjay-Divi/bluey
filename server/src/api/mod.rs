@@ -138,6 +138,7 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         .route("/admin/echo-peer", get(admin::echo_peer_key))
         .route("/admin/metrics", get(metrics::get_metrics))
         .route("/admin/trial-abuse", get(admin::trial_abuse))
+        .route("/admin/billing-risk", get(admin::billing_risk))
         .route_layer(axum::middleware::from_fn(auth::require_admin));
 
     // ---- Authenticated (Bearer JWT) -----------------------------------------
