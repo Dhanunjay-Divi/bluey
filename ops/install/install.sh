@@ -35,6 +35,87 @@ ok()   { printf "%s✓%s %s\n" "$GREEN" "$RESET" "$1"; }
 warn() { printf "%s⚠%s %s\n" "$RED" "$RESET" "$1" >&2; }
 fail() { warn "$1"; exit 1; }
 
+path_has_dir() {
+    case ":$PATH:" in
+        *":$1:"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+append_path_profile_line() {
+    local profile="$1"
+    local dir="$2"
+    local export_line='export PATH="$HOME/.local/bin:$PATH"'
+
+    [ "$dir" = "$HOME/.local/bin" ] || return 0
+    if [ -f "$profile" ] && grep -Fq "$export_line" "$profile"; then
+        return 0
+    fi
+    mkdir -p "$(dirname "$profile")"
+    {
+        printf "\n# Added by Bluey installer.\n"
+        printf "%s\n" "$export_line"
+    } >> "$profile"
+}
+
+ensure_user_path_entry() {
+    local dir="$1"
+    path_has_dir "$dir" && return 0
+
+    local shell_name
+    shell_name="$(basename "${SHELL:-}")"
+    case "$shell_name" in
+        zsh)
+            append_path_profile_line "$HOME/.zprofile" "$dir"
+            append_path_profile_line "$HOME/.zshrc" "$dir"
+            ;;
+        bash)
+            append_path_profile_line "$HOME/.bash_profile" "$dir"
+            append_path_profile_line "$HOME/.bashrc" "$dir"
+            ;;
+        *)
+            append_path_profile_line "$HOME/.profile" "$dir"
+            ;;
+    esac
+}
+
+link_cli_pair() {
+    local dir="$1"
+    local sudo_prefix="${2:-}"
+
+    if [ -n "$sudo_prefix" ]; then
+        $sudo_prefix mkdir -p "$dir"
+        $sudo_prefix ln -sf "$CLI_SOURCE" "$dir/bluey"
+        if [ -x "$DAEMON_SOURCE" ]; then
+            $sudo_prefix ln -sf "$DAEMON_SOURCE" "$dir/bluey-daemon"
+        fi
+    else
+        mkdir -p "$dir"
+        ln -sf "$CLI_SOURCE" "$dir/bluey"
+        if [ -x "$DAEMON_SOURCE" ]; then
+            ln -sf "$DAEMON_SOURCE" "$dir/bluey-daemon"
+        fi
+    fi
+}
+
+try_sudo_cli_link() {
+    local dir="$1"
+
+    [ "${BLUEY_INSTALL_NO_SUDO:-0}" != "1" ] || return 1
+    [ "$dir" = "/usr/local/bin" ] || return 1
+    command -v sudo >/dev/null 2>&1 || return 1
+    [ -r /dev/tty ] || return 1
+
+    say "Installing Bluey command to $dir..."
+    printf "  macOS may ask for your password to make ${BOLD}bluey${RESET} available in every terminal.\n"
+    if sudo -v </dev/tty; then
+        link_cli_pair "$dir" sudo
+        return 0
+    fi
+    warn "Could not get sudo permission; falling back to a user-local command path."
+    return 1
+}
+
 install_local_doc_tools() {
     local root="$1"
     local tools_dir="$root/tools/doc-converter"
@@ -197,30 +278,37 @@ ok "Quarantine attribute cleared"
 # ── CLI symlink ──────────────────────────────────────────────────────
 CLI_SOURCE="$INSTALL_ROOT/bin/bluey"
 DAEMON_SOURCE="$INSTALL_ROOT/bin/bluey-daemon"
-if [ -n "${BLUEY_CLI_DIR:-}" ]; then
-    mkdir -p "$CLI_DIR"
-fi
-if [ -d "$CLI_DIR" ] && [ -w "$CLI_DIR" ]; then
-    ln -sf "$CLI_SOURCE" "$CLI_DIR/bluey"
-    [ -x "$DAEMON_SOURCE" ] && ln -sf "$DAEMON_SOURCE" "$CLI_DIR/bluey-daemon"
+CLI_LINK_PATH=""
+if [ -n "${BLUEY_CLI_DIR:-}" ] || { [ -d "$CLI_DIR" ] && [ -w "$CLI_DIR" ]; }; then
+    link_cli_pair "$CLI_DIR"
     ok "CLI symlink: $CLI_DIR/bluey"
+    CLI_LINK_PATH="$CLI_DIR/bluey"
+elif try_sudo_cli_link "$CLI_DIR"; then
+    ok "CLI symlink: $CLI_DIR/bluey"
+    CLI_LINK_PATH="$CLI_DIR/bluey"
 elif [ -d "$HOME/.local/bin" ] || mkdir -p "$HOME/.local/bin" 2>/dev/null; then
-    ln -sf "$CLI_SOURCE" "$HOME/.local/bin/bluey"
-    [ -x "$DAEMON_SOURCE" ] && ln -sf "$DAEMON_SOURCE" "$HOME/.local/bin/bluey-daemon"
+    link_cli_pair "$HOME/.local/bin"
     ok "CLI symlink: $HOME/.local/bin/bluey"
-    case ":$PATH:" in
-        *":$HOME/.local/bin:"*) ;;
-        *) warn "Add $HOME/.local/bin to PATH if the bluey command is not found." ;;
-    esac
+    CLI_LINK_PATH="$HOME/.local/bin/bluey"
+    if ! path_has_dir "$HOME/.local/bin"; then
+        ensure_user_path_entry "$HOME/.local/bin"
+        ok "Added $HOME/.local/bin to your shell PATH for new terminals"
+    fi
 else
     warn "Could not create a CLI symlink. Run $CLI_SOURCE directly."
+    CLI_LINK_PATH="$CLI_SOURCE"
 fi
 
 # ── Done ─────────────────────────────────────────────────────────────
 echo
 say "Bluey installed."
 echo
-printf "  ${BOLD}Run:${RESET} bluey on\n"
+if command -v bluey >/dev/null 2>&1 || path_has_dir "$(dirname "$CLI_LINK_PATH")"; then
+    printf "  ${BOLD}Run:${RESET} bluey on\n"
+else
+    printf "  ${BOLD}Run:${RESET} %s on\n" "$CLI_LINK_PATH"
+    printf "  Open a new terminal after install and ${BOLD}bluey on${RESET} will work normally.\n"
+fi
 printf "  Bluey opens the browser sign-in flow only when your account\n"
 printf "  is not already linked. Use ${BOLD}bluey off${RESET} to stop it.\n"
 echo

@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-26 16:07 EDT
+Latest checkpoint: 2026-06-26 16:12 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,23 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-200-WEB-SEARCH-CUSTOMER-COPY.md`; the next canonical Bluey round doc should start at `ROUND-201-...`.
+- Latest assigned Bluey round doc is `ROUND-201-MAC-INSTALLER-PATH-AUTOSETUP.md`; the next canonical Bluey round doc should start at `ROUND-202-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-routing-hardening`.
+- Round 201 fixed the macOS installer PATH gap shown in the owner's screenshot:
+  - `ops/install/install.sh` now asks for sudo to create `/usr/local/bin/bluey` and `/usr/local/bin/bluey-daemon` when `/usr/local/bin` is not writable
+  - sudo is only for command symlinks; the Bluey install root stays user-owned
+  - users can opt out with `BLUEY_INSTALL_NO_SUDO=1`
+  - if sudo is unavailable or declined, fallback `~/.local/bin` install now auto-adds PATH lines to zsh/bash profile files for new terminals
+  - final installer output uses `bluey on` only when it should work in the current shell, otherwise it prints the full path and says new terminals can use `bluey on`
+  - Windows already had PATH automation through `Ensure-UserPathEntry`, so no Windows change was needed
+- Round 201 verification passed:
+  - `bash -n ops/install/install.sh`
+  - temp fake-release installer smoke with `BLUEY_INSTALL_NO_SUDO=1`, temp `HOME`, temp artifact, checksum/local-tools skipped, confirming `.zprofile`, `.zshrc`, symlink, and installed command
+- Round 201 release gate: do not manually publish only `install.sh`; live production install must go through the signed release publish flow because `latest.json` pins the installer SHA.
 - Round 200 cleaned paid web-search customer copy:
   - customer-facing/product language should say paid web search uses credits and can have spend controls
   - do not frame normal paid search as a fixed daily search count
