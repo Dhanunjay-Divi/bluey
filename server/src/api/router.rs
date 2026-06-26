@@ -1677,7 +1677,7 @@ fn web_search_skipped_label(reason: &str) -> &'static str {
         "provider_not_configured" => "Web search is not configured yet.",
         "query_sanitized_empty_or_sensitive" => "Web search skipped for private or unsafe text.",
         "trial_web_search_quota_reached" => "Trial web search limit reached today.",
-        "repeated_query_guard" => "Web search skipped because this exact search just ran.",
+        "repeated_query_guard" => "Web search paused briefly for this repeated question.",
         "provider_timeout" => "Web search timed out.",
         "provider_error" => "Web search provider failed.",
         _ => "Web search skipped.",
@@ -4665,6 +4665,26 @@ mod tests {
         assert_eq!(event.output_tokens, 1);
         assert_eq!(event.cost_cents_to_customer, 2);
         assert_eq!(event.cost_cents_to_bluey, 1);
+    }
+
+    #[test]
+    fn web_search_skipped_labels_stay_customer_friendly() {
+        for reason in [
+            "provider_not_configured",
+            "query_sanitized_empty_or_sensitive",
+            "trial_web_search_quota_reached",
+            "repeated_query_guard",
+            "provider_timeout",
+            "provider_error",
+        ] {
+            let label = web_search_skipped_label(reason).to_ascii_lowercase();
+            for blocked in ["50", "abuse", "fraud", "scrap", "automation"] {
+                assert!(
+                    !label.contains(blocked),
+                    "customer-facing label for {reason} exposed internal wording: {label}"
+                );
+            }
+        }
     }
 
     #[test]

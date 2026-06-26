@@ -8,7 +8,7 @@ Owner asked to implement the concrete web-search behavior after Round 198:
 - decide that web search is needed
 - show clear overlay status such as `Searching web...`, `Reading 3 sources...`, and `Web search used: 1 search, 3 sources`
 - charge web search separately from the AI answer
-- keep trial search capped, but do not apply a low fixed daily search cap to paid credit users
+- keep trial search capped, but keep paid search credit-based
 - show source chips/source details on Mac and Windows
 
 Backup thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
@@ -28,7 +28,7 @@ Backend:
 - Added trial search accounting:
   - default `BLUEY_TRIAL_WEB_SEARCHES_PER_DAY=5`
   - durable count comes from `usage_events` where `task_type='web_search'`
-- Kept paid users credit-metered instead of a `50/day` product cap.
+- Kept paid users credit-metered instead of a small fixed daily search-count cap.
 - Added a short-window repeated identical query guard:
   - `BLUEY_WEB_SEARCH_REPEAT_WINDOW_SECS`, default `600`
   - guard key is hashed in-memory rather than storing raw query text

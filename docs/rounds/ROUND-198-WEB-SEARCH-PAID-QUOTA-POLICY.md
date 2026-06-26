@@ -2,9 +2,8 @@
 
 ## Trigger
 
-Owner questioned the proposed paid web-search cap:
-
-`Paid account: 50 searches/day why for paid cap because theyre paying right?`
+Owner asked to remove low fixed paid search-cap framing and make paid search
+credit-based.
 
 Backup thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
@@ -13,14 +12,15 @@ Round completed: 2026-06-26 15:34 EDT
 
 ## Finding
 
-- `50 searches/day` is not currently enforced in product code.
+- A low fixed daily paid-search cap is not currently enforced in product code.
 - Current server web search is still an opt-in managed lane guarded by env configuration.
 - Existing docs only say account/day search quotas should be added before broad production use.
 - A low hard daily cap for paid users would feel wrong because paid users are already paying for usage.
 
 ## Policy Decision
 
-Paid web search should be credit-metered and abuse-guarded, not blocked by a small fixed daily count.
+Paid web search should be credit-metered with clear spend controls, not blocked
+by a small fixed daily count.
 
 Recommended model:
 
@@ -30,40 +30,41 @@ Recommended model:
   - no background/bulk search
 - Paid credit accounts:
   - charge/reserve credits for search provider cost, fetched-page processing, and answer tokens
-  - no ordinary `50/day` product cap
-  - keep short-window rate limits to stop runaway loops
-  - keep a high daily circuit breaker for fraud/automation, support-overridable
+  - no ordinary small fixed daily search-count cap
+  - keep short-window controls to stop accidental repeated searches
   - allow user/workspace spend controls such as daily search spend limit or low-balance stop
+  - keep support-overridable service-protection pauses for unusual account activity
 - Admin/ops:
   - log search attempts, source fetch count, cost, cache hits, and rejection reason
-  - flag suspicious account/device/IP/domain velocity
-  - block scraping-style use even when credits exist
+  - monitor unusual account/device/IP/domain velocity
+  - keep enforcement wording internal, not in customer-facing copy
 
-## Why Any Paid Guard Still Exists
+## Why Any Paid Control Still Exists
 
-Paid does not mean unbounded provider risk.
+Paid search still needs account-friendly controls.
 
-Bluey still needs guards because web search can:
+Bluey should keep controls because web search can:
 
-- burn upstream search/fetch/model cost very quickly
-- be automated for scraping
-- hit provider rate limits
-- create privacy risk if sensitive queries are sent out
-- generate refund/dispute risk if a bug loops searches
+- spend credits quickly if a client repeats the same request
+- hit provider capacity or reliability limits
+- send sensitive-looking text to an external search provider if not sanitized
+- surprise customers if there is no daily spend control
 
-Those controls should feel like safety rails, not like a low usage cap.
+Those controls should feel like account protection, not like a low usage cap.
 
 ## Product Copy Direction
 
 Avoid:
 
-- `Paid: 50 searches/day`
+- `Paid: fixed daily search count`
+- internal enforcement language in customer-facing copy
 
 Use:
 
-- `Paid: web search uses credits, with safety limits to prevent runaway or abusive usage.`
+- `Paid: web search uses credits.`
 - `You can set a daily search spend limit.`
 - `Bluey shows when it searches and cites sources.`
+- `If a request repeats too quickly, Bluey may briefly pause web search and use available context.`
 
 ## Implementation Notes
 

@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-26 16:00 EDT
+Latest checkpoint: 2026-06-26 16:07 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,17 +30,28 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-199-WEB-SEARCH-CREDIT-METERING-SOURCES.md`; the next canonical Bluey round doc should start at `ROUND-200-...`.
+- Latest assigned Bluey round doc is `ROUND-200-WEB-SEARCH-CUSTOMER-COPY.md`; the next canonical Bluey round doc should start at `ROUND-201-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-routing-hardening`.
+- Round 200 cleaned paid web-search customer copy:
+  - customer-facing/product language should say paid web search uses credits and can have spend controls
+  - do not frame normal paid search as a fixed daily search count
+  - do not expose internal enforcement/risk language in customer copy
+  - repeated-query status now says `Web search paused briefly for this repeated question.`
+  - added `web_search_skipped_labels_stay_customer_friendly`
+- Round 200 verification passed:
+  - `cargo fmt --manifest-path server/Cargo.toml`
+  - `git diff --check`
+  - `cargo test --manifest-path server/Cargo.toml web_search_skipped_labels_stay_customer_friendly -- --nocapture`
+  - `cargo test --manifest-path server/Cargo.toml router_cost_label_includes_web_search_usage -- --nocapture`
 - Round 199 implemented the first production-shaped managed web-search lane:
   - server-side search remains provider/API based with Brave, Tavily, or generic endpoint configuration
   - default web-search pricing is `2` customer cents and `1` Bluey cost cent per successful managed search call, overridable by env
   - trial accounts default to `5` searches/day via durable `usage_events` counting
-  - paid accounts are credit-metered and not blocked by a low `50/day` cap
+  - paid accounts are credit-metered and not blocked by a small fixed daily search-count cap
   - repeated identical searches are blocked for a short in-memory hashed-query window, default `600` seconds
   - status SSE copy now includes `Checking saved context...`, `Searching web...`, `Reading N sources...`, and `Web search used: 1 search, N sources`
   - combined paid deduction happens once after completion, while answer and search are recorded as separate usage events
@@ -74,9 +85,9 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
   - deploy server before expecting live cloud web search
   - run live provider smoke confirming statuses, citations, source card, separate `llm` and `web_search` usage events, and one combined balance deduction
   - build a polished native source drawer later; current source-card path is the cross-platform foundation
-- Round 198 clarified web-search quota policy after the owner questioned `Paid account: 50 searches/day`.
-- `50 searches/day` is not currently enforced in product code and should not become the normal paid-user product cap.
-- Paid web search should be credit-metered and abuse-guarded: charge/reserve credits for search provider cost, fetched-page processing, and answer tokens; keep short-window rate limits and high fraud circuit breakers; allow user/workspace daily search spend controls.
+- Round 198 clarified web-search quota policy after the owner asked for paid search to be credit-based instead of framed as a fixed daily count.
+- A low fixed daily paid-search cap is not currently enforced in product code and should not become the normal paid-user product model.
+- Paid web search should be credit-metered with clear spend controls: charge/reserve credits for search provider cost, fetched-page processing, and answer tokens; keep short-window repeated-search controls; allow user/workspace daily search spend controls.
 - Free/trial web search can have a small hard daily cap. Paid accounts should not feel blocked by a low fixed count when they have credits.
 - Future implementation should add durable account/day search accounting, idempotency, paid daily spend guard, query/source caching, and clear UI copy.
 - Round 197 fixed the likely doubled-caption path when Mic + System both hear the same utterance.
