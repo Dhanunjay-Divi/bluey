@@ -3193,14 +3193,14 @@ async fn build_real_audio_runtime_config(
                 }
             }
             _ if is_parakeet_chunk_enabled() => {
-                // Keyless, fully-local, on-device English STT: BLUEY_STT_PARAKEET=1
-                // routes the mic + chunk loop through the Parakeet (Nemotron)
-                // provider built by `build_stt_chain` — unifying the chunk path
-                // onto the streaming `SttProvider` trait. Nothing leaves the
-                // machine. If the model can't be provisioned, the failure surfaces
-                // honestly at transcribe time (not as a sign-in gate). Checked
-                // before whisper so the preferred on-device engine wins when both
-                // are enabled.
+                // Keyless, fully-local, on-device English STT (default when built
+                // in; disable with BLUEY_STT_PARAKEET=0). Routes the mic + chunk
+                // loop through the Parakeet (Nemotron) provider built by
+                // `build_stt_chain` — unifying the chunk path onto the streaming
+                // `SttProvider` trait. Nothing leaves the machine. This is the
+                // fallthrough backstop: an explicit cloud STT key / managed
+                // account above takes precedence. If the model can't be
+                // provisioned, the failure surfaces honestly at transcribe time.
                 let stt_model =
                     env_first(&["BLUEY_STT_MODEL"]).unwrap_or_else(|| "parakeet-en".into());
                 (
@@ -4262,17 +4262,26 @@ fn pcm_source_for_audio_source(source: AudioSourceKind) -> cue_core::pcm::AudioS
     }
 }
 
-/// Whether the on-device Parakeet chunk path is both built in (the
-/// `parakeet-stt` feature) AND enabled at runtime (`BLUEY_STT_PARAKEET=1`).
+/// Whether the on-device Parakeet chunk path is available: built in (the
+/// `parakeet-stt` feature) AND not explicitly disabled at runtime.
 ///
-/// Returns `false` in builds without the feature so the chunk loop never
-/// selects the Parakeet transport when the engine isn't compiled in — the
-/// resolver then falls through to whisper / managed / the honest "no STT"
-/// error, exactly as before.
+/// Default-ON when compiled in, so a packaged build transcribes locally out of
+/// the box (local-first) with no env var to set. This is reached only in the
+/// resolver's fallthrough arm — AFTER an explicit cloud STT key / managed
+/// account — so configuring cloud STT still takes precedence; Parakeet is the
+/// keyless local backstop. Disable explicitly with `BLUEY_STT_PARAKEET=0`
+/// (or false/off/no). Always `false` without the feature so the chunk loop
+/// never selects a transport whose engine isn't compiled in.
 fn is_parakeet_chunk_enabled() -> bool {
     #[cfg(feature = "parakeet-stt")]
     {
-        env_truthy_any(&["BLUEY_STT_PARAKEET"])
+        // Default true; only an explicit falsey value turns it off.
+        !matches!(
+            env_first(&["BLUEY_STT_PARAKEET"])
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("0") | Some("false") | Some("off") | Some("no")
+        )
     }
     #[cfg(not(feature = "parakeet-stt"))]
     {

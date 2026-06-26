@@ -120,30 +120,41 @@ pub async fn build_stt_chain(
     }
 
     // Fallback: on-device Parakeet (English STT + on-demand diarization).
-    // Gated by BOTH the `parakeet-stt` build feature AND BLUEY_STT_PARAKEET=1 at
-    // runtime, so it never engages unless explicitly enabled and built in.
+    // Default-ON when the feature is built (disable with BLUEY_STT_PARAKEET=0),
+    // but engaged ONLY as the keyless local backstop — i.e. only when no cloud
+    // provider was configured above. This is the local-first default for users
+    // with no STT key, WITHOUT forcing a ~660MB model download on users who DID
+    // configure a cloud provider (we don't provision the model unless it'll be
+    // the actual STT). `BLUEY_STT_PARAKEET=1` still forces it on even alongside
+    // a cloud provider (e.g. local-only preference / failover).
     #[cfg(feature = "parakeet-stt")]
-    if is_parakeet_enabled() {
-        // First-run provisioning: resolve the model dir (default under the app
-        // data dir; env-overridable) and download the model once if absent, so
-        // "install it and it just works". A fully-present dir skips the network.
-        match cue_core::app_paths::AppPaths::discover() {
-            Ok(app_paths) => match super::model_setup::ensure_parakeet_model(&app_paths).await {
-                Ok(paths) => {
-                    let p = super::parakeet::ParakeetProvider::connect(paths, source);
-                    providers.push(Box::new(p));
+    {
+        let forced_on = env_bool("BLUEY_STT_PARAKEET").unwrap_or(false);
+        let needed_as_backstop = providers.is_empty() && is_parakeet_enabled();
+        if forced_on || needed_as_backstop {
+            // First-run provisioning: resolve the model dir (default under the app
+            // data dir; env-overridable) and download the model once if absent, so
+            // "install it and it just works". A fully-present dir skips the network.
+            match cue_core::app_paths::AppPaths::discover() {
+                Ok(app_paths) => {
+                    match super::model_setup::ensure_parakeet_model(&app_paths).await {
+                        Ok(paths) => {
+                            let p = super::parakeet::ParakeetProvider::connect(paths, source);
+                            providers.push(Box::new(p));
+                        }
+                        Err(e) => tracing::warn!(
+                            provider = "parakeet",
+                            error = %e,
+                            "parakeet model unavailable (download/setup failed); skipping"
+                        ),
+                    }
                 }
                 Err(e) => tracing::warn!(
                     provider = "parakeet",
                     error = %e,
-                    "parakeet model unavailable (download/setup failed); skipping"
+                    "could not resolve app paths for parakeet model; skipping"
                 ),
-            },
-            Err(e) => tracing::warn!(
-                provider = "parakeet",
-                error = %e,
-                "could not resolve app paths for parakeet model; skipping"
-            ),
+            }
         }
     }
 
@@ -166,9 +177,16 @@ fn use_mock_stt() -> bool {
 }
 
 /// Runtime switch for the on-device Parakeet provider (build-feature-gated too).
+///
+/// Default-ON when the feature is compiled in: a packaged build should be
+/// fully local out of the box (the local-first thesis), so on-device STT is the
+/// keyless backstop in the chain without the user setting anything. Parakeet is
+/// always added LAST (after any configured cloud provider), so a user with a
+/// Deepgram/OpenAI key still gets cloud-first; everyone else gets on-device
+/// instead of "no STT". Explicitly disable with `BLUEY_STT_PARAKEET=0`.
 #[cfg(feature = "parakeet-stt")]
 fn is_parakeet_enabled() -> bool {
-    env_bool("BLUEY_STT_PARAKEET").unwrap_or(false)
+    env_bool("BLUEY_STT_PARAKEET").unwrap_or(true)
 }
 
 fn env_stt_key() -> Option<String> {
