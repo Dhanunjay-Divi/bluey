@@ -98,6 +98,10 @@ Passed:
 - The current live `v0.1.16` installer path and active release artifact are clean for visible-overlay/dev markers.
 - The release publish script now fails closed before upload if the current release artifact contains local visible-overlay or dev overlay flags.
 - Server billing, auth, router, sync, GDPR, token, and update security checks passed.
+- The local visible QA daemon was stopped after verification and Bluey was restarted normally:
+  - daemon pid `66383`
+  - overlay capture excluded `true`
+  - screen capture active `false`
 
 ## Remaining QA / Gates
 

@@ -46,6 +46,7 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
   - built and scanned fresh macOS overlay release binaries; no forbidden visible-overlay/dev strings were found
   - added an archive-level guard to `scripts/publish-bluey-release.sh` so current `.tar.gz`, `.zip`, and raw release artifacts are refused before manifest/checksum/sign/upload if they contain production-forbidden visible-overlay or dev markers
   - verified the guard passes on the current `v0.1.16` artifact and fails on a poisoned fake Windows zip containing `BLUEY_DEV_OVERLAY`
+  - stopped the local visible QA daemon after verification and restarted Bluey normally; final local status reports `overlay_capture_excluded: true` and `screen_capture_active: false`
   - Round doc: `docs/rounds/ROUND-217-UPLOAD-SECURITY-RELEASE-GUARD.md`
   - Verification passed:
     - `cargo test --manifest-path server/Cargo.toml --test integration_e2e -- --test-threads=1` (`41 passed`)
