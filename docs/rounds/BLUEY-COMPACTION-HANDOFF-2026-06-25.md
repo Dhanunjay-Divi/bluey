@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-26 20:28 EDT
+Latest checkpoint: 2026-06-26 20:40 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,29 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-207-MAC-HEADER-BADGE-SPACING.md`; the next canonical Bluey round doc should start at `ROUND-208-...`.
+- Latest assigned Bluey round doc is `ROUND-208-OVERLAY-RESIZE-STABILITY.md`; the next canonical Bluey round doc should start at `ROUND-209-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 208 fixed overlay resize stability after the owner reported resizing still felt bad:
+  - macOS resize edges now win before header dragging, so the top border does not accidentally move the window instead of resizing
+  - click-through mode treats the visible border as interactive resize chrome while blank interior space still passes through
+  - full-screen mode disables manual edge resize until restored
+  - manual resize now anchors the opposite edge and clamps to the current screen before setting the frame
+  - resize frames are snapped to the backing pixel grid
+  - manual resize can shrink below the default compact width, while the default open size remains familiar
+  - macOS max resize now uses the available screen instead of the older canvas/focus cap
+  - Windows parity adds expanded edge hit-testing, minimum track size, monitor-work-area max tracking, and removes the old 1040x620 post-resize snapback
+  - rebuilt and relaunched local visible/debug Bluey
+  - Round doc: `docs/rounds/ROUND-208-OVERLAY-RESIZE-STABILITY.md`
+  - Verification passed:
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `BLUEY_OVERLAY_SWIFT_CONFIGURATION=debug native/macos/cue-overlay/build.sh`
+    - `BLUEY_BIN="$PWD/target/debug/bluey" scripts/bluey-visible-local.sh`
+    - `target/debug/bluey status`
 - Round 207 tightened the macOS expanded header spacing from the owner's visible-mode screenshot:
   - reduced the history button width and nearby left-cluster gaps
   - reduced the logo/wordmark spacing and wordmark frame cap

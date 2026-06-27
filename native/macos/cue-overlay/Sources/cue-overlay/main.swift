@@ -436,6 +436,7 @@ private final class OpacityScrubberView: NSControl {
 private enum ExpandedPanelMetrics {
     static let maxCompactWidth: CGFloat = 960
     static let minCompactWidth: CGFloat = 760
+    static let minResizeWidth: CGFloat = 620
     static let maxCanvasWidth: CGFloat = 1120
     static let maxFocusWidth: CGFloat = 1040
     static let focusHeight: CGFloat = 620
@@ -468,7 +469,15 @@ private enum ExpandedPanelMetrics {
 
     static func fittingMinimumWidth(for screen: NSRect, targetWidth: CGFloat) -> CGFloat {
         let available = max(360, screen.width - screenInset * 2)
-        return min(minCompactWidth, targetWidth, available)
+        return min(minResizeWidth, targetWidth, available)
+    }
+
+    static func fittingMaximumWidth(for screen: NSRect) -> CGFloat {
+        max(360, screen.width - screenInset * 2)
+    }
+
+    static func fittingMaximumHeight(for screen: NSRect) -> CGFloat {
+        max(minHeight, screen.height - screenInset * 2)
     }
 
     static func compactFrame(in visibleFrame: NSRect) -> NSRect {
@@ -4803,7 +4812,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     override func resetCursorRects() {
         super.resetCursorRects()
-        guard closeConfirmOverlay.isHidden, answerStyleOverlay.isHidden else { return }
+        guard closeConfirmOverlay.isHidden, answerStyleOverlay.isHidden, !windowFullSize else { return }
         addCursorRect(NSRect(x: 0, y: 0, width: resizeHitSize, height: resizeHitSize), cursor: Self.resizeNortheastSouthwestCursor)
         addCursorRect(NSRect(x: bounds.width - resizeHitSize, y: bounds.height - resizeHitSize, width: resizeHitSize, height: resizeHitSize), cursor: Self.resizeNortheastSouthwestCursor)
         addCursorRect(NSRect(x: 0, y: bounds.height - resizeHitSize, width: resizeHitSize, height: resizeHitSize), cursor: Self.resizeNorthwestSoutheastCursor)
@@ -5032,6 +5041,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             if let hit = super.hitTest(point), isExplicitInteractiveHit(hit) {
                 return hit
             }
+            if !resizeEdges(at: point).isEmpty {
+                return self
+            }
             if isHeaderMoveHandleHit(at: point) {
                 return self
             }
@@ -5060,6 +5072,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             }
         }
         if passThroughMode {
+            let edges = resizeEdges(at: localPoint)
+            if !edges.isEmpty, let window {
+                beginResize(edges: edges, window: window)
+                return
+            }
             if isHeaderMoveHandleHit(at: localPoint) {
                 beginHeaderDrag(with: event)
                 return
@@ -5069,16 +5086,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             }
             return
         }
-        if !passThroughMode, shouldStartHeaderDrag(at: localPoint) {
-            beginHeaderDrag(with: event)
-            return
-        }
         let edges = resizeEdges(at: localPoint)
         if !passThroughMode, !edges.isEmpty, let window {
-            activeResizeEdges = edges
-            setResizeCursor(for: edges)
-            resizeStartMouse = NSEvent.mouseLocation
-            resizeStartFrame = window.frame
+            beginResize(edges: edges, window: window)
+            return
+        }
+        if !passThroughMode, shouldStartHeaderDrag(at: localPoint) {
+            beginHeaderDrag(with: event)
             return
         }
         if !hasInteractiveView(at: localPoint) {
@@ -5264,15 +5278,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
 
         frame = clampedResizeFrame(frame, from: resizeStartFrame, edges: activeResizeEdges, window: window)
-        let verticalResize = activeResizeEdges.contains(.top) || activeResizeEdges.contains(.bottom)
-        if let overlayWindow = window as? OverlayWindow, !verticalResize {
-            let topLeft = NSPoint(x: frame.minX, y: resizeStartFrame.maxY)
-            overlayWindow.lockedFrameHeight = resizeStartFrame.height
-            window.setFrame(frame, display: true)
-            window.setFrameTopLeftPoint(topLeft)
-            overlayWindow.lockedFrameHeight = nil
-        } else {
-            window.setFrame(frame, display: true)
+        frame = snappedResizeFrame(frame, for: window)
+        guard !framesNearlyEqual(frame, window.frame) else {
+            return
+        }
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0
+            context.allowsImplicitAnimation = false
+            window.setFrame(frame, display: true, animate: false)
         }
     }
 
@@ -5353,6 +5367,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return true
         }
         if isHeaderMoveHandleHit(at: localPoint) {
+            return true
+        }
+        if !resizeEdges(at: localPoint).isEmpty {
             return true
         }
         if hasInteractiveView(at: localPoint) {
@@ -5520,6 +5537,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
     }
 
+    private func beginResize(edges: ResizeEdges, window: NSWindow) {
+        activeResizeEdges = edges
+        setResizeCursor(for: edges)
+        resizeStartMouse = NSEvent.mouseLocation
+        resizeStartFrame = window.frame
+        window.makeKey()
+    }
+
     private func hasInteractiveView(at localPoint: NSPoint) -> Bool {
         var hit: NSView? = super.hitTest(localPoint)
         while let view = hit {
@@ -5584,6 +5609,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         guard bounds.contains(point),
               closeConfirmOverlay.isHidden,
               answerStyleOverlay.isHidden,
+              !windowFullSize,
               canStartResize(at: point)
         else {
             return []
@@ -5709,37 +5735,93 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         edges: ResizeEdges,
         window: NSWindow
     ) -> NSRect {
-        var frame = proposed
-        let minWidth = max(window.minSize.width, 360)
-        let minHeight = max(window.minSize.height, ExpandedPanelMetrics.minHeight)
-        let maxWidth = window.maxSize.width > 0 ? window.maxSize.width : CGFloat.greatestFiniteMagnitude
-        let maxHeight = window.maxSize.height > 0 ? window.maxSize.height : CGFloat.greatestFiniteMagnitude
+        let visibleFrame = window.screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let inset = ExpandedPanelMetrics.screenInset
+        let minX = visibleFrame.minX + inset
+        let maxX = visibleFrame.maxX - inset
+        let minY = visibleFrame.minY + inset
+        let maxY = visibleFrame.maxY - inset
+        let availableWidth = max(360, maxX - minX)
+        let availableHeight = max(ExpandedPanelMetrics.minHeight, maxY - minY)
+        let minWidth = min(
+            max(window.minSize.width, ExpandedPanelMetrics.minResizeWidth),
+            availableWidth)
+        let minHeight = min(
+            max(window.minSize.height, ExpandedPanelMetrics.minHeight),
+            availableHeight)
+        let configuredMaxWidth = window.maxSize.width > 0
+            ? window.maxSize.width
+            : CGFloat.greatestFiniteMagnitude
+        let configuredMaxHeight = window.maxSize.height > 0
+            ? window.maxSize.height
+            : CGFloat.greatestFiniteMagnitude
+        let maxWidth = max(minWidth, min(configuredMaxWidth, availableWidth))
+        let maxHeight = max(minHeight, min(configuredMaxHeight, availableHeight))
 
-        if frame.width < minWidth {
-            if edges.contains(.left) {
-                frame.origin.x = start.maxX - minWidth
-            }
-            frame.size.width = minWidth
-        } else if frame.width > maxWidth {
-            if edges.contains(.left) {
-                frame.origin.x = start.maxX - maxWidth
-            }
-            frame.size.width = maxWidth
+        var left = start.minX
+        var right = start.maxX
+        var bottom = start.minY
+        var top = start.maxY
+
+        if edges.contains(.left), !edges.contains(.right) {
+            let lower = max(minX, right - maxWidth)
+            let upper = min(right - minWidth, maxX - minWidth)
+            left = clamp(proposed.minX, lower, upper)
+        } else if edges.contains(.right), !edges.contains(.left) {
+            let lower = max(left + minWidth, minX + minWidth)
+            let upper = min(maxX, left + maxWidth)
+            right = clamp(proposed.maxX, lower, upper)
+        } else {
+            let width = clamp(proposed.width, minWidth, maxWidth)
+            left = clamp(proposed.minX, minX, maxX - width)
+            right = left + width
         }
 
-        if frame.height < minHeight {
-            if edges.contains(.bottom) {
-                frame.origin.y = start.maxY - minHeight
-            }
-            frame.size.height = minHeight
-        } else if frame.height > maxHeight {
-            if edges.contains(.bottom) {
-                frame.origin.y = start.maxY - maxHeight
-            }
-            frame.size.height = maxHeight
+        if edges.contains(.bottom), !edges.contains(.top) {
+            let lower = max(minY, top - maxHeight)
+            let upper = min(top - minHeight, maxY - minHeight)
+            bottom = clamp(proposed.minY, lower, upper)
+        } else if edges.contains(.top), !edges.contains(.bottom) {
+            let lower = max(bottom + minHeight, minY + minHeight)
+            let upper = min(maxY, bottom + maxHeight)
+            top = clamp(proposed.maxY, lower, upper)
+        } else {
+            let height = clamp(proposed.height, minHeight, maxHeight)
+            bottom = clamp(proposed.minY, minY, maxY - height)
+            top = bottom + height
         }
 
-        return frame
+        return NSRect(
+            x: left,
+            y: bottom,
+            width: max(minWidth, right - left),
+            height: max(minHeight, top - bottom))
+    }
+
+    private func clamp(_ value: CGFloat, _ lower: CGFloat, _ upper: CGFloat) -> CGFloat {
+        guard lower <= upper else { return lower }
+        return min(max(value, lower), upper)
+    }
+
+    private func snappedResizeFrame(_ frame: NSRect, for window: NSWindow) -> NSRect {
+        let scale = max(1, window.screen?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 1)
+        func snap(_ value: CGFloat) -> CGFloat {
+            (value * scale).rounded() / scale
+        }
+        return NSRect(
+            x: snap(frame.origin.x),
+            y: snap(frame.origin.y),
+            width: snap(frame.size.width),
+            height: snap(frame.size.height))
+    }
+
+    private func framesNearlyEqual(_ lhs: NSRect, _ rhs: NSRect) -> Bool {
+        abs(lhs.origin.x - rhs.origin.x) < 0.5
+            && abs(lhs.origin.y - rhs.origin.y) < 0.5
+            && abs(lhs.size.width - rhs.size.width) < 0.5
+            && abs(lhs.size.height - rhs.size.height) < 0.5
     }
 
     /// The expanded overlay is a bounded, resizable tool surface. Header,
@@ -8722,10 +8804,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let screen = window.screen?.visibleFrame
             ?? NSScreen.main?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let maxWidth = ExpandedPanelMetrics.fittingFocusWidth(
-            for: screen,
-            preferred: ExpandedPanelMetrics.maxCanvasWidth)
-        let maxHeight = ExpandedPanelMetrics.fittingFocusHeight(for: screen)
+        let maxWidth = ExpandedPanelMetrics.fittingMaximumWidth(for: screen)
+        let maxHeight = ExpandedPanelMetrics.fittingMaximumHeight(for: screen)
         if let overlayWindow = window as? OverlayWindow {
             overlayWindow.fillsVisibleFrame = false
             overlayWindow.minimumFrameWidth = min(ExpandedPanelMetrics.minCompactWidth, maxWidth)
@@ -8782,8 +8862,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let clampedTargetWidth = ExpandedPanelMetrics.fittingWidth(for: screen, preferred: targetWidth)
         let minimumWidth = ExpandedPanelMetrics.fittingMinimumWidth(for: screen, targetWidth: clampedTargetWidth)
-        let maximumWidth = clampedTargetWidth
-        let maximumHeight = ExpandedPanelMetrics.fittingHeight(for: screen)
+        let maximumWidth = ExpandedPanelMetrics.fittingMaximumWidth(for: screen)
+        let maximumHeight = ExpandedPanelMetrics.fittingMaximumHeight(for: screen)
         if let overlayWindow = window as? OverlayWindow {
             overlayWindow.minimumFrameWidth = minimumWidth
             overlayWindow.maximumFrameWidth = maximumWidth
@@ -8811,10 +8891,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             for: screen,
             preferred: ExpandedPanelMetrics.maxCompactWidth)
         let minimumWidth = ExpandedPanelMetrics.fittingMinimumWidth(for: screen, targetWidth: compactWidth)
-        let maximumWidth = ExpandedPanelMetrics.fittingWidth(
-            for: screen,
-            preferred: ExpandedPanelMetrics.maxCanvasWidth)
-        let maximumHeight = ExpandedPanelMetrics.fittingHeight(for: screen)
+        let maximumWidth = ExpandedPanelMetrics.fittingMaximumWidth(for: screen)
+        let maximumHeight = ExpandedPanelMetrics.fittingMaximumHeight(for: screen)
         if let overlayWindow = window as? OverlayWindow {
             overlayWindow.fillsVisibleFrame = false
             overlayWindow.minimumFrameWidth = minimumWidth
@@ -10698,10 +10776,8 @@ private final class OverlayApp {
             resizable: false)
         window.contentCornerRadius = ExpandedPanelMetrics.cornerRadius
         window.preserveProgrammaticFrameHeight = true
-        let maxExpandedWidth = ExpandedPanelMetrics.fittingWidth(
-            for: screen,
-            preferred: ExpandedPanelMetrics.maxCanvasWidth)
-        let maxExpandedHeight = ExpandedPanelMetrics.fittingHeight(for: screen)
+        let maxExpandedWidth = ExpandedPanelMetrics.fittingMaximumWidth(for: screen)
+        let maxExpandedHeight = ExpandedPanelMetrics.fittingMaximumHeight(for: screen)
         window.minimumFrameWidth = minimumWidth
         window.maximumFrameWidth = maxExpandedWidth
         window.minimumFrameHeight = ExpandedPanelMetrics.minHeight

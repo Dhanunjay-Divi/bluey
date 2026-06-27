@@ -95,6 +95,11 @@ static IDWriteTextFormat *g_fmt_label = NULL;
 static IDWriteTextFormat *g_fmt_title = NULL;
 static IDWriteTextFormat *g_fmt_body = NULL;
 static IDWriteTextFormat *g_fmt_partial = NULL;
+
+#define EXPANDED_MIN_WIDTH 520
+#define EXPANDED_MIN_HEIGHT 360
+#define EXPANDED_RESIZE_HIT_SIZE 14
+#define EXPANDED_SCREEN_MARGIN 12
 static wchar_t g_transcript_partial[1024] = L"";
 static wchar_t g_transcript_final[1024] = L"";
 static wchar_t g_transcript_source[64] = L"";
@@ -714,14 +719,16 @@ static RECT clamp_expanded_rect_to_focus_area(RECT rect, int margin) {
     RECT work = work_area_for_rect(rect);
     int work_w = work.right - work.left;
     int work_h = work.bottom - work.top;
-    int max_w = clamp_int(1040, 520, work_w - margin * 2);
-    int max_h = clamp_int(620, 360, work_h - margin * 2);
+    int max_w = work_w - margin * 2;
+    int max_h = work_h - margin * 2;
+    if (max_w < EXPANDED_MIN_WIDTH) max_w = work_w;
+    if (max_h < EXPANDED_MIN_HEIGHT) max_h = work_h;
+    int min_w = EXPANDED_MIN_WIDTH < max_w ? EXPANDED_MIN_WIDTH : max_w;
+    int min_h = EXPANDED_MIN_HEIGHT < max_h ? EXPANDED_MIN_HEIGHT : max_h;
     int width = rect.right - rect.left;
     int height = rect.bottom - rect.top;
-    if (width > max_w) width = max_w;
-    if (height > max_h) height = max_h;
-    if (width < 520) width = 520;
-    if (height < 360) height = 360;
+    width = clamp_int(width, min_w, max_w);
+    height = clamp_int(height, min_h, max_h);
 
     RECT clamped = rect;
     clamped.right = clamped.left + width;
@@ -771,7 +778,7 @@ static bool load_overlay_rect(const wchar_t *name, RECT *rect) {
 static void load_overlay_placement(void) {
     RECT loaded;
     if (load_overlay_rect(L"expanded_rect", &loaded)) {
-        g_expanded_rect = clamp_expanded_rect_to_focus_area(loaded, 12);
+        g_expanded_rect = clamp_expanded_rect_to_focus_area(loaded, EXPANDED_SCREEN_MARGIN);
     }
     if (load_overlay_rect(L"collapsed_rect", &loaded)) {
         g_collapsed_rect = clamp_rect_to_work_area(loaded, 8);
@@ -784,7 +791,7 @@ static void show_full_overlay(bool emit_event) {
     apply_capture_exclusion(g_hwnd);
 
     if (rect_is_valid(g_expanded_rect)) {
-        g_expanded_rect = clamp_expanded_rect_to_focus_area(g_expanded_rect, 12);
+        g_expanded_rect = clamp_expanded_rect_to_focus_area(g_expanded_rect, EXPANDED_SCREEN_MARGIN);
         SetWindowPos(
             g_hwnd,
             HWND_TOPMOST,
@@ -806,7 +813,7 @@ static void show_full_overlay(bool emit_event) {
 static void collapse_to_pill(HWND hwnd, bool emit_event) {
     if (!g_collapsed) {
         GetWindowRect(hwnd, &g_expanded_rect);
-        g_expanded_rect = clamp_expanded_rect_to_focus_area(g_expanded_rect, 12);
+        g_expanded_rect = clamp_expanded_rect_to_focus_area(g_expanded_rect, EXPANDED_SCREEN_MARGIN);
         save_overlay_rect(L"expanded_rect", g_expanded_rect);
     }
 
@@ -1080,6 +1087,32 @@ static bool point_hits_brand_move_handle(POINT point) {
     int header_left = (rect.right - header_w) / 2;
     RECT handle = {header_left + 8, 8, header_left + 132, 54};
     return PtInRect(&handle, local) != 0;
+}
+
+static LRESULT hit_test_expanded_resize(POINT point) {
+    if (!g_hwnd || g_collapsed) return HTNOWHERE;
+    RECT rect;
+    if (!GetClientRect(g_hwnd, &rect)) return HTNOWHERE;
+    POINT local = point;
+    if (!ScreenToClient(g_hwnd, &local)) return HTNOWHERE;
+    if (local.x < 0 || local.y < 0 || local.x >= rect.right || local.y >= rect.bottom) {
+        return HTNOWHERE;
+    }
+
+    bool left = local.x < EXPANDED_RESIZE_HIT_SIZE;
+    bool right = local.x >= rect.right - EXPANDED_RESIZE_HIT_SIZE;
+    bool top = local.y < EXPANDED_RESIZE_HIT_SIZE;
+    bool bottom = local.y >= rect.bottom - EXPANDED_RESIZE_HIT_SIZE;
+
+    if (top && left) return HTTOPLEFT;
+    if (top && right) return HTTOPRIGHT;
+    if (bottom && left) return HTBOTTOMLEFT;
+    if (bottom && right) return HTBOTTOMRIGHT;
+    if (left) return HTLEFT;
+    if (right) return HTRIGHT;
+    if (top) return HTTOP;
+    if (bottom) return HTBOTTOM;
+    return HTNOWHERE;
 }
 
 static LRESULT CALLBACK ask_edit_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
@@ -2095,6 +2128,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         if (g_collapsed) return HTCLIENT;
         POINT point = { GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) };
         if (point_hits_overlay_control(point)) return HTCLIENT;
+        LRESULT resize_hit = hit_test_expanded_resize(point);
+        if (resize_hit != HTNOWHERE) return resize_hit;
         if (point_hits_brand_move_handle(point)) return HTCAPTION;
         return HTTRANSPARENT;
     }
@@ -2126,10 +2161,34 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
     case WM_EXITSIZEMOVE:
         if (!g_collapsed) {
             GetWindowRect(hwnd, &g_expanded_rect);
-            g_expanded_rect = clamp_expanded_rect_to_focus_area(g_expanded_rect, 12);
+            g_expanded_rect = clamp_expanded_rect_to_focus_area(g_expanded_rect, EXPANDED_SCREEN_MARGIN);
+            SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                g_expanded_rect.left,
+                g_expanded_rect.top,
+                g_expanded_rect.right - g_expanded_rect.left,
+                g_expanded_rect.bottom - g_expanded_rect.top,
+                SWP_NOACTIVATE
+            );
             save_overlay_rect(L"expanded_rect", g_expanded_rect);
         }
         return 0;
+    case WM_GETMINMAXINFO: {
+        if (!g_collapsed) {
+            MINMAXINFO *mmi = (MINMAXINFO *)lparam;
+            RECT current;
+            if (!GetWindowRect(hwnd, &current)) current = g_expanded_rect;
+            RECT work = work_area_for_rect(current);
+            int work_w = work.right - work.left;
+            int work_h = work.bottom - work.top;
+            mmi->ptMinTrackSize.x = EXPANDED_MIN_WIDTH;
+            mmi->ptMinTrackSize.y = EXPANDED_MIN_HEIGHT;
+            mmi->ptMaxTrackSize.x = work_w;
+            mmi->ptMaxTrackSize.y = work_h;
+        }
+        return 0;
+    }
     case WM_PAINT: {
         if (paint_with_d2d(hwnd)) {
             ValidateRect(hwnd, NULL);
@@ -2297,7 +2356,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     int initial_w = 860;
     int initial_h = 460;
     if (rect_is_valid(g_expanded_rect)) {
-        g_expanded_rect = clamp_expanded_rect_to_focus_area(g_expanded_rect, 12);
+        g_expanded_rect = clamp_expanded_rect_to_focus_area(g_expanded_rect, EXPANDED_SCREEN_MARGIN);
         initial_x = g_expanded_rect.left;
         initial_y = g_expanded_rect.top;
         initial_w = g_expanded_rect.right - g_expanded_rect.left;
