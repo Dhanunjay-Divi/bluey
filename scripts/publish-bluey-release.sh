@@ -56,6 +56,71 @@ if [ "${#artifacts[@]}" -eq 0 ]; then
     exit 1
 fi
 
+python3 - "$DIST_DIR" "${artifacts[@]}" <<'PY'
+import sys
+import tarfile
+import zipfile
+from pathlib import Path
+
+patterns = [
+    b"BLUEY_OVERLAY_CAPTURE_VISIBLE",
+    b"BLUEY_HOST_OVERLAY_CAPTURE_VISIBLE",
+    b"BLUEY_LOCAL_VISIBLE_OVERLAY",
+    b"BLUEY_ALLOW_CAPTURE_VISIBLE_LOCAL",
+    b"BLUEY_DEV_OVERLAY",
+    b"bluey-local-visible-overlay",
+    b"bluey-overlay-capture-visible",
+    b"bluey-dev-overlay",
+]
+
+dist_dir = Path(sys.argv[1])
+failures = []
+checked = 0
+for pair in sys.argv[2:]:
+    _platform, filename = pair.split(":", 1)
+    path = dist_dir / filename
+    if not path.exists():
+        failures.append(f"{filename}: missing artifact")
+        continue
+    if path.suffix == ".zip":
+        with zipfile.ZipFile(path) as zf:
+            for info in zf.infolist():
+                if info.is_dir():
+                    continue
+                data = zf.read(info.filename)
+                checked += 1
+                for pattern in patterns:
+                    if pattern in data:
+                        failures.append(f"{filename}:{info.filename}: {pattern.decode()}")
+    elif path.name.endswith(".tar.gz"):
+        with tarfile.open(path, "r:gz") as tf:
+            for member in tf.getmembers():
+                if not member.isfile():
+                    continue
+                extracted = tf.extractfile(member)
+                if extracted is None:
+                    continue
+                data = extracted.read()
+                checked += 1
+                for pattern in patterns:
+                    if pattern in data:
+                        failures.append(f"{filename}:{member.name}: {pattern.decode()}")
+    else:
+        data = path.read_bytes()
+        checked += 1
+        for pattern in patterns:
+            if pattern in data:
+                failures.append(f"{filename}: {pattern.decode()}")
+
+if failures:
+    print("Refusing to publish release artifacts with dev-only overlay flags:", file=sys.stderr)
+    for failure in failures:
+        print(f"  - {failure}", file=sys.stderr)
+    sys.exit(1)
+
+print(f"Release artifact dev-flag scan passed ({checked} files checked).")
+PY
+
 (
     cd "$STAGE_DIR/releases/$VERSION_TAG"
     for file in bluey-*; do

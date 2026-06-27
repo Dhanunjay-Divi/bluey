@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-27 01:45 EDT
+Latest checkpoint: 2026-06-27 02:05 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,36 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-216-LIGHT-THEME-BLUE-CONTRAST.md`; the next canonical Bluey round doc should start at `ROUND-217-...`.
+- Latest assigned Bluey round doc is `ROUND-217-UPLOAD-SECURITY-RELEASE-GUARD.md`; the next canonical Bluey round doc should start at `ROUND-218-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 217 hardened the upload/release path after visible-overlay QA:
+  - confirmed live `latest.json` points to current `v0.1.16` macOS arm64 artifact
+  - downloaded the live active artifact and verified its hash matched `latest.json`: `c88e6d7faa32c0242f249076d4bf39c43ba61a557460368702d9a0ef62f3a5b1`
+  - scanned the live active artifact inside the archive; no visible-overlay/dev flag strings were found
+  - scanned live `install.sh` and `install.ps1`; no visible-overlay/dev flag strings were found
+  - confirmed live `latest.json.sig` exists
+  - scanned fresh local release `bluey`, `bluey-daemon`, `cue`, and `cue-daemon` binaries; no forbidden visible-overlay/dev strings were found
+  - built and scanned fresh macOS overlay release binaries; no forbidden visible-overlay/dev strings were found
+  - added an archive-level guard to `scripts/publish-bluey-release.sh` so current `.tar.gz`, `.zip`, and raw release artifacts are refused before manifest/checksum/sign/upload if they contain production-forbidden visible-overlay or dev markers
+  - verified the guard passes on the current `v0.1.16` artifact and fails on a poisoned fake Windows zip containing `BLUEY_DEV_OVERLAY`
+  - Round doc: `docs/rounds/ROUND-217-UPLOAD-SECURITY-RELEASE-GUARD.md`
+  - Verification passed:
+    - `cargo test --manifest-path server/Cargo.toml --test integration_e2e -- --test-threads=1` (`41 passed`)
+    - `cargo test --manifest-path server/Cargo.toml --test gdpr_webhook_cleanup` (`2 passed`)
+    - `cargo test --manifest-path server/Cargo.toml --test connectinfo_real_serve` (`1 passed`)
+    - `cargo test -p cue-daemon macos_overlay_capture_visible_requires_dev_and_local_gates --lib`
+    - `cargo test -p cue-cli redact --lib`
+    - `cargo test -p cue-cloud-client tokens --lib`
+    - `cargo test -p cue-cli update --lib`
+    - `cargo test --manifest-path server/Cargo.toml --lib` (`172 passed`)
+    - `bash -n scripts/publish-bluey-release.sh`
+    - `scripts/release-hygiene-scan.sh dist`
+    - `cargo build --release -p cue-daemon -p cue-cli`
+    - `BLUEY_OVERLAY_SWIFT_CONFIGURATION=release native/macos/cue-overlay/build.sh`
 - Round 216 improved white/light theme blue contrast:
   - added dedicated macOS light-theme accent tokens: `accent`, `accentBorder`, and `accentSoft`
   - strengthened the macOS light-theme panel/feed/drop-target border contrast
