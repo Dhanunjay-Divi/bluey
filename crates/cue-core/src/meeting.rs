@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::cards::CueCardArtifact;
 use crate::clock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,6 +231,8 @@ pub struct ConversationTurn {
     pub answer: String,
     #[serde(default)]
     pub attachment_ids: Vec<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<CueCardArtifact>,
     #[serde(default)]
     pub source: Option<String>,
     #[serde(default)]
@@ -249,6 +252,7 @@ impl ConversationTurn {
             question: question.into(),
             answer: answer.into(),
             attachment_ids: Vec::new(),
+            artifact: None,
             source,
             provider,
             created_at: clock::now_epoch_ms_string(),
@@ -257,6 +261,11 @@ impl ConversationTurn {
 
     pub fn with_attachment_ids(mut self, attachment_ids: Vec<Uuid>) -> Self {
         self.attachment_ids = attachment_ids;
+        self
+    }
+
+    pub fn with_artifact(mut self, artifact: Option<CueCardArtifact>) -> Self {
+        self.artifact = artifact;
         self
     }
 }

@@ -15,8 +15,8 @@ use cue_cloud_client::{
     SyncSessionRecord, SyncTranscriptSegment,
 };
 use cue_core::{
-    ContextArtifact, ContextKind, ContextProcessingStatus, ConversationTurn, MeetingRecord,
-    Speaker, TranscriptSegment,
+    CardArtifactType, ContextArtifact, ContextKind, ContextProcessingStatus, ConversationTurn,
+    CueCardArtifact, MeetingRecord, Speaker, TranscriptSegment,
 };
 use serde_json::json;
 use tracing::{debug, warn};
@@ -690,6 +690,11 @@ fn conversation_turn_from_cloud(response: SyncCueResponseRecord) -> Option<Conve
         question,
         answer: response.text,
         attachment_ids: attachment_ids_from_metadata(&response.metadata),
+        artifact: cloud_response_artifact(
+            response.artifact_type,
+            response.artifact_body,
+            response.artifact_confidence,
+        ),
         source: response
             .metadata
             .get("source")
@@ -697,6 +702,40 @@ fn conversation_turn_from_cloud(response: SyncCueResponseRecord) -> Option<Conve
             .map(ToString::to_string),
         provider: response.provider,
         created_at: response.ts_ms.to_string(),
+    })
+}
+
+fn cloud_response_artifact(
+    artifact_type: Option<String>,
+    artifact_body: Option<String>,
+    artifact_confidence: Option<f32>,
+) -> Option<CueCardArtifact> {
+    let body = artifact_body?.trim().to_string();
+    if body.is_empty() {
+        return None;
+    }
+    let artifact_type = match artifact_type?.trim().to_ascii_lowercase().as_str() {
+        "code" | "patch" | "diff" => CardArtifactType::Code,
+        "system_design" | "system-design" | "architecture" | "design" => {
+            CardArtifactType::SystemDesign
+        }
+        "screen" => CardArtifactType::Screen,
+        "document" => CardArtifactType::Document,
+        "structured" => CardArtifactType::Structured,
+        _ => return None,
+    };
+    let title = match artifact_type {
+        CardArtifactType::Code => "Code canvas",
+        CardArtifactType::SystemDesign => "System design canvas",
+        CardArtifactType::Screen => "Screen context",
+        CardArtifactType::Document => "Document context",
+        CardArtifactType::Structured => "Details",
+    };
+    Some(CueCardArtifact {
+        artifact_type,
+        title: title.to_string(),
+        body,
+        confidence: artifact_confidence.unwrap_or(0.88).clamp(0.0, 1.0),
     })
 }
 
@@ -903,9 +942,15 @@ fn conversation_response_record(
         cost_cents: None,
         balance_cents_after: None,
         cost_label: None,
-        artifact_type: None,
-        artifact_body: None,
-        artifact_confidence: None,
+        artifact_type: turn
+            .artifact
+            .as_ref()
+            .map(|artifact| cloud_artifact_type_value(artifact.artifact_type).to_string()),
+        artifact_body: turn
+            .artifact
+            .as_ref()
+            .map(|artifact| truncate_chars(&artifact.body, MAX_RESPONSE_CHARS)),
+        artifact_confidence: turn.artifact.as_ref().map(|artifact| artifact.confidence),
         metadata: json!({
             "source": turn.source.as_deref(),
             "attachment_ids": turn
@@ -914,6 +959,16 @@ fn conversation_response_record(
                 .map(|id| id.to_string())
                 .collect::<Vec<_>>(),
         }),
+    }
+}
+
+fn cloud_artifact_type_value(artifact_type: CardArtifactType) -> &'static str {
+    match artifact_type {
+        CardArtifactType::Code => "code",
+        CardArtifactType::SystemDesign => "system_design",
+        CardArtifactType::Screen => "screen",
+        CardArtifactType::Document => "document",
+        CardArtifactType::Structured => "structured",
     }
 }
 
@@ -1123,6 +1178,40 @@ mod tests {
             batches[0].cue_responses[0].metadata["attachment_ids"][0],
             attachment_id.to_string()
         );
+    }
+
+    #[test]
+    fn conversation_sync_preserves_code_artifact_fields() {
+        let meeting = MeetingRecord::new(Some("Chat".into()));
+        let artifact = CueCardArtifact {
+            artifact_type: CardArtifactType::Code,
+            title: "Code canvas".into(),
+            body: "CODE\n----\nfn main() {}".into(),
+            confidence: 0.95,
+        };
+        let turn = ConversationTurn::new("code?", "Here is code.", None, Some("test".into()))
+            .with_artifact(Some(artifact));
+
+        let record = conversation_response_record(&meeting, &turn);
+        assert_eq!(record.artifact_type.as_deref(), Some("code"));
+        assert_eq!(
+            record.artifact_body.as_deref(),
+            Some("CODE\n----\nfn main() {}")
+        );
+        assert_eq!(record.artifact_confidence, Some(0.95));
+
+        let restored = conversation_turn_from_cloud(record).expect("restored turn");
+        assert_eq!(
+            restored
+                .artifact
+                .as_ref()
+                .map(|artifact| artifact.artifact_type),
+            Some(CardArtifactType::Code)
+        );
+        assert!(restored
+            .artifact
+            .as_ref()
+            .is_some_and(|artifact| artifact.body.contains("fn main")));
     }
 
     #[tokio::test]

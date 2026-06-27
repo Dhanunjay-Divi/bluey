@@ -63,6 +63,7 @@ const AUTO_CLOUD_SYNC_DEBOUNCE_SECS: u64 = 20;
 struct LiveProviderAnswer {
     provider: ProviderSelector,
     answer: String,
+    artifact: Option<CueCardArtifact>,
     token_usage: Option<TokenUsage>,
     latency_ms: u64,
     sources: Vec<LlmSourceMetadata>,
@@ -4251,9 +4252,17 @@ fn overlay_history_cards_for_meeting(meeting: &MeetingRecord) -> Vec<CueCard> {
             .filter(|provider| !provider.trim().is_empty())
             .map(|provider| format!("session history ({provider})"))
             .unwrap_or_else(|| "session history".to_string());
-        cards.push(
-            CueCard::new(CardKind::Answer, "Bluey", turn.answer.clone()).with_source(answer_source),
-        );
+        let artifact = turn
+            .artifact
+            .clone()
+            .or_else(|| answer_overlay_artifact(&turn.answer));
+        let answer_body = visible_answer_body_for_artifact(&turn.answer, artifact.as_ref());
+        let mut answer_card =
+            CueCard::new(CardKind::Answer, "Bluey", answer_body).with_source(answer_source);
+        if let Some(artifact) = artifact {
+            answer_card = answer_card.with_artifact(artifact);
+        }
+        cards.push(answer_card);
     }
 
     if cards.is_empty() {
@@ -5331,16 +5340,24 @@ async fn answer_with_provider_runtime(
         let _ = send_overlay(daemon, OverlayCommand::PushCard { card: source_card }).await;
     }
 
+    let persisted_artifact = outcome
+        .artifact
+        .clone()
+        .or_else(|| answer_overlay_artifact(&response.answer));
+    let persisted_answer =
+        visible_answer_body_for_artifact(&response.answer, persisted_artifact.as_ref());
+
     let meeting_snapshot = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if let Some(meeting) = meeting_guard.as_mut() {
             meeting.push_conversation_turn(
                 ConversationTurn::new(
                     visible_question.clone(),
-                    response.answer.clone(),
+                    persisted_answer.clone(),
                     Some(source.clone()),
                     Some(outcome.provider.display_label()),
                 )
+                .with_artifact(persisted_artifact.clone())
                 .with_attachment_ids(request.metadata.visible_context_ids.clone()),
             );
             let used_image_context = mark_visible_image_context_used_once(
@@ -5348,7 +5365,7 @@ async fn answer_with_provider_runtime(
                 meeting,
                 &request.metadata.visible_context_ids,
                 &visible_question,
-                &response.answer,
+                &persisted_answer,
             );
             maybe_autoname_meeting(meeting, &request.question);
             daemon.store.save_active(meeting)?;
@@ -5637,7 +5654,11 @@ fn clamp_code_preview(code: &str, max_lines: usize) -> String {
 
 fn infer_code_language(code: &str) -> &'static str {
     let lower = code.to_ascii_lowercase();
-    if lower.contains("def ") || lower.contains("print(") || lower.contains("__init__") {
+    if lower.contains("def ")
+        || lower.contains("print(")
+        || lower.contains("__init__")
+        || looks_like_python_assignment(code)
+    {
         "python"
     } else if lower.contains("select ") && lower.contains(" from ") {
         "sql"
@@ -5990,7 +6011,44 @@ fn code_canvas_has_real_code(body: &str) -> bool {
         || code.contains('(') && code.contains(')')
         || code.contains('[') && code.contains(']');
 
-    has_signal || (non_empty_lines.len() >= 2 && has_punctuation)
+    has_signal
+        || looks_like_code_assignment(code)
+        || (non_empty_lines.len() >= 2 && has_punctuation)
+}
+
+fn looks_like_code_assignment(code: &str) -> bool {
+    code.lines().map(str::trim).any(|line| {
+        if line.is_empty()
+            || line.starts_with("//")
+            || line.starts_with('#')
+            || line.starts_with("- ")
+            || line.contains("==")
+            || line.contains("!=")
+            || line.contains("<=")
+            || line.contains(">=")
+        {
+            return false;
+        }
+        line.contains('=')
+            && (line.contains(',')
+                || line.contains('+')
+                || line.contains('-')
+                || line.contains('*')
+                || line.contains('/')
+                || line.contains('.')
+                || line.contains('[')
+                || line.contains('('))
+    })
+}
+
+fn looks_like_python_assignment(code: &str) -> bool {
+    code.lines().map(str::trim).any(|line| {
+        line.contains('=')
+            && line.contains(',')
+            && !line.contains(';')
+            && !line.contains('{')
+            && !line.contains('}')
+    })
 }
 
 fn extract_code_section_from_canvas(body: &str) -> String {
@@ -6421,6 +6479,7 @@ fn source_attachment_title(source: &LlmSourceMetadata, idx: usize) -> String {
 struct AnswerRouteOutcome {
     provider: ProviderSelector,
     answer: String,
+    artifact: Option<CueCardArtifact>,
     attempts: Vec<RouteAttemptMetadata>,
     latency_ms: u64,
     token_usage: Option<TokenUsage>,
@@ -6446,6 +6505,7 @@ async fn resolve_answer_route(
         return Ok(AnswerRouteOutcome {
             provider: provider.clone(),
             answer: refusal.to_string(),
+            artifact: None,
             attempts: vec![RouteAttemptMetadata::started(provider, 0).succeeded(latency_ms)],
             latency_ms,
             token_usage: None,
@@ -6511,6 +6571,7 @@ async fn resolve_answer_route(
             return Ok(AnswerRouteOutcome {
                 provider: step.provider.clone(),
                 answer,
+                artifact: None,
                 attempts,
                 latency_ms,
                 token_usage: None,
@@ -6536,6 +6597,7 @@ async fn resolve_answer_route(
                     return Ok(AnswerRouteOutcome {
                         provider: answer.provider,
                         answer: answer.answer,
+                        artifact: answer.artifact,
                         attempts,
                         latency_ms: answer.latency_ms,
                         token_usage: answer.token_usage,
@@ -6581,6 +6643,7 @@ async fn resolve_answer_route(
                 return Ok(AnswerRouteOutcome {
                     provider: answer.provider,
                     answer: answer.answer,
+                    artifact: answer.artifact,
                     attempts,
                     latency_ms: answer.latency_ms,
                     token_usage: answer.token_usage,
@@ -6717,13 +6780,18 @@ async fn call_bluey_managed_provider(
         }
         if let Some(stream) = stream.as_mut() {
             stream
-                .finish_with_cost_label_and_artifact(&answer, cost_label.clone(), overlay_artifact)
+                .finish_with_cost_label_and_artifact(
+                    &answer,
+                    cost_label.clone(),
+                    overlay_artifact.clone(),
+                )
                 .await?;
         }
 
         return Ok(LiveProviderAnswer {
             provider: provider.clone(),
             answer,
+            artifact: overlay_artifact,
             token_usage,
             latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
             sources,
@@ -6752,7 +6820,7 @@ async fn call_bluey_managed_provider(
             .finish_with_cost_label_and_artifact(
                 &answer,
                 response.cost_label.clone(),
-                overlay_artifact,
+                overlay_artifact.clone(),
             )
             .await?;
     }
@@ -6760,6 +6828,7 @@ async fn call_bluey_managed_provider(
     Ok(LiveProviderAnswer {
         provider: provider.clone(),
         answer,
+        artifact: overlay_artifact,
         token_usage,
         latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         sources: response.sources,
@@ -6893,6 +6962,7 @@ async fn call_chat_provider(
     Ok(LiveProviderAnswer {
         provider: config.provider.clone(),
         answer,
+        artifact: None,
         token_usage,
         latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         sources: Vec::new(),
@@ -7040,6 +7110,7 @@ async fn read_streaming_chat_response(
     Ok(LiveProviderAnswer {
         provider: config.provider.clone(),
         answer,
+        artifact: None,
         token_usage,
         latency_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         sources: Vec::new(),
@@ -11719,6 +11790,62 @@ mod tests {
         assert_eq!(cards[0].body, "What is a DDoS attack?");
         assert!(matches!(cards[1].kind, CardKind::Answer));
         assert!(cards[1].body.contains("DDoS floods"));
+    }
+
+    #[test]
+    fn overlay_history_cards_restore_code_artifact_button() {
+        let mut meeting = MeetingRecord::new(Some("Code".to_string()));
+        let artifact = CueCardArtifact {
+            artifact_type: CardArtifactType::Code,
+            title: "Code canvas".to_string(),
+            body: "CODE\n----\na, b = 10, 20\na, b = b, a\n\nCOMPLEXITY\n----------\nO(1)"
+                .to_string(),
+            confidence: 0.95,
+        };
+        meeting.push_conversation_turn(
+            ConversationTurn::new(
+                "I want the code in Python.",
+                "Here is the Python code:",
+                Some("overlay ask".to_string()),
+                Some("Bluey Managed".to_string()),
+            )
+            .with_artifact(Some(artifact)),
+        );
+
+        let cards = overlay_history_cards_for_meeting(&meeting);
+        assert_eq!(cards.len(), 2);
+        let answer = &cards[1];
+        assert!(matches!(answer.kind, CardKind::Answer));
+        assert_eq!(
+            answer
+                .artifact
+                .as_ref()
+                .map(|artifact| artifact.artifact_type),
+            Some(CardArtifactType::Code)
+        );
+        assert!(answer.body.contains("```python"));
+        assert!(answer.body.contains("a, b = b, a"));
+    }
+
+    #[test]
+    fn overlay_history_cards_infer_code_artifact_for_old_saved_turns() {
+        let mut meeting = MeetingRecord::new(Some("Old Code".to_string()));
+        meeting.push_conversation_turn(ConversationTurn::new(
+            "Swap two numbers.",
+            "```python\na, b = b, a\n```",
+            Some("overlay ask".to_string()),
+            Some("OpenAI".to_string()),
+        ));
+
+        let cards = overlay_history_cards_for_meeting(&meeting);
+        assert_eq!(cards.len(), 2);
+        assert_eq!(
+            cards[1]
+                .artifact
+                .as_ref()
+                .map(|artifact| artifact.artifact_type),
+            Some(CardArtifactType::Code)
+        );
     }
 
     #[test]

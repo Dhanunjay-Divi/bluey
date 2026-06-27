@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-27 13:27 EDT
+Latest checkpoint: 2026-06-27 13:50 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,37 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-221-CODE-REQUEST-VISIBLE-SNIPPET.md`; the next canonical Bluey round doc should start at `ROUND-222-...`.
+- Latest assigned Bluey round doc is `ROUND-222-HISTORY-CODE-ARTIFACT-RESTORE.md`; the next canonical Bluey round doc should start at `ROUND-223-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 222 fixed restored-chat code artifacts disappearing after switching chats:
+  - root cause was that live answer cards could carry `CueCardArtifact` metadata, but saved `ConversationTurn` records only stored question/answer/source/provider/attachments/timestamp
+  - when a user switched to another chat and returned, history replay rebuilt the answer card without the `{}` code/canvas artifact action
+  - `ConversationTurn` now has optional `artifact: CueCardArtifact` with serde defaults for old sessions
+  - answer completion now persists the same visible answer body plus the inferred or managed artifact
+  - history replay restores `turn.artifact` onto answer cards and can infer code artifacts from fenced code for older saved turns
+  - cloud sync fallback now preserves conversation artifact fields when turns are uploaded as cue responses and restores them during hydration
+  - code detection now accepts small explicit assignment snippets like Python tuple swap so tiny interview answers remain code artifacts
+  - this is shared core/daemon/history/sync behavior for Mac and Windows; no native UI fork was needed
+  - local Bluey is currently running in visible QA mode after verification; final status reports daemon pid `60912`, `overlay_capture_excluded: false`, and `screen_capture_active: false`
+  - Round doc: `docs/rounds/ROUND-222-HISTORY-CODE-ARTIFACT-RESTORE.md`
+  - Verification passed:
+    - `cargo fmt --manifest-path crates/cue-core/Cargo.toml`
+    - `cargo fmt --manifest-path crates/cue-daemon/Cargo.toml`
+    - `cargo test -p cue-daemon overlay_history_cards_restore_code_artifact_button --lib`
+    - `cargo test -p cue-daemon overlay_history_cards_infer_code_artifact_for_old_saved_turns --lib`
+    - `cargo test -p cue-daemon conversation_sync_preserves_code_artifact_fields --lib`
+    - `cargo test -p cue-daemon answer_overlay_artifact --lib`
+    - `cargo test -p cue-daemon overlay_history_cards_replay_saved_conversation --lib`
+    - `cargo test -p cue-core --lib`
+    - `cargo build -p cue-daemon --bin bluey-daemon`
+    - `cargo test -p cue-daemon --lib`
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `git diff --check`
 - Round 221 fixed explicit code requests that produced prose-only or vague chat answers:
   - owner showed a live QA case where "I want the code, in Python" produced prose in chat while only a small code snippet appeared in canvas
   - daemon output-format prompt now says explicit requests for code, a program, an implementation, "I want the code", or "write code in language" must include a complete fenced code block with a language tag
