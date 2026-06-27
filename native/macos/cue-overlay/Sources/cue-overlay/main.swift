@@ -5041,6 +5041,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             if let hit = super.hitTest(point), isExplicitInteractiveHit(hit) {
                 return hit
             }
+            if hasManualInteractiveControl(at: point) {
+                return self
+            }
             if !resizeEdges(at: point).isEmpty {
                 return self
             }
@@ -5357,6 +5360,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if !answerStyleOverlay.isHidden {
             return true
         }
+        if hasManualInteractiveControl(at: localPoint) {
+            return true
+        }
         if isKnowledgeBadgeHit(at: localPoint) {
             return true
         }
@@ -5395,6 +5401,17 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     func manualOpacityScrubber(atWindowPoint point: NSPoint) -> OpacityScrubberView? {
         let localPoint = convert(point, from: nil)
+        return manualOpacityScrubber(atRootPoint: localPoint)
+    }
+
+    private func hasManualInteractiveControl(at localPoint: NSPoint) -> Bool {
+        guard bounds.contains(localPoint) else { return false }
+        return manualButton(in: self, atRootPoint: localPoint) != nil
+            || manualOpacityScrubber(atRootPoint: localPoint) != nil
+            || transcriptClearHit(at: localPoint)
+    }
+
+    private func manualOpacityScrubber(atRootPoint localPoint: NSPoint) -> OpacityScrubberView? {
         guard bounds.contains(localPoint),
               closeConfirmOverlay.isHidden,
               answerStyleOverlay.isHidden,
@@ -10526,7 +10543,14 @@ private final class OverlayApp {
     @discardableResult
     private func applyRemoteInputPassthroughIfActive() -> Bool {
         guard isRemoteInputPassthroughActive else { return false }
-        expandedWindow?.ignoresMouseEvents = true
+        if let expandedWindow,
+           expandedWindow.isVisible,
+           expandedView?.isInteractiveAtScreenPoint(NSEvent.mouseLocation) == true {
+            expandedWindow.acceptsMouseMovedEvents = true
+            expandedWindow.ignoresMouseEvents = false
+        } else {
+            expandedWindow?.ignoresMouseEvents = true
+        }
         pillWindow?.ignoresMouseEvents = true
         return true
     }
@@ -10735,11 +10759,15 @@ private final class OverlayApp {
 
         expandedWindow.acceptsMouseMovedEvents = true
         let point = NSEvent.mouseLocation
-        let shouldReceiveMouse = expandedView?.isInteractiveAtScreenPoint(point) ?? true
-        expandedWindow.ignoresMouseEvents = !shouldReceiveMouse
-        if shouldReceiveMouse {
-            lastExpandedInteractiveMouseAt = CACurrentMediaTime()
+        let isInteractive = expandedView?.isInteractiveAtScreenPoint(point) ?? true
+        let now = CACurrentMediaTime()
+        if isInteractive {
+            lastExpandedInteractiveMouseAt = now
         }
+        let keepControlPressAlive = NSEvent.pressedMouseButtons != 0
+            && now - lastExpandedInteractiveMouseAt < 0.45
+        let shouldReceiveMouse = isInteractive || keepControlPressAlive
+        expandedWindow.ignoresMouseEvents = !shouldReceiveMouse
     }
 
     private func expand() {

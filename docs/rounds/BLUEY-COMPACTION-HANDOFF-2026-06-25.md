@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-26 20:40 EDT
+Latest checkpoint: 2026-06-26 20:59 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,26 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-208-OVERLAY-RESIZE-STABILITY.md`; the next canonical Bluey round doc should start at `ROUND-209-...`.
+- Latest assigned Bluey round doc is `ROUND-209-CLICKTHROUGH-CONTROL-HITBOX-RESTORE.md`; the next canonical Bluey round doc should start at `ROUND-210-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 209 restored control clickability while macOS click-through mode is enabled:
+  - added manual control hit-zone detection to the pass-through hit-test path
+  - included manually routed buttons, opacity scrubber, and transcript clear hit zones in the interactive region
+  - updated the window-level mouse policy so padded Bluey controls keep the window mouse-active while blank interior still passes through
+  - changed remote-input passthrough so it does not override Bluey controls when the pointer is currently over an interactive region
+  - kept mouse-up alive briefly after a control mouse-down so a click does not get interrupted by tiny pointer movement
+  - Windows parity checked; no Windows change needed because the Windows overlay already routes controls through `HTCLIENT`, borders through resize handles, logo/wordmark through `HTCAPTION`, and blank space through `HTTRANSPARENT`
+  - rebuilt and relaunched local visible/debug Bluey
+  - Round doc: `docs/rounds/ROUND-209-CLICKTHROUGH-CONTROL-HITBOX-RESTORE.md`
+  - Verification passed:
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `BLUEY_OVERLAY_SWIFT_CONFIGURATION=debug native/macos/cue-overlay/build.sh`
+    - `BLUEY_BIN="$PWD/target/debug/bluey" scripts/bluey-visible-local.sh`
+    - `target/debug/bluey status`
 - Round 208 fixed overlay resize stability after the owner reported resizing still felt bad:
   - macOS resize edges now win before header dragging, so the top border does not accidentally move the window instead of resizing
   - click-through mode treats the visible border as interactive resize chrome while blank interior space still passes through
