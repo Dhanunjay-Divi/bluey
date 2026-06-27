@@ -75,6 +75,12 @@ static bool g_recording = false;
 static int g_auto_send_mode = 2;
 static bool g_light_theme = false;
 static double g_opacity = 0.92;
+static const int BLUEY_LIGHT_ACCENT_R = 0;
+static const int BLUEY_LIGHT_ACCENT_G = 98;
+static const int BLUEY_LIGHT_ACCENT_B = 154;
+static const int BLUEY_LIGHT_ACCENT_SOFT_R = 176;
+static const int BLUEY_LIGHT_ACCENT_SOFT_G = 226;
+static const int BLUEY_LIGHT_ACCENT_SOFT_B = 246;
 static RECT g_expanded_rect = {0, 0, 0, 0};
 static RECT g_collapsed_rect = {0, 0, 0, 0};
 static HHOOK g_popup_hook = NULL;
@@ -628,10 +634,10 @@ static void draw_dark_button(const DRAWITEMSTRUCT *item) {
     bool pressed = (item->itemState & ODS_SELECTED) != 0;
     HBRUSH bg = CreateSolidBrush(
         g_light_theme
-            ? (pressed ? RGB(205, 232, 246) : RGB(244, 249, 252))
+            ? (pressed ? RGB(BLUEY_LIGHT_ACCENT_SOFT_R, BLUEY_LIGHT_ACCENT_SOFT_G, BLUEY_LIGHT_ACCENT_SOFT_B) : RGB(244, 249, 252))
             : (pressed ? RGB(34, 47, 58) : RGB(10, 15, 22))
     );
-    HPEN border = CreatePen(PS_SOLID, 1, g_light_theme ? RGB(82, 172, 205) : RGB(45, 91, 112));
+    HPEN border = CreatePen(PS_SOLID, 1, g_light_theme ? RGB(BLUEY_LIGHT_ACCENT_R, BLUEY_LIGHT_ACCENT_G, BLUEY_LIGHT_ACCENT_B) : RGB(45, 91, 112));
     HGDIOBJ old_brush = SelectObject(item->hDC, bg);
     HGDIOBJ old_pen = SelectObject(item->hDC, border);
     RoundRect(item->hDC, item->rcItem.left, item->rcItem.top, item->rcItem.right, item->rcItem.bottom, 18, 18);
@@ -1927,10 +1933,10 @@ static bool paint_with_d2d(HWND hwnd) {
         int composer_left = (rect.right - composer_w) / 2;
 
         d2d_fill_round((float)header_left, 8.0f, (float)(header_left + header_w), 54.0f, 22.0f, g_light_theme ? 248 : 5, g_light_theme ? 252 : 11, g_light_theme ? 255 : 18, 1.0f);
-        d2d_stroke_round((float)header_left + 0.5f, 8.5f, (float)(header_left + header_w) - 0.5f, 53.5f, 22.0f, g_light_theme ? 82 : 36, g_light_theme ? 172 : 102, g_light_theme ? 205 : 124, 0.9f, 1.2f);
+        d2d_stroke_round((float)header_left + 0.5f, 8.5f, (float)(header_left + header_w) - 0.5f, 53.5f, 22.0f, g_light_theme ? BLUEY_LIGHT_ACCENT_R : 36, g_light_theme ? BLUEY_LIGHT_ACCENT_G : 102, g_light_theme ? BLUEY_LIGHT_ACCENT_B : 124, g_light_theme ? 0.82f : 0.9f, g_light_theme ? 1.5f : 1.2f);
 
         d2d_fill_round((float)composer_left, (float)rect.bottom - 110.0f, (float)(composer_left + composer_w), (float)rect.bottom - 8.0f, 22.0f, g_light_theme ? 248 : 5, g_light_theme ? 252 : 11, g_light_theme ? 255 : 18, 1.0f);
-        d2d_stroke_round((float)composer_left + 0.5f, (float)rect.bottom - 109.5f, (float)(composer_left + composer_w) - 0.5f, (float)rect.bottom - 8.5f, 22.0f, g_light_theme ? 82 : 38, g_light_theme ? 172 : 98, g_light_theme ? 205 : 138, 0.9f, 1.2f);
+        d2d_stroke_round((float)composer_left + 0.5f, (float)rect.bottom - 109.5f, (float)(composer_left + composer_w) - 0.5f, (float)rect.bottom - 8.5f, 22.0f, g_light_theme ? BLUEY_LIGHT_ACCENT_R : 38, g_light_theme ? BLUEY_LIGHT_ACCENT_G : 98, g_light_theme ? BLUEY_LIGHT_ACCENT_B : 138, g_light_theme ? 0.86f : 0.9f, g_light_theme ? 1.5f : 1.2f);
 
         draw_resize_affordance_d2d(rect);
         draw_bluey_logo_d2d((float)header_left + 14.0f, 14.0f, 28.0f);
@@ -2316,7 +2322,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
 
         SetBkMode(hdc, TRANSPARENT);
         HBRUSH header = CreateSolidBrush(g_light_theme ? RGB(248, 252, 255) : RGB(5, 11, 18));
-        HPEN header_pen = CreatePen(PS_SOLID, 1, g_light_theme ? RGB(82, 172, 205) : RGB(36, 102, 124));
+        HPEN header_pen = CreatePen(PS_SOLID, g_light_theme ? 2 : 1, g_light_theme ? RGB(BLUEY_LIGHT_ACCENT_R, BLUEY_LIGHT_ACCENT_G, BLUEY_LIGHT_ACCENT_B) : RGB(36, 102, 124));
         HGDIOBJ old_brush = SelectObject(hdc, header);
         HGDIOBJ old_pen = SelectObject(hdc, header_pen);
         int header_w = clamp_int((rect.right * 84) / 100, 520, 780);
@@ -2332,7 +2338,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         int composer_w = clamp_int((rect.right * 72) / 100, 560, 760);
         int composer_left = (rect.right - composer_w) / 2;
         HBRUSH composer = CreateSolidBrush(g_light_theme ? RGB(248, 252, 255) : RGB(5, 11, 18));
-        HPEN composer_pen = CreatePen(PS_SOLID, 1, g_light_theme ? RGB(82, 172, 205) : RGB(38, 98, 138));
+        HPEN composer_pen = CreatePen(PS_SOLID, g_light_theme ? 2 : 1, g_light_theme ? RGB(BLUEY_LIGHT_ACCENT_R, BLUEY_LIGHT_ACCENT_G, BLUEY_LIGHT_ACCENT_B) : RGB(38, 98, 138));
         old_brush = SelectObject(hdc, composer);
         old_pen = SelectObject(hdc, composer_pen);
         RECT composer_rect = {composer_left, rect.bottom - 110, composer_left + composer_w, rect.bottom - 8};

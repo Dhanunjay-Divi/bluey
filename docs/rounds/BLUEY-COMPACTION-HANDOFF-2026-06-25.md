@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-27 01:29 EDT
+Latest checkpoint: 2026-06-27 01:45 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,28 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-215-AUTOMATIC-SAVED-SESSION-SYNC.md`; the next canonical Bluey round doc should start at `ROUND-216-...`.
+- Latest assigned Bluey round doc is `ROUND-216-LIGHT-THEME-BLUE-CONTRAST.md`; the next canonical Bluey round doc should start at `ROUND-217-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 216 improved white/light theme blue contrast:
+  - added dedicated macOS light-theme accent tokens: `accent`, `accentBorder`, and `accentSoft`
+  - strengthened the macOS light-theme panel/feed/drop-target border contrast
+  - routed the plus/attach icon, Answer accent button, History border/icon, active canvas icon, click-through icon, screen-ready route badge, and drop-highlight outline through the stronger light-theme accent
+  - kept dark-theme cyan behavior unchanged
+  - added matching Windows light-theme accent constants
+  - Windows owner-drawn button borders, pressed light fill, Direct2D header/composer strokes, and GDI fallback header/composer strokes now use the stronger light accent
+  - local visible/debug Bluey was rebuilt and relaunched
+  - Round doc: `docs/rounds/ROUND-216-LIGHT-THEME-BLUE-CONTRAST.md`
+  - Verification passed:
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `BLUEY_OVERLAY_SWIFT_CONFIGURATION=debug native/macos/cue-overlay/build.sh`
+    - `git diff --check`
+    - `BLUEY_BIN=/Users/uno/Downloads/cue/target/debug/bluey scripts/bluey-visible-local.sh`
+    - `/Users/uno/Downloads/cue/target/debug/bluey status`
 - Round 215 made saved-session sync automatic for signed-in desktop users:
   - `CueSettings.cloud_sync_enabled` now defaults to `true`
   - `bluey login` enables saved-session background sync for linked accounts, fixing older default-false settings files on newly linked machines

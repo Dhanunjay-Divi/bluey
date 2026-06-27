@@ -182,6 +182,9 @@ private enum BlueyTheme {
 }
 
 private enum BlueyLightTheme {
+    static let accent = NSColor(red: 0.000, green: 0.385, blue: 0.600, alpha: 1.0)
+    static let accentBorder = NSColor(red: 0.000, green: 0.465, blue: 0.700, alpha: 1.0)
+    static let accentSoft = NSColor(red: 0.690, green: 0.885, blue: 0.965, alpha: 1.0)
     static let panel = NSColor(red: 0.565, green: 0.610, blue: 0.638, alpha: 1.0)
     static let content = NSColor(red: 0.720, green: 0.748, blue: 0.765, alpha: 1.0)
     static let contentHigh = NSColor(red: 0.790, green: 0.810, blue: 0.822, alpha: 1.0)
@@ -345,8 +348,10 @@ private func drawBlueyLightPanel(
     ])?.draw(in: path, angle: -16)
     NSGraphicsContext.restoreGraphicsState()
 
-    BlueyTheme.cyan.withAlphaComponent(blueyLightMaterialAlpha(0.34, opacity: opacity, floor: 0.10)).setStroke()
-    path.lineWidth = 1.0
+    BlueyLightTheme.accentBorder
+        .withAlphaComponent(blueyLightMaterialAlpha(0.64, opacity: opacity, floor: 0.30))
+        .setStroke()
+    path.lineWidth = 1.35
     path.stroke()
 
     let inner = rect.insetBy(dx: 1.5, dy: 1.5)
@@ -2838,7 +2843,7 @@ private final class FeedView: NSView {
                     view.layer?.backgroundColor = BlueyLightTheme.surfaceRaised
                         .withAlphaComponent(blueyLightMaterialAlpha(0.92, opacity: currentOpacity, floor: 0.18))
                         .cgColor
-                    view.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.28).cgColor
+                    view.layer?.borderColor = BlueyLightTheme.accentBorder.withAlphaComponent(0.56).cgColor
                     view.layer?.shadowColor = NSColor.black.cgColor
                     view.layer?.shadowOpacity = 0.12
                     view.layer?.shadowRadius = 16
@@ -4941,7 +4946,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         layer?.backgroundColor = NSColor.clear.cgColor
         layer?.borderWidth = 1
         layer?.borderColor = (lightThemeEnabled
-            ? BlueyTheme.cyan.withAlphaComponent(0.30)
+            ? BlueyLightTheme.accentBorder.withAlphaComponent(0.70)
             : BlueyTheme.cyan.withAlphaComponent(materialAlpha(0.24, floor: 0.06))).cgColor
         layer?.shadowColor = NSColor.black.cgColor
         layer?.shadowOpacity = lightThemeEnabled ? Float(lightMaterialAlpha(0.20, floor: 0.06)) : Float(materialAlpha(0.30, floor: 0.10))
@@ -4996,15 +5001,27 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             : NSColor.white.withAlphaComponent(materialAlpha(0.045))
     }
 
+    private var themedAccentColor: NSColor {
+        lightThemeEnabled ? BlueyLightTheme.accent : BlueyTheme.cyan
+    }
+
+    private var themedAccentBorderColor: NSColor {
+        lightThemeEnabled ? BlueyLightTheme.accentBorder : BlueyTheme.cyan
+    }
+
+    private var themedAccentFillColor: NSColor {
+        lightThemeEnabled ? BlueyLightTheme.accentSoft : BlueyTheme.cyan
+    }
+
     private func refreshBackgroundChrome() {
         layer?.backgroundColor = NSColor.clear.cgColor
         layer?.borderColor = (lightThemeEnabled
-            ? BlueyTheme.cyan.withAlphaComponent(0.30)
+            ? BlueyLightTheme.accentBorder.withAlphaComponent(0.70)
             : BlueyTheme.cyan.withAlphaComponent(materialAlpha(0.26, floor: 0.06))).cgColor
         layer?.shadowOpacity = lightThemeEnabled ? Float(lightMaterialAlpha(0.20, floor: 0.06)) : Float(materialAlpha(0.30, floor: 0.10))
         headerBar.layer?.backgroundColor = themedHeaderColor.cgColor
         headerBar.layer?.borderColor = (lightThemeEnabled
-            ? BlueyTheme.cyan.withAlphaComponent(0.24)
+            ? BlueyLightTheme.accentBorder.withAlphaComponent(0.62)
             : BlueyTheme.cyan.withAlphaComponent(0.18)).cgColor
         headerBar.layer?.shadowOpacity = lightThemeEnabled ? 0.12 : 0.18
         headerChrome.layer?.backgroundColor = themedHeaderChromeColor.cgColor
@@ -5038,7 +5055,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             alpha: lightThemeEnabled ? lightMaterialAlpha(0.88, floor: 0.18) : materialAlpha(0.96)
         ).cgColor
         toastView.layer?.borderColor = (lightThemeEnabled
-            ? BlueyTheme.cyan.withAlphaComponent(0.26)
+            ? BlueyLightTheme.accentBorder.withAlphaComponent(0.60)
             : BlueyTheme.cyan.withAlphaComponent(0.28)).cgColor
         toastTitleLabel.textColor = themedTextColor
         toastBodyLabel.textColor = themedDimTextColor
@@ -5065,7 +5082,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             .cgColor
         composerBar.layer?.backgroundColor = themedComposerColor.cgColor
         composerBar.layer?.borderColor = (lightThemeEnabled
-            ? BlueyTheme.cyan.withAlphaComponent(0.22)
+            ? BlueyLightTheme.accentBorder.withAlphaComponent(0.68)
             : BlueyTheme.cyan.withAlphaComponent(0.22)).cgColor
         composerBar.layer?.shadowOpacity = lightThemeEnabled ? 0.10 : 0.18
         composerSurface.layer?.backgroundColor = themedSurfaceColor.cgColor
@@ -6593,12 +6610,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         button.wantsLayer = true
         button.layer?.cornerRadius = 11
         let titleColor = lightThemeEnabled ? BlueyLightTheme.text : BlueyTheme.text
+        let accentColor = themedAccentColor
         if lightThemeEnabled {
             button.layer?.backgroundColor = (accent
-                ? BlueyTheme.cyan.withAlphaComponent(lightMaterialAlpha(0.24, floor: 0.10))
+                ? themedAccentFillColor.withAlphaComponent(lightMaterialAlpha(0.92, floor: 0.28))
                 : BlueyLightTheme.surface.withAlphaComponent(lightMaterialAlpha(0.82, floor: 0.16))).cgColor
             button.layer?.borderColor = (accent
-                ? BlueyTheme.cyan.withAlphaComponent(0.44)
+                ? themedAccentBorderColor.withAlphaComponent(0.78)
                 : BlueyLightTheme.border).cgColor
         } else {
             button.layer?.backgroundColor = accent
@@ -6614,7 +6632,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 .font: button.font ?? NSFont.systemFont(ofSize: 10.6, weight: .bold),
                 .foregroundColor: titleColor,
             ])
-        button.contentTintColor = accent ? BlueyTheme.cyan : (lightThemeEnabled ? BlueyLightTheme.textDim : BlueyTheme.cyan)
+        button.contentTintColor = accent ? accentColor : (lightThemeEnabled ? BlueyLightTheme.textDim : BlueyTheme.cyan)
         button.image = nil
         if let image = symbolImage(symbol) {
             image.isTemplate = true
@@ -6690,7 +6708,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             ? BlueyLightTheme.surface.withAlphaComponent(lightMaterialAlpha(0.82, floor: 0.16))
             : NSColor.white.withAlphaComponent(0.045)).cgColor
         button.layer?.borderWidth = 0.7
-        button.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(lightThemeEnabled ? 0.26 : 0.18).cgColor
+        button.layer?.borderColor = themedAccentBorderColor.withAlphaComponent(lightThemeEnabled ? 0.48 : 0.18).cgColor
         button.font = NSFont.systemFont(ofSize: 10.5, weight: .bold)
         button.attributedTitle = NSAttributedString(
             string: "History",
@@ -6698,7 +6716,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 .font: button.font ?? NSFont.systemFont(ofSize: 10.5, weight: .bold),
                 .foregroundColor: lightThemeEnabled ? BlueyLightTheme.text : BlueyTheme.text,
             ])
-        button.contentTintColor = BlueyTheme.cyan
+        button.contentTintColor = themedAccentColor
         button.image = nil
         if let image = symbolImage("sidebar.left") {
             image.isTemplate = true
@@ -6719,7 +6737,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         button.layer?.borderWidth = 0
         button.layer?.borderColor = NSColor.clear.cgColor
         button.font = NSFont.systemFont(ofSize: 12, weight: .bold)
-        button.contentTintColor = accent ? (lightThemeEnabled ? BlueyLightTheme.text : BlueyTheme.text) : BlueyTheme.cyan
+        button.contentTintColor = accent ? (lightThemeEnabled ? BlueyLightTheme.text : BlueyTheme.text) : themedAccentColor
         if let image = symbolImage(symbol) {
             image.isTemplate = true
             button.title = ""
@@ -7257,7 +7275,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let raw = composer.string.trimmingCharacters(in: .whitespacesAndNewlines)
         let question = composedQuestionForAnswer(typed: raw)
         routeBadge.stringValue = "Screen · ready"
-        routeBadge.textColor = BlueyTheme.cyan
+        routeBadge.textColor = themedAccentColor
         routeBadge.toolTip = "Screen capture is ready for the next answer"
         setHeaderSubtitle("Capturing screen")
         screenContextReadyForAnswer = true
@@ -7389,9 +7407,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         guard dropHighlightActive != active else { return }
         dropHighlightActive = active
         feed.layer?.borderColor = active
-            ? BlueyTheme.cyan.withAlphaComponent(0.72).cgColor
-            : BlueyTheme.cyan.withAlphaComponent(0.16).cgColor
-        feed.layer?.shadowColor = BlueyTheme.cyan.cgColor
+            ? themedAccentBorderColor.withAlphaComponent(lightThemeEnabled ? 0.86 : 0.72).cgColor
+            : themedAccentBorderColor.withAlphaComponent(lightThemeEnabled ? 0.34 : 0.16).cgColor
+        feed.layer?.shadowColor = themedAccentBorderColor.cgColor
         feed.layer?.shadowOpacity = active ? 0.22 : 0
         feed.layer?.shadowRadius = active ? 18 : 0
         feed.layer?.shadowOffset = .zero
@@ -7819,7 +7837,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             routeBadge.toolTip = "Bluey is using the screen/image lane"
         } else {
             routeBadge.stringValue = "Auto · Balanced"
-            routeBadge.textColor = BlueyTheme.cyan
+            routeBadge.textColor = themedAccentColor
             routeBadge.toolTip = "Bluey is answering with the balanced auto lane"
         }
     }
@@ -8944,7 +8962,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         canvasPane.isHidden = !open
         updateCanvasWidth()
         canvasToggleButton.isHidden = canvases.isEmpty
-        canvasToggleButton.contentTintColor = open ? BlueyTheme.cyan : themedDimTextColor
+        canvasToggleButton.contentTintColor = open ? themedAccentColor : themedDimTextColor
         canvasToggleButton.toolTip = open ? "Collapse canvas" : "Open canvas"
         if open {
             ensureRoomForCanvas()
@@ -8992,7 +9010,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let symbol = passThroughMode ? "cursorarrow.rays" : "hand.tap"
         let fallback = passThroughMode ? "P" : "I"
         styleHeaderIconButton(interactionModeButton, symbol: symbol, fallback: fallback)
-        interactionModeButton.contentTintColor = passThroughMode ? BlueyTheme.cyan : themedTextColor
+        interactionModeButton.contentTintColor = passThroughMode ? themedAccentColor : themedTextColor
         interactionModeButton.toolTip = passThroughMode
             ? "Click-through on: blank Bluey space clicks the app behind it. Drag the Bluey logo to move."
             : "Interactive on: controls click normally, and blank Bluey space moves/resizes the panel."
