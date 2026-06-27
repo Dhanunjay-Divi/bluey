@@ -26,6 +26,26 @@ fn final_supersedes_matching_partial() {
 }
 
 #[test]
+fn final_supersedes_compact_spacing_partial() {
+    let mut meeting = MeetingRecord::new(Some("test".into()));
+    meeting.transcript.push(TranscriptSegment::new(
+        Speaker::User,
+        "Build me LRU cache",
+        false,
+    ));
+
+    let removed = dedup_partial_on_final(&mut meeting, Speaker::User, "BuildMeLRUCache.");
+    assert!(
+        removed,
+        "partial should be removed when final has the same text with compact STT spacing"
+    );
+    assert!(
+        meeting.transcript.is_empty(),
+        "compact-spacing final should have removed the partial"
+    );
+}
+
+#[test]
 fn final_does_not_remove_unrelated_partial() {
     let mut meeting = MeetingRecord::new(Some("test".into()));
     meeting

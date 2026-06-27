@@ -1191,6 +1191,13 @@ static void consume_sent_context_chips(void) {
     g_context_chip_count = 0;
 }
 
+static void clear_local_transcript_context(void) {
+    g_transcript_partial[0] = L'\0';
+    g_transcript_final[0] = L'\0';
+    g_transcript_source[0] = L'\0';
+    update_transcript_clear_button();
+}
+
 static void send_current_question(void) {
     static const wchar_t *fallback = L"Answer the latest clear question from the current transcript, screen context, and attached files. If there is no clear question yet, summarize what Bluey needs next.";
     int length = GetWindowTextLengthW(g_ask_edit);
@@ -1204,6 +1211,7 @@ static void send_current_question(void) {
         free(question);
     }
     SetWindowTextW(g_ask_edit, L"");
+    clear_local_transcript_context();
     consume_sent_context_chips();
     InvalidateRect(g_hwnd, NULL, TRUE);
     SetFocus(g_ask_edit);
@@ -1973,10 +1981,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             return 0;
         }
         if (id == ID_TRANSCRIPT_CLEAR_BUTTON) {
-            g_transcript_partial[0] = L'\0';
-            g_transcript_final[0] = L'\0';
-            g_transcript_source[0] = L'\0';
-            update_transcript_clear_button();
+            clear_local_transcript_context();
             InvalidateRect(hwnd, NULL, TRUE);
             emit_simple_event("transcript_clear_requested");
             return 0;

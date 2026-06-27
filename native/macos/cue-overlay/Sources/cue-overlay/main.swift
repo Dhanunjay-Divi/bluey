@@ -9008,7 +9008,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func appendTranscriptSnippet(_ card: RenderedCard) {
         let title = card.title.trimmingCharacters(in: .whitespacesAndNewlines)
-        let body = displayTranscriptText(card.body)
+        let body = trimConsumedTranscriptPrefix(from: displayTranscriptText(card.body))
         guard !body.isEmpty else { return }
 
         let label = transcriptSourceLabel(title)
@@ -9024,7 +9024,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func appendLiveTranscript(source: String, text: String, final: Bool) {
-        let body = displayTranscriptText(text)
+        let body = trimConsumedTranscriptPrefix(from: displayTranscriptText(text))
         let label = transcriptSourceLabel(source)
         let state = recordingActive ? "TRANSCRIBING" : (final ? "CAPTURED" : "HEARD")
         guard !body.isEmpty else {
@@ -9227,6 +9227,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         autoSendListenCaptureActive = false
         autoSendTranscriptLinesBySource.removeAll()
         liveTranscriptPreviewBodies.removeAll()
+        lastTranscriptStripSource = nil
+        updateTranscriptStripText(
+            recordingActive ? "Listening for follow-up..." : "Live captions preview",
+            scrollToEnd: false)
         updateTranscriptClearButtonVisibility()
     }
 
@@ -9381,10 +9385,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func transcriptLineWasJustConsumed(_ line: String) -> Bool {
         let fingerprint = transcriptMemoryFingerprint(line)
         guard !fingerprint.isEmpty else { return false }
+        let compactFingerprint = compactTranscriptMemoryLine(fingerprint)
         let words = fingerprint.split(separator: " ").count
         for consumed in consumedTranscriptFingerprints {
             guard !consumed.isEmpty else { continue }
             if consumed == fingerprint { return true }
+            let compactConsumed = compactTranscriptMemoryLine(consumed)
+            if !compactConsumed.isEmpty, compactConsumed == compactFingerprint {
+                return true
+            }
             let consumedWords = consumed.split(separator: " ").count
             let shorter = min(words, consumedWords)
             let longer = max(words, consumedWords)
@@ -9397,11 +9406,75 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         return false
     }
 
+    private func trimConsumedTranscriptPrefix(from body: String) -> String {
+        let clean = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return clean }
+        let compactBody = compactTranscriptMemoryLine(clean)
+        guard compactBody.count >= 8 else { return clean }
+        let consumedPrefixes = consumedTranscriptFingerprints
+            .map { compactTranscriptMemoryLine($0) }
+            .filter { $0.count >= 8 }
+            .sorted { $0.count > $1.count }
+
+        for consumed in consumedPrefixes {
+            guard compactBody.hasPrefix(consumed) else { continue }
+            if compactBody == consumed { return "" }
+            guard let suffix = suffixAfterAlnumPrefix(consumed, in: clean), !suffix.isEmpty else {
+                return ""
+            }
+            return suffix
+        }
+        return clean
+    }
+
+    private func suffixAfterAlnumPrefix(_ prefix: String, in text: String) -> String? {
+        let prefixChars = Array(prefix)
+        guard !prefixChars.isEmpty else { return text }
+
+        var matched = 0
+        var scalarIndex = text.unicodeScalars.startIndex
+        while scalarIndex < text.unicodeScalars.endIndex {
+            let scalar = text.unicodeScalars[scalarIndex]
+            if let normalized = normalizedAsciiAlnum(scalar) {
+                guard matched < prefixChars.count, normalized == prefixChars[matched] else {
+                    return nil
+                }
+                matched += 1
+                if matched == prefixChars.count {
+                    let nextScalarIndex = text.unicodeScalars.index(after: scalarIndex)
+                    let stringIndex = String.Index(nextScalarIndex, within: text) ?? text.endIndex
+                    let trimSet = CharacterSet.whitespacesAndNewlines.union(.punctuationCharacters)
+                    return String(text[stringIndex...]).trimmingCharacters(in: trimSet)
+                }
+            }
+            scalarIndex = text.unicodeScalars.index(after: scalarIndex)
+        }
+        return nil
+    }
+
+    private func normalizedAsciiAlnum(_ scalar: UnicodeScalar) -> Character? {
+        switch scalar.value {
+        case 48...57:
+            return Character(UnicodeScalar(scalar.value)!)
+        case 65...90:
+            return Character(UnicodeScalar(scalar.value + 32)!)
+        case 97...122:
+            return Character(UnicodeScalar(scalar.value)!)
+        default:
+            return nil
+        }
+    }
+
     private func normalizeTranscriptMemoryLine(_ value: String) -> String {
         value
             .lowercased()
             .replacingOccurrences(of: #"[^a-z0-9]+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func compactTranscriptMemoryLine(_ value: String) -> String {
+        normalizeTranscriptMemoryLine(value)
+            .replacingOccurrences(of: " ", with: "")
     }
 
     private func transcriptSourceLabel(_ raw: String) -> String {

@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-26 20:59 EDT
+Latest checkpoint: 2026-06-26 21:28 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,31 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-209-CLICKTHROUGH-CONTROL-HITBOX-RESTORE.md`; the next canonical Bluey round doc should start at `ROUND-210-...`.
+- Latest assigned Bluey round doc is `ROUND-210-LISTEN-TRANSCRIPT-CONSUME-ON-SEND.md`; the next canonical Bluey round doc should start at `ROUND-211-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 210 fixed Listen transcript reuse after send:
+  - macOS trims already-consumed transcript prefixes from late cumulative STT partial/final events before they enter the next answer buffer
+  - macOS consumed-transcript matching now also compares compact alphanumeric fingerprints, so `Build me LRU cache` and `BuildMeLRUCache` are treated as the same phrase
+  - macOS resets the caption strip after a successful send instead of visually holding old transcript text
+  - daemon duplicate and partial-to-final transcript dedup now handle compact-spacing variants
+  - Windows clears only its local caption preview/send buffer after send, without clearing daemon meeting transcript context
+  - visible QA status now follows the capture-visible debug gate, and the final local visible run reported `overlay_capture_excluded: false`
+  - rebuilt and relaunched local visible/debug Bluey
+  - Round doc: `docs/rounds/ROUND-210-LISTEN-TRANSCRIPT-CONSUME-ON-SEND.md`
+  - Verification passed:
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `cargo test -p cue-daemon duplicate_transcript_detection_skips_same_speaker_and_cross_source_echoes --lib`
+    - `cargo test -p cue-daemon --test live_transcript_dedup`
+    - `BLUEY_OVERLAY_SWIFT_CONFIGURATION=debug native/macos/cue-overlay/build.sh`
+    - `cargo build -p cue-cli`
+    - `cargo build -p cue-daemon --bin bluey-daemon`
+    - `BLUEY_BIN="$PWD/target/debug/bluey" scripts/bluey-visible-local.sh`
+    - `target/debug/bluey status`
 - Round 209 restored control clickability while macOS click-through mode is enabled:
   - added manual control hit-zone detection to the pass-through hit-test path
   - included manually routed buttons, opacity scrubber, and transcript clear hit zones in the interactive region
@@ -1668,7 +1687,7 @@ swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift
 native/macos/cue-overlay/build.sh
 ```
 
-## Latest Round After Handoff: 202
+## Historical Carried Section: Round 202
 
 Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 

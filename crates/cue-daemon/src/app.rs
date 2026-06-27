@@ -498,10 +498,16 @@ fn is_near_duplicate_transcript(
     if normalized.len() < 4 {
         return false;
     }
+    let compact_normalized = compact_normalized_transcript_text(text);
 
     let now_ms = clock::now_epoch_ms_string().parse::<u64>().unwrap_or(0);
     meeting.transcript.iter().rev().take(8).any(|segment| {
-        if !segment.is_final || normalize_transcript_text(&segment.text) != normalized {
+        if !segment.is_final {
+            return false;
+        }
+        let segment_normalized = normalize_transcript_text(&segment.text);
+        let segment_compact_normalized = compact_normalized_transcript_text(&segment.text);
+        if segment_normalized != normalized && segment_compact_normalized != compact_normalized {
             return false;
         }
         let age_ms = transcript_age_ms(&segment.created_at, now_ms);
@@ -518,6 +524,13 @@ pub fn normalize_transcript_text(text: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_lowercase()
+}
+
+fn compact_normalized_transcript_text(text: &str) -> String {
+    normalize_transcript_text(text)
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect()
 }
 
 fn is_mic_system_echo_pair(existing: Speaker, incoming: Speaker) -> bool {
@@ -545,6 +558,7 @@ pub fn dedup_partial_on_final(
     final_text: &str,
 ) -> bool {
     let norm_final = normalize_transcript_text(final_text);
+    let compact_final = compact_normalized_transcript_text(final_text);
     // Search backwards for the most recent non-final segment from same speaker
     if let Some(idx) = meeting
         .transcript
@@ -552,8 +566,15 @@ pub fn dedup_partial_on_final(
         .rposition(|seg| !seg.is_final && seg.speaker == speaker)
     {
         let norm_partial = normalize_transcript_text(&meeting.transcript[idx].text);
+        let compact_partial = compact_normalized_transcript_text(&meeting.transcript[idx].text);
         // Final supersedes partial if final starts with partial text
-        if norm_final.starts_with(&norm_partial) || norm_partial.starts_with(&norm_final) {
+        if norm_final.starts_with(&norm_partial)
+            || norm_partial.starts_with(&norm_final)
+            || (!compact_final.is_empty()
+                && !compact_partial.is_empty()
+                && (compact_final.starts_with(&compact_partial)
+                    || compact_partial.starts_with(&compact_final)))
+        {
             meeting.transcript.remove(idx);
             return true;
         }
@@ -885,7 +906,8 @@ pub async fn run() -> Result<()> {
             Ok(overlay) => {
                 info!("native overlay started");
                 *daemon.overlay.lock().await = Some(overlay);
-                daemon.state.lock().await.overlay_capture_excluded = Some(true);
+                daemon.state.lock().await.overlay_capture_excluded =
+                    Some(default_overlay_capture_excluded_state());
             }
             Err(error) => {
                 warn!("native overlay not available yet: {error:#}");
@@ -1756,10 +1778,21 @@ async fn ensure_overlay_ready(
         .context("failed to start native overlay")?;
         *overlay = Some(process);
         let mut state = daemon.state.lock().await;
-        state.overlay_capture_excluded = Some(true);
+        state.overlay_capture_excluded = Some(default_overlay_capture_excluded_state());
     }
 
     Ok(())
+}
+
+fn default_overlay_capture_excluded_state() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        !macos_overlay_capture_visible_for_debug()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
+    }
 }
 
 fn dispose_overlay_process(process: Option<OverlayProcess>) {
@@ -12785,6 +12818,12 @@ mod tests {
             &meeting,
             Speaker::User,
             "we should cache the answer.",
+            true,
+        ));
+        assert!(is_near_duplicate_transcript(
+            &meeting,
+            Speaker::System,
+            "WeShouldCacheTheAnswer.",
             true,
         ));
         assert!(!is_near_duplicate_transcript(
