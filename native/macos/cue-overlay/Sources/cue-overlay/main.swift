@@ -4005,11 +4005,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private enum ChromeMetrics {
-        static let headerGuardHeight: CGFloat = 86
+        static let headerGuardHeight: CGFloat = 64
         static let headerBarHeight: CGFloat = 42
         static let headerHorizontalInset: CGFloat = 10
         static let headerTopInset: CGFloat = 14
-        static let workspaceTopInset: CGFloat = 92
         static let composerInputHeight: CGFloat = 26
         static let composerBaseHeight: CGFloat = 64
         static let composerExtraChromeHeight: CGFloat = 38
