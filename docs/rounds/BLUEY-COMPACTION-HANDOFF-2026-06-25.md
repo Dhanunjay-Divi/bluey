@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-27 13:13 EDT
+Latest checkpoint: 2026-06-27 13:27 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,34 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-220-WEB-SEARCH-GUARDS-OVERLAY-POLISH.md`; the next canonical Bluey round doc should start at `ROUND-221-...`.
+- Latest assigned Bluey round doc is `ROUND-221-CODE-REQUEST-VISIBLE-SNIPPET.md`; the next canonical Bluey round doc should start at `ROUND-222-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 221 fixed explicit code requests that produced prose-only or vague chat answers:
+  - owner showed a live QA case where "I want the code, in Python" produced prose in chat while only a small code snippet appeared in canvas
+  - daemon output-format prompt now says explicit requests for code, a program, an implementation, "I want the code", or "write code in language" must include a complete fenced code block with a language tag
+  - small standalone coding tasks must include the full runnable snippet directly in chat, not only prose or a canvas artifact
+  - Code mode and General mode now repeat the explicit-code rule
+  - added a runtime fallback for managed code artifacts: if a code artifact exists but visible chat has no fenced code, extract the first real code section from the artifact, infer a simple language tag, and append a compact fenced preview to the visible answer
+  - this is shared daemon/backend behavior for Mac and Windows; no native UI fork was needed
+  - local Bluey is currently running in visible QA mode after verification; final status reports daemon pid `40009`, `overlay_capture_excluded: false`, and `screen_capture_active: false`
+  - Round doc: `docs/rounds/ROUND-221-CODE-REQUEST-VISIBLE-SNIPPET.md`
+  - Verification passed:
+    - `cargo fmt --manifest-path crates/cue-daemon/Cargo.toml`
+    - `cargo test -p cue-daemon code_artifact_adds_preview_when_chat_body_is_vague --lib`
+    - `cargo test -p cue-daemon provider_messages_include_overlay_friendly_answer_shape --lib`
+    - `cargo test -p cue-daemon mode_instructions_specialize_default_answer_shapes --lib`
+    - `cargo test -p cue-daemon general_mode_keeps_code_shape_for_coding_questions --lib`
+    - `cargo test -p cue-daemon answer_overlay_artifact --lib`
+    - `cargo build -p cue-daemon --bin bluey-daemon`
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `git diff --check`
+    - `BLUEY_BIN=/Users/uno/Downloads/cue/target/debug/bluey scripts/bluey-visible-local.sh`
+    - `/Users/uno/Downloads/cue/target/debug/bluey status`
 - Round 220 fixed web-search unavailable behavior, added stronger search safety rails, and polished overlay actions/loading/cursors:
   - root cause for "secret passage ranch" not using web search was that the managed server has a web-search lane but still requires real provider configuration; when not configured, search skipped and the final prompt did not explicitly tell the model web search was unavailable
   - AnswerPlan prompt now tells the model when web search was attempted but returned no usable sources, so it must not imply search succeeded and should say web search was unavailable when public/current info is required

@@ -5557,8 +5557,96 @@ fn visible_answer_body_for_artifact(
     };
 
     match artifact.artifact_type {
+        CardArtifactType::Code => code_chat_body_for_artifact(&clean, artifact),
         CardArtifactType::SystemDesign => compact_system_design_chat_body(&clean),
         _ => clean,
+    }
+}
+
+fn code_chat_body_for_artifact(body: &str, artifact: &CueCardArtifact) -> String {
+    if !extract_fenced_code_blocks(body).is_empty() {
+        return body.to_string();
+    }
+
+    let Some(code) = first_code_section_from_artifact(&artifact.body) else {
+        return body.to_string();
+    };
+    let mut visible = strip_canvas_pointer_lines(body).trim().to_string();
+    if visible.is_empty() || code_answer_is_pointer_only(&visible) {
+        visible = "Here is the code:".to_string();
+    }
+    let language = infer_code_language(&code);
+    format!("{visible}\n\n```{language}\n{code}\n```")
+}
+
+fn code_answer_is_pointer_only(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.chars().count() < 220
+        && lower.contains("code")
+        && !lower.contains("def ")
+        && !lower.contains("class ")
+        && !lower.contains("print(")
+        && !lower.contains("return ")
+        && !lower.contains("for ")
+        && !lower.contains("while ")
+}
+
+fn first_code_section_from_artifact(body: &str) -> Option<String> {
+    let mut in_code = false;
+    let mut lines = Vec::new();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        let upper = trimmed.to_ascii_uppercase();
+        if matches!(
+            upper.as_str(),
+            "CODE" | "PATCH" | "DIFF" | "CHANGED BLOCK" | "CHANGED LINES"
+        ) {
+            in_code = true;
+            continue;
+        }
+        if in_code
+            && matches!(
+                upper.as_str(),
+                "COMPLEXITY" | "TIME" | "SPACE" | "NOTES" | "EXPLANATION"
+            )
+        {
+            break;
+        }
+        if in_code && trimmed.chars().all(|ch| ch == '-' || ch == '=') {
+            continue;
+        }
+        if in_code {
+            lines.push(line);
+        }
+    }
+    let code = lines.join("\n").trim().to_string();
+    if code_canvas_has_real_code(&code) {
+        Some(clamp_code_preview(&code, 40))
+    } else {
+        None
+    }
+}
+
+fn clamp_code_preview(code: &str, max_lines: usize) -> String {
+    let mut lines = code.lines().take(max_lines).collect::<Vec<_>>().join("\n");
+    if code.lines().count() > max_lines {
+        lines.push_str("\n# ...");
+    }
+    lines
+}
+
+fn infer_code_language(code: &str) -> &'static str {
+    let lower = code.to_ascii_lowercase();
+    if lower.contains("def ") || lower.contains("print(") || lower.contains("__init__") {
+        "python"
+    } else if lower.contains("select ") && lower.contains(" from ") {
+        "sql"
+    } else if lower.contains("function ") || lower.contains("const ") || lower.contains("let ") {
+        "javascript"
+    } else if lower.contains("public static void main") {
+        "java"
+    } else {
+        "text"
     }
 }
 
@@ -7040,7 +7128,7 @@ fn provider_prompt_parts(payload: &ProviderRequestPayload) -> Result<ProviderPro
     system.push_str("\n\n");
     system.push_str(HUMAN_SPEAK_CONTRACT);
     system.push_str(
-        "\n\nOutput format:\n- Stream a clear, readable answer with short line breaks.\n- Put the direct, speakable answer first as one natural paragraph whenever possible.\n- For quick \"what is\" / \"explain\" answers, do not default to bullets. A compact spoken answer is better than a polished reference note.\n- Do not turn normal chat answers into a markdown outline. Use headings only when the task truly needs structure or when an artifact/canvas will render the deeper detail.\n- Do not use Markdown emphasis in chat prose. Avoid bold, italics, and inline backticks unless a fenced code block is actually needed.\n- Do not use em dashes in streamed chat, final answers, or artifact text.\n- Use the canvas split: chat is the explanation/talk track; the workbench is code, patch, architecture, data flow, APIs, tables, or deeper detail.\n- Do not write \"Code is in the canvas\", \"Architecture is in the canvas\", or similar pointer-only lines. Make the chat answer useful by itself.\n- For first-time coding/build answers, keep the chat explanation short and put the complete code in fenced Markdown code blocks with a language tag so Bluey can place it in the canvas.\n- Treat repeated build/implement/write requests as requests to show or regenerate the implementation. Do not answer only with \"already above\" or \"already in the session\" unless the user explicitly asks whether it already exists.\n- For code follow-ups or requested changes, prefer in-place edits: name the file/function, show only the changed block, PATCH, or unified diff, and explain where it lands. Do not replace the whole implementation unless the user explicitly asks, the file is new/tiny, or a full replacement is materially safer than a patch.\n- For explanation-only coding questions or follow-ups, do not emit a new code fence by default. Use a teaching flow: Core idea, Data structures, Operation walkthrough, Invariant, Complexity, Edge cases.\n- Auto-detect the task type. For coding, debugging, algorithms, API, or configuration questions that ask for implementation or changes, use this shape after the talk track when useful: Approach, Patch, Explanation, Complexity, Edge cases. Put code in fenced Markdown code blocks with a language tag when possible.\n- For system design questions, keep chat to the recommendation, assumptions, and the key tradeoff. Put the full architecture workbench in sections: Architecture, Components, Data flow, APIs/contracts, Storage, Scaling, Tradeoffs, Failure modes, Observability, and Rollout / next steps when useful.\n- For system design follow-ups, answer the low-level explanation in chat unless the user asks to change the design. If they ask for a design change, update only the affected workbench section and call out what changed.\n- For design/debug/product questions, use compact bullets with concrete next steps.\n- Avoid long paragraphs; make the overlay easy to scan while it streams.",
+        "\n\nOutput format:\n- Stream a clear, readable answer with short line breaks.\n- Put the direct, speakable answer first as one natural paragraph whenever possible.\n- For quick \"what is\" / \"explain\" answers, do not default to bullets. A compact spoken answer is better than a polished reference note.\n- Do not turn normal chat answers into a markdown outline. Use headings only when the task truly needs structure or when an artifact/canvas will render the deeper detail.\n- Do not use Markdown emphasis in chat prose. Avoid bold, italics, and inline backticks unless a fenced code block is actually needed.\n- Do not use em dashes in streamed chat, final answers, or artifact text.\n- Use the canvas split: chat is the explanation/talk track; the workbench is code, patch, architecture, data flow, APIs, tables, or deeper detail.\n- Do not write \"Code is in the canvas\", \"Architecture is in the canvas\", or similar pointer-only lines. Make the chat answer useful by itself.\n- If the user explicitly asks for code, a program, implementation, or says \"I want the code\" / \"write code in <language>\", the answer must include a complete fenced code block with a language tag. For small standalone tasks, include the full runnable snippet directly in chat, not only prose or a canvas artifact.\n- For first-time coding/build answers, keep the chat explanation short and put the complete code in fenced Markdown code blocks with a language tag so Bluey can place it in the canvas.\n- Treat repeated build/implement/write requests as requests to show or regenerate the implementation. Do not answer only with \"already above\" or \"already in the session\" unless the user explicitly asks whether it already exists.\n- For code follow-ups or requested changes, prefer in-place edits: name the file/function, show only the changed block, PATCH, or unified diff, and explain where it lands. Do not replace the whole implementation unless the user explicitly asks, the file is new/tiny, or a full replacement is materially safer than a patch.\n- For explanation-only coding questions or follow-ups, do not emit a new code fence by default. Use a teaching flow: Core idea, Data structures, Operation walkthrough, Invariant, Complexity, Edge cases.\n- Auto-detect the task type. For coding, debugging, algorithms, API, or configuration questions that ask for implementation or changes, use this shape after the talk track when useful: Approach, Patch, Explanation, Complexity, Edge cases. Put code in fenced Markdown code blocks with a language tag when possible.\n- For system design questions, keep chat to the recommendation, assumptions, and the key tradeoff. Put the full architecture workbench in sections: Architecture, Components, Data flow, APIs/contracts, Storage, Scaling, Tradeoffs, Failure modes, Observability, and Rollout / next steps when useful.\n- For system design follow-ups, answer the low-level explanation in chat unless the user asks to change the design. If they ask for a design change, update only the affected workbench section and call out what changed.\n- For design/debug/product questions, use compact bullets with concrete next steps.\n- Avoid long paragraphs; make the overlay easy to scan while it streams.",
     );
     system.push_str(
         "\n- If a screenshot or attachment is insufficient, do not fill gaps from generic knowledge. State what is visible, what is missing, and ask for the next concrete evidence: failing output, current directory/tree, relevant file, expected result, or a fresh screenshot.",
@@ -7808,7 +7896,7 @@ fn answer_request_from_overlay(
 fn mode_instructions(mode: &str) -> String {
     match mode.trim().to_ascii_lowercase().as_str() {
         "code" => {
-            "Answer in Code mode. For implementation or change requests, use a scan-friendly layout with Approach, Patch, Explanation, Complexity, and Edge cases. If the user repeats a build/implement/write request, show or regenerate the implementation instead of saying it is already above. Preserve the existing implementation by default: show the smallest safe changed block, PATCH, or unified diff, and name exactly where it belongs. Only provide a full replacement when the user asks for it, the file is new/tiny, or the surrounding code is too small for a safe patch. For explanation-only questions, skip Patch and teach the logic step by step: core idea, data structures, operation walkthrough, invariant, complexity, and edge cases. Keep commentary practical and avoid unrelated theory.".to_string()
+            "Answer in Code mode. For implementation or change requests, use a scan-friendly layout with Approach, Patch, Explanation, Complexity, and Edge cases. If the user explicitly asks for code, a program, implementation, or says they want code in a language, include a complete fenced code block with a language tag; for small standalone tasks, include the full runnable snippet directly in chat. If the user repeats a build/implement/write request, show or regenerate the implementation instead of saying it is already above. Preserve the existing implementation by default: show the smallest safe changed block, PATCH, or unified diff, and name exactly where it belongs. Only provide a full replacement when the user asks for it, the file is new/tiny, or the surrounding code is too small for a safe patch. For explanation-only questions, skip Patch and teach the logic step by step: core idea, data structures, operation walkthrough, invariant, complexity, and edge cases. Keep commentary practical and avoid unrelated theory.".to_string()
         }
         "system design" | "system-design" | "design" => {
             "Answer in System Design mode. Keep chat to the short recommendation, assumptions, and key tradeoff. Put deeper workbench detail under `### Architecture`, `### Components`, `### Data flow`, `### APIs / contracts`, `### Storage`, `### Scaling`, `### Tradeoffs`, `### Failure modes`, `### Observability`, and `### Rollout / next steps` when useful. Prefer concrete services, storage choices, queues, cache boundaries, APIs, capacity assumptions, and failure modes. Use compact bullets and simple text diagrams when useful. For follow-ups, answer low-level explanation in chat unless the user asks to change the design; then update only the affected section unless a full redesign is requested.".to_string()
@@ -7820,7 +7908,7 @@ fn mode_instructions(mode: &str) -> String {
             "Answer in Writing mode. Produce polished copy first, then a short `### Notes` section explaining tone, edits, and optional variants. Keep the draft easy to reuse.".to_string()
         }
         _ => {
-            "Answer in General mode. Auto-detect the task type. Put the direct answer first, then concise context, reasoning, and next steps. If the question asks to explain code, an algorithm, or logic, teach it step by step in plain language and avoid a Patch section unless the user asks for code changes. If the question asks for implementation, debugging, APIs, config, or terminal commands, preserve existing code by default and use Approach, Patch, Explanation, Complexity, and Edge cases, with fenced code blocks where useful. If the user repeats a build/implement/write request, show or regenerate the implementation instead of saying it is already above. For follow-up code changes, prefer a small changed block, PATCH, or unified diff over full replacement. Keep it practical and easy to scan in a small overlay.".to_string()
+            "Answer in General mode. Auto-detect the task type. Put the direct answer first, then concise context, reasoning, and next steps. If the question asks to explain code, an algorithm, or logic, teach it step by step in plain language and avoid a Patch section unless the user asks for code changes. If the question asks for implementation, debugging, APIs, config, terminal commands, or explicitly asks for code in a language, preserve existing code by default and use Approach, Patch, Explanation, Complexity, and Edge cases. Explicit code requests must include a complete fenced code block with a language tag; for small standalone tasks, include the full runnable snippet directly in chat. If the user repeats a build/implement/write request, show or regenerate the implementation instead of saying it is already above. For follow-up code changes, prefer a small changed block, PATCH, or unified diff over full replacement. Keep it practical and easy to scan in a small overlay.".to_string()
         }
     }
 }
@@ -12423,6 +12511,8 @@ mod tests {
         assert!(system.contains("Approach, Patch, Explanation, Complexity, Edge cases"));
         assert!(system.contains("fenced Markdown code blocks"));
         assert!(system.contains("complete code in fenced Markdown code blocks"));
+        assert!(system.contains("I want the code"));
+        assert!(system.contains("full runnable snippet directly in chat"));
         assert!(system.contains("Do not use Markdown emphasis in chat prose"));
         assert!(system.contains("teach the logic instead of dumping implementation notes"));
         assert!(system.contains("Operation walkthrough"));
@@ -12583,6 +12673,8 @@ mod tests {
         assert!(code.contains("unified diff"));
         assert!(code.contains("explanation-only questions"));
         assert!(code.contains("full replacement"));
+        assert!(code.contains("complete fenced code block"));
+        assert!(code.contains("full runnable snippet directly in chat"));
         assert!(design.contains("### Architecture"));
         assert!(design.contains("### APIs / contracts"));
         assert!(design.contains("### Failure modes"));
@@ -12599,7 +12691,9 @@ mod tests {
         assert!(general.contains("preserve existing code by default"));
         assert!(general.contains("teach it step by step"));
         assert!(general.contains("avoid a Patch section"));
-        assert!(general.contains("fenced code blocks"));
+        assert!(general.contains("complete fenced code block"));
+        assert!(general.contains("Explicit code requests must include"));
+        assert!(general.contains("full runnable snippet directly in chat"));
         assert!(general.contains("small changed block"));
         assert!(general.contains("unified diff"));
     }
@@ -13041,6 +13135,25 @@ mod tests {
         assert!(body.contains("I’d keep the design simple"));
         assert!(!body.contains("### Architecture"));
         assert!(!body.contains("Worker retry"));
+    }
+
+    #[test]
+    fn code_artifact_adds_preview_when_chat_body_is_vague() {
+        let artifact = CueCardArtifact {
+            artifact_type: CardArtifactType::Code,
+            title: "Code canvas".to_string(),
+            body: "CODE\n----\na, b = 10, 20\nprint('Before:', a, b)\na, b = b, a\nprint('After:', a, b)"
+                .to_string(),
+            confidence: 0.95,
+        };
+        let body = visible_answer_body_for_artifact(
+            "Here is the Python code for swapping two numbers without a third variable:",
+            Some(&artifact),
+        );
+
+        assert!(body.contains("```python"));
+        assert!(body.contains("a, b = b, a"));
+        assert!(body.contains("print('After:', a, b)"));
     }
 
     #[test]
