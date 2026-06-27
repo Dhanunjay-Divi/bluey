@@ -324,6 +324,79 @@ static char *wide_to_utf8_alloc(const wchar_t *text) {
     return utf8;
 }
 
+static void normalize_answer_display_text(wchar_t *text, size_t capacity) {
+    if (!text || capacity == 0) return;
+
+    wchar_t out[2048];
+    size_t write = 0;
+    bool at_line_start = true;
+    bool in_fence = false;
+    size_t limit = capacity < 2048 ? capacity : 2048;
+
+    for (size_t read = 0; text[read] != L'\0' && write + 1 < limit; read++) {
+        wchar_t ch = text[read];
+
+        if (at_line_start && ch == L'`' && text[read + 1] == L'`' && text[read + 2] == L'`') {
+            in_fence = !in_fence;
+            while (text[read] != L'\0' && text[read] != L'\n') {
+                read++;
+            }
+            if (text[read] == L'\n' && write + 1 < limit) {
+                out[write++] = L'\n';
+            }
+            at_line_start = true;
+            continue;
+        }
+
+        if (in_fence) {
+            out[write++] = ch;
+            if (ch == L'\n') {
+                at_line_start = true;
+            } else if (ch != L'\r') {
+                at_line_start = false;
+            }
+            continue;
+        }
+
+        if (at_line_start) {
+            size_t cursor = read;
+            while (text[cursor] == L' ' || text[cursor] == L'\t') {
+                cursor++;
+            }
+            if (text[cursor] == L'#') {
+                while (text[cursor] == L'#') {
+                    cursor++;
+                }
+                if (text[cursor] == L' ') {
+                    cursor++;
+                }
+                read = cursor;
+                ch = text[read];
+                if (ch == L'\0') break;
+            }
+        }
+
+        if (ch == L'`') {
+            continue;
+        }
+        if ((ch == L'*' && text[read + 1] == L'*')
+            || (ch == L'_' && text[read + 1] == L'_')) {
+            read++;
+            continue;
+        }
+
+        out[write++] = ch;
+        if (ch == L'\n') {
+            at_line_start = true;
+        } else if (ch != L'\r') {
+            at_line_start = false;
+        }
+    }
+
+    out[write] = L'\0';
+    wcscpy_s(text, capacity, out);
+}
+
 static void emit_simple_event(const char *type) {
     printf("{\"type\":\"%s\"", type);
     emit_token_field();
@@ -1356,6 +1429,9 @@ static DWORD WINAPI stdin_thread(LPVOID unused) {
             safe_extract_json_to_wide(line, line_len, "title", g_title, 256);
             safe_extract_json_to_wide(line, line_len, "body", g_body, 2048);
             safe_extract_json_to_wide(line, line_len, "kind", g_kind, 64);
+            if (_wcsicmp(g_kind, L"answer") == 0) {
+                normalize_answer_display_text(g_body, 2048);
+            }
             safe_extract_json_to_wide(line, line_len, "source", g_source, 256);
             safe_extract_json_to_wide(line, line_len, "id", g_card_id, 80);
             set_sent_chips_from_json(line, line_len);
@@ -1369,6 +1445,9 @@ static DWORD WINAPI stdin_thread(LPVOID unused) {
             safe_extract_json_to_wide(line, line_len, "id", id, 80);
             if (wcslen(g_card_id) == 0 || wcscmp(id, g_card_id) == 0) {
                 safe_extract_json_to_wide(line, line_len, "body", g_body, 2048);
+                if (_wcsicmp(g_kind, L"answer") == 0) {
+                    normalize_answer_display_text(g_body, 2048);
+                }
                 update_paste_answer_button();
                 InvalidateRect(g_hwnd, NULL, TRUE);
             }

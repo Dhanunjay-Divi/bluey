@@ -59,7 +59,7 @@ private func sanitizeOverlayOutput(kind: String, body: String) -> String {
 }
 
 private func formatOverlayAnswerText(_ body: String) -> String {
-    body
+    stripPlainTextMarkdownDecoration(body)
         .replacingOccurrences(
             of: #"(?<=[\:\.\!\?\*\)])\s*(-\s+[A-Z])"#,
             with: "\n$1",
@@ -69,6 +69,33 @@ private func formatOverlayAnswerText(_ body: String) -> String {
             with: ".\n\n$1",
             options: .regularExpression)
         .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
+}
+
+private func stripPlainTextMarkdownDecoration(_ text: String) -> String {
+    var output: [String] = []
+    var inFence = false
+    for rawLine in text.components(separatedBy: .newlines) {
+        let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("```") {
+            inFence.toggle()
+            output.append(rawLine)
+            continue
+        }
+        guard !inFence else {
+            output.append(rawLine)
+            continue
+        }
+
+        let withoutHeading = rawLine.replacingOccurrences(
+            of: #"^\s{0,3}#{1,6}\s+"#,
+            with: "",
+            options: .regularExpression)
+        output.append(
+            withoutHeading
+                .replacingOccurrences(of: "**", with: "")
+                .replacingOccurrences(of: "__", with: ""))
+    }
+    return output.joined(separator: "\n")
 }
 
 private func sanitizeOverlayArtifact(_ artifact: OverlayArtifact?) -> OverlayArtifact? {
@@ -3481,7 +3508,7 @@ private final class FeedView: NSView {
                 suffix: "")
         }
 
-        return rawBody
+        return stripInlineCodeMarkers(rawBody)
     }
 
     private func stripVisibleAttachmentFallback(from text: String) -> String {
@@ -3493,11 +3520,15 @@ private final class FeedView: NSView {
     }
 
     private func canvasBackedChatBody(from text: String, fallback: String, suffix: String) -> String {
-        let body = cleanedCanvasChatBody(from: text)
+        let body = stripInlineCodeMarkers(cleanedCanvasChatBody(from: text))
         if body.isEmpty {
             return fallback
         }
         return body
+    }
+
+    private func stripInlineCodeMarkers(_ text: String) -> String {
+        text.replacingOccurrences(of: "`", with: "")
     }
 
     private func artifactFallbackLine(for artifactType: String) -> String {

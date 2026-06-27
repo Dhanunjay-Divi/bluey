@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-26 21:44 EDT
+Latest checkpoint: 2026-06-26 22:57 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,35 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-211-CODE-CANVAS-PARTIAL-STREAM-GUARD.md`; the next canonical Bluey round doc should start at `ROUND-212-...`.
+- Latest assigned Bluey round doc is `ROUND-212-CODE-EXPLANATION-CHAT-QUALITY.md`; the next canonical Bluey round doc should start at `ROUND-213-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 212 fixed code-explanation answer quality after the owner showed an LRU answer that looked like raw notes and an old partial code canvas:
+  - shared daemon prompt now separates implementation/patch requests from explanation-only coding questions
+  - explanation-only coding questions now ask the model to teach: core idea, data structures, operation walkthrough, invariant, complexity, and edge cases
+  - General mode avoids a Patch section for algorithm/code explanation requests unless the user asks for code changes
+  - Code mode keeps Patch for implementation/change requests, but teaches step-by-step for explanation-only questions
+  - chat prompt discourages Markdown emphasis in prose
+  - macOS answer rendering strips Markdown headings/bold/underline decoration from prose and strips inline backticks only after code-fence/canvas handling
+  - Windows answer rendering strips the same plain-text Markdown decoration for answer cards and preserves fenced-code identifiers such as `__init__`
+  - local visible/debug Bluey was rebuilt and relaunched from the fresh daemon and macOS overlay
+  - Round doc: `docs/rounds/ROUND-212-CODE-EXPLANATION-CHAT-QUALITY.md`
+  - Verification passed:
+    - `cargo fmt --manifest-path crates/cue-daemon/Cargo.toml`
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `cargo test -p cue-daemon mode_instructions --lib`
+    - `cargo test -p cue-daemon provider_messages --lib`
+    - `cargo test -p cue-daemon sanitize_answer_text --lib`
+    - `cargo test -p cue-daemon general_mode_keeps_code_shape_for_coding_questions --lib`
+    - `cargo build -p cue-cli`
+    - `cargo build -p cue-daemon --bin bluey-daemon`
+    - `BLUEY_OVERLAY_SWIFT_CONFIGURATION=debug native/macos/cue-overlay/build.sh`
+    - `BLUEY_BIN=/Users/uno/Downloads/cue/target/debug/bluey scripts/bluey-visible-local.sh`
+    - `target/debug/bluey status`
 - Round 211 fixed broken-looking coding canvases from partial streams:
   - fallback answer artifact inference now runs only on final overlay updates, not every `done: false` stream tick
   - unclosed fenced code blocks are no longer extracted as complete code canvases
