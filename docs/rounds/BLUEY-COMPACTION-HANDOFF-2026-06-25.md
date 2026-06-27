@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-27 02:05 EDT
+Latest checkpoint: 2026-06-27 02:24 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,25 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-217-UPLOAD-SECURITY-RELEASE-GUARD.md`; the next canonical Bluey round doc should start at `ROUND-218-...`.
+- Latest assigned Bluey round doc is `ROUND-218-VISIBLE-MODE-HISTORY-BOOT.md`; the next canonical Bluey round doc should start at `ROUND-219-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 218 fixed visible-mode startup and saved-session dashboard boot:
+  - root cause for `overlay_capture_excluded: true` after visible helper was that the prior release pass built the macOS overlay in release mode, which compiles out the debug visible-capture gate
+  - `scripts/bluey-visible-local.sh` now prefers local debug Bluey, rebuilds the macOS overlay in debug mode, pins the matching local daemon/overlay paths when possible, forces the raw helper path, sets both capture-visible request env names, and only prints success after `bluey status` reports `overlay_capture_excluded: false`
+  - web dashboard saved sessions now render a `Loading saved sessions...` placeholder and load asynchronously instead of blocking account/usage boot
+  - local Bluey is currently running in visible QA mode after verification; final status reports daemon pid `78144`, `overlay_capture_excluded: false`, and `screen_capture_active: false`
+  - Round doc: `docs/rounds/ROUND-218-VISIBLE-MODE-HISTORY-BOOT.md`
+  - Verification passed:
+    - `BLUEY_BIN=/Users/uno/Downloads/cue/target/debug/bluey scripts/bluey-visible-local.sh`
+    - `/Users/uno/Downloads/cue/target/debug/bluey status`
+    - `bash -n scripts/bluey-visible-local.sh`
+    - `node --check web/assets/bluey-site.js`
+    - `cargo test -p cue-daemon macos_overlay_capture_visible_requires_dev_and_local_gates --lib`
+    - `scripts/release-hygiene-scan.sh`
 - Round 217 hardened the upload/release path after visible-overlay QA:
   - confirmed live `latest.json` points to current `v0.1.16` macOS arm64 artifact
   - downloaded the live active artifact and verified its hash matched `latest.json`: `c88e6d7faa32c0242f249076d4bf39c43ba61a557460368702d9a0ef62f3a5b1`

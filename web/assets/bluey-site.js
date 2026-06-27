@@ -1087,6 +1087,16 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
     }
 
+    function renderCloudSessionsLoading() {
+      const list = document.getElementById('cloudSessionsList');
+      if (!list) return;
+      list.replaceChildren();
+      const loading = document.createElement('div');
+      loading.className = 'session-empty';
+      loading.textContent = 'Loading saved sessions...';
+      list.append(loading);
+    }
+
     function setCloudSessionDetail(text) {
       const detail = document.getElementById('cloudSessionDetail');
       if (!detail) return;
@@ -1238,19 +1248,23 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const refreshButton = document.getElementById('refreshAccountButton');
       if (refreshButton) refreshButton.disabled = true;
       accountMessage('Loading account...');
+      renderCloudSessionsLoading();
+      const linkedDevicesPromise = loadLinkedDevices().catch((error) => {
+        renderLinkedDevices({ devices: [] }, `Could not load host activity: ${error.message}`);
+        return null;
+      });
+      const sessionsPromise = loadCloudSessions().then((sessions) => {
+        setCloudSessionDetail('');
+        return sessions;
+      }).catch((error) => {
+        renderCloudSessions({ sessions: [] });
+        setCloudSessionDetail(`Could not load saved sessions: ${error.message}`);
+        return null;
+      });
       try {
-        const [me, usage, , sessions] = await Promise.all([
+        const [me, usage] = await Promise.all([
           apiJson('/account/me'),
           apiJson('/account/usage'),
-          loadLinkedDevices().catch((error) => {
-            renderLinkedDevices({ devices: [] }, `Could not load host activity: ${error.message}`);
-            return null;
-          }),
-          loadCloudSessions().catch((error) => {
-            renderCloudSessions({ sessions: [] });
-            setCloudSessionDetail(`Could not load saved sessions: ${error.message}`);
-            return null;
-          }),
         ]);
         currentAccountEmail = me.email || '';
         document.getElementById('accountEmailLabel').textContent = me.email || 'Bluey account';
@@ -1271,7 +1285,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
             renderAdminAbuse({}, `Could not load trial abuse events: ${error.message}`);
           });
         }
-        if (sessions) setCloudSessionDetail('');
+        void linkedDevicesPromise;
+        void sessionsPromise;
         accountMessage(new URLSearchParams(location.search).get('reload') === 'success'
           ? 'Credits added. If the balance still looks old, checkout is finishing; press Refresh balance in a moment.'
           : '');
