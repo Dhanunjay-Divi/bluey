@@ -413,10 +413,13 @@ impl OverlayAnswerStream {
                 body: self.body.clone(),
                 done,
                 cost_label,
-                artifact: self
-                    .artifact
-                    .clone()
-                    .or_else(|| answer_overlay_artifact(&self.body)),
+                artifact: self.artifact.clone().or_else(|| {
+                    if done {
+                        answer_overlay_artifact(&self.body)
+                    } else {
+                        None
+                    }
+                }),
             },
         )
         .await;
@@ -643,6 +646,8 @@ struct ChatCompletionStreamResponse {
 #[derive(Debug, serde::Deserialize)]
 struct ChatStreamChoice {
     delta: ChatStreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -5397,13 +5402,6 @@ fn extract_fenced_code_blocks(text: &str) -> Vec<String> {
             current.push(line);
         }
     }
-    if in_fence {
-        let block = current.join("\n").trim().to_string();
-        if !block.is_empty() {
-            blocks.push(block);
-        }
-    }
-
     blocks
 }
 
@@ -6485,6 +6483,7 @@ async fn read_streaming_chat_response(
     let mut answer = String::new();
     let mut token_usage = None;
     let mut blocked_internal_output = false;
+    let mut truncated_finish_reason = None;
 
     while let Some(chunk) = response
         .chunk()
@@ -6518,6 +6517,14 @@ async fn read_streaming_chat_response(
                     });
                 }
                 for choice in parsed.choices {
+                    if let Some(reason) = choice
+                        .finish_reason
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|reason| is_truncated_finish_reason(reason))
+                    {
+                        truncated_finish_reason = Some(reason.to_string());
+                    }
                     if let Some(delta) = choice.delta.content.filter(|delta| !delta.is_empty()) {
                         if blocked_internal_output {
                             continue;
@@ -6556,6 +6563,14 @@ async fn read_streaming_chat_response(
             let parsed: ChatCompletionStreamResponse =
                 serde_json::from_str(data).context("trailing provider stream event was invalid")?;
             for choice in parsed.choices {
+                if let Some(reason) = choice
+                    .finish_reason
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|reason| is_truncated_finish_reason(reason))
+                {
+                    truncated_finish_reason = Some(reason.to_string());
+                }
                 if let Some(delta) = choice.delta.content.filter(|delta| !delta.is_empty()) {
                     if blocked_internal_output {
                         continue;
@@ -6584,6 +6599,11 @@ async fn read_streaming_chat_response(
     if answer.is_empty() {
         return Err(anyhow!("provider stream returned no answer text"));
     }
+    if let Some(reason) = truncated_finish_reason {
+        return Err(anyhow!(
+            "provider stream ended before completion: finish_reason={reason}"
+        ));
+    }
 
     Ok(LiveProviderAnswer {
         provider: config.provider.clone(),
@@ -6601,6 +6621,13 @@ fn next_sse_frame(pending: &str) -> Option<(usize, usize)> {
         (None, Some(crlf)) => Some((crlf, 4)),
         (None, None) => None,
     }
+}
+
+fn is_truncated_finish_reason(reason: &str) -> bool {
+    matches!(
+        reason.to_ascii_lowercase().as_str(),
+        "length" | "max_tokens" | "max_output_tokens" | "model_length"
+    )
 }
 
 fn provider_api_key(config: &ProviderClientConfig) -> Option<String> {
@@ -12504,6 +12531,13 @@ mod tests {
     }
 
     #[test]
+    fn provider_length_finish_reason_is_incomplete_stream() {
+        assert!(is_truncated_finish_reason("length"));
+        assert!(is_truncated_finish_reason("max_tokens"));
+        assert!(!is_truncated_finish_reason("stop"));
+    }
+
+    #[test]
     fn user_facing_answer_error_explains_oversized_screen_context() {
         let error =
             anyhow!("bluey_managed/vision request failed: provider error: server error: 413");
@@ -12541,15 +12575,12 @@ mod tests {
     }
 
     #[test]
-    fn answer_overlay_artifact_detects_streaming_partial_code() {
+    fn answer_overlay_artifact_ignores_unclosed_streaming_code() {
         let artifact = answer_overlay_artifact(
             "Compare the string with its reverse.\n```python\ndef is_palindrome(s: str) -> bool:\n    return s == s[::-1]",
-        )
-        .expect("code artifact");
+        );
 
-        assert_eq!(artifact.artifact_type, CardArtifactType::Code);
-        assert!(artifact.body.contains("def is_palindrome"));
-        assert!(artifact.body.contains("CODE\n----"));
+        assert!(artifact.is_none());
     }
 
     #[test]

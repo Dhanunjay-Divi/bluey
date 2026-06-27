@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-26 21:28 EDT
+Latest checkpoint: 2026-06-26 21:44 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,29 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-210-LISTEN-TRANSCRIPT-CONSUME-ON-SEND.md`; the next canonical Bluey round doc should start at `ROUND-211-...`.
+- Latest assigned Bluey round doc is `ROUND-211-CODE-CANVAS-PARTIAL-STREAM-GUARD.md`; the next canonical Bluey round doc should start at `ROUND-212-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 211 fixed broken-looking coding canvases from partial streams:
+  - fallback answer artifact inference now runs only on final overlay updates, not every `done: false` stream tick
+  - unclosed fenced code blocks are no longer extracted as complete code canvases
+  - OpenAI-compatible streams now treat truncation finish reasons such as `length` and `max_tokens` as incomplete-stream errors
+  - explicit managed/provider final artifacts still pass through normally
+  - this is a shared daemon/backend fix, so Mac and Windows get the same behavior without native UI forks
+  - local visible/debug Bluey was rebuilt and relaunched
+  - Round doc: `docs/rounds/ROUND-211-CODE-CANVAS-PARTIAL-STREAM-GUARD.md`
+  - Verification passed:
+    - `cargo fmt --manifest-path crates/cue-daemon/Cargo.toml`
+    - `cargo test -p cue-daemon answer_overlay_artifact --lib`
+    - `cargo test -p cue-daemon provider_length_finish_reason_is_incomplete_stream --lib`
+    - `cargo test -p cue-daemon llm_overlay_artifact_keeps_sql_code_canvas --lib`
+    - `cargo build -p cue-cli`
+    - `cargo build -p cue-daemon --bin bluey-daemon`
+    - `BLUEY_BIN=/Users/uno/Downloads/cue/target/debug/bluey scripts/bluey-visible-local.sh`
+    - `target/debug/bluey status`
 - Round 210 fixed Listen transcript reuse after send:
   - macOS trims already-consumed transcript prefixes from late cumulative STT partial/final events before they enter the next answer buffer
   - macOS consumed-transcript matching now also compares compact alphanumeric fingerprints, so `Build me LRU cache` and `BuildMeLRUCache` are treated as the same phrase
