@@ -1215,6 +1215,10 @@ static LRESULT CALLBACK ask_edit_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
         send_current_question();
         return 0;
     }
+    if (msg == WM_SETCURSOR) {
+        SetCursor(LoadCursorW(NULL, IDC_ARROW));
+        return TRUE;
+    }
     if (msg == WM_GETDLGCODE) {
         LRESULT code = g_ask_edit_proc ? CallWindowProcW(g_ask_edit_proc, hwnd, msg, wparam, lparam) : 0;
         return code | DLGC_WANTCHARS | DLGC_WANTARROWS;
@@ -2279,6 +2283,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             case HTTOPRIGHT:
             case HTBOTTOMLEFT:
                 SetCursor(LoadCursorW(NULL, IDC_SIZENESW));
+                return TRUE;
+            case HTCLIENT:
+                SetCursor(LoadCursorW(NULL, IDC_ARROW));
                 return TRUE;
             default:
                 break;

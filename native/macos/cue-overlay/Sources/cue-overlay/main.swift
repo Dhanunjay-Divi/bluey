@@ -765,9 +765,18 @@ private final class ComposerTextView: NSTextView {
         addCursorRect(bounds, cursor: .arrow)
     }
 
-    override func mouseMoved(with event: NSEvent) {
+    override func cursorUpdate(with event: NSEvent) {
         NSCursor.arrow.set()
+    }
+
+    override func mouseMoved(with event: NSEvent) {
         super.mouseMoved(with: event)
+        NSCursor.arrow.set()
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        super.mouseDragged(with: event)
+        NSCursor.arrow.set()
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -1007,15 +1016,38 @@ private final class ArrowCursorTextView: NSTextView {
         addCursorRect(bounds, cursor: .arrow)
     }
 
-    override func mouseMoved(with event: NSEvent) {
+    override func cursorUpdate(with event: NSEvent) {
         NSCursor.arrow.set()
+    }
+
+    override func mouseMoved(with event: NSEvent) {
         super.mouseMoved(with: event)
+        NSCursor.arrow.set()
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        super.mouseDragged(with: event)
+        NSCursor.arrow.set()
     }
 }
 
 private final class ArrowCursorTextField: NSTextField {
     override func resetCursorRects() {
         addCursorRect(bounds, cursor: .arrow)
+    }
+
+    override func cursorUpdate(with event: NSEvent) {
+        NSCursor.arrow.set()
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        super.mouseMoved(with: event)
+        NSCursor.arrow.set()
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        super.mouseDragged(with: event)
+        NSCursor.arrow.set()
     }
 }
 
@@ -1503,8 +1535,10 @@ private final class OverlayWindow: NSWindow {
     override var canBecomeMain: Bool { true }
 
     override func sendEvent(_ event: NSEvent) {
+        let shouldApplyOverlayCursorAfterDispatch: Bool
         switch event.type {
         case .leftMouseDown:
+            shouldApplyOverlayCursorAfterDispatch = true
             if let scrubber = manualOpacityScrubber(atWindowPoint: event.locationInWindow) {
                 pendingManualScrubber = scrubber
                 scrubber.updateValue(fromWindowEvent: event)
@@ -1516,6 +1550,7 @@ private final class OverlayWindow: NSWindow {
                 return
             }
         case .leftMouseUp:
+            shouldApplyOverlayCursorAfterDispatch = true
             if let scrubber = pendingManualScrubber {
                 scrubber.updateValue(fromWindowEvent: event)
                 pendingManualScrubber = nil
@@ -1531,6 +1566,7 @@ private final class OverlayWindow: NSWindow {
                 return
             }
         case .leftMouseDragged:
+            shouldApplyOverlayCursorAfterDispatch = true
             if let scrubber = pendingManualScrubber {
                 scrubber.updateValue(fromWindowEvent: event)
                 return
@@ -1539,15 +1575,23 @@ private final class OverlayWindow: NSWindow {
                 button.highlight(false)
                 pendingManualButton = nil
             }
+        case .mouseMoved, .cursorUpdate:
+            shouldApplyOverlayCursorAfterDispatch = true
         case .keyDown:
+            shouldApplyOverlayCursorAfterDispatch = false
             if let panel = contentView as? ExpandedPanelView,
                panel.routeKeyDownToComposer(event) {
                 return
             }
         default:
+            shouldApplyOverlayCursorAfterDispatch = false
             break
         }
         super.sendEvent(event)
+        if shouldApplyOverlayCursorAfterDispatch,
+           let panel = contentView as? ExpandedPanelView {
+            panel.applyOverlayCursorPolicy(atWindowPoint: event.locationInWindow)
+        }
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
@@ -2938,7 +2982,7 @@ private final class FeedView: NSView {
         let bodyText = signInURL == nil
             ? chatBody(for: card, rawBody: rawBody)
             : signInBody(from: rawBody)
-        let bodyLabel = NSTextField(wrappingLabelWithString: bodyText)
+        let bodyLabel = ArrowCursorTextField(wrappingLabelWithString: bodyText)
         bodyLabel.font = bodyFont(for: card)
         bodyLabel.textColor = rightAligned ? NSColor.black : textColor
         bodyLabel.alignment = signInURL == nil ? .left : .center
@@ -5112,7 +5156,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         opacityLabel.textColor = themedDimTextColor
         opacityValueLabel.textColor = themedDimTextColor
         composer.textColor = themedTextColor
-        composer.insertionPointColor = themedTextColor
+        composer.insertionPointColor = themedAccentColor
         composer.placeholderColor = themedDimTextColor.withAlphaComponent(lightThemeEnabled ? 0.82 : 0.78)
         composer.typingAttributes = [
             .font: composer.font ?? NSFont.systemFont(ofSize: 13.5, weight: .semibold),
@@ -5306,13 +5350,31 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     override func mouseMoved(with event: NSEvent) {
-        updateResizeCursor(at: convert(event.locationInWindow, from: nil))
         super.mouseMoved(with: event)
+        applyOverlayCursorPolicy(atWindowPoint: event.locationInWindow)
     }
 
     override func mouseExited(with event: NSEvent) {
         clearResizeCursorIfNeeded()
         super.mouseExited(with: event)
+    }
+
+    func applyOverlayCursorPolicy(atWindowPoint windowPoint: NSPoint) {
+        let localPoint = convert(windowPoint, from: nil)
+        guard bounds.contains(localPoint) else {
+            clearResizeCursorIfNeeded()
+            return
+        }
+        guard shouldReceiveMouseEvents(atWindowPoint: windowPoint) else {
+            return
+        }
+        let edges = resizeEdges(at: localPoint)
+        if !edges.isEmpty {
+            setResizeCursor(for: edges)
+            return
+        }
+        clearResizeCursorIfNeeded()
+        NSCursor.arrow.set()
     }
 
     func routeKeyDownToComposer(_ event: NSEvent) -> Bool {
@@ -7552,9 +7614,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         answerStyleOverlay.alphaValue = 0
         updateBackgroundControlsEnabledForModalState()
         window?.makeFirstResponder(answerStyleBox)
+        applyAccentInsertionPoint(to: answerStyleBox)
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.12
             answerStyleOverlay.animator().alphaValue = 1
+        }
+    }
+
+    private func applyAccentInsertionPoint(to control: NSControl) {
+        if let editor = control.currentEditor() as? NSTextView {
+            editor.insertionPointColor = themedAccentColor
         }
     }
 
@@ -10307,6 +10376,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         DispatchQueue.main.async { [weak self, weak field] in
             guard self?.editingSessionId == session.id else { return }
             self?.window?.makeFirstResponder(field)
+            if let field {
+                self?.applyAccentInsertionPoint(to: field)
+            }
             field?.selectText(nil)
         }
         return row

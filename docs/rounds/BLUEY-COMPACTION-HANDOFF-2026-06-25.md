@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-27 18:41 EDT
+Latest checkpoint: 2026-06-27 18:57 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,29 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-224-PRIVACY-SAFE-LIVE-QA-DIAGNOSTICS.md`; the next canonical Bluey round doc should start at `ROUND-225-...`.
+- Latest assigned Bluey round doc is `ROUND-225-OVERLAY-ARROW-CURSOR-INPUT-CARET.md`; the next canonical Bluey round doc should start at `ROUND-226-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 225 fixed I-beam cursor leakage inside the overlay:
+  - macOS text-view and text-field subclasses now force arrow cursor on cursor updates, mouse move, and mouse drag after AppKit runs
+  - macOS answer body labels now use the arrow-cursor text field subclass while remaining selectable/copyable
+  - macOS overlay window now reapplies a top-level cursor policy after mouse/cursor dispatch: resize cursor on resize edges, arrow inside interactive Bluey surfaces, and no forced cursor when passthrough leaves the pointer to the app behind Bluey
+  - macOS composer caret now stays on the themed blue accent
+  - macOS Tone/rename field editors also receive the themed blue insertion point
+  - Windows edit control now returns an arrow cursor instead of an I-beam
+  - Windows main client-area cursor handling now explicitly returns arrow while preserving resize cursors
+  - Windows custom blue caret was not added; the current Win32 edit control uses the platform caret and a custom colored caret would require a larger owner-drawn input change
+  - Round doc: `docs/rounds/ROUND-225-OVERLAY-ARROW-CURSOR-INPUT-CARET.md`
+  - Verification passed:
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `BLUEY_OVERLAY_SWIFT_CONFIGURATION=debug native/macos/cue-overlay/build.sh`
+    - `git diff --check`
+    - `BLUEY_BIN=/Users/uno/Downloads/cue/target/debug/bluey scripts/bluey-visible-local.sh`
+    - `/Users/uno/Downloads/cue/target/debug/bluey status` reports daemon pid `8782`, overlay visible `true`, overlay capture excluded `false`, and screen capture active `false`
 - Round 224 added privacy-safe diagnostics for the current live QA issues:
   - daemon now logs `session_list_requested`, session refresh elapsed time, session counts, context/image totals, active count, and overlay send failures
   - history replay now logs rebuilt card count, question/answer card counts, restored artifact count, inferred artifact count, attachment-chip count, transcript fallback, and empty-session fallback
