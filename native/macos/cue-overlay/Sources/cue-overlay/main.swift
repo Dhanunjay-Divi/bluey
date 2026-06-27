@@ -3885,9 +3885,89 @@ private final class CanvasPaneView: NSView {
             image.isTemplate = true
             iconView.image = image
         }
-        textView.string = artifact.content
+        textView.textStorage?.setAttributedString(attributedCanvasText(artifact.content))
         updateTextWrapping()
         textView.scrollRangeToVisible(NSRange(location: 0, length: 0))
+    }
+
+    private func attributedCanvasText(_ text: String) -> NSAttributedString {
+        let baseFont = NSFont.monospacedSystemFont(ofSize: 12.2, weight: .regular)
+        let headerFont = NSFont.monospacedSystemFont(ofSize: 12.2, weight: .semibold)
+        let output = NSMutableAttributedString(
+            string: text,
+            attributes: [
+                .font: baseFont,
+                .foregroundColor: BlueyTheme.text,
+            ])
+        var location = 0
+        var inChangedSection = false
+
+        for rawLine in text.components(separatedBy: "\n") {
+            let lineLength = (rawLine as NSString).length
+            let range = NSRange(location: location, length: lineLength)
+            let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            let header = trimmed.uppercased()
+            let isDivider = !trimmed.isEmpty && trimmed.allSatisfy { $0 == "-" || $0 == "=" }
+
+            if let role = canvasHeaderRole(header) {
+                inChangedSection = role == "change"
+                output.addAttributes(
+                    [
+                        .font: headerFont,
+                        .foregroundColor: role == "change" ? BlueyTheme.green : BlueyTheme.cyan,
+                    ],
+                    range: range)
+            } else if inChangedSection, !isDivider, range.length > 0 {
+                output.addAttribute(
+                    .backgroundColor,
+                    value: BlueyTheme.green.withAlphaComponent(0.08),
+                    range: range)
+                if trimmed.hasPrefix("+") {
+                    output.addAttribute(.foregroundColor, value: BlueyTheme.green, range: range)
+                } else if trimmed.hasPrefix("-") {
+                    output.addAttribute(.foregroundColor, value: BlueyTheme.danger, range: range)
+                } else if trimmed.hasPrefix("@@") || trimmed.hasPrefix("diff --git") {
+                    output.addAttribute(.foregroundColor, value: BlueyTheme.cyan, range: range)
+                }
+            } else if isDivider, range.length > 0 {
+                output.addAttribute(
+                    .foregroundColor,
+                    value: BlueyTheme.textDim.withAlphaComponent(0.65),
+                    range: range)
+            }
+
+            location += lineLength + 1
+        }
+
+        return output
+    }
+
+    private func canvasHeaderRole(_ header: String) -> String? {
+        if header == "PATCH"
+            || header.hasPrefix("PATCH ")
+            || header == "DIFF"
+            || header.hasPrefix("DIFF ")
+            || header == "CHANGED BLOCK"
+            || header.hasPrefix("CHANGED BLOCK ")
+            || header == "CHANGED LINES"
+            || header.hasPrefix("CHANGED LINES ")
+            || header == "FOLLOW-UP"
+            || header.hasPrefix("FOLLOW-UP ")
+        {
+            return "change"
+        }
+        if [
+            "CODE",
+            "COMPLEXITY",
+            "TIME",
+            "SPACE",
+            "NOTES",
+            "EXPLANATION",
+            "APPROACH",
+        ].contains(header) {
+            return "section"
+        }
+        return nil
     }
 
     func setNavigation(index: Int, total: Int) {
@@ -8659,6 +8739,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         artifact: CanvasArtifact,
         number: Int
     ) -> String {
+        if artifact.kind == .code {
+            return mergeCodeCanvasUpdate(
+                existing: existing,
+                update: artifact.content,
+                question: question,
+                number: number)
+        }
+
         var parts = [
             existing.trimmingCharacters(in: .whitespacesAndNewlines),
             "",
@@ -8676,6 +8764,162 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             parts.append(body)
         }
         return parts.joined(separator: "\n")
+    }
+
+    private func mergeCodeCanvasUpdate(
+        existing: String,
+        update: String,
+        question: String?,
+        number: Int
+    ) -> String {
+        let base = existing.trimmingCharacters(in: .whitespacesAndNewlines)
+        let updateBody = update.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !updateBody.isEmpty else { return base }
+
+        let existingCode = extractCanvasCodeSection(from: base)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let updateCode = extractCanvasCodeSection(from: updateBody)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if shouldReplaceCodeSectionForFollowup(
+            question: question,
+            existingCode: existingCode,
+            updateCode: updateCode,
+            updateBody: updateBody)
+        {
+            return replacementCodeCanvas(
+                existingCanvas: base,
+                existingCode: existingCode,
+                updateCode: updateCode,
+                updateBody: updateBody,
+                number: number)
+        }
+
+        let patchBody = patchBodyForFollowup(updateBody: updateBody, updateCode: updateCode)
+        guard !patchBody.isEmpty else { return base }
+        return [
+            base,
+            "",
+            "PATCH \(number)",
+            "-------",
+            patchBody,
+        ].joined(separator: "\n")
+    }
+
+    private func shouldReplaceCodeSectionForFollowup(
+        question: String?,
+        existingCode: String,
+        updateCode: String,
+        updateBody: String
+    ) -> Bool {
+        guard !existingCode.isEmpty, !updateCode.isEmpty else { return false }
+        if updateBodyLooksLikePatch(updateBody) {
+            return false
+        }
+        if questionAsksForFullReplacement(question) {
+            return true
+        }
+        let existingLines = codeLineCount(existingCode)
+        let updateLines = codeLineCount(updateCode)
+        guard existingLines > 0, updateLines > 0 else { return false }
+        return updateLines >= max(3, existingLines / 2)
+    }
+
+    private func replacementCodeCanvas(
+        existingCanvas: String,
+        existingCode: String,
+        updateCode: String,
+        updateBody: String,
+        number: Int
+    ) -> String {
+        var sections = [
+            "CODE\n----\n" + updateCode,
+        ]
+        let updateComplexity = extractComplexitySummary(from: updateBody)
+        let complexity = updateComplexity.isEmpty
+            ? extractComplexitySummary(from: existingCanvas)
+            : updateComplexity
+        if !complexity.isEmpty {
+            sections.append("COMPLEXITY\n----------\n" + complexity)
+        }
+        let changed = changedLinesSummary(oldCode: existingCode, newCode: updateCode, limit: 48)
+        if !changed.isEmpty {
+            sections.append("CHANGED LINES \(number)\n---------------\n" + changed)
+        }
+        return sections.joined(separator: "\n\n")
+    }
+
+    private func patchBodyForFollowup(updateBody: String, updateCode: String) -> String {
+        if !updateCode.isEmpty {
+            return updateCode
+        }
+        return updateBody
+    }
+
+    private func updateBodyLooksLikePatch(_ body: String) -> Bool {
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        let upper = trimmed.uppercased()
+        return upper.hasPrefix("PATCH")
+            || upper.hasPrefix("DIFF")
+            || upper.hasPrefix("CHANGED BLOCK")
+            || upper.hasPrefix("CHANGED LINES")
+            || trimmed.hasPrefix("@@")
+            || trimmed.hasPrefix("diff --git")
+            || trimmed.contains("\n@@")
+            || trimmed.contains("\ndiff --git")
+    }
+
+    private func questionAsksForFullReplacement(_ question: String?) -> Bool {
+        let lower = question?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        guard !lower.isEmpty else { return false }
+        let signals = [
+            "full code",
+            "complete code",
+            "whole code",
+            "entire code",
+            "full replacement",
+            "replace everything",
+            "rewrite all",
+            "rewrite the whole",
+            "from scratch",
+        ]
+        return signals.contains { lower.contains($0) }
+    }
+
+    private func codeLineCount(_ code: String) -> Int {
+        code.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .count
+    }
+
+    private func changedLinesSummary(oldCode: String, newCode: String, limit: Int) -> String {
+        let oldLines = oldCode.components(separatedBy: .newlines)
+        let newLines = newCode.components(separatedBy: .newlines)
+        let maxCount = max(oldLines.count, newLines.count)
+        var output: [String] = []
+
+        for index in 0..<maxCount {
+            let oldLine = index < oldLines.count ? oldLines[index] : nil
+            let newLine = index < newLines.count ? newLines[index] : nil
+            if oldLine == newLine {
+                continue
+            }
+            if let oldLine, !oldLine.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                output.append("- " + oldLine)
+            }
+            if let newLine, !newLine.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                output.append("+ " + newLine)
+            }
+            if output.count >= limit {
+                output.append("...")
+                break
+            }
+        }
+
+        return output.joined(separator: "\n")
     }
 
     private func shouldAutoOpenCanvas(for card: RenderedCard, artifact: CanvasArtifact) -> Bool {
@@ -10218,12 +10462,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         for line in normalized.components(separatedBy: .newlines) {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
             let header = trimmed.uppercased()
-            if ["CODE", "PATCH", "DIFF"].contains(header) {
+            if isCanvasCodeHeader(header) {
                 inCode = true
                 sawHeader = true
                 continue
             }
-            if ["COMPLEXITY", "TIME", "SPACE", "NOTES", "EXPLANATION", "APPROACH"].contains(header) {
+            if isCanvasStopHeader(header) {
                 if inCode {
                     break
                 }
@@ -10238,6 +10482,29 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             }
         }
         return sawHeader ? lines.joined(separator: "\n") : normalized
+    }
+
+    private func isCanvasCodeHeader(_ header: String) -> Bool {
+        header == "CODE"
+            || header == "PATCH"
+            || header.hasPrefix("PATCH ")
+            || header == "DIFF"
+            || header.hasPrefix("DIFF ")
+            || header == "CHANGED BLOCK"
+            || header.hasPrefix("CHANGED BLOCK ")
+            || header == "CHANGED LINES"
+            || header.hasPrefix("CHANGED LINES ")
+    }
+
+    private func isCanvasStopHeader(_ header: String) -> Bool {
+        [
+            "COMPLEXITY",
+            "TIME",
+            "SPACE",
+            "NOTES",
+            "EXPLANATION",
+            "APPROACH",
+        ].contains(header)
     }
 
     private func extractInlineImplementationCode(from text: String) -> String {
