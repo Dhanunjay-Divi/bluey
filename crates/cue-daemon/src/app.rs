@@ -10042,29 +10042,28 @@ fn discover_overlay_bin() -> Result<PathBuf> {
     #[cfg(target_os = "macos")]
     {
         let mut candidates = Vec::new();
-        // The MEETING overlay (cue-meeting-overlay) is the real product surface —
-        // the Ask/answer feed + screen-share invisibility. Prefer it above the
-        // older interview overlay (cue-overlay-tauri) and the legacy Swift one.
-        // Both a plain binary and a bundled `.app` (Contents/MacOS/<name>) are
-        // accepted so packaged installs resolve too.
-        candidates.extend([
-            cwd.join("target/debug/cue-meeting-overlay"),
-            cwd.join("target/release/cue-meeting-overlay"),
-            cwd.join(
-                "target/debug/bundle/macos/Bluey Meeting.app/Contents/MacOS/cue-meeting-overlay",
-            ),
-            cwd.join(
-                "target/release/bundle/macos/Bluey Meeting.app/Contents/MacOS/cue-meeting-overlay",
-            ),
-        ]);
-        // Tauri overlay (the new HTML/Tauri overlay that replaces the Swift one).
-        // Preferred when present; falls through to the legacy Swift overlay paths.
-        candidates.extend([
-            cwd.join("target/debug/cue-overlay-tauri"),
-            cwd.join("target/release/cue-overlay-tauri"),
-        ]);
-        if cfg!(debug_assertions) {
+        // DEV ONLY: cwd-relative `target/` paths. An INSTALLED daemon verifies the
+        // overlay is inside its own install dir (crate::overlay::verify_overlay_binary),
+        // so probing the repo's target/ in a release build finds a binary the guard
+        // then rejects — never falling through to the valid installed sibling. Gate
+        // these behind debug so release discovery goes straight to the exe-relative
+        // install-dir candidates below.
+        #[cfg(debug_assertions)]
+        {
+            // The MEETING overlay (cue-meeting-overlay) is the real product surface —
+            // the Ask/answer feed + screen-share invisibility. Prefer it above the
+            // older interview overlay (cue-overlay-tauri) and the legacy Swift one.
             candidates.extend([
+                cwd.join("target/debug/cue-meeting-overlay"),
+                cwd.join("target/release/cue-meeting-overlay"),
+                cwd.join(
+                    "target/debug/bundle/macos/Bluey Meeting.app/Contents/MacOS/cue-meeting-overlay",
+                ),
+                cwd.join(
+                    "target/release/bundle/macos/Bluey Meeting.app/Contents/MacOS/cue-meeting-overlay",
+                ),
+                cwd.join("target/debug/cue-overlay-tauri"),
+                cwd.join("target/release/cue-overlay-tauri"),
                 cwd.join("native/macos/cue-overlay/.build/bluey-overlay-macos"),
                 cwd.join("native/macos/cue-overlay/.build/cue-overlay-macos"),
             ]);
