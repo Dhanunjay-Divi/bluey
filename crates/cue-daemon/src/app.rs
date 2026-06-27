@@ -58,6 +58,8 @@ use crate::overlay_state::{
 use crate::rag_indexer::RagIndexCoordinator;
 use crate::storage::MeetingStore;
 
+const AUTO_CLOUD_SYNC_DEBOUNCE_SECS: u64 = 20;
+
 struct LiveProviderAnswer {
     provider: ProviderSelector,
     answer: String,
@@ -999,6 +1001,7 @@ struct Daemon {
     audio: Mutex<AudioPipelineStatus>,
     audio_runtime: Mutex<AudioRuntime>,
     cloud: Mutex<CloudSyncStatus>,
+    auto_cloud_sync_debounce: Mutex<Option<tokio::task::JoinHandle<()>>>,
     balance_poll_shutdown: Mutex<Option<watch::Sender<bool>>>,
     balance_watch: crate::cloud::balance::BalanceWatch,
     answer_generation: AtomicU64,
@@ -1127,6 +1130,7 @@ pub async fn run() -> Result<()> {
             session_id: None,
         }),
         cloud: Mutex::new(cloud_status),
+        auto_cloud_sync_debounce: Mutex::new(None),
         balance_poll_shutdown: Mutex::new(None),
         balance_watch,
         answer_generation: AtomicU64::new(0),
@@ -1422,6 +1426,7 @@ async fn handle_request_inner(
             .with_source("bluey daemon");
             let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
             write_state(daemon).await?;
+            schedule_auto_cloud_sync(daemon, "meeting_start", Some(trace_id.to_string())).await;
             Ok(DaemonResponse::Text {
                 text: "Meeting started.".to_string(),
             })
@@ -1519,6 +1524,10 @@ async fn handle_request_inner(
             if has_cards {
                 write_state(daemon).await?;
             }
+            if is_final {
+                schedule_auto_cloud_sync(daemon, "transcript_final", Some(trace_id.to_string()))
+                    .await;
+            }
 
             Ok(DaemonResponse::Text {
                 text: format!("Added transcript segment from {speaker}."),
@@ -1611,6 +1620,7 @@ async fn handle_request_inner(
                     .unwrap_or_else(|| "No instructions set.".to_string()),
             )
             .await;
+            schedule_auto_cloud_sync(daemon, "instructions_set", Some(trace_id.to_string())).await;
             Ok(DaemonResponse::Text {
                 text: "Answer instructions saved.".to_string(),
             })
@@ -1921,6 +1931,27 @@ fn spawn_auto_cloud_sync(daemon: &Arc<Daemon>, reason: &'static str, trace_id: O
     });
 }
 
+async fn schedule_auto_cloud_sync(
+    daemon: &Arc<Daemon>,
+    reason: &'static str,
+    trace_id: Option<String>,
+) {
+    if !auto_cloud_sync_enabled(&daemon.paths) {
+        return;
+    }
+
+    let mut pending = daemon.auto_cloud_sync_debounce.lock().await;
+    if let Some(handle) = pending.take() {
+        handle.abort();
+    }
+
+    let daemon = Arc::clone(daemon);
+    *pending = Some(tokio::spawn(async move {
+        sleep(Duration::from_secs(AUTO_CLOUD_SYNC_DEBOUNCE_SECS)).await;
+        spawn_auto_cloud_sync(&daemon, reason, trace_id);
+    }));
+}
+
 async fn sync_and_hydrate_cloud_meetings(
     daemon: &Arc<Daemon>,
     trace_id: Option<&str>,
@@ -1949,11 +1980,14 @@ async fn sync_and_hydrate_cloud_meetings(
 }
 
 fn auto_cloud_sync_enabled(paths: &AppPaths) -> bool {
+    if env_flag_disabled("BLUEY_AUTO_CLOUD_SYNC") || env_flag_disabled("CUE_AUTO_CLOUD_SYNC") {
+        return false;
+    }
     env_flag_enabled("BLUEY_AUTO_CLOUD_SYNC")
         || env_flag_enabled("CUE_AUTO_CLOUD_SYNC")
         || load_settings(paths)
             .map(|settings| settings.cloud_sync_enabled)
-            .unwrap_or(false)
+            .unwrap_or(true)
 }
 
 fn env_flag_enabled(name: &str) -> bool {
@@ -1962,6 +1996,17 @@ fn env_flag_enabled(name: &str) -> bool {
             matches!(
                 value.trim().to_ascii_lowercase().as_str(),
                 "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn env_flag_disabled(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
             )
         })
         .unwrap_or(false)
@@ -4829,6 +4874,7 @@ async fn add_audio_transcript_segment_inner(
         Speaker::Other => "Other",
         Speaker::Unknown => "Transcript",
     };
+    schedule_auto_cloud_sync(daemon, "audio_transcript_final", None).await;
     let source = segment
         .speaker_label
         .as_deref()
@@ -4919,6 +4965,7 @@ async fn clear_active_transcript_context(daemon: &Arc<Daemon>) -> Result<()> {
     reindex_meeting_for_rag(daemon, meeting_snapshot.clone());
     refresh_overlay_sessions(daemon).await;
     write_state(daemon).await?;
+    schedule_auto_cloud_sync(daemon, "transcript_clear", None).await;
 
     push_system_card(
         daemon,
@@ -5030,6 +5077,7 @@ async fn handle_remove_context_requested(daemon: &Arc<Daemon>, id: uuid::Uuid) -
     refresh_overlay_context_items(daemon, &meeting_snapshot).await;
     refresh_overlay_sessions(daemon).await;
     reindex_meeting_for_rag(daemon, meeting_snapshot);
+    schedule_auto_cloud_sync(daemon, "context_remove", None).await;
     push_system_card(
         daemon,
         CardKind::Context,
@@ -5321,6 +5369,7 @@ async fn answer_with_provider_runtime(
     update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
     refresh_overlay_context_items(daemon, &meeting_snapshot).await;
     write_state(daemon).await?;
+    schedule_auto_cloud_sync(daemon, "answer_saved", None).await;
     Ok((response, events))
 }
 
@@ -9265,6 +9314,7 @@ async fn attach_context_artifacts(
     };
 
     index_context_artifacts_for_rag(daemon, meeting_snapshot.id.to_string(), indexed_artifacts);
+    schedule_auto_cloud_sync(daemon, "context_attach", None).await;
     Ok(meeting_snapshot)
 }
 
@@ -9442,6 +9492,7 @@ async fn continue_session(
     refresh_overlay_sessions(daemon).await;
     push_system_card(daemon, CardKind::System, title, body).await;
     write_state(daemon).await?;
+    schedule_auto_cloud_sync(daemon, "session_continue", None).await;
     Ok(meeting)
 }
 
@@ -9488,6 +9539,7 @@ async fn open_meeting_session(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<Me
         debug!(summary = %summary, "active session archived while opening saved session");
     }
     write_state(daemon).await?;
+    schedule_auto_cloud_sync(daemon, "session_open", None).await;
     Ok(selected)
 }
 
@@ -9513,6 +9565,7 @@ async fn rename_meeting_session(
     )
     .await;
     write_state(daemon).await?;
+    schedule_auto_cloud_sync(daemon, "session_rename", None).await;
     Ok(renamed)
 }
 
@@ -9628,6 +9681,7 @@ async fn start_new_session(
     )
     .await;
     write_state(daemon).await?;
+    schedule_auto_cloud_sync(daemon, "session_new", None).await;
     Ok(meeting)
 }
 
@@ -10069,6 +10123,9 @@ fn transcript_event_to_stt_segment(
 }
 
 async fn shutdown_daemon(daemon: &Arc<Daemon>) {
+    if let Some(handle) = daemon.auto_cloud_sync_debounce.lock().await.take() {
+        handle.abort();
+    }
     if let Some(capture) = daemon.system_audio.lock().await.take() {
         capture.stop().await;
     }

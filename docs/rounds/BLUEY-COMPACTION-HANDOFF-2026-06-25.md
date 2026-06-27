@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-27 01:03 EDT
+Latest checkpoint: 2026-06-27 01:29 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,43 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-214-CODE-FOLLOWUP-INPLACE-UPDATES.md`; the next canonical Bluey round doc should start at `ROUND-215-...`.
+- Latest assigned Bluey round doc is `ROUND-215-AUTOMATIC-SAVED-SESSION-SYNC.md`; the next canonical Bluey round doc should start at `ROUND-216-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 215 made saved-session sync automatic for signed-in desktop users:
+  - `CueSettings.cloud_sync_enabled` now defaults to `true`
+  - `bluey login` enables saved-session background sync for linked accounts, fixing older default-false settings files on newly linked machines
+  - daemon auto-sync now uses a 20s debounced scheduler after durable local session changes such as final transcript saves, answers, attachments, context removal, transcript clear, instructions, and session open/rename/new/continue
+  - pending debounced sync is aborted on daemon shutdown
+  - `BLUEY_AUTO_CLOUD_SYNC=0` and `CUE_AUTO_CLOUD_SYNC=0` explicitly opt out
+  - manual `bluey cloud sync` remains available for support/debug, but normal web/CLI copy no longer tells users to run it
+  - web saved-session empty state now tells users to keep Bluey on while signed in because sessions sync automatically
+  - download command grid now shows `bluey account` for account/sync status instead of `bluey cloud sync`
+  - privacy/terms copy now describes signed-in saved-session sync and the ability to turn it off
+  - local visible/debug Bluey was rebuilt and relaunched; local setting now reports `Cloud sync: automatic`
+  - Round doc: `docs/rounds/ROUND-215-AUTOMATIC-SAVED-SESSION-SYNC.md`
+  - Verification passed:
+    - `cargo fmt --manifest-path crates/cue-daemon/Cargo.toml`
+    - `cargo fmt --manifest-path crates/cue-cli/Cargo.toml`
+    - `cargo fmt --manifest-path crates/cue-core/Cargo.toml`
+    - `git diff --check`
+    - `cargo test -p cue-core default_settings_enable_cloud_sync_after_sign_in --lib`
+    - `cargo test -p cue-daemon cloud --lib`
+    - `cargo build -p cue-cli`
+    - `cargo build -p cue-daemon --bin bluey-daemon`
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `BLUEY_OVERLAY_SWIFT_CONFIGURATION=debug native/macos/cue-overlay/build.sh`
+    - `cargo test -p cue-daemon --lib` (`268 passed; 2 ignored`)
+    - `cargo test -p cue-core --lib` (`83 passed`)
+    - `cargo test -p cue-cli --lib` (`53 passed`)
+    - `/Users/uno/Downloads/cue/target/debug/bluey settings --cloud-sync true`
+    - `BLUEY_BIN=/Users/uno/Downloads/cue/target/debug/bluey scripts/bluey-visible-local.sh`
+    - `/Users/uno/Downloads/cue/target/debug/bluey status`
+    - `/Users/uno/Downloads/cue/target/debug/bluey cloud status`
 - Round 214 improved coding follow-up behavior:
   - backend answer-shape rules now explicitly require complete code for first-time coding/build answers, but small changed blocks, `PATCH`, or unified diffs for code-changing follow-ups
   - backend code canvas normalization preserves `PATCH`, `DIFF`, `CHANGED BLOCK`, and `CHANGED LINES` sections instead of flattening them into generic full-code replacements

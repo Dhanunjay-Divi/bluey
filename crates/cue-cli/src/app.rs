@@ -1187,6 +1187,14 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
 
     let has_cloud_tokens = account.token_configured();
     cue_cloud_client::save_account_profile_and_tokens(&paths, &account)?;
+    if has_cloud_tokens {
+        let mut settings = load_settings(&paths)?;
+        if !settings.cloud_sync_enabled {
+            settings.cloud_sync_enabled = true;
+            settings.touch();
+            save_settings(&paths, &settings)?;
+        }
+    }
 
     println!(
         "Bluey account linked: {} ({})",
@@ -1194,6 +1202,7 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
     );
     if has_cloud_tokens {
         println!("Cloud token saved in Bluey's private local account profile.");
+        println!("Saved sessions sync automatically in the background while Bluey is on.");
     } else {
         println!("Local account linked. Run `bluey on` later to sign in when the Bluey cloud endpoint is ready.");
     }
@@ -1522,7 +1531,14 @@ fn print_settings(settings: &CueSettings) {
     println!("Opacity: {}%", (settings.overlay_opacity * 100.0).round());
     println!("System audio: {}", on_off(settings.audio_system_enabled));
     println!("Microphone: {}", on_off(settings.audio_microphone_enabled));
-    println!("Cloud sync: {}", on_off(settings.cloud_sync_enabled));
+    println!(
+        "Cloud sync: {}",
+        if settings.cloud_sync_enabled {
+            "automatic"
+        } else {
+            "off"
+        }
+    );
     println!("Retention: {} day(s)", settings.retention_days);
 }
 
@@ -2739,7 +2755,7 @@ async fn print_cloud_sessions(limit: i64, json: bool) -> Result<()> {
         return Ok(());
     }
     if sessions.sessions.is_empty() {
-        println!("No cloud sessions yet. Run `bluey cloud sync` after a session.");
+        println!("No cloud sessions yet. Start or answer in Bluey while signed in; saved sessions sync automatically in the background.");
         return Ok(());
     }
     println!("Cloud sessions:");

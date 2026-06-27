@@ -1053,7 +1053,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (!sessions.length) {
         const empty = document.createElement('div');
         empty.className = 'session-empty';
-        empty.textContent = 'No saved sessions yet. Run bluey cloud sync after a local session, then refresh here.';
+        empty.textContent = 'No saved sessions yet. Keep Bluey on while signed in; sessions sync automatically, then refresh here.';
         list.append(empty);
         return;
       }

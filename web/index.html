@@ -128,7 +128,7 @@
         <p>When a request needs an AI model, Bluey sends only the context needed for that request: your prompt, selected transcript snippets, attached document text, screen-analysis output, saved session memory, and routing metadata such as task type and cost estimate. Speech transcription, image understanding, embedding, and answer generation may use separate providers.</p>
 
         <h2>Files, Sessions, and Memory</h2>
-        <p>Documents, images, screenshots, and other files you attach are parsed into readable text where supported and are tied to the active Bluey session. If you choose cloud sync or saved sessions, Bluey may store the original synced file bytes, lightweight previews, extracted text, summaries, and search indexes so another signed-in device can restore the session and answer from the same context. You can keep using local sessions without cloud sync.</p>
+        <p>Documents, images, screenshots, and other files you attach are parsed into readable text where supported and are tied to the active Bluey session. When you sign in with saved-session sync on, Bluey may store the original synced file bytes, lightweight previews, extracted text, summaries, and search indexes so another signed-in device can restore the session and answer from the same context. You can turn cloud sync off in settings and keep using local sessions.</p>
 
         <h2>Your Controls</h2>
         <p>Desktop capture starts only through visible user controls. You can stop listening, hide the overlay, attach or remove documents, export account data, delete your account, and clear local state.</p>
@@ -166,7 +166,7 @@
         <p>You are responsible for the documents, transcripts, screenshots, repositories, and other context you attach or ask Bluey to analyze. Bluey should be used with consent where required, and it should not be used for hidden capture of people or information you are not allowed to process.</p>
 
         <h2>Cloud Sync and Retention</h2>
-        <p>If you enable cloud sync or saved sessions, you authorize Bluey to store synced session metadata, transcripts, generated answers, original file or screenshot bytes, extracted text, summaries, and search indexes for restoration and answer context. These synced objects are retained for up to 12 months (365 days) from last sync or use unless you delete them earlier. Expired objects are removed lazily during cleanup, restore attempts, or maintenance passes.</p>
+        <p>If you sign in with cloud sync or saved sessions enabled, you authorize Bluey to store synced session metadata, transcripts, generated answers, original file or screenshot bytes, extracted text, summaries, and search indexes for restoration and answer context. These synced objects are retained for up to 12 months (365 days) from last sync or use unless you delete them earlier. Expired objects are removed lazily during cleanup, restore attempts, or maintenance passes.</p>
 
         <h2>AI Output</h2>
         <p>Bluey can help draft answers, summarize sessions, explain code, reason about systems, and organize context. AI output may be incomplete or wrong. You are responsible for reviewing generated output before relying on it, sending it, submitting it, or using it to make decisions.</p>
@@ -625,8 +625,8 @@
             <button class="copy-command" type="button" data-copy="bluey status">Copy</button>
           </div>
           <div class="cmd">
-            <div><code>bluey cloud sync</code><span>Save session history to your account</span></div>
-            <button class="copy-command" type="button" data-copy="bluey cloud sync">Copy</button>
+            <div><code>bluey account</code><span>Check account and sync status</span></div>
+            <button class="copy-command" type="button" data-copy="bluey account">Copy</button>
           </div>
           <div class="cmd">
             <div><code>bluey ask</code><span>Ask from Terminal without opening the overlay</span></div>

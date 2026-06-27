@@ -75,7 +75,7 @@ impl Default for CueSettings {
             overlay_opacity: 0.92,
             audio_system_enabled: true,
             audio_microphone_enabled: true,
-            cloud_sync_enabled: false,
+            cloud_sync_enabled: true,
             retention_days: 30,
             updated_at: clock::now_epoch_ms_string(),
             auto_disguise_prompted: false,
@@ -142,4 +142,16 @@ fn write_private_json<T: Serialize>(path: &std::path::Path, value: &T) -> Result
 
 fn default_disguise_mode() -> String {
     "activity".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_settings_enable_cloud_sync_after_sign_in() {
+        let settings = CueSettings::default();
+
+        assert!(settings.cloud_sync_enabled);
+    }
 }
