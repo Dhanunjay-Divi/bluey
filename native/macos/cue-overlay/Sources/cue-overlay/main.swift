@@ -8155,25 +8155,40 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             "card=\(card.id)",
             "kind=\(card.kind)",
             "done=\(card.done)",
-            "question=\"\(compactLogSnippet(question))\"",
+            "question_chars=\((question ?? "").count)",
+            "question_words=\(wordCount(question))",
+            "question_intent=\(questionIntentLabel(question))",
+            "body_chars=\(card.body.count)",
+            "body_lines=\(card.body.components(separatedBy: .newlines).count)",
         ]
         if let artifact {
             parts.append("artifact_kind=\(artifact.kind.shortTitle)")
-            parts.append("artifact_title=\"\(compactLogSnippet(artifact.title))\"")
+            parts.append("artifact_title_chars=\(artifact.title.count)")
+            parts.append("artifact_body_chars=\(artifact.content.count)")
         }
         return parts.joined(separator: " ")
     }
 
-    private func compactLogSnippet(_ text: String?, maxLength: Int = 72) -> String {
-        let compact = (text ?? "")
-            .components(separatedBy: .whitespacesAndNewlines)
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-        guard !compact.isEmpty else { return "empty" }
-        if compact.count <= maxLength {
-            return compact
-        }
-        return String(compact.prefix(maxLength)) + "..."
+    private func wordCount(_ text: String?) -> Int {
+        (text ?? "")
+            .split(whereSeparator: { $0.isWhitespace })
+            .count
+    }
+
+    private func questionIntentLabel(_ text: String?) -> String {
+        let lower = (text ?? "").lowercased()
+        let codeSignals = ["code", "build", "implement", "function", "class", "api", "algorithm", "cache", "sql", "bug", "error"]
+        let explainSignals = ["explain", "logic", "why", "how does", "how it works", "walk me", "understand"]
+        let designSignals = ["system design", "architecture", "scale", "design "]
+        let hasCode = codeSignals.contains { lower.contains($0) }
+        let hasExplain = explainSignals.contains { lower.contains($0) }
+        let hasDesign = designSignals.contains { lower.contains($0) }
+        if hasCode && hasExplain { return "code_explanation" }
+        if hasCode { return "code_or_debug" }
+        if hasDesign { return "system_design" }
+        if hasExplain { return "explanation" }
+        if wordCount(text) <= 6 { return "short_query" }
+        return "general"
     }
 
     private func registerCanvasArtifact(_ artifact: inout CanvasArtifact, question: String?) {
@@ -8189,7 +8204,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             renderActiveCanvas()
             emitLifecycle(
                 "canvas_replace",
-                detail: "source_card=\(artifact.sourceCardId) index=\(existingIndex) kind=\(artifact.kind.shortTitle) title=\"\(compactLogSnippet(artifact.title))\"")
+                detail: "source_card=\(artifact.sourceCardId) index=\(existingIndex) kind=\(artifact.kind.shortTitle) title_chars=\(artifact.title.count) body_chars=\(artifact.content.count)")
             return
         }
 
@@ -8211,7 +8226,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             renderActiveCanvas()
             emitLifecycle(
                 "canvas_append_followup",
-                detail: "source_card=\(artifact.sourceCardId) index=\(index) followups=\(followupNumber) kind=\(artifact.kind.shortTitle) question=\"\(compactLogSnippet(question))\"")
+                detail: "source_card=\(artifact.sourceCardId) index=\(index) followups=\(followupNumber) kind=\(artifact.kind.shortTitle) question_chars=\((question ?? "").count) question_words=\(wordCount(question)) question_intent=\(questionIntentLabel(question)) body_chars=\(artifact.content.count)")
             return
         }
 
@@ -8225,7 +8240,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         renderActiveCanvas()
         emitLifecycle(
             "canvas_new",
-            detail: "source_card=\(artifact.sourceCardId) index=\(canvases.count - 1) kind=\(artifact.kind.shortTitle) title=\"\(compactLogSnippet(artifact.title))\"")
+            detail: "source_card=\(artifact.sourceCardId) index=\(canvases.count - 1) kind=\(artifact.kind.shortTitle) title_chars=\(artifact.title.count) body_chars=\(artifact.content.count)")
     }
 
     private func renderActiveCanvas() {
@@ -8968,7 +8983,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             if card.kind == "answer", kind != .code, kind != .systemDesign {
                 emitLifecycle(
                     "canvas_ignore_answer_artifact",
-                    detail: "card=\(card.id) kind=\(kind.shortTitle) title=\"\(compactLogSnippet(artifact.title))\"")
+                    detail: "card=\(card.id) kind=\(kind.shortTitle) title_chars=\(artifact.title.count) body_chars=\(artifact.body.count)")
                 return nil
             }
             let confidence = artifact.confidence.map { "Confidence \(Int(($0 * 100).rounded()))%" }

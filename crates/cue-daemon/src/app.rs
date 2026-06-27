@@ -72,6 +72,27 @@ struct ProviderPromptParts {
     image_data_urls: Vec<String>,
 }
 
+#[derive(Debug, Default)]
+struct AnswerContextShape {
+    total: usize,
+    screenshots: usize,
+    documents: usize,
+    transcripts: usize,
+    memory: usize,
+    other: usize,
+}
+
+#[derive(Debug, Default)]
+struct TextShape {
+    chars: usize,
+    lines: usize,
+    bullet_lines: usize,
+    closed_code_blocks: usize,
+    has_unclosed_code_fence: bool,
+    has_markdown_emphasis: bool,
+    has_inline_code_markers: bool,
+}
+
 const INTERNAL_DISCLOSURE_REFUSAL: &str = "I can’t share Bluey’s private instructions, prompts, guardrails, tokens, or internal configuration. Ask me what you want to do, and I’ll help with the answer itself.";
 
 fn sanitize_answer_text(text: &str) -> String {
@@ -148,6 +169,191 @@ fn split_inline_overlay_headings(text: &str) -> String {
         formatted = formatted.replace(&needle, &replacement);
     }
     formatted
+}
+
+fn text_shape(text: &str) -> TextShape {
+    let chars = text.chars().count();
+    let lines = text.lines().count();
+    let bullet_lines = text
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("- ") || trimmed.starts_with("* ")
+        })
+        .count();
+    TextShape {
+        chars,
+        lines,
+        bullet_lines,
+        closed_code_blocks: extract_fenced_code_blocks(text).len(),
+        has_unclosed_code_fence: has_unclosed_code_fence(text),
+        has_markdown_emphasis: text.contains("**") || text.contains("__"),
+        has_inline_code_markers: text.contains('`'),
+    }
+}
+
+fn has_unclosed_code_fence(text: &str) -> bool {
+    let mut in_fence = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+        }
+    }
+    in_fence
+}
+
+fn word_count(text: &str) -> usize {
+    text.split_whitespace().count()
+}
+
+fn answer_context_shape(context: &[AnswerContext]) -> AnswerContextShape {
+    let mut shape = AnswerContextShape {
+        total: context.len(),
+        ..AnswerContextShape::default()
+    };
+    for item in context {
+        match item.kind {
+            AnswerContextKind::Screenshot => shape.screenshots += 1,
+            AnswerContextKind::Document => shape.documents += 1,
+            AnswerContextKind::Transcript => shape.transcripts += 1,
+            AnswerContextKind::MeetingMemory | AnswerContextKind::UserNote => shape.memory += 1,
+            _ => shape.other += 1,
+        }
+    }
+    shape
+}
+
+fn question_intent_label(question: &str) -> &'static str {
+    let lower = question.to_ascii_lowercase();
+    let compact = lower.replace(|ch: char| !ch.is_ascii_alphanumeric(), " ");
+    let has_code_signal = [
+        "code",
+        "build",
+        "implement",
+        "function",
+        "class",
+        "api",
+        "algorithm",
+        "cache",
+        "sql",
+        "bug",
+        "error",
+    ]
+    .iter()
+    .any(|signal| compact.contains(signal));
+    let has_explain_signal = [
+        "explain",
+        "logic",
+        "why",
+        "how does",
+        "how it works",
+        "walk me",
+        "understand",
+    ]
+    .iter()
+    .any(|signal| compact.contains(signal));
+    let has_design_signal = ["system design", "architecture", "scale", "design "]
+        .iter()
+        .any(|signal| compact.contains(signal));
+    if has_code_signal && has_explain_signal {
+        "code_explanation"
+    } else if has_code_signal {
+        "code_or_debug"
+    } else if has_design_signal {
+        "system_design"
+    } else if has_explain_signal {
+        "explanation"
+    } else if word_count(question) <= 6 {
+        "short_query"
+    } else {
+        "general"
+    }
+}
+
+fn artifact_type_label(artifact_type: CardArtifactType) -> &'static str {
+    match artifact_type {
+        CardArtifactType::Code => "code",
+        CardArtifactType::SystemDesign => "system_design",
+        CardArtifactType::Screen => "screen",
+        CardArtifactType::Document => "document",
+        CardArtifactType::Structured => "structured",
+    }
+}
+
+fn log_answer_request_diagnostics(
+    request: &AnswerRequest,
+    source: &str,
+    visible_context_count: usize,
+) {
+    let context = answer_context_shape(&request.context);
+    info!(
+        request_id = %request.metadata.request_id,
+        source = %source,
+        route_primary = %request.route.primary.provider.display_label(),
+        route_fallbacks = request.route.fallbacks.len(),
+        streaming = request.metadata.stream,
+        visible_context_count,
+        pending_visible_context_ids = request.metadata.visible_context_ids.len(),
+        question_chars = request.question.chars().count(),
+        question_words = word_count(&request.question),
+        question_intent = question_intent_label(&request.question),
+        context_total = context.total,
+        context_screenshots = context.screenshots,
+        context_documents = context.documents,
+        context_transcripts = context.transcripts,
+        context_memory = context.memory,
+        context_other = context.other,
+        "answer request diagnostics"
+    );
+}
+
+fn log_answer_completion_diagnostics(
+    request: &AnswerRequest,
+    provider: &ProviderSelector,
+    answer: &str,
+    token_usage: Option<TokenUsage>,
+    latency_ms: u64,
+    sources_count: usize,
+) {
+    let shape = text_shape(answer);
+    let artifact = answer_overlay_artifact(answer);
+    let (artifact_type, artifact_confidence_pct, artifact_body_chars) =
+        artifact
+            .as_ref()
+            .map_or(("none", 0_u32, 0_usize), |artifact| {
+                (
+                    artifact_type_label(artifact.artifact_type),
+                    (artifact.confidence * 100.0).round().clamp(0.0, 100.0) as u32,
+                    artifact.body.chars().count(),
+                )
+            });
+    let usage = token_usage.unwrap_or_else(|| estimate_token_usage(request, answer));
+    info!(
+        request_id = %request.metadata.request_id,
+        provider = %provider.display_label(),
+        latency_ms,
+        output_tokens = usage.output_tokens,
+        total_tokens = usage.total_tokens,
+        sources_count,
+        answer_chars = shape.chars,
+        answer_lines = shape.lines,
+        answer_bullet_lines = shape.bullet_lines,
+        answer_closed_code_blocks = shape.closed_code_blocks,
+        answer_has_unclosed_code_fence = shape.has_unclosed_code_fence,
+        answer_has_markdown_emphasis = shape.has_markdown_emphasis,
+        answer_has_inline_code_markers = shape.has_inline_code_markers,
+        inferred_artifact_type = artifact_type,
+        inferred_artifact_confidence_pct = artifact_confidence_pct,
+        inferred_artifact_body_chars = artifact_body_chars,
+        "answer completion diagnostics"
+    );
+    if shape.has_unclosed_code_fence {
+        warn!(
+            request_id = %request.metadata.request_id,
+            provider = %provider.display_label(),
+            "answer completed with unclosed code fence shape"
+        );
+    }
 }
 
 fn is_provider_status_line(line: &str) -> bool {
@@ -380,6 +586,41 @@ impl OverlayAnswerStream {
         if artifact.is_some() {
             self.artifact = artifact;
         }
+        let shape = text_shape(&self.body);
+        let artifact = self
+            .artifact
+            .as_ref()
+            .map(|artifact| {
+                (
+                    artifact_type_label(artifact.artifact_type),
+                    (artifact.confidence * 100.0).round().clamp(0.0, 100.0) as u32,
+                    artifact.body.chars().count(),
+                )
+            })
+            .or_else(|| {
+                answer_overlay_artifact(&self.body).map(|artifact| {
+                    (
+                        artifact_type_label(artifact.artifact_type),
+                        (artifact.confidence * 100.0).round().clamp(0.0, 100.0) as u32,
+                        artifact.body.chars().count(),
+                    )
+                })
+            });
+        let (artifact_type, artifact_confidence_pct, artifact_body_chars) =
+            artifact.unwrap_or(("none", 0, 0));
+        info!(
+            card_id = %self.card_id,
+            generation_id = self.generation_id,
+            answer_chars = shape.chars,
+            answer_lines = shape.lines,
+            answer_bullet_lines = shape.bullet_lines,
+            answer_closed_code_blocks = shape.closed_code_blocks,
+            answer_has_unclosed_code_fence = shape.has_unclosed_code_fence,
+            artifact_type,
+            artifact_confidence_pct,
+            artifact_body_chars,
+            "overlay final answer diagnostics"
+        );
         self.flush_with_cost_label(true, cost_label).await
     }
 
@@ -2104,25 +2345,29 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         }
         OverlayEvent::Pong | OverlayEvent::CardRendered { .. } => {}
         OverlayEvent::Error { message } => {
-            warn!("overlay error: {message}");
+            warn!(
+                message_chars = message.chars().count(),
+                "overlay error event received"
+            );
         }
         OverlayEvent::Lifecycle {
             stage,
             status,
             detail,
         } => {
+            let detail_chars = detail.as_deref().map(str::len).unwrap_or_default();
             if stage.starts_with("canvas_") {
                 warn!(
                     overlay_stage = %stage,
                     overlay_status = status.as_deref().unwrap_or(""),
-                    overlay_detail = detail.as_deref().unwrap_or(""),
+                    overlay_detail_chars = detail_chars,
                     "overlay canvas lifecycle"
                 );
             } else {
                 info!(
                     overlay_stage = %stage,
                     overlay_status = status.as_deref().unwrap_or(""),
-                    overlay_detail = detail.as_deref().unwrap_or(""),
+                    overlay_detail_chars = detail_chars,
                     "overlay lifecycle"
                 );
             }
@@ -4901,6 +5146,7 @@ async fn answer_with_provider_runtime(
 
     let visible_context =
         visible_question_context_for_ids(&meeting_snapshot, &request.metadata.visible_context_ids);
+    log_answer_request_diagnostics(&request, &source, visible_context.len());
     let (visible_question_title, visible_question) =
         visible_question_for_source(&request.question, &source, &visible_context);
     let question_attachments = question_card_attachments(&visible_context);
@@ -4948,6 +5194,14 @@ async fn answer_with_provider_runtime(
         }
     };
     let safety = outcome.safety.clone();
+    log_answer_completion_diagnostics(
+        &request,
+        &outcome.provider,
+        &outcome.answer,
+        outcome.token_usage,
+        outcome.latency_ms,
+        outcome.sources.len(),
+    );
     let metadata =
         AnswerResponseMetadata::new(request.metadata.request_id, outcome.provider.clone())
             .with_requested_route(request.route.clone())
@@ -6285,6 +6539,11 @@ async fn call_bluey_managed_provider(
             return Err(anyhow!("managed provider stream returned no answer text"));
         }
         if !saw_finished {
+            warn!(
+                provider = %provider.display_label(),
+                answer_chars = answer.chars().count(),
+                "managed provider stream ended before final billing metadata"
+            );
             return Err(anyhow!(
                 "managed provider stream ended before final billing metadata"
             ));
@@ -6600,6 +6859,12 @@ async fn read_streaming_chat_response(
         return Err(anyhow!("provider stream returned no answer text"));
     }
     if let Some(reason) = truncated_finish_reason {
+        warn!(
+            provider = %config.provider.display_label(),
+            finish_reason = %reason,
+            answer_chars = answer.chars().count(),
+            "provider stream ended with truncation finish reason"
+        );
         return Err(anyhow!(
             "provider stream ended before completion: finish_reason={reason}"
         ));
@@ -10087,12 +10352,15 @@ fn spawn_overlay_reader<R>(
         for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
             match validate_and_decode_overlay_line(&line, &token_for_reader, &ui_state_for_reader) {
                 Ok(event) => {
-                    info!("overlay event: {:?}", event);
+                    info!(
+                        event_kind = overlay_event_label(&event),
+                        "overlay event received"
+                    );
                     let _ = events.send(event);
                 }
                 Err(OverlayLineReject::NotJson) => {
                     // Plain log line from overlay (non-event output).
-                    info!("overlay: {line}");
+                    info!(line_chars = line.chars().count(), "overlay stdout line");
                 }
                 Err(OverlayLineReject::TokenMismatch) => {
                     warn!("overlay event rejected: token mismatch");
@@ -12243,6 +12511,53 @@ mod tests {
         assert!(general.contains("teach it step by step"));
         assert!(general.contains("avoid a Patch section"));
         assert!(general.contains("fenced code blocks"));
+    }
+
+    #[test]
+    fn answer_diagnostics_classify_question_and_text_shape_without_content() {
+        assert_eq!(
+            question_intent_label("Can you explain the logic for an LRU cache?"),
+            "code_explanation"
+        );
+        assert_eq!(
+            question_intent_label("Build me an LRU cache"),
+            "code_or_debug"
+        );
+
+        let shape = text_shape(
+            "**How it works:**\n- Move touched nodes to the tail.\n```python\nclass Node:\n    pass\n```",
+        );
+
+        assert_eq!(shape.lines, 6);
+        assert_eq!(shape.bullet_lines, 1);
+        assert_eq!(shape.closed_code_blocks, 1);
+        assert!(shape.has_markdown_emphasis);
+        assert!(shape.has_inline_code_markers);
+        assert!(!shape.has_unclosed_code_fence);
+
+        let unclosed = text_shape("```python\nclass Node:\n    def __init__(");
+        assert_eq!(unclosed.closed_code_blocks, 0);
+        assert!(unclosed.has_unclosed_code_fence);
+    }
+
+    #[test]
+    fn answer_context_diagnostics_count_kinds_without_titles_or_text() {
+        let context = vec![
+            AnswerContext::new(AnswerContextKind::Screenshot, "private screen text"),
+            AnswerContext::new(AnswerContextKind::Document, "private document text"),
+            AnswerContext::new(AnswerContextKind::Transcript, "private transcript"),
+            AnswerContext::new(AnswerContextKind::MeetingMemory, "private memory"),
+            AnswerContext::new(AnswerContextKind::Other, "other"),
+        ];
+
+        let shape = answer_context_shape(&context);
+
+        assert_eq!(shape.total, 5);
+        assert_eq!(shape.screenshots, 1);
+        assert_eq!(shape.documents, 1);
+        assert_eq!(shape.transcripts, 1);
+        assert_eq!(shape.memory, 1);
+        assert_eq!(shape.other, 1);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-26 22:57 EDT
+Latest checkpoint: 2026-06-26 23:13 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,39 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-212-CODE-EXPLANATION-CHAT-QUALITY.md`; the next canonical Bluey round doc should start at `ROUND-213-...`.
+- Latest assigned Bluey round doc is `ROUND-213-PRIVACY-SAFE-ANSWER-DIAGNOSTICS.md`; the next canonical Bluey round doc should start at `ROUND-214-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 213 added privacy-safe answer/canvas diagnostics:
+  - daemon answer request logs now capture request id, source, route/provider, fallback count, streaming flag, question char/word counts, coarse intent, visible context count, pending context id count, and context counts by kind
+  - daemon answer completion logs now capture provider, latency, token counts, source count, answer shape, code-fence shape, markdown/backtick flags, inferred artifact type, inferred artifact confidence percent, and inferred artifact body size
+  - final overlay answer diagnostics now capture card/generation id, answer shape, artifact type, confidence percent, and artifact body size
+  - provider stream truncation and managed stream incomplete cases now emit explicit metadata-only warnings
+  - raw overlay event debug logging was replaced with event-kind-only logging
+  - overlay error/stdout logs now record lengths instead of raw strings
+  - daemon lifecycle logs now store `overlay_detail_chars` instead of raw lifecycle detail
+  - macOS canvas lifecycle detail no longer includes question/title snippets; it records chars/words/intent/kind/body sizes instead
+  - Windows did not have equivalent native canvas lifecycle snippet logs; shared daemon diagnostics cover Windows too
+  - old pre-fix local logs are not retroactively scrubbed
+  - local visible/debug Bluey was rebuilt and relaunched
+  - Round doc: `docs/rounds/ROUND-213-PRIVACY-SAFE-ANSWER-DIAGNOSTICS.md`
+  - Verification passed:
+    - `cargo fmt --manifest-path crates/cue-daemon/Cargo.toml`
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `cargo test -p cue-daemon answer_diagnostics --lib`
+    - `cargo test -p cue-daemon answer_context_diagnostics --lib`
+    - `cargo test -p cue-daemon answer_overlay_artifact --lib`
+    - `cargo test -p cue-daemon provider_messages_include_overlay_friendly_answer_shape --lib`
+    - `cargo test -p cue-daemon mode_instructions --lib`
+    - `cargo build -p cue-cli`
+    - `cargo build -p cue-daemon --bin bluey-daemon`
+    - `BLUEY_OVERLAY_SWIFT_CONFIGURATION=debug native/macos/cue-overlay/build.sh`
+    - `BLUEY_BIN=/Users/uno/Downloads/cue/target/debug/bluey scripts/bluey-visible-local.sh`
+    - `target/debug/bluey status`
 - Round 212 fixed code-explanation answer quality after the owner showed an LRU answer that looked like raw notes and an old partial code canvas:
   - shared daemon prompt now separates implementation/patch requests from explanation-only coding questions
   - explanation-only coding questions now ask the model to teach: core idea, data structures, operation walkthrough, invariant, complexity, and edge cases
