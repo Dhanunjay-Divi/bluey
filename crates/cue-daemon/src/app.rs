@@ -1490,6 +1490,14 @@ async fn handle_request_inner(
 
                 let meeting = meeting_guard.as_mut().expect("meeting exists");
                 if is_near_duplicate_transcript(meeting, speaker, &text, is_final) {
+                    info!(
+                        speaker = %speaker,
+                        is_final,
+                        text_chars = text.chars().count(),
+                        text_words = word_count(&text),
+                        recent_transcript_segments = meeting.transcript.len(),
+                        "transcript add skipped duplicate"
+                    );
                     None
                 } else {
                     let segment = TranscriptSegment::new(speaker, text, is_final);
@@ -1505,6 +1513,17 @@ async fn handle_request_inner(
                     let indexed_segment = segment
                         .is_final
                         .then(|| (meeting.id.to_string(), segment.text.clone()));
+                    info!(
+                        meeting_id = %meeting.id,
+                        speaker = %segment.speaker,
+                        is_final = segment.is_final,
+                        text_chars = segment.text.chars().count(),
+                        text_words = word_count(&segment.text),
+                        transcript_segments = meeting.transcript.len(),
+                        action_items = meeting.action_items.len(),
+                        decisions = meeting.decisions.len(),
+                        "transcript segment stored"
+                    );
                     Some((meeting.clone(), analysis.cards, indexed_segment))
                 }
             }) else {
@@ -2145,6 +2164,21 @@ fn overlay_event_label(event: &OverlayEvent) -> &'static str {
     }
 }
 
+fn overlay_lifecycle_detail_is_safe(stage: &str) -> bool {
+    matches!(
+        stage,
+        "session_drawer_opened"
+            | "session_drawer_sessions_rendered"
+            | "transcript_buffer_consumed"
+            | "transcript_buffer_skip_consumed"
+            | "transcript_context_cleared"
+            | "autosend_answer_sent"
+            | "autosend_answer_skipped"
+            | "ask_answer_sent"
+            | "ask_answer_skipped"
+    )
+}
+
 async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Result<()> {
     match event {
         OverlayEvent::Ready {
@@ -2267,6 +2301,14 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             delete_meeting_session(daemon, id).await?;
         }
         OverlayEvent::SessionListRequested => {
+            let active_session_id = daemon
+                .meeting
+                .lock()
+                .await
+                .as_ref()
+                .map(|meeting| meeting.id.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            info!(active_session_id, "overlay session list requested");
             refresh_overlay_sessions(daemon).await;
         }
         OverlayEvent::SessionContinueRequested => {
@@ -2370,6 +2412,7 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             .await;
         }
         OverlayEvent::TranscriptClearRequested => {
+            info!("overlay transcript clear requested");
             clear_active_transcript_context(daemon).await?;
         }
         OverlayEvent::CloseRequested => {
@@ -2406,6 +2449,10 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             detail,
         } => {
             let detail_chars = detail.as_deref().map(str::len).unwrap_or_default();
+            let safe_detail = detail
+                .as_deref()
+                .filter(|_| overlay_lifecycle_detail_is_safe(&stage))
+                .unwrap_or("");
             if stage.starts_with("canvas_") {
                 warn!(
                     overlay_stage = %stage,
@@ -2418,6 +2465,7 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
                     overlay_stage = %stage,
                     overlay_status = status.as_deref().unwrap_or(""),
                     overlay_detail_chars = detail_chars,
+                    overlay_safe_detail = safe_detail,
                     "overlay lifecycle"
                 );
             }
@@ -3949,13 +3997,48 @@ async fn refresh_overlay_context_items(daemon: &Arc<Daemon>, meeting: &MeetingRe
 }
 
 async fn refresh_overlay_sessions(daemon: &Arc<Daemon>) {
+    let started = Instant::now();
     let active_id = daemon.meeting.lock().await.as_ref().map(|m| m.id);
     match overlay_session_items(daemon, active_id) {
         Ok(sessions) => {
-            let _ = send_overlay(daemon, OverlayCommand::SetSessions { sessions }).await;
+            let session_count = sessions.len();
+            let active_count = sessions.iter().filter(|session| session.is_active).count();
+            let context_count: usize = sessions.iter().map(|session| session.context_count).sum();
+            let image_count: usize = sessions.iter().map(|session| session.image_count).sum();
+            match send_overlay(daemon, OverlayCommand::SetSessions { sessions }).await {
+                Ok(()) => {
+                    info!(
+                        active_session_id = active_id
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        session_count,
+                        active_count,
+                        context_count,
+                        image_count,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "overlay session list refreshed"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        active_session_id = active_id
+                            .map(|id| id.to_string())
+                            .unwrap_or_else(|| "none".to_string()),
+                        session_count,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "overlay session list refresh send failed: {error:#}"
+                    );
+                }
+            }
         }
         Err(error) => {
-            debug!("overlay session list refresh skipped: {error:#}");
+            warn!(
+                active_session_id = active_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "overlay session list refresh failed: {error:#}"
+            );
         }
     }
 }
@@ -4237,6 +4320,13 @@ const SESSION_TITLE_STOP_WORDS: &[&str] = &[
 
 fn overlay_history_cards_for_meeting(meeting: &MeetingRecord) -> Vec<CueCard> {
     let mut cards = Vec::new();
+    let mut question_cards = 0_usize;
+    let mut answer_cards = 0_usize;
+    let mut restored_artifacts = 0_usize;
+    let mut inferred_artifacts = 0_usize;
+    let mut question_attachment_chips = 0_usize;
+    let mut used_transcript_fallback = false;
+    let mut used_empty_session_fallback = false;
     for turn in &meeting.conversation {
         let question_source = turn
             .source
@@ -4244,11 +4334,14 @@ fn overlay_history_cards_for_meeting(meeting: &MeetingRecord) -> Vec<CueCard> {
             .filter(|source| !source.trim().is_empty())
             .cloned()
             .unwrap_or_else(|| "session history".to_string());
+        let question_attachments = history_question_card_attachments(meeting, turn);
+        question_attachment_chips += question_attachments.len();
         cards.push(
             CueCard::new(CardKind::Question, "Question", turn.question.clone())
                 .with_source(question_source)
-                .with_attachments(history_question_card_attachments(meeting, turn)),
+                .with_attachments(question_attachments),
         );
+        question_cards += 1;
 
         let answer_source = turn
             .provider
@@ -4256,10 +4349,15 @@ fn overlay_history_cards_for_meeting(meeting: &MeetingRecord) -> Vec<CueCard> {
             .filter(|provider| !provider.trim().is_empty())
             .map(|provider| format!("session history ({provider})"))
             .unwrap_or_else(|| "session history".to_string());
-        let artifact = turn
-            .artifact
-            .clone()
-            .or_else(|| answer_overlay_artifact(&turn.answer));
+        let mut artifact = turn.artifact.clone();
+        if artifact.is_some() {
+            restored_artifacts += 1;
+        } else {
+            artifact = answer_overlay_artifact(&turn.answer);
+            if artifact.is_some() {
+                inferred_artifacts += 1;
+            }
+        }
         let answer_body = visible_answer_body_for_artifact(&turn.answer, artifact.as_ref());
         let mut answer_card =
             CueCard::new(CardKind::Answer, "Bluey", answer_body).with_source(answer_source);
@@ -4267,6 +4365,7 @@ fn overlay_history_cards_for_meeting(meeting: &MeetingRecord) -> Vec<CueCard> {
             answer_card = answer_card.with_artifact(artifact);
         }
         cards.push(answer_card);
+        answer_cards += 1;
     }
 
     if cards.is_empty() {
@@ -4276,6 +4375,7 @@ fn overlay_history_cards_for_meeting(meeting: &MeetingRecord) -> Vec<CueCard> {
                 CueCard::new(CardKind::System, "Transcript", transcript)
                     .with_source("session history"),
             );
+            used_transcript_fallback = true;
         }
     }
 
@@ -4293,8 +4393,24 @@ fn overlay_history_cards_for_meeting(meeting: &MeetingRecord) -> Vec<CueCard> {
         cards.push(
             CueCard::new(CardKind::System, "Session loaded", body).with_source("session history"),
         );
+        used_empty_session_fallback = true;
     }
 
+    info!(
+        meeting_id = %meeting.id,
+        conversation_turns = meeting.conversation.len(),
+        transcript_segments = meeting.transcript.len(),
+        context_items = meeting.context.len(),
+        rebuilt_cards = cards.len(),
+        question_cards,
+        answer_cards,
+        restored_artifacts,
+        inferred_artifacts,
+        question_attachment_chips,
+        used_transcript_fallback,
+        used_empty_session_fallback,
+        "overlay history cards rebuilt"
+    );
     cards
 }
 
@@ -4322,9 +4438,37 @@ fn meeting_has_overlay_history(meeting: &MeetingRecord) -> bool {
 
 async fn hydrate_overlay_meeting_history(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
     let _ = send_overlay(daemon, OverlayCommand::Clear).await;
-    for card in overlay_history_cards_for_meeting(meeting) {
-        let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
+    let cards = overlay_history_cards_for_meeting(meeting);
+    let card_count = cards.len();
+    info!(
+        meeting_id = %meeting.id,
+        card_count,
+        conversation_turns = meeting.conversation.len(),
+        transcript_segments = meeting.transcript.len(),
+        context_items = meeting.context.len(),
+        "overlay meeting history hydration started"
+    );
+    let mut pushed_cards = 0_usize;
+    let mut failed_cards = 0_usize;
+    for card in cards {
+        match send_overlay(daemon, OverlayCommand::PushCard { card }).await {
+            Ok(()) => pushed_cards += 1,
+            Err(error) => {
+                failed_cards += 1;
+                warn!(
+                    meeting_id = %meeting.id,
+                    "overlay meeting history card send failed: {error:#}"
+                );
+            }
+        }
     }
+    info!(
+        meeting_id = %meeting.id,
+        card_count,
+        pushed_cards,
+        failed_cards,
+        "overlay meeting history hydration finished"
+    );
 }
 
 fn overlay_context_items(meeting: &MeetingRecord) -> Vec<OverlayContextItem> {
@@ -4865,6 +5009,15 @@ async fn add_audio_transcript_segment_inner(
 
         let meeting = meeting_guard.as_mut().expect("meeting exists");
         if is_near_duplicate_transcript(meeting, speaker, text, segment.is_final) {
+            info!(
+                source = source_label,
+                speaker = %speaker,
+                is_final = segment.is_final,
+                text_chars = text.chars().count(),
+                text_words = word_count(text),
+                recent_transcript_segments = meeting.transcript.len(),
+                "audio transcript segment skipped duplicate"
+            );
             return Ok(());
         }
         // Dedup: if this is a final, remove superseded partial from same speaker
@@ -4877,6 +5030,18 @@ async fn add_audio_transcript_segment_inner(
         meeting.action_items.extend(analysis.action_items);
         meeting.decisions.extend(analysis.decisions);
         daemon.store.save_active(meeting)?;
+        info!(
+            meeting_id = %meeting.id,
+            source = source_label,
+            speaker = %speaker,
+            is_final = segment.is_final,
+            text_chars = text.chars().count(),
+            text_words = word_count(text),
+            transcript_segments = meeting.transcript.len(),
+            action_items = meeting.action_items.len(),
+            decisions = meeting.decisions.len(),
+            "audio transcript segment stored"
+        );
         meeting.clone()
     };
 
@@ -4949,20 +5114,29 @@ fn reindex_meeting_for_rag(daemon: &Arc<Daemon>, meeting: MeetingRecord) {
 }
 
 async fn clear_active_transcript_context(daemon: &Arc<Daemon>) -> Result<()> {
-    let meeting_snapshot = {
+    let cleared = {
         let mut meeting_guard = daemon.meeting.lock().await;
         meeting_guard.as_mut().and_then(|meeting| {
             if meeting.transcript.is_empty() {
                 return None;
             }
+            let transcript_segments = meeting.transcript.len();
+            let action_items = meeting.action_items.len();
+            let decisions = meeting.decisions.len();
             meeting.transcript.clear();
             meeting.action_items.clear();
             meeting.decisions.clear();
             meeting.summary = None;
-            Some(meeting.clone())
+            Some((
+                meeting.clone(),
+                transcript_segments,
+                action_items,
+                decisions,
+            ))
         })
     };
-    let Some(meeting_snapshot) = meeting_snapshot else {
+    let Some((meeting_snapshot, transcript_segments, action_items, decisions)) = cleared else {
+        info!("transcript clear requested but active transcript was already clear");
         push_system_card(
             daemon,
             CardKind::System,
@@ -4972,6 +5146,13 @@ async fn clear_active_transcript_context(daemon: &Arc<Daemon>) -> Result<()> {
         .await;
         return Ok(());
     };
+    info!(
+        meeting_id = %meeting_snapshot.id,
+        transcript_segments,
+        action_items,
+        decisions,
+        "active transcript context cleared"
+    );
 
     daemon.store.save_active(&meeting_snapshot)?;
     update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
@@ -5350,6 +5531,32 @@ async fn answer_with_provider_runtime(
         .or_else(|| answer_overlay_artifact(&response.answer));
     let persisted_answer =
         visible_answer_body_for_artifact(&response.answer, persisted_artifact.as_ref());
+    let persisted_shape = text_shape(&persisted_answer);
+    let (persisted_artifact_type, persisted_artifact_confidence_pct, persisted_artifact_body_chars) =
+        persisted_artifact
+            .as_ref()
+            .map_or(("none", 0_u32, 0_usize), |artifact| {
+                (
+                    artifact_type_label(artifact.artifact_type),
+                    (artifact.confidence * 100.0).round().clamp(0.0, 100.0) as u32,
+                    artifact.body.chars().count(),
+                )
+            });
+    info!(
+        request_id = %request.metadata.request_id,
+        meeting_id = %meeting_snapshot.id,
+        provider = %outcome.provider.display_label(),
+        visible_context_count = visible_context.len(),
+        attachment_ids = request.metadata.visible_context_ids.len(),
+        persisted_answer_chars = persisted_shape.chars,
+        persisted_answer_lines = persisted_shape.lines,
+        persisted_answer_closed_code_blocks = persisted_shape.closed_code_blocks,
+        persisted_answer_has_unclosed_code_fence = persisted_shape.has_unclosed_code_fence,
+        persisted_artifact_type,
+        persisted_artifact_confidence_pct,
+        persisted_artifact_body_chars,
+        "conversation answer persistence diagnostics"
+    );
 
     let meeting_snapshot = {
         let mut meeting_guard = daemon.meeting.lock().await;

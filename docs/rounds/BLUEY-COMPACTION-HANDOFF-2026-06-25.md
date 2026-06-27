@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-27 18:12 EDT
+Latest checkpoint: 2026-06-27 18:41 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,39 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-223-HISTORY-LOAD-REFRESH-EVENT.md`; the next canonical Bluey round doc should start at `ROUND-224-...`.
+- Latest assigned Bluey round doc is `ROUND-224-PRIVACY-SAFE-LIVE-QA-DIAGNOSTICS.md`; the next canonical Bluey round doc should start at `ROUND-225-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 224 added privacy-safe diagnostics for the current live QA issues:
+  - daemon now logs `session_list_requested`, session refresh elapsed time, session counts, context/image totals, active count, and overlay send failures
+  - history replay now logs rebuilt card count, question/answer card counts, restored artifact count, inferred artifact count, attachment-chip count, transcript fallback, and empty-session fallback
+  - history hydration now logs pushed versus failed card delivery
+  - answer persistence now logs saved answer shape, code-fence count, visible context count, attachment count, artifact type, confidence, and artifact body length
+  - direct transcript add and audio/STT transcript paths now log duplicate skips and stored-segment metadata without raw text
+  - transcript clear now logs cleared transcript/action/decision counts or already-clear state
+  - macOS overlay now emits safe lifecycle events for History drawer opened, sessions rendered, transcript buffer consumed/skipped/cleared, auto-send sent/skipped, and manual Ask sent/skipped
+  - Windows overlay now emits matching safe lifecycle events for transcript clear and manual Ask send
+  - daemon only prints lifecycle detail for the new safe diagnostic stages; raw question, answer, transcript, code, filenames, URLs, and source titles remain out of logs
+  - this round is diagnostics-only; it does not change answer quality, billing, web search, click-through, or STT accuracy directly
+  - Round doc: `docs/rounds/ROUND-224-PRIVACY-SAFE-LIVE-QA-DIAGNOSTICS.md`
+  - Verification passed:
+    - `cargo fmt --manifest-path crates/cue-daemon/Cargo.toml`
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `cargo test -p cue-daemon overlay_history_cards_restore_code_artifact_button --lib`
+    - `cargo test -p cue-daemon overlay_history_cards_replay_saved_conversation --lib`
+    - `cargo test -p cue-daemon duplicate_transcript_detection --lib`
+    - `cargo test -p cue-daemon answer_overlay_artifact --lib`
+    - `cargo build -p cue-daemon --bin bluey-daemon`
+    - `cargo build -p cue-cli --bin bluey`
+    - `git diff --check`
+    - `BLUEY_OVERLAY_SWIFT_CONFIGURATION=debug native/macos/cue-overlay/build.sh`
+    - `BLUEY_BIN=/Users/uno/Downloads/cue/target/debug/bluey scripts/bluey-visible-local.sh`
+    - `/Users/uno/Downloads/cue/target/debug/bluey status` reports daemon pid `96701`, overlay visible `true`, overlay capture excluded `false`, and screen capture active `false`
+    - `cargo test -p cue-daemon --lib` (`273 passed`, `2 ignored`)
 - Round 223 fixed the History drawer getting stuck on `Loading...`:
   - expected behavior is local history should usually render in under a second; more than a couple seconds means the overlay missed a session refresh or daemon reply
   - root cause was that opening the macOS History drawer showed `Loading...` but did not explicitly request a fresh session list

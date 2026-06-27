@@ -6959,6 +6959,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             setHeaderSubtitle()
             return
         }
+        emitLifecycle(
+            "session_drawer_opened",
+            detail: "had_loaded=\(sessionsHaveLoaded) cached_sessions=\(sessionItems.count)"
+        )
         if !sessionsHaveLoaded {
             renderSessionDrawerMessage("Loading...")
         }
@@ -7247,6 +7251,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func sendAutoStopAnswer(mode: AutoSendStopMode) {
         guard let q = autoSendQuestionForStopMode(mode) else {
+            emitLifecycle(
+                "autosend_answer_skipped",
+                status: "empty",
+                detail: "mode=\(mode.rawValue) sources=\(autoSendTranscriptLinesBySource.count)"
+            )
             autoSendListenCaptureActive = false
             autoSendTranscriptLinesBySource.removeAll()
             return
@@ -7256,10 +7265,19 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         updateRouteBadge(for: q, selectedRoute: route)
         let sentContextIds = Array(pendingContextItemIds)
         guard !shouldSuppressDuplicateAsk(question: q, visibleContextIds: sentContextIds) else {
+            emitLifecycle(
+                "autosend_answer_skipped",
+                status: "duplicate",
+                detail: "mode=\(mode.rawValue) question_chars=\(q.count) context_ids=\(sentContextIds.count)"
+            )
             autoSendListenCaptureActive = false
             autoSendTranscriptLinesBySource.removeAll()
             return
         }
+        emitLifecycle(
+            "autosend_answer_sent",
+            detail: "mode=\(mode.rawValue) question_chars=\(q.count) context_ids=\(sentContextIds.count)"
+        )
         emitAsk(
             question: q,
             provider: route.provider,
@@ -7308,6 +7326,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         autoSendAfterStopWorkItem?.cancel()
         autoSendAfterStopWorkItem = nil
         let raw = composer.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hadTranscriptContext = transcriptQuestionForAnswer() != nil
         guard !shouldBlockSilentListenAnswer(raw: raw) else {
             window?.makeFirstResponder(composer)
             return
@@ -7327,6 +7346,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
         let sentContextIds = Array(pendingContextItemIds)
         guard !shouldSuppressDuplicateAsk(question: q, visibleContextIds: sentContextIds) else {
+            emitLifecycle(
+                "ask_answer_skipped",
+                status: "duplicate_suppressed",
+                detail: "typed_chars=\(raw.count) question_chars=\(q.count) transcript_context=\(hadTranscriptContext) context_ids=\(sentContextIds.count)"
+            )
             showSystemToast(title: "Already sent", body: "Bluey is already answering that request.", duration: 1.8)
             window?.makeFirstResponder(composer)
             return
@@ -7335,6 +7359,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         consumeTranscriptBufferForAnswer()
         let route = selectedRoute()
         updateRouteBadge(for: q, selectedRoute: route)
+        emitLifecycle(
+            "ask_answer_sent",
+            detail: "typed_chars=\(raw.count) question_chars=\(q.count) transcript_context=\(hadTranscriptContext) context_ids=\(sentContextIds.count)"
+        )
         emitAsk(
             question: q,
             provider: route.provider,
@@ -8066,10 +8094,18 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
 
         if sessions.isEmpty {
+            emitLifecycle("session_drawer_sessions_rendered", detail: "session_count=0 active_count=0 context_total=0 image_total=0")
             renderSessionDrawerMessage("No local saved recordings found. Synced sessions live on the web dashboard.")
             return
         }
 
+        let activeCount = sessions.filter { $0.isActive }.count
+        let contextTotal = sessions.reduce(0) { $0 + $1.contextCount }
+        let imageTotal = sessions.reduce(0) { $0 + $1.imageCount }
+        emitLifecycle(
+            "session_drawer_sessions_rendered",
+            detail: "session_count=\(sessions.count) active_count=\(activeCount) context_total=\(contextTotal) image_total=\(imageTotal)"
+        )
         for session in sessions {
             let row = makeSessionRow(session)
             sessionStack.addArrangedSubview(row)
@@ -9512,6 +9548,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let key = cleanLabel.isEmpty ? "Audio" : cleanLabel
         let line = cleanLabel.isEmpty ? cleanBody : "\(cleanLabel): \(cleanBody)"
         if transcriptLineWasJustConsumed(line) {
+            emitLifecycle(
+                "transcript_buffer_skip_consumed",
+                detail: "source=\(transcriptSourceLabel(key)) final=\(final) body_chars=\(cleanBody.count)"
+            )
             if !final {
                 latestLiveTranscriptLine = nil
                 latestLiveTranscriptLinesBySource.removeValue(forKey: key)
@@ -9563,6 +9603,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func clearLocalTranscriptContext(replacementText: String) {
+        emitLifecycle(
+            "transcript_context_cleared",
+            detail: "snippets=\(transcriptSnippets.count) live_sources=\(latestLiveTranscriptLinesBySource.count) autosend_sources=\(autoSendTranscriptLinesBySource.count) preview_sources=\(liveTranscriptPreviewBodies.count) consumed_fingerprints=\(consumedTranscriptFingerprints.count)"
+        )
         transcriptSnippets.removeAll()
         latestLiveTranscriptLine = nil
         latestLiveTranscriptLinesBySource.removeAll()
@@ -9617,16 +9661,22 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func consumeTranscriptBufferForAnswer() {
         var lines = transcriptSnippets
         appendLiveTranscriptLines(to: &lines)
+        var newlyConsumed = 0
         for line in lines {
             let fingerprint = transcriptMemoryFingerprint(line)
             guard !fingerprint.isEmpty else { continue }
             if !consumedTranscriptFingerprints.contains(fingerprint) {
                 consumedTranscriptFingerprints.append(fingerprint)
+                newlyConsumed += 1
             }
         }
         if consumedTranscriptFingerprints.count > 24 {
             consumedTranscriptFingerprints.removeFirst(consumedTranscriptFingerprints.count - 24)
         }
+        emitLifecycle(
+            "transcript_buffer_consumed",
+            detail: "lines=\(lines.count) new_fingerprints=\(newlyConsumed) retained_fingerprints=\(consumedTranscriptFingerprints.count) recording=\(recordingActive)"
+        )
         transcriptSnippets.removeAll()
         latestLiveTranscriptLine = nil
         latestLiveTranscriptLinesBySource.removeAll()

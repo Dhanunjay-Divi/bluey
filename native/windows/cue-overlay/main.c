@@ -410,6 +410,22 @@ static void emit_simple_event(const char *type) {
     fflush(stdout);
 }
 
+static void emit_lifecycle_event(const char *stage, const char *status, const char *detail) {
+    printf("{\"type\":\"lifecycle\",\"stage\":\"");
+    json_print_escaped(stage ? stage : "");
+    printf("\",\"status\":\"");
+    json_print_escaped(status ? status : "ok");
+    printf("\"");
+    if (detail && detail[0] != '\0') {
+        printf(",\"detail\":\"");
+        json_print_escaped(detail);
+        printf("\"");
+    }
+    emit_token_field();
+    printf("}\n");
+    fflush(stdout);
+}
+
 static void emit_ask_event(const wchar_t *question) {
     char *utf8 = wide_to_utf8_alloc(question);
     if (!utf8) return;
@@ -1271,6 +1287,16 @@ static void consume_sent_context_chips(void) {
 }
 
 static void clear_local_transcript_context(void) {
+    char detail[160];
+    snprintf(
+        detail,
+        sizeof(detail),
+        "final_chars=%zu partial_chars=%zu source_chars=%zu",
+        wcslen(g_transcript_final),
+        wcslen(g_transcript_partial),
+        wcslen(g_transcript_source)
+    );
+    emit_lifecycle_event("transcript_context_cleared", "ok", detail);
     g_transcript_partial[0] = L'\0';
     g_transcript_final[0] = L'\0';
     g_transcript_source[0] = L'\0';
@@ -1280,6 +1306,18 @@ static void clear_local_transcript_context(void) {
 static void send_current_question(void) {
     static const wchar_t *fallback = L"Answer the latest clear question from the current transcript, screen context, and attached files. If there is no clear question yet, summarize what Bluey needs next.";
     int length = GetWindowTextLengthW(g_ask_edit);
+    bool used_fallback = length <= 0;
+    char detail[192];
+    snprintf(
+        detail,
+        sizeof(detail),
+        "typed_chars=%d fallback=%s transcript_context=%s context_ids=%d",
+        length > 0 ? length : 0,
+        used_fallback ? "true" : "false",
+        has_transcript_context() ? "true" : "false",
+        g_context_chip_count
+    );
+    emit_lifecycle_event("ask_answer_sent", "ok", detail);
     if (length <= 0) {
         emit_ask_event(fallback);
     } else {
