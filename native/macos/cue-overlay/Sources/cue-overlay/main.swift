@@ -5916,21 +5916,21 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let yIcon = (frame.height - iconSize) / 2
         let yBadge = (frame.height - 22) / 2
 
-        var left = CGFloat(11)
+        var left = CGFloat(10)
         let showHistoryLabel = frame.width >= 760
-        let historyWidth: CGFloat = showHistoryLabel ? 86 : buttonSize
+        let historyWidth: CGFloat = showHistoryLabel ? 82 : buttonSize
         styleHistoryHeaderButton(navButton, compact: !showHistoryLabel)
         navButton.frame = NSRect(x: left, y: yButton, width: historyWidth, height: buttonSize)
-        left += historyWidth + 8
+        left += historyWidth + 6
         newSessionButton.frame = NSRect(x: left, y: yButton, width: buttonSize, height: buttonSize)
-        left += buttonSize + 10
+        left += buttonSize + 8
         headerLogo.frame = NSRect(x: left, y: yIcon, width: iconSize, height: iconSize)
-        left += iconSize + 7
+        left += iconSize + 5
 
-        let brandWidth = min(124, max(88, frame.width * 0.14))
+        let brandWidth = min(108, max(84, frame.width * 0.10))
         let brandHeight: CGFloat = statusLabel.isHidden ? 23 : 34
         brandStack.frame = NSRect(x: left, y: (frame.height - brandHeight) / 2, width: brandWidth, height: brandHeight)
-        left += brandWidth + 14
+        left += brandWidth + 8
 
         var right = frame.width - 12
         closeButton.frame = NSRect(x: right - 26, y: yButton + 1, width: 26, height: 26)
@@ -5959,18 +5959,26 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             canvasToggleButton.frame = NSRect(x: right, y: yButton + 1, width: 0, height: 26)
         }
 
-        let middleWidth = max(0, right - left - 8)
-        let routeWidth = min(116, max(78, middleWidth * 0.44))
-        let docsWidth = min(128, max(0, middleWidth - routeWidth - 8))
-        routeBadge.isHidden = middleWidth < 96
-        knowledgeBadge.isHidden = !knowledgeBadgeContentVisible || docsWidth < 72
+        let badgeGap: CGFloat = 6
+        let middleWidth = max(0, right - left)
+        let routeWidth = headerBadgeWidth(routeBadge, minimum: 74, maximum: 94)
+        let preferredDocsWidth = headerBadgeWidth(knowledgeBadge, minimum: 92, maximum: 112)
+        let canShowRoute = middleWidth >= routeWidth
+        let docsWidth = min(preferredDocsWidth, max(0, middleWidth - (canShowRoute ? routeWidth + badgeGap : 0)))
+        routeBadge.isHidden = !canShowRoute
+        knowledgeBadge.isHidden = !knowledgeBadgeContentVisible || docsWidth < 82
         if !routeBadge.isHidden {
             routeBadge.frame = NSRect(x: left, y: yBadge, width: routeWidth, height: 22)
-            left += routeWidth + 8
+            left += routeWidth + badgeGap
         }
         if !knowledgeBadge.isHidden {
             knowledgeBadge.frame = NSRect(x: left, y: yBadge, width: docsWidth, height: 22)
         }
+    }
+
+    private func headerBadgeWidth(_ label: NSTextField, minimum: CGFloat, maximum: CGFloat) -> CGFloat {
+        let measured = ceil(label.attributedStringValue.size().width) + 14
+        return min(maximum, max(minimum, measured))
     }
 
     private func configureHeader() {

@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-26 18:58 EDT
+Latest checkpoint: 2026-06-26 20:28 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,24 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-206-CLICKTHROUGH-FULLSCREEN-LISTEN-QA.md`; the next canonical Bluey round doc should start at `ROUND-207-...`.
+- Latest assigned Bluey round doc is `ROUND-207-MAC-HEADER-BADGE-SPACING.md`; the next canonical Bluey round doc should start at `ROUND-208-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
-- Current Codex working branch for the latest saved work is `codex/bluey-overlay-routing-hardening`.
+- Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 207 tightened the macOS expanded header spacing from the owner's visible-mode screenshot:
+  - reduced the history button width and nearby left-cluster gaps
+  - reduced the logo/wordmark spacing and wordmark frame cap
+  - changed the `Ready` route badge and `Show N files` badge from broad middle-width slots to compact text-measured widths
+  - kept Windows parity checked; Windows does not render the same header badge cluster in that position, so no equivalent Windows spacing change was needed
+  - rebuilt and relaunched local visible/debug Bluey
+  - Round doc: `docs/rounds/ROUND-207-MAC-HEADER-BADGE-SPACING.md`
+  - Verification passed:
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `BLUEY_OVERLAY_SWIFT_CONFIGURATION=debug native/macos/cue-overlay/build.sh`
+    - `BLUEY_BIN="$PWD/target/debug/bluey" scripts/bluey-visible-local.sh`
+    - `target/debug/bluey status`
 - Round 206 fixed the owner's visible-QA report about click-through, full-screen, spacing, and Listen/doubled captions:
   - Restored true macOS mode split:
     - Interactive mode keeps blank Bluey space draggable/resizable.
