@@ -2125,6 +2125,7 @@ fn overlay_event_label(event: &OverlayEvent) -> &'static str {
         OverlayEvent::SessionOpenRequested { .. } => "session_open_requested",
         OverlayEvent::SessionRenameRequested { .. } => "session_rename_requested",
         OverlayEvent::SessionDeleteRequested { .. } => "session_delete_requested",
+        OverlayEvent::SessionListRequested => "session_list_requested",
         OverlayEvent::SessionContinueRequested => "session_continue_requested",
         OverlayEvent::SessionNewRequested => "session_new_requested",
         OverlayEvent::ActivePageCaptureRequested => "active_page_capture_requested",
@@ -2264,6 +2265,9 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         }
         OverlayEvent::SessionDeleteRequested { id } => {
             delete_meeting_session(daemon, id).await?;
+        }
+        OverlayEvent::SessionListRequested => {
+            refresh_overlay_sessions(daemon).await;
         }
         OverlayEvent::SessionContinueRequested => {
             continue_session(daemon, "overlay session").await?;

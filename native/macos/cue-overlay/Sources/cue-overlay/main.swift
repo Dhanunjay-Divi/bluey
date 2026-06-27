@@ -6962,6 +6962,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if !sessionsHaveLoaded {
             renderSessionDrawerMessage("Loading...")
         }
+        emitSimple("session_list_requested")
         updateSessionDrawerGeometry(layoutWidth: bounds.width, layoutHeight: bounds.height)
         sessionDrawer.isHidden = false
         setHeaderSubtitle()

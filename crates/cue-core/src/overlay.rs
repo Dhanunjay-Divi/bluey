@@ -153,6 +153,7 @@ pub enum OverlayEvent {
     SessionDeleteRequested {
         id: uuid::Uuid,
     },
+    SessionListRequested,
     SessionContinueRequested,
     SessionNewRequested,
     ActivePageCaptureRequested,
@@ -291,6 +292,14 @@ mod tests {
             json,
             r#"{"type":"session_delete_requested","id":"00000000-0000-0000-0000-000000000000"}"#
         );
+    }
+
+    #[test]
+    fn session_list_event_serializes() {
+        let json = serde_json::to_string(&OverlayEvent::SessionListRequested)
+            .expect("serialize session list event");
+
+        assert_eq!(json, r#"{"type":"session_list_requested"}"#);
     }
 
     #[test]

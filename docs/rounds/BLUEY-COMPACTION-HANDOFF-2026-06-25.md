@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-27 13:50 EDT
+Latest checkpoint: 2026-06-27 18:12 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,35 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-222-HISTORY-CODE-ARTIFACT-RESTORE.md`; the next canonical Bluey round doc should start at `ROUND-223-...`.
+- Latest assigned Bluey round doc is `ROUND-223-HISTORY-LOAD-REFRESH-EVENT.md`; the next canonical Bluey round doc should start at `ROUND-224-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 223 fixed the History drawer getting stuck on `Loading...`:
+  - expected behavior is local history should usually render in under a second; more than a couple seconds means the overlay missed a session refresh or daemon reply
+  - root cause was that opening the macOS History drawer showed `Loading...` but did not explicitly request a fresh session list
+  - it depended on daemon startup `set_sessions`, so a missed/delayed startup push could leave the drawer waiting
+  - added shared protocol event `session_list_requested`
+  - macOS now emits `session_list_requested` every time the History drawer opens
+  - daemon handles `SessionListRequested` by refreshing overlay sessions and sending `set_sessions`
+  - Windows currently uses a session prompt rather than this drawer; shared protocol supports the event and Windows syntax check passed
+  - local Bluey is currently running in visible QA mode after verification; final status reports daemon pid `75048`, `overlay_capture_excluded: false`, and `screen_capture_active: false`
+  - Round doc: `docs/rounds/ROUND-223-HISTORY-LOAD-REFRESH-EVENT.md`
+  - Verification passed:
+    - `cargo fmt --manifest-path crates/cue-core/Cargo.toml`
+    - `cargo fmt --manifest-path crates/cue-daemon/Cargo.toml`
+    - `cargo test -p cue-core session_list_event_serializes --lib`
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `cargo test -p cue-daemon overlay_history_cards_replay_saved_conversation --lib`
+    - `cargo build -p cue-daemon --bin bluey-daemon`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `git diff --check`
+    - `cargo build -p cue-cli --bin bluey`
+    - `cargo test -p cue-core --lib`
+    - `BLUEY_BIN=/Users/uno/Downloads/cue/target/debug/bluey scripts/bluey-visible-local.sh`
+    - `/Users/uno/Downloads/cue/target/debug/bluey status`
 - Round 222 fixed restored-chat code artifacts disappearing after switching chats:
   - root cause was that live answer cards could carry `CueCardArtifact` metadata, but saved `ConversationTurn` records only stored question/answer/source/provider/attachments/timestamp
   - when a user switched to another chat and returned, history replay rebuilt the answer card without the `{}` code/canvas artifact action
