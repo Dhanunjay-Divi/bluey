@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-27 02:24 EDT
+Latest checkpoint: 2026-06-27 02:54 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,36 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-218-VISIBLE-MODE-HISTORY-BOOT.md`; the next canonical Bluey round doc should start at `ROUND-219-...`.
+- Latest assigned Bluey round doc is `ROUND-219-HISTORY-CANVAS-STT-CLARITY.md`; the next canonical Bluey round doc should start at `ROUND-220-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 219 fixed local history visibility, answer-card action clarity, repeated code-request behavior, and STT clear-copy clarity:
+  - root cause for an empty History drawer was that current Bluey data existed under `~/Library/Application Support/bluey`, while older local recordings still lived under legacy `~/Library/Application Support/cue`
+  - `MeetingStore` now bridges current Bluey and legacy Cue local active/archive meeting records for `all_meetings`, `last_meeting`, `load_by_id`, `rename`, and `delete`
+  - history results are newest-first and deduped by meeting id; new writes still stay in the current Bluey store
+  - macOS answer cards now expose a distinct open-canvas button for answer artifacts, alongside copy and paste-into-behind-app actions
+  - the paste action now uses a text-cursor style icon when available instead of the confusing download-like icon
+  - backend answer-shape rules now tell repeated build/implement/write requests to show or regenerate the implementation instead of saying it is already above
+  - transcript-clear tooltip now clarifies that clearing captions affects the next answer context, while already transcribed cloud audio may still count as used
+  - local Bluey is currently running in visible QA mode after verification; final status reports daemon pid `2855`, `overlay_capture_excluded: false`, and `screen_capture_active: false`
+  - Round doc: `docs/rounds/ROUND-219-HISTORY-CANVAS-STT-CLARITY.md`
+  - Verification passed:
+    - `git diff --check`
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `cargo fmt --manifest-path crates/cue-daemon/Cargo.toml`
+    - `cargo test -p cue-daemon meeting_store_reads_legacy_cue_history_from_bluey_store --lib`
+    - `cargo test -p cue-daemon storage::security_tests::meeting_store --lib`
+    - `cargo test -p cue-daemon mode_instructions --lib`
+    - `cargo test -p cue-daemon provider_messages_include_overlay_friendly_answer_shape --lib`
+    - `cargo test -p cue-daemon answer_overlay_artifact --lib`
+    - `BLUEY_OVERLAY_SWIFT_CONFIGURATION=debug native/macos/cue-overlay/build.sh`
+    - `cargo build -p cue-daemon --bin bluey-daemon`
+    - `BLUEY_BIN=/Users/uno/Downloads/cue/target/debug/bluey scripts/bluey-visible-local.sh`
+    - `/Users/uno/Downloads/cue/target/debug/bluey status`
 - Round 218 fixed visible-mode startup and saved-session dashboard boot:
   - root cause for `overlay_capture_excluded: true` after visible helper was that the prior release pass built the macOS overlay in release mode, which compiles out the debug visible-capture gate
   - `scripts/bluey-visible-local.sh` now prefers local debug Bluey, rebuilds the macOS overlay in debug mode, pins the matching local daemon/overlay paths when possible, forces the raw helper path, sets both capture-visible request env names, and only prints success after `bluey status` reports `overlay_capture_excluded: false`

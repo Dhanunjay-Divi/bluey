@@ -1814,6 +1814,10 @@ private final class PasteCardButton: NSButton {
     var resetWorkItem: DispatchWorkItem?
 }
 
+private final class CanvasCardButton: NSButton {
+    var cardId = ""
+}
+
 private final class RemoveAttachmentButton: NSButton {
     var contextId = ""
 }
@@ -2376,6 +2380,7 @@ private final class FeedView: NSView {
     var onTranscript: ((RenderedCard) -> Void)?
     var onOpenURL: ((URL) -> Void)?
     var onPasteText: ((String) -> Void)?
+    var onOpenCanvasForCard: ((String) -> Void)?
 
     private var panelColor: NSColor {
         lightThemeEnabled
@@ -2590,7 +2595,7 @@ private final class FeedView: NSView {
 
         var hit: NSView? = hitTest(localPoint)
         while let view = hit {
-            if view is CopyCardButton || view is PasteCardButton {
+            if view is CopyCardButton || view is CanvasCardButton || view is PasteCardButton {
                 return true
             }
             hit = view.superview
@@ -2926,9 +2931,13 @@ private final class FeedView: NSView {
         let copyButton = shouldShowCopyButton(for: card, rightAligned: rightAligned, signInURL: signInURL)
             ? makeCopyCardButton(text: rawBody.isEmpty ? bodyText : rawBody, rightAligned: rightAligned)
             : nil
+        let canvasButton = shouldShowCanvasButton(for: card, rightAligned: rightAligned, signInURL: signInURL)
+            ? makeCanvasCardButton(cardId: card.id, artifactType: card.artifact?.artifactType, rightAligned: rightAligned)
+            : nil
         let pasteButton = shouldShowPasteButton(for: card, rightAligned: rightAligned, signInURL: signInURL)
             ? makePasteCardButton(text: bodyText, rightAligned: rightAligned)
             : nil
+        let actionButtons = [copyButton, canvasButton, pasteButton].compactMap { $0 }
 
         let signInButton: NSButton? = signInURL.map { url in
             let button = NSButton(title: "Open login", target: self, action: #selector(openURLButtonClicked(_:)))
@@ -2961,6 +2970,9 @@ private final class FeedView: NSView {
         }
         if let copyButton {
             bubble.addSubview(copyButton)
+        }
+        if let canvasButton {
+            bubble.addSubview(canvasButton)
         }
         if let pasteButton {
             bubble.addSubview(pasteButton)
@@ -3017,35 +3029,20 @@ private final class FeedView: NSView {
                 bodyLabel.leadingAnchor.constraint(equalTo: metaLabel.leadingAnchor),
                 bodyLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14),
             ])
-            if let copyButton, let pasteButton {
-                constraints.append(contentsOf: [
-                    statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: copyButton.leadingAnchor, constant: -6),
-                    copyButton.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
-                    copyButton.trailingAnchor.constraint(equalTo: pasteButton.leadingAnchor, constant: -6),
-                    copyButton.widthAnchor.constraint(equalToConstant: 22),
-                    copyButton.heightAnchor.constraint(equalToConstant: 22),
-
-                    pasteButton.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
-                    pasteButton.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -10),
-                    pasteButton.widthAnchor.constraint(equalToConstant: 24),
-                    pasteButton.heightAnchor.constraint(equalToConstant: 22),
-                ])
-            } else if let copyButton {
-                constraints.append(contentsOf: [
-                    statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: copyButton.leadingAnchor, constant: -6),
-                    copyButton.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
-                    copyButton.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -10),
-                    copyButton.widthAnchor.constraint(equalToConstant: 22),
-                    copyButton.heightAnchor.constraint(equalToConstant: 22),
-                ])
-            } else if let pasteButton {
-                constraints.append(contentsOf: [
-                    statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: pasteButton.leadingAnchor, constant: -6),
-                    pasteButton.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
-                    pasteButton.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -10),
-                    pasteButton.widthAnchor.constraint(equalToConstant: 24),
-                    pasteButton.heightAnchor.constraint(equalToConstant: 22),
-                ])
+            if let firstButton = actionButtons.first {
+                constraints.append(statusLabel.trailingAnchor.constraint(lessThanOrEqualTo: firstButton.leadingAnchor, constant: -6))
+                for (index, button) in actionButtons.enumerated() {
+                    constraints.append(contentsOf: [
+                        button.centerYAnchor.constraint(equalTo: metaLabel.centerYAnchor),
+                        button.widthAnchor.constraint(equalToConstant: actionButtonWidth(button)),
+                        button.heightAnchor.constraint(equalToConstant: 22),
+                    ])
+                    if index + 1 < actionButtons.count {
+                        constraints.append(button.trailingAnchor.constraint(equalTo: actionButtons[index + 1].leadingAnchor, constant: -6))
+                    } else {
+                        constraints.append(button.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -10))
+                    }
+                }
             } else {
                 constraints.append(statusLabel.trailingAnchor.constraint(equalTo: bubble.trailingAnchor, constant: -14))
             }
@@ -3267,7 +3264,7 @@ private final class FeedView: NSView {
         button.contentTintColor = rightAligned
             ? NSColor.black.withAlphaComponent(0.58)
             : BlueyTheme.cyan.withAlphaComponent(0.92)
-        if let image = symbolImage("arrow.down.doc") {
+        if let image = symbolImage("text.cursor") ?? symbolImage("arrow.down.doc") {
             image.isTemplate = true
             button.image = image
             button.imagePosition = .imageOnly
@@ -3279,12 +3276,52 @@ private final class FeedView: NSView {
         return button
     }
 
+    private func makeCanvasCardButton(cardId: String, artifactType: String?, rightAligned: Bool) -> CanvasCardButton {
+        let button = CanvasCardButton(title: "", target: self, action: #selector(openCanvasCardClicked(_:)))
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.cardId = cardId
+        button.isBordered = false
+        button.wantsLayer = true
+        button.layer?.cornerRadius = 10
+        button.layer?.backgroundColor = rightAligned
+            ? NSColor.black.withAlphaComponent(0.06).cgColor
+            : BlueyTheme.cyan.withAlphaComponent(0.10).cgColor
+        button.layer?.borderWidth = 1
+        button.layer?.borderColor = rightAligned
+            ? NSColor.black.withAlphaComponent(0.10).cgColor
+            : BlueyTheme.cyan.withAlphaComponent(0.28).cgColor
+        button.contentTintColor = rightAligned
+            ? NSColor.black.withAlphaComponent(0.58)
+            : BlueyTheme.cyan.withAlphaComponent(0.96)
+        let kind = CanvasKind.fromArtifactType(artifactType ?? "")
+        if let image = symbolImage(kind.icon) ?? symbolImage("sidebar.right") {
+            image.isTemplate = true
+            button.image = image
+            button.imagePosition = .imageOnly
+            button.imageScaling = .scaleProportionallyDown
+        } else {
+            button.title = "Canvas"
+        }
+        button.toolTip = "Open \(kind.title)"
+        return button
+    }
+
+    private func actionButtonWidth(_ button: NSButton) -> CGFloat {
+        button is CopyCardButton ? 22 : 24
+    }
+
     private func shouldShowCopyButton(for card: RenderedCard, rightAligned: Bool, signInURL: URL?) -> Bool {
         guard signInURL == nil, !rightAligned else { return false }
         let body = card.body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !body.isEmpty, body != "Thinking..." else { return false }
         let kind = normalizedCardKind(card.kind)
         return kind == "answer" || kind == "context" || kind == "warning" || card.artifact != nil
+    }
+
+    private func shouldShowCanvasButton(for card: RenderedCard, rightAligned: Bool, signInURL: URL?) -> Bool {
+        guard signInURL == nil, !rightAligned else { return false }
+        guard normalizedCardKind(card.kind) == "answer" else { return false }
+        return card.artifact != nil
     }
 
     private func shouldShowPasteButton(for card: RenderedCard, rightAligned: Bool, signInURL: URL?) -> Bool {
@@ -3307,6 +3344,10 @@ private final class FeedView: NSView {
         guard !text.isEmpty, text != "Thinking..." else { return }
         onPasteText?(text)
         flashPasteSuccess(sender)
+    }
+
+    @objc private func openCanvasCardClicked(_ sender: CanvasCardButton) {
+        onOpenCanvasForCard?(sender.cardId)
     }
 
     private func flashCopySuccess(_ button: CopyCardButton) {
@@ -4327,7 +4368,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         newSessionButton = NSButton(title: "", target: nil, action: nil)
         sessionDrawer = SessionDrawerView()
         drawerTitleLabel = NSTextField(labelWithString: "History")
-        drawerSubtitleLabel = NSTextField(labelWithString: "Continue, rename, or delete saved recordings.")
+        drawerSubtitleLabel = NSTextField(labelWithString: "Local recordings on this device.")
         drawerCloseButton = NSButton(title: "", target: nil, action: nil)
         latestSessionButton = NSButton(title: "Continue latest", target: nil, action: nil)
         sessionScroll = NSScrollView()
@@ -4410,6 +4451,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
         feed.onPasteText = { [weak self] text in
             self?.onPasteText?(text)
+        }
+        feed.onOpenCanvasForCard = { [weak self] cardId in
+            self?.openCanvasForCardId(cardId)
         }
 
         for view in [
@@ -6575,7 +6619,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         askButton.toolTip = "Send the question. Enter answers; Shift+Enter adds a new line."
         composer.toolTip = "Type or paste a question for Bluey"
         transcriptStrip.toolTip = "Live captions preview"
-        transcriptClearButton.toolTip = "Clear current captions from the next answer"
+        transcriptClearButton.toolTip = "Clear captions from the next answer. Already transcribed cloud audio may still count as used."
         attachmentStrip.toolTip = "Attached documents and images. Scroll horizontally to see more."
         opacityControl.toolTip = "Adjust Bluey opacity"
         opacitySlider.toolTip = "Adjust Bluey opacity"
@@ -7989,7 +8033,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
 
         if sessions.isEmpty {
-            let empty = NSTextField(wrappingLabelWithString: "No saved recordings on this device yet.")
+            let empty = NSTextField(wrappingLabelWithString: "No local saved recordings found. Synced sessions live on the web dashboard.")
             empty.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
             empty.textColor = BlueyTheme.textDim
             empty.alignment = .center
@@ -8350,6 +8394,18 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         activeCanvasIndex = index
         canvasPane.render(canvases[index])
         canvasPane.setNavigation(index: index, total: canvases.count)
+    }
+
+    private func openCanvasForCardId(_ cardId: String) {
+        if let index = canvasCardAssignments[cardId],
+           canvases.indices.contains(index) {
+            activeCanvasIndex = index
+        }
+        renderActiveCanvas()
+        setCanvasOpen(true)
+        emitLifecycle(
+            "canvas_open_from_card",
+            detail: "source_card=\(cardId) index=\(activeCanvasIndex ?? -1) count=\(canvases.count)")
     }
 
     private func showPreviousCanvas() {

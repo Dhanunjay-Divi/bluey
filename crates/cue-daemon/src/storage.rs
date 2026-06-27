@@ -9,15 +9,22 @@ use cue_core::MeetingRecord;
 pub struct MeetingStore {
     active_file: PathBuf,
     archive_dir: PathBuf,
+    legacy_active_file: Option<PathBuf>,
+    legacy_archive_dir: Option<PathBuf>,
 }
 
 impl MeetingStore {
     pub fn new(paths: &AppPaths) -> Result<Self> {
         let archive_dir = paths.data_dir.join("meetings");
         cue_core::app_paths::create_private_dir(&archive_dir)?;
+        let legacy_dir = legacy_data_dir_for(&paths.data_dir);
         Ok(Self {
             active_file: paths.data_dir.join("active-meeting.json"),
             archive_dir,
+            legacy_active_file: legacy_dir
+                .as_ref()
+                .map(|dir| dir.join("active-meeting.json")),
+            legacy_archive_dir: legacy_dir.map(|dir| dir.join("meetings")),
         })
     }
 
@@ -52,32 +59,7 @@ impl MeetingStore {
     }
 
     pub fn last_meeting(&self) -> Result<Option<MeetingRecord>> {
-        if let Some(active) = self.load_active()? {
-            return Ok(Some(active));
-        }
-
-        let mut candidates = Vec::new();
-        for entry in fs::read_dir(&self.archive_dir)
-            .with_context(|| format!("failed to read {}", self.archive_dir.display()))?
-        {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
-                let modified = entry.metadata()?.modified()?;
-                candidates.push((modified, path));
-            }
-        }
-
-        candidates.sort_by_key(|(modified, _)| *modified);
-        let Some((_, path)) = candidates.pop() else {
-            return Ok(None);
-        };
-
-        let bytes =
-            fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-        let meeting = serde_json::from_slice(&bytes)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
-        Ok(Some(meeting))
+        Ok(self.all_meetings()?.into_iter().next())
     }
 
     pub fn all_meetings(&self) -> Result<Vec<MeetingRecord>> {
@@ -85,28 +67,19 @@ impl MeetingStore {
         if let Some(active) = self.load_active()? {
             meetings.push(active);
         }
-
-        if !self.archive_dir.exists() {
-            return Ok(meetings);
+        if let Some(path) = self.legacy_active_file.as_ref() {
+            if let Some(active) = read_optional_meeting(path)? {
+                meetings.push(active);
+            }
         }
 
-        for entry in fs::read_dir(&self.archive_dir)
-            .with_context(|| format!("failed to read {}", self.archive_dir.display()))?
-        {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-                continue;
-            }
-
-            let bytes =
-                fs::read(&path).with_context(|| format!("failed to read {}", path.display()))?;
-            let meeting = serde_json::from_slice(&bytes)
-                .with_context(|| format!("failed to parse {}", path.display()))?;
-            meetings.push(meeting);
+        for archive_dir in self.archive_dirs() {
+            meetings.extend(read_archived_meetings(archive_dir)?);
         }
 
         meetings.sort_by(|left, right| right.started_at.cmp(&left.started_at));
+        let mut seen = std::collections::HashSet::new();
+        meetings.retain(|meeting| seen.insert(meeting.id));
         Ok(meetings)
     }
 
@@ -114,6 +87,13 @@ impl MeetingStore {
         if let Some(active) = self.load_active()? {
             if active.id == id {
                 return Ok(Some(active));
+            }
+        }
+        if let Some(path) = self.legacy_active_file.as_ref() {
+            if let Some(active) = read_optional_meeting(path)? {
+                if active.id == id {
+                    return Ok(Some(active));
+                }
             }
         }
 
@@ -136,6 +116,15 @@ impl MeetingStore {
                 return Ok(active);
             }
         }
+        if let Some(path) = self.legacy_active_file.as_ref() {
+            if let Some(mut active) = read_optional_meeting(path)? {
+                if active.id == id {
+                    active.title = title.to_string();
+                    write_private_json(path, &active)?;
+                    return Ok(active);
+                }
+            }
+        }
 
         let path = self
             .archive_path_for(id)?
@@ -155,6 +144,15 @@ impl MeetingStore {
                 deleted = true;
             }
         }
+        if let Some(path) = self.legacy_active_file.as_ref() {
+            if let Some(active) = read_optional_meeting(path)? {
+                if active.id == id {
+                    fs::remove_file(path)
+                        .with_context(|| format!("failed to delete {}", path.display()))?;
+                    deleted = true;
+                }
+            }
+        }
 
         if let Some(path) = self.archive_path_for(id)? {
             fs::remove_file(&path)
@@ -166,27 +164,36 @@ impl MeetingStore {
     }
 
     fn archive_path_for(&self, id: uuid::Uuid) -> Result<Option<PathBuf>> {
-        if !self.archive_dir.exists() {
-            return Ok(None);
-        }
-
-        for entry in fs::read_dir(&self.archive_dir)
-            .with_context(|| format!("failed to read {}", self.archive_dir.display()))?
-        {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+        for archive_dir in self.archive_dirs() {
+            if !archive_dir.exists() {
                 continue;
             }
-            if path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .is_some_and(|stem| stem.ends_with(&id.to_string()))
+            for entry in fs::read_dir(archive_dir)
+                .with_context(|| format!("failed to read {}", archive_dir.display()))?
             {
-                return Ok(Some(path));
+                let entry = entry?;
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                    continue;
+                }
+                if path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| stem.ends_with(&id.to_string()))
+                {
+                    return Ok(Some(path));
+                }
             }
         }
         Ok(None)
+    }
+
+    fn archive_dirs(&self) -> Vec<&Path> {
+        let mut dirs = vec![self.archive_dir.as_path()];
+        if let Some(dir) = self.legacy_archive_dir.as_deref() {
+            dirs.push(dir);
+        }
+        dirs
     }
 
     fn read_meeting(&self, path: &Path) -> Result<MeetingRecord> {
@@ -194,6 +201,45 @@ impl MeetingStore {
         serde_json::from_slice(&bytes)
             .with_context(|| format!("failed to parse {}", path.display()))
     }
+}
+
+fn legacy_data_dir_for(data_dir: &Path) -> Option<PathBuf> {
+    if data_dir.file_name().and_then(|name| name.to_str()) != Some("bluey") {
+        return None;
+    }
+    let legacy = data_dir.parent()?.join("cue");
+    legacy.exists().then_some(legacy)
+}
+
+fn read_optional_meeting(path: &Path) -> Result<Option<MeetingRecord>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let meeting = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(Some(meeting))
+}
+
+fn read_archived_meetings(archive_dir: &Path) -> Result<Vec<MeetingRecord>> {
+    if !archive_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut meetings = Vec::new();
+    for entry in fs::read_dir(archive_dir)
+        .with_context(|| format!("failed to read {}", archive_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(meeting) = read_optional_meeting(&path)? {
+            meetings.push(meeting);
+        }
+    }
+    Ok(meetings)
 }
 
 fn write_private_json(path: &Path, meeting: &MeetingRecord) -> Result<()> {
@@ -300,6 +346,58 @@ mod security_tests {
         assert!(!store
             .delete(uuid::Uuid::new_v4())
             .expect("delete missing meeting"));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn meeting_store_reads_legacy_cue_history_from_bluey_store() {
+        let base = std::env::temp_dir().join(format!(
+            "bluey-meeting-store-legacy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = AppPaths {
+            data_dir: base.join("bluey"),
+            config_dir: base.join("config"),
+            runtime_dir: base.join("run"),
+            state_file: base.join("run/daemon-state.json"),
+            account_file: base.join("config/account.json"),
+            settings_file: base.join("config/settings.json"),
+        };
+        paths.ensure().expect("ensure paths");
+
+        let legacy_paths = AppPaths {
+            data_dir: base.join("cue"),
+            config_dir: base.join("config-legacy"),
+            runtime_dir: base.join("run-legacy"),
+            state_file: base.join("run-legacy/daemon-state.json"),
+            account_file: base.join("config-legacy/account.json"),
+            settings_file: base.join("config-legacy/settings.json"),
+        };
+        legacy_paths.ensure().expect("ensure legacy paths");
+        let legacy_store = MeetingStore::new(&legacy_paths).expect("legacy store");
+        let mut legacy = MeetingRecord::new(Some("Legacy local recording".to_string()));
+        legacy.transcript.push(cue_core::TranscriptSegment::new(
+            cue_core::Speaker::User,
+            "legacy transcript",
+            true,
+        ));
+        let legacy_id = legacy.id;
+        legacy_store
+            .save_archived(&legacy)
+            .expect("save legacy archived meeting");
+
+        let store = MeetingStore::new(&paths).expect("bluey store");
+        let meetings = store.all_meetings().expect("all meetings");
+        assert!(meetings.iter().any(|meeting| meeting.id == legacy_id));
+        assert_eq!(
+            store
+                .load_by_id(legacy_id)
+                .expect("load by id")
+                .expect("legacy meeting")
+                .title,
+            "Legacy local recording"
+        );
 
         let _ = fs::remove_dir_all(base);
     }
