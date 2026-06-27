@@ -984,7 +984,7 @@ fn prompt_with_answer_plan(
     system: &str,
     user: &str,
     plan: &AnswerPlan,
-    web_sources: &[CompleteSource],
+    web_search: &WebSearchOutcome,
 ) -> (String, String) {
     let evidence = plan.evidence_labels().join(", ");
     let mut instructions = format!(
@@ -995,10 +995,19 @@ fn prompt_with_answer_plan(
         plan.intent.as_str()
     );
 
-    if !web_sources.is_empty() {
+    if !web_search.sources.is_empty() {
         instructions.push_str(
             "\nWhen using managed web results, cite factual/current claims with the matching source label like [W1]. Prefer direct, specific sources over generic advice.",
         );
+    } else if plan.needs_web_search && web_search.attempted {
+        let skipped = web_search
+            .skipped_reason
+            .map(web_search_skipped_label)
+            .unwrap_or("Web search did not return sources.");
+        instructions.push_str(&format!(
+            "\nManaged web search did not return usable sources for this request: {skipped} \
+             Do not imply web search succeeded. If the answer depends on public or current information, say web search was unavailable for this request and give the next useful step without asking for unrelated session documents."
+        ));
     }
 
     (format!("{system}\n\n{instructions}"), user.to_string())
@@ -1038,6 +1047,9 @@ const MAX_WEB_SEARCH_QUERY_CHARS: usize = 160;
 const DEFAULT_WEB_SEARCH_CUSTOMER_COST_CENTS: i64 = 2;
 const DEFAULT_WEB_SEARCH_BLUEY_COST_CENTS: i64 = 1;
 const DEFAULT_TRIAL_WEB_SEARCHES_PER_DAY: i64 = 5;
+const DEFAULT_WEB_SEARCH_ACCOUNT_HOURLY_LIMIT: i64 = 120;
+const DEFAULT_WEB_SEARCH_BURST_LIMIT: i64 = 12;
+const DEFAULT_WEB_SEARCH_BURST_WINDOW_SECS: u64 = 60;
 const DEFAULT_WEB_SEARCH_REPEAT_WINDOW_SECS: u64 = 600;
 const WEB_SEARCH_USAGE_KIND: &str = "web_search";
 const WEB_SEARCH_TASK_TYPE: &str = "web_search";
@@ -1216,6 +1228,100 @@ async fn completion_web_search_budgeted(
             };
         }
     }
+    if account.trial_seconds_remaining <= 0 && config.customer_cost_cents > 0 {
+        match balance::can_afford(pool, &account.id, config.customer_cost_cents) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    request_id,
+                    search_cost_cents = config.customer_cost_cents,
+                    "managed web search skipped; account needs credits"
+                );
+                return WebSearchOutcome {
+                    attempted: true,
+                    provider: Some(config.provider.clone()),
+                    skipped_reason: Some("insufficient_credits"),
+                    ..Default::default()
+                };
+            }
+            Err(error) => {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    request_id,
+                    error = %error,
+                    "managed web search skipped; credit preflight failed"
+                );
+                return WebSearchOutcome {
+                    attempted: true,
+                    provider: Some(config.provider.clone()),
+                    skipped_reason: Some("credit_check_unavailable"),
+                    ..Default::default()
+                };
+            }
+        }
+    }
+    let hourly_limit = web_search_env_i64(
+        "BLUEY_WEB_SEARCH_ACCOUNT_HOURLY_LIMIT",
+        DEFAULT_WEB_SEARCH_ACCOUNT_HOURLY_LIMIT,
+        0,
+        10_000,
+    );
+    if hourly_limit > 0 {
+        match usage::count_task_events_in_window(pool, &account.id, WEB_SEARCH_TASK_TYPE, 1) {
+            Ok(searches_used) if searches_used >= hourly_limit => {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    request_id,
+                    searches_used,
+                    hourly_limit,
+                    "managed web search skipped; hourly safety rail reached"
+                );
+                return WebSearchOutcome {
+                    attempted: true,
+                    provider: Some(config.provider.clone()),
+                    skipped_reason: Some("account_search_cooldown"),
+                    ..Default::default()
+                };
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    request_id,
+                    error = %error,
+                    "managed web search hourly safety lookup failed; allowing request"
+                );
+            }
+        }
+    }
+    let burst_limit = web_search_env_i64(
+        "BLUEY_WEB_SEARCH_BURST_LIMIT",
+        DEFAULT_WEB_SEARCH_BURST_LIMIT,
+        0,
+        1_000,
+    );
+    let burst_window = Duration::from_secs(web_search_env_i64(
+        "BLUEY_WEB_SEARCH_BURST_WINDOW_SECS",
+        DEFAULT_WEB_SEARCH_BURST_WINDOW_SECS as i64,
+        0,
+        3_600,
+    ) as u64);
+    if !allow_web_search_burst(&account.id, burst_window, burst_limit) {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            request_id,
+            burst_limit,
+            burst_window_secs = burst_window.as_secs(),
+            "managed web search skipped; short-window safety rail reached"
+        );
+        return WebSearchOutcome {
+            attempted: true,
+            provider: Some(config.provider.clone()),
+            skipped_reason: Some("account_search_cooldown"),
+            ..Default::default()
+        };
+    }
     let repeat_window = Duration::from_secs(web_search_env_i64(
         "BLUEY_WEB_SEARCH_REPEAT_WINDOW_SECS",
         DEFAULT_WEB_SEARCH_REPEAT_WINDOW_SECS as i64,
@@ -1320,6 +1426,25 @@ fn trial_web_searches_used_today(
     }
 }
 
+fn allow_web_search_burst(account_id: &str, window: Duration, limit: i64) -> bool {
+    if window.is_zero() || limit <= 0 {
+        return true;
+    }
+    let now = Instant::now();
+    let key = web_search_account_guard_key(account_id);
+    let guard = WEB_SEARCH_BURST_GUARD.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut entries) = guard.lock() else {
+        return true;
+    };
+    let timestamps = entries.entry(key).or_insert_with(Vec::new);
+    timestamps.retain(|seen_at| now.duration_since(*seen_at) <= window);
+    if timestamps.len() >= limit as usize {
+        return false;
+    }
+    timestamps.push(now);
+    true
+}
+
 fn allow_web_search_repeat(account_id: &str, query: &str, window: Duration) -> bool {
     if window.is_zero() {
         return true;
@@ -1338,6 +1463,12 @@ fn allow_web_search_repeat(account_id: &str, query: &str, window: Duration) -> b
     true
 }
 
+fn web_search_account_guard_key(account_id: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    account_id.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn web_search_repeat_guard_key(account_id: &str, query: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     account_id.hash(&mut hasher);
@@ -1348,6 +1479,7 @@ fn web_search_repeat_guard_key(account_id: &str, query: &str) -> u64 {
 }
 
 static WEB_SEARCH_REPEAT_GUARD: OnceLock<Mutex<HashMap<u64, Instant>>> = OnceLock::new();
+static WEB_SEARCH_BURST_GUARD: OnceLock<Mutex<HashMap<u64, Vec<Instant>>>> = OnceLock::new();
 
 async fn perform_web_search(
     config: &WebSearchConfig,
@@ -1678,6 +1810,9 @@ fn web_search_skipped_label(reason: &str) -> &'static str {
         "query_sanitized_empty_or_sensitive" => "Web search skipped for private or unsafe text.",
         "trial_web_search_quota_reached" => "Trial web search limit reached today.",
         "repeated_query_guard" => "Web search paused briefly for this repeated question.",
+        "account_search_cooldown" => "Web search paused briefly. Try again soon.",
+        "insufficient_credits" => "Add credits to use web search.",
+        "credit_check_unavailable" => "Web search is temporarily unavailable.",
         "provider_timeout" => "Web search timed out.",
         "provider_error" => "Web search provider failed.",
         _ => "Web search skipped.",
@@ -1968,7 +2103,7 @@ async fn complete_stream_inner(
     let (provider_system, provider_user) =
         prompt_with_web_context(&provider_system, &provider_user, &web_sources);
     let (provider_system, provider_user) =
-        prompt_with_answer_plan(&provider_system, &provider_user, &answer_plan, &web_sources);
+        prompt_with_answer_plan(&provider_system, &provider_user, &answer_plan, &web_search);
 
     let thinking = routing::resolve_thinking_budget(
         effective_lane,
@@ -2757,7 +2892,7 @@ async fn complete_inner(
     let (provider_system, provider_user) =
         prompt_with_web_context(&provider_system, &provider_user, &web_sources);
     let (provider_system, provider_user) =
-        prompt_with_answer_plan(&provider_system, &provider_user, &answer_plan, &web_sources);
+        prompt_with_answer_plan(&provider_system, &provider_user, &answer_plan, &web_search);
 
     // 2. Resolve lane → provider+model candidates. Entry balance check uses
     // the maximum candidate estimate so provider failover cannot overrun a
@@ -4701,6 +4836,9 @@ mod tests {
             "query_sanitized_empty_or_sensitive",
             "trial_web_search_quota_reached",
             "repeated_query_guard",
+            "account_search_cooldown",
+            "insufficient_credits",
+            "credit_check_unavailable",
             "provider_timeout",
             "provider_error",
         ] {
@@ -4712,6 +4850,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn web_search_burst_guard_blocks_obsessive_short_window_use() {
+        let account_id = format!("acct-{}", uuid::Uuid::new_v4());
+        assert!(allow_web_search_burst(
+            &account_id,
+            Duration::from_secs(60),
+            2
+        ));
+        assert!(allow_web_search_burst(
+            &account_id,
+            Duration::from_secs(60),
+            2
+        ));
+        assert!(!allow_web_search_burst(
+            &account_id,
+            Duration::from_secs(60),
+            2
+        ));
+        assert!(allow_web_search_burst(
+            &account_id,
+            Duration::from_secs(60),
+            0
+        ));
     }
 
     #[test]
@@ -4855,6 +5018,34 @@ mod tests {
 
         assert_eq!(plan.intent, AnswerIntent::Research);
         assert!(plan.needs_web_search);
+    }
+
+    #[test]
+    fn answer_plan_prompt_explains_unavailable_web_search() {
+        let plan = AnswerPlan {
+            intent: AnswerIntent::Research,
+            needs_screen: false,
+            needs_docs: false,
+            needs_memory: false,
+            needs_web_search: true,
+        };
+        let web_search = WebSearchOutcome {
+            attempted: true,
+            skipped_reason: Some("provider_not_configured"),
+            ..Default::default()
+        };
+
+        let (system, user) = prompt_with_answer_plan(
+            "You are Bluey.",
+            "Question:\nsecret passage ranch",
+            &plan,
+            &web_search,
+        );
+
+        assert_eq!(user, "Question:\nsecret passage ranch");
+        assert!(system.contains("Managed web search did not return usable sources"));
+        assert!(system.contains("Web search is not configured yet."));
+        assert!(system.contains("Do not imply web search succeeded"));
     }
 
     #[test]

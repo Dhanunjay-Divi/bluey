@@ -761,6 +761,15 @@ private final class ComposerTextView: NSTextView {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .arrow)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        NSCursor.arrow.set()
+        super.mouseMoved(with: event)
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
         guard string.isEmpty else { return }
@@ -990,6 +999,23 @@ private final class ComposerTextView: NSTextView {
         default:
             return false
         }
+    }
+}
+
+private final class ArrowCursorTextView: NSTextView {
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .arrow)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        NSCursor.arrow.set()
+        super.mouseMoved(with: event)
+    }
+}
+
+private final class ArrowCursorTextField: NSTextField {
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .arrow)
     }
 }
 
@@ -3264,7 +3290,7 @@ private final class FeedView: NSView {
         button.contentTintColor = rightAligned
             ? NSColor.black.withAlphaComponent(0.58)
             : BlueyTheme.cyan.withAlphaComponent(0.92)
-        if let image = symbolImage("text.cursor") ?? symbolImage("arrow.down.doc") {
+        if let image = symbolImage("keyboard") ?? symbolImage("rectangle.and.pencil.and.ellipsis") ?? symbolImage("arrow.down.doc") {
             image.isTemplate = true
             button.image = image
             button.imagePosition = .imageOnly
@@ -3751,7 +3777,7 @@ private final class CanvasPaneView: NSView {
     private let copyButton = NSButton(title: "", target: nil, action: nil)
     private let closeButton = NSButton(title: "", target: nil, action: nil)
     private let scroll = NSScrollView()
-    private let textView = NSTextView()
+    private let textView = ArrowCursorTextView()
     private var currentText = ""
     private var fullWindow = false
 
@@ -4264,6 +4290,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var consumedTranscriptFingerprints: [String] = []
     private var lastTranscriptStripSource: String?
     private var sessionItems: [OverlaySessionItem] = []
+    private var sessionsHaveLoaded = false
     private var editingSessionId: String?
     private var pendingDeleteSessionId: String?
     private var renameField: NSTextField?
@@ -4376,7 +4403,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         answerStyleOverlay = ModalBlockerView()
         answerStylePanel = NSView()
         answerStyleLabel = NSTextField(labelWithString: "How Bluey should answer")
-        answerStyleBox = NSTextField()
+        answerStyleBox = ArrowCursorTextField()
         answerStyleSaveButton = NSButton(title: "Save", target: nil, action: nil)
         transcriptStrip = NSView()
         transcriptActivityDot = NSView()
@@ -4972,6 +4999,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     override func resetCursorRects() {
         super.resetCursorRects()
+        addCursorRect(bounds, cursor: .arrow)
         guard closeConfirmOverlay.isHidden, answerStyleOverlay.isHidden, !windowFullSize else { return }
         addCursorRect(NSRect(x: 0, y: 0, width: resizeHitSize, height: resizeHitSize), cursor: Self.resizeNortheastSouthwestCursor)
         addCursorRect(NSRect(x: bounds.width - resizeHitSize, y: bounds.height - resizeHitSize, width: resizeHitSize, height: resizeHitSize), cursor: Self.resizeNortheastSouthwestCursor)
@@ -6931,6 +6959,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             setHeaderSubtitle()
             return
         }
+        if !sessionsHaveLoaded {
+            renderSessionDrawerMessage("Loading...")
+        }
         updateSessionDrawerGeometry(layoutWidth: bounds.width, layoutHeight: bounds.height)
         sessionDrawer.isHidden = false
         setHeaderSubtitle()
@@ -8025,6 +8056,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     func setSessions(_ sessions: [OverlaySessionItem]) {
         sessionItems = sessions
+        sessionsHaveLoaded = true
         renameField = nil
         updateSessionDrawerGeometry(layoutWidth: bounds.width, layoutHeight: bounds.height)
         for view in sessionStack.arrangedSubviews {
@@ -8033,13 +8065,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
 
         if sessions.isEmpty {
-            let empty = NSTextField(wrappingLabelWithString: "No local saved recordings found. Synced sessions live on the web dashboard.")
-            empty.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
-            empty.textColor = BlueyTheme.textDim
-            empty.alignment = .center
-            empty.translatesAutoresizingMaskIntoConstraints = false
-            sessionStack.addArrangedSubview(empty)
-            empty.widthAnchor.constraint(equalTo: sessionStack.widthAnchor, constant: -20).isActive = true
+            renderSessionDrawerMessage("No local saved recordings found. Synced sessions live on the web dashboard.")
             return
         }
 
@@ -8049,6 +8075,21 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             row.widthAnchor.constraint(equalTo: sessionStack.widthAnchor, constant: -2).isActive = true
         }
         updateSessionDrawerGeometry(layoutWidth: bounds.width, layoutHeight: bounds.height)
+    }
+
+    private func renderSessionDrawerMessage(_ message: String) {
+        renameField = nil
+        for view in sessionStack.arrangedSubviews {
+            sessionStack.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
+        let label = NSTextField(wrappingLabelWithString: message)
+        label.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        label.textColor = BlueyTheme.textDim
+        label.alignment = .center
+        label.translatesAutoresizingMaskIntoConstraints = false
+        sessionStack.addArrangedSubview(label)
+        label.widthAnchor.constraint(equalTo: sessionStack.widthAnchor, constant: -20).isActive = true
     }
 
     private func updateSessionDrawerGeometry(layoutWidth: CGFloat, layoutHeight: CGFloat) {
@@ -10169,7 +10210,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func configureRenameRow(_ row: NSView, session: OverlaySessionItem) -> NSView {
-        let field = NSTextField()
+        let field = ArrowCursorTextField()
         field.translatesAutoresizingMaskIntoConstraints = false
         field.stringValue = session.title
         field.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)

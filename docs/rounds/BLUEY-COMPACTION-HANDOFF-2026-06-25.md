@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-27 02:54 EDT
+Latest checkpoint: 2026-06-27 13:13 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,36 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-219-HISTORY-CANVAS-STT-CLARITY.md`; the next canonical Bluey round doc should start at `ROUND-220-...`.
+- Latest assigned Bluey round doc is `ROUND-220-WEB-SEARCH-GUARDS-OVERLAY-POLISH.md`; the next canonical Bluey round doc should start at `ROUND-221-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 220 fixed web-search unavailable behavior, added stronger search safety rails, and polished overlay actions/loading/cursors:
+  - root cause for "secret passage ranch" not using web search was that the managed server has a web-search lane but still requires real provider configuration; when not configured, search skipped and the final prompt did not explicitly tell the model web search was unavailable
+  - AnswerPlan prompt now tells the model when web search was attempted but returned no usable sources, so it must not imply search succeeded and should say web search was unavailable when public/current info is required
+  - paid web search now preflights credits before calling the search provider
+  - trial web search keeps a durable daily cap
+  - paid accounts remain credit-metered instead of a low daily count, but now have a configurable durable hourly safety rail: `BLUEY_WEB_SEARCH_ACCOUNT_HOURLY_LIMIT`, default `120`, `0` disables
+  - added a configurable short-window burst guard before provider calls: `BLUEY_WEB_SEARCH_BURST_LIMIT`, default `12`, and `BLUEY_WEB_SEARCH_BURST_WINDOW_SECS`, default `60`
+  - repeated-identical-query guard remains in place
+  - customer-facing skipped labels remain neutral and avoid internal abuse/fraud/scraping wording
+  - macOS answer-card paste icon changed from confusing `A|`/text-cursor symbol to a keyboard-style icon
+  - macOS History drawer now renders `Loading...` until the first session list arrives
+  - macOS composer/canvas/answer-style/rename text areas now use arrow cursor rects so the overlay does not show an I-beam cursor while hovering
+  - local Bluey is currently running in visible QA mode after verification; final status reports daemon pid `26805`, `overlay_capture_excluded: false`, and `screen_capture_active: false`
+  - Round doc: `docs/rounds/ROUND-220-WEB-SEARCH-GUARDS-OVERLAY-POLISH.md`
+  - Verification passed:
+    - `cargo fmt --manifest-path server/Cargo.toml`
+    - `cargo test --manifest-path server/Cargo.toml web_search --lib`
+    - `cargo test --manifest-path server/Cargo.toml answer_plan_prompt_explains_unavailable_web_search --lib`
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `git diff --check`
+    - `BLUEY_OVERLAY_SWIFT_CONFIGURATION=debug native/macos/cue-overlay/build.sh`
+    - `BLUEY_BIN=/Users/uno/Downloads/cue/target/debug/bluey scripts/bluey-visible-local.sh`
+    - `/Users/uno/Downloads/cue/target/debug/bluey status`
 - Round 219 fixed local history visibility, answer-card action clarity, repeated code-request behavior, and STT clear-copy clarity:
   - root cause for an empty History drawer was that current Bluey data existed under `~/Library/Application Support/bluey`, while older local recordings still lived under legacy `~/Library/Application Support/cue`
   - `MeetingStore` now bridges current Bluey and legacy Cue local active/archive meeting records for `all_meetings`, `last_meeting`, `load_by_id`, `rename`, and `delete`
