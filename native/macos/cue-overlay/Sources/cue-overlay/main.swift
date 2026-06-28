@@ -4294,6 +4294,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var canvasCardAssignments: [String: Int] = [:]
     private var canvasOpen = false
     private var canvasFullWindow = false
+    private var lastSessionToggleAt: TimeInterval = 0
+    private var lastCanvasToggleAt: TimeInterval = 0
+    private var suppressCanvasFullWindowUntil: TimeInterval = 0
     private var preCanvasFullWindowFrame: NSRect?
     private var windowFullSize = false
     private var preWindowFullSizeFrame: NSRect?
@@ -6918,7 +6921,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         composer.scrollRangeToVisible(composer.selectedRange())
     }
 
+    private func shouldIgnoreRapidToggle(lastActionAt: inout TimeInterval) -> Bool {
+        let now = CACurrentMediaTime()
+        let eventClickCount = NSApp.currentEvent?.clickCount ?? 1
+        let isRapidRepeat = now - lastActionAt < 0.28
+        lastActionAt = now
+        return eventClickCount > 1 || isRapidRepeat
+    }
+
     @objc private func toggleSessionsClicked() {
+        guard !shouldIgnoreRapidToggle(lastActionAt: &lastSessionToggleAt) else { return }
         if !sessionDrawer.isHidden {
             sessionDrawer.isHidden = true
             setHeaderSubtitle()
@@ -6943,9 +6955,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     @objc private func toggleCanvasClicked() {
         guard !canvases.isEmpty else { return }
+        guard !shouldIgnoreRapidToggle(lastActionAt: &lastCanvasToggleAt) else { return }
         if canvasOpen {
             setCanvasOpen(false)
         } else {
+            suppressCanvasFullWindowUntil = CACurrentMediaTime() + 0.45
             renderActiveCanvas()
             setCanvasOpen(true)
         }
@@ -6953,6 +6967,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func toggleCanvasFullWindow() {
         guard canvasOpen, window != nil else { return }
+        guard CACurrentMediaTime() >= suppressCanvasFullWindowUntil else { return }
         if canvasFullWindow {
             restoreCanvasWindow()
         } else {

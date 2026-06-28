@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-28 02:12 EDT
+Latest checkpoint: 2026-06-28 02:21 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,26 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-226-REMOVE-ANSWER-PASTE-KEYBOARD-ACTION.md`; the next canonical Bluey round doc should start at `ROUND-227-...`.
+- Latest assigned Bluey round doc is `ROUND-227-CANVAS-SIDEBAR-DOUBLE-CLICK-GUARD.md`; the next canonical Bluey round doc should start at `ROUND-228-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 227 fixed accidental canvas/window expansion from rapid double clicks on the sidebar/canvas icon:
+  - added a short rapid-repeat guard for the History toggle
+  - added a short rapid-repeat guard for the canvas/sidebar toggle
+  - when canvas opens from the header button, canvas full-window expansion is suppressed for 450ms so a second physical click cannot land on newly exposed canvas expand chrome
+  - normal single-click behavior remains unchanged
+  - Windows does not have the same macOS sidebar/canvas header interaction path; Windows syntax check passed for parity coverage
+  - Round doc: `docs/rounds/ROUND-227-CANVAS-SIDEBAR-DOUBLE-CLICK-GUARD.md`
+  - Verification passed:
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `BLUEY_OVERLAY_SWIFT_CONFIGURATION=debug native/macos/cue-overlay/build.sh`
+    - `git diff --check`
+    - `BLUEY_BIN=/Users/uno/Downloads/cue/target/debug/bluey scripts/bluey-visible-local.sh`
+    - `/Users/uno/Downloads/cue/target/debug/bluey status` reports daemon pid `41825`, overlay visible `true`, overlay capture excluded `false`, and screen capture active `false`
 - Round 226 removed the answer-card keyboard/paste action:
   - macOS no longer renders the answer-card paste action button
   - removed the macOS `PasteCardButton` class, keyboard icon setup, paste-click handler, paste-success flash, and parent callback chain
