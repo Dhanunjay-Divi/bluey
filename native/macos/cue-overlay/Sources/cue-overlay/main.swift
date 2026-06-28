@@ -1449,15 +1449,6 @@ private func emitInstructions(text: String) {
     emitEvent(["type": "instructions_updated", "text": text])
 }
 
-private func emitPasteText(text: String, targetBundleId: String?) {
-    var payload: [String: Any] = ["type": "paste_text_requested", "text": text]
-    if let targetBundleId,
-       !targetBundleId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-        payload["target_bundle_id"] = targetBundleId
-    }
-    emitEvent(payload)
-}
-
 private func emitSessionOpen(id: String) {
     emitEvent(["type": "session_open_requested", "id": id])
 }
@@ -1876,11 +1867,6 @@ private final class ClickableHeaderBadge: NSTextField {
 
 private final class CopyCardButton: NSButton {
     var copyText = ""
-    var resetWorkItem: DispatchWorkItem?
-}
-
-private final class PasteCardButton: NSButton {
-    var pasteText = ""
     var resetWorkItem: DispatchWorkItem?
 }
 
@@ -2449,7 +2435,6 @@ private final class FeedView: NSView {
     private var currentOpacity: CGFloat = 0.94
     var onTranscript: ((RenderedCard) -> Void)?
     var onOpenURL: ((URL) -> Void)?
-    var onPasteText: ((String) -> Void)?
     var onOpenCanvasForCard: ((String) -> Void)?
 
     private var panelColor: NSColor {
@@ -2665,7 +2650,7 @@ private final class FeedView: NSView {
 
         var hit: NSView? = hitTest(localPoint)
         while let view = hit {
-            if view is CopyCardButton || view is CanvasCardButton || view is PasteCardButton {
+            if view is CopyCardButton || view is CanvasCardButton {
                 return true
             }
             hit = view.superview
@@ -3004,10 +2989,7 @@ private final class FeedView: NSView {
         let canvasButton = shouldShowCanvasButton(for: card, rightAligned: rightAligned, signInURL: signInURL)
             ? makeCanvasCardButton(cardId: card.id, artifactType: card.artifact?.artifactType, rightAligned: rightAligned)
             : nil
-        let pasteButton = shouldShowPasteButton(for: card, rightAligned: rightAligned, signInURL: signInURL)
-            ? makePasteCardButton(text: bodyText, rightAligned: rightAligned)
-            : nil
-        let actionButtons = [copyButton, canvasButton, pasteButton].compactMap { $0 }
+        let actionButtons = [copyButton, canvasButton].compactMap { $0 }
 
         let signInButton: NSButton? = signInURL.map { url in
             let button = NSButton(title: "Open login", target: self, action: #selector(openURLButtonClicked(_:)))
@@ -3043,9 +3025,6 @@ private final class FeedView: NSView {
         }
         if let canvasButton {
             bubble.addSubview(canvasButton)
-        }
-        if let pasteButton {
-            bubble.addSubview(pasteButton)
         }
         if let signInButton {
             bubble.addSubview(signInButton)
@@ -3317,35 +3296,6 @@ private final class FeedView: NSView {
         return button
     }
 
-    private func makePasteCardButton(text: String, rightAligned: Bool) -> PasteCardButton {
-        let button = PasteCardButton(title: "", target: self, action: #selector(pasteCardClicked(_:)))
-        button.translatesAutoresizingMaskIntoConstraints = false
-        button.pasteText = text
-        button.isBordered = false
-        button.wantsLayer = true
-        button.layer?.cornerRadius = 10
-        button.layer?.backgroundColor = rightAligned
-            ? NSColor.black.withAlphaComponent(0.06).cgColor
-            : BlueyTheme.cyan.withAlphaComponent(0.08).cgColor
-        button.layer?.borderWidth = 1
-        button.layer?.borderColor = rightAligned
-            ? NSColor.black.withAlphaComponent(0.10).cgColor
-            : BlueyTheme.cyan.withAlphaComponent(0.22).cgColor
-        button.contentTintColor = rightAligned
-            ? NSColor.black.withAlphaComponent(0.58)
-            : BlueyTheme.cyan.withAlphaComponent(0.92)
-        if let image = symbolImage("keyboard") ?? symbolImage("rectangle.and.pencil.and.ellipsis") ?? symbolImage("arrow.down.doc") {
-            image.isTemplate = true
-            button.image = image
-            button.imagePosition = .imageOnly
-            button.imageScaling = .scaleProportionallyDown
-        } else {
-            button.title = "P"
-        }
-        button.toolTip = "Paste this answer into the app behind Bluey"
-        return button
-    }
-
     private func makeCanvasCardButton(cardId: String, artifactType: String?, rightAligned: Bool) -> CanvasCardButton {
         let button = CanvasCardButton(title: "", target: self, action: #selector(openCanvasCardClicked(_:)))
         button.translatesAutoresizingMaskIntoConstraints = false
@@ -3394,26 +3344,12 @@ private final class FeedView: NSView {
         return card.artifact != nil
     }
 
-    private func shouldShowPasteButton(for card: RenderedCard, rightAligned: Bool, signInURL: URL?) -> Bool {
-        guard signInURL == nil, !rightAligned else { return false }
-        let body = card.body.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !body.isEmpty, body != "Thinking..." else { return false }
-        return normalizedCardKind(card.kind) == "answer"
-    }
-
     @objc private func copyCardClicked(_ sender: CopyCardButton) {
         let text = sender.copyText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
         flashCopySuccess(sender)
-    }
-
-    @objc private func pasteCardClicked(_ sender: PasteCardButton) {
-        let text = sender.pasteText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, text != "Thinking..." else { return }
-        onPasteText?(text)
-        flashPasteSuccess(sender)
     }
 
     @objc private func openCanvasCardClicked(_ sender: CanvasCardButton) {
@@ -3443,35 +3379,6 @@ private final class FeedView: NSView {
             button.title = originalTitle
             button.contentTintColor = originalTint
             button.toolTip = "Copy this message"
-            button.resetWorkItem = nil
-        }
-        button.resetWorkItem = reset
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.1, execute: reset)
-    }
-
-    private func flashPasteSuccess(_ button: PasteCardButton) {
-        button.resetWorkItem?.cancel()
-        let originalImage = button.image
-        let originalTitle = button.title
-        let originalTint = button.contentTintColor
-        if let image = symbolImage("checkmark") {
-            image.isTemplate = true
-            button.image = image
-            button.imagePosition = .imageOnly
-            button.title = ""
-        } else {
-            button.image = nil
-            button.title = "OK"
-        }
-        button.contentTintColor = BlueyTheme.green
-        button.toolTip = "Sent to app"
-
-        let reset = DispatchWorkItem { [weak button] in
-            guard let button else { return }
-            button.image = originalImage
-            button.title = originalTitle
-            button.contentTintColor = originalTint
-            button.toolTip = "Paste this answer into the app behind Bluey"
             button.resetWorkItem = nil
         }
         button.resetWorkItem = reset
@@ -4323,7 +4230,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     var onListeningStateChanged: ((PillRunState) -> Void)?
     var onWindowFrameChanged: ((NSRect) -> Void)?
     var onInteractionModeChanged: (() -> Void)?
-    var onPasteText: ((String) -> Void)?
     private var recordingActive = false
     private var transcriptSnippets: [String] = []
     private var latestLiveTranscriptLine: String?
@@ -4519,9 +4425,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
         feed.onOpenURL = { url in
             NSWorkspace.shared.open(url)
-        }
-        feed.onPasteText = { [weak self] text in
-            self?.onPasteText?(text)
         }
         feed.onOpenCanvasForCard = { [weak self] cardId in
             self?.openCanvasForCardId(cardId)
@@ -11455,9 +11358,6 @@ private final class OverlayApp {
         view.onInteractionModeChanged = { [weak self] in
             self?.updateExpandedMousePolicy()
         }
-        view.onPasteText = { [weak self] text in
-            self?.pasteAnswerToTarget(text)
-        }
         expandedWindow = window
         expandedView = view
         view.setListeningState(currentRunState)
@@ -11466,12 +11366,6 @@ private final class OverlayApp {
             pushBootCard(title: pending.title, lines: pending.lines)
             pendingBoot = nil
         }
-    }
-
-    private func pasteAnswerToTarget(_ text: String) {
-        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !clean.isEmpty else { return }
-        emitPasteText(text: clean, targetBundleId: lastTargetBundleIdentifier)
     }
 
     private func placeExpandedWindowForOpen() {

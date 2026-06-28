@@ -274,7 +274,6 @@ static void configure_tooltips(void) {
     add_control_tooltip(g_record_button, L"Start or stop listening");
     add_control_tooltip(g_auto_send_combo, L"Choose which audio source should auto-send when listening stops.");
     add_control_tooltip(g_transcript_clear_button, L"Clear current captions from the next answer");
-    add_control_tooltip(g_paste_answer_button, L"Paste this answer into the app behind Bluey");
     add_control_tooltip(g_help_button, L"Show Bluey help");
     add_control_tooltip(g_session_button, L"Open conversation history");
     add_control_tooltip(g_page_button, L"Capture the screen as context");
@@ -630,16 +629,13 @@ static void update_transcript_clear_button(void) {
 }
 
 static bool has_pasteable_answer(void) {
-    return !g_collapsed
-        && _wcsicmp(g_kind, L"answer") == 0
-        && g_body[0] != L'\0'
-        && _wcsicmp(g_body, L"Thinking...") != 0;
+    return false;
 }
 
 static void update_paste_answer_button(void) {
     if (!g_paste_answer_button) return;
-    ShowWindow(g_paste_answer_button, has_pasteable_answer() ? SW_SHOW : SW_HIDE);
-    EnableWindow(g_paste_answer_button, has_pasteable_answer());
+    ShowWindow(g_paste_answer_button, SW_HIDE);
+    EnableWindow(g_paste_answer_button, FALSE);
     InvalidateRect(g_paste_answer_button, NULL, TRUE);
 }
 
@@ -1252,7 +1248,7 @@ static void create_controls(HWND hwnd) {
     SendMessageW(g_auto_send_combo, CB_SETCURSEL, g_auto_send_mode, 0);
     g_transcript_clear_button = CreateWindowW(L"BUTTON", L"Clear", WS_CHILD | BS_OWNERDRAW,
         0, 0, 60, 24, hwnd, (HMENU)ID_TRANSCRIPT_CLEAR_BUTTON, GetModuleHandleW(NULL), NULL);
-    g_paste_answer_button = CreateWindowW(L"BUTTON", L"Paste answer", WS_CHILD | BS_OWNERDRAW,
+    g_paste_answer_button = CreateWindowW(L"BUTTON", L"", WS_CHILD | BS_OWNERDRAW,
         0, 0, 106, 28, hwnd, (HMENU)ID_PASTE_ANSWER_BUTTON, GetModuleHandleW(NULL), NULL);
     g_help_button = CreateWindowW(L"BUTTON", L"Help", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
         0, 0, 60, 30, hwnd, (HMENU)ID_HELP_BUTTON, GetModuleHandleW(NULL), NULL);
@@ -2114,15 +2110,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             return 0;
         }
         if (id == ID_PASTE_ANSWER_BUTTON) {
-            if (has_pasteable_answer()) {
-                emit_paste_text_event(g_body);
-                collapse_to_pill(hwnd, true);
-            }
             return 0;
         }
         if (id == ID_HELP_BUTTON) {
             overlay_message_box(
-                L"Green dot: Bluey is connected.\nHelp: show this guide.\nSession: continue or start clean.\nAttach: add files or show attached docs.\nTheme: switch black/white background while keeping Bluey borders.\nStyle: answer rules.\nAnalyse Screen: search/read the active browser page or available screen context and generate an answer.\nRecap: summarize the active session from the bottom bar.\nPaste answer: place the current Bluey answer into the app behind the overlay.\nQuit: stop Bluey completely. Hide/collapse behavior becomes a small Bluey button.\nMic: start/stop audio capture.\nMic dot: dim off, bright green recording.\nAnswer: ask Bluey.\nBlank Bluey space clicks the app behind it. Drag the Bluey logo/wordmark to move it. Controls stay clickable.",
+                L"Green dot: Bluey is connected.\nHelp: show this guide.\nSession: continue or start clean.\nAttach: add files or show attached docs.\nTheme: switch black/white background while keeping Bluey borders.\nStyle: answer rules.\nAnalyse Screen: search/read the active browser page or available screen context and generate an answer.\nRecap: summarize the active session from the bottom bar.\nQuit: stop Bluey completely. Hide/collapse behavior becomes a small Bluey button.\nMic: start/stop audio capture.\nMic dot: dim off, bright green recording.\nAnswer: ask Bluey.\nBlank Bluey space clicks the app behind it. Drag the Bluey logo/wordmark to move it. Controls stay clickable.",
                 L"Bluey controls",
                 MB_OK | MB_ICONINFORMATION
             );
