@@ -7387,6 +7387,7 @@ Human-speak contract:
 - When those explicit session rules say to ask clarifying questions first or stay in an interview role, follow that rule instead of giving a generic explainer.
 - For follow-ups, answer the delta directly in 2-4 sentences. Do not restart the whole previous answer unless the user asks.
 - Treat transcript, screen, and attached documents as the user's current working context. Prefer the latest relevant turn and avoid repeating stale context.
+- If the latest question introduces a standalone new topic, answer that topic directly. Do not connect it to prior session context unless the user explicitly asks to compare, continue, modify, or use the previous answer.
 - If the supplied context includes a previous answer attachment, previous screen, or previous file for an immediate follow-up, use that retained context as part of the same conversation. Do not say the original screen/file is unavailable unless the context explicitly says no preview or retained image data exists.
 - Do not invent personal experience, shipped work, metrics, or ownership that is not in the question or session context.
 - No assistant preamble such as \"Sure\", \"Here is\", \"As an AI\", or \"You can say\".
@@ -8313,7 +8314,7 @@ async fn answer_context_for_question(
     question: &str,
     visible_context_ids: &[uuid::Uuid],
 ) -> Vec<AnswerContext> {
-    let mut context = answer_context_from_meeting(meeting, visible_context_ids);
+    let mut context = answer_context_from_meeting(meeting, visible_context_ids, Some(question));
     context.extend(relevant_current_attachment_context_for_question(
         meeting,
         visible_context_ids,
@@ -8712,6 +8713,7 @@ fn relevant_current_attachment_context_for_question(
 fn answer_context_from_meeting(
     meeting: &MeetingRecord,
     visible_context_ids: &[uuid::Uuid],
+    question: Option<&str>,
 ) -> Vec<AnswerContext> {
     let mut context = Vec::new();
     if let Some(summary) = meeting
@@ -8740,7 +8742,11 @@ fn answer_context_from_meeting(
     }
 
     let conversation = meeting.last_conversation_text(10);
-    if !conversation.trim().is_empty() {
+    if !conversation.trim().is_empty()
+        && question.is_none_or(|question| {
+            should_include_recent_conversation_context(meeting, &conversation, question)
+        })
+    {
         context.push(
             AnswerContext::new(AnswerContextKind::MeetingMemory, conversation)
                 .with_title("Recent Bluey Q&A")
@@ -8769,6 +8775,216 @@ fn answer_context_from_meeting(
     }
 
     context
+}
+
+fn should_include_recent_conversation_context(
+    meeting: &MeetingRecord,
+    conversation: &str,
+    question: &str,
+) -> bool {
+    let trimmed = question.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    if conversation.trim().is_empty() {
+        return false;
+    }
+
+    let question_terms = topic_terms(trimmed);
+    if question_terms.is_empty() {
+        return true;
+    }
+
+    let conversation_terms = topic_terms(conversation);
+    if conversation_terms.is_empty() {
+        return false;
+    }
+
+    let has_reference = has_recent_context_reference(trimmed);
+    let standalone_new_topic = looks_like_standalone_new_topic_request(trimmed, &question_terms);
+    if standalone_new_topic && !has_reference {
+        debug!(
+            session_id = %meeting.id,
+            question_intent = question_intent_label(trimmed),
+            question_topic_terms = question_terms.len(),
+            "skipping recent Bluey Q&A for standalone new-topic question"
+        );
+        return false;
+    }
+
+    let overlap = question_terms
+        .iter()
+        .filter(|term| conversation_terms.contains(*term))
+        .count();
+    if overlap >= 2 {
+        return true;
+    }
+
+    if has_reference {
+        return true;
+    }
+
+    let has_new_topic_anchor = question_terms
+        .iter()
+        .any(|term| is_strong_topic_anchor(term) && !conversation_terms.contains(term));
+    if has_new_topic_anchor && overlap == 0 {
+        debug!(
+            session_id = %meeting.id,
+            question_intent = question_intent_label(trimmed),
+            "skipping recent Bluey Q&A for likely topic shift"
+        );
+        return false;
+    }
+
+    overlap > 0 && !has_new_topic_anchor
+}
+
+fn has_recent_context_reference(question: &str) -> bool {
+    let q = question.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return false;
+    }
+
+    let words: std::collections::BTreeSet<String> = query_terms(&q).into_iter().collect();
+    let word_signal = [
+        "this", "that", "it", "above", "previous", "earlier", "same", "again", "continue",
+    ]
+    .iter()
+    .any(|signal| words.contains(*signal));
+    if word_signal {
+        return true;
+    }
+
+    [
+        "the code",
+        "the answer",
+        "the solution",
+        "the design",
+        "the previous",
+        "what about",
+        "why did",
+        "how did",
+    ]
+    .iter()
+    .any(|signal| q.contains(signal))
+}
+
+fn looks_like_standalone_new_topic_request(
+    question: &str,
+    terms: &std::collections::BTreeSet<String>,
+) -> bool {
+    let q = question.trim().to_ascii_lowercase();
+    if terms.len() < 2 || !terms.iter().any(|term| is_strong_topic_anchor(term)) {
+        return false;
+    }
+
+    [
+        "what is",
+        "what's",
+        "tell me about",
+        "explain",
+        "can you explain",
+        "could you explain",
+        "build me",
+        "write",
+        "implement",
+        "create",
+        "make",
+    ]
+    .iter()
+    .any(|signal| q.contains(signal))
+}
+
+fn topic_terms(text: &str) -> std::collections::BTreeSet<String> {
+    query_terms(text)
+        .into_iter()
+        .filter(|term| !is_topic_stopword(term))
+        .map(|term| match term.as_str() {
+            "lro" => "lru".to_string(),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
+fn is_topic_stopword(term: &str) -> bool {
+    matches!(
+        term,
+        "about"
+            | "again"
+            | "also"
+            | "and"
+            | "answer"
+            | "are"
+            | "ask"
+            | "asked"
+            | "bluey"
+            | "build"
+            | "can"
+            | "code"
+            | "could"
+            | "does"
+            | "explain"
+            | "for"
+            | "from"
+            | "give"
+            | "how"
+            | "implement"
+            | "into"
+            | "is"
+            | "it"
+            | "me"
+            | "need"
+            | "new"
+            | "number"
+            | "numbers"
+            | "okay"
+            | "ok"
+            | "one"
+            | "please"
+            | "question"
+            | "series"
+            | "should"
+            | "six"
+            | "so"
+            | "tell"
+            | "that"
+            | "the"
+            | "there"
+            | "this"
+            | "to"
+            | "two"
+            | "use"
+            | "using"
+            | "want"
+            | "way"
+            | "we"
+            | "what"
+            | "when"
+            | "why"
+            | "with"
+            | "write"
+            | "you"
+            | "your"
+    )
+}
+
+fn is_strong_topic_anchor(term: &str) -> bool {
+    term.len() >= 4
+        || matches!(
+            term,
+            "ai" | "api"
+                | "aws"
+                | "css"
+                | "db"
+                | "dfs"
+                | "dp"
+                | "gcp"
+                | "ide"
+                | "lru"
+                | "sql"
+                | "ui"
+                | "ux"
+        )
 }
 
 fn answer_context_from_artifact(artifact: &ContextArtifact) -> AnswerContext {
@@ -12269,7 +12485,7 @@ mod tests {
         let mut meeting = MeetingRecord::new(Some("Attachment test".to_string()));
         meeting.context.push(artifact);
 
-        let context = answer_context_from_meeting(&meeting, &[artifact_id]);
+        let context = answer_context_from_meeting(&meeting, &[artifact_id], None);
         let document = context
             .iter()
             .find(|item| item.title.as_deref() == Some("Large spec"))
@@ -12301,7 +12517,7 @@ mod tests {
         meeting.context.push(saved_doc);
         meeting.context.push(old_screen);
 
-        let context = answer_context_from_meeting(&meeting, &[]);
+        let context = answer_context_from_meeting(&meeting, &[], None);
 
         assert!(!context
             .iter()
@@ -12309,6 +12525,54 @@ mod tests {
         assert!(!context
             .iter()
             .any(|item| item.title.as_deref() == Some("Old screen")));
+    }
+
+    #[test]
+    fn meeting_context_skips_recent_qa_for_standalone_new_topic() {
+        let mut meeting = MeetingRecord::new(Some("Coding practice".to_string()));
+        meeting.push_conversation_turn(ConversationTurn::new(
+            "Can you write Fibonacci series?",
+            "Use iteration for O(n), recursion for teaching, and memoization to avoid repeated subproblems.",
+            Some("overlay ask".to_string()),
+            Some("Bluey managed".to_string()),
+        ));
+        meeting.push_conversation_turn(ConversationTurn::new(
+            "Is there a way you can reduce time complexity for this?",
+            "Memoization caches each Fibonacci result once, so recursive calls drop from exponential to linear time.",
+            Some("overlay ask".to_string()),
+            Some("Bluey managed".to_string()),
+        ));
+
+        let context = answer_context_from_meeting(
+            &meeting,
+            &[],
+            Some("So, okay, six numbers. Can you explain LRO cache?"),
+        );
+
+        assert!(!context
+            .iter()
+            .any(|item| item.title.as_deref() == Some("Recent Bluey Q&A")));
+    }
+
+    #[test]
+    fn meeting_context_keeps_recent_qa_for_true_follow_up() {
+        let mut meeting = MeetingRecord::new(Some("Coding practice".to_string()));
+        meeting.push_conversation_turn(ConversationTurn::new(
+            "Can you write Fibonacci series?",
+            "The recursive version recomputes the same subproblems repeatedly.",
+            Some("overlay ask".to_string()),
+            Some("Bluey managed".to_string()),
+        ));
+
+        let context = answer_context_from_meeting(
+            &meeting,
+            &[],
+            Some("Is there a way you can reduce time complexity for this?"),
+        );
+
+        assert!(context
+            .iter()
+            .any(|item| item.title.as_deref() == Some("Recent Bluey Q&A")));
     }
 
     #[test]
@@ -12430,7 +12694,7 @@ mod tests {
             .expect("doc artifact");
         assert!(doc.text_preview.is_none());
 
-        let future_context = answer_context_from_meeting(&meeting, &[]);
+        let future_context = answer_context_from_meeting(&meeting, &[], None);
         assert!(!future_context
             .iter()
             .any(|item| item.title.as_deref() == Some("Screen context")));
@@ -12779,7 +13043,7 @@ mod tests {
                 .to_string(),
         );
 
-        let context = answer_context_from_meeting(&meeting, &[]);
+        let context = answer_context_from_meeting(&meeting, &[], None);
 
         let summary = context
             .iter()
@@ -12822,6 +13086,8 @@ mod tests {
         assert!(system.contains("stay in an interview role"));
         assert!(system.contains("For follow-ups, answer the delta directly"));
         assert!(system.contains("Prefer the latest relevant turn"));
+        assert!(system.contains("standalone new topic"));
+        assert!(system.contains("Do not connect it to prior session context"));
         assert!(system.contains("Do not invent personal experience"));
         assert!(system.contains("No assistant preamble"));
         assert!(system.contains("AI-sounding filler"));

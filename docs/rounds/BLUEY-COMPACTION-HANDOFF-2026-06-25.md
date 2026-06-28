@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-28 02:21 EDT
+Latest checkpoint: 2026-06-28 02:38 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,31 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-227-CANVAS-SIDEBAR-DOUBLE-CLICK-GUARD.md`; the next canonical Bluey round doc should start at `ROUND-228-...`.
+- Latest assigned Bluey round doc is `ROUND-228-TOPIC-SHIFT-CONTEXT-GUARD.md`; the next canonical Bluey round doc should start at `ROUND-229-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 228 fixed stale-context anchoring for standalone new-topic questions:
+  - owner showed Fibonacci follow-up context bleeding into a new LRO/LRU cache question
+  - root cause was that daemon answer context always added the last 10 Bluey Q&A turns
+  - `answer_context_from_meeting` now receives the latest question and conditionally includes recent Bluey Q&A
+  - recent Q&A is kept for true follow-ups with explicit references such as "this", "that", "the code", "previous", or "what about"
+  - recent Q&A is skipped for standalone named-topic requests like "explain LRU cache" when the user did not explicitly ask to compare or continue
+  - topic matching ignores filler/ASR noise and normalizes `lro` to `lru`
+  - provider instructions now say standalone new topics should be answered directly and not connected to prior session context unless requested
+  - shared daemon behavior applies to both macOS and Windows overlays; no native overlay code changed
+  - Round doc: `docs/rounds/ROUND-228-TOPIC-SHIFT-CONTEXT-GUARD.md`
+  - Verification passed:
+    - `cargo fmt --manifest-path crates/cue-daemon/Cargo.toml`
+    - `cargo test -p cue-daemon meeting_context_ --lib`
+    - `cargo test -p cue-daemon provider_messages_include_overlay_friendly_answer_shape --lib`
+    - `cargo test -p cue-daemon follow_up_context_ --lib`
+    - `cargo test -p cue-daemon --lib` (`275 passed`, `2 ignored`)
+    - `cargo build -p cue-daemon --bin bluey-daemon`
+    - `BLUEY_BIN=/Users/uno/Downloads/cue/target/debug/bluey scripts/bluey-visible-local.sh`
+    - `/Users/uno/Downloads/cue/target/debug/bluey status` reports daemon pid `59487`, overlay visible `true`, overlay capture excluded `false`, and screen capture active `false`
 - Round 227 fixed accidental canvas/window expansion from rapid double clicks on the sidebar/canvas icon:
   - added a short rapid-repeat guard for the History toggle
   - added a short rapid-repeat guard for the canvas/sidebar toggle
