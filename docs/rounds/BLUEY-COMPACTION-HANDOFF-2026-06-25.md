@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-28 02:38 EDT
+Latest checkpoint: 2026-06-28 03:02 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,33 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-228-TOPIC-SHIFT-CONTEXT-GUARD.md`; the next canonical Bluey round doc should start at `ROUND-229-...`.
+- Latest assigned Bluey round doc is `ROUND-229-LIVE-STT-DUPLICATE-DIAGNOSTICS.md`; the next canonical Bluey round doc should start at `ROUND-230-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 229 fixed the strongest live-transcript duplication path and added better safe diagnostics:
+  - active visible QA status had `transcript_segments: 0`, so current no-transcript cases are before answer generation
+  - local settings have both system and microphone audio enabled, which can capture the same speech twice when the mic hears speaker audio
+  - backend duplicate detection previously caught exact duplicates but not near-identical mic/system echoes
+  - backend final transcript handling sent both `TranscriptFinal` and a second transcript `PushCard`, which macOS could display as duplicated/stiched transcript UI
+  - final transcript display now uses the `TranscriptFinal` event path only; daemon no longer pushes an extra transcript feed card for the same final text
+  - `add_audio_transcript_segment` now returns whether a final was actually stored, so skipped duplicates do not inflate emitted transcript metrics
+  - added fuzzy near-duplicate detection that catches high-overlap echoes while keeping real longer continuations
+  - added privacy-safe live STT relay diagnostics for source start, periodic audio chunks, and transcript event shape without raw transcript text
+  - shared daemon behavior applies to both macOS and Windows overlays; no native overlay code changed
+  - Round doc: `docs/rounds/ROUND-229-LIVE-STT-DUPLICATE-DIAGNOSTICS.md`
+  - Verification passed:
+    - `cargo fmt --manifest-path crates/cue-daemon/Cargo.toml`
+    - `cargo test -p cue-daemon duplicate_transcript_detection --lib`
+    - `cargo test -p cue-daemon --lib` (`277 passed`, `2 ignored`)
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `cargo build -p cue-daemon --bin bluey-daemon`
+    - `git diff --check`
+    - `BLUEY_BIN=/Users/uno/Downloads/cue/target/debug/bluey scripts/bluey-visible-local.sh`
+    - `/Users/uno/Downloads/cue/target/debug/bluey status` reports daemon pid `77359`, overlay visible `true`, overlay capture excluded `false`, screen capture active `false`, and transcript segments `0` until Listen receives final STT
 - Round 228 fixed stale-context anchoring for standalone new-topic questions:
   - owner showed Fibonacci follow-up context bleeding into a new LRO/LRU cache question
   - root cause was that daemon answer context always added the last 10 Bluey Q&A turns

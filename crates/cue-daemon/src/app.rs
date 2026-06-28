@@ -752,9 +752,7 @@ fn is_near_duplicate_transcript(
         if !segment.is_final {
             return false;
         }
-        let segment_normalized = normalize_transcript_text(&segment.text);
-        let segment_compact_normalized = compact_normalized_transcript_text(&segment.text);
-        if segment_normalized != normalized && segment_compact_normalized != compact_normalized {
+        if !transcript_texts_are_near_duplicate(&segment.text, &normalized, &compact_normalized) {
             return false;
         }
         let age_ms = transcript_age_ms(&segment.created_at, now_ms);
@@ -764,6 +762,74 @@ fn is_near_duplicate_transcript(
         is_mic_system_echo_pair(segment.speaker, speaker)
             && age_ms <= CROSS_SOURCE_TRANSCRIPT_ECHO_DUP_MS
     })
+}
+
+fn transcript_texts_are_near_duplicate(
+    existing: &str,
+    incoming_normalized: &str,
+    incoming_compact_normalized: &str,
+) -> bool {
+    let existing_normalized = normalize_transcript_text(existing);
+    if existing_normalized.is_empty() || incoming_normalized.is_empty() {
+        return false;
+    }
+    if existing_normalized == incoming_normalized {
+        return true;
+    }
+
+    let existing_compact = compact_normalized_transcript_text(existing);
+    if !existing_compact.is_empty() && existing_compact == incoming_compact_normalized {
+        return true;
+    }
+
+    if existing_normalized.contains(incoming_normalized)
+        || incoming_normalized.contains(&existing_normalized)
+    {
+        let existing_words = existing_normalized.split_whitespace().count();
+        let incoming_words = incoming_normalized.split_whitespace().count();
+        let shorter = existing_words.min(incoming_words);
+        let longer = existing_words.max(incoming_words);
+        return shorter >= 3 && longer <= shorter + 4;
+    }
+
+    let existing_set = transcript_similarity_terms(&existing_normalized);
+    let incoming_set = transcript_similarity_terms(incoming_normalized);
+    let shorter = existing_set.len().min(incoming_set.len());
+    let longer = existing_set.len().max(incoming_set.len());
+    let overlap = existing_set.intersection(&incoming_set).count();
+    shorter >= 3 && longer <= shorter + 3 && overlap >= shorter.saturating_sub(1).max(1)
+}
+
+fn transcript_similarity_terms(text: &str) -> std::collections::BTreeSet<&str> {
+    text.split_whitespace()
+        .filter(|term| {
+            !matches!(
+                *term,
+                "a" | "an"
+                    | "and"
+                    | "are"
+                    | "as"
+                    | "at"
+                    | "for"
+                    | "from"
+                    | "i"
+                    | "in"
+                    | "is"
+                    | "it"
+                    | "of"
+                    | "on"
+                    | "or"
+                    | "should"
+                    | "that"
+                    | "the"
+                    | "this"
+                    | "to"
+                    | "we"
+                    | "with"
+                    | "you"
+            )
+        })
+        .collect()
 }
 
 pub fn normalize_transcript_text(text: &str) -> String {
@@ -3414,10 +3480,14 @@ async fn real_audio_loop(
             match result {
                 Ok(Some(segment)) => {
                     last_transcript_at = Instant::now();
-                    if let Err(error) = add_audio_transcript_segment(&daemon, &segment).await {
-                        warn!("real audio transcript emission failed: {error:#}");
-                    } else {
-                        daemon.audio.lock().await.record_stt_segment();
+                    match add_audio_transcript_segment(&daemon, &segment).await {
+                        Ok(true) => {
+                            daemon.audio.lock().await.record_stt_segment();
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            warn!("real audio transcript emission failed: {error:#}");
+                        }
                     }
                 }
                 Ok(None) => {}
@@ -3727,6 +3797,14 @@ async fn run_relay_audio_source(
             source.source
         )
     })?;
+    info!(
+        source = %source.source,
+        stream_id = %source.stream_id,
+        stt_provider = %runtime.stt_provider_label,
+        stt_model = %runtime.stt_model,
+        helper_arg = %source_arg,
+        "live STT relay source started"
+    );
     let mut stdout = child
         .stdout
         .take()
@@ -3773,6 +3851,16 @@ async fn run_relay_audio_source(
                         break;
                     }
                     audio.record_chunk(&chunk);
+                }
+                if sequence == 1 || sequence % 50 == 0 {
+                    debug!(
+                        source = %source.source,
+                        stream_id = %source.stream_id,
+                        sequence,
+                        bytes = read,
+                        duration_ms,
+                        "live STT relay audio chunk forwarded"
+                    );
                 }
                 ws_tx
                     .send(WebSocketMessage::Binary(buffer[..read].to_vec()))
@@ -3838,10 +3926,22 @@ async fn emit_deepgram_relay_payload(
             .with_provider_segment_id(format!("relay-{}-{sequence}", source.default_label()))
             .with_source_sequence_range(sequence, sequence);
         *last_transcript_at.lock().await = Instant::now();
-        if let Err(error) = add_audio_transcript_segment(daemon, &segment).await {
-            warn!("live relay transcript emission failed: {error:#}");
-        } else if segment.is_final {
-            daemon.audio.lock().await.record_stt_segment();
+        debug!(
+            source = %source,
+            sequence,
+            is_final = segment.is_final,
+            text_chars = segment.text.chars().count(),
+            text_words = word_count(&segment.text),
+            "live STT relay transcript event received"
+        );
+        match add_audio_transcript_segment(daemon, &segment).await {
+            Ok(true) => {
+                daemon.audio.lock().await.record_stt_segment();
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!("live relay transcript emission failed: {error:#}");
+            }
         }
         if daemon.audio.lock().await.session_id.as_deref() != Some(session_id) {
             break;
@@ -4944,14 +5044,14 @@ async fn stop_audio_capture(daemon: &Arc<Daemon>) -> AudioPipelineStatus {
 async fn add_audio_transcript_segment(
     daemon: &Arc<Daemon>,
     segment: &cue_core::audio::SttSegmentMetadata,
-) -> Result<()> {
+) -> Result<bool> {
     add_audio_transcript_segment_inner(daemon, segment, false).await
 }
 
 async fn add_audio_transcript_segment_allowing_session_start(
     daemon: &Arc<Daemon>,
     segment: &cue_core::audio::SttSegmentMetadata,
-) -> Result<()> {
+) -> Result<bool> {
     add_audio_transcript_segment_inner(daemon, segment, true).await
 }
 
@@ -4959,11 +5059,11 @@ async fn add_audio_transcript_segment_inner(
     daemon: &Arc<Daemon>,
     segment: &cue_core::audio::SttSegmentMetadata,
     allow_session_start: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let audio_session_id = daemon.audio.lock().await.session_id.clone();
     if audio_session_id.is_none() && !allow_session_start {
         debug!("dropping late audio transcript segment after capture stopped");
-        return Ok(());
+        return Ok(false);
     }
 
     let speaker = match segment.source {
@@ -4973,7 +5073,7 @@ async fn add_audio_transcript_segment_inner(
     };
     let text = segment.text.trim();
     if text.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     let source_label = match segment.source {
         Some(AudioSourceKind::System) => "system",
@@ -4998,7 +5098,7 @@ async fn add_audio_transcript_segment_inner(
             speaker: None,
             ts_ms: clock::now_epoch_ms_string().parse::<u64>().unwrap_or(0),
         });
-        return Ok(());
+        return Ok(false);
     }
 
     let meeting_snapshot = {
@@ -5018,7 +5118,7 @@ async fn add_audio_transcript_segment_inner(
                 recent_transcript_segments = meeting.transcript.len(),
                 "audio transcript segment skipped duplicate"
             );
-            return Ok(());
+            return Ok(false);
         }
         // Dedup: if this is a final, remove superseded partial from same speaker
         if segment.is_final {
@@ -5046,19 +5146,7 @@ async fn add_audio_transcript_segment_inner(
     };
 
     update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
-    let title = match speaker {
-        Speaker::System => "System",
-        Speaker::User => "Mic",
-        Speaker::Other => "Other",
-        Speaker::Unknown => "Transcript",
-    };
     schedule_auto_cloud_sync(daemon, "audio_transcript_final", None).await;
-    let source = segment
-        .speaker_label
-        .as_deref()
-        .filter(|label| !label.trim().is_empty())
-        .map(|label| format!("{label} STT"))
-        .unwrap_or_else(|| "audio STT".to_string());
     let _ = send_overlay(
         daemon,
         OverlayCommand::TranscriptFinal {
@@ -5067,8 +5155,6 @@ async fn add_audio_transcript_segment_inner(
         },
     )
     .await;
-    let card = CueCard::new(CardKind::Transcript, title, text).with_source(source);
-    let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
 
     // Broadcast live transcript event for dashboard consumption.
     let ts_ms = meeting_snapshot
@@ -5088,7 +5174,7 @@ async fn add_audio_transcript_segment_inner(
     if segment.is_final {
         index_transcript_for_rag(daemon, meeting_snapshot.id.to_string(), text.to_string());
     }
-    Ok(())
+    Ok(true)
 }
 
 fn index_transcript_for_rag(daemon: &Arc<Daemon>, session_id: String, text: String) {
@@ -14010,6 +14096,40 @@ mod tests {
             &meeting,
             Speaker::System,
             "we should cache a different answer.",
+            true,
+        ));
+    }
+
+    #[test]
+    fn duplicate_transcript_detection_skips_near_cross_source_echoes() {
+        let mut meeting = MeetingRecord::new(Some("Audio".to_string()));
+        meeting.transcript.push(TranscriptSegment::new(
+            Speaker::System,
+            "We should cache the answer before returning it.",
+            true,
+        ));
+
+        assert!(is_near_duplicate_transcript(
+            &meeting,
+            Speaker::User,
+            "we should cache that answer before returning it",
+            true,
+        ));
+    }
+
+    #[test]
+    fn duplicate_transcript_detection_keeps_real_continuations() {
+        let mut meeting = MeetingRecord::new(Some("Audio".to_string()));
+        meeting.transcript.push(TranscriptSegment::new(
+            Speaker::User,
+            "Build me LRU cache.",
+            true,
+        ));
+
+        assert!(!is_near_duplicate_transcript(
+            &meeting,
+            Speaker::User,
+            "Build me LRU cache. Can you explain why the linked list is needed?",
             true,
         ));
     }
