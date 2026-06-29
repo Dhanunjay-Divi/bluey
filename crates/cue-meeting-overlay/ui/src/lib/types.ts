@@ -38,7 +38,10 @@ export type ListeningState =
   | "connecting"
   | "listening"
   | "paused"
-  | "failed";
+  | "failed"
+  // A required macOS permission (Screen Recording for system audio, or
+  // Microphone) is not granted — the overlay shows a "grant access" flow.
+  | "permission_denied";
 
 /** A normalized transcript line surfaced during a live meeting. */
 export interface TranscriptLine {

@@ -1,9 +1,10 @@
 // The composer — the primary place to ask. Context pill above, + menu, mic,
 // ⌘↵ hint, send. Submits on Enter (⌘↵ or plain Enter) when there's text.
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import type { AskMode, ListeningState } from "../lib/types";
 import { PlusMenu } from "./PlusMenu";
+import { AlertIcon, MicIcon, SpinnerIcon, StopIcon } from "./icons";
 
 /** The three answer-speed presets, ordered fast → deep. `hint` is the title
  *  tooltip; the label is what the pill shows. Data-driven so adding/removing a
@@ -167,7 +168,17 @@ export function Composer({
             color: micMeta(listenState).fg,
           }}
         >
-          {micMeta(listenState).glyph}
+          <span
+            style={{
+              display: "inline-flex",
+              animation:
+                listenState === "connecting"
+                  ? "aurora-spin 1.1s linear infinite"
+                  : undefined,
+            }}
+          >
+            {micMeta(listenState).glyph}
+          </span>
         </button>
         <span
           style={{
@@ -220,7 +231,7 @@ const iconBtn = {
 // Per-state visual for the mic button, so a connecting/failed start is visible
 // (the bug before: any non-"listening" state silently snapped back to off).
 function micMeta(state: ListeningState): {
-  glyph: string;
+  glyph: ReactNode;
   label: string;
   title: string;
   bg: string;
@@ -229,7 +240,7 @@ function micMeta(state: ListeningState): {
   switch (state) {
     case "listening":
       return {
-        glyph: "🎙",
+        glyph: <StopIcon size={16} />,
         label: "Stop listening",
         title: "Listening — click to stop",
         bg: "rgba(229,72,77,.12)",
@@ -237,7 +248,7 @@ function micMeta(state: ListeningState): {
       };
     case "connecting":
       return {
-        glyph: "◌",
+        glyph: <SpinnerIcon size={16} />,
         label: "Connecting",
         title: "Starting audio…",
         bg: "rgba(180,140,40,.12)",
@@ -245,7 +256,7 @@ function micMeta(state: ListeningState): {
       };
     case "failed":
       return {
-        glyph: "⚠",
+        glyph: <AlertIcon size={16} />,
         label: "Audio failed — click to retry",
         title: "Audio couldn't start (setup needed) — click to retry",
         bg: "rgba(229,72,77,.12)",
@@ -255,7 +266,7 @@ function micMeta(state: ListeningState): {
     case "idle":
     default:
       return {
-        glyph: "🎙",
+        glyph: <MicIcon size={16} />,
         label: "Listen",
         title: "Listen",
         bg: "transparent",

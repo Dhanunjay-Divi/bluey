@@ -3,6 +3,38 @@ use serde::{Deserialize, Serialize};
 use crate::agent_ui::{AgentConnectorInfo, AgentSessionSummary, AgentSummary};
 use crate::{overlay_ipc::ListeningState, CueCard, CueCardArtifact};
 
+/// serde default for opt-in-by-default booleans (e.g. capture both audio sources
+/// unless the overlay explicitly disables one).
+fn default_true() -> bool {
+    true
+}
+
+/// A fixed set of macOS System Settings privacy panes the overlay may ask the
+/// daemon to open. An enum (not a free URL) keeps the daemon's `open` call to a
+/// known allowlist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SettingsPane {
+    /// Privacy & Security → Screen Recording (system-audio capture).
+    ScreenRecording,
+    /// Privacy & Security → Microphone.
+    Microphone,
+}
+
+impl SettingsPane {
+    /// The macOS deep-link URL for this pane.
+    pub fn url(self) -> &'static str {
+        match self {
+            SettingsPane::ScreenRecording => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+            }
+            SettingsPane::Microphone => {
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OverlayPosition {
@@ -381,7 +413,29 @@ pub enum OverlayEvent {
     ContextListRequested,
     CaptureStartRequested,
     CaptureStopRequested,
-    RecordingStartRequested,
+    /// Open a specific macOS System Settings privacy pane so the user can grant
+    /// the permission audio capture needs. `pane` is a fixed enum (not a free
+    /// URL) so the daemon maps it to a known `x-apple.systempreferences:` target
+    /// — no arbitrary-URL/command-injection surface.
+    OpenSettingsRequested {
+        pane: SettingsPane,
+    },
+    /// Start system-audio capture via the interactive macOS content-sharing
+    /// picker: the daemon spawns the helper in `--pick` mode, which presents the
+    /// system picker so the user chooses which app to capture, then streams that
+    /// app's audio into the live transcript pipeline.
+    PickSystemAudioRequested,
+    /// Start audio capture. Optional per-source flags let the overlay pick which
+    /// sources to capture (the Audio tab's mic / system toggles). Both default to
+    /// `true` (#[serde(default)] yields `false`, so we use explicit option-style
+    /// defaults via `default_true`) preserving the prior dual-capture behavior
+    /// for callers that send no flags.
+    RecordingStartRequested {
+        #[serde(default = "default_true")]
+        enable_microphone: bool,
+        #[serde(default = "default_true")]
+        enable_system: bool,
+    },
     RecordingStopRequested,
     CloseRequested,
     CardRendered {

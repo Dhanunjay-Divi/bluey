@@ -50,6 +50,11 @@ pub enum ListeningState {
     Listening,
     Paused,
     Failed,
+    /// Capture couldn't start because a required macOS permission (Screen
+    /// Recording for system audio, or Microphone) is not granted. Distinct from
+    /// `Failed` so the overlay can show a "grant access" flow instead of a
+    /// generic error.
+    PermissionDenied,
 }
 
 /// Messages the overlay can send BACK to the daemon (IPC).

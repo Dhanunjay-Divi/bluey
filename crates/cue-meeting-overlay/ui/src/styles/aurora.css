@@ -316,3 +316,9 @@ body.dev-backdrop {
   border-bottom: 1px dotted var(--ink-4);
   cursor: default;
 }
+
+/* Live status-dot pulse for the collapsed pill (listening indicator). */
+@keyframes blueyPulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.55; transform: scale(0.82); }
+}

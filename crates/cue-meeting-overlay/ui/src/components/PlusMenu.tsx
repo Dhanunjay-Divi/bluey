@@ -1,17 +1,28 @@
-// The "+" context menu — opens from the composer's + button. Matches the
-// designed menu (docs/design mockup + interview overlay): Capture page / Attach
-// files / Take a screenshot. Each item maps to a REAL daemon action via the
-// client; nothing here is a stub.
-//
-// "Attach files" opens the native file picker (Tauri dialog plugin) and hands
-// the chosen paths to the daemon, which attaches them as context artifacts.
+// The "+" context menu — opens from the composer's + button. Real daemon
+// actions only; nothing here is a stub. Holds BOTH the context actions (attach /
+// capture / screenshot) AND the audio controls (listen with mic/system, or pick
+// a specific app to capture) — so audio lives in the quick "+" dialog rather
+// than a separate tab.
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getClient } from "../lib";
+import type { ListeningState } from "../lib/types";
+import {
+  AlertIcon,
+  AttachIcon,
+  GlobeIcon,
+  ScreenIcon,
+  StopIcon,
+  SystemAudioIcon,
+} from "./icons";
 
 export function PlusMenu({ onClose }: { onClose: () => void }) {
   const ref = useRef<HTMLDivElement>(null);
   const client = getClient();
+  const [listen, setListen] = useState<ListeningState>("idle");
+
+  // Live listening state so the menu shows Start vs Stop + permission hints.
+  useEffect(() => client.onListeningState(setListen), [client]);
 
   // Dismiss on outside-click / Escape — standard popover behavior.
   useEffect(() => {
@@ -29,24 +40,13 @@ export function PlusMenu({ onClose }: { onClose: () => void }) {
     };
   }, [onClose]);
 
-  const pickFiles = () => {
+  const act = (fn: () => void) => () => {
     onClose();
-    // Use the DAEMON-owned file picker (it runs as a normal app and can open a
-    // native dialog). We must NOT open NSOpenPanel from the overlay's webview:
-    // the overlay is an ActivationPolicy::Accessory app, so +[NSOpenPanel
-    // openPanel] returns NULL and the dialog plugin panics, killing the overlay.
-    client.openAttachPicker();
+    fn();
   };
 
-  const capturePage = () => {
-    onClose();
-    client.capturePage();
-  };
-
-  const screenshot = () => {
-    onClose();
-    client.captureScreenshot();
-  };
+  const active = listen === "listening" || listen === "connecting";
+  const denied = listen === "permission_denied";
 
   return (
     <div
@@ -56,34 +56,109 @@ export function PlusMenu({ onClose }: { onClose: () => void }) {
         position: "absolute",
         left: 14,
         bottom: 60,
-        width: 208,
+        width: 224,
         zIndex: 20,
         borderRadius: "var(--r-lg)",
         background: "var(--glass-solid)",
         border: "1px solid var(--line-2)",
-        boxShadow: "0 16px 40px -12px rgba(40,40,90,.35), inset 0 0 0 1px rgba(255,255,255,.5)",
+        boxShadow:
+          "0 16px 40px -12px rgba(40,40,90,.35), inset 0 0 0 1px rgba(255,255,255,.5)",
         overflow: "hidden",
         animation: "aurora-fade-in .16s ease both",
+        padding: "5px 0",
       }}
     >
-      <MenuItem glyph="📎" label="Attach files" onClick={pickFiles} />
-      <MenuItem glyph="🌐" label="Capture page" hint="⌥S" onClick={capturePage} />
-      <MenuItem glyph="🖥" label="Take a screenshot" onClick={screenshot} />
+      {/* Audio — the listen controls live here now (no separate tab) */}
+      <MenuLabel>AUDIO</MenuLabel>
+      {active ? (
+        <MenuItem
+          icon={<StopIcon size={15} />}
+          label="Stop listening"
+          onClick={act(() => client.stopListening())}
+        />
+      ) : (
+        // v1 streams SYSTEM audio only (the other people in the call — the
+        // question trigger). Mic streaming is a deliberate follow-up, so the
+        // copy promises only what we capture. No `microphone: true` here.
+        <MenuItem
+          icon={<SystemAudioIcon size={15} />}
+          label="Listen (system audio)"
+          onClick={act(() => client.startListening({ microphone: false, system: true }))}
+        />
+      )}
+      <MenuItem
+        icon={<SystemAudioIcon size={15} />}
+        label="Listen — pick app…"
+        hint="⌘⇧A"
+        onClick={act(() => client.pickSystemAudio())}
+      />
+      {denied && (
+        <MenuItem
+          icon={<AlertIcon size={15} />}
+          label="Grant Screen Recording…"
+          tone="warn"
+          onClick={act(() => client.openPermissionSettings("screen_recording"))}
+        />
+      )}
+
+      <Divider />
+
+      {/* Context — the original "+" actions */}
+      <MenuLabel>CONTEXT</MenuLabel>
+      <MenuItem
+        icon={<AttachIcon size={15} />}
+        label="Attach files"
+        onClick={act(() => client.openAttachPicker())}
+      />
+      <MenuItem
+        icon={<GlobeIcon size={15} />}
+        label="Capture page"
+        hint="⌥S"
+        onClick={act(() => client.capturePage())}
+      />
+      <MenuItem
+        icon={<ScreenIcon size={15} />}
+        label="Take a screenshot"
+        onClick={act(() => client.captureScreenshot())}
+      />
     </div>
   );
 }
 
+function MenuLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      style={{
+        fontSize: 9.5,
+        fontWeight: 680,
+        letterSpacing: ".12em",
+        color: "var(--ink-4)",
+        padding: "5px 13px 3px",
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function Divider() {
+  return <div style={{ height: 1, background: "var(--line)", margin: "5px 0" }} />;
+}
+
 function MenuItem({
-  glyph,
+  icon,
   label,
   hint,
+  tone,
   onClick,
 }: {
-  glyph: string;
+  icon: React.ReactNode;
   label: string;
   hint?: string;
+  tone?: "warn";
   onClick: () => void;
 }) {
+  const color = tone === "warn" ? "#b87503" : "var(--ink)";
   return (
     <button
       role="menuitem"
@@ -96,20 +171,31 @@ function MenuItem({
         border: "none",
         background: "transparent",
         cursor: "pointer",
-        padding: "9px 12px",
+        padding: "9px 13px",
         fontSize: 12.5,
-        color: "var(--ink)",
+        color,
         textAlign: "left",
       }}
       onMouseEnter={(e) => (e.currentTarget.style.background = "var(--tint-wash)")}
       onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
     >
-      <span aria-hidden style={{ fontSize: 14, width: 18, textAlign: "center" }}>
-        {glyph}
+      <span
+        aria-hidden
+        style={{
+          width: 18,
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          color: tone === "warn" ? "#b87503" : "var(--ink-3)",
+        }}
+      >
+        {icon}
       </span>
       <span style={{ flex: 1 }}>{label}</span>
       {hint && (
-        <span style={{ fontSize: 10, color: "var(--ink-4)", fontFamily: "var(--mono)" }}>{hint}</span>
+        <span style={{ fontSize: 10, color: "var(--ink-4)", fontFamily: "var(--mono)" }}>
+          {hint}
+        </span>
       )}
     </button>
   );

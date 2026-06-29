@@ -51,6 +51,16 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
     () => client.onTranscript((l) => l.final && setTranscript(l)),
     [client],
   );
+  // A daemon-detected for-me question (master doc §6) — the distinct signal that
+  // rises into the "They asked…" hero card. Cleared once asked or superseded.
+  const [detectedQ, setDetectedQ] = useState<{
+    text: string;
+    title?: string;
+  } | null>(null);
+  useEffect(
+    () => client.onForMeQuestion((q) => setDetectedQ(q)),
+    [client],
+  );
   useEffect(() => client.onListeningState(setListenState), [client]);
   // Keep the newest turn / streaming text in view as the feed grows.
   useEffect(() => {
@@ -131,7 +141,12 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
     );
   };
 
-  const askDetected = () => transcript && runAsk(transcript.text);
+  const askDetected = () => {
+    const q = detectedQ?.text ?? transcript?.text;
+    if (!q) return;
+    setDetectedQ(null);
+    runAsk(q);
+  };
 
   return (
     <div
@@ -156,24 +171,27 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
           overflowY: "auto",
         }}
       >
-        {transcript && (
-          <div style={{ padding: "9px 16px" }}>
-            <div style={role}>
-              TRANSCRIPT
-              <span style={meta}>
-                {transcript.speaker ?? transcript.source} · heard
-              </span>
+        {/* THE TRIGGER MOMENT (master doc §6): a detected for-me question rises
+            into a hero card — the heart of the product. It is NOT styled as
+            "transcript"; it's the actionable prompt. Shown only when idle (while
+            answering, the answer owns the screen). */}
+        {detectedQ && phase === "idle" && (
+          <div style={heroWrap}>
+            <div style={heroCard}>
+              <div style={heroEyebrow}>
+                <span style={heroDot} />
+                {detectedQ.title ?? "Looks like a question for you"}
+              </div>
+              <div style={heroQ}>{detectedQ.text}</div>
+              <div style={{ display: "flex", gap: 8, marginTop: 11 }}>
+                <button onClick={askDetected} style={heroAsk}>
+                  Ask {agent?.displayName ?? "your agent"}
+                </button>
+                <button onClick={() => setDetectedQ(null)} style={heroDismiss}>
+                  Dismiss
+                </button>
+              </div>
             </div>
-            <div
-              style={{ fontSize: 13.5, lineHeight: 1.6, color: "var(--ink-2)" }}
-            >
-              {transcript.text}
-            </div>
-            {phase === "idle" && (
-              <button onClick={askDetected} style={detectBtn}>
-                ✦ Ask your agent about this
-              </button>
-            )}
           </div>
         )}
 
@@ -216,7 +234,7 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
           );
         })}
 
-        {turns.length === 0 && !transcript && (
+        {turns.length === 0 && !detectedQ && (
           <div
             style={{
               padding: "28px 16px",
@@ -225,16 +243,32 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
               fontSize: 13,
             }}
           >
-            Listening — ask a question, or one will be detected from the call.
+            {listenState === "listening"
+              ? "Listening — a question will surface here, or just ask."
+              : "Start listening, or ask a question."}
           </div>
         )}
 
         <div ref={feedEndRef} />
       </div>
 
+      {/* AMBIENT CAPTION (master doc §4/§12 — "felt, not read"): a single quiet
+          live line proving Bluey hears you, pinned above the composer. NOT a
+          transcript wall. Hidden while answering (the answer owns the screen)
+          and while a detected question is being shown (that's the focus). */}
+      {transcript && phase === "idle" && !detectedQ && (
+        <div style={captionWrap} title={transcript.text}>
+          <span style={captionDot} />
+          <span style={captionWho}>
+            {transcript.source === "mic" ? "You" : "They"}
+          </span>
+          <span style={captionText}>{transcript.text}</span>
+        </div>
+      )}
+
       <Composer
         placeholder="Ask a follow-up while Bluey listens…"
-        contextLabel={transcript ? "in context · live transcript" : undefined}
+        contextLabel={transcript ? "live transcript · in context" : undefined}
         onSubmit={runAsk}
         mode={mode}
         onModeChange={setMode}
@@ -251,31 +285,92 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
   );
 }
 
-const role = {
-  fontSize: 10,
-  fontWeight: 680,
-  letterSpacing: ".1em",
+// ---- The trigger-moment hero card (a detected for-me question) ----
+const heroWrap = { padding: "10px 14px 4px" } as const;
+const heroCard = {
+  borderRadius: "var(--r-lg)",
+  border: "1px solid var(--tint-wash)",
+  background:
+    "linear-gradient(180deg, var(--tint-wash), rgba(255,255,255,0.4))",
+  padding: "13px 15px",
+  boxShadow: "0 6px 22px -14px var(--tint)",
+} as const;
+const heroEyebrow = {
+  fontSize: 11,
+  fontWeight: 600,
+  color: "var(--tint-ink)",
+  display: "flex",
+  alignItems: "center",
+  gap: 7,
+  marginBottom: 6,
+} as const;
+const heroDot = {
+  width: 7,
+  height: 7,
+  borderRadius: 999,
+  background: "var(--tint-ink)",
+  boxShadow: "0 0 8px var(--tint)",
+  animation: "blueyPulse 1.6s ease-in-out infinite",
+} as const;
+const heroQ = {
+  fontSize: 15,
+  lineHeight: 1.45,
+  fontWeight: 540,
+  color: "var(--ink)",
+  letterSpacing: "-.01em",
+} as const;
+const heroAsk = {
+  fontSize: 12.5,
+  fontWeight: 600,
+  color: "#fff",
+  background: "var(--tint)",
+  border: "none",
+  borderRadius: "var(--r-pill)",
+  padding: "7px 15px",
+  cursor: "pointer",
+} as const;
+const heroDismiss = {
+  fontSize: 12.5,
   color: "var(--ink-3)",
-  marginBottom: 5,
+  background: "transparent",
+  border: "none",
+  borderRadius: "var(--r-pill)",
+  padding: "7px 12px",
+  cursor: "pointer",
+} as const;
+
+// ---- The ambient caption (a single quiet live line — "felt, not read") ----
+const captionWrap = {
   display: "flex",
   alignItems: "center",
   gap: 8,
+  padding: "7px 16px",
+  borderTop: "1px solid var(--line)",
+  minWidth: 0,
 } as const;
-const meta = {
-  fontWeight: 430,
-  letterSpacing: 0,
-  textTransform: "none",
+const captionDot = {
+  width: 6,
+  height: 6,
+  borderRadius: 999,
+  background: "var(--mint)",
+  flex: "none",
+  animation: "blueyPulse 1.8s ease-in-out infinite",
+} as const;
+const captionWho = {
+  fontSize: 10.5,
+  fontWeight: 600,
   color: "var(--ink-4)",
+  letterSpacing: ".04em",
+  flex: "none",
 } as const;
-const detectBtn = {
-  marginTop: 9,
-  fontSize: 11.5,
-  color: "var(--tint-ink)",
-  background: "var(--tint-wash)",
-  border: "none",
-  borderRadius: "var(--r-pill)",
-  padding: "5px 12px",
-  cursor: "pointer",
+const captionText = {
+  fontSize: 12,
+  color: "var(--ink-3)",
+  whiteSpace: "nowrap",
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  flex: 1,
+  minWidth: 0,
 } as const;
 const trig = {
   display: "flex",

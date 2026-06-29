@@ -298,7 +298,8 @@ export function createTauriClient(): MeetingClient {
           s === "connecting" ||
           s === "listening" ||
           s === "paused" ||
-          s === "failed"
+          s === "failed" ||
+          s === "permission_denied"
             ? s
             : "idle";
         cb(known);
@@ -307,15 +308,32 @@ export function createTauriClient(): MeetingClient {
       return () => handlers.delete(handler);
     },
 
-    startListening() {
-      // The mic: start AUDIO capture (mic + system audio). The daemon replies
+    startListening(sources) {
+      // Start AUDIO capture. Optional per-source selection (Audio tab toggles);
+      // omitted = both, matching the daemon's serde defaults. The daemon replies
       // with listening_state_changed, which onListeningState reflects.
       // (recording_* = audio; capture_* = the screen "eye" — different feature.)
-      sendEvent({ type: "recording_start_requested" });
+      sendEvent({
+        type: "recording_start_requested",
+        ...(sources?.microphone !== undefined ? { enable_microphone: sources.microphone } : {}),
+        ...(sources?.system !== undefined ? { enable_system: sources.system } : {}),
+      });
     },
 
     stopListening() {
       sendEvent({ type: "recording_stop_requested" });
+    },
+
+    openPermissionSettings(pane) {
+      // The daemon maps `pane` (a fixed enum) to a known System Settings URL and
+      // opens it — no plugin/permission needed UI-side, no arbitrary URL.
+      sendEvent({ type: "open_settings_requested", pane });
+    },
+
+    pickSystemAudio() {
+      // Daemon spawns the helper in --pick mode → macOS content-sharing picker →
+      // captures the chosen app's audio into the live transcript pipeline.
+      sendEvent({ type: "pick_system_audio_requested" });
     },
 
     capturePage() {
@@ -357,6 +375,24 @@ export function createTauriClient(): MeetingClient {
           final: true,
         };
         cb(line);
+      };
+      handlers.add(handler);
+      return () => handlers.delete(handler);
+    },
+
+    onForMeQuestion(cb) {
+      // The daemon emits a push_card with kind "question" when it detects a
+      // for-me question in the transcript (master doc §6). This is the distinct
+      // signal that drives the Ask view's "They asked…" hero card — separate
+      // from plain transcript lines, so the UI never has to re-detect.
+      const handler = (cmd: OverlayCommand) => {
+        if (cmd.type !== "push_card") return;
+        const card = (cmd as Extract<OverlayCommand, { type: "push_card" }>)
+          .card;
+        if (card.kind !== "question") return;
+        // body = the question text; title = the framing ("Alex, this looks…").
+        const text = (card.body || card.title || "").trim();
+        if (text) cb({ text, title: card.title || undefined });
       };
       handlers.add(handler);
       return () => handlers.delete(handler);

@@ -34,6 +34,10 @@ export interface MeetingClient {
   // ---- the live loop ----
   /** Subscribe to live transcript lines; returns an unsubscribe fn. */
   onTranscript(cb: (line: TranscriptLine) => void): () => void;
+  /** Subscribe to daemon-detected "for-me" questions (master doc §6) — the
+   *  distinct signal that drives the Ask view's "They asked…" hero card.
+   *  Returns an unsubscribe fn. */
+  onForMeQuestion(cb: (q: { text: string; title?: string }) => void): () => void;
   /**
    * Ask the attached agent a question; streams chunks (text / tool-fired /
    * source / done) to `onChunk`. The agent answer is SLOW by nature (driving a
@@ -54,10 +58,17 @@ export interface MeetingClient {
   /** Subscribe to the daemon's listening state; returns an unsubscribe fn.
    *  State mirrors the daemon: idle | connecting | listening | paused | failed. */
   onListeningState(cb: (state: ListeningState) => void): () => void;
-  /** Start audio capture (the mic/listen toggle). */
-  startListening(): void;
+  /** Start audio capture. Optionally select sources (Audio tab toggles);
+   *  omitted = both mic + system (the daemon's defaults). */
+  startListening(sources?: { microphone?: boolean; system?: boolean }): void;
   /** Stop audio capture. */
   stopListening(): void;
+  /** Ask the daemon to open a macOS privacy settings pane (so the user can
+   *  grant Screen Recording / Microphone access). */
+  openPermissionSettings(pane: "screen_recording" | "microphone"): void;
+  /** Start system-audio capture via the macOS content-sharing picker — the user
+   *  chooses which app to capture (e.g. their Zoom call). */
+  pickSystemAudio(): void;
 
   // ---- context (the "+" menu: capture page / attach files / screenshot) ----
   /** Capture the active browser page's text as a context artifact. */
