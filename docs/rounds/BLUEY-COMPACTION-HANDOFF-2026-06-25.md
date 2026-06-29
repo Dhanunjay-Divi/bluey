@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-28 03:02 EDT
+Latest checkpoint: 2026-06-29 11:26 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,29 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-229-LIVE-STT-DUPLICATE-DIAGNOSTICS.md`; the next canonical Bluey round doc should start at `ROUND-230-...`.
+- Latest assigned Bluey round doc is `ROUND-230-LIVE-CAPTION-RAIL-SEND-BOUNDS.md`; the next canonical Bluey round doc should start at `ROUND-231-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 230 bounded the live-caption rail and stopped raw live captions from becoming giant visible Question bubbles:
+  - owner showed a long Listen transcript becoming a bulky repeated Question card after pressing Enter
+  - macOS already had a transcript `NSScrollView`, but it felt like a clipped one-line caption because scroll-wheel events were not forwarded to it and the scrollbar auto-hidden
+  - macOS live caption rail now forwards scroll-wheel events to the transcript scroll view, keeps the horizontal scroller available, caps rail display to the latest 520 characters, and caps preview memory to 1400 characters
+  - macOS `composedQuestionForAnswer` no longer pastes live transcript text into the visible question; empty live-caption sends now use a short "Answer the latest live captions from the current session transcript..." intent
+  - typed asks stay as typed asks while the daemon supplies recent transcript through the existing `active meeting transcript` answer-context path
+  - duplicate ask suppression now includes a private compact transcript fingerprint so different spoken asks are not suppressed as the same short prompt
+  - transcript merge overlap was widened and near-identical revisions are coalesced before appending
+  - Windows empty-input transcript sends now use the same live-caption intent when transcript context exists; Windows already uses a capped local transcript preview buffer and does not have the macOS horizontal rail
+  - transcript text is not uploaded through the R2/artifact object endpoint; artifacts/screenshots use `/sync/artifacts/:artifact_id/object`, while transcripts sync via `/sync/batch` into cloud transcript tables/RAG
+  - Round doc: `docs/rounds/ROUND-230-LIVE-CAPTION-RAIL-SEND-BOUNDS.md`
+  - Verification passed:
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `native/macos/cue-overlay/build.sh`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+  - Current local QA status after the change: daemon pid `77359`, active meeting id `259b7fee-a3a2-478a-9061-325aedf31dcd`, transcript segments `12`, overlay visible `false`, overlay capture excluded `false`, screen capture active `false`
+  - Remaining gate: restart the local visible QA overlay from the rebuilt macOS overlay binary before live-testing the rail, and before any release/upload return to capture-excluded mode and verify `overlay_capture_excluded: true`
 - Round 229 fixed the strongest live-transcript duplication path and added better safe diagnostics:
   - active visible QA status had `transcript_segments: 0`, so current no-transcript cases are before answer generation
   - local settings have both system and microphone audio enabled, which can capture the same speech twice when the mic hears speaker audio

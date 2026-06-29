@@ -1305,6 +1305,7 @@ static void clear_local_transcript_context(void) {
 
 static void send_current_question(void) {
     static const wchar_t *fallback = L"Answer the latest clear question from the current transcript, screen context, and attached files. If there is no clear question yet, summarize what Bluey needs next.";
+    static const wchar_t *transcript_fallback = L"Answer the latest live captions from the current session transcript. Treat the transcript as the user's current question or working context.";
     int length = GetWindowTextLengthW(g_ask_edit);
     bool used_fallback = length <= 0;
     char detail[192];
@@ -1319,7 +1320,7 @@ static void send_current_question(void) {
     );
     emit_lifecycle_event("ask_answer_sent", "ok", detail);
     if (length <= 0) {
-        emit_ask_event(fallback);
+        emit_ask_event(has_transcript_context() ? transcript_fallback : fallback);
     } else {
         wchar_t *question = (wchar_t *)calloc((size_t)length + 1, sizeof(wchar_t));
         if (!question) return;

@@ -4156,6 +4156,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         static let composerBaseHeight: CGFloat = 64
         static let composerExtraChromeHeight: CGFloat = 38
         static let transcriptStripHeight: CGFloat = 20
+        static let transcriptRailDisplayChars: Int = 520
+        static let transcriptPreviewMemoryChars: Int = 1_400
     }
 
     let feed: FeedView
@@ -5145,6 +5147,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let localPoint = convert(event.locationInWindow, from: nil)
         if !sessionDrawer.isHidden, rectForView(sessionDrawer).contains(localPoint) {
             sessionScroll.scrollWheel(with: event)
+            return
+        }
+        if rectForView(transcriptScroll).contains(localPoint) {
+            transcriptScroll.scrollWheel(with: event)
             return
         }
         if rectForView(composerSurface).contains(localPoint) {
@@ -6385,7 +6391,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         transcriptScroll.drawsBackground = false
         transcriptScroll.hasVerticalScroller = false
         transcriptScroll.hasHorizontalScroller = true
-        transcriptScroll.autohidesScrollers = true
+        transcriptScroll.autohidesScrollers = false
         transcriptScroll.borderType = .noBorder
         transcriptScroll.scrollerStyle = .overlay
 
@@ -7185,7 +7191,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func shouldSuppressDuplicateAsk(question: String, visibleContextIds: [String]) -> Bool {
-        let normalizedQuestion = normalizeTranscriptMemoryLine(question)
+        var normalizedQuestion = normalizeTranscriptMemoryLine(question)
+        if let transcript = transcriptQuestionForAnswer() {
+            let transcriptFingerprint = compactTranscriptMemoryLine(transcript)
+            if !transcriptFingerprint.isEmpty {
+                normalizedQuestion += "|transcript:"
+                normalizedQuestion += String(transcriptFingerprint.suffix(640))
+            }
+        }
         let normalizedContext = visibleContextIds.sorted().joined(separator: ",")
         let fingerprint = "\(normalizedQuestion)|\(normalizedContext)"
         guard !fingerprint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -7292,7 +7305,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let joined = compactTranscriptQuestionLines(lines)
             .joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return joined.isEmpty ? nil : joined
+        return joined.isEmpty ? nil : liveTranscriptAnswerPrompt(forSources: allowedSources)
     }
 
     func prepareAutoSendListenCapture() {
@@ -9484,8 +9497,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let existing = liveTranscriptPreviewBodies[cleanLabel]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let merged: String
         merged = mergedTranscriptBody(existing, cleanBody)
-        liveTranscriptPreviewBodies[cleanLabel] = merged
-        return merged
+        let bounded = boundedTranscriptTail(merged, maxChars: ChromeMetrics.transcriptPreviewMemoryChars)
+        liveTranscriptPreviewBodies[cleanLabel] = bounded
+        return bounded
     }
 
     private func shouldSuppressCrossSourceTranscriptPreview(label: String, body: String) -> Bool {
@@ -9523,7 +9537,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return
         }
 
-        let display = cleanLabel.isEmpty ? cleanBody : "\(cleanLabel): \(cleanBody)"
+        let displayBody = boundedTranscriptTail(
+            cleanBody,
+            maxChars: ChromeMetrics.transcriptRailDisplayChars)
+        let display = cleanLabel.isEmpty ? displayBody : "\(cleanLabel): \(displayBody)"
         updateTranscriptStripText(display, scrollToEnd: scrollToEnd)
         updateTranscriptClearButtonVisibility()
     }
@@ -9681,18 +9698,22 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let typed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let transcript = transcriptQuestionForAnswer()
         if typed.isEmpty {
-            return transcript
+            return transcript == nil ? nil : liveTranscriptAnswerPrompt()
         }
-        guard let transcript, !transcript.isEmpty else {
-            return typed
-        }
-        return """
-        User question:
-        \(typed)
+        return typed
+    }
 
-        Live captions context:
-        \(transcript)
-        """
+    private func liveTranscriptAnswerPrompt(forSources sources: [String]? = nil) -> String {
+        let normalized = sources?
+            .map(transcriptSourceLabel)
+            .filter { !$0.isEmpty }
+        let scopedSource: String
+        if let normalized, !normalized.isEmpty {
+            scopedSource = normalized.joined(separator: " and ") + " "
+        } else {
+            scopedSource = ""
+        }
+        return "Answer the latest \(scopedSource)live captions from the current session transcript. Treat the transcript as the user's current question or working context."
     }
 
     private func fallbackQuestionForAttachedContext() -> String? {
@@ -9767,10 +9788,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let newNorm = normalizeTranscriptMemoryLine(new)
         if oldNorm == newNorm || oldNorm.contains(newNorm) { return old }
         if newNorm.contains(oldNorm) { return new }
+        if isSameTranscriptMemoryBody(oldNorm, newNorm) {
+            return longerTranscriptMemoryLine(old, new)
+        }
 
         let oldWords = old.split(whereSeparator: { $0.isWhitespace }).map(String.init)
         let newWords = new.split(whereSeparator: { $0.isWhitespace }).map(String.init)
-        let maxOverlap = min(oldWords.count, newWords.count, 8)
+        let maxOverlap = min(oldWords.count, newWords.count, 32)
         if maxOverlap > 0 {
             for count in stride(from: maxOverlap, through: 1, by: -1) {
                 let suffix = oldWords.suffix(count).joined(separator: " ")
@@ -9782,6 +9806,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
 
         return "\(old) \(new)"
+    }
+
+    private func boundedTranscriptTail(_ text: String, maxChars: Int) -> String {
+        let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard maxChars > 0, clean.count > maxChars else { return clean }
+        let suffixStart = clean.index(clean.endIndex, offsetBy: -maxChars)
+        let suffix = String(clean[suffixStart...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return "... " + suffix
     }
 
     private func shouldReplaceTranscriptMemoryLine(_ old: String, with new: String) -> Bool {
