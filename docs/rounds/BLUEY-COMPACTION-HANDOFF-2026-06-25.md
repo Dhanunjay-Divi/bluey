@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-29 18:25 EDT
+Latest checkpoint: 2026-06-29 18:45 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,34 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-234-LIVE-CAPTION-VISIBLE-QUESTION-TIMING.md`; the next canonical Bluey round doc should start at `ROUND-235-...`.
+- Latest assigned Bluey round doc is `ROUND-235-BILLING-USAGE-MARGIN-AUDIT.md`; the next canonical Bluey round doc should start at `ROUND-236-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 235 audited the `$5.28` to `$4.82` balance-drop concern and provider
+  cost versus customer charge:
+  - active account is linked to `https://bluey.sh`, user
+    `codex-smoke-20260608183100@bluey.sh`, balance `$4.82`
+  - `bluey usage` reported last 7 days: `484` cues and `$7.72` customer spend
+  - account export includes customer usage rows but does not include
+    `cost_cents_to_bluey`, so provider actuals were estimated from exported
+    provider/model/token/audio rows using `server/src/pricing/mod.rs`
+  - newest usage rows adding to `46` customer cents were mostly dual-source
+    Deepgram STT rows plus recent Anthropic balanced LLM calls, so the visible
+    drop was accumulated settled usage rather than one single 50-cent call
+  - last 7 days estimated provider actual: about `$2.09` versus `$7.72`
+    customer charge
+  - all exported usage estimated provider actual: about `$2.90` versus `$15.80`
+    customer charge
+  - product gap: add an admin-only usage-cost report that exposes customer
+    charge, stored `cost_cents_to_bluey`, raw provider actual estimate,
+    provider/model breakdown, balance ledger, and STT reservation/settlement
+    rows without requiring account exports
+  - Auto Reload note: balance is below `$5` and CLI says Auto Reload is ON at
+    `$30` under `$5`; if it does not run, audit reload worker/idempotency next
+  - Round doc: `docs/rounds/ROUND-235-BILLING-USAGE-MARGIN-AUDIT.md`
 - Round 234 fixed the visible Question card for short spoken Listen asks and
   added privacy-safe stream timing diagnostics:
   - owner spoke "Explain LRU cache", but the visible Question card showed the
