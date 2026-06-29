@@ -49,6 +49,12 @@ const DEEPSEEK_PRO_MODEL: &str = "deepseek-v4-pro";
 const DEEPSEEK_FLASH_MODEL: &str = "deepseek-v4-flash";
 const ZAI_FLAGSHIP_MODEL: &str = "glm-5.2";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RoutePolicy {
+    QualityFirst,
+    CostOptimized,
+}
+
 #[derive(Debug, Error)]
 #[error("{provider} upstream http {status}")]
 pub struct UpstreamHttpError {
@@ -279,14 +285,71 @@ pub fn resolve_route(lane: &str) -> (&'static str, &'static str) {
         .unwrap_or(("anthropic", ANTHROPIC_BALANCED_MODEL))
 }
 
+pub fn resolve_route_candidates(lane: &str) -> Vec<(&'static str, &'static str)> {
+    resolve_route_candidates_for_policy(lane, route_policy())
+}
+
+fn route_policy() -> RoutePolicy {
+    let raw = std::env::var("BLUEY_ROUTE_POLICY")
+        .or_else(|_| std::env::var("BLUEY_ROUTE_ORDER"))
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_");
+    match raw.as_str() {
+        "cost" | "cost_first" | "cost_optimized" | "cheap" | "glm" | "deepseek" => {
+            RoutePolicy::CostOptimized
+        }
+        _ => RoutePolicy::QualityFirst,
+    }
+}
+
 /// Ordered fallback candidates for one lane.
 ///
-/// The list is intentionally conservative: the first route preserves product
-/// quality, later routes preserve availability. Pricing and provider capacity
+/// The default list is intentionally conservative: the first route preserves
+/// product quality, later routes preserve availability. Operators can opt into
+/// `BLUEY_ROUTE_POLICY=cost_optimized` to live-smoke cheaper GLM/DeepSeek text
+/// lanes first without changing vision routing. Pricing and provider capacity
 /// are checked by the API layer before dispatch.
-pub fn resolve_route_candidates(lane: &str) -> Vec<(&'static str, &'static str)> {
-    match lane {
-        "instant" => vec![
+fn resolve_route_candidates_for_policy(
+    lane: &str,
+    policy: RoutePolicy,
+) -> Vec<(&'static str, &'static str)> {
+    match (policy, lane) {
+        (RoutePolicy::CostOptimized, "instant") => vec![
+            ("deepseek", DEEPSEEK_FLASH_MODEL),
+            ("gemini", GEMINI_LITE_MODEL),
+            ("openai", OPENAI_FAST_MODEL),
+            ("anthropic", ANTHROPIC_FAST_MODEL),
+            ("gemini", GEMINI_FLASH_MODEL),
+            ("anthropic", ANTHROPIC_BALANCED_MODEL),
+        ],
+        (RoutePolicy::CostOptimized, "deep") => vec![
+            ("zai", ZAI_FLAGSHIP_MODEL),
+            ("deepseek", DEEPSEEK_PRO_MODEL),
+            ("anthropic", ANTHROPIC_DEEP_MODEL),
+            ("gemini", GEMINI_PRO_MODEL),
+            ("openai", OPENAI_ACCURATE_MODEL),
+            ("anthropic", ANTHROPIC_BALANCED_MODEL),
+            ("deepseek", DEEPSEEK_FLASH_MODEL),
+            ("gemini", GEMINI_FLASH_MODEL),
+        ],
+        (RoutePolicy::CostOptimized, "vision") => vec![
+            ("openai", OPENAI_ACCURATE_MODEL),
+            ("gemini", GEMINI_PRO_MODEL),
+            ("gemini", GEMINI_FLASH_MODEL),
+            ("openai", OPENAI_FAST_MODEL),
+        ],
+        (RoutePolicy::CostOptimized, "local") => vec![],
+        (RoutePolicy::CostOptimized, _) => vec![
+            ("zai", ZAI_FLAGSHIP_MODEL),
+            ("deepseek", DEEPSEEK_FLASH_MODEL),
+            ("anthropic", ANTHROPIC_BALANCED_MODEL),
+            ("gemini", GEMINI_PRO_MODEL),
+            ("openai", OPENAI_ACCURATE_MODEL),
+            ("gemini", GEMINI_FLASH_MODEL),
+            ("openai", OPENAI_FAST_MODEL),
+        ],
+        (RoutePolicy::QualityFirst, "instant") => vec![
             ("openai", OPENAI_FAST_MODEL),
             ("deepseek", DEEPSEEK_FLASH_MODEL),
             ("gemini", GEMINI_LITE_MODEL),
@@ -294,7 +357,7 @@ pub fn resolve_route_candidates(lane: &str) -> Vec<(&'static str, &'static str)>
             ("gemini", GEMINI_FLASH_MODEL),
             ("anthropic", ANTHROPIC_BALANCED_MODEL),
         ],
-        "deep" => vec![
+        (RoutePolicy::QualityFirst, "deep") => vec![
             ("anthropic", ANTHROPIC_DEEP_MODEL),
             ("zai", ZAI_FLAGSHIP_MODEL),
             ("deepseek", DEEPSEEK_PRO_MODEL),
@@ -304,17 +367,14 @@ pub fn resolve_route_candidates(lane: &str) -> Vec<(&'static str, &'static str)>
             ("deepseek", DEEPSEEK_FLASH_MODEL),
             ("gemini", GEMINI_FLASH_MODEL),
         ],
-        "vision" => vec![
+        (RoutePolicy::QualityFirst, "vision") => vec![
             ("openai", OPENAI_ACCURATE_MODEL),
             ("gemini", GEMINI_PRO_MODEL),
             ("gemini", GEMINI_FLASH_MODEL),
             ("openai", OPENAI_FAST_MODEL),
         ],
-        // The managed cloud never dispatches local/on-device models. Local
-        // fallback is selected in the daemon before traffic reaches
-        // bluey-server.
-        "local" => vec![],
-        _ => vec![
+        (RoutePolicy::QualityFirst, "local") => vec![],
+        (RoutePolicy::QualityFirst, _) => vec![
             ("anthropic", ANTHROPIC_BALANCED_MODEL),
             ("deepseek", DEEPSEEK_FLASH_MODEL),
             ("zai", ZAI_FLAGSHIP_MODEL),
@@ -322,7 +382,7 @@ pub fn resolve_route_candidates(lane: &str) -> Vec<(&'static str, &'static str)>
             ("openai", OPENAI_ACCURATE_MODEL),
             ("gemini", GEMINI_FLASH_MODEL),
             ("openai", OPENAI_FAST_MODEL),
-        ], // balanced default
+        ],
     }
 }
 
@@ -2290,13 +2350,60 @@ mod tests {
     }
 
     #[test]
+    fn cost_optimized_policy_prefers_glm_and_deepseek_text_routes() {
+        assert_eq!(
+            resolve_route_candidates_for_policy("instant", RoutePolicy::CostOptimized),
+            vec![
+                ("deepseek", "deepseek-v4-flash"),
+                ("gemini", "gemini-3.1-flash-lite"),
+                ("openai", "gpt-5.4-mini"),
+                ("anthropic", "claude-haiku-4-5-20251001"),
+                ("gemini", "gemini-3-flash-preview"),
+                ("anthropic", "claude-sonnet-4-6")
+            ]
+        );
+        assert_eq!(
+            resolve_route_candidates_for_policy("balanced", RoutePolicy::CostOptimized),
+            vec![
+                ("zai", "glm-5.2"),
+                ("deepseek", "deepseek-v4-flash"),
+                ("anthropic", "claude-sonnet-4-6"),
+                ("gemini", "gemini-3.1-pro-preview"),
+                ("openai", "gpt-5.5"),
+                ("gemini", "gemini-3-flash-preview"),
+                ("openai", "gpt-5.4-mini")
+            ]
+        );
+        assert_eq!(
+            resolve_route_candidates_for_policy("deep", RoutePolicy::CostOptimized),
+            vec![
+                ("zai", "glm-5.2"),
+                ("deepseek", "deepseek-v4-pro"),
+                ("anthropic", "claude-opus-4-8"),
+                ("gemini", "gemini-3.1-pro-preview"),
+                ("openai", "gpt-5.5"),
+                ("anthropic", "claude-sonnet-4-6"),
+                ("deepseek", "deepseek-v4-flash"),
+                ("gemini", "gemini-3-flash-preview")
+            ]
+        );
+        assert_eq!(
+            resolve_route_candidates_for_policy("vision", RoutePolicy::CostOptimized),
+            resolve_route_candidates_for_policy("vision", RoutePolicy::QualityFirst),
+            "GLM/DeepSeek text policy must not steal image routes"
+        );
+    }
+
+    #[test]
     fn route_candidates_have_pricing_entries() {
-        for lane in ["instant", "balanced", "deep", "vision"] {
-            for (provider, model) in resolve_route_candidates(lane) {
-                assert!(
-                    crate::pricing::lookup(provider, model).is_some(),
-                    "missing pricing for {lane} candidate {provider}/{model}"
-                );
+        for policy in [RoutePolicy::QualityFirst, RoutePolicy::CostOptimized] {
+            for lane in ["instant", "balanced", "deep", "vision"] {
+                for (provider, model) in resolve_route_candidates_for_policy(lane, policy) {
+                    assert!(
+                        crate::pricing::lookup(provider, model).is_some(),
+                        "missing pricing for {policy:?} {lane} candidate {provider}/{model}"
+                    );
+                }
             }
         }
     }

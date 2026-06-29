@@ -132,11 +132,27 @@ The server now resolves each lane to an ordered candidate list, not a single
 hard dependency. If the preferred provider is unavailable, over quota, or
 temporarily busy, Bluey tries the next candidate before returning an error.
 
+Default `quality_first` candidate order:
+
 | Lane | Candidate order |
 | --- | --- |
 | `instant` | OpenAI `gpt-5.4-mini` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.1-flash-lite` -> Anthropic `claude-haiku-4-5-20251001` -> Gemini `gemini-3-flash-preview` -> Anthropic `claude-sonnet-4-6` |
 | `balanced` | Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Z.AI `glm-5.2` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Gemini `gemini-3-flash-preview` -> OpenAI `gpt-5.4-mini` |
 | `deep` | Anthropic `claude-opus-4-8` -> Z.AI `glm-5.2` -> DeepSeek `deepseek-v4-pro` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3-flash-preview` |
+| `vision` | OpenAI `gpt-5.5` -> Gemini `gemini-3.1-pro-preview` -> Gemini `gemini-3-flash-preview` -> OpenAI `gpt-5.4-mini` |
+
+Optional `cost_optimized` candidate order:
+
+Enable with `BLUEY_ROUTE_POLICY=cost_optimized` on the server. This is meant
+for owner-controlled smoke/A-B testing and margin tuning, not an unannounced
+quality downgrade. It only changes text lanes; vision stays on providers with
+image support.
+
+| Lane | Candidate order |
+| --- | --- |
+| `instant` | DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.1-flash-lite` -> OpenAI `gpt-5.4-mini` -> Anthropic `claude-haiku-4-5-20251001` -> Gemini `gemini-3-flash-preview` -> Anthropic `claude-sonnet-4-6` |
+| `balanced` | Z.AI `glm-5.2` -> DeepSeek `deepseek-v4-flash` -> Anthropic `claude-sonnet-4-6` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Gemini `gemini-3-flash-preview` -> OpenAI `gpt-5.4-mini` |
+| `deep` | Z.AI `glm-5.2` -> DeepSeek `deepseek-v4-pro` -> Anthropic `claude-opus-4-8` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3-flash-preview` |
 | `vision` | OpenAI `gpt-5.5` -> Gemini `gemini-3.1-pro-preview` -> Gemini `gemini-3-flash-preview` -> OpenAI `gpt-5.4-mini` |
 
 Every managed LLM candidate above has a matching entry in
@@ -176,6 +192,7 @@ Default server knobs:
 | `BLUEY_LIMIT_PROVIDER_GEMINI_LLM_PER_MIN` | 600/min, burst 120 | Gemini text/vision capacity |
 | `BLUEY_LIMIT_PROVIDER_DEEPSEEK_LLM_PER_MIN` | 600/min, burst 120 | DeepSeek text capacity |
 | `BLUEY_LIMIT_PROVIDER_ZAI_LLM_PER_MIN` | 300/min, burst 60 | Z.AI GLM text capacity |
+| `BLUEY_ROUTE_POLICY` | `quality_first` | Set to `cost_optimized` to prefer GLM/DeepSeek first for managed text lanes |
 | `BLUEY_LIMIT_PROVIDER_OPENAI_EMBED_PER_MIN` | 900/min, burst 180 | OpenAI embedding capacity |
 | `BLUEY_LIMIT_PROVIDER_DEEPGRAM_STT_PER_MIN` | 600/min, burst 120 | Deepgram STT capacity |
 | `BLUEY_LIMIT_PROVIDER_OPENAI_STT_PER_MIN` | 600/min, burst 120 | OpenAI STT fallback capacity |

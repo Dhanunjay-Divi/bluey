@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-29 19:24 EDT
+Latest checkpoint: 2026-06-29 19:38 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,41 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-237-BILLING-PER-QUESTION-AVERAGES.md`; the next canonical Bluey round doc should start at `ROUND-238-...`.
+- Latest assigned Bluey round doc is `ROUND-238-COST-OPTIMIZED-GLM-DEEPSEEK-ROUTING.md`; the next canonical Bluey round doc should start at `ROUND-239-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 238 added an explicit server route policy to use cheaper GLM/DeepSeek
+  text routes first without silently changing the default production route:
+  - root cause: GLM-5.2 and DeepSeek were wired/priced but placed after
+    Anthropic/OpenAI in the quality-first candidate order, so they mostly acted
+    as fallbacks
+  - default remains quality-first
+  - `BLUEY_ROUTE_POLICY=cost_optimized` or
+    `BLUEY_ROUTE_ORDER=cost_optimized` makes:
+    - `instant` start with DeepSeek Flash
+    - `balanced` start with Z.AI GLM-5.2, then DeepSeek Flash
+    - `deep` start with Z.AI GLM-5.2, then DeepSeek V4 Pro
+    - `vision` remain unchanged on OpenAI/Gemini because GLM/DeepSeek are only
+      wired for text/chat in this codebase
+  - docs updated:
+    - `docs/MODEL-ROUTING.md`
+    - `docs/PRICING-MODEL.md`
+  - security note: pasted provider keys must be rotated before production and
+    stored only in server env/secrets, not repo/docs
+  - Round doc:
+    `docs/rounds/ROUND-238-COST-OPTIMIZED-GLM-DEEPSEEK-ROUTING.md`
+  - Verification passed:
+    - `cargo fmt --manifest-path server/Cargo.toml`
+    - `cargo test --manifest-path server/Cargo.toml routing::dispatcher::tests -- --nocapture`
+    - `cargo test --manifest-path server/Cargo.toml pricing -- --nocapture`
+    - `cargo check --manifest-path server/Cargo.toml`
+    - `git diff --check`
+  - Remaining gates: rotate keys, configure rotated `ZAI_API_KEY(S)` and
+    `DEEPSEEK_API_KEY(S)` on staging/prod, live-smoke instant/balanced/deep and
+    vision, compare quality/latency, then canary before broad rollout
 - Round 237 calculated per-question/per-row billing averages from a fresh
   account export:
   - `bluey usage` at the time showed `474` billable rows/cues and `$7.52`
