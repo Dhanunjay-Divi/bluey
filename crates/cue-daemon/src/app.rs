@@ -4096,6 +4096,14 @@ async fn refresh_overlay_context_items(daemon: &Arc<Daemon>, meeting: &MeetingRe
     .await;
 }
 
+async fn refresh_current_overlay_context_items(daemon: &Arc<Daemon>) {
+    if let Some(meeting) = daemon.meeting.lock().await.clone() {
+        refresh_overlay_context_items(daemon, &meeting).await;
+    } else {
+        let _ = send_overlay(daemon, OverlayCommand::SetContextItems { items: vec![] }).await;
+    }
+}
+
 async fn refresh_overlay_sessions(daemon: &Arc<Daemon>) {
     let started = Instant::now();
     let active_id = daemon.meeting.lock().await.as_ref().map(|m| m.id);
@@ -5264,6 +5272,7 @@ async fn handle_attach_requested(daemon: &Arc<Daemon>) -> Result<()> {
 
 async fn handle_attach_paths(daemon: &Arc<Daemon>, paths: Vec<PathBuf>) -> Result<()> {
     if paths.is_empty() {
+        refresh_current_overlay_context_items(daemon).await;
         return Ok(());
     }
 
@@ -5309,6 +5318,8 @@ async fn handle_attach_paths(daemon: &Arc<Daemon>, paths: Vec<PathBuf>) -> Resul
     }
 
     if attached.is_empty() {
+        refresh_current_overlay_context_items(daemon).await;
+        refresh_overlay_sessions(daemon).await;
         return Ok(());
     }
 

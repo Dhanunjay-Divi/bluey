@@ -7967,6 +7967,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if !newlyAddedIds.isEmpty, isExpectingContextMutationForPendingSend() {
             pendingContextItemIds.formUnion(newlyAddedIds)
             showingSavedContextItems = false
+        } else if pendingContextItemIds.isEmpty {
+            showingSavedContextItems = true
         }
         guard !items.isEmpty else {
             pendingContextItemIds.removeAll()
@@ -8078,7 +8080,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         showingSavedContextItems = false
         contextMutationExpectedUntil = nil
         if !contextItems.isEmpty {
-            setKnowledgeBadge(savedContextBadgeTitle(for: contextItems.count), accent: BlueyTheme.green)
+            showingSavedContextItems = true
+            setKnowledgeBadge(
+                savedContextBadgeTitle(for: contextItems.count, showing: showingSavedContextItems),
+                accent: BlueyTheme.green)
+            renderAttachmentStrip(itemsForVisibleAttachmentStrip())
+            refreshAttachmentStripLayout()
+            return
         }
         renderAttachmentStrip([])
     }

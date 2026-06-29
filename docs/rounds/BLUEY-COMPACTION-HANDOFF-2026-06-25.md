@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-29 11:26 EDT
+Latest checkpoint: 2026-06-29 11:42 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,33 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-230-LIVE-CAPTION-RAIL-SEND-BOUNDS.md`; the next canonical Bluey round doc should start at `ROUND-231-...`.
+- Latest assigned Bluey round doc is `ROUND-231-ATTACH-INDEXING-VISIBLE-RESET.md`; the next canonical Bluey round doc should start at `ROUND-232-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 231 fixed document attach attempts getting stuck on `Indexing...` and improved attachment visibility:
+  - owner attached a document, saw `Indexing...`, and could not see the document afterward
+  - active local status showed `context_items: 0`, and `active-meeting.json` had `context: []`, so the current session did not retain an attached document
+  - `handle_attach_paths` returned early when the picker returned no paths, which left the macOS overlay in the optimistic indexing placeholder because no fresh `set_context_items` was sent
+  - all-skipped/all-failed attach attempts also had an early return that did not refresh the context list
+  - added a daemon helper to always refresh the current overlay context list
+  - empty/canceled attach attempts and all-skipped/all-failed attempts now send a fresh context list and refresh sessions before returning
+  - macOS now shows saved attached files by default when there are no pending attachment chips, and after sending pending attachments it shows saved conversation files instead of clearing the strip completely
+  - daemon refresh fix applies to both macOS and Windows; Windows does not have the same macOS pending/saved attachment strip UI
+  - Round doc: `docs/rounds/ROUND-231-ATTACH-INDEXING-VISIBLE-RESET.md`
+  - Verification passed:
+    - `cargo fmt --manifest-path crates/cue-daemon/Cargo.toml`
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `cargo test -p cue-daemon overlay_context_items --lib`
+    - `cargo build -p cue-daemon --bin bluey-daemon`
+    - `native/macos/cue-overlay/build.sh`
+    - `BLUEY_BIN=/Users/uno/Downloads/cue/target/debug/bluey scripts/bluey-visible-local.sh`
+    - `/Users/uno/Downloads/cue/target/debug/bluey status`
+  - Current local visible QA status after restart: daemon pid `16450`, active meeting id `93e731e4-a161-4f83-8f98-6019c86bfb92`, overlay visible `true`, overlay capture excluded `false`, transcript segments `0`, context items `0`
+  - Remaining QA: attach a known small file and confirm `Indexing...` becomes a visible chip and `context_items` increments; cancel picker and confirm overlay returns to `Docs empty`; before release/upload return to capture-excluded mode and verify `overlay_capture_excluded: true`
 - Round 230 bounded the live-caption rail and stopped raw live captions from becoming giant visible Question bubbles:
   - owner showed a long Listen transcript becoming a bulky repeated Question card after pressing Enter
   - macOS already had a transcript `NSScrollView`, but it felt like a clipped one-line caption because scroll-wheel events were not forwarded to it and the scrollbar auto-hidden
