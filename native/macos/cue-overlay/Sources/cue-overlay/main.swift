@@ -4250,6 +4250,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var liveTranscriptPreviewBodies: [String: String] = [:]
     private var consumedTranscriptFingerprints: [String] = []
     private var lastTranscriptStripSource: String?
+    private var transcriptStripShouldFollowTail = false
     private var sessionItems: [OverlaySessionItem] = []
     private var sessionsHaveLoaded = false
     private var editingSessionId: String?
@@ -4956,7 +4957,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if canvasOpen {
             updateCanvasWidth()
         }
-        resizeTranscriptLabelToContent()
+        layoutTranscriptRailForCurrentText()
     }
 
     override func resetCursorRects() {
@@ -6417,6 +6418,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             cell.wraps = false
             cell.lineBreakMode = .byClipping
         }
+        transcriptScroll.horizontalScrollElasticity = .allowed
+        transcriptScroll.verticalScrollElasticity = .none
+        transcriptScroll.usesPredominantAxisScrolling = false
 
         attachmentStack.orientation = .horizontal
         attachmentStack.alignment = .centerY
@@ -7014,6 +7018,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             && transcriptSnippets.isEmpty
             && latestLiveTranscriptLine == nil
             && latestLiveTranscriptLinesBySource.isEmpty
+            && liveTranscriptPreviewBodies.isEmpty
             && !hasVisibleContextAttachments
             && !screenContextReadyForAnswer
             && canvases.isEmpty
@@ -7197,6 +7202,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func hasTranscriptQuestionContext() -> Bool {
         transcriptQuestionForAnswer()?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            || liveTranscriptPreviewQuestionForAnswer()?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     }
 
     private func shouldBlockSilentListenAnswer(raw: String) -> Bool {
@@ -7221,7 +7227,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func shouldSuppressDuplicateAsk(question: String, visibleContextIds: [String]) -> Bool {
         var normalizedQuestion = normalizeTranscriptMemoryLine(question)
-        if let transcript = transcriptQuestionForAnswer() {
+        if let transcript = transcriptQuestionForAnswer() ?? liveTranscriptPreviewQuestionForAnswer() {
             let transcriptFingerprint = compactTranscriptMemoryLine(transcript)
             if !transcriptFingerprint.isEmpty {
                 normalizedQuestion += "|transcript:"
@@ -7335,7 +7341,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             .joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return liveTranscriptVisibleQuestion(from: joined)
-            ?? (joined.isEmpty ? nil : liveTranscriptAnswerPrompt(forSources: allowedSources))
+            ?? (joined.isEmpty ? nil : boundedTranscriptTail(joined, maxChars: ChromeMetrics.transcriptPreviewMemoryChars))
     }
 
     func prepareAutoSendListenCapture() {
@@ -7349,7 +7355,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         autoSendAfterStopWorkItem?.cancel()
         autoSendAfterStopWorkItem = nil
         let raw = composer.string.trimmingCharacters(in: .whitespacesAndNewlines)
-        let hadTranscriptContext = transcriptQuestionForAnswer() != nil
+        let hadTranscriptContext = hasTranscriptQuestionContext()
+        let hadPreviewTranscriptContext = liveTranscriptPreviewQuestionForAnswer() != nil
         guard !shouldBlockSilentListenAnswer(raw: raw) else {
             window?.makeFirstResponder(composer)
             return
@@ -7372,7 +7379,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             emitLifecycle(
                 "ask_answer_skipped",
                 status: "duplicate_suppressed",
-                detail: "typed_chars=\(raw.count) question_chars=\(q.count) transcript_context=\(hadTranscriptContext) context_ids=\(sentContextIds.count)"
+                detail: "typed_chars=\(raw.count) question_chars=\(q.count) transcript_context=\(hadTranscriptContext) preview_transcript_context=\(hadPreviewTranscriptContext) context_ids=\(sentContextIds.count)"
             )
             showSystemToast(title: "Already sent", body: "Bluey is already answering that request.", duration: 1.8)
             window?.makeFirstResponder(composer)
@@ -7384,7 +7391,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         updateRouteBadge(for: q, selectedRoute: route)
         emitLifecycle(
             "ask_answer_sent",
-            detail: "typed_chars=\(raw.count) question_chars=\(q.count) transcript_context=\(hadTranscriptContext) generic_live_prompt=\(isLiveTranscriptAnswerPrompt(q)) context_ids=\(sentContextIds.count)"
+            detail: "typed_chars=\(raw.count) question_chars=\(q.count) transcript_context=\(hadTranscriptContext) preview_transcript_context=\(hadPreviewTranscriptContext) generic_live_prompt=\(isLiveTranscriptAnswerPrompt(q)) context_ids=\(sentContextIds.count)"
         )
         emitAsk(
             question: q,
@@ -9743,12 +9750,68 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             .joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !joined.isEmpty else { return nil }
-        return joined
+        return boundedTranscriptTail(joined, maxChars: ChromeMetrics.transcriptPreviewMemoryChars)
+    }
+
+    private func liveTranscriptPreviewQuestionForAnswer() -> String? {
+        var candidates: [String] = []
+        if let latestLiveTranscriptLine {
+            candidates.append(latestLiveTranscriptLine)
+        }
+        for key in ["Mic", "System", "Audio"] {
+            if let line = latestLiveTranscriptLinesBySource[key] {
+                candidates.append(line)
+            }
+        }
+        for key in ["Mic", "System", "Audio"] {
+            if let body = liveTranscriptPreviewBodies[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !body.isEmpty {
+                candidates.append("\(key): \(body)")
+            }
+        }
+        let railText = transcriptLabel.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !railText.isEmpty {
+            candidates.append(railText)
+        }
+
+        for candidate in candidates {
+            if let compact = compactLiveTranscriptQuestionCandidate(candidate) {
+                return compact
+            }
+        }
+        return nil
+    }
+
+    private func compactLiveTranscriptQuestionCandidate(_ transcript: String) -> String? {
+        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let lines = trimmed
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !lines.isEmpty else { return nil }
+        let compact = lines.joined(separator: " ")
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard compact.count >= 3 else { return nil }
+        let lower = compact.lowercased()
+        let placeholderFragments = [
+            "captions appear here",
+            "live captions preview",
+            "starting audio",
+            "audio is live",
+            "listening for follow-up"
+        ]
+        guard !placeholderFragments.contains(where: { lower.contains($0) }) else { return nil }
+        return boundedTranscriptTail(compact, maxChars: ChromeMetrics.transcriptPreviewMemoryChars)
     }
 
     private func consumeTranscriptBufferForAnswer() {
         var lines = transcriptSnippets
         appendLiveTranscriptLines(to: &lines)
+        if lines.isEmpty, let preview = liveTranscriptPreviewQuestionForAnswer() {
+            lines.append(preview)
+        }
         var newlyConsumed = 0
         for line in lines {
             let fingerprint = transcriptMemoryFingerprint(line)
@@ -9782,8 +9845,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let typed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let transcript = transcriptQuestionForAnswer()
         if typed.isEmpty {
-            guard let transcript else { return nil }
-            return liveTranscriptVisibleQuestion(from: transcript) ?? liveTranscriptAnswerPrompt()
+            guard let transcript = transcript ?? liveTranscriptPreviewQuestionForAnswer() else { return nil }
+            return liveTranscriptVisibleQuestion(from: transcript) ?? transcript
         }
         return typed
     }
@@ -10085,6 +10148,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func updateTranscriptStripText(_ text: String, scrollToEnd: Bool) {
+        transcriptStripShouldFollowTail = scrollToEnd
         transcriptLabel.attributedStringValue = attributedTranscriptStripText(text)
         resizeTranscriptLabelToContent()
         guard scrollToEnd else {
@@ -10092,13 +10156,23 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             transcriptScroll.reflectScrolledClipView(transcriptScroll.contentView)
             return
         }
+        scrollTranscriptRailToEnd()
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.resizeTranscriptLabelToContent()
-            let maxX = max(0, self.transcriptLabel.frame.width - self.transcriptScroll.contentView.bounds.width)
-            self.transcriptScroll.contentView.scroll(to: NSPoint(x: maxX, y: 0))
-            self.transcriptScroll.reflectScrolledClipView(self.transcriptScroll.contentView)
+            self.layoutTranscriptRailForCurrentText()
         }
+    }
+
+    private func layoutTranscriptRailForCurrentText() {
+        resizeTranscriptLabelToContent()
+        guard transcriptStripShouldFollowTail else { return }
+        scrollTranscriptRailToEnd()
+    }
+
+    private func scrollTranscriptRailToEnd() {
+        let maxX = max(0, transcriptLabel.frame.width - transcriptScroll.contentView.bounds.width)
+        transcriptScroll.contentView.scroll(to: NSPoint(x: maxX, y: 0))
+        transcriptScroll.reflectScrolledClipView(transcriptScroll.contentView)
     }
 
     private func attributedTranscriptStripText(_ text: String) -> NSAttributedString {
@@ -10139,9 +10213,19 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func resizeTranscriptLabelToContent() {
         let viewport = max(0, transcriptScroll.contentView.bounds.width)
         let height = max(22, transcriptScroll.contentView.bounds.height)
-        let font = transcriptLabel.font ?? NSFont.systemFont(ofSize: 11.5, weight: .medium)
-        let textWidth = ceil((transcriptLabel.stringValue as NSString).size(
-            withAttributes: [.font: font]).width) + 24
+        let attributed = transcriptLabel.attributedStringValue
+        let measuredWidth: CGFloat
+        if attributed.length > 0 {
+            measuredWidth = ceil(attributed.boundingRect(
+                with: NSSize(width: CGFloat.greatestFiniteMagnitude, height: height),
+                options: [.usesLineFragmentOrigin, .usesFontLeading]
+            ).width)
+        } else {
+            let font = transcriptLabel.font ?? NSFont.systemFont(ofSize: 11.5, weight: .medium)
+            measuredWidth = ceil((transcriptLabel.stringValue as NSString).size(
+                withAttributes: [.font: font]).width)
+        }
+        let textWidth = measuredWidth + 28
         transcriptLabel.frame = NSRect(
             x: 0,
             y: max(0, (height - 18) / 2),

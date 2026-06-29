@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-29 18:45 EDT
+Latest checkpoint: 2026-06-29 19:03 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,54 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-235-BILLING-USAGE-MARGIN-AUDIT.md`; the next canonical Bluey round doc should start at `ROUND-236-...`.
+- Latest assigned Bluey round doc is `ROUND-236-LIVE-PARTIAL-ENTER-RAIL-TICKER.md`; the next canonical Bluey round doc should start at `ROUND-237-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 236 fixed the live partial caption Enter path and the bottom transcript
+  rail tailing behavior:
+  - owner pressed Enter while the bottom rail showed a live partial caption, but
+    the sent Question card used the generic live-caption instruction and then
+    hit the provider-error fallback
+  - daemon status showed `transcript_segments: 0` while the overlay still had
+    `Mic: ...` in its live rail, so the caption existed only in overlay partial
+    memory and not yet in finalized daemon transcript state
+  - macOS now recovers answer text from latest live line, live lines by source,
+    merged preview bodies, and the rail text before falling back
+  - manual Enter/Answer now sends the actual bounded caption text when
+    available instead of the generic live-caption instruction
+  - auto-send-after-stop also sends bounded caption text for longer captions
+  - duplicate suppression, "has transcript context", and current-session
+    emptiness now include preview-only caption memory
+  - `ask_answer_sent` / duplicate-suppressed lifecycle logs include
+    `preview_transcript_context` so partial-caption sends can be diagnosed
+    without logging personal transcript text
+  - the rail now follows the newest caption immediately, after the next run
+    loop, and after layout/resizing; it also measures attributed text width and
+    allows horizontal elasticity
+  - Windows parity: longer live transcript sends now use the bounded transcript
+    text instead of the generic live-caption prompt when the short visible
+    question is unavailable
+  - Round doc: `docs/rounds/ROUND-236-LIVE-PARTIAL-ENTER-RAIL-TICKER.md`
+  - Verification passed:
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `native/macos/cue-overlay/build.sh`
+    - `BLUEY_BIN=/Users/uno/Downloads/cue/target/debug/bluey scripts/bluey-visible-local.sh`
+    - `/Users/uno/Downloads/cue/target/debug/bluey status`
+    - `git diff --check`
+  - Current local visible QA status after restart: daemon pid `33583`, active
+    meeting id `ea11ad65-014f-419c-adbd-0b4a4ed64e7b`, overlay visible `true`,
+    overlay capture excluded `false`, transcript segments `0`, context items
+    `0`
+  - Important: before release/upload, return to normal mode and verify
+    `overlay_capture_excluded: true`
+  - Separate remaining backend/cloud gate: logs are still showing many cloud
+    object-sync failures such as `object sync is not configured`, `503 Service
+    Unavailable`, `cloud object upload failed; continuing with text sync`, and
+    occasional `sync failed` / `500 Internal Server Error`
 - Round 235 audited the `$5.28` to `$4.82` balance-drop concern and provider
   cost versus customer charge:
   - active account is linked to `https://bluey.sh`, user

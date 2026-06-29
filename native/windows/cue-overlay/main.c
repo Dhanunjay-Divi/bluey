@@ -1359,6 +1359,28 @@ static bool live_transcript_visible_question(wchar_t *out, size_t capacity) {
     return true;
 }
 
+static bool live_transcript_question_text(wchar_t *out, size_t capacity) {
+    if (!out || capacity == 0) return false;
+    out[0] = L'\0';
+    const wchar_t *source = g_transcript_final[0] ? g_transcript_final : g_transcript_partial;
+    if (!source || source[0] == L'\0') return false;
+    size_t len = wcslen(source);
+    if (len < 3) return false;
+    if (len >= capacity) {
+        source += len - (capacity - 1);
+    }
+    wcscpy_s(out, capacity, source);
+    trim_transcript_question(out);
+    if (wcslen(out) < 3) return false;
+    for (wchar_t *p = out; *p; p++) {
+        if (*p == L'\r' || *p == L'\n') {
+            *p = L' ';
+        }
+    }
+    if (is_placeholder_transcript_question(out)) return false;
+    return true;
+}
+
 static bool is_live_transcript_answer_prompt(const wchar_t *question) {
     if (!question) return false;
     return wcsncmp(question, L"Answer the latest ", 18) == 0
@@ -1370,10 +1392,12 @@ static void send_current_question(void) {
     static const wchar_t *transcript_fallback = L"Answer the latest live captions from the current session transcript. Treat the transcript as the user's current question or working context.";
     int length = GetWindowTextLengthW(g_ask_edit);
     bool used_fallback = length <= 0;
-    wchar_t transcript_question[260] = L"";
+    wchar_t transcript_question[1024] = L"";
     bool used_short_transcript = used_fallback && live_transcript_visible_question(transcript_question, 260);
+    bool used_transcript_text = used_short_transcript
+        || (used_fallback && live_transcript_question_text(transcript_question, 1024));
     const wchar_t *fallback_question = has_transcript_context()
-        ? (used_short_transcript ? transcript_question : transcript_fallback)
+        ? (used_transcript_text ? transcript_question : transcript_fallback)
         : fallback;
     char detail[192];
     snprintf(
