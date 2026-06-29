@@ -38,6 +38,8 @@ async fn boot_harness() -> Harness {
         openai_api_key: Some("sk-test-openai".to_string()),
         anthropic_api_key: Some("sk-test-anthropic".to_string()),
         gemini_api_key: None,
+        deepseek_api_key: None,
+        zai_api_key: None,
         deepgram_api_key: Some("dg-test".to_string()),
         ollama_base_url: None,
     })
@@ -574,6 +576,8 @@ async fn router_complete_upstream_spend_guard_blocks_before_provider_hit() {
             openai_api_key: Some("sk-test-openai".to_string()),
             anthropic_api_key: Some("sk-test-anthropic".to_string()),
             gemini_api_key: None,
+            deepseek_api_key: None,
+            zai_api_key: None,
             deepgram_api_key: Some("dg-test".to_string()),
             ollama_base_url: None,
         },
@@ -1032,6 +1036,8 @@ async fn router_complete_retries_next_openai_key_on_429_without_customer_wait() 
         openai_api_key: Some("sk-openai-a,sk-openai-b".to_string()),
         anthropic_api_key: Some("sk-test-anthropic".to_string()),
         gemini_api_key: None,
+        deepseek_api_key: None,
+        zai_api_key: None,
         deepgram_api_key: Some("dg-test".to_string()),
         ollama_base_url: None,
     };

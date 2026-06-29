@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-29 12:20 EDT
+Latest checkpoint: 2026-06-29 13:05 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,55 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-232-LISTEN-STT-RESERVATION-GUARDS.md`; the next canonical Bluey round doc should start at `ROUND-233-...`.
+- Latest assigned Bluey round doc is `ROUND-233-FLAGSHIP-MODEL-ROUTES.md`; the next canonical Bluey round doc should start at `ROUND-234-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 233 added optional managed flagship model routes for Z.AI GLM-5.2 and DeepSeek:
+  - official provider docs checked:
+    - Z.AI pricing/model docs at `https://docs.z.ai/guides/overview/pricing`
+    - Z.AI GLM-5.2 docs at `https://docs.z.ai/guides/llm/glm-5.2`
+    - DeepSeek pricing docs at `https://api-docs.deepseek.com/quick_start/pricing`
+    - DeepSeek chat completion docs at `https://api-docs.deepseek.com/api/create-chat-completion`
+  - added server-side key pools:
+    - `DEEPSEEK_API_KEYS` / `DEEPSEEK_API_KEY`
+    - `ZAI_API_KEYS` / `ZAI_API_KEY`
+    - `ZHIPU_API_KEYS` / `ZHIPU_API_KEY` as GLM/Z.AI aliases
+  - added first-class managed provider names `deepseek` and `zai`, not mislabeled as OpenAI in logs/billing
+  - added OpenAI-compatible dispatch to:
+    - DeepSeek `deepseek-v4-pro`
+    - DeepSeek `deepseek-v4-flash`
+    - Z.AI `glm-5.2`
+  - added route candidates:
+    - `instant`: DeepSeek flash after OpenAI fast
+    - `balanced`: DeepSeek flash, then Z.AI GLM-5.2
+    - `deep`: Z.AI GLM-5.2, then DeepSeek V4 Pro, plus DeepSeek flash as later fallback
+    - `vision`: unchanged because these are text/chat routes in this pass
+  - added conservative cache-miss pricing rows:
+    - Z.AI `glm-5.2`: `$1.40/1M` input, `$4.40/1M` output, `150%` markup
+    - DeepSeek `deepseek-v4-pro`: `$0.435/1M` input, `$0.87/1M` output, `150%` markup
+    - DeepSeek `deepseek-v4-flash`: `$0.14/1M` input, `$0.28/1M` output, `200%` markup
+  - added provider capacity buckets:
+    - `BLUEY_LIMIT_PROVIDER_DEEPSEEK_LLM_PER_MIN`
+    - `BLUEY_LIMIT_PROVIDER_ZAI_LLM_PER_MIN`
+  - non-deep DeepSeek/Z.AI lanes send thinking disabled; deep can enable provider reasoning, and reasoning text is not surfaced in the overlay
+  - if an OpenAI-compatible stream omits final usage, Bluey now uses the server input estimate plus a conservative output character estimate instead of charging zero
+  - source-of-truth docs updated:
+    - `docs/PRICING-MODEL.md`
+    - `docs/MODEL-ROUTING.md`
+  - Round doc: `docs/rounds/ROUND-233-FLAGSHIP-MODEL-ROUTES.md`
+  - Verification passed:
+    - `cargo fmt --manifest-path server/Cargo.toml`
+    - `cargo fmt --all`
+    - `cargo check --manifest-path server/Cargo.toml`
+    - `cargo test --manifest-path server/Cargo.toml pricing -- --nocapture`
+    - `cargo test --manifest-path server/Cargo.toml routing::dispatcher -- --nocapture`
+    - `cargo test --manifest-path server/Cargo.toml rate_limit -- --nocapture`
+    - `cargo test --manifest-path server/Cargo.toml config::tests -- --nocapture`
+    - `cargo test --manifest-path server/Cargo.toml` (`179` unit tests, `41` integration tests, and doc-tests passed)
+  - Remaining QA/gates: configure real `DEEPSEEK_API_KEY(S)` and `ZAI_API_KEY(S)`, run live smoke tests on staging/production, then compare provider dashboard usage with Bluey's usage ledger. Future improvement: add cache-hit/cache-miss token split accounting for DeepSeek/Z.AI cached inputs.
 - Round 232 fixed rapid Listen on/off STT reservation churn and misleading balance drops:
   - owner clicked Listen on/off repeatedly and saw balance move from about `$5.28` to `$4.68` within a few seconds
   - root cause was layered: one dual-source Listen can reserve about `56` cents for 10 minutes of Deepgram relay capacity, macOS could emit repeated start events while still `Starting`, daemon start was not idempotent, relay sources reserved before first audio bytes, zero-audio relay settlements rounded up to one second, and balance could refresh before relay settlement finished

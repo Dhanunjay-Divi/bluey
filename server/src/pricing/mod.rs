@@ -96,6 +96,32 @@ pub const PRICING: &[ModelPricing] = &[
         markup_percent: 200,
     },
     ModelPricing {
+        // Z.AI GLM-5.2: $1.40/1M cache-miss input, $4.40/1M output.
+        // Cached input is cheaper upstream, but Bluey uses cache-miss pricing
+        // until per-request cache accounting is modeled.
+        provider: "zai",
+        model: "glm-5.2",
+        upstream_in_microcents_per_1m: 1_400_000,
+        upstream_out_microcents_per_1m: 4_400_000,
+        markup_percent: 150,
+    },
+    ModelPricing {
+        // DeepSeek V4 Pro: $0.435/1M cache-miss input, $0.87/1M output.
+        provider: "deepseek",
+        model: "deepseek-v4-pro",
+        upstream_in_microcents_per_1m: 435_000,
+        upstream_out_microcents_per_1m: 870_000,
+        markup_percent: 150,
+    },
+    ModelPricing {
+        // DeepSeek V4 Flash: $0.14/1M cache-miss input, $0.28/1M output.
+        provider: "deepseek",
+        model: "deepseek-v4-flash",
+        upstream_in_microcents_per_1m: 140_000,
+        upstream_out_microcents_per_1m: 280_000,
+        markup_percent: 200,
+    },
+    ModelPricing {
         // Ollama (local fallback): no upstream cost, no markup.
         provider: "ollama",
         model: "llama3.1",
@@ -218,6 +244,19 @@ mod tests {
                 .markup_percent,
             200
         );
+        assert_eq!(lookup("zai", "glm-5.2").unwrap().markup_percent, 150);
+        assert_eq!(
+            lookup("deepseek", "deepseek-v4-pro")
+                .unwrap()
+                .markup_percent,
+            150
+        );
+        assert_eq!(
+            lookup("deepseek", "deepseek-v4-flash")
+                .unwrap()
+                .markup_percent,
+            200
+        );
     }
 
     #[test]
@@ -296,6 +335,21 @@ mod tests {
         let pricing = lookup("openai", "text-embedding-3-small").unwrap();
         assert_eq!(pricing.upstream_in_microcents_per_1m, 20_000);
         assert_eq!(pricing.upstream_out_microcents_per_1m, 0);
+    }
+
+    #[test]
+    fn openai_compatible_flagship_pricing_uses_cache_miss_rates() {
+        let glm = lookup("zai", "glm-5.2").unwrap();
+        assert_eq!(glm.upstream_in_microcents_per_1m, 1_400_000);
+        assert_eq!(glm.upstream_out_microcents_per_1m, 4_400_000);
+
+        let deepseek = lookup("deepseek", "deepseek-v4-pro").unwrap();
+        assert_eq!(deepseek.upstream_in_microcents_per_1m, 435_000);
+        assert_eq!(deepseek.upstream_out_microcents_per_1m, 870_000);
+
+        let flash = lookup("deepseek", "deepseek-v4-flash").unwrap();
+        assert_eq!(flash.upstream_in_microcents_per_1m, 140_000);
+        assert_eq!(flash.upstream_out_microcents_per_1m, 280_000);
     }
 
     #[test]

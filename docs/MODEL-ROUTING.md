@@ -1,6 +1,6 @@
 # Bluey Model Routing
 
-Last updated: 2026-06-20
+Last updated: 2026-06-29
 
 This document is the source-of-truth snapshot for the model/provider routing
 currently implemented in the Bluey codebase. It is intentionally operational:
@@ -13,7 +13,7 @@ Provider model catalogs and prices change frequently. Before every deploy that
 can reach paying users, treat model freshness as a required release gate:
 
 1. Check the official provider docs/dashboards for OpenAI, Anthropic, Gemini,
-   Deepgram, and the embedding provider in use.
+   Z.AI, DeepSeek, Deepgram, and the embedding provider in use.
 2. Confirm each Bluey lane still points at an available, non-deprecated model:
    `instant`, `balanced`, `deep`, `vision`, `embed`, and STT.
 3. Re-check pricing for every routed model and update
@@ -37,6 +37,8 @@ can reach paying users, treat model freshness as a required release gate:
    OpenAI: <model ids> / pricing checked
    Anthropic: <model ids> / pricing checked
    Gemini: <model ids> / pricing checked
+   Z.AI: <model ids> / pricing checked
+   DeepSeek: <model ids> / pricing checked
    Deepgram/STT: <model ids> / pricing checked
    Embeddings: <model ids> / pricing checked
    Live smoke: pass/fail + trace ids
@@ -57,6 +59,15 @@ actual upstream models.
 | `balanced` | Anthropic | `claude-sonnet-4-6` | Default technical/general answer |
 | `deep` | Anthropic | `claude-opus-4-8` | Hard coding, system design, long reasoning with a larger thinking/output budget |
 | `vision` | OpenAI | `gpt-5.5` | Analyse Screen, screenshots, image context |
+
+Optional server-managed text candidates are also wired when their key pools are
+configured:
+
+| Provider | Model | Lanes | Notes |
+| --- | --- | --- | --- |
+| Z.AI | `glm-5.2` | `balanced`, `deep` | OpenAI-compatible endpoint; deep lane sends thinking enabled |
+| DeepSeek | `deepseek-v4-pro` | `deep` | OpenAI-compatible endpoint; deep lane sends thinking enabled |
+| DeepSeek | `deepseek-v4-flash` | `instant`, `balanced`, `deep` fallback | OpenAI-compatible endpoint; instant/balanced send thinking disabled |
 
 ## Thinking Budget Policy
 
@@ -109,6 +120,10 @@ Provider mapping today:
 - Gemini is wired as a managed text/vision candidate. We pass output token and
   temperature controls today; explicit thinking-budget controls are left to a
   future Gemini-specific pass once live quality/cost measurements are in.
+- Z.AI `glm-5.2` and DeepSeek V4 routes use the OpenAI-compatible Chat
+  Completions shape. Bluey sends `thinking: {"type":"disabled"}` on non-deep
+  lanes and enables provider reasoning on deep lanes without exposing reasoning
+  text in the overlay.
 
 This gives us the operational knob the user asked for without making every
 easy question slower or more expensive.
@@ -119,9 +134,9 @@ temporarily busy, Bluey tries the next candidate before returning an error.
 
 | Lane | Candidate order |
 | --- | --- |
-| `instant` | OpenAI `gpt-5.4-mini` -> Gemini `gemini-3.1-flash-lite` -> Anthropic `claude-haiku-4-5-20251001` -> Gemini `gemini-3-flash-preview` -> Anthropic `claude-sonnet-4-6` |
-| `balanced` | Anthropic `claude-sonnet-4-6` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Gemini `gemini-3-flash-preview` -> OpenAI `gpt-5.4-mini` |
-| `deep` | Anthropic `claude-opus-4-8` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Anthropic `claude-sonnet-4-6` -> Gemini `gemini-3-flash-preview` |
+| `instant` | OpenAI `gpt-5.4-mini` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3.1-flash-lite` -> Anthropic `claude-haiku-4-5-20251001` -> Gemini `gemini-3-flash-preview` -> Anthropic `claude-sonnet-4-6` |
+| `balanced` | Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Z.AI `glm-5.2` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Gemini `gemini-3-flash-preview` -> OpenAI `gpt-5.4-mini` |
+| `deep` | Anthropic `claude-opus-4-8` -> Z.AI `glm-5.2` -> DeepSeek `deepseek-v4-pro` -> Gemini `gemini-3.1-pro-preview` -> OpenAI `gpt-5.5` -> Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3-flash-preview` |
 | `vision` | OpenAI `gpt-5.5` -> Gemini `gemini-3.1-pro-preview` -> Gemini `gemini-3-flash-preview` -> OpenAI `gpt-5.4-mini` |
 
 Every managed LLM candidate above has a matching entry in
@@ -159,6 +174,8 @@ Default server knobs:
 | `BLUEY_LIMIT_PROVIDER_OPENAI_LLM_PER_MIN` | 900/min, burst 180 | OpenAI chat/vision capacity |
 | `BLUEY_LIMIT_PROVIDER_ANTHROPIC_LLM_PER_MIN` | 300/min, burst 60 | Anthropic chat capacity |
 | `BLUEY_LIMIT_PROVIDER_GEMINI_LLM_PER_MIN` | 600/min, burst 120 | Gemini text/vision capacity |
+| `BLUEY_LIMIT_PROVIDER_DEEPSEEK_LLM_PER_MIN` | 600/min, burst 120 | DeepSeek text capacity |
+| `BLUEY_LIMIT_PROVIDER_ZAI_LLM_PER_MIN` | 300/min, burst 60 | Z.AI GLM text capacity |
 | `BLUEY_LIMIT_PROVIDER_OPENAI_EMBED_PER_MIN` | 900/min, burst 180 | OpenAI embedding capacity |
 | `BLUEY_LIMIT_PROVIDER_DEEPGRAM_STT_PER_MIN` | 600/min, burst 120 | Deepgram STT capacity |
 | `BLUEY_LIMIT_PROVIDER_OPENAI_STT_PER_MIN` | 600/min, burst 120 | OpenAI STT fallback capacity |
@@ -173,11 +190,14 @@ Each capacity env var also supports a `_BURST` suffix, for example
 `BLUEY_LIMIT_PROVIDER_OPENAI_LLM_PER_MIN_BURST=240`.
 
 Provider keys can be supplied either as single-key env vars (`OPENAI_API_KEY`,
-`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `DEEPGRAM_API_KEY`) or
+`ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `DEEPSEEK_API_KEY`,
+`ZAI_API_KEY`, `ZHIPU_API_KEY`, `DEEPGRAM_API_KEY`) or
 as comma-separated, provider-approved key pools (`OPENAI_API_KEYS`,
-`ANTHROPIC_API_KEYS`, `GEMINI_API_KEYS`, `GOOGLE_API_KEYS`, `DEEPGRAM_API_KEYS`). Bluey
-shards requests across the pool. This is for approved capacity across projects,
-regions, or enterprise allocations; do not use it for provider-limit evasion.
+`ANTHROPIC_API_KEYS`, `GEMINI_API_KEYS`, `GOOGLE_API_KEYS`,
+`DEEPSEEK_API_KEYS`, `ZAI_API_KEYS`, `ZHIPU_API_KEYS`, `DEEPGRAM_API_KEYS`).
+Bluey shards requests across the pool. This is for approved capacity across
+projects, regions, or enterprise allocations; do not use it for provider-limit
+evasion.
 
 Set `BLUEY_REDIS_URL` in production so capacity buckets are shared across every
 Bluey server instance. Optional knobs:

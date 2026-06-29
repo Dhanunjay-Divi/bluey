@@ -265,6 +265,10 @@ pub struct RateLimiters {
     pub provider_anthropic_llm: SharedLimiter,
     /// Provider-wide capacity bucket for Gemini chat/vision requests.
     pub provider_gemini_llm: SharedLimiter,
+    /// Provider-wide capacity bucket for DeepSeek chat requests.
+    pub provider_deepseek_llm: SharedLimiter,
+    /// Provider-wide capacity bucket for Z.AI GLM chat requests.
+    pub provider_zai_llm: SharedLimiter,
     /// Provider-wide capacity bucket for OpenAI embeddings.
     pub provider_openai_embed: SharedLimiter,
     /// Provider-wide capacity bucket for Deepgram STT.
@@ -330,6 +334,20 @@ impl Default for RateLimiters {
                 "BLUEY_LIMIT_PROVIDER_GEMINI_LLM_PER_MIN",
                 600,
                 120,
+                redis.clone(),
+            ),
+            provider_deepseek_llm: limiter_from_env(
+                "provider_deepseek_llm",
+                "BLUEY_LIMIT_PROVIDER_DEEPSEEK_LLM_PER_MIN",
+                600,
+                120,
+                redis.clone(),
+            ),
+            provider_zai_llm: limiter_from_env(
+                "provider_zai_llm",
+                "BLUEY_LIMIT_PROVIDER_ZAI_LLM_PER_MIN",
+                300,
+                60,
                 redis.clone(),
             ),
             provider_openai_embed: limiter_from_env(
@@ -430,6 +448,22 @@ impl RateLimiters {
                         reason: "provider_gemini_llm_busy",
                     })
             }
+            "deepseek" => self
+                .provider_deepseek_llm
+                .check(&key)
+                .await
+                .map_err(|retry| CapacityDenied {
+                    retry_after_secs: retry,
+                    reason: "provider_deepseek_llm_busy",
+                }),
+            "zai" => self
+                .provider_zai_llm
+                .check(&key)
+                .await
+                .map_err(|retry| CapacityDenied {
+                    retry_after_secs: retry,
+                    reason: "provider_zai_llm_busy",
+                }),
             _ => Ok(()),
         }
     }
@@ -760,6 +794,32 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(denied.reason, "provider_gemini_llm_busy");
+        assert!(limits.check_provider_llm("openai", "gpt-5.5").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_provider_capacity_has_own_bucket() {
+        let limits = RateLimiters {
+            provider_deepseek_llm: SharedLimiter::new("test_provider_deepseek_llm", 60, 1, None),
+            provider_zai_llm: SharedLimiter::new("test_provider_zai_llm", 60, 1, None),
+            ..RateLimiters::default()
+        };
+        limits
+            .check_provider_llm("deepseek", "deepseek-v4-pro")
+            .await
+            .unwrap();
+        let denied = limits
+            .check_provider_llm("deepseek", "deepseek-v4-pro")
+            .await
+            .unwrap_err();
+        assert_eq!(denied.reason, "provider_deepseek_llm_busy");
+
+        limits.check_provider_llm("zai", "glm-5.2").await.unwrap();
+        let denied = limits
+            .check_provider_llm("zai", "glm-5.2")
+            .await
+            .unwrap_err();
+        assert_eq!(denied.reason, "provider_zai_llm_busy");
         assert!(limits.check_provider_llm("openai", "gpt-5.5").await.is_ok());
     }
 

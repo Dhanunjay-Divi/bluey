@@ -140,6 +140,10 @@ pub struct UpstreamKeys {
     /// Single key or comma-separated, provider-approved key pool.
     pub gemini_api_key: Option<String>,
     /// Single key or comma-separated, provider-approved key pool.
+    pub deepseek_api_key: Option<String>,
+    /// Single key or comma-separated, provider-approved key pool.
+    pub zai_api_key: Option<String>,
+    /// Single key or comma-separated, provider-approved key pool.
     pub deepgram_api_key: Option<String>,
     pub ollama_base_url: Option<String>,
 }
@@ -202,6 +206,14 @@ impl UpstreamKeys {
         select_key_from_pool(self.gemini_api_key.as_deref(), shard_key)
     }
 
+    pub fn deepseek_key(&self, shard_key: &str) -> Option<&str> {
+        select_key_from_pool(self.deepseek_api_key.as_deref(), shard_key)
+    }
+
+    pub fn zai_key(&self, shard_key: &str) -> Option<&str> {
+        select_key_from_pool(self.zai_api_key.as_deref(), shard_key)
+    }
+
     pub fn deepgram_key(&self, shard_key: &str) -> Option<&str> {
         select_key_from_pool(self.deepgram_api_key.as_deref(), shard_key)
     }
@@ -211,6 +223,8 @@ impl UpstreamKeys {
             "openai" => self.openai_api_key.as_deref(),
             "anthropic" => self.anthropic_api_key.as_deref(),
             "gemini" => self.gemini_api_key.as_deref(),
+            "deepseek" => self.deepseek_api_key.as_deref(),
+            "zai" => self.zai_api_key.as_deref(),
             "deepgram" => self.deepgram_api_key.as_deref(),
             _ => None,
         };
@@ -269,6 +283,13 @@ impl Config {
                 "GEMINI_API_KEY",
                 "GOOGLE_API_KEYS",
                 "GOOGLE_API_KEY",
+            ]),
+            deepseek_api_key: env_any(&["DEEPSEEK_API_KEYS", "DEEPSEEK_API_KEY"]),
+            zai_api_key: env_any(&[
+                "ZAI_API_KEYS",
+                "ZAI_API_KEY",
+                "ZHIPU_API_KEYS",
+                "ZHIPU_API_KEY",
             ]),
             deepgram_api_key: env_any(&["DEEPGRAM_API_KEYS", "DEEPGRAM_API_KEY"]),
             ollama_base_url: std::env::var("OLLAMA_BASE_URL")
@@ -654,6 +675,19 @@ mod tests {
         let selected = keys.gemini_key("vision-request").unwrap();
         assert!(["gm-a", "gm-b", "gm-c"].contains(&selected));
         assert_eq!(keys.key_candidates("gemini", "vision-request").len(), 3);
+    }
+
+    #[test]
+    fn openai_compatible_key_pools_are_supported() {
+        let keys = UpstreamKeys {
+            deepseek_api_key: Some("ds-a,ds-b".into()),
+            zai_api_key: Some("zai-a,zai-b".into()),
+            ..Default::default()
+        };
+        assert!(["ds-a", "ds-b"].contains(&keys.deepseek_key("chat").unwrap()));
+        assert!(["zai-a", "zai-b"].contains(&keys.zai_key("chat").unwrap()));
+        assert_eq!(keys.key_candidates("deepseek", "chat").len(), 2);
+        assert_eq!(keys.key_candidates("zai", "chat").len(), 2);
     }
 
     #[test]

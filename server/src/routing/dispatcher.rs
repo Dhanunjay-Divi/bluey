@@ -19,6 +19,13 @@ fn override_url(default: &str, env_var: &str) -> String {
         .unwrap_or_else(|| default.to_string())
 }
 
+fn override_direct_url(default: &str, env_var: &str) -> String {
+    std::env::var(env_var)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
 use anyhow::{anyhow, Context, Result};
 use futures_util::Stream;
 use futures_util::StreamExt;
@@ -38,6 +45,9 @@ const ANTHROPIC_FAST_MODEL: &str = "claude-haiku-4-5-20251001";
 const GEMINI_PRO_MODEL: &str = "gemini-3.1-pro-preview";
 const GEMINI_FLASH_MODEL: &str = "gemini-3-flash-preview";
 const GEMINI_LITE_MODEL: &str = "gemini-3.1-flash-lite";
+const DEEPSEEK_PRO_MODEL: &str = "deepseek-v4-pro";
+const DEEPSEEK_FLASH_MODEL: &str = "deepseek-v4-flash";
+const ZAI_FLAGSHIP_MODEL: &str = "glm-5.2";
 
 #[derive(Debug, Error)]
 #[error("{provider} upstream http {status}")]
@@ -278,6 +288,7 @@ pub fn resolve_route_candidates(lane: &str) -> Vec<(&'static str, &'static str)>
     match lane {
         "instant" => vec![
             ("openai", OPENAI_FAST_MODEL),
+            ("deepseek", DEEPSEEK_FLASH_MODEL),
             ("gemini", GEMINI_LITE_MODEL),
             ("anthropic", ANTHROPIC_FAST_MODEL),
             ("gemini", GEMINI_FLASH_MODEL),
@@ -285,9 +296,12 @@ pub fn resolve_route_candidates(lane: &str) -> Vec<(&'static str, &'static str)>
         ],
         "deep" => vec![
             ("anthropic", ANTHROPIC_DEEP_MODEL),
+            ("zai", ZAI_FLAGSHIP_MODEL),
+            ("deepseek", DEEPSEEK_PRO_MODEL),
             ("gemini", GEMINI_PRO_MODEL),
             ("openai", OPENAI_ACCURATE_MODEL),
             ("anthropic", ANTHROPIC_BALANCED_MODEL),
+            ("deepseek", DEEPSEEK_FLASH_MODEL),
             ("gemini", GEMINI_FLASH_MODEL),
         ],
         "vision" => vec![
@@ -302,6 +316,8 @@ pub fn resolve_route_candidates(lane: &str) -> Vec<(&'static str, &'static str)>
         "local" => vec![],
         _ => vec![
             ("anthropic", ANTHROPIC_BALANCED_MODEL),
+            ("deepseek", DEEPSEEK_FLASH_MODEL),
+            ("zai", ZAI_FLAGSHIP_MODEL),
             ("gemini", GEMINI_PRO_MODEL),
             ("openai", OPENAI_ACCURATE_MODEL),
             ("gemini", GEMINI_FLASH_MODEL),
@@ -387,6 +403,42 @@ pub async fn complete(
             )
             .await
         }
+        "deepseek" => {
+            let key = keys
+                .deepseek_key(&format!("chat:{model}:{system}:{user}"))
+                .ok_or_else(|| anyhow!("DEEPSEEK_API_KEY(S) not configured on bluey-server"))?;
+            openai_compatible_complete(
+                "deepseek",
+                key,
+                model,
+                system,
+                user,
+                max_tokens,
+                temperature,
+                thinking,
+                fallback_input_tokens,
+                image_data_urls,
+            )
+            .await
+        }
+        "zai" => {
+            let key = keys
+                .zai_key(&format!("chat:{model}:{system}:{user}"))
+                .ok_or_else(|| anyhow!("ZAI_API_KEY(S) not configured on bluey-server"))?;
+            openai_compatible_complete(
+                "zai",
+                key,
+                model,
+                system,
+                user,
+                max_tokens,
+                temperature,
+                thinking,
+                fallback_input_tokens,
+                image_data_urls,
+            )
+            .await
+        }
         // Codex S4.4: explicit failure for unsupported providers
         // including `ollama` (which only the daemon's local fallback
         // path should run).
@@ -440,6 +492,21 @@ pub async fn complete_with_key(
         }
         "gemini" => {
             gemini_complete(
+                api_key,
+                model,
+                system,
+                user,
+                max_tokens,
+                temperature,
+                thinking,
+                fallback_input_tokens,
+                image_data_urls,
+            )
+            .await
+        }
+        "deepseek" | "zai" => {
+            openai_compatible_complete(
+                provider,
                 api_key,
                 model,
                 system,
@@ -514,6 +581,21 @@ pub async fn complete_stream_with_key(
             )
             .await
         }
+        "deepseek" | "zai" => {
+            openai_compatible_complete_stream(
+                provider,
+                api_key,
+                model,
+                system,
+                user,
+                max_tokens,
+                temperature,
+                thinking,
+                fallback_input_tokens,
+                image_data_urls,
+            )
+            .await
+        }
         other => Err(anyhow!(
             "unsupported provider for managed streaming dispatch: {other}"
         )),
@@ -536,11 +618,21 @@ struct OpenAiChatReq<'a> {
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream_options: Option<OpenAiStreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<OpenAiCompatibleThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
 }
 
 #[derive(Serialize)]
 struct OpenAiStreamOptions {
     include_usage: bool,
+}
+
+#[derive(Serialize)]
+struct OpenAiCompatibleThinking {
+    #[serde(rename = "type")]
+    ty: &'static str,
 }
 
 fn openai_token_limit_fields(model: &str, max_tokens: Option<u32>) -> (Option<u32>, Option<u32>) {
@@ -560,6 +652,51 @@ fn openai_effective_token_limit_fields(
         model,
         Some(effective_max_output_tokens(max_tokens, thinking)),
     )
+}
+
+fn openai_compatible_chat_url(provider: &str) -> Result<String> {
+    match provider {
+        "openai" => Ok(override_url(
+            "https://api.openai.com/v1/chat/completions",
+            "BLUEY_TEST_OPENAI_URL",
+        )),
+        "deepseek" => Ok(override_direct_url(
+            "https://api.deepseek.com/chat/completions",
+            "BLUEY_TEST_DEEPSEEK_URL",
+        )),
+        "zai" => Ok(override_direct_url(
+            "https://api.z.ai/api/paas/v4/chat/completions",
+            "BLUEY_TEST_ZAI_URL",
+        )),
+        other => Err(anyhow!("unsupported OpenAI-compatible provider: {other}")),
+    }
+}
+
+fn openai_compatible_thinking_for(
+    provider: &str,
+    thinking: ThinkingBudget,
+) -> (Option<OpenAiCompatibleThinking>, Option<&'static str>) {
+    if !matches!(provider, "deepseek" | "zai") {
+        return (None, None);
+    }
+    match thinking.mode {
+        ThinkingMode::Off => (Some(OpenAiCompatibleThinking { ty: "disabled" }), None),
+        ThinkingMode::High => (
+            Some(OpenAiCompatibleThinking { ty: "enabled" }),
+            Some("max"),
+        ),
+        ThinkingMode::Low | ThinkingMode::Medium | ThinkingMode::Auto => (
+            Some(OpenAiCompatibleThinking { ty: "enabled" }),
+            Some("high"),
+        ),
+    }
+}
+
+fn estimated_tokens_from_chars(chars: usize) -> i64 {
+    if chars == 0 {
+        return 0;
+    }
+    ((chars as i64) + 2) / 3
 }
 
 #[derive(Serialize)]
@@ -602,7 +739,7 @@ struct OpenAiChoice {
 
 #[derive(Deserialize)]
 struct OpenAiResponseMessage {
-    content: String,
+    content: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -625,9 +762,38 @@ async fn openai_complete(
     fallback_input_tokens: Option<i64>,
     image_data_urls: &[String],
 ) -> Result<Completion> {
+    openai_compatible_complete(
+        "openai",
+        key,
+        model,
+        system,
+        user,
+        max_tokens,
+        temperature,
+        thinking,
+        fallback_input_tokens,
+        image_data_urls,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn openai_compatible_complete(
+    provider: &str,
+    key: &str,
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    thinking: ThinkingBudget,
+    fallback_input_tokens: Option<i64>,
+    image_data_urls: &[String],
+) -> Result<Completion> {
     let user_content = openai_user_content(user, image_data_urls);
     let (max_tokens, max_completion_tokens) =
         openai_effective_token_limit_fields(model, max_tokens, thinking);
+    let (thinking, reasoning_effort) = openai_compatible_thinking_for(provider, thinking);
     let req = OpenAiChatReq {
         model,
         messages: vec![
@@ -645,40 +811,44 @@ async fn openai_complete(
         temperature,
         stream: None,
         stream_options: None,
+        thinking,
+        reasoning_effort,
     };
     let resp = reqwest::Client::new()
-        .post(
-            override_url(
-                "https://api.openai.com/v1/chat/completions",
-                "BLUEY_TEST_OPENAI_URL",
-            )
-            .as_str(),
-        )
+        .post(openai_compatible_chat_url(provider)?.as_str())
         .bearer_auth(key)
         .json(&req)
         .send()
         .await
-        .context("openai http")?;
+        .with_context(|| format!("{provider} http"))?;
     let status = resp.status();
     if !status.is_success() {
-        let error = upstream_http_error("openai", status, resp.headers());
+        let error = upstream_http_error(provider, status, resp.headers());
         let _ = resp.text().await.unwrap_or_default();
         return Err(error);
     }
-    let parsed: OpenAiChatResp = resp.json().await.context("openai json")?;
+    let parsed: OpenAiChatResp = resp
+        .json()
+        .await
+        .with_context(|| format!("{provider} json"))?;
     let text = parsed
         .choices
         .into_iter()
         .next()
-        .map(|c| c.message.content)
+        .and_then(|c| c.message.content)
         .unwrap_or_default();
     let (input_tokens, output_tokens) = parsed
         .usage
         .map(|u| (u.prompt_tokens, u.completion_tokens))
-        .unwrap_or((fallback_input_tokens.unwrap_or(0), 0));
+        .unwrap_or_else(|| {
+            (
+                fallback_input_tokens.unwrap_or(0),
+                estimated_tokens_from_chars(text.chars().count()),
+            )
+        });
     Ok(Completion {
         text,
-        provider: "openai".to_string(),
+        provider: provider.to_string(),
         model: model.to_string(),
         input_tokens,
         output_tokens,
@@ -719,12 +889,41 @@ async fn openai_complete_stream(
     max_tokens: Option<u32>,
     temperature: Option<f32>,
     thinking: ThinkingBudget,
-    _fallback_input_tokens: Option<i64>,
+    fallback_input_tokens: Option<i64>,
+    image_data_urls: &[String],
+) -> Result<StreamingCompletion> {
+    openai_compatible_complete_stream(
+        "openai",
+        key,
+        model,
+        system,
+        user,
+        max_tokens,
+        temperature,
+        thinking,
+        fallback_input_tokens,
+        image_data_urls,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn openai_compatible_complete_stream(
+    provider: &str,
+    key: &str,
+    model: &str,
+    system: &str,
+    user: &str,
+    max_tokens: Option<u32>,
+    temperature: Option<f32>,
+    thinking: ThinkingBudget,
+    fallback_input_tokens: Option<i64>,
     image_data_urls: &[String],
 ) -> Result<StreamingCompletion> {
     let user_content = openai_user_content(user, image_data_urls);
     let (max_tokens, max_completion_tokens) =
         openai_effective_token_limit_fields(model, max_tokens, thinking);
+    let (thinking, reasoning_effort) = openai_compatible_thinking_for(provider, thinking);
     let req = OpenAiChatReq {
         model,
         messages: vec![
@@ -744,38 +943,37 @@ async fn openai_complete_stream(
         stream_options: Some(OpenAiStreamOptions {
             include_usage: true,
         }),
+        thinking,
+        reasoning_effort,
     };
     let resp = reqwest::Client::new()
-        .post(
-            override_url(
-                "https://api.openai.com/v1/chat/completions",
-                "BLUEY_TEST_OPENAI_URL",
-            )
-            .as_str(),
-        )
+        .post(openai_compatible_chat_url(provider)?.as_str())
         .bearer_auth(key)
         .json(&req)
         .send()
         .await
-        .context("openai stream http")?;
+        .with_context(|| format!("{provider} stream http"))?;
     let status = resp.status();
     if !status.is_success() {
-        let error = upstream_http_error("openai", status, resp.headers());
+        let error = upstream_http_error(provider, status, resp.headers());
         let _ = resp.text().await.unwrap_or_default();
         return Err(error);
     }
 
-    let provider = "openai".to_string();
+    let provider_string = provider.to_string();
     let model_string = model.to_string();
+    let stream_provider = provider_string.clone();
+    let stream_model = model_string.clone();
     let mut bytes = resp.bytes_stream();
     let stream = async_stream::try_stream! {
         let mut buffer = String::new();
         let mut pending_utf8 = Vec::new();
         let mut seen_done = false;
         let mut final_usage: Option<OpenAiUsage> = None;
+        let mut output_chars: usize = 0;
 
         while let Some(chunk) = bytes.next().await {
-            let chunk = chunk.context("openai stream read")?;
+            let chunk = chunk.with_context(|| format!("{stream_provider} stream read"))?;
             append_utf8_chunk(&chunk, &mut pending_utf8, &mut buffer)?;
             while let Some((_, data)) = take_sse_event(&mut buffer) {
                 let data = data.trim();
@@ -787,12 +985,14 @@ async fn openai_complete_stream(
                     continue;
                 }
                 for delta in parse_openai_stream_chunk(data, &mut final_usage)? {
+                    output_chars = output_chars.saturating_add(delta.chars().count());
                     yield CompletionStreamEvent::Delta(delta);
                 }
             }
         }
         if !pending_utf8.is_empty() {
-            let tail = std::str::from_utf8(&pending_utf8).context("openai stream trailing utf8")?;
+            let tail = std::str::from_utf8(&pending_utf8)
+                .with_context(|| format!("{stream_provider} stream trailing utf8"))?;
             buffer.push_str(tail);
         }
         while let Some((_, data)) = take_sse_event(&mut buffer) {
@@ -802,14 +1002,24 @@ async fn openai_complete_stream(
                 continue;
             }
             for delta in parse_openai_stream_chunk(data, &mut final_usage)? {
+                output_chars = output_chars.saturating_add(delta.chars().count());
                 yield CompletionStreamEvent::Delta(delta);
             }
         }
         if !seen_done {
-            Err::<(), anyhow::Error>(anyhow!("openai stream ended before [DONE]"))?;
+            Err::<(), anyhow::Error>(anyhow!("{stream_provider} stream ended before [DONE]"))?;
         }
-        let usage = final_usage
-            .ok_or_else(|| anyhow!("openai stream ended before final usage"))?;
+        let usage = final_usage.unwrap_or_else(|| {
+            tracing::warn!(
+                provider = %stream_provider,
+                model = %stream_model,
+                "OpenAI-compatible stream ended without final usage; using token estimate"
+            );
+            OpenAiUsage {
+                prompt_tokens: fallback_input_tokens.unwrap_or(0),
+                completion_tokens: estimated_tokens_from_chars(output_chars),
+            }
+        });
         let (input_tokens, output_tokens) = (usage.prompt_tokens, usage.completion_tokens);
         yield CompletionStreamEvent::Done {
             input_tokens,
@@ -818,7 +1028,7 @@ async fn openai_complete_stream(
     };
 
     Ok(StreamingCompletion {
-        provider,
+        provider: provider_string,
         model: model_string,
         events: Box::pin(stream),
     })
@@ -2032,6 +2242,7 @@ mod tests {
             resolve_route_candidates("instant"),
             vec![
                 ("openai", "gpt-5.4-mini"),
+                ("deepseek", "deepseek-v4-flash"),
                 ("gemini", "gemini-3.1-flash-lite"),
                 ("anthropic", "claude-haiku-4-5-20251001"),
                 ("gemini", "gemini-3-flash-preview"),
@@ -2042,6 +2253,8 @@ mod tests {
             resolve_route_candidates("balanced"),
             vec![
                 ("anthropic", "claude-sonnet-4-6"),
+                ("deepseek", "deepseek-v4-flash"),
+                ("zai", "glm-5.2"),
                 ("gemini", "gemini-3.1-pro-preview"),
                 ("openai", "gpt-5.5"),
                 ("gemini", "gemini-3-flash-preview"),
@@ -2052,9 +2265,12 @@ mod tests {
             resolve_route_candidates("deep"),
             vec![
                 ("anthropic", "claude-opus-4-8"),
+                ("zai", "glm-5.2"),
+                ("deepseek", "deepseek-v4-pro"),
                 ("gemini", "gemini-3.1-pro-preview"),
                 ("openai", "gpt-5.5"),
                 ("anthropic", "claude-sonnet-4-6"),
+                ("deepseek", "deepseek-v4-flash"),
                 ("gemini", "gemini-3-flash-preview")
             ]
         );
@@ -2303,6 +2519,25 @@ mod tests {
             openai_effective_token_limit_fields("gpt-5.5", None, budget);
         assert_eq!(max_tokens, None);
         assert_eq!(max_completion_tokens, Some(5120));
+    }
+
+    #[test]
+    fn openai_compatible_thinking_is_provider_scoped() {
+        let (thinking, effort) = openai_compatible_thinking_for("openai", ThinkingBudget::off());
+        assert!(thinking.is_none());
+        assert!(effort.is_none());
+
+        let (thinking, effort) = openai_compatible_thinking_for("deepseek", ThinkingBudget::off());
+        assert_eq!(thinking.unwrap().ty, "disabled");
+        assert_eq!(effort, None);
+
+        let budget = ThinkingBudget {
+            mode: ThinkingMode::High,
+            max_tokens: Some(4096),
+        };
+        let (thinking, effort) = openai_compatible_thinking_for("zai", budget);
+        assert_eq!(thinking.unwrap().ty, "enabled");
+        assert_eq!(effort, Some("max"));
     }
 
     #[test]

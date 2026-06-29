@@ -7,7 +7,7 @@
 > per-decision sections. Cross-referenced from `DECISIONS.md`,
 > `docs/HOW-IT-WORKS.md`, `FUTURE-IMPLEMENTATIONS.md` R14.13.
 >
-> Last updated: 2026-06-23.
+> Last updated: 2026-06-29.
 
 ---
 
@@ -44,15 +44,23 @@
 > - The Light tier projection (~1,500 cues per $15) reflects the
 >   1¢ floor; under fractional-cent billing it would be ~10x higher.
 
-> **Provider price snapshot date:** 2026-06-20. List prices from
+> **Provider price snapshot date:** 2026-06-29. List prices from
 > `https://platform.openai.com/docs/models`,
 > `https://docs.anthropic.com/en/docs/about-claude/pricing`, and
-> `https://ai.google.dev/gemini-api/docs/pricing`.
+> `https://ai.google.dev/gemini-api/docs/pricing`,
+> `https://docs.z.ai/guides/overview/pricing`, and
+> `https://api-docs.deepseek.com/quick_start/pricing`.
 > Refresh at every minor release. Managed LLM routes currently price
 > OpenAI `gpt-5.4-mini`, OpenAI `gpt-5.5`, Anthropic
 > `claude-sonnet-4-6`, Anthropic `claude-opus-4-8`, Anthropic
 > `claude-haiku-4-5-20251001`, Gemini `gemini-3.1-pro-preview`,
-> Gemini `gemini-3-flash-preview`, and Gemini `gemini-3.1-flash-lite`.
+> Gemini `gemini-3-flash-preview`, Gemini `gemini-3.1-flash-lite`,
+> Z.AI `glm-5.2`, DeepSeek `deepseek-v4-pro`, and DeepSeek
+> `deepseek-v4-flash`.
+>
+> **Cache-price caveat:** DeepSeek and Z.AI publish lower cached-input prices.
+> Bluey v0.2 uses cache-miss input pricing for reservation and billing until
+> usage events store cache-hit/cache-miss token splits.
 >
 > **Vision tokenization caveat:** "1 image" in the table below is a
 > simplification. OpenAI GPT-5.5 vision input is billed as image/text
@@ -71,6 +79,14 @@
 | Vision | ~200 | ~300 | ~3 tiles | `gpt-5.5` vision | image+text in: ~$0.0027 + out: $0.0090 = **$0.0117** | raw markup ~$0.029; charged 3¢ |
 | Easy general | ~150 | ~150 | 0 | `gpt-5.4-mini` Instant | in: $0.000113 + out: $0.000675 = **$0.000788** | raw markup $0.0024; 1¢ minimum |
 | Medium general | ~400 | ~500 | 0 | `claude-sonnet-4-6` | in: $0.0012 + out: $0.0075 = **$0.0087** | raw markup $0.026; charged 3¢ |
+
+**Additional managed text candidates:**
+
+| Provider/model | Upstream input | Upstream output | Customer markup | Bluey note |
+|---|---:|---:|---:|---|
+| Z.AI `glm-5.2` | $1.40/1M cache-miss tokens | $4.40/1M tokens | 150% | Optional deep/balanced candidate when `ZAI_API_KEY(S)` is configured |
+| DeepSeek `deepseek-v4-pro` | $0.435/1M cache-miss tokens | $0.87/1M tokens | 150% | Optional deep candidate when `DEEPSEEK_API_KEY(S)` is configured |
+| DeepSeek `deepseek-v4-flash` | $0.14/1M cache-miss tokens | $0.28/1M tokens | 200% | Optional instant/balanced fallback when `DEEPSEEK_API_KEY(S)` is configured |
 
 **STT pricing used by server meters:**
 
