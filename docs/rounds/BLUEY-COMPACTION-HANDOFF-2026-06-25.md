@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-29 19:03 EDT
+Latest checkpoint: 2026-06-29 19:24 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,36 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-236-LIVE-PARTIAL-ENTER-RAIL-TICKER.md`; the next canonical Bluey round doc should start at `ROUND-237-...`.
+- Latest assigned Bluey round doc is `ROUND-237-BILLING-PER-QUESTION-AVERAGES.md`; the next canonical Bluey round doc should start at `ROUND-238-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 237 calculated per-question/per-row billing averages from a fresh
+  account export:
+  - `bluey usage` at the time showed `474` billable rows/cues and `$7.52`
+    spent over the last 7 days
+  - average across every billable row: `1.59c` customer charge and `0.42c`
+    estimated provider cost
+  - average for actual LLM answer rows only: `7.33c` customer charge and
+    `2.57c` estimated provider cost
+  - normal balanced text answers: `42` rows, average `4.07c` charged and
+    `1.20c` provider estimate
+  - screen/vision answers: `16` rows, average `15.88c` charged and `6.16c`
+    provider estimate
+  - Listen/STT rows: `74` rows, average `1.96c` per lane row; with mic+system
+    active, a typical Listen window is roughly `3.92c` before the answer
+  - embeddings/indexing: `342` rows, average `0.53c` charged while estimated
+    upstream cost is tiny, about `$0.0046` total for those rows
+  - practical examples:
+    - normal typed answer: about `4c`
+    - screen/image answer: about `16c`
+    - spoken Listen + normal answer: about `8c`
+    - spoken Listen + screen answer: about `20c`
+  - temporary export `bluey-export-20260629-231921.json` was removed and not
+    committed
+  - Round doc: `docs/rounds/ROUND-237-BILLING-PER-QUESTION-AVERAGES.md`
 - Round 236 fixed the live partial caption Enter path and the bottom transcript
   rail tailing behavior:
   - owner pressed Enter while the bottom rail showed a live partial caption, but
