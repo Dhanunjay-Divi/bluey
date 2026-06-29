@@ -1,4 +1,11 @@
 [workspace]
+# `members` is the full set in this shared repo (the meeting app AND the
+# managed-AI dashboard cluster). `default-members` is the meeting app's live
+# closure only (cli/daemon/meeting-overlay + their deps), so a bare
+# `cargo build`/`clippy`/`test` — and an AI agent's working set — stay focused
+# on the meeting app. The dashboard cluster (cue-dashboard + its deps
+# cue-router, cue-stealth) is still a member: build it explicitly with
+# `-p cue-dashboard`, and packaging/other branches are unaffected.
 members = [
     "crates/cue-cli",
     "crates/cue-core",
@@ -10,7 +17,16 @@ members = [
     "crates/cue-cloud-client",
     "crates/cue-router",
     "crates/cue-agent-bridge",
-    "crates/cue-overlay-tauri",
+    "crates/cue-meeting-overlay",
+]
+default-members = [
+    "crates/cue-cli",
+    "crates/cue-core",
+    "crates/cue-daemon",
+    "crates/cue-llm",
+    "crates/cue-rag",
+    "crates/cue-cloud-client",
+    "crates/cue-agent-bridge",
     "crates/cue-meeting-overlay",
 ]
 resolver = "2"

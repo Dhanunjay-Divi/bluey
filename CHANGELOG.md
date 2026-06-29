@@ -8,13 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- On-device English STT via Parakeet (Nemotron, `parakeet-rs`/ONNX): the mic +
-  chunk capture loop now runs through the streaming `SttProvider` trait
-  (`BLUEY_STT_PARAKEET=1`), unifying it with the system-audio path. First-run
-  model auto-download (atomic, resumable) from a public int8 mirror, env-
-  overridable via `BLUEY_PARAKEET_MODEL_URL` / `BLUEY_PARAKEET_MODEL_DIR`. Real
-  inference verified end-to-end on native arm64 (`parakeet_real_inference` test +
-  an in-module daemon-path test).
+- On-device English STT via Parakeet (Nemotron, `parakeet-rs`/ONNX): system-audio
+  capture runs through the streaming `SttProvider` trait as the keyless local
+  backstop (no cloud key / account required — nothing leaves the machine).
+  First-run model auto-download (atomic, resumable) from a public int8 mirror,
+  env-overridable via `BLUEY_PARAKEET_MODEL_URL` / `BLUEY_PARAKEET_MODEL_DIR`.
+  Real inference verified end-to-end on native arm64 (`parakeet_real_inference`
+  test). (The earlier chunk-file mic loop was superseded by the continuous
+  streaming path — see Changed.)
 - Speaker labels: transcript renders conversational `You` / `They` (mic vs
   system) for both the agent context and the recap (`Speaker::display_label`).
 - Question→trigger (master doc §6): a final line from another speaker that is
@@ -68,6 +69,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same validation gate. Design: docs/work/PLAN-ADAPTIVE-RESOLVER.md.
 
 ### Changed
+- On-device capture is now **continuous-streaming, not chunk-file**. The overlay
+  "Listen" button and the `bluey listen` CLI (when no cloud STT is configured)
+  route to the proven streaming system-audio task — continuous PCM → one
+  streaming `SttProvider`, no per-second WAV record/transcribe/delete cycle. This
+  is the real-time path; the old chunk-file on-device Parakeet branch (record 1s
+  `.wav` → transcribe → delete, with its fragment accumulator and dual-drain
+  pipeline) is **removed** (net −400+ lines). On-device system-audio STT is now
+  on by default (disable with `BLUEY_SYSTEM_AUDIO_STT=0`); `BLUEY_STT_PARAKEET`
+  (the chunk-path switch) no longer applies. The cloud/REST transcription path
+  (OpenAI / Bluey-managed / local-whisper) is unchanged. v1 streams **system
+  audio only** (the other participants — the question trigger); mic streaming is
+  a deliberate follow-up, and the overlay copy ("Listen (system audio)") no
+  longer promises mic capture it doesn't yet do. `stop_audio_capture` now
+  actually tears down the streaming handle, and the streaming start is idempotent
+  (no double-spawn of the capture helper / STT model).
 - ACP agent driving is now ON by default for ACP-capable agents (was opt-in
   `BLUEY_USE_ACP=1`), made safe by a CLI fallback: a pre-first-token ACP failure
   (spawn/handshake/adapter) transparently falls back to the CLI driver, so the

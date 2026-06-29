@@ -1403,21 +1403,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cue-overlay-tauri"
-version = "0.1.0"
-dependencies = [
- "cue-core",
- "objc2 0.5.2",
- "objc2-foundation 0.2.2",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-nspanel",
- "tokio",
-]
-
-[[package]]
 name = "cue-rag"
 version = "0.1.10"
 dependencies = [
