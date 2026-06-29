@@ -38,6 +38,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include <wctype.h>
 #include "json_type_extract.h"
 
 #ifndef WDA_EXCLUDEFROMCAPTURE
@@ -1305,24 +1306,89 @@ static void clear_local_transcript_context(void) {
     update_transcript_clear_button();
 }
 
+static void trim_transcript_question(wchar_t *text) {
+    if (!text) return;
+    size_t len = wcslen(text);
+    size_t start = 0;
+    while (start < len && iswspace(text[start])) start++;
+    size_t end = len;
+    while (end > start && iswspace(text[end - 1])) end--;
+    if (start > 0 || end < len) {
+        size_t out = 0;
+        for (size_t i = start; i < end; i++) {
+            text[out++] = text[i];
+        }
+        text[out] = L'\0';
+    }
+}
+
+static bool is_placeholder_transcript_question(const wchar_t *text) {
+    if (!text || text[0] == L'\0') return true;
+    wchar_t lower[260];
+    size_t i = 0;
+    for (; i < 259 && text[i] != L'\0'; i++) {
+        lower[i] = (wchar_t)towlower(text[i]);
+    }
+    lower[i] = L'\0';
+    return wcsstr(lower, L"captions appear here") != NULL
+        || wcsstr(lower, L"live captions preview") != NULL
+        || wcsstr(lower, L"starting audio") != NULL
+        || wcsstr(lower, L"audio is live") != NULL
+        || wcsstr(lower, L"listening for follow-up") != NULL;
+}
+
+static bool live_transcript_visible_question(wchar_t *out, size_t capacity) {
+    if (!out || capacity == 0) return false;
+    out[0] = L'\0';
+    const wchar_t *source = g_transcript_final[0] ? g_transcript_final : g_transcript_partial;
+    if (!source || source[0] == L'\0') return false;
+    size_t len = wcslen(source);
+    if (len < 3 || len > 220 || len >= capacity) return false;
+    wcscpy_s(out, capacity, source);
+    trim_transcript_question(out);
+    if (wcslen(out) < 3 || wcslen(out) > 220) return false;
+    int line_count = 1;
+    for (wchar_t *p = out; *p; p++) {
+        if (*p == L'\r' || *p == L'\n') {
+            line_count++;
+            *p = L' ';
+        }
+    }
+    if (line_count > 2) return false;
+    if (is_placeholder_transcript_question(out)) return false;
+    return true;
+}
+
+static bool is_live_transcript_answer_prompt(const wchar_t *question) {
+    if (!question) return false;
+    return wcsncmp(question, L"Answer the latest ", 18) == 0
+        && wcsstr(question, L"live captions from the current session transcript") != NULL;
+}
+
 static void send_current_question(void) {
     static const wchar_t *fallback = L"Answer the latest clear question from the current transcript, screen context, and attached files. If there is no clear question yet, summarize what Bluey needs next.";
     static const wchar_t *transcript_fallback = L"Answer the latest live captions from the current session transcript. Treat the transcript as the user's current question or working context.";
     int length = GetWindowTextLengthW(g_ask_edit);
     bool used_fallback = length <= 0;
+    wchar_t transcript_question[260] = L"";
+    bool used_short_transcript = used_fallback && live_transcript_visible_question(transcript_question, 260);
+    const wchar_t *fallback_question = has_transcript_context()
+        ? (used_short_transcript ? transcript_question : transcript_fallback)
+        : fallback;
     char detail[192];
     snprintf(
         detail,
         sizeof(detail),
-        "typed_chars=%d fallback=%s transcript_context=%s context_ids=%d",
+        "typed_chars=%d fallback=%s transcript_context=%s generic_live_prompt=%s context_ids=%d",
         length > 0 ? length : 0,
         used_fallback ? "true" : "false",
         has_transcript_context() ? "true" : "false",
+        is_live_transcript_answer_prompt(fallback_question) ? "true" : "false",
         g_context_chip_count
     );
     emit_lifecycle_event("ask_answer_sent", "ok", detail);
     if (length <= 0) {
-        emit_ask_event(has_transcript_context() ? transcript_fallback : fallback);
+        emit_ask_event(fallback_question);
     } else {
         wchar_t *question = (wchar_t *)calloc((size_t)length + 1, sizeof(wchar_t));
         if (!question) return;

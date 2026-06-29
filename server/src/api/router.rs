@@ -2275,6 +2275,13 @@ async fn complete_stream_inner(
                         Ok(first_event) => {
                             selected_route_idx = idx;
                             selected_route = Some(*route);
+                            let first_event_latency_ms = started.elapsed().as_millis() as i64;
+                            let first_event_kind = match &first_event {
+                                Some(Ok(routing::CompletionStreamEvent::Delta(_))) => "delta",
+                                Some(Ok(routing::CompletionStreamEvent::Done { .. })) => "done",
+                                Some(Err(_)) => "error",
+                                None => "end",
+                            };
                             tracing::info!(
                                 account_id_hash = %account_id_hash,
                                 request_id = %req.request_id,
@@ -2285,6 +2292,8 @@ async fn complete_stream_inner(
                                 model = %route.model,
                                 route_index = idx,
                                 was_fallback = idx > 0,
+                                first_event_latency_ms,
+                                first_event_kind,
                                 streaming = true,
                                 "managed chat route selected"
                             );

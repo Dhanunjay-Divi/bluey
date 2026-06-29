@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-29 13:05 EDT
+Latest checkpoint: 2026-06-29 18:25 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,47 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-233-FLAGSHIP-MODEL-ROUTES.md`; the next canonical Bluey round doc should start at `ROUND-234-...`.
+- Latest assigned Bluey round doc is `ROUND-234-LIVE-CAPTION-VISIBLE-QUESTION-TIMING.md`; the next canonical Bluey round doc should start at `ROUND-235-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 234 fixed the visible Question card for short spoken Listen asks and
+  added privacy-safe stream timing diagnostics:
+  - owner spoke "Explain LRU cache", but the visible Question card showed the
+    generic "Answer the latest live captions..." instruction even though the
+    model used the transcript correctly
+  - root cause was the Round 230 safety change that stopped raw long
+    transcripts from becoming giant Question bubbles, but it also hid short
+    clear spoken asks behind the generic prompt
+  - macOS now shows the actual short live-caption question when it is safe:
+    `<= 220` characters, `<= 2` non-empty lines, and not a placeholder
+  - long or messy live transcript sends still use the compact generic prompt so
+    the chat is not flooded by raw transcript blocks
+  - auto-send-after-stop uses the same visible-question rule
+  - Windows has parity for empty-input transcript sends
+  - ask lifecycle logs now include `generic_live_prompt`
+  - macOS answer-card logs now include privacy-safe
+    `answer_stream_first_update` and `answer_stream_finished` timing events
+  - server managed streaming logs now include provider first-event latency and
+    first-event kind
+  - Round doc: `docs/rounds/ROUND-234-LIVE-CAPTION-VISIBLE-QUESTION-TIMING.md`
+  - Verification passed:
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `cargo fmt --manifest-path server/Cargo.toml`
+    - `cargo check --manifest-path server/Cargo.toml`
+    - `native/macos/cue-overlay/build.sh`
+    - `cargo test --manifest-path server/Cargo.toml first_token_deadline -- --nocapture`
+  - Current local visible QA status after restart: daemon pid `89067`, active
+    meeting id `3a84f982-4c7d-4df5-8a3c-0062bec9a8cb`, overlay visible `true`,
+    overlay capture excluded `false`, transcript segments `3`, context items
+    `0`
+  - Remaining QA: speak a short ask and confirm the visible Question card uses
+    the short spoken text; speak a long rambling ask and confirm Bluey keeps the
+    card compact; before release/upload return to capture-excluded mode and
+    verify `overlay_capture_excluded: true`
 - Round 233 added optional managed flagship model routes for Z.AI GLM-5.2 and DeepSeek:
   - official provider docs checked:
     - Z.AI pricing/model docs at `https://docs.z.ai/guides/overview/pricing`

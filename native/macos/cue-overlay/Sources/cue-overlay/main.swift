@@ -2420,6 +2420,12 @@ private struct CanvasArtifact {
     var sourceQuestion: String? = nil
 }
 
+private struct AnswerStreamStats {
+    let startedAt: CFTimeInterval
+    var firstUpdateAt: CFTimeInterval?
+    var lastBodyChars: Int = 0
+}
+
 private final class FlippedStackView: NSStackView {
     override var isFlipped: Bool { true }
 }
@@ -4284,6 +4290,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var autoSendAfterStopWorkItem: DispatchWorkItem?
     private var lastSubmittedAskFingerprint: String?
     private var lastSubmittedAskAt: CFTimeInterval = 0
+    private var answerStreamStats: [String: AnswerStreamStats] = [:]
     private var audioPulseTimer: Timer?
     private var audioPulseFrame = 0
     private var attachPickerPending = false
@@ -7291,7 +7298,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
         emitLifecycle(
             "autosend_answer_sent",
-            detail: "mode=\(mode.rawValue) question_chars=\(q.count) context_ids=\(sentContextIds.count)"
+            detail: "mode=\(mode.rawValue) question_chars=\(q.count) generic_live_prompt=\(isLiveTranscriptAnswerPrompt(q)) context_ids=\(sentContextIds.count)"
         )
         emitAsk(
             question: q,
@@ -7327,7 +7334,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let joined = compactTranscriptQuestionLines(lines)
             .joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return joined.isEmpty ? nil : liveTranscriptAnswerPrompt(forSources: allowedSources)
+        return liveTranscriptVisibleQuestion(from: joined)
+            ?? (joined.isEmpty ? nil : liveTranscriptAnswerPrompt(forSources: allowedSources))
     }
 
     func prepareAutoSendListenCapture() {
@@ -7376,7 +7384,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         updateRouteBadge(for: q, selectedRoute: route)
         emitLifecycle(
             "ask_answer_sent",
-            detail: "typed_chars=\(raw.count) question_chars=\(q.count) transcript_context=\(hadTranscriptContext) context_ids=\(sentContextIds.count)"
+            detail: "typed_chars=\(raw.count) question_chars=\(q.count) transcript_context=\(hadTranscriptContext) generic_live_prompt=\(isLiveTranscriptAnswerPrompt(q)) context_ids=\(sentContextIds.count)"
         )
         emitAsk(
             question: q,
@@ -8226,6 +8234,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             emitCardRendered(id: card.id)
             return
         }
+        trackAnswerStreamPush(card)
         feed.push(card)
         routeCanvasIfNeeded(card)
     }
@@ -8234,6 +8243,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         guard let card = feed.update(id: id, body: body, done: done, costLabel: costLabel, artifact: artifact) else {
             return
         }
+        trackAnswerStreamUpdate(card)
         if let artifact {
             let question = feed.nearestQuestionBody(beforeCardId: id)
             let artifactKind = CanvasKind.fromArtifactType(artifact.artifactType)
@@ -8263,6 +8273,40 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             }
         }
         routeCanvasIfNeeded(card)
+    }
+
+    private func trackAnswerStreamPush(_ card: RenderedCard) {
+        guard normalizedCardKind(card.kind) == "answer", !card.done else { return }
+        answerStreamStats[card.id] = AnswerStreamStats(
+            startedAt: CACurrentMediaTime(),
+            firstUpdateAt: card.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : CACurrentMediaTime(),
+            lastBodyChars: card.body.count)
+    }
+
+    private func trackAnswerStreamUpdate(_ card: RenderedCard) {
+        guard normalizedCardKind(card.kind) == "answer" else { return }
+        let now = CACurrentMediaTime()
+        var stats = answerStreamStats[card.id] ?? AnswerStreamStats(startedAt: now)
+        let bodyChars = card.body.count
+        let artifactType = card.artifact?.artifactType ?? "none"
+        if stats.firstUpdateAt == nil, bodyChars > 0 {
+            stats.firstUpdateAt = now
+            emitLifecycle(
+                "answer_stream_first_update",
+                detail: "card_id=\(card.id) first_update_ms=\(Int((now - stats.startedAt) * 1000)) body_chars=\(bodyChars) artifact=\(artifactType)"
+            )
+        }
+        stats.lastBodyChars = bodyChars
+        if card.done {
+            let firstUpdateMs = stats.firstUpdateAt.map { Int(($0 - stats.startedAt) * 1000) } ?? -1
+            emitLifecycle(
+                "answer_stream_finished",
+                detail: "card_id=\(card.id) first_update_ms=\(firstUpdateMs) total_ms=\(Int((now - stats.startedAt) * 1000)) body_chars=\(bodyChars) artifact=\(artifactType) cost_label=\(card.costLabel == nil ? "none" : "present")"
+            )
+            answerStreamStats.removeValue(forKey: card.id)
+        } else {
+            answerStreamStats[card.id] = stats
+        }
     }
 
     private func shouldRenderAsToast(_ card: RenderedCard) -> Bool {
@@ -9738,9 +9782,35 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let typed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let transcript = transcriptQuestionForAnswer()
         if typed.isEmpty {
-            return transcript == nil ? nil : liveTranscriptAnswerPrompt()
+            guard let transcript else { return nil }
+            return liveTranscriptVisibleQuestion(from: transcript) ?? liveTranscriptAnswerPrompt()
         }
         return typed
+    }
+
+    private func liveTranscriptVisibleQuestion(from transcript: String) -> String? {
+        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard trimmed.count <= 220 else { return nil }
+        let lines = trimmed
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !lines.isEmpty, lines.count <= 2 else { return nil }
+        let compact = lines.joined(separator: " ")
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard compact.count >= 3 else { return nil }
+        let lower = compact.lowercased()
+        let placeholderFragments = [
+            "captions appear here",
+            "live captions preview",
+            "starting audio",
+            "audio is live",
+            "listening for follow-up"
+        ]
+        guard !placeholderFragments.contains(where: { lower.contains($0) }) else { return nil }
+        return compact
     }
 
     private func liveTranscriptAnswerPrompt(forSources sources: [String]? = nil) -> String {
@@ -9754,6 +9824,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             scopedSource = ""
         }
         return "Answer the latest \(scopedSource)live captions from the current session transcript. Treat the transcript as the user's current question or working context."
+    }
+
+    private func isLiveTranscriptAnswerPrompt(_ question: String) -> Bool {
+        let normalized = question
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return normalized.hasPrefix("answer the latest ")
+            && normalized.contains("live captions from the current session transcript")
     }
 
     private func fallbackQuestionForAttachedContext() -> String? {
