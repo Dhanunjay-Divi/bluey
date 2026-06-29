@@ -145,16 +145,27 @@ async fn system_audio_chunks_drive_stt_provider() {
     }
 }
 
-/// Test that system audio STT is gated behind BLUEY_SYSTEM_AUDIO_STT env var.
+/// Test that system audio STT is ON by default (local-first) and only an
+/// explicit falsey `BLUEY_SYSTEM_AUDIO_STT` disables it.
 #[tokio::test]
 async fn system_audio_stt_gating() {
-    // When BLUEY_SYSTEM_AUDIO_STT is not set, STT should not be enabled
+    // local-first default: with nothing set, on-device STT is ON so "Listen"
+    // produces a transcript out of the box.
     std::env::remove_var("BLUEY_SYSTEM_AUDIO_STT");
-    assert!(!cue_daemon::audio::system_capture::is_system_audio_stt_enabled());
+    assert!(cue_daemon::audio::system_capture::is_system_audio_stt_enabled());
 
-    // When set to "1", STT should be enabled
+    // Explicitly enabling stays enabled.
     std::env::set_var("BLUEY_SYSTEM_AUDIO_STT", "1");
     assert!(cue_daemon::audio::system_capture::is_system_audio_stt_enabled());
+
+    // An explicit falsey value disables it (case-insensitive, trimmed).
+    for falsey in ["0", "false", "off", "no", " OFF "] {
+        std::env::set_var("BLUEY_SYSTEM_AUDIO_STT", falsey);
+        assert!(
+            !cue_daemon::audio::system_capture::is_system_audio_stt_enabled(),
+            "{falsey:?} should disable system-audio STT"
+        );
+    }
 
     // Clean up
     std::env::remove_var("BLUEY_SYSTEM_AUDIO_STT");

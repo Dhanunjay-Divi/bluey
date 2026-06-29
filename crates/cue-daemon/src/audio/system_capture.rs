@@ -32,15 +32,26 @@ pub struct SystemAudioCapture {
 }
 
 impl SystemAudioCapture {
-    /// Start system audio capture. Spawns the native helper and begins
-    /// streaming `AudioChunk`s to `sender`.
+    /// Start system audio capture (whole-display). Spawns the native helper and
+    /// streams `AudioChunk`s to `sender`.
     pub fn start(sender: UnboundedSender<AudioChunk>) -> std::io::Result<Self> {
+        Self::start_with_mode(sender, false)
+    }
+
+    /// Start system audio capture, optionally via the interactive picker
+    /// (`pick = true`): the helper presents the macOS content-sharing picker so
+    /// the user chooses which app to capture, then streams that app's audio.
+    /// PCM output is identical to whole-display mode, so the pipeline is the same.
+    pub fn start_with_mode(
+        sender: UnboundedSender<AudioChunk>,
+        pick: bool,
+    ) -> std::io::Result<Self> {
         let binary = resolve_binary()?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
 
         let task = tokio::spawn(async move {
-            supervisor_loop(binary, sender, stop_clone).await;
+            supervisor_loop(binary, sender, stop_clone, pick).await;
         });
 
         Ok(Self {
@@ -136,10 +147,16 @@ fn platform_binary_path() -> PathBuf {
     PathBuf::from("bluey-audio")
 }
 
-async fn spawn_child(binary: &PathBuf) -> std::io::Result<Child> {
-    Command::new(binary)
-        .args(["--source", "system", "--continuous"])
-        .stdout(std::process::Stdio::piped())
+async fn spawn_child(binary: &PathBuf, pick: bool) -> std::io::Result<Child> {
+    let mut cmd = Command::new(binary);
+    if pick {
+        // Interactive picker mode: the helper presents the system content-sharing
+        // picker, then streams the chosen app's audio (same PCM format).
+        cmd.args(["--pick", "--continuous"]);
+    } else {
+        cmd.args(["--source", "system", "--continuous"]);
+    }
+    cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
@@ -149,6 +166,7 @@ async fn supervisor_loop(
     binary: PathBuf,
     sender: UnboundedSender<AudioChunk>,
     stop: Arc<AtomicBool>,
+    pick: bool,
 ) {
     let mut consecutive_failures: u32 = 0;
 
@@ -157,7 +175,7 @@ async fn supervisor_loop(
             return;
         }
 
-        let child = match spawn_child(&binary).await {
+        let child = match spawn_child(&binary, pick).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(error = %e, "failed to spawn system audio helper");
@@ -271,11 +289,27 @@ pub fn restart_delay(attempt: u32) -> Duration {
     Duration::from_millis(ms.min(5_000))
 }
 
-/// Check if system audio STT is enabled via env var.
+/// Whether the continuous system-audio capture task should build an on-device
+/// STT provider and emit a live transcript.
+///
+/// local-first: on-device system-audio STT is ON by default; disable with
+/// `BLUEY_SYSTEM_AUDIO_STT=0`. Continuous system-audio streaming is the default
+/// capture path (overlay "Listen" + keyless `bluey listen`), so transcription
+/// must be on out of the box or "Listen" would capture audio and show nothing.
+/// Only an explicit falsey value (`0`/`false`/`off`/`no`) turns it off.
+///
+/// This module is not behind the `parakeet-stt` feature flag, so the default is
+/// unconditional here; the STT factory (`build_stt_chain`) is the layer that
+/// actually no-ops the on-device provider when `parakeet-stt` is not compiled
+/// in (it returns `NotActive`), so a default-on gate degrades safely.
 pub fn is_system_audio_stt_enabled() -> bool {
-    std::env::var("BLUEY_SYSTEM_AUDIO_STT")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    !matches!(
+        std::env::var("BLUEY_SYSTEM_AUDIO_STT")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("0") | Some("false") | Some("off") | Some("no")
+    )
 }
 
 #[cfg(test)]

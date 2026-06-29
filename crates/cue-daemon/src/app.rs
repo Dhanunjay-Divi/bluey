@@ -720,13 +720,6 @@ enum RealSttTransport {
     /// network). Chunks are transcribed through the STT factory's
     /// `LocalWhisperProvider` rather than an HTTP endpoint.
     LocalWhisper,
-    /// Fully on-device transcription via the on-device Parakeet (Nemotron)
-    /// model. This is the path that unifies the mic + chunk loop onto the
-    /// streaming [`SttProvider`] trait: chunks are decoded back to PCM16 and
-    /// driven through a provider built by `build_stt_chain` (no HTTP, nothing
-    /// leaves the machine). Gated by `BLUEY_STT_PARAKEET=1` + the
-    /// `parakeet-stt` build feature.
-    Parakeet,
 }
 
 #[derive(Debug, Clone)]
@@ -1005,112 +998,13 @@ pub async fn run() -> Result<()> {
     spawn_overlay_event_handler(daemon.clone(), overlay_events_rx);
     spawn_overlay_balance_bridge(daemon.clone());
 
-    // System audio continuous capture (opt-in via env var).
+    // System audio continuous capture (opt-in via env var). Whole-display mode.
     if std::env::var("BLUEY_SYSTEM_AUDIO_CONTINUOUS")
         .map(|v| v == "1")
         .unwrap_or(false)
     {
-        let stt_enabled = crate::audio::system_capture::is_system_audio_stt_enabled();
-        let (sys_tx, mut sys_rx) = mpsc::unbounded_channel();
-        match crate::audio::system_capture::SystemAudioCapture::start(sys_tx) {
-            Ok(handle) => {
-                info!(
-                    system_stt = stt_enabled,
-                    "system audio continuous capture started"
-                );
-                *daemon.system_audio.lock().await = Some(handle);
-                let daemon_sys = daemon.clone();
-                tokio::spawn(async move {
-                    let mut stt: Option<Box<dyn cue_core::stt::SttProvider>> = if stt_enabled {
-                        match build_system_audio_stt_provider().await {
-                            Ok(provider) => Some(provider),
-                            Err(e) => {
-                                warn!("system audio STT provider failed to start: {e:#}");
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    let vad_config = crate::audio::vad::config_from_env();
-                    let mut vad = if stt_enabled {
-                        // WebRTC VAD's native handle is not Send, so the
-                        // async system-audio task uses the Send-safe RMS gate
-                        // and relies on provider endpointing for the second
-                        // speech-boundary signal.
-                        Some(crate::audio::vad::RmsGate::new(&vad_config))
-                    } else {
-                        None
-                    };
-
-                    // Single-task select! loop: send audio AND drain events
-                    // from the SAME provider instance.
-                    loop {
-                        if let Some(ref mut provider) = stt {
-                            tokio::select! {
-                                chunk_opt = sys_rx.recv() => {
-                                    match chunk_opt {
-                                        Some(chunk) => {
-                                            debug!("[system audio chunk: {}ms]", chunk.duration_ms());
-                                            if let Some(vad) = vad.as_mut() {
-                                                let action = vad.process(&chunk);
-                                                if !action.should_forward() {
-                                                    trace!(
-                                                        vad_action = action.as_str(),
-                                                        "system audio VAD dropped silence frame"
-                                                    );
-                                                    continue;
-                                                }
-                                                trace!(
-                                                    vad_action = action.as_str(),
-                                                    "system audio VAD forwarded frame"
-                                                );
-                                            }
-                                            if let Err(e) = provider.send_audio(&chunk).await {
-                                                warn!("system audio STT send failed: {e}");
-                                            }
-                                        }
-                                        None => break,
-                                    }
-                                }
-                                event_opt = provider.next_event() => {
-                                    match event_opt {
-                                        Some(Ok(event)) => {
-                                            if let Some(segment) = transcript_event_to_stt_segment(&event) {
-                                                if let Err(e) = add_audio_transcript_segment_allowing_session_start(&daemon_sys, &segment).await {
-                                                    warn!("system audio STT drain: forward failed: {e:#}");
-                                                }
-                                            }
-                                        }
-                                        Some(Err(e)) => {
-                                            warn!("system audio STT drain: provider error: {e}");
-                                            if !e.is_retryable() {
-                                                break;
-                                            }
-                                        }
-                                        None => break,
-                                    }
-                                }
-                            }
-                        } else {
-                            // No STT provider — just drain audio chunks.
-                            match sys_rx.recv().await {
-                                Some(chunk) => {
-                                    debug!("[system audio chunk: {}ms]", chunk.duration_ms());
-                                }
-                                None => break,
-                            }
-                        }
-                    }
-
-                    if let Some(ref mut provider) = stt {
-                        let _ = provider.close().await;
-                    }
-                });
-            }
-            Err(e) => {
-                debug!("system audio continuous capture not available: {e}");
-            }
+        if let Err(e) = start_system_audio_capture_task(&daemon, false).await {
+            warn!("system audio continuous capture (env) failed to start: {e:#}");
         }
     }
     write_state(&daemon).await?;
@@ -1129,6 +1023,167 @@ pub async fn run() -> Result<()> {
                 error!("client handler failed: {error:#}");
             }
         });
+    }
+}
+
+/// Start the continuous system-audio capture + STT-drain task and store the
+/// handle on the daemon. `pick = true` routes through the interactive macOS
+/// content-sharing picker (the helper presents it, then streams the chosen app's
+/// audio); `false` captures the whole display. Both feed the same STT pipeline.
+/// Start (or restart) the continuous system-audio streaming capture: one
+/// helper subprocess → one streaming STT provider → live transcript. This is
+/// the real-time path (no chunk files); the overlay "Listen" button and the
+/// `bluey listen` CLI both route here.
+///
+/// Idempotent: any prior capture handle is stopped before the new one is
+/// stored, with `daemon.system_audio` held across stop+spawn so two callers
+/// can't stack two helpers / two providers. Returns `Err` if the capture
+/// helper fails to start (e.g. missing helper binary or denied Screen
+/// Recording permission) so the caller can surface a setup card instead of
+/// silently sitting in "Connecting".
+async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Result<()> {
+    let stt_enabled = crate::audio::system_capture::is_system_audio_stt_enabled();
+    let (sys_tx, mut sys_rx) = mpsc::unbounded_channel();
+    // Hold the handle slot across stop+spawn: stop any prior capture, then
+    // store the new one, all under one guard (idempotent / race-free start).
+    let mut slot = daemon.system_audio.lock().await;
+    if let Some(prev) = slot.take() {
+        prev.stop().await;
+    }
+    match crate::audio::system_capture::SystemAudioCapture::start_with_mode(sys_tx, pick) {
+        Ok(handle) => {
+            info!(
+                system_stt = stt_enabled,
+                pick, "system audio continuous capture started"
+            );
+            *slot = Some(handle);
+            drop(slot);
+            // Register this capture as the live audio session so the idle
+            // watchdog can match it and so a later stop clears it. The streaming
+            // task forwards via the session-start-allowing sink, so its own
+            // segments aren't gated by this id; it exists to scope auto-stop.
+            let session_id = format!("audio-{}", clock::now_epoch_ms_string());
+            daemon.audio.lock().await.session_id = Some(session_id.clone());
+            let idle_timeout = audio_idle_stop_timeout();
+            let daemon_sys = daemon.clone();
+            tokio::spawn(async move {
+                let mut stt: Option<Box<dyn cue_core::stt::SttProvider>> = if stt_enabled {
+                    match build_system_audio_stt_provider().await {
+                        Ok(provider) => Some(provider),
+                        Err(e) => {
+                            warn!("system audio STT provider failed to start: {e:#}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let vad_config = crate::audio::vad::config_from_env();
+                let mut vad = if stt_enabled {
+                    // WebRTC VAD's native handle is not Send, so the
+                    // async system-audio task uses the Send-safe RMS gate
+                    // and relies on provider endpointing for the second
+                    // speech-boundary signal.
+                    Some(crate::audio::vad::RmsGate::new(&vad_config))
+                } else {
+                    None
+                };
+
+                // Idle auto-stop: if no transcript lands for `idle_timeout`,
+                // tear the capture down (saves CPU/battery + STT cost when a
+                // meeting is left running). Tracked locally and checked on a
+                // periodic tick arm of the same select! — when the watchdog
+                // stops the capture it closes `sys_rx`, so the next recv()
+                // returns None and the loop breaks: clean, no detached poll.
+                let mut last_transcript_at = Instant::now();
+                let mut idle_tick = tokio::time::interval(Duration::from_secs(15));
+                idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+                // Single-task select! loop: send audio AND drain events
+                // from the SAME provider instance.
+                loop {
+                    if let Some(ref mut provider) = stt {
+                        tokio::select! {
+                            chunk_opt = sys_rx.recv() => {
+                                match chunk_opt {
+                                    Some(chunk) => {
+                                        debug!("[system audio chunk: {}ms]", chunk.duration_ms());
+                                        if let Some(vad) = vad.as_mut() {
+                                            let action = vad.process(&chunk);
+                                            if !action.should_forward() {
+                                                trace!(
+                                                    vad_action = action.as_str(),
+                                                    "system audio VAD dropped silence frame"
+                                                );
+                                                continue;
+                                            }
+                                            trace!(
+                                                vad_action = action.as_str(),
+                                                "system audio VAD forwarded frame"
+                                            );
+                                        }
+                                        if let Err(e) = provider.send_audio(&chunk).await {
+                                            warn!("system audio STT send failed: {e}");
+                                        }
+                                    }
+                                    None => break,
+                                }
+                            }
+                            event_opt = provider.next_event() => {
+                                match event_opt {
+                                    Some(Ok(event)) => {
+                                        if let Some(segment) = transcript_event_to_stt_segment(&event) {
+                                            last_transcript_at = Instant::now();
+                                            if let Err(e) = add_audio_transcript_segment_allowing_session_start(&daemon_sys, &segment).await {
+                                                warn!("system audio STT drain: forward failed: {e:#}");
+                                            }
+                                        }
+                                    }
+                                    Some(Err(e)) => {
+                                        warn!("system audio STT drain: provider error: {e}");
+                                        if !e.is_retryable() {
+                                            break;
+                                        }
+                                    }
+                                    None => break,
+                                }
+                            }
+                            _ = idle_tick.tick() => {
+                                if maybe_auto_stop_idle_audio(
+                                    &daemon_sys,
+                                    &session_id,
+                                    last_transcript_at,
+                                    idle_timeout,
+                                )
+                                .await
+                                {
+                                    // Either this session was auto-stopped or it
+                                    // is no longer current — stop draining.
+                                    break;
+                                }
+                            }
+                        }
+                    } else {
+                        // No STT provider — just drain audio chunks.
+                        match sys_rx.recv().await {
+                            Some(chunk) => {
+                                debug!("[system audio chunk: {}ms]", chunk.duration_ms());
+                            }
+                            None => break,
+                        }
+                    }
+                }
+
+                if let Some(ref mut provider) = stt {
+                    let _ = provider.close().await;
+                }
+            });
+            Ok(())
+        }
+        Err(e) => {
+            debug!("system audio continuous capture not available: {e:#}");
+            Err(e.into())
+        }
     }
 }
 
@@ -1507,10 +1562,43 @@ async fn handle_request_inner(
                 config.microphone.device_id = Some(device_id);
             }
             set_overlay_listening_state(daemon, ListeningState::Connecting).await;
+
+            // Keyless on-device default: route through the SAME continuous
+            // streaming path the overlay "Listen" button uses (system audio →
+            // one streaming STT provider → live transcript). A configured cloud
+            // STT key / managed account keeps the chunk-file REST path. Decided
+            // with the resolver's precedence so the two never diverge.
+            if !cloud_stt_configured(&daemon.paths) {
+                if let Err(error) = start_system_audio_capture_task(daemon, false).await {
+                    set_overlay_listening_state(daemon, listening_state_for_audio_error(&error))
+                        .await;
+                    return Err(error);
+                }
+                // Synthesize a live, native, on-device system-audio status. The
+                // streaming task owns its own subprocess + provider lifecycle
+                // (stored on `daemon.system_audio`), so there is no REST
+                // `daemon.audio_runtime` session here; we still publish an
+                // AudioPipelineStatus so the CLI/overlay reflect "listening".
+                // v1 is system-only — never claim mic capture even if the mic
+                // toggle was set.
+                let session_id = format!("audio-{}", clock::now_epoch_ms_string());
+                let status = AudioPipelineStatus::native(
+                    session_id,
+                    AudioCaptureConfig::from_enabled_sources(true, false),
+                    cue_core::audio::default_planned_devices(),
+                    "parakeet:on-device (system audio)",
+                    "Continuous on-device system-audio capture with live speech-to-text. Nothing leaves the machine.",
+                );
+                *daemon.audio.lock().await = status.clone();
+                set_overlay_listening_state(daemon, ListeningState::Listening).await;
+                return Ok(DaemonResponse::AudioStatus { status });
+            }
+
             let status = match start_audio_capture(daemon, config).await {
                 Ok(status) => status,
                 Err(error) => {
-                    set_overlay_listening_state(daemon, ListeningState::Failed).await;
+                    set_overlay_listening_state(daemon, listening_state_for_audio_error(&error))
+                        .await;
                     return Err(error);
                 }
             };
@@ -1761,6 +1849,20 @@ async fn push_overlay_balance_snapshot(
 
 async fn set_overlay_listening_state(daemon: &Arc<Daemon>, state: ListeningState) {
     let _ = send_overlay(daemon, OverlayCommand::ListeningStateChanged { state }).await;
+}
+
+/// Classify an audio-start failure: `PermissionDenied` when the error is a macOS
+/// permission gate (Screen Recording / Microphone), else generic `Failed`. Lets
+/// the overlay show a "grant access" flow instead of an unhelpful error.
+fn listening_state_for_audio_error(error: &anyhow::Error) -> ListeningState {
+    let msg = format!("{error:#}");
+    if crate::audio::capture::is_permission_denied_message(&msg)
+        || crate::audio::system_capture::is_system_audio_permission_denied_message(&msg)
+    {
+        ListeningState::PermissionDenied
+    } else {
+        ListeningState::Failed
+    }
 }
 
 async fn ensure_overlay_ready(
@@ -2038,10 +2140,57 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         OverlayEvent::CaptureStopRequested => {
             stop_screen_capture(daemon, "overlay eye").await?;
         }
-        OverlayEvent::RecordingStartRequested => {
+        OverlayEvent::OpenSettingsRequested { pane } => {
+            // Open a known macOS privacy pane so the user can grant audio access.
+            // `pane.url()` is from a fixed allowlist (cue-core SettingsPane), so
+            // this never opens an arbitrary URL.
+            #[cfg(target_os = "macos")]
+            {
+                if let Err(e) = std::process::Command::new("open").arg(pane.url()).spawn() {
+                    warn!(error = %e, pane = ?pane, "failed to open System Settings pane");
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = pane;
+            }
+        }
+        OverlayEvent::PickSystemAudioRequested => {
+            // Replace any running system capture with a picker-mode one: the
+            // helper presents the macOS content-sharing picker and streams the
+            // chosen app's audio into the same STT pipeline. The streaming task
+            // is idempotent (stops any prior capture internally).
             set_overlay_listening_state(daemon, ListeningState::Connecting).await;
-            match start_audio_capture(daemon, AudioCaptureConfig::dual_default()).await {
-                Ok(status) => {
+            match start_system_audio_capture_task(daemon, true).await {
+                Ok(()) => {
+                    set_overlay_listening_state(daemon, ListeningState::Listening).await;
+                }
+                Err(error) => {
+                    set_overlay_listening_state(daemon, listening_state_for_audio_error(&error))
+                        .await;
+                    push_system_card(
+                        daemon,
+                        CardKind::Warning,
+                        "Audio setup needed",
+                        format!("{error:#}"),
+                    )
+                    .await;
+                }
+            }
+        }
+        OverlayEvent::RecordingStartRequested {
+            enable_microphone,
+            enable_system: _,
+        } => {
+            // v1 streams SYSTEM audio only (the other people in the meeting —
+            // the question trigger). Mic streaming is a deliberate follow-up,
+            // so the per-source toggles are not honored yet; the overlay copy
+            // says "Listen (system audio)" so this is not a false promise. We
+            // route to the proven continuous streaming task (no chunk files).
+            let _ = enable_microphone;
+            set_overlay_listening_state(daemon, ListeningState::Connecting).await;
+            match start_system_audio_capture_task(daemon, false).await {
+                Ok(()) => {
                     set_overlay_listening_state(daemon, ListeningState::Listening).await;
                     let balance = refresh_overlay_balance(daemon, None).await;
                     let balance_line = balance
@@ -2050,10 +2199,9 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
                     push_system_card(
                         daemon,
                         CardKind::System,
-                        "Recording on",
+                        "Listening",
                         format!(
-                            "{} Auto-stop after {} with no transcript.{}",
-                            recording_sources_label(&status),
+                            "Capturing system audio. Auto-stops after {} with no transcript.{}",
                             format_duration(audio_idle_stop_timeout()),
                             balance_line
                         ),
@@ -2061,7 +2209,8 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
                     .await;
                 }
                 Err(error) => {
-                    set_overlay_listening_state(daemon, ListeningState::Failed).await;
+                    set_overlay_listening_state(daemon, listening_state_for_audio_error(&error))
+                        .await;
                     push_system_card(
                         daemon,
                         CardKind::Warning,
@@ -3111,6 +3260,36 @@ async fn build_system_audio_stt_provider() -> anyhow::Result<Box<dyn cue_core::s
         .map_err(|e| anyhow::anyhow!("STT factory: {e}"))
 }
 
+/// Whether a CLOUD speech-to-text path is configured, using the SAME precedence
+/// the transport resolver in [`build_real_audio_runtime_config`] applies: an
+/// explicit STT API key (`BLUEY_STT_API_KEY` / `OPENAI_API_KEY`) OR a managed
+/// account with both an access token and an API URL.
+///
+/// When this is `false` we are in the keyless, on-device default — the same
+/// state that makes the resolver fall through to the local backstop — so the
+/// CLI `bluey listen` routes through the continuous streaming path for parity
+/// with the overlay's "Listen" button, instead of the chunk-file REST path.
+///
+/// Shares the exact env-var spellings and account-resolution logic with the
+/// resolver (no duplicated literals): keep the two in lockstep.
+fn cloud_stt_configured(paths: &AppPaths) -> bool {
+    if env_first(&["BLUEY_STT_API_KEY", "OPENAI_API_KEY"]).is_some() {
+        return true;
+    }
+    let account = load_account(paths).ok().flatten();
+    let account_token = cloud_access_token_from_env().or_else(|| {
+        account
+            .as_ref()
+            .and_then(|account| account.access_token.clone())
+            .filter(|token| !token.trim().is_empty())
+    });
+    let account_api_url = env::var("BLUEY_CLOUD_API_URL")
+        .or_else(|_| env::var("CUE_CLOUD_API_URL"))
+        .ok()
+        .or_else(|| account.as_ref().map(|account| account.api_url.clone()));
+    matches!((account_token, account_api_url), (Some(_), Some(_)))
+}
+
 async fn build_real_audio_runtime_config(
     paths: &AppPaths,
     config: &AudioCaptureConfig,
@@ -3192,25 +3371,6 @@ async fn build_real_audio_runtime_config(
                     )
                 }
             }
-            _ if is_parakeet_chunk_enabled() => {
-                // Keyless, fully-local, on-device English STT (default when built
-                // in; disable with BLUEY_STT_PARAKEET=0). Routes the mic + chunk
-                // loop through the Parakeet (Nemotron) provider built by
-                // `build_stt_chain` — unifying the chunk path onto the streaming
-                // `SttProvider` trait. Nothing leaves the machine. This is the
-                // fallthrough backstop: an explicit cloud STT key / managed
-                // account above takes precedence. If the model can't be
-                // provisioned, the failure surfaces honestly at transcribe time.
-                let stt_model =
-                    env_first(&["BLUEY_STT_MODEL"]).unwrap_or_else(|| "parakeet-en".into());
-                (
-                    String::new(),
-                    String::new(),
-                    stt_model.clone(),
-                    format!("parakeet:{stt_model}"),
-                    RealSttTransport::Parakeet,
-                )
-            }
             _ if crate::stt::router::is_local_whisper_enabled() => {
                 // Keyless, fully-local fallback: BLUEY_STT_LOCAL_WHISPER=1 routes
                 // transcription through the on-device whisper helper (no key, no
@@ -3230,7 +3390,7 @@ async fn build_real_audio_runtime_config(
             }
             _ => {
                 return Ok(AudioRuntimeConfigResolution::Unavailable(
-                    "Listen needs speech-to-text: sign in to Bluey for managed transcription, set an STT API key, or enable on-device transcription with BLUEY_STT_PARAKEET=1 (English, on-device) or BLUEY_STT_LOCAL_WHISPER=1.".to_string(),
+                    "Listen needs speech-to-text: sign in to Bluey for managed transcription, set an STT API key, or enable on-device transcription with BLUEY_STT_LOCAL_WHISPER=1.".to_string(),
                 ))
             }
         }
@@ -3799,84 +3959,41 @@ async fn real_audio_loop(
     let idle_timeout = audio_idle_stop_timeout();
     let mut last_transcript_at = Instant::now();
 
-    // On-device transports drive a single, stateful `SttProvider` (one model in
-    // memory). It is built lazily on the first chunk and reused for the life of
-    // the capture session. A shared `&mut` provider cannot be split across the
-    // concurrent `join_all` jobs, so when on-device we process sources
-    // sequentially through this one provider; the REST transports keep their
-    // concurrent fan-out.
-    let on_device = runtime.stt_transport == RealSttTransport::Parakeet;
-    let mut on_device_provider: Option<Box<dyn cue_core::stt::SttProvider>> = None;
-
     loop {
-        // Collect this round's results either sequentially (on-device, shared
-        // provider) or concurrently (REST), then handle them identically below.
-        let mut round_results: Vec<(
-            AudioSourceKind,
-            Result<Option<cue_core::audio::SttSegmentMetadata>>,
-        )> = Vec::with_capacity(runtime.sources.len());
+        // Capture + transcribe every source concurrently this round (REST
+        // fan-out), then handle the results below.
+        let mut source_jobs = Vec::with_capacity(runtime.sources.len());
+        for source in &runtime.sources {
+            let sequence = match source.source {
+                AudioSourceKind::System => {
+                    system_sequence = system_sequence.saturating_add(1);
+                    system_sequence
+                }
+                AudioSourceKind::Microphone => {
+                    microphone_sequence = microphone_sequence.saturating_add(1);
+                    microphone_sequence
+                }
+            };
 
-        if on_device {
-            for source in &runtime.sources {
-                let sequence = match source.source {
-                    AudioSourceKind::System => {
-                        system_sequence = system_sequence.saturating_add(1);
-                        system_sequence
-                    }
-                    AudioSourceKind::Microphone => {
-                        microphone_sequence = microphone_sequence.saturating_add(1);
-                        microphone_sequence
-                    }
-                };
+            let daemon_ref = &daemon;
+            let session_id_ref = &session_id;
+            let runtime_ref = &runtime;
+            let client_ref = &client;
+            source_jobs.push(async move {
+                let source_kind = source.source;
                 let result = capture_transcribe_audio_chunk(
-                    &daemon,
-                    &session_id,
-                    &runtime,
+                    daemon_ref,
+                    session_id_ref,
+                    runtime_ref,
                     source,
                     sequence,
-                    &client,
-                    &mut on_device_provider,
+                    client_ref,
                 )
                 .await;
-                round_results.push((source.source, result));
-            }
-        } else {
-            let mut source_jobs = Vec::with_capacity(runtime.sources.len());
-            for source in &runtime.sources {
-                let sequence = match source.source {
-                    AudioSourceKind::System => {
-                        system_sequence = system_sequence.saturating_add(1);
-                        system_sequence
-                    }
-                    AudioSourceKind::Microphone => {
-                        microphone_sequence = microphone_sequence.saturating_add(1);
-                        microphone_sequence
-                    }
-                };
-
-                let daemon_ref = &daemon;
-                let session_id_ref = &session_id;
-                let runtime_ref = &runtime;
-                let client_ref = &client;
-                source_jobs.push(async move {
-                    let source_kind = source.source;
-                    // REST transports never touch the on-device provider holder.
-                    let mut no_provider: Option<Box<dyn cue_core::stt::SttProvider>> = None;
-                    let result = capture_transcribe_audio_chunk(
-                        daemon_ref,
-                        session_id_ref,
-                        runtime_ref,
-                        source,
-                        sequence,
-                        client_ref,
-                        &mut no_provider,
-                    )
-                    .await;
-                    (source_kind, result)
-                });
-            }
-            round_results = join_all(source_jobs).await;
+                (source_kind, result)
+            });
         }
+        let round_results = join_all(source_jobs).await;
 
         for (source_kind, result) in round_results {
             match result {
@@ -4272,23 +4389,6 @@ fn pcm_source_for_audio_source(source: AudioSourceKind) -> cue_core::pcm::AudioS
 /// keyless local backstop. Disable explicitly with `BLUEY_STT_PARAKEET=0`
 /// (or false/off/no). Always `false` without the feature so the chunk loop
 /// never selects a transport whose engine isn't compiled in.
-fn is_parakeet_chunk_enabled() -> bool {
-    #[cfg(feature = "parakeet-stt")]
-    {
-        // Default true; only an explicit falsey value turns it off.
-        !matches!(
-            env_first(&["BLUEY_STT_PARAKEET"])
-                .map(|v| v.trim().to_ascii_lowercase())
-                .as_deref(),
-            Some("0") | Some("false") | Some("off") | Some("no")
-        )
-    }
-    #[cfg(not(feature = "parakeet-stt"))]
-    {
-        false
-    }
-}
-
 fn pcm16_16k_duration_ms(byte_len: usize) -> u32 {
     let samples = (byte_len / 2) as u64;
     ((samples.saturating_mul(1_000) / 16_000)
@@ -4355,6 +4455,10 @@ fn audio_idle_stop_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
+// Only referenced by a unit test now that the streaming "Listen" path no longer
+// renders this chunk-era recording label in production. Kept test-only so the
+// behavior assertion survives without tripping dead-code lints.
+#[cfg(test)]
 fn recording_sources_label(status: &AudioPipelineStatus) -> &'static str {
     match status.runtime_mode {
         AudioRuntimeMode::Native => "Bluey is listening to system audio and microphone.",
@@ -4755,8 +4859,45 @@ async fn capture_transcribe_audio_chunk(
     source: &RealAudioSource,
     sequence: u64,
     client: &reqwest::Client,
-    on_device_provider: &mut Option<Box<dyn cue_core::stt::SttProvider>>,
 ) -> Result<Option<cue_core::audio::SttSegmentMetadata>> {
+    // Combined capture-then-transcribe for one chunk: capture the WAV to disk
+    // (`capture_audio_chunk_half`) then push it through the STT endpoint
+    // (`transcribe_captured_chunk`).
+    let Some(chunk_path) = capture_audio_chunk_half(
+        Arc::clone(daemon),
+        session_id.to_string(),
+        runtime.clone(),
+        source.clone(),
+        sequence,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    transcribe_captured_chunk(
+        daemon,
+        session_id,
+        runtime,
+        source.source,
+        sequence,
+        &chunk_path,
+        client,
+    )
+    .await
+}
+
+/// CAPTURE HALF (`'static`): record one chunk WAV to disk and return its path,
+/// or `None` if the session rotated. Owns its inputs so each source's
+/// capture-then-transcribe job can run concurrently in the loop's `join_all`
+/// fan-out. The session guard runs BEFORE `record_chunk` so a capture from a
+/// superseded session can never stamp the new session's ledger.
+async fn capture_audio_chunk_half(
+    daemon: Arc<Daemon>,
+    session_id: String,
+    runtime: RealAudioRuntimeConfig,
+    source: RealAudioSource,
+    sequence: u64,
+) -> Result<Option<PathBuf>> {
     let audio_dir = daemon.paths.runtime_dir.join("audio");
     tokio::fs::create_dir_all(&audio_dir)
         .await
@@ -4767,7 +4908,7 @@ async fn capture_transcribe_audio_chunk(
         clock::now_epoch_ms_string()
     ));
 
-    capture_audio_chunk_to_file(runtime, source, &chunk_path).await?;
+    capture_audio_chunk_to_file(&runtime, &source, &chunk_path).await?;
     let byte_len = tokio::fs::metadata(&chunk_path)
         .await
         .map(|metadata| metadata.len())
@@ -4785,27 +4926,42 @@ async fn capture_transcribe_audio_chunk(
         byte_len,
     );
     {
+        // Guard the session BEFORE recording the chunk so a look-ahead capture
+        // for a superseded session never mutates the new session's ledger.
         let mut audio = daemon.audio.lock().await;
+        if audio.session_id.as_deref() != Some(session_id.as_str()) {
+            drop(audio);
+            let _ = tokio::fs::remove_file(&chunk_path).await;
+            return Ok(None);
+        }
         audio.record_chunk(&chunk);
     }
+    Ok(Some(chunk_path))
+}
 
+/// TRANSCRIBE HALF (runs inline on the loop task): re-check the session, then
+/// transcribe the captured WAV through the shared on-device provider. Deletes
+/// the WAV on every exit path. The pre-transcribe session re-check closes the
+/// window where a chunk captured under the prior session could feed the provider
+/// after a rotation (the downstream `_inner` guard only checks `is_none()`).
+async fn transcribe_captured_chunk(
+    daemon: &Arc<Daemon>,
+    session_id: &str,
+    runtime: &RealAudioRuntimeConfig,
+    source: AudioSourceKind,
+    sequence: u64,
+    chunk_path: &Path,
+    client: &reqwest::Client,
+) -> Result<Option<cue_core::audio::SttSegmentMetadata>> {
     if daemon.audio.lock().await.session_id.as_deref() != Some(session_id) {
-        let _ = tokio::fs::remove_file(&chunk_path).await;
+        let _ = tokio::fs::remove_file(chunk_path).await;
         return Ok(None);
     }
-
-    let transcript_result = transcribe_audio_file(
-        runtime,
-        source.source,
-        sequence,
-        &chunk_path,
-        client,
-        on_device_provider,
-    )
-    .await
-    .with_context(|| format!("failed to transcribe {}", source.source));
-    let _ = tokio::fs::remove_file(&chunk_path).await;
-    Ok(transcript_result?)
+    let transcript_result = transcribe_audio_file(runtime, source, sequence, chunk_path, client)
+        .await
+        .with_context(|| format!("failed to transcribe {source}"));
+    let _ = tokio::fs::remove_file(chunk_path).await;
+    transcript_result
 }
 
 async fn capture_audio_chunk_to_file(
@@ -4969,7 +5125,6 @@ async fn transcribe_audio_file(
     sequence: u64,
     chunk_path: &Path,
     client: &reqwest::Client,
-    on_device_provider: &mut Option<Box<dyn cue_core::stt::SttProvider>>,
 ) -> Result<Option<cue_core::audio::SttSegmentMetadata>> {
     let audio = tokio::fs::read(chunk_path)
         .await
@@ -5040,20 +5195,6 @@ async fn transcribe_audio_file(
                 source,
                 sequence,
                 runtime.chunk_duration_ms,
-            )
-            .await;
-        }
-        RealSttTransport::Parakeet => {
-            // On-device transcription through the streaming `SttProvider` trait:
-            // this is the path that unifies the mic + chunk loop with the same
-            // factory the continuous system-audio path uses. No HTTP, nothing
-            // leaves the machine.
-            return transcribe_chunk_on_device(
-                &audio,
-                source,
-                sequence,
-                runtime.chunk_duration_ms,
-                on_device_provider,
             )
             .await;
         }
@@ -5138,216 +5279,22 @@ async fn transcribe_chunk_local_whisper(
     ))
 }
 
-/// Transcribe one saved audio chunk fully on-device by driving the streaming
-/// [`SttProvider`] built from the STT factory (the `BLUEY_STT_PARAKEET=1`
-/// path). This is the unification point: the mic + chunk loop now consumes the
-/// exact same provider trait the continuous system-audio path uses.
-///
-/// The provider is built lazily on first call and reused across chunks via
-/// `provider_slot` (one model instance for the session). We decode the saved
-/// WAV back to PCM16, push it through `send_audio` + `finalize`, then drain the
-/// provider's events for a brief window — collecting the finalized text and any
-/// diarization speaker label.
-async fn transcribe_chunk_on_device(
-    pcm_wav: &[u8],
-    source: AudioSourceKind,
-    sequence: u64,
-    chunk_duration_ms: u32,
-    provider_slot: &mut Option<Box<dyn cue_core::stt::SttProvider>>,
-) -> Result<Option<cue_core::audio::SttSegmentMetadata>> {
-    use cue_core::pcm::{AudioChunk, SampleRate};
-    use cue_core::stt::{SttConfig, TranscriptEvent};
-
-    let pcm_source = pcm_source_for_audio_source(source);
-
-    // Build the provider once, on the first chunk of the session.
-    if provider_slot.is_none() {
-        let stt_cfg = SttConfig {
-            source: pcm_source,
-            ..Default::default()
-        };
-        let provider = crate::stt::factory::build_stt_chain(&stt_cfg, pcm_source)
-            .await
-            .map_err(|e| anyhow!("on-device STT unavailable: {e}"))?;
-        *provider_slot = Some(provider);
-    }
-    let provider = provider_slot
-        .as_mut()
-        .expect("on-device provider built above");
-
-    // Decode the WAV `data` section back to 16 kHz mono PCM16, locating the
-    // `data` chunk properly (the capture path may prepend a metadata chunk).
-    let samples = decode_pcm16_16k_mono_wav(pcm_wav);
-    if samples.is_empty() {
-        return Ok(None);
-    }
-
-    // Feed the audio to the streaming model in ~1s windows rather than one giant
-    // `send_audio`. The on-device Nemotron processes ~0.5s blocks per call and
-    // buffers the rest; handing it a single multi-second chunk (a configured
-    // `chunk_duration_ms` can be up to 15s) starves the worker of incremental
-    // calls and — observed on the int8 model — yields no output and can crash
-    // the ONNX session. Windowing keeps each `transcribe_chunk` near the model's
-    // native block size, matching what the live capture cadence would produce.
-    const FEED_WINDOW_SAMPLES: usize = 16_000; // 1s @ 16 kHz
-    let captured_at_ms = sequence
-        .saturating_sub(1)
-        .saturating_mul(chunk_duration_ms as u64);
-    for window in samples.chunks(FEED_WINDOW_SAMPLES) {
-        let chunk = AudioChunk {
-            source: pcm_source,
-            sample_rate: SampleRate::SR_16K,
-            samples: window.to_vec(),
-            captured_at_ms,
-        };
-        provider
-            .send_audio(&chunk)
-            .await
-            .map_err(|e| anyhow!("on-device STT send failed: {e}"))?;
-    }
-
-    // Drain this chunk's output, then any extra events that are immediately
-    // ready — without blocking for diarization.
-    //
-    // The on-device model is streaming and stateful: it buffers audio internally
-    // and commits a finalized block whenever enough has accumulated, so a given
-    // `send_audio` may emit zero, one, or (after a backlog) more than one
-    // `Final`, and the boundary need not line up with our fixed chunk size.
-    //
-    // Two budgets, deliberately different:
-    //   * `first_budget` — generous, scaled to the chunk duration. The FIRST
-    //     inference after model load is cold (mel + encoder + decode can exceed
-    //     a second), and a Final dropped here is lost (the worker emits it into
-    //     the channel after we stop, with nothing to re-collect it). So we wait
-    //     up to roughly one chunk's worth for the first event rather than racing
-    //     the worker and losing the text.
-    //   * `poll_budget` — short. Once we've seen activity we only sweep up
-    //     whatever else is already queued, then stop, so the capture loop is
-    //     never parked for the full chunk (the old ~2s/chunk diarization-wait
-    //     bug). Diarization labels are taken opportunistically, never waited on.
-    let mut texts: Vec<String> = Vec::new();
-    let mut confidence: Option<f32> = None;
-    let mut speaker_id: Option<u32> = None;
-    let first_budget = Duration::from_millis((chunk_duration_ms as u64).clamp(1_000, 5_000));
-    let poll_budget = Duration::from_millis(50);
-    let mut seen_any = false;
-    loop {
-        let budget = if seen_any { poll_budget } else { first_budget };
-        match tokio::time::timeout(budget, provider.next_event()).await {
-            Ok(Some(Ok(event))) => {
-                seen_any = true;
-                match event {
-                    TranscriptEvent::Final {
-                        text: t,
-                        confidence: c,
-                        ..
-                    } => {
-                        let trimmed = t.trim();
-                        if !trimmed.is_empty() {
-                            texts.push(trimmed.to_string());
-                            confidence = c.or(confidence);
-                        }
-                    }
-                    TranscriptEvent::SpeakerLabel { speaker, .. } => {
-                        speaker_id = Some(speaker);
-                    }
-                    TranscriptEvent::Partial { .. } => {}
-                }
-            }
-            Ok(Some(Err(e))) => {
-                return Err(anyhow!("on-device STT error: {e}"));
-            }
-            // Provider closed, or nothing more is ready within the budget — stop.
-            Ok(None) | Err(_) => break,
-        }
-    }
-
-    if texts.is_empty() {
-        return Ok(None);
-    }
-    let text = texts.join(" ");
-
-    let label = source.default_label();
-    let speaker_label = match speaker_id {
-        Some(id) => format!("{label} (speaker {id})"),
-        None => label.to_string(),
-    };
-    let mut segment = cue_core::audio::SttSegmentMetadata::new(
-        text,
-        sequence
-            .saturating_sub(1)
-            .saturating_mul(chunk_duration_ms as u64),
-        chunk_duration_ms,
-        true,
-    )
-    .with_provider_segment_id(format!("{label}-{sequence}"))
-    .with_source(source)
-    .with_speaker_label(speaker_label)
-    .with_source_sequence_range(sequence, sequence);
-    if let Some(confidence) = confidence {
-        segment = segment.with_confidence(confidence);
-    }
-    Ok(Some(segment))
-}
-
-/// Decode a 16 kHz mono PCM16 WAV into `i16` samples by locating the `data`
-/// chunk via RIFF chunk-walking — NOT by assuming a fixed 44-byte header.
-///
-/// Both producers in this daemon feed here: our own [`wav_from_i16le_16k_mono`]
-/// writes a canonical 44-byte header, but the direct-ffmpeg capture path
-/// (AVFoundation / dshow / WASAPI loopback) inserts a `LIST`/`INFO` metadata
-/// chunk between `fmt ` and `data`, pushing the samples past byte 44. A
-/// hardcoded 44-byte skip there decodes ~17 metadata bytes as leading samples
-/// and corrupts the start of every chunk. Walking the chunk table is correct
-/// for both. Returns empty for non-RIFF / malformed / dataless input.
-fn decode_pcm16_16k_mono_wav(wav: &[u8]) -> Vec<i16> {
-    let Some(pcm) = find_wav_data_chunk(wav) else {
-        return Vec::new();
-    };
-    pcm.chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]))
-        .collect()
-}
-
-/// Return the bytes of the WAV `data` chunk, or `None` if the input is not a
-/// valid RIFF/WAVE container or has no `data` chunk. Walks the standard chunk
-/// table: 12-byte RIFF header (`RIFF` + size + `WAVE`), then a sequence of
-/// `<4-byte id><4-byte LE size><payload>` chunks (payloads are word-aligned, so
-/// an odd size is padded by one byte).
-fn find_wav_data_chunk(wav: &[u8]) -> Option<&[u8]> {
-    const RIFF_HEADER_LEN: usize = 12;
-    if wav.len() < RIFF_HEADER_LEN || &wav[0..4] != b"RIFF" || &wav[8..12] != b"WAVE" {
-        return None;
-    }
-    let mut offset = RIFF_HEADER_LEN;
-    while offset + 8 <= wav.len() {
-        let id = &wav[offset..offset + 4];
-        let size = u32::from_le_bytes([
-            wav[offset + 4],
-            wav[offset + 5],
-            wav[offset + 6],
-            wav[offset + 7],
-        ]) as usize;
-        let body_start = offset + 8;
-        let body_end = body_start.saturating_add(size).min(wav.len());
-        if id == b"data" {
-            return Some(&wav[body_start..body_end]);
-        }
-        // Chunks are word-aligned: a chunk of odd size carries a 1-byte pad.
-        let advance = 8 + size + (size & 1);
-        offset = match offset.checked_add(advance) {
-            Some(next) => next,
-            None => break,
-        };
-    }
-    None
-}
-
 async fn stop_audio_capture(daemon: &Arc<Daemon>) -> AudioPipelineStatus {
     if let Some(stop) = daemon.audio_runtime.lock().await.stop.take() {
         let _ = stop.send(());
     }
     daemon.audio_runtime.lock().await.session_id = None;
+
+    // Stop the continuous system-audio streaming capture (overlay "Listen" /
+    // `bluey listen` / picker all store their handle here). Without this,
+    // "Stop listening" would leave the helper subprocess + STT provider
+    // running until full daemon shutdown. stop() is async and must be awaited
+    // — Drop only sets the stop flag, it does not join the supervisor task.
+    // Safe alongside shutdown_daemon: both use take(), so the later caller
+    // sees None and is a no-op.
+    if let Some(capture) = daemon.system_audio.lock().await.take() {
+        capture.stop().await;
+    }
 
     let mut audio = daemon.audio.lock().await;
     let status = audio.clone().stopped();
@@ -5474,6 +5421,20 @@ async fn maybe_trigger_for_me_question(daemon: &Arc<Daemon>, segment: &Transcrip
     let Some(detected) = cue_core::detect_for_me_question(segment, &settings.my_names) else {
         return;
     };
+
+    // Substance guard: never drive the agent (or surface a card) on a thin
+    // fragment. Live STT can emit scraps ("is the", "cas") that are technically
+    // question-shaped; driving an agent with near-nothing makes it reply with a
+    // generic "How can I help you?" greeting. Require a minimum of real words.
+    let word_count = detected.question.split_whitespace().count();
+    if detected.question.trim().chars().count() < 12 || word_count < 3 {
+        debug!(
+            q = %detected.question,
+            words = word_count,
+            "for-me question too thin to act on; ignoring"
+        );
+        return;
+    }
 
     info!(
         matched_name = detected.matched_name.as_deref().unwrap_or("(any)"),
@@ -10999,161 +10960,6 @@ fn build_recap_llm_from_env() -> Option<Box<dyn cue_llm::LlmProvider>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---- REAL Parakeet through the DAEMON path (not the provider in isolation) ----
-    //
-    // Exercises `transcribe_audio_file` with `RealSttTransport::Parakeet` — the
-    // exact function the audio capture loop calls — so the WAV decode + on-device
-    // transport arm + provider drive are proven together. Gated on the
-    // `parakeet-stt` feature AND `BLUEY_PARAKEET_MODEL_DIR`; skips cleanly
-    // otherwise so normal/CI runs are unaffected.
-    #[cfg(feature = "parakeet-stt")]
-    #[tokio::test]
-    async fn daemon_transcribe_audio_file_parakeet_real() {
-        let Ok(model_dir) = std::env::var("BLUEY_PARAKEET_MODEL_DIR") else {
-            eprintln!("SKIP: set BLUEY_PARAKEET_MODEL_DIR to run the real daemon-path test");
-            return;
-        };
-        let model_dir = std::path::PathBuf::from(model_dir.trim());
-        if !["encoder.onnx", "decoder_joint.onnx", "tokenizer.model"]
-            .iter()
-            .all(|f| model_dir.join(f).is_file())
-        {
-            eprintln!("SKIP: model dir incomplete: {}", model_dir.display());
-            return;
-        }
-        // A real WAV fixture (16k mono PCM16). Same fixtures the integration test uses.
-        let wav_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("fixtures")
-            .join("clip8s.wav");
-        if !wav_path.is_file() {
-            eprintln!("SKIP: no fixture at {}", wav_path.display());
-            return;
-        }
-
-        // Minimal runtime config selecting the on-device Parakeet transport.
-        let runtime = RealAudioRuntimeConfig {
-            ffmpeg_path: None,
-            stt_endpoint: String::new(),
-            stt_api_key: String::new(),
-            stt_model: "parakeet-en".to_string(),
-            stt_provider_label: "parakeet:test".to_string(),
-            stt_transport: RealSttTransport::Parakeet,
-            chunk_duration_ms: 1_000,
-            sources: Vec::new(),
-        };
-
-        // Drive the REAL daemon function the way the capture loop does: feed the
-        // clip, then keep calling with silence "chunk files" so the streaming
-        // model's buffered tail flushes and any backlog (the cold first inference
-        // can lag the first call) is collected on later iterations. The provider
-        // is built once and reused via the `&mut provider` slot — same as the loop.
-        // `build_stt_chain` gates the Parakeet provider on BLUEY_STT_PARAKEET=1
-        // (the same runtime switch the daemon uses).
-        std::env::set_var("BLUEY_PARAKEET_MODEL_DIR", &model_dir);
-        std::env::set_var("BLUEY_STT_PARAKEET", "1");
-        let client = reqwest::Client::new();
-        let mut provider: Option<Box<dyn cue_core::stt::SttProvider>> = None;
-
-        let silence_wav = wav_from_i16le_16k_mono(&vec![0u8; 16_000 * 2]);
-        let silence_path = std::env::temp_dir().join("bluey-parakeet-silence.wav");
-        std::fs::write(&silence_path, &silence_wav).expect("write silence wav");
-
-        let mut collected: Vec<String> = Vec::new();
-        // Iteration 1 = the real clip; iterations 2.. = silence to drain backlog.
-        for seq in 1..=6u64 {
-            let path = if seq == 1 { &wav_path } else { &silence_path };
-            let seg = transcribe_audio_file(
-                &runtime,
-                AudioSourceKind::Microphone,
-                seq,
-                path,
-                &client,
-                &mut provider,
-            )
-            .await
-            .expect("transcribe_audio_file should not error");
-            if let Some(seg) = seg {
-                if !seg.text.trim().is_empty() {
-                    collected.push(seg.text);
-                }
-            }
-        }
-        let _ = std::fs::remove_file(&silence_path);
-
-        let text = collected.join(" ");
-        eprintln!("=== DAEMON-PATH REAL PARAKEET TRANSCRIPT ===\n{text}\n===========================================");
-        assert!(
-            !text.trim().is_empty(),
-            "daemon Parakeet path produced no transcript"
-        );
-        assert!(
-            text.split_whitespace().count() >= 3,
-            "transcript suspiciously short: {text:?}"
-        );
-    }
-
-    // ---- On-device WAV decode (regression for the hardcoded-44 header bug) ----
-
-    fn riff_wav(extra_chunks: &[(&[u8; 4], &[u8])], pcm: &[i16]) -> Vec<u8> {
-        // Build a minimal RIFF/WAVE: header + `fmt ` + any extra chunks + `data`.
-        let mut body = Vec::new();
-        // fmt chunk (16 bytes, PCM mono 16k 16-bit).
-        body.extend_from_slice(b"fmt ");
-        body.extend_from_slice(&16u32.to_le_bytes());
-        body.extend_from_slice(&1u16.to_le_bytes()); // PCM
-        body.extend_from_slice(&1u16.to_le_bytes()); // mono
-        body.extend_from_slice(&16_000u32.to_le_bytes());
-        body.extend_from_slice(&32_000u32.to_le_bytes());
-        body.extend_from_slice(&2u16.to_le_bytes());
-        body.extend_from_slice(&16u16.to_le_bytes());
-        for (id, payload) in extra_chunks {
-            body.extend_from_slice(*id);
-            body.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-            body.extend_from_slice(payload);
-            if payload.len() % 2 == 1 {
-                body.push(0); // word-align pad
-            }
-        }
-        let mut data = Vec::new();
-        for &s in pcm {
-            data.extend_from_slice(&s.to_le_bytes());
-        }
-        body.extend_from_slice(b"data");
-        body.extend_from_slice(&(data.len() as u32).to_le_bytes());
-        body.extend_from_slice(&data);
-
-        let mut wav = Vec::new();
-        wav.extend_from_slice(b"RIFF");
-        wav.extend_from_slice(&((4 + body.len()) as u32).to_le_bytes());
-        wav.extend_from_slice(b"WAVE");
-        wav.extend_from_slice(&body);
-        wav
-    }
-
-    #[test]
-    fn decode_wav_handles_canonical_44_byte_header() {
-        let pcm = [1i16, -2, 3, -4, 5];
-        let wav = riff_wav(&[], &pcm);
-        assert_eq!(decode_pcm16_16k_mono_wav(&wav), pcm);
-    }
-
-    #[test]
-    fn decode_wav_handles_ffmpeg_metadata_chunk_before_data() {
-        // ffmpeg inserts a LIST/INFO chunk between `fmt ` and `data`; a hardcoded
-        // 44-byte skip would read metadata bytes as leading samples. The walker
-        // must still return exactly the PCM samples.
-        let pcm = [100i16, 200, -300, 400];
-        let wav = riff_wav(&[(b"LIST", b"INFOISFTLavf60.0\0")], &pcm);
-        assert_eq!(decode_pcm16_16k_mono_wav(&wav), pcm);
-    }
-
-    #[test]
-    fn decode_wav_rejects_non_riff_input() {
-        assert!(decode_pcm16_16k_mono_wav(b"not a wav file at all").is_empty());
-        assert!(decode_pcm16_16k_mono_wav(&[]).is_empty());
-    }
 
     // ---- Pinned context survives compaction by being emitted first (#4/#5) ----
 
