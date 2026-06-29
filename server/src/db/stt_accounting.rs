@@ -453,7 +453,11 @@ pub(crate) fn settle_session(
     crate::db::run_blocking_db(|| {
         let pricing =
             pricing::lookup("deepgram", model).ok_or(SttAccountingError::UnsupportedModel)?;
-        let elapsed_seconds = ((elapsed_ms.max(1) + 999) / 1000).max(1);
+        let elapsed_seconds = if elapsed_ms <= 0 {
+            0
+        } else {
+            ((elapsed_ms + 999) / 1000).max(1)
+        };
         let (
             capped_seconds,
             billable_seconds,
@@ -491,7 +495,7 @@ pub(crate) fn settle_session(
                     return Err(SttAccountingError::AlreadySettled);
                 }
 
-                let capped_seconds = elapsed_seconds.min(max_seconds.max(1));
+                let capped_seconds = elapsed_seconds.min(max_seconds.max(0));
                 let trial_seconds = reserved_trial_seconds.min(capped_seconds);
                 let billable_seconds = capped_seconds - trial_seconds;
                 let (bluey_cents, customer_cents) =
@@ -648,7 +652,7 @@ pub(crate) fn settle_session(
                     return Err(SttAccountingError::AlreadySettled);
                 }
 
-                let capped_seconds = elapsed_seconds.min(max_seconds.max(1));
+                let capped_seconds = elapsed_seconds.min(max_seconds.max(0));
                 let trial_seconds = reserved_trial_seconds.min(capped_seconds);
                 let billable_seconds = capped_seconds - trial_seconds;
                 let (bluey_cents, customer_cents) =
@@ -933,6 +937,70 @@ mod tests {
             vec![
                 ("stt_reserve".to_string(), -28, 1000, 972),
                 ("stt_settle".to_string(), 25, 972, 997),
+            ]
+        );
+    }
+
+    #[test]
+    fn zero_audio_settlement_releases_full_paid_reservation() {
+        let pool = temp_pool();
+        let account_id = create_paid_account(&pool, "zero-audio@example.com", 528);
+        let reserved = reserve_session(&pool, input(&account_id, "stt-zero-audio", 600)).unwrap();
+        assert_eq!(reserved.reserved_cents, 28);
+
+        let settled = settle_session(
+            &pool,
+            "stt-zero-audio",
+            &account_id,
+            "nova-3",
+            0,
+            "client_closed:no_audio",
+            2_000,
+        )
+        .unwrap();
+        assert_eq!(settled.elapsed_seconds, 0);
+        assert_eq!(settled.billable_seconds, 0);
+        assert_eq!(settled.customer_cents, 0);
+        assert_eq!(settled.refunded_cents, 28);
+
+        let conn = pool.get().unwrap();
+        let (balance_cents, reserved_cents): (i64, i64) = conn
+            .query_row(
+                "SELECT balance_cents, reserved_cents FROM accounts WHERE id = ?1",
+                params![account_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let batch_remaining: i64 = conn
+            .query_row(
+                "SELECT remaining_cents FROM credit_batches WHERE account_id = ?1",
+                params![account_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(balance_cents, 528);
+        assert_eq!(reserved_cents, 0);
+        assert_eq!(batch_remaining, 528);
+
+        let ledger: Vec<(String, i64, i64, i64)> = conn
+            .prepare(
+                "SELECT event_type, amount_cents, balance_cents_before, balance_cents_after
+                   FROM balance_ledger_entries
+                  WHERE account_id = ?1 AND event_type LIKE 'stt_%'
+                  ORDER BY created_at ASC",
+            )
+            .unwrap()
+            .query_map(params![account_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            ledger,
+            vec![
+                ("stt_reserve".to_string(), -28, 528, 500),
+                ("stt_settle".to_string(), 28, 500, 528),
             ]
         );
     }

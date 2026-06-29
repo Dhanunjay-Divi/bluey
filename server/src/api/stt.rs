@@ -64,6 +64,20 @@ pub struct SttSessionResponse {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct SttSessionCancelRequest {
+    pub session_token: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SttSessionCancelResponse {
+    pub released: bool,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct SttRelayQuery {
     pub session_token: String,
 }
@@ -149,6 +163,46 @@ pub async fn create_session(
         )),
         provider_token: None,
     }))
+}
+
+pub async fn cancel_session(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Json(req): Json<SttSessionCancelRequest>,
+) -> Result<Json<SttSessionCancelResponse>, (StatusCode, String)> {
+    let token = req.session_token.trim();
+    if token.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "session_token is required".into()));
+    }
+    let model = req.model.unwrap_or_else(|| "nova-3".to_string());
+    let reason = req
+        .reason
+        .filter(|reason| !reason.trim().is_empty())
+        .unwrap_or_else(|| "client_cancelled_before_audio".to_string());
+    match stt_accounting::settle_session(
+        &state.pool,
+        token,
+        &account.id,
+        &model,
+        0,
+        &reason,
+        now_ms(),
+    ) {
+        Ok(settled) => {
+            tracing::info!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                refunded_cents = settled.refunded_cents,
+                refunded_trial_seconds = settled.refunded_trial_seconds,
+                reason = %reason,
+                "STT relay session canceled and reservation released"
+            );
+            Ok(Json(SttSessionCancelResponse { released: true }))
+        }
+        Err(SttAccountingError::AlreadySettled) => {
+            Ok(Json(SttSessionCancelResponse { released: false }))
+        }
+        Err(error) => Err(map_create_error(error)),
+    }
 }
 
 pub async fn relay(
@@ -340,6 +394,8 @@ async fn run_deepgram_relay(
     let (mut upstream_tx, mut upstream_rx) = upstream.split();
     let deadline = Duration::from_secs(session.max_seconds.max(1) as u64);
     let mut close_reason = "completed".to_string();
+    let mut forwarded_audio_bytes = 0_u64;
+    let mut forwarded_audio_chunks = 0_u64;
 
     tokio::select! {
         _ = tokio::time::sleep(deadline) => {
@@ -350,7 +406,13 @@ async fn run_deepgram_relay(
         result = async {
             while let Some(message) = client_rx.next().await {
                 match message? {
-                    ClientMessage::Binary(bytes) => upstream_tx.send(UpstreamMessage::Binary(bytes)).await?,
+                    ClientMessage::Binary(bytes) => {
+                        if !bytes.is_empty() {
+                            forwarded_audio_bytes = forwarded_audio_bytes.saturating_add(bytes.len() as u64);
+                            forwarded_audio_chunks = forwarded_audio_chunks.saturating_add(1);
+                        }
+                        upstream_tx.send(UpstreamMessage::Binary(bytes)).await?
+                    }
                     ClientMessage::Text(text) => upstream_tx.send(UpstreamMessage::Text(text)).await?,
                     ClientMessage::Ping(bytes) => upstream_tx.send(UpstreamMessage::Ping(bytes)).await?,
                     ClientMessage::Pong(bytes) => upstream_tx.send(UpstreamMessage::Pong(bytes)).await?,
@@ -395,7 +457,24 @@ async fn run_deepgram_relay(
         }
     }
 
-    finalize_relay_session(&state, &session, started.elapsed(), &close_reason)?;
+    let billable_elapsed = if forwarded_audio_bytes == 0 {
+        Duration::ZERO
+    } else {
+        started.elapsed()
+    };
+    let settle_reason = if forwarded_audio_bytes == 0 {
+        format!("{close_reason}:no_audio")
+    } else {
+        close_reason
+    };
+    finalize_relay_session(
+        &state,
+        &session,
+        billable_elapsed,
+        &settle_reason,
+        forwarded_audio_bytes,
+        forwarded_audio_chunks,
+    )?;
     Ok(())
 }
 
@@ -425,8 +504,10 @@ fn finalize_relay_session(
     session: &ClaimedSttSession,
     elapsed: Duration,
     reason: &str,
+    audio_bytes: u64,
+    audio_chunks: u64,
 ) -> anyhow::Result<()> {
-    let elapsed_ms = elapsed.as_millis().clamp(1, i64::MAX as u128) as i64;
+    let elapsed_ms = elapsed.as_millis().min(i64::MAX as u128) as i64;
     let settled = stt_accounting::settle_session(
         &state.pool,
         &session.token,
@@ -468,6 +549,8 @@ fn finalize_relay_session(
         cost_cents = settled.customer_cents,
         refunded_cents = settled.refunded_cents,
         refunded_trial_seconds = settled.refunded_trial_seconds,
+        audio_bytes,
+        audio_chunks,
         reason,
         "STT relay session settled"
     );

@@ -4233,6 +4233,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     var onWindowFrameChanged: ((NSRect) -> Void)?
     var onInteractionModeChanged: (() -> Void)?
     private var recordingActive = false
+    private var recordingDesiredActive = false
+    private var recordingTransitionInFlight = false
+    private var lastRecordingToggleAt = Date.distantPast
     private var transcriptSnippets: [String] = []
     private var latestLiveTranscriptLine: String?
     private var latestLiveTranscriptLinesBySource: [String: String] = [:]
@@ -7056,21 +7059,40 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     @objc private func recordingClicked() {
-        if recordingActive {
+        let now = Date()
+        if now.timeIntervalSince(lastRecordingToggleAt) < 0.45 {
+            return
+        }
+        lastRecordingToggleAt = now
+
+        if recordingTransitionInFlight && !recordingDesiredActive {
+            return
+        }
+
+        if recordingActive || recordingDesiredActive {
+            let shouldScheduleAutoSend = recordingActive
             emitSimple("recording_stop_requested")
             recordingActive = false
+            recordingDesiredActive = false
+            recordingTransitionInFlight = true
             onListeningStateChanged?(.paused)
+            recordingDesiredActive = false
+            recordingTransitionInFlight = true
             recordingButton.title = "Listen"
             setHeaderSubtitle()
             composer.placeholder = "Ask anything..."
             updateAudioRouteBadge("● Ready", accent: BlueyTheme.green)
             styleControlButton(recordingButton, symbol: "waveform", accent: false)
             setTranscriptState("READY", active: false)
-            scheduleAutoSendAfterExplicitStop()
+            if shouldScheduleAutoSend {
+                scheduleAutoSendAfterExplicitStop()
+            }
         } else {
             prepareAutoSendListenCapture()
             emitSimple("recording_start_requested")
             recordingActive = false
+            recordingDesiredActive = true
+            recordingTransitionInFlight = true
             onListeningStateChanged?(.connecting)
             recordingButton.title = "Starting"
             setHeaderSubtitle()
@@ -7842,6 +7864,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         switch state {
         case .connecting:
             recordingActive = false
+            recordingDesiredActive = true
+            recordingTransitionInFlight = true
             lastTranscriptStripSource = nil
             recordingButton.title = "Starting"
             setHeaderSubtitle()
@@ -7852,6 +7876,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             seedTranscriptPreviewIfEmpty("Mic + System: starting audio...")
         case .listening:
             recordingActive = true
+            recordingDesiredActive = true
+            recordingTransitionInFlight = false
             lastTranscriptStripSource = nil
             recordingButton.title = "Stop"
             setHeaderSubtitle()
@@ -7862,6 +7888,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             seedTranscriptPreviewIfEmpty("Mic + System: captions appear here.")
         case .paused:
             recordingActive = false
+            recordingDesiredActive = false
+            recordingTransitionInFlight = false
             lastTranscriptStripSource = nil
             recordingButton.title = "Listen"
             setHeaderSubtitle()
@@ -7872,6 +7900,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             seedTranscriptPreviewIfEmpty("Live captions preview")
         case .failed:
             recordingActive = false
+            recordingDesiredActive = false
+            recordingTransitionInFlight = false
             autoSendAfterStopWorkItem?.cancel()
             autoSendAfterStopWorkItem = nil
             autoSendListenCaptureActive = false
@@ -7885,6 +7915,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             setTranscriptState("FAILED", active: false)
         case .ready:
             recordingActive = false
+            recordingDesiredActive = false
+            recordingTransitionInFlight = false
             autoSendAfterStopWorkItem?.cancel()
             autoSendAfterStopWorkItem = nil
             autoSendListenCaptureActive = false
@@ -10957,6 +10989,7 @@ private final class OverlayApp {
     private var externalFileDragCaptureUntil = 0.0
     private var lastExpandedInteractiveMouseAt = CACurrentMediaTime()
     private var currentRunState: PillRunState = .ready
+    private var lastPillRecordingToggleAt = Date.distantPast
     private var overlayOpacity = 0.94
     private var expandedModeActive = false
     private var stickyPillFrame: NSRect?
@@ -11474,6 +11507,12 @@ private final class OverlayApp {
     }
 
     private func toggleListeningFromPill() {
+        let now = Date()
+        if now.timeIntervalSince(lastPillRecordingToggleAt) < 0.45 {
+            return
+        }
+        lastPillRecordingToggleAt = now
+
         expand()
         if currentRunState == .listening || currentRunState == .connecting {
             emitSimple("recording_stop_requested")
@@ -11482,7 +11521,7 @@ private final class OverlayApp {
         } else {
             expandedView?.prepareAutoSendListenCapture()
             emitSimple("recording_start_requested")
-            setRunState(.listening)
+            setRunState(.connecting)
         }
     }
 

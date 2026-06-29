@@ -400,6 +400,20 @@ pub struct SttSessionResponse {
     pub provider_token: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SttSessionCancelRequest {
+    pub session_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SttSessionCancelResponse {
+    pub released: bool,
+}
+
 // ─── Usage ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]

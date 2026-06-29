@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-29 11:42 EDT
+Latest checkpoint: 2026-06-29 12:20 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,38 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-231-ATTACH-INDEXING-VISIBLE-RESET.md`; the next canonical Bluey round doc should start at `ROUND-232-...`.
+- Latest assigned Bluey round doc is `ROUND-232-LISTEN-STT-RESERVATION-GUARDS.md`; the next canonical Bluey round doc should start at `ROUND-233-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 232 fixed rapid Listen on/off STT reservation churn and misleading balance drops:
+  - owner clicked Listen on/off repeatedly and saw balance move from about `$5.28` to `$4.68` within a few seconds
+  - root cause was layered: one dual-source Listen can reserve about `56` cents for 10 minutes of Deepgram relay capacity, macOS could emit repeated start events while still `Starting`, daemon start was not idempotent, relay sources reserved before first audio bytes, zero-audio relay settlements rounded up to one second, and balance could refresh before relay settlement finished
+  - daemon audio runtime now has `starting` plus `start_generation`; duplicate starts while starting/active are ignored and stop invalidates a pending start generation
+  - live relay sources now start the native helper first and reserve a server STT session only after the first PCM bytes arrive
+  - if the user stops before audio bytes arrive, no cloud STT session is reserved
+  - added authenticated `/stt/session/cancel` plus a cloud-client method so the daemon can release a just-created reservation if websocket open fails before streaming
+  - server relay settlement now tracks forwarded audio bytes/chunks and settles zero-audio sessions with `0` billable seconds and full reservation refund
+  - daemon refreshes balance after relay source settlement and also after late relay settlement
+  - macOS Listen button and pill toggle now debounce/guard in-flight start/stop states
+  - Windows record button now has bounce protection and a short restart guard after Stop
+  - privacy-safe logs were added for hashed account id, source, bytes/chunks, reserved/settled/refunded cents, and close reason, without transcript text
+  - Round doc: `docs/rounds/ROUND-232-LISTEN-STT-RESERVATION-GUARDS.md`
+  - Verification passed:
+    - `cargo fmt --all`
+    - `cargo fmt --manifest-path server/Cargo.toml`
+    - `cargo check -p cue-daemon`
+    - `cargo check --manifest-path server/Cargo.toml`
+    - `cargo test --manifest-path server/Cargo.toml db::stt_accounting::tests -- --nocapture`
+    - `BLUEY_OVERLAY_SWIFT_CONFIGURATION=debug bash native/macos/cue-overlay/build.sh`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `cargo build -p cue-cli -p cue-daemon`
+    - `BLUEY_BIN=/Users/uno/Downloads/cue/target/debug/bluey scripts/bluey-visible-local.sh`
+    - `/Users/uno/Downloads/cue/target/debug/bluey status`
+  - Current local visible QA status after restart: daemon pid `54661`, active meeting id `3cce79e2-6031-406a-a7bc-2d9eb3c83e96`, overlay visible `true`, overlay capture excluded `false`, transcript segments `0`, context items `0`
+  - Remaining QA: rapidly click Listen on/off and confirm no repeated start sessions; normal short speech should settle to the actual small STT charge, not the 10-minute reservation; before release/upload return to capture-excluded mode and verify `overlay_capture_excluded: true`
 - Round 231 fixed document attach attempts getting stuck on `Indexing...` and improved attachment visibility:
   - owner attached a document, saw `Indexing...`, and could not see the document afterward
   - active local status showed `context_items: 0`, and `active-meeting.json` had `context: []`, so the current session did not retain an attached document

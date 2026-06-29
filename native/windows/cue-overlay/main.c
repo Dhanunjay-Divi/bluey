@@ -72,6 +72,8 @@ static wchar_t g_card_id[80] = L"";
 static bool g_visible = true;
 static bool g_collapsed = false;
 static bool g_recording = false;
+static DWORD g_last_record_toggle_ms = 0;
+static DWORD g_record_restart_after_ms = 0;
 static int g_auto_send_mode = 2;
 static bool g_light_theme = false;
 static double g_opacity = 0.92;
@@ -2094,8 +2096,17 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             return 0;
         }
         if (id == ID_RECORD_BUTTON) {
+            DWORD now_ms = GetTickCount();
+            if ((DWORD)(now_ms - g_last_record_toggle_ms) < 300) {
+                return 0;
+            }
+            if (!g_recording && g_record_restart_after_ms != 0 && (LONG)(now_ms - g_record_restart_after_ms) < 0) {
+                return 0;
+            }
+            g_last_record_toggle_ms = now_ms;
             bool was_recording = g_recording;
             g_recording = !g_recording;
+            g_record_restart_after_ms = was_recording ? now_ms + 1200 : 0;
             update_record_button();
             InvalidateRect(hwnd, NULL, TRUE);
             emit_simple_event(g_recording ? "recording_start_requested" : "recording_stop_requested");

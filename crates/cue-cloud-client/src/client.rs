@@ -19,8 +19,8 @@ use crate::{
     types::{
         ArtifactObjectResponse, AuthResponse, CloudSessionBundle, EmbedBatchRequest,
         EmbedBatchResponse, EmbedRequest, EmbedResponse, InsufficientBalanceBody, RagQueryRequest,
-        RagQueryResponse, SessionListResponse, SttSessionRequest, SttSessionResponse,
-        SyncBatchRequest, SyncBatchResponse,
+        RagQueryResponse, SessionListResponse, SttSessionCancelRequest, SttSessionCancelResponse,
+        SttSessionRequest, SttSessionResponse, SyncBatchRequest, SyncBatchResponse,
     },
 };
 
@@ -276,6 +276,13 @@ impl CloudClient {
         request: &SttSessionRequest,
     ) -> Result<SttSessionResponse> {
         self.auth_post("/stt/session", request).await
+    }
+
+    pub async fn cancel_stt_session(
+        &self,
+        request: &SttSessionCancelRequest,
+    ) -> Result<SttSessionCancelResponse> {
+        self.auth_post("/stt/session/cancel", request).await
     }
 
     /// Authenticated POST returning the raw response body stream.

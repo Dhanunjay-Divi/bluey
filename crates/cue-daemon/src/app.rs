@@ -1118,6 +1118,8 @@ struct CaptureRuntime {
 struct AudioRuntime {
     stop: Option<oneshot::Sender<()>>,
     session_id: Option<String>,
+    start_generation: u64,
+    starting: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1195,6 +1197,8 @@ pub async fn run() -> Result<()> {
         audio_runtime: Mutex::new(AudioRuntime {
             stop: None,
             session_id: None,
+            start_generation: 0,
+            starting: false,
         }),
         cloud: Mutex::new(cloud_status),
         auto_cloud_sync_debounce: Mutex::new(None),
@@ -1774,7 +1778,11 @@ async fn handle_request_inner(
                     return Err(error);
                 }
             };
-            set_overlay_listening_state(daemon, ListeningState::Listening).await;
+            if status.session_id.is_some() {
+                set_overlay_listening_state(daemon, ListeningState::Listening).await;
+            } else {
+                set_overlay_listening_state(daemon, ListeningState::Connecting).await;
+            }
             Ok(DaemonResponse::AudioStatus { status })
         }
         DaemonRequest::AudioStop => {
@@ -2428,7 +2436,7 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         OverlayEvent::RecordingStartRequested => {
             set_overlay_listening_state(daemon, ListeningState::Connecting).await;
             match start_audio_capture(daemon, AudioCaptureConfig::dual_default()).await {
-                Ok(status) => {
+                Ok(status) if status.session_id.is_some() => {
                     set_overlay_listening_state(daemon, ListeningState::Listening).await;
                     let balance = refresh_overlay_balance(daemon, None).await;
                     let balance_line = balance
@@ -2446,6 +2454,12 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
                         ),
                     )
                     .await;
+                }
+                Ok(_) => {
+                    info!(
+                        "duplicate recording start ignored while audio capture is still starting"
+                    );
+                    set_overlay_listening_state(daemon, ListeningState::Connecting).await;
                 }
                 Err(error) => {
                     set_overlay_listening_state(daemon, ListeningState::Failed).await;
@@ -2602,12 +2616,35 @@ async fn start_audio_capture(
     daemon: &Arc<Daemon>,
     config: AudioCaptureConfig,
 ) -> Result<AudioPipelineStatus> {
-    let _ = stop_audio_capture(daemon).await;
+    let start_generation = {
+        let mut runtime = daemon.audio_runtime.lock().await;
+        if runtime.starting || runtime.session_id.is_some() || runtime.stop.is_some() {
+            let status = daemon.audio.lock().await.clone();
+            info!(
+                active_session_id = runtime.session_id.as_deref().unwrap_or("none"),
+                starting = runtime.starting,
+                "audio start ignored because capture is already starting or active"
+            );
+            return Ok(status);
+        }
+        runtime.start_generation = runtime.start_generation.wrapping_add(1);
+        runtime.starting = true;
+        runtime.start_generation
+    };
 
     let session_id = format!("audio-{}", clock::now_epoch_ms_string());
     let (stop_tx, stop_rx) = oneshot::channel();
 
-    let runtime = build_real_audio_runtime_config(&daemon.paths, &config).await?;
+    let runtime = match build_real_audio_runtime_config(&daemon.paths, &config).await {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let mut runtime = daemon.audio_runtime.lock().await;
+            if runtime.start_generation == start_generation {
+                runtime.starting = false;
+            }
+            return Err(error);
+        }
+    };
     let status = if let AudioRuntimeConfigResolution::Real(real_runtime) = runtime.clone() {
         let devices = real_runtime
             .sources
@@ -2639,14 +2676,33 @@ async fn start_audio_capture(
             }
         };
         let status = failed_audio_status(config, &message);
-        *daemon.audio.lock().await = status;
+        let still_current = {
+            let mut runtime = daemon.audio_runtime.lock().await;
+            if runtime.start_generation == start_generation {
+                runtime.starting = false;
+                true
+            } else {
+                false
+            }
+        };
+        if still_current {
+            *daemon.audio.lock().await = status;
+        }
         return Err(anyhow!(message));
     };
 
     {
         let mut runtime = daemon.audio_runtime.lock().await;
+        if runtime.start_generation != start_generation || !runtime.starting {
+            info!(
+                session_id = %session_id,
+                "audio start canceled before capture runtime became active"
+            );
+            return Ok(daemon.audio.lock().await.clone());
+        }
         runtime.stop = Some(stop_tx);
         runtime.session_id = Some(session_id.clone());
+        runtime.starting = false;
     }
     *daemon.audio.lock().await = status.clone();
 
@@ -3705,9 +3761,35 @@ async fn real_audio_relay_loop(
     }
 
     let _ = relay_stop_tx.send(true);
-    for handle in handles {
-        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+    let mut late_settlements = 0_usize;
+    for mut handle in handles {
+        if tokio::time::timeout(Duration::from_secs(5), &mut handle)
+            .await
+            .is_err()
+        {
+            late_settlements = late_settlements.saturating_add(1);
+            let daemon_for_late_settle = Arc::clone(&daemon);
+            let session_id_for_late_settle = session_id.clone();
+            tokio::spawn(async move {
+                let _ = handle.await;
+                let refreshed = refresh_overlay_balance(&daemon_for_late_settle, None).await;
+                info!(
+                    session_id = %session_id_for_late_settle,
+                    balance_refreshed = refreshed.is_some(),
+                    "live STT relay source settled after stop wait"
+                );
+            });
+        }
     }
+    let refreshed = refresh_overlay_balance(&daemon, None).await;
+    info!(
+        session_id = %session_id,
+        completed_sources,
+        source_count,
+        late_settlements,
+        balance_refreshed = refreshed.is_some(),
+        "live STT relay loop settlement refresh completed"
+    );
     if completed_sources >= source_count
         && daemon
             .audio
@@ -3751,38 +3833,6 @@ async fn run_relay_audio_source(
         }
     };
 
-    let stt_session = cloud
-        .create_stt_session(&cue_cloud_client::SttSessionRequest {
-            session_id: session_id.clone(),
-            source: source.source.default_label().to_string(),
-            provider: Some("deepgram".to_string()),
-            model: Some(runtime.stt_model.clone()),
-            requested_seconds: Some(10 * 60),
-        })
-        .await
-        .with_context(|| format!("failed to create live STT session for {}", source.source))?;
-    let access_token = cloud
-        .current_tokens()
-        .context("Bluey account token unavailable after live STT session creation")?
-        .access;
-    let websocket_url = stt_relay_websocket_url(
-        stt_session
-            .websocket_url
-            .as_deref()
-            .context("Bluey STT session did not include a websocket URL")?,
-        &stt_session.session_token,
-    )?;
-    let mut request = websocket_url.into_client_request()?;
-    request.headers_mut().insert(
-        "Authorization",
-        HeaderValue::from_str(&format!("Bearer {access_token}"))?,
-    );
-
-    let (socket, _) = tokio_tungstenite::connect_async(request)
-        .await
-        .with_context(|| format!("failed to open live STT websocket for {}", source.source))?;
-    let (mut ws_tx, mut ws_rx) = socket.split();
-
     let mut command = TokioCommand::new(&helper_path);
     command
         .arg("--source")
@@ -3810,10 +3860,138 @@ async fn run_relay_audio_source(
         .take()
         .context("native audio helper did not expose stdout")?;
 
+    let mut buffer = vec![0_u8; 4096];
+    let first_read = loop {
+        tokio::select! {
+            changed = stop_rx.changed() => {
+                if changed.is_err() || *stop_rx.borrow() {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    info!(
+                        source = %source.source,
+                        stream_id = %source.stream_id,
+                        "live STT relay source stopped before audio bytes; no cloud session reserved"
+                    );
+                    return Ok(());
+                }
+            }
+            read = stdout.read(&mut buffer) => {
+                let read = read.with_context(|| format!("failed to read first live {} audio", source.source))?;
+                if read == 0 {
+                    return Err(anyhow!(
+                        "native live audio helper for {} exited before producing audio bytes",
+                        source.source
+                    ));
+                }
+                break read;
+            }
+        }
+    };
+
+    let stt_session = cloud
+        .create_stt_session(&cue_cloud_client::SttSessionRequest {
+            session_id: session_id.clone(),
+            source: source.source.default_label().to_string(),
+            provider: Some("deepgram".to_string()),
+            model: Some(runtime.stt_model.clone()),
+            requested_seconds: Some(10 * 60),
+        })
+        .await
+        .with_context(|| format!("failed to create live STT session for {}", source.source))?;
+    let access_token = cloud
+        .current_tokens()
+        .context("Bluey account token unavailable after live STT session creation")?
+        .access;
+    let websocket_url = stt_relay_websocket_url(
+        stt_session
+            .websocket_url
+            .as_deref()
+            .context("Bluey STT session did not include a websocket URL")?,
+        &stt_session.session_token,
+    )?;
+    let mut request = websocket_url.into_client_request()?;
+    request.headers_mut().insert(
+        "Authorization",
+        HeaderValue::from_str(&format!("Bearer {access_token}"))?,
+    );
+
+    let (socket, _) = match tokio_tungstenite::connect_async(request).await {
+        Ok(socket) => socket,
+        Err(error) => {
+            match cloud
+                .cancel_stt_session(&cue_cloud_client::SttSessionCancelRequest {
+                    session_token: stt_session.session_token.clone(),
+                    model: Some(stt_session.model.clone()),
+                    reason: Some("websocket_open_failed".to_string()),
+                })
+                .await
+            {
+                Ok(response) => {
+                    info!(
+                        source = %source.source,
+                        stream_id = %source.stream_id,
+                        released = response.released,
+                        "released live STT reservation after websocket open failure"
+                    );
+                }
+                Err(cancel_error) => {
+                    warn!(
+                        source = %source.source,
+                        stream_id = %source.stream_id,
+                        "failed to release live STT reservation after websocket open failure: {cancel_error:#}"
+                    );
+                }
+            }
+            return Err(anyhow!(
+                "failed to open live STT websocket for {}: {error}",
+                source.source
+            ));
+        }
+    };
+    let (mut ws_tx, mut ws_rx) = socket.split();
+
     let mut sequence = 0_u64;
     let mut start_ms = 0_u64;
-    let mut saw_audio_bytes = false;
-    let mut buffer = vec![0_u8; 4096];
+    sequence = sequence.saturating_add(1);
+    let duration_ms = pcm16_16k_duration_ms(first_read);
+    let chunk = AudioChunkMetadata::new(
+        source.source,
+        source.stream_id.clone(),
+        sequence,
+        start_ms,
+        duration_ms,
+        cue_core::AudioStreamFormat::stt_mono(),
+        first_read as u64,
+    );
+    start_ms = start_ms.saturating_add(duration_ms as u64);
+    {
+        let mut audio = daemon.audio.lock().await;
+        if audio.session_id.as_deref() != Some(session_id.as_str()) {
+            let _ = ws_tx.send(WebSocketMessage::Close(None)).await;
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Ok(());
+        }
+        audio.record_chunk(&chunk);
+    }
+    debug!(
+        source = %source.source,
+        stream_id = %source.stream_id,
+        sequence,
+        bytes = first_read,
+        duration_ms,
+        "live STT relay first audio chunk forwarded"
+    );
+    ws_tx
+        .send(WebSocketMessage::Binary(buffer[..first_read].to_vec()))
+        .await
+        .with_context(|| {
+            format!(
+                "failed to send first live {} audio to Bluey STT relay",
+                source.source
+            )
+        })?;
+
     loop {
         tokio::select! {
             changed = stop_rx.changed() => {
@@ -3824,15 +4002,8 @@ async fn run_relay_audio_source(
             read = stdout.read(&mut buffer) => {
                 let read = read.with_context(|| format!("failed to read live {} audio", source.source))?;
                 if read == 0 {
-                    if !saw_audio_bytes {
-                        return Err(anyhow!(
-                            "native live audio helper for {} exited before producing audio bytes",
-                            source.source
-                        ));
-                    }
                     break;
                 }
-                saw_audio_bytes = true;
                 sequence = sequence.saturating_add(1);
                 let duration_ms = pcm16_16k_duration_ms(read);
                 let chunk = AudioChunkMetadata::new(
@@ -5038,10 +5209,16 @@ async fn transcribe_audio_file(
 }
 
 async fn stop_audio_capture(daemon: &Arc<Daemon>) -> AudioPipelineStatus {
-    if let Some(stop) = daemon.audio_runtime.lock().await.stop.take() {
+    let stop = {
+        let mut runtime = daemon.audio_runtime.lock().await;
+        runtime.start_generation = runtime.start_generation.wrapping_add(1);
+        runtime.starting = false;
+        runtime.session_id = None;
+        runtime.stop.take()
+    };
+    if let Some(stop) = stop {
         let _ = stop.send(());
     }
-    daemon.audio_runtime.lock().await.session_id = None;
 
     let mut audio = daemon.audio.lock().await;
     let status = audio.clone().stopped();

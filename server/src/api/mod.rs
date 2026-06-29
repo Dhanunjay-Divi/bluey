@@ -201,6 +201,10 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
             ),
         )
         .route("/stt/session", axum::routing::post(stt::create_session))
+        .route(
+            "/stt/session/cancel",
+            axum::routing::post(stt::cancel_session),
+        )
         .route("/stt/relay", axum::routing::get(stt::relay))
         .route("/sync/batch", axum::routing::post(sync::batch))
         .route(
