@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-29 23:54 EDT
+Latest checkpoint: 2026-06-30 00:15 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,46 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-243-COMPOSER-DOCS-INTERACTION-DEFAULTS.md`; the next canonical Bluey round doc should start at `ROUND-244-...`.
+- Latest assigned Bluey round doc is `ROUND-244-AUTO-RELOAD-READINESS-DIAGNOSTIC.md`; the next canonical Bluey round doc should start at `ROUND-245-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 244 audited why the current test account did not auto-reload even
+  though the CLI said `auto top-up: ON, $30 at <$5`:
+  - live `/account/me` for the smoke/test account returned balance `482`,
+    threshold `500`, amount `3000`, `auto_topup_enabled: true`, provider
+    `square`, environment `production`, and `auto_topup_available: false`
+  - the account export showed no saved Stripe customer/payment method and no
+    saved Square customer/card, so the account cannot auto-reload until a card
+    is saved
+  - the server already returned the correct readiness fields; the desktop
+    client type and CLI were ignoring them
+  - `cue-cloud-client::AccountMe` now deserializes billing readiness fields:
+    provider, availability, unavailable reason, saved payment label, Square
+    environment, billing restricted, and restriction reason
+  - `bluey usage` now prints:
+    `ON, setup needed: Save a card for Auto Reload before turning this on.`
+    instead of a misleading plain `ON`
+  - rebuilt and installed local CLI aliases:
+    - `~/.bluey/bin/bluey`
+    - `~/.bluey/bin/cue`
+  - files changed:
+    - `crates/cue-cloud-client/src/types.rs`
+    - `crates/cue-cli/src/bluey_cmds.rs`
+  - Round doc:
+    `docs/rounds/ROUND-244-AUTO-RELOAD-READINESS-DIAGNOSTIC.md`
+  - Verification passed:
+    - `cargo fmt -p cue-cloud-client -p cue-cli`
+    - `cargo test -p cue-cli auto_topup_label -- --nocapture`
+    - `cargo check -p cue-cloud-client -p cue-cli`
+    - `git diff --check`
+    - `cargo build --release -p cue-cli`
+    - install local CLI aliases and run `~/.bluey/bin/bluey usage`
+  - Remaining gate: save a test Square card, verify
+    `auto_topup_available: true`, then trigger a paid low-balance usage event
+    and confirm exactly-one Square payment/credit.
 - Round 243 fixed the composer/document/interaction defaults reported during
   live overlay testing:
   - macOS empty composer clicks now show an explicit focused blue blinking caret

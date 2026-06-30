@@ -45,6 +45,20 @@ pub struct AccountMe {
     pub auto_topup_enabled: bool,
     pub auto_topup_threshold_cents: i64,
     pub auto_topup_amount_cents: i64,
+    #[serde(default)]
+    pub billing_provider: Option<String>,
+    #[serde(default)]
+    pub auto_topup_available: Option<bool>,
+    #[serde(default)]
+    pub auto_topup_unavailable_reason: Option<String>,
+    #[serde(default)]
+    pub saved_payment_method_label: Option<String>,
+    #[serde(default)]
+    pub square_environment: Option<String>,
+    #[serde(default)]
+    pub billing_restricted: Option<bool>,
+    #[serde(default)]
+    pub billing_restriction_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
