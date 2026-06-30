@@ -2216,7 +2216,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         }
         if (id == ID_HELP_BUTTON) {
             overlay_message_box(
-                L"Green dot: Bluey is connected.\nHelp: show this guide.\nSession: continue or start clean.\nAttach: add files or show attached docs.\nTheme: switch black/white background while keeping Bluey borders.\nStyle: answer rules.\nAnalyse Screen: search/read the active browser page or available screen context and generate an answer.\nRecap: summarize the active session from the bottom bar.\nQuit: stop Bluey completely. Hide/collapse behavior becomes a small Bluey button.\nMic: start/stop audio capture.\nMic dot: dim off, bright green recording.\nAnswer: ask Bluey.\nBlank Bluey space clicks the app behind it. Drag the Bluey logo/wordmark to move it. Controls stay clickable.",
+                L"Green dot: Bluey is connected.\nHelp: show this guide.\nSession: continue or start clean.\nAttach: add files or show attached docs.\nTheme: switch black/white background while keeping Bluey borders.\nStyle: answer rules.\nAnalyse Screen: search/read the active browser page or available screen context and generate an answer.\nRecap: summarize the active session from the bottom bar.\nQuit: stop Bluey completely. Hide/collapse behavior becomes a small Bluey button.\nMic: start/stop audio capture.\nMic dot: dim off, bright green recording.\nAnswer: ask Bluey.\nHold any blank Bluey space to move it. Controls stay clickable.",
                 L"Bluey controls",
                 MB_OK | MB_ICONINFORMATION
             );
@@ -2357,7 +2357,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         LRESULT resize_hit = hit_test_expanded_resize(point);
         if (resize_hit != HTNOWHERE) return resize_hit;
         if (point_hits_brand_move_handle(point)) return HTCAPTION;
-        return HTTRANSPARENT;
+        return HTCAPTION;
     }
     case WM_SETCURSOR: {
         if ((HWND)wparam == hwnd) {

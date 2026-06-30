@@ -5323,10 +5323,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             if !resizeEdges(at: point).isEmpty {
                 return self
             }
-            if isHeaderMoveHandleHit(at: point) {
-                return self
-            }
-            return nil
+            return self
         }
         if let hit = super.hitTest(point), isExplicitInteractiveHit(hit) {
             return hit
@@ -5362,7 +5359,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             }
             if hasInteractiveView(at: localPoint) {
                 super.mouseDown(with: event)
+                return
             }
+            beginHeaderDrag(with: event)
             return
         }
         let edges = resizeEdges(at: localPoint)
@@ -5677,7 +5676,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return true
         }
         clearResizeCursorIfNeeded()
-        return false
+        return true
     }
 
     func manualButton(atWindowPoint point: NSPoint) -> NSButton? {
@@ -6737,7 +6736,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         balanceLabel.toolTip = "Remaining Bluey credits"
         fullSizeButton.toolTip = windowFullSize ? "Restore compact Bluey" : "Fill this screen"
         interactionModeButton.toolTip = passThroughMode
-            ? "Click-through on: blank Bluey space passes to the app behind it. Drag the Bluey logo to move."
+            ? "Move-anywhere on: controls click normally, and blank Bluey space drags the panel."
             : "Interactive on: blank Bluey space moves/resizes the panel, and the whole panel receives clicks."
         hideButton.toolTip = "Minimize Bluey to the small pill"
         closeButton.toolTip = "Turn Bluey off"
@@ -9354,13 +9353,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         styleHeaderIconButton(interactionModeButton, symbol: symbol, fallback: fallback)
         interactionModeButton.contentTintColor = passThroughMode ? themedAccentColor : themedTextColor
         interactionModeButton.toolTip = passThroughMode
-            ? "Click-through on: blank Bluey space clicks the app behind it. Drag the Bluey logo to move."
+            ? "Move-anywhere on: controls click normally, and blank Bluey space drags the panel."
             : "Interactive on: controls click normally, and blank Bluey space moves/resizes the panel."
         if showToast {
             showSystemToast(
-                title: passThroughMode ? "Click-through on" : "Interactive on",
+                title: passThroughMode ? "Move-anywhere on" : "Interactive on",
                 body: passThroughMode
-                    ? "Blank spaces pass through. Drag the Bluey logo or wordmark to move the panel."
+                    ? "Hold any blank Bluey space to move the panel. Controls remain clickable."
                     : "Blank Bluey space now moves/resizes Bluey. Controls and text remain clickable.",
                 duration: 2.0)
         }
@@ -9409,6 +9408,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func restoreWindowFromFullSize() {
         guard let window else { return }
+        let targetFrame = preWindowFullSizeFrame
         windowFullSize = false
         preWindowFullSizeFrame = nil
         restoreCompactWidth()
@@ -9422,8 +9422,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let screen = window.screen?.visibleFrame
             ?? NSScreen.main?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let compactFrame = ExpandedPanelMetrics.compactFrame(in: screen)
-        let fittedFrame = compactFrame
+        let fallbackFrame = targetFrame
+            ?? OverlayPlacementStore.loadExpandedFrame(in: screen)
+            ?? ExpandedPanelMetrics.compactFrame(in: screen)
+        let fittedFrame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(
+            fallbackFrame,
+            visibleFrame: screen)
         if let overlayWindow = window as? OverlayWindow {
             overlayWindow.preserveProgrammaticFrameHeight = false
             overlayWindow.lockedFrameHeight = fittedFrame.height

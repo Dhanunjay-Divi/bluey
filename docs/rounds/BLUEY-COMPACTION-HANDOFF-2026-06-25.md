@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-30 00:47 EDT
+Latest checkpoint: 2026-06-30 01:22 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,44 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-245-PROVIDER-429-COOLDOWN-HARDENING.md`; the next canonical Bluey round doc should start at `ROUND-246-...`.
+- Latest assigned Bluey round doc is `ROUND-246-OVERLAY-MOVE-ANYWHERE-FULLSCREEN-RESTORE.md`; the next canonical Bluey round doc should start at `ROUND-247-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 246 restored the owner's preferred move-anywhere overlay behavior and
+  fixed full-screen restore placement:
+  - macOS click-through/default mode now keeps real controls clickable while
+    blank Bluey surface acts as a drag handle again
+  - macOS tooltip/toast copy now says `Move-anywhere on` instead of promising
+    strict blank-space pass-through
+  - macOS `restoreWindowFromFullSize()` now restores the saved
+    `preWindowFullSizeFrame` instead of throwing it away and recalculating the
+    default compact frame
+  - Windows parity changed blank expanded hit testing from `HTTRANSPARENT` to
+    `HTCAPTION`, while controls remain `HTCLIENT` and resize edges remain resize
+    hits
+  - local installed macOS overlay helpers were refreshed for live testing:
+    `~/.bluey/bin/bluey-overlay-macos`,
+    `~/.bluey/bin/cue-overlay-macos`, and
+    `~/.bluey/bin/BlueyOverlay.app`
+  - files changed:
+    - `native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `native/windows/cue-overlay/main.c`
+    - `scripts/macos-overlay-visual-smoke.sh`
+  - Round doc:
+    `docs/rounds/ROUND-246-OVERLAY-MOVE-ANYWHERE-FULLSCREEN-RESTORE.md`
+  - Verification passed:
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `bash -n scripts/macos-overlay-visual-smoke.sh`
+    - `BLUEY_OVERLAY_SWIFT_CONFIGURATION=debug native/macos/cue-overlay/build.sh`
+  - Manual QA still needed after relaunch:
+    - drag from blank center/feed/chrome space while the mode button is active
+    - header/composer/control buttons still click
+    - move Bluey, enter full screen, restore, and confirm it returns to the
+      moved position
 - Round 245 hardened provider cooldown and `429` behavior:
   - server-side `Retry-After` parsing now accepts both seconds and HTTP-date
     values
