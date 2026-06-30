@@ -2732,6 +2732,50 @@ temp-home install smoke from https://bluey.sh/install.sh -> bluey 0.1.17
 
 Caveat: live `latest.json` currently advertises only `darwin-arm64` for `0.1.17`. `install.ps1` remains published, but a fresh Windows `0.1.17` zip still needs the Windows build host before Windows can update to this exact version.
 
+## Current Active Round: Round 254
+
+Round doc:
+
+- `docs/rounds/ROUND-254-DELETED-ACCOUNT-INFLIGHT-STREAM-GUARD.md`
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
+
+Fixed the deleted-account inflight streaming race:
+
+- Managed chat streams now re-check account liveness before dispatch, before every provider SSE event, and immediately before the billing event.
+- Non-streaming managed answers now re-check account liveness before dispatch and immediately before billing.
+- If the account is deleted mid-stream, Bluey emits `reason: account_deleted` with: `This Bluey account was deleted. The answer was stopped and was not billed.`
+- If the account is billing-restricted or cannot be verified, Bluey stops before continuing output/billing.
+- STT relay now checks account liveness before forwarding client audio and before forwarding provider transcript messages.
+- STT relay skips settlement when the account is deleted while the relay is open.
+
+Verification passed:
+
+```bash
+cargo fmt --manifest-path server/Cargo.toml
+cargo check --manifest-path server/Cargo.toml --bin bluey-server
+cargo test --manifest-path server/Cargo.toml stt -- --nocapture
+cargo test --manifest-path server/Cargo.toml account_delete_requires_typed_delete_and_credit_loss_consent -- --nocapture
+cargo test --manifest-path server/Cargo.toml auth_device -- --nocapture
+git diff --check
+```
+
+Deployed to `/usr/local/bin/bluey-server`, restarted `bluey-api.service`, and verified `https://bluey.sh/health`.
+
+Live stream/delete smoke:
+
+```text
+email=codex-stream-delete-1782837633@bluey.local
+request_id=codex-stream-delete-1782837633
+delete_status=200
+curl_code=0
+exists_after=0
+event: error
+data: {"error":"This Bluey account was deleted. The answer was stopped and was not billed.","reason":"account_deleted"}
+```
+
+Journal confirmed the request was accepted, the route was selected, the account was deleted, then the stream stopped because the account was no longer active. There was no `managed chat completed and billed` line for that request.
+
 ## Current Active Round: Round 253
 
 Round doc:

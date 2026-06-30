@@ -293,6 +293,74 @@ fn billing_restricted_error(account: &Account) -> Option<(StatusCode, Json<ApiEr
     ))
 }
 
+enum LiveAccountState {
+    Active,
+    BillingRestricted,
+    Missing,
+    CheckFailed(String),
+}
+
+fn live_account_state(pool: &crate::db::DbPool, account_id: &str) -> LiveAccountState {
+    match Account::fetch_by_id(pool, account_id) {
+        Ok(Some(account)) if account.billing_restricted => LiveAccountState::BillingRestricted,
+        Ok(Some(_)) => LiveAccountState::Active,
+        Ok(None) => LiveAccountState::Missing,
+        Err(e) => LiveAccountState::CheckFailed(e.to_string()),
+    }
+}
+
+fn live_account_error_payload(state: LiveAccountState) -> Option<serde_json::Value> {
+    match state {
+        LiveAccountState::Active => None,
+        LiveAccountState::BillingRestricted => Some(serde_json::json!({
+            "error": "Account usage is paused while billing is under review.",
+            "reason": "billing_restricted",
+        })),
+        LiveAccountState::Missing => Some(serde_json::json!({
+            "error": "This Bluey account was deleted. The answer was stopped and was not billed.",
+            "reason": "account_deleted",
+        })),
+        LiveAccountState::CheckFailed(_error) => Some(serde_json::json!({
+            "error": "Bluey could not verify this account before billing, so the answer was stopped.",
+            "reason": "account_check_failed",
+        })),
+    }
+}
+
+fn account_not_active_error(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+) -> Option<(StatusCode, Json<ApiError>)> {
+    match live_account_state(pool, account_id) {
+        LiveAccountState::Active => None,
+        LiveAccountState::BillingRestricted => Some((
+            StatusCode::FORBIDDEN,
+            Json(ApiError {
+                error: "Account usage is paused while billing is under review.".into(),
+                reason: Some("billing_restricted".into()),
+                ..Default::default()
+            }),
+        )),
+        LiveAccountState::Missing => Some((
+            StatusCode::GONE,
+            Json(ApiError {
+                error: "This Bluey account was deleted.".into(),
+                reason: Some("account_deleted".into()),
+                ..Default::default()
+            }),
+        )),
+        LiveAccountState::CheckFailed(_error) => Some((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiError {
+                error: "Bluey could not verify this account before billing.".into(),
+                reason: Some("account_check_failed".into()),
+                retry_after_secs: Some(5),
+                ..Default::default()
+            }),
+        )),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct CompleteRequest {
     /// Client-supplied idempotency key. REQUIRED. Codex S4.1: a retry
@@ -3056,6 +3124,17 @@ async fn complete_stream_inner(
         }
     }
 
+    if let Some(err) = account_not_active_error(&state.pool, &account.id) {
+        let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
+        tracing::warn!(
+            account_id_hash = %account_id_hash,
+            request_id = %req.request_id,
+            streaming = true,
+            "managed chat stopped before dispatch because account is no longer active"
+        );
+        return Err(err);
+    }
+
     if let Err(denied) = state.rate_limiters.check_account_llm(&account.id).await {
         return Err(release_and_capacity_error(
             &state.pool,
@@ -3498,6 +3577,17 @@ async fn complete_stream_inner(
                 None => events.next().await,
             };
             let Some(event) = event else { break };
+            if let Some(payload) = live_account_error_payload(live_account_state(&state.pool, &account.id)) {
+                idempotency_guard.mark_failed_now();
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    request_id = %req.request_id,
+                    streaming = true,
+                    "streaming answer stopped because account is no longer active"
+                );
+                yield Ok(Event::default().event("error").data(payload.to_string()));
+                return;
+            }
             match event {
                 Ok(routing::CompletionStreamEvent::Delta(delta)) => {
                     if blocked_internal_output {
@@ -3583,6 +3673,17 @@ async fn complete_stream_inner(
             ));
             return;
         };
+        if let Some(payload) = live_account_error_payload(live_account_state(&state.pool, &account.id)) {
+            idempotency_guard.mark_failed_now();
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                request_id = %req.request_id,
+                streaming = true,
+                "streaming answer stopped before billing because account is no longer active"
+            );
+            yield Ok(Event::default().event("error").data(payload.to_string()));
+            return;
+        }
         let elapsed_ms = started.elapsed().as_millis() as i64;
         let (llm_bluey_cost, llm_customer_cost) = pricing::compute_cost(
             &selected_route.pricing,
@@ -3964,6 +4065,17 @@ async fn complete_inner(
         }
     }
 
+    if let Some(err) = account_not_active_error(&state.pool, &account.id) {
+        let _ = idempotency::release(&state.pool, &account.id, &req.request_id);
+        tracing::warn!(
+            account_id_hash = %account_id_hash,
+            request_id = %req.request_id,
+            streaming = false,
+            "managed chat stopped before dispatch because account is no longer active"
+        );
+        return Err(err);
+    }
+
     if let Err(denied) = state.rate_limiters.check_account_llm(&account.id).await {
         return Err(release_and_capacity_error(
             &state.pool,
@@ -4313,6 +4425,17 @@ async fn complete_inner(
             ));
         }
     };
+
+    if let Some(err) = account_not_active_error(&state.pool, &account.id) {
+        let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
+        tracing::warn!(
+            account_id_hash = %account_id_hash,
+            request_id = %req.request_id,
+            streaming = false,
+            "managed chat stopped before billing because account is no longer active"
+        );
+        return Err(err);
+    }
 
     // 6. Compute actual cost from real token counts.
     let (llm_bluey_cost, llm_customer_cost) = pricing::compute_cost(

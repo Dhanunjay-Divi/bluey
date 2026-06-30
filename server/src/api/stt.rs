@@ -26,6 +26,7 @@ use tokio_tungstenite::tungstenite::{
 use super::AppState;
 use crate::auth::AuthedAccount;
 use crate::db::{
+    accounts::Account,
     stt_accounting::{
         self, ClaimSttSessionError, ClaimedSttSession, ReserveSessionInput, SttAccountingError,
     },
@@ -405,6 +406,7 @@ async fn run_deepgram_relay(
         }
         result = async {
             while let Some(message) = client_rx.next().await {
+                ensure_stt_account_active(&state, &session.account_id)?;
                 match message? {
                     ClientMessage::Binary(bytes) => {
                         if !bytes.is_empty() {
@@ -430,12 +432,18 @@ async fn run_deepgram_relay(
             anyhow::Ok(())
         } => {
             if let Err(err) = result {
-                close_reason = "client_to_provider_error".to_string();
-                tracing::warn!(error = %err, "STT relay client-to-provider pipe failed");
+                if is_account_closed_error(&err) {
+                    close_reason = "account_deleted".to_string();
+                    let _ = upstream_tx.send(UpstreamMessage::Close(None)).await;
+                } else {
+                    close_reason = "client_to_provider_error".to_string();
+                    tracing::warn!(error = %err, "STT relay client-to-provider pipe failed");
+                }
             }
         }
         result = async {
             while let Some(message) = upstream_rx.next().await {
+                ensure_stt_account_active(&state, &session.account_id)?;
                 match message? {
                     UpstreamMessage::Text(text) => client_tx.send(ClientMessage::Text(text)).await?,
                     UpstreamMessage::Binary(bytes) => client_tx.send(ClientMessage::Binary(bytes)).await?,
@@ -451,10 +459,28 @@ async fn run_deepgram_relay(
             anyhow::Ok(())
         } => {
             if let Err(err) = result {
-                close_reason = "provider_to_client_error".to_string();
-                tracing::warn!(error = %err, "STT relay provider-to-client pipe failed");
+                if is_account_closed_error(&err) {
+                    close_reason = "account_deleted".to_string();
+                    let _ = client_tx.send(ClientMessage::Close(None)).await;
+                } else {
+                    close_reason = "provider_to_client_error".to_string();
+                    tracing::warn!(error = %err, "STT relay provider-to-client pipe failed");
+                }
             }
         }
+    }
+
+    if close_reason == "account_deleted" {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&session.account_id),
+            source = %session.source,
+            provider = %session.provider,
+            model = %session.model,
+            forwarded_audio_bytes,
+            forwarded_audio_chunks,
+            "STT relay stopped because account was deleted; skipping billing settlement"
+        );
+        return Ok(());
     }
 
     let billable_elapsed = if forwarded_audio_bytes == 0 {
@@ -476,6 +502,26 @@ async fn run_deepgram_relay(
         forwarded_audio_chunks,
     )?;
     Ok(())
+}
+
+fn ensure_stt_account_active(state: &AppState, account_id: &str) -> anyhow::Result<()> {
+    match Account::fetch_by_id(&state.pool, account_id) {
+        Ok(Some(account)) if !account.billing_restricted => Ok(()),
+        Ok(Some(_)) => anyhow::bail!("account_closed"),
+        Ok(None) => anyhow::bail!("account_closed"),
+        Err(e) => {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                error = %e,
+                "failed to verify STT account liveness"
+            );
+            anyhow::bail!("account_closed")
+        }
+    }
+}
+
+fn is_account_closed_error(error: &anyhow::Error) -> bool {
+    error.to_string().contains("account_closed")
 }
 
 fn deepgram_realtime_url(session: &ClaimedSttSession) -> String {
