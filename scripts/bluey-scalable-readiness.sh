@@ -131,6 +131,16 @@ if [[ -z "${GEMINI_API_KEYS:-}" && -z "${GEMINI_API_KEY:-}" ]]; then
   warn "GEMINI_API_KEYS/GEMINI_API_KEY is missing from this environment"
   provider_ready=0
 fi
+if [[ -z "${ZAI_API_KEYS:-}" && -z "${ZAI_API_KEY:-}" ]]; then
+  warn "ZAI_API_KEYS/ZAI_API_KEY is missing; GLM routes will be skipped"
+else
+  ok "Z.AI GLM server-side provider env is present"
+fi
+if [[ -z "${DEEPSEEK_API_KEYS:-}" && -z "${DEEPSEEK_API_KEY:-}" ]]; then
+  warn "DEEPSEEK_API_KEYS/DEEPSEEK_API_KEY is missing; DeepSeek routes will be skipped"
+else
+  ok "DeepSeek server-side provider env is present"
+fi
 if [[ "${provider_ready}" == "1" ]]; then
   ok "OpenAI, Anthropic, Gemini, and Deepgram server-side provider env is present"
 fi

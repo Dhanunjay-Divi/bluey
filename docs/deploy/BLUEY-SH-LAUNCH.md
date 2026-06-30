@@ -55,6 +55,11 @@ Caddy routes the API paths to `bluey-server` and serves everything else from
    - `ANTHROPIC_API_KEYS`
    - `GEMINI_API_KEYS`
    - `DEEPGRAM_API_KEYS`
+   - optional `ZAI_API_KEYS` and `DEEPSEEK_API_KEYS` for GLM/DeepSeek routes
+   - `BLUEY_ANSWER_PLAN_ROUTING=1` for explicit deploy posture
+   - `BLUEY_ROUTE_POLICY=provider_mix` by default, or
+     `BLUEY_ROUTE_POLICY=cost_optimized` for an owner-controlled GLM/DeepSeek
+     canary
    - SMTP credentials for `hello@bluey.sh`
    - R2/S3 backup credentials before paid users
    - `BLUEY_REDIS_URL` before running more than one server instance

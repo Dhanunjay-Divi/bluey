@@ -115,6 +115,47 @@ key_count() {
   }'
 }
 
+normalize_route_policy() {
+  local raw="$1"
+  raw="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed 's/[- ]/_/g')"
+  case "$raw" in
+    cost|cost_first|cost_optimized|cheap|glm|deepseek)
+      printf 'cost_optimized'
+      ;;
+    quality|quality_first|static|legacy)
+      printf 'quality_first'
+      ;;
+    mix|mixed|provider_mix|balanced_mix|anti_429|capacity_mix|"")
+      printf 'provider_mix'
+      ;;
+    *)
+      printf 'unknown'
+      ;;
+  esac
+}
+
+truthy_env() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    1|true|yes|on)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+falsey_env() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    0|false|no|off)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 is_local_redis_url() {
   case "$1" in
     redis://127.0.0.1:*|redis://localhost:*|rediss://127.0.0.1:*|rediss://localhost:*|unix:*)
@@ -268,6 +309,47 @@ for provider in OPENAI_API_KEYS ANTHROPIC_API_KEYS GEMINI_API_KEYS DEEPGRAM_API_
     fail "$provider missing"
   fi
 done
+
+if [ -n "${BLUEY_ANSWER_PLAN_ROUTING:-}" ] && falsey_env "$BLUEY_ANSWER_PLAN_ROUTING"; then
+  warn "BLUEY_ANSWER_PLAN_ROUTING is disabled; managed Auto will not promote coding/research/behavioral lanes before provider routing"
+elif [ -n "${BLUEY_ANSWER_PLAN_ROUTING:-}" ] && ! truthy_env "$BLUEY_ANSWER_PLAN_ROUTING"; then
+  warn "BLUEY_ANSWER_PLAN_ROUTING has an unrecognized value; server treats only 0/false/no/off as disabled"
+else
+  ok "AnswerPlan routing enabled (default-on; set BLUEY_ANSWER_PLAN_ROUTING=0 only for rollback)"
+fi
+
+route_policy="$(normalize_route_policy "${BLUEY_ROUTE_POLICY:-${BLUEY_ROUTE_ORDER:-}}")"
+case "$route_policy" in
+  provider_mix)
+    ok "BLUEY_ROUTE_POLICY=${BLUEY_ROUTE_POLICY:-provider_mix} (default anti-429 provider mix)"
+    ;;
+  quality_first)
+    ok "BLUEY_ROUTE_POLICY=quality_first"
+    ;;
+  cost_optimized)
+    ok "BLUEY_ROUTE_POLICY=cost_optimized"
+    zai_ready=0
+    deepseek_ready=0
+    if { [ -n "${ZAI_API_KEYS:-}" ] && ! is_placeholder "${ZAI_API_KEYS:-}"; } || { [ -n "${ZAI_API_KEY:-}" ] && ! is_placeholder "${ZAI_API_KEY:-}"; }; then
+      zai_ready=1
+      ok "ZAI key pool set for cost-optimized GLM routes"
+    else
+      warn "cost_optimized selected but ZAI_API_KEYS/ZAI_API_KEY is missing; GLM routes will be skipped"
+    fi
+    if { [ -n "${DEEPSEEK_API_KEYS:-}" ] && ! is_placeholder "${DEEPSEEK_API_KEYS:-}"; } || { [ -n "${DEEPSEEK_API_KEY:-}" ] && ! is_placeholder "${DEEPSEEK_API_KEY:-}"; }; then
+      deepseek_ready=1
+      ok "DeepSeek key pool set for cost-optimized routes"
+    else
+      warn "cost_optimized selected but DEEPSEEK_API_KEYS/DEEPSEEK_API_KEY is missing; DeepSeek routes will be skipped"
+    fi
+    if [ "$zai_ready" = "0" ] && [ "$deepseek_ready" = "0" ]; then
+      fail "BLUEY_ROUTE_POLICY=cost_optimized requires at least one configured ZAI or DeepSeek key pool"
+    fi
+    ;;
+  *)
+    fail "BLUEY_ROUTE_POLICY/BLUEY_ROUTE_ORDER has an unknown value: ${BLUEY_ROUTE_POLICY:-${BLUEY_ROUTE_ORDER:-unset}}"
+    ;;
+esac
 
 optional_env BLUEY_SMTP_HOST "transactional email"
 optional_env BLUEY_SMTP_PASSWORD "transactional email secret"

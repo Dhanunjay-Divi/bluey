@@ -76,9 +76,10 @@ configured:
 
 ## AnswerPlan Pre-Routing
 
-`BLUEY_ANSWER_PLAN_ROUTING=1` enables a deterministic server-side AnswerPlan
-step before provider route selection. The planner is local rules first, not an
-extra AI classifier call, so it does not add latency or cost.
+AnswerPlan is default-on for managed server routing. Set
+`BLUEY_ANSWER_PLAN_ROUTING=0` only as a temporary rollback. The step runs before
+provider route selection and is local rules first, not an extra AI classifier
+call, so it does not add latency or cost.
 
 The planner classifies the request into intents such as `quick`, `coding`,
 `coding_followup`, `behavioral`, `system_design`, `screen`, `research`,
@@ -95,9 +96,10 @@ evidence needs and preferred output shape:
 | `research` | `balanced` | source answer | Public/current unknowns can enter managed web search |
 | `missing_context` | `balanced` | compact | Missing docs/screen are named once with a concrete next step |
 
-When the flag is off, managed requests keep the lane selected by the client.
-When it is on, AnswerPlan may promote `balanced` Auto traffic to `instant`,
-`deep`, or `vision` before the dispatcher applies `BLUEY_ROUTE_POLICY`.
+When AnswerPlan is enabled, it may promote `balanced` Auto traffic to `instant`,
+`deep`, or `vision` before the dispatcher applies `BLUEY_ROUTE_POLICY`. If it is
+rolled back with `BLUEY_ANSWER_PLAN_ROUTING=0`, managed requests keep the lane
+selected by the client.
 Provider selection remains separate: `provider_mix`, `quality_first`, or
 `cost_optimized` still decides which approved Claude/OpenAI/Gemini/GLM/DeepSeek
 candidate handles the chosen lane.
@@ -244,7 +246,7 @@ Default server knobs:
 | `BLUEY_LIMIT_PROVIDER_GEMINI_LLM_PER_MIN` | 600/min, burst 120 | Gemini text/vision capacity |
 | `BLUEY_LIMIT_PROVIDER_DEEPSEEK_LLM_PER_MIN` | 600/min, burst 120 | DeepSeek text capacity |
 | `BLUEY_LIMIT_PROVIDER_ZAI_LLM_PER_MIN` | 300/min, burst 60 | Z.AI GLM text capacity |
-| `BLUEY_ANSWER_PLAN_ROUTING` | unset/disabled | Set to `1` to let server AnswerPlan promote Auto requests to instant/deep/vision/research-aware behavior before provider routing |
+| `BLUEY_ANSWER_PLAN_ROUTING` | enabled | Set to `0` only for rollback; default server AnswerPlan promotes Auto requests to instant/deep/vision/research-aware behavior before provider routing |
 | `BLUEY_ROUTE_POLICY` | `provider_mix` | Default rotates first attempts across configured providers. Set `quality_first` for the older static order or `cost_optimized` to prefer GLM/DeepSeek first for managed text lanes |
 | `BLUEY_LIMIT_PROVIDER_OPENAI_EMBED_PER_MIN` | 900/min, burst 180 | OpenAI embedding capacity |
 | `BLUEY_LIMIT_PROVIDER_DEEPGRAM_STT_PER_MIN` | 600/min, burst 120 | Deepgram STT capacity |

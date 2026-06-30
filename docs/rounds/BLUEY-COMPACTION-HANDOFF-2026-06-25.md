@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-29 23:11 EDT
+Latest checkpoint: 2026-06-29 23:32 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,34 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-241-ANSWERPLAN-ROUTING-GATE.md`; the next canonical Bluey round doc should start at `ROUND-242-...`.
+- Latest assigned Bluey round doc is `ROUND-242-ANSWERPLAN-DEFAULT-AND-PREFLIGHT.md`; the next canonical Bluey round doc should start at `ROUND-243-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 242 made AnswerPlan routing default-on and improved deploy/preflight
+  visibility:
+  - `BLUEY_ANSWER_PLAN_ROUTING` now defaults to enabled in server code
+  - `BLUEY_ANSWER_PLAN_ROUTING=0`/`false`/`no`/`off` is the rollback switch
+  - `BLUEY_ROUTE_POLICY` still defaults to `provider_mix`, which is the safe
+    anti-429 default across configured flagship providers
+  - `BLUEY_ROUTE_POLICY=cost_optimized` remains available for owner-controlled
+    GLM/DeepSeek-first testing
+  - `ops/bluey-api.env.example` now makes the intended deploy posture explicit
+  - `scripts/bluey-cloud-preflight.sh` reports AnswerPlan state and route
+    policy, and fails if `cost_optimized` is selected without any Z.AI or
+    DeepSeek key pool
+  - `scripts/bluey-scalable-readiness.sh` reports optional Z.AI/DeepSeek route
+    capacity readiness
+  - deploy docs updated:
+    - `docs/MODEL-ROUTING.md`
+    - `docs/deploy/PHASE3-SERVER-DEPLOY.md`
+    - `docs/deploy/BLUEY-SH-LAUNCH.md`
+  - Round doc:
+    `docs/rounds/ROUND-242-ANSWERPLAN-DEFAULT-AND-PREFLIGHT.md`
+  - Remaining gates: deploy server binary, run cloud preflight on the droplet,
+    then live-smoke Round 241 prompts.
 - Round 241 implemented `BLUEY_ANSWER_PLAN_ROUTING=1` as a server-side
   AnswerPlan lane-promotion gate before managed provider routing:
   - the planner is deterministic local rules first, not an AI classifier call

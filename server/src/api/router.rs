@@ -1045,7 +1045,7 @@ fn answer_plan_for_request(
 }
 
 fn answer_plan_routing_enabled() -> bool {
-    env_flag_is_true("BLUEY_ANSWER_PLAN_ROUTING")
+    !env_flag_is_false("BLUEY_ANSWER_PLAN_ROUTING")
 }
 
 fn lane_for_answer_plan(requested_lane: &str, plan: &AnswerPlan, enabled: bool) -> String {
@@ -5426,6 +5426,19 @@ mod tests {
 
         assert_eq!(lane_for_answer_plan("balanced", &plan, false), "balanced");
         assert_eq!(lane_for_answer_plan("balanced", &plan, true), "deep");
+    }
+
+    #[test]
+    fn answer_plan_routing_is_default_on_with_env_rollback() {
+        std::env::remove_var("BLUEY_ANSWER_PLAN_ROUTING");
+        assert!(answer_plan_routing_enabled());
+        std::env::set_var("BLUEY_ANSWER_PLAN_ROUTING", "0");
+        assert!(!answer_plan_routing_enabled());
+        std::env::set_var("BLUEY_ANSWER_PLAN_ROUTING", "false");
+        assert!(!answer_plan_routing_enabled());
+        std::env::set_var("BLUEY_ANSWER_PLAN_ROUTING", "1");
+        assert!(answer_plan_routing_enabled());
+        std::env::remove_var("BLUEY_ANSWER_PLAN_ROUTING");
     }
 
     #[test]
