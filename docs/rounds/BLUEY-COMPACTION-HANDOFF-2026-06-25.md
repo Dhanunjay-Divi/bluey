@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-30 15:55 EDT
+Latest checkpoint: 2026-06-30 16:48 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,53 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-260-UPDATE-RESTART-LISTEN-LATENCY.md`; the next canonical Bluey round doc should start at `ROUND-261-...`.
+- Latest assigned Bluey round doc is `ROUND-261-STRICT-CLICKTHROUGH-ATTACHMENT-STRIP.md`; the next canonical Bluey round doc should start at `ROUND-262-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 261 restores strict click-through semantics and hides attached-file strips
+  unless the user asks to inspect them:
+  - macOS click-through mode now only receives mouse events for explicit
+    controls, manual overlay controls, open history drawer, open canvas pane,
+    resize edges, and the Bluey logo/name drag handle
+  - blank expanded-panel space now returns no hit-test target in click-through
+    mode, so clicks pass to the app behind Bluey
+  - blank-space drag from pass-through mode was removed; movement in strict
+    click-through mode is via the Bluey logo/name drag handle
+  - window-level interactivity now returns false for blank click-through areas
+  - Windows expanded blank space now returns `HTTRANSPARENT`; controls, resize
+    edges, and the brand drag handle remain interactive
+  - tooltips/toasts now say `Click-through on` instead of `Move-anywhere on`
+  - uploaded/dropped files still prepare context immediately for the next answer
+  - macOS attachment chips are collapsed by default behind `Show N files`
+  - sending an answer collapses the attachment strip again
+  - Windows context chips are hidden by default behind an explicit show state
+    and collapse after sends/new attach flows
+  - release version bumped to `0.1.21`
+  - local checks passed:
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only -municode native/windows/cue-overlay/main.c`
+    - `BLUEY_OVERLAY_SWIFT_CONFIGURATION=debug native/macos/cue-overlay/build.sh`
+    - `cargo check -p cue-cli -p cue-daemon --quiet`
+    - `git diff --check`
+  - local patched overlay installed into `~/.bluey/bin` for immediate testing
+  - live `0.1.21` package installed locally from `https://bluey.sh/install.sh`
+    and restarted with `BLUEY_SKIP_UPDATE=1`
+  - local smoke returned `bluey 0.1.21` and daemon pid `26781`
+  - verification/deploy passed:
+    - release artifact dev-flag/secret scan passed
+    - `latest.json` version `0.1.21`
+    - `latest.json.sig` 88 bytes and OpenSSL verified
+    - live darwin-arm64 SHA256
+      `6c1ff0a731c63e10ca66d7d06aa0b936c7da6044960c2d13ca4a4f9cc20db0f4`
+      matched `SHA256SUMS.txt`
+    - temp-home installer smoke from `https://bluey.sh/install.sh` installed
+      `bluey 0.1.21`
+    - local install smoke moved this machine to `bluey 0.1.21`
+  - Round doc:
+    `docs/rounds/ROUND-261-STRICT-CLICKTHROUGH-ATTACHMENT-STRIP.md`
 - Round 260 hardens auto-update restart and repeated Listen start latency:
   - root cause for `Bluey daemon did not become ready`: update restart could
     race daemon shutdown/port release, waited only `5s`, and did not report

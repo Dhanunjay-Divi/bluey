@@ -5398,10 +5398,19 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             if hasManualInteractiveControl(at: point) {
                 return self
             }
+            if !sessionDrawer.isHidden, rectForView(sessionDrawer).contains(point) {
+                return super.hitTest(point) ?? sessionDrawer
+            }
+            if canvasOpen, rectForView(canvasPane).contains(point) {
+                return super.hitTest(point) ?? canvasPane
+            }
             if !resizeEdges(at: point).isEmpty {
                 return self
             }
-            return self
+            if isHeaderMoveHandleHit(at: point) {
+                return self
+            }
+            return nil
         }
         if let hit = super.hitTest(point), isExplicitInteractiveHit(hit) {
             return hit
@@ -5439,7 +5448,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 super.mouseDown(with: event)
                 return
             }
-            beginHeaderDrag(with: event)
             return
         }
         let edges = resizeEdges(at: localPoint)
@@ -5754,7 +5762,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return true
         }
         clearResizeCursorIfNeeded()
-        return true
+        return false
     }
 
     func manualButton(atWindowPoint point: NSPoint) -> NSButton? {
@@ -6800,8 +6808,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func configureTooltips() {
-        headerBar.toolTip = "Drag this bar to move Bluey"
-        headerChrome.toolTip = "Drag this bar to move Bluey"
+        headerBar.toolTip = passThroughMode ? "Drag the Bluey logo or name to move Bluey" : "Drag this bar to move Bluey"
+        headerChrome.toolTip = passThroughMode ? "Blank header space clicks through" : "Drag this bar to move Bluey"
         headerLogo.toolTip = "Bluey"
         headerWordmark.toolTip = "Bluey"
         navButton.toolTip = "Open or close conversation history"
@@ -6814,7 +6822,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         balanceLabel.toolTip = "Remaining Bluey credits"
         fullSizeButton.toolTip = windowFullSize ? "Restore compact Bluey" : "Fill this screen"
         interactionModeButton.toolTip = passThroughMode
-            ? "Move-anywhere on: controls click normally, and blank Bluey space drags the panel."
+            ? "Click-through on: controls click normally, logo/name drags Bluey, and blank space clicks the app behind it."
             : "Interactive on: blank Bluey space moves/resizes the panel, and the whole panel receives clicks."
         hideButton.toolTip = "Minimize Bluey to the small pill"
         closeButton.toolTip = "Turn Bluey off"
@@ -8244,9 +8252,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             if mutationExpected {
                 pendingContextItemIds.formUnion(newlyAddedIds)
             }
-            showingSavedContextItems = true
-        } else if pendingContextItemIds.isEmpty {
-            showingSavedContextItems = true
+            // New files are prepared for the next answer immediately, but the
+            // visible chip strip stays collapsed unless the user opened it.
         }
         guard !items.isEmpty else {
             pendingContextItemIds.removeAll()
@@ -8303,10 +8310,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func itemsForVisibleAttachmentStrip() -> [OverlayContextItem] {
-        if showingSavedContextItems {
-            return contextItems
-        }
-        return contextItems.filter { pendingContextItemIds.contains($0.id) }
+        showingSavedContextItems ? contextItems : []
     }
 
     private func isScreenContextItem(_ item: OverlayContextItem) -> Bool {
@@ -8358,7 +8362,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         showingSavedContextItems = false
         contextMutationExpectedUntil = nil
         if !contextItems.isEmpty {
-            showingSavedContextItems = true
             setKnowledgeBadge(
                 savedContextBadgeTitle(for: contextItems.count, showing: showingSavedContextItems),
                 accent: BlueyTheme.green)
@@ -9467,14 +9470,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let fallback = passThroughMode ? "P" : "I"
         styleHeaderIconButton(interactionModeButton, symbol: symbol, fallback: fallback)
         interactionModeButton.contentTintColor = passThroughMode ? themedAccentColor : themedTextColor
+        headerBar.toolTip = passThroughMode ? "Drag the Bluey logo or name to move Bluey" : "Drag this bar to move Bluey"
+        headerChrome.toolTip = passThroughMode ? "Blank header space clicks through" : "Drag this bar to move Bluey"
         interactionModeButton.toolTip = passThroughMode
-            ? "Move-anywhere on: controls click normally, and blank Bluey space drags the panel."
+            ? "Click-through on: controls click normally, logo/name drags Bluey, and blank space clicks the app behind it."
             : "Interactive on: controls click normally, and blank Bluey space moves/resizes the panel."
         if showToast {
             showSystemToast(
-                title: passThroughMode ? "Move-anywhere on" : "Interactive on",
+                title: passThroughMode ? "Click-through on" : "Interactive on",
                 body: passThroughMode
-                    ? "Hold any blank Bluey space to move the panel. Controls remain clickable."
+                    ? "Blank Bluey space now clicks the app behind it. Drag the Bluey logo or name to move the panel."
                     : "Blank Bluey space now moves/resizes Bluey. Controls and text remain clickable.",
                 duration: 2.0)
         }
