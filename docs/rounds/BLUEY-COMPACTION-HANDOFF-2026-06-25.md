@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-29 19:57 EDT
+Latest checkpoint: 2026-06-29 20:14 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,25 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-239-PROVIDER-MIX-ANTI-429-ROUTING.md`; the next canonical Bluey round doc should start at `ROUND-240-...`.
+- Latest assigned Bluey round doc is `ROUND-240-RELEASE-SECRET-ARTIFACT-GUARD.md`; the next canonical Bluey round doc should start at `ROUND-241-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 240 added a release artifact secret guard after the owner asked whether
+  deployed API keys can stay server-side and out of downloadable binaries:
+  - confirmed intended architecture: provider keys live in `bluey-server`
+    runtime env/secrets, not Mac/Windows/Linux release artifacts
+  - `scripts/publish-bluey-release.sh` now scans release artifacts for actual
+    configured provider secret values from the publish environment
+  - the scan covers AI/STT/web-search/object-storage/billing secret env vars,
+    including OpenAI, Anthropic, Gemini/Google, DeepSeek, Z.AI/Zhipu, Deepgram,
+    Tavily/Brave, R2/S3, Square, and Stripe
+  - scan failures name only the env var label, not the secret value
+  - verified with a clean fake artifact and a fake `DEEPSEEK_API_KEY` leak
+  - Round doc:
+    `docs/rounds/ROUND-240-RELEASE-SECRET-ARTIFACT-GUARD.md`
 - Round 239 made managed answer routing default to `provider_mix` so Bluey uses
   all configured flagship providers as needed without concentrating the first
   burst on one upstream:
