@@ -168,6 +168,7 @@ pub enum OverlayEvent {
     RecordingStartRequested,
     RecordingStopRequested,
     TranscriptClearRequested,
+    SignInRequested,
     CloseRequested,
     CardRendered {
         id: uuid::Uuid,
@@ -314,5 +315,13 @@ mod tests {
             json,
             r#"{"type":"paste_text_requested","text":"hello","target_bundle_id":"com.apple.TextEdit"}"#
         );
+    }
+
+    #[test]
+    fn sign_in_event_serializes() {
+        let json =
+            serde_json::to_string(&OverlayEvent::SignInRequested).expect("serialize sign-in event");
+
+        assert_eq!(json, r#"{"type":"sign_in_requested"}"#);
     }
 }

@@ -1068,6 +1068,7 @@ struct Daemon {
     audio: Mutex<AudioPipelineStatus>,
     audio_runtime: Mutex<AudioRuntime>,
     cloud: Mutex<CloudSyncStatus>,
+    cloud_login: Mutex<Option<tokio::task::JoinHandle<()>>>,
     auto_cloud_sync_debounce: Mutex<Option<tokio::task::JoinHandle<()>>>,
     balance_poll_shutdown: Mutex<Option<watch::Sender<bool>>>,
     balance_watch: crate::cloud::balance::BalanceWatch,
@@ -1140,6 +1141,7 @@ const MAX_PROVIDER_IMAGE_DATA_URL_TOTAL_BYTES: usize = 12 * 1024 * 1024;
 const RETAINED_SCREEN_THUMBNAIL_MAX_EDGE: u32 = 1_800;
 const SAME_SPEAKER_TRANSCRIPT_DUP_MS: u64 = 8_000;
 const CROSS_SOURCE_TRANSCRIPT_ECHO_DUP_MS: u64 = 6_000;
+const BACKGROUND_DEVICE_LOGIN_TIMEOUT_SECS: u64 = 600;
 
 impl OverlayProcess {
     fn send(&mut self, command: &OverlayCommand) -> Result<()> {
@@ -1201,6 +1203,7 @@ pub async fn run() -> Result<()> {
             starting: false,
         }),
         cloud: Mutex::new(cloud_status),
+        cloud_login: Mutex::new(None),
         auto_cloud_sync_debounce: Mutex::new(None),
         balance_poll_shutdown: Mutex::new(None),
         balance_watch,
@@ -1794,6 +1797,12 @@ async fn handle_request_inner(
         DaemonRequest::AiStatus => Ok(DaemonResponse::AiStatus {
             status: ai_status_from_env(Some(&daemon.paths)),
         }),
+        DaemonRequest::CloudLogin => {
+            let text =
+                start_background_cloud_login(daemon, "daemon ipc", Some(trace_id.to_string()))
+                    .await?;
+            Ok(DaemonResponse::Text { text })
+        }
         DaemonRequest::CloudStatus => {
             let status = cloud_status_from_env(&daemon.paths);
             *daemon.cloud.lock().await = status.clone();
@@ -2230,6 +2239,7 @@ fn overlay_event_label(event: &OverlayEvent) -> &'static str {
         OverlayEvent::RecordingStartRequested => "recording_start_requested",
         OverlayEvent::RecordingStopRequested => "recording_stop_requested",
         OverlayEvent::TranscriptClearRequested => "transcript_clear_requested",
+        OverlayEvent::SignInRequested => "sign_in_requested",
         OverlayEvent::CloseRequested => "close_requested",
         OverlayEvent::CardRendered { .. } => "card_rendered",
         OverlayEvent::Error { .. } => "error",
@@ -2494,6 +2504,9 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         OverlayEvent::TranscriptClearRequested => {
             info!("overlay transcript clear requested");
             clear_active_transcript_context(daemon).await?;
+        }
+        OverlayEvent::SignInRequested => {
+            let _ = start_background_cloud_login(daemon, "overlay sign-in", None).await?;
         }
         OverlayEvent::CloseRequested => {
             shutdown_daemon(daemon).await;
@@ -4886,6 +4899,218 @@ fn build_cloud_client(
     Err(anyhow::anyhow!(
         "Bluey cloud account is not linked; run `bluey login`"
     ))
+}
+
+async fn start_background_cloud_login(
+    daemon: &Arc<Daemon>,
+    source: &'static str,
+    trace_id: Option<String>,
+) -> Result<String> {
+    if cloud_account_linked(&daemon.paths) {
+        refresh_signed_in_overlay_state(daemon, trace_id.as_deref()).await;
+        return Ok("Bluey is already signed in.".to_string());
+    }
+
+    let mut login_guard = daemon.cloud_login.lock().await;
+    if login_guard
+        .as_ref()
+        .is_some_and(|handle| !handle.is_finished())
+    {
+        return Ok("Bluey sign-in is already open in your browser.".to_string());
+    }
+    if login_guard
+        .as_ref()
+        .is_some_and(|handle| handle.is_finished())
+    {
+        login_guard.take();
+    }
+
+    let daemon_for_login = Arc::clone(daemon);
+    let trace_id = trace_id
+        .as_deref()
+        .and_then(sanitize_observability_id)
+        .unwrap_or_else(new_trace_id);
+    let handle = tokio::spawn(async move {
+        if let Err(error) =
+            run_background_cloud_login(daemon_for_login.clone(), source, trace_id).await
+        {
+            warn!(source, "background Bluey login failed: {error:#}");
+            push_system_card(
+                &daemon_for_login,
+                CardKind::Warning,
+                "Sign in did not finish",
+                "Bluey could not finish desktop sign-in. Click Sign in again, or run `bluey login`.",
+            )
+            .await;
+        }
+    });
+    *login_guard = Some(handle);
+    Ok("Opening Bluey sign-in in your browser.".to_string())
+}
+
+async fn run_background_cloud_login(
+    daemon: Arc<Daemon>,
+    source: &'static str,
+    trace_id: String,
+) -> Result<()> {
+    let api_url = resolve_background_login_api_url(&daemon.paths);
+    let config = cue_cloud_client::client::ClientConfig {
+        base_url: api_url.clone(),
+        trace_id: Some(trace_id.clone()),
+        ..Default::default()
+    };
+    let client = cue_cloud_client::CloudClient::new(
+        config,
+        Arc::new(cue_cloud_client::tokens::MemoryStore::new()),
+    )
+    .context("failed to initialize Bluey browser login client")?;
+    let flow = cue_cloud_client::DeviceFlow::start(&client)
+        .await
+        .context("failed to start Bluey browser login")?;
+    let login_url = device_login_url(&flow.verification_uri, &flow.user_code);
+    info!(
+        source,
+        user_code_chars = flow.user_code.chars().count(),
+        "Bluey desktop login started"
+    );
+    push_system_card(
+        &daemon,
+        CardKind::System,
+        "Finish sign in",
+        format!(
+            "Your browser is opening. Code: {}. After signing in, click Connect desktop; Bluey will finish automatically.",
+            flow.user_code
+        ),
+    )
+    .await;
+    if let Err(error) = open_browser_from_daemon(&login_url) {
+        push_system_card(
+            &daemon,
+            CardKind::Warning,
+            "Open login manually",
+            format!("Open this URL in your browser:\n{login_url}\n\n{error:#}"),
+        )
+        .await;
+    }
+
+    let auth = timeout(
+        Duration::from_secs(BACKGROUND_DEVICE_LOGIN_TIMEOUT_SECS),
+        async {
+            let interval = Duration::from_secs(flow.interval_secs.max(1));
+            loop {
+                match flow.poll(&client).await? {
+                    cue_cloud_client::DeviceFlowState::LoggedIn(auth) => return Ok(auth),
+                    cue_cloud_client::DeviceFlowState::Pending => sleep(interval).await,
+                    cue_cloud_client::DeviceFlowState::Expired => {
+                        return Err(cue_cloud_client::Error::Other(
+                            "device_code expired".to_string(),
+                        ));
+                    }
+                }
+            }
+        },
+    )
+    .await
+    .context("Bluey desktop login timed out")??;
+
+    let existing = load_account(&daemon.paths).ok().flatten();
+    let mut account = existing.unwrap_or_else(cue_core::AccountConfig::local);
+    account.provider = "bluey".to_string();
+    account.api_url = api_url;
+    account.user_id = auth.account.email;
+    if account.workspace_id.trim().is_empty() || account.workspace_id == "local-workspace" {
+        account.workspace_id = "default".to_string();
+    }
+    if account.device_id.trim().is_empty() {
+        account.device_id = "local-device".to_string();
+    }
+    account.linked_at = clock::now_epoch_ms_string();
+    account.access_token = Some(auth.access_token);
+    account.refresh_token = Some(auth.refresh_token);
+    cue_cloud_client::save_account_profile_and_tokens(&daemon.paths, &account)
+        .context("failed to save Bluey account tokens")?;
+
+    let mut settings = load_settings(&daemon.paths)?;
+    if !settings.cloud_sync_enabled {
+        settings.cloud_sync_enabled = true;
+        settings.touch();
+        cue_core::save_settings(&daemon.paths, &settings)?;
+    }
+
+    refresh_signed_in_overlay_state(&daemon, Some(&trace_id)).await;
+    info!(
+        source,
+        balance_cents_after_login = auth.account.balance_cents,
+        "Bluey desktop login completed"
+    );
+    Ok(())
+}
+
+async fn refresh_signed_in_overlay_state(daemon: &Arc<Daemon>, trace_id: Option<&str>) {
+    let ready_lines = vec![
+        "account linked".to_string(),
+        "cloud answers, balance, sync, and saved sessions are ready".to_string(),
+        "ask from the composer or start listening".to_string(),
+    ];
+    let _ = send_overlay(
+        daemon,
+        OverlayCommand::Boot {
+            title: "Bluey online".to_string(),
+            lines: ready_lines,
+        },
+    )
+    .await;
+    let status = cloud_status_from_env(&daemon.paths);
+    *daemon.cloud.lock().await = status.clone();
+    if status.sync_state == CloudSyncState::Disabled {
+        stop_balance_polling(daemon).await;
+    } else {
+        maybe_spawn_balance_polling(daemon).await;
+        daemon.rag_indexer.refresh_from_paths(&daemon.paths);
+        spawn_auto_cloud_sync(daemon, "cloud_login", trace_id.map(str::to_string));
+    }
+    let _ = refresh_overlay_balance(daemon, trace_id).await;
+}
+
+fn resolve_background_login_api_url(paths: &AppPaths) -> String {
+    env::var("BLUEY_CLOUD_API_URL")
+        .or_else(|_| env::var("CUE_CLOUD_API_URL"))
+        .ok()
+        .or_else(|| {
+            load_account(paths).ok().flatten().and_then(|account| {
+                let api_url = account.api_url.trim().to_string();
+                (account.provider == "bluey" && !api_url.is_empty()).then_some(api_url)
+            })
+        })
+        .unwrap_or_else(|| "https://bluey.sh".to_string())
+}
+
+fn device_login_url(verification_uri: &str, user_code: &str) -> String {
+    let base = verification_uri.trim_end_matches('/');
+    let separator = if base.contains('?') { '&' } else { '?' };
+    format!("{base}{separator}user_code={user_code}")
+}
+
+fn open_browser_from_daemon(url: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("cmd");
+        command.arg("/C").arg("start").arg("");
+        command
+    };
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let mut command = Command::new("xdg-open");
+
+    let status = command
+        .arg(url)
+        .status()
+        .context("failed to open browser")?;
+    if !status.success() {
+        return Err(anyhow!("browser opener exited with status {status}"));
+    }
+    Ok(())
 }
 
 fn cloud_client_with_optional_trace(
@@ -14259,6 +14484,19 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn overlay_sign_in_event_is_accepted_by_production_validator() {
+        let state = parking_lot::Mutex::new(cue_core::overlay_ipc::OverlayUiState::Idle);
+        let event = validate_and_decode_overlay_line(
+            r#"{"type":"sign_in_requested","token":"tok"}"#,
+            "tok",
+            &state,
+        )
+        .expect("sign-in event should decode");
+
+        assert!(matches!(event, OverlayEvent::SignInRequested));
     }
 
     #[test]

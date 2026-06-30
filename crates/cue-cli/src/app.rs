@@ -845,13 +845,31 @@ async fn cue_on(args: OnArgs) -> Result<()> {
         lines: bluey_on_boot_lines(&auth_state),
     })
     .await;
+    let should_start_login = matches!(auth_state, BlueyOnAuthState::SignInAvailable { .. });
 
     match boot {
         Ok(DaemonResponse::Ok) => {
+            if should_start_login {
+                match request(DaemonRequest::CloudLogin).await {
+                    Ok(DaemonResponse::Text { text }) => println!("{text}"),
+                    Ok(DaemonResponse::Ok) => println!("Opening Bluey sign-in in your browser."),
+                    Ok(DaemonResponse::Error { message }) => {
+                        println!("Open sign-in manually with `bluey login`: {message}");
+                    }
+                    Ok(other) => {
+                        let _ = print_response(other);
+                    }
+                    Err(error) => {
+                        println!("Open sign-in manually with `bluey login`: {error:#}");
+                    }
+                }
+            }
             match auth_state {
                 BlueyOnAuthState::Ready => println!("Bluey is on."),
                 BlueyOnAuthState::SignInAvailable { url } => {
-                    println!("Bluey is on. Click the pill to sign in when cloud help is needed, or run `bluey login`.");
+                    println!(
+                        "Bluey is on. Finish sign-in in the browser, or click the pill to retry."
+                    );
                     println!("Login: {url}");
                 }
             }
@@ -1122,8 +1140,8 @@ fn bluey_on_boot_lines(auth_state: &BlueyOnAuthState) -> Vec<String> {
         ],
         BlueyOnAuthState::SignInAvailable { url } => vec![
             "local recording is ready".to_string(),
-            "sign in from the Bluey window only when you want cloud answers, balance, sync, or knowledge base".to_string(),
-            "the pill stays visible; browser sign-in is not forced".to_string(),
+            "browser sign-in opens automatically when this desktop is not linked".to_string(),
+            "click Sign in from the Bluey window if you need to retry cloud answers, balance, sync, or knowledge base".to_string(),
             format!("login_url: {url}"),
         ],
     }
@@ -3150,7 +3168,9 @@ mod tests {
         });
         assert!(lines.iter().any(|line| line.contains("local recording")));
         assert!(lines.iter().any(|line| line.contains("knowledge base")));
-        assert!(lines.iter().any(|line| line.contains("not forced")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("opens automatically")));
     }
 
     #[test]

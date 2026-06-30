@@ -3172,10 +3172,9 @@ private final class FeedView: NSView {
             : nil
         let actionButtons = [copyButton, canvasButton].compactMap { $0 }
 
-        let signInButton: NSButton? = signInURL.map { url in
-            let button = NSButton(title: "Open login", target: self, action: #selector(openURLButtonClicked(_:)))
+        let signInButton: NSButton? = signInURL.map { _ in
+            let button = NSButton(title: "Sign in", target: self, action: #selector(signInButtonClicked(_:)))
             button.translatesAutoresizingMaskIntoConstraints = false
-            button.identifier = NSUserInterfaceItemIdentifier(url.absoluteString)
             styleSignInButton(button)
             return button
         }
@@ -3598,6 +3597,10 @@ private final class FeedView: NSView {
             let url = URL(string: raw)
         else { return }
         onOpenURL?(url)
+    }
+
+    @objc private func signInButtonClicked(_ sender: NSButton) {
+        emitSimple("sign_in_requested")
     }
 
     private func kindLabel(_ card: RenderedCard) -> String {

@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-30 13:49 EDT
+Latest checkpoint: 2026-06-30 14:53 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,43 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-257-ACTIVE-TEST-ACCOUNT-BALANCE-RESET.md`; the next canonical Bluey round doc should start at `ROUND-258-...`.
+- Latest assigned Bluey round doc is `ROUND-258-DESKTOP-LOGIN-AUTO-LINK-DEPLOY.md`; the next canonical Bluey round doc should start at `ROUND-259-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 258 fixed the native desktop login gap where clicking the Bluey sign-in
+  pill authenticated the browser but did not link the running desktop:
+  - root cause: macOS overlay opened plain `https://bluey.sh/login`; no
+    device-code flow was started, the daemon did not poll, and no local tokens
+    were saved
+  - added shared `DaemonRequest::CloudLogin` and `OverlayEvent::SignInRequested`
+  - `bluey on` now automatically starts a browser device-code login when no
+    local token is linked
+  - macOS Sign in button emits `sign_in_requested` instead of opening a plain
+    URL
+  - daemon starts `/auth/device/start`, opens `verification_uri?user_code=...`,
+    polls `/auth/device/poll`, saves tokens, refreshes cloud/balance state, and
+    switches the overlay to `Bluey online`
+  - duplicate guard avoids multiple simultaneous login flows
+  - Windows parity: shared CLI/daemon behavior works on Windows package builds;
+    `open_browser_from_daemon` includes a Windows `cmd /C start` branch; the
+    current Windows overlay has no sign-in button to patch
+  - bumped the desktop package to `0.1.18` so existing `0.1.17` installs can
+    auto-update instead of seeing the same version
+  - built macOS arm64 with embedded update pubkey and published signed
+    `latest.json.sig`
+  - live checks passed:
+    - `latest.json` version `0.1.18`
+    - `latest.json.sig` 88 bytes and OpenSSL verified
+    - live darwin-arm64 SHA256
+      `2272286b801c327e8c8f6913ce69ee76351367d6ea27aeef1341c6a03cf9eaab`
+      matched `SHA256SUMS.txt`
+    - temp-home installer smoke from `https://bluey.sh/install.sh` installed
+      `bluey 0.1.18`
+  - Round doc:
+    `docs/rounds/ROUND-258-DESKTOP-LOGIN-AUTO-LINK-DEPLOY.md`
 - Round 257 explained and fixed the still-low `$4.79` balance:
   - active local desktop account was `codex-smoke-20260608183100@bluey.sh`,
     not the earlier restored `internal-admin-20260606023943@bluey.sh`
