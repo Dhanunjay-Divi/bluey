@@ -8,6 +8,7 @@ use axum::{
 };
 use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::hash::{Hash, Hasher};
@@ -875,6 +876,81 @@ impl AnswerPlan {
     }
 }
 
+#[derive(Debug, Clone)]
+struct AnswerRequestDiagnostics {
+    user_chars: usize,
+    question_chars: usize,
+    question_hash: String,
+    transcript_chars: usize,
+    transcript_hash: String,
+    transcript_source_labels: usize,
+    generic_live_transcript_prompt: bool,
+}
+
+fn answer_request_diagnostics(req: &CompleteRequest) -> AnswerRequestDiagnostics {
+    let question = extract_search_question(&req.user);
+    let normalized = normalize_guardrail_text(&question);
+    let transcript = transcript_diagnostic_text(&question);
+    AnswerRequestDiagnostics {
+        user_chars: req.user.chars().count(),
+        question_chars: question.chars().count(),
+        question_hash: stable_text_hash_prefix(&question),
+        transcript_chars: transcript.chars().count(),
+        transcript_hash: stable_text_hash_prefix(&transcript),
+        transcript_source_labels: transcript_source_label_count(&question),
+        generic_live_transcript_prompt: is_generic_live_transcript_prompt(&normalized),
+    }
+}
+
+fn stable_text_hash_prefix(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return "none".to_string();
+    }
+    let digest = Sha256::digest(trimmed.as_bytes());
+    hex::encode(&digest[..8])
+}
+
+fn transcript_diagnostic_text(question: &str) -> String {
+    let lines: Vec<String> = question
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            let (_, body) = split_transcript_source_line(trimmed)?;
+            let body = body.trim();
+            (!body.is_empty()).then(|| body.to_string())
+        })
+        .collect();
+    if !lines.is_empty() {
+        return lines.join("\n");
+    }
+    let normalized = normalize_guardrail_text(question);
+    if is_generic_live_transcript_prompt(&normalized)
+        || looks_like_transcript_placeholder(&normalized)
+    {
+        String::new()
+    } else {
+        String::new()
+    }
+}
+
+fn transcript_source_label_count(question: &str) -> usize {
+    question
+        .lines()
+        .filter(|line| split_transcript_source_line(line.trim()).is_some())
+        .count()
+}
+
+fn split_transcript_source_line(line: &str) -> Option<(&str, &str)> {
+    let (label, body) = line.split_once(':')?;
+    let clean_label = label.trim().to_ascii_lowercase();
+    matches!(
+        clean_label.as_str(),
+        "mic" | "microphone" | "system" | "speaker" | "audio"
+    )
+    .then_some((label.trim(), body))
+}
+
 fn answer_plan_for_request(
     req: &CompleteRequest,
     requested_lane: &str,
@@ -884,8 +960,12 @@ fn answer_plan_for_request(
     let normalized = normalize_guardrail_text(&question);
     let word_count = normalized.split_whitespace().count();
     let short_question = word_count <= 8;
+    let topic_reset = looks_like_new_topic_request(&normalized);
+    let generic_live_transcript_prompt = is_generic_live_transcript_prompt(&normalized);
+    let transcript_placeholder = looks_like_transcript_placeholder(&normalized);
     let has_images = !req.image_data_urls.is_empty() || requested_lane == "vision";
-    let follow_up = short_question
+    let follow_up = !topic_reset
+        && short_question
         && contains_any(
             &normalized,
             &["that", "this", "those", "same", "above", "previous", "next"],
@@ -927,27 +1007,29 @@ fn answer_plan_for_request(
         &["rewrite", "write", "draft", "polish", "email", "message"],
     ) && !coding
         && !behavioral;
-    let explicit_web = contains_any(
-        &normalized,
-        &[
-            "search web",
-            "web search",
-            "look up",
-            "lookup",
-            "google",
-            "browse",
-            "search online",
-            "current",
-            "latest",
-            "today",
-            "news",
-            "price",
-            "stock",
-            "weather",
-            "schedule",
-            "recent",
-        ],
-    );
+    let explicit_web = !generic_live_transcript_prompt
+        && !transcript_placeholder
+        && contains_any(
+            &normalized,
+            &[
+                "search web",
+                "web search",
+                "look up",
+                "lookup",
+                "google",
+                "browse",
+                "search online",
+                "current",
+                "latest",
+                "today",
+                "news",
+                "price",
+                "stock",
+                "weather",
+                "schedule",
+                "recent",
+            ],
+        );
     let public_lookup_phrase = looks_like_public_lookup_phrase(&normalized, word_count);
     let about_unknown = rag_matches.is_empty()
         && !screen
@@ -964,6 +1046,8 @@ fn answer_plan_for_request(
     let screen_without_image = screen && !has_images;
     let missing_context = rag_matches.is_empty()
         && ((docs || screen_without_image)
+            || generic_live_transcript_prompt
+            || transcript_placeholder
             || contains_any(
                 &normalized,
                 &[
@@ -973,23 +1057,29 @@ fn answer_plan_for_request(
                     "current session",
                 ],
             ));
-    let needs_web_search =
-        !screen && !coding && !behavioral && !system_design && (explicit_web || about_unknown);
+    let needs_web_search = !missing_context
+        && !screen
+        && !coding
+        && !behavioral
+        && !system_design
+        && (explicit_web || about_unknown);
 
     let intent = if missing_context {
         AnswerIntent::MissingContext
-    } else if coding_followup {
-        AnswerIntent::CodingFollowUp
-    } else if coding {
-        AnswerIntent::Coding
     } else if behavioral {
         AnswerIntent::Behavioral
     } else if system_design {
         AnswerIntent::SystemDesign
+    } else if coding_followup {
+        AnswerIntent::CodingFollowUp
+    } else if coding {
+        AnswerIntent::Coding
     } else if screen {
         AnswerIntent::Screen
     } else if needs_web_search {
         AnswerIntent::Research
+    } else if topic_reset && short_question {
+        AnswerIntent::Quick
     } else if meeting {
         AnswerIntent::Meeting
     } else if follow_up {
@@ -1040,7 +1130,7 @@ fn answer_plan_for_request(
         needs_docs: docs,
         needs_transcript: meeting,
         needs_memory: !rag_matches.is_empty(),
-        needs_web_search,
+        needs_web_search: matches!(intent, AnswerIntent::Research) && needs_web_search,
     }
 }
 
@@ -1569,23 +1659,37 @@ fn looks_like_coding_question(normalized: &str) -> bool {
         &[
             "code",
             "coding",
+            "write a code",
+            "write code",
+            "give me code",
+            "full code",
+            "implementation",
+            "implement",
             "function",
             "class",
             "test",
+            "unit test",
+            "test case",
             "traceback",
             "stack trace",
             "compile",
             "build error",
             "exception",
             "jsonresponse",
+            "sql",
             "typescript",
             "javascript",
             "python",
+            "java",
+            "c++",
+            "c#",
+            "golang",
             "rust",
             "backend",
             "frontend",
             "database",
             "api",
+            "endpoint",
             "algorithm",
             "leetcode",
             "lru",
@@ -1595,6 +1699,18 @@ fn looks_like_coding_question(normalized: &str) -> bool {
             "swap two numbers",
             "time complexity",
             "space complexity",
+            "binary search",
+            "linked list",
+            "doubly linked",
+            "stack",
+            "queue",
+            "heap",
+            "tree",
+            "graph",
+            "dfs",
+            "bfs",
+            "dynamic programming",
+            "memoization",
         ],
     ) || normalized.contains("```")
         || normalized.contains(".rs")
@@ -1618,6 +1734,19 @@ fn looks_like_coding_followup(normalized: &str, follow_up: bool) -> bool {
             "explain the code",
             "explain this logic",
             "i want the code",
+            "give full code",
+            "give me full code",
+            "send full code",
+            "convert this to",
+            "translate this to",
+            "add comments",
+            "comment this",
+            "dry run",
+            "walk through this",
+            "update the code",
+            "modify the code",
+            "only change",
+            "smallest change",
         ],
     ) || (follow_up
         && contains_any(
@@ -1633,6 +1762,47 @@ fn looks_like_coding_followup(normalized: &str, follow_up: bool) -> bool {
                 "rust",
             ],
         ))
+}
+
+fn looks_like_new_topic_request(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "new question",
+            "different question",
+            "separate question",
+            "unrelated question",
+            "ignore previous",
+            "forget previous",
+            "forget the above",
+            "start fresh",
+            "start over",
+            "fresh question",
+            "now answer this",
+        ],
+    )
+}
+
+fn is_generic_live_transcript_prompt(normalized: &str) -> bool {
+    normalized.starts_with("answer the latest ")
+        && normalized.contains("live captions from the current session transcript")
+}
+
+fn looks_like_transcript_placeholder(normalized: &str) -> bool {
+    normalized.is_empty()
+        || contains_any(
+            normalized,
+            &[
+                "captions appear here",
+                "live captions preview",
+                "starting audio",
+                "audio is live",
+                "listening for follow-up",
+                "listening for follow up",
+                "no captions yet",
+                "nothing was transcribed",
+            ],
+        )
 }
 
 fn looks_like_behavioral_question(normalized: &str) -> bool {
@@ -1724,10 +1894,10 @@ fn prompt_with_answer_plan(
             "Answer directly in 1-4 sentences. Do not open with setup unless it prevents confusion."
         }
         AnswerIntent::Coding => {
-            "If the user asks for code, include complete working code in a fenced code block, then a concise explanation of the key idea and complexity. Do not give only a summary."
+            "If the user asks for code, start with complete working code in a fenced code block, then give a concise explanation of the key idea and complexity. Do not give only a summary."
         }
         AnswerIntent::CodingFollowUp => {
-            "Treat this as a follow-up to existing code when relevant. Give the smallest useful delta, but include the actual updated code or snippet when the user asks for code."
+            "Treat this as a follow-up to existing code when relevant. Preserve the existing artifact unless the user asks for a new one. Give the smallest useful delta, but include the actual updated code or snippet when the user asks for code."
         }
         AnswerIntent::Behavioral => {
             "Answer like a polished interview response: natural, first-person when appropriate, specific, and conversational. Never route resume/self-intro prompts into system design."
@@ -2868,6 +3038,7 @@ async fn complete_stream_inner(
     )
     .await;
     let answer_plan = resolved_answer_plan.plan.clone();
+    let request_diag = answer_request_diagnostics(&req);
     let answer_plan_routing = answer_plan_routing_enabled();
     let effective_lane =
         lane_for_answer_plan(&requested_effective_lane, &answer_plan, answer_plan_routing);
@@ -2888,6 +3059,14 @@ async fn complete_stream_inner(
         needs_screen = answer_plan.needs_screen,
         needs_docs = answer_plan.needs_docs,
         needs_transcript = answer_plan.needs_transcript,
+        user_chars = request_diag.user_chars,
+        question_chars = request_diag.question_chars,
+        question_hash = %request_diag.question_hash,
+        transcript_chars = request_diag.transcript_chars,
+        transcript_hash = %request_diag.transcript_hash,
+        transcript_source_labels = request_diag.transcript_source_labels,
+        generic_live_transcript_prompt = request_diag.generic_live_transcript_prompt,
+        image_count = req.image_data_urls.len(),
         "managed chat answer plan resolved"
     );
     let web_search = completion_web_search_budgeted(
@@ -3495,6 +3674,11 @@ async fn complete_stream_inner(
             true,
         );
 
+        let artifact = response_artifact(&text);
+        let artifact_type = artifact.as_ref().map(|artifact| artifact.artifact_type).unwrap_or("none");
+        let artifact_confidence = artifact.as_ref().map(|artifact| artifact.confidence).unwrap_or(0.0);
+        let web_search_skipped_reason = web_search.skipped_reason.unwrap_or("none");
+
         tracing::info!(
             account_id_hash = %account_id_hash,
             request_id = %req.request_id,
@@ -3513,11 +3697,30 @@ async fn complete_stream_inner(
             trial_seconds_remaining = trial_remaining,
             latency_ms = elapsed_ms,
             was_fallback = selected_route_idx > 0,
+            answer_plan_source = resolved_answer_plan.source,
+            answer_plan_ai_attempted = resolved_answer_plan.ai_attempted,
+            answer_plan_ai_reason = resolved_answer_plan.ai_reason,
+            answer_intent = %answer_plan.intent.as_str(),
+            answer_output = %answer_plan.output.as_str(),
+            answer_confidence = answer_plan.confidence,
+            user_chars = request_diag.user_chars,
+            question_chars = request_diag.question_chars,
+            question_hash = %request_diag.question_hash,
+            transcript_chars = request_diag.transcript_chars,
+            transcript_hash = %request_diag.transcript_hash,
+            transcript_source_labels = request_diag.transcript_source_labels,
+            generic_live_transcript_prompt = request_diag.generic_live_transcript_prompt,
+            image_count = req.image_data_urls.len(),
+            canvas_artifact_type = artifact_type,
+            canvas_artifact_confidence = artifact_confidence,
+            web_search_attempted = web_search.attempted,
+            web_search_searches_used = web_search.searches_used,
+            web_search_sources = web_search.sources.len(),
+            web_search_skipped_reason,
             streaming = true,
             "managed chat completed and billed"
         );
 
-        let artifact = response_artifact(&text);
         let response = CompleteResponse {
             text,
             provider: streaming.provider,
@@ -3743,6 +3946,7 @@ async fn complete_inner(
     )
     .await;
     let answer_plan = resolved_answer_plan.plan.clone();
+    let request_diag = answer_request_diagnostics(&req);
     let answer_plan_routing = answer_plan_routing_enabled();
     let effective_lane =
         lane_for_answer_plan(&requested_effective_lane, &answer_plan, answer_plan_routing);
@@ -3763,6 +3967,14 @@ async fn complete_inner(
         needs_screen = answer_plan.needs_screen,
         needs_docs = answer_plan.needs_docs,
         needs_transcript = answer_plan.needs_transcript,
+        user_chars = request_diag.user_chars,
+        question_chars = request_diag.question_chars,
+        question_hash = %request_diag.question_hash,
+        transcript_chars = request_diag.transcript_chars,
+        transcript_hash = %request_diag.transcript_hash,
+        transcript_source_labels = request_diag.transcript_source_labels,
+        generic_live_transcript_prompt = request_diag.generic_live_transcript_prompt,
+        image_count = req.image_data_urls.len(),
         "managed chat answer plan resolved"
     );
     let web_search = completion_web_search_budgeted(
@@ -4186,6 +4398,22 @@ async fn complete_inner(
         false,
     );
 
+    let response_text = if looks_like_internal_disclosure_leak(&comp.text) {
+        INTERNAL_DISCLOSURE_REFUSAL.to_string()
+    } else {
+        comp.text
+    };
+    let artifact = response_artifact(&response_text);
+    let artifact_type = artifact
+        .as_ref()
+        .map(|artifact| artifact.artifact_type)
+        .unwrap_or("none");
+    let artifact_confidence = artifact
+        .as_ref()
+        .map(|artifact| artifact.confidence)
+        .unwrap_or(0.0);
+    let web_search_skipped_reason = web_search.skipped_reason.unwrap_or("none");
+
     tracing::info!(
         account_id_hash = %account_id_hash,
         request_id = %req.request_id,
@@ -4204,16 +4432,30 @@ async fn complete_inner(
         trial_seconds_remaining = trial_remaining,
         latency_ms = elapsed_ms,
         was_fallback = selected_route_idx > 0,
+        answer_plan_source = resolved_answer_plan.source,
+        answer_plan_ai_attempted = resolved_answer_plan.ai_attempted,
+        answer_plan_ai_reason = resolved_answer_plan.ai_reason,
+        answer_intent = %answer_plan.intent.as_str(),
+        answer_output = %answer_plan.output.as_str(),
+        answer_confidence = answer_plan.confidence,
+        user_chars = request_diag.user_chars,
+        question_chars = request_diag.question_chars,
+        question_hash = %request_diag.question_hash,
+        transcript_chars = request_diag.transcript_chars,
+        transcript_hash = %request_diag.transcript_hash,
+        transcript_source_labels = request_diag.transcript_source_labels,
+        generic_live_transcript_prompt = request_diag.generic_live_transcript_prompt,
+        image_count = req.image_data_urls.len(),
+        canvas_artifact_type = artifact_type,
+        canvas_artifact_confidence = artifact_confidence,
+        web_search_attempted = web_search.attempted,
+        web_search_searches_used = web_search.searches_used,
+        web_search_sources = web_search.sources.len(),
+        web_search_skipped_reason,
         streaming = false,
         "managed chat completed and billed"
     );
 
-    let response_text = if looks_like_internal_disclosure_leak(&comp.text) {
-        INTERNAL_DISCLOSURE_REFUSAL.to_string()
-    } else {
-        comp.text
-    };
-    let artifact = response_artifact(&response_text);
     let response = CompleteResponse {
         text: response_text,
         provider: comp.provider,
@@ -5969,6 +6211,114 @@ mod tests {
         assert_eq!(plan.intent, AnswerIntent::CodingFollowUp);
         assert_eq!(plan.output, AnswerOutput::CodeArtifact);
         assert_eq!(plan.recommended_lane, "deep");
+    }
+
+    #[test]
+    fn answer_plan_eval_suite_covers_live_overlay_regressions() {
+        let cases = [
+            (
+                "lru_code",
+                "Question:\nBuild me LRU cache.",
+                AnswerIntent::Coding,
+                AnswerOutput::CodeArtifact,
+                "deep",
+                false,
+            ),
+            (
+                "fibonacci_new_topic",
+                "Question:\nNew question: can you write Fibonacci series?",
+                AnswerIntent::Coding,
+                AnswerOutput::CodeArtifact,
+                "deep",
+                false,
+            ),
+            (
+                "fibonacci_followup",
+                "Question:\nIs there a way you can reduce time complexity for this?",
+                AnswerIntent::CodingFollowUp,
+                AnswerOutput::CodeArtifact,
+                "deep",
+                false,
+            ),
+            (
+                "self_intro_behavioral",
+                "Question:\nTell me about yourself for a senior software engineer interview.",
+                AnswerIntent::Behavioral,
+                AnswerOutput::Compact,
+                "balanced",
+                false,
+            ),
+            (
+                "secret_passage_research",
+                "Question:\nsecret passage ranch",
+                AnswerIntent::Research,
+                AnswerOutput::SourceAnswer,
+                "balanced",
+                true,
+            ),
+            (
+                "empty_live_caption_prompt",
+                "Question:\nAnswer the latest live captions from the current session transcript. Treat the transcript as the user's current question or working context.",
+                AnswerIntent::MissingContext,
+                AnswerOutput::Compact,
+                "balanced",
+                false,
+            ),
+            (
+                "live_caption_placeholder",
+                "Question:\nLive captions preview",
+                AnswerIntent::MissingContext,
+                AnswerOutput::Compact,
+                "balanced",
+                false,
+            ),
+            (
+                "missing_docs",
+                "Question:\nAnswer using the attached documents and current session context.",
+                AnswerIntent::MissingContext,
+                AnswerOutput::Compact,
+                "balanced",
+                false,
+            ),
+        ];
+
+        for (name, user, intent, output, lane, needs_web_search) in cases {
+            let req = complete_request(user);
+            let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+            assert_eq!(plan.intent, intent, "{name}");
+            assert_eq!(plan.output, output, "{name}");
+            assert_eq!(plan.recommended_lane, lane, "{name}");
+            assert_eq!(plan.needs_web_search, needs_web_search, "{name}");
+        }
+    }
+
+    #[test]
+    fn answer_request_diagnostics_hashes_transcripts_without_storing_text() {
+        let req =
+            complete_request("Question:\nMic: Build me LRU cache\nSystem: Build me LRU cache");
+
+        let diagnostics = answer_request_diagnostics(&req);
+
+        assert_eq!(diagnostics.transcript_source_labels, 2);
+        assert!(diagnostics.transcript_chars > 0);
+        assert_ne!(diagnostics.transcript_hash, "none");
+        assert_ne!(diagnostics.question_hash, "none");
+        assert!(!diagnostics.generic_live_transcript_prompt);
+    }
+
+    #[test]
+    fn generic_live_caption_prompt_logs_as_empty_transcript_context() {
+        let req = complete_request(
+            "Question:\nAnswer the latest live captions from the current session transcript. Treat the transcript as the user's current question or working context.",
+        );
+
+        let diagnostics = answer_request_diagnostics(&req);
+
+        assert_eq!(diagnostics.transcript_source_labels, 0);
+        assert_eq!(diagnostics.transcript_chars, 0);
+        assert_eq!(diagnostics.transcript_hash, "none");
+        assert!(diagnostics.generic_live_transcript_prompt);
     }
 
     #[test]

@@ -3070,6 +3070,13 @@ fn real_stt_chunk_duration_ms(configured: u32) -> u32 {
         .clamp(500, 15_000)
 }
 
+fn managed_stt_relay_requested_seconds() -> i64 {
+    env_first(&["BLUEY_MANAGED_STT_RELAY_SECONDS", "BLUEY_STT_RELAY_SECONDS"])
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(120)
+        .clamp(30, 10 * 60)
+}
+
 async fn resolve_real_audio_sources(
     config: &AudioCaptureConfig,
     native_audio_helper: Option<&Path>,
@@ -3888,16 +3895,24 @@ async fn run_relay_audio_source(
         }
     };
 
+    let requested_seconds = managed_stt_relay_requested_seconds();
     let stt_session = cloud
         .create_stt_session(&cue_cloud_client::SttSessionRequest {
             session_id: session_id.clone(),
             source: source.source.default_label().to_string(),
             provider: Some("deepgram".to_string()),
             model: Some(runtime.stt_model.clone()),
-            requested_seconds: Some(10 * 60),
+            requested_seconds: Some(requested_seconds),
         })
         .await
         .with_context(|| format!("failed to create live STT session for {}", source.source))?;
+    info!(
+        source = %source.source,
+        stream_id = %source.stream_id,
+        requested_seconds,
+        reserved_max_seconds = stt_session.max_seconds,
+        "live STT relay reservation created"
+    );
     let access_token = cloud
         .current_tokens()
         .context("Bluey account token unavailable after live STT session creation")?
@@ -13654,6 +13669,25 @@ mod tests {
     fn pcm16_16k_duration_ms_tracks_byte_length() {
         assert_eq!(pcm16_16k_duration_ms(3_200), 100);
         assert_eq!(pcm16_16k_duration_ms(0), 1);
+    }
+
+    #[test]
+    fn managed_stt_relay_requested_seconds_defaults_and_clamps() {
+        std::env::remove_var("BLUEY_MANAGED_STT_RELAY_SECONDS");
+        std::env::remove_var("BLUEY_STT_RELAY_SECONDS");
+        assert_eq!(managed_stt_relay_requested_seconds(), 120);
+
+        std::env::set_var("BLUEY_MANAGED_STT_RELAY_SECONDS", "12");
+        assert_eq!(managed_stt_relay_requested_seconds(), 30);
+
+        std::env::set_var("BLUEY_MANAGED_STT_RELAY_SECONDS", "900");
+        assert_eq!(managed_stt_relay_requested_seconds(), 600);
+
+        std::env::set_var("BLUEY_MANAGED_STT_RELAY_SECONDS", "180");
+        assert_eq!(managed_stt_relay_requested_seconds(), 180);
+
+        std::env::remove_var("BLUEY_MANAGED_STT_RELAY_SECONDS");
+        std::env::remove_var("BLUEY_STT_RELAY_SECONDS");
     }
 
     #[test]

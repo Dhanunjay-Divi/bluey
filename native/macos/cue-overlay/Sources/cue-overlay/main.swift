@@ -4266,6 +4266,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         static let transcriptStripHeight: CGFloat = 20
         static let transcriptRailDisplayChars: Int = 520
         static let transcriptPreviewMemoryChars: Int = 1_400
+        static let minTranscriptQuestionChars: Int = 8
+        static let minTranscriptQuestionWords: Int = 2
     }
 
     let feed: FeedView
@@ -7452,8 +7454,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let joined = compactTranscriptQuestionLines(lines)
             .joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return liveTranscriptVisibleQuestion(from: joined)
-            ?? (joined.isEmpty ? nil : boundedTranscriptTail(joined, maxChars: ChromeMetrics.transcriptPreviewMemoryChars))
+        guard !joined.isEmpty else { return nil }
+        let candidate = liveTranscriptVisibleQuestion(from: joined)
+            ?? boundedTranscriptTail(joined, maxChars: ChromeMetrics.transcriptPreviewMemoryChars)
+        guard isMeaningfulTranscriptQuestion(candidate) else { return nil }
+        return candidate
     }
 
     func prepareAutoSendListenCapture() {
@@ -9871,7 +9876,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             .joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !joined.isEmpty else { return nil }
-        return boundedTranscriptTail(joined, maxChars: ChromeMetrics.transcriptPreviewMemoryChars)
+        let candidate = boundedTranscriptTail(joined, maxChars: ChromeMetrics.transcriptPreviewMemoryChars)
+        guard isMeaningfulTranscriptQuestion(candidate) else { return nil }
+        return candidate
     }
 
     private func liveTranscriptPreviewQuestionForAnswer() -> String? {
@@ -9914,7 +9921,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let compact = lines.joined(separator: " ")
             .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard compact.count >= 3 else { return nil }
+        guard isMeaningfulTranscriptQuestion(compact) else { return nil }
         let lower = compact.lowercased()
         let placeholderFragments = [
             "captions appear here",
@@ -9967,7 +9974,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let transcript = transcriptQuestionForAnswer()
         if typed.isEmpty {
             guard let transcript = transcript ?? liveTranscriptPreviewQuestionForAnswer() else { return nil }
-            return liveTranscriptVisibleQuestion(from: transcript) ?? transcript
+            return transcript
         }
         return typed
     }
@@ -9984,7 +9991,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let compact = lines.joined(separator: " ")
             .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard compact.count >= 3 else { return nil }
+        guard isMeaningfulTranscriptQuestion(compact) else { return nil }
         let lower = compact.lowercased()
         let placeholderFragments = [
             "captions appear here",
@@ -9995,6 +10002,57 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         ]
         guard !placeholderFragments.contains(where: { lower.contains($0) }) else { return nil }
         return compact
+    }
+
+    private func isMeaningfulTranscriptQuestion(_ transcript: String) -> Bool {
+        let body = transcriptSemanticBody(transcript)
+        guard body.count >= ChromeMetrics.minTranscriptQuestionChars else { return false }
+        let lower = body.lowercased()
+        let placeholderFragments = [
+            "captions appear here",
+            "live captions preview",
+            "starting audio",
+            "audio is live",
+            "listening for follow-up",
+            "listening for follow up"
+        ]
+        guard !placeholderFragments.contains(where: { lower.contains($0) }) else { return false }
+        let fillerWords: Set<String> = [
+            "a", "an", "and", "but", "i", "it", "like", "okay", "ok", "so",
+            "sure", "the", "then", "uh", "um", "yeah", "yes", "you", "know"
+        ]
+        let words = body
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .map { $0.lowercased() }
+            .filter { !$0.isEmpty && !fillerWords.contains($0) }
+        if words.count >= ChromeMetrics.minTranscriptQuestionWords {
+            return true
+        }
+        return body.contains("?") && (words.first?.count ?? 0) >= 5
+    }
+
+    private func transcriptSemanticBody(_ transcript: String) -> String {
+        let sourceLabels: Set<String> = ["mic", "microphone", "system", "speaker", "audio"]
+        let body = transcript
+            .components(separatedBy: .newlines)
+            .map { line -> String in
+                var trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let colon = trimmed.firstIndex(of: ":") {
+                    let label = String(trimmed[..<colon])
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                        .lowercased()
+                    if sourceLabels.contains(label) {
+                        trimmed = String(trimmed[trimmed.index(after: colon)...])
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                    }
+                }
+                return trimmed
+            }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        return body
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func liveTranscriptAnswerPrompt(forSources sources: [String]? = nil) -> String {

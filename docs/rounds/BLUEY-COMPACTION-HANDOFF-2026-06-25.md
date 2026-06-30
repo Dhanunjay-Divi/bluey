@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-30 03:02 EDT
+Latest checkpoint: 2026-06-30 03:59 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,62 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-247-ANSWERPLAN-AI-FALLBACK.md`; the next canonical Bluey round doc should start at `ROUND-248-...`.
+- Latest assigned Bluey round doc is `ROUND-248-ANSWERPLAN-E2E-STT-TRANSCRIPT-SMOKE.md`; the next canonical Bluey round doc should start at `ROUND-249-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 248 tightened the end-to-end AnswerPlan, transcript, STT, and smoke-test
+  path:
+  - added privacy-safe answer diagnostics with question/transcript hashes,
+    lengths, transcript source counts, generic-live-prompt detection, plan source,
+    provider/model, canvas artifact type/confidence, web-search status, and billing
+    cents in server logs
+  - added local eval coverage for the live tester prompts: LRU code, Fibonacci
+    follow-up/topic reset, tell-me-about-yourself, Secret Passage Ranch, empty
+    live-caption prompt, live-caption placeholder, and missing docs
+  - fixed AnswerPlan priority so missing docs do not trigger web search and
+    system design beats generic queue/cache/database code keywords
+  - strengthened code prompt guidance so explicit code asks start with fenced
+    working code and follow-ups preserve the existing artifact unless a new one
+    is requested
+  - macOS and Windows now require meaningful transcript text before Listen output
+    can become a paid answer; one-word filler and placeholders are blocked
+  - Windows no longer sends the generic live-caption prompt when transcript
+    context exists but no usable question is present
+  - Windows transcript-derived answer sends now preserve `Mic:`, `System:`, or
+    `Audio:` source labels so server transcript diagnostics match macOS
+  - daemon managed STT relay reservation default changed from 10 minutes to 120
+    seconds, with `BLUEY_MANAGED_STT_RELAY_SECONDS` / `BLUEY_STT_RELAY_SECONDS`
+    override and logs for requested/reserved seconds
+  - added `scripts/bluey-e2e-staging-smoke.sh` for no-cost local/staging gates and
+    opt-in paid provider smoke with `BLUEY_RUN_PAID_SMOKE=1`
+  - live test account `codex-smoke-20260608183100@bluey.sh` was credited from
+    `$12.68` to `$15.00`; `reserved_cents` remained `0`
+  - files changed:
+    - `server/src/api/router.rs`
+    - `crates/cue-daemon/src/app.rs`
+    - `native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `native/windows/cue-overlay/main.c`
+    - `scripts/bluey-e2e-staging-smoke.sh`
+  - Round doc:
+    `docs/rounds/ROUND-248-ANSWERPLAN-E2E-STT-TRANSCRIPT-SMOKE.md`
+  - Verification passed:
+    - `bash -n scripts/bluey-e2e-staging-smoke.sh`
+    - `cargo fmt --manifest-path server/Cargo.toml`
+    - `cargo fmt`
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `cargo test --manifest-path server/Cargo.toml answer_plan --quiet`
+    - `cargo test --manifest-path server/Cargo.toml web_search --quiet`
+    - `cargo test --manifest-path server/Cargo.toml answer_request_diagnostics --quiet`
+    - `cargo test --manifest-path server/Cargo.toml generic_live_caption_prompt --quiet`
+    - `cargo test -p cue-daemon managed_stt_relay_requested_seconds_defaults_and_clamps --quiet`
+    - `cargo test -p cue-daemon stt_relay_websocket_url --quiet`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c -Inative/windows/cue-overlay -DUNICODE -D_UNICODE`
+    - `git diff --check`
+  - Remaining gate: rebuild/hot-install local macOS binaries and deploy server/daemon
+    changes to staging before expecting the live app to show these fixes.
 - Round 247 added a hybrid AnswerPlan fallback classifier:
   - deterministic local rules remain the fast path for obvious coding,
     behavioral, system-design, screen, research, and missing-context requests

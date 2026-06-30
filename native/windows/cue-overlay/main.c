@@ -601,6 +601,47 @@ static bool transcript_text_has_prefix(const wchar_t *prefix) {
     return false;
 }
 
+static const wchar_t *transcript_source_label_for_answer(void) {
+    if (wcsstr(g_transcript_source, L"microphone") != NULL
+        || wcsstr(g_transcript_source, L"user") != NULL
+        || wcsstr(g_transcript_source, L"Mic") != NULL
+        || transcript_text_has_prefix(L"Mic:")) {
+        return L"Mic";
+    }
+    if (wcsstr(g_transcript_source, L"system") != NULL
+        || wcsstr(g_transcript_source, L"System") != NULL
+        || transcript_text_has_prefix(L"System:")) {
+        return L"System";
+    }
+    return L"Audio";
+}
+
+static bool transcript_question_has_source_label(const wchar_t *text) {
+    if (!text) return false;
+    return _wcsnicmp(text, L"Mic:", 4) == 0
+        || _wcsnicmp(text, L"Microphone:", 11) == 0
+        || _wcsnicmp(text, L"System:", 7) == 0
+        || _wcsnicmp(text, L"Speaker:", 8) == 0
+        || _wcsnicmp(text, L"Audio:", 6) == 0;
+}
+
+static void prefix_transcript_source_label(wchar_t *text, size_t capacity) {
+    if (!text || text[0] == L'\0' || transcript_question_has_source_label(text)) return;
+    wchar_t original[1024];
+    wcscpy_s(original, 1024, text);
+    wchar_t prefix[24];
+    swprintf_s(prefix, 24, L"%ls: ", transcript_source_label_for_answer());
+    size_t prefix_len = wcslen(prefix);
+    if (capacity <= prefix_len + 1) return;
+    size_t max_body = capacity - prefix_len - 1;
+    size_t body_len = wcslen(original);
+    const wchar_t *body = original;
+    if (body_len > max_body) {
+        body = original + (body_len - max_body);
+    }
+    swprintf_s(text, capacity, L"%ls%ls", prefix, body);
+}
+
 static bool transcript_source_matches_auto_send_mode(void) {
     if (!has_transcript_context()) return false;
     if (g_auto_send_mode == 3) return true;
@@ -1337,6 +1378,54 @@ static bool is_placeholder_transcript_question(const wchar_t *text) {
         || wcsstr(lower, L"listening for follow-up") != NULL;
 }
 
+static bool is_filler_transcript_word(const wchar_t *word) {
+    if (!word || word[0] == L'\0') return true;
+    static const wchar_t *fillers[] = {
+        L"a", L"an", L"and", L"audio", L"but", L"i", L"it", L"like",
+        L"mic", L"microphone", L"okay", L"ok", L"so", L"speaker",
+        L"sure", L"system", L"the", L"then", L"uh", L"um", L"yeah",
+        L"yes", L"you", L"know"
+    };
+    for (int i = 0; i < (int)(sizeof(fillers) / sizeof(fillers[0])); i++) {
+        if (wcscmp(word, fillers[i]) == 0) return true;
+    }
+    return false;
+}
+
+static bool is_meaningful_transcript_question(const wchar_t *text) {
+    if (!text || text[0] == L'\0') return false;
+    if (is_placeholder_transcript_question(text)) return false;
+    size_t len = wcslen(text);
+    if (len < 8) return false;
+
+    int meaningful_words = 0;
+    int first_meaningful_len = 0;
+    bool has_question_mark = false;
+    wchar_t word[64];
+    int word_len = 0;
+    for (size_t i = 0; i <= len; i++) {
+        wchar_t ch = text[i];
+        if (ch == L'?') has_question_mark = true;
+        if (iswalnum(ch)) {
+            if (word_len < (int)(sizeof(word) / sizeof(word[0])) - 1) {
+                word[word_len++] = (wchar_t)towlower(ch);
+            }
+            continue;
+        }
+        if (word_len > 0) {
+            word[word_len] = L'\0';
+            if (!is_filler_transcript_word(word)) {
+                meaningful_words++;
+                if (first_meaningful_len == 0) first_meaningful_len = word_len;
+            }
+            word_len = 0;
+        }
+    }
+
+    if (meaningful_words >= 2) return true;
+    return has_question_mark && first_meaningful_len >= 5;
+}
+
 static bool live_transcript_visible_question(wchar_t *out, size_t capacity) {
     if (!out || capacity == 0) return false;
     out[0] = L'\0';
@@ -1355,7 +1444,8 @@ static bool live_transcript_visible_question(wchar_t *out, size_t capacity) {
         }
     }
     if (line_count > 2) return false;
-    if (is_placeholder_transcript_question(out)) return false;
+    prefix_transcript_source_label(out, capacity);
+    if (!is_meaningful_transcript_question(out)) return false;
     return true;
 }
 
@@ -1377,7 +1467,8 @@ static bool live_transcript_question_text(wchar_t *out, size_t capacity) {
             *p = L' ';
         }
     }
-    if (is_placeholder_transcript_question(out)) return false;
+    prefix_transcript_source_label(out, capacity);
+    if (!is_meaningful_transcript_question(out)) return false;
     return true;
 }
 
@@ -1389,16 +1480,24 @@ static bool is_live_transcript_answer_prompt(const wchar_t *question) {
 
 static void send_current_question(void) {
     static const wchar_t *fallback = L"Answer the latest clear question from the current transcript, screen context, and attached files. If there is no clear question yet, summarize what Bluey needs next.";
-    static const wchar_t *transcript_fallback = L"Answer the latest live captions from the current session transcript. Treat the transcript as the user's current question or working context.";
     int length = GetWindowTextLengthW(g_ask_edit);
     bool used_fallback = length <= 0;
     wchar_t transcript_question[1024] = L"";
     bool used_short_transcript = used_fallback && live_transcript_visible_question(transcript_question, 260);
     bool used_transcript_text = used_short_transcript
         || (used_fallback && live_transcript_question_text(transcript_question, 1024));
-    const wchar_t *fallback_question = has_transcript_context()
-        ? (used_transcript_text ? transcript_question : transcript_fallback)
-        : fallback;
+    bool transcript_context = has_transcript_context();
+    if (used_fallback && transcript_context && !used_transcript_text) {
+        emit_lifecycle_event("ask_answer_blocked", "unusable_transcript", "typed_chars=0 transcript_context=true");
+        SetFocus(g_ask_edit);
+        return;
+    }
+    if (used_fallback && !transcript_context && g_context_chip_count <= 0) {
+        emit_lifecycle_event("ask_answer_blocked", "empty", "typed_chars=0 transcript_context=false context_ids=0");
+        SetFocus(g_ask_edit);
+        return;
+    }
+    const wchar_t *fallback_question = used_transcript_text ? transcript_question : fallback;
     char detail[192];
     snprintf(
         detail,
@@ -1406,7 +1505,7 @@ static void send_current_question(void) {
         "typed_chars=%d fallback=%s transcript_context=%s generic_live_prompt=%s context_ids=%d",
         length > 0 ? length : 0,
         used_fallback ? "true" : "false",
-        has_transcript_context() ? "true" : "false",
+        transcript_context ? "true" : "false",
         is_live_transcript_answer_prompt(fallback_question) ? "true" : "false",
         g_context_chip_count
     );
