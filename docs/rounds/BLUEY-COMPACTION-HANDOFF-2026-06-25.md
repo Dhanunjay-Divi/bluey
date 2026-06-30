@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-30 17:10 EDT
+Latest checkpoint: 2026-06-30 17:50 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,51 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-262-PROD-R2-STORAGE-AUDIT.md`; the next canonical Bluey round doc should start at `ROUND-263-...`.
+- Latest assigned Bluey round doc is `ROUND-263-PROD-POSTGRES-R2-STORAGE-SETUP.md`; the next canonical Bluey round doc should start at `ROUND-264-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 263 completed the production Postgres/R2 storage setup:
+  - live `bluey-api.service` was confirmed running with
+    `BLUEY_SERVER_DB_BACKEND=postgres`, `BLUEY_DATABASE_URL=<set>`, strict
+    Redis/Valkey, and port `8080`
+  - R2 object-byte sync was enabled live with:
+    - `BLUEY_OBJECT_BUCKET=bluey-prod`
+    - `BLUEY_OBJECT_ENDPOINT_URL=<set>`
+    - `BLUEY_OBJECT_REGION=auto`
+    - `BLUEY_OBJECT_KEY_PREFIX=bluey-cloud`
+    - `BLUEY_OBJECT_RETENTION_DAYS=365`
+    - `BLUEY_OBJECT_MAX_BYTES=26214400`
+    - `BLUEY_REQUIRE_OBJECT_STORAGE=1`
+  - previous live env file was backed up on the droplet at
+    `/etc/bluey-api/bluey-api.env.bak.20260630T213447Z`
+  - service restart and local health check passed
+  - R2 object put/list/delete preflight passed under
+    `bluey-cloud/preflight/object-storage-20260630T213605Z.txt`
+  - unauthenticated object upload returned `401`
+  - discovered the old backup script was SQLite-only while runtime was
+    Postgres-backed
+  - patched and installed `ops/backup-bluey-db.sh` so cron now creates
+    backend-aware backups:
+    - SQLite -> `.db`
+    - Postgres -> `pg_dump --format=custom` `.pgdump`
+  - installed `postgresql-client-18` on the droplet because managed Postgres is
+    `18.4` and `pg_dump 16` failed with a server-version mismatch
+  - forced Postgres backup passed:
+    `/var/backups/bluey-api/hourly/bluey-postgres-20260630T214349Z.pgdump`
+    (`11211157` bytes)
+  - `pg_restore -l` could read the backup and showed server/dump version `18.4`
+  - R2 now contains the `.pgdump` plus `.pgdump.sha256` under
+    `s3://bluey-prod/backups/api/`
+  - currently published signed release files were mirrored to:
+    `s3://bluey-prod/releases/bluey-sh/`
+  - `scripts/publish-bluey-release.sh` now supports optional future release
+    mirroring via `BLUEY_RELEASE_MIRROR_DESTINATION`
+  - runbook docs were updated for Postgres backups/restore and R2 release mirror
+  - Round doc:
+    `docs/rounds/ROUND-263-PROD-POSTGRES-R2-STORAGE-SETUP.md`
 - Round 262 audited production R2 storage:
   - live droplet env confirms R2/S3-compatible off-host backups are configured:
     `OFFSITE_DESTINATION=s3://bluey-prod/backups/api/`

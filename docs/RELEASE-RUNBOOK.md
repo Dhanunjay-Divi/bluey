@@ -168,6 +168,18 @@ PUBLISH_HOST=<host> PUBLISH_PATH=/var/www/bluey \
   bash scripts/publish-bluey-release.sh
 ```
 
+To mirror the same signed release files into R2/S3-compatible durable storage
+while still serving public downloads from `bluey.sh`, add:
+
+```bash
+BLUEY_RELEASE_MIRROR_DESTINATION=s3://bluey-prod/releases/bluey-sh \
+BLUEY_RELEASE_MIRROR_ENDPOINT_URL=https://<cloudflare-account-id>.r2.cloudflarestorage.com
+```
+
+The mirror stores `install.sh`, `install.ps1`, `latest.json`,
+`latest.json.sig`, and the versioned release directory. It must not replace the
+signed manifest/checksum verification path used by the installer.
+
 The matching raw Ed25519 public key must be embedded in the CLI build:
 
 ```bash

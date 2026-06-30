@@ -27,6 +27,8 @@ STAGE_DIR="${BLUEY_RELEASE_STAGE:-$DIST_DIR/publish-bluey-sh}"
 PUBLIC_BASE="${BLUEY_PUBLIC_BASE:-https://bluey.sh}"
 PUBLISH_PATH="${PUBLISH_PATH:-/var/www/bluey}"
 SIGNING_KEY_FILE="${BLUEY_RELEASE_SIGNING_KEY_FILE:-}"
+RELEASE_MIRROR_DESTINATION="${BLUEY_RELEASE_MIRROR_DESTINATION:-}"
+RELEASE_MIRROR_ENDPOINT_URL="${BLUEY_RELEASE_MIRROR_ENDPOINT_URL:-${BLUEY_BACKUP_S3_ENDPOINT_URL:-}}"
 
 mkdir -p "$STAGE_DIR/releases/$VERSION_TAG"
 rm -f "$STAGE_DIR/latest.json" "$STAGE_DIR/latest.json.sig" "$STAGE_DIR/install.sh" "$STAGE_DIR/install.ps1"
@@ -298,4 +300,24 @@ if [ "${PUBLISH_DO:-0}" = "1" ]; then
         "$PUBLISH_HOST:$PUBLISH_PATH/releases/$VERSION_TAG/"
     ssh "$PUBLISH_HOST" "chmod -R u=rwX,go=rX '$PUBLISH_PATH/install.sh' '$PUBLISH_PATH/install.ps1' '$PUBLISH_PATH/latest.json' '$PUBLISH_PATH/latest.json.sig' '$PUBLISH_PATH/releases/$VERSION_TAG'"
     echo "Published to $PUBLISH_HOST:$PUBLISH_PATH"
+
+    if [ -n "$RELEASE_MIRROR_DESTINATION" ]; then
+        if ! command -v aws >/dev/null 2>&1; then
+            echo "BLUEY_RELEASE_MIRROR_DESTINATION is set but aws CLI is not installed" >&2
+            exit 1
+        fi
+        mirror_args=()
+        if [ -n "$RELEASE_MIRROR_ENDPOINT_URL" ]; then
+            mirror_args+=(--endpoint-url "$RELEASE_MIRROR_ENDPOINT_URL")
+        fi
+        mirror_root="${RELEASE_MIRROR_DESTINATION%/}"
+        aws "${mirror_args[@]}" s3 cp "$STAGE_DIR/install.sh" "$mirror_root/install.sh" --quiet
+        aws "${mirror_args[@]}" s3 cp "$STAGE_DIR/install.ps1" "$mirror_root/install.ps1" --quiet
+        aws "${mirror_args[@]}" s3 cp "$STAGE_DIR/latest.json" "$mirror_root/latest.json" --quiet
+        if [ -f "$STAGE_DIR/latest.json.sig" ]; then
+            aws "${mirror_args[@]}" s3 cp "$STAGE_DIR/latest.json.sig" "$mirror_root/latest.json.sig" --quiet
+        fi
+        aws "${mirror_args[@]}" s3 sync "$STAGE_DIR/releases/$VERSION_TAG/" "$mirror_root/releases/$VERSION_TAG/" --quiet
+        echo "Mirrored release files to $mirror_root"
+    fi
 fi

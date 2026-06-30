@@ -169,7 +169,20 @@ cat > /etc/cron.d/bluey-api-backup <<'EOF'
 EOF
 ```
 
-The script lives at `ops/backup-bluey-db.sh` in this repo. It uses SQLite's online backup API (safe with the daemon running) and rotates the last 14 hourly + 14 daily snapshots locally; off-host shipping to S3-compatible storage/SFTP is configured by setting `OFFSITE_DESTINATION`.
+The script lives at `ops/backup-bluey-db.sh` in this repo. It auto-detects the
+runtime database backend:
+
+- `BLUEY_SERVER_DB_BACKEND=sqlite`: uses SQLite's online `.backup` API.
+- `BLUEY_SERVER_DB_BACKEND=postgres`: loads `/etc/bluey-api/bluey-postgres.env`
+  by default and writes a `pg_dump --format=custom` archive.
+
+Both modes are safe while `bluey-api.service` is live. The script rotates the
+last 14 hourly + 14 daily snapshots locally; off-host shipping to
+S3-compatible storage/SFTP is configured by setting `OFFSITE_DESTINATION`.
+
+For managed Postgres, install a `pg_dump` client that is the same major version
+as the server, or newer. A PostgreSQL 18 server requires `postgresql-client-18`;
+older clients abort with a server-version mismatch.
 
 For Cloudflare R2:
 
@@ -237,7 +250,9 @@ Before flipping DNS or announcing the product:
 - [ ] Square webhook fires successfully on a sandbox purchase first, then on a real production purchase.
 - [ ] SMTP emails arrive in <30 seconds for both `/auth/verify-email/start` and `/auth/password-reset/start`.
 - [ ] `/admin/metrics` is reachable with a bearer + the metrics look sane (accounts >= 1, no in_progress > 0).
-- [ ] Backup script runs successfully via `sudo -u root /usr/local/sbin/backup-bluey-db.sh` and produces a file in `/var/backups/bluey-api/`.
+- [ ] Backup script runs successfully via `/usr/local/sbin/backup-bluey-db.sh`
+      and produces the expected backend file in `/var/backups/bluey-api/`:
+      `.db` for SQLite or `.pgdump` for Postgres.
 - [ ] Off-host backup destination receives the snapshot.
 - [ ] At least one full money-path smoke: signup → trial → reload via Square → cue dispatch → balance debited → cue response.
 - [ ] First `bluey on` from a clean Mac opens browser sign-in and successfully completes the deep-link flow against the production server.
@@ -250,7 +265,10 @@ If the droplet is destroyed:
 
 1. Provision a new droplet (any region with the same Ubuntu version).
 2. Re-run sections 1, 2, 4, 5, 6.
-3. Restore the most recent backup: `cp /tmp/<latest-snapshot>.db /opt/bluey-api/bluey.db && chown bluey:bluey /opt/bluey-api/bluey.db`.
+3. Restore the most recent backup:
+   - SQLite: `cp /tmp/<latest-snapshot>.db /opt/bluey-api/bluey.db && chown bluey:bluey /opt/bluey-api/bluey.db`.
+   - Postgres: create/provision the target database, then run
+     `pg_restore --clean --if-exists --no-owner --no-acl --dbname "$BLUEY_DATABASE_URL" /tmp/<latest-snapshot>.pgdump`.
 4. Repoint DNS A/AAAA records.
 5. Verify section 7.
 
@@ -258,8 +276,12 @@ RPO is 1 hour (cron interval). RTO is roughly the time to provision + restore = 
 
 ## 14. Things explicitly NOT in this runbook
 
-- **Multi-host / load-balanced deployment.** Today's binary uses in-memory rate-limit state; horizontal scaling needs a Redis-backed limiter swap. Single-host is the supported v0.2 shape.
-- **Database replication.** SQLite + hourly backup is the v0.2 RPO. PostgreSQL migration is queued for v0.3 if multi-region matters.
+- **Multi-host / load-balanced deployment.** The server supports shared
+  Redis/Valkey rate/capacity state, but multi-host rollout still needs a
+  separate load balancer smoke and deployment runbook.
+- **Database replication.** Managed Postgres is the main production DB path;
+  this runbook covers hourly logical backups, not cross-region replication or
+  managed point-in-time-recovery policy.
 - **Auto-update server for the macOS app.** A separate distribution server (`R14.8` in `FUTURE-IMPLEMENTATIONS.md`) hosts the signed `.dmg` + `latest.json`.
 - **Full web app polish on `bluey.sh`.** The same origin should host landing,
   install, link, reload, account, and docs pages. This repo includes the API
