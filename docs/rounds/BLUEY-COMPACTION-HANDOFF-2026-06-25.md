@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-30 16:48 EDT
+Latest checkpoint: 2026-06-30 17:10 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,25 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-261-STRICT-CLICKTHROUGH-ATTACHMENT-STRIP.md`; the next canonical Bluey round doc should start at `ROUND-262-...`.
+- Latest assigned Bluey round doc is `ROUND-262-PROD-R2-STORAGE-AUDIT.md`; the next canonical Bluey round doc should start at `ROUND-263-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 262 audited production R2 storage:
+  - live droplet env confirms R2/S3-compatible off-host backups are configured:
+    `OFFSITE_DESTINATION=s3://bluey-prod/backups/api/`
+  - no R2 secrets were printed into docs
+  - live R2 listing showed hourly `.db` backups plus `.sha256` checksum objects,
+    with `470` objects and `246984702` bytes at audit time
+  - backup cron is installed at `/etc/cron.d/bluey-api-backup` and runs hourly
+  - live env did not show separate `BLUEY_OBJECT_*` settings, so raw user
+    artifact object-byte sync is implemented in code but not observed enabled
+    on the production droplet during this audit
+  - source of truth remains database tables; R2 is blob/object storage only
+  - Round doc:
+    `docs/rounds/ROUND-262-PROD-R2-STORAGE-AUDIT.md`
 - Round 261 restores strict click-through semantics and hides attached-file strips
   unless the user asks to inspect them:
   - macOS click-through mode now only receives mouse events for explicit
