@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-30 01:22 EDT
+Latest checkpoint: 2026-06-30 03:02 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,46 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-246-OVERLAY-MOVE-ANYWHERE-FULLSCREEN-RESTORE.md`; the next canonical Bluey round doc should start at `ROUND-247-...`.
+- Latest assigned Bluey round doc is `ROUND-247-ANSWERPLAN-AI-FALLBACK.md`; the next canonical Bluey round doc should start at `ROUND-248-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 247 added a hybrid AnswerPlan fallback classifier:
+  - deterministic local rules remain the fast path for obvious coding,
+    behavioral, system-design, screen, research, and missing-context requests
+  - low-confidence or mixed-signal requests can now call a tiny managed
+    `instant`-lane classifier before provider route selection
+  - the classifier receives only a short sanitized routing prompt, not RAG
+    chunks, document text, screenshots, private prompts, or secrets
+  - hard overrides keep `tell me about yourself` behavioral, code prompts on
+    code artifact/deep routing, and screen/image prompts on vision behavior
+  - invalid classifier JSON or unsafe lane/output combinations fall back to the
+    local rule plan
+  - classifier usage is recorded as `answer_plan_classifier` with customer cost
+    `0` so owner cost can be audited without charging users for hidden planning
+  - new deploy knobs:
+    - `BLUEY_ANSWER_PLAN_AI_FALLBACK=0` disables only the AI fallback
+    - `BLUEY_ANSWER_PLAN_AI_CONFIDENCE_THRESHOLD`
+    - `BLUEY_ANSWER_PLAN_AI_TIMEOUT_MS`
+    - `BLUEY_ANSWER_PLAN_AI_MAX_TOKENS`
+  - files changed:
+    - `server/src/api/router.rs`
+    - `docs/MODEL-ROUTING.md`
+    - `ops/bluey-api.env.example`
+    - `scripts/bluey-cloud-preflight.sh`
+  - Round doc:
+    `docs/rounds/ROUND-247-ANSWERPLAN-AI-FALLBACK.md`
+  - Verification passed:
+    - `cargo fmt --manifest-path server/Cargo.toml`
+    - `cargo test --manifest-path server/Cargo.toml answer_plan_ -- --nocapture`
+    - `cargo test --manifest-path server/Cargo.toml api::router::tests -- --nocapture`
+    - `cargo test --manifest-path server/Cargo.toml routing::dispatcher::tests -- --nocapture`
+    - `cargo check --manifest-path server/Cargo.toml`
+  - Remaining gate: deploy to staging, confirm logs show
+    `answer_plan_source`, `answer_plan_ai_attempted`, and
+    `answer_plan_ai_reason`, then live-smoke ambiguous prompts before production.
 - Round 246 restored the owner's preferred move-anywhere overlay behavior and
   fixed full-screen restore placement:
   - macOS click-through/default mode now keeps real controls clickable while

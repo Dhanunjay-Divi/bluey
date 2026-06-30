@@ -318,6 +318,14 @@ else
   ok "AnswerPlan routing enabled (default-on; set BLUEY_ANSWER_PLAN_ROUTING=0 only for rollback)"
 fi
 
+if [ -n "${BLUEY_ANSWER_PLAN_AI_FALLBACK:-}" ] && falsey_env "$BLUEY_ANSWER_PLAN_AI_FALLBACK"; then
+  warn "BLUEY_ANSWER_PLAN_AI_FALLBACK is disabled; ambiguous requests will use local rules only"
+elif [ -n "${BLUEY_ANSWER_PLAN_AI_FALLBACK:-}" ] && ! truthy_env "$BLUEY_ANSWER_PLAN_AI_FALLBACK"; then
+  warn "BLUEY_ANSWER_PLAN_AI_FALLBACK has an unrecognized value; server treats only 0/false/no/off as disabled"
+else
+  ok "AnswerPlan AI fallback enabled for low-confidence/mixed-signal requests"
+fi
+
 route_policy="$(normalize_route_policy "${BLUEY_ROUTE_POLICY:-${BLUEY_ROUTE_ORDER:-}}")"
 case "$route_policy" in
   provider_mix)

@@ -1,6 +1,6 @@
 # Bluey Model Routing
 
-Last updated: 2026-06-29
+Last updated: 2026-06-30
 
 This document is the source-of-truth snapshot for the model/provider routing
 currently implemented in the Bluey codebase. It is intentionally operational:
@@ -78,8 +78,7 @@ configured:
 
 AnswerPlan is default-on for managed server routing. Set
 `BLUEY_ANSWER_PLAN_ROUTING=0` only as a temporary rollback. The step runs before
-provider route selection and is local rules first, not an extra AI classifier
-call, so it does not add latency or cost.
+provider route selection and is deterministic local rules first.
 
 The planner classifies the request into intents such as `quick`, `coding`,
 `coding_followup`, `behavioral`, `system_design`, `screen`, `research`,
@@ -103,6 +102,36 @@ selected by the client.
 Provider selection remains separate: `provider_mix`, `quality_first`, or
 `cost_optimized` still decides which approved Claude/OpenAI/Gemini/GLM/DeepSeek
 candidate handles the chosen lane.
+
+### AI Fallback Classifier
+
+Rules are still the fast path. For obvious requests such as `tell me about
+yourself`, `write Python code`, `system design`, screen/image requests, or
+explicit missing-context cases, Bluey does not call an AI classifier. Those hard
+signals stay deterministic so a behavioral answer cannot accidentally route as
+system design and a code request keeps its code artifact path.
+
+For low-confidence or mixed-signal requests only, Bluey may run a tiny managed
+classifier on the `instant` lane. It receives a short sanitized routing prompt:
+the user question, selected local-rule signals, requested lane, image count, and
+local rule confidence. It does not receive RAG chunks, attached document text,
+screen images, private prompts, or provider secrets. The classifier must return
+JSON with `intent`, `lane`, `output`, `needs_web_search`, and `confidence`; any
+invalid or unsafe result falls back to the local rule plan.
+
+The classifier hop is owner-visible as usage kind `answer_plan_classifier`, but
+the customer charge is `0` cents. It is capped by a short timeout and small token
+budget so it can improve ambiguous routing without making normal overlay answers
+feel sluggish.
+
+Operator knobs:
+
+| Env var | Default | Purpose |
+| --- | ---: | --- |
+| `BLUEY_ANSWER_PLAN_AI_FALLBACK` | enabled | Set to `0` only to disable the tiny classifier fallback; local rules still run |
+| `BLUEY_ANSWER_PLAN_AI_CONFIDENCE_THRESHOLD` | `0.70` | Only plans below this confidence are eligible unless mixed signals are detected |
+| `BLUEY_ANSWER_PLAN_AI_TIMEOUT_MS` | `900` | Max time spent on the fallback classifier call |
+| `BLUEY_ANSWER_PLAN_AI_MAX_TOKENS` | `180` | Max completion tokens reserved for classifier JSON |
 
 ## Thinking Budget Policy
 
@@ -249,6 +278,7 @@ Default server knobs:
 | `BLUEY_LIMIT_PROVIDER_DEEPSEEK_LLM_PER_MIN` | 600/min, burst 120 | DeepSeek text capacity |
 | `BLUEY_LIMIT_PROVIDER_ZAI_LLM_PER_MIN` | 300/min, burst 60 | Z.AI GLM text capacity |
 | `BLUEY_ANSWER_PLAN_ROUTING` | enabled | Set to `0` only for rollback; default server AnswerPlan promotes Auto requests to instant/deep/vision/research-aware behavior before provider routing |
+| `BLUEY_ANSWER_PLAN_AI_FALLBACK` | enabled | Set to `0` only to disable the low-confidence/mixed-signal tiny classifier fallback |
 | `BLUEY_ROUTE_POLICY` | `provider_mix` | Default rotates first attempts across configured providers. Set `quality_first` for the older static order or `cost_optimized` to prefer GLM/DeepSeek first for managed text lanes |
 | `BLUEY_LIMIT_PROVIDER_OPENAI_EMBED_PER_MIN` | 900/min, burst 180 | OpenAI embedding capacity |
 | `BLUEY_LIMIT_PROVIDER_DEEPGRAM_STT_PER_MIN` | 600/min, burst 120 | Deepgram STT capacity |

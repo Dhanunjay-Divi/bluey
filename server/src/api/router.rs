@@ -1048,6 +1048,33 @@ fn answer_plan_routing_enabled() -> bool {
     !env_flag_is_false("BLUEY_ANSWER_PLAN_ROUTING")
 }
 
+fn answer_plan_ai_fallback_enabled() -> bool {
+    !env_flag_is_false("BLUEY_ANSWER_PLAN_AI_FALLBACK")
+}
+
+const DEFAULT_ANSWER_PLAN_AI_CONFIDENCE_THRESHOLD: f32 = 0.70;
+const DEFAULT_ANSWER_PLAN_AI_TIMEOUT_MS: u64 = 900;
+const DEFAULT_ANSWER_PLAN_AI_MAX_TOKENS: u32 = 180;
+
+#[derive(Debug, Clone)]
+struct ResolvedAnswerPlan {
+    plan: AnswerPlan,
+    source: &'static str,
+    ai_attempted: bool,
+    ai_reason: &'static str,
+}
+
+impl ResolvedAnswerPlan {
+    fn rules(plan: AnswerPlan, reason: &'static str) -> Self {
+        Self {
+            plan,
+            source: "rules",
+            ai_attempted: false,
+            ai_reason: reason,
+        }
+    }
+}
+
 fn lane_for_answer_plan(requested_lane: &str, plan: &AnswerPlan, enabled: bool) -> String {
     let requested = requested_lane.trim();
     if !enabled || requested == "local" {
@@ -1057,6 +1084,483 @@ fn lane_for_answer_plan(requested_lane: &str, plan: &AnswerPlan, enabled: bool) 
         return "vision".to_string();
     }
     plan.recommended_lane.to_string()
+}
+
+async fn resolve_answer_plan_for_request(
+    state: &AppState,
+    account: &Account,
+    req: &CompleteRequest,
+    requested_lane: &str,
+    rag_matches: &[sync::RagMatch],
+) -> ResolvedAnswerPlan {
+    let rule_plan = answer_plan_for_request(req, requested_lane, rag_matches);
+    let Some(reason) =
+        should_run_ai_answer_plan_classifier(req, requested_lane, rag_matches, &rule_plan)
+    else {
+        return ResolvedAnswerPlan::rules(rule_plan, "rule_confident");
+    };
+
+    match refine_answer_plan_with_ai_classifier(state, account, req, requested_lane, &rule_plan)
+        .await
+    {
+        Some(plan) => ResolvedAnswerPlan {
+            plan,
+            source: "ai_refined",
+            ai_attempted: true,
+            ai_reason: reason,
+        },
+        None => ResolvedAnswerPlan {
+            plan: rule_plan,
+            source: "rules",
+            ai_attempted: true,
+            ai_reason: "ai_unavailable_or_invalid",
+        },
+    }
+}
+
+fn should_run_ai_answer_plan_classifier(
+    req: &CompleteRequest,
+    requested_lane: &str,
+    rag_matches: &[sync::RagMatch],
+    plan: &AnswerPlan,
+) -> Option<&'static str> {
+    if !answer_plan_ai_fallback_enabled() {
+        return None;
+    }
+    if requested_lane == "local" || requested_lane == "vision" || !req.image_data_urls.is_empty() {
+        return None;
+    }
+    let question = extract_search_question(&req.user);
+    let normalized = normalize_guardrail_text(&question);
+    if normalized.is_empty() || contains_sensitive_classifier_text(&normalized) {
+        return None;
+    }
+    if is_hard_answer_plan_signal(&normalized) {
+        return None;
+    }
+
+    let threshold = answer_plan_ai_confidence_threshold();
+    if plan.confidence < threshold {
+        return Some("low_confidence");
+    }
+
+    let signal_count = [
+        looks_like_coding_question(&normalized),
+        looks_like_behavioral_question(&normalized),
+        looks_like_system_design_question(&normalized),
+        contains_any(
+            &normalized,
+            &["screen", "screenshot", "image", "visible page"],
+        ),
+        contains_any(
+            &normalized,
+            &["rewrite", "draft", "polish", "email", "message"],
+        ),
+        !rag_matches.is_empty(),
+    ]
+    .into_iter()
+    .filter(|value| *value)
+    .count();
+    if signal_count >= 2 && plan.confidence < 0.86 {
+        return Some("conflicting_signals");
+    }
+
+    None
+}
+
+fn answer_plan_ai_confidence_threshold() -> f32 {
+    std::env::var("BLUEY_ANSWER_PLAN_AI_CONFIDENCE_THRESHOLD")
+        .ok()
+        .and_then(|value| value.trim().parse::<f32>().ok())
+        .filter(|value| (0.50..=0.95).contains(value))
+        .unwrap_or(DEFAULT_ANSWER_PLAN_AI_CONFIDENCE_THRESHOLD)
+}
+
+fn answer_plan_ai_timeout() -> Duration {
+    let ms = std::env::var("BLUEY_ANSWER_PLAN_AI_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| (100..=3_000).contains(value))
+        .unwrap_or(DEFAULT_ANSWER_PLAN_AI_TIMEOUT_MS);
+    Duration::from_millis(ms)
+}
+
+fn answer_plan_ai_max_tokens() -> u32 {
+    std::env::var("BLUEY_ANSWER_PLAN_AI_MAX_TOKENS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| (64..=512).contains(value))
+        .unwrap_or(DEFAULT_ANSWER_PLAN_AI_MAX_TOKENS)
+}
+
+fn contains_sensitive_classifier_text(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "api key",
+            "secret key",
+            "password",
+            "bearer ",
+            "authorization:",
+            "private key",
+            "access token",
+            "refresh token",
+        ],
+    ) || normalized.contains("sk-")
+        || normalized.contains('@')
+}
+
+fn is_hard_answer_plan_signal(normalized: &str) -> bool {
+    looks_like_behavioral_question(normalized)
+        || looks_like_coding_question(normalized)
+        || looks_like_system_design_question(normalized)
+}
+
+#[derive(Debug, Deserialize)]
+struct AiAnswerPlanPayload {
+    intent: Option<String>,
+    lane: Option<String>,
+    output: Option<String>,
+    needs_web_search: Option<bool>,
+    confidence: Option<f32>,
+}
+
+async fn refine_answer_plan_with_ai_classifier(
+    state: &AppState,
+    account: &Account,
+    req: &CompleteRequest,
+    requested_lane: &str,
+    rule_plan: &AnswerPlan,
+) -> Option<AnswerPlan> {
+    let question = truncate_chars(&extract_search_question(&req.user), 1_200);
+    let system = "You are Bluey's fast routing classifier. Return only one JSON object. Do not answer the user. Valid intent values: quick, coding, coding_followup, behavioral, system_design, screen, research, follow_up, missing_context, writing, meeting, general. Valid lane values: instant, balanced, deep, vision. Valid output values: compact, code_artifact, source_answer, canvas_detail.";
+    let user = format!(
+        "Classify this Bluey request for routing.\n\
+         User question:\n{question}\n\n\
+         Signals:\n\
+         requested_lane={requested_lane}\n\
+         image_count={}\n\
+         rule_intent={}\n\
+         rule_output={}\n\
+         rule_lane={}\n\
+         rule_confidence={:.2}\n\n\
+         Return JSON with keys: intent, lane, output, needs_web_search, confidence.",
+        req.image_data_urls.len(),
+        rule_plan.intent.as_str(),
+        rule_plan.output.as_str(),
+        rule_plan.recommended_lane,
+        rule_plan.confidence
+    );
+    let max_tokens = answer_plan_ai_max_tokens();
+    let fallback_input_tokens = ((system.len() + user.len()) as i64 / 4).max(1);
+    let routes = priced_routes_for(
+        "instant",
+        fallback_input_tokens,
+        i64::from(max_tokens),
+        &format!("{}:answer-plan", req.request_id),
+    );
+    if routes.is_empty() {
+        return None;
+    }
+
+    let started = Instant::now();
+    for route in routes {
+        let key_candidates = state.config.upstream.key_candidates(
+            route.provider,
+            &format!(
+                "answer-plan:{}:{}:{}",
+                req.request_id, route.provider, route.model
+            ),
+        );
+        if key_candidates.is_empty() {
+            continue;
+        }
+
+        loop {
+            let selected_key = match state
+                .provider_health
+                .choose_key(route.provider, route.model, &key_candidates)
+                .await
+            {
+                Ok(key) => key,
+                Err(_) => break,
+            };
+            if state
+                .rate_limiters
+                .check_provider_llm(route.provider, route.model)
+                .await
+                .is_err()
+            {
+                break;
+            }
+
+            let completion = tokio::time::timeout(
+                answer_plan_ai_timeout(),
+                routing::complete_with_key(
+                    &selected_key.secret,
+                    route.provider,
+                    route.model,
+                    system,
+                    &user,
+                    Some(max_tokens),
+                    Some(0.0),
+                    routing::ThinkingBudget::off(),
+                    Some(fallback_input_tokens),
+                    &[],
+                ),
+            )
+            .await;
+
+            match completion {
+                Ok(Ok(comp)) => {
+                    record_answer_plan_classifier_usage(
+                        &state.pool,
+                        account,
+                        req,
+                        &comp,
+                        started.elapsed().as_millis() as i64,
+                    );
+                    if let Some(plan) = parse_ai_answer_plan(&comp.text).and_then(|payload| {
+                        merge_ai_answer_plan(rule_plan, payload, req, requested_lane)
+                    }) {
+                        tracing::info!(
+                            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                            request_id = %req.request_id,
+                            provider = %comp.provider,
+                            model = %comp.model,
+                            answer_intent = %plan.intent.as_str(),
+                            answer_output = %plan.output.as_str(),
+                            answer_lane = %plan.recommended_lane,
+                            answer_confidence = plan.confidence,
+                            "answer plan AI classifier refined route"
+                        );
+                        return Some(plan);
+                    }
+                    return None;
+                }
+                Ok(Err(err)) => {
+                    if let Some(retry_after_secs) = routing::upstream_retry_after(&err) {
+                        let _ = state
+                            .provider_health
+                            .record_cooldown(
+                                route.provider,
+                                route.model,
+                                &selected_key.fingerprint,
+                                retry_after_secs,
+                            )
+                            .await;
+                        continue;
+                    }
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_ai_answer_plan(text: &str) -> Option<AiAnswerPlanPayload> {
+    let trimmed = text.trim();
+    serde_json::from_str::<AiAnswerPlanPayload>(trimmed)
+        .ok()
+        .or_else(|| {
+            let start = trimmed.find('{')?;
+            let end = trimmed.rfind('}')?;
+            if end <= start {
+                return None;
+            }
+            serde_json::from_str::<AiAnswerPlanPayload>(&trimmed[start..=end]).ok()
+        })
+}
+
+fn merge_ai_answer_plan(
+    rule_plan: &AnswerPlan,
+    payload: AiAnswerPlanPayload,
+    req: &CompleteRequest,
+    requested_lane: &str,
+) -> Option<AnswerPlan> {
+    let question = extract_search_question(&req.user);
+    let normalized = normalize_guardrail_text(&question);
+    let mut intent = payload
+        .intent
+        .as_deref()
+        .and_then(parse_answer_intent)
+        .unwrap_or(rule_plan.intent);
+    let mut hard_override_applied = false;
+
+    if !req.image_data_urls.is_empty() || requested_lane == "vision" {
+        intent = AnswerIntent::Screen;
+        hard_override_applied = true;
+    } else if looks_like_behavioral_question(&normalized) {
+        intent = AnswerIntent::Behavioral;
+        hard_override_applied = true;
+    } else if looks_like_coding_followup(&normalized, true) {
+        intent = AnswerIntent::CodingFollowUp;
+        hard_override_applied = true;
+    } else if looks_like_coding_question(&normalized) {
+        intent = AnswerIntent::Coding;
+        hard_override_applied = true;
+    } else if looks_like_system_design_question(&normalized) && intent == AnswerIntent::Behavioral {
+        return None;
+    }
+
+    let mut output = payload
+        .output
+        .as_deref()
+        .and_then(parse_answer_output)
+        .unwrap_or_else(|| default_output_for_intent(intent));
+    if !output_matches_intent(intent, output) {
+        output = default_output_for_intent(intent);
+    }
+    let recommended_lane = default_lane_for_intent(intent);
+    if let Some(lane) = payload.lane.as_deref().and_then(valid_answer_lane) {
+        if !lane_matches_intent(intent, lane) {
+            if !hard_override_applied {
+                return None;
+            }
+        }
+    }
+    let mut needs_web_search = payload
+        .needs_web_search
+        .unwrap_or(rule_plan.needs_web_search);
+    if matches!(
+        intent,
+        AnswerIntent::Coding
+            | AnswerIntent::CodingFollowUp
+            | AnswerIntent::Behavioral
+            | AnswerIntent::SystemDesign
+            | AnswerIntent::Screen
+            | AnswerIntent::MissingContext
+    ) {
+        needs_web_search = false;
+    }
+    if intent == AnswerIntent::Research {
+        needs_web_search = true;
+    }
+
+    let confidence = payload
+        .confidence
+        .map(|value| value.clamp(0.0, 0.99))
+        .unwrap_or(rule_plan.confidence)
+        .max(rule_plan.confidence.min(0.80));
+
+    Some(AnswerPlan {
+        intent,
+        output,
+        recommended_lane,
+        confidence,
+        needs_screen: intent == AnswerIntent::Screen || rule_plan.needs_screen,
+        needs_docs: rule_plan.needs_docs,
+        needs_transcript: intent == AnswerIntent::Meeting || rule_plan.needs_transcript,
+        needs_memory: rule_plan.needs_memory,
+        needs_web_search,
+    })
+}
+
+fn parse_answer_intent(value: &str) -> Option<AnswerIntent> {
+    match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "quick" => Some(AnswerIntent::Quick),
+        "coding" | "code" => Some(AnswerIntent::Coding),
+        "coding_followup" | "code_followup" => Some(AnswerIntent::CodingFollowUp),
+        "behavioral" | "interview_behavioral" => Some(AnswerIntent::Behavioral),
+        "system_design" => Some(AnswerIntent::SystemDesign),
+        "screen" | "vision" => Some(AnswerIntent::Screen),
+        "research" | "web_research" => Some(AnswerIntent::Research),
+        "follow_up" | "followup" => Some(AnswerIntent::FollowUp),
+        "missing_context" => Some(AnswerIntent::MissingContext),
+        "writing" => Some(AnswerIntent::Writing),
+        "meeting" => Some(AnswerIntent::Meeting),
+        "general" => Some(AnswerIntent::General),
+        _ => None,
+    }
+}
+
+fn parse_answer_output(value: &str) -> Option<AnswerOutput> {
+    match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "compact" => Some(AnswerOutput::Compact),
+        "code_artifact" | "code" => Some(AnswerOutput::CodeArtifact),
+        "source_answer" | "sources" => Some(AnswerOutput::SourceAnswer),
+        "canvas_detail" | "canvas" => Some(AnswerOutput::CanvasDetail),
+        _ => None,
+    }
+}
+
+fn default_lane_for_intent(intent: AnswerIntent) -> &'static str {
+    match intent {
+        AnswerIntent::Quick => "instant",
+        AnswerIntent::Coding | AnswerIntent::CodingFollowUp | AnswerIntent::SystemDesign => "deep",
+        AnswerIntent::Screen => "vision",
+        _ => "balanced",
+    }
+}
+
+fn default_output_for_intent(intent: AnswerIntent) -> AnswerOutput {
+    match intent {
+        AnswerIntent::Coding | AnswerIntent::CodingFollowUp => AnswerOutput::CodeArtifact,
+        AnswerIntent::Research => AnswerOutput::SourceAnswer,
+        AnswerIntent::SystemDesign | AnswerIntent::Screen => AnswerOutput::CanvasDetail,
+        _ => AnswerOutput::Compact,
+    }
+}
+
+fn output_matches_intent(intent: AnswerIntent, output: AnswerOutput) -> bool {
+    default_output_for_intent(intent) == output
+        || matches!(
+            (intent, output),
+            (AnswerIntent::General, AnswerOutput::CanvasDetail)
+                | (AnswerIntent::Writing, AnswerOutput::CanvasDetail)
+                | (AnswerIntent::Meeting, AnswerOutput::CanvasDetail)
+        )
+}
+
+fn valid_answer_lane(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "instant" => Some("instant"),
+        "balanced" => Some("balanced"),
+        "deep" => Some("deep"),
+        "vision" => Some("vision"),
+        _ => None,
+    }
+}
+
+fn lane_matches_intent(intent: AnswerIntent, lane: &str) -> bool {
+    default_lane_for_intent(intent) == lane
+        || matches!(
+            (intent, lane),
+            (AnswerIntent::General, "instant")
+                | (AnswerIntent::Quick, "balanced")
+                | (AnswerIntent::Writing, "instant")
+        )
+}
+
+fn record_answer_plan_classifier_usage(
+    pool: &crate::db::DbPool,
+    account: &Account,
+    req: &CompleteRequest,
+    comp: &routing::Completion,
+    latency_ms: i64,
+) {
+    let bluey_cost = pricing::lookup(&comp.provider, &comp.model)
+        .map(|entry| pricing::compute_cost(entry, comp.input_tokens, comp.output_tokens).0)
+        .unwrap_or(0);
+    let event = UsageEvent {
+        request_id: req.request_id.clone(),
+        kind: "answer_plan_classifier".into(),
+        task_type: Some("answer_plan_classifier".into()),
+        lane: Some("instant".into()),
+        provider: Some(comp.provider.clone()),
+        model: Some(comp.model.clone()),
+        input_tokens: comp.input_tokens,
+        output_tokens: comp.output_tokens,
+        latency_ms,
+        cost_cents_to_bluey: bluey_cost,
+        cost_cents_to_customer: 0,
+        was_speculative: false,
+        was_fallback: false,
+    };
+    let _ = usage::record(pool, &account.id, &event);
 }
 
 fn looks_like_coding_question(normalized: &str) -> bool {
@@ -2355,7 +2859,15 @@ async fn complete_stream_inner(
         streaming = true,
         "managed chat memory context prepared"
     );
-    let answer_plan = answer_plan_for_request(&req, &requested_effective_lane, &rag_matches);
+    let resolved_answer_plan = resolve_answer_plan_for_request(
+        &state,
+        &account,
+        &req,
+        &requested_effective_lane,
+        &rag_matches,
+    )
+    .await;
+    let answer_plan = resolved_answer_plan.plan.clone();
     let answer_plan_routing = answer_plan_routing_enabled();
     let effective_lane =
         lane_for_answer_plan(&requested_effective_lane, &answer_plan, answer_plan_routing);
@@ -2366,6 +2878,9 @@ async fn complete_stream_inner(
         requested_effective_lane = %requested_effective_lane_log,
         effective_lane = %effective_lane_log,
         answer_plan_routing,
+        answer_plan_source = resolved_answer_plan.source,
+        answer_plan_ai_attempted = resolved_answer_plan.ai_attempted,
+        answer_plan_ai_reason = resolved_answer_plan.ai_reason,
         answer_intent = %answer_plan.intent.as_str(),
         answer_output = %answer_plan.output.as_str(),
         answer_confidence = answer_plan.confidence,
@@ -3219,7 +3734,15 @@ async fn complete_inner(
         streaming = false,
         "managed chat memory context prepared"
     );
-    let answer_plan = answer_plan_for_request(&req, &requested_effective_lane, &rag_matches);
+    let resolved_answer_plan = resolve_answer_plan_for_request(
+        &state,
+        &account,
+        &req,
+        &requested_effective_lane,
+        &rag_matches,
+    )
+    .await;
+    let answer_plan = resolved_answer_plan.plan.clone();
     let answer_plan_routing = answer_plan_routing_enabled();
     let effective_lane =
         lane_for_answer_plan(&requested_effective_lane, &answer_plan, answer_plan_routing);
@@ -3230,6 +3753,9 @@ async fn complete_inner(
         requested_effective_lane = %requested_effective_lane_log,
         effective_lane = %effective_lane_log,
         answer_plan_routing,
+        answer_plan_source = resolved_answer_plan.source,
+        answer_plan_ai_attempted = resolved_answer_plan.ai_attempted,
+        answer_plan_ai_reason = resolved_answer_plan.ai_reason,
         answer_intent = %answer_plan.intent.as_str(),
         answer_output = %answer_plan.output.as_str(),
         answer_confidence = answer_plan.confidence,
@@ -5487,6 +6013,74 @@ mod tests {
 
         assert_eq!(plan.intent, AnswerIntent::Screen);
         assert_eq!(lane_for_answer_plan("vision", &plan, true), "vision");
+    }
+
+    #[test]
+    fn answer_plan_ai_fallback_targets_only_ambiguous_low_confidence_requests() {
+        std::env::remove_var("BLUEY_ANSWER_PLAN_AI_FALLBACK");
+        std::env::remove_var("BLUEY_ANSWER_PLAN_AI_CONFIDENCE_THRESHOLD");
+        let ambiguous = complete_request(
+            "Question:\nI need a better way to think through what to do next in this situation.",
+        );
+        let ambiguous_plan = answer_plan_for_request(&ambiguous, "balanced", &[]);
+        assert_eq!(ambiguous_plan.intent, AnswerIntent::General);
+        assert_eq!(
+            should_run_ai_answer_plan_classifier(&ambiguous, "balanced", &[], &ambiguous_plan),
+            Some("low_confidence")
+        );
+
+        let code = complete_request("Question:\nBuild me LRU cache in Python.");
+        let code_plan = answer_plan_for_request(&code, "balanced", &[]);
+        assert_eq!(code_plan.intent, AnswerIntent::Coding);
+        assert_eq!(
+            should_run_ai_answer_plan_classifier(&code, "balanced", &[], &code_plan),
+            None
+        );
+
+        std::env::set_var("BLUEY_ANSWER_PLAN_AI_FALLBACK", "0");
+        assert_eq!(
+            should_run_ai_answer_plan_classifier(&ambiguous, "balanced", &[], &ambiguous_plan),
+            None
+        );
+        std::env::remove_var("BLUEY_ANSWER_PLAN_AI_FALLBACK");
+    }
+
+    #[test]
+    fn answer_plan_ai_payload_is_json_only_and_hard_overrides_behavioral() {
+        let req = complete_request(
+            "Question:\nTell me about yourself for a senior software engineer interview.",
+        );
+        let rule_plan = answer_plan_for_request(&req, "balanced", &[]);
+        let payload = parse_ai_answer_plan(
+            "```json\n{\"intent\":\"system_design\",\"lane\":\"deep\",\"output\":\"canvas_detail\",\"needs_web_search\":true,\"confidence\":0.98}\n```",
+        )
+        .expect("fenced json should parse");
+
+        let plan = merge_ai_answer_plan(&rule_plan, payload, &req, "balanced")
+            .expect("hard override should produce a safe plan");
+
+        assert_eq!(plan.intent, AnswerIntent::Behavioral);
+        assert_eq!(plan.recommended_lane, "balanced");
+        assert_eq!(plan.output, AnswerOutput::Compact);
+        assert!(!plan.needs_web_search);
+    }
+
+    #[test]
+    fn answer_plan_ai_payload_can_refine_general_to_research() {
+        let req = complete_request("Question:\nNorth pier project status");
+        let rule_plan = answer_plan_for_request(&req, "balanced", &[]);
+        let payload = parse_ai_answer_plan(
+            "{\"intent\":\"research\",\"lane\":\"balanced\",\"output\":\"source_answer\",\"needs_web_search\":true,\"confidence\":0.82}",
+        )
+        .expect("json should parse");
+
+        let plan = merge_ai_answer_plan(&rule_plan, payload, &req, "balanced")
+            .expect("research plan should be valid");
+
+        assert_eq!(plan.intent, AnswerIntent::Research);
+        assert_eq!(plan.recommended_lane, "balanced");
+        assert_eq!(plan.output, AnswerOutput::SourceAnswer);
+        assert!(plan.needs_web_search);
     }
 
     #[test]
