@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-30 13:36 EDT
+Latest checkpoint: 2026-06-30 13:49 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,27 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-256-DESKTOP-LOGIN-HANDOFF-VISIBILITY.md`; the next canonical Bluey round doc should start at `ROUND-257-...`.
+- Latest assigned Bluey round doc is `ROUND-257-ACTIVE-TEST-ACCOUNT-BALANCE-RESET.md`; the next canonical Bluey round doc should start at `ROUND-258-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 257 explained and fixed the still-low `$4.79` balance:
+  - active local desktop account was `codex-smoke-20260608183100@bluey.sh`,
+    not the earlier restored `internal-admin-20260606023943@bluey.sh`
+  - live Postgres had `codex-smoke` at `balance_cents=479` and
+    `internal-admin` at `balance_cents=1500`
+  - recent ledger rows showed normal LLM/STT usage on `codex-smoke`
+  - credited `codex-smoke` internally by `1021` cents:
+    `479 -> 1500`
+  - cleared stale `auto_topup_enabled=1` because the account had no saved
+    Square/Stripe payment method; current backend already blocks enabling Auto
+    Reload without a saved method
+  - live verification showed `balance_cents=1500`, `reserved_cents=0`, and
+    `auto_topup_enabled=0`
+  - Round doc:
+    `docs/rounds/ROUND-257-ACTIVE-TEST-ACCOUNT-BALANCE-RESET.md`
 - Round 256 fixed the confusing `bluey login` browser handoff where login
   succeeded but the terminal kept waiting:
   - root cause: the pending desktop-link hint lived inside the login card, which
