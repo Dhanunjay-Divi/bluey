@@ -2688,6 +2688,50 @@ swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift
 native/macos/cue-overlay/build.sh
 ```
 
+## Latest Round: Round 250
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`.
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-250-DROPLET-RELEASE-DEPLOY-0.1.17.md`
+
+Round 250 deployed the current Bluey work to the live droplet download/API path:
+
+- workspace release bumped to `0.1.17`
+- release notes added at `docs/release/RELEASE-v0.1.17.md`
+- macOS arm64 release artifact built with embedded updater public key
+- signed `latest.json` and `latest.json.sig` published to `bluey.sh`
+- live artifact:
+  - `https://bluey.sh/releases/v0.1.17/bluey-0.1.17-darwin-arm64.tar.gz`
+  - SHA256 `8a91bdc1bd34444fb31f76450461e5d2b287405f205a415611c82d069359451d`
+- static web, install scripts, release notes, checksum file, and manifest published to `/var/www/bluey`
+- API server rebuilt on the droplet from `/opt/bluey-build-codex-0.1.17` and restarted through `bluey-api.service`
+- previous server binary backed up at `/var/backups/bluey-api/bin/bluey-server.previous-20260630T090432Z`
+
+Verification passed:
+
+```bash
+BLUEY_UPDATE_PUBKEY=... make package-darwin-arm64
+cargo build --release --manifest-path server/Cargo.toml --bin bluey-server
+bash scripts/release-hygiene-scan.sh
+BLUEY_RELEASE_SIGNING_KEY_FILE=... scripts/publish-bluey-release.sh
+BLUEY_RELEASE_SIGNING_KEY_FILE=... PUBLISH_HOST=root@165.227.77.152 PUBLISH_PATH=/var/www/bluey bash scripts/deploy-bluey-sh-manual.sh
+curl -fsS https://bluey.sh/health
+curl -fsS https://bluey.sh/latest.json
+openssl pkeyutl -verify -rawin -pubin ...
+curl download + shasum against live SHA256SUMS.txt
+temp-home install smoke from https://bluey.sh/install.sh -> bluey 0.1.17
+```
+
+Caveat: live `latest.json` currently advertises only `darwin-arm64` for `0.1.17`. `install.ps1` remains published, but a fresh Windows `0.1.17` zip still needs the Windows build host before Windows can update to this exact version.
+
 ## Historical Carried Section: Round 202
 
 Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
