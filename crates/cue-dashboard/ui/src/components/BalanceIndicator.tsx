@@ -47,22 +47,49 @@ export function BalanceIndicator() {
           ? "Balance --"
           : "Checking";
 
-  const tone = snapshot?.low_balance_warning
-    ? "border-amber-500/50 bg-amber-950/50 text-amber-100"
-    : "border-cyan-400/25 bg-zinc-900/85 text-zinc-100";
+  const balanceTone = snapshot
+    ? toneForBalance(snapshot.balance_cents, snapshot.low_balance_warning)
+    : status === "signed-out"
+      ? "warning"
+      : "normal";
+  const tone =
+    balanceTone === "critical"
+      ? "border-red-500/55 bg-red-950/50 text-red-100"
+      : balanceTone === "warning"
+        ? "border-amber-500/50 bg-amber-950/50 text-amber-100"
+        : "border-cyan-400/25 bg-zinc-900/85 text-zinc-100";
+  const dot =
+    balanceTone === "critical"
+      ? "bg-red-400 shadow-red-400/50"
+      : balanceTone === "warning"
+        ? "bg-amber-300 shadow-amber-300/45"
+        : "bg-emerald-400 shadow-emerald-400/45";
+  const icon =
+    balanceTone === "critical"
+      ? "text-red-300"
+      : balanceTone === "warning"
+        ? "text-amber-200"
+        : "text-cyan-300";
 
   return (
     <div
       className={`absolute right-5 top-4 z-20 flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold shadow-lg backdrop-blur ${tone}`}
       title={tooltip(snapshot, status)}
     >
-      <CreditCard size={14} className="text-cyan-300" />
+      <span className={`h-2 w-2 rounded-full shadow ${dot}`} aria-hidden="true" />
+      <CreditCard size={14} className={icon} />
       <span>{label}</span>
       {snapshot?.auto_topup_enabled ? (
         <span className="text-[10px] text-zinc-400">auto</span>
       ) : null}
     </div>
   );
+}
+
+function toneForBalance(cents: number, lowBalanceWarning: boolean): "normal" | "warning" | "critical" {
+  if (cents < 500) return "critical";
+  if (cents < 1_000 || lowBalanceWarning) return "warning";
+  return "normal";
 }
 
 function tooltip(snapshot: BalanceSnapshot | null, status: string): string {

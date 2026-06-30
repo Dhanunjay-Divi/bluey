@@ -201,6 +201,65 @@ private enum BlueyLightTheme {
     static let shadow = NSColor.black.withAlphaComponent(0.28)
 }
 
+private enum BalanceVisualTone: Equatable {
+    case unknown
+    case normal
+    case low
+    case critical
+    case signedOut
+}
+
+private func parsedBalanceCents(from label: String) -> Int? {
+    let clean = label.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let dollar = clean.firstIndex(of: "$") else { return nil }
+    let negative = clean[..<dollar].contains("-")
+    var index = clean.index(after: dollar)
+    var dollars = ""
+    var cents = ""
+    while index < clean.endIndex, clean[index].isNumber {
+        dollars.append(clean[index])
+        index = clean.index(after: index)
+    }
+    if index < clean.endIndex, clean[index] == "." {
+        index = clean.index(after: index)
+        while index < clean.endIndex, clean[index].isNumber, cents.count < 2 {
+            cents.append(clean[index])
+            index = clean.index(after: index)
+        }
+    }
+    guard let dollarValue = Int(dollars) else { return nil }
+    while cents.count < 2 {
+        cents.append("0")
+    }
+    let centValue = Int(String(cents.prefix(2))) ?? 0
+    let value = dollarValue * 100 + centValue
+    return negative ? -value : value
+}
+
+private func balanceVisualTone(for label: String) -> BalanceVisualTone {
+    let clean = label.trimmingCharacters(in: .whitespacesAndNewlines)
+    let lower = clean.lowercased()
+    if clean.isEmpty || lower.contains("--") {
+        return .unknown
+    }
+    if lower.contains("login") || lower.contains("sign in") {
+        return .signedOut
+    }
+    if let cents = parsedBalanceCents(from: clean) {
+        if cents < 500 {
+            return .critical
+        }
+        if cents < 1_000 || lower.contains("low") {
+            return .low
+        }
+        return .normal
+    }
+    if lower.contains("low") {
+        return .low
+    }
+    return .unknown
+}
+
 private let minimumOverlayBackgroundOpacity: CGFloat = 0.18
 private let supportedDropFormatsMessage =
     "Supported: PDF, DOC/DOCX, Excel/ODS, CSV/TSV, text, Markdown, code/data files, and PNG/JPEG/WebP/GIF/HEIC/BMP/TIFF images."
@@ -2070,6 +2129,8 @@ private enum PillRunState: Equatable {
 private enum PillHealthState: Equatable {
     case unknown
     case ready
+    case lowBalance
+    case criticalBalance
     case needsAttention
 }
 
@@ -2097,11 +2158,17 @@ private final class PillView: NSView {
     func setBalanceLabel(_ label: String) {
         let clean = label.trimmingCharacters(in: .whitespacesAndNewlines)
         balanceText = clean
-        let lower = clean.lowercased()
-        if lower.contains("login") || lower.contains("sign in") || lower.contains("low") {
+        switch balanceVisualTone(for: clean) {
+        case .critical:
+            setHealthState(.criticalBalance)
+        case .low:
+            setHealthState(.lowBalance)
+        case .signedOut:
             setHealthState(.needsAttention)
-        } else if clean.hasPrefix("$") && !lower.contains("--") {
+        case .normal:
             setHealthState(.ready)
+        case .unknown:
+            setHealthState(.unknown)
         }
     }
     var dotColor: NSColor = NSColor.systemGreen {
@@ -2244,10 +2311,10 @@ private final class PillView: NSView {
     }
 
     private var resolvedDotColor: NSColor {
-        if runState == .failed || healthState == .needsAttention {
+        if runState == .failed || healthState == .criticalBalance {
             return BlueyTheme.danger
         }
-        if runState == .connecting {
+        if runState == .connecting || healthState == .lowBalance || healthState == .needsAttention {
             return BlueyTheme.warning
         }
         if runState == .listening || healthState == .ready {
@@ -2257,8 +2324,14 @@ private final class PillView: NSView {
     }
 
     private var resolvedAccessibilityLabel: String {
-        if runState == .failed || healthState == .needsAttention {
+        if runState == .failed || healthState == .criticalBalance {
             return "Bluey needs attention"
+        }
+        if healthState == .lowBalance {
+            return "Bluey low balance"
+        }
+        if healthState == .needsAttention {
+            return "Bluey needs sign in"
         }
         if runState == .connecting || runState == .listening {
             return runState.accessibilityLabel
@@ -5176,7 +5249,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         refreshControlChromeForTheme()
         updateThemeButtonChrome()
         statusLabel.textColor = themedDimTextColor
-        balanceLabel.textColor = themedTextColor
+        updateBalanceLabelTone()
         transcriptStateLabel.textColor = transcriptStateLabel.stringValue == "LIVE" ? BlueyTheme.green : themedDimTextColor
         transcriptLabel.textColor = themedTextColor
         opacityLabel.textColor = themedDimTextColor
@@ -7758,6 +7831,45 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     func setBalanceLabel(_ label: String) {
         let clean = label.trimmingCharacters(in: .whitespacesAndNewlines)
         balanceLabel.stringValue = clean.isEmpty ? "Balance --" : clean
+        updateBalanceLabelTone()
+    }
+
+    private func updateBalanceLabelTone() {
+        let tone = balanceVisualTone(for: balanceLabel.stringValue)
+        balanceLabel.textColor = balanceLabelColor(for: tone)
+        balanceLabel.toolTip = balanceLabelTooltip(for: tone)
+    }
+
+    private func balanceLabelColor(for tone: BalanceVisualTone) -> NSColor {
+        switch tone {
+        case .critical:
+            return lightThemeEnabled
+                ? NSColor(red: 0.70, green: 0.05, blue: 0.10, alpha: 1.0)
+                : BlueyTheme.danger
+        case .low, .signedOut:
+            return lightThemeEnabled
+                ? NSColor(red: 0.58, green: 0.30, blue: 0.00, alpha: 1.0)
+                : BlueyTheme.warning
+        case .normal:
+            return themedTextColor
+        case .unknown:
+            return themedDimTextColor
+        }
+    }
+
+    private func balanceLabelTooltip(for tone: BalanceVisualTone) -> String {
+        switch tone {
+        case .critical:
+            return "Balance below $5. Add credits before paid cloud work pauses."
+        case .low:
+            return "Low balance. Add credits soon."
+        case .signedOut:
+            return "Sign in to use managed answers and balance."
+        case .normal:
+            return "Remaining Bluey credits."
+        case .unknown:
+            return "Balance unavailable."
+        }
     }
 
     private func setHeaderSubtitle(_ text: String = "") {
@@ -7775,6 +7887,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         routeBadge.layer?.borderColor = NSColor.clear.cgColor
         routeBadge.layer?.backgroundColor = NSColor.clear.cgColor
         balanceLabel.stringValue = "Login"
+        updateBalanceLabelTone()
         setKnowledgeBadge("Docs locked", accent: BlueyTheme.textDim)
         composer.placeholder = url == nil ? "Sign in to use managed answers..." : "Sign in, then ask anything..."
         statusLabel.toolTip = "Cloud answers, balance, sync, and documents unlock after login"
@@ -7790,6 +7903,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         routeBadge.layer?.backgroundColor = NSColor.clear.cgColor
         if balanceLabel.stringValue == "Login" {
             balanceLabel.stringValue = "Balance --"
+            updateBalanceLabelTone()
         }
         setKnowledgeBadge("Docs empty", accent: BlueyTheme.textDim)
         composer.placeholder = recordingActive

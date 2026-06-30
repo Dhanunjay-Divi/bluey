@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-30 03:59 EDT
+Latest checkpoint: 2026-06-30 04:26 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,39 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-248-ANSWERPLAN-E2E-STT-TRANSCRIPT-SMOKE.md`; the next canonical Bluey round doc should start at `ROUND-249-...`.
+- Latest assigned Bluey round doc is `ROUND-249-BALANCE-WARNING-COLOR-STATES.md`; the next canonical Bluey round doc should start at `ROUND-250-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 249 added clearer low/critical balance visual states:
+  - `>= $10.00` remains normal
+  - `$5.00` through `$9.99` shows orange low-balance warning
+  - `< $5.00` shows red critical balance warning
+  - macOS collapsed pill dot now uses orange for low/sign-in-needed and red for
+    critical balance under `$5`
+  - macOS expanded header balance label now uses theme-aware orange/red text
+  - dashboard floating balance pill now includes a matching colored dot
+  - dashboard settings balance and web account balance KPI now use the same
+    orange/red thresholds
+  - Windows parity note: `native/windows/cue-overlay/main.c` has no matching
+    overlay balance renderer in this round; shared dashboard/web account
+    surfaces were updated
+  - files changed:
+    - `native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `crates/cue-dashboard/ui/src/components/BalanceIndicator.tsx`
+    - `crates/cue-dashboard/ui/src/pages/Settings.tsx`
+    - `web/assets/bluey-site.js`
+    - `web/assets/bluey-site.css`
+  - Round doc:
+    `docs/rounds/ROUND-249-BALANCE-WARNING-COLOR-STATES.md`
+  - Verification passed:
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `npm --prefix crates/cue-dashboard/ui run build`
+    - `git diff --check`
+  - Remaining gate: rebuild/hot-install the macOS overlay and deploy web assets
+    before expecting live users to see this balance color update.
 - Round 248 tightened the end-to-end AnswerPlan, transcript, STT, and smoke-test
   path:
   - added privacy-safe answer diagnostics with question/transcript hashes,

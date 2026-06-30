@@ -1271,7 +1271,13 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const profileEmailLabel = document.getElementById('profileEmailLabel');
         if (profileEmailLabel) profileEmailLabel.textContent = me.email || 'Bluey account';
         setRailCommand(true, me.email || '');
-        document.getElementById('balanceValue').textContent = money(me.balance_cents);
+        const balanceValue = document.getElementById('balanceValue');
+        const balanceCard = balanceValue?.closest('.balance-kpi');
+        if (balanceValue) {
+          balanceValue.textContent = money(me.balance_cents);
+          balanceCard?.classList.toggle('balance-critical', me.balance_cents < 500);
+          balanceCard?.classList.toggle('balance-low', me.balance_cents >= 500 && me.balance_cents < 1000);
+        }
         document.getElementById('balanceHint').textContent = me.trial_seconds_remaining > 0
           ? `${Math.round(me.trial_seconds_remaining / 60)} trial minutes left. Credits are used after the trial when paid cloud work is needed.`
           : 'When balance reaches $0, paid cloud work pauses until you add credits.';

@@ -1667,6 +1667,16 @@
       background: linear-gradient(135deg, rgba(99, 216, 255, .08), #0a0a0a 48%);
     }
 
+    #accountApp .balance-kpi.balance-low {
+      border-color: rgba(255, 183, 76, .46);
+      background: linear-gradient(135deg, rgba(255, 183, 76, .12), #0a0a0a 48%);
+    }
+
+    #accountApp .balance-kpi.balance-critical {
+      border-color: rgba(255, 80, 96, .52);
+      background: linear-gradient(135deg, rgba(255, 80, 96, .13), #0a0a0a 48%);
+    }
+
     #accountApp .account-kpi span {
       display: block;
       color: #666;
@@ -1682,6 +1692,14 @@
       color: #f2f2f2;
       font-size: 1.3rem;
       line-height: 1;
+    }
+
+    #accountApp .balance-kpi.balance-low strong {
+      color: #ffbd63;
+    }
+
+    #accountApp .balance-kpi.balance-critical strong {
+      color: #ff5a66;
     }
 
     #accountApp .account-kpi em {

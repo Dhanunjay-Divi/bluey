@@ -99,6 +99,14 @@ function AccountCard() {
     catch (e) { console.warn("delete_account failed", e); }
   }
 
+  const balanceClass = me
+    ? me.balance_cents < 500
+      ? "text-red-300"
+      : me.balance_cents < 1_000
+        ? "text-amber-300"
+        : "text-zinc-200"
+    : "text-zinc-200";
+
   return (
     <div className="rounded-xl bg-zinc-900 border border-zinc-800 p-5 space-y-4">
       <h3 className="font-semibold text-zinc-100">Account</h3>
@@ -108,7 +116,7 @@ function AccountCard() {
             <Mail className="h-4 w-4 text-zinc-500" /> {me.email}
           </div>
           <div className="text-zinc-400 text-xs">
-            Balance: <span className="text-zinc-200 font-medium tabular-nums">
+            Balance: <span className={`${balanceClass} font-medium tabular-nums`}>
               ${(me.balance_cents / 100).toFixed(2)}
             </span>
             {me.trial_seconds_remaining > 0 && (
