@@ -74,6 +74,34 @@ configured:
 | DeepSeek | `deepseek-v4-pro` | `deep` | OpenAI-compatible endpoint; deep lane sends thinking enabled |
 | DeepSeek | `deepseek-v4-flash` | `instant`, `balanced`, `deep` fallback | OpenAI-compatible endpoint; instant/balanced send thinking disabled |
 
+## AnswerPlan Pre-Routing
+
+`BLUEY_ANSWER_PLAN_ROUTING=1` enables a deterministic server-side AnswerPlan
+step before provider route selection. The planner is local rules first, not an
+extra AI classifier call, so it does not add latency or cost.
+
+The planner classifies the request into intents such as `quick`, `coding`,
+`coding_followup`, `behavioral`, `system_design`, `screen`, `research`,
+`missing_context`, `writing`, `meeting`, and `general`. It also decides the
+evidence needs and preferred output shape:
+
+| Intent | Preferred lane | Output shape | Guardrail |
+| --- | --- | --- | --- |
+| `quick` | `instant` | compact | Short answers stay cheap and fast |
+| `coding` / `coding_followup` | `deep` | code artifact | Code requests should include real code, not vague summaries |
+| `behavioral` | `balanced` | compact | Self-intro/resume answers must not become system-design answers |
+| `system_design` | `deep` | canvas detail | Architecture prompts get larger reasoning/output budget |
+| `screen` | `vision` | canvas detail | Image/screen requests stay on image-capable routes |
+| `research` | `balanced` | source answer | Public/current unknowns can enter managed web search |
+| `missing_context` | `balanced` | compact | Missing docs/screen are named once with a concrete next step |
+
+When the flag is off, managed requests keep the lane selected by the client.
+When it is on, AnswerPlan may promote `balanced` Auto traffic to `instant`,
+`deep`, or `vision` before the dispatcher applies `BLUEY_ROUTE_POLICY`.
+Provider selection remains separate: `provider_mix`, `quality_first`, or
+`cost_optimized` still decides which approved Claude/OpenAI/Gemini/GLM/DeepSeek
+candidate handles the chosen lane.
+
 ## Thinking Budget Policy
 
 Bluey now carries provider-neutral thinking controls through the managed path:
@@ -216,6 +244,7 @@ Default server knobs:
 | `BLUEY_LIMIT_PROVIDER_GEMINI_LLM_PER_MIN` | 600/min, burst 120 | Gemini text/vision capacity |
 | `BLUEY_LIMIT_PROVIDER_DEEPSEEK_LLM_PER_MIN` | 600/min, burst 120 | DeepSeek text capacity |
 | `BLUEY_LIMIT_PROVIDER_ZAI_LLM_PER_MIN` | 300/min, burst 60 | Z.AI GLM text capacity |
+| `BLUEY_ANSWER_PLAN_ROUTING` | unset/disabled | Set to `1` to let server AnswerPlan promote Auto requests to instant/deep/vision/research-aware behavior before provider routing |
 | `BLUEY_ROUTE_POLICY` | `provider_mix` | Default rotates first attempts across configured providers. Set `quality_first` for the older static order or `cost_optimized` to prefer GLM/DeepSeek first for managed text lanes |
 | `BLUEY_LIMIT_PROVIDER_OPENAI_EMBED_PER_MIN` | 900/min, burst 180 | OpenAI embedding capacity |
 | `BLUEY_LIMIT_PROVIDER_DEEPGRAM_STT_PER_MIN` | 600/min, burst 120 | Deepgram STT capacity |

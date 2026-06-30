@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-29 20:14 EDT
+Latest checkpoint: 2026-06-29 23:11 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,42 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-240-RELEASE-SECRET-ARTIFACT-GUARD.md`; the next canonical Bluey round doc should start at `ROUND-241-...`.
+- Latest assigned Bluey round doc is `ROUND-241-ANSWERPLAN-ROUTING-GATE.md`; the next canonical Bluey round doc should start at `ROUND-242-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 241 implemented `BLUEY_ANSWER_PLAN_ROUTING=1` as a server-side
+  AnswerPlan lane-promotion gate before managed provider routing:
+  - the planner is deterministic local rules first, not an AI classifier call
+  - it classifies quick, coding, coding follow-up, behavioral, system design,
+    screen, research, missing context, writing, meeting, and general intents
+  - when enabled, it can promote Auto/balanced traffic to `instant`, `deep`, or
+    `vision` before the existing dispatcher applies `BLUEY_ROUTE_POLICY`
+  - code/code-follow-up prompts now carry prompt guidance to include actual
+    fenced code instead of vague summaries
+  - self-intro/interview prompts route as behavioral and explicitly avoid
+    system-design treatment
+  - bare public lookup phrases such as `secret passage ranch` are eligible for
+    research/web-search planning when no saved context applies
+  - Mac/Windows parity: server-side managed routing benefits both clients once
+    deployed to the shared `bluey-server`
+  - `BLUEY_ROUTE_POLICY=cost_optimized` remains available and still applies
+    after AnswerPlan chooses the lane
+  - docs updated:
+    - `docs/MODEL-ROUTING.md`
+  - Round doc:
+    `docs/rounds/ROUND-241-ANSWERPLAN-ROUTING-GATE.md`
+  - Verification passed:
+    - `cargo fmt --manifest-path server/Cargo.toml`
+    - `cargo test --manifest-path server/Cargo.toml api::router::tests -- --nocapture`
+    - `cargo test --manifest-path server/Cargo.toml routing::dispatcher::tests -- --nocapture`
+    - `cargo check --manifest-path server/Cargo.toml`
+    - secret-fragment scan over `server docs scripts`
+  - Remaining gates: deploy with `BLUEY_ANSWER_PLAN_ROUTING=1` in staging,
+    live-smoke the exact prompts listed in the round doc, compare answer-plan
+    and provider logs, then canary production.
 - Round 240 added a release artifact secret guard after the owner asked whether
   deployed API keys can stay server-side and out of downloadable binaries:
   - confirmed intended architecture: provider keys live in `bluey-server`
