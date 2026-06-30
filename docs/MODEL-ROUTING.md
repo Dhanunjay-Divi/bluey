@@ -53,19 +53,24 @@ When a user is logged in, the desktop talks to `bluey-server` through
 `BlueyManagedProvider`. The server owns provider API keys and maps lanes to
 actual upstream models.
 
-| Bluey lane | Provider | Model | Primary use |
-| --- | --- | --- | --- |
-| `instant` | OpenAI | `gpt-5.4-mini` | Easy questions, quick answers, optional cheap draft |
-| `balanced` | Anthropic | `claude-sonnet-4-6` | Default technical/general answer |
-| `deep` | Anthropic | `claude-opus-4-8` | Hard coding, system design, long reasoning with a larger thinking/output budget |
-| `vision` | OpenAI | `gpt-5.5` | Analyse Screen, screenshots, image context |
+Default routing is `provider_mix`: Bluey keeps a lane-appropriate top tier, then
+rotates the first attempt by request id so one burst does not hammer only Claude,
+OpenAI, Gemini, GLM, or DeepSeek. Missing keys, provider capacity denials, and
+HTTP 429/529 cooldowns still fall through to the next approved route.
+
+| Bluey lane | Default top tier | Primary use |
+| --- | --- | --- |
+| `instant` | OpenAI `gpt-5.4-mini`, DeepSeek `deepseek-v4-flash`, Gemini `gemini-3.1-flash-lite`, Anthropic `claude-haiku-4-5-20251001`, Z.AI `glm-5.2` | Easy questions, quick answers, optional cheap draft |
+| `balanced` | Anthropic `claude-sonnet-4-6`, DeepSeek `deepseek-v4-flash`, Z.AI `glm-5.2`, Gemini `gemini-3.1-pro-preview`, OpenAI `gpt-5.5` | Default technical/general answer |
+| `deep` | Anthropic `claude-opus-4-8`, Z.AI `glm-5.2`, DeepSeek `deepseek-v4-pro`, Gemini `gemini-3.1-pro-preview`, OpenAI `gpt-5.5` | Hard coding, system design, long reasoning with a larger thinking/output budget |
+| `vision` | OpenAI `gpt-5.5`, Gemini `gemini-3.1-pro-preview`, Gemini `gemini-3-flash-preview` | Analyse Screen, screenshots, image context |
 
 Optional server-managed text candidates are also wired when their key pools are
 configured:
 
 | Provider | Model | Lanes | Notes |
 | --- | --- | --- | --- |
-| Z.AI | `glm-5.2` | `balanced`, `deep` | OpenAI-compatible endpoint; deep lane sends thinking enabled |
+| Z.AI | `glm-5.2` | `instant`, `balanced`, `deep` | OpenAI-compatible endpoint; deep lane sends thinking enabled |
 | DeepSeek | `deepseek-v4-pro` | `deep` | OpenAI-compatible endpoint; deep lane sends thinking enabled |
 | DeepSeek | `deepseek-v4-flash` | `instant`, `balanced`, `deep` fallback | OpenAI-compatible endpoint; instant/balanced send thinking disabled |
 
@@ -129,10 +134,28 @@ This gives us the operational knob the user asked for without making every
 easy question slower or more expensive.
 
 The server now resolves each lane to an ordered candidate list, not a single
-hard dependency. If the preferred provider is unavailable, over quota, or
-temporarily busy, Bluey tries the next candidate before returning an error.
+hard dependency. If the first provider for that request is unavailable, over
+quota, or temporarily busy, Bluey tries the next candidate before returning an
+error.
 
-Default `quality_first` candidate order:
+Default `provider_mix` candidate order:
+
+Enable explicitly with `BLUEY_ROUTE_POLICY=provider_mix`, or leave
+`BLUEY_ROUTE_POLICY` unset. The top tier rotates by request id; the fallback
+tail stays fixed so weaker/cheaper fallbacks do not become the first choice for
+harder work.
+
+| Lane | Rotated top tier | Fixed fallback tail |
+| --- | --- | --- |
+| `instant` | OpenAI `gpt-5.4-mini` / DeepSeek `deepseek-v4-flash` / Gemini `gemini-3.1-flash-lite` / Anthropic `claude-haiku-4-5-20251001` / Z.AI `glm-5.2` | Gemini `gemini-3-flash-preview` -> Anthropic `claude-sonnet-4-6` |
+| `balanced` | Anthropic `claude-sonnet-4-6` / DeepSeek `deepseek-v4-flash` / Z.AI `glm-5.2` / Gemini `gemini-3.1-pro-preview` / OpenAI `gpt-5.5` | Gemini `gemini-3-flash-preview` -> OpenAI `gpt-5.4-mini` |
+| `deep` | Anthropic `claude-opus-4-8` / Z.AI `glm-5.2` / DeepSeek `deepseek-v4-pro` / Gemini `gemini-3.1-pro-preview` / OpenAI `gpt-5.5` | Anthropic `claude-sonnet-4-6` -> DeepSeek `deepseek-v4-flash` -> Gemini `gemini-3-flash-preview` |
+| `vision` | OpenAI `gpt-5.5` / Gemini `gemini-3.1-pro-preview` / Gemini `gemini-3-flash-preview` | OpenAI `gpt-5.4-mini` |
+
+Optional `quality_first` candidate order:
+
+Enable with `BLUEY_ROUTE_POLICY=quality_first` if an incident requires the older
+static first-provider order.
 
 | Lane | Candidate order |
 | --- | --- |
@@ -173,8 +196,9 @@ Bluey protects realtime work at three layers:
    abuse. Authenticated router edge buckets are disabled by default to avoid
    punishing legitimate customers behind the same office/VPN/NAT; operators can
    enable them during an incident with `BLUEY_LIMIT_ROUTER_*`.
-2. **Provider/model buckets**: keeps OpenAI, Anthropic, Deepgram, and embedding
-   calls inside configured capacity and lets LLM lanes fall back before failing.
+2. **Provider/model buckets**: keeps OpenAI, Anthropic, Gemini, Z.AI, DeepSeek,
+   Deepgram, and embedding calls inside configured capacity and lets LLM lanes
+   fall back before failing.
 3. **Provider/model/key health ledger**: if an upstream key returns a capacity
    response such as HTTP 429, Bluey cools down that exact provider/model/key for
    `Retry-After` and immediately tries the next approved key or route.
@@ -192,7 +216,7 @@ Default server knobs:
 | `BLUEY_LIMIT_PROVIDER_GEMINI_LLM_PER_MIN` | 600/min, burst 120 | Gemini text/vision capacity |
 | `BLUEY_LIMIT_PROVIDER_DEEPSEEK_LLM_PER_MIN` | 600/min, burst 120 | DeepSeek text capacity |
 | `BLUEY_LIMIT_PROVIDER_ZAI_LLM_PER_MIN` | 300/min, burst 60 | Z.AI GLM text capacity |
-| `BLUEY_ROUTE_POLICY` | `quality_first` | Set to `cost_optimized` to prefer GLM/DeepSeek first for managed text lanes |
+| `BLUEY_ROUTE_POLICY` | `provider_mix` | Default rotates first attempts across configured providers. Set `quality_first` for the older static order or `cost_optimized` to prefer GLM/DeepSeek first for managed text lanes |
 | `BLUEY_LIMIT_PROVIDER_OPENAI_EMBED_PER_MIN` | 900/min, burst 180 | OpenAI embedding capacity |
 | `BLUEY_LIMIT_PROVIDER_DEEPGRAM_STT_PER_MIN` | 600/min, burst 120 | Deepgram STT capacity |
 | `BLUEY_LIMIT_PROVIDER_OPENAI_STT_PER_MIN` | 600/min, burst 120 | OpenAI STT fallback capacity |

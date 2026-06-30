@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-29 19:38 EDT
+Latest checkpoint: 2026-06-29 19:57 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,18 +30,40 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-238-COST-OPTIMIZED-GLM-DEEPSEEK-ROUTING.md`; the next canonical Bluey round doc should start at `ROUND-239-...`.
+- Latest assigned Bluey round doc is `ROUND-239-PROVIDER-MIX-ANTI-429-ROUTING.md`; the next canonical Bluey round doc should start at `ROUND-240-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 239 made managed answer routing default to `provider_mix` so Bluey uses
+  all configured flagship providers as needed without concentrating the first
+  burst on one upstream:
+  - streaming and non-streaming answer paths now pass `request_id` into route
+    candidate resolution
+  - the dispatcher rotates the top-tier route list deterministically by request
+    id
+  - text lanes can now start across Anthropic, DeepSeek, Gemini, OpenAI, and
+    Z.AI GLM when keys are configured
+  - vision rotates only across image-capable OpenAI/Gemini routes
+  - existing provider/model buckets, key health cooldowns, 429/529 retry-after
+    handling, balance checks, and upstream spend guards remain in place
+  - operators can force the older static order with
+    `BLUEY_ROUTE_POLICY=quality_first`
+  - operators can still smoke GLM/DeepSeek-first behavior with
+    `BLUEY_ROUTE_POLICY=cost_optimized`
+  - docs updated:
+    - `docs/MODEL-ROUTING.md`
+    - `docs/PRICING-MODEL.md`
+  - Round doc:
+    `docs/rounds/ROUND-239-PROVIDER-MIX-ANTI-429-ROUTING.md`
 - Round 238 added an explicit server route policy to use cheaper GLM/DeepSeek
-  text routes first without silently changing the default production route:
+  text routes first. Its "default remains quality-first" note is superseded by
+  Round 239, where the new default became provider-mix:
   - root cause: GLM-5.2 and DeepSeek were wired/priced but placed after
     Anthropic/OpenAI in the quality-first candidate order, so they mostly acted
     as fallbacks
-  - default remains quality-first
+  - previous default remained quality-first at the time of Round 238
   - `BLUEY_ROUTE_POLICY=cost_optimized` or
     `BLUEY_ROUTE_ORDER=cost_optimized` makes:
     - `instant` start with DeepSeek Flash

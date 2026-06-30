@@ -645,8 +645,9 @@ fn priced_routes_for(
     lane: &str,
     estimated_input_tokens: i64,
     max_output_tokens: i64,
+    route_seed: &str,
 ) -> Vec<PricedRoute> {
-    routing::resolve_route_candidates(lane)
+    routing::resolve_route_candidates_with_seed(lane, route_seed)
         .into_iter()
         .filter_map(|(provider, model)| {
             pricing::lookup(provider, model).map(|entry| {
@@ -2118,7 +2119,7 @@ async fn complete_stream_inner(
         .estimated_input_tokens
         .unwrap_or_else(|| ((provider_system.len() + provider_user.len()) as i64) / 4)
         + image_token_estimate(req.image_data_urls.len());
-    let routes = priced_routes_for(effective_lane, est_in, max_out);
+    let routes = priced_routes_for(effective_lane, est_in, max_out, &req.request_id);
     if routes.is_empty() {
         let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
         return Err((
@@ -2128,6 +2129,16 @@ async fn complete_stream_inner(
                 ..Default::default()
             }),
         ));
+    }
+    if let Some(first_route) = routes.first() {
+        tracing::debug!(
+            request_id = %req.request_id,
+            lane = %effective_lane,
+            first_provider = %first_route.provider,
+            first_model = %first_route.model,
+            candidate_count = routes.len(),
+            "resolved streaming LLM route candidates"
+        );
     }
 
     let est_cost = routes
@@ -2917,7 +2928,7 @@ async fn complete_inner(
         // Crude fallback: ~4 chars/token
         ((provider_system.len() + provider_user.len()) as i64) / 4
     }) + image_token_estimate(req.image_data_urls.len());
-    let routes = priced_routes_for(effective_lane, est_in, max_out);
+    let routes = priced_routes_for(effective_lane, est_in, max_out, &req.request_id);
     if routes.is_empty() {
         let _ = idempotency::mark_failed(&state.pool, &account.id, &req.request_id);
         return Err((
@@ -2927,6 +2938,16 @@ async fn complete_inner(
                 ..Default::default()
             }),
         ));
+    }
+    if let Some(first_route) = routes.first() {
+        tracing::debug!(
+            request_id = %req.request_id,
+            lane = %effective_lane,
+            first_provider = %first_route.provider,
+            first_model = %first_route.model,
+            candidate_count = routes.len(),
+            "resolved LLM route candidates"
+        );
     }
 
     // 3. Estimate cost ceiling for the entry check.
@@ -4889,14 +4910,14 @@ mod tests {
     #[test]
     fn local_lane_has_no_managed_priced_routes() {
         assert!(
-            priced_routes_for("local", 100, 100).is_empty(),
+            priced_routes_for("local", 100, 100, "test-local").is_empty(),
             "local/Ollama fallback must stay daemon-only, not managed cloud"
         );
     }
 
     #[test]
     fn deep_lane_fallbacks_keep_deep_markup() {
-        let routes = priced_routes_for("deep", 1_000, 1_000);
+        let routes = priced_routes_for("deep", 1_000, 1_000, "test-deep");
         let sonnet_fallback = routes
             .iter()
             .find(|route| route.provider == "anthropic" && route.model.contains("sonnet"))

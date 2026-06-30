@@ -84,9 +84,9 @@
 
 | Provider/model | Upstream input | Upstream output | Customer markup | Bluey note |
 |---|---:|---:|---:|---|
-| Z.AI `glm-5.2` | $1.40/1M cache-miss tokens | $4.40/1M tokens | 150% | Balanced/deep candidate; first text candidate when `BLUEY_ROUTE_POLICY=cost_optimized` and `ZAI_API_KEY(S)` is configured |
-| DeepSeek `deepseek-v4-pro` | $0.435/1M cache-miss tokens | $0.87/1M tokens | 150% | Deep candidate; second deep candidate when `BLUEY_ROUTE_POLICY=cost_optimized` and `DEEPSEEK_API_KEY(S)` is configured |
-| DeepSeek `deepseek-v4-flash` | $0.14/1M cache-miss tokens | $0.28/1M tokens | 200% | Instant/balanced candidate; first instant candidate when `BLUEY_ROUTE_POLICY=cost_optimized` and `DEEPSEEK_API_KEY(S)` is configured |
+| Z.AI `glm-5.2` | $1.40/1M cache-miss tokens | $4.40/1M tokens | 150% | Instant/balanced/deep candidate in default `provider_mix`; first balanced/deep text candidate when `BLUEY_ROUTE_POLICY=cost_optimized` and `ZAI_API_KEY(S)` is configured |
+| DeepSeek `deepseek-v4-pro` | $0.435/1M cache-miss tokens | $0.87/1M tokens | 150% | Deep candidate in default `provider_mix`; second deep candidate when `BLUEY_ROUTE_POLICY=cost_optimized` and `DEEPSEEK_API_KEY(S)` is configured |
+| DeepSeek `deepseek-v4-flash` | $0.14/1M cache-miss tokens | $0.28/1M tokens | 200% | Instant/balanced candidate in default `provider_mix`; first instant candidate when `BLUEY_ROUTE_POLICY=cost_optimized` and `DEEPSEEK_API_KEY(S)` is configured |
 
 **STT pricing used by server meters:**
 

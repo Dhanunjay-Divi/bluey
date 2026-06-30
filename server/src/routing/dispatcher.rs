@@ -51,6 +51,7 @@ const ZAI_FLAGSHIP_MODEL: &str = "glm-5.2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RoutePolicy {
+    ProviderMix,
     QualityFirst,
     CostOptimized,
 }
@@ -286,7 +287,14 @@ pub fn resolve_route(lane: &str) -> (&'static str, &'static str) {
 }
 
 pub fn resolve_route_candidates(lane: &str) -> Vec<(&'static str, &'static str)> {
-    resolve_route_candidates_for_policy(lane, route_policy())
+    resolve_route_candidates_with_seed(lane, "")
+}
+
+pub fn resolve_route_candidates_with_seed(
+    lane: &str,
+    seed: &str,
+) -> Vec<(&'static str, &'static str)> {
+    resolve_route_candidates_for_policy_and_seed(lane, route_policy(), seed)
 }
 
 fn route_policy() -> RoutePolicy {
@@ -299,22 +307,29 @@ fn route_policy() -> RoutePolicy {
         "cost" | "cost_first" | "cost_optimized" | "cheap" | "glm" | "deepseek" => {
             RoutePolicy::CostOptimized
         }
-        _ => RoutePolicy::QualityFirst,
+        "quality" | "quality_first" | "static" | "legacy" => RoutePolicy::QualityFirst,
+        "mix" | "mixed" | "provider_mix" | "balanced_mix" | "anti_429" | "capacity_mix" => {
+            RoutePolicy::ProviderMix
+        }
+        _ => RoutePolicy::ProviderMix,
     }
 }
 
 /// Ordered fallback candidates for one lane.
 ///
-/// The default list is intentionally conservative: the first route preserves
-/// product quality, later routes preserve availability. Operators can opt into
+/// The default provider-mix policy rotates the top tier by request id so bursts
+/// do not all start on the same upstream. Operators can force the older static
+/// quality order with `BLUEY_ROUTE_POLICY=quality_first`, or opt into
 /// `BLUEY_ROUTE_POLICY=cost_optimized` to live-smoke cheaper GLM/DeepSeek text
-/// lanes first without changing vision routing. Pricing and provider capacity
-/// are checked by the API layer before dispatch.
-fn resolve_route_candidates_for_policy(
+/// lanes first. Pricing and provider capacity are checked by the API layer
+/// before dispatch.
+fn resolve_route_candidates_for_policy_and_seed(
     lane: &str,
     policy: RoutePolicy,
+    seed: &str,
 ) -> Vec<(&'static str, &'static str)> {
     match (policy, lane) {
+        (RoutePolicy::ProviderMix, lane) => resolve_provider_mix_candidates(lane, seed),
         (RoutePolicy::CostOptimized, "instant") => vec![
             ("deepseek", DEEPSEEK_FLASH_MODEL),
             ("gemini", GEMINI_LITE_MODEL),
@@ -384,6 +399,99 @@ fn resolve_route_candidates_for_policy(
             ("openai", OPENAI_FAST_MODEL),
         ],
     }
+}
+
+fn resolve_provider_mix_candidates(lane: &str, seed: &str) -> Vec<(&'static str, &'static str)> {
+    match lane {
+        "instant" => rotate_preferred_routes(
+            vec![
+                ("openai", OPENAI_FAST_MODEL),
+                ("deepseek", DEEPSEEK_FLASH_MODEL),
+                ("gemini", GEMINI_LITE_MODEL),
+                ("anthropic", ANTHROPIC_FAST_MODEL),
+                ("zai", ZAI_FLAGSHIP_MODEL),
+            ],
+            vec![
+                ("gemini", GEMINI_FLASH_MODEL),
+                ("anthropic", ANTHROPIC_BALANCED_MODEL),
+            ],
+            lane,
+            seed,
+        ),
+        "deep" => rotate_preferred_routes(
+            vec![
+                ("anthropic", ANTHROPIC_DEEP_MODEL),
+                ("zai", ZAI_FLAGSHIP_MODEL),
+                ("deepseek", DEEPSEEK_PRO_MODEL),
+                ("gemini", GEMINI_PRO_MODEL),
+                ("openai", OPENAI_ACCURATE_MODEL),
+            ],
+            vec![
+                ("anthropic", ANTHROPIC_BALANCED_MODEL),
+                ("deepseek", DEEPSEEK_FLASH_MODEL),
+                ("gemini", GEMINI_FLASH_MODEL),
+            ],
+            lane,
+            seed,
+        ),
+        "vision" => rotate_preferred_routes(
+            vec![
+                ("openai", OPENAI_ACCURATE_MODEL),
+                ("gemini", GEMINI_PRO_MODEL),
+                ("gemini", GEMINI_FLASH_MODEL),
+            ],
+            vec![("openai", OPENAI_FAST_MODEL)],
+            lane,
+            seed,
+        ),
+        "local" => vec![],
+        _ => rotate_preferred_routes(
+            vec![
+                ("anthropic", ANTHROPIC_BALANCED_MODEL),
+                ("deepseek", DEEPSEEK_FLASH_MODEL),
+                ("zai", ZAI_FLAGSHIP_MODEL),
+                ("gemini", GEMINI_PRO_MODEL),
+                ("openai", OPENAI_ACCURATE_MODEL),
+            ],
+            vec![
+                ("gemini", GEMINI_FLASH_MODEL),
+                ("openai", OPENAI_FAST_MODEL),
+            ],
+            lane,
+            seed,
+        ),
+    }
+}
+
+fn rotate_preferred_routes(
+    mut preferred: Vec<(&'static str, &'static str)>,
+    fallback: Vec<(&'static str, &'static str)>,
+    lane: &str,
+    seed: &str,
+) -> Vec<(&'static str, &'static str)> {
+    if preferred.len() > 1 && !seed.trim().is_empty() {
+        let bucket = stable_route_bucket(seed, lane, preferred.len());
+        preferred.rotate_left(bucket);
+    }
+    preferred.into_iter().chain(fallback).collect()
+}
+
+fn stable_route_bucket(seed: &str, lane: &str, modulo: usize) -> usize {
+    if modulo <= 1 {
+        return 0;
+    }
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in seed.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash ^= u64::from(b':');
+    hash = hash.wrapping_mul(0x100000001b3);
+    for byte in lane.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    (hash % modulo as u64) as usize
 }
 
 /// Ordered fallback candidates for chunked server-side STT.
@@ -2299,7 +2407,7 @@ mod tests {
     #[test]
     fn route_candidates_preserve_2026_lane_order() {
         assert_eq!(
-            resolve_route_candidates("instant"),
+            resolve_route_candidates_for_policy_and_seed("instant", RoutePolicy::QualityFirst, ""),
             vec![
                 ("openai", "gpt-5.4-mini"),
                 ("deepseek", "deepseek-v4-flash"),
@@ -2310,7 +2418,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            resolve_route_candidates("balanced"),
+            resolve_route_candidates_for_policy_and_seed("balanced", RoutePolicy::QualityFirst, ""),
             vec![
                 ("anthropic", "claude-sonnet-4-6"),
                 ("deepseek", "deepseek-v4-flash"),
@@ -2322,7 +2430,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            resolve_route_candidates("deep"),
+            resolve_route_candidates_for_policy_and_seed("deep", RoutePolicy::QualityFirst, ""),
             vec![
                 ("anthropic", "claude-opus-4-8"),
                 ("zai", "glm-5.2"),
@@ -2335,7 +2443,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            resolve_route_candidates("vision"),
+            resolve_route_candidates_for_policy_and_seed("vision", RoutePolicy::QualityFirst, ""),
             vec![
                 ("openai", "gpt-5.5"),
                 ("gemini", "gemini-3.1-pro-preview"),
@@ -2344,7 +2452,8 @@ mod tests {
             ]
         );
         assert!(
-            resolve_route_candidates("local").is_empty(),
+            resolve_route_candidates_for_policy_and_seed("local", RoutePolicy::QualityFirst, "")
+                .is_empty(),
             "managed cloud must not dispatch daemon-only local lanes"
         );
     }
@@ -2352,7 +2461,7 @@ mod tests {
     #[test]
     fn cost_optimized_policy_prefers_glm_and_deepseek_text_routes() {
         assert_eq!(
-            resolve_route_candidates_for_policy("instant", RoutePolicy::CostOptimized),
+            resolve_route_candidates_for_policy_and_seed("instant", RoutePolicy::CostOptimized, ""),
             vec![
                 ("deepseek", "deepseek-v4-flash"),
                 ("gemini", "gemini-3.1-flash-lite"),
@@ -2363,7 +2472,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            resolve_route_candidates_for_policy("balanced", RoutePolicy::CostOptimized),
+            resolve_route_candidates_for_policy_and_seed(
+                "balanced",
+                RoutePolicy::CostOptimized,
+                ""
+            ),
             vec![
                 ("zai", "glm-5.2"),
                 ("deepseek", "deepseek-v4-flash"),
@@ -2375,7 +2488,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            resolve_route_candidates_for_policy("deep", RoutePolicy::CostOptimized),
+            resolve_route_candidates_for_policy_and_seed("deep", RoutePolicy::CostOptimized, ""),
             vec![
                 ("zai", "glm-5.2"),
                 ("deepseek", "deepseek-v4-pro"),
@@ -2388,17 +2501,70 @@ mod tests {
             ]
         );
         assert_eq!(
-            resolve_route_candidates_for_policy("vision", RoutePolicy::CostOptimized),
-            resolve_route_candidates_for_policy("vision", RoutePolicy::QualityFirst),
+            resolve_route_candidates_for_policy_and_seed("vision", RoutePolicy::CostOptimized, ""),
+            resolve_route_candidates_for_policy_and_seed("vision", RoutePolicy::QualityFirst, ""),
             "GLM/DeepSeek text policy must not steal image routes"
         );
     }
 
     #[test]
+    fn provider_mix_rotates_first_text_provider_by_seed() {
+        for lane in ["instant", "balanced", "deep"] {
+            let mut first_providers = Vec::new();
+            for idx in 0..80 {
+                let seed = format!("mix-request-{idx}");
+                let Some((provider, _model)) = resolve_route_candidates_for_policy_and_seed(
+                    lane,
+                    RoutePolicy::ProviderMix,
+                    &seed,
+                )
+                .into_iter()
+                .next() else {
+                    panic!("provider mix returned no candidates for {lane}");
+                };
+                if !first_providers.contains(&provider) {
+                    first_providers.push(provider);
+                }
+            }
+
+            for provider in ["anthropic", "deepseek", "gemini", "openai", "zai"] {
+                assert!(
+                    first_providers.contains(&provider),
+                    "provider mix should rotate {lane} first attempts across {provider}; got {first_providers:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_mix_keeps_vision_on_image_capable_routes() {
+        for idx in 0..24 {
+            let seed = format!("vision-request-{idx}");
+            let routes = resolve_route_candidates_for_policy_and_seed(
+                "vision",
+                RoutePolicy::ProviderMix,
+                &seed,
+            );
+            assert!(
+                routes
+                    .iter()
+                    .all(|(provider, _model)| *provider == "openai" || *provider == "gemini"),
+                "vision provider mix must not route image payloads to text-only providers: {routes:?}"
+            );
+        }
+    }
+
+    #[test]
     fn route_candidates_have_pricing_entries() {
-        for policy in [RoutePolicy::QualityFirst, RoutePolicy::CostOptimized] {
+        for policy in [
+            RoutePolicy::ProviderMix,
+            RoutePolicy::QualityFirst,
+            RoutePolicy::CostOptimized,
+        ] {
             for lane in ["instant", "balanced", "deep", "vision"] {
-                for (provider, model) in resolve_route_candidates_for_policy(lane, policy) {
+                for (provider, model) in
+                    resolve_route_candidates_for_policy_and_seed(lane, policy, "")
+                {
                     assert!(
                         crate::pricing::lookup(provider, model).is_some(),
                         "missing pricing for {policy:?} {lane} candidate {provider}/{model}"
