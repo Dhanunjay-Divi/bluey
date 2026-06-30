@@ -64,6 +64,11 @@ export function Settings() {
 function AccountCard() {
   const [me, setMe] = useState<AccountMe | null>(null);
   const [loaded, setLoaded] = useState(false);
+  const [deleteOpen, setDeleteOpen] = useState(false);
+  const [deleteText, setDeleteText] = useState("");
+  const [acceptDataLoss, setAcceptDataLoss] = useState(false);
+  const [acceptCreditLoss, setAcceptCreditLoss] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
   useEffect(() => {
     invoke<AccountMe | null>("account_me")
       .then(setMe)
@@ -93,10 +98,14 @@ function AccountCard() {
     catch (e) { console.warn("sign_out failed", e); }
   }
   async function deleteAccount() {
-    if (!confirm("This will permanently delete your account. Continue?")) return;
-    if (prompt("Type DELETE to confirm") !== "DELETE") return;
-    try { await invoke("delete_account_now"); window.location.href = "/"; }
+    if (!acceptDataLoss || !acceptCreditLoss || deleteText !== "DELETE") return;
+    setDeleteBusy(true);
+    try {
+      await invoke("delete_account_now");
+      window.location.href = "/";
+    }
     catch (e) { console.warn("delete_account failed", e); }
+    finally { setDeleteBusy(false); }
   }
 
   const balanceClass = me
@@ -155,12 +164,75 @@ function AccountCard() {
           Sign out <LogOut className="h-3 w-3" />
         </button>
         <button
-          onClick={deleteAccount}
+          onClick={() => setDeleteOpen(true)}
           className="inline-flex items-center gap-1 text-sm px-3 py-1.5 rounded-md bg-red-500/10 border border-red-500/30 hover:bg-red-500/20 text-red-300"
         >
           Delete account <Trash2 className="h-3 w-3" />
         </button>
       </div>}
+      {deleteOpen && me && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+          <div className="w-full max-w-lg rounded-xl border border-red-500/30 bg-zinc-950 p-5 shadow-2xl">
+            <div className="flex items-start gap-3">
+              <Trash2 className="mt-1 h-5 w-5 text-red-300" />
+              <div>
+                <h3 className="text-lg font-semibold text-zinc-100">Delete Bluey account?</h3>
+                <p className="mt-1 text-sm leading-relaxed text-zinc-400">
+                  This permanently deletes {me.email}, synced sessions, files, transcripts,
+                  generated answers, usage history, and account records. Unused Bluey credits
+                  are lost when the account is deleted.
+                </p>
+              </div>
+            </div>
+            <div className="mt-4 space-y-3 text-sm text-zinc-300">
+              <label className="flex gap-2">
+                <input
+                  type="checkbox"
+                  checked={acceptDataLoss}
+                  onChange={(event) => setAcceptDataLoss(event.target.checked)}
+                />
+                <span>I understand this deletes account files, saved sessions, history, and data.</span>
+              </label>
+              <label className="flex gap-2">
+                <input
+                  type="checkbox"
+                  checked={acceptCreditLoss}
+                  onChange={(event) => setAcceptCreditLoss(event.target.checked)}
+                />
+                <span>I understand unused credits are lost after deletion.</span>
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-xs font-semibold uppercase tracking-wide text-zinc-500">
+                  Type DELETE to confirm
+                </span>
+                <input
+                  value={deleteText}
+                  onChange={(event) => setDeleteText(event.target.value)}
+                  className="w-full rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2 text-zinc-100 outline-none focus:border-red-400"
+                  placeholder="DELETE"
+                />
+              </label>
+            </div>
+            <div className="mt-5 flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setDeleteOpen(false)}
+                className="rounded-md bg-zinc-800 px-3 py-2 text-sm text-zinc-100 hover:bg-zinc-700"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={deleteBusy || !acceptDataLoss || !acceptCreditLoss || deleteText !== "DELETE"}
+                onClick={deleteAccount}
+                className="rounded-md border border-red-500/40 bg-red-500/15 px-3 py-2 text-sm text-red-200 hover:bg-red-500/25 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {deleteBusy ? "Deleting..." : "Delete account"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

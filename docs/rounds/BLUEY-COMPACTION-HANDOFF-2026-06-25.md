@@ -2732,6 +2732,52 @@ temp-home install smoke from https://bluey.sh/install.sh -> bluey 0.1.17
 
 Caveat: live `latest.json` currently advertises only `darwin-arm64` for `0.1.17`. `install.ps1` remains published, but a fresh Windows `0.1.17` zip still needs the Windows build host before Windows can update to this exact version.
 
+## Current Active Round: Round 253
+
+Round doc:
+
+- `docs/rounds/ROUND-253-ACCOUNT-DELETE-LINK-RECOVERY-GUARD.md`
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
+
+Investigated the low-balance/account-delete/login-code issue:
+
+- The `$4.82 low` screenshot matched the smoke account `codex-smoke-20260608183100@bluey.sh`, not the internal admin test account.
+- `internal-admin-20260606023943@bluey.sh` had been hard-deleted from live Postgres.
+- Recovered that internal admin account from `/var/backups/bluey-api/hourly/bluey-20260630T150001Z.db` into live Postgres with the same account id, password hash, admin flag, verification timestamp, and auto top-up settings.
+- Restored its live balance to `$15.00` with an `internal_credit` ledger entry.
+- Confirmed the device login code is an authenticated, single-use device-flow approval; the main issue was copy clarity, not that a random code alone grants access.
+- CLI login now warns users to approve the code only in the account they want the desktop to use.
+- Web auth copy now says the desktop link must be confirmed after signing in.
+- Server `/account/delete` now requires typed `DELETE`, explicit data-loss consent, and explicit credit-loss consent.
+- CLI, dashboard, and web account deletion all send the explicit consent payload.
+- Dashboard and web account deletion now use in-app Bluey modals instead of native browser confirm/prompt dialogs.
+- Terms and privacy copy now document that account deletion is permanent and unused Bluey credits are lost on deletion.
+
+Local verification passed:
+
+```bash
+cargo fmt --manifest-path server/Cargo.toml
+cargo check -p cue-cli -p cue-dashboard
+cargo test --manifest-path server/Cargo.toml account_delete_requires_typed_delete_and_credit_loss_consent -- --nocapture
+cargo test --manifest-path server/Cargo.toml auth_device -- --nocapture
+cargo build --manifest-path server/Cargo.toml --bin bluey-server
+cargo build --release --manifest-path server/Cargo.toml --bin bluey-server
+git diff --check
+```
+
+Deployment verified:
+
+- Web static files synced to `/var/www/bluey/`.
+- Linux x86_64 server binary built on the droplet from `/opt/bluey-build-codex-delete-guard`.
+- Installed to `/usr/local/bin/bluey-server`.
+- `bluey-api.service` restarted cleanly and `https://bluey.sh/health` returned `status=ok`.
+- Live throwaway-account delete smoke passed:
+  - empty payload rejected with `422`, account still existed
+  - typed `DELETE` without credit-loss consent rejected with `400`, account still existed
+  - full data-loss plus credit-loss consent returned `200`, account deleted
+- Live static copy contains the delete modal, credit-loss consent, and desktop-link confirmation wording.
+
 ## Current Active Round: Round 252
 
 Round doc:

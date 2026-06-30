@@ -1544,6 +1544,125 @@
       display: none;
     }
 
+    #accountApp .account-modal-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 80;
+      display: grid;
+      place-items: center;
+      padding: 20px;
+      background: rgba(0, 0, 0, .72);
+      backdrop-filter: blur(10px);
+    }
+
+    #accountApp .account-modal {
+      width: min(520px, 100%);
+      border: 1px solid rgba(248, 113, 113, .30);
+      border-radius: 22px;
+      padding: 20px;
+      background: linear-gradient(180deg, rgba(13, 17, 21, .98), rgba(4, 7, 9, .98));
+      box-shadow: 0 28px 90px rgba(0, 0, 0, .58);
+    }
+
+    #accountApp .account-modal-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+
+    #accountApp .account-modal h2 {
+      margin: 0;
+      color: #fff;
+      font-size: 24px;
+      line-height: 1.1;
+    }
+
+    #accountApp .account-modal p {
+      margin: 7px 0 0;
+      color: #aebdc4;
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    #accountApp .account-modal-close {
+      width: 34px;
+      height: 34px;
+      border: 1px solid rgba(255, 255, 255, .10);
+      border-radius: 12px;
+      color: #e8f5f8;
+      background: rgba(255, 255, 255, .04);
+      font-size: 24px;
+      line-height: 1;
+      cursor: pointer;
+    }
+
+    #accountApp .delete-warning {
+      display: grid;
+      gap: 4px;
+      margin: 12px 0 14px;
+      padding: 13px 14px;
+      border: 1px solid rgba(248, 113, 113, .28);
+      border-radius: 16px;
+      background: rgba(127, 29, 29, .22);
+      color: #fecaca;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    #accountApp .delete-check {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      margin: 10px 0;
+      color: #d8e5ea;
+      font-size: 13px;
+      line-height: 1.35;
+    }
+
+    #accountApp .delete-check input {
+      width: 18px;
+      height: 18px;
+      margin-top: 0;
+      accent-color: #f87171;
+    }
+
+    #accountApp .delete-type-label {
+      display: grid;
+      gap: 8px;
+      margin-top: 14px;
+      color: #9fb0ba;
+      font-size: 12px;
+      font-weight: 850;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    #accountApp .delete-type-label input {
+      height: 46px;
+      border: 1px solid rgba(248, 113, 113, .24);
+      border-radius: 14px;
+      padding: 0 13px;
+      color: #fff;
+      background: rgba(255, 255, 255, .04);
+      font-size: 15px;
+      outline: none;
+      text-transform: uppercase;
+    }
+
+    #accountApp .delete-type-label input:focus {
+      border-color: rgba(248, 113, 113, .7);
+      box-shadow: 0 0 0 3px rgba(248, 113, 113, .12);
+    }
+
+    #accountApp .account-modal-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 18px;
+    }
+
     #accountApp .account-note a {
       color: var(--bluey-accent);
       text-decoration: none;

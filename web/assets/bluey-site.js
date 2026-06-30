@@ -402,8 +402,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (title) title.textContent = accountAuthMode === 'signup' ? 'Create account' : 'Sign in';
       if (copy) {
         copy.textContent = accountAuthMode === 'signup'
-          ? 'Create a Bluey account, verify your email, then the desktop links automatically.'
-          : 'Use your Bluey account. If the desktop opened this page, it links automatically after sign in.';
+          ? 'Create a Bluey account, verify your email, then confirm the desktop link.'
+          : 'Use your Bluey account. If the desktop opened this page, confirm the link after signing in.';
       }
       if (terms) terms.hidden = accountAuthMode !== 'signup';
       if (primary) primary.textContent = accountAuthMode === 'signup' ? 'Send verification code' : 'Sign in';
@@ -626,16 +626,60 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       recoveryMessage('Password updated. You can sign in now.');
     }
 
+    function resetDeleteAccountDialog() {
+      const dialog = document.getElementById('deleteAccountDialog');
+      const data = document.getElementById('deleteAcceptDataLoss');
+      const credits = document.getElementById('deleteAcceptCreditLoss');
+      const text = document.getElementById('deleteConfirmText');
+      const confirm = document.getElementById('deleteAccountConfirm');
+      if (dialog) dialog.hidden = true;
+      if (data) data.checked = false;
+      if (credits) credits.checked = false;
+      if (text) text.value = '';
+      if (confirm) confirm.disabled = true;
+    }
+
+    function updateDeleteAccountConfirmState() {
+      const data = document.getElementById('deleteAcceptDataLoss');
+      const credits = document.getElementById('deleteAcceptCreditLoss');
+      const text = document.getElementById('deleteConfirmText');
+      const confirm = document.getElementById('deleteAccountConfirm');
+      if (!confirm) return;
+      confirm.disabled = !(data?.checked && credits?.checked && text?.value === 'DELETE');
+    }
+
+    function openDeleteAccountDialog() {
+      const dialog = document.getElementById('deleteAccountDialog');
+      const email = document.getElementById('deleteAccountEmail');
+      const text = document.getElementById('deleteConfirmText');
+      if (!dialog) return;
+      resetDeleteAccountDialog();
+      if (email) {
+        email.textContent = `This permanently deletes ${currentAccountEmail || 'this Bluey account'}.`;
+      }
+      dialog.hidden = false;
+      setTimeout(() => text?.focus(), 0);
+    }
+
     async function deleteAccount() {
-      const email = currentAccountEmail || 'this Bluey account';
-      if (!window.confirm(`Delete ${email}? This permanently removes the account and cannot be undone.`)) {
+      const data = document.getElementById('deleteAcceptDataLoss');
+      const credits = document.getElementById('deleteAcceptCreditLoss');
+      const text = document.getElementById('deleteConfirmText');
+      if (!(data?.checked && credits?.checked && text?.value === 'DELETE')) {
+        accountMessage('Confirm account deletion, credit loss, and type DELETE first.');
+        updateDeleteAccountConfirmState();
         return;
       }
       accountMessage('Deleting account...');
       await apiJson('/account/delete', {
         method: 'POST',
-        body: JSON.stringify({}),
+        body: JSON.stringify({
+          confirm_text: 'DELETE',
+          accept_data_loss: true,
+          accept_credit_loss: true,
+        }),
       });
+      resetDeleteAccountDialog();
       clearAccountToken();
       await loadAccount();
     }
@@ -1470,6 +1514,17 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       });
       document.getElementById('deleteAccountButton')?.addEventListener('click', () => {
         closeProfileMenu();
+        openDeleteAccountDialog();
+      });
+      document.getElementById('deleteAcceptDataLoss')?.addEventListener('change', updateDeleteAccountConfirmState);
+      document.getElementById('deleteAcceptCreditLoss')?.addEventListener('change', updateDeleteAccountConfirmState);
+      document.getElementById('deleteConfirmText')?.addEventListener('input', updateDeleteAccountConfirmState);
+      document.getElementById('deleteAccountCancel')?.addEventListener('click', resetDeleteAccountDialog);
+      document.getElementById('deleteAccountCancelX')?.addEventListener('click', resetDeleteAccountDialog);
+      document.getElementById('deleteAccountDialog')?.addEventListener('click', (event) => {
+        if (event.target?.id === 'deleteAccountDialog') resetDeleteAccountDialog();
+      });
+      document.getElementById('deleteAccountConfirm')?.addEventListener('click', () => {
         deleteAccount().catch((error) => accountMessage(error.message));
       });
       document.getElementById('refreshSessionsButton').addEventListener('click', () => {

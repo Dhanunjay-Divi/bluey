@@ -1350,6 +1350,7 @@ async fn browser_login(
 
     println!("Opening Bluey sign-in...");
     println!("Code: {}", flow.user_code);
+    println!("Approve this code only in the Bluey account you want this desktop to use.");
     println!("{login_url}");
     let _ = open_browser(&login_url);
 

@@ -259,6 +259,7 @@ pub async fn delete_account(client: &CloudClient, force: bool) -> Result<()> {
         println!();
         println!("⚠  This will PERMANENTLY DELETE your Bluey account.");
         println!("   - All credit batches forfeited (1-year validity does NOT apply on delete).");
+        println!("   - Any unused Bluey credits are lost and cannot be used after deletion.");
         println!("   - All usage history removed.");
         println!("   - Refund eligibility check via support@bluey.sh BEFORE deletion if you have unused credits.");
         println!();
@@ -276,7 +277,14 @@ pub async fn delete_account(client: &CloudClient, force: bool) -> Result<()> {
         deleted_at: String,
     }
     let ack: DeleteAck = client
-        .auth_post("/account/delete", &serde_json::json!({}))
+        .auth_post(
+            "/account/delete",
+            &serde_json::json!({
+                "confirm_text": "DELETE",
+                "accept_data_loss": true,
+                "accept_credit_loss": true
+            }),
+        )
         .await
         .context("/account/delete")?;
     if ack.deleted {

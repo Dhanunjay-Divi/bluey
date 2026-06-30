@@ -1376,6 +1376,55 @@ async fn auth_device_approve_cannot_overwrite_approved_code() {
 
 #[tokio::test]
 #[serial]
+async fn account_delete_requires_typed_delete_and_credit_loss_consent() {
+    let h = boot_harness().await;
+    let email = "delete-confirm@example.com";
+    let access = signup_and_login(&h, email, "longenoughpw").await;
+
+    let req = Request::post("/account/delete")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_ne!(resp.status(), StatusCode::OK);
+    assert!(Account::fetch_by_email(&h.pool, email).unwrap().is_some());
+
+    let req = Request::post("/account/delete")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "confirm_text": "DELETE",
+                "accept_data_loss": true,
+                "accept_credit_loss": false
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(Account::fetch_by_email(&h.pool, email).unwrap().is_some());
+
+    let req = Request::post("/account/delete")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "confirm_text": "DELETE",
+                "accept_data_loss": true,
+                "accept_credit_loss": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(Account::fetch_by_email(&h.pool, email).unwrap().is_none());
+}
+
+#[tokio::test]
+#[serial]
 async fn sync_batch_session_bundle_and_rag_roundtrip() {
     let h = boot_harness().await;
     let access = signup_and_login(&h, "sync@example.com", "longenoughpw").await;

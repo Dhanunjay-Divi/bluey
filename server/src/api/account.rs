@@ -471,10 +471,21 @@ pub struct DeleteAck {
     pub note: &'static str,
 }
 
+#[derive(serde::Deserialize)]
+pub struct DeleteAccountRequest {
+    pub confirm_text: String,
+    pub accept_data_loss: bool,
+    pub accept_credit_loss: bool,
+}
+
 pub async fn delete_account(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Json(req): Json<DeleteAccountRequest>,
 ) -> Result<Json<DeleteAck>, axum::http::StatusCode> {
+    if req.confirm_text.trim() != "DELETE" || !req.accept_data_loss || !req.accept_credit_loss {
+        return Err(axum::http::StatusCode::BAD_REQUEST);
+    }
     // Hard delete. ON DELETE CASCADE on the foreign keys (accounts ->
     // credit_batches, refresh_tokens, usage_events,
     // email_verification_tokens, password_reset_tokens, request_idempotency)

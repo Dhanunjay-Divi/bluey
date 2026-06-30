@@ -261,7 +261,14 @@ pub async fn delete_account_now(db: State<'_, DbState>) -> Result<(), String> {
     let trace_id = dashboard_trace_id();
     let client = cloud_client_with_trace(&trace_id)?;
     let ack: DeleteAck = client
-        .auth_post("/account/delete", &serde_json::json!({}))
+        .auth_post(
+            "/account/delete",
+            &serde_json::json!({
+                "confirm_text": "DELETE",
+                "accept_data_loss": true,
+                "accept_credit_loss": true
+            }),
+        )
         .await
         .map_err(|e| format!("delete account failed: {e}"))?;
     if ack.deleted {

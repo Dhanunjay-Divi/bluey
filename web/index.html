@@ -136,6 +136,9 @@
         <h2>Retention</h2>
         <p>Account-credit batches remain in the ledger for accounting and expire up to 12 months (365 days) after purchase. Cloud-synced session records, transcripts, document bytes, screenshots, extracted text, summaries, and search indexes are kept for up to 12 months (365 days) from their last sync or use unless you delete them earlier. Cleanup is lazy, so expired objects may remain briefly until a sweeper, restore attempt, or maintenance pass removes them, but they are no longer intended for active product use.</p>
 
+        <h2>Account Deletion</h2>
+        <p>Deleting your account is permanent. It removes account records, local-device authorization records, saved cloud sessions, synced files, screenshots, transcripts, extracted text, generated answers, usage history, and related searchable indexes where deletion is technically available. Unused Bluey credits are lost when the account is deleted, so contact support before deletion if you need a billing review.</p>
+
         <h2>Security</h2>
         <p>Desktop account tokens are stored in Bluey's private local account profile so the app can reconnect without operating-system keychain prompts. Provider API keys stay server-side for managed cloud requests. Logs are designed for debugging and support, not for storing raw secrets or full user content.</p>
 
@@ -156,6 +159,7 @@
           <li>Bluey is not a monthly subscription by default. You reload non-transferable account credits and spend them on AI model requests, speech transcription, screen analysis, searchable history, and related cloud work.</li>
           <li>Credits have no cash value, are not a stored-value card or gift card, are not transferable, and cannot be used outside Bluey.</li>
           <li>Credits are valid for up to 12 months (365 days) from purchase. Bluey spends the oldest unexpired credit batch first and stops at zero so you do not accrue usage debt.</li>
+          <li>Deleting your account forfeits unused credits. Contact support before deleting if you want a billing review for unused credits.</li>
           <li>Refund handling, payment disputes, taxes, and receipts follow the support and payment-provider process shown in your account page.</li>
         </ul>
 
@@ -266,7 +270,7 @@
         <section class="account-grid">
           <aside class="account-card" id="accountAuthCard">
             <h2 id="accountAuthTitle">Sign in</h2>
-            <p id="accountAuthCopy">Use your Bluey account. If the desktop opened this page, it links automatically after sign in.</p>
+            <p id="accountAuthCopy">Use your Bluey account. If the desktop opened this page, confirm the link after signing in.</p>
             <div class="device-link-hint" id="deviceLinkHint" hidden></div>
             <form class="account-form" id="accountForm">
               <label>
@@ -480,6 +484,37 @@
           </section>
         </section>
       </main>
+      <div class="account-modal-backdrop" id="deleteAccountDialog" hidden>
+        <section class="account-modal" role="dialog" aria-modal="true" aria-labelledby="deleteAccountTitle">
+          <div class="account-modal-head">
+            <div>
+              <h2 id="deleteAccountTitle">Delete Bluey account?</h2>
+              <p id="deleteAccountEmail">This permanently deletes this Bluey account.</p>
+            </div>
+            <button class="account-modal-close" id="deleteAccountCancelX" type="button" aria-label="Close delete account dialog">×</button>
+          </div>
+          <div class="delete-warning">
+            <strong>This cannot be undone.</strong>
+            <span>It removes saved sessions, files, screenshots, transcripts, generated answers, usage history, and account records. Any unused Bluey credits are lost when the account is deleted.</span>
+          </div>
+          <label class="delete-check">
+            <input id="deleteAcceptDataLoss" type="checkbox">
+            <span>I understand this deletes account files, saved sessions, history, and data.</span>
+          </label>
+          <label class="delete-check">
+            <input id="deleteAcceptCreditLoss" type="checkbox">
+            <span>I understand unused Bluey credits are lost after deletion.</span>
+          </label>
+          <label class="delete-type-label" for="deleteConfirmText">
+            <span>Type DELETE to confirm</span>
+            <input id="deleteConfirmText" type="text" autocomplete="off" spellcheck="false" placeholder="DELETE">
+          </label>
+          <div class="account-modal-actions">
+            <button class="account-button ghost" id="deleteAccountCancel" type="button">Cancel</button>
+            <button class="account-button danger" id="deleteAccountConfirm" type="button" disabled>Delete account</button>
+          </div>
+        </section>
+      </div>
       <div class="page-footer-links">
         Reach us at&nbsp;<a class="email-link" href="mailto:hello@bluey.sh">hello@bluey.sh</a><span class="dot">&middot;</span><span class="muted-note">Private context for live work</span><span class="dot">&middot;</span><a href="/how-bluey-works/">How it works</a><span class="dot">&middot;</span><a href="/bluey-faq/">FAQ</a><span class="dot">&middot;</span><a href="/docs/terms">Terms</a><span class="dot">&middot;</span><a href="/docs/privacy">Privacy</a><span class="dot">&middot;</span><a href="/docs/disguise">Controls</a>
       </div>
