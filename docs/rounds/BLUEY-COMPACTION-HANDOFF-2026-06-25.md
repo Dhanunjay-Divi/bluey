@@ -2732,6 +2732,30 @@ temp-home install smoke from https://bluey.sh/install.sh -> bluey 0.1.17
 
 Caveat: live `latest.json` currently advertises only `darwin-arm64` for `0.1.17`. `install.ps1` remains published, but a fresh Windows `0.1.17` zip still needs the Windows build host before Windows can update to this exact version.
 
+## Current Active Round: Round 252
+
+Round doc:
+
+- `docs/rounds/ROUND-252-BLUEY-LOGO-WORDING-PACK.md`
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
+
+Created a local brand pack for the owner at:
+
+```text
+/Users/uno/Downloads/bluey-logo-and-wording/
+```
+
+Included files:
+
+- `bluey-logo.svg`
+- `bluey-wordmark.svg`
+- `bluey-checkout-logo.png`
+- `bluey-social-preview.png`
+- `bluey-wording.txt`
+
+No product code changed.
+
 ## Current Active Round: Round 251
 
 Round doc:
