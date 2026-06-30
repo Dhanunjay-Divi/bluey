@@ -7295,13 +7295,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             recordingActive = false
             recordingDesiredActive = true
             recordingTransitionInFlight = true
-            onListeningStateChanged?(.connecting)
-            recordingButton.title = "Starting"
-            setHeaderSubtitle()
-            composer.placeholder = "Starting audio..."
-            styleControlButton(recordingButton, symbol: "waveform", accent: false)
-            setTranscriptState("STARTING", active: true)
-            seedTranscriptPreviewIfEmpty("Mic + System: starting audio...")
         }
     }
 
@@ -11979,7 +11972,6 @@ private final class OverlayApp {
         } else {
             expandedView?.prepareAutoSendListenCapture()
             emitSimple("recording_start_requested")
-            setRunState(.connecting)
         }
     }
 

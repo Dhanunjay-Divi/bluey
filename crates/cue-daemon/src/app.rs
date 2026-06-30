@@ -1129,6 +1129,28 @@ enum AudioRuntimeConfigResolution {
     Unavailable(String),
 }
 
+#[derive(Debug, Clone)]
+struct ListenStartBlock {
+    message: String,
+    open_login: bool,
+}
+
+impl ListenStartBlock {
+    fn sign_in(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            open_login: true,
+        }
+    }
+
+    fn wait(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            open_login: false,
+        }
+    }
+}
+
 const DEFAULT_AUDIO_IDLE_STOP_SECS: u64 = 5 * 60;
 const ANSWER_TRANSCRIPT_TURN_LIMIT: usize = 32;
 const ANSWER_TRANSCRIPT_CHAR_BUDGET: usize = 8_000;
@@ -1772,6 +1794,16 @@ async fn handle_request_inner(
                 AudioCaptureConfig::from_enabled_sources(enable_system, enable_microphone);
             if let Some(device_id) = mic_device_id {
                 config.microphone.device_id = Some(device_id);
+            }
+            if let Some(status) = block_audio_start_if_not_signed_in(
+                daemon,
+                &config,
+                "ipc audio start",
+                Some(trace_id),
+            )
+            .await
+            {
+                return Ok(DaemonResponse::AudioStatus { status });
             }
             set_overlay_listening_state(daemon, ListeningState::Connecting).await;
             let status = match start_audio_capture(daemon, config).await {
@@ -2444,8 +2476,15 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             stop_screen_capture(daemon, "overlay eye").await?;
         }
         OverlayEvent::RecordingStartRequested => {
+            let config = AudioCaptureConfig::dual_default();
+            if block_audio_start_if_not_signed_in(daemon, &config, "overlay listen", None)
+                .await
+                .is_some()
+            {
+                return Ok(());
+            }
             set_overlay_listening_state(daemon, ListeningState::Connecting).await;
-            match start_audio_capture(daemon, AudioCaptureConfig::dual_default()).await {
+            match start_audio_capture(daemon, config).await {
                 Ok(status) if status.session_id.is_some() => {
                     set_overlay_listening_state(daemon, ListeningState::Listening).await;
                     let balance = refresh_overlay_balance(daemon, None).await;
@@ -2623,6 +2662,128 @@ async fn stop_screen_capture(daemon: &Arc<Daemon>, source: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn block_audio_start_if_not_signed_in(
+    daemon: &Arc<Daemon>,
+    config: &AudioCaptureConfig,
+    source: &'static str,
+    trace_id: Option<&str>,
+) -> Option<AudioPipelineStatus> {
+    let Err(block) = verify_cloud_account_for_listen(&daemon.paths, trace_id).await else {
+        return None;
+    };
+
+    warn!(
+        source,
+        reason = %block.message,
+        open_login = block.open_login,
+        "listen start blocked before audio capture because desktop is not signed in"
+    );
+    let status = failed_audio_status(config.clone(), &block.message);
+    {
+        let mut audio = daemon.audio.lock().await;
+        *audio = status.clone();
+    }
+    set_overlay_listening_state(daemon, ListeningState::Paused).await;
+    let next_step = if block.open_login {
+        "Your browser is opening now. Finish sign-in, then click Listen again."
+    } else {
+        "Listen stayed off. Fix the account state, then click Listen again."
+    };
+    let title = if block.open_login {
+        "Sign in to use Listen"
+    } else {
+        "Listen stayed off"
+    };
+    push_system_card(
+        daemon,
+        CardKind::Warning,
+        title,
+        format!("{}\n\n{next_step}", block.message),
+    )
+    .await;
+    if block.open_login {
+        if let Err(error) =
+            start_background_cloud_login(daemon, "listen auth gate", trace_id.map(str::to_string))
+                .await
+        {
+            warn!("failed to start sign-in after blocked Listen click: {error:#}");
+        }
+    }
+    Some(status)
+}
+
+async fn verify_cloud_account_for_listen(
+    paths: &AppPaths,
+    trace_id: Option<&str>,
+) -> std::result::Result<(), ListenStartBlock> {
+    let client = match build_cloud_client(paths, trace_id) {
+        Ok(client) => client,
+        Err(_) => {
+            return Err(ListenStartBlock::sign_in(
+                "Sign in to Bluey before using Listen. Audio capture, live transcription, and billing stay off until this desktop is linked."
+                    .to_string(),
+            ));
+        }
+    };
+
+    match timeout(
+        Duration::from_secs(4),
+        client.auth_get::<cue_cloud_client::AccountMe>("/account/me"),
+    )
+    .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => {
+            if listen_auth_error_should_clear_tokens(&error) {
+                if let Err(clear_error) = client.clear_tokens() {
+                    warn!("failed to clear invalid Bluey account tokens: {clear_error:#}");
+                }
+            }
+            Err(match error {
+                cue_cloud_client::Error::Unauthorized => ListenStartBlock::sign_in(
+                    "Your Bluey sign-in expired or the account is no longer active. Sign in again before using Listen.".to_string()
+                ),
+                cue_cloud_client::Error::Server { status } if status == 403 || status == 404 => ListenStartBlock::sign_in(
+                    "This desktop is linked to a Bluey account that is no longer available. Sign in again before using Listen.".to_string()
+                ),
+                cue_cloud_client::Error::InsufficientBalance { .. }
+                | cue_cloud_client::Error::TrialEnded => ListenStartBlock::wait(
+                    "Bluey could verify sign-in, but this account needs credits before Listen can start.".to_string()
+                ),
+                cue_cloud_client::Error::RateLimited { retry_after_secs } => ListenStartBlock::wait(
+                    format!(
+                        "Bluey is cooling down account checks. Try Listen again in about {retry_after_secs} seconds."
+                    )
+                ),
+                cue_cloud_client::Error::CapacityBusy {
+                    retry_after_secs, ..
+                } => ListenStartBlock::wait(
+                    format!(
+                        "Bluey account checks are busy. Try Listen again in about {retry_after_secs} seconds."
+                    )
+                ),
+                other => ListenStartBlock::wait(
+                    format!(
+                        "Bluey could not verify this desktop sign-in yet: {other}. Listen will stay off until sign-in is verified."
+                    )
+                ),
+            })
+        }
+        Err(_) => Err(ListenStartBlock::wait(
+            "Bluey could not verify sign-in quickly enough. Listen stayed off so audio is not captured or billed. Try again in a moment."
+                .to_string(),
+        )),
+    }
+}
+
+fn listen_auth_error_should_clear_tokens(error: &cue_cloud_client::Error) -> bool {
+    matches!(
+        error,
+        cue_cloud_client::Error::Unauthorized
+            | cue_cloud_client::Error::Server { status: 403 | 404 }
+    )
 }
 
 async fn start_audio_capture(
@@ -14497,6 +14658,46 @@ mod tests {
         .expect("sign-in event should decode");
 
         assert!(matches!(event, OverlayEvent::SignInRequested));
+    }
+
+    #[tokio::test]
+    async fn listen_auth_gate_requires_linked_cloud_account() {
+        let base = env::temp_dir().join(format!(
+            "bluey-listen-auth-gate-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = AppPaths {
+            data_dir: base.join("data"),
+            config_dir: base.join("config"),
+            runtime_dir: base.join("runtime"),
+            state_file: base.join("runtime/state.json"),
+            account_file: base.join("config/account.json"),
+            settings_file: base.join("config/settings.json"),
+        };
+        paths.ensure().expect("ensure temp paths");
+
+        let err = verify_cloud_account_for_listen(&paths, None)
+            .await
+            .expect_err("unsigned profile should not start Listen");
+
+        assert!(err.message.contains("Sign in to Bluey before using Listen"));
+        assert!(err.open_login);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn listen_auth_gate_clears_deleted_account_errors() {
+        assert!(listen_auth_error_should_clear_tokens(
+            &cue_cloud_client::Error::Unauthorized
+        ));
+        assert!(listen_auth_error_should_clear_tokens(
+            &cue_cloud_client::Error::Server { status: 404 }
+        ));
+        assert!(!listen_auth_error_should_clear_tokens(
+            &cue_cloud_client::Error::RateLimited {
+                retry_after_secs: 10
+            }
+        ));
     }
 
     #[test]

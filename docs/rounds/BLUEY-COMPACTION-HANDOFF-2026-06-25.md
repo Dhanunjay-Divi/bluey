@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-30 14:53 EDT
+Latest checkpoint: 2026-06-30 15:17 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,34 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-258-DESKTOP-LOGIN-AUTO-LINK-DEPLOY.md`; the next canonical Bluey round doc should start at `ROUND-259-...`.
+- Latest assigned Bluey round doc is `ROUND-259-LISTEN-SIGNIN-GATE-DEPLOY.md`; the next canonical Bluey round doc should start at `ROUND-260-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 259 prevents Listen/mic from starting before verified desktop sign-in:
+  - added a daemon-side gate for both direct `AudioStart` IPC and overlay
+    `recording_start_requested`
+  - the gate verifies `/account/me` before audio capture starts
+  - unsigned profiles keep Listen off and open browser sign-in
+  - expired/deleted-account tokens (`401`, `403`, `404`) are cleared before
+    sign-in is reopened
+  - verified accounts with credit/cooldown/temporary verification issues keep
+    Listen off without pretending sign-in is opening
+  - macOS overlay no longer optimistically switches expanded or collapsed
+    Listen UI into `Starting` before the daemon accepts the request
+  - release version bumped to `0.1.19` for the downloadable package
+  - live checks passed:
+    - `latest.json` version `0.1.19`
+    - `latest.json.sig` 88 bytes and OpenSSL verified
+    - live darwin-arm64 SHA256
+      `ebc2f52e07faf40ef7e09f167fcb804c60f00f7ebba8875d528567289b84c885`
+      matched `SHA256SUMS.txt`
+    - temp-home installer smoke from `https://bluey.sh/install.sh` installed
+      `bluey 0.1.19`
+  - Round doc:
+    `docs/rounds/ROUND-259-LISTEN-SIGNIN-GATE-DEPLOY.md`
 - Round 258 fixed the native desktop login gap where clicking the Bluey sign-in
   pill authenticated the browser but did not link the running desktop:
   - root cause: macOS overlay opened plain `https://bluey.sh/login`; no
