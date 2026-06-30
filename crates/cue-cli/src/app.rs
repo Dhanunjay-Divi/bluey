@@ -1353,12 +1353,16 @@ async fn browser_login(
     println!("Approve this code only in the Bluey account you want this desktop to use.");
     println!("{login_url}");
     let _ = open_browser(&login_url);
+    println!("Waiting for browser approval...");
+    println!("After signing in, click Connect desktop on the Bluey page. This terminal will finish automatically.");
 
     let auth = tokio::time::timeout(Duration::from_secs(DEVICE_LOGIN_TIMEOUT_SECS), async {
-        flow.await_login(&client).await.map_err(anyhow::Error::from)
+        await_browser_device_login(&flow, &client)
+            .await
+            .map_err(anyhow::Error::from)
     })
     .await
-    .context("login timed out after 10 minutes")??;
+    .context("login timed out after 10 minutes. Re-run `bluey login`, then click Connect desktop in the browser.")??;
 
     let mut account = AccountConfig::local();
     account.provider = "bluey".to_string();
@@ -1375,6 +1379,29 @@ async fn browser_login(
 }
 
 const DEVICE_LOGIN_TIMEOUT_SECS: u64 = 600;
+
+async fn await_browser_device_login(
+    flow: &cue_cloud_client::DeviceFlow,
+    client: &cue_cloud_client::CloudClient,
+) -> cue_cloud_client::error::Result<cue_cloud_client::AuthResponse> {
+    let interval = Duration::from_secs(flow.interval_secs.max(1));
+    let mut next_hint = Instant::now() + Duration::from_secs(20);
+    loop {
+        match flow.poll(client).await? {
+            cue_cloud_client::DeviceFlowState::LoggedIn(auth) => return Ok(auth),
+            cue_cloud_client::DeviceFlowState::Pending => {
+                if Instant::now() >= next_hint {
+                    println!("Still waiting. In the browser, click Connect desktop to approve this terminal.");
+                    next_hint += Duration::from_secs(20);
+                }
+                sleep(interval).await;
+            }
+            cue_cloud_client::DeviceFlowState::Expired => {
+                return Err(cue_cloud_client::Error::Other("device_code expired".into()));
+            }
+        }
+    }
+}
 
 fn resolve_login_api_url(local: bool, explicit_api_url: Option<String>) -> String {
     resolve_login_api_url_from(

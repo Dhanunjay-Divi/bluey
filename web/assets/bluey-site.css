@@ -1504,6 +1504,49 @@
       overflow: hidden;
     }
 
+    #accountApp .device-link-hint {
+      display: grid;
+      gap: .75rem;
+      margin: 1rem 0;
+      padding: 1rem;
+      border: 1px solid rgba(76, 200, 255, .32);
+      border-radius: 18px;
+      background: rgba(76, 200, 255, .08);
+      color: #dff6ff;
+      line-height: 1.45;
+    }
+
+    #accountApp .device-link-hint[hidden] {
+      display: none;
+    }
+
+    #accountApp .device-link-hint strong {
+      color: #fff;
+      font-size: 1rem;
+    }
+
+    #accountApp .device-link-hint span {
+      color: #aebdc4;
+      font-size: .92rem;
+    }
+
+    #accountApp .device-link-hint code {
+      color: #9be8ff;
+      font-weight: 800;
+      letter-spacing: .04em;
+    }
+
+    #accountApp .device-link-hint .account-button {
+      width: fit-content;
+      min-width: 180px;
+      justify-content: center;
+    }
+
+    #accountApp .dashboard-device-link-hint {
+      margin-top: 0;
+      margin-bottom: 1.25rem;
+    }
+
     #accountApp .account-form input:-webkit-autofill,
     #accountApp .account-form input:-webkit-autofill:hover,
     #accountApp .account-form input:-webkit-autofill:focus {

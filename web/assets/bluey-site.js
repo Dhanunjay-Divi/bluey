@@ -475,37 +475,58 @@ if (!window.__BLUEY_SITE_BOOTED__) {
 
     function renderDeviceLinkHint() {
       const code = pendingDeviceCode();
-      const el = document.getElementById('deviceLinkHint');
-      if (!el) return;
-      if (!code) {
+      const targets = [
+        document.getElementById('deviceLinkHint'),
+        document.getElementById('dashboardDeviceLinkHint'),
+      ].filter(Boolean);
+      if (!targets.length) return;
+      for (const el of targets) {
         el.hidden = true;
-        return;
+        el.replaceChildren();
       }
-      el.hidden = false;
-      el.replaceChildren();
-      const title = document.createElement('strong');
-      title.textContent = 'Linking desktop Bluey';
-      const body = document.createElement('span');
-      body.append('Code ');
-      const codeEl = document.createElement('code');
-      codeEl.textContent = code;
-      body.append(codeEl, accountToken()
-        ? '. Confirm before this browser links the desktop app.'
-        : '. Sign in or create an account here, then confirm the desktop link.');
-      el.append(title, body);
-      if (accountToken() && sessionStorage.getItem(`bluey_device_approved_${code}`) !== '1') {
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.className = 'account-button secondary compact';
-        button.textContent = 'Connect desktop';
-        button.addEventListener('click', () => {
-          sessionStorage.setItem(`bluey_device_confirmed_${code}`, '1');
-          approvePendingDevice()
-            .then(() => loadAccount())
-            .catch((error) => accountMessage(`Desktop link failed: ${error.message}`));
-        });
-        el.append(button);
-      }
+      if (!code) return;
+
+      const renderInto = (el) => {
+        el.hidden = false;
+        el.replaceChildren();
+        const title = document.createElement('strong');
+        const approved = sessionStorage.getItem(`bluey_device_approved_${code}`) === '1';
+        title.textContent = approved ? 'Desktop Bluey is connected' : 'Finish connecting desktop Bluey';
+        const body = document.createElement('span');
+        if (approved) {
+          body.textContent = 'Return to Terminal or Bluey. This browser tab can stay open.';
+          el.append(title, body);
+          return;
+        }
+        body.append('Terminal is waiting on code ');
+        const codeEl = document.createElement('code');
+        codeEl.textContent = code;
+        body.append(codeEl, accountToken()
+          ? '. Click Connect desktop to finish bluey login.'
+          : '. Sign in or create an account here, then confirm the desktop link.');
+        el.append(title, body);
+        if (accountToken()) {
+          const button = document.createElement('button');
+          button.type = 'button';
+          button.className = 'account-button secondary compact';
+          button.textContent = 'Connect desktop';
+          button.setAttribute('aria-label', `Connect desktop Bluey using code ${code}`);
+          button.addEventListener('click', () => {
+            button.disabled = true;
+            button.textContent = 'Connecting...';
+            sessionStorage.setItem(`bluey_device_confirmed_${code}`, '1');
+            approvePendingDevice()
+              .then(() => loadAccount())
+              .catch((error) => {
+                button.disabled = false;
+                button.textContent = 'Connect desktop';
+                accountMessage(`Desktop link failed: ${error.message}`);
+              });
+            });
+          el.append(button);
+        }
+      };
+      for (const el of targets) renderInto(el);
     }
 
     async function approvePendingDevice() {
@@ -514,7 +535,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const storageKey = `bluey_device_approved_${code}`;
       if (sessionStorage.getItem(storageKey) === '1') return true;
       if (sessionStorage.getItem(`bluey_device_confirmed_${code}`) !== '1') {
-        accountMessage('Confirm the desktop link before connecting this account.');
+        accountMessage('Click Connect desktop to finish bluey login.');
         return false;
       }
       accountMessage('Connecting this account to the desktop app...');

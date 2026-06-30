@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-30 13:17 EDT
+Latest checkpoint: 2026-06-30 13:36 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,31 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-255-INSTALLER-RELEASE-FILES-RESTORE.md`; the next canonical Bluey round doc should start at `ROUND-256-...`.
+- Latest assigned Bluey round doc is `ROUND-256-DESKTOP-LOGIN-HANDOFF-VISIBILITY.md`; the next canonical Bluey round doc should start at `ROUND-257-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 256 fixed the confusing `bluey login` browser handoff where login
+  succeeded but the terminal kept waiting:
+  - root cause: the pending desktop-link hint lived inside the login card, which
+    became hidden after the browser switched to the dashboard
+  - added a dashboard-level `Connect desktop` banner for pending `user_code`
+    approvals
+  - kept explicit approval so pasted/random codes cannot silently bind a signed
+    in account to someone else's desktop
+  - added clearer CLI waiting/timeout hints in source; installed users will see
+    those after the next binary release
+  - deployed static web assets live using release-safe rsync excludes
+  - live checks confirmed the new dashboard hint/copy is served and
+    `/install.sh` still serves the shell installer
+  - verification passed:
+    - `node --check web/assets/bluey-site.js`
+    - `cargo check -p cue-cli`
+    - `git diff --check`
+  - Round doc:
+    `docs/rounds/ROUND-256-DESKTOP-LOGIN-HANDOFF-VISIBILITY.md`
 - Round 255 restored the public installer and release files after
   `https://bluey.sh/install.sh` started serving static website HTML:
   - restored `/install.sh`, `/install.ps1`, `/latest.json`,
