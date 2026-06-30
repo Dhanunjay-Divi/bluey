@@ -1286,7 +1286,7 @@ static void create_controls(HWND hwnd) {
 }
 
 static void consume_sent_context_chips(void) {
-    g_context_chip_count = 0;
+    InvalidateRect(g_hwnd, NULL, TRUE);
 }
 
 static void clear_local_transcript_context(void) {

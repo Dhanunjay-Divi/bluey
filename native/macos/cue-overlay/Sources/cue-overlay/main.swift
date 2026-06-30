@@ -715,6 +715,11 @@ private final class ComposerTextView: NSTextView {
     }
     var onSubmit: (() -> Void)?
     var onMeasuredHeight: ((CGFloat) -> Void)?
+    var onFocusChanged: ((Bool) -> Void)?
+
+    private var inputFocused = false
+    private var customCaretVisible = true
+    private var customCaretTimer: Timer?
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -761,6 +766,27 @@ private final class ComposerTextView: NSTextView {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    deinit {
+        customCaretTimer?.invalidate()
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted {
+            setInputFocused(true)
+            armTypingCaret()
+        }
+        return accepted
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let accepted = super.resignFirstResponder()
+        if accepted {
+            setInputFocused(false)
+        }
+        return accepted
+    }
+
     override func resetCursorRects() {
         addCursorRect(bounds, cursor: .arrow)
     }
@@ -786,8 +812,22 @@ private final class ComposerTextView: NSTextView {
             .font: font ?? NSFont.systemFont(ofSize: 14.5, weight: .medium),
             .foregroundColor: placeholderColor,
         ]
-        let rect = NSRect(x: 0, y: textContainerInset.height + 1, width: bounds.width, height: 22)
+        let caretOffset: CGFloat = inputFocused ? 13 : 0
+        let rect = NSRect(
+            x: caretOffset,
+            y: textContainerInset.height + 1,
+            width: max(0, bounds.width - caretOffset),
+            height: 22)
         placeholder.draw(in: rect, withAttributes: attributes)
+        if inputFocused, customCaretVisible {
+            let caretRect = NSRect(
+                x: 2,
+                y: textContainerInset.height + 1,
+                width: 2,
+                height: max(18, min(24, bounds.height - textContainerInset.height * 2)))
+            insertionPointColor.setFill()
+            NSBezierPath(roundedRect: caretRect, xRadius: 1, yRadius: 1).fill()
+        }
     }
 
     override func didChangeText() {
@@ -832,13 +872,24 @@ private final class ComposerTextView: NSTextView {
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(self)
         handleMouseGesture(atWindowPoint: event.locationInWindow, clickCount: event.clickCount)
+        armTypingCaret()
     }
 
     func clearText() {
         string = ""
         selectedRange = NSRange(location: 0, length: 0)
+        armTypingCaret()
         needsDisplay = true
         notifyMeasuredHeight()
+    }
+
+    func armTypingCaret() {
+        let length = (string as NSString).length
+        let range = selectedRange()
+        setSelectedRange(NSRange(location: min(range.location, length), length: 0))
+        customCaretVisible = true
+        needsDisplay = true
+        displayIfNeeded()
     }
 
     func insertPlainText(_ text: String) {
@@ -862,6 +913,7 @@ private final class ComposerTextView: NSTextView {
         let length = (string as NSString).length
         guard length > 0 else {
             setSelectedRange(NSRange(location: 0, length: 0))
+            armTypingCaret()
             needsDisplay = true
             return
         }
@@ -875,6 +927,31 @@ private final class ComposerTextView: NSTextView {
             setSelectedRange(NSRange(location: min(index, length), length: 0))
         }
         scrollRangeToVisible(selectedRange())
+        needsDisplay = true
+    }
+
+    private func setInputFocused(_ focused: Bool) {
+        guard inputFocused != focused else {
+            needsDisplay = true
+            return
+        }
+        inputFocused = focused
+        onFocusChanged?(focused)
+        if focused {
+            customCaretVisible = true
+            customCaretTimer?.invalidate()
+            let timer = Timer(timeInterval: 0.52, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                self.customCaretVisible.toggle()
+                self.needsDisplay = true
+            }
+            customCaretTimer = timer
+            RunLoop.main.add(timer, forMode: .common)
+        } else {
+            customCaretTimer?.invalidate()
+            customCaretTimer = nil
+            customCaretVisible = false
+        }
         needsDisplay = true
     }
 
@@ -1053,6 +1130,9 @@ private final class ArrowCursorTextField: NSTextField {
 
 private final class ComposerSurfaceView: NSView {
     weak var composer: ComposerTextView?
+    private var inputFocused = false
+    private var restingBorderColor = NSColor.white.withAlphaComponent(0.105)
+    private var focusedBorderColor = BlueyTheme.cyan.withAlphaComponent(0.62)
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -1061,8 +1141,30 @@ private final class ComposerSurfaceView: NSView {
             NSApp.activate(ignoringOtherApps: true)
             window?.makeKeyAndOrderFront(nil)
             window?.makeFirstResponder(composer)
+            composer.armTypingCaret()
         }
         super.mouseDown(with: event)
+    }
+
+    func setInputFocused(_ focused: Bool) {
+        guard inputFocused != focused else { return }
+        inputFocused = focused
+        refreshFocusChrome()
+    }
+
+    func updateBorderColors(resting: NSColor, focused: NSColor) {
+        restingBorderColor = resting
+        focusedBorderColor = focused
+        refreshFocusChrome()
+    }
+
+    private func refreshFocusChrome() {
+        guard let layer else { return }
+        layer.borderColor = (inputFocused ? focusedBorderColor : restingBorderColor).cgColor
+        layer.shadowColor = focusedBorderColor.cgColor
+        layer.shadowOpacity = inputFocused ? 0.18 : 0
+        layer.shadowRadius = inputFocused ? 10 : 0
+        layer.shadowOffset = .zero
     }
 }
 
@@ -4313,7 +4415,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var preCanvasFullWindowFrame: NSRect?
     private var windowFullSize = false
     private var preWindowFullSizeFrame: NSRect?
-    private var passThroughMode = false
+    private var passThroughMode = true
     private var headerDragInProgress = false
     private struct ResizeEdges: OptionSet {
         let rawValue: Int
@@ -4885,6 +4987,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
         composer.onSubmit = { [weak self] in self?.askClicked() }
         composer.onMeasuredHeight = { [weak self] height in self?.setComposerTextHeight(height) }
+        composer.onFocusChanged = { [weak self] focused in
+            (self?.composerSurface as? ComposerSurfaceView)?.setInputFocused(focused)
+        }
         (composerSurface as? ComposerSurfaceView)?.composer = composer
         headerBar.onDragStateChanged = { [weak self] active in
             self?.headerDragInProgress = active
@@ -5121,9 +5226,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             : BlueyTheme.cyan.withAlphaComponent(0.22)).cgColor
         composerBar.layer?.shadowOpacity = lightThemeEnabled ? 0.10 : 0.18
         composerSurface.layer?.backgroundColor = themedSurfaceColor.cgColor
-        composerSurface.layer?.borderColor = (lightThemeEnabled
+        let composerSurfaceBorder = lightThemeEnabled
             ? BlueyLightTheme.border
-            : NSColor.white.withAlphaComponent(materialAlpha(0.105))).cgColor
+            : NSColor.white.withAlphaComponent(materialAlpha(0.105))
+        composerSurface.layer?.borderColor = composerSurfaceBorder.cgColor
+        (composerSurface as? ComposerSurfaceView)?.updateBorderColors(
+            resting: composerSurfaceBorder,
+            focused: themedAccentBorderColor.withAlphaComponent(lightThemeEnabled ? 0.82 : 0.68))
         opacityControl.layer?.backgroundColor = NSColor.clear.cgColor
         opacityControl.layer?.borderColor = NSColor.clear.cgColor
         closeConfirmPanel.layer?.backgroundColor = BlueyTheme.panelDeep
@@ -5437,6 +5546,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(composer)
+        composer.armTypingCaret()
         composerInputArmedUntil = CACurrentMediaTime() + 1.5
     }
 
@@ -6529,6 +6639,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         composerSurface.layer?.cornerRadius = 13
         composerSurface.layer?.borderWidth = 1
         composerSurface.layer?.borderColor = NSColor.white.withAlphaComponent(0.105).cgColor
+        (composerSurface as? ComposerSurfaceView)?.updateBorderColors(
+            resting: NSColor.white.withAlphaComponent(0.105),
+            focused: BlueyTheme.cyan.withAlphaComponent(0.62))
 
         composerScroll.drawsBackground = false
         composerScroll.borderType = .noBorder
@@ -7602,6 +7715,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             ? "Ask while Bluey listens..."
             : "Ask anything..."
         window?.makeFirstResponder(composer)
+        composer.armTypingCaret()
     }
 
     private func updateBackgroundControlsEnabledForModalState() {
@@ -8008,12 +8122,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let previousIds = Set(contextItems.map(\.id))
         let currentIds = Set(items.map(\.id))
         let newlyAddedIds = currentIds.subtracting(previousIds)
+        let mutationExpected = isExpectingContextMutationForPendingSend()
         contextItems = items
         hasVisibleContextAttachments = !items.isEmpty
         pendingContextItemIds.formIntersection(currentIds)
-        if !newlyAddedIds.isEmpty, isExpectingContextMutationForPendingSend() {
-            pendingContextItemIds.formUnion(newlyAddedIds)
-            showingSavedContextItems = false
+        if !newlyAddedIds.isEmpty {
+            if mutationExpected {
+                pendingContextItemIds.formUnion(newlyAddedIds)
+            }
+            showingSavedContextItems = true
         } else if pendingContextItemIds.isEmpty {
             showingSavedContextItems = true
         }

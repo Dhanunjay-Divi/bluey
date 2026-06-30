@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-29 23:32 EDT
+Latest checkpoint: 2026-06-29 23:54 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,46 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-242-ANSWERPLAN-DEFAULT-AND-PREFLIGHT.md`; the next canonical Bluey round doc should start at `ROUND-243-...`.
+- Latest assigned Bluey round doc is `ROUND-243-COMPOSER-DOCS-INTERACTION-DEFAULTS.md`; the next canonical Bluey round doc should start at `ROUND-244-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 243 fixed the composer/document/interaction defaults reported during
+  live overlay testing:
+  - macOS empty composer clicks now show an explicit focused blue blinking caret
+    beside the placeholder
+  - macOS composer surface now shows a blue focus border/shadow when it owns
+    input
+  - macOS click-through/interactive-off mode is now the default for new overlay
+    windows, while controls, composer, resize edges, and header move handles
+    remain interactive
+  - newly added context files/screens now reveal the attachment strip
+    automatically
+  - sent attachments remain visible as saved session context instead of needing
+    a manual `Show files` click
+  - Windows parity: the existing ask box already forces arrow cursor and blank
+    overlay space pass-through; Windows now keeps visible context chips after
+    send instead of clearing them immediately
+  - files changed:
+    - `native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `native/windows/cue-overlay/main.c`
+  - Round doc:
+    `docs/rounds/ROUND-243-COMPOSER-DOCS-INTERACTION-DEFAULTS.md`
+  - Verification passed:
+    - `git diff --check`
+    - `native/macos/cue-overlay/build.sh`
+    - `x86_64-w64-mingw32-gcc -municode -D_WIN32_WINNT=0x0601 -o /tmp/bluey-win-check/bluey-overlay.exe native/windows/cue-overlay/main.c -luser32 -lgdi32 -ld2d1 -ldwrite -luuid -lshell32 -lcomctl32`
+  - Local install/restart completed:
+    - installed rebuilt `bluey-overlay-macos`, `cue-overlay-macos`, and
+      `BlueyOverlay.app` into `~/.bluey/bin`
+    - restarted with `~/.bluey/bin/bluey off && ~/.bluey/bin/bluey on`
+    - post-restart status: daemon pid `59401`, meeting id
+      `56431f96-80c0-438f-94c0-e650e9b17064`, `overlay_visible: true`,
+      `overlay_capture_excluded: true`
+  - Remaining gate: live-test the focus caret, auto-visible documents, send
+    retention, and click-through controls before shipping.
 - Round 242 made AnswerPlan routing default-on and improved deploy/preflight
   visibility:
   - `BLUEY_ANSWER_PLAN_ROUTING` now defaults to enabled in server code
