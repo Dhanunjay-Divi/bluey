@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-30 04:26 EDT
+Latest checkpoint: 2026-06-30 13:17 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,31 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-249-BALANCE-WARNING-COLOR-STATES.md`; the next canonical Bluey round doc should start at `ROUND-250-...`.
+- Latest assigned Bluey round doc is `ROUND-255-INSTALLER-RELEASE-FILES-RESTORE.md`; the next canonical Bluey round doc should start at `ROUND-256-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 255 restored the public installer and release files after
+  `https://bluey.sh/install.sh` started serving static website HTML:
+  - restored `/install.sh`, `/install.ps1`, `/latest.json`,
+    `/latest.json.sig`, and `/releases/v0.1.17/*` on the droplet
+  - root cause was a web-only deploy/delete path that removed release files,
+    causing Caddy to fall back to `index.html`
+  - future Bluey.sh deploys should use `scripts/deploy-bluey-sh-manual.sh` or
+    explicitly preserve installer, manifest, signature, and `/releases/**`
+  - live checks passed:
+    - `curl -fsSL https://bluey.sh/install.sh | sed -n '1p'`
+    - `curl -fsSL https://bluey.sh/install.sh | bash -n`
+    - `curl -fsSL https://bluey.sh/latest.json`
+    - `curl -fsSL https://bluey.sh/latest.json.sig | wc -c`
+    - release artifact `shasum -a 256 -c SHA256SUMS.txt`
+    - temp-home installer smoke, ending with `bluey 0.1.17`
+  - Round doc:
+    `docs/rounds/ROUND-255-INSTALLER-RELEASE-FILES-RESTORE.md`
+  - Current live install entrypoint is working again:
+    `curl -fsSL https://bluey.sh/install.sh | bash`
 - Round 249 added clearer low/critical balance visual states:
   - `>= $10.00` remains normal
   - `$5.00` through `$9.99` shows orange low-balance warning
