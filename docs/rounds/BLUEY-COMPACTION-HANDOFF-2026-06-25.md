@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-30 15:17 EDT
+Latest checkpoint: 2026-06-30 15:55 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,44 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-259-LISTEN-SIGNIN-GATE-DEPLOY.md`; the next canonical Bluey round doc should start at `ROUND-260-...`.
+- Latest assigned Bluey round doc is `ROUND-260-UPDATE-RESTART-LISTEN-LATENCY.md`; the next canonical Bluey round doc should start at `ROUND-261-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 260 hardens auto-update restart and repeated Listen start latency:
+  - root cause for `Bluey daemon did not become ready`: update restart could
+    race daemon shutdown/port release, waited only `5s`, and did not report
+    child early exit clearly
+  - `bluey off` now waits for the daemon to stop before returning
+  - `bluey on` waits up to `20s` and reports daemon child early exit
+  - stale-daemon cleanup waits briefly after SIGTERM before removing state
+  - auto-update relaunch prefers the current installed `bluey` executable path
+    instead of relying on PATH order
+  - Listen remains gated behind verified sign-in, but a successful account
+    verification is cached for `30s` so repeated Listen toggles avoid the same
+    `/account/me` round trip
+  - logout and failed account checks clear the Listen verification cache
+  - release version bumped to `0.1.20`
+  - verification/deploy passed:
+    - `cargo check -p cue-cli --quiet`
+    - `cargo check -p cue-daemon --quiet`
+    - `cargo test -p cue-cli relaunch_ --quiet`
+    - `cargo test -p cue-daemon listen_auth_gate_requires_linked_cloud_account --quiet`
+    - `latest.json` version `0.1.20`
+    - `latest.json.sig` 88 bytes and OpenSSL verified
+    - live darwin-arm64 SHA256
+      `bfa16fc62e45eaf7ed613a162fd3547b97616392143c710b78ac3e22d7980f2e`
+      matched `SHA256SUMS.txt`
+    - temp-home installer smoke from `https://bluey.sh/install.sh` installed
+      `bluey 0.1.20`
+    - local install smoke moved this machine to `bluey 0.1.20` and
+      `bluey-daemon 0.1.20`
+    - local `BLUEY_SKIP_UPDATE=1 ~/.bluey/bin/bluey on` started daemon pid
+      `70850`
+  - Round doc:
+    `docs/rounds/ROUND-260-UPDATE-RESTART-LISTEN-LATENCY.md`
 - Round 259 prevents Listen/mic from starting before verified desktop sign-in:
   - added a daemon-side gate for both direct `AudioStart` IPC and overlay
     `recording_start_requested`

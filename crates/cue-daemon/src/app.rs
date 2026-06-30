@@ -1069,6 +1069,7 @@ struct Daemon {
     audio_runtime: Mutex<AudioRuntime>,
     cloud: Mutex<CloudSyncStatus>,
     cloud_login: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    listen_account_verified_until: Mutex<Option<Instant>>,
     auto_cloud_sync_debounce: Mutex<Option<tokio::task::JoinHandle<()>>>,
     balance_poll_shutdown: Mutex<Option<watch::Sender<bool>>>,
     balance_watch: crate::cloud::balance::BalanceWatch,
@@ -1164,6 +1165,7 @@ const RETAINED_SCREEN_THUMBNAIL_MAX_EDGE: u32 = 1_800;
 const SAME_SPEAKER_TRANSCRIPT_DUP_MS: u64 = 8_000;
 const CROSS_SOURCE_TRANSCRIPT_ECHO_DUP_MS: u64 = 6_000;
 const BACKGROUND_DEVICE_LOGIN_TIMEOUT_SECS: u64 = 600;
+const LISTEN_ACCOUNT_VERIFICATION_TTL_SECS: u64 = 30;
 
 impl OverlayProcess {
     fn send(&mut self, command: &OverlayCommand) -> Result<()> {
@@ -1226,6 +1228,7 @@ pub async fn run() -> Result<()> {
         }),
         cloud: Mutex::new(cloud_status),
         cloud_login: Mutex::new(None),
+        listen_account_verified_until: Mutex::new(None),
         auto_cloud_sync_debounce: Mutex::new(None),
         balance_poll_shutdown: Mutex::new(None),
         balance_watch,
@@ -1849,6 +1852,7 @@ async fn handle_request_inner(
             Ok(DaemonResponse::CloudStatus { status })
         }
         DaemonRequest::CloudLogout => {
+            clear_listen_account_verification(daemon).await;
             stop_balance_polling(daemon).await;
             let status = cloud_status_from_env(&daemon.paths);
             *daemon.cloud.lock().await = status.clone();
@@ -2670,9 +2674,18 @@ async fn block_audio_start_if_not_signed_in(
     source: &'static str,
     trace_id: Option<&str>,
 ) -> Option<AudioPipelineStatus> {
-    let Err(block) = verify_cloud_account_for_listen(&daemon.paths, trace_id).await else {
+    if listen_account_verification_is_fresh(daemon).await {
         return None;
+    }
+
+    let block = match verify_cloud_account_for_listen(&daemon.paths, trace_id).await {
+        Ok(()) => {
+            mark_listen_account_verified(daemon).await;
+            return None;
+        }
+        Err(block) => block,
     };
+    clear_listen_account_verification(daemon).await;
 
     warn!(
         source,
@@ -2712,6 +2725,23 @@ async fn block_audio_start_if_not_signed_in(
         }
     }
     Some(status)
+}
+
+async fn listen_account_verification_is_fresh(daemon: &Arc<Daemon>) -> bool {
+    daemon
+        .listen_account_verified_until
+        .lock()
+        .await
+        .is_some_and(|until| Instant::now() < until)
+}
+
+async fn mark_listen_account_verified(daemon: &Arc<Daemon>) {
+    *daemon.listen_account_verified_until.lock().await =
+        Some(Instant::now() + Duration::from_secs(LISTEN_ACCOUNT_VERIFICATION_TTL_SECS));
+}
+
+async fn clear_listen_account_verification(daemon: &Arc<Daemon>) {
+    *daemon.listen_account_verified_until.lock().await = None;
 }
 
 async fn verify_cloud_account_for_listen(
@@ -5198,6 +5228,7 @@ async fn run_background_cloud_login(
         cue_core::save_settings(&daemon.paths, &settings)?;
     }
 
+    mark_listen_account_verified(&daemon).await;
     refresh_signed_in_overlay_state(&daemon, Some(&trace_id)).await;
     info!(
         source,

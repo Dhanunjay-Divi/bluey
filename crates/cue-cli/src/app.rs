@@ -1,7 +1,7 @@
 use std::env;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::{Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
@@ -1157,6 +1157,9 @@ fn bluey_on_boot_title(auth_state: &BlueyOnAuthState) -> &'static str {
 async fn cue_off() -> Result<()> {
     match request(DaemonRequest::Shutdown).await {
         Ok(DaemonResponse::Ok) => {
+            if let Err(error) = wait_for_daemon_stopped(Duration::from_secs(8)).await {
+                eprintln!("warning: Bluey shutdown is still settling: {error:#}");
+            }
             println!("Bluey is off.");
             Ok(())
         }
@@ -2159,8 +2162,8 @@ async fn start(args: StartArgs) -> Result<()> {
         .stderr(Stdio::null());
     configure_detached_daemon(&mut command);
 
-    let child = command.spawn().context("failed to start Bluey daemon")?;
-    wait_for_daemon_ready(Duration::from_secs(5)).await?;
+    let mut child = command.spawn().context("failed to start Bluey daemon")?;
+    wait_for_daemon_ready(Duration::from_secs(20), Some(&mut child)).await?;
     if !args.quiet {
         println!("Bluey daemon started with pid {}.", child.id());
     }
@@ -2172,6 +2175,21 @@ async fn cleanup_stale_daemon(paths: &AppPaths, quiet: bool) -> Result<()> {
 
     let daemon_bin = resolve_daemon_bin().ok();
     let killed = terminate_recorded_daemon_process(state_pid, daemon_bin.as_deref())?;
+    if killed > 0 {
+        if let Some(pid) = state_pid {
+            match wait_for_recorded_daemon_exit(pid, Duration::from_secs(5)).await {
+                Ok(true) => {}
+                Ok(false) if !quiet => {
+                    eprintln!("Bluey daemon shutdown is still settling.");
+                }
+                Ok(false) => {}
+                Err(error) if !quiet => {
+                    eprintln!("warning: could not confirm stale Bluey daemon exit: {error:#}");
+                }
+                Err(_) => {}
+            }
+        }
+    }
 
     if paths.state_file.exists() {
         tokio::fs::remove_file(&paths.state_file)
@@ -2251,6 +2269,42 @@ fn terminate_recorded_daemon_process(
 }
 
 #[cfg(unix)]
+async fn wait_for_recorded_daemon_exit(pid: u32, timeout: Duration) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !pid_is_running(pid)? {
+            return Ok(true);
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    Ok(!pid_is_running(pid)?)
+}
+
+#[cfg(not(unix))]
+async fn wait_for_recorded_daemon_exit(_pid: u32, _timeout: Duration) -> Result<bool> {
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn pid_is_running(pid: u32) -> Result<bool> {
+    if pid == 0 {
+        return Ok(false);
+    }
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(false);
+    }
+    if error.raw_os_error() == Some(libc::EPERM) {
+        return Ok(true);
+    }
+    Err(error).with_context(|| format!("failed to inspect Bluey daemon pid {pid}"))
+}
+
+#[cfg(unix)]
 fn recorded_daemon_command_matches(command: &str, daemon_bin: Option<&Path>) -> bool {
     let expected = daemon_bin.and_then(|path| path.canonicalize().ok());
     let Some(exe) = command.split_whitespace().next() else {
@@ -2279,11 +2333,22 @@ fn is_daemon_executable_name(path: &str) -> bool {
         })
 }
 
-async fn wait_for_daemon_ready(timeout: Duration) -> Result<()> {
+async fn wait_for_daemon_ready(timeout: Duration, mut child: Option<&mut Child>) -> Result<()> {
     let deadline = Instant::now() + timeout;
     let mut last_error = None;
 
     while Instant::now() < deadline {
+        if let Some(child) = child.as_mut() {
+            match (*child).try_wait() {
+                Ok(Some(status)) => {
+                    bail!("Bluey daemon exited before becoming ready: {status}");
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return Err(error).context("failed to inspect Bluey daemon startup process");
+                }
+            }
+        }
         match request(DaemonRequest::Ping).await {
             Ok(DaemonResponse::Pong) => return Ok(()),
             Ok(other) => last_error = Some(anyhow!("unexpected daemon response: {other:?}")),
@@ -2296,6 +2361,19 @@ async fn wait_for_daemon_ready(timeout: Duration) -> Result<()> {
         Some(error) => Err(error).context("Bluey daemon did not become ready"),
         None => bail!("Bluey daemon did not become ready"),
     }
+}
+
+async fn wait_for_daemon_stopped(timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        if request(DaemonRequest::Ping).await.is_err() {
+            return Ok(());
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    bail!("Bluey daemon did not stop within {}s", timeout.as_secs())
 }
 
 #[cfg(unix)]

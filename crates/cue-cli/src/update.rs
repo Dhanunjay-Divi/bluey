@@ -497,7 +497,7 @@ fn best_effort_stop_running_bluey() {
 
 fn relaunch_bluey_on(title: Option<&str>) -> Result<()> {
     println!("Bluey updated. Restarting Bluey...");
-    let mut command = Command::new("bluey");
+    let mut command = Command::new(relaunch_bluey_bin());
     command.arg("on");
     if let Some(title) = title.filter(|value| !value.trim().is_empty()) {
         command.arg("--title").arg(title);
@@ -515,6 +515,16 @@ fn relaunch_bluey_on(title: Option<&str>) -> Result<()> {
             .context("failed to relaunch updated bluey")?;
         std::process::exit(0);
     }
+}
+
+fn relaunch_bluey_bin() -> PathBuf {
+    relaunch_bluey_bin_from(env::current_exe().ok())
+}
+
+fn relaunch_bluey_bin_from(current_exe: Option<PathBuf>) -> PathBuf {
+    current_exe
+        .filter(|path| !path_has_component(path, "target"))
+        .unwrap_or_else(|| PathBuf::from("bluey"))
 }
 
 fn select_artifact(manifest: &ReleaseManifest) -> Option<(String, PlatformArtifact)> {
@@ -613,7 +623,11 @@ fn running_from_dev_target() -> bool {
     env::current_exe()
         .ok()
         .as_deref()
-        .is_some_and(|path| path_has_component(path, "target"))
+        .is_some_and(running_from_dev_target_path)
+}
+
+fn running_from_dev_target_path(path: &Path) -> bool {
+    path_has_component(path, "target")
 }
 
 fn path_has_component(path: &Path, component: &str) -> bool {
@@ -792,6 +806,22 @@ mod tests {
             Path::new("/tmp/project/not-target/debug/bluey"),
             "target"
         ));
+    }
+
+    #[test]
+    fn relaunch_prefers_installed_current_exe() {
+        assert_eq!(
+            relaunch_bluey_bin_from(Some(PathBuf::from("/Users/example/.bluey/bin/bluey"))),
+            PathBuf::from("/Users/example/.bluey/bin/bluey")
+        );
+    }
+
+    #[test]
+    fn relaunch_falls_back_to_path_for_dev_target() {
+        assert_eq!(
+            relaunch_bluey_bin_from(Some(PathBuf::from("/Users/example/cue/target/debug/bluey"))),
+            PathBuf::from("bluey")
+        );
     }
 
     #[test]
