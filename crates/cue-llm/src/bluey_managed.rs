@@ -337,6 +337,10 @@ fn parse_managed_json_event(
     chunks: &mut Vec<Result<LlmChunk, LlmError>>,
 ) {
     if is_error_event(event, parsed) {
+        if let Some(error) = managed_capacity_busy_error(parsed) {
+            chunks.push(Err(error));
+            return;
+        }
         chunks.push(Err(LlmError::Provider(error_message_from_value(parsed))));
         return;
     }
@@ -642,6 +646,58 @@ fn json_bool(value: &serde_json::Value, keys: &[&str]) -> bool {
         .any(|key| value.get(*key).and_then(|v| v.as_bool()) == Some(true))
 }
 
+fn managed_capacity_busy_error(value: &serde_json::Value) -> Option<LlmError> {
+    let reason = json_string(value, &["reason"])
+        .or_else(|| {
+            value
+                .get("error")
+                .and_then(|error| json_string(error, &["reason"]))
+        })
+        .unwrap_or_default();
+    let retry_after_secs = json_u64(
+        value,
+        &["retry_after_secs", "retryAfterSecs", "retry_after"],
+    )
+    .or_else(|| {
+        value
+            .get("error")
+            .and_then(|error| json_u64(error, &["retry_after_secs", "retryAfterSecs"]))
+    });
+    let is_capacity = reason.contains("capacity")
+        || reason.contains("cooling")
+        || matches!(
+            reason.as_str(),
+            "provider_key_cooling_down" | "provider_capacity" | "upstream_spend_guard"
+        );
+    if !is_capacity && retry_after_secs.is_none() {
+        return None;
+    }
+    Some(LlmError::CapacityBusy {
+        retry_after_secs: retry_after_secs.unwrap_or(60).max(1),
+        reason: if reason.trim().is_empty() {
+            "capacity_busy".to_string()
+        } else {
+            reason
+        },
+    })
+}
+
+fn json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(|v| v.as_str()))
+        .map(ToOwned::to_owned)
+}
+
+fn json_u64(value: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| {
+        let value = value.get(*key)?;
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+            .filter(|seconds| *seconds > 0)
+    })
+}
+
 fn error_message_from_value(value: &serde_json::Value) -> String {
     value
         .get("error")
@@ -928,6 +984,30 @@ mod tests {
         assert_eq!(chunks[2].text, "Answer");
         assert!(chunks[3].finished);
         assert_eq!(chunks[3].sources.len(), 1);
+    }
+
+    #[test]
+    fn parses_stream_capacity_error_as_capacity_busy() {
+        let mut buffer = concat!(
+            "event: error\n",
+            "data: {\"error\":\"Bluey is handling a burst right now; retry shortly\",\"reason\":\"provider_key_cooling_down\",\"retry_after_secs\":19}\n\n",
+        )
+        .to_string();
+
+        let result = parse_managed_sse_chunks(&mut buffer)
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>();
+
+        match result {
+            Err(LlmError::CapacityBusy {
+                retry_after_secs,
+                reason,
+            }) => {
+                assert_eq!(retry_after_secs, 19);
+                assert_eq!(reason, "provider_key_cooling_down");
+            }
+            other => panic!("expected CapacityBusy, got {other:?}"),
+        }
     }
 
     #[test]

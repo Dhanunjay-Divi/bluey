@@ -232,6 +232,8 @@ Bluey protects realtime work at three layers:
 3. **Provider/model/key health ledger**: if an upstream key returns a capacity
    response such as HTTP 429, Bluey cools down that exact provider/model/key for
    `Retry-After` and immediately tries the next approved key or route.
+   HTTP-date and seconds-style `Retry-After` values are both accepted; cooldowns
+   are capped by `BLUEY_PROVIDER_MAX_COOLDOWN_SECS`.
 4. **Optional per-account emergency guardrails**: disabled by default. Turn
    them on only during abuse incidents, stolen-token response, or runaway-client
    mitigation. Normal paid usage is controlled by account-credit balance and provider
@@ -294,6 +296,14 @@ server.
 all-keys-cooling events, and Redis ledger errors. Keep these low during load
 tests; a spike means Bluey needs more approved provider capacity or a route mix
 change.
+
+For streaming requests, Bluey now treats provider SSE error frames containing
+rate-limit, quota, overload, capacity, or `RESOURCE_EXHAUSTED` signals as
+typed upstream capacity. If this arrives as the first provider event, the
+router cools the selected key and tries another key/route before committing
+the stream. If it happens after partial output, the managed stream emits a
+typed capacity error so the desktop can show a calm retry message instead of a
+generic broken-answer error.
 
 ## Internal Developer/Offline Fallback Routing
 

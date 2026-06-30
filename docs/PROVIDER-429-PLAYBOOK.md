@@ -54,13 +54,16 @@ and the router candidate loop. New code MUST go through these layers.
 5. **Self-throttle to avoid causing 429s** — `rate_limit::check_provider_*`
    per-provider limiters + per-account runaway guardrails.
 
-6. **First-token deadline → fallback** (B2): a provider that accepts (2xx)
-   then stalls before the first token falls back to the next route instead
-   of hanging.
+6. **First-token deadline / first-frame capacity → fallback** (B2): a
+   provider that accepts (2xx) then stalls before the first token falls back
+   to the next route instead of hanging. If the first stream frame is an
+   upstream rate-limit/overload error, Bluey cools that key and continues
+   routing before committing the stream.
 
 7. **Clean exhaustion** — when all keys + routes are cooling, the customer
-   gets a 503 with `retry_after_secs` (shortest cooldown), so the client
-   backs off instead of hammering.
+   gets a typed capacity `429` with `retry_after_secs` (shortest cooldown),
+   so the client backs off instead of hammering. The cloud client also maps
+   legacy/guardrail `503` capacity bodies to the same `CapacityBusy` type.
 
 ---
 
@@ -119,6 +122,7 @@ In priority order:
 |---|---|---|
 | `OPENAI_API_KEYS` / `ANTHROPIC_API_KEYS` / `GEMINI_API_KEYS` / `GOOGLE_API_KEYS` / `DEEPGRAM_API_KEYS` | comma-separated key pools (fall back to singular `*_API_KEY`) | - |
 | `BLUEY_PROVIDER_429_COOLDOWN_SECS` | cooldown when no Retry-After header | 30 |
+| `BLUEY_PROVIDER_MAX_COOLDOWN_SECS` | maximum key cooldown after any upstream Retry-After | 300 |
 | `BLUEY_MAX_OUTPUT_TOKENS` | non-thinking output ceiling (TPM/cost) | 2048 |
 | `BLUEY_STREAM_FIRST_TOKEN_TIMEOUT_MS` | stall → fallback deadline (B2) | 6000 |
 | `BLUEY_RAG_RETRIEVAL_BUDGET_MS` | RAG retrieval budget (B1) | 300 |
@@ -132,7 +136,8 @@ it they are per-instance (local fallback).
 ## 6. Customer-facing behavior on capacity exhaustion
 
 When Bluey genuinely can't serve (all keys + routes cooling), the API returns
-**503 with `retry_after_secs` + `reason: "upstream_spend_guard"` /
-`"provider_key_cooling_down"`**. The desktop/overlay should show a brief
-"capacity is busy, retrying shortly" state and honor the retry-after rather
-than spamming. (Overlay copy is codex's lane — flagging for that polish.)
+**429 with `retry_after_secs` + `reason: "provider_key_cooling_down"`**. Spend
+guard and incident guardrails may also return typed capacity bodies. The
+desktop/overlay should show a brief "capacity is busy, retrying shortly" state
+and honor the retry-after rather than spamming. (Overlay copy is codex's lane —
+flagging for that polish.)

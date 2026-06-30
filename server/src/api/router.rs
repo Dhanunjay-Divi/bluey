@@ -2569,6 +2569,35 @@ async fn complete_stream_inner(
                     } = streaming;
                     match tokio::time::timeout(first_output_deadline, stream_events.next()).await {
                         Ok(first_event) => {
+                            if let Some(Err(e)) = &first_event {
+                                if let Some(retry_after_secs) = routing::upstream_retry_after(e) {
+                                    let cooldown_secs = state
+                                        .provider_health
+                                        .record_cooldown(
+                                            route.provider,
+                                            route.model,
+                                            &selected_key.fingerprint,
+                                            retry_after_secs,
+                                        )
+                                        .await;
+                                    tracing::warn!(
+                                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                                        request_id = %req.request_id,
+                                        provider = %route.provider,
+                                        model = %route.model,
+                                        key_fingerprint = %selected_key.fingerprint,
+                                        retry_after_secs = cooldown_secs,
+                                        error = %e,
+                                        "streaming first event was upstream capacity; cooled key and retrying route"
+                                    );
+                                    last_capacity = Some(crate::rate_limit::CapacityDenied {
+                                        retry_after_secs: cooldown_secs,
+                                        reason: "provider_key_cooling_down",
+                                    });
+                                    last_failure_was_capacity = true;
+                                    continue;
+                                }
+                            }
                             selected_route_idx = idx;
                             selected_route = Some(*route);
                             let first_event_latency_ms = started.elapsed().as_millis() as i64;
@@ -2760,20 +2789,28 @@ async fn complete_stream_inner(
                     } else {
                         idempotency_guard.release_now();
                     }
+                    let retry_after_secs = routing::upstream_retry_after(&e);
                     tracing::warn!(
                         account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                         request_id = %req.request_id,
                         error = %e,
                         delivered_delta,
+                        retry_after_secs = retry_after_secs.unwrap_or_default(),
                         "streaming upstream read failed"
                     );
-                    yield Ok(Event::default().event("error").data(
+                    let payload = if let Some(retry_after_secs) = retry_after_secs {
+                        serde_json::json!({
+                            "error": "Bluey is handling a burst right now; retry shortly",
+                            "reason": "provider_key_cooling_down",
+                            "retry_after_secs": retry_after_secs.max(1),
+                        })
+                    } else {
                         serde_json::json!({
                             "error": "upstream provider stream interrupted; please retry",
                             "reason": "upstream_stream_error",
                         })
-                        .to_string(),
-                    ));
+                    };
+                    yield Ok(Event::default().event("error").data(payload.to_string()));
                     return;
                 }
             }

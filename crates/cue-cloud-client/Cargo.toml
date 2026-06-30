@@ -15,6 +15,7 @@ tracing.workspace = true
 cue-core = { path = "../cue-core" }
 keyring = "2"
 url.workspace = true
+chrono = "0.4"
 
 [dev-dependencies]
 wiremock.workspace = true

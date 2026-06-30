@@ -27,6 +27,7 @@ fn override_direct_url(default: &str, env_var: &str) -> String {
 }
 
 use anyhow::{anyhow, Context, Result};
+use chrono::{DateTime, Utc};
 use futures_util::Stream;
 use futures_util::StreamExt;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
@@ -86,8 +87,7 @@ fn retry_after_secs(status: reqwest::StatusCode, headers: &HeaderMap) -> Option<
     let explicit = headers
         .get(RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0);
+        .and_then(parse_retry_after_value);
     if explicit.is_some() {
         return explicit;
     }
@@ -95,6 +95,21 @@ fn retry_after_secs(status: reqwest::StatusCode, headers: &HeaderMap) -> Option<
         429 | 529 => Some(default_capacity_cooldown_secs()),
         _ => None,
     }
+}
+
+fn parse_retry_after_value(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(seconds) = value.parse::<u64>() {
+        return (seconds > 0).then_some(seconds);
+    }
+    let deadline = DateTime::parse_from_rfc2822(value)
+        .ok()?
+        .with_timezone(&Utc);
+    let seconds = (deadline - Utc::now()).num_seconds();
+    (seconds > 0).then_some(seconds as u64)
 }
 
 fn default_capacity_cooldown_secs() -> u64 {
@@ -1152,7 +1167,9 @@ async fn openai_compatible_complete_stream(
                     seen_done = true;
                     continue;
                 }
-                for delta in parse_openai_stream_chunk(data, &mut final_usage)? {
+                for delta in
+                    parse_openai_stream_chunk(stream_provider.as_str(), data, &mut final_usage)?
+                {
                     output_chars = output_chars.saturating_add(delta.chars().count());
                     yield CompletionStreamEvent::Delta(delta);
                 }
@@ -1169,7 +1186,9 @@ async fn openai_compatible_complete_stream(
                 seen_done = seen_done || data == "[DONE]";
                 continue;
             }
-            for delta in parse_openai_stream_chunk(data, &mut final_usage)? {
+            for delta in
+                parse_openai_stream_chunk(stream_provider.as_str(), data, &mut final_usage)?
+            {
                 output_chars = output_chars.saturating_add(delta.chars().count());
                 yield CompletionStreamEvent::Delta(delta);
             }
@@ -1203,19 +1222,21 @@ async fn openai_compatible_complete_stream(
 }
 
 fn parse_openai_stream_chunk(
+    provider: &str,
     data: &str,
     final_usage: &mut Option<OpenAiUsage>,
 ) -> Result<Vec<String>> {
     let parsed: OpenAiStreamChunk =
         serde_json::from_str(data).with_context(|| format!("openai stream json: {data}"))?;
     if let Some(error) = parsed.error {
-        return Err(anyhow!(
-            "openai stream error: {}",
-            error
-                .message
-                .or(error.kind)
-                .unwrap_or_else(|| "unknown upstream error".to_string())
-        ));
+        let message = error
+            .message
+            .or(error.kind)
+            .unwrap_or_else(|| "unknown upstream error".to_string());
+        if let Some(capacity) = provider_stream_capacity_error(provider, &message, None) {
+            return Err(capacity);
+        }
+        return Err(anyhow!("openai stream error: {message}"));
     }
     if let Some(usage) = parsed.usage {
         *final_usage = Some(usage);
@@ -1617,13 +1638,17 @@ fn parse_gemini_stream_chunk(
     let parsed: GeminiGenerateResp =
         serde_json::from_str(data).with_context(|| format!("gemini stream json: {data}"))?;
     if let Some(error) = parsed.error {
-        return Err(anyhow!(
-            "gemini stream error: {}",
-            error
-                .message
-                .or(error.status)
-                .unwrap_or_else(|| "unknown upstream error".to_string())
-        ));
+        let message = error
+            .message
+            .clone()
+            .or(error.status.clone())
+            .unwrap_or_else(|| "unknown upstream error".to_string());
+        if let Some(capacity) =
+            provider_stream_capacity_error("gemini", &message, error.status.as_deref())
+        {
+            return Err(capacity);
+        }
+        return Err(anyhow!("gemini stream error: {message}"));
     }
     if let Some(usage) = parsed.usage_metadata.clone() {
         *final_usage = Some(usage);
@@ -1927,13 +1952,24 @@ fn parse_anthropic_stream_event(
     let parsed: AnthropicStreamPayload =
         serde_json::from_str(data).with_context(|| format!("anthropic stream json: {data}"))?;
     if event == "error" || parsed.kind == "error" {
-        return Err(anyhow!(
-            "anthropic stream error: {}",
-            parsed
-                .error
-                .and_then(|error| error.message.or(error.kind))
-                .unwrap_or_else(|| "unknown upstream error".to_string())
-        ));
+        let (message, kind) = parsed
+            .error
+            .map(|error| {
+                let kind = error.kind;
+                let message = error
+                    .message
+                    .clone()
+                    .or(kind.clone())
+                    .unwrap_or_else(|| "unknown upstream error".to_string());
+                (message, kind)
+            })
+            .unwrap_or_else(|| ("unknown upstream error".to_string(), None));
+        if let Some(capacity) =
+            provider_stream_capacity_error("anthropic", &message, kind.as_deref())
+        {
+            return Err(capacity);
+        }
+        return Err(anyhow!("anthropic stream error: {message}"));
     }
     if event == "message_start" || parsed.kind == "message_start" {
         if let Some(usage) = parsed.message.and_then(|message| message.usage) {
@@ -1966,6 +2002,38 @@ fn parse_anthropic_stream_event(
         }
     }
     Ok(None)
+}
+
+fn provider_stream_capacity_error(
+    provider: &str,
+    message: &str,
+    kind: Option<&str>,
+) -> Option<anyhow::Error> {
+    let mut lower = message.to_ascii_lowercase();
+    if let Some(kind) = kind {
+        lower.push(' ');
+        lower.push_str(&kind.to_ascii_lowercase());
+    }
+    let is_capacity = lower.contains("rate_limit")
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+        || lower.contains("resource_exhausted")
+        || lower.contains("overload")
+        || lower.contains("capacity")
+        || lower.contains("quota");
+    if !is_capacity {
+        return None;
+    }
+    let status = if provider == "anthropic" && lower.contains("overload") {
+        529
+    } else {
+        429
+    };
+    Some(anyhow!(UpstreamHttpError {
+        provider: provider.to_string(),
+        status,
+        retry_after_secs: Some(default_capacity_cooldown_secs()),
+    }))
 }
 
 fn anthropic_thinking_for(model: &str, thinking: ThinkingBudget) -> Option<AnthropicThinkingReq> {
@@ -2650,7 +2718,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.to_string().contains("provider overloaded"));
+        let capacity = err.downcast_ref::<UpstreamHttpError>().unwrap();
+        assert_eq!(capacity.provider, "gemini");
+        assert_eq!(capacity.status, 429);
+        assert!(capacity.retry_after_secs.is_some());
         assert!(usage.is_none());
         assert!(!seen_terminal);
     }
@@ -2675,12 +2746,16 @@ mod tests {
     fn openai_stream_error_frame_is_not_treated_as_empty_success() {
         let mut usage = None;
         let err = parse_openai_stream_chunk(
+            "openai",
             r#"{"error":{"message":"provider overloaded","type":"rate_limit_error"}}"#,
             &mut usage,
         )
         .unwrap_err();
 
-        assert!(err.to_string().contains("provider overloaded"));
+        let capacity = err.downcast_ref::<UpstreamHttpError>().unwrap();
+        assert_eq!(capacity.provider, "openai");
+        assert_eq!(capacity.status, 429);
+        assert!(capacity.retry_after_secs.is_some());
         assert!(usage.is_none());
     }
 
@@ -2698,10 +2773,24 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(err.to_string().contains("provider busy"));
+        let capacity = err.downcast_ref::<UpstreamHttpError>().unwrap();
+        assert_eq!(capacity.provider, "anthropic");
+        assert_eq!(capacity.status, 529);
+        assert!(capacity.retry_after_secs.is_some());
         assert!(input_tokens.is_none());
         assert!(output_tokens.is_none());
         assert!(!seen_stop);
+    }
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_date() {
+        assert_eq!(parse_retry_after_value("12"), Some(12));
+
+        let future = (Utc::now() + chrono::Duration::seconds(30))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        let parsed = parse_retry_after_value(&future).unwrap();
+        assert!((1..=30).contains(&parsed));
     }
 
     #[tokio::test]

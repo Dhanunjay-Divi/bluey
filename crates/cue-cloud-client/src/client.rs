@@ -5,6 +5,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use reqwest::{header, Client, Method, Response, StatusCode};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -568,8 +569,22 @@ fn retry_after_header(resp: &Response) -> Option<u64> {
     resp.headers()
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
+        .and_then(parse_retry_after_value)
+}
+
+fn parse_retry_after_value(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(seconds) = value.parse::<u64>() {
+        return (seconds > 0).then_some(seconds);
+    }
+    let deadline = DateTime::parse_from_rfc2822(value)
+        .ok()?
+        .with_timezone(&Utc);
+    let seconds = (deadline - Utc::now()).num_seconds();
+    (seconds > 0).then_some(seconds as u64)
 }
 
 fn capacity_busy_error(body: &str, header_retry_after_secs: Option<u64>) -> Option<Error> {
@@ -886,6 +901,17 @@ mod tests {
             Err(Error::RateLimited { retry_after_secs }) => assert_eq!(retry_after_secs, 12),
             other => panic!("expected RateLimited, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn retry_after_parser_accepts_seconds_and_http_date() {
+        assert_eq!(parse_retry_after_value("12"), Some(12));
+
+        let future = (Utc::now() + chrono::Duration::seconds(30))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        let parsed = parse_retry_after_value(&future).unwrap();
+        assert!((1..=30).contains(&parsed));
     }
 
     #[tokio::test]

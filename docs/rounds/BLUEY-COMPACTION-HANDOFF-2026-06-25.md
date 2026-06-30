@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-30 00:15 EDT
+Latest checkpoint: 2026-06-30 00:47 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,47 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-244-AUTO-RELOAD-READINESS-DIAGNOSTIC.md`; the next canonical Bluey round doc should start at `ROUND-245-...`.
+- Latest assigned Bluey round doc is `ROUND-245-PROVIDER-429-COOLDOWN-HARDENING.md`; the next canonical Bluey round doc should start at `ROUND-246-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 245 hardened provider cooldown and `429` behavior:
+  - server-side `Retry-After` parsing now accepts both seconds and HTTP-date
+    values
+  - OpenAI-compatible, Gemini, and Anthropic stream error frames that signal
+    rate-limit, quota, overload, capacity, or `RESOURCE_EXHAUSTED` now become
+    typed upstream capacity errors
+  - if the first provider stream event is typed capacity, Bluey cools the
+    provider/model/key and keeps trying healthy keys/routes before committing
+    the answer stream
+  - if a selected stream later fails with typed capacity, the SSE error payload
+    carries `reason: "provider_key_cooling_down"` and `retry_after_secs`
+  - managed desktop stream parsing now maps those capacity payloads to
+    `LlmError::CapacityBusy` instead of generic provider errors
+  - cloud client `Retry-After` parsing now accepts seconds and HTTP-date values
+  - docs updated:
+    - `docs/PROVIDER-429-PLAYBOOK.md`
+    - `docs/MODEL-ROUTING.md`
+  - files changed:
+    - `server/src/routing/dispatcher.rs`
+    - `server/src/api/router.rs`
+    - `crates/cue-llm/src/bluey_managed.rs`
+    - `crates/cue-cloud-client/src/client.rs`
+    - `crates/cue-cloud-client/Cargo.toml`
+  - Round doc:
+    `docs/rounds/ROUND-245-PROVIDER-429-COOLDOWN-HARDENING.md`
+  - Verification passed:
+    - `cargo fmt -p cue-cloud-client -p cue-llm`
+    - `cargo fmt --manifest-path server/Cargo.toml`
+    - `cargo test -p cue-cloud-client retry_after -- --nocapture`
+    - `cargo test -p cue-llm capacity_busy -- --nocapture`
+    - `cargo test --manifest-path server/Cargo.toml stream_error_frame -- --nocapture`
+    - `cargo test -p cue-cloud-client parse_or_err_429_capacity_body_maps_to_capacity_busy -- --nocapture`
+    - `cargo test -p cue-llm complete_stream_posts_to_managed_endpoint_and_parses_ndjson -- --nocapture`
+    - `cargo check -p cue-cloud-client -p cue-llm`
+    - `cargo check --manifest-path server/Cargo.toml`
 - Round 244 audited why the current test account did not auto-reload even
   though the CLI said `auto top-up: ON, $30 at <$5`:
   - live `/account/me` for the smoke/test account returned balance `482`,
