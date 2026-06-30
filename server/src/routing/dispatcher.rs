@@ -875,6 +875,17 @@ fn openai_compatible_thinking_for(
     }
 }
 
+fn openai_compatible_temperature_for(
+    provider: &str,
+    model: &str,
+    temperature: Option<f32>,
+) -> Option<f32> {
+    if provider == "openai" && model.to_ascii_lowercase().starts_with("gpt-5") {
+        return None;
+    }
+    temperature
+}
+
 fn estimated_tokens_from_chars(chars: usize) -> i64 {
     if chars == 0 {
         return 0;
@@ -991,7 +1002,7 @@ async fn openai_compatible_complete(
         ],
         max_tokens,
         max_completion_tokens,
-        temperature,
+        temperature: openai_compatible_temperature_for(provider, model, temperature),
         stream: None,
         stream_options: None,
         thinking,
@@ -1121,7 +1132,7 @@ async fn openai_compatible_complete_stream(
         ],
         max_tokens,
         max_completion_tokens,
-        temperature,
+        temperature: openai_compatible_temperature_for(provider, model, temperature),
         stream: Some(true),
         stream_options: Some(OpenAiStreamOptions {
             include_usage: true,
@@ -1739,7 +1750,11 @@ async fn anthropic_complete(
     }
 
     let thinking_req = anthropic_thinking_for(model, thinking);
-    let effective_max_tokens = effective_max_output_tokens(max_tokens, thinking);
+    let effective_max_tokens = if thinking_req.is_some() {
+        effective_max_output_tokens(max_tokens, thinking)
+    } else {
+        effective_max_output_tokens(max_tokens, ThinkingBudget::off())
+    };
     let req = AnthropicReq {
         model,
         max_tokens: effective_max_tokens,
@@ -1851,7 +1866,11 @@ async fn anthropic_complete_stream(
     }
 
     let thinking_req = anthropic_thinking_for(model, thinking);
-    let effective_max_tokens = effective_max_output_tokens(max_tokens, thinking);
+    let effective_max_tokens = if thinking_req.is_some() {
+        effective_max_output_tokens(max_tokens, thinking)
+    } else {
+        effective_max_output_tokens(max_tokens, ThinkingBudget::off())
+    };
     let req = AnthropicReq {
         model,
         max_tokens: effective_max_tokens,
@@ -2053,11 +2072,11 @@ fn anthropic_thinking_for(model: &str, thinking: ThinkingBudget) -> Option<Anthr
 }
 
 fn anthropic_supports_manual_thinking(model: &str) -> bool {
-    let model = model.to_ascii_lowercase();
-    model.contains("claude-3-7")
-        || model.contains("claude-opus-4-8")
-        || model.contains("claude-sonnet-4-6")
-        || model.contains("claude-haiku-4-5")
+    let _ = model;
+    // Current Anthropic flagship models reject the older
+    // `thinking.type=enabled` request shape. Keep manual thinking off until
+    // Bluey implements the newer adaptive/output_config effort schema.
+    false
 }
 
 fn append_utf8_chunk(bytes: &[u8], pending: &mut Vec<u8>, buffer: &mut String) -> Result<()> {
@@ -2903,13 +2922,31 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_manual_thinking_only_for_known_supported_models() {
+    fn openai_gpt5_temperature_is_omitted() {
+        assert_eq!(
+            openai_compatible_temperature_for("openai", "gpt-5.5", Some(0.1)),
+            None
+        );
+        assert_eq!(
+            openai_compatible_temperature_for("openai", "gpt-5.4-mini", Some(0.2)),
+            None
+        );
+        assert_eq!(
+            openai_compatible_temperature_for("openai", "gpt-4o", Some(0.2)),
+            Some(0.2)
+        );
+        assert_eq!(
+            openai_compatible_temperature_for("zai", "glm-5.2", Some(0.2)),
+            Some(0.2)
+        );
+    }
+
+    #[test]
+    fn anthropic_manual_thinking_disabled_until_adaptive_schema() {
         let budget = resolve_thinking_budget("deep", None, None);
-        let enabled = anthropic_thinking_for("claude-opus-4-8", budget).unwrap();
-        assert_eq!(enabled.ty, "enabled");
-        assert_eq!(enabled.budget_tokens, 4096);
-        assert!(anthropic_thinking_for("claude-sonnet-4-6", budget).is_some());
-        assert!(anthropic_thinking_for("claude-haiku-4-5-20251001", budget).is_some());
+        assert!(anthropic_thinking_for("claude-opus-4-8", budget).is_none());
+        assert!(anthropic_thinking_for("claude-sonnet-4-6", budget).is_none());
+        assert!(anthropic_thinking_for("claude-haiku-4-5-20251001", budget).is_none());
         assert!(anthropic_thinking_for("claude-fable-5-20260609", budget).is_none());
         assert!(anthropic_thinking_for("gpt-5.5", budget).is_none());
     }

@@ -1026,7 +1026,7 @@ async fn router_complete_falls_back_when_preferred_provider_429s() {
     let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(v["text"], "fallback answer");
     assert_eq!(v["provider"], "openai");
-    assert_eq!(v["model"], "gpt-5.5");
+    assert_eq!(v["model"], "gpt-5.4-mini");
 }
 
 #[tokio::test]

@@ -2732,6 +2732,66 @@ temp-home install smoke from https://bluey.sh/install.sh -> bluey 0.1.17
 
 Caveat: live `latest.json` currently advertises only `darwin-arm64` for `0.1.17`. `install.ps1` remains published, but a fresh Windows `0.1.17` zip still needs the Windows build host before Windows can update to this exact version.
 
+## Current Active Round: Round 251
+
+Round doc:
+
+- `docs/rounds/ROUND-251-LIVE-QA-SHUTDOWN-ROUTING-SMOKE.md`
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
+
+Live QA and fixes completed:
+
+- Fixed the production Postgres graceful-shutdown/core-dump issue by replacing the raw r2d2 Postgres pool connection with `SafePostgresClient`, which drops sync `postgres::Client` on a normal thread when route state is dropped from a Tokio worker.
+- Corrected deploy path awareness: systemd uses `/usr/local/bin/bluey-server`, not `/opt/bluey-api/bluey-server`.
+- Deployed the fixed server to `/usr/local/bin/bluey-server`.
+- Verified clean `bluey-api.service` restart after deploy:
+  - active PID after final restart: `890981`
+  - journal showed `Deactivated successfully`
+  - no Tokio runtime panic
+  - no core dump
+- Fixed provider request-shape issues found by live smoke:
+  - OpenAI GPT-5-family routes now omit non-default `temperature`.
+  - Anthropic old manual `thinking.type=enabled` is disabled until the newer adaptive schema is implemented.
+  - Anthropic no-thinking paths keep requested output caps bounded.
+- Adjusted AnswerPlan so simple code prompts route to `balanced` but still produce `code_artifact`; LRU/cache/backend/debug/system-design remains `deep`.
+
+Final live smoke:
+
+```text
+request_id: codex-live-route-smoke-1782814794
+effective_lane: balanced
+provider/model: anthropic / claude-sonnet-4-6
+artifact_type: code
+was_fallback: false
+server latency: 2228ms
+wall-clock curl latency: about 2412ms
+cost: 1c
+```
+
+Verification passed:
+
+```bash
+cargo test --manifest-path server/Cargo.toml answer_plan -- --nocapture
+cargo test --manifest-path server/Cargo.toml temperature -- --nocapture
+cargo test --manifest-path server/Cargo.toml anthropic_manual_thinking -- --nocapture
+cargo test --manifest-path server/Cargo.toml web_search -- --nocapture
+cargo test --manifest-path server/Cargo.toml provider_health -- --nocapture
+cargo test --manifest-path server/Cargo.toml router_complete_falls_back_when_preferred_provider_429s -- --nocapture
+cargo test -p cue-daemon --test live_transcript_dedup --test live_transcript_emit --test pipeline_integration -- --nocapture
+scripts/release-hygiene-scan.sh
+```
+
+Remaining live gates:
+
+- Production preflight still fails because Turnstile is not configured:
+  - add `BLUEY_TURNSTILE_SITE_KEY`
+  - add `BLUEY_TURNSTILE_SECRET_KEY`
+  - `/auth/captcha/config` currently returns provider/site key as null
+- Managed web-search code/guards exist, but no real search provider key is configured yet.
+- Anthropic adaptive thinking schema still needs implementation before Claude manual thinking should be re-enabled.
+- Windows `0.1.17` downloadable artifact still needs a Windows build host/package.
+
 ## Historical Carried Section: Round 202
 
 Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`

@@ -972,6 +972,7 @@ fn answer_plan_for_request(
         );
     let coding = looks_like_coding_question(&normalized);
     let coding_followup = looks_like_coding_followup(&normalized, follow_up);
+    let simple_coding = coding && looks_like_simple_coding_question(&normalized, short_question);
     let behavioral = looks_like_behavioral_question(&normalized);
     let system_design = !behavioral && looks_like_system_design_question(&normalized);
     let screen = has_images
@@ -1094,6 +1095,7 @@ fn answer_plan_for_request(
 
     let recommended_lane = match intent {
         AnswerIntent::Quick => "instant",
+        AnswerIntent::Coding if simple_coding => "balanced",
         AnswerIntent::Coding | AnswerIntent::CodingFollowUp | AnswerIntent::SystemDesign => "deep",
         AnswerIntent::Screen => "vision",
         AnswerIntent::Research
@@ -1717,6 +1719,56 @@ fn looks_like_coding_question(normalized: &str) -> bool {
         || normalized.contains(".py")
         || normalized.contains(".ts")
         || normalized.contains(".tsx")
+}
+
+fn looks_like_simple_coding_question(normalized: &str, short_question: bool) -> bool {
+    if contains_any(
+        normalized,
+        &[
+            "lru",
+            "cache",
+            "system design",
+            "architecture",
+            "backend",
+            "frontend",
+            "database",
+            "api",
+            "endpoint",
+            "full code",
+            "full implementation",
+            "production",
+            "debug",
+            "traceback",
+            "stack trace",
+            "unit test",
+            "test case",
+            "optimize",
+            "concurrency",
+            "thread",
+            "async",
+            "distributed",
+            "graph",
+            "dynamic programming",
+            "doubly linked",
+            "linked list",
+        ],
+    ) {
+        return false;
+    }
+    short_question
+        || contains_any(
+            normalized,
+            &[
+                "tiny",
+                "simple",
+                "small",
+                "basic",
+                "swap two numbers",
+                "fibonacci",
+                "series",
+                "function",
+            ],
+        )
 }
 
 fn looks_like_coding_followup(normalized: &str, follow_up: bool) -> bool {
@@ -6203,6 +6255,17 @@ mod tests {
     }
 
     #[test]
+    fn answer_plan_simple_code_uses_balanced_code_artifact() {
+        let req = complete_request("Question:\nWrite a tiny Python Fibonacci function.");
+
+        let plan = answer_plan_for_request(&req, "balanced", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::Coding);
+        assert_eq!(plan.output, AnswerOutput::CodeArtifact);
+        assert_eq!(plan.recommended_lane, "balanced");
+    }
+
+    #[test]
     fn answer_plan_python_followup_uses_code_followup() {
         let req = complete_request("Question:\nI want the code in Python.");
 
@@ -6229,7 +6292,7 @@ mod tests {
                 "Question:\nNew question: can you write Fibonacci series?",
                 AnswerIntent::Coding,
                 AnswerOutput::CodeArtifact,
-                "deep",
+                "balanced",
                 false,
             ),
             (
@@ -6334,7 +6397,7 @@ mod tests {
 
     #[test]
     fn answer_plan_routing_gate_can_override_auto_lane() {
-        let req = complete_request("Question:\nCan you write Fibonacci series in Python?");
+        let req = complete_request("Question:\nBuild me LRU cache in Python.");
         let plan = answer_plan_for_request(&req, "balanced", &[]);
 
         assert_eq!(lane_for_answer_plan("balanced", &plan, false), "balanced");

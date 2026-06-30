@@ -8,10 +8,11 @@
 use anyhow::{Context, Result};
 use native_tls::{Certificate, TlsConnector};
 use postgres_native_tls::MakeTlsConnector;
-use r2d2::{Pool, PooledConnection};
+use r2d2::{ManageConnection, Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
 use r2d2_sqlite::SqliteConnectionManager;
 use std::cell::Cell;
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use tokio::runtime::{Handle, RuntimeFlavor};
 
@@ -32,9 +33,81 @@ pub mod usage;
 pub mod webhook_events;
 
 pub type SqliteDbPool = Pool<SqliteConnectionManager>;
-pub type PostgresDbPool = Pool<PostgresConnectionManager<MakeTlsConnector>>;
+pub type PostgresDbPool = Pool<SafePostgresConnectionManager>;
 pub type SqliteDbConn = PooledConnection<SqliteConnectionManager>;
-pub type PostgresDbConn = PooledConnection<PostgresConnectionManager<MakeTlsConnector>>;
+pub type PostgresDbConn = PooledConnection<SafePostgresConnectionManager>;
+
+pub struct SafePostgresConnectionManager {
+    inner: PostgresConnectionManager<MakeTlsConnector>,
+}
+
+pub struct SafePostgresClient {
+    inner: Option<postgres::Client>,
+}
+
+impl SafePostgresConnectionManager {
+    fn new(inner: PostgresConnectionManager<MakeTlsConnector>) -> Self {
+        Self { inner }
+    }
+}
+
+impl Deref for SafePostgresClient {
+    type Target = postgres::Client;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner
+            .as_ref()
+            .expect("safe postgres client missing inner client")
+    }
+}
+
+impl DerefMut for SafePostgresClient {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner
+            .as_mut()
+            .expect("safe postgres client missing inner client")
+    }
+}
+
+impl Drop for SafePostgresClient {
+    fn drop(&mut self) {
+        let Some(client) = self.inner.take() else {
+            return;
+        };
+
+        if Handle::try_current().is_ok() {
+            let _ = std::thread::Builder::new()
+                .name("bluey-postgres-client-drop".to_string())
+                .spawn(move || drop(client))
+                .and_then(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| std::io::Error::other("postgres client drop panicked"))
+                });
+        } else {
+            drop(client);
+        }
+    }
+}
+
+impl ManageConnection for SafePostgresConnectionManager {
+    type Connection = SafePostgresClient;
+    type Error = postgres::Error;
+
+    fn connect(&self) -> Result<Self::Connection, Self::Error> {
+        self.inner.connect().map(|client| SafePostgresClient {
+            inner: Some(client),
+        })
+    }
+
+    fn is_valid(&self, client: &mut Self::Connection) -> Result<(), Self::Error> {
+        self.inner.is_valid(client)
+    }
+
+    fn has_broken(&self, client: &mut Self::Connection) -> bool {
+        self.inner.has_broken(client)
+    }
+}
 
 #[derive(Clone)]
 pub enum DbPool {
@@ -171,7 +244,10 @@ pub fn open_postgres_pool(database_url: &str) -> Result<DbPool> {
     let tls = tls_builder
         .build()
         .context("build postgres TLS connector")?;
-    let manager = PostgresConnectionManager::new(pg_config, MakeTlsConnector::new(tls));
+    let manager = SafePostgresConnectionManager::new(PostgresConnectionManager::new(
+        pg_config,
+        MakeTlsConnector::new(tls),
+    ));
     let pool = Pool::builder()
         .max_size(16)
         .build(manager)
