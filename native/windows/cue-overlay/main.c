@@ -73,7 +73,7 @@ static wchar_t g_source[256] = L"";
 static wchar_t g_card_id[80] = L"";
 static bool g_visible = true;
 static bool g_collapsed = false;
-static bool g_interactive_mode = false;
+static bool g_interactive_mode = true;
 static bool g_recording = false;
 static DWORD g_last_record_toggle_ms = 0;
 static DWORD g_record_restart_after_ms = 0;
@@ -1264,17 +1264,22 @@ static bool point_hits_overlay_control(POINT point) {
     return false;
 }
 
-static bool point_hits_brand_move_handle(POINT point) {
+static RECT clickthrough_move_handle_rect(RECT client) {
+    int header_w = clamp_int((client.right * 84) / 100, 520, 780);
+    if (header_w > client.right - 28) header_w = client.right - 28;
+    int header_left = (client.right - header_w) / 2;
+    RECT handle = {header_left + 128, 18, header_left + 154, 44};
+    return handle;
+}
+
+static bool point_hits_clickthrough_move_handle(POINT point) {
     if (!g_hwnd || g_collapsed) return false;
     RECT rect;
     if (!GetClientRect(g_hwnd, &rect)) return false;
     POINT local = point;
     if (!ScreenToClient(g_hwnd, &local)) return false;
 
-    int header_w = clamp_int((rect.right * 84) / 100, 520, 780);
-    if (header_w > rect.right - 28) header_w = rect.right - 28;
-    int header_left = (rect.right - header_w) / 2;
-    RECT handle = {header_left + 8, 8, header_left + 132, 54};
+    RECT handle = clickthrough_move_handle_rect(rect);
     return PtInRect(&handle, local) != 0;
 }
 
@@ -2333,6 +2338,36 @@ static bool paint_with_d2d(HWND hwnd) {
 
         d2d_text(L"bluey", g_fmt_brand, d2d_rectf((float)header_left + 50.0f, 10.0f, (float)header_left + 118.0f, 46.0f), g_light_theme ? 8 : 230, g_light_theme ? 22 : 240, g_light_theme ? 32 : 245, 1.0f);
 
+        if (!g_interactive_mode) {
+            RECT handle = clickthrough_move_handle_rect(rect);
+            d2d_fill_round(
+                (float)handle.left,
+                (float)handle.top,
+                (float)handle.right,
+                (float)handle.bottom,
+                9.0f,
+                g_light_theme ? BLUEY_LIGHT_ACCENT_R : 0,
+                g_light_theme ? BLUEY_LIGHT_ACCENT_G : 174,
+                g_light_theme ? BLUEY_LIGHT_ACCENT_B : 236,
+                g_light_theme ? 0.16f : 0.18f);
+            d2d_stroke_round(
+                (float)handle.left + 0.5f,
+                (float)handle.top + 0.5f,
+                (float)handle.right - 0.5f,
+                (float)handle.bottom - 0.5f,
+                9.0f,
+                g_light_theme ? BLUEY_LIGHT_ACCENT_R : 66,
+                g_light_theme ? BLUEY_LIGHT_ACCENT_G : 190,
+                g_light_theme ? BLUEY_LIGHT_ACCENT_B : 255,
+                0.95f,
+                1.5f);
+            d2d_set_brush_color(g_light_theme ? 0 : 102, g_light_theme ? 126 : 213, g_light_theme ? 178 : 255, 1.0f);
+            float cx = ((float)handle.left + (float)handle.right) * 0.5f;
+            float cy = ((float)handle.top + (float)handle.bottom) * 0.5f;
+            BLUEY_DRAW_LINE(g_d2d_target, d2d_point(cx, (float)handle.top + 6.0f), d2d_point(cx, (float)handle.bottom - 6.0f), g_d2d_brush, 1.8f, NULL);
+            BLUEY_DRAW_LINE(g_d2d_target, d2d_point((float)handle.left + 6.0f, cy), d2d_point((float)handle.right - 6.0f, cy), g_d2d_brush, 1.8f, NULL);
+        }
+
         wchar_t card_label[32];
         current_card_label(card_label, 32);
         if (wcscmp(card_label, L"MIC") == 0) {
@@ -2468,7 +2503,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         }
         if (id == ID_HELP_BUTTON) {
             overlay_message_box(
-                L"Green dot: Bluey is connected.\nHelp: show this guide.\nKeys: show keyboard shortcuts.\nSession: continue or start clean.\nAttach: add files or show attached docs.\nTheme: switch black/white background while keeping Bluey borders.\nStyle: answer rules.\nAnalyse Screen: search/read the active browser page or available screen context and generate an answer.\nRecap: summarize the active session from the bottom bar.\nQuit: stop Bluey completely. Hide minimizes to the small button.\nMic: start/stop audio capture.\nMic dot: dim off, bright green recording.\nAnswer: ask Bluey.\nWhen Interactive is on, blank Bluey space drags the window. When click-through is on, blank Bluey space clicks the app behind it.",
+                L"Green dot: Bluey is connected.\nHelp: show this guide.\nKeys: show keyboard shortcuts.\nSession: continue or start clean.\nAttach: add files or show attached docs.\nTheme: switch black/white background while keeping Bluey borders.\nStyle: answer rules.\nAnalyse Screen: search/read the active browser page or available screen context and generate an answer.\nRecap: summarize the active session from the bottom bar.\nQuit: stop Bluey completely. Hide minimizes to the small button.\nMic: start/stop audio capture.\nMic dot: dim off, bright green recording.\nAnswer: ask Bluey.\nWhen click-through is off, blank Bluey space drags the window. When click-through is on, blank space clicks behind Bluey; drag the cyan move handle to reposition.",
                 L"Bluey controls",
                 MB_OK | MB_ICONINFORMATION
             );
@@ -2477,15 +2512,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         if (id == ID_SHORTCUTS_BUTTON) {
             const wchar_t *shortcut_body = g_interactive_mode
                 ? L"Click-through is off\n"
-                  L"Inside Bluey works when Ask is not focused:\n\n"
-                  L"T                  Text input\n"
-                  L"L                  Start or stop Listen\n"
-                  L"S                  Capture screen context\n"
-                  L"I                  Toggle click-through\n"
-                  L"H                  History\n"
-                  L"F                  Files\n"
-                  L"Enter              Answer\n"
-                  L"Esc                Close panel\n\n"
+                  L"Drag blank Bluey space to move. Inside keys work when Ask is not focused:\n\n"
+                  L"T Text input        L Listen\n"
+                  L"S Screen            I Click-through\n"
+                  L"H History           F Files\n"
+                  L"Enter Answer        Esc Close panel\n\n"
                   L"Global shortcuts also work from anywhere:\n"
                   L"Ctrl+Alt+B         Minimize to pill / restore\n"
                   L"Ctrl+Alt+T         Text input\n"
@@ -2495,14 +2526,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
                   L"Ctrl+Alt+Enter     Answer\n\n"
                   L"Ask focused: type normally. Enter answers. Shift+Enter adds a new line."
                 : L"Click-through is on\n"
-                  L"Blank Bluey space clicks the app behind it. Use global shortcuts:\n\n"
+                  L"Blank Bluey space clicks behind it. Drag the cyan move handle to move.\n\n"
+                  L"Global shortcuts:\n"
                   L"Ctrl+Alt+B         Minimize to pill / restore\n"
                   L"Ctrl+Alt+T         Text input\n"
                   L"Ctrl+Alt+L         Start or stop Listen\n"
                   L"Ctrl+Alt+S         Capture screen context\n"
                   L"Ctrl+Alt+I         Toggle click-through\n"
-                  L"Ctrl+Alt+Enter     Answer\n\n"
-                  L"If a global shortcut is unavailable, Bluey still keeps the visible buttons clickable.";
+                  L"Ctrl+Alt+Enter     Answer";
             overlay_message_box(
                 shortcut_body,
                 L"Keyboard shortcuts",
@@ -2698,9 +2729,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         if (g_collapsed) return HTCLIENT;
         POINT point = { GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam) };
         if (point_hits_overlay_control(point)) return HTCLIENT;
+        if (!g_interactive_mode && point_hits_clickthrough_move_handle(point)) return HTCAPTION;
         LRESULT resize_hit = hit_test_expanded_resize(point);
         if (resize_hit != HTNOWHERE) return resize_hit;
-        if (point_hits_brand_move_handle(point) || g_interactive_mode) return HTCAPTION;
+        if (g_interactive_mode) return HTCAPTION;
         return HTTRANSPARENT;
     }
     case WM_SETCURSOR: {
@@ -2854,6 +2886,30 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         SelectObject(hdc, title_font);
         RECT brand_rect = {header_left + 50, 10, header_left + 118, 46};
         DrawTextW(hdc, L"bluey", -1, &brand_rect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+        if (!g_interactive_mode) {
+            RECT handle = clickthrough_move_handle_rect(rect);
+            HBRUSH handle_brush = CreateSolidBrush(g_light_theme ? RGB(224, 245, 255) : RGB(5, 36, 52));
+            HPEN handle_pen = CreatePen(PS_SOLID, 2, g_light_theme ? RGB(BLUEY_LIGHT_ACCENT_R, BLUEY_LIGHT_ACCENT_G, BLUEY_LIGHT_ACCENT_B) : RGB(66, 190, 255));
+            HGDIOBJ previous_handle_brush = SelectObject(hdc, handle_brush);
+            HGDIOBJ previous_handle_pen = SelectObject(hdc, handle_pen);
+            RoundRect(hdc, handle.left, handle.top, handle.right, handle.bottom, 14, 14);
+            SelectObject(hdc, previous_handle_brush);
+            SelectObject(hdc, previous_handle_pen);
+            DeleteObject(handle_brush);
+            DeleteObject(handle_pen);
+
+            HPEN arrow_pen = CreatePen(PS_SOLID, 2, g_light_theme ? RGB(0, 126, 178) : RGB(102, 213, 255));
+            HGDIOBJ previous_arrow_pen = SelectObject(hdc, arrow_pen);
+            int cx = (handle.left + handle.right) / 2;
+            int cy = (handle.top + handle.bottom) / 2;
+            MoveToEx(hdc, cx, handle.top + 6, NULL);
+            LineTo(hdc, cx, handle.bottom - 6);
+            MoveToEx(hdc, handle.left + 6, cy, NULL);
+            LineTo(hdc, handle.right - 6, cy);
+            SelectObject(hdc, previous_arrow_pen);
+            DeleteObject(arrow_pen);
+        }
 
         wchar_t card_label[32];
         current_card_label(card_label, 32);

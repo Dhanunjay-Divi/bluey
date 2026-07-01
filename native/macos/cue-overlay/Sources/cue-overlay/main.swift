@@ -1198,6 +1198,31 @@ private final class ComposerSurfaceView: NSView {
 
 private final class SessionDrawerView: NSView {
     weak var scrollView: NSScrollView?
+    var onBeginDrag: ((NSEvent) -> Void)?
+    var receivesBlankHits = true
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, alphaValue > 0.01, bounds.contains(point) else { return nil }
+        guard let hit = super.hitTest(point) else { return self }
+        if let button = hit as? NSButton, button.isEnabled {
+            return button
+        }
+        if let scrollView, hit === scrollView || isView(hit, inside: scrollView) {
+            return hit
+        }
+        if let textField = hit as? NSTextField,
+           textField.isEditable || textField.isSelectable {
+            return hit
+        }
+        if hit is NSTextView {
+            return hit
+        }
+        return receivesBlankHits ? self : nil
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onBeginDrag?(event)
+    }
 
     override func scrollWheel(with event: NSEvent) {
         guard let scrollView else {
@@ -1205,6 +1230,17 @@ private final class SessionDrawerView: NSView {
             return
         }
         scrollView.scrollWheel(with: event)
+    }
+
+    private func isView(_ view: NSView, inside ancestor: NSView) -> Bool {
+        var current: NSView? = view
+        while let candidate = current {
+            if candidate === ancestor {
+                return true
+            }
+            current = candidate.superview
+        }
+        return false
     }
 }
 
@@ -1862,15 +1898,30 @@ private final class OverlayWindow: NSWindow {
 
 private final class ModalBlockerView: NSView {
     var onEscape: (() -> Void)?
+    var onBeginDrag: ((NSEvent) -> Void)?
+    var receivesBlankHits = true
 
     override var acceptsFirstResponder: Bool { true }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
         guard !isHidden, alphaValue > 0.01 else { return nil }
-        return super.hitTest(point) ?? self
+        guard let hit = super.hitTest(point) else { return self }
+        if let button = hit as? NSButton, button.isEnabled {
+            return button
+        }
+        if let textView = hit as? NSTextView {
+            return textView
+        }
+        if let textField = hit as? NSTextField,
+           textField.isEditable || textField.isSelectable {
+            return textField
+        }
+        return receivesBlankHits ? self : nil
     }
 
-    override func mouseDown(with event: NSEvent) {}
+    override func mouseDown(with event: NSEvent) {
+        onBeginDrag?(event)
+    }
     override func mouseUp(with event: NSEvent) {}
 
     override func keyDown(with event: NSEvent) {
@@ -1879,6 +1930,30 @@ private final class ModalBlockerView: NSView {
             return
         }
         super.keyDown(with: event)
+    }
+}
+
+private final class HeaderMoveButton: NSButton {
+    var onDragStateChanged: ((Bool) -> Void)?
+    var onMoved: ((NSRect) -> Void)?
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .openHand)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onDragStateChanged?(true)
+        window?.makeKey()
+        defer {
+            onDragStateChanged?(false)
+        }
+        window?.performDrag(with: event)
+        if let window {
+            onMoved?(window.frame)
+        }
     }
 }
 
@@ -4337,6 +4412,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     let knowledgeBadge: ClickableHeaderBadge
     let themeButton: NSButton
     let shortcutsButton: NSButton
+    let moveHandleButton: HeaderMoveButton
     let balanceLabel: NSTextField
     let fullSizeButton: NSButton
     let interactionModeButton: NSButton
@@ -4466,7 +4542,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var preCanvasFullWindowFrame: NSRect?
     private var windowFullSize = false
     private var preWindowFullSizeFrame: NSRect?
-    private var passThroughMode = true
+    private var passThroughMode = false
     private var signedOutGateActive = false
     private var headerDragInProgress = false
     private var closeConfirmPanelWidthConstraint: NSLayoutConstraint?
@@ -4511,6 +4587,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         knowledgeBadge = ClickableHeaderBadge(labelWithString: "")
         themeButton = NSButton(title: "", target: nil, action: nil)
         shortcutsButton = NSButton(title: "", target: nil, action: nil)
+        moveHandleButton = HeaderMoveButton(title: "", target: nil, action: nil)
         balanceLabel = NSTextField(labelWithString: "Balance --")
         fullSizeButton = NSButton(title: "", target: nil, action: nil)
         interactionModeButton = NSButton(title: "", target: nil, action: nil)
@@ -4563,6 +4640,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         super.init(frame: frameRect)
 
         (sessionDrawer as? SessionDrawerView)?.scrollView = sessionScroll
+        (sessionDrawer as? SessionDrawerView)?.onBeginDrag = { [weak self] event in
+            guard let self, !self.passThroughMode else { return }
+            self.beginHeaderDrag(with: event)
+        }
 
         migrateAutoSendStopModeDefaultsIfNeeded()
         registerForDraggedTypes([.fileURL])
@@ -4570,8 +4651,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         (answerStyleOverlay as? ModalBlockerView)?.onEscape = { [weak self] in
             self?.dismissAnswerStyleEditor(animated: true)
         }
+        (answerStyleOverlay as? ModalBlockerView)?.onBeginDrag = { [weak self] event in
+            guard let self, !self.passThroughMode else { return }
+            self.beginHeaderDrag(with: event)
+        }
         (closeConfirmOverlay as? ModalBlockerView)?.onEscape = { [weak self] in
             self?.dismissCloseConfirm(animated: true)
+        }
+        (closeConfirmOverlay as? ModalBlockerView)?.onBeginDrag = { [weak self] event in
+            guard let self, !self.passThroughMode else { return }
+            self.beginHeaderDrag(with: event)
         }
 
         applyShellChrome()
@@ -4618,6 +4707,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             knowledgeBadge,
             themeButton,
             shortcutsButton,
+            moveHandleButton,
             balanceLabel,
             fullSizeButton,
             interactionModeButton,
@@ -4748,6 +4838,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             canvasToggleButton,
             themeButton,
             shortcutsButton,
+            moveHandleButton,
             balanceLabel,
             fullSizeButton,
             interactionModeButton,
@@ -5064,6 +5155,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         headerBar.onWindowFrameChanged = { [weak self] frame in
             self?.onWindowFrameChanged?(frame)
         }
+        moveHandleButton.onDragStateChanged = { [weak self] active in
+            self?.headerDragInProgress = active
+        }
+        moveHandleButton.onMoved = { [weak self] frame in
+            self?.onWindowFrameChanged?(frame)
+        }
         recordingButton.target = self
         recordingButton.action = #selector(recordingClicked)
         askButton.target = self
@@ -5095,6 +5192,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         styleHeaderIconButton(drawerCloseButton, symbol: "xmark", fallback: "x")
         styleHeaderIconButton(canvasToggleButton, symbol: "sidebar.right", fallback: "|")
         styleHeaderIconButton(newSessionButton, symbol: "square.and.pencil", fallback: "+")
+        updateMoveHandleChrome()
         styleControlButton(latestSessionButton, symbol: "clock.arrow.circlepath", accent: false)
         styleControlButton(answerStyleSaveButton, symbol: "checkmark", accent: true)
         styleControlButton(recordingButton, symbol: "waveform", accent: false)
@@ -5373,7 +5471,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return nil
         }
         if !closeConfirmOverlay.isHidden || !answerStyleOverlay.isHidden {
-            return super.hitTest(point) ?? self
+            return super.hitTest(point) ?? (passThroughMode ? nil : self)
         }
         if signedOutGateActive {
             return super.hitTest(point) ?? self
@@ -5392,7 +5490,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 return self
             }
             if !sessionDrawer.isHidden, rectForView(sessionDrawer).contains(point) {
-                return super.hitTest(point) ?? sessionDrawer
+                return super.hitTest(point)
             }
             if canvasOpen, rectForView(canvasPane).contains(point) {
                 return super.hitTest(point) ?? canvasPane
@@ -5923,10 +6021,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return false
         }
 
-        if !closeConfirmOverlay.isHidden {
-            return true
-        }
-        if !answerStyleOverlay.isHidden {
+        if !closeConfirmOverlay.isHidden || !answerStyleOverlay.isHidden {
+            if passThroughMode {
+                return overlayInteractiveHit(closeConfirmOverlay, at: localPoint)
+                    || overlayInteractiveHit(answerStyleOverlay, at: localPoint)
+            }
             return true
         }
         if signedOutGateActive {
@@ -5939,7 +6038,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return true
         }
         if !sessionDrawer.isHidden, rectForView(sessionDrawer).contains(localPoint) {
-            return true
+            return passThroughMode
+                ? overlayInteractiveHit(sessionDrawer, at: localPoint)
+                : true
         }
         if canvasOpen, rectForView(canvasPane).contains(localPoint) {
             return true
@@ -5955,6 +6056,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
         clearResizeCursorIfNeeded()
         return false
+    }
+
+    private func overlayInteractiveHit(_ overlay: NSView, at rootPoint: NSPoint) -> Bool {
+        guard !overlay.isHidden, overlay.alphaValue > 0.01 else { return false }
+        let point = overlay.convert(rootPoint, from: self)
+        guard overlay.bounds.contains(point), let hit = overlay.hitTest(point) else {
+            return false
+        }
+        return isExplicitInteractiveHit(hit)
     }
 
     func manualButton(atWindowPoint point: NSPoint) -> NSButton? {
@@ -6024,6 +6134,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             knowledgeBadge,
             themeButton,
             shortcutsButton,
+            moveHandleButton,
             navButton,
             newSessionButton,
             canvasToggleButton,
@@ -6086,6 +6197,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func isHeaderMoveHandleHit(at localPoint: NSPoint) -> Bool {
         guard !headerBar.isHidden, headerBar.alphaValue > 0.01 else { return false }
+        if passThroughMode {
+            guard !moveHandleButton.isHidden, moveHandleButton.alphaValue > 0.01 else { return false }
+            return rectForView(moveHandleButton).insetBy(dx: -8, dy: -8).contains(localPoint)
+        }
         let handles = [headerLogo, brandStack]
         return handles.contains { view in
             guard !view.isHidden, view.alphaValue > 0.01 else { return false }
@@ -6524,6 +6639,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             canvasToggleButton,
             themeButton,
             shortcutsButton,
+            moveHandleButton,
             balanceLabel,
             fullSizeButton,
             interactionModeButton,
@@ -6615,6 +6731,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let brandHeight: CGFloat = statusLabel.isHidden ? 23 : 34
         brandStack.frame = NSRect(x: left, y: (frame.height - brandHeight) / 2, width: brandWidth, height: brandHeight)
         left += brandWidth + 8
+
+        if passThroughMode {
+            moveHandleButton.isHidden = false
+            moveHandleButton.frame = NSRect(x: left, y: yButton + 1, width: 26, height: 26)
+            left += 32
+        } else {
+            moveHandleButton.isHidden = true
+            moveHandleButton.frame = NSRect(x: left, y: yButton + 1, width: 0, height: 26)
+        }
 
         var right = frame.width - 12
         closeButton.frame = NSRect(x: right - 26, y: yButton + 1, width: 26, height: 26)
@@ -7016,8 +7141,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func configureTooltips() {
-        headerBar.toolTip = passThroughMode ? "Drag the Bluey logo or name to move Bluey" : "Drag blank Bluey space to move"
-        headerChrome.toolTip = passThroughMode ? "Blank header space clicks through" : "Drag blank Bluey space to move"
+        headerBar.toolTip = passThroughMode ? "Blank header space clicks through. Drag the blue move handle to move Bluey." : "Drag blank Bluey space to move"
+        headerChrome.toolTip = passThroughMode ? "Blank header space clicks through. Drag the blue move handle to move Bluey." : "Drag blank Bluey space to move"
         headerLogo.toolTip = "Bluey"
         headerWordmark.toolTip = "Bluey"
         navButton.toolTip = "Open or close conversation history"
@@ -7028,10 +7153,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         canvasToggleButton.toolTip = "Open or collapse the canvas"
         themeButton.toolTip = lightThemeEnabled ? "Switch to dark theme" : "Switch to light theme"
         shortcutsButton.toolTip = "Show keyboard shortcuts"
+        moveHandleButton.toolTip = "Drag to move Bluey while click-through is on"
         balanceLabel.toolTip = "Remaining Bluey credits"
         fullSizeButton.toolTip = windowFullSize ? "Restore compact Bluey" : "Fill this screen"
         interactionModeButton.toolTip = passThroughMode
-            ? "Click-through on: controls click normally, logo/name drags Bluey, and blank space clicks the app behind it."
+            ? "Click-through on: controls click normally, the blue move handle drags Bluey, and blank space clicks the app behind it."
             : "Interactive on: blank Bluey space moves/resizes the panel, and the whole panel receives clicks."
         hideButton.toolTip = "Minimize Bluey to the small pill"
         closeButton.toolTip = "Turn Bluey off"
@@ -7046,9 +7172,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         attachmentStrip.toolTip = "Attached documents and images. Scroll horizontally to see more."
         opacityControl.toolTip = "Adjust Bluey opacity"
         opacitySlider.toolTip = "Adjust Bluey opacity"
-        headerLogo.toolTip = "Drag Bluey"
-        headerWordmark.toolTip = "Drag Bluey"
-        brandStack.toolTip = "Drag Bluey"
+        headerLogo.toolTip = passThroughMode ? "Bluey" : "Drag Bluey"
+        headerWordmark.toolTip = passThroughMode ? "Bluey" : "Drag Bluey"
+        brandStack.toolTip = passThroughMode ? "Bluey" : "Drag Bluey"
         latestSessionButton.toolTip = "Continue the latest recording"
         answerStyleSaveButton.toolTip = "Save answer style for this session"
     }
@@ -7068,6 +7194,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         styleControlButton(askButton, symbol: "arrow.up", accent: true)
         let recordingSymbol = recordingActive ? "stop.fill" : "waveform"
         styleControlButton(recordingButton, symbol: recordingSymbol, accent: recordingActive)
+        updateMoveHandleChrome()
         updateFullSizeButtonChrome()
         updateInteractionModeChrome(showToast: false)
     }
@@ -7301,12 +7428,30 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
 
         func appendShortcut(_ shortcut: String, _ action: String) {
-            let paddedShortcut = shortcut.padding(toLength: 18, withPad: " ", startingAt: 0)
+            let paddedShortcut = shortcut.padding(toLength: 17, withPad: " ", startingAt: 0)
             result.append(NSAttributedString(
                 string: paddedShortcut,
                 attributes: attributes(font: keyFont, color: keyColor)))
             result.append(NSAttributedString(
                 string: action + "\n",
+                attributes: attributes(font: actionFont, color: actionColor)))
+        }
+
+        func appendPair(_ leftKey: String, _ leftAction: String, _ rightKey: String, _ rightAction: String) {
+            let first = leftKey.padding(toLength: 7, withPad: " ", startingAt: 0)
+            let middle = leftAction.padding(toLength: 19, withPad: " ", startingAt: 0)
+            let second = rightKey.padding(toLength: 7, withPad: " ", startingAt: 0)
+            result.append(NSAttributedString(
+                string: first,
+                attributes: attributes(font: keyFont, color: keyColor)))
+            result.append(NSAttributedString(
+                string: middle,
+                attributes: attributes(font: actionFont, color: actionColor)))
+            result.append(NSAttributedString(
+                string: second,
+                attributes: attributes(font: keyFont, color: keyColor)))
+            result.append(NSAttributedString(
+                string: rightAction + "\n",
                 attributes: attributes(font: actionFont, color: actionColor)))
         }
 
@@ -7318,31 +7463,23 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             ("Ctrl+Option+I", "Toggle click-through"),
             ("Ctrl+Option+Enter", "Answer"),
         ]
-        let insideBlueyShortcuts = [
-            ("T", "Text input"),
-            ("L", "Start or stop Listen"),
-            ("S", "Capture screen context"),
-            ("I", "Toggle click-through"),
-            ("H", "History"),
-            ("F", "Files"),
-            ("Enter", "Answer"),
-            ("Esc", "Close panel"),
-        ]
 
         if passThroughMode {
             appendLine("Click-through is on", font: titleFont, color: titleColor)
-            appendLine("Blank Bluey space clicks the app behind it. Use global shortcuts:")
+            appendLine("Blank Bluey space clicks behind it. Drag the blue move handle to move.")
             appendLine()
+            appendLine("Global shortcuts:", font: noteFont, color: titleColor)
             globalShortcuts.forEach { appendShortcut($0.0, $0.1) }
-            appendLine()
-            appendLine("If a shortcut is unavailable, Bluey still keeps the visible buttons clickable.")
             return result
         }
 
         appendLine("Click-through is off", font: titleFont, color: titleColor)
-        appendLine("Inside Bluey works when Ask is not focused:")
+        appendLine("Drag blank Bluey space to move. Inside keys work when Ask is not focused:")
         appendLine()
-        insideBlueyShortcuts.forEach { appendShortcut($0.0, $0.1) }
+        appendPair("T", "Text input", "L", "Listen")
+        appendPair("S", "Screen", "I", "Click-through")
+        appendPair("H", "History", "F", "Files")
+        appendPair("Enter", "Answer", "Esc", "Close panel")
         appendLine()
         appendLine("Global shortcuts also work from anywhere:")
         globalShortcuts.forEach { appendShortcut($0.0, $0.1) }
@@ -7365,12 +7502,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func configureCloseConfirmForShortcutList() {
         closeConfirmTitle.stringValue = "Keyboard shortcuts"
-        closeConfirmPanelWidthConstraint?.constant = 430
+        closeConfirmPanelWidthConstraint?.constant = 470
         closeConfirmCancelLeadingConstraint?.isActive = false
         closeConfirmCancelCenterXConstraint?.isActive = true
         closeConfirmBody.attributedStringValue = macShortcutHelpText
         closeConfirmBody.alignment = .left
-        closeConfirmBody.maximumNumberOfLines = 24
+        closeConfirmBody.maximumNumberOfLines = 20
 
         closeConfirmCancelButton.title = "Done"
         closeConfirmCancelButton.target = self
@@ -9882,21 +10019,36 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         shortcutsButton.toolTip = "Show keyboard shortcuts"
     }
 
+    private func updateMoveHandleChrome() {
+        styleHeaderIconButton(moveHandleButton, symbol: "arrow.up.and.down.and.arrow.left.and.right", fallback: "↕")
+        moveHandleButton.contentTintColor = themedAccentColor
+        moveHandleButton.toolTip = "Drag to move Bluey while click-through is on"
+        moveHandleButton.isHidden = !passThroughMode
+    }
+
     private func updateInteractionModeChrome(showToast: Bool = true) {
         let symbol = passThroughMode ? "cursorarrow.rays" : "hand.tap"
         let fallback = passThroughMode ? "P" : "I"
         styleHeaderIconButton(interactionModeButton, symbol: symbol, fallback: fallback)
         interactionModeButton.contentTintColor = passThroughMode ? themedAccentColor : themedTextColor
-        headerBar.toolTip = passThroughMode ? "Drag the Bluey logo or name to move Bluey" : "Drag this bar to move Bluey"
-        headerChrome.toolTip = passThroughMode ? "Blank header space clicks through" : "Drag this bar to move Bluey"
+        (sessionDrawer as? SessionDrawerView)?.receivesBlankHits = !passThroughMode
+        (answerStyleOverlay as? ModalBlockerView)?.receivesBlankHits = !passThroughMode
+        (closeConfirmOverlay as? ModalBlockerView)?.receivesBlankHits = !passThroughMode
+        updateMoveHandleChrome()
+        layoutHeaderChromeControls()
+        headerBar.toolTip = passThroughMode ? "Blank header space clicks through. Drag the blue move handle to move Bluey." : "Drag blank Bluey space to move"
+        headerChrome.toolTip = passThroughMode ? "Blank header space clicks through. Drag the blue move handle to move Bluey." : "Drag blank Bluey space to move"
+        headerLogo.toolTip = passThroughMode ? "Bluey" : "Drag Bluey"
+        headerWordmark.toolTip = passThroughMode ? "Bluey" : "Drag Bluey"
+        brandStack.toolTip = passThroughMode ? "Bluey" : "Drag Bluey"
         interactionModeButton.toolTip = passThroughMode
-            ? "Click-through on: controls click normally, logo/name drags Bluey, and blank space clicks the app behind it."
+            ? "Click-through on: controls click normally, the blue move handle drags Bluey, and blank space clicks the app behind it."
             : "Interactive on: controls click normally, and blank Bluey space moves/resizes the panel."
         if showToast {
             showSystemToast(
                 title: passThroughMode ? "Click-through on" : "Interactive on",
                 body: passThroughMode
-                    ? "Blank Bluey space now clicks the app behind it. Drag the Bluey logo or name to move the panel."
+                    ? "Blank Bluey space now clicks the app behind it. Drag the blue move handle to move the panel."
                     : "Blank Bluey space now moves/resizes Bluey. Controls and text remain clickable.",
                 duration: 2.0)
         }

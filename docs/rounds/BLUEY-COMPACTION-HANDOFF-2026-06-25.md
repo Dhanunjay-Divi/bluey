@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 06:43 EDT
+Latest checkpoint: 2026-07-01 12:14 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,46 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-277-SHORTCUTS-FOCUS-DRAG-POLISH.md`; the next canonical Bluey round doc should start at `ROUND-278-...`.
+- Latest assigned Bluey round doc is `ROUND-278-CLICKTHROUGH-DEFAULT-MOVE-HANDLE.md`; the next canonical Bluey round doc should start at `ROUND-279-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 278 fixed the default click-through and movement model:
+  - macOS now starts with click-through off by default
+  - click-through-off mode lets blank Bluey space drag the window
+  - blank history and keyboard/tone popup areas now drag Bluey while preserving real controls and editable/selectable text
+  - click-through-on mode now shows a dedicated blue four-direction move handle
+  - in click-through-on mode, blank space passes through and only the move handle drags the overlay
+  - the old implicit logo/name move target is no longer used in click-through-on mode
+  - keyboard shortcut help is more compact and explains the move behavior for both modes
+  - Windows parity:
+    - default mode is click-through off
+    - click-through-on mode draws a cyan move handle
+    - blank click-through space returns transparent hit testing; the cyan handle returns window-drag hit testing
+    - Windows help/shortcut copy mirrors the new model
+  - desktop workspace version bumped to `0.1.32`
+  - verification passed:
+    - `swift build -c debug --package-path native/macos/cue-overlay`
+    - `/opt/homebrew/bin/x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c`
+    - `cargo check -p cue-daemon --offline`
+    - `cargo check -p cue-dashboard --locked`
+    - `cargo test -p cue-daemon --lib --locked`
+    - `cargo test -p cue-core sign_in_event_serializes --locked`
+    - `git diff --check`
+  - release artifact dev-flag/secret scan passed
+  - live artifact:
+    `https://bluey.sh/releases/v0.1.32/bluey-0.1.32-darwin-arm64.tar.gz`
+  - live SHA256:
+    `9883b0bff4be1e8967b463295011bd631fc0d7d6d43f3c86c32ebb3475e6de4f`
+  - live `https://bluey.sh/latest.json` reports `0.1.32`
+  - `latest.json.sig` verified successfully
+  - `https://bluey.sh/install.sh` serves `application/x-shellscript`
+  - local install updated to `bluey 0.1.32` and restarted with `overlay_capture_excluded: true`
+  - Windows packaging was not produced on this Mac because the release artifact path still needs the Windows/MSVC runner; Windows source parity and syntax check passed
+  - Round doc:
+    `docs/rounds/ROUND-278-CLICKTHROUGH-DEFAULT-MOVE-HANDLE.md`
 - Round 277 polished shortcut help, focus, and drag behavior:
   - macOS shortcut sheet now uses attributed text with shortcut keys in accent color and actions in primary text color
   - click-through on shows global shortcuts only
