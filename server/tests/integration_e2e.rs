@@ -10,12 +10,15 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
 use serial_test::serial;
+use std::io::{Cursor, Read};
 use tower::ServiceExt;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use bluey_server::auth;
-use bluey_server::config::{Config, SmtpConfig, UpstreamKeys, UpstreamSpendGuard};
+use bluey_server::config::{
+    Config, ObjectStorageConfig, SmtpConfig, UpstreamKeys, UpstreamSpendGuard,
+};
 use bluey_server::db::accounts::Account;
 use bluey_server::db::usage::{self, UsageEvent};
 use bluey_server::db::{idempotency, open_pool, run_migrations, DbPool};
@@ -1535,6 +1538,289 @@ async fn sync_batch_session_bundle_and_rag_roundtrip() {
         .unwrap();
     let rag: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(rag["matches"][0]["chunk_id"], "chunk-cloud-1");
+}
+
+#[tokio::test]
+#[serial]
+async fn account_export_zip_contains_readable_bundle() {
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "export-zip@example.com", "longenoughpw").await;
+
+    let batch = json!({
+        "sessions": [{
+            "session_id": "sess-export-1",
+            "title": "Export test",
+            "status": "active",
+            "created_at_ms": 1000,
+            "updated_at_ms": 2000,
+            "last_active_at_ms": 2000,
+            "answer_style": "be concise"
+        }],
+        "transcript_segments": [{
+            "segment_id": "seg-export-1",
+            "session_id": "sess-export-1",
+            "speaker": "system",
+            "source": "system",
+            "text": "Secret transcript only for account export.",
+            "ts_ms": 1500,
+            "is_final": true
+        }],
+        "cue_responses": [{
+            "response_id": "resp-export-1",
+            "session_id": "sess-export-1",
+            "kind": "answer",
+            "text": "Export answer text.",
+            "ts_ms": 1600,
+            "provider": "bluey-managed-instant",
+            "model": "gpt-5.4-mini"
+        }],
+        "context_artifacts": [{
+            "artifact_id": "ctx-export-1",
+            "session_id": "sess-export-1",
+            "kind": "document",
+            "title": "Export brief",
+            "text_preview": "Export preview.",
+            "created_at_ms": 1400
+        }]
+    });
+    let req = Request::post("/sync/batch")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(serde_json::to_vec(&batch).unwrap()))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = Request::get("/account/export?format=zip&include_objects=false")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/zip")
+    );
+    let body = axum::body::to_bytes(resp.into_body(), 2 * 1024 * 1024)
+        .await
+        .unwrap();
+    let mut archive = zip::ZipArchive::new(Cursor::new(body.to_vec())).unwrap();
+    assert!(archive.by_name("account-export.json").is_ok());
+    assert!(archive.by_name("manifest.json").is_ok());
+
+    let mut transcript = String::new();
+    archive
+        .by_name("sessions/transcript.md")
+        .unwrap()
+        .read_to_string(&mut transcript)
+        .unwrap();
+    assert!(transcript.contains("Secret transcript only for account export."));
+
+    let mut answers = String::new();
+    archive
+        .by_name("sessions/answers.md")
+        .unwrap()
+        .read_to_string(&mut answers)
+        .unwrap();
+    assert!(answers.contains("Export answer text."));
+    let event_count: i64 = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM ops_audit_events
+             WHERE event_type = 'account.export' AND status = 'completed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(event_count, 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn delete_account_deletes_artifact_objects_before_account_rows() {
+    let object_store = MockServer::start().await;
+    let endpoint = object_store.uri();
+    let h = boot_harness_with_config(UpstreamKeys::default(), vec![], None, |config| {
+        config.object_storage = Some(ObjectStorageConfig {
+            endpoint_url: endpoint,
+            bucket: "bucket".to_string(),
+            access_key_id: "ak".to_string(),
+            secret_access_key: "secret".to_string(),
+            region: "auto".to_string(),
+            key_prefix: "bluey-cloud".to_string(),
+            retention_days: 365,
+            max_object_bytes: 1024 * 1024,
+        });
+    })
+    .await;
+    let email = "delete-objects@example.com";
+    let access = signup_and_login(&h, email, "longenoughpw").await;
+    let account = Account::fetch_by_email(&h.pool, email)
+        .unwrap()
+        .expect("account should exist");
+    let object_key = format!(
+        "bluey-cloud/accounts/{}/context/ctx-object-delete-1",
+        account.id
+    );
+
+    Mock::given(method("DELETE"))
+        .and(path(format!("/bucket/{object_key}")))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+
+    let batch = json!({
+        "sessions": [{
+            "session_id": "sess-delete-1",
+            "title": "Delete object test",
+            "status": "active",
+            "created_at_ms": 1000,
+            "updated_at_ms": 2000,
+            "last_active_at_ms": 2000,
+            "answer_style": "be concise"
+        }],
+        "context_artifacts": [{
+            "artifact_id": "ctx-object-delete-1",
+            "session_id": "sess-delete-1",
+            "kind": "document",
+            "title": "Delete me",
+            "text_preview": "private bytes",
+            "created_at_ms": 1400,
+            "metadata": {
+                "object_key": object_key,
+                "object_size_bytes": 12,
+                "object_content_type": "text/plain",
+                "object_sha256": "abc"
+            }
+        }]
+    });
+    let req = Request::post("/sync/batch")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(serde_json::to_vec(&batch).unwrap()))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = Request::post("/account/delete")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "confirm_text": "DELETE",
+                "accept_data_loss": true,
+                "accept_credit_loss": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let ack: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(ack["object_count_deleted"], 1);
+    assert!(Account::fetch_by_email(&h.pool, email).unwrap().is_none());
+    let event_count: i64 = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM ops_audit_events
+             WHERE event_type = 'account.delete' AND status = 'completed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(event_count, 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn admin_support_bundle_is_redacted() {
+    let h = boot_harness_with_upstream_and_admin_emails(
+        UpstreamKeys::default(),
+        vec!["admin-support@example.com".to_string()],
+    )
+    .await;
+    let user_access = signup_and_login(&h, "support-user@example.com", "longenoughpw").await;
+    let admin_access = signup_and_login(&h, "admin-support@example.com", "longenoughpw").await;
+    let account = Account::fetch_by_email(&h.pool, "support-user@example.com")
+        .unwrap()
+        .expect("support target account should exist");
+
+    let batch = json!({
+        "sessions": [{
+            "session_id": "sess-support-1",
+            "title": "Support secret title",
+            "status": "active",
+            "created_at_ms": 1000,
+            "updated_at_ms": 2000,
+            "last_active_at_ms": 2000,
+            "answer_style": "be concise"
+        }],
+        "transcript_segments": [{
+            "segment_id": "seg-support-1",
+            "session_id": "sess-support-1",
+            "speaker": "system",
+            "source": "system",
+            "text": "never leak this support transcript",
+            "ts_ms": 1500,
+            "is_final": true
+        }],
+        "cue_responses": [{
+            "response_id": "resp-support-1",
+            "session_id": "sess-support-1",
+            "kind": "answer",
+            "text": "never leak this support answer",
+            "ts_ms": 1600,
+            "provider": "bluey-managed-instant",
+            "model": "gpt-5.4-mini"
+        }]
+    });
+    let req = Request::post("/sync/batch")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {user_access}"))
+        .body(Body::from(serde_json::to_vec(&batch).unwrap()))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = Request::get(format!("/admin/support/accounts/{}", account.id))
+        .header("authorization", format!("Bearer {admin_access}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body_text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(!body_text.contains("never leak this support transcript"));
+    assert!(!body_text.contains("never leak this support answer"));
+    assert!(!body_text.contains("support-user@example.com"));
+    let bundle: serde_json::Value = serde_json::from_str(&body_text).unwrap();
+    assert_eq!(bundle["counts"]["transcript_segments"], 1);
+    assert_eq!(bundle["counts"]["cue_responses"], 1);
+
+    let req = Request::get("/admin/ops/events?limit=5")
+        .header("authorization", format!("Bearer {admin_access}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let events_text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(events_text.contains("admin.support_bundle"));
+    assert!(!events_text.contains("never leak this support transcript"));
 }
 
 #[tokio::test]

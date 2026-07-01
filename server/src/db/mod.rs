@@ -24,6 +24,7 @@ pub mod device_codes;
 pub mod idempotency;
 pub mod link_codes;
 pub mod metrics;
+pub mod ops_audit;
 pub mod refresh_tokens;
 pub mod signup_otps;
 pub mod stt_accounting;
@@ -652,6 +653,27 @@ const MIGRATIONS: &[&str] = &[
         ON balance_ledger_entries(provider, processor_payment_id);
     CREATE INDEX IF NOT EXISTS idx_balance_ledger_request
         ON balance_ledger_entries(account_id, request_id);
+    "#,
+    // 0016 - redacted ops audit events.
+    //
+    // This table intentionally avoids an account foreign key so delete/export
+    // evidence survives account hard-delete without retaining account data.
+    r#"
+    CREATE TABLE IF NOT EXISTS ops_audit_events (
+        id                    TEXT PRIMARY KEY,
+        account_id_hash       TEXT,
+        actor_account_id_hash TEXT,
+        event_type            TEXT NOT NULL,
+        status                TEXT NOT NULL,
+        metadata_json         TEXT NOT NULL DEFAULT '{}',
+        created_at            DATETIME NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_ops_audit_created
+        ON ops_audit_events(created_at);
+    CREATE INDEX IF NOT EXISTS idx_ops_audit_event_created
+        ON ops_audit_events(event_type, created_at);
+    CREATE INDEX IF NOT EXISTS idx_ops_audit_account_created
+        ON ops_audit_events(account_id_hash, created_at);
     "#,
 ];
 

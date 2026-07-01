@@ -139,6 +139,12 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         .route("/admin/metrics", get(metrics::get_metrics))
         .route("/admin/trial-abuse", get(admin::trial_abuse))
         .route("/admin/billing-risk", get(admin::billing_risk))
+        .route("/admin/storage/health", get(admin::storage_health))
+        .route("/admin/ops/events", get(admin::ops_events))
+        .route(
+            "/admin/support/accounts/:account_id",
+            get(admin::support_account),
+        )
         .route_layer(axum::middleware::from_fn(auth::require_admin));
 
     // ---- Authenticated (Bearer JWT) -----------------------------------------

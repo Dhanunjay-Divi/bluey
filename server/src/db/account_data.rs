@@ -35,6 +35,17 @@ pub struct ExportBundle {
     pub exported_at: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ArtifactObjectRef {
+    pub artifact_id: String,
+    pub title: String,
+    pub object_key: String,
+    pub content_type: Option<String>,
+    pub size_bytes: Option<i64>,
+    pub sha256: Option<String>,
+    pub expires_at_ms: Option<i64>,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct ExportAccount {
     pub id: String,
@@ -69,6 +80,13 @@ pub fn hard_delete_account(pool: &DbPool, account_id: &str) -> Result<bool> {
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => hard_delete_account_sqlite(pool, account_id),
         DbPool::Postgres(_) => hard_delete_account_postgres(pool, account_id),
+    })
+}
+
+pub fn artifact_object_refs(pool: &DbPool, account_id: &str) -> Result<Vec<ArtifactObjectRef>> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => artifact_object_refs_sqlite(pool, account_id),
+        DbPool::Postgres(_) => artifact_object_refs_postgres(pool, account_id),
     })
 }
 
@@ -461,6 +479,88 @@ fn hard_delete_account_postgres(pool: &DbPool, account_id: &str) -> Result<bool>
     let deleted = tx.execute("DELETE FROM accounts WHERE id = $1", &[&account_id])?;
     tx.commit()?;
     Ok(deleted > 0)
+}
+
+fn artifact_object_refs_sqlite(pool: &DbPool, account_id: &str) -> Result<Vec<ArtifactObjectRef>> {
+    let conn = pool.get()?;
+    let mut stmt = conn.prepare(
+        "SELECT artifact_id, title, metadata_json
+         FROM cloud_context_artifacts
+         WHERE account_id = ?1
+         ORDER BY created_at_ms ASC",
+    )?;
+    let rows = stmt.query_map(params![account_id], |row| {
+        let artifact_id: String = row.get(0)?;
+        let title: String = row.get(1)?;
+        let metadata: String = row.get(2)?;
+        Ok((artifact_id, title, metadata))
+    })?;
+    let mut refs = Vec::new();
+    for row in rows {
+        let (artifact_id, title, metadata) = row?;
+        if let Some(reference) = object_ref_from_metadata(artifact_id, title, &metadata) {
+            refs.push(reference);
+        }
+    }
+    Ok(refs)
+}
+
+fn artifact_object_refs_postgres(
+    pool: &DbPool,
+    account_id: &str,
+) -> Result<Vec<ArtifactObjectRef>> {
+    let mut conn = pool.get_pg()?;
+    let rows = conn.query(
+        "SELECT artifact_id, title, metadata_json
+         FROM cloud_context_artifacts
+         WHERE account_id = $1
+         ORDER BY created_at_ms ASC",
+        &[&account_id],
+    )?;
+    let mut refs = Vec::with_capacity(rows.len());
+    for row in rows {
+        let artifact_id: String = row.try_get(0)?;
+        let title: String = row.try_get(1)?;
+        let metadata: String = row.try_get(2)?;
+        if let Some(reference) = object_ref_from_metadata(artifact_id, title, &metadata) {
+            refs.push(reference);
+        }
+    }
+    Ok(refs)
+}
+
+fn object_ref_from_metadata(
+    artifact_id: String,
+    title: String,
+    metadata_json: &str,
+) -> Option<ArtifactObjectRef> {
+    let metadata = serde_json::from_str::<serde_json::Value>(metadata_json).ok()?;
+    let object_key = metadata
+        .get("object_key")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?
+        .to_string();
+    Some(ArtifactObjectRef {
+        artifact_id,
+        title,
+        object_key,
+        content_type: metadata
+            .get("object_content_type")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+        size_bytes: metadata
+            .get("object_size_bytes")
+            .or_else(|| metadata.get("size_bytes"))
+            .and_then(|value| value.as_i64()),
+        sha256: metadata
+            .get("object_sha256")
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string),
+        expires_at_ms: metadata
+            .get("object_expires_at_ms")
+            .and_then(|value| value.as_i64()),
+    })
 }
 
 fn export_rows(

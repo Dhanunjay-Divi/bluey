@@ -66,6 +66,7 @@ async-stream = "0.3"
 bytes = "1"
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # CLI / config
 clap = { version = "4", features = ["derive", "env"] }

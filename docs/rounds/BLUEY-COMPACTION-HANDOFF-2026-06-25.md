@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-30 17:50 EDT
+Latest checkpoint: 2026-06-30 20:37 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,48 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-263-PROD-POSTGRES-R2-STORAGE-SETUP.md`; the next canonical Bluey round doc should start at `ROUND-264-...`.
+- Latest assigned Bluey round doc is `ROUND-264-PROD-DATA-OPS-GATES.md`; the next canonical Bluey round doc should start at `ROUND-265-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 264 implemented the production data operations gates in the repo:
+  - `/account/export` keeps the existing JSON export
+  - `/account/export?format=zip` now produces a structured zip with
+    `account-export.json`, `manifest.json`, readable transcript/answer
+    markdown, and original artifact bytes when object storage is configured
+  - zip export fails closed if referenced object bytes cannot be fetched, object
+    keys fall outside the account scope, or the configured export byte budget is
+    exceeded
+  - `/account/delete` now deletes account-scoped R2/S3 artifact objects before
+    deleting account DB rows; if object storage is unavailable or object delete
+    fails, the account delete fails closed
+  - new redacted `ops_audit_events` table records export, delete, and admin
+    support-bundle events without account foreign keys, so evidence survives
+    hard-delete while avoiding transcript/document retention
+  - new admin-only endpoints:
+    - `/admin/storage/health`
+    - `/admin/support/accounts/:account_id`
+    - `/admin/ops/events`
+  - new `ops/restore-drill-bluey-db.sh` restores latest local backup into an
+    explicit non-production drill target, refuses live `BLUEY_DATABASE_URL`, and
+    verifies core table counts
+  - `docs/PRODUCTION-DEPLOY-RUNBOOK.md` now documents restore drills,
+    zip exports, object-aware deletes, and admin ops endpoints
+  - focused tests passed:
+    - `account_export_zip_contains_readable_bundle`
+    - `delete_account_deletes_artifact_objects_before_account_rows`
+    - `admin_support_bundle_is_redacted`
+    - `cargo check --manifest-path server/Cargo.toml`
+    - `bash -n ops/backup-bluey-db.sh`
+    - `bash -n ops/restore-drill-bluey-db.sh`
+    - disposable SQLite restore drill
+  - this round did not deploy a new live server binary to the droplet; live
+    rollout should follow the runbook and include a real Postgres restore drill
+    against a disposable target database
+  - Round doc:
+    `docs/rounds/ROUND-264-PROD-DATA-OPS-GATES.md`
 - Round 263 completed the production Postgres/R2 storage setup:
   - live `bluey-api.service` was confirmed running with
     `BLUEY_SERVER_DB_BACKEND=postgres`, `BLUEY_DATABASE_URL=<set>`, strict

@@ -1,16 +1,20 @@
 //! Account endpoints — real implementations.
 
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
+    body::Body,
+    extract::{Path, Query, State},
+    http::{header, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     Extension, Json,
 };
 use serde::{Deserialize, Serialize};
+use std::io::{Cursor, Write};
 
 use super::AppState;
 use crate::auth::AuthedAccount;
 use crate::config::BillingProvider;
 use crate::db::account_data;
+use crate::object_storage::ObjectStorage;
 
 const MIN_AUTO_RELOAD_CENTS: i64 = 1500;
 const MAX_AUTO_RELOAD_CENTS: i64 = 10_000;
@@ -454,20 +458,50 @@ pub async fn usage(
 
 // ─── Codex Stage 14: GDPR delete + export ───────────────────────────────
 
+#[derive(Debug, Deserialize)]
+pub struct ExportQuery {
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub include_objects: Option<bool>,
+}
+
 pub async fn export_data(
     State(state): State<AppState>,
+    Query(query): Query<ExportQuery>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
-) -> Result<Json<account_data::ExportBundle>, axum::http::StatusCode> {
+) -> Result<Response, axum::http::StatusCode> {
     let bundle = account_data::export_bundle(&state.pool, &account.id)
         .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(axum::http::StatusCode::NOT_FOUND)?;
-    Ok(Json(bundle))
+    if query
+        .format
+        .as_deref()
+        .is_some_and(|format| format.eq_ignore_ascii_case("zip"))
+    {
+        return export_zip(
+            &state,
+            &account.id,
+            bundle,
+            query.include_objects.unwrap_or(true),
+        )
+        .await;
+    }
+    record_account_ops_event(
+        &state,
+        &account.id,
+        "account.export",
+        "completed",
+        serde_json::json!({"format": "json"}),
+    );
+    Ok(Json(bundle).into_response())
 }
 
 #[derive(serde::Serialize)]
 pub struct DeleteAck {
     pub deleted: bool,
     pub deleted_at: String,
+    pub object_count_deleted: usize,
     pub note: &'static str,
 }
 
@@ -486,6 +520,48 @@ pub async fn delete_account(
     if req.confirm_text.trim() != "DELETE" || !req.accept_data_loss || !req.accept_credit_loss {
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
+
+    let object_refs =
+        account_data::artifact_object_refs(&state.pool, &account.id).map_err(|e| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                error = %e,
+                "failed to list account artifact objects before delete"
+            );
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let mut object_count_deleted = 0usize;
+    if !object_refs.is_empty() {
+        let storage_config = state
+            .config
+            .object_storage
+            .clone()
+            .ok_or(axum::http::StatusCode::SERVICE_UNAVAILABLE)?;
+        let storage = ObjectStorage::new(storage_config);
+        for object_ref in &object_refs {
+            if !storage.key_belongs_to_account(&object_ref.object_key, &account.id) {
+                tracing::error!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    artifact_id = %object_ref.artifact_id,
+                    "refusing account delete because artifact object key is outside account scope"
+                );
+                return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+        for object_ref in &object_refs {
+            storage.delete(&object_ref.object_key).await.map_err(|e| {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    artifact_id = %object_ref.artifact_id,
+                    error = %e,
+                    "failed to delete account artifact object"
+                );
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            object_count_deleted += 1;
+        }
+    }
+
     // Hard delete. ON DELETE CASCADE on the foreign keys (accounts ->
     // credit_batches, refresh_tokens, usage_events,
     // email_verification_tokens, password_reset_tokens, request_idempotency)
@@ -499,9 +575,291 @@ pub async fn delete_account(
         account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
         "account deleted (GDPR hard-delete)"
     );
+    record_account_ops_event(
+        &state,
+        &account.id,
+        "account.delete",
+        "completed",
+        serde_json::json!({
+            "object_count_deleted": object_count_deleted,
+            "credits_lost": true,
+            "data_loss_accepted": true
+        }),
+    );
     Ok(Json(DeleteAck {
         deleted: true,
         deleted_at: chrono::Utc::now().to_rfc3339(),
+        object_count_deleted,
         note: "All account data has been removed. Re-signup is allowed with the same email.",
     }))
+}
+
+async fn export_zip(
+    state: &AppState,
+    account_id: &str,
+    bundle: account_data::ExportBundle,
+    include_objects: bool,
+) -> Result<Response, axum::http::StatusCode> {
+    let object_refs = account_data::artifact_object_refs(&state.pool, account_id).map_err(|e| {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+            error = %e,
+            "failed to list account artifact objects for export"
+        );
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let object_budget_bytes = std::env::var("BLUEY_EXPORT_MAX_OBJECT_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(100 * 1024 * 1024);
+    let storage = if include_objects {
+        match state.config.object_storage.clone() {
+            Some(config) => Some(ObjectStorage::new(config)),
+            None if object_refs.is_empty() => None,
+            None => return Err(axum::http::StatusCode::SERVICE_UNAVAILABLE),
+        }
+    } else {
+        None
+    };
+    let mut manifest_objects = Vec::new();
+    let mut exported_object_bytes = 0u64;
+
+    let cursor = Cursor::new(Vec::new());
+    let mut zip = zip::ZipWriter::new(cursor);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    write_zip_json(&mut zip, options, "account-export.json", &bundle)?;
+    write_zip_file(
+        &mut zip,
+        options,
+        "README.txt",
+        "Bluey account export. account-export.json contains the complete structured export. sessions/ contains readable transcript and answer views. artifacts/manifest.json lists attached artifact objects and whether original bytes were included.\n".as_bytes(),
+    )?;
+    write_zip_file(
+        &mut zip,
+        options,
+        "sessions/transcript.md",
+        render_transcripts_markdown(&bundle).as_bytes(),
+    )?;
+    write_zip_file(
+        &mut zip,
+        options,
+        "sessions/answers.md",
+        render_answers_markdown(&bundle).as_bytes(),
+    )?;
+
+    for object_ref in &object_refs {
+        let mut object_manifest = serde_json::json!({
+            "artifact_id": object_ref.artifact_id,
+            "title": object_ref.title,
+            "object_key_sha256": sha256_text(&object_ref.object_key),
+            "content_type": object_ref.content_type,
+            "size_bytes": object_ref.size_bytes,
+            "sha256": object_ref.sha256,
+            "expires_at_ms": object_ref.expires_at_ms,
+            "included": false,
+            "skipped_reason": null,
+        });
+        let Some(storage) = storage.as_ref() else {
+            object_manifest["skipped_reason"] = serde_json::json!("object storage not configured");
+            manifest_objects.push(object_manifest);
+            continue;
+        };
+        if !storage.key_belongs_to_account(&object_ref.object_key, account_id) {
+            tracing::error!(
+                account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                artifact_id = %object_ref.artifact_id,
+                "refusing account export because artifact object key is outside account scope"
+            );
+            return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        let expected_size = object_ref.size_bytes.unwrap_or(0).max(0) as u64;
+        if expected_size > 0
+            && exported_object_bytes.saturating_add(expected_size) > object_budget_bytes
+        {
+            return Err(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        }
+        match storage.get(&object_ref.object_key).await {
+            Ok(stored) => {
+                let bytes_len = stored.bytes.len() as u64;
+                if exported_object_bytes.saturating_add(bytes_len) > object_budget_bytes {
+                    return Err(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+                }
+                exported_object_bytes = exported_object_bytes.saturating_add(bytes_len);
+                let name = format!(
+                    "artifacts/files/{}-{}",
+                    safe_zip_name(&object_ref.artifact_id),
+                    safe_zip_name(&object_ref.title)
+                );
+                write_zip_file(&mut zip, options, &name, &stored.bytes)?;
+                object_manifest["included"] = serde_json::json!(true);
+                object_manifest["zip_path"] = serde_json::json!(name);
+                object_manifest["downloaded_content_type"] = serde_json::json!(stored.content_type);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                    artifact_id = %object_ref.artifact_id,
+                    error = %error,
+                    "failed to include account artifact object in export"
+                );
+                return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+            }
+        }
+        manifest_objects.push(object_manifest);
+    }
+
+    let manifest = serde_json::json!({
+        "exported_at": chrono::Utc::now().to_rfc3339(),
+        "format": "bluey-account-export-v1",
+        "object_budget_bytes": object_budget_bytes,
+        "exported_object_bytes": exported_object_bytes,
+        "include_objects_requested": include_objects,
+        "objects": manifest_objects,
+        "counts": {
+            "credit_batches": bundle.credit_batches.len(),
+            "usage_events": bundle.usage_events.len(),
+            "sessions": bundle.cloud_sessions.len(),
+            "transcript_segments": bundle.cloud_transcript_segments.len(),
+            "cue_responses": bundle.cloud_cue_responses.len(),
+            "context_artifacts": bundle.cloud_context_artifacts.len(),
+            "rag_chunks": bundle.cloud_rag_chunks_count,
+            "refresh_tokens": bundle.refresh_tokens_count,
+            "stripe_webhook_events": bundle.stripe_webhook_events_count
+        }
+    });
+    write_zip_json(&mut zip, options, "manifest.json", &manifest)?;
+
+    let bytes = zip
+        .finish()
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
+        .into_inner();
+    let mut response = Body::from(bytes).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/zip"),
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=\"bluey-account-export.zip\""),
+    );
+    record_account_ops_event(
+        state,
+        account_id,
+        "account.export",
+        "completed",
+        serde_json::json!({
+            "format": "zip",
+            "include_objects": include_objects,
+            "object_count": object_refs.len(),
+            "exported_object_bytes": exported_object_bytes
+        }),
+    );
+    Ok(response)
+}
+
+fn record_account_ops_event(
+    state: &AppState,
+    account_id: &str,
+    event_type: &str,
+    status: &str,
+    metadata_json: serde_json::Value,
+) {
+    if let Err(error) = crate::db::ops_audit::record_event(
+        &state.pool,
+        crate::db::ops_audit::OpsAuditEventInput {
+            account_id_hash: Some(cue_core::account_id_hash_prefix(account_id)),
+            actor_account_id_hash: Some(cue_core::account_id_hash_prefix(account_id)),
+            event_type: event_type.to_string(),
+            status: status.to_string(),
+            metadata_json,
+        },
+    ) {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+            event_type,
+            error = %error,
+            "failed to record account ops audit event"
+        );
+    }
+}
+
+fn write_zip_json<T: Serialize>(
+    zip: &mut zip::ZipWriter<Cursor<Vec<u8>>>,
+    options: zip::write::SimpleFileOptions,
+    path: &str,
+    value: &T,
+) -> Result<(), axum::http::StatusCode> {
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    write_zip_file(zip, options, path, &bytes)
+}
+
+fn write_zip_file(
+    zip: &mut zip::ZipWriter<Cursor<Vec<u8>>>,
+    options: zip::write::SimpleFileOptions,
+    path: &str,
+    bytes: &[u8],
+) -> Result<(), axum::http::StatusCode> {
+    zip.start_file(path, options)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    zip.write_all(bytes)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+fn render_transcripts_markdown(bundle: &account_data::ExportBundle) -> String {
+    let mut out = String::from("# Bluey Transcripts\n\n");
+    for segment in &bundle.cloud_transcript_segments {
+        let session_id = json_str(segment, "session_id").unwrap_or("unknown");
+        let speaker = json_str(segment, "speaker").unwrap_or("speaker");
+        let text = json_str(segment, "text").unwrap_or("");
+        out.push_str(&format!(
+            "## Session {session_id}\n\n**{speaker}:** {text}\n\n"
+        ));
+    }
+    out
+}
+
+fn render_answers_markdown(bundle: &account_data::ExportBundle) -> String {
+    let mut out = String::from("# Bluey Answers\n\n");
+    for answer in &bundle.cloud_cue_responses {
+        let session_id = json_str(answer, "session_id").unwrap_or("unknown");
+        let kind = json_str(answer, "kind").unwrap_or("answer");
+        let model = json_str(answer, "model").unwrap_or("unknown model");
+        let text = json_str(answer, "text").unwrap_or("");
+        out.push_str(&format!(
+            "## Session {session_id} - {kind}\n\n_Model: {model}_\n\n{text}\n\n"
+        ));
+    }
+    out
+}
+
+fn json_str<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    value.get(key).and_then(serde_json::Value::as_str)
+}
+
+fn safe_zip_name(value: &str) -> String {
+    let mut out = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    out.truncate(96);
+    if out.trim_matches('_').is_empty() {
+        "artifact".to_string()
+    } else {
+        out
+    }
+}
+
+fn sha256_text(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(value.as_bytes()))
 }

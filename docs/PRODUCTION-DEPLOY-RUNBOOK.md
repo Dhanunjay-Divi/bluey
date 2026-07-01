@@ -197,6 +197,79 @@ AWS_DEFAULT_REGION=auto
 Keep these values in root-owned environment/cron config on the server. They must
 never be shipped in the desktop app.
 
+### Restore Drills
+
+Backups are not considered production-ready until a restore has been proven
+against a disposable target database.
+
+Install the restore drill script next to the backup script:
+
+```bash
+cp ops/restore-drill-bluey-db.sh /usr/local/sbin/restore-drill-bluey-db.sh
+chmod 750 /usr/local/sbin/restore-drill-bluey-db.sh
+chown root:root /usr/local/sbin/restore-drill-bluey-db.sh
+```
+
+For Postgres, provision a non-production drill database and set the target only
+for the drill command:
+
+```bash
+BLUEY_RESTORE_DRILL_DATABASE_URL='postgres://bluey_drill:...@.../bluey_restore_drill?sslmode=require' \
+  /usr/local/sbin/restore-drill-bluey-db.sh
+```
+
+The script loads `/etc/bluey-api/bluey-api.env` and
+`/etc/bluey-api/bluey-postgres.env`, selects the latest local backup from
+`/var/backups/bluey-api/hourly`, refuses to restore into the live
+`BLUEY_DATABASE_URL`, restores the dump, and prints counts for core tables. For
+SQLite backups it copies the `.db` to a temp path and runs
+`PRAGMA integrity_check`.
+
+Run this drill after database migrations, before launch, and at least monthly.
+
+### Data Requests And Deletes
+
+Authenticated users can download:
+
+- `/account/export` for the existing JSON export.
+- `/account/export?format=zip` for a complete zip with structured JSON,
+  readable transcript/answer markdown, artifact metadata, and original object
+  bytes when object storage is configured.
+
+Zip exports fail closed if referenced object bytes cannot be fetched, if an
+object key is outside the account scope, or if the export would exceed
+`BLUEY_EXPORT_MAX_OBJECT_BYTES` (default `100 MiB`). Use
+`include_objects=false` only when a metadata/text-only bundle is explicitly
+acceptable.
+
+Account deletion requires explicit consent fields:
+
+```json
+{
+  "confirm_text": "DELETE",
+  "accept_data_loss": true,
+  "accept_credit_loss": true
+}
+```
+
+If synced artifact objects exist, Bluey deletes those R2/S3 objects first and
+only then deletes the account rows. If object storage is not configured or an
+object delete fails, the account delete fails closed instead of leaving orphaned
+blobs.
+
+Admin-only support and storage endpoints:
+
+- `/admin/storage/health`: backup directory, latest local backup, off-host
+  destination configured, object storage configured, and feature readiness.
+- `/admin/support/accounts/<account_id>`: redacted account support bundle with
+  counts, hashed identifiers, recent provider/cost rows, and artifact object
+  metadata. It deliberately excludes transcript text, answer text, document
+  previews, source URIs, raw object keys, and raw email.
+- `/admin/ops/events`: recent redacted export/delete/support audit events. These
+  records store account hashes, actor hashes, status, and small metadata only,
+  so delete/export evidence survives account hard-delete without retaining user
+  transcripts or documents.
+
 ## 10. Monitoring
 
 The server exposes `/admin/metrics` in Prometheus exposition format (admin-only). To scrape:
