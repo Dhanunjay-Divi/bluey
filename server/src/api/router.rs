@@ -2056,10 +2056,10 @@ fn prompt_with_answer_plan(
             "Answer directly in 1-4 sentences. Do not open with setup unless it prevents confusion."
         }
         AnswerIntent::Coding => {
-            "If the user asks for code, start with complete working code in a fenced code block, then give a concise explanation of the key idea and complexity. Do not give only a summary."
+            "If the user asks for code, start with complete working code in a fenced code block, then give a concise explanation of the key idea and complexity. For non-trivial code, add a short `Line notes:` block outside the code fence using `1: ...` style notes for the important lines. Keep explanatory notes outside the code so copied code stays clean. Do not give only a summary."
         }
         AnswerIntent::CodingFollowUp => {
-            "Treat this as a follow-up to existing code when relevant. Preserve the existing artifact unless the user asks for a new one. Give the smallest useful delta, but include the actual updated code or snippet when the user asks for code."
+            "Treat this as a follow-up to existing code when relevant. Preserve the existing artifact unless the user asks for a new one. Give the smallest useful delta, but include the actual updated code or snippet when the user asks for code. If you include code, add any line-by-line explanation as `Line notes:` outside the code fence so copied code stays clean."
         }
         AnswerIntent::Behavioral => {
             "Answer like a polished interview response: natural, first-person when appropriate, specific, and conversational. Never route resume/self-intro prompts into system design."
@@ -5033,6 +5033,7 @@ fn strip_fenced_code(text: &str) -> String {
 
 fn format_code_artifact(body: &str, code_blocks: &[String]) -> String {
     let notes = strip_fenced_code(body).trim().to_string();
+    let (line_notes, remaining_notes) = split_line_notes(&notes);
     let mut sections = Vec::new();
     if !code_blocks.is_empty() {
         sections.push(format!(
@@ -5040,14 +5041,126 @@ fn format_code_artifact(body: &str, code_blocks: &[String]) -> String {
             code_blocks.join("\n\n// ---\n\n")
         ));
     }
-    if !notes.is_empty() {
-        sections.push(format!("NOTES\n-----\n{notes}"));
+    if let Some(line_notes) = line_notes {
+        sections.push(format!("LINE NOTES\n----------\n{line_notes}"));
+    }
+    if !remaining_notes.is_empty() {
+        sections.push(format!("NOTES\n-----\n{remaining_notes}"));
     }
     if sections.is_empty() {
         body.to_string()
     } else {
         sections.join("\n\n")
     }
+}
+
+fn split_line_notes(notes: &str) -> (Option<String>, String) {
+    let clean = notes.trim();
+    if clean.is_empty() {
+        return (None, String::new());
+    }
+
+    let mut before = Vec::new();
+    let mut line_notes = Vec::new();
+    let mut after = Vec::new();
+    let mut in_line_notes = false;
+    let mut in_after = false;
+
+    for raw_line in clean.lines() {
+        let line = raw_line.trim_end();
+        if !in_line_notes && !in_after {
+            if let Some(rest) = line_notes_heading_remainder(line) {
+                in_line_notes = true;
+                if !rest.trim().is_empty() {
+                    line_notes.push(rest.trim().to_string());
+                }
+                continue;
+            }
+            before.push(line.to_string());
+            continue;
+        }
+
+        if in_line_notes && !in_after && looks_like_post_line_notes_heading(line) {
+            in_after = true;
+            after.push(line.to_string());
+            continue;
+        }
+
+        if in_after {
+            after.push(line.to_string());
+        } else {
+            line_notes.push(line.to_string());
+        }
+    }
+
+    let line_notes_text = trim_joined_lines(line_notes);
+    let mut remaining_parts = Vec::new();
+    let before_text = trim_joined_lines(before);
+    let after_text = trim_joined_lines(after);
+    if !before_text.is_empty() {
+        remaining_parts.push(before_text);
+    }
+    if !after_text.is_empty() {
+        remaining_parts.push(after_text);
+    }
+
+    (
+        (!line_notes_text.is_empty()).then_some(line_notes_text),
+        remaining_parts.join("\n\n"),
+    )
+}
+
+fn trim_joined_lines(lines: Vec<String>) -> String {
+    lines.join("\n").trim().to_string()
+}
+
+fn line_notes_heading_remainder(line: &str) -> Option<&str> {
+    let trimmed = trim_markdown_heading(line);
+    let lower = trimmed.to_ascii_lowercase();
+    for heading in [
+        "line notes",
+        "line-by-line notes",
+        "line by line notes",
+        "line annotations",
+        "visual line notes",
+    ] {
+        if lower == heading {
+            return Some("");
+        }
+        if let Some(rest) = lower.strip_prefix(&format!("{heading}:")) {
+            let offset = trimmed.len().saturating_sub(rest.len());
+            return Some(trimmed[offset..].trim_start());
+        }
+    }
+    None
+}
+
+fn looks_like_post_line_notes_heading(line: &str) -> bool {
+    let trimmed = trim_markdown_heading(line);
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.trim_end_matches(':').to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "notes"
+            | "explanation"
+            | "approach"
+            | "complexity"
+            | "time complexity"
+            | "space complexity"
+            | "edge cases"
+            | "walkthrough"
+            | "why this works"
+    )
+}
+
+fn trim_markdown_heading(line: &str) -> &str {
+    line.trim()
+        .trim_start_matches('#')
+        .trim()
+        .trim_matches('*')
+        .trim()
 }
 
 fn format_structured_artifact(body: &str, fallback_heading: &str) -> String {
@@ -6185,6 +6298,21 @@ mod tests {
         assert_eq!(artifact.artifact_type, "code");
         assert!(artifact.body.contains("CODE\n----"));
         assert!(artifact.body.contains("def solve()"));
+    }
+
+    #[test]
+    fn response_artifact_separates_code_line_notes() {
+        let artifact = response_artifact(
+            "```python\na = 1\nb = 2\na, b = b, a\n```\nLine notes:\n1: Store the first value.\n2: Store the second value.\n3: Swap both names in one tuple assignment.\nExplanation:\nTuple unpacking avoids a temporary variable.",
+        )
+        .expect("code artifact");
+
+        assert_eq!(artifact.artifact_type, "code");
+        assert!(artifact.body.contains("CODE\n----\na = 1"));
+        assert!(artifact.body.contains("LINE NOTES\n----------"));
+        assert!(artifact.body.contains("3: Swap both names"));
+        assert!(artifact.body.contains("NOTES\n-----\nExplanation:"));
+        assert!(!artifact.body.contains("Line notes:"));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 17:04 EDT
+Latest checkpoint: 2026-07-01 17:47 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,49 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-284-SCREEN-CODE-ANSWER-PLAN-FIRST-TOKEN.md`; the next canonical Bluey round doc should start at `ROUND-285-...`.
+- Latest completed Bluey round doc is `ROUND-285-CODE-CANVAS-LINE-NOTES.md`; the next canonical Bluey round doc should start at `ROUND-286-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 285 is complete for code canvas line notes:
+  - managed coding instructions now ask for separate `Line notes:` outside fenced code for non-trivial code answers
+  - server code artifact formatting splits `Line notes:` into a dedicated `LINE NOTES` section
+  - macOS code canvas renders `LINE NOTES` in muted grey
+  - macOS code canvas tints existing inline code comments grey
+  - macOS code canvas copy button now copies only the `CODE` section for code artifacts
+  - non-code canvases still copy full canvas content
+  - desktop workspace version bumped to `0.1.39`
+  - Windows parity note:
+    - Windows compact overlay does not yet have the Mac artifact canvas renderer
+    - shared server line-note separation still improves Windows answer text
+    - grey visual-only canvas annotations remain Mac-only until Windows gains artifact canvas support
+  - local verification passed:
+    - `cargo fmt --all`
+    - `cargo test --manifest-path server/Cargo.toml response_artifact --quiet`
+    - `cargo check --manifest-path server/Cargo.toml --quiet`
+    - `swift build -c debug --package-path native/macos/cue-overlay`
+  - production deploy completed:
+    - built on droplet from source-only tree `/opt/bluey-build-codex-round285-line-notes/server`
+    - installed `/usr/local/bin/bluey-server`
+    - previous production binary backup:
+      `/var/backups/bluey-api/bin/bluey-server.previous-20260701T213819Z`
+    - installed binary SHA256:
+      `f201d6f077033eb334e1f090fe09cabd1afa1d6e7b7e5ecc155fe32aa2a4472d`
+    - `bluey-api.service` restarted active
+    - `https://bluey.sh/health` returned `status=ok`
+  - macOS release verification passed:
+    - `https://bluey.sh/latest.json` reported `0.1.39`
+    - live `latest.json.sig` verified successfully against the release Ed25519 key
+    - live artifact SHA256:
+      `d17f49268f1581815be41ccb5711a60354b6b50edaa3797256e7d10b9a635b92`
+    - `/install.sh` returned `application/x-shellscript`
+    - `/install.ps1` returned `application/x-powershell`
+  - live artifact:
+    `https://bluey.sh/releases/v0.1.39/bluey-0.1.39-darwin-arm64.tar.gz`
+  - Round doc:
+    `docs/rounds/ROUND-285-CODE-CANVAS-LINE-NOTES.md`
 - Round 284 is complete for screen-code answer planning and first-token fallback:
   - production logs for the owner screenshot showed the generic screen prompt was planned as `missing_context`
   - root cause was the generic `documents` wording plus planner logic that did not use appended screen/session context strongly enough for coding signals

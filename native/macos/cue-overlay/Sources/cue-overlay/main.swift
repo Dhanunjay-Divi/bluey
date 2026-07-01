@@ -4054,6 +4054,7 @@ private final class CanvasPaneView: NSView {
     private let scroll = NSScrollView()
     private let textView = ArrowCursorTextView()
     private var currentText = ""
+    private var currentCopyText = ""
     private var fullWindow = false
 
     var onCollapse: (() -> Void)?
@@ -4228,6 +4229,7 @@ private final class CanvasPaneView: NSView {
         titleLabel.stringValue = artifact.title
         subtitleLabel.stringValue = artifact.subtitle
         currentText = artifact.content
+        currentCopyText = copyableCanvasText(for: artifact)
         if let image = symbolImage(artifact.kind.icon) {
             image.isTemplate = true
             iconView.image = image
@@ -4247,7 +4249,7 @@ private final class CanvasPaneView: NSView {
                 .foregroundColor: BlueyTheme.text,
             ])
         var location = 0
-        var inChangedSection = false
+        var currentSection: String?
 
         for rawLine in text.components(separatedBy: "\n") {
             let lineLength = (rawLine as NSString).length
@@ -4257,14 +4259,22 @@ private final class CanvasPaneView: NSView {
             let isDivider = !trimmed.isEmpty && trimmed.allSatisfy { $0 == "-" || $0 == "=" }
 
             if let role = canvasHeaderRole(header) {
-                inChangedSection = role == "change"
+                currentSection = role
+                let headerColor: NSColor
+                if role == "change" {
+                    headerColor = BlueyTheme.green
+                } else if role == "annotation" {
+                    headerColor = BlueyTheme.textDim.withAlphaComponent(0.84)
+                } else {
+                    headerColor = BlueyTheme.cyan
+                }
                 output.addAttributes(
                     [
                         .font: headerFont,
-                        .foregroundColor: role == "change" ? BlueyTheme.green : BlueyTheme.cyan,
+                        .foregroundColor: headerColor,
                     ],
                     range: range)
-            } else if inChangedSection, !isDivider, range.length > 0 {
+            } else if currentSection == "change", !isDivider, range.length > 0 {
                 output.addAttribute(
                     .backgroundColor,
                     value: BlueyTheme.green.withAlphaComponent(0.08),
@@ -4276,6 +4286,21 @@ private final class CanvasPaneView: NSView {
                 } else if trimmed.hasPrefix("@@") || trimmed.hasPrefix("diff --git") {
                     output.addAttribute(.foregroundColor, value: BlueyTheme.cyan, range: range)
                 }
+            } else if currentSection == "annotation", !isDivider, range.length > 0 {
+                output.addAttribute(
+                    .foregroundColor,
+                    value: BlueyTheme.textDim.withAlphaComponent(0.82),
+                    range: range)
+                if let colon = rawLine.firstIndex(of: ":") {
+                    let prefixLength = rawLine.distance(from: rawLine.startIndex, to: colon) + 1
+                    let prefixRange = NSRange(location: location, length: prefixLength)
+                    output.addAttribute(
+                        .foregroundColor,
+                        value: BlueyTheme.textDim.withAlphaComponent(0.96),
+                        range: prefixRange)
+                }
+            } else if currentSection == "code", range.length > 0 {
+                tintCodeComment(in: rawLine, lineRange: range, output: output)
             } else if isDivider, range.length > 0 {
                 output.addAttribute(
                     .foregroundColor,
@@ -4304,7 +4329,19 @@ private final class CanvasPaneView: NSView {
             return "change"
         }
         if [
-            "CODE",
+            "LINE NOTES",
+            "LINE NOTES:",
+            "LINE-BY-LINE NOTES",
+            "LINE BY LINE NOTES",
+            "LINE ANNOTATIONS",
+            "VISUAL LINE NOTES",
+        ].contains(header) {
+            return "annotation"
+        }
+        if header == "CODE" || header.hasPrefix("CODE ") {
+            return "code"
+        }
+        if [
             "COMPLEXITY",
             "TIME",
             "SPACE",
@@ -4315,6 +4352,37 @@ private final class CanvasPaneView: NSView {
             return "section"
         }
         return nil
+    }
+
+    private func tintCodeComment(
+        in rawLine: String,
+        lineRange: NSRange,
+        output: NSMutableAttributedString
+    ) {
+        guard let commentOffset = codeCommentOffset(in: rawLine) else { return }
+        let commentLength = max(0, lineRange.length - commentOffset)
+        guard commentLength > 0 else { return }
+        output.addAttribute(
+            .foregroundColor,
+            value: BlueyTheme.textDim.withAlphaComponent(0.74),
+            range: NSRange(location: lineRange.location + commentOffset, length: commentLength))
+    }
+
+    private func codeCommentOffset(in rawLine: String) -> Int? {
+        let leading = rawLine.prefix { $0 == " " || $0 == "\t" }.count
+        let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
+        for prefix in ["//", "#", "--", "/*", "*", "*/"] where trimmed.hasPrefix(prefix) {
+            return leading
+        }
+
+        let nsLine = rawLine as NSString
+        let candidates = [" //", "\t//", " #", "\t#", " --", "\t--", " /*", "\t/*"]
+            .compactMap { marker -> Int? in
+                let found = nsLine.range(of: marker)
+                guard found.location != NSNotFound else { return nil }
+                return found.location + (marker.hasPrefix("\t") ? 1 : 1)
+            }
+        return candidates.min()
     }
 
     func setNavigation(index: Int, total: Int) {
@@ -4374,11 +4442,59 @@ private final class CanvasPaneView: NSView {
     }
 
     @objc private func copyClicked() {
-        let text = currentText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = currentCopyText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
         flashCanvasCopySuccess()
+    }
+
+    private func copyableCanvasText(for artifact: CanvasArtifact) -> String {
+        guard artifact.kind == .code else { return artifact.content }
+        return extractCodeSection(from: artifact.content) ?? artifact.content
+    }
+
+    private func extractCodeSection(from text: String) -> String? {
+        let lines = text.components(separatedBy: "\n")
+        var collecting = false
+        var waitingForDivider = false
+        var collected: [String] = []
+
+        for rawLine in lines {
+            let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            let header = trimmed.uppercased()
+            let isDivider = !trimmed.isEmpty && trimmed.allSatisfy { $0 == "-" || $0 == "=" }
+
+            if !collecting {
+                if header == "CODE" || header.hasPrefix("CODE ") {
+                    waitingForDivider = true
+                    continue
+                }
+                if waitingForDivider {
+                    if isDivider {
+                        collecting = true
+                        waitingForDivider = false
+                        continue
+                    }
+                    collecting = true
+                    waitingForDivider = false
+                } else {
+                    continue
+                }
+            }
+
+            if collecting,
+               !collected.isEmpty,
+               let role = canvasHeaderRole(header),
+               role != "code" {
+                break
+            }
+
+            collected.append(rawLine)
+        }
+
+        let code = collected.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return code.isEmpty ? nil : code
     }
 
     private func flashCanvasCopySuccess() {
