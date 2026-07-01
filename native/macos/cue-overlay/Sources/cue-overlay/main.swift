@@ -4364,6 +4364,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     let routeBadge: NSTextField
     let knowledgeBadge: ClickableHeaderBadge
     let themeButton: NSButton
+    let shortcutsButton: NSButton
     let balanceLabel: NSTextField
     let fullSizeButton: NSButton
     let interactionModeButton: NSButton
@@ -4533,6 +4534,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         routeBadge = NSTextField(labelWithString: "● Ready")
         knowledgeBadge = ClickableHeaderBadge(labelWithString: "")
         themeButton = NSButton(title: "", target: nil, action: nil)
+        shortcutsButton = NSButton(title: "", target: nil, action: nil)
         balanceLabel = NSTextField(labelWithString: "Balance --")
         fullSizeButton = NSButton(title: "", target: nil, action: nil)
         interactionModeButton = NSButton(title: "", target: nil, action: nil)
@@ -4639,6 +4641,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             routeBadge,
             knowledgeBadge,
             themeButton,
+            shortcutsButton,
             balanceLabel,
             fullSizeButton,
             interactionModeButton,
@@ -4768,6 +4771,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             knowledgeBadge,
             canvasToggleButton,
             themeButton,
+            shortcutsButton,
             balanceLabel,
             fullSizeButton,
             interactionModeButton,
@@ -5052,6 +5056,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         interactionModeButton.action = #selector(interactionModeClicked)
         themeButton.target = self
         themeButton.action = #selector(themeClicked)
+        shortcutsButton.target = self
+        shortcutsButton.action = #selector(shortcutsClicked)
         closeButton.target = self
         closeButton.action = #selector(closeClicked)
         closeConfirmCancelButton.target = self
@@ -5251,6 +5257,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         updateAutoSendModeChrome()
         refreshControlChromeForTheme()
         updateThemeButtonChrome()
+        updateShortcutsButtonChrome()
         statusLabel.textColor = themedDimTextColor
         updateBalanceLabelTone()
         transcriptStateLabel.textColor = transcriptStateLabel.stringValue == "LIVE" ? BlueyTheme.green : themedDimTextColor
@@ -5955,6 +5962,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let controls: [NSView] = [
             knowledgeBadge,
             themeButton,
+            shortcutsButton,
             navButton,
             newSessionButton,
             canvasToggleButton,
@@ -6443,6 +6451,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             knowledgeBadge,
             canvasToggleButton,
             themeButton,
+            shortcutsButton,
             balanceLabel,
             fullSizeButton,
             interactionModeButton,
@@ -6551,6 +6560,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         themeButton.frame = NSRect(x: right - 26, y: yButton + 1, width: 26, height: 26)
         right -= 33
+        shortcutsButton.frame = NSRect(x: right - 26, y: yButton + 1, width: 26, height: 26)
+        right -= 33
 
         if !canvases.isEmpty {
             canvasToggleButton.isHidden = false
@@ -6645,6 +6656,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         autoSendModeMenu.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         updateAutoSendModeChrome()
         updateThemeButtonChrome()
+        updateShortcutsButtonChrome()
 
         styleHeaderBadge(routeBadge, textColor: BlueyTheme.green)
         routeBadge.toolTip = "Auto Router classification and selected lane"
@@ -6943,6 +6955,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         autoSendModeMenu.toolTip = autoSendStopMode.tooltip
         canvasToggleButton.toolTip = "Open or collapse the canvas"
         themeButton.toolTip = lightThemeEnabled ? "Switch to dark theme" : "Switch to light theme"
+        shortcutsButton.toolTip = "Show keyboard shortcuts"
         balanceLabel.toolTip = "Remaining Bluey credits"
         fullSizeButton.toolTip = windowFullSize ? "Restore compact Bluey" : "Fill this screen"
         interactionModeButton.toolTip = passThroughMode
@@ -7148,6 +7161,19 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         needsDisplay = true
     }
 
+    @objc private func shortcutsClicked() {
+        pendingDeleteSessionId = nil
+        configureCloseConfirmForShortcutList()
+        presentConfirmationOverlay()
+        emitLifecycle("shortcuts_overlay_opened", detail: "platform=macos")
+    }
+
+    @objc private func copyShortcutsClicked() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(macShortcutHelpText, forType: .string)
+        showSystemToast(title: "Copied", body: "Keyboard shortcuts copied.", duration: 1.2)
+    }
+
     @objc private func closeClicked() {
         showTurnOffConfirmation()
     }
@@ -7164,14 +7190,62 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     func showTurnOffConfirmation() {
         pendingDeleteSessionId = nil
+        configureCloseConfirmBodyStandard()
         closeConfirmTitle.stringValue = "Turn Bluey off?"
         closeConfirmBody.stringValue = "This closes Bluey completely. To start again, run: bluey on"
+        closeConfirmCancelButton.title = "Cancel"
+        closeConfirmCancelButton.target = self
+        closeConfirmCancelButton.action = #selector(cancelCloseConfirmClicked)
+        closeConfirmCancelButton.toolTip = "Keep Bluey running"
+        styleControlButton(closeConfirmCancelButton, symbol: "xmark", accent: false)
         closeConfirmTurnOffButton.title = "Turn Off"
         closeConfirmTurnOffButton.target = self
         closeConfirmTurnOffButton.action = #selector(confirmTurnOffClicked)
         closeConfirmTurnOffButton.toolTip = "Turn Bluey off. Run bluey on to start again."
         styleControlButton(closeConfirmTurnOffButton, symbol: "power", accent: true)
         presentConfirmationOverlay()
+    }
+
+    private var macShortcutHelpText: String {
+        [
+            "Global",
+            "Ctrl+Option+B    Show or hide Bluey",
+            "Ctrl+Option+T    Focus Ask",
+            "Ctrl+Option+L    Start or stop Listen",
+            "Ctrl+Option+S    Capture screen context",
+            "Ctrl+Option+I    Toggle click-through / interactive",
+            "Ctrl+Option+Enter    Answer",
+            "",
+            "Inside Bluey, when Ask is not focused",
+            "L Listen    S Screen    I Interactive",
+            "H History    F Files    Esc Close panel",
+            "",
+            "Typing always wins inside Ask."
+        ].joined(separator: "\n")
+    }
+
+    private func configureCloseConfirmBodyStandard() {
+        closeConfirmBody.alignment = .center
+        closeConfirmBody.maximumNumberOfLines = 3
+    }
+
+    private func configureCloseConfirmForShortcutList() {
+        closeConfirmTitle.stringValue = "Keyboard shortcuts"
+        closeConfirmBody.stringValue = macShortcutHelpText
+        closeConfirmBody.alignment = .left
+        closeConfirmBody.maximumNumberOfLines = 14
+
+        closeConfirmCancelButton.title = "Done"
+        closeConfirmCancelButton.target = self
+        closeConfirmCancelButton.action = #selector(cancelCloseConfirmClicked)
+        closeConfirmCancelButton.toolTip = "Close keyboard shortcuts"
+        styleControlButton(closeConfirmCancelButton, symbol: "checkmark", accent: false)
+
+        closeConfirmTurnOffButton.title = "Copy"
+        closeConfirmTurnOffButton.target = self
+        closeConfirmTurnOffButton.action = #selector(copyShortcutsClicked)
+        closeConfirmTurnOffButton.toolTip = "Copy keyboard shortcuts"
+        styleControlButton(closeConfirmTurnOffButton, symbol: "doc.on.doc", accent: true)
     }
 
     private func presentConfirmationOverlay() {
@@ -9589,6 +9663,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         themeButton.toolTip = lightThemeEnabled ? "Switch to dark theme" : "Switch to light theme"
     }
 
+    private func updateShortcutsButtonChrome() {
+        styleHeaderIconButton(shortcutsButton, symbol: "keyboard", fallback: "K")
+        shortcutsButton.contentTintColor = lightThemeEnabled ? NSColor.black.withAlphaComponent(0.68) : BlueyTheme.cyan
+        shortcutsButton.toolTip = "Show keyboard shortcuts"
+    }
+
     private func updateInteractionModeChrome(showToast: Bool = true) {
         let symbol = passThroughMode ? "cursorarrow.rays" : "hand.tap"
         let fallback = passThroughMode ? "P" : "I"
@@ -10977,8 +11057,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         guard sender.tag >= 0, sender.tag < sessionItems.count else { return }
         let session = sessionItems[sender.tag]
         pendingDeleteSessionId = session.id
+        configureCloseConfirmBodyStandard()
         closeConfirmTitle.stringValue = "Delete recording?"
         closeConfirmBody.stringValue = "Remove \"\(session.title)\" from this device. This cannot be undone."
+        closeConfirmCancelButton.title = "Cancel"
+        closeConfirmCancelButton.target = self
+        closeConfirmCancelButton.action = #selector(cancelCloseConfirmClicked)
+        closeConfirmCancelButton.toolTip = "Keep this recording"
+        styleControlButton(closeConfirmCancelButton, symbol: "xmark", accent: false)
         closeConfirmTurnOffButton.title = "Delete"
         closeConfirmTurnOffButton.target = self
         closeConfirmTurnOffButton.action = #selector(confirmDeleteSessionClicked)

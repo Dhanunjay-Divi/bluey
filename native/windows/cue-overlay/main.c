@@ -63,6 +63,7 @@ static HWND g_attach_button;
 static HWND g_recap_button;
 static HWND g_note_button;
 static HWND g_theme_button;
+static HWND g_shortcuts_button;
 static HWND g_close_button;
 static HWND g_tooltip;
 static wchar_t g_title[256] = L"bluey";
@@ -195,6 +196,7 @@ static void consume_sent_context_chips(void);
 #define ID_CLOSE_BUTTON 1010
 #define ID_RECAP_BUTTON 1011
 #define ID_THEME_BUTTON 1012
+#define ID_SHORTCUTS_BUTTON 1016
 #define COLLAPSED_DRAG_THRESHOLD 4
 #define ID_HOTKEY_TOGGLE_OVERLAY 2001
 #define ID_HOTKEY_FOCUS_ASK 2002
@@ -297,6 +299,7 @@ static void configure_tooltips(void) {
     add_control_tooltip(g_recap_button, L"Create a recap for this recording");
     add_control_tooltip(g_note_button, L"Set how Bluey should answer");
     add_control_tooltip(g_theme_button, L"Toggle light or dark theme");
+    add_control_tooltip(g_shortcuts_button, L"Show keyboard shortcuts");
     add_control_tooltip(g_close_button, L"Turn Bluey off");
 }
 
@@ -815,7 +818,7 @@ static void set_controls_visible(bool visible) {
     int state = visible ? SW_SHOW : SW_HIDE;
     HWND controls[] = {
         g_ask_edit, g_send_button, g_record_button, g_auto_send_combo, g_paste_answer_button, g_help_button, g_session_button,
-        g_page_button, g_attach_button, g_recap_button, g_note_button, g_theme_button, g_close_button
+        g_page_button, g_attach_button, g_recap_button, g_note_button, g_theme_button, g_shortcuts_button, g_close_button
     };
     for (int i = 0; i < (int)(sizeof(controls) / sizeof(controls[0])); i++) {
         if (controls[i]) ShowWindow(controls[i], state);
@@ -1179,10 +1182,11 @@ static void layout_controls(void) {
     int header_h = 30;
     MoveWindow(g_close_button, header_right - margin - 62, header_y + 4, 62, header_h, TRUE);
     MoveWindow(g_note_button, header_right - margin - 62 - small_w - 8, header_y + 4, small_w, header_h, TRUE);
-    MoveWindow(g_theme_button, header_right - margin - 62 - (small_w + 8) * 2, header_y + 4, small_w, header_h, TRUE);
-    MoveWindow(g_attach_button, header_right - margin - 62 - (small_w + 8) * 3, header_y + 4, small_w, header_h, TRUE);
-    MoveWindow(g_session_button, header_right - margin - 62 - (small_w + 8) * 4, header_y + 4, small_w, header_h, TRUE);
-    MoveWindow(g_help_button, header_right - margin - 62 - (small_w + 8) * 5, header_y + 4, small_w, header_h, TRUE);
+    MoveWindow(g_shortcuts_button, header_right - margin - 62 - (small_w + 8) * 2, header_y + 4, small_w, header_h, TRUE);
+    MoveWindow(g_theme_button, header_right - margin - 62 - (small_w + 8) * 3, header_y + 4, small_w, header_h, TRUE);
+    MoveWindow(g_attach_button, header_right - margin - 62 - (small_w + 8) * 4, header_y + 4, small_w, header_h, TRUE);
+    MoveWindow(g_session_button, header_right - margin - 62 - (small_w + 8) * 5, header_y + 4, small_w, header_h, TRUE);
+    MoveWindow(g_help_button, header_right - margin - 62 - (small_w + 8) * 6, header_y + 4, small_w, header_h, TRUE);
 
     int transcript_right = rect.right - 18;
     int transcript_bottom = rect.bottom - 132;
@@ -1216,6 +1220,7 @@ static bool point_hits_overlay_control(POINT point) {
         g_recap_button,
         g_note_button,
         g_theme_button,
+        g_shortcuts_button,
         g_close_button,
     };
     for (size_t i = 0; i < sizeof(controls) / sizeof(controls[0]); i++) {
@@ -1326,12 +1331,14 @@ static void create_controls(HWND hwnd) {
         0, 0, 60, 30, hwnd, (HMENU)ID_NOTE_BUTTON, GetModuleHandleW(NULL), NULL);
     g_theme_button = CreateWindowW(L"BUTTON", L"Theme", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
         0, 0, 60, 30, hwnd, (HMENU)ID_THEME_BUTTON, GetModuleHandleW(NULL), NULL);
+    g_shortcuts_button = CreateWindowW(L"BUTTON", L"Keys", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
+        0, 0, 60, 30, hwnd, (HMENU)ID_SHORTCUTS_BUTTON, GetModuleHandleW(NULL), NULL);
     g_close_button = CreateWindowW(L"BUTTON", L"Quit", WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
         0, 0, 60, 30, hwnd, (HMENU)ID_CLOSE_BUTTON, GetModuleHandleW(NULL), NULL);
 
     HWND controls[] = {
         g_ask_edit, g_send_button, g_record_button, g_auto_send_combo, g_transcript_clear_button, g_paste_answer_button, g_help_button, g_session_button,
-        g_page_button, g_attach_button, g_recap_button, g_note_button, g_theme_button, g_close_button
+        g_page_button, g_attach_button, g_recap_button, g_note_button, g_theme_button, g_shortcuts_button, g_close_button
     };
     for (int i = 0; i < (int)(sizeof(controls) / sizeof(controls[0])); i++) {
         SendMessageW(controls[i], WM_SETFONT, (WPARAM)font, TRUE);
@@ -2426,10 +2433,29 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         }
         if (id == ID_HELP_BUTTON) {
             overlay_message_box(
-                L"Green dot: Bluey is connected.\nHelp: show this guide.\nSession: continue or start clean.\nAttach: add files or show attached docs.\nTheme: switch black/white background while keeping Bluey borders.\nStyle: answer rules.\nAnalyse Screen: search/read the active browser page or available screen context and generate an answer.\nRecap: summarize the active session from the bottom bar.\nQuit: stop Bluey completely. Hide/collapse behavior becomes a small Bluey button.\nMic: start/stop audio capture.\nMic dot: dim off, bright green recording.\nAnswer: ask Bluey.\nCtrl+Alt+B shows or hides Bluey. Ctrl+Alt+T focuses Ask. Ctrl+Alt+L/S/I/Enter controls Listen, Screen, Interactive, and Answer.\nWhen Interactive is on, blank Bluey space drags the window. When click-through is on, blank Bluey space clicks the app behind it.",
+                L"Green dot: Bluey is connected.\nHelp: show this guide.\nKeys: show keyboard shortcuts.\nSession: continue or start clean.\nAttach: add files or show attached docs.\nTheme: switch black/white background while keeping Bluey borders.\nStyle: answer rules.\nAnalyse Screen: search/read the active browser page or available screen context and generate an answer.\nRecap: summarize the active session from the bottom bar.\nQuit: stop Bluey completely. Hide/collapse behavior becomes a small Bluey button.\nMic: start/stop audio capture.\nMic dot: dim off, bright green recording.\nAnswer: ask Bluey.\nWhen Interactive is on, blank Bluey space drags the window. When click-through is on, blank Bluey space clicks the app behind it.",
                 L"Bluey controls",
                 MB_OK | MB_ICONINFORMATION
             );
+            return 0;
+        }
+        if (id == ID_SHORTCUTS_BUTTON) {
+            overlay_message_box(
+                L"Global\n"
+                L"Ctrl+Alt+B    Show or hide Bluey\n"
+                L"Ctrl+Alt+T    Focus Ask\n"
+                L"Ctrl+Alt+L    Start or stop Listen\n"
+                L"Ctrl+Alt+S    Capture screen context\n"
+                L"Ctrl+Alt+I    Toggle click-through / interactive\n"
+                L"Ctrl+Alt+Enter    Answer\n\n"
+                L"Inside Bluey, when Ask is not focused\n"
+                L"L Listen    S Screen    I Interactive\n"
+                L"H History    F Files    Esc Collapse\n\n"
+                L"Typing always wins inside Ask.",
+                L"Keyboard shortcuts",
+                MB_OK | MB_ICONINFORMATION
+            );
+            emit_lifecycle_event("shortcuts_overlay_opened", "ok", "platform=windows");
             return 0;
         }
         if (id == ID_RECAP_BUTTON) {

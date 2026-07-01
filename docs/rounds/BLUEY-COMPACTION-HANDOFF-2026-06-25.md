@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 00:00 EDT
+Latest checkpoint: 2026-07-01 00:38 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,31 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-266-SHORTCUTS-OVERLAY-PARITY.md`; the next canonical Bluey round doc should start at `ROUND-267-...`.
+- Latest assigned Bluey round doc is `ROUND-267-KEYBOARD-SHORTCUTS-DISCLOSURE.md`; the next canonical Bluey round doc should start at `ROUND-268-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 267 added a visible keyboard/shortcuts entry point:
+  - macOS header now has a keyboard icon beside the theme icon
+  - macOS opens an in-overlay shortcuts panel with `Ctrl+Option`
+    shortcuts and local `L/S/I/H/F/Esc` rules
+  - macOS panel includes a Copy action
+  - Windows header now has a `Keys` button beside Theme
+  - Windows `Keys` dialog lists `Ctrl+Alt` shortcuts and local
+    `L/S/I/H/F/Esc` rules
+  - Windows Help copy now points to Keys for shortcuts
+  - macOS overlay was rebuilt, hot-installed, signed, and restarted locally
+  - live macOS check verified `Ctrl+Option+B` toggles `overlay_visible`
+    false/true through `System Events`
+  - safe macOS checks exercised `Ctrl+Option+I` twice and
+    `Ctrl+Option+Enter` on an empty session without creating transcript or
+    context rows
+  - AX focus probe for `Ctrl+Option+T` was blocked with `AX` error `-25204`,
+    so focus should still be manually confirmed in the visible overlay
+  - Round doc:
+    `docs/rounds/ROUND-267-KEYBOARD-SHORTCUTS-DISCLOSURE.md`
 - Round 266 unified the shortcut model across macOS and Windows:
   - global shortcut family is now `Ctrl+Option+key` on macOS and
     `Ctrl+Alt+key` on Windows
