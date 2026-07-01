@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 06:09 EDT
+Latest checkpoint: 2026-07-01 06:43 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,48 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-276-REMOVE-LEGACY-H-HIDE-TOAST.md`; the next canonical Bluey round doc should start at `ROUND-277-...`.
+- Latest assigned Bluey round doc is `ROUND-277-SHORTCUTS-FOCUS-DRAG-POLISH.md`; the next canonical Bluey round doc should start at `ROUND-278-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 277 polished shortcut help, focus, and drag behavior:
+  - macOS shortcut sheet now uses attributed text with shortcut keys in accent color and actions in primary text color
+  - click-through on shows global shortcuts only
+  - click-through off shows inside-Bluey shortcuts for when Ask is not focused, plus the global shortcuts
+  - `H` is only an inside-Bluey History shortcut; there is no `Ctrl+Option+H` global History shortcut
+  - `Ctrl+Option+Enter` is documented as global Answer
+  - `Enter` is documented as inside-Bluey Answer, with `Shift+Enter` for a new Ask line
+  - shortcut sheet Done button is centered and the panel is wider
+  - clicking outside Ask clears Ask focus
+  - feed answer text is no longer selectable, so blank/feed space can drag the overlay in click-through-off mode; copy buttons remain the answer-copy path
+  - Windows shortcut help copy now matches the same mode split
+  - Windows single-letter local shortcuts now require interactive/click-through-off mode
+  - Windows clears Ask focus when clicking outside the Ask control
+  - desktop workspace version bumped to `0.1.31`
+  - verification passed:
+    - `swift build -c debug --package-path native/macos/cue-overlay`
+    - `/opt/homebrew/bin/x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c`
+    - `git diff --check`
+    - `cargo check -p cue-daemon --offline`
+    - `cargo check -p cue-dashboard --locked`
+    - `cargo test -p cue-daemon --lib --locked`
+    - `cargo test -p cue-core sign_in_event_serializes --locked`
+  - release artifact dev-flag/secret scan passed
+  - live artifact:
+    `https://bluey.sh/releases/v0.1.31/bluey-0.1.31-darwin-arm64.tar.gz`
+  - live SHA256:
+    `698e885a66fc60e35c84f85053200cb45aa837af2f44b5d5962ca04ade133e8a`
+  - live `https://bluey.sh/latest.json` reports `0.1.31`
+  - `latest.json.sig` verified successfully
+  - `https://bluey.sh/install.sh` serves `application/x-shellscript`
+  - local install updated to `bluey 0.1.31` and restarted with `overlay_capture_excluded: true`
+  - local shortcut smoke:
+    - `Ctrl+Option+B` restored from collapsed state
+    - `Ctrl+Option+H` did not change Bluey overlay state
+  - Round doc:
+    `docs/rounds/ROUND-277-SHORTCUTS-FOCUS-DRAG-POLISH.md`
 - Round 276 removed the legacy `Ctrl+Option+H`/full-hide confusion:
   - dashboard no longer registers `Ctrl+Alt+H` / `Ctrl+Option+H` as a global overlay toggle
   - `H` remains only as an inside-overlay History shortcut when the native overlay is interactive and Ask is not focused

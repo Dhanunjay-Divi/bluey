@@ -2476,29 +2476,33 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         }
         if (id == ID_SHORTCUTS_BUTTON) {
             const wchar_t *shortcut_body = g_interactive_mode
-                ? L"Interactive is on\n"
-                  L"Global shortcuts work from anywhere:\n\n"
-                  L"Ctrl+Alt+B    Minimize to pill / restore\n"
-                  L"Ctrl+Alt+T    Text input\n"
-                  L"Ctrl+Alt+L    Start or stop Listen\n"
-                  L"Ctrl+Alt+S    Capture screen context\n"
-                  L"Ctrl+Alt+I    Toggle click-through / interactive\n"
-                  L"Ctrl+Alt+Enter    Answer\n\n"
-                  L"Optional inside Bluey, when Ask is not focused:\n"
-                  L"T Text input    L Listen    S Screen\n"
-                  L"I Interactive    H History    F Files\n"
-                  L"Esc Collapse\n\n"
-                  L"Typing in Ask always wins."
+                ? L"Click-through is off\n"
+                  L"Inside Bluey works when Ask is not focused:\n\n"
+                  L"T                  Text input\n"
+                  L"L                  Start or stop Listen\n"
+                  L"S                  Capture screen context\n"
+                  L"I                  Toggle click-through\n"
+                  L"H                  History\n"
+                  L"F                  Files\n"
+                  L"Enter              Answer\n"
+                  L"Esc                Close panel\n\n"
+                  L"Global shortcuts also work from anywhere:\n"
+                  L"Ctrl+Alt+B         Minimize to pill / restore\n"
+                  L"Ctrl+Alt+T         Text input\n"
+                  L"Ctrl+Alt+L         Start or stop Listen\n"
+                  L"Ctrl+Alt+S         Capture screen context\n"
+                  L"Ctrl+Alt+I         Toggle click-through\n"
+                  L"Ctrl+Alt+Enter     Answer\n\n"
+                  L"Ask focused: type normally. Enter answers. Shift+Enter adds a new line."
                 : L"Click-through is on\n"
-                  L"Blank Bluey space passes clicks to the app behind it.\n"
-                  L"Use global shortcuts from anywhere:\n\n"
-                  L"Ctrl+Alt+B    Minimize to pill / restore\n"
-                  L"Ctrl+Alt+T    Text input\n"
-                  L"Ctrl+Alt+L    Start or stop Listen\n"
-                  L"Ctrl+Alt+S    Capture screen context\n"
-                  L"Ctrl+Alt+I    Toggle click-through / interactive\n"
-                  L"Ctrl+Alt+Enter    Answer\n\n"
-                  L"If a shortcut is taken by the system, Bluey keeps the buttons available.";
+                  L"Blank Bluey space clicks the app behind it. Use global shortcuts:\n\n"
+                  L"Ctrl+Alt+B         Minimize to pill / restore\n"
+                  L"Ctrl+Alt+T         Text input\n"
+                  L"Ctrl+Alt+L         Start or stop Listen\n"
+                  L"Ctrl+Alt+S         Capture screen context\n"
+                  L"Ctrl+Alt+I         Toggle click-through\n"
+                  L"Ctrl+Alt+Enter     Answer\n\n"
+                  L"If a global shortcut is unavailable, Bluey still keeps the visible buttons clickable.";
             overlay_message_box(
                 shortcut_body,
                 L"Keyboard shortcuts",
@@ -2577,6 +2581,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             GetWindowRect(hwnd, &g_collapsed_drag_rect);
             SetCapture(hwnd);
             return 0;
+        }
+        if (GetFocus() == g_ask_edit) {
+            POINT point;
+            GetCursorPos(&point);
+            if (!point_hits_visible_child(g_ask_edit, point, 0)) {
+                SetFocus(hwnd);
+            }
         }
         break;
     case WM_MOUSEMOVE:
@@ -2659,12 +2670,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         bool edit_focused = GetFocus() == g_ask_edit;
-        if (!edit_focused && !ctrl && !alt && !shift) {
+        if (g_interactive_mode && !edit_focused && !ctrl && !alt && !shift) {
             if (handle_overlay_shortcut_key(wparam, true)) {
                 return 0;
             }
         }
-        if (!edit_focused && ctrl && !alt && !shift) {
+        if (g_interactive_mode && !edit_focused && ctrl && !alt && !shift) {
             if (wparam == VK_RETURN || wparam == 'L' || wparam == 'S' || wparam == 'I') {
                 if (handle_overlay_shortcut_key(wparam, true)) {
                     return 0;

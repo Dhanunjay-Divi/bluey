@@ -895,8 +895,8 @@ private final class ComposerTextView: NSTextView {
             if event.modifierFlags.contains(.shift) {
                 insertNewline(nil)
             } else {
-                // Enter submits. Cmd+Enter is shown as the explicit shortcut,
-                // and Shift+Enter keeps a multiline thought inside the composer.
+                // Enter submits in Bluey; Shift+Enter keeps a multiline thought
+                // inside the composer. Ctrl+Option+Enter is the global answer hotkey.
                 onSubmit?()
             }
             return
@@ -3126,7 +3126,7 @@ private final class FeedView: NSView {
         bodyLabel.alignment = signInURL == nil ? .left : .center
         bodyLabel.translatesAutoresizingMaskIntoConstraints = false
         bodyLabel.preferredMaxLayoutWidth = signInURL == nil ? (rightAligned ? 360 : 480) : 430
-        bodyLabel.isSelectable = signInURL == nil
+        bodyLabel.isSelectable = false
         bodyLabel.allowsEditingTextAttributes = false
         if let attributedBody = attributedChatBody(for: card, text: bodyText, rightAligned: rightAligned) {
             bodyLabel.attributedStringValue = attributedBody
@@ -4469,6 +4469,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var passThroughMode = true
     private var signedOutGateActive = false
     private var headerDragInProgress = false
+    private var closeConfirmPanelWidthConstraint: NSLayoutConstraint?
+    private var closeConfirmCancelLeadingConstraint: NSLayoutConstraint?
+    private var closeConfirmCancelCenterXConstraint: NSLayoutConstraint?
     private struct ResizeEdges: OptionSet {
         let rawValue: Int
         static let left = ResizeEdges(rawValue: 1 << 0)
@@ -4785,6 +4788,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let sessionDrawerLeading = sessionDrawer.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 18)
         let sessionDrawerWidth = sessionDrawer.widthAnchor.constraint(equalToConstant: 360)
         let sessionDrawerHeight = sessionDrawer.heightAnchor.constraint(equalToConstant: 420)
+        let closeConfirmPanelWidth = closeConfirmPanel.widthAnchor.constraint(equalToConstant: 360)
+        let closeConfirmCancelLeading = closeConfirmCancelButton.leadingAnchor.constraint(equalTo: closeConfirmPanel.leadingAnchor, constant: 18)
+        let closeConfirmCancelCenterX = closeConfirmCancelButton.centerXAnchor.constraint(equalTo: closeConfirmPanel.centerXAnchor)
         composerTextHeightConstraint = composerTextHeight
         composerDocumentHeightConstraint = composerDocumentHeight
         composerBarHeightConstraint = composerBarHeight
@@ -4793,6 +4799,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         sessionDrawerLeadingConstraint = sessionDrawerLeading
         sessionDrawerWidthConstraint = sessionDrawerWidth
         sessionDrawerHeightConstraint = sessionDrawerHeight
+        closeConfirmPanelWidthConstraint = closeConfirmPanelWidth
+        closeConfirmCancelLeadingConstraint = closeConfirmCancelLeading
+        closeConfirmCancelCenterXConstraint = closeConfirmCancelCenterX
+        closeConfirmCancelCenterX.isActive = false
 
         NSLayoutConstraint.activate([
             headerWordmark.widthAnchor.constraint(equalToConstant: 62),
@@ -4986,7 +4996,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
             closeConfirmPanel.centerXAnchor.constraint(equalTo: workspace.centerXAnchor),
             closeConfirmPanel.centerYAnchor.constraint(equalTo: workspace.centerYAnchor),
-            closeConfirmPanel.widthAnchor.constraint(equalToConstant: 360),
+            closeConfirmPanelWidth,
 
             closeConfirmTitle.topAnchor.constraint(equalTo: closeConfirmPanel.topAnchor, constant: 18),
             closeConfirmTitle.leadingAnchor.constraint(equalTo: closeConfirmPanel.leadingAnchor, constant: 18),
@@ -4997,7 +5007,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             closeConfirmBody.trailingAnchor.constraint(equalTo: closeConfirmTitle.trailingAnchor),
 
             closeConfirmCancelButton.topAnchor.constraint(equalTo: closeConfirmBody.bottomAnchor, constant: 18),
-            closeConfirmCancelButton.leadingAnchor.constraint(equalTo: closeConfirmPanel.leadingAnchor, constant: 18),
+            closeConfirmCancelLeading,
             closeConfirmCancelButton.bottomAnchor.constraint(equalTo: closeConfirmPanel.bottomAnchor, constant: -18),
             closeConfirmCancelButton.widthAnchor.constraint(equalToConstant: 150),
             closeConfirmCancelButton.heightAnchor.constraint(equalToConstant: 34),
@@ -5393,6 +5403,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             if isHeaderMoveHandleHit(at: point) {
                 return self
             }
+            blurComposerIfFocused()
             return nil
         }
         if let hit = super.hitTest(point), isExplicitInteractiveHit(hit) {
@@ -5427,6 +5438,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 return
             }
         }
+        blurComposerIfFocused()
         if passThroughMode {
             let edges = resizeEdges(at: localPoint)
             if !edges.isEmpty, let window {
@@ -6109,6 +6121,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func beginHeaderDrag(with event: NSEvent) {
         headerDragInProgress = true
+        blurComposerIfFocused()
         window?.makeKey()
         defer {
             headerDragInProgress = false
@@ -6117,6 +6130,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if let window {
             onWindowFrameChanged?(window.frame)
         }
+    }
+
+    private func blurComposerIfFocused() {
+        guard window?.firstResponder === composer else { return }
+        composerInputArmedUntil = 0
+        window?.makeFirstResponder(nil)
     }
 
     private func beginResize(edges: ResizeEdges, window: NSWindow) {
@@ -6997,8 +7016,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func configureTooltips() {
-        headerBar.toolTip = passThroughMode ? "Drag the Bluey logo or name to move Bluey" : "Drag this bar to move Bluey"
-        headerChrome.toolTip = passThroughMode ? "Blank header space clicks through" : "Drag this bar to move Bluey"
+        headerBar.toolTip = passThroughMode ? "Drag the Bluey logo or name to move Bluey" : "Drag blank Bluey space to move"
+        headerChrome.toolTip = passThroughMode ? "Blank header space clicks through" : "Drag blank Bluey space to move"
         headerLogo.toolTip = "Bluey"
         headerWordmark.toolTip = "Bluey"
         navButton.toolTip = "Open or close conversation history"
@@ -7253,42 +7272,91 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         presentConfirmationOverlay()
     }
 
-    private var macShortcutHelpText: String {
-        let globalLines = [
-            "Ctrl+Option+B    Minimize to pill / restore",
-            "Ctrl+Option+T    Text input",
-            "Ctrl+Option+L    Start or stop Listen",
-            "Ctrl+Option+S    Capture screen context",
-            "Ctrl+Option+I    Toggle click-through / interactive",
-            "Ctrl+Option+Enter    Answer",
-        ]
-        if passThroughMode {
-            return ([
-                "Click-through is on",
-                "Blank Bluey space passes clicks to the app behind it.",
-                "Use global shortcuts from anywhere:",
-                "",
-            ] + globalLines + [
-                "",
-                "If a shortcut is taken by the system, Bluey keeps the buttons available.",
-            ]).joined(separator: "\n")
+    private var macShortcutHelpText: NSAttributedString {
+        let result = NSMutableAttributedString()
+        let keyColor = lightThemeEnabled ? BlueyLightTheme.accent : BlueyTheme.cyan
+        let titleColor = lightThemeEnabled ? BlueyLightTheme.text : BlueyTheme.text
+        let actionColor = lightThemeEnabled ? BlueyLightTheme.text : NSColor.white.withAlphaComponent(0.94)
+        let mutedColor = lightThemeEnabled ? BlueyLightTheme.textDim : BlueyTheme.textDim
+        let titleFont = NSFont.systemFont(ofSize: 12.8, weight: .bold)
+        let noteFont = NSFont.systemFont(ofSize: 11.6, weight: .medium)
+        let keyFont = NSFont.monospacedSystemFont(ofSize: 11.6, weight: .semibold)
+        let actionFont = NSFont.systemFont(ofSize: 11.6, weight: .semibold)
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.alignment = .left
+        paragraph.lineSpacing = 2.5
+
+        func attributes(font: NSFont, color: NSColor) -> [NSAttributedString.Key: Any] {
+            [
+                .font: font,
+                .foregroundColor: color,
+                .paragraphStyle: paragraph,
+            ]
         }
-        return ([
-            "Interactive is on",
-            "Global shortcuts work from anywhere:",
-            "",
-        ] + globalLines + [
-            "",
-            "Optional inside Bluey, when Ask is not focused:",
-            "T Text input    L Listen    S Screen",
-            "I Interactive    H History    F Files",
-            "Esc Close panel",
-            "",
-            "Typing in Ask always wins.",
-        ]).joined(separator: "\n")
+
+        func appendLine(_ text: String = "", font: NSFont = noteFont, color: NSColor = mutedColor) {
+            result.append(NSAttributedString(
+                string: text + "\n",
+                attributes: attributes(font: font, color: color)))
+        }
+
+        func appendShortcut(_ shortcut: String, _ action: String) {
+            let paddedShortcut = shortcut.padding(toLength: 18, withPad: " ", startingAt: 0)
+            result.append(NSAttributedString(
+                string: paddedShortcut,
+                attributes: attributes(font: keyFont, color: keyColor)))
+            result.append(NSAttributedString(
+                string: action + "\n",
+                attributes: attributes(font: actionFont, color: actionColor)))
+        }
+
+        let globalShortcuts = [
+            ("Ctrl+Option+B", "Minimize to pill / restore"),
+            ("Ctrl+Option+T", "Text input"),
+            ("Ctrl+Option+L", "Start or stop Listen"),
+            ("Ctrl+Option+S", "Capture screen context"),
+            ("Ctrl+Option+I", "Toggle click-through"),
+            ("Ctrl+Option+Enter", "Answer"),
+        ]
+        let insideBlueyShortcuts = [
+            ("T", "Text input"),
+            ("L", "Start or stop Listen"),
+            ("S", "Capture screen context"),
+            ("I", "Toggle click-through"),
+            ("H", "History"),
+            ("F", "Files"),
+            ("Enter", "Answer"),
+            ("Esc", "Close panel"),
+        ]
+
+        if passThroughMode {
+            appendLine("Click-through is on", font: titleFont, color: titleColor)
+            appendLine("Blank Bluey space clicks the app behind it. Use global shortcuts:")
+            appendLine()
+            globalShortcuts.forEach { appendShortcut($0.0, $0.1) }
+            appendLine()
+            appendLine("If a shortcut is unavailable, Bluey still keeps the visible buttons clickable.")
+            return result
+        }
+
+        appendLine("Click-through is off", font: titleFont, color: titleColor)
+        appendLine("Inside Bluey works when Ask is not focused:")
+        appendLine()
+        insideBlueyShortcuts.forEach { appendShortcut($0.0, $0.1) }
+        appendLine()
+        appendLine("Global shortcuts also work from anywhere:")
+        globalShortcuts.forEach { appendShortcut($0.0, $0.1) }
+        appendLine()
+        appendLine("Ask focused: type normally. Enter answers. Shift+Enter adds a new line.")
+        return result
     }
 
     private func configureCloseConfirmBodyStandard() {
+        closeConfirmPanelWidthConstraint?.constant = 360
+        closeConfirmCancelCenterXConstraint?.isActive = false
+        closeConfirmCancelLeadingConstraint?.isActive = true
+        closeConfirmBody.font = NSFont.systemFont(ofSize: 12.5, weight: .medium)
+        closeConfirmBody.textColor = lightThemeEnabled ? BlueyLightTheme.textDim : BlueyTheme.textDim
         closeConfirmBody.alignment = .center
         closeConfirmBody.maximumNumberOfLines = 3
         closeConfirmTurnOffButton.isHidden = false
@@ -7297,15 +7365,18 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func configureCloseConfirmForShortcutList() {
         closeConfirmTitle.stringValue = "Keyboard shortcuts"
-        closeConfirmBody.stringValue = macShortcutHelpText
+        closeConfirmPanelWidthConstraint?.constant = 430
+        closeConfirmCancelLeadingConstraint?.isActive = false
+        closeConfirmCancelCenterXConstraint?.isActive = true
+        closeConfirmBody.attributedStringValue = macShortcutHelpText
         closeConfirmBody.alignment = .left
-        closeConfirmBody.maximumNumberOfLines = 18
+        closeConfirmBody.maximumNumberOfLines = 24
 
         closeConfirmCancelButton.title = "Done"
         closeConfirmCancelButton.target = self
         closeConfirmCancelButton.action = #selector(cancelCloseConfirmClicked)
         closeConfirmCancelButton.toolTip = "Close keyboard shortcuts"
-        styleControlButton(closeConfirmCancelButton, symbol: "checkmark", accent: false)
+        styleControlButton(closeConfirmCancelButton, symbol: "checkmark", accent: true)
 
         closeConfirmTurnOffButton.isHidden = true
         closeConfirmTurnOffButton.isEnabled = false
