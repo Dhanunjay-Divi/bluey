@@ -5540,7 +5540,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if flags.contains(.control) || flags.contains(.option) {
             return false
         }
-        focusComposerForInput()
+        let composerAlreadyFocused = window?.firstResponder === composer
+        if !composerAlreadyFocused {
+            focusComposerForInput()
+        }
         if flags.contains(.command) {
             switch key {
             case "a":
@@ -5567,12 +5570,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return true
         }
 
-        if event.keyCode == 51 {
-            composer.deleteBackwardPlainText()
-            return true
-        }
-
-        if event.keyCode == 36 || event.keyCode == 76 {
+        if isComposerEditingKey(event.keyCode) {
             composer.keyDown(with: event)
             return true
         }
@@ -5584,6 +5582,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         composer.keyDown(with: event)
         return true
+    }
+
+    private func isComposerEditingKey(_ keyCode: UInt16) -> Bool {
+        switch keyCode {
+        case 36, 51, 76, 115, 116, 117, 119, 121, 123, 124, 125, 126:
+            return true
+        default:
+            return false
+        }
     }
 
     @discardableResult
@@ -5601,15 +5608,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             && !flags.contains(.shift)
 
         if controlOption {
-            if performBlueyShortcut(key: key, isReturn: isReturn, source: source, allowFocusShortcut: true) {
-                return true
-            }
+            return performModifiedBlueyShortcut(key: key, isReturn: isReturn, source: source)
         }
 
         if localControl {
-            if performBlueyShortcut(key: key, isReturn: isReturn, source: source, allowFocusShortcut: true) {
-                return true
-            }
+            return false
         }
 
         guard source == "local",
@@ -5625,6 +5628,40 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         guard !passThroughMode else { return false }
         return performBlueyShortcut(key: key, isReturn: isReturn, source: source, allowFocusShortcut: false)
+    }
+
+    @discardableResult
+    private func performModifiedBlueyShortcut(
+        key: String,
+        isReturn: Bool,
+        source: String
+    ) -> Bool {
+        if isReturn {
+            askClicked()
+            emitLifecycle("shortcut_invoked", detail: "source=\(source) action=answer")
+            return true
+        }
+
+        switch key {
+        case "t":
+            focusComposerForQuestion()
+            emitLifecycle("shortcut_invoked", detail: "source=\(source) action=text_input")
+            return true
+        case "l":
+            recordingClicked()
+            emitLifecycle("shortcut_invoked", detail: "source=\(source) action=listen")
+            return true
+        case "s":
+            analyzeClicked()
+            emitLifecycle("shortcut_invoked", detail: "source=\(source) action=screen")
+            return true
+        case "i":
+            interactionModeClicked()
+            emitLifecycle("shortcut_invoked", detail: "source=\(source) action=interactive")
+            return true
+        default:
+            return false
+        }
     }
 
     private var isTextEditingResponderActive: Bool {
@@ -11981,21 +12018,44 @@ private final class OverlayApp {
             expandAndFocusQuestion()
             emitLifecycle("shortcut_invoked", detail: "source=global action=text_input")
             return true
-        default:
-            break
-        }
-
-        guard expandedModeActive,
-              expandedWindow?.isVisible == true,
-              let expandedView
-        else {
-            return false
-        }
-        if expandedView.routeBlueyShortcut(event, source: "global") {
+        case "l":
+            guard expandedModeActive, expandedWindow?.isVisible == true else {
+                expand()
+                return true
+            }
+            expandedView?.invokeListenShortcut()
             updateExpandedMousePolicy()
+            emitLifecycle("shortcut_invoked", detail: "source=global action=listen")
+            return true
+        case "s":
+            guard expandedModeActive, expandedWindow?.isVisible == true else {
+                expand()
+                return true
+            }
+            expandedView?.invokeScreenShortcut()
+            updateExpandedMousePolicy()
+            emitLifecycle("shortcut_invoked", detail: "source=global action=screen")
+            return true
+        case "i":
+            guard expandedModeActive, expandedWindow?.isVisible == true else {
+                expand()
+                return true
+            }
+            expandedView?.invokeInteractiveShortcut()
+            updateExpandedMousePolicy()
+            emitLifecycle("shortcut_invoked", detail: "source=global action=interactive")
+            return true
+        default:
+            let isReturn = event.keyCode == 36 || event.keyCode == 76 || key == "\r" || key == "\n"
+            guard isReturn else { return false }
+            guard expandedModeActive, expandedWindow?.isVisible == true else {
+                expandAndFocusQuestion()
+                return true
+            }
+            expandedView?.invokeAnswerShortcut()
+            emitLifecycle("shortcut_invoked", detail: "source=global action=answer")
             return true
         }
-        return false
     }
 
     private func bringPillToFront(force: Bool = false) {

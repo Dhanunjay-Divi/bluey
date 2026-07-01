@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 03:26 EDT
+Latest checkpoint: 2026-07-01 03:48 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,34 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-271-SHORTCUT-MODE-GUIDANCE-RELEASE-GUARD.md`; the next canonical Bluey round doc should start at `ROUND-272-...`.
+- Latest assigned Bluey round doc is `ROUND-272-KEYBOARD-EDITING-SHORTCUT-SCOPE.md`; the next canonical Bluey round doc should start at `ROUND-273-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 272 fixed macOS keyboard editing and shortcut scope:
+  - `Ctrl+Option+H` and other unassigned modified keys no longer route into old inside-Bluey shortcuts
+  - official macOS global shortcuts are now limited to `Ctrl+Option+B/T/L/S/I/Enter`
+  - local `Ctrl+<key>` no longer triggers optional inside-Bluey shortcuts
+  - Ask no longer refocuses/re-arms the caret when already focused, so `Cmd+A` then Delete can clear selected text normally
+  - Delete, Return, Home/End, Page Up/Down, and arrow keys are forwarded to the composer text view for normal editing behavior
+  - Enter still submits while Ask is focused; from outside Ask the intended global answer shortcut is `Ctrl+Option+Enter`
+  - Windows parity checked: Windows already only registers `Ctrl+Alt+B/T/L/S/I/Enter`, and Ask edit requests arrow handling with `DLGC_WANTARROWS`
+  - desktop workspace version bumped to `0.1.26`
+  - live artifact:
+    `dist/bluey-0.1.26-darwin-arm64.tar.gz`
+  - live SHA256:
+    `697bde7408e8a6a06927bbe6f810b923f02d9eccce1f3fe420ac541a3aa63f67`
+  - live `https://bluey.sh/latest.json` reports `0.1.26`
+  - local `bluey update` updated from `0.1.25` to `0.1.26`
+  - shortcut smoke passed before and after update:
+    - `Ctrl+Option+H` -> `overlay_visible: true`
+    - `Ctrl+Option+B` -> `overlay_visible: false`
+    - `Ctrl+Option+B` again -> `overlay_visible: true`
+  - Windows artifact was not republished; live manifest remains macOS arm64
+  - Round doc:
+    `docs/rounds/ROUND-272-KEYBOARD-EDITING-SHORTCUT-SCOPE.md`
 - Round 271 refined shortcut guidance and fixed a release guard:
   - macOS shortcuts panel is mode-aware:
     - click-through on: tells users to use global shortcuts because blank Bluey space clicks through
