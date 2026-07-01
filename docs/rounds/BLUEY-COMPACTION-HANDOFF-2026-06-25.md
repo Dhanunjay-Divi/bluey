@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 03:48 EDT
+Latest checkpoint: 2026-07-01 04:32 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,33 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-272-KEYBOARD-EDITING-SHORTCUT-SCOPE.md`; the next canonical Bluey round doc should start at `ROUND-273-...`.
+- Latest assigned Bluey round doc is `ROUND-273-INCOMPLETE-ANSWER-GUARD.md`; the next canonical Bluey round doc should start at `ROUND-274-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 273 fixed incomplete answer finalization:
+  - investigated the screenshot where the refrigeration / ML answer stopped in the middle of a Markdown table
+  - confirmed the local saved answer itself ended at the table separator, so this was not only UI clipping
+  - added final-answer integrity checks for unclosed code fences, unfinished Markdown tables, dangling headings, and bare list markers
+  - incomplete final text now logs `answer_incomplete_reason` and returns the retryable incomplete-answer path instead of being saved as complete
+  - updated overlay answer-shape instructions to avoid Markdown tables in streamed chat
+  - desktop workspace version bumped to `0.1.27`
+  - verification passed:
+    - `cargo test -p cue-daemon --lib --locked`
+    - `cargo test -p cue-llm --locked`
+    - `cargo check -p cue-daemon --offline`
+    - `cargo fmt`
+  - live artifact:
+    `dist/bluey-0.1.27-darwin-arm64.tar.gz`
+  - live SHA256:
+    `75651a30e1983f1183b3ee32297b0a6e075eba0af712ec4477a8031bd80237aa`
+  - live `https://bluey.sh/latest.json` reports `0.1.27`
+  - local `bluey update` updated from `0.1.26` to `0.1.27`, and `bluey status` showed the daemon running after restart
+  - Windows artifact was not republished; daemon-side guard is shared Rust and should apply on the next Windows build
+  - Round doc:
+    `docs/rounds/ROUND-273-INCOMPLETE-ANSWER-GUARD.md`
 - Round 272 fixed macOS keyboard editing and shortcut scope:
   - `Ctrl+Option+H` and other unassigned modified keys no longer route into old inside-Bluey shortcuts
   - official macOS global shortcuts are now limited to `Ctrl+Option+B/T/L/S/I/Enter`

@@ -195,6 +195,72 @@ fn text_shape(text: &str) -> TextShape {
     }
 }
 
+fn incomplete_answer_reason(text: &str) -> Option<&'static str> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if has_unclosed_code_fence(trimmed) {
+        return Some("unclosed_code_fence");
+    }
+
+    let non_empty_lines = trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let Some(last_line) = non_empty_lines.last().copied() else {
+        return None;
+    };
+    if is_markdown_table_separator_line(last_line) {
+        return Some("unfinished_markdown_table");
+    }
+    if is_bare_markdown_heading(last_line) && non_empty_lines.len() > 1 {
+        return Some("dangling_heading");
+    }
+    if is_bare_list_marker(last_line) {
+        return Some("dangling_list_marker");
+    }
+    None
+}
+
+fn is_markdown_table_separator_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') || !trimmed.contains("---") {
+        return false;
+    }
+    let cells = trimmed
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .filter(|cell| !cell.is_empty())
+        .collect::<Vec<_>>();
+    cells.len() >= 2
+        && cells.iter().all(|cell| {
+            let without_colons = cell.replace(':', "");
+            without_colons.contains("---")
+                && without_colons
+                    .chars()
+                    .all(|ch| ch == '-' || ch.is_ascii_whitespace())
+        })
+}
+
+fn is_bare_markdown_heading(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let hashes = trimmed.chars().take_while(|ch| *ch == '#').count();
+    (1..=6).contains(&hashes)
+        && trimmed
+            .chars()
+            .nth(hashes)
+            .is_some_and(|ch| ch.is_ascii_whitespace())
+        && trimmed[hashes..].trim().chars().count() >= 3
+}
+
+fn is_bare_list_marker(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed == "-" || trimmed == "*" || trimmed == "•"
+}
+
 fn has_unclosed_code_fence(text: &str) -> bool {
     let mut in_fence = false;
     for line in text.lines() {
@@ -319,6 +385,7 @@ fn log_answer_completion_diagnostics(
     sources_count: usize,
 ) {
     let shape = text_shape(answer);
+    let incomplete_reason = incomplete_answer_reason(answer).unwrap_or("none");
     let artifact = answer_overlay_artifact(answer);
     let (artifact_type, artifact_confidence_pct, artifact_body_chars) =
         artifact
@@ -345,6 +412,7 @@ fn log_answer_completion_diagnostics(
         answer_has_unclosed_code_fence = shape.has_unclosed_code_fence,
         answer_has_markdown_emphasis = shape.has_markdown_emphasis,
         answer_has_inline_code_markers = shape.has_inline_code_markers,
+        answer_incomplete_reason = incomplete_reason,
         inferred_artifact_type = artifact_type,
         inferred_artifact_confidence_pct = artifact_confidence_pct,
         inferred_artifact_body_chars = artifact_body_chars,
@@ -355,6 +423,14 @@ fn log_answer_completion_diagnostics(
             request_id = %request.metadata.request_id,
             provider = %provider.display_label(),
             "answer completed with unclosed code fence shape"
+        );
+    }
+    if incomplete_reason != "none" {
+        warn!(
+            request_id = %request.metadata.request_id,
+            provider = %provider.display_label(),
+            answer_incomplete_reason = incomplete_reason,
+            "answer completed with incomplete markdown shape"
         );
     }
 }
@@ -6359,6 +6435,7 @@ fn user_facing_answer_error(error: &anyhow::Error) -> String {
 fn is_incomplete_stream_error(lower_error: &str) -> bool {
     lower_error.contains("stream ended before final billing metadata")
         || lower_error.contains("stream ended before completion")
+        || lower_error.contains("incomplete answer shape")
         || lower_error.contains("stream returned no answer text")
         || lower_error.contains("stream interrupted")
         || lower_error.contains("upstream_stream_error")
@@ -6389,6 +6466,10 @@ fn retry_after_hint(raw: &str) -> Option<String> {
     } else {
         Some(format!(" Retry in about {digits}s."))
     }
+}
+
+fn incomplete_answer_error(reason: &str) -> anyhow::Error {
+    anyhow!("answer stream ended with incomplete answer shape: {reason}")
 }
 
 fn answer_overlay_cost_label(
@@ -7692,6 +7773,16 @@ async fn call_bluey_managed_provider(
         if answer.is_empty() {
             return Err(anyhow!("managed provider stream returned no answer text"));
         }
+        if let Some(reason) = incomplete_answer_reason(&answer) {
+            warn!(
+                provider = %provider.display_label(),
+                request_id = %request.metadata.request_id,
+                answer_chars = answer.chars().count(),
+                answer_incomplete_reason = reason,
+                "managed provider stream produced incomplete answer shape"
+            );
+            return Err(incomplete_answer_error(reason));
+        }
         if !saw_finished {
             warn!(
                 provider = %provider.display_label(),
@@ -7731,6 +7822,16 @@ async fn call_bluey_managed_provider(
         .to_string();
     if answer.is_empty() {
         return Err(anyhow!("managed provider returned no answer text"));
+    }
+    if let Some(reason) = incomplete_answer_reason(&answer) {
+        warn!(
+            provider = %provider.display_label(),
+            request_id = %request.metadata.request_id,
+            answer_chars = answer.chars().count(),
+            answer_incomplete_reason = reason,
+            "managed provider returned incomplete answer shape"
+        );
+        return Err(incomplete_answer_error(reason));
     }
     let overlay_artifact = response.artifact.as_ref().and_then(llm_overlay_artifact);
     if let Some(stream) = stream.as_mut() {
@@ -7873,6 +7974,15 @@ async fn call_chat_provider(
         .map(|content| sanitize_answer_text(content.trim()).trim().to_string())
         .filter(|content| !content.is_empty())
         .context("provider returned no answer text")?;
+    if let Some(reason) = incomplete_answer_reason(&answer) {
+        warn!(
+            provider = %config.provider.display_label(),
+            answer_chars = answer.chars().count(),
+            answer_incomplete_reason = reason,
+            "provider returned incomplete answer shape"
+        );
+        return Err(incomplete_answer_error(reason));
+    }
     let token_usage = parsed.usage.map(|usage| {
         let input = usage.prompt_tokens.unwrap_or_default();
         let output = usage.completion_tokens.unwrap_or_default();
@@ -8030,6 +8140,15 @@ async fn read_streaming_chat_response(
             "provider stream ended before completion: finish_reason={reason}"
         ));
     }
+    if let Some(reason) = incomplete_answer_reason(&answer) {
+        warn!(
+            provider = %config.provider.display_label(),
+            answer_chars = answer.chars().count(),
+            answer_incomplete_reason = reason,
+            "provider stream produced incomplete answer shape"
+        );
+        return Err(incomplete_answer_error(reason));
+    }
 
     Ok(LiveProviderAnswer {
         provider: config.provider.clone(),
@@ -8124,7 +8243,7 @@ fn provider_prompt_parts(payload: &ProviderRequestPayload) -> Result<ProviderPro
     system.push_str("\n\n");
     system.push_str(HUMAN_SPEAK_CONTRACT);
     system.push_str(
-        "\n\nOutput format:\n- Stream a clear, readable answer with short line breaks.\n- Put the direct, speakable answer first as one natural paragraph whenever possible.\n- For quick \"what is\" / \"explain\" answers, do not default to bullets. A compact spoken answer is better than a polished reference note.\n- Do not turn normal chat answers into a markdown outline. Use headings only when the task truly needs structure or when an artifact/canvas will render the deeper detail.\n- Do not use Markdown emphasis in chat prose. Avoid bold, italics, and inline backticks unless a fenced code block is actually needed.\n- Do not use em dashes in streamed chat, final answers, or artifact text.\n- Use the canvas split: chat is the explanation/talk track; the workbench is code, patch, architecture, data flow, APIs, tables, or deeper detail.\n- Do not write \"Code is in the canvas\", \"Architecture is in the canvas\", or similar pointer-only lines. Make the chat answer useful by itself.\n- If the user explicitly asks for code, a program, implementation, or says \"I want the code\" / \"write code in <language>\", the answer must include a complete fenced code block with a language tag. For small standalone tasks, include the full runnable snippet directly in chat, not only prose or a canvas artifact.\n- For first-time coding/build answers, keep the chat explanation short and put the complete code in fenced Markdown code blocks with a language tag so Bluey can place it in the canvas.\n- Treat repeated build/implement/write requests as requests to show or regenerate the implementation. Do not answer only with \"already above\" or \"already in the session\" unless the user explicitly asks whether it already exists.\n- For code follow-ups or requested changes, prefer in-place edits: name the file/function, show only the changed block, PATCH, or unified diff, and explain where it lands. Do not replace the whole implementation unless the user explicitly asks, the file is new/tiny, or a full replacement is materially safer than a patch.\n- For explanation-only coding questions or follow-ups, do not emit a new code fence by default. Use a teaching flow: Core idea, Data structures, Operation walkthrough, Invariant, Complexity, Edge cases.\n- Auto-detect the task type. For coding, debugging, algorithms, API, or configuration questions that ask for implementation or changes, use this shape after the talk track when useful: Approach, Patch, Explanation, Complexity, Edge cases. Put code in fenced Markdown code blocks with a language tag when possible.\n- For system design questions, keep chat to the recommendation, assumptions, and the key tradeoff. Put the full architecture workbench in sections: Architecture, Components, Data flow, APIs/contracts, Storage, Scaling, Tradeoffs, Failure modes, Observability, and Rollout / next steps when useful.\n- For system design follow-ups, answer the low-level explanation in chat unless the user asks to change the design. If they ask for a design change, update only the affected workbench section and call out what changed.\n- For design/debug/product questions, use compact bullets with concrete next steps.\n- Avoid long paragraphs; make the overlay easy to scan while it streams.",
+        "\n\nOutput format:\n- Stream a clear, readable answer with short line breaks.\n- Put the direct, speakable answer first as one natural paragraph whenever possible.\n- For quick \"what is\" / \"explain\" answers, do not default to bullets. A compact spoken answer is better than a polished reference note.\n- Do not turn normal chat answers into a markdown outline. Use headings only when the task truly needs structure or when an artifact/canvas will render the deeper detail.\n- Do not use Markdown emphasis in chat prose. Avoid bold, italics, and inline backticks unless a fenced code block is actually needed.\n- Do not use Markdown tables in streamed chat. Use short bullets or plain lines instead, and reserve table-like detail for the workbench/canvas when it is truly useful.\n- Do not use em dashes in streamed chat, final answers, or artifact text.\n- Use the canvas split: chat is the explanation/talk track; the workbench is code, patch, architecture, data flow, APIs, tables, or deeper detail.\n- Do not write \"Code is in the canvas\", \"Architecture is in the canvas\", or similar pointer-only lines. Make the chat answer useful by itself.\n- If the user explicitly asks for code, a program, implementation, or says \"I want the code\" / \"write code in <language>\", the answer must include a complete fenced code block with a language tag. For small standalone tasks, include the full runnable snippet directly in chat, not only prose or a canvas artifact.\n- For first-time coding/build answers, keep the chat explanation short and put the complete code in fenced Markdown code blocks with a language tag so Bluey can place it in the canvas.\n- Treat repeated build/implement/write requests as requests to show or regenerate the implementation. Do not answer only with \"already above\" or \"already in the session\" unless the user explicitly asks whether it already exists.\n- For code follow-ups or requested changes, prefer in-place edits: name the file/function, show only the changed block, PATCH, or unified diff, and explain where it lands. Do not replace the whole implementation unless the user explicitly asks, the file is new/tiny, or a full replacement is materially safer than a patch.\n- For explanation-only coding questions or follow-ups, do not emit a new code fence by default. Use a teaching flow: Core idea, Data structures, Operation walkthrough, Invariant, Complexity, Edge cases.\n- Auto-detect the task type. For coding, debugging, algorithms, API, or configuration questions that ask for implementation or changes, use this shape after the talk track when useful: Approach, Patch, Explanation, Complexity, Edge cases. Put code in fenced Markdown code blocks with a language tag when possible.\n- For system design questions, keep chat to the recommendation, assumptions, and the key tradeoff. Put the full architecture workbench in sections: Architecture, Components, Data flow, APIs/contracts, Storage, Scaling, Tradeoffs, Failure modes, Observability, and Rollout / next steps when useful.\n- For system design follow-ups, answer the low-level explanation in chat unless the user asks to change the design. If they ask for a design change, update only the affected workbench section and call out what changed.\n- For design/debug/product questions, use compact bullets with concrete next steps.\n- Avoid long paragraphs; make the overlay easy to scan while it streams.",
     );
     system.push_str(
         "\n- If a screenshot or attachment is insufficient, do not fill gaps from generic knowledge. State what is visible, what is missing, and ask for the next concrete evidence: failing output, current directory/tree, relevant file, expected result, or a fresh screenshot.",
@@ -13831,6 +13950,7 @@ mod tests {
         assert!(system.contains("I want the code"));
         assert!(system.contains("full runnable snippet directly in chat"));
         assert!(system.contains("Do not use Markdown emphasis in chat prose"));
+        assert!(system.contains("Do not use Markdown tables in streamed chat"));
         assert!(system.contains("teach the logic instead of dumping implementation notes"));
         assert!(system.contains("Operation walkthrough"));
         assert!(system.contains("expected result, or a fresh screenshot"));
@@ -14040,6 +14160,26 @@ mod tests {
         let unclosed = text_shape("```python\nclass Node:\n    def __init__(");
         assert_eq!(unclosed.closed_code_blocks, 0);
         assert!(unclosed.has_unclosed_code_fence);
+        assert_eq!(
+            incomplete_answer_reason("```python\nclass Node:\n    def __init__("),
+            Some("unclosed_code_fence")
+        );
+        assert_eq!(
+            incomplete_answer_reason(
+                "### Data Architecture & Feature Engineering\n\n| Feature Type | Description | Rationale |\n| :--- | :--- | :---"
+            ),
+            Some("unfinished_markdown_table")
+        );
+        assert_eq!(
+            incomplete_answer_reason("Use telemetry counters.\n\n### Observability"),
+            Some("dangling_heading")
+        );
+        assert_eq!(
+            incomplete_answer_reason(
+                "Use bullets instead of a table:\n- Feature type: pressure delta\n- Rationale: catches drift"
+            ),
+            None
+        );
     }
 
     #[test]
