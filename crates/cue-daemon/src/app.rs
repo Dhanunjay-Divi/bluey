@@ -5344,7 +5344,7 @@ async fn push_login_started_card(
         CardKind::System,
         title,
         format!(
-            "Your browser is opening with desktop code {user_code}.\nAfter signing in, click Connect desktop; Bluey will finish automatically.\nlogin_url: {login_url}"
+            "Open the browser, sign in, then click Connect desktop.\nCode: {user_code}\nBluey will finish automatically.\nlogin_url: {login_url}"
         ),
     )
     .await;

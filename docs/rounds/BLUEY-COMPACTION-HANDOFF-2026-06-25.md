@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 13:49 EDT
+Latest checkpoint: 2026-07-01 14:08 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,39 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-280-PRODUCTION-UPDATE-RECOVERY-COPY.md`; the next canonical Bluey round doc should start at `ROUND-281-...`.
+- Latest assigned Bluey round doc is `ROUND-281-OVERLAY-CONNECT-CODE.md`; the next canonical Bluey round doc should start at `ROUND-282-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 281 is complete for overlay connect-code visibility:
+  - daemon login cards now use structured body copy with `Code: XXXX-XXXX` and hidden `login_url: ...`
+  - macOS overlay sign-in cards extract the code and show a dedicated `Connect code` pill
+  - macOS sign-in card hides raw `Code:` / `login_url:` metadata from the body
+  - macOS sign-in CTA now says `Open browser`
+  - Windows parity:
+    - the daemon sends the structured code line to Windows too; current Windows body renderer shows the code plainly
+  - desktop workspace version bumped to `0.1.36`
+  - local verification passed:
+    - `cargo fmt --all`
+    - `cargo check -p cue-daemon --quiet`
+    - `cargo check -p cue-cli --quiet`
+    - `swift build -c debug --package-path native/macos/cue-overlay`
+    - `/opt/homebrew/bin/x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c`
+  - live deploy verification passed:
+    - `https://bluey.sh/latest.json` reports `0.1.36`
+    - live `latest.json.sig` verifies successfully against the release Ed25519 key
+    - live artifact checksum matches `SHA256SUMS.txt`
+    - live `/install.sh` returns `application/x-shellscript`
+    - live `/install.ps1` returns `application/x-powershell`
+    - temp-root installer smoke installed `bluey 0.1.36`
+  - live artifact:
+    `https://bluey.sh/releases/v0.1.36/bluey-0.1.36-darwin-arm64.tar.gz`
+  - live SHA256:
+    `4c0f90d748019ad05fb5a520e4775d77ab58e8350dde692cb93923347968e0b5`
+  - Round doc:
+    `docs/rounds/ROUND-281-OVERLAY-CONNECT-CODE.md`
 - Round 280 is complete for production-facing updater/install/uninstall copy:
   - replaced old updater failure copy that mentioned `BLUEY_UPDATE_ALLOW_UNSIGNED` / local testing with production recovery language
   - old unverifiable builds now say to reinstall once from the production installer; after that `bluey on` keeps Bluey updated automatically

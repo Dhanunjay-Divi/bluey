@@ -3191,6 +3191,7 @@ private final class FeedView: NSView {
         titleLabel.lineBreakMode = .byTruncatingTail
 
         let signInURL = signInLike ? loginURL(from: card) : nil
+        let signInCode = signInURL == nil ? nil : loginCode(from: card)
         let rawBody = card.body.isEmpty && !card.done ? "Thinking..." : card.body
         let bodyText = signInURL == nil
             ? chatBody(for: card, rawBody: rawBody)
@@ -3225,6 +3226,7 @@ private final class FeedView: NSView {
             styleSignInButton(button)
             return button
         }
+        let signInCodeView = signInCode.map { makeSignInCodeView($0) }
         if signInURL != nil {
             bubble.layer?.backgroundColor = NSColor(red: 0.020, green: 0.030, blue: 0.040, alpha: 0.98).cgColor
             bubble.layer?.borderWidth = 1
@@ -3255,6 +3257,9 @@ private final class FeedView: NSView {
         }
         if let signInButton {
             bubble.addSubview(signInButton)
+        }
+        if let signInCodeView {
+            bubble.addSubview(signInCodeView)
         }
 
         let leading = bubble.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 8)
@@ -3324,8 +3329,19 @@ private final class FeedView: NSView {
             }
         }
         if let signInButton {
+            if let signInCodeView {
+                constraints.append(contentsOf: [
+                    bodyLabel.bottomAnchor.constraint(equalTo: signInCodeView.topAnchor, constant: -10),
+                    signInCodeView.centerXAnchor.constraint(equalTo: bubble.centerXAnchor),
+                    signInCodeView.leadingAnchor.constraint(greaterThanOrEqualTo: bubble.leadingAnchor, constant: 28),
+                    signInCodeView.trailingAnchor.constraint(lessThanOrEqualTo: bubble.trailingAnchor, constant: -28),
+                    signInCodeView.heightAnchor.constraint(equalToConstant: 34),
+                    signInCodeView.bottomAnchor.constraint(equalTo: signInButton.topAnchor, constant: -12),
+                ])
+            } else {
+                constraints.append(bodyLabel.bottomAnchor.constraint(equalTo: signInButton.topAnchor, constant: -12))
+            }
             constraints.append(contentsOf: [
-                bodyLabel.bottomAnchor.constraint(equalTo: signInButton.topAnchor, constant: -12),
                 signInButton.centerXAnchor.constraint(equalTo: bubble.centerXAnchor),
                 signInButton.bottomAnchor.constraint(equalTo: bubble.bottomAnchor, constant: -14),
                 signInButton.widthAnchor.constraint(equalToConstant: 150),
@@ -3621,7 +3637,7 @@ private final class FeedView: NSView {
         button.layer?.borderColor = NSColor.white.withAlphaComponent(0.20).cgColor
         button.font = NSFont.systemFont(ofSize: 12.5, weight: .bold)
         button.attributedTitle = NSAttributedString(
-            string: "Open login",
+            string: "Open browser",
             attributes: [
                 .font: button.font ?? NSFont.systemFont(ofSize: 12.5, weight: .bold),
                 .foregroundColor: NSColor.black.withAlphaComponent(0.86),
@@ -3635,7 +3651,42 @@ private final class FeedView: NSView {
         }
         button.imageHugsTitle = true
         button.alignment = .center
-        button.toolTip = "Open Bluey login"
+        button.toolTip = "Open the Bluey sign-in page"
+    }
+
+    private func makeSignInCodeView(_ code: String) -> NSView {
+        let stack = NSStackView()
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.distribution = .gravityAreas
+        stack.spacing = 9
+        stack.edgeInsets = NSEdgeInsets(top: 6, left: 12, bottom: 6, right: 12)
+        stack.wantsLayer = true
+        stack.layer?.cornerRadius = 15
+        stack.layer?.backgroundColor = BlueyTheme.cyan.withAlphaComponent(0.13).cgColor
+        stack.layer?.borderWidth = 1
+        stack.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.38).cgColor
+        stack.toolTip = "Use this code on the Bluey account page to connect this device"
+
+        let label = NSTextField(labelWithString: "Connect code")
+        label.translatesAutoresizingMaskIntoConstraints = false
+        label.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
+        label.textColor = dimTextColor
+        label.alignment = .right
+        label.setContentHuggingPriority(.required, for: .horizontal)
+
+        let codeLabel = NSTextField(labelWithString: code)
+        codeLabel.translatesAutoresizingMaskIntoConstraints = false
+        codeLabel.font = NSFont.monospacedSystemFont(ofSize: 13.5, weight: .bold)
+        codeLabel.textColor = BlueyTheme.cyan
+        codeLabel.alignment = .left
+        codeLabel.isSelectable = true
+        codeLabel.setContentHuggingPriority(.required, for: .horizontal)
+
+        stack.addArrangedSubview(label)
+        stack.addArrangedSubview(codeLabel)
+        return stack
     }
 
     @objc private func openURLButtonClicked(_ sender: NSButton) {
@@ -3876,10 +3927,52 @@ private final class FeedView: NSView {
 
     private func signInBody(from text: String) -> String {
         text.components(separatedBy: .newlines)
-            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("login_url:") }
+            .filter { !isLoginMetadataLine($0) }
             .joined(separator: "\n")
             .replacingOccurrences(of: "knowledge base", with: "documents")
             .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func isLoginMetadataLine(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+        return lower.hasPrefix("login_url:")
+            || lower.hasPrefix("code:")
+            || lower.hasPrefix("connect code:")
+            || lower.contains("desktop code ")
+    }
+
+    private func loginCode(from card: RenderedCard) -> String? {
+        for line in card.body.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let lower = trimmed.lowercased()
+            if lower.hasPrefix("code:")
+                || lower.hasPrefix("connect code:")
+                || lower.contains("desktop code ")
+            {
+                if let code = extractLoginCode(from: trimmed) {
+                    return code
+                }
+            }
+        }
+        if let url = loginURL(from: card),
+           let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+           let code = components.queryItems?
+            .first(where: { $0.name == "user_code" || $0.name == "device_code" })?
+            .value,
+           let extracted = extractLoginCode(from: code)
+        {
+            return extracted
+        }
+        return nil
+    }
+
+    private func extractLoginCode(from text: String) -> String? {
+        let pattern = #"[A-Z0-9]{3,8}(?:-[A-Z0-9]{3,8})+"#
+        guard let range = text.range(of: pattern, options: [.regularExpression, .caseInsensitive]) else {
+            return nil
+        }
+        return String(text[range]).uppercased()
     }
 
     private func loginURL(from card: RenderedCard) -> URL? {
