@@ -295,9 +295,8 @@ fn register_global_shortcut(app: &tauri::App) -> Result<(), Box<dyn std::error::
 
     // Toggle dashboard visibility: Ctrl+Option/Alt+B.
     let handle = app.handle().clone();
-    app.global_shortcut().on_shortcut(
-        "Ctrl+Alt+B",
-        move |_app, shortcut, event| {
+    app.global_shortcut()
+        .on_shortcut("Ctrl+Alt+B", move |_app, shortcut, event| {
             if event.state == ShortcutState::Pressed {
                 tracing::debug!(shortcut = %shortcut, "global shortcut pressed");
                 if let Some(window) = handle.get_webview_window("main") {
@@ -308,54 +307,36 @@ fn register_global_shortcut(app: &tauri::App) -> Result<(), Box<dyn std::error::
                     }
                 }
             }
-        },
-    )?;
+        })?;
 
     // Toggle listening: Ctrl+Option/Alt+L.
     let handle2 = app.handle().clone();
-    app.global_shortcut().on_shortcut(
-        "Ctrl+Alt+L",
-        move |_app, _shortcut, event| {
+    app.global_shortcut()
+        .on_shortcut("Ctrl+Alt+L", move |_app, _shortcut, event| {
             if event.state == ShortcutState::Pressed {
                 let _ = handle2.emit("hotkey_toggle_listening", ());
             }
-        },
-    )?;
+        })?;
 
     // Push-to-talk toggle: Ctrl+Option/Alt+P.
     // Note: tauri-plugin-global-shortcut does not expose distinct press/release
     // events, so we use a toggle approach (each press cycles the state).
     let handle3 = app.handle().clone();
-    app.global_shortcut().on_shortcut(
-        "Ctrl+Alt+P",
-        move |_app, _shortcut, event| {
+    app.global_shortcut()
+        .on_shortcut("Ctrl+Alt+P", move |_app, _shortcut, event| {
             if event.state == ShortcutState::Pressed {
                 let _ = handle3.emit("hotkey_push_to_talk", ());
             }
-        },
-    )?;
+        })?;
 
     // Request cue (AI answer): Ctrl+Option/Alt+Enter.
     let handle_a = app.handle().clone();
-    app.global_shortcut().on_shortcut(
-        "Ctrl+Alt+Enter",
-        move |_app, _shortcut, event| {
+    app.global_shortcut()
+        .on_shortcut("Ctrl+Alt+Enter", move |_app, _shortcut, event| {
             if event.state == ShortcutState::Pressed {
                 let _ = handle_a.emit("hotkey_request_cue", ());
             }
-        },
-    )?;
-
-    // Legacy dashboard overlay toggle: Ctrl+Option/Alt+H.
-    let handle4 = app.handle().clone();
-    app.global_shortcut().on_shortcut(
-        "Ctrl+Alt+H",
-        move |_app, _shortcut, event| {
-            if event.state == ShortcutState::Pressed {
-                let _ = handle4.emit("hotkey_toggle_overlay", ());
-            }
-        },
-    )?;
+        })?;
 
     // Codex Stage 18 commit 6: F19 system-wide invisibility toggle.
     let handle_f19 = app.handle().clone();
