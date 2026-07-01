@@ -550,6 +550,8 @@ fn release_and_upstream_spend_guard_check(
 /// Override with BLUEY_STREAM_FIRST_TOKEN_TIMEOUT_MS.
 const DEFAULT_FIRST_TOKEN_TIMEOUT_MS: u64 = 6_000;
 const DEFAULT_DEEP_FIRST_TOKEN_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_STREAM_ROUTE_CONNECT_TIMEOUT_MS: u64 = 12_000;
+const DEFAULT_DEEP_STREAM_ROUTE_CONNECT_TIMEOUT_MS: u64 = 45_000;
 
 fn first_token_deadline_for_lane(
     effective_lane: &str,
@@ -564,6 +566,26 @@ fn first_token_deadline_for_lane(
         return std::time::Duration::from_millis(ms);
     }
     first_token_deadline()
+}
+
+fn stream_route_connect_deadline_for_lane(
+    effective_lane: &str,
+    has_thinking_budget: bool,
+) -> std::time::Duration {
+    if effective_lane == "deep" || has_thinking_budget {
+        let ms = std::env::var("BLUEY_STREAM_DEEP_ROUTE_CONNECT_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .unwrap_or(DEFAULT_DEEP_STREAM_ROUTE_CONNECT_TIMEOUT_MS);
+        return std::time::Duration::from_millis(ms);
+    }
+    let ms = std::env::var("BLUEY_STREAM_ROUTE_CONNECT_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(DEFAULT_STREAM_ROUTE_CONNECT_TIMEOUT_MS);
+    std::time::Duration::from_millis(ms)
 }
 
 /// Time budget for managed cloud RAG retrieval before answering. RAG
@@ -949,6 +971,9 @@ struct AnswerRequestDiagnostics {
     user_chars: usize,
     question_chars: usize,
     question_hash: String,
+    context_chars: usize,
+    context_hash: String,
+    context_coding_signal: bool,
     transcript_chars: usize,
     transcript_hash: String,
     transcript_source_labels: usize,
@@ -958,11 +983,17 @@ struct AnswerRequestDiagnostics {
 fn answer_request_diagnostics(req: &CompleteRequest) -> AnswerRequestDiagnostics {
     let question = extract_search_question(&req.user);
     let normalized = normalize_guardrail_text(&question);
+    let context = extract_planning_context(&req.user);
+    let normalized_context = normalize_guardrail_text(&context);
     let transcript = transcript_diagnostic_text(&question);
     AnswerRequestDiagnostics {
         user_chars: req.user.chars().count(),
         question_chars: question.chars().count(),
         question_hash: stable_text_hash_prefix(&question),
+        context_chars: context.chars().count(),
+        context_hash: stable_text_hash_prefix(&context),
+        context_coding_signal: looks_like_coding_question(&normalized_context)
+            || has_code_shape(&normalized_context),
         transcript_chars: transcript.chars().count(),
         transcript_hash: stable_text_hash_prefix(&transcript),
         transcript_source_labels: transcript_source_label_count(&question),
@@ -1026,20 +1057,26 @@ fn answer_plan_for_request(
 ) -> AnswerPlan {
     let question = extract_search_question(&req.user);
     let normalized = normalize_guardrail_text(&question);
+    let planning_context = extract_planning_context(&req.user);
+    let normalized_context = normalize_guardrail_text(&planning_context);
     let word_count = normalized.split_whitespace().count();
     let short_question = word_count <= 8;
     let topic_reset = looks_like_new_topic_request(&normalized);
     let generic_live_transcript_prompt = is_generic_live_transcript_prompt(&normalized);
     let transcript_placeholder = looks_like_transcript_placeholder(&normalized);
     let has_images = !req.image_data_urls.is_empty() || requested_lane == "vision";
+    let has_planning_context = !planning_context.trim().is_empty();
     let follow_up = !topic_reset
         && short_question
         && contains_any(
             &normalized,
             &["that", "this", "those", "same", "above", "previous", "next"],
         );
-    let coding = looks_like_coding_question(&normalized);
-    let coding_followup = looks_like_coding_followup(&normalized, follow_up);
+    let context_coding = has_planning_context
+        && (looks_like_coding_question(&normalized_context) || has_code_shape(&normalized_context));
+    let coding = looks_like_coding_question(&normalized) || (has_images && context_coding);
+    let coding_followup = looks_like_coding_followup(&normalized, follow_up)
+        || (has_images && context_coding && follow_up);
     let simple_coding = coding && looks_like_simple_coding_question(&normalized, short_question);
     let behavioral = looks_like_behavioral_question(&normalized);
     let system_design = !behavioral && looks_like_system_design_question(&normalized);
@@ -1048,7 +1085,7 @@ fn answer_plan_for_request(
             &normalized,
             &["screen", "screenshot", "image", "canvas", "visible page"],
         );
-    let docs = contains_any(
+    let docs_requested = contains_any(
         &normalized,
         &[
             "attached document",
@@ -1059,6 +1096,9 @@ fn answer_plan_for_request(
             "spreadsheet",
         ],
     );
+    let generic_screen_capture_prompt = looks_like_generic_screen_capture_prompt(&normalized);
+    let docs = docs_requested
+        && (!generic_screen_capture_prompt || planning_context_has_document_signal(&normalized_context));
     let meeting = contains_any(
         &normalized,
         &[
@@ -1113,19 +1153,21 @@ fn answer_plan_for_request(
             || normalized.starts_with("can you tell me about ")
             || normalized.contains(" information about "));
     let screen_without_image = screen && !has_images;
+    let has_any_attached_evidence = has_images || has_planning_context || !rag_matches.is_empty();
     let missing_context = rag_matches.is_empty()
-        && ((docs || screen_without_image)
+        && (((docs && !has_any_attached_evidence) || screen_without_image)
             || generic_live_transcript_prompt
             || transcript_placeholder
-            || contains_any(
-                &normalized,
-                &[
-                    "attached",
-                    "session context",
-                    "current context",
-                    "current session",
-                ],
-            ));
+            || (!has_any_attached_evidence
+                && contains_any(
+                    &normalized,
+                    &[
+                        "attached",
+                        "session context",
+                        "current context",
+                        "current session",
+                    ],
+                )));
     let needs_web_search = !missing_context
         && !screen
         && !coding
@@ -2756,21 +2798,64 @@ fn sanitized_web_search_query(user_text: &str) -> Option<String> {
 
 fn extract_search_question(user_text: &str) -> String {
     let text = user_text.trim();
-    if let Some(rest) = text.strip_prefix("Question:") {
-        return rest
-            .split("\n\nSession context:")
-            .next()
-            .unwrap_or(rest)
-            .split("\n\nScreen context:")
-            .next()
-            .unwrap_or(rest)
-            .split("\n\nAttached")
-            .next()
-            .unwrap_or(rest)
-            .trim()
-            .to_string();
+    if text.starts_with("Question:") {
+        return split_question_and_planning_context(text).0.trim().to_string();
     }
     text.to_string()
+}
+
+fn extract_planning_context(user_text: &str) -> String {
+    let text = user_text.trim();
+    if !text.starts_with("Question:") {
+        return String::new();
+    }
+    split_question_and_planning_context(text).1.trim().to_string()
+}
+
+fn split_question_and_planning_context(text: &str) -> (&str, &str) {
+    let rest = text.strip_prefix("Question:").unwrap_or(text);
+    let markers = [
+        "\n\nSession context:",
+        "\n\nScreen context:",
+        "\n\nAttached",
+        "\n\nDocument context:",
+    ];
+    let Some(index) = markers.iter().filter_map(|marker| rest.find(marker)).min() else {
+        return (rest, "");
+    };
+    (&rest[..index], &rest[index..])
+}
+
+fn looks_like_generic_screen_capture_prompt(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "answer using the attached screen capture",
+            "answer using attached screen capture",
+            "answer using the attached screen context",
+            "answer using attached screen context",
+        ],
+    )
+}
+
+fn planning_context_has_document_signal(normalized_context: &str) -> bool {
+    contains_any(
+        normalized_context,
+        &[
+            "[document",
+            "[file",
+            "kind: document",
+            "(document)",
+            ".pdf",
+            ".docx",
+            ".xlsx",
+            ".csv",
+            "attached document",
+            "document context",
+            "resume",
+            "job description",
+        ],
+    )
 }
 
 fn collapse_spaces(text: &str) -> String {
@@ -3193,6 +3278,9 @@ async fn complete_stream_inner(
         user_chars = request_diag.user_chars,
         question_chars = request_diag.question_chars,
         question_hash = %request_diag.question_hash,
+        context_chars = request_diag.context_chars,
+        context_hash = %request_diag.context_hash,
+        context_coding_signal = request_diag.context_coding_signal,
         transcript_chars = request_diag.transcript_chars,
         transcript_hash = %request_diag.transcript_hash,
         transcript_source_labels = request_diag.transcript_source_labels,
@@ -3223,6 +3311,8 @@ async fn complete_stream_inner(
     );
     let has_thinking_budget = !matches!(thinking.mode, routing::ThinkingMode::Off);
     let first_output_deadline = first_token_deadline_for_lane(&effective_lane, has_thinking_budget);
+    let stream_connect_deadline =
+        stream_route_connect_deadline_for_lane(&effective_lane, has_thinking_budget);
     let effective_max_out = routing::effective_max_output_tokens(req.max_tokens, thinking);
     let max_out = i64::from(effective_max_out);
     let est_in = req
@@ -3366,21 +3456,21 @@ async fn complete_stream_inner(
                 break;
             }
 
-            match routing::complete_stream_with_key(
-                &selected_key.secret,
-                route.provider,
-                route.model,
-                &provider_system,
-                &provider_user,
-                req.max_tokens,
-                req.temperature,
-                thinking,
-                Some(est_in),
-                &req.image_data_urls,
-            )
-            .await
-            {
-                Ok(streaming) => {
+            let dispatch = routing::complete_stream_with_key(
+                    &selected_key.secret,
+                    route.provider,
+                    route.model,
+                    &provider_system,
+                    &provider_user,
+                    req.max_tokens,
+                    req.temperature,
+                    thinking,
+                    Some(est_in),
+                    &req.image_data_urls,
+                );
+
+            match tokio::time::timeout(stream_connect_deadline, dispatch).await {
+                Ok(Ok(streaming)) => {
                     // B2: a 2xx connection is not yet a usable stream. Wait for
                     // the first event under a deadline. Any response (delta,
                     // terminal Done, in-band error, or empty stream) commits
@@ -3470,7 +3560,7 @@ async fn complete_stream_inner(
                         }
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     if let Some(retry_after_secs) = routing::upstream_retry_after(&e) {
                         let cooldown_secs = state
                             .provider_health
@@ -3507,6 +3597,19 @@ async fn complete_stream_inner(
                         "streaming upstream dispatch failed; trying next route"
                     );
                     last_error = Some(e);
+                    last_failure_was_capacity = false;
+                    break;
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                        request_id = %req.request_id,
+                        provider = %route.provider,
+                        model = %route.model,
+                        route_connect_timeout_ms = stream_connect_deadline.as_millis() as u64,
+                        "streaming route connect deadline exceeded; trying next route"
+                    );
+                    last_error = Some(anyhow::anyhow!("streaming route connect deadline exceeded"));
                     last_failure_was_capacity = false;
                     break;
                 }
@@ -3859,6 +3962,9 @@ async fn complete_stream_inner(
             user_chars = request_diag.user_chars,
             question_chars = request_diag.question_chars,
             question_hash = %request_diag.question_hash,
+            context_chars = request_diag.context_chars,
+            context_hash = %request_diag.context_hash,
+            context_coding_signal = request_diag.context_coding_signal,
             transcript_chars = request_diag.transcript_chars,
             transcript_hash = %request_diag.transcript_hash,
             transcript_source_labels = request_diag.transcript_source_labels,
@@ -4134,6 +4240,9 @@ async fn complete_inner(
         user_chars = request_diag.user_chars,
         question_chars = request_diag.question_chars,
         question_hash = %request_diag.question_hash,
+        context_chars = request_diag.context_chars,
+        context_hash = %request_diag.context_hash,
+        context_coding_signal = request_diag.context_coding_signal,
         transcript_chars = request_diag.transcript_chars,
         transcript_hash = %request_diag.transcript_hash,
         transcript_source_labels = request_diag.transcript_source_labels,
@@ -4616,6 +4725,9 @@ async fn complete_inner(
         user_chars = request_diag.user_chars,
         question_chars = request_diag.question_chars,
         question_hash = %request_diag.question_hash,
+        context_chars = request_diag.context_chars,
+        context_hash = %request_diag.context_hash,
+        context_coding_signal = request_diag.context_coding_signal,
         transcript_chars = request_diag.transcript_chars,
         transcript_hash = %request_diag.transcript_hash,
         transcript_source_labels = request_diag.transcript_source_labels,
@@ -5997,6 +6109,32 @@ mod tests {
     }
 
     #[test]
+    fn stream_route_connect_deadline_default_and_override() {
+        std::env::remove_var("BLUEY_STREAM_ROUTE_CONNECT_TIMEOUT_MS");
+        std::env::remove_var("BLUEY_STREAM_DEEP_ROUTE_CONNECT_TIMEOUT_MS");
+        assert_eq!(
+            stream_route_connect_deadline_for_lane("vision", false),
+            std::time::Duration::from_millis(DEFAULT_STREAM_ROUTE_CONNECT_TIMEOUT_MS)
+        );
+        assert_eq!(
+            stream_route_connect_deadline_for_lane("deep", true),
+            std::time::Duration::from_millis(DEFAULT_DEEP_STREAM_ROUTE_CONNECT_TIMEOUT_MS)
+        );
+        std::env::set_var("BLUEY_STREAM_ROUTE_CONNECT_TIMEOUT_MS", "3000");
+        std::env::set_var("BLUEY_STREAM_DEEP_ROUTE_CONNECT_TIMEOUT_MS", "20000");
+        assert_eq!(
+            stream_route_connect_deadline_for_lane("vision", false),
+            std::time::Duration::from_millis(3_000)
+        );
+        assert_eq!(
+            stream_route_connect_deadline_for_lane("balanced", true),
+            std::time::Duration::from_millis(20_000)
+        );
+        std::env::remove_var("BLUEY_STREAM_ROUTE_CONNECT_TIMEOUT_MS");
+        std::env::remove_var("BLUEY_STREAM_DEEP_ROUTE_CONNECT_TIMEOUT_MS");
+    }
+
+    #[test]
     fn streaming_idempotency_guard_releases_on_drop_before_billing() {
         let pool = temp_pool();
         let account_id = make_account(&pool, "stream-drop@example.com");
@@ -6477,6 +6615,45 @@ mod tests {
             assert_eq!(plan.recommended_lane, lane, "{name}");
             assert_eq!(plan.needs_web_search, needs_web_search, "{name}");
         }
+    }
+
+    #[test]
+    fn answer_plan_uses_screen_context_code_signals() {
+        let mut req = complete_request(
+            "Question:\nAnswer using the attached screen capture, documents, and current session context.\n\nSession context:\n[Screen context from screenshot]\nCODE\nimport math\n\ndef build_map(robot_pose, measurements):\n    robot_x, robot_y, robot_theta = robot_pose\n    obj_map = {}\n    for dist, bearing, obj_id in measurements:\n        global_angle = robot_theta + bearing\n        obj_x = robot_x + dist * math.cos(global_angle)\n        obj_y = robot_y + dist * math.sin(global_angle)\n        obj_map[obj_id] = (obj_x, obj_y)\n    return obj_map",
+        );
+        req.image_data_urls
+            .push("data:image/png;base64,aGVsbG8=".to_string());
+
+        let plan = answer_plan_for_request(&req, "vision", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::Coding);
+        assert_eq!(plan.output, AnswerOutput::CodeArtifact);
+        assert_eq!(plan.recommended_lane, "deep");
+        assert!(plan.needs_screen);
+        assert!(!plan.needs_docs);
+        assert_eq!(lane_for_answer_plan("vision", &plan, true), "vision");
+
+        let diagnostics = answer_request_diagnostics(&req);
+        assert!(diagnostics.context_chars > 0);
+        assert_ne!(diagnostics.context_hash, "none");
+        assert!(diagnostics.context_coding_signal);
+    }
+
+    #[test]
+    fn generic_screen_template_with_image_is_not_missing_context() {
+        let mut req = complete_request(
+            "Question:\nAnswer using the attached screen capture, documents, and current session context.",
+        );
+        req.image_data_urls
+            .push("data:image/png;base64,aGVsbG8=".to_string());
+
+        let plan = answer_plan_for_request(&req, "vision", &[]);
+
+        assert_eq!(plan.intent, AnswerIntent::Screen);
+        assert_eq!(plan.output, AnswerOutput::CanvasDetail);
+        assert!(plan.needs_screen);
+        assert!(!plan.needs_docs);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 15:52 EDT
+Latest checkpoint: 2026-07-01 17:04 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,13 +30,41 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-283-CLICKTHROUGH-MOVE-HANDLE-RELIABILITY.md`; the next canonical Bluey round doc should start at `ROUND-284-...`.
+- Latest assigned Bluey round doc is `ROUND-284-SCREEN-CODE-ANSWER-PLAN-FIRST-TOKEN.md`; the next canonical Bluey round doc should start at `ROUND-285-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
-- Round 283 is in progress for click-through move-handle reliability:
+- Round 284 is complete for screen-code answer planning and first-token fallback:
+  - production logs for the owner screenshot showed the generic screen prompt was planned as `missing_context`
+  - root cause was the generic `documents` wording plus planner logic that did not use appended screen/session context strongly enough for coding signals
+  - production logs also showed Gemini vision 429/503 and slow fallback could delay first answer
+  - server planner now extracts planning context, detects code-shaped screen/session context, and plans generic screen-code requests as `coding` / `code_artifact`
+  - generic screen-capture prompts no longer request docs unless real document context is present
+  - image or planning context now counts as attached evidence and prevents false missing-context plans
+  - answer-plan logs now include privacy-safe context character count, context hash, and `context_coding_signal`
+  - streaming routes now have a connect deadline before falling through to the next provider
+  - vision provider mix now prefers Gemini Flash and OpenAI accurate before Gemini Pro preview fallback
+  - local verification passed:
+    - `cargo fmt --all`
+    - `git diff --check`
+    - `cargo test --manifest-path server/Cargo.toml answer_plan --quiet`
+    - `cargo test --manifest-path server/Cargo.toml provider_mix_keeps_vision_on_image_capable_routes --quiet`
+    - `cargo test --manifest-path server/Cargo.toml stream_route_connect_deadline --quiet`
+    - `cargo check --manifest-path server/Cargo.toml --quiet`
+  - production deploy completed:
+    - built on droplet from source-only tree `/opt/bluey-build-codex-round284-router`
+    - installed `/usr/local/bin/bluey-server`
+    - previous production binary backup:
+      `/var/backups/bluey-api/bin/bluey-server.previous-20260701T210318Z`
+    - installed binary SHA256:
+      `87020cba27eabb004640920b1e2725322d7a2c377944fa807e2f11571a3c8192`
+    - `bluey-api.service` restarted active
+    - `https://bluey.sh/health` returned `status=ok`
+  - Round doc:
+    `docs/rounds/ROUND-284-SCREEN-CODE-ANSWER-PLAN-FIRST-TOKEN.md`
+- Round 283 is complete for click-through move-handle reliability:
   - macOS click-through move handle is larger and has a larger practical hitbox
   - macOS window-level pass-through policy now checks the move handle directly
   - macOS has a global mouse fallback so a move-handle press can arm/manual-drag the window even if the window was still ignored at mouse-down time

@@ -451,11 +451,13 @@ fn resolve_provider_mix_candidates(lane: &str, seed: &str) -> Vec<(&'static str,
         ),
         "vision" => rotate_preferred_routes(
             vec![
-                ("openai", OPENAI_ACCURATE_MODEL),
-                ("gemini", GEMINI_PRO_MODEL),
                 ("gemini", GEMINI_FLASH_MODEL),
+                ("openai", OPENAI_ACCURATE_MODEL),
             ],
-            vec![("openai", OPENAI_FAST_MODEL)],
+            vec![
+                ("gemini", GEMINI_PRO_MODEL),
+                ("openai", OPENAI_FAST_MODEL),
+            ],
             lane,
             seed,
         ),
@@ -2637,6 +2639,10 @@ mod tests {
                     .iter()
                     .all(|(provider, _model)| *provider == "openai" || *provider == "gemini"),
                 "vision provider mix must not route image payloads to text-only providers: {routes:?}"
+            );
+            assert!(
+                !matches!(routes.first(), Some(("gemini", GEMINI_PRO_MODEL))),
+                "vision provider mix should keep the slower pro preview as fallback, not first: {routes:?}"
             );
         }
     }
