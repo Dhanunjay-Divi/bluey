@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-30 21:31 EDT
+Latest checkpoint: 2026-07-01 00:00 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,33 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-265-BALANCE-POLL-RECOVERY-DEPLOY.md`; the next canonical Bluey round doc should start at `ROUND-266-...`.
+- Latest assigned Bluey round doc is `ROUND-266-SHORTCUTS-OVERLAY-PARITY.md`; the next canonical Bluey round doc should start at `ROUND-267-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 266 unified the shortcut model across macOS and Windows:
+  - global shortcut family is now `Ctrl+Option+key` on macOS and
+    `Ctrl+Alt+key` on Windows
+  - `B` show/hide, `T` focus Ask, `L` Listen, `S` Screen, `I`
+    click-through/interactive, `Enter` Answer
+  - local direct `L/S/I/H/F/Esc` works only when the full overlay is
+    interactive and a text editor is not focused
+  - macOS now has global key routing plus local overlay shortcut routing
+  - Windows now registers `Ctrl+Alt` hotkeys and has a real
+    click-through/interactive toggle for blank-space hit testing
+  - older dashboard shortcut registrations moved away from `Ctrl+Shift`
+  - F19 remains only as a legacy fallback where it already exists
+  - verification passed:
+    - `swiftc -parse native/macos/cue-overlay/Sources/cue-overlay/main.swift`
+    - `/opt/homebrew/bin/x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c`
+    - `cargo check -p cue-dashboard --quiet`
+    - `git diff --check`
+    - release macOS overlay build
+    - local `~/.bluey/bin` overlay hot-install, ad-hoc sign, and restart
+  - Round doc:
+    `docs/rounds/ROUND-266-SHORTCUTS-OVERLAY-PARITY.md`
 - Round 265 fixed and deployed the balance poll recovery issue:
   - root cause was a stale in-memory token cache inside the long-running daemon
     balance poller while CLI/browser auth could refresh the secure token store

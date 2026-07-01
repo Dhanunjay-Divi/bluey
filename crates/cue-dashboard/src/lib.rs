@@ -293,14 +293,10 @@ pub fn run() {
 fn register_global_shortcut(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     use tauri_plugin_global_shortcut::ShortcutState;
 
-    // Toggle dashboard visibility: Cmd/Ctrl+Shift+D
+    // Toggle dashboard visibility: Ctrl+Option/Alt+B.
     let handle = app.handle().clone();
     app.global_shortcut().on_shortcut(
-        if cfg!(target_os = "macos") {
-            "CmdOrCtrl+Shift+D"
-        } else {
-            "Ctrl+Shift+D"
-        },
+        "Ctrl+Alt+B",
         move |_app, shortcut, event| {
             if event.state == ShortcutState::Pressed {
                 tracing::debug!(shortcut = %shortcut, "global shortcut pressed");
@@ -315,14 +311,10 @@ fn register_global_shortcut(app: &tauri::App) -> Result<(), Box<dyn std::error::
         },
     )?;
 
-    // Toggle listening: Cmd/Ctrl+Shift+L
+    // Toggle listening: Ctrl+Option/Alt+L.
     let handle2 = app.handle().clone();
     app.global_shortcut().on_shortcut(
-        if cfg!(target_os = "macos") {
-            "CmdOrCtrl+Shift+L"
-        } else {
-            "Ctrl+Shift+L"
-        },
+        "Ctrl+Alt+L",
         move |_app, _shortcut, event| {
             if event.state == ShortcutState::Pressed {
                 let _ = handle2.emit("hotkey_toggle_listening", ());
@@ -330,16 +322,12 @@ fn register_global_shortcut(app: &tauri::App) -> Result<(), Box<dyn std::error::
         },
     )?;
 
-    // Push-to-talk toggle: Cmd/Ctrl+Shift+P
+    // Push-to-talk toggle: Ctrl+Option/Alt+P.
     // Note: tauri-plugin-global-shortcut does not expose distinct press/release
     // events, so we use a toggle approach (each press cycles the state).
     let handle3 = app.handle().clone();
     app.global_shortcut().on_shortcut(
-        if cfg!(target_os = "macos") {
-            "CmdOrCtrl+Shift+P"
-        } else {
-            "Ctrl+Shift+P"
-        },
+        "Ctrl+Alt+P",
         move |_app, _shortcut, event| {
             if event.state == ShortcutState::Pressed {
                 let _ = handle3.emit("hotkey_push_to_talk", ());
@@ -347,14 +335,10 @@ fn register_global_shortcut(app: &tauri::App) -> Result<(), Box<dyn std::error::
         },
     )?;
 
-    // Request cue (AI answer): Cmd/Ctrl+Shift+A
+    // Request cue (AI answer): Ctrl+Option/Alt+Enter.
     let handle_a = app.handle().clone();
     app.global_shortcut().on_shortcut(
-        if cfg!(target_os = "macos") {
-            "CmdOrCtrl+Shift+A"
-        } else {
-            "Ctrl+Shift+A"
-        },
+        "Ctrl+Alt+Enter",
         move |_app, _shortcut, event| {
             if event.state == ShortcutState::Pressed {
                 let _ = handle_a.emit("hotkey_request_cue", ());
@@ -362,14 +346,10 @@ fn register_global_shortcut(app: &tauri::App) -> Result<(), Box<dyn std::error::
         },
     )?;
 
-    // Toggle overlay: Cmd/Ctrl+Shift+H
+    // Legacy dashboard overlay toggle: Ctrl+Option/Alt+H.
     let handle4 = app.handle().clone();
     app.global_shortcut().on_shortcut(
-        if cfg!(target_os = "macos") {
-            "CmdOrCtrl+Shift+H"
-        } else {
-            "Ctrl+Shift+H"
-        },
+        "Ctrl+Alt+H",
         move |_app, _shortcut, event| {
             if event.state == ShortcutState::Pressed {
                 let _ = handle4.emit("hotkey_toggle_overlay", ());

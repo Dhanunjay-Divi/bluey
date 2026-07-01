@@ -5495,6 +5495,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func routeKeyDownToComposer(_ event: NSEvent) -> Bool {
+        if routeBlueyShortcut(event, source: "local") {
+            return true
+        }
         guard closeConfirmOverlay.isHidden, answerStyleOverlay.isHidden else {
             return false
         }
@@ -5570,6 +5573,127 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         composer.keyDown(with: event)
         return true
+    }
+
+    @discardableResult
+    func routeBlueyShortcut(_ event: NSEvent, source: String) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let key = (event.charactersIgnoringModifiers ?? "").lowercased()
+        let isReturn = event.keyCode == 36 || event.keyCode == 76 || key == "\r" || key == "\n"
+        let controlOption = flags.contains(.control)
+            && flags.contains(.option)
+            && !flags.contains(.command)
+            && !flags.contains(.shift)
+        let localControl = flags.contains(.control)
+            && !flags.contains(.option)
+            && !flags.contains(.command)
+            && !flags.contains(.shift)
+
+        if controlOption {
+            if performBlueyShortcut(key: key, isReturn: isReturn, source: source, allowFocusShortcut: true) {
+                return true
+            }
+        }
+
+        if localControl {
+            if performBlueyShortcut(key: key, isReturn: isReturn, source: source, allowFocusShortcut: true) {
+                return true
+            }
+        }
+
+        guard source == "local",
+              flags.isDisjoint(with: [.control, .option, .command, .shift]),
+              !isTextEditingResponderActive
+        else {
+            return false
+        }
+
+        if event.keyCode == 53 {
+            return performBlueyShortcut(key: "escape", isReturn: false, source: source, allowFocusShortcut: false)
+        }
+
+        guard !passThroughMode else { return false }
+        return performBlueyShortcut(key: key, isReturn: isReturn, source: source, allowFocusShortcut: false)
+    }
+
+    private var isTextEditingResponderActive: Bool {
+        guard let firstResponder = window?.firstResponder else { return false }
+        if firstResponder === composer { return true }
+        if let textView = firstResponder as? NSTextView {
+            return textView !== composer || textView.string.isEmpty == false || composerInputArmedUntil > CACurrentMediaTime()
+        }
+        if let textField = firstResponder as? NSTextField,
+           textField.isEditable || textField.isSelectable {
+            return true
+        }
+        if let editor = window?.fieldEditor(false, for: nil) as? NSTextView,
+           editor !== composer {
+            return true
+        }
+        return false
+    }
+
+    @discardableResult
+    private func performBlueyShortcut(
+        key: String,
+        isReturn: Bool,
+        source: String,
+        allowFocusShortcut: Bool
+    ) -> Bool {
+        if isReturn {
+            askClicked()
+            emitLifecycle("shortcut_invoked", detail: "source=\(source) action=answer")
+            return true
+        }
+
+        switch key {
+        case "t" where allowFocusShortcut:
+            focusComposerForQuestion()
+            emitLifecycle("shortcut_invoked", detail: "source=\(source) action=focus_ask")
+            return true
+        case "l":
+            recordingClicked()
+            emitLifecycle("shortcut_invoked", detail: "source=\(source) action=listen")
+            return true
+        case "s":
+            analyzeClicked()
+            emitLifecycle("shortcut_invoked", detail: "source=\(source) action=screen")
+            return true
+        case "i":
+            interactionModeClicked()
+            emitLifecycle("shortcut_invoked", detail: "source=\(source) action=interactive")
+            return true
+        case "h":
+            toggleSessionsClicked()
+            emitLifecycle("shortcut_invoked", detail: "source=\(source) action=history")
+            return true
+        case "f":
+            if contextItems.isEmpty {
+                attachClicked()
+            } else {
+                toggleSavedContextItems()
+            }
+            emitLifecycle("shortcut_invoked", detail: "source=\(source) action=files")
+            return true
+        case "escape":
+            if dismissActiveOverlay() {
+                emitLifecycle("shortcut_invoked", detail: "source=\(source) action=escape_modal")
+                return true
+            }
+            if !sessionDrawer.isHidden {
+                closeSessionsClicked()
+                emitLifecycle("shortcut_invoked", detail: "source=\(source) action=escape_history")
+                return true
+            }
+            if canvasOpen {
+                setCanvasOpen(false)
+                emitLifecycle("shortcut_invoked", detail: "source=\(source) action=escape_canvas")
+                return true
+            }
+            return false
+        default:
+            return false
+        }
     }
 
     private func routeTextResponderShortcut(
@@ -11437,6 +11561,7 @@ private final class OverlayApp {
     private var remoteInputPassthroughTimer: Timer?
     private var remoteControlHeuristicTimer: Timer?
     private var localKeyMonitor: Any?
+    private var globalKeyMonitor: Any?
     private var externalFileDragMonitor: Any?
     private var activeAppObserver: NSObjectProtocol?
     private var trustedRemoteInputEventTap: CFMachPort?
@@ -11458,6 +11583,15 @@ private final class OverlayApp {
     deinit {
         if let activeAppObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(activeAppObserver)
+        }
+        if let localKeyMonitor {
+            NSEvent.removeMonitor(localKeyMonitor)
+        }
+        if let globalKeyMonitor {
+            NSEvent.removeMonitor(globalKeyMonitor)
+        }
+        if let externalFileDragMonitor {
+            NSEvent.removeMonitor(externalFileDragMonitor)
         }
     }
 
@@ -11509,6 +11643,7 @@ private final class OverlayApp {
         startParentWatchdog()
         startExpandedPassthroughTracking()
         startLocalKeyRouting()
+        startGlobalKeyRouting()
         startExternalFileDragCaptureMonitor()
         if trustedRemoteInputTapEnabled {
             startTrustedRemoteInputPassthroughMonitor()
@@ -11543,6 +11678,55 @@ private final class OverlayApp {
                 return event
             }
             return nil
+        }
+    }
+
+    private func startGlobalKeyRouting() {
+        guard globalKeyMonitor == nil else { return }
+        globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            DispatchQueue.main.async {
+                self?.routeGlobalBlueyShortcut(event)
+            }
+        }
+        emitLifecycle("global_shortcuts", status: "ready", detail: "modifier=ctrl_option")
+    }
+
+    private func routeGlobalBlueyShortcut(_ event: NSEvent) {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard flags.contains(.control),
+              flags.contains(.option),
+              !flags.contains(.command),
+              !flags.contains(.shift)
+        else {
+            return
+        }
+
+        let key = (event.charactersIgnoringModifiers ?? "").lowercased()
+        switch key {
+        case "b":
+            if expandedWindow?.isVisible == true {
+                collapse()
+            } else {
+                expand()
+            }
+            emitLifecycle("shortcut_invoked", detail: "source=global action=toggle_overlay")
+            return
+        case "t":
+            expandAndFocusQuestion()
+            emitLifecycle("shortcut_invoked", detail: "source=global action=focus_ask")
+            return
+        default:
+            break
+        }
+
+        guard expandedModeActive,
+              expandedWindow?.isVisible == true,
+              let expandedView
+        else {
+            return
+        }
+        if expandedView.routeBlueyShortcut(event, source: "global") {
+            updateExpandedMousePolicy()
         }
     }
 
@@ -12333,7 +12517,7 @@ private final class RestoreToast {
         bg.layer?.cornerRadius = 12
         bg.layer?.masksToBounds = true
 
-        let label = NSTextField(labelWithString: "Bluey hidden — press F19 to restore")
+        let label = NSTextField(labelWithString: "Bluey hidden — press Ctrl+Option+B to restore")
         label.alignment = .center
         label.font = NSFont.systemFont(ofSize: 13, weight: .medium)
         label.textColor = NSColor(white: 0.95, alpha: 1.0)

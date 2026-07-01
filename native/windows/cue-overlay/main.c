@@ -72,6 +72,7 @@ static wchar_t g_source[256] = L"";
 static wchar_t g_card_id[80] = L"";
 static bool g_visible = true;
 static bool g_collapsed = false;
+static bool g_interactive_mode = false;
 static bool g_recording = false;
 static DWORD g_last_record_toggle_ms = 0;
 static DWORD g_record_restart_after_ms = 0;
@@ -119,6 +120,10 @@ static WNDPROC g_ask_edit_proc = NULL;
 static void send_current_question(void);
 static void show_full_overlay(bool emit_event);
 static void update_paste_answer_button(void);
+static void invoke_button_command(int id, HWND control);
+static void focus_ask_input(void);
+static void toggle_interactive_mode(void);
+static bool handle_overlay_shortcut_key(WPARAM key, bool local_key);
 
 #define MAX_CONTEXT_CHIPS 16
 typedef struct OverlayContextChip {
@@ -191,6 +196,13 @@ static void consume_sent_context_chips(void);
 #define ID_RECAP_BUTTON 1011
 #define ID_THEME_BUTTON 1012
 #define COLLAPSED_DRAG_THRESHOLD 4
+#define ID_HOTKEY_TOGGLE_OVERLAY 2001
+#define ID_HOTKEY_FOCUS_ASK 2002
+#define ID_HOTKEY_LISTEN 2003
+#define ID_HOTKEY_SCREEN 2004
+#define ID_HOTKEY_INTERACTIVE 2005
+#define ID_HOTKEY_ANSWER 2006
+#define BLUEY_GLOBAL_HOTKEY_MODS (MOD_CONTROL | MOD_ALT | MOD_NOREPEAT)
 
 /* Stealth: hide overlay from screen recording, screenshots, and screen-share.
  * WDA_EXCLUDEFROMCAPTURE (Windows 10 2004+ / build 19041) makes the window
@@ -1253,6 +1265,10 @@ static LRESULT hit_test_expanded_resize(POINT point) {
 }
 
 static LRESULT CALLBACK ask_edit_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    if (msg == WM_KEYDOWN && wparam == VK_RETURN && (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+        send_current_question();
+        return 0;
+    }
     if (msg == WM_KEYDOWN && wparam == VK_RETURN && (GetKeyState(VK_SHIFT) & 0x8000) == 0) {
         send_current_question();
         return 0;
@@ -1527,6 +1543,95 @@ static void send_current_question(void) {
     consume_sent_context_chips();
     InvalidateRect(g_hwnd, NULL, TRUE);
     SetFocus(g_ask_edit);
+}
+
+static void invoke_button_command(int id, HWND control) {
+    if (!g_hwnd) return;
+    SendMessageW(g_hwnd, WM_COMMAND, MAKEWPARAM(id, BN_CLICKED), (LPARAM)control);
+}
+
+static void focus_ask_input(void) {
+    if (!g_hwnd || !g_ask_edit) return;
+    if (g_collapsed || !g_visible) show_full_overlay(true);
+    SetFocus(g_ask_edit);
+    int length = GetWindowTextLengthW(g_ask_edit);
+    SendMessageW(g_ask_edit, EM_SETSEL, (WPARAM)length, (LPARAM)length);
+    emit_lifecycle_event("shortcut_invoked", "ok", "source=keyboard action=focus_ask");
+}
+
+static void toggle_interactive_mode(void) {
+    g_interactive_mode = !g_interactive_mode;
+    InvalidateRect(g_hwnd, NULL, TRUE);
+    emit_lifecycle_event(
+        "shortcut_invoked",
+        "ok",
+        g_interactive_mode
+            ? "source=keyboard action=interactive_on"
+            : "source=keyboard action=clickthrough_on"
+    );
+}
+
+static bool handle_overlay_shortcut_key(WPARAM key, bool local_key) {
+    if (!g_hwnd) return false;
+    bool expanded = !g_collapsed && g_visible;
+
+    if (key == 'B') {
+        if (expanded) {
+            collapse_to_pill(g_hwnd, true);
+        } else {
+            show_full_overlay(true);
+        }
+        emit_lifecycle_event("shortcut_invoked", "ok", "source=keyboard action=toggle_overlay");
+        return true;
+    }
+
+    if (key == 'T') {
+        focus_ask_input();
+        return true;
+    }
+
+    if (!expanded) return false;
+
+    switch (key) {
+    case VK_RETURN:
+        send_current_question();
+        emit_lifecycle_event("shortcut_invoked", "ok", "source=keyboard action=answer");
+        return true;
+    case 'L':
+        invoke_button_command(ID_RECORD_BUTTON, g_record_button);
+        emit_lifecycle_event("shortcut_invoked", "ok", "source=keyboard action=listen");
+        return true;
+    case 'S':
+        invoke_button_command(ID_PAGE_BUTTON, g_page_button);
+        emit_lifecycle_event("shortcut_invoked", "ok", "source=keyboard action=screen");
+        return true;
+    case 'I':
+        toggle_interactive_mode();
+        return true;
+    case 'H':
+        if (local_key) {
+            invoke_button_command(ID_SESSION_BUTTON, g_session_button);
+            emit_lifecycle_event("shortcut_invoked", "ok", "source=keyboard action=history");
+            return true;
+        }
+        return false;
+    case 'F':
+        if (local_key) {
+            invoke_button_command(ID_ATTACH_BUTTON, g_attach_button);
+            emit_lifecycle_event("shortcut_invoked", "ok", "source=keyboard action=files");
+            return true;
+        }
+        return false;
+    case VK_ESCAPE:
+        if (local_key) {
+            collapse_to_pill(g_hwnd, true);
+            emit_lifecycle_event("shortcut_invoked", "ok", "source=keyboard action=collapse");
+            return true;
+        }
+        return false;
+    default:
+        return false;
+    }
 }
 
 static void safe_extract_json_to_wide(const char *line, size_t line_len, const char *key, wchar_t *dest, size_t dest_wchars) {
@@ -2321,7 +2426,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         }
         if (id == ID_HELP_BUTTON) {
             overlay_message_box(
-                L"Green dot: Bluey is connected.\nHelp: show this guide.\nSession: continue or start clean.\nAttach: add files or show attached docs.\nTheme: switch black/white background while keeping Bluey borders.\nStyle: answer rules.\nAnalyse Screen: search/read the active browser page or available screen context and generate an answer.\nRecap: summarize the active session from the bottom bar.\nQuit: stop Bluey completely. Hide/collapse behavior becomes a small Bluey button.\nMic: start/stop audio capture.\nMic dot: dim off, bright green recording.\nAnswer: ask Bluey.\nHold any blank Bluey space to move it. Controls stay clickable.",
+                L"Green dot: Bluey is connected.\nHelp: show this guide.\nSession: continue or start clean.\nAttach: add files or show attached docs.\nTheme: switch black/white background while keeping Bluey borders.\nStyle: answer rules.\nAnalyse Screen: search/read the active browser page or available screen context and generate an answer.\nRecap: summarize the active session from the bottom bar.\nQuit: stop Bluey completely. Hide/collapse behavior becomes a small Bluey button.\nMic: start/stop audio capture.\nMic dot: dim off, bright green recording.\nAnswer: ask Bluey.\nCtrl+Alt+B shows or hides Bluey. Ctrl+Alt+T focuses Ask. Ctrl+Alt+L/S/I/Enter controls Listen, Screen, Interactive, and Answer.\nWhen Interactive is on, blank Bluey space drags the window. When click-through is on, blank Bluey space clicks the app behind it.",
                 L"Bluey controls",
                 MB_OK | MB_ICONINFORMATION
             );
@@ -2450,12 +2555,53 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             return 0;
         }
         break;
-    case WM_KEYDOWN:
+    case WM_HOTKEY:
+        switch ((int)wparam) {
+        case ID_HOTKEY_TOGGLE_OVERLAY:
+            handle_overlay_shortcut_key('B', false);
+            return 0;
+        case ID_HOTKEY_FOCUS_ASK:
+            handle_overlay_shortcut_key('T', false);
+            return 0;
+        case ID_HOTKEY_LISTEN:
+            handle_overlay_shortcut_key('L', false);
+            return 0;
+        case ID_HOTKEY_SCREEN:
+            handle_overlay_shortcut_key('S', false);
+            return 0;
+        case ID_HOTKEY_INTERACTIVE:
+            handle_overlay_shortcut_key('I', false);
+            return 0;
+        case ID_HOTKEY_ANSWER:
+            handle_overlay_shortcut_key(VK_RETURN, false);
+            return 0;
+        default:
+            break;
+        }
+        break;
+    case WM_KEYDOWN: {
+        bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+        bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
+        bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        bool edit_focused = GetFocus() == g_ask_edit;
+        if (!edit_focused && !ctrl && !alt && !shift) {
+            if (handle_overlay_shortcut_key(wparam, true)) {
+                return 0;
+            }
+        }
+        if (!edit_focused && ctrl && !alt && !shift) {
+            if (wparam == VK_RETURN || wparam == 'L' || wparam == 'S' || wparam == 'I') {
+                if (handle_overlay_shortcut_key(wparam, true)) {
+                    return 0;
+                }
+            }
+        }
         if (wparam == VK_RETURN && GetFocus() == g_ask_edit) {
             send_current_question();
             return 0;
         }
         break;
+    }
     case WM_DROPFILES: {
         HDROP drop = (HDROP)wparam;
         emit_attach_files_event_from_drop(drop);
@@ -2468,7 +2614,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         if (point_hits_overlay_control(point)) return HTCLIENT;
         LRESULT resize_hit = hit_test_expanded_resize(point);
         if (resize_hit != HTNOWHERE) return resize_hit;
-        if (point_hits_brand_move_handle(point)) return HTCAPTION;
+        if (point_hits_brand_move_handle(point) || g_interactive_mode) return HTCAPTION;
         return HTTRANSPARENT;
     }
     case WM_SETCURSOR: {
@@ -2661,6 +2807,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         collapse_to_pill(hwnd, true);
         return 0;
     case WM_DESTROY:
+        UnregisterHotKey(hwnd, ID_HOTKEY_TOGGLE_OVERLAY);
+        UnregisterHotKey(hwnd, ID_HOTKEY_FOCUS_ASK);
+        UnregisterHotKey(hwnd, ID_HOTKEY_LISTEN);
+        UnregisterHotKey(hwnd, ID_HOTKEY_SCREEN);
+        UnregisterHotKey(hwnd, ID_HOTKEY_INTERACTIVE);
+        UnregisterHotKey(hwnd, ID_HOTKEY_ANSWER);
         if (g_edit_brush) {
             DeleteObject(g_edit_brush);
             g_edit_brush = NULL;
@@ -2725,6 +2877,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
     load_session_token();
     emit_ready();
+    RegisterHotKey(g_hwnd, ID_HOTKEY_TOGGLE_OVERLAY, BLUEY_GLOBAL_HOTKEY_MODS, 'B');
+    RegisterHotKey(g_hwnd, ID_HOTKEY_FOCUS_ASK, BLUEY_GLOBAL_HOTKEY_MODS, 'T');
+    RegisterHotKey(g_hwnd, ID_HOTKEY_LISTEN, BLUEY_GLOBAL_HOTKEY_MODS, 'L');
+    RegisterHotKey(g_hwnd, ID_HOTKEY_SCREEN, BLUEY_GLOBAL_HOTKEY_MODS, 'S');
+    RegisterHotKey(g_hwnd, ID_HOTKEY_INTERACTIVE, BLUEY_GLOBAL_HOTKEY_MODS, 'I');
+    RegisterHotKey(g_hwnd, ID_HOTKEY_ANSWER, BLUEY_GLOBAL_HOTKEY_MODS, VK_RETURN);
+    emit_lifecycle_event("global_shortcuts", "ready", "modifier=ctrl_alt");
     CreateThread(NULL, 0, stdin_thread, NULL, 0, NULL);
 
     MSG msg;
