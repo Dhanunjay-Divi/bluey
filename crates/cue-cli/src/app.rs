@@ -45,7 +45,7 @@ enum Commands {
     On(OnArgs),
     /// Turn Bluey off.
     Off,
-    /// Remove the local Bluey desktop install.
+    /// Remove Bluey from this device.
     Uninstall(UninstallArgs),
     /// Sign in or link Bluey to a cloud account.
     #[command(hide = true)]
@@ -70,7 +70,7 @@ enum Commands {
     /// Check for and install a Bluey desktop update.
     #[command(hide = true)]
     Update(UpdateArgs),
-    /// Log out of Bluey: clear local account tokens.
+    /// Log out of Bluey: clear device account tokens.
     #[command(hide = true)]
     Logout,
     /// Open the Bluey billing page in your browser to manage credits and provider-backed billing.
@@ -94,7 +94,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Manage local Bluey logs.
+    /// Manage Bluey logs on this device.
     #[command(hide = true)]
     Logs {
         #[command(subcommand)]
@@ -230,7 +230,7 @@ struct UninstallArgs {
     /// Do not ask for confirmation.
     #[arg(long)]
     yes: bool,
-    /// Also remove local account tokens, settings, saved sessions, logs, and runtime state.
+    /// Also remove device account tokens, settings, saved sessions, logs, and runtime state.
     #[arg(long)]
     purge_data: bool,
 }
@@ -313,7 +313,7 @@ struct SettingsArgs {
 
 #[derive(Debug, clap::Subcommand)]
 enum LogsCommands {
-    /// Bundle local Bluey logs into a redacted zip for support.
+    /// Bundle Bluey logs from this device into a redacted zip for support.
     Export {
         /// Disable redaction. By default the export strips bearer tokens,
         /// magic-link URLs, billing IDs, provider keys, emails, and IPv4
@@ -1275,9 +1275,9 @@ async fn cue_uninstall(args: UninstallArgs) -> Result<()> {
             }
         }
     } else {
-        println!("Preserved local data: {}", paths.data_dir.display());
+        println!("Preserved device data: {}", paths.data_dir.display());
         println!("Preserved account/settings: {}", paths.config_dir.display());
-        println!("Use `bluey uninstall --purge-data` to remove local data too.");
+        println!("Use `bluey uninstall --purge-data` to remove device data too.");
     }
 
     println!("Bluey uninstall complete. Removed {removed} item(s), skipped {skipped}.");
@@ -1285,11 +1285,11 @@ async fn cue_uninstall(args: UninstallArgs) -> Result<()> {
 }
 
 fn confirm_uninstall(purge_data: bool) -> Result<()> {
-    println!("This will stop Bluey and remove the local Bluey desktop install.");
+    println!("This will stop Bluey and remove it from this device.");
     if purge_data {
-        println!("--purge-data is enabled: local tokens, settings, saved sessions, logs, and runtime data will also be removed.");
+        println!("--purge-data is enabled: device tokens, settings, saved sessions, logs, and runtime data will also be removed.");
     } else {
-        println!("Local account data and saved sessions will be kept.");
+        println!("Account data and saved sessions on this device will be kept.");
     }
     print!("Type uninstall to continue: ");
     io::stdout().flush().ok();

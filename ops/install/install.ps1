@@ -130,7 +130,7 @@ function Install-BlueyLocalDocTools {
     param([string]$Root)
 
     if ($env:BLUEY_SKIP_LOCAL_TOOLS -eq "1") {
-        Write-Warn "Skipping Bluey-local document tools because BLUEY_SKIP_LOCAL_TOOLS=1"
+        Write-Warn "Skipping Bluey document tools because BLUEY_SKIP_LOCAL_TOOLS=1"
         return
     }
 
@@ -150,7 +150,7 @@ function Install-BlueyLocalDocTools {
         return
     }
 
-    Write-Step "Installing Bluey-local document tools..."
+    Write-Step "Installing Bluey document tools..."
     $toolsDir = Join-Path $Root "tools\doc-converter"
     $venvDir = Join-Path $toolsDir ".venv"
     $wrapper = Join-Path (Join-Path $Root "bin") "bluey-doc-converter.cmd"
@@ -159,7 +159,7 @@ function Install-BlueyLocalDocTools {
     try {
         & $pythonCommand.Source @pythonArgs -m venv $venvDir | Out-Null
         if ($LASTEXITCODE -ne 0) {
-            Write-Warn "Could not create Bluey-local Python venv; document conversion will use built-in fallbacks only"
+            Write-Warn "Could not prepare Bluey document tools; document conversion will use built-in fallbacks only"
             return
         }
 
@@ -170,7 +170,7 @@ function Install-BlueyLocalDocTools {
             & $venvPython -m pip install --disable-pip-version-check markitdown | Out-Null
         }
         if ($LASTEXITCODE -ne 0) {
-            Write-Warn "Could not install MarkItDown into Bluey's local tools venv; document conversion will use built-in fallbacks only"
+            Write-Warn "Could not install MarkItDown for Bluey document tools; document conversion will use built-in fallbacks only"
             return
         }
 
@@ -180,9 +180,9 @@ function Install-BlueyLocalDocTools {
             "`"%ROOT%\tools\doc-converter\.venv\Scripts\markitdown.exe`" %*"
         )
         Set-Content -Path $wrapper -Encoding ASCII -Value $wrapperLines
-        Write-Ok "Bluey-local document tools installed"
+        Write-Ok "Bluey document tools installed"
     } catch {
-        Write-Warn "Could not install Bluey-local document tools: $($_.Exception.Message)"
+        Write-Warn "Could not install Bluey document tools: $($_.Exception.Message)"
     }
 }
 

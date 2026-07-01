@@ -341,24 +341,23 @@ fn print_update_posture(plan: &UpdatePlan) {
             println!("Run `bluey update` to install when ready.");
         }
         ManifestTrust::UnsignedAllowed(reason) => {
-            println!("warning: unsigned update install is enabled for development ({reason}).");
+            println!("warning: update verification override is enabled ({reason}).");
         }
         ManifestTrust::Unverified(reason) => {
-            println!(
-                "Update install is disabled because the release manifest is not verified: {reason}"
-            );
-            println!(
-                "Release operators must publish latest.json.sig; BLUEY_UPDATE_ALLOW_UNSIGNED=1 is for local testing only."
-            );
+            println!("{}", update_verification_blocked_message(reason));
+            if env_flag("BLUEY_UPDATE_VERBOSE") {
+                println!("Technical reason: {reason}");
+            }
         }
     }
 }
 
 fn ensure_update_installable(plan: &UpdatePlan) -> Result<()> {
+    if let ManifestTrust::Unverified(reason) = &plan.manifest_trust {
+        bail!("{}", update_verification_blocked_message(reason));
+    }
     if !plan.manifest_trust.permits_install() {
-        bail!(
-            "refusing to install unsigned Bluey update; publish latest.json.sig or set BLUEY_UPDATE_ALLOW_UNSIGNED=1 only for local testing"
-        );
+        bail!("Bluey could not verify this production update. Please try again shortly.");
     }
     if !plan.manifest_trust.is_verified() && !env_flag("BLUEY_UPDATE_ALLOW_UNSIGNED") {
         bail!("refusing to install update without a verified release manifest");
@@ -370,6 +369,27 @@ fn ensure_update_installable(plan: &UpdatePlan) -> Result<()> {
         bail!("refusing to install update because latest.json does not pin artifact sha256");
     }
     Ok(())
+}
+
+fn update_verification_blocked_message(reason: &str) -> String {
+    let reinstall = production_reinstall_hint();
+    if reason.contains("build has no BLUEY_UPDATE_PUBKEY") {
+        return format!(
+            "This Bluey install is too old to verify production updates. Reinstall once with {reinstall}. After that, `bluey on` will keep Bluey updated automatically."
+        );
+    }
+
+    format!(
+        "Bluey could not verify the production update. Please try again shortly, or reinstall with {reinstall}."
+    )
+}
+
+fn production_reinstall_hint() -> &'static str {
+    if cfg!(windows) {
+        "`irm https://bluey.sh/install.ps1 | iex`"
+    } else {
+        "`curl -fsSL https://bluey.sh/install.sh | bash`"
+    }
 }
 
 fn confirm_or_auto_update(plan: &UpdatePlan, manual: bool) -> bool {
@@ -868,6 +888,16 @@ mod tests {
         };
 
         assert!(ensure_update_installable(&plan).is_err());
+    }
+
+    #[test]
+    fn old_build_update_message_is_production_safe() {
+        let message = update_verification_blocked_message("build has no BLUEY_UPDATE_PUBKEY");
+
+        assert!(message.contains("too old to verify production updates"));
+        assert!(message.contains("bluey.sh/install"));
+        assert!(!message.contains("BLUEY_UPDATE_ALLOW_UNSIGNED"));
+        assert!(!message.contains("local testing"));
     }
 
     #[test]

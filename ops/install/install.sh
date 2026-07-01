@@ -122,7 +122,7 @@ install_local_doc_tools() {
     local wrapper="$root/bin/bluey-doc-converter"
 
     if [ "${BLUEY_SKIP_LOCAL_TOOLS:-0}" = "1" ]; then
-        warn "Skipping Bluey-local document tools because BLUEY_SKIP_LOCAL_TOOLS=1"
+        warn "Skipping Bluey document tools because BLUEY_SKIP_LOCAL_TOOLS=1"
         return 0
     fi
     if ! command -v python3 >/dev/null 2>&1; then
@@ -130,10 +130,10 @@ install_local_doc_tools() {
         return 0
     fi
 
-    say "Installing Bluey-local document tools..."
+    say "Installing Bluey document tools..."
     mkdir -p "$tools_dir" "$root/bin"
     if ! python3 -m venv "$tools_dir/.venv" >/dev/null 2>&1; then
-        warn "Could not create Bluey-local Python venv; document conversion will use built-in fallbacks only"
+        warn "Could not prepare Bluey document tools; document conversion will use built-in fallbacks only"
         return 0
     fi
 
@@ -141,7 +141,7 @@ install_local_doc_tools() {
     "$py" -m pip install --disable-pip-version-check --upgrade pip >/dev/null 2>&1 || true
     if ! "$py" -m pip install --disable-pip-version-check "markitdown[all]" >/dev/null 2>&1; then
         if ! "$py" -m pip install --disable-pip-version-check markitdown >/dev/null 2>&1; then
-            warn "Could not install MarkItDown into Bluey's local tools venv; document conversion will use built-in fallbacks only"
+            warn "Could not install MarkItDown for Bluey document tools; document conversion will use built-in fallbacks only"
             return 0
         fi
     fi
@@ -153,7 +153,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 exec "$ROOT/tools/doc-converter/.venv/bin/markitdown" "$@"
 SH
     chmod +x "$wrapper"
-    ok "Bluey-local document tools installed"
+    ok "Bluey document tools installed"
 }
 
 # ── Pre-flight ───────────────────────────────────────────────────────
@@ -213,7 +213,7 @@ fi
 ok "Downloaded $(stat -f%z "$TARBALL" 2>/dev/null || stat -c%s "$TARBALL") bytes"
 
 if [ "${BLUEY_SKIP_CHECKSUM:-0}" != "1" ]; then
-    command -v shasum >/dev/null || fail "shasum is required to verify the Bluey download; install it or set BLUEY_SKIP_CHECKSUM=1 for local testing only"
+    command -v shasum >/dev/null || fail "shasum is required to verify the Bluey download. Install shasum and rerun the Bluey installer."
     CHECKSUMS="$DOWNLOAD_TMP/SHA256SUMS.txt"
     if [ -n "${BLUEY_ARTIFACT_SHA256:-}" ]; then
         printf "%s  %s\n" "$BLUEY_ARTIFACT_SHA256" "$ARTIFACT" > "$CHECKSUMS.one"

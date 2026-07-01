@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 13:22 EDT
+Latest checkpoint: 2026-07-01 13:49 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,42 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-279-DESKTOP-LOGIN-UNINSTALL.md`; the next canonical Bluey round doc should start at `ROUND-280-...`.
+- Latest assigned Bluey round doc is `ROUND-280-PRODUCTION-UPDATE-RECOVERY-COPY.md`; the next canonical Bluey round doc should start at `ROUND-281-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 280 is complete for production-facing updater/install/uninstall copy:
+  - replaced old updater failure copy that mentioned `BLUEY_UPDATE_ALLOW_UNSIGNED` / local testing with production recovery language
+  - old unverifiable builds now say to reinstall once from the production installer; after that `bluey on` keeps Bluey updated automatically
+  - strict signed-update verification remains intact
+  - `bluey uninstall --help` now says `Remove Bluey from this device`
+  - `--purge-data` copy now refers to device account tokens and device data
+  - macOS and Windows installers say `Bluey document tools`, not `Bluey-local document tools`
+  - desktop workspace version bumped to `0.1.35`
+  - local verification passed:
+    - `cargo test -p cue-cli old_build_update_message_is_production_safe --quiet`
+    - `cargo test -p cue-cli unverified_manifest_is_not_installable_by_default --quiet`
+    - `cargo check -p cue-cli --quiet`
+    - `cargo fmt --all`
+    - `cargo run -p cue-cli --bin bluey --quiet -- uninstall --help`
+  - live deploy verification passed:
+    - `https://bluey.sh/latest.json` reports `0.1.35`
+    - live `latest.json.sig` verifies successfully against the release Ed25519 key
+    - live artifact checksum matches `SHA256SUMS.txt`
+    - live `/install.sh` returns `application/x-shellscript`
+    - live `/install.ps1` returns `application/x-powershell`
+    - temp-root installer smoke installed `bluey 0.1.35` and exposed production-safe uninstall help
+  - live artifact:
+    `https://bluey.sh/releases/v0.1.35/bluey-0.1.35-darwin-arm64.tar.gz`
+  - live SHA256:
+    `ce9aaebf515f998efc533c81345f3e662035416a2df4c8ff7aeb667504e71190`
+  - Important recovery note:
+    - a customer already on a very old binary that cannot verify signed updates needs one production reinstall with `curl -fsSL https://bluey.sh/install.sh | bash`
+    - after that, current builds have the embedded updater key and should update normally through `bluey on`
+  - Round doc:
+    `docs/rounds/ROUND-280-PRODUCTION-UPDATE-RECOVERY-COPY.md`
 - Round 279 is complete for desktop login and uninstall:
   - daemon sign-in now stores the active desktop login URL/code and reopens it on repeated `Open login` clicks
   - duplicate close-together login requests reuse the active device-code flow
