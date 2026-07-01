@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 12:14 EDT
+Latest checkpoint: 2026-07-01 13:22 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,46 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-278-CLICKTHROUGH-DEFAULT-MOVE-HANDLE.md`; the next canonical Bluey round doc should start at `ROUND-279-...`.
+- Latest assigned Bluey round doc is `ROUND-279-DESKTOP-LOGIN-UNINSTALL.md`; the next canonical Bluey round doc should start at `ROUND-280-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 279 is complete for desktop login and uninstall:
+  - daemon sign-in now stores the active desktop login URL/code and reopens it on repeated `Open login` clicks
+  - duplicate close-together login requests reuse the active device-code flow
+  - device login URLs now include `desktop=1&user_code=...`
+  - `bluey on` no longer prints the plain `/login` fallback after starting the browser device flow
+  - web `/login` remembers pending desktop codes for the 10-minute device-flow lifetime and keeps the Connect desktop banner visible
+  - added `bluey uninstall` with `--yes` and `--purge-data`; default uninstall preserves local account data and saved sessions
+  - macOS and Windows installer copy now mentions `bluey uninstall`
+  - Caddy example and live Caddy config have a real-file handler for `/install.sh`, `/install.ps1`, `latest.json`, `latest.json.sig`, and `/releases/*`
+  - desktop workspace version bumped to `0.1.33`
+  - local verification passed:
+    - `node --check web/assets/bluey-site.js`
+    - `cargo test -p cue-cli device_login_url --quiet`
+    - `cargo test -p cue-cli uninstall_root_detection --quiet`
+    - `cargo check -p cue-cli --quiet`
+    - `cargo check -p cue-daemon --quiet`
+    - `cargo check -p cue-dashboard --quiet`
+    - `cargo run -p cue-cli --bin bluey --quiet -- uninstall --help`
+    - `cargo test -p cue-daemon overlay_sign_in_event_is_accepted_by_production_validator --quiet`
+  - live deploy verification passed:
+    - `https://bluey.sh/latest.json` reports `0.1.33`
+    - live `latest.json.sig` verifies successfully against the release Ed25519 key
+    - live `/install.sh` returns `application/x-shellscript` and starts with `#!/usr/bin/env bash`
+    - live `/install.ps1` returns `application/x-powershell`
+    - live artifact checksum matches `SHA256SUMS.txt`
+    - temp-root installer smoke installed `bluey 0.1.33` and exposed `bluey uninstall --help`
+  - live artifact:
+    `https://bluey.sh/releases/v0.1.33/bluey-0.1.33-darwin-arm64.tar.gz`
+  - live SHA256:
+    `d0d6ff6059eff0f32ee61ec93fb9777bc1d6a1a0c4b6e24a885d62916ef6d183`
+  - remaining QA:
+    - run a real signed-out desktop login on a user machine to confirm the browser account page reflects the device code after auth and the daemon receives the completed link
+  - Round doc:
+    `docs/rounds/ROUND-279-DESKTOP-LOGIN-UNINSTALL.md`
 - Round 278 fixed the default click-through and movement model:
   - macOS now starts with click-through off by default
   - click-through-off mode lets blank Bluey space drag the window

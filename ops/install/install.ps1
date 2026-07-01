@@ -285,6 +285,7 @@ try {
     Write-Host "Bluey installed." -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  Run: bluey on" -ForegroundColor White
+    Write-Host "  Remove later: bluey uninstall" -ForegroundColor White
     Write-Host "  Bluey will check for signed updates before starting." -ForegroundColor DarkGray
     Write-Host ""
 } finally {

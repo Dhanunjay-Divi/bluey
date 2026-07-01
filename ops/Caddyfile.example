@@ -8,6 +8,7 @@ bluey.sh, www.bluey.sh {
     encode gzip zstd
 
     @bluey_api path /health /admin/* /auth/* /billing/* /pricing/* /router/* /stt/* /sync/* /rag/* /usage/* /account/me /account/usage /account/billing /account/devices /account/devices/* /account/export /account/delete
+    @bluey_install path /install.sh /install.ps1 /latest.json /latest.json.sig /releases/*
     @bluey_html path / /login /download /install /account /reload /link /device /verify-email /password-reset /docs/* /llms.txt /robots.txt /sitemap.xml /how-bluey-works* /bluey-faq* /ai-meeting-context-copilot* /engineering-meeting-copilot* /ai-copilot-for-design-reviews* /screen-context-ai-assistant* /meeting-memory-and-project-context* /auto-model-router* /private-desktop-ai-overlay* /bluey-vs-ai-meeting-notetakers* /bluey-vs-coding-agents* /context-coverage*
 
     handle @bluey_api {
@@ -21,6 +22,11 @@ bluey.sh, www.bluey.sh {
             header_up X-Forwarded-Proto {scheme}
             header_up X-Forwarded-Host {host}
         }
+    }
+
+    handle @bluey_install {
+        root * /var/www/bluey
+        file_server
     }
 
     handle {

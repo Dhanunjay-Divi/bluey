@@ -311,6 +311,7 @@ else
 fi
 printf "  Bluey opens the browser sign-in flow only when your account\n"
 printf "  is not already linked. Use ${BOLD}bluey off${RESET} to stop it.\n"
+printf "  To remove the app later, run ${BOLD}bluey uninstall${RESET}.\n"
 echo
 printf "  ${DIM}First launch may ask for Accessibility permission so\n"
 printf "  Bluey shortcuts work. Press Ctrl+Option+B to minimize/restore.${RESET}\n"

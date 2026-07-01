@@ -1144,7 +1144,7 @@ struct Daemon {
     audio: Mutex<AudioPipelineStatus>,
     audio_runtime: Mutex<AudioRuntime>,
     cloud: Mutex<CloudSyncStatus>,
-    cloud_login: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    cloud_login: Mutex<Option<CloudLoginTask>>,
     listen_account_verified_until: Mutex<Option<Instant>>,
     auto_cloud_sync_debounce: Mutex<Option<tokio::task::JoinHandle<()>>>,
     balance_poll_shutdown: Mutex<Option<watch::Sender<bool>>>,
@@ -1175,6 +1175,13 @@ struct Daemon {
     /// while AttachRequested + InstructionsRequested are entry-point events
     /// allowed from any state.
     overlay_ui_state: SharedOverlayUiState,
+}
+
+struct CloudLoginTask {
+    handle: tokio::task::JoinHandle<()>,
+    login_url: String,
+    user_code: String,
+    started_at: Instant,
 }
 
 struct OverlayProcess {
@@ -5186,28 +5193,61 @@ async fn start_background_cloud_login(
         return Ok("Bluey is already signed in.".to_string());
     }
 
-    let mut login_guard = daemon.cloud_login.lock().await;
-    if login_guard
-        .as_ref()
-        .is_some_and(|handle| !handle.is_finished())
-    {
-        return Ok("Bluey sign-in is already open in your browser.".to_string());
-    }
-    if login_guard
-        .as_ref()
-        .is_some_and(|handle| handle.is_finished())
-    {
-        login_guard.take();
-    }
-
-    let daemon_for_login = Arc::clone(daemon);
     let trace_id = trace_id
         .as_deref()
         .and_then(sanitize_observability_id)
         .unwrap_or_else(new_trace_id);
+    let active_login = {
+        let mut login_guard = daemon.cloud_login.lock().await;
+        if login_guard
+            .as_ref()
+            .is_some_and(|task| task.handle.is_finished())
+        {
+            login_guard.take();
+        }
+        login_guard.as_ref().map(|task| {
+            (
+                task.login_url.clone(),
+                task.user_code.clone(),
+                task.started_at.elapsed().as_secs(),
+            )
+        })
+    };
+    if let Some((login_url, user_code, age_secs)) = active_login {
+        let _ = open_browser_from_daemon(&login_url);
+        push_login_started_card(daemon, &login_url, &user_code, true).await;
+        info!(
+            source,
+            age_secs,
+            user_code_chars = user_code.chars().count(),
+            "reopened active Bluey desktop login"
+        );
+        return Ok(login_prompt_text(&login_url, &user_code, true));
+    }
+
+    let login = prepare_background_cloud_login(&daemon.paths, &trace_id).await?;
+    let login_url = login.login_url.clone();
+    let user_code = login.flow.user_code.clone();
+    let daemon_for_login = Arc::clone(daemon);
+    let trace_id_for_task = trace_id.clone();
+    {
+        let login_guard = daemon.cloud_login.lock().await;
+        if let Some(task) = login_guard
+            .as_ref()
+            .filter(|task| !task.handle.is_finished())
+        {
+            let active_url = task.login_url.clone();
+            let active_code = task.user_code.clone();
+            drop(login_guard);
+            let _ = open_browser_from_daemon(&active_url);
+            push_login_started_card(daemon, &active_url, &active_code, true).await;
+            return Ok(login_prompt_text(&active_url, &active_code, true));
+        }
+    }
     let handle = tokio::spawn(async move {
         if let Err(error) =
-            run_background_cloud_login(daemon_for_login.clone(), source, trace_id).await
+            run_background_cloud_login(daemon_for_login.clone(), source, trace_id_for_task, login)
+                .await
         {
             warn!(source, "background Bluey login failed: {error:#}");
             push_system_card(
@@ -5219,19 +5259,56 @@ async fn start_background_cloud_login(
             .await;
         }
     });
-    *login_guard = Some(handle);
-    Ok("Opening Bluey sign-in in your browser.".to_string())
+
+    {
+        let mut login_guard = daemon.cloud_login.lock().await;
+        if let Some(task) = login_guard
+            .as_ref()
+            .filter(|task| !task.handle.is_finished())
+        {
+            let active_url = task.login_url.clone();
+            let active_code = task.user_code.clone();
+            handle.abort();
+            drop(login_guard);
+            let _ = open_browser_from_daemon(&active_url);
+            push_login_started_card(daemon, &active_url, &active_code, true).await;
+            return Ok(login_prompt_text(&active_url, &active_code, true));
+        }
+        *login_guard = Some(CloudLoginTask {
+            handle,
+            login_url: login_url.clone(),
+            user_code: user_code.clone(),
+            started_at: Instant::now(),
+        });
+    }
+    if let Err(error) = open_browser_from_daemon(&login_url) {
+        push_system_card(
+            daemon,
+            CardKind::Warning,
+            "Open login manually",
+            format!("Open this URL in your browser:\n{login_url}\n\n{error:#}"),
+        )
+        .await;
+    }
+    push_login_started_card(daemon, &login_url, &user_code, false).await;
+    Ok(login_prompt_text(&login_url, &user_code, false))
 }
 
-async fn run_background_cloud_login(
-    daemon: Arc<Daemon>,
-    source: &'static str,
-    trace_id: String,
-) -> Result<()> {
-    let api_url = resolve_background_login_api_url(&daemon.paths);
+struct PreparedCloudLogin {
+    api_url: String,
+    client: cue_cloud_client::CloudClient,
+    flow: cue_cloud_client::DeviceFlow,
+    login_url: String,
+}
+
+async fn prepare_background_cloud_login(
+    paths: &AppPaths,
+    trace_id: &str,
+) -> Result<PreparedCloudLogin> {
+    let api_url = resolve_background_login_api_url(paths);
     let config = cue_cloud_client::client::ClientConfig {
         base_url: api_url.clone(),
-        trace_id: Some(trace_id.clone()),
+        trace_id: Some(trace_id.to_string()),
         ..Default::default()
     };
     let client = cue_cloud_client::CloudClient::new(
@@ -5243,37 +5320,63 @@ async fn run_background_cloud_login(
         .await
         .context("failed to start Bluey browser login")?;
     let login_url = device_login_url(&flow.verification_uri, &flow.user_code);
-    info!(
-        source,
-        user_code_chars = flow.user_code.chars().count(),
-        "Bluey desktop login started"
-    );
+    Ok(PreparedCloudLogin {
+        api_url,
+        client,
+        flow,
+        login_url,
+    })
+}
+
+async fn push_login_started_card(
+    daemon: &Arc<Daemon>,
+    login_url: &str,
+    user_code: &str,
+    reopened: bool,
+) {
+    let title = if reopened {
+        "Sign in reopened"
+    } else {
+        "Finish sign in"
+    };
     push_system_card(
-        &daemon,
+        daemon,
         CardKind::System,
-        "Finish sign in",
+        title,
         format!(
-            "Your browser is opening. Code: {}. After signing in, click Connect desktop; Bluey will finish automatically.",
-            flow.user_code
+            "Your browser is opening with desktop code {user_code}.\nAfter signing in, click Connect desktop; Bluey will finish automatically.\nlogin_url: {login_url}"
         ),
     )
     .await;
-    if let Err(error) = open_browser_from_daemon(&login_url) {
-        push_system_card(
-            &daemon,
-            CardKind::Warning,
-            "Open login manually",
-            format!("Open this URL in your browser:\n{login_url}\n\n{error:#}"),
-        )
-        .await;
-    }
+}
+
+fn login_prompt_text(login_url: &str, user_code: &str, reopened: bool) -> String {
+    let prefix = if reopened {
+        "Reopening Bluey sign-in in your browser."
+    } else {
+        "Opening Bluey sign-in in your browser."
+    };
+    format!("{prefix}\nCode: {user_code}\nLogin: {login_url}")
+}
+
+async fn run_background_cloud_login(
+    daemon: Arc<Daemon>,
+    source: &'static str,
+    trace_id: String,
+    login: PreparedCloudLogin,
+) -> Result<()> {
+    info!(
+        source,
+        user_code_chars = login.flow.user_code.chars().count(),
+        "Bluey desktop login started"
+    );
 
     let auth = timeout(
         Duration::from_secs(BACKGROUND_DEVICE_LOGIN_TIMEOUT_SECS),
         async {
-            let interval = Duration::from_secs(flow.interval_secs.max(1));
+            let interval = Duration::from_secs(login.flow.interval_secs.max(1));
             loop {
-                match flow.poll(&client).await? {
+                match login.flow.poll(&login.client).await? {
                     cue_cloud_client::DeviceFlowState::LoggedIn(auth) => return Ok(auth),
                     cue_cloud_client::DeviceFlowState::Pending => sleep(interval).await,
                     cue_cloud_client::DeviceFlowState::Expired => {
@@ -5291,7 +5394,7 @@ async fn run_background_cloud_login(
     let existing = load_account(&daemon.paths).ok().flatten();
     let mut account = existing.unwrap_or_else(cue_core::AccountConfig::local);
     account.provider = "bluey".to_string();
-    account.api_url = api_url;
+    account.api_url = login.api_url;
     account.user_id = auth.account.email;
     if account.workspace_id.trim().is_empty() || account.workspace_id == "local-workspace" {
         account.workspace_id = "default".to_string();
@@ -5364,7 +5467,7 @@ fn resolve_background_login_api_url(paths: &AppPaths) -> String {
 fn device_login_url(verification_uri: &str, user_code: &str) -> String {
     let base = verification_uri.trim_end_matches('/');
     let separator = if base.contains('?') { '&' } else { '?' };
-    format!("{base}{separator}user_code={user_code}")
+    format!("{base}{separator}desktop=1&user_code={user_code}")
 }
 
 fn open_browser_from_daemon(url: &str) -> Result<()> {

@@ -42,6 +42,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
     let captchaConfig = { provider: null, site_key: null };
     let signupTurnstileWidgetId = null;
     let signupTurnstileToken = '';
+    const DEVICE_LINK_TTL_MS = 10 * 60 * 1000;
+    const DEVICE_LINK_STORAGE_KEY = 'bluey_pending_device_code';
 
     function money(cents) {
       return `$${(Number(cents || 0) / 100).toFixed(2)}`;
@@ -61,10 +63,52 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       return localStorage.getItem('bluey_access_token') || '';
     }
 
+    function normalizeDeviceCode(value) {
+      return String(value || '')
+        .trim()
+        .toUpperCase()
+        .replace(/[^A-Z0-9-]/g, '')
+        .slice(0, 32);
+    }
+
+    function rememberPendingDeviceCode(code) {
+      if (!code) return;
+      try {
+        sessionStorage.setItem(DEVICE_LINK_STORAGE_KEY, JSON.stringify({
+          code,
+          saved_at: Date.now(),
+        }));
+      } catch {
+        // Browser storage can be disabled; the query-param path still works.
+      }
+    }
+
+    function storedPendingDeviceCode() {
+      try {
+        const raw = sessionStorage.getItem(DEVICE_LINK_STORAGE_KEY);
+        if (!raw) return '';
+        const parsed = JSON.parse(raw);
+        const code = normalizeDeviceCode(parsed?.code);
+        const savedAt = Number(parsed?.saved_at || 0);
+        if (!code || !savedAt || Date.now() - savedAt > DEVICE_LINK_TTL_MS) {
+          sessionStorage.removeItem(DEVICE_LINK_STORAGE_KEY);
+          return '';
+        }
+        return code;
+      } catch {
+        sessionStorage.removeItem(DEVICE_LINK_STORAGE_KEY);
+        return '';
+      }
+    }
+
     function pendingDeviceCode() {
       const params = new URLSearchParams(location.search);
-      const code = params.get('user_code') || params.get('device_code') || '';
-      return code.trim().toUpperCase();
+      const code = normalizeDeviceCode(params.get('user_code') || params.get('device_code') || '');
+      if (code) {
+        rememberPendingDeviceCode(code);
+        return code;
+      }
+      return storedPendingDeviceCode();
     }
 
     function setAccountToken(auth) {
@@ -502,8 +546,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const codeEl = document.createElement('code');
         codeEl.textContent = code;
         body.append(codeEl, accountToken()
-          ? '. Click Connect desktop to finish bluey login.'
-          : '. Sign in or create an account here, then confirm the desktop link.');
+          ? '. Click Connect desktop to finish Bluey login.'
+          : '. This code is already filled from your desktop app. Sign in or create an account here, then confirm the desktop link.');
         el.append(title, body);
         if (accountToken()) {
           const button = document.createElement('button');

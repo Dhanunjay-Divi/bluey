@@ -45,6 +45,8 @@ enum Commands {
     On(OnArgs),
     /// Turn Bluey off.
     Off,
+    /// Remove the local Bluey desktop install.
+    Uninstall(UninstallArgs),
     /// Sign in or link Bluey to a cloud account.
     #[command(hide = true)]
     Login(LoginArgs),
@@ -221,6 +223,16 @@ struct OnArgs {
     /// Optional title for the fresh session that `bluey on` starts.
     #[arg(long)]
     title: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct UninstallArgs {
+    /// Do not ask for confirmation.
+    #[arg(long)]
+    yes: bool,
+    /// Also remove local account tokens, settings, saved sessions, logs, and runtime state.
+    #[arg(long)]
+    purge_data: bool,
 }
 
 #[derive(Debug, Args)]
@@ -551,6 +563,7 @@ pub async fn cli_main() -> Result<()> {
         Commands::Run(args) => run(args).await,
         Commands::On(args) => cue_on(args).await,
         Commands::Off => cue_off().await,
+        Commands::Uninstall(args) => cue_uninstall(args).await,
         Commands::Login(args) => cue_login(args).await,
         Commands::Account => print_account().await,
         Commands::Sessions(args) => print_sessions(args),
@@ -866,11 +879,10 @@ async fn cue_on(args: OnArgs) -> Result<()> {
             }
             match auth_state {
                 BlueyOnAuthState::Ready => println!("Bluey is on."),
-                BlueyOnAuthState::SignInAvailable { url } => {
+                BlueyOnAuthState::SignInAvailable { .. } => {
                     println!(
-                        "Bluey is on. Finish sign-in in the browser, or click the pill to retry."
+                        "Bluey is on. Finish sign-in in the browser, or click the Bluey window to reopen the desktop sign-in link."
                     );
-                    println!("Login: {url}");
                 }
             }
             Ok(())
@@ -1173,6 +1185,230 @@ async fn cue_off() -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn cue_uninstall(args: UninstallArgs) -> Result<()> {
+    if !args.yes {
+        confirm_uninstall(args.purge_data)?;
+    }
+
+    let paths = AppPaths::discover()?;
+    println!("Stopping Bluey...");
+    match request(DaemonRequest::Shutdown).await {
+        Ok(_) => {
+            let _ = wait_for_daemon_stopped(Duration::from_secs(8)).await;
+        }
+        Err(_) => {
+            let _ = cleanup_stale_daemon(&paths, true).await;
+        }
+    }
+
+    let roots = install_roots_for_uninstall();
+    let cli_links = cli_links_for_uninstall();
+    let mut removed = 0usize;
+    let mut skipped = 0usize;
+
+    for link in cli_links {
+        match remove_bluey_cli_link(&link, &roots) {
+            Ok(true) => {
+                println!("Removed {}", link.display());
+                removed += 1;
+            }
+            Ok(false) => {
+                skipped += 1;
+            }
+            Err(error) => {
+                skipped += 1;
+                eprintln!("Could not remove {}: {error:#}", link.display());
+            }
+        }
+    }
+
+    for root in &roots {
+        for child in ["bin", "tools"] {
+            let path = root.join(child);
+            if path.exists() {
+                match std::fs::remove_dir_all(&path) {
+                    Ok(()) => {
+                        println!("Removed {}", path.display());
+                        removed += 1;
+                    }
+                    Err(error) => {
+                        skipped += 1;
+                        eprintln!("Could not remove {}: {error}", path.display());
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_dir(root);
+    }
+
+    if paths.runtime_dir.exists() {
+        match std::fs::remove_dir_all(&paths.runtime_dir) {
+            Ok(()) => {
+                println!("Removed runtime state {}", paths.runtime_dir.display());
+                removed += 1;
+            }
+            Err(error) => {
+                skipped += 1;
+                eprintln!(
+                    "Could not remove runtime state {}: {error}",
+                    paths.runtime_dir.display()
+                );
+            }
+        }
+    }
+
+    if args.purge_data {
+        for path in [&paths.data_dir, &paths.config_dir] {
+            if path.exists() {
+                match std::fs::remove_dir_all(path) {
+                    Ok(()) => {
+                        println!("Removed {}", path.display());
+                        removed += 1;
+                    }
+                    Err(error) => {
+                        skipped += 1;
+                        eprintln!("Could not remove {}: {error}", path.display());
+                    }
+                }
+            }
+        }
+    } else {
+        println!("Preserved local data: {}", paths.data_dir.display());
+        println!("Preserved account/settings: {}", paths.config_dir.display());
+        println!("Use `bluey uninstall --purge-data` to remove local data too.");
+    }
+
+    println!("Bluey uninstall complete. Removed {removed} item(s), skipped {skipped}.");
+    Ok(())
+}
+
+fn confirm_uninstall(purge_data: bool) -> Result<()> {
+    println!("This will stop Bluey and remove the local Bluey desktop install.");
+    if purge_data {
+        println!("--purge-data is enabled: local tokens, settings, saved sessions, logs, and runtime data will also be removed.");
+    } else {
+        println!("Local account data and saved sessions will be kept.");
+    }
+    print!("Type uninstall to continue: ");
+    io::stdout().flush().ok();
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("failed to read confirmation")?;
+    if input.trim() != "uninstall" {
+        bail!("uninstall cancelled");
+    }
+    Ok(())
+}
+
+fn install_roots_for_uninstall() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(root) = env::var_os("BLUEY_INSTALL_ROOT") {
+        roots.push(PathBuf::from(root));
+    }
+    if let Some(home) = env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        roots.push(home.join(".bluey"));
+        roots.push(home.join(".local/bluey"));
+    }
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+        roots.push(PathBuf::from(local_app_data).join("Bluey"));
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(root) = install_root_from_exe(&exe) {
+            roots.push(root);
+        }
+    }
+    dedup_paths(roots)
+}
+
+fn install_root_from_exe(exe: &Path) -> Option<PathBuf> {
+    let bin = exe.parent()?;
+    if bin.file_name().and_then(|name| name.to_str()) != Some("bin") {
+        return None;
+    }
+    let root = bin.parent()?;
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(name.as_str(), ".bluey" | "bluey").then(|| root.to_path_buf())
+}
+
+fn cli_links_for_uninstall() -> Vec<PathBuf> {
+    let mut links = Vec::new();
+    if let Some(dir) = env::var_os("BLUEY_CLI_DIR") {
+        let dir = PathBuf::from(dir);
+        links.push(dir.join(format!("bluey{}", env::consts::EXE_SUFFIX)));
+        links.push(dir.join(format!("bluey-daemon{}", env::consts::EXE_SUFFIX)));
+    }
+    if let Some(home) = env::var_os("HOME") {
+        let local_bin = PathBuf::from(home).join(".local/bin");
+        links.push(local_bin.join(format!("bluey{}", env::consts::EXE_SUFFIX)));
+        links.push(local_bin.join(format!("bluey-daemon{}", env::consts::EXE_SUFFIX)));
+    }
+    #[cfg(unix)]
+    {
+        links.push(PathBuf::from("/usr/local/bin/bluey"));
+        links.push(PathBuf::from("/usr/local/bin/bluey-daemon"));
+    }
+    if let Some(local_app_data) = env::var_os("LOCALAPPDATA") {
+        let bin = PathBuf::from(local_app_data).join("Bluey/bin");
+        links.push(bin.join("bluey.exe"));
+        links.push(bin.join("bluey-daemon.exe"));
+    }
+    dedup_paths(links)
+}
+
+fn remove_bluey_cli_link(link: &Path, install_roots: &[PathBuf]) -> Result<bool> {
+    let Ok(meta) = std::fs::symlink_metadata(link) else {
+        return Ok(false);
+    };
+    if meta.file_type().is_symlink() {
+        let target = std::fs::read_link(link)
+            .with_context(|| format!("failed to read symlink {}", link.display()))?;
+        let target_abs = if target.is_absolute() {
+            target
+        } else {
+            link.parent().unwrap_or_else(|| Path::new(".")).join(target)
+        };
+        if path_is_under_any_root(&target_abs, install_roots) {
+            std::fs::remove_file(link)
+                .with_context(|| format!("failed to remove {}", link.display()))?;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+
+    if meta.is_file() && path_is_under_any_root(link, install_roots) {
+        std::fs::remove_file(link)
+            .with_context(|| format!("failed to remove {}", link.display()))?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn path_is_under_any_root(path: &Path, roots: &[PathBuf]) -> bool {
+    let candidate = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    roots.iter().any(|root| {
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        candidate.starts_with(root)
+    })
+}
+
+fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for path in paths {
+        let key = path.to_string_lossy().to_string();
+        if seen.insert(key) {
+            out.push(path);
+        }
+    }
+    out
 }
 
 async fn cue_login(args: LoginArgs) -> Result<()> {
@@ -1495,7 +1731,7 @@ fn keyring_has_tokens_with_timeout(timeout: std::time::Duration) -> Result<Optio
 fn device_login_url(verification_uri: &str, user_code: &str) -> String {
     let base = verification_uri.trim_end_matches('/');
     let separator = if base.contains('?') { '&' } else { '?' };
-    format!("{base}{separator}user_code={user_code}")
+    format!("{base}{separator}desktop=1&user_code={user_code}")
 }
 
 fn load_local_meetings() -> Result<Vec<MeetingRecord>> {
@@ -3235,10 +3471,13 @@ async fn bluey_delete_account_cmd(force: bool) -> Result<()> {
 mod tests {
     use super::{
         bluey_on_boot_lines, bluey_on_boot_title, default_bluey_signin_url, device_login_url,
-        login_account_provider, resolve_daemon_bin_from_roots, resolve_login_api_url_from,
-        BlueyOnAuthState,
+        install_root_from_exe, login_account_provider, resolve_daemon_bin_from_roots,
+        resolve_login_api_url_from, BlueyOnAuthState,
     };
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
 
     #[test]
     fn bluey_on_boot_lines_offer_browser_signin_when_unlinked() {
@@ -3338,7 +3577,7 @@ mod tests {
     fn device_login_url_appends_code_to_login_page() {
         assert_eq!(
             device_login_url("https://bluey.sh/login", "ABCD-EFGH"),
-            "https://bluey.sh/login?user_code=ABCD-EFGH"
+            "https://bluey.sh/login?desktop=1&user_code=ABCD-EFGH"
         );
     }
 
@@ -3346,7 +3585,19 @@ mod tests {
     fn device_login_url_preserves_existing_query() {
         assert_eq!(
             device_login_url("https://bluey.sh/login?source=desktop", "ABCD-EFGH"),
-            "https://bluey.sh/login?source=desktop&user_code=ABCD-EFGH"
+            "https://bluey.sh/login?source=desktop&desktop=1&user_code=ABCD-EFGH"
+        );
+    }
+
+    #[test]
+    fn uninstall_root_detection_accepts_bluey_installs_only() {
+        assert_eq!(
+            install_root_from_exe(Path::new("/Users/me/.bluey/bin/bluey")),
+            Some(PathBuf::from("/Users/me/.bluey"))
+        );
+        assert_eq!(
+            install_root_from_exe(Path::new("/Users/me/Downloads/cue/target/debug/bluey")),
+            None
         );
     }
 
