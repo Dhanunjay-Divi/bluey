@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 02:02 EDT
+Latest checkpoint: 2026-07-01 02:10 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,28 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-268-OVERLAY-LOGIN-STATE-RECOVERY.md`; the next canonical Bluey round doc should start at `ROUND-269-...`.
+- Latest assigned Bluey round doc is `ROUND-269-LOGIN-STATE-RELEASE-DEPLOY.md`; the next canonical Bluey round doc should start at `ROUND-270-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 269 deployed the Round 268 login-state recovery fix:
+  - bumped desktop workspace version to `0.1.23`
+  - built `dist/bluey-0.1.23-darwin-arm64.tar.gz`
+  - live SHA256:
+    `105f3101e2a119e7a19bbee9a70efe8c61f7193556f79c570c527885d6301284`
+  - published signed release files to
+    `root@165.227.77.152:/var/www/bluey`
+  - live `https://bluey.sh/latest.json` reports `0.1.23`
+  - live `install.sh` serves as `application/x-shellscript`, not HTML
+  - `latest.json.sig` verified successfully with OpenSSL
+  - temp-home installer smoke installed `bluey 0.1.23`
+  - noninteractive smoke could not use `/dev/tty` for sudo, but correctly
+    fell back to user-local `$HOME/.local/bin`
+  - Windows artifact was not republished; live manifest remains macOS arm64
+  - Round doc:
+    `docs/rounds/ROUND-269-LOGIN-STATE-RELEASE-DEPLOY.md`
 - Round 268 fixed the overlay mixed login state:
   - added shared overlay command `set_account_state`
   - daemon now sends signed-in state after successful balance refresh,
