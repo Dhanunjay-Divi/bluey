@@ -778,8 +778,6 @@ private final class ComposerTextView: NSTextView {
     var onFocusChanged: ((Bool) -> Void)?
 
     private var inputFocused = false
-    private var customCaretVisible = true
-    private var customCaretTimer: Timer?
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -826,10 +824,6 @@ private final class ComposerTextView: NSTextView {
 
     required init?(coder: NSCoder) { fatalError() }
 
-    deinit {
-        customCaretTimer?.invalidate()
-    }
-
     override func becomeFirstResponder() -> Bool {
         let accepted = super.becomeFirstResponder()
         if accepted {
@@ -872,22 +866,12 @@ private final class ComposerTextView: NSTextView {
             .font: font ?? NSFont.systemFont(ofSize: 14.5, weight: .medium),
             .foregroundColor: placeholderColor,
         ]
-        let caretOffset: CGFloat = inputFocused ? 13 : 0
         let rect = NSRect(
-            x: caretOffset,
+            x: 0,
             y: textContainerInset.height + 1,
-            width: max(0, bounds.width - caretOffset),
+            width: bounds.width,
             height: 22)
         placeholder.draw(in: rect, withAttributes: attributes)
-        if inputFocused, customCaretVisible {
-            let caretRect = NSRect(
-                x: 2,
-                y: textContainerInset.height + 1,
-                width: 2,
-                height: max(18, min(24, bounds.height - textContainerInset.height * 2)))
-            insertionPointColor.setFill()
-            NSBezierPath(roundedRect: caretRect, xRadius: 1, yRadius: 1).fill()
-        }
     }
 
     override func didChangeText() {
@@ -947,7 +931,6 @@ private final class ComposerTextView: NSTextView {
         let length = (string as NSString).length
         let range = selectedRange()
         setSelectedRange(NSRange(location: min(range.location, length), length: 0))
-        customCaretVisible = true
         needsDisplay = true
         displayIfNeeded()
     }
@@ -997,21 +980,6 @@ private final class ComposerTextView: NSTextView {
         }
         inputFocused = focused
         onFocusChanged?(focused)
-        if focused {
-            customCaretVisible = true
-            customCaretTimer?.invalidate()
-            let timer = Timer(timeInterval: 0.52, repeats: true) { [weak self] _ in
-                guard let self else { return }
-                self.customCaretVisible.toggle()
-                self.needsDisplay = true
-            }
-            customCaretTimer = timer
-            RunLoop.main.add(timer, forMode: .common)
-        } else {
-            customCaretTimer?.invalidate()
-            customCaretTimer = nil
-            customCaretVisible = false
-        }
         needsDisplay = true
     }
 
@@ -4499,6 +4467,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var windowFullSize = false
     private var preWindowFullSizeFrame: NSRect?
     private var passThroughMode = true
+    private var signedOutGateActive = false
     private var headerDragInProgress = false
     private struct ResizeEdges: OptionSet {
         let rawValue: Int
@@ -5396,6 +5365,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if !closeConfirmOverlay.isHidden || !answerStyleOverlay.isHidden {
             return super.hitTest(point) ?? self
         }
+        if signedOutGateActive {
+            return super.hitTest(point) ?? self
+        }
         if headerDragInProgress {
             return super.hitTest(point) ?? self
         }
@@ -5433,6 +5405,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let localPoint = convert(event.locationInWindow, from: nil)
         if isKnowledgeBadgeHit(at: localPoint) {
             toggleSavedContextItems()
+            return
+        }
+        if signedOutGateActive {
+            if let hit = super.hitTest(localPoint), isExplicitInteractiveHit(hit) {
+                super.mouseDown(with: event)
+                return
+            }
+            if shouldStartHeaderDrag(at: localPoint) {
+                beginHeaderDrag(with: event)
+            }
             return
         }
         if rectForView(composerBar).insetBy(dx: -8, dy: -8).contains(localPoint) {
@@ -5745,10 +5727,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func invokeListenShortcut() {
+        guard !handleSignedOutGateAction(action: "listen") else { return }
         recordingClicked()
     }
 
     func invokeScreenShortcut() {
+        guard !handleSignedOutGateAction(action: "screen") else { return }
         analyzeClicked()
     }
 
@@ -5757,6 +5741,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func invokeAnswerShortcut() {
+        guard !handleSignedOutGateAction(action: "answer") else { return }
         askClicked()
     }
 
@@ -5816,6 +5801,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func focusComposerForInput() {
+        guard !handleSignedOutGateAction(action: "text_input") else { return }
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(composer)
@@ -5904,6 +5890,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             clearResizeCursorIfNeeded()
             return false
         }
+        if signedOutGateActive {
+            return true
+        }
         guard passThroughMode else {
             return true
         }
@@ -5926,6 +5915,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return true
         }
         if !answerStyleOverlay.isHidden {
+            return true
+        }
+        if signedOutGateActive {
             return true
         }
         if hasManualInteractiveControl(at: localPoint) {
@@ -6087,6 +6079,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             guard !view.isHidden, view.alphaValue > 0.01 else { return false }
             return rectForView(view).insetBy(dx: -8, dy: -8).contains(localPoint)
         }
+    }
+
+    var isSignedOutGateActive: Bool {
+        signedOutGateActive
     }
 
     private func headerHitView(at localPoint: NSPoint) -> NSView? {
@@ -7534,6 +7530,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     @objc private func recordingClicked() {
+        guard !handleSignedOutGateAction(action: "listen") else { return }
         let now = Date()
         if now.timeIntervalSince(lastRecordingToggleAt) < 0.45 {
             return
@@ -7811,6 +7808,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     @objc private func askClicked() {
+        guard !handleSignedOutGateAction(action: "answer") else { return }
         autoSendAfterStopWorkItem?.cancel()
         autoSendAfterStopWorkItem = nil
         let raw = composer.string.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -7865,6 +7863,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     @objc private func analyzeClicked() {
+        guard !handleSignedOutGateAction(action: "screen") else { return }
         let raw = composer.string.trimmingCharacters(in: .whitespacesAndNewlines)
         let question = composedQuestionForAnswer(typed: raw)
         routeBadge.stringValue = "Screen · ready"
@@ -7878,6 +7877,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     @objc private func attachClicked() {
+        guard !handleSignedOutGateAction(action: "attach") else { return }
         guard beginAttachPickerHandoff() else {
             showKnowledgePlaceholder("File picker is already opening...")
             return
@@ -8055,6 +8055,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func focusComposerForQuestion() {
+        guard !handleSignedOutGateAction(action: "text_input") else { return }
         dismissAnswerStyleEditor(animated: false)
         dismissCloseConfirm(animated: false)
         composer.placeholder = recordingActive
@@ -8070,6 +8071,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func setBackgroundControlsEnabled(_ isEnabled: Bool) {
+        let effectiveEnabled = isEnabled && !signedOutGateActive
         let controls: [NSControl] = [
             navButton,
             newSessionButton,
@@ -8090,11 +8092,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             closeButton,
         ]
         for control in controls {
-            control.isEnabled = isEnabled
-            control.alphaValue = isEnabled ? 1.0 : 0.45
+            control.isEnabled = effectiveEnabled
+            control.alphaValue = effectiveEnabled ? 1.0 : 0.45
         }
-        composer.isEditable = isEnabled
-        composer.alphaValue = isEnabled ? 1.0 : 0.55
+        closeButton.isEnabled = isEnabled
+        closeButton.alphaValue = isEnabled ? 1.0 : 0.45
+        composer.isEditable = effectiveEnabled
+        composer.alphaValue = effectiveEnabled ? 1.0 : 0.55
+        if signedOutGateActive {
+            applySignedOutGateControlState()
+        }
     }
 
     func setBalanceLabel(_ label: String) {
@@ -8153,6 +8160,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func showSignedOutLogin(url: URL?) {
+        signedOutGateActive = true
         setHeaderSubtitle("Local ready")
         routeBadge.stringValue = "Sign in"
         routeBadge.textColor = BlueyTheme.warning
@@ -8164,6 +8172,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         setKnowledgeBadge("Docs locked", accent: BlueyTheme.textDim)
         composer.placeholder = url == nil ? "Sign in to use managed answers..." : "Sign in, then ask anything..."
         statusLabel.toolTip = "Cloud answers, balance, sync, and documents unlock after login"
+        applySignedOutGateControlState()
     }
 
     func showSignedInReady() {
@@ -8172,6 +8181,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func showSignedInChromeReady() {
+        signedOutGateActive = false
+        applySignedOutGateControlState()
         setHeaderSubtitle()
         statusLabel.toolTip = nil
         routeBadge.stringValue = "● Ready"
@@ -8188,6 +8199,51 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         composer.placeholder = recordingActive
             ? "Listening... type a follow-up anytime"
             : "Ask anything..."
+    }
+
+    @discardableResult
+    private func handleSignedOutGateAction(action: String) -> Bool {
+        guard signedOutGateActive else { return false }
+        emitSimple("sign_in_requested")
+        emitLifecycle("auth_gate_action", status: "signin_requested", detail: "action=\(action)")
+        showSystemToast(
+            title: "Sign in first",
+            body: "Your browser is opening. Finish sign-in there, then Bluey will unlock.",
+            duration: 2.4)
+        return true
+    }
+
+    private func applySignedOutGateControlState() {
+        let locked = signedOutGateActive
+        for control in [
+            navButton,
+            newSessionButton,
+            latestSessionButton,
+            canvasToggleButton,
+            modelMenu,
+            autoSendModeMenu,
+            recordingButton,
+            askButton,
+            analyzeButton,
+            transcriptClearButton,
+            attachButton,
+            instructionsButton,
+        ] {
+            control.isEnabled = !locked
+            control.alphaValue = locked ? 0.35 : 1.0
+        }
+        composer.isEditable = !locked
+        composer.isSelectable = !locked
+        composer.alphaValue = locked ? 0.50 : 1.0
+        composerSurface.alphaValue = locked ? 0.60 : 1.0
+        composerBar.alphaValue = locked ? 0.72 : 1.0
+        transcriptStrip.alphaValue = locked ? 0.55 : 1.0
+        if locked {
+            composer.clearText()
+            composer.placeholder = "Finish sign-in first..."
+            window?.makeFirstResponder(nil)
+        }
+        needsLayout = true
     }
 
     private func hideSignedOutToastIfNeeded() {
@@ -12557,9 +12613,15 @@ private final class OverlayApp {
             pillView?.setBalanceLabel(label)
         case .setAccountState(let signedIn):
             if signedIn {
+                let shouldCollapseAfterUnlock = expandedView?.isSignedOutGateActive == true
                 expandedView?.showSignedInChromeReady()
                 pillView?.setHealthState(.ready)
+                if shouldCollapseAfterUnlock {
+                    collapse()
+                }
             } else {
+                ensureExpandedWindow()
+                expand()
                 expandedView?.showSignedOutLogin(url: nil)
                 pillView?.setHealthState(.needsAttention)
             }
@@ -12602,11 +12664,17 @@ private final class OverlayApp {
     }
 
     private func pushBootCard(title: String, lines: [String]) {
+        let signInURL = loginURL(from: lines)
+        let isSignInBoot = signInURL != nil || title.localizedCaseInsensitiveContains("sign in")
         guard let view = expandedView else {
             pendingBoot = (title, lines)
+            if isSignInBoot {
+                ensureExpandedWindow()
+                expand()
+            }
             return
         }
-        let signInURL = loginURL(from: lines)
+        let shouldCollapseAfterUnlock = view.isSignedOutGateActive && !isSignInBoot
         let body = lines.joined(separator: "\n")
         let card = RenderedCard(
             id: UUID().uuidString,
@@ -12617,14 +12685,18 @@ private final class OverlayApp {
             costLabel: nil,
             artifact: nil,
             attachments: [])
-        if signInURL != nil || title.localizedCaseInsensitiveContains("sign in") {
+        if isSignInBoot {
             view.showSignedOutLogin(url: signInURL)
             pillView?.setHealthState(.needsAttention)
+            expand()
         } else {
             view.showSignedInReady()
             pillView?.setHealthState(.ready)
         }
         view.pushCard(card)
+        if shouldCollapseAfterUnlock {
+            collapse()
+        }
     }
 
     private func loginURL(from lines: [String]) -> URL? {

@@ -2628,7 +2628,8 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             clear_active_transcript_context(daemon).await?;
         }
         OverlayEvent::SignInRequested => {
-            let _ = start_background_cloud_login(daemon, "overlay sign-in", None).await?;
+            let text = start_background_cloud_login(daemon, "overlay sign-in", None).await?;
+            push_system_card(daemon, CardKind::System, "Bluey sign-in", text).await;
         }
         OverlayEvent::CloseRequested => {
             shutdown_daemon(daemon).await;

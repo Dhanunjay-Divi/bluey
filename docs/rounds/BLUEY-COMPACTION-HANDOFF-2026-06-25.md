@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 04:32 EDT
+Latest checkpoint: 2026-07-01 05:13 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,29 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-273-INCOMPLETE-ANSWER-GUARD.md`; the next canonical Bluey round doc should start at `ROUND-274-...`.
+- Latest assigned Bluey round doc is `ROUND-274-SIGNIN-GATE-INPUT-CARET.md`; the next canonical Bluey round doc should start at `ROUND-275-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 274 fixed the signed-out gate and duplicate input caret:
+  - removed the custom macOS composer caret so `NSTextView` owns the only blinking insertion point
+  - added a signed-out gate state to the macOS expanded overlay
+  - signed-out overlay now receives mouse events even when click-through is enabled, so Sign in remains clickable
+  - disabled and dimmed unusable controls while signed out
+  - Listen, Screen, Answer, Attach, and Text shortcuts now route to sign-in feedback instead of paid/local actions while signed out
+  - successful account state unlock collapses the signed-out gate back to the pill
+  - daemon `sign_in_requested` now pushes a visible `Bluey sign-in` status card instead of discarding helper text
+  - desktop workspace version bumped to `0.1.28`
+  - verification passed:
+    - `swift build -c debug --package-path native/macos/cue-overlay`
+    - `cargo check -p cue-daemon --offline`
+    - `cargo test -p cue-daemon --lib --locked`
+    - `cargo test -p cue-core sign_in_event_serializes --locked`
+  - Windows artifact was not republished yet; daemon sign-in feedback is shared, but the visual gate/caret patch is macOS Swift overlay specific
+  - Round doc:
+    `docs/rounds/ROUND-274-SIGNIN-GATE-INPUT-CARET.md`
 - Round 273 fixed incomplete answer finalization:
   - investigated the screenshot where the refrigeration / ML answer stopped in the middle of a Markdown table
   - confirmed the local saved answer itself ended at the table separator, so this was not only UI clipping
