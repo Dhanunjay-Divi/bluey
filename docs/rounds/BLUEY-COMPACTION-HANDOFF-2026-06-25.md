@@ -70,6 +70,7 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
   - local shortcut smoke:
     - `Ctrl+Option+B` restored from collapsed state
     - `Ctrl+Option+H` did not change Bluey overlay state
+  - Windows packaging attempt on this Mac did not produce a ZIP because the Makefile target expects `x86_64-pc-windows-msvc`, while this host only has `x86_64-pc-windows-gnu` installed; Windows source parity and syntax check are complete, but a fresh Windows artifact needs the Windows/MSVC release runner
   - Round doc:
     `docs/rounds/ROUND-277-SHORTCUTS-FOCUS-DRAG-POLISH.md`
 - Round 276 removed the legacy `Ctrl+Option+H`/full-hide confusion:

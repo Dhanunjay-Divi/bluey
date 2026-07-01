@@ -62,6 +62,7 @@ Continuity anchor: backup thread id `019e133e-d92a-7830-8df0-3a050a4e22f6`.
 - Local macOS shortcut smoke:
   - `Ctrl+Option+B` restored from collapsed state.
   - `Ctrl+Option+H` did not change Bluey overlay state.
+- Windows packaging attempt on this Mac did not produce a ZIP because the Makefile target expects `x86_64-pc-windows-msvc`, while this host only has `x86_64-pc-windows-gnu` installed. Windows source parity and syntax check are complete; a fresh Windows artifact needs the Windows/MSVC release runner.
 
 ## Current State
 
@@ -90,3 +91,4 @@ SHA256: 698e885a66fc60e35c84f85053200cb45aa837af2f44b5d5962ca04ade133e8a
   - blank space passes through when click-through is on
   - `Ctrl+Option+Enter` answers globally
   - `Enter` answers inside Bluey
+- Build and publish a fresh Windows ZIP from the Windows/MSVC release runner.
