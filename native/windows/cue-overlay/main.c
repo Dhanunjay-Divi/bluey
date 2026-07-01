@@ -445,6 +445,25 @@ static void emit_lifecycle_event(const char *stage, const char *status, const ch
     fflush(stdout);
 }
 
+static bool register_bluey_hotkey(int id, UINT key, const char *name, char *failures, size_t failures_len) {
+    if (RegisterHotKey(g_hwnd, id, BLUEY_GLOBAL_HOTKEY_MODS, key)) {
+        return true;
+    }
+    if (failures && failures_len > 0) {
+        char item[48];
+        snprintf(item, sizeof(item), "%s:%lu", name ? name : "unknown", (unsigned long)GetLastError());
+        size_t used = strlen(failures);
+        if (used + 1 < failures_len && failures[0] != '\0') {
+            strncat(failures, ",", failures_len - used - 1);
+            used = strlen(failures);
+        }
+        if (used + 1 < failures_len) {
+            strncat(failures, item, failures_len - used - 1);
+        }
+    }
+    return false;
+}
+
 static void emit_ask_event(const wchar_t *question) {
     char *utf8 = wide_to_utf8_alloc(question);
     if (!utf8) return;
@@ -2456,19 +2475,32 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             return 0;
         }
         if (id == ID_SHORTCUTS_BUTTON) {
+            const wchar_t *shortcut_body = g_interactive_mode
+                ? L"Interactive is on\n"
+                  L"Global shortcuts work from anywhere:\n\n"
+                  L"Ctrl+Alt+B    Hide or restore Bluey\n"
+                  L"Ctrl+Alt+T    Text input\n"
+                  L"Ctrl+Alt+L    Start or stop Listen\n"
+                  L"Ctrl+Alt+S    Capture screen context\n"
+                  L"Ctrl+Alt+I    Toggle click-through / interactive\n"
+                  L"Ctrl+Alt+Enter    Answer\n\n"
+                  L"Optional inside Bluey, when Ask is not focused:\n"
+                  L"T Text input    L Listen    S Screen\n"
+                  L"I Interactive    H History    F Files\n"
+                  L"Esc Collapse\n\n"
+                  L"Typing in Ask always wins."
+                : L"Click-through is on\n"
+                  L"Blank Bluey space passes clicks to the app behind it.\n"
+                  L"Use global shortcuts from anywhere:\n\n"
+                  L"Ctrl+Alt+B    Hide or restore Bluey\n"
+                  L"Ctrl+Alt+T    Text input\n"
+                  L"Ctrl+Alt+L    Start or stop Listen\n"
+                  L"Ctrl+Alt+S    Capture screen context\n"
+                  L"Ctrl+Alt+I    Toggle click-through / interactive\n"
+                  L"Ctrl+Alt+Enter    Answer\n\n"
+                  L"If a shortcut is taken by the system, Bluey keeps the buttons available.";
             overlay_message_box(
-                L"Global\n"
-                L"Ctrl+Alt+B    Hide or restore Bluey\n"
-                L"Ctrl+Alt+T    Text input\n"
-                L"Ctrl+Alt+L    Start or stop Listen\n"
-                L"Ctrl+Alt+S    Capture screen context\n"
-                L"Ctrl+Alt+I    Toggle click-through / interactive\n"
-                L"Ctrl+Alt+Enter    Answer\n\n"
-                L"Inside Bluey, when Ask is not focused\n"
-                L"T Text input    L Listen    S Screen\n"
-                L"I Interactive    H History    F Files\n"
-                L"Esc Collapse\n\n"
-                L"Typing always wins inside Ask.",
+                shortcut_body,
                 L"Keyboard shortcuts",
                 MB_OK | MB_ICONINFORMATION
             );
@@ -2920,13 +2952,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
     load_session_token();
     emit_ready();
-    RegisterHotKey(g_hwnd, ID_HOTKEY_TOGGLE_OVERLAY, BLUEY_GLOBAL_HOTKEY_MODS, 'B');
-    RegisterHotKey(g_hwnd, ID_HOTKEY_FOCUS_ASK, BLUEY_GLOBAL_HOTKEY_MODS, 'T');
-    RegisterHotKey(g_hwnd, ID_HOTKEY_LISTEN, BLUEY_GLOBAL_HOTKEY_MODS, 'L');
-    RegisterHotKey(g_hwnd, ID_HOTKEY_SCREEN, BLUEY_GLOBAL_HOTKEY_MODS, 'S');
-    RegisterHotKey(g_hwnd, ID_HOTKEY_INTERACTIVE, BLUEY_GLOBAL_HOTKEY_MODS, 'I');
-    RegisterHotKey(g_hwnd, ID_HOTKEY_ANSWER, BLUEY_GLOBAL_HOTKEY_MODS, VK_RETURN);
-    emit_lifecycle_event("global_shortcuts", "ready", "modifier=ctrl_alt");
+    int hotkeys_registered = 0;
+    char hotkey_failures[192] = "";
+    hotkeys_registered += register_bluey_hotkey(ID_HOTKEY_TOGGLE_OVERLAY, 'B', "B", hotkey_failures, sizeof(hotkey_failures)) ? 1 : 0;
+    hotkeys_registered += register_bluey_hotkey(ID_HOTKEY_FOCUS_ASK, 'T', "T", hotkey_failures, sizeof(hotkey_failures)) ? 1 : 0;
+    hotkeys_registered += register_bluey_hotkey(ID_HOTKEY_LISTEN, 'L', "L", hotkey_failures, sizeof(hotkey_failures)) ? 1 : 0;
+    hotkeys_registered += register_bluey_hotkey(ID_HOTKEY_SCREEN, 'S', "S", hotkey_failures, sizeof(hotkey_failures)) ? 1 : 0;
+    hotkeys_registered += register_bluey_hotkey(ID_HOTKEY_INTERACTIVE, 'I', "I", hotkey_failures, sizeof(hotkey_failures)) ? 1 : 0;
+    hotkeys_registered += register_bluey_hotkey(ID_HOTKEY_ANSWER, VK_RETURN, "Enter", hotkey_failures, sizeof(hotkey_failures)) ? 1 : 0;
+    char hotkey_detail[256];
+    if (hotkey_failures[0] != '\0') {
+        snprintf(hotkey_detail, sizeof(hotkey_detail), "modifier=ctrl_alt registered=%d failures=%s", hotkeys_registered, hotkey_failures);
+        emit_lifecycle_event("global_shortcuts", "partial", hotkey_detail);
+    } else {
+        snprintf(hotkey_detail, sizeof(hotkey_detail), "modifier=ctrl_alt registered=%d", hotkeys_registered);
+        emit_lifecycle_event("global_shortcuts", "ready", hotkey_detail);
+    }
     CreateThread(NULL, 0, stdin_thread, NULL, 0, NULL);
 
     MSG msg;

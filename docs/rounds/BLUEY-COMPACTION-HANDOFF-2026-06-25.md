@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 02:59 EDT
+Latest checkpoint: 2026-07-01 03:26 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,35 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-270-SHORTCUT-HIDE-INPUT-POLISH.md`; the next canonical Bluey round doc should start at `ROUND-271-...`.
+- Latest assigned Bluey round doc is `ROUND-271-SHORTCUT-MODE-GUIDANCE-RELEASE-GUARD.md`; the next canonical Bluey round doc should start at `ROUND-272-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 271 refined shortcut guidance and fixed a release guard:
+  - macOS shortcuts panel is mode-aware:
+    - click-through on: tells users to use global shortcuts because blank Bluey space clicks through
+    - interactive on: lists global shortcuts first and labels inside-Bluey shortcuts as optional
+  - Windows shortcuts dialog mirrors the same mode-aware guidance
+  - Windows global hotkey registration now checks every `RegisterHotKey` result and logs `global_shortcuts` as `ready` or `partial` with failed key/error detail
+  - Release packaging now fails closed if `BLUEY_UPDATE_PUBKEY` is missing
+  - desktop workspace version bumped to `0.1.25`
+  - an intermediate `0.1.25` artifact was republished after discovering the local `0.1.24` build lacked `BLUEY_UPDATE_PUBKEY`; the final `0.1.25` artifact embeds the update public key
+  - live artifact:
+    `dist/bluey-0.1.25-darwin-arm64.tar.gz`
+  - live SHA256:
+    `cf6ab7072d61a78de166463240060ed6e4792cdd7328f93df5f10e573fd0cfab`
+  - live `https://bluey.sh/latest.json` reports `0.1.25`
+  - live `latest.json.sig` verified successfully
+  - local reinstall from `https://bluey.sh/install.sh` installed `bluey 0.1.25`
+  - local `bluey update` now reports up to date without unsigned-update warnings
+  - shortcut smoke passed:
+    - `Ctrl+Option+B` -> `overlay_visible: false`
+    - `Ctrl+Option+B` again -> `overlay_visible: true`
+  - Windows artifact was not republished; live manifest remains macOS arm64
+  - Round doc:
+    `docs/rounds/ROUND-271-SHORTCUT-MODE-GUIDANCE-RELEASE-GUARD.md`
 - Round 270 fixed and deployed shortcut/hide/input polish:
   - macOS now registers OS-level Carbon hotkeys for `Ctrl+Option+B/T/L/S/I/Enter`, with the existing event monitor retained as fallback
   - local macOS key routing checks the global shortcut path first, so shortcuts work while Bluey itself has focus

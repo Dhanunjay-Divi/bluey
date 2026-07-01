@@ -7,11 +7,14 @@
 #   - cue-cli crate produces: "cue" and "bluey"
 # We package the "bluey" / "bluey-daemon" variants.
 
-.PHONY: build-daemon-release build-dashboard-release build-helpers-release \
+.PHONY: require-update-pubkey build-daemon-release build-dashboard-release build-helpers-release \
         build-darwin-arm64 build-darwin-x86_64 build-windows-x86_64 build-all \
         package-darwin-arm64 package-darwin-x86_64 package-windows-x86_64
 
 VERSION ?= $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+
+require-update-pubkey:
+	@test -n "$(BLUEY_UPDATE_PUBKEY)" || (echo "BLUEY_UPDATE_PUBKEY is required for release packages; set it from the release public key before packaging." >&2; exit 1)
 
 build-daemon-release:
 	cargo build --release -p cue-daemon -p cue-cli
@@ -34,7 +37,7 @@ build-windows-x86_64:
 
 build-all: build-darwin-arm64 build-darwin-x86_64
 
-package-darwin-arm64: build-darwin-arm64 build-helpers-release
+package-darwin-arm64: require-update-pubkey build-darwin-arm64 build-helpers-release
 	mkdir -p dist staging-arm64/bin
 	cp target/aarch64-apple-darwin/release/bluey-daemon staging-arm64/bin/ 2>/dev/null || \
 		cp target/aarch64-apple-darwin/release/cue-daemon staging-arm64/bin/bluey-daemon
@@ -54,7 +57,7 @@ package-darwin-arm64: build-darwin-arm64 build-helpers-release
 	  > dist/bluey-$(VERSION)-darwin-arm64.tar.gz.sha256
 	rm -rf staging-arm64
 
-package-darwin-x86_64: build-darwin-x86_64
+package-darwin-x86_64: require-update-pubkey build-darwin-x86_64
 	mkdir -p dist staging-x86/bin
 	cp target/x86_64-apple-darwin/release/bluey-daemon staging-x86/bin/ 2>/dev/null || \
 		cp target/x86_64-apple-darwin/release/cue-daemon staging-x86/bin/bluey-daemon
@@ -66,7 +69,7 @@ package-darwin-x86_64: build-darwin-x86_64
 build-darwin-universal: build-darwin-arm64 build-darwin-x86_64
 	@bash scripts/build-macos-universal.sh
 
-package-darwin-universal: build-darwin-universal
+package-darwin-universal: require-update-pubkey build-darwin-universal
 	mkdir -p dist staging-universal/bin
 	cp dist/bluey-macos-universal/bluey staging-universal/bin/bluey
 	cp dist/bluey-macos-universal/bluey-daemon staging-universal/bin/bluey-daemon
@@ -81,7 +84,7 @@ package-darwin-universal: build-darwin-universal
 	rm -rf staging-universal
 
 
-package-windows-x86_64: build-windows-x86_64
+package-windows-x86_64: require-update-pubkey build-windows-x86_64
 	mkdir -p dist staging-win/bin
 	cp target/x86_64-pc-windows-msvc/release/bluey-daemon.exe staging-win/bin/ 2>/dev/null || \
 		cp target/x86_64-pc-windows-msvc/release/cue-daemon.exe staging-win/bin/bluey-daemon.exe

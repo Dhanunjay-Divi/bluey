@@ -7221,22 +7221,38 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private var macShortcutHelpText: String {
-        [
-            "Global shortcuts",
+        let globalLines = [
             "Ctrl+Option+B    Hide or restore Bluey",
             "Ctrl+Option+T    Text input",
             "Ctrl+Option+L    Start or stop Listen",
             "Ctrl+Option+S    Capture screen context",
             "Ctrl+Option+I    Toggle click-through / interactive",
             "Ctrl+Option+Enter    Answer",
+        ]
+        if passThroughMode {
+            return ([
+                "Click-through is on",
+                "Blank Bluey space passes clicks to the app behind it.",
+                "Use global shortcuts from anywhere:",
+                "",
+            ] + globalLines + [
+                "",
+                "If a shortcut is taken by the system, Bluey keeps the buttons available.",
+            ]).joined(separator: "\n")
+        }
+        return ([
+            "Interactive is on",
+            "Global shortcuts work from anywhere:",
             "",
-            "Inside Bluey, when Ask is not focused",
+        ] + globalLines + [
+            "",
+            "Optional inside Bluey, when Ask is not focused:",
             "T Text input    L Listen    S Screen",
             "I Interactive    H History    F Files",
             "Esc Close panel",
             "",
-            "Typing always wins inside Ask."
-        ].joined(separator: "\n")
+            "Typing in Ask always wins.",
+        ]).joined(separator: "\n")
     }
 
     private func configureCloseConfirmBodyStandard() {
@@ -7250,7 +7266,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         closeConfirmTitle.stringValue = "Keyboard shortcuts"
         closeConfirmBody.stringValue = macShortcutHelpText
         closeConfirmBody.alignment = .left
-        closeConfirmBody.maximumNumberOfLines = 14
+        closeConfirmBody.maximumNumberOfLines = 18
 
         closeConfirmCancelButton.title = "Done"
         closeConfirmCancelButton.target = self
