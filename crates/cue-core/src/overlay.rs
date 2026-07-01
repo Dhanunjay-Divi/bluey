@@ -65,6 +65,9 @@ pub enum OverlayCommand {
     SetBalance {
         label: String,
     },
+    SetAccountState {
+        signed_in: bool,
+    },
     SetContextItems {
         items: Vec<OverlayContextItem>,
     },
@@ -198,6 +201,14 @@ mod tests {
         .expect("serialize overlay balance command");
 
         assert_eq!(json, r#"{"type":"set_balance","label":"$12.34"}"#);
+    }
+
+    #[test]
+    fn set_account_state_serializes_as_overlay_command() {
+        let json = serde_json::to_string(&OverlayCommand::SetAccountState { signed_in: true })
+            .expect("serialize overlay account-state command");
+
+        assert_eq!(json, r#"{"type":"set_account_state","signed_in":true}"#);
     }
 
     #[test]

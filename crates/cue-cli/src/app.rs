@@ -1215,6 +1215,7 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
             settings.touch();
             save_settings(&paths, &settings)?;
         }
+        let _ = request(DaemonRequest::CloudStatus).await;
     }
 
     println!(

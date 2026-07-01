@@ -1324,6 +1324,7 @@ private enum OverlayCommand {
     case setOpacity(Double)
     case setPosition(String)
     case setBalance(String)
+    case setAccountState(signedIn: Bool)
     case setContextItems([OverlayContextItem])
     case setSessions([OverlaySessionItem])
     case listeningStateChanged(String)
@@ -1363,6 +1364,8 @@ private func parseCommand(_ line: String) -> OverlayCommand {
     case "set_balance":
         let label = obj["label"] as? String ?? "Balance --"
         return .setBalance(label)
+    case "set_account_state":
+        return .setAccountState(signedIn: obj["signed_in"] as? Bool ?? false)
     case "set_context_items":
         let rawItems = obj["items"] as? [[String: Any]] ?? []
         let items = rawItems.map { item in
@@ -8033,6 +8036,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     func setBalanceLabel(_ label: String) {
         let clean = label.trimmingCharacters(in: .whitespacesAndNewlines)
         balanceLabel.stringValue = clean.isEmpty ? "Balance --" : clean
+        let tone = balanceVisualTone(for: balanceLabel.stringValue)
+        if tone != .signedOut && tone != .unknown {
+            showSignedInChromeReady()
+        }
         updateBalanceLabelTone()
     }
 
@@ -8088,7 +8095,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         routeBadge.toolTip = "Sign in to use managed answers and balance"
         routeBadge.layer?.borderColor = NSColor.clear.cgColor
         routeBadge.layer?.backgroundColor = NSColor.clear.cgColor
-        balanceLabel.stringValue = "Login"
+        balanceLabel.stringValue = "Sign in"
         updateBalanceLabelTone()
         setKnowledgeBadge("Docs locked", accent: BlueyTheme.textDim)
         composer.placeholder = url == nil ? "Sign in to use managed answers..." : "Sign in, then ask anything..."
@@ -8096,6 +8103,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func showSignedInReady() {
+        showSignedInChromeReady()
+        setKnowledgeBadge("Docs empty", accent: BlueyTheme.textDim)
+    }
+
+    func showSignedInChromeReady() {
         setHeaderSubtitle()
         statusLabel.toolTip = nil
         routeBadge.stringValue = "● Ready"
@@ -8103,14 +8115,23 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         routeBadge.toolTip = "Ready"
         routeBadge.layer?.borderColor = NSColor.clear.cgColor
         routeBadge.layer?.backgroundColor = NSColor.clear.cgColor
-        if balanceLabel.stringValue == "Login" {
+        let balanceTone = balanceVisualTone(for: balanceLabel.stringValue)
+        if balanceTone == .signedOut {
             balanceLabel.stringValue = "Balance --"
             updateBalanceLabelTone()
         }
-        setKnowledgeBadge("Docs empty", accent: BlueyTheme.textDim)
+        hideSignedOutToastIfNeeded()
         composer.placeholder = recordingActive
             ? "Listening... type a follow-up anytime"
             : "Ask anything..."
+    }
+
+    private func hideSignedOutToastIfNeeded() {
+        let title = toastTitleLabel.stringValue.lowercased()
+        let body = toastBodyLabel.stringValue.lowercased()
+        if title.contains("sign in") || body.contains("sign in") || body.contains("linked account") {
+            hideSystemToast(immediately: false)
+        }
     }
 
     private func setKnowledgeBadge(_ text: String, accent: NSColor) {
@@ -12290,6 +12311,14 @@ private final class OverlayApp {
         case .setBalance(let label):
             expandedView?.setBalanceLabel(label)
             pillView?.setBalanceLabel(label)
+        case .setAccountState(let signedIn):
+            if signedIn {
+                expandedView?.showSignedInChromeReady()
+                pillView?.setHealthState(.ready)
+            } else {
+                expandedView?.showSignedOutLogin(url: nil)
+                pillView?.setHealthState(.needsAttention)
+            }
         case .setContextItems(let items):
             expandedView?.setContextItems(items)
         case .setSessions(let sessions):

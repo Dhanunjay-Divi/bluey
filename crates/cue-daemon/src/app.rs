@@ -1856,10 +1856,12 @@ async fn handle_request_inner(
             stop_balance_polling(daemon).await;
             let status = cloud_status_from_env(&daemon.paths);
             *daemon.cloud.lock().await = status.clone();
+            let _ =
+                send_overlay(daemon, OverlayCommand::SetAccountState { signed_in: false }).await;
             let _ = send_overlay(
                 daemon,
                 OverlayCommand::SetBalance {
-                    label: "--".to_string(),
+                    label: "Sign in".to_string(),
                 },
             )
             .await;
@@ -2176,6 +2178,7 @@ async fn push_overlay_balance_snapshot(
     if snapshot.low_balance_warning {
         label.push_str(" low");
     }
+    let _ = send_overlay(daemon, OverlayCommand::SetAccountState { signed_in: true }).await;
     let _ = send_overlay(daemon, OverlayCommand::SetBalance { label }).await;
 }
 
@@ -2675,12 +2678,15 @@ async fn block_audio_start_if_not_signed_in(
     trace_id: Option<&str>,
 ) -> Option<AudioPipelineStatus> {
     if listen_account_verification_is_fresh(daemon).await {
+        let _ = send_overlay(daemon, OverlayCommand::SetAccountState { signed_in: true }).await;
         return None;
     }
 
     let block = match verify_cloud_account_for_listen(&daemon.paths, trace_id).await {
         Ok(()) => {
             mark_listen_account_verified(daemon).await;
+            let _ = send_overlay(daemon, OverlayCommand::SetAccountState { signed_in: true }).await;
+            let _ = refresh_overlay_balance(daemon, trace_id).await;
             return None;
         }
         Err(block) => block,
@@ -4466,6 +4472,7 @@ async fn refresh_overlay_balance(daemon: &Arc<Daemon>, trace_id: Option<&str>) -
     let snapshot = fetch_current_balance_snapshot(trace_id).await?;
     let label = format_balance_cents(snapshot.balance_cents);
     daemon.balance_watch.publish(snapshot);
+    let _ = send_overlay(daemon, OverlayCommand::SetAccountState { signed_in: true }).await;
     let _ = send_overlay(
         daemon,
         OverlayCommand::SetBalance {

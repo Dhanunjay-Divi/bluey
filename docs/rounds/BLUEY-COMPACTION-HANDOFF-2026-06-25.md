@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 00:38 EDT
+Latest checkpoint: 2026-07-01 02:02 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,35 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-267-KEYBOARD-SHORTCUTS-DISCLOSURE.md`; the next canonical Bluey round doc should start at `ROUND-268-...`.
+- Latest assigned Bluey round doc is `ROUND-268-OVERLAY-LOGIN-STATE-RECOVERY.md`; the next canonical Bluey round doc should start at `ROUND-269-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 268 fixed the overlay mixed login state:
+  - added shared overlay command `set_account_state`
+  - daemon now sends signed-in state after successful balance refresh,
+    background balance snapshots, and Listen auth verification
+  - daemon now sends signed-out state on logout
+  - standalone `bluey login` now best-effort pings daemon `CloudStatus`
+    after saving cloud tokens, so a running overlay refreshes immediately
+  - macOS overlay parses `set_account_state`, clears signed-out chrome
+    without wiping attached docs/context state, hides stale sign-in toasts,
+    and uses `Sign in` instead of `Login` for real signed-out state
+  - local macOS binaries were rebuilt, installed into `~/.bluey/bin`,
+    ad-hoc signed, and restarted
+  - verification passed:
+    - `cargo fmt`
+    - `cargo test -p cue-core set_account_state_serializes_as_overlay_command -- --nocapture`
+    - `cargo check -p cue-daemon -p cue-cli --quiet`
+    - `swift build -c debug --package-path native/macos/cue-overlay`
+    - `git diff --check`
+    - `~/.bluey/bin/bluey status`
+    - `~/.bluey/bin/bluey credits` -> `Balance: $14.50`
+    - `~/.bluey/bin/bluey cloud status` -> `auth: TokenConfigured`
+  - Round doc:
+    `docs/rounds/ROUND-268-OVERLAY-LOGIN-STATE-RECOVERY.md`
 - Round 267 added a visible keyboard/shortcuts entry point:
   - macOS header now has a keyboard icon beside the theme icon
   - macOS opens an in-overlay shortcuts panel with `Ctrl+Option`
