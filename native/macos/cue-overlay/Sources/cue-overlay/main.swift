@@ -4484,6 +4484,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         static let transcriptPreviewMemoryChars: Int = 1_400
         static let minTranscriptQuestionChars: Int = 8
         static let minTranscriptQuestionWords: Int = 2
+        static let clickThroughMoveHandleSize: CGFloat = 34
+        static let clickThroughMoveHandleHitPadding: CGFloat = 18
     }
 
     let feed: FeedView
@@ -6078,6 +6080,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         return shouldReceiveMouseEvents(atWindowPoint: windowPoint)
     }
 
+    func moveHandleContainsScreenPoint(_ screenPoint: NSPoint) -> Bool {
+        guard let window else { return false }
+        let windowPoint = window.convertPoint(fromScreen: screenPoint)
+        let localPoint = convert(windowPoint, from: nil)
+        return isHeaderMoveHandleHit(at: localPoint)
+    }
+
     func shouldReceiveMouseEvents(at screenPoint: NSPoint) -> Bool {
         guard let window else { return false }
         let windowPoint = window.convertPoint(fromScreen: screenPoint)
@@ -6292,7 +6301,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         guard !headerBar.isHidden, headerBar.alphaValue > 0.01 else { return false }
         if passThroughMode {
             guard !moveHandleButton.isHidden, moveHandleButton.alphaValue > 0.01 else { return false }
-            return rectForView(moveHandleButton).insetBy(dx: -8, dy: -8).contains(localPoint)
+            return rectForView(moveHandleButton)
+                .insetBy(
+                    dx: -ChromeMetrics.clickThroughMoveHandleHitPadding,
+                    dy: -ChromeMetrics.clickThroughMoveHandleHitPadding)
+                .contains(localPoint)
         }
         let handles = [headerLogo, brandStack]
         return handles.contains { view in
@@ -6303,6 +6316,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     var isSignedOutGateActive: Bool {
         signedOutGateActive
+    }
+
+    var isPassThroughMode: Bool {
+        passThroughMode
     }
 
     private func headerHitView(at localPoint: NSPoint) -> NSView? {
@@ -6827,8 +6844,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         if passThroughMode {
             moveHandleButton.isHidden = false
-            moveHandleButton.frame = NSRect(x: left, y: yButton + 1, width: 26, height: 26)
-            left += 32
+            let handleSize = ChromeMetrics.clickThroughMoveHandleSize
+            moveHandleButton.frame = NSRect(
+                x: left,
+                y: (frame.height - handleSize) / 2,
+                width: handleSize,
+                height: handleSize)
+            left += handleSize + 8
         } else {
             moveHandleButton.isHidden = true
             moveHandleButton.frame = NSRect(x: left, y: yButton + 1, width: 0, height: 26)
@@ -12106,6 +12128,7 @@ private final class OverlayApp {
     private var remoteControlHeuristicTimer: Timer?
     private var localKeyMonitor: Any?
     private var globalKeyMonitor: Any?
+    private var globalMouseMonitor: Any?
     private var globalHotKeyRefs: [EventHotKeyRef?] = []
     private var globalHotKeyHandler: EventHandlerRef?
     private var externalFileDragMonitor: Any?
@@ -12115,6 +12138,8 @@ private final class OverlayApp {
     private var remoteInputPassthroughUntil = 0.0
     private var externalFileDragCaptureUntil = 0.0
     private var lastExpandedInteractiveMouseAt = CACurrentMediaTime()
+    private var clickThroughHandleDragStartMouse: NSPoint?
+    private var clickThroughHandleDragStartFrame: NSRect?
     private var currentRunState: PillRunState = .ready
     private var lastPillRecordingToggleAt = Date.distantPast
     private var overlayOpacity = 0.94
@@ -12135,6 +12160,9 @@ private final class OverlayApp {
         }
         if let globalKeyMonitor {
             NSEvent.removeMonitor(globalKeyMonitor)
+        }
+        if let globalMouseMonitor {
+            NSEvent.removeMonitor(globalMouseMonitor)
         }
         for hotKeyRef in globalHotKeyRefs {
             if let hotKeyRef {
@@ -12198,6 +12226,7 @@ private final class OverlayApp {
         startExpandedPassthroughTracking()
         startLocalKeyRouting()
         startGlobalKeyRouting()
+        startGlobalMouseRouting()
         startExternalFileDragCaptureMonitor()
         if trustedRemoteInputTapEnabled {
             startTrustedRemoteInputPassthroughMonitor()
@@ -12251,6 +12280,87 @@ private final class OverlayApp {
             }
         }
         emitLifecycle("global_shortcuts", status: "ready", detail: "modifier=ctrl_option registered_hotkeys=\(!globalHotKeyRefs.isEmpty)")
+    }
+
+    private func startGlobalMouseRouting() {
+        guard globalMouseMonitor == nil else { return }
+        globalMouseMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.mouseMoved, .leftMouseDown, .leftMouseDragged, .leftMouseUp]
+        ) { [weak self] event in
+            DispatchQueue.main.async {
+                self?.handleGlobalMouseEventForClickThrough(event)
+            }
+        }
+        emitLifecycle("global_mouse_monitor", status: "ready", detail: "clickthrough_move_handle")
+    }
+
+    private func clearClickThroughHandleDragState() {
+        clickThroughHandleDragStartMouse = nil
+        clickThroughHandleDragStartFrame = nil
+    }
+
+    private func handleGlobalMouseEventForClickThrough(_ event: NSEvent) {
+        guard
+            expandedModeActive,
+            let expandedWindow,
+            expandedWindow.isVisible,
+            let expandedView,
+            expandedView.isPassThroughMode
+        else {
+            clearClickThroughHandleDragState()
+            return
+        }
+
+        let point = NSEvent.mouseLocation
+        switch event.type {
+        case .mouseMoved:
+            if expandedWindow.frame.insetBy(dx: -12, dy: -12).contains(point) {
+                updateExpandedMousePolicy()
+            }
+
+        case .leftMouseDown:
+            guard expandedView.moveHandleContainsScreenPoint(point) else {
+                updateExpandedMousePolicy()
+                return
+            }
+            clickThroughHandleDragStartMouse = point
+            clickThroughHandleDragStartFrame = expandedWindow.frame
+            lastExpandedInteractiveMouseAt = CACurrentMediaTime()
+            expandedWindow.acceptsMouseMovedEvents = true
+            expandedWindow.ignoresMouseEvents = false
+            expandedWindow.makeKey()
+            emitLifecycle("clickthrough_move_handle", status: "armed")
+
+        case .leftMouseDragged:
+            guard
+                let startMouse = clickThroughHandleDragStartMouse,
+                let startFrame = clickThroughHandleDragStartFrame
+            else {
+                return
+            }
+            var frame = startFrame
+            frame.origin.x += point.x - startMouse.x
+            frame.origin.y += point.y - startMouse.y
+            let visibleFrame = expandedWindow.screen?.visibleFrame
+                ?? OverlayScreenPlacement.activeVisibleFrame()
+            frame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(
+                frame,
+                visibleFrame: visibleFrame)
+            expandedWindow.setFrame(frame, display: true, animate: false)
+            lastExpandedInteractiveMouseAt = CACurrentMediaTime()
+            expandedWindow.ignoresMouseEvents = false
+
+        case .leftMouseUp:
+            if clickThroughHandleDragStartMouse != nil {
+                rememberExpandedFrame(expandedWindow.frame)
+                emitLifecycle("clickthrough_move_handle", status: "moved")
+            }
+            clearClickThroughHandleDragState()
+            updateExpandedMousePolicy()
+
+        default:
+            break
+        }
     }
 
     private enum BlueyRegisteredHotKey: UInt32 {
@@ -12499,9 +12609,11 @@ private final class OverlayApp {
     @discardableResult
     private func applyRemoteInputPassthroughIfActive() -> Bool {
         guard isRemoteInputPassthroughActive else { return false }
+        let point = NSEvent.mouseLocation
         if let expandedWindow,
            expandedWindow.isVisible,
-           expandedView?.isInteractiveAtScreenPoint(NSEvent.mouseLocation) == true {
+           (expandedView?.moveHandleContainsScreenPoint(point) == true
+               || expandedView?.isInteractiveAtScreenPoint(point) == true) {
             expandedWindow.acceptsMouseMovedEvents = true
             expandedWindow.ignoresMouseEvents = false
         } else {
@@ -12715,7 +12827,8 @@ private final class OverlayApp {
 
         expandedWindow.acceptsMouseMovedEvents = true
         let point = NSEvent.mouseLocation
-        let isInteractive = expandedView?.isInteractiveAtScreenPoint(point) ?? true
+        let isMoveHandle = expandedView?.moveHandleContainsScreenPoint(point) ?? false
+        let isInteractive = isMoveHandle || (expandedView?.isInteractiveAtScreenPoint(point) ?? true)
         let now = CACurrentMediaTime()
         if isInteractive {
             lastExpandedInteractiveMouseAt = now

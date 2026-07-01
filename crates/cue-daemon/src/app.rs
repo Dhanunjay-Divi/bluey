@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::env;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -59,6 +60,11 @@ use crate::rag_indexer::RagIndexCoordinator;
 use crate::storage::MeetingStore;
 
 const AUTO_CLOUD_SYNC_DEBOUNCE_SECS: u64 = 20;
+const LIVE_STT_AUDIBLE_RMS_DBFS: f64 = -58.0;
+const LIVE_STT_AUDIBLE_PEAK_DBFS: f64 = -34.0;
+const LIVE_STT_PREFACE_CHUNKS: usize = 8;
+const LIVE_STT_SILENCE_NOTICE_MS: u128 = 8_000;
+const PCM16_DBFS_FLOOR: f64 = -120.0;
 
 struct LiveProviderAnswer {
     provider: ProviderSelector,
@@ -4112,6 +4118,37 @@ async fn real_audio_relay_loop(
     }
 }
 
+async fn publish_live_stt_waiting_for_audio_notice(
+    daemon: &Arc<Daemon>,
+    session_id: &str,
+    source: AudioSourceKind,
+    saw_pcm_bytes: bool,
+) {
+    {
+        let mut audio = daemon.audio.lock().await;
+        if audio.session_id.as_deref() == Some(session_id) {
+            audio.note = Some(format!(
+                "Waiting for audible {source} audio before starting paid transcription."
+            ));
+            audio.updated_at = clock::now_epoch_ms_string();
+        }
+    }
+    let title = match source {
+        AudioSourceKind::Microphone => "Mic is quiet",
+        AudioSourceKind::System => "System audio is quiet",
+    };
+    let body = if saw_pcm_bytes {
+        format!(
+            "Bluey can see the {source} source, but it is below the speech threshold. It will wait and avoid starting paid transcription until it hears usable audio."
+        )
+    } else {
+        format!(
+            "Bluey is waiting for {source} audio packets. It will avoid starting paid transcription until the source produces usable audio."
+        )
+    };
+    push_system_card(daemon, CardKind::System, title, body).await;
+}
+
 async fn run_relay_audio_source(
     daemon: Arc<Daemon>,
     session_id: String,
@@ -4162,7 +4199,12 @@ async fn run_relay_audio_source(
         .context("native audio helper did not expose stdout")?;
 
     let mut buffer = vec![0_u8; 4096];
-    let first_read = loop {
+    let mut startup_chunks = 0_u64;
+    let mut startup_bytes = 0_u64;
+    let mut preface_chunks: VecDeque<Vec<u8>> = VecDeque::with_capacity(LIVE_STT_PREFACE_CHUNKS);
+    let startup_started = Instant::now();
+    let mut silence_notice_sent = false;
+    let first_audible_stats = loop {
         tokio::select! {
             changed = stop_rx.changed() => {
                 if changed.is_err() || *stop_rx.borrow() {
@@ -4184,7 +4226,57 @@ async fn run_relay_audio_source(
                         source.source
                     ));
                 }
-                break read;
+                let stats = pcm16_i16le_stats(&buffer[..read]);
+                startup_chunks = startup_chunks.saturating_add(1);
+                startup_bytes = startup_bytes.saturating_add(read as u64);
+                if preface_chunks.len() >= LIVE_STT_PREFACE_CHUNKS {
+                    preface_chunks.pop_front();
+                }
+                preface_chunks.push_back(buffer[..read].to_vec());
+
+                if startup_chunks == 1 || startup_chunks % 25 == 0 || stats.is_audible_for_stt() {
+                    info!(
+                        source = %source.source,
+                        stream_id = %source.stream_id,
+                        startup_chunks,
+                        startup_bytes,
+                        samples = stats.samples,
+                        rms_dbfs = stats.rms_dbfs,
+                        peak_dbfs = stats.peak_dbfs,
+                        nonzero_percent = stats.nonzero_percent,
+                        audible = stats.is_audible_for_stt(),
+                        "live STT relay startup audio level"
+                    );
+                }
+
+                if stats.is_audible_for_stt() {
+                    break stats;
+                }
+
+                if !silence_notice_sent
+                    && startup_started.elapsed().as_millis() >= LIVE_STT_SILENCE_NOTICE_MS
+                {
+                    silence_notice_sent = true;
+                    publish_live_stt_waiting_for_audio_notice(
+                        &daemon,
+                        &session_id,
+                        source.source,
+                        true,
+                    )
+                    .await;
+                }
+            }
+            _ = sleep(Duration::from_millis(250)), if !silence_notice_sent => {
+                if startup_started.elapsed().as_millis() >= LIVE_STT_SILENCE_NOTICE_MS {
+                    silence_notice_sent = true;
+                    publish_live_stt_waiting_for_audio_notice(
+                        &daemon,
+                        &session_id,
+                        source.source,
+                        false,
+                    )
+                    .await;
+                }
             }
         }
     };
@@ -4205,6 +4297,10 @@ async fn run_relay_audio_source(
         stream_id = %source.stream_id,
         requested_seconds,
         reserved_max_seconds = stt_session.max_seconds,
+        startup_chunks,
+        startup_bytes,
+        first_audible_rms_dbfs = first_audible_stats.rms_dbfs,
+        first_audible_peak_dbfs = first_audible_stats.peak_dbfs,
         "live STT relay reservation created"
     );
     let access_token = cloud
@@ -4261,45 +4357,53 @@ async fn run_relay_audio_source(
 
     let mut sequence = 0_u64;
     let mut start_ms = 0_u64;
-    sequence = sequence.saturating_add(1);
-    let duration_ms = pcm16_16k_duration_ms(first_read);
-    let chunk = AudioChunkMetadata::new(
-        source.source,
-        source.stream_id.clone(),
-        sequence,
-        start_ms,
-        duration_ms,
-        cue_core::AudioStreamFormat::stt_mono(),
-        first_read as u64,
-    );
-    start_ms = start_ms.saturating_add(duration_ms as u64);
-    {
-        let mut audio = daemon.audio.lock().await;
-        if audio.session_id.as_deref() != Some(session_id.as_str()) {
-            let _ = ws_tx.send(WebSocketMessage::Close(None)).await;
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            return Ok(());
+    while let Some(preface) = preface_chunks.pop_front() {
+        sequence = sequence.saturating_add(1);
+        let duration_ms = pcm16_16k_duration_ms(preface.len());
+        let stats = pcm16_i16le_stats(&preface);
+        let chunk = AudioChunkMetadata::new(
+            source.source,
+            source.stream_id.clone(),
+            sequence,
+            start_ms,
+            duration_ms,
+            cue_core::AudioStreamFormat::stt_mono(),
+            preface.len() as u64,
+        );
+        start_ms = start_ms.saturating_add(duration_ms as u64);
+        {
+            let mut audio = daemon.audio.lock().await;
+            if audio.session_id.as_deref() != Some(session_id.as_str()) {
+                let _ = ws_tx.send(WebSocketMessage::Close(None)).await;
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Ok(());
+            }
+            audio.record_chunk(&chunk);
         }
-        audio.record_chunk(&chunk);
+        if sequence == 1 || stats.is_audible_for_stt() {
+            info!(
+                source = %source.source,
+                stream_id = %source.stream_id,
+                sequence,
+                bytes = preface.len(),
+                duration_ms,
+                rms_dbfs = stats.rms_dbfs,
+                peak_dbfs = stats.peak_dbfs,
+                audible = stats.is_audible_for_stt(),
+                "live STT relay preface audio chunk forwarded"
+            );
+        }
+        ws_tx
+            .send(WebSocketMessage::Binary(preface))
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to send buffered live {} audio to Bluey STT relay",
+                    source.source
+                )
+            })?;
     }
-    debug!(
-        source = %source.source,
-        stream_id = %source.stream_id,
-        sequence,
-        bytes = first_read,
-        duration_ms,
-        "live STT relay first audio chunk forwarded"
-    );
-    ws_tx
-        .send(WebSocketMessage::Binary(buffer[..first_read].to_vec()))
-        .await
-        .with_context(|| {
-            format!(
-                "failed to send first live {} audio to Bluey STT relay",
-                source.source
-            )
-        })?;
 
     loop {
         tokio::select! {
@@ -4313,6 +4417,7 @@ async fn run_relay_audio_source(
                 if read == 0 {
                     break;
                 }
+                let stats = pcm16_i16le_stats(&buffer[..read]);
                 sequence = sequence.saturating_add(1);
                 let duration_ms = pcm16_16k_duration_ms(read);
                 let chunk = AudioChunkMetadata::new(
@@ -4333,12 +4438,16 @@ async fn run_relay_audio_source(
                     audio.record_chunk(&chunk);
                 }
                 if sequence == 1 || sequence % 50 == 0 {
-                    debug!(
+                    info!(
                         source = %source.source,
                         stream_id = %source.stream_id,
                         sequence,
                         bytes = read,
                         duration_ms,
+                        rms_dbfs = stats.rms_dbfs,
+                        peak_dbfs = stats.peak_dbfs,
+                        nonzero_percent = stats.nonzero_percent,
+                        audible = stats.is_audible_for_stt(),
                         "live STT relay audio chunk forwarded"
                     );
                 }
@@ -4398,6 +4507,24 @@ async fn emit_deepgram_relay_payload(
     let pcm_source = pcm_source_for_audio_source(source);
     let events = crate::stt::deepgram::parse_frame(payload, pcm_source)
         .map_err(|error| anyhow!("Deepgram relay frame parse failed: {error}"))?;
+    if events.is_empty() {
+        let frame_type = serde_json::from_str::<serde_json::Value>(payload)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("type")
+                    .and_then(|ty| ty.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        debug!(
+            source = %source,
+            sequence,
+            frame_type = %frame_type,
+            payload_bytes = payload.len(),
+            "live STT relay provider frame without transcript"
+        );
+    }
     for event in events {
         let Some(segment) = transcript_event_to_stt_segment(&event) else {
             continue;
@@ -4453,6 +4580,69 @@ fn pcm_source_for_audio_source(source: AudioSourceKind) -> cue_core::pcm::AudioS
     match source {
         AudioSourceKind::System => cue_core::pcm::AudioSource::System,
         AudioSourceKind::Microphone => cue_core::pcm::AudioSource::Microphone,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Pcm16AudioStats {
+    samples: usize,
+    rms_dbfs: f64,
+    peak_dbfs: f64,
+    nonzero_percent: f64,
+}
+
+impl Pcm16AudioStats {
+    fn is_audible_for_stt(self) -> bool {
+        self.samples > 0
+            && (self.rms_dbfs >= LIVE_STT_AUDIBLE_RMS_DBFS
+                || self.peak_dbfs >= LIVE_STT_AUDIBLE_PEAK_DBFS)
+    }
+}
+
+fn pcm16_i16le_stats(raw: &[u8]) -> Pcm16AudioStats {
+    let sample_bytes = raw.len() - (raw.len() % 2);
+    if sample_bytes == 0 {
+        return Pcm16AudioStats {
+            samples: 0,
+            rms_dbfs: PCM16_DBFS_FLOOR,
+            peak_dbfs: PCM16_DBFS_FLOOR,
+            nonzero_percent: 0.0,
+        };
+    }
+
+    let mut samples = 0_usize;
+    let mut peak = 0_i32;
+    let mut nonzero = 0_usize;
+    let mut sum_squares = 0_f64;
+    for chunk in raw[..sample_bytes].chunks_exact(2) {
+        let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
+        let magnitude = sample.abs();
+        if magnitude > 0 {
+            nonzero = nonzero.saturating_add(1);
+        }
+        peak = peak.max(magnitude);
+        sum_squares += (sample as f64) * (sample as f64);
+        samples = samples.saturating_add(1);
+    }
+
+    let rms = if samples == 0 {
+        0.0
+    } else {
+        (sum_squares / samples as f64).sqrt()
+    };
+    Pcm16AudioStats {
+        samples,
+        rms_dbfs: pcm16_dbfs(rms),
+        peak_dbfs: pcm16_dbfs(peak as f64),
+        nonzero_percent: (nonzero as f64 * 100.0) / samples.max(1) as f64,
+    }
+}
+
+fn pcm16_dbfs(magnitude: f64) -> f64 {
+    if magnitude <= 0.0 {
+        PCM16_DBFS_FLOOR
+    } else {
+        (20.0 * (magnitude / 32768.0).log10()).max(PCM16_DBFS_FLOOR)
     }
 }
 
@@ -5653,6 +5843,17 @@ async fn capture_native_audio_chunk_to_file(
             "native audio helper captured no usable {source} audio"
         ));
     }
+    let stats = pcm16_i16le_stats(&output.stdout);
+    info!(
+        source = %source,
+        bytes = output.stdout.len(),
+        samples = stats.samples,
+        rms_dbfs = stats.rms_dbfs,
+        peak_dbfs = stats.peak_dbfs,
+        nonzero_percent = stats.nonzero_percent,
+        audible = stats.is_audible_for_stt(),
+        "native audio helper chunk level"
+    );
 
     let wav = wav_from_i16le_16k_mono(&output.stdout);
     tokio::fs::write(chunk_path, wav)
@@ -14337,6 +14538,24 @@ mod tests {
     fn pcm16_16k_duration_ms_tracks_byte_length() {
         assert_eq!(pcm16_16k_duration_ms(3_200), 100);
         assert_eq!(pcm16_16k_duration_ms(0), 1);
+    }
+
+    #[test]
+    fn pcm16_i16le_stats_detect_silence_and_audible_samples() {
+        let silence = vec![0_u8; 3_200];
+        let silent_stats = pcm16_i16le_stats(&silence);
+        assert_eq!(silent_stats.samples, 1_600);
+        assert_eq!(silent_stats.rms_dbfs, PCM16_DBFS_FLOOR);
+        assert_eq!(silent_stats.peak_dbfs, PCM16_DBFS_FLOOR);
+        assert!(!silent_stats.is_audible_for_stt());
+
+        let mut audible = Vec::new();
+        for _ in 0..1_600 {
+            audible.extend_from_slice(&8_000_i16.to_le_bytes());
+        }
+        let audible_stats = pcm16_i16le_stats(&audible);
+        assert!(audible_stats.rms_dbfs > -20.0);
+        assert!(audible_stats.is_audible_for_stt());
     }
 
     #[test]

@@ -1268,7 +1268,7 @@ static RECT clickthrough_move_handle_rect(RECT client) {
     int header_w = clamp_int((client.right * 84) / 100, 520, 780);
     if (header_w > client.right - 28) header_w = client.right - 28;
     int header_left = (client.right - header_w) / 2;
-    RECT handle = {header_left + 128, 18, header_left + 154, 44};
+    RECT handle = {header_left + 128, 14, header_left + 162, 48};
     return handle;
 }
 
@@ -1280,6 +1280,7 @@ static bool point_hits_clickthrough_move_handle(POINT point) {
     if (!ScreenToClient(g_hwnd, &local)) return false;
 
     RECT handle = clickthrough_move_handle_rect(rect);
+    InflateRect(&handle, 10, 10);
     return PtInRect(&handle, local) != 0;
 }
 

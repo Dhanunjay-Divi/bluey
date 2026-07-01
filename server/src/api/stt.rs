@@ -36,6 +36,7 @@ use crate::pricing;
 
 const DEFAULT_MAX_SECONDS: i64 = 10 * 60;
 const MAX_SESSION_SECONDS: i64 = 20 * 60;
+const PCM16_DBFS_FLOOR: f64 = -120.0;
 
 #[derive(Debug, Deserialize)]
 pub struct SttSessionRequest {
@@ -412,6 +413,23 @@ async fn run_deepgram_relay(
                         if !bytes.is_empty() {
                             forwarded_audio_bytes = forwarded_audio_bytes.saturating_add(bytes.len() as u64);
                             forwarded_audio_chunks = forwarded_audio_chunks.saturating_add(1);
+                            if forwarded_audio_chunks == 1 || forwarded_audio_chunks % 50 == 0 {
+                                let stats = pcm16_i16le_stats(bytes.as_ref());
+                                tracing::info!(
+                                    account_id_hash = %cue_core::account_id_hash_prefix(&session.account_id),
+                                    source = %session.source,
+                                    provider = %session.provider,
+                                    model = %session.model,
+                                    audio_chunks = forwarded_audio_chunks,
+                                    audio_bytes = forwarded_audio_bytes,
+                                    chunk_bytes = bytes.len(),
+                                    samples = stats.samples,
+                                    rms_dbfs = stats.rms_dbfs,
+                                    peak_dbfs = stats.peak_dbfs,
+                                    nonzero_percent = stats.nonzero_percent,
+                                    "STT relay forwarded audio level"
+                                );
+                            }
                         }
                         upstream_tx.send(UpstreamMessage::Binary(bytes)).await?
                     }
@@ -527,10 +545,18 @@ fn is_account_closed_error(error: &anyhow::Error) -> bool {
 fn deepgram_realtime_url(session: &ClaimedSttSession) -> String {
     let base = std::env::var("BLUEY_TEST_DEEPGRAM_WS_URL")
         .unwrap_or_else(|_| "wss://api.deepgram.com/v1/listen".to_string());
-    format!(
-        "{base}?model={}&encoding=linear16&sample_rate=16000&channels=1&punctuate=true&smart_format=true&interim_results=true",
+    let mut url = format!(
+        "{base}?model={}&encoding=linear16&sample_rate=16000&channels=1&punctuate=true&smart_format=true&interim_results=true&endpointing=300&utterance_end_ms=1000&vad_events=true",
         url_escape(&session.model)
-    )
+    );
+    if let Ok(language) = std::env::var("BLUEY_DEEPGRAM_LANGUAGE") {
+        let language = language.trim();
+        if !language.is_empty() {
+            url.push_str("&language=");
+            url.push_str(&url_escape(language));
+        }
+    }
+    url
 }
 
 fn url_escape(value: &str) -> String {
@@ -543,6 +569,61 @@ fn url_escape(value: &str) -> String {
             _ => format!("%{byte:02X}").chars().collect(),
         })
         .collect()
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Pcm16AudioStats {
+    samples: usize,
+    rms_dbfs: f64,
+    peak_dbfs: f64,
+    nonzero_percent: f64,
+}
+
+fn pcm16_i16le_stats(raw: &[u8]) -> Pcm16AudioStats {
+    let sample_bytes = raw.len() - (raw.len() % 2);
+    if sample_bytes == 0 {
+        return Pcm16AudioStats {
+            samples: 0,
+            rms_dbfs: PCM16_DBFS_FLOOR,
+            peak_dbfs: PCM16_DBFS_FLOOR,
+            nonzero_percent: 0.0,
+        };
+    }
+
+    let mut samples = 0_usize;
+    let mut peak = 0_i32;
+    let mut nonzero = 0_usize;
+    let mut sum_squares = 0_f64;
+    for chunk in raw[..sample_bytes].chunks_exact(2) {
+        let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
+        let magnitude = sample.abs();
+        if magnitude > 0 {
+            nonzero = nonzero.saturating_add(1);
+        }
+        peak = peak.max(magnitude);
+        sum_squares += (sample as f64) * (sample as f64);
+        samples = samples.saturating_add(1);
+    }
+
+    let rms = if samples == 0 {
+        0.0
+    } else {
+        (sum_squares / samples as f64).sqrt()
+    };
+    Pcm16AudioStats {
+        samples,
+        rms_dbfs: pcm16_dbfs(rms),
+        peak_dbfs: pcm16_dbfs(peak as f64),
+        nonzero_percent: (nonzero as f64 * 100.0) / samples.max(1) as f64,
+    }
+}
+
+fn pcm16_dbfs(magnitude: f64) -> f64 {
+    if magnitude <= 0.0 {
+        PCM16_DBFS_FLOOR
+    } else {
+        (20.0 * (magnitude / 32768.0).log10()).max(PCM16_DBFS_FLOOR)
+    }
 }
 
 fn finalize_relay_session(
@@ -632,7 +713,28 @@ mod tests {
         let url = deepgram_realtime_url(&session);
         assert!(url.contains("model=nova%203%2Ftest"));
         assert!(url.contains("interim_results=true"));
+        assert!(url.contains("endpointing=300"));
+        assert!(url.contains("utterance_end_ms=1000"));
+        assert!(url.contains("vad_events=true"));
         assert!(!url.contains("Token "));
+    }
+
+    #[test]
+    fn pcm16_i16le_stats_are_privacy_safe_levels() {
+        let silence = vec![0_u8; 640];
+        let silent = pcm16_i16le_stats(&silence);
+        assert_eq!(silent.samples, 320);
+        assert_eq!(silent.rms_dbfs, PCM16_DBFS_FLOOR);
+        assert_eq!(silent.peak_dbfs, PCM16_DBFS_FLOOR);
+
+        let mut audible = Vec::new();
+        for _ in 0..320 {
+            audible.extend_from_slice(&4_000_i16.to_le_bytes());
+        }
+        let stats = pcm16_i16le_stats(&audible);
+        assert!(stats.rms_dbfs > -25.0);
+        assert!(stats.peak_dbfs > -25.0);
+        assert_eq!(stats.nonzero_percent, 100.0);
     }
 
     #[test]

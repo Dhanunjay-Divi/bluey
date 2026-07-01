@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 14:08 EDT
+Latest checkpoint: 2026-07-01 15:52 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,69 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-281-OVERLAY-CONNECT-CODE.md`; the next canonical Bluey round doc should start at `ROUND-282-...`.
+- Latest assigned Bluey round doc is `ROUND-283-CLICKTHROUGH-MOVE-HANDLE-RELIABILITY.md`; the next canonical Bluey round doc should start at `ROUND-284-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 283 is in progress for click-through move-handle reliability:
+  - macOS click-through move handle is larger and has a larger practical hitbox
+  - macOS window-level pass-through policy now checks the move handle directly
+  - macOS has a global mouse fallback so a move-handle press can arm/manual-drag the window even if the window was still ignored at mouse-down time
+  - blank Bluey space remains click-through while click-through is on
+  - Windows parity:
+    - cyan move-handle rect is larger
+    - Windows `HTCAPTION` hitbox for the click-through handle is inflated
+  - desktop workspace version bumped to `0.1.38`
+  - local verification passed:
+    - `cargo fmt --all`
+    - `swift build -c debug --package-path native/macos/cue-overlay`
+    - `/opt/homebrew/bin/x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c`
+    - `cargo check -p cue-daemon --quiet`
+    - `cargo test -p cue-daemon pcm16_i16le_stats_detect_silence_and_audible_samples --quiet`
+    - `cargo test --manifest-path server/Cargo.toml stt::tests --quiet`
+  - release/deploy verification passed:
+    - `https://bluey.sh/latest.json` reported `0.1.38`
+    - live `latest.json.sig` verified successfully against the release Ed25519 key
+    - live artifact SHA256:
+      `480722b769522f43051b1056fc2e3d63395e5545bb62b341c6b711e7b2bc7669`
+    - `/install.sh` returned `application/x-shellscript`
+    - `/install.ps1` returned `application/x-powershell`
+  - live artifact:
+    `https://bluey.sh/releases/v0.1.38/bluey-0.1.38-darwin-arm64.tar.gz`
+  - Round doc:
+    `docs/rounds/ROUND-283-CLICKTHROUGH-MOVE-HANDLE-RELIABILITY.md`
+- Round 282 is complete for STT audible gating and relay diagnostics:
+  - desktop live STT now waits for audible PCM before opening a paid `/stt/session`
+  - the daemon keeps a short prebuffer so first audible words are forwarded after the relay opens
+  - quiet mic/system startup now produces user-visible waiting notices instead of looking broken
+  - desktop logs now include privacy-safe PCM level fields: sample count, RMS dBFS, peak dBFS, nonzero percentage
+  - server relay logs forwarded audio level fields without transcript text or raw audio
+  - desktop logs no-transcript Deepgram frames by provider frame type and payload size only
+  - server Deepgram live URL now mirrors direct tuning with `endpointing=300`, `utterance_end_ms=1000`, and `vad_events=true`
+  - optional `BLUEY_DEEPGRAM_LANGUAGE` is supported server-side
+  - desktop workspace version bumped to `0.1.37`
+  - local verification passed:
+    - `cargo fmt --all`
+    - `cargo check -p cue-daemon --quiet`
+    - `cargo test -p cue-daemon pcm16_i16le_stats_detect_silence_and_audible_samples --quiet`
+    - `cargo test --manifest-path server/Cargo.toml stt::tests --quiet`
+    - `cargo check --manifest-path server/Cargo.toml --quiet`
+    - `bash native/macos/cue-audio/build.sh`
+    - direct microphone helper smoke produced PCM bytes
+  - deploy/release verification passed:
+    - server relay was built on the droplet, installed to `/usr/local/bin/bluey-server`, and restarted active
+    - previous server binary backup:
+      `/var/backups/bluey-api/bin/bluey-server.previous-20260701T185425Z`
+    - `https://bluey.sh/health` returned `status=ok`
+    - `https://bluey.sh/latest.json` reported `0.1.37`
+    - live artifact SHA256:
+      `8c698f5faf664823bb304d790c743bc3f1b78baf67725d19b15d4ce4c6a0e942`
+    - `/install.sh` returned `application/x-shellscript`
+    - `/install.ps1` returned `application/x-powershell`
+  - Round doc:
+    `docs/rounds/ROUND-282-STT-AUDIBLE-GATE-RELAY-DIAGNOSTICS.md`
 - Round 281 is complete for overlay connect-code visibility:
   - daemon login cards now use structured body copy with `Code: XXXX-XXXX` and hidden `login_url: ...`
   - macOS overlay sign-in cards extract the code and show a dedicated `Connect code` pill
