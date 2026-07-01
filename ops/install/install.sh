@@ -312,6 +312,6 @@ fi
 printf "  Bluey opens the browser sign-in flow only when your account\n"
 printf "  is not already linked. Use ${BOLD}bluey off${RESET} to stop it.\n"
 echo
-printf "  ${DIM}First launch will ask for Accessibility permission so\n"
-printf "  the F19 hotkey works. Grant it and you're ready.${RESET}\n"
+printf "  ${DIM}First launch may ask for Accessibility permission so\n"
+printf "  Bluey shortcuts work. Press Ctrl+Option+B to hide/restore.${RESET}\n"
 echo

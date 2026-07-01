@@ -22,6 +22,7 @@
 
 import AppKit
 import ApplicationServices
+import Carbon
 import Darwin
 import Foundation
 import QuartzCore
@@ -5657,9 +5658,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
 
         switch key {
-        case "t" where allowFocusShortcut:
+        case "t":
             focusComposerForQuestion()
-            emitLifecycle("shortcut_invoked", detail: "source=\(source) action=focus_ask")
+            emitLifecycle("shortcut_invoked", detail: "source=\(source) action=text_input")
             return true
         case "l":
             recordingClicked()
@@ -5704,6 +5705,22 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         default:
             return false
         }
+    }
+
+    func invokeListenShortcut() {
+        recordingClicked()
+    }
+
+    func invokeScreenShortcut() {
+        analyzeClicked()
+    }
+
+    func invokeInteractiveShortcut() {
+        interactionModeClicked()
+    }
+
+    func invokeAnswerShortcut() {
+        askClicked()
     }
 
     private func routeTextResponderShortcut(
@@ -7171,12 +7188,6 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         emitLifecycle("shortcuts_overlay_opened", detail: "platform=macos")
     }
 
-    @objc private func copyShortcutsClicked() {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(macShortcutHelpText, forType: .string)
-        showSystemToast(title: "Copied", body: "Keyboard shortcuts copied.", duration: 1.2)
-    }
-
     @objc private func closeClicked() {
         showTurnOffConfirmation()
     }
@@ -7211,17 +7222,18 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private var macShortcutHelpText: String {
         [
-            "Global",
-            "Ctrl+Option+B    Show or hide Bluey",
-            "Ctrl+Option+T    Focus Ask",
+            "Global shortcuts",
+            "Ctrl+Option+B    Hide or restore Bluey",
+            "Ctrl+Option+T    Text input",
             "Ctrl+Option+L    Start or stop Listen",
             "Ctrl+Option+S    Capture screen context",
             "Ctrl+Option+I    Toggle click-through / interactive",
             "Ctrl+Option+Enter    Answer",
             "",
             "Inside Bluey, when Ask is not focused",
-            "L Listen    S Screen    I Interactive",
-            "H History    F Files    Esc Close panel",
+            "T Text input    L Listen    S Screen",
+            "I Interactive    H History    F Files",
+            "Esc Close panel",
             "",
             "Typing always wins inside Ask."
         ].joined(separator: "\n")
@@ -7230,6 +7242,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func configureCloseConfirmBodyStandard() {
         closeConfirmBody.alignment = .center
         closeConfirmBody.maximumNumberOfLines = 3
+        closeConfirmTurnOffButton.isHidden = false
+        closeConfirmTurnOffButton.isEnabled = true
     }
 
     private func configureCloseConfirmForShortcutList() {
@@ -7244,11 +7258,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         closeConfirmCancelButton.toolTip = "Close keyboard shortcuts"
         styleControlButton(closeConfirmCancelButton, symbol: "checkmark", accent: false)
 
-        closeConfirmTurnOffButton.title = "Copy"
-        closeConfirmTurnOffButton.target = self
-        closeConfirmTurnOffButton.action = #selector(copyShortcutsClicked)
-        closeConfirmTurnOffButton.toolTip = "Copy keyboard shortcuts"
-        styleControlButton(closeConfirmTurnOffButton, symbol: "doc.on.doc", accent: true)
+        closeConfirmTurnOffButton.isHidden = true
+        closeConfirmTurnOffButton.isEnabled = false
     }
 
     private func presentConfirmationOverlay() {
@@ -11669,6 +11680,8 @@ private final class OverlayApp {
     private var remoteControlHeuristicTimer: Timer?
     private var localKeyMonitor: Any?
     private var globalKeyMonitor: Any?
+    private var globalHotKeyRefs: [EventHotKeyRef?] = []
+    private var globalHotKeyHandler: EventHandlerRef?
     private var externalFileDragMonitor: Any?
     private var activeAppObserver: NSObjectProtocol?
     private var trustedRemoteInputEventTap: CFMachPort?
@@ -11696,6 +11709,14 @@ private final class OverlayApp {
         }
         if let globalKeyMonitor {
             NSEvent.removeMonitor(globalKeyMonitor)
+        }
+        for hotKeyRef in globalHotKeyRefs {
+            if let hotKeyRef {
+                UnregisterEventHotKey(hotKeyRef)
+            }
+        }
+        if let globalHotKeyHandler {
+            RemoveEventHandler(globalHotKeyHandler)
         }
         if let externalFileDragMonitor {
             NSEvent.removeMonitor(externalFileDragMonitor)
@@ -11777,7 +11798,14 @@ private final class OverlayApp {
         guard localKeyMonitor == nil else { return }
         localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard
-                let self,
+                let self
+            else {
+                return event
+            }
+            if self.routeGlobalBlueyShortcut(event) {
+                return nil
+            }
+            guard
                 self.expandedWindow?.isVisible == true,
                 let expandedView = self.expandedView,
                 expandedView.routeKeyDownToComposer(event)
@@ -11790,38 +11818,153 @@ private final class OverlayApp {
 
     private func startGlobalKeyRouting() {
         guard globalKeyMonitor == nil else { return }
+        registerSystemHotKeys()
         globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
             DispatchQueue.main.async {
                 self?.routeGlobalBlueyShortcut(event)
             }
         }
-        emitLifecycle("global_shortcuts", status: "ready", detail: "modifier=ctrl_option")
+        emitLifecycle("global_shortcuts", status: "ready", detail: "modifier=ctrl_option registered_hotkeys=\(!globalHotKeyRefs.isEmpty)")
     }
 
-    private func routeGlobalBlueyShortcut(_ event: NSEvent) {
+    private enum BlueyRegisteredHotKey: UInt32 {
+        case hideRestore = 1
+        case textInput = 2
+        case listen = 3
+        case screen = 4
+        case interactive = 5
+        case answer = 6
+    }
+
+    private func registerSystemHotKeys() {
+        guard globalHotKeyRefs.isEmpty else { return }
+        var eventSpec = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: UInt32(kEventHotKeyPressed))
+        let userData = UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())
+        let handlerStatus = InstallEventHandler(
+            GetApplicationEventTarget(),
+            { _, event, userData in
+                guard let event, let userData else { return OSStatus(eventNotHandledErr) }
+                var hotKeyID = EventHotKeyID()
+                let status = GetEventParameter(
+                    event,
+                    EventParamName(kEventParamDirectObject),
+                    EventParamType(typeEventHotKeyID),
+                    nil,
+                    MemoryLayout<EventHotKeyID>.size,
+                    nil,
+                    &hotKeyID)
+                guard status == noErr else { return status }
+                let app = Unmanaged<OverlayApp>.fromOpaque(userData).takeUnretainedValue()
+                DispatchQueue.main.async {
+                    app.handleRegisteredGlobalHotKey(id: hotKeyID.id)
+                }
+                return noErr
+            },
+            1,
+            &eventSpec,
+            userData,
+            &globalHotKeyHandler)
+        guard handlerStatus == noErr else {
+            emitLifecycle("global_shortcuts", status: "fallback", detail: "register_handler_status=\(handlerStatus)")
+            return
+        }
+
+        let signature = OSType(0x426C7565) // "Blue"
+        let modifiers = UInt32(controlKey | optionKey)
+        let keys: [(BlueyRegisteredHotKey, UInt32)] = [
+            (.hideRestore, UInt32(kVK_ANSI_B)),
+            (.textInput, UInt32(kVK_ANSI_T)),
+            (.listen, UInt32(kVK_ANSI_L)),
+            (.screen, UInt32(kVK_ANSI_S)),
+            (.interactive, UInt32(kVK_ANSI_I)),
+            (.answer, UInt32(kVK_Return)),
+        ]
+        var failures: [String] = []
+        for (hotKey, keyCode) in keys {
+            var hotKeyRef: EventHotKeyRef?
+            let hotKeyID = EventHotKeyID(signature: signature, id: hotKey.rawValue)
+            let status = RegisterEventHotKey(
+                keyCode,
+                modifiers,
+                hotKeyID,
+                GetApplicationEventTarget(),
+                0,
+                &hotKeyRef)
+            if status == noErr {
+                globalHotKeyRefs.append(hotKeyRef)
+            } else {
+                failures.append("\(hotKey.rawValue):\(status)")
+            }
+        }
+        if !failures.isEmpty {
+            emitLifecycle("global_shortcuts", status: "partial", detail: "registered=\(globalHotKeyRefs.count) failures=\(failures.joined(separator: ","))")
+        }
+    }
+
+    private func handleRegisteredGlobalHotKey(id: UInt32) {
+        guard let hotKey = BlueyRegisteredHotKey(rawValue: id) else { return }
+        switch hotKey {
+        case .hideRestore:
+            toggleBlueyHiddenFromShortcut()
+            emitLifecycle("shortcut_invoked", detail: "source=registered_global action=hide_restore")
+        case .textInput:
+            expandAndFocusQuestion()
+            emitLifecycle("shortcut_invoked", detail: "source=registered_global action=text_input")
+        case .listen:
+            guard expandedModeActive, expandedWindow?.isVisible == true else {
+                expand()
+                return
+            }
+            expandedView?.invokeListenShortcut()
+            emitLifecycle("shortcut_invoked", detail: "source=registered_global action=listen")
+        case .screen:
+            guard expandedModeActive, expandedWindow?.isVisible == true else {
+                expand()
+                return
+            }
+            expandedView?.invokeScreenShortcut()
+            emitLifecycle("shortcut_invoked", detail: "source=registered_global action=screen")
+        case .interactive:
+            guard expandedModeActive, expandedWindow?.isVisible == true else {
+                expand()
+                return
+            }
+            expandedView?.invokeInteractiveShortcut()
+            updateExpandedMousePolicy()
+            emitLifecycle("shortcut_invoked", detail: "source=registered_global action=interactive")
+        case .answer:
+            guard expandedModeActive, expandedWindow?.isVisible == true else {
+                expandAndFocusQuestion()
+                return
+            }
+            expandedView?.invokeAnswerShortcut()
+            emitLifecycle("shortcut_invoked", detail: "source=registered_global action=answer")
+        }
+    }
+
+    @discardableResult
+    private func routeGlobalBlueyShortcut(_ event: NSEvent) -> Bool {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         guard flags.contains(.control),
               flags.contains(.option),
               !flags.contains(.command),
               !flags.contains(.shift)
         else {
-            return
+            return false
         }
 
         let key = (event.charactersIgnoringModifiers ?? "").lowercased()
         switch key {
         case "b":
-            if expandedWindow?.isVisible == true {
-                collapse()
-            } else {
-                expand()
-            }
-            emitLifecycle("shortcut_invoked", detail: "source=global action=toggle_overlay")
-            return
+            toggleBlueyHiddenFromShortcut()
+            emitLifecycle("shortcut_invoked", detail: "source=global action=hide_restore")
+            return true
         case "t":
             expandAndFocusQuestion()
-            emitLifecycle("shortcut_invoked", detail: "source=global action=focus_ask")
-            return
+            emitLifecycle("shortcut_invoked", detail: "source=global action=text_input")
+            return true
         default:
             break
         }
@@ -11830,11 +11973,13 @@ private final class OverlayApp {
               expandedWindow?.isVisible == true,
               let expandedView
         else {
-            return
+            return false
         }
         if expandedView.routeBlueyShortcut(event, source: "global") {
             updateExpandedMousePolicy()
+            return true
         }
+        return false
     }
 
     private func bringPillToFront(force: Bool = false) {
@@ -12133,6 +12278,7 @@ private final class OverlayApp {
     }
 
     private func expand() {
+        RestoreToast.shared.dismiss(animated: false)
         ensureExpandedWindow()
         guard let expandedWindow else { return }
         expandedModeActive = true
@@ -12281,6 +12427,33 @@ private final class OverlayApp {
         expandedView?.showTurnOffConfirmation()
     }
 
+    private var isAnyBlueyChromeVisible: Bool {
+        (expandedWindow?.isVisible == true) || (pillWindow?.isVisible == true)
+    }
+
+    private func toggleBlueyHiddenFromShortcut() {
+        if isAnyBlueyChromeVisible {
+            hideAllBlueyChrome(reason: "shortcut")
+        } else {
+            RestoreToast.shared.dismiss(animated: false)
+            expand()
+        }
+    }
+
+    private func hideAllBlueyChrome(reason: String) {
+        if let expandedWindow, expandedWindow.isVisible {
+            rememberExpandedFrame(expandedWindow.frame)
+        }
+        expandedModeActive = false
+        expandedWindow?.ignoresMouseEvents = true
+        pillWindow?.ignoresMouseEvents = true
+        expandedWindow?.fadeOutAndHide()
+        pillWindow?.fadeOutAndHide()
+        RestoreToast.shared.show()
+        emitSimple("hidden")
+        emitLifecycle("hidden", detail: "reason=\(reason)")
+    }
+
     func handleCommand(_ cmd: OverlayCommand) {
         switch cmd {
         case .ping:
@@ -12288,12 +12461,7 @@ private final class OverlayApp {
         case .show:
             expand()
         case .hide:
-            // Codex Stage 18 commit 5: smooth fade on the visible windows
-            // + center-screen restore-toast for 2s.
-            pillWindow?.fadeOutAndHide()
-            expandedWindow?.fadeOutAndHide()
-            RestoreToast.shared.show()
-            emitLifecycle("hidden")
+            hideAllBlueyChrome(reason: "command")
 
         case .toggle:
             if expandedWindow?.isVisible == true { collapse() } else { expand() }

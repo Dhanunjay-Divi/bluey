@@ -120,6 +120,7 @@ static WNDPROC g_ask_edit_proc = NULL;
 
 static void send_current_question(void);
 static void show_full_overlay(bool emit_event);
+static void hide_overlay_completely(bool emit_event);
 static void update_paste_answer_button(void);
 static void invoke_button_command(int id, HWND control);
 static void focus_ask_input(void);
@@ -962,6 +963,21 @@ static void show_full_overlay(bool emit_event) {
     if (emit_event) emit_simple_event("shown");
 }
 
+static void hide_overlay_completely(bool emit_event) {
+    if (!g_hwnd) return;
+    if (!g_collapsed && g_visible) {
+        GetWindowRect(g_hwnd, &g_expanded_rect);
+        g_expanded_rect = clamp_expanded_rect_to_focus_area(g_expanded_rect, EXPANDED_SCREEN_MARGIN);
+        save_overlay_rect(L"expanded_rect", g_expanded_rect);
+    }
+
+    g_collapsed = false;
+    g_visible = false;
+    set_controls_visible(false);
+    ShowWindow(g_hwnd, SW_HIDE);
+    if (emit_event) emit_simple_event("hidden");
+}
+
 static void collapse_to_pill(HWND hwnd, bool emit_event) {
     if (!g_collapsed) {
         GetWindowRect(hwnd, &g_expanded_rect);
@@ -1563,7 +1579,7 @@ static void focus_ask_input(void) {
     SetFocus(g_ask_edit);
     int length = GetWindowTextLengthW(g_ask_edit);
     SendMessageW(g_ask_edit, EM_SETSEL, (WPARAM)length, (LPARAM)length);
-    emit_lifecycle_event("shortcut_invoked", "ok", "source=keyboard action=focus_ask");
+    emit_lifecycle_event("shortcut_invoked", "ok", "source=keyboard action=text_input");
 }
 
 static void toggle_interactive_mode(void) {
@@ -1583,12 +1599,12 @@ static bool handle_overlay_shortcut_key(WPARAM key, bool local_key) {
     bool expanded = !g_collapsed && g_visible;
 
     if (key == 'B') {
-        if (expanded) {
-            collapse_to_pill(g_hwnd, true);
+        if (expanded || g_collapsed || IsWindowVisible(g_hwnd)) {
+            hide_overlay_completely(true);
         } else {
             show_full_overlay(true);
         }
-        emit_lifecycle_event("shortcut_invoked", "ok", "source=keyboard action=toggle_overlay");
+        emit_lifecycle_event("shortcut_invoked", "ok", "source=keyboard action=hide_restore");
         return true;
     }
 
@@ -1741,9 +1757,9 @@ static DWORD WINAPI stdin_thread(LPVOID unused) {
         if (strcmp(msg_type, "show") == 0) {
             show_full_overlay(true);
         } else if (strcmp(msg_type, "hide") == 0) {
-            collapse_to_pill(g_hwnd, true);
+            hide_overlay_completely(true);
         } else if (strcmp(msg_type, "toggle") == 0) {
-            if (g_visible) collapse_to_pill(g_hwnd, true);
+            if (g_visible || g_collapsed || IsWindowVisible(g_hwnd)) hide_overlay_completely(true);
             else show_full_overlay(true);
         } else if (strcmp(msg_type, "clear") == 0) {
             wcscpy_s(g_title, 256, L"bluey");
@@ -2433,7 +2449,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         }
         if (id == ID_HELP_BUTTON) {
             overlay_message_box(
-                L"Green dot: Bluey is connected.\nHelp: show this guide.\nKeys: show keyboard shortcuts.\nSession: continue or start clean.\nAttach: add files or show attached docs.\nTheme: switch black/white background while keeping Bluey borders.\nStyle: answer rules.\nAnalyse Screen: search/read the active browser page or available screen context and generate an answer.\nRecap: summarize the active session from the bottom bar.\nQuit: stop Bluey completely. Hide/collapse behavior becomes a small Bluey button.\nMic: start/stop audio capture.\nMic dot: dim off, bright green recording.\nAnswer: ask Bluey.\nWhen Interactive is on, blank Bluey space drags the window. When click-through is on, blank Bluey space clicks the app behind it.",
+                L"Green dot: Bluey is connected.\nHelp: show this guide.\nKeys: show keyboard shortcuts.\nSession: continue or start clean.\nAttach: add files or show attached docs.\nTheme: switch black/white background while keeping Bluey borders.\nStyle: answer rules.\nAnalyse Screen: search/read the active browser page or available screen context and generate an answer.\nRecap: summarize the active session from the bottom bar.\nQuit: stop Bluey completely. Hide restores from the keyboard shortcut.\nMic: start/stop audio capture.\nMic dot: dim off, bright green recording.\nAnswer: ask Bluey.\nWhen Interactive is on, blank Bluey space drags the window. When click-through is on, blank Bluey space clicks the app behind it.",
                 L"Bluey controls",
                 MB_OK | MB_ICONINFORMATION
             );
@@ -2442,15 +2458,16 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         if (id == ID_SHORTCUTS_BUTTON) {
             overlay_message_box(
                 L"Global\n"
-                L"Ctrl+Alt+B    Show or hide Bluey\n"
-                L"Ctrl+Alt+T    Focus Ask\n"
+                L"Ctrl+Alt+B    Hide or restore Bluey\n"
+                L"Ctrl+Alt+T    Text input\n"
                 L"Ctrl+Alt+L    Start or stop Listen\n"
                 L"Ctrl+Alt+S    Capture screen context\n"
                 L"Ctrl+Alt+I    Toggle click-through / interactive\n"
                 L"Ctrl+Alt+Enter    Answer\n\n"
                 L"Inside Bluey, when Ask is not focused\n"
-                L"L Listen    S Screen    I Interactive\n"
-                L"H History    F Files    Esc Collapse\n\n"
+                L"T Text input    L Listen    S Screen\n"
+                L"I Interactive    H History    F Files\n"
+                L"Esc Collapse\n\n"
                 L"Typing always wins inside Ask.",
                 L"Keyboard shortcuts",
                 MB_OK | MB_ICONINFORMATION

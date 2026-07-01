@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 02:10 EDT
+Latest checkpoint: 2026-07-01 02:59 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,34 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-269-LOGIN-STATE-RELEASE-DEPLOY.md`; the next canonical Bluey round doc should start at `ROUND-270-...`.
+- Latest assigned Bluey round doc is `ROUND-270-SHORTCUT-HIDE-INPUT-POLISH.md`; the next canonical Bluey round doc should start at `ROUND-271-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 270 fixed and deployed shortcut/hide/input polish:
+  - macOS now registers OS-level Carbon hotkeys for `Ctrl+Option+B/T/L/S/I/Enter`, with the existing event monitor retained as fallback
+  - local macOS key routing checks the global shortcut path first, so shortcuts work while Bluey itself has focus
+  - `Ctrl+Option+B` now fully hides/restores Bluey chrome instead of collapsing to the pill
+  - `Ctrl+Option+T` and local `T` are labeled/handled as Text input
+  - the macOS shortcuts panel no longer exposes the Copy action
+  - Windows source parity updates `Ctrl+Alt+B` to hide/restore fully and updates shortcut copy to Text input
+  - macOS install copy now points to `Ctrl+Option+B` instead of the legacy F19 wording
+  - desktop workspace version bumped to `0.1.24`
+  - live artifact:
+    `dist/bluey-0.1.24-darwin-arm64.tar.gz`
+  - live SHA256:
+    `b5a9cd1e65a0b6e45a29c4c8d8070e89361241cc61a8929363ee619135d0f2f7`
+  - live `https://bluey.sh/latest.json` reports `0.1.24`
+  - live `latest.json.sig` verified successfully
+  - local machine updated from the published artifact and reports `bluey 0.1.24`
+  - shortcut smoke passed:
+    - `Ctrl+Option+B` -> `overlay_visible: false`
+    - `Ctrl+Option+B` again -> `overlay_visible: true`
+  - Windows artifact was not republished; live manifest remains macOS arm64
+  - Round doc:
+    `docs/rounds/ROUND-270-SHORTCUT-HIDE-INPUT-POLISH.md`
 - Round 269 deployed the Round 268 login-state recovery fix:
   - bumped desktop workspace version to `0.1.23`
   - built `dist/bluey-0.1.23-darwin-arm64.tar.gz`
