@@ -1618,8 +1618,8 @@ static bool handle_overlay_shortcut_key(WPARAM key, bool local_key) {
     bool expanded = !g_collapsed && g_visible;
 
     if (key == 'B') {
-        if (expanded || g_collapsed || IsWindowVisible(g_hwnd)) {
-            hide_overlay_completely(true);
+        if (expanded) {
+            collapse_to_pill(g_hwnd, true);
         } else {
             show_full_overlay(true);
         }
@@ -1776,9 +1776,9 @@ static DWORD WINAPI stdin_thread(LPVOID unused) {
         if (strcmp(msg_type, "show") == 0) {
             show_full_overlay(true);
         } else if (strcmp(msg_type, "hide") == 0) {
-            hide_overlay_completely(true);
+            collapse_to_pill(g_hwnd, true);
         } else if (strcmp(msg_type, "toggle") == 0) {
-            if (g_visible || g_collapsed || IsWindowVisible(g_hwnd)) hide_overlay_completely(true);
+            if (g_visible && !g_collapsed) collapse_to_pill(g_hwnd, true);
             else show_full_overlay(true);
         } else if (strcmp(msg_type, "clear") == 0) {
             wcscpy_s(g_title, 256, L"bluey");
@@ -2468,7 +2468,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         }
         if (id == ID_HELP_BUTTON) {
             overlay_message_box(
-                L"Green dot: Bluey is connected.\nHelp: show this guide.\nKeys: show keyboard shortcuts.\nSession: continue or start clean.\nAttach: add files or show attached docs.\nTheme: switch black/white background while keeping Bluey borders.\nStyle: answer rules.\nAnalyse Screen: search/read the active browser page or available screen context and generate an answer.\nRecap: summarize the active session from the bottom bar.\nQuit: stop Bluey completely. Hide restores from the keyboard shortcut.\nMic: start/stop audio capture.\nMic dot: dim off, bright green recording.\nAnswer: ask Bluey.\nWhen Interactive is on, blank Bluey space drags the window. When click-through is on, blank Bluey space clicks the app behind it.",
+                L"Green dot: Bluey is connected.\nHelp: show this guide.\nKeys: show keyboard shortcuts.\nSession: continue or start clean.\nAttach: add files or show attached docs.\nTheme: switch black/white background while keeping Bluey borders.\nStyle: answer rules.\nAnalyse Screen: search/read the active browser page or available screen context and generate an answer.\nRecap: summarize the active session from the bottom bar.\nQuit: stop Bluey completely. Hide minimizes to the small button.\nMic: start/stop audio capture.\nMic dot: dim off, bright green recording.\nAnswer: ask Bluey.\nWhen Interactive is on, blank Bluey space drags the window. When click-through is on, blank Bluey space clicks the app behind it.",
                 L"Bluey controls",
                 MB_OK | MB_ICONINFORMATION
             );
@@ -2478,7 +2478,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             const wchar_t *shortcut_body = g_interactive_mode
                 ? L"Interactive is on\n"
                   L"Global shortcuts work from anywhere:\n\n"
-                  L"Ctrl+Alt+B    Hide or restore Bluey\n"
+                  L"Ctrl+Alt+B    Minimize to pill / restore\n"
                   L"Ctrl+Alt+T    Text input\n"
                   L"Ctrl+Alt+L    Start or stop Listen\n"
                   L"Ctrl+Alt+S    Capture screen context\n"
@@ -2492,7 +2492,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
                 : L"Click-through is on\n"
                   L"Blank Bluey space passes clicks to the app behind it.\n"
                   L"Use global shortcuts from anywhere:\n\n"
-                  L"Ctrl+Alt+B    Hide or restore Bluey\n"
+                  L"Ctrl+Alt+B    Minimize to pill / restore\n"
                   L"Ctrl+Alt+T    Text input\n"
                   L"Ctrl+Alt+L    Start or stop Listen\n"
                   L"Ctrl+Alt+S    Capture screen context\n"

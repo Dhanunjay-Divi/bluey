@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 05:13 EDT
+Latest checkpoint: 2026-07-01 05:39 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,38 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-274-SIGNIN-GATE-INPUT-CARET.md`; the next canonical Bluey round doc should start at `ROUND-275-...`.
+- Latest assigned Bluey round doc is `ROUND-275-HIDE-COLLAPSES-TO-PILL.md`; the next canonical Bluey round doc should start at `ROUND-276-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 275 changed Hide back into a minimize-to-pill action:
+  - macOS `Ctrl+Option+B` collapses expanded Bluey to the pill and restores from the pill
+  - macOS IPC `hide` collapses to the pill instead of fully hiding every Bluey window
+  - signed-out auth gate does not collapse to the pill; its hide control is disabled so users complete auth first
+  - Windows `Ctrl+Alt+B`, IPC `hide`, and IPC `toggle` now use the existing `collapse_to_pill(...)` path
+  - macOS and Windows shortcut/help copy now says `Minimize to pill / restore`
+  - desktop workspace version bumped to `0.1.29`
+  - verification passed:
+    - `cargo check -p cue-daemon --offline`
+    - `swift build -c debug --package-path native/macos/cue-overlay`
+    - `/opt/homebrew/bin/x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c`
+    - `cargo test -p cue-daemon --lib --locked`
+    - `cargo test -p cue-core sign_in_event_serializes --locked`
+  - live artifact:
+    `dist/bluey-0.1.29-darwin-arm64.tar.gz`
+  - live SHA256:
+    `17ad3711d96a16d3647cb6a0f16b454fc5ea5cf608cdc4ea0fa1f37c2457b016`
+  - live `https://bluey.sh/latest.json` reports `0.1.29`
+  - `latest.json.sig` verified successfully
+  - local install updated to `bluey 0.1.29` and restarted with `overlay_capture_excluded: true`
+  - local shortcut smoke:
+    - `Ctrl+Option+B` collapsed overlay state to false
+    - `Ctrl+Option+B` restored overlay state to true
+  - Windows source parity is included, but Windows artifact was not republished yet
+  - Round doc:
+    `docs/rounds/ROUND-275-HIDE-COLLAPSES-TO-PILL.md`
 - Round 274 fixed the signed-out gate and duplicate input caret:
   - removed the custom macOS composer caret so `NSTextView` owns the only blinking insertion point
   - added a signed-out gate state to the macOS expanded overlay

@@ -7255,7 +7255,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private var macShortcutHelpText: String {
         let globalLines = [
-            "Ctrl+Option+B    Hide or restore Bluey",
+            "Ctrl+Option+B    Minimize to pill / restore",
             "Ctrl+Option+T    Text input",
             "Ctrl+Option+L    Start or stop Listen",
             "Ctrl+Option+S    Capture screen context",
@@ -8228,6 +8228,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             transcriptClearButton,
             attachButton,
             instructionsButton,
+            hideButton,
         ] {
             control.isEnabled = !locked
             control.alphaValue = locked ? 0.35 : 1.0
@@ -12564,10 +12565,14 @@ private final class OverlayApp {
     }
 
     private func toggleBlueyHiddenFromShortcut() {
-        if isAnyBlueyChromeVisible {
-            hideAllBlueyChrome(reason: "shortcut")
+        RestoreToast.shared.dismiss(animated: false)
+        if expandedView?.isSignedOutGateActive == true {
+            expand()
+            return
+        }
+        if expandedWindow?.isVisible == true {
+            collapse()
         } else {
-            RestoreToast.shared.dismiss(animated: false)
             expand()
         }
     }
@@ -12593,7 +12598,11 @@ private final class OverlayApp {
         case .show:
             expand()
         case .hide:
-            hideAllBlueyChrome(reason: "command")
+            if expandedView?.isSignedOutGateActive == true {
+                expand()
+            } else {
+                collapse()
+            }
 
         case .toggle:
             if expandedWindow?.isVisible == true { collapse() } else { expand() }
