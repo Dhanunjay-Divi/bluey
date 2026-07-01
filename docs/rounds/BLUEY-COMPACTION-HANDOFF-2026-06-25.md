@@ -47,6 +47,9 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
   - live `install.sh` serves as `application/x-shellscript`, not HTML
   - `latest.json.sig` verified successfully with OpenSSL
   - temp-home installer smoke installed `bluey 0.1.23`
+  - local machine was installed from the `0.1.23` artifact, restarted,
+    and reports `bluey 0.1.23`, `overlay_visible: true`, and
+    `Balance: $14.50`
   - noninteractive smoke could not use `/dev/tty` for sudo, but correctly
     fell back to user-local `$HOME/.local/bin`
   - Windows artifact was not republished; live manifest remains macOS arm64

@@ -40,10 +40,14 @@ Live results:
 - Live `install.sh` returns `content-type: application/x-shellscript` and begins with the shell installer, not HTML.
 - Live SHA256SUMS matches the local artifact checksum.
 - Temp-home installer smoke installed `bluey 0.1.23`.
+- Local machine was installed from `dist/bluey-0.1.23-darwin-arm64.tar.gz`, restarted, and now reports:
+  - `bluey 0.1.23`
+  - `overlay_visible: true`
+  - `Balance: $14.50`
 
 Installer smoke caveat:
 
-- The noninteractive temp-home run could not attach sudo to `/dev/tty`, so it correctly fell back to a user-local symlink under `$HOME/.local/bin`. This is expected for the smoke environment and does not block normal terminal installs.
+- The noninteractive temp-home and Codex-run local installs could not attach sudo to `/dev/tty`, so they correctly fell back to a user-local symlink under `$HOME/.local/bin`. This is expected for this command environment and does not block normal terminal installs.
 
 ## Current State
 
