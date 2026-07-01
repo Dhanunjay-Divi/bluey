@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 17:47 EDT
+Latest checkpoint: 2026-07-01 18:43 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,46 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-285-CODE-CANVAS-LINE-NOTES.md`; the next canonical Bluey round doc should start at `ROUND-286-...`.
+- Latest completed Bluey round doc is `ROUND-286-SHORTCUT-PARITY-KEYBOARD-NAV.md`; the next canonical Bluey round doc should start at `ROUND-287-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 286 is complete for shortcut parity and button keyboard navigation:
+  - shortcut guide now shows a stable command list in click-through on and off
+  - the guide now separates mode guidance from available commands instead of hiding commands by mode
+  - added global History/Files shortcuts:
+    - macOS `Ctrl+Option+H` / `Ctrl+Option+F`
+    - Windows `Ctrl+Alt+H` / `Ctrl+Alt+F`
+  - macOS overlay now has a Bluey-managed keyboard focus ring:
+    - `Tab` / `Shift+Tab` cycles visible enabled buttons when click-through is off
+    - `Enter` / `Space` activates the selected button
+    - modal help/confirm panels keep local keys inside the modal
+    - shortcut help body is non-editable and non-selectable
+  - Windows overlay parity:
+    - owner-drawn buttons draw a focus outline
+    - `Tab` / `Shift+Tab` cycles visible enabled buttons in interactive mode
+    - `Enter` / `Space` activates the focused button
+    - History/Files are registered/unregistered as global hotkeys
+  - desktop workspace version bumped to `0.1.40`
+  - local verification passed:
+    - `cargo check -p cue-daemon --quiet`
+    - `swift build -c debug --package-path native/macos/cue-overlay`
+    - `/opt/homebrew/bin/x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c`
+    - `git diff --check`
+  - macOS release verification passed:
+    - `https://bluey.sh/latest.json` reported `0.1.40`
+    - live `latest.json.sig` verified successfully against the release Ed25519 key
+    - live artifact SHA256:
+      `e1551312aaba717e8bac446995297ddc26a55ad11a135e5218bb145783fc97d8`
+    - `/install.sh` returned `application/x-shellscript`
+    - `/install.ps1` returned `application/x-powershell`
+  - live artifact:
+    `https://bluey.sh/releases/v0.1.40/bluey-0.1.40-darwin-arm64.tar.gz`
+  - Windows source parity is implemented and syntax-checked, but the live public release manifest still advertises `darwin-arm64` only until a Windows build/package host publishes the Windows artifact.
+  - Round doc:
+    `docs/rounds/ROUND-286-SHORTCUT-PARITY-KEYBOARD-NAV.md`
 - Round 285 is complete for code canvas line notes:
   - managed coding instructions now ask for separate `Line notes:` outside fenced code for non-trivial code answers
   - server code artifact formatting splits `Line notes:` into a dedicated `LINE NOTES` section

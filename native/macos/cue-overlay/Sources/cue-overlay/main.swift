@@ -4777,6 +4777,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var backgroundOpacity: CGFloat = 0.94
     private var dropHighlightActive = false
     private var lightThemeEnabled = UserDefaults.standard.bool(forKey: overlayLightThemeDefaultsKey)
+    private let keyboardFocusRing = HeaderShieldView()
+    private weak var keyboardFocusedButton: NSButton?
 
     override init(frame frameRect: NSRect) {
         feed = FeedView(frame: .zero)
@@ -4886,6 +4888,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         workspace.wantsLayer = true
         workspace.layer?.backgroundColor = NSColor.clear.cgColor
         workspace.layer?.masksToBounds = true
+        keyboardFocusRing.wantsLayer = true
+        keyboardFocusRing.isHidden = true
+        keyboardFocusRing.layer?.cornerRadius = 12
+        keyboardFocusRing.layer?.borderWidth = 1.8
+        keyboardFocusRing.layer?.shadowOpacity = 0.22
+        keyboardFocusRing.layer?.shadowRadius = 8
+        keyboardFocusRing.layer?.shadowOffset = .zero
+        keyboardFocusRing.layer?.zPosition = 3_000
 
         configureHeader()
         configureSystemToast()
@@ -5070,6 +5080,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         closeConfirmPanel.addSubview(closeConfirmBody)
         closeConfirmPanel.addSubview(closeConfirmCancelButton)
         closeConfirmPanel.addSubview(closeConfirmTurnOffButton)
+        keyboardFocusRing.translatesAutoresizingMaskIntoConstraints = true
+        addSubview(keyboardFocusRing)
         // Keep the fixed chrome rows above transparent scroll/canvas surfaces
         // even when AppKit re-lays out the dense center workspace. The shield
         // sits below the real header and never receives mouse events.
@@ -5421,6 +5433,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         setContextItems([])
         setTranscriptState("READY", active: false)
         applyOpacity(opacitySlider.doubleValue)
+        refreshKeyboardFocusRingStyle()
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -5439,6 +5452,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             updateCanvasWidth()
         }
         layoutTranscriptRailForCurrentText()
+        updateKeyboardFocusRingFrame()
     }
 
     override func resetCursorRects() {
@@ -5615,6 +5629,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         closeConfirmPanel.layer?.backgroundColor = BlueyTheme.panelDeep
             .withAlphaComponent(materialAlpha(0.97))
             .cgColor
+        refreshKeyboardFocusRingStyle()
         feed.setLightTheme(lightThemeEnabled, opacity: backgroundOpacity)
         canvasPane.applyBackgroundOpacity(backgroundOpacity)
         needsDisplay = true
@@ -5722,6 +5737,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     override func mouseDown(with event: NSEvent) {
+        clearKeyboardButtonFocus()
         let localPoint = convert(event.locationInWindow, from: nil)
         if isKnowledgeBadgeHit(at: localPoint) {
             toggleSavedContextItems()
@@ -5809,11 +5825,17 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func routeKeyDownToComposer(_ event: NSEvent) -> Bool {
-        if routeBlueyShortcut(event, source: "local") {
+        if routeKeyboardControlNavigation(event) {
+            return true
+        }
+        if event.keyCode == 53, dismissActiveOverlay() {
             return true
         }
         guard closeConfirmOverlay.isHidden, answerStyleOverlay.isHidden else {
             return false
+        }
+        if routeBlueyShortcut(event, source: "local") {
+            return true
         }
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         let key = (event.charactersIgnoringModifiers ?? "").lowercased()
@@ -5896,6 +5918,237 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
     }
 
+    private func routeKeyboardControlNavigation(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let hasCommandLikeModifier = flags.contains(.control)
+            || flags.contains(.option)
+            || flags.contains(.command)
+        let isTab = event.keyCode == 48
+            || event.charactersIgnoringModifiers == "\t"
+        let isReturn = event.keyCode == 36
+            || event.keyCode == 76
+            || event.charactersIgnoringModifiers == "\r"
+            || event.charactersIgnoringModifiers == "\n"
+        let isSpace = event.keyCode == 49
+
+        if isTab {
+            guard !hasCommandLikeModifier else { return false }
+            guard shouldHandleKeyboardButtonNavigation else { return false }
+            cycleKeyboardButtonFocus(backward: flags.contains(.shift))
+            return true
+        }
+
+        if (isReturn || isSpace),
+           !hasCommandLikeModifier,
+           let button = keyboardFocusedButton,
+           isKeyboardFocusable(button) {
+            button.performClick(nil)
+            emitLifecycle("keyboard_focus_activated", detail: "button=\(buttonIdentifier(button))")
+            return true
+        }
+
+        if keyboardFocusedButton != nil,
+           !isReturn,
+           !isSpace,
+           !isTab,
+           !hasCommandLikeModifier,
+           event.keyCode != 53 {
+            clearKeyboardButtonFocus()
+        }
+
+        return false
+    }
+
+    private var shouldHandleKeyboardButtonNavigation: Bool {
+        if !closeConfirmOverlay.isHidden || !answerStyleOverlay.isHidden {
+            return true
+        }
+        guard !passThroughMode else { return false }
+        if let firstResponder = window?.firstResponder {
+            if let editor = window?.fieldEditor(false, for: nil) as? NSTextView,
+               firstResponder === editor,
+               editor !== composer {
+                return false
+            }
+            if let textField = firstResponder as? NSTextField,
+               textField.isEditable,
+               textField !== closeConfirmBody {
+                return false
+            }
+        }
+        return true
+    }
+
+    private func cycleKeyboardButtonFocus(backward: Bool) {
+        let buttons = keyboardFocusableButtons()
+        guard !buttons.isEmpty else {
+            clearKeyboardButtonFocus()
+            return
+        }
+
+        let currentIndex = keyboardFocusedButton.flatMap { current in
+            buttons.firstIndex { $0 === current }
+        }
+        let nextIndex: Int
+        if let currentIndex {
+            nextIndex = backward
+                ? (currentIndex - 1 + buttons.count) % buttons.count
+                : (currentIndex + 1) % buttons.count
+        } else {
+            nextIndex = backward ? buttons.count - 1 : 0
+        }
+        setKeyboardFocusedButton(buttons[nextIndex])
+    }
+
+    private func setKeyboardFocusedButton(_ button: NSButton?) {
+        guard keyboardFocusedButton !== button else {
+            updateKeyboardFocusRingFrame()
+            return
+        }
+        keyboardFocusedButton = button
+        updateKeyboardFocusRingFrame()
+        if let button {
+            emitLifecycle("keyboard_focus_moved", detail: "button=\(buttonIdentifier(button))")
+        }
+    }
+
+    private func clearKeyboardButtonFocus() {
+        keyboardFocusedButton = nil
+        keyboardFocusRing.isHidden = true
+    }
+
+    private func updateKeyboardFocusRingFrame() {
+        guard let button = keyboardFocusedButton,
+              isKeyboardFocusable(button)
+        else {
+            keyboardFocusRing.isHidden = true
+            return
+        }
+        let frame = button.convert(button.bounds, to: self)
+            .insetBy(dx: -5, dy: -5)
+        keyboardFocusRing.frame = frame
+        keyboardFocusRing.layer?.cornerRadius = min(14, max(8, frame.height / 2))
+        keyboardFocusRing.isHidden = false
+    }
+
+    private func refreshKeyboardFocusRingStyle() {
+        let color = lightThemeEnabled
+            ? BlueyLightTheme.accent
+            : BlueyTheme.cyan
+        keyboardFocusRing.layer?.borderColor = color.withAlphaComponent(0.92).cgColor
+        keyboardFocusRing.layer?.shadowColor = color.cgColor
+    }
+
+    private func keyboardFocusableButtons() -> [NSButton] {
+        if !closeConfirmOverlay.isHidden {
+            return buttonsInView(closeConfirmPanel)
+                .filter(isKeyboardFocusable)
+        }
+        if !answerStyleOverlay.isHidden {
+            return buttonsInView(answerStylePanel)
+                .filter(isKeyboardFocusable)
+        }
+
+        var buttons: [NSButton] = [
+            navButton,
+            newSessionButton,
+            canvasToggleButton,
+            themeButton,
+            shortcutsButton,
+            moveHandleButton,
+            fullSizeButton,
+            interactionModeButton,
+            hideButton,
+            closeButton,
+        ]
+
+        if !sessionDrawer.isHidden {
+            buttons.append(contentsOf: buttonsInView(sessionDrawer))
+        }
+
+        buttons.append(contentsOf: [
+            transcriptClearButton,
+            attachButton,
+            instructionsButton,
+            recordingButton,
+            askButton,
+            analyzeButton,
+        ])
+
+        return dedupeButtons(buttons).filter(isKeyboardFocusable)
+    }
+
+    private func buttonsInView(_ view: NSView) -> [NSButton] {
+        var result: [NSButton] = []
+        for subview in view.subviews {
+            if let button = subview as? NSButton {
+                result.append(button)
+            }
+            result.append(contentsOf: buttonsInView(subview))
+        }
+        return result
+    }
+
+    private func dedupeButtons(_ buttons: [NSButton]) -> [NSButton] {
+        var seen = Set<ObjectIdentifier>()
+        return buttons.filter { button in
+            let id = ObjectIdentifier(button)
+            guard !seen.contains(id) else { return false }
+            seen.insert(id)
+            return true
+        }
+    }
+
+    private func isKeyboardFocusable(_ button: NSButton) -> Bool {
+        guard button.isEnabled,
+              !button.isHidden,
+              button.alphaValue > 0.01,
+              button.window != nil,
+              button.bounds.width > 4,
+              button.bounds.height > 4
+        else {
+            return false
+        }
+
+        var view: NSView? = button
+        while let current = view {
+            if current.isHidden || current.alphaValue <= 0.01 {
+                return false
+            }
+            if current === self { return true }
+            view = current.superview
+        }
+        return false
+    }
+
+    private func buttonIdentifier(_ button: NSButton) -> String {
+        if button === navButton { return "history" }
+        if button === newSessionButton { return "new_session" }
+        if button === canvasToggleButton { return "canvas" }
+        if button === themeButton { return "theme" }
+        if button === shortcutsButton { return "shortcuts" }
+        if button === moveHandleButton { return "move_handle" }
+        if button === fullSizeButton { return "fullscreen" }
+        if button === interactionModeButton { return "clickthrough" }
+        if button === hideButton { return "pill" }
+        if button === closeButton { return "turn_off" }
+        if button === drawerCloseButton { return "history_close" }
+        if button === latestSessionButton { return "continue_latest" }
+        if button === transcriptClearButton { return "transcript_clear" }
+        if button === attachButton { return "attach" }
+        if button === instructionsButton { return "tone" }
+        if button === recordingButton { return "listen" }
+        if button === askButton { return "answer" }
+        if button === analyzeButton { return "screen" }
+        if button === closeConfirmCancelButton { return "modal_primary" }
+        if button === closeConfirmTurnOffButton { return "modal_danger" }
+        if button === answerStyleSaveButton { return "tone_save" }
+        return button.title
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "_")
+    }
+
     @discardableResult
     func routeBlueyShortcut(_ event: NSEvent, source: String) -> Bool {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
@@ -5961,6 +6214,18 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         case "i":
             interactionModeClicked()
             emitLifecycle("shortcut_invoked", detail: "source=\(source) action=interactive")
+            return true
+        case "h":
+            toggleSessionsClicked()
+            emitLifecycle("shortcut_invoked", detail: "source=\(source) action=history")
+            return true
+        case "f":
+            if contextItems.isEmpty {
+                attachClicked()
+            } else {
+                toggleSavedContextItems()
+            }
+            emitLifecycle("shortcut_invoked", detail: "source=\(source) action=files")
             return true
         default:
             return false
@@ -6066,6 +6331,18 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         askClicked()
     }
 
+    func invokeHistoryShortcut() {
+        toggleSessionsClicked()
+    }
+
+    func invokeFilesShortcut() {
+        if contextItems.isEmpty {
+            attachClicked()
+        } else {
+            toggleSavedContextItems()
+        }
+    }
+
     private func routeTextResponderShortcut(
         key: String,
         flags: NSEvent.ModifierFlags,
@@ -6123,6 +6400,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func focusComposerForInput() {
         guard !handleSignedOutGateAction(action: "text_input") else { return }
+        clearKeyboardButtonFocus()
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
         window?.makeFirstResponder(composer)
@@ -7364,6 +7642,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         closeConfirmBody.textColor = BlueyTheme.textDim
         closeConfirmBody.alignment = .center
         closeConfirmBody.maximumNumberOfLines = 3
+        closeConfirmBody.isEditable = false
+        closeConfirmBody.isSelectable = false
+        closeConfirmBody.allowsEditingTextAttributes = false
 
         styleControlButton(closeConfirmCancelButton, symbol: "xmark", accent: false)
         styleControlButton(closeConfirmTurnOffButton, symbol: "power", accent: true)
@@ -7608,6 +7889,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     @objc private func interactionModeClicked() {
         passThroughMode.toggle()
+        clearKeyboardButtonFocus()
         updateInteractionModeChrome()
         onInteractionModeChanged?()
     }
@@ -7692,27 +7974,28 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             ("Ctrl+Option+L", "Start or stop Listen"),
             ("Ctrl+Option+S", "Capture screen context"),
             ("Ctrl+Option+I", "Toggle click-through"),
+            ("Ctrl+Option+H", "History"),
+            ("Ctrl+Option+F", "Files"),
             ("Ctrl+Option+Enter", "Answer"),
         ]
 
-        if passThroughMode {
-            appendLine("Click-through is on", font: titleFont, color: titleColor)
-            appendLine("Blank Bluey space clicks behind it. Drag the blue move handle to move.")
-            appendLine()
-            appendLine("Global shortcuts:", font: noteFont, color: titleColor)
-            globalShortcuts.forEach { appendShortcut($0.0, $0.1) }
-            return result
-        }
-
-        appendLine("Click-through is off", font: titleFont, color: titleColor)
-        appendLine("Drag blank Bluey space to move. Inside keys work when Ask is not focused:")
+        appendLine(
+            passThroughMode ? "Click-through is on" : "Click-through is off",
+            font: titleFont,
+            color: titleColor)
+        appendLine(passThroughMode
+            ? "Blank Bluey space clicks behind it. Drag the blue move handle to move."
+            : "Blank Bluey space drags the window. Tab selects Bluey buttons; Enter opens the selected button.")
+        appendLine()
+        appendLine("Inside Bluey when click-through is off and Ask is not focused:", font: noteFont, color: titleColor)
         appendLine()
         appendPair("T", "Text input", "L", "Listen")
         appendPair("S", "Screen", "I", "Click-through")
         appendPair("H", "History", "F", "Files")
         appendPair("Enter", "Answer", "Esc", "Close panel")
+        appendPair("Tab", "Next button", "Shift+Tab", "Previous button")
         appendLine()
-        appendLine("Global shortcuts also work from anywhere:")
+        appendLine("Global shortcuts work in both modes:")
         globalShortcuts.forEach { appendShortcut($0.0, $0.1) }
         appendLine()
         appendLine("Ask focused: type normally. Enter answers. Shift+Enter adds a new line.")
@@ -7732,11 +8015,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func configureCloseConfirmForShortcutList() {
+        clearKeyboardButtonFocus()
         closeConfirmTitle.stringValue = "Keyboard shortcuts"
         closeConfirmPanelWidthConstraint?.constant = 470
         closeConfirmCancelLeadingConstraint?.isActive = false
         closeConfirmCancelCenterXConstraint?.isActive = true
         closeConfirmBody.attributedStringValue = macShortcutHelpText
+        closeConfirmBody.isEditable = false
+        closeConfirmBody.isSelectable = false
         closeConfirmBody.alignment = .left
         closeConfirmBody.maximumNumberOfLines = 20
 
@@ -12486,6 +12772,8 @@ private final class OverlayApp {
         case screen = 4
         case interactive = 5
         case answer = 6
+        case history = 7
+        case files = 8
     }
 
     private func registerSystemHotKeys() {
@@ -12532,6 +12820,8 @@ private final class OverlayApp {
             (.screen, UInt32(kVK_ANSI_S)),
             (.interactive, UInt32(kVK_ANSI_I)),
             (.answer, UInt32(kVK_Return)),
+            (.history, UInt32(kVK_ANSI_H)),
+            (.files, UInt32(kVK_ANSI_F)),
         ]
         var failures: [String] = []
         for (hotKey, keyCode) in keys {
@@ -12593,6 +12883,20 @@ private final class OverlayApp {
             }
             expandedView?.invokeAnswerShortcut()
             emitLifecycle("shortcut_invoked", detail: "source=registered_global action=answer")
+        case .history:
+            guard expandedModeActive, expandedWindow?.isVisible == true else {
+                expand()
+                return
+            }
+            expandedView?.invokeHistoryShortcut()
+            emitLifecycle("shortcut_invoked", detail: "source=registered_global action=history")
+        case .files:
+            guard expandedModeActive, expandedWindow?.isVisible == true else {
+                expand()
+                return
+            }
+            expandedView?.invokeFilesShortcut()
+            emitLifecycle("shortcut_invoked", detail: "source=registered_global action=files")
         }
     }
 
@@ -12643,6 +12947,24 @@ private final class OverlayApp {
             expandedView?.invokeInteractiveShortcut()
             updateExpandedMousePolicy()
             emitLifecycle("shortcut_invoked", detail: "source=global action=interactive")
+            return true
+        case "h":
+            guard expandedModeActive, expandedWindow?.isVisible == true else {
+                expand()
+                return true
+            }
+            expandedView?.invokeHistoryShortcut()
+            updateExpandedMousePolicy()
+            emitLifecycle("shortcut_invoked", detail: "source=global action=history")
+            return true
+        case "f":
+            guard expandedModeActive, expandedWindow?.isVisible == true else {
+                expand()
+                return true
+            }
+            expandedView?.invokeFilesShortcut()
+            updateExpandedMousePolicy()
+            emitLifecycle("shortcut_invoked", detail: "source=global action=files")
             return true
         default:
             let isReturn = event.keyCode == 36 || event.keyCode == 76 || key == "\r" || key == "\n"

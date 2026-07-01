@@ -126,6 +126,8 @@ static void invoke_button_command(int id, HWND control);
 static void focus_ask_input(void);
 static void toggle_interactive_mode(void);
 static bool handle_overlay_shortcut_key(WPARAM key, bool local_key);
+static bool focus_next_keyboard_control(bool backward);
+static bool activate_focused_keyboard_control(void);
 
 #define MAX_CONTEXT_CHIPS 16
 typedef struct OverlayContextChip {
@@ -205,6 +207,8 @@ static void consume_sent_context_chips(void);
 #define ID_HOTKEY_SCREEN 2004
 #define ID_HOTKEY_INTERACTIVE 2005
 #define ID_HOTKEY_ANSWER 2006
+#define ID_HOTKEY_HISTORY 2007
+#define ID_HOTKEY_FILES 2008
 #define BLUEY_GLOBAL_HOTKEY_MODS (MOD_CONTROL | MOD_ALT | MOD_NOREPEAT)
 
 /* Stealth: hide overlay from screen recording, screenshots, and screen-share.
@@ -738,6 +742,19 @@ static void draw_dark_button(const DRAWITEMSTRUCT *item) {
     SelectObject(item->hDC, old_pen);
     DeleteObject(bg);
     DeleteObject(border);
+
+    bool focused = ((item->itemState & ODS_FOCUS) != 0) || GetFocus() == item->hwndItem;
+    if (focused) {
+        HPEN focus_pen = CreatePen(PS_SOLID, 2, g_light_theme ? RGB(0, 118, 184) : RGB(86, 218, 255));
+        HGDIOBJ old_focus_pen = SelectObject(item->hDC, focus_pen);
+        HGDIOBJ old_focus_brush = SelectObject(item->hDC, GetStockObject(NULL_BRUSH));
+        RECT focus_rect = item->rcItem;
+        InflateRect(&focus_rect, -2, -2);
+        RoundRect(item->hDC, focus_rect.left, focus_rect.top, focus_rect.right, focus_rect.bottom, 16, 16);
+        SelectObject(item->hDC, old_focus_brush);
+        SelectObject(item->hDC, old_focus_pen);
+        DeleteObject(focus_pen);
+    }
 
     SetBkMode(item->hDC, TRANSPARENT);
     SetTextColor(item->hDC, g_light_theme ? RGB(8, 22, 32) : RGB(234, 240, 246));
@@ -1619,6 +1636,96 @@ static void toggle_interactive_mode(void) {
     );
 }
 
+static bool is_keyboard_focusable_control(HWND control) {
+    if (!control || !IsWindow(control) || !IsWindowVisible(control) || !IsWindowEnabled(control)) {
+        return false;
+    }
+    RECT rect = {0};
+    GetWindowRect(control, &rect);
+    return (rect.right - rect.left) > 4 && (rect.bottom - rect.top) > 4;
+}
+
+static int keyboard_focus_controls(HWND *controls, int max_controls) {
+    HWND ordered[] = {
+        g_help_button,
+        g_session_button,
+        g_page_button,
+        g_attach_button,
+        g_recap_button,
+        g_note_button,
+        g_theme_button,
+        g_shortcuts_button,
+        g_close_button,
+        g_transcript_clear_button,
+        g_record_button,
+        g_send_button,
+    };
+    int count = 0;
+    for (int i = 0; i < (int)(sizeof(ordered) / sizeof(ordered[0])) && count < max_controls; i++) {
+        if (is_keyboard_focusable_control(ordered[i])) {
+            controls[count++] = ordered[i];
+        }
+    }
+    return count;
+}
+
+static bool focus_next_keyboard_control(bool backward) {
+    HWND controls[16];
+    int count = keyboard_focus_controls(controls, (int)(sizeof(controls) / sizeof(controls[0])));
+    if (count <= 0) return false;
+
+    HWND focused = GetFocus();
+    int current = -1;
+    for (int i = 0; i < count; i++) {
+        if (controls[i] == focused) {
+            current = i;
+            break;
+        }
+    }
+
+    int next = 0;
+    if (current >= 0) {
+        next = backward ? (current - 1 + count) % count : (current + 1) % count;
+    } else if (backward) {
+        next = count - 1;
+    }
+
+    SetFocus(controls[next]);
+    InvalidateRect(controls[next], NULL, TRUE);
+    if (focused && focused != controls[next]) {
+        InvalidateRect(focused, NULL, TRUE);
+    }
+    emit_lifecycle_event("keyboard_focus_moved", "ok", "platform=windows");
+    return true;
+}
+
+static bool activate_focused_keyboard_control(void) {
+    HWND focused = GetFocus();
+    if (!focused || focused == g_ask_edit) return false;
+    if (!is_keyboard_focusable_control(focused)) return false;
+
+    int id = GetDlgCtrlID(focused);
+    switch (id) {
+    case ID_SEND_BUTTON:
+    case ID_RECORD_BUTTON:
+    case ID_TRANSCRIPT_CLEAR_BUTTON:
+    case ID_HELP_BUTTON:
+    case ID_SESSION_BUTTON:
+    case ID_PAGE_BUTTON:
+    case ID_ATTACH_BUTTON:
+    case ID_RECAP_BUTTON:
+    case ID_NOTE_BUTTON:
+    case ID_THEME_BUTTON:
+    case ID_SHORTCUTS_BUTTON:
+    case ID_CLOSE_BUTTON:
+        invoke_button_command(id, focused);
+        emit_lifecycle_event("keyboard_focus_activated", "ok", "platform=windows");
+        return true;
+    default:
+        return false;
+    }
+}
+
 static bool handle_overlay_shortcut_key(WPARAM key, bool local_key) {
     if (!g_hwnd) return false;
     bool expanded = !g_collapsed && g_visible;
@@ -1657,19 +1764,13 @@ static bool handle_overlay_shortcut_key(WPARAM key, bool local_key) {
         toggle_interactive_mode();
         return true;
     case 'H':
-        if (local_key) {
-            invoke_button_command(ID_SESSION_BUTTON, g_session_button);
-            emit_lifecycle_event("shortcut_invoked", "ok", "source=keyboard action=history");
-            return true;
-        }
-        return false;
+        invoke_button_command(ID_SESSION_BUTTON, g_session_button);
+        emit_lifecycle_event("shortcut_invoked", "ok", local_key ? "source=keyboard action=history" : "source=global action=history");
+        return true;
     case 'F':
-        if (local_key) {
-            invoke_button_command(ID_ATTACH_BUTTON, g_attach_button);
-            emit_lifecycle_event("shortcut_invoked", "ok", "source=keyboard action=files");
-            return true;
-        }
-        return false;
+        invoke_button_command(ID_ATTACH_BUTTON, g_attach_button);
+        emit_lifecycle_event("shortcut_invoked", "ok", local_key ? "source=keyboard action=files" : "source=global action=files");
+        return true;
     case VK_ESCAPE:
         if (local_key) {
             collapse_to_pill(g_hwnd, true);
@@ -2511,30 +2612,33 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             return 0;
         }
         if (id == ID_SHORTCUTS_BUTTON) {
-            const wchar_t *shortcut_body = g_interactive_mode
-                ? L"Click-through is off\n"
-                  L"Drag blank Bluey space to move. Inside keys work when Ask is not focused:\n\n"
-                  L"T Text input        L Listen\n"
-                  L"S Screen            I Click-through\n"
-                  L"H History           F Files\n"
-                  L"Enter Answer        Esc Close panel\n\n"
-                  L"Global shortcuts also work from anywhere:\n"
-                  L"Ctrl+Alt+B         Minimize to pill / restore\n"
-                  L"Ctrl+Alt+T         Text input\n"
-                  L"Ctrl+Alt+L         Start or stop Listen\n"
-                  L"Ctrl+Alt+S         Capture screen context\n"
-                  L"Ctrl+Alt+I         Toggle click-through\n"
-                  L"Ctrl+Alt+Enter     Answer\n\n"
-                  L"Ask focused: type normally. Enter answers. Shift+Enter adds a new line."
-                : L"Click-through is on\n"
-                  L"Blank Bluey space clicks behind it. Drag the cyan move handle to move.\n\n"
-                  L"Global shortcuts:\n"
-                  L"Ctrl+Alt+B         Minimize to pill / restore\n"
-                  L"Ctrl+Alt+T         Text input\n"
-                  L"Ctrl+Alt+L         Start or stop Listen\n"
-                  L"Ctrl+Alt+S         Capture screen context\n"
-                  L"Ctrl+Alt+I         Toggle click-through\n"
-                  L"Ctrl+Alt+Enter     Answer";
+            wchar_t shortcut_body[1800];
+            swprintf(
+                shortcut_body,
+                sizeof(shortcut_body) / sizeof(shortcut_body[0]),
+                L"%ls\n"
+                L"%ls\n\n"
+                L"Inside Bluey when click-through is off and Ask is not focused:\n\n"
+                L"T Text input        L Listen\n"
+                L"S Screen            I Click-through\n"
+                L"H History           F Files\n"
+                L"Enter Answer        Esc Close panel\n"
+                L"Tab Next button     Shift+Tab Previous button\n\n"
+                L"Global shortcuts work in both modes:\n"
+                L"Ctrl+Alt+B         Minimize to pill / restore\n"
+                L"Ctrl+Alt+T         Text input\n"
+                L"Ctrl+Alt+L         Start or stop Listen\n"
+                L"Ctrl+Alt+S         Capture screen context\n"
+                L"Ctrl+Alt+I         Toggle click-through\n"
+                L"Ctrl+Alt+H         History\n"
+                L"Ctrl+Alt+F         Files\n"
+                L"Ctrl+Alt+Enter     Answer\n\n"
+                L"Ask focused: type normally. Enter answers. Shift+Enter adds a new line.",
+                g_interactive_mode ? L"Click-through is off" : L"Click-through is on",
+                g_interactive_mode
+                    ? L"Blank Bluey space drags the window. Tab selects Bluey buttons; Enter opens the selected button."
+                    : L"Blank Bluey space clicks behind it. Drag the cyan move handle to move."
+            );
             overlay_message_box(
                 shortcut_body,
                 L"Keyboard shortcuts",
@@ -2693,6 +2797,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         case ID_HOTKEY_ANSWER:
             handle_overlay_shortcut_key(VK_RETURN, false);
             return 0;
+        case ID_HOTKEY_HISTORY:
+            handle_overlay_shortcut_key('H', false);
+            return 0;
+        case ID_HOTKEY_FILES:
+            handle_overlay_shortcut_key('F', false);
+            return 0;
         default:
             break;
         }
@@ -2702,6 +2812,16 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         bool alt = (GetKeyState(VK_MENU) & 0x8000) != 0;
         bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
         bool edit_focused = GetFocus() == g_ask_edit;
+        if (g_interactive_mode && !ctrl && !alt && wparam == VK_TAB) {
+            if (focus_next_keyboard_control(shift)) {
+                return 0;
+            }
+        }
+        if (g_interactive_mode && !ctrl && !alt && (wparam == VK_RETURN || wparam == VK_SPACE)) {
+            if (activate_focused_keyboard_control()) {
+                return 0;
+            }
+        }
         if (g_interactive_mode && !edit_focused && !ctrl && !alt && !shift) {
             if (handle_overlay_shortcut_key(wparam, true)) {
                 return 0;
@@ -2956,6 +3076,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
         UnregisterHotKey(hwnd, ID_HOTKEY_SCREEN);
         UnregisterHotKey(hwnd, ID_HOTKEY_INTERACTIVE);
         UnregisterHotKey(hwnd, ID_HOTKEY_ANSWER);
+        UnregisterHotKey(hwnd, ID_HOTKEY_HISTORY);
+        UnregisterHotKey(hwnd, ID_HOTKEY_FILES);
         if (g_edit_brush) {
             DeleteObject(g_edit_brush);
             g_edit_brush = NULL;
@@ -3028,6 +3150,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE prev, PWSTR cmd, int show) {
     hotkeys_registered += register_bluey_hotkey(ID_HOTKEY_SCREEN, 'S', "S", hotkey_failures, sizeof(hotkey_failures)) ? 1 : 0;
     hotkeys_registered += register_bluey_hotkey(ID_HOTKEY_INTERACTIVE, 'I', "I", hotkey_failures, sizeof(hotkey_failures)) ? 1 : 0;
     hotkeys_registered += register_bluey_hotkey(ID_HOTKEY_ANSWER, VK_RETURN, "Enter", hotkey_failures, sizeof(hotkey_failures)) ? 1 : 0;
+    hotkeys_registered += register_bluey_hotkey(ID_HOTKEY_HISTORY, 'H', "H", hotkey_failures, sizeof(hotkey_failures)) ? 1 : 0;
+    hotkeys_registered += register_bluey_hotkey(ID_HOTKEY_FILES, 'F', "F", hotkey_failures, sizeof(hotkey_failures)) ? 1 : 0;
     char hotkey_detail[256];
     if (hotkey_failures[0] != '\0') {
         snprintf(hotkey_detail, sizeof(hotkey_detail), "modifier=ctrl_alt registered=%d failures=%s", hotkeys_registered, hotkey_failures);
