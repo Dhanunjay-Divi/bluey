@@ -151,6 +151,19 @@ impl CloudClient {
         self.cached.lock().unwrap().clone()
     }
 
+    /// Reload tokens from the persistent store into the in-memory cache.
+    ///
+    /// Long-running daemon tasks keep a `CloudClient` alive for hours. Browser
+    /// login, CLI login, or a one-off CLI refresh can update the secure token
+    /// store while that client still holds stale cached tokens. This gives those
+    /// background tasks a safe recovery path without restarting Bluey.
+    pub fn reload_tokens_from_store(&self) -> Result<bool> {
+        let loaded = self.tokens.load()?;
+        let present = loaded.is_some();
+        *self.cached.lock().unwrap() = loaded;
+        Ok(present)
+    }
+
     /// Return a copy of this client that attaches a fixed trace id to all
     /// outgoing HTTP calls.
     pub fn with_trace_id(mut self, trace_id: impl Into<String>) -> Self {
@@ -734,6 +747,47 @@ mod tests {
         assert!(d1 >= base * 2, "d1={d1} base={base}");
         // Bounded: jitter is < base/2 above the exponential term.
         assert!(d0 < base * 2, "d0={d0} should stay under 2x base");
+    }
+
+    #[test]
+    fn reload_tokens_from_store_refreshes_cached_tokens() {
+        let config = ClientConfig {
+            base_url: "https://bluey.test".to_string(),
+            user_agent: "test".into(),
+            timeout: Duration::from_secs(10),
+            trace_id: None,
+        };
+        let store = Arc::new(MemoryStore::new());
+        TokenStore::save(
+            store.as_ref(),
+            &Tokens {
+                access: "old-access".to_string(),
+                refresh: "old-refresh".to_string(),
+                email: "old@example.com".to_string(),
+            },
+        )
+        .unwrap();
+        let client = CloudClient::new(config, store.clone()).unwrap();
+        assert_eq!(
+            client.current_tokens().unwrap().access.as_str(),
+            "old-access"
+        );
+
+        TokenStore::save(
+            store.as_ref(),
+            &Tokens {
+                access: "new-access".to_string(),
+                refresh: "new-refresh".to_string(),
+                email: "new@example.com".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert!(client.reload_tokens_from_store().unwrap());
+        assert_eq!(
+            client.current_tokens().unwrap().access.as_str(),
+            "new-access"
+        );
     }
 
     #[tokio::test]

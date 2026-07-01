@@ -121,11 +121,36 @@ async fn run_loop_inner(
             }
             Err(e) => {
                 consecutive_errors += 1;
-                tracing::debug!(
-                    error = %e,
+                let error_message = e.to_string();
+                tracing::warn!(
+                    error = %error_message,
                     consecutive_errors,
-                    "balance poll error (will retry next interval)"
+                    "balance poll error; reloading stored tokens before retry"
                 );
+                match client.reload_tokens_from_store() {
+                    Ok(true) => match poll_once(&client).await {
+                        Ok(snap) => {
+                            consecutive_errors = 0;
+                            let _ = watch_handle.inner.send(Some(snap));
+                            continue;
+                        }
+                        Err(retry_error) => {
+                            tracing::warn!(
+                                error = %retry_error,
+                                "balance poll still failed after reloading stored tokens"
+                            );
+                        }
+                    },
+                    Ok(false) => {
+                        tracing::warn!("balance poll reload found no stored tokens");
+                    }
+                    Err(reload_error) => {
+                        tracing::warn!(
+                            error = %reload_error,
+                            "balance poll could not reload stored tokens"
+                        );
+                    }
+                }
                 // After 10 consecutive errors (5 minutes at default
                 // interval) emit a low-confidence snapshot if we have
                 // one cached. Keeps the overlay from showing stale

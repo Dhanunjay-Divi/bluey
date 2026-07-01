@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-06-30 20:37 EDT
+Latest checkpoint: 2026-06-30 21:31 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,30 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest assigned Bluey round doc is `ROUND-264-PROD-DATA-OPS-GATES.md`; the next canonical Bluey round doc should start at `ROUND-265-...`.
+- Latest assigned Bluey round doc is `ROUND-265-BALANCE-POLL-RECOVERY-DEPLOY.md`; the next canonical Bluey round doc should start at `ROUND-266-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 265 fixed and deployed the balance poll recovery issue:
+  - root cause was a stale in-memory token cache inside the long-running daemon
+    balance poller while CLI/browser auth could refresh the secure token store
+  - added `CloudClient::reload_tokens_from_store()`
+  - balance polling now reloads stored tokens and retries immediately after a
+    poll failure
+  - desktop version bumped to `0.1.22`
+  - live `https://bluey.sh/latest.json` reports `0.1.22`
+  - `latest.json.sig` verifies and the live artifact checksum matches
+  - temp-home install smoke installed `bluey 0.1.22`
+  - local machine is installed/running `bluey 0.1.22`
+  - local `bluey credits` returned `Balance: $14.56`
+  - the server binary on the droplet was rolled forward to commit `0a3c67e`
+    so Round 264 data-ops gates are live
+  - `bluey-api.service` is active and `https://bluey.sh/health` reports
+    `status=ok`, `commit=0a3c67e`
+  - Round doc:
+    `docs/rounds/ROUND-265-BALANCE-POLL-RECOVERY-DEPLOY.md`
 - Round 264 implemented the production data operations gates in the repo:
   - `/account/export` keeps the existing JSON export
   - `/account/export?format=zip` now produces a structured zip with
@@ -67,9 +85,7 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
     - `bash -n ops/backup-bluey-db.sh`
     - `bash -n ops/restore-drill-bluey-db.sh`
     - disposable SQLite restore drill
-  - this round did not deploy a new live server binary to the droplet; live
-    rollout should follow the runbook and include a real Postgres restore drill
-    against a disposable target database
+  - this round was deployed to the droplet during Round 265
   - Round doc:
     `docs/rounds/ROUND-264-PROD-DATA-OPS-GATES.md`
 - Round 263 completed the production Postgres/R2 storage setup:
