@@ -1465,6 +1465,29 @@ static bool is_placeholder_transcript_question(const wchar_t *text) {
         || wcsstr(lower, L"listening for follow-up") != NULL;
 }
 
+static bool is_usable_transcript_question(const wchar_t *text) {
+    if (!text || text[0] == L'\0') return false;
+    if (is_placeholder_transcript_question(text)) return false;
+    wchar_t body[1024];
+    wcsncpy_s(body, 1024, text, _TRUNCATE);
+    trim_transcript_question(body);
+    if (transcript_question_has_source_label(body)) {
+        wchar_t *colon = wcschr(body, L':');
+        if (colon) {
+            wchar_t remainder[1024];
+            wcsncpy_s(remainder, 1024, colon + 1, _TRUNCATE);
+            trim_transcript_question(remainder);
+            wcsncpy_s(body, 1024, remainder, _TRUNCATE);
+        }
+    }
+    size_t len = wcslen(body);
+    if (len < 3) return false;
+    for (size_t i = 0; i < len; i++) {
+        if (iswalnum(body[i])) return true;
+    }
+    return false;
+}
+
 static bool is_filler_transcript_word(const wchar_t *word) {
     if (!word || word[0] == L'\0') return true;
     static const wchar_t *fillers[] = {
@@ -1532,7 +1555,7 @@ static bool live_transcript_visible_question(wchar_t *out, size_t capacity) {
     }
     if (line_count > 2) return false;
     prefix_transcript_source_label(out, capacity);
-    if (!is_meaningful_transcript_question(out)) return false;
+    if (!is_usable_transcript_question(out)) return false;
     return true;
 }
 
@@ -1555,7 +1578,7 @@ static bool live_transcript_question_text(wchar_t *out, size_t capacity) {
         }
     }
     prefix_transcript_source_label(out, capacity);
-    if (!is_meaningful_transcript_question(out)) return false;
+    if (!is_usable_transcript_question(out)) return false;
     return true;
 }
 

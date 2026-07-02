@@ -8654,8 +8654,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func hasTranscriptQuestionContext() -> Bool {
-        transcriptQuestionForAnswer()?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            || liveTranscriptPreviewQuestionForAnswer()?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        transcriptSendQuestionForAnswer()?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
     }
 
     private func shouldBlockSilentListenAnswer(raw: String) -> Bool {
@@ -11474,15 +11473,51 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     private func composedQuestionForAnswer(typed raw: String) -> String? {
         let typed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        let transcript = transcriptQuestionForAnswer()
         if typed.isEmpty {
-            guard let transcript = transcript ?? liveTranscriptPreviewQuestionForAnswer() else { return nil }
-            return transcript
+            return transcriptSendQuestionForAnswer()
         }
         return typed
     }
 
-    private func liveTranscriptVisibleQuestion(from transcript: String) -> String? {
+    private func transcriptSendQuestionForAnswer() -> String? {
+        guard let candidate = transcriptTextReadyForAnswer() else { return nil }
+        if let visible = liveTranscriptVisibleQuestion(from: candidate, requireMeaningful: false) {
+            return visible
+        }
+        return liveTranscriptAnswerPrompt()
+    }
+
+    private func transcriptTextReadyForAnswer() -> String? {
+        if let transcript = transcriptQuestionForAnswer() {
+            return transcript
+        }
+        if let preview = liveTranscriptPreviewQuestionForAnswer() {
+            return preview
+        }
+        var lines = transcriptSnippets
+        appendLiveTranscriptLines(to: &lines)
+        if lines.isEmpty {
+            for key in ["Mic", "System", "Audio"] {
+                if let body = liveTranscriptPreviewBodies[key]?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !body.isEmpty {
+                    lines.append("\(key): \(body)")
+                }
+            }
+        }
+        if lines.isEmpty {
+            let railText = transcriptLabel.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !railText.isEmpty {
+                lines.append(railText)
+            }
+        }
+        let joined = compactTranscriptQuestionLines(Array(lines.suffix(12)))
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isUsableTranscriptText(joined) else { return nil }
+        return boundedTranscriptTail(joined, maxChars: ChromeMetrics.transcriptPreviewMemoryChars)
+    }
+
+    private func liveTranscriptVisibleQuestion(from transcript: String, requireMeaningful: Bool = true) -> String? {
         let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         guard trimmed.count <= 220 else { return nil }
@@ -11494,17 +11529,24 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let compact = lines.joined(separator: " ")
             .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard isMeaningfulTranscriptQuestion(compact) else { return nil }
-        let lower = compact.lowercased()
+        guard requireMeaningful ? isMeaningfulTranscriptQuestion(compact) : isUsableTranscriptText(compact) else { return nil }
+        return compact
+    }
+
+    private func isUsableTranscriptText(_ transcript: String) -> Bool {
+        let body = transcriptSemanticBody(transcript)
+        guard body.count >= 3 else { return false }
+        let lower = body.lowercased()
         let placeholderFragments = [
             "captions appear here",
             "live captions preview",
             "starting audio",
             "audio is live",
-            "listening for follow-up"
+            "listening for follow-up",
+            "listening for follow up"
         ]
-        guard !placeholderFragments.contains(where: { lower.contains($0) }) else { return nil }
-        return compact
+        guard !placeholderFragments.contains(where: { lower.contains($0) }) else { return false }
+        return body.rangeOfCharacter(from: .alphanumerics) != nil
     }
 
     private func isMeaningfulTranscriptQuestion(_ transcript: String) -> Bool {
@@ -11832,6 +11874,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func updateTranscriptStripText(_ text: String, scrollToEnd: Bool) {
         transcriptStripShouldFollowTail = scrollToEnd
         transcriptLabel.attributedStringValue = attributedTranscriptStripText(text)
+        transcriptScroll.layoutSubtreeIfNeeded()
+        transcriptScroll.contentView.layoutSubtreeIfNeeded()
         resizeTranscriptLabelToContent()
         guard scrollToEnd else {
             transcriptScroll.contentView.scroll(to: .zero)
@@ -11840,6 +11884,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
         scrollTranscriptRailToEnd()
         DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.layoutTranscriptRailForCurrentText()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) { [weak self] in
             guard let self else { return }
             self.layoutTranscriptRailForCurrentText()
         }
