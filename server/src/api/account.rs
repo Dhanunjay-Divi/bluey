@@ -12,6 +12,9 @@ use std::io::{Cursor, Write};
 
 use super::AppState;
 use crate::auth::AuthedAccount;
+use crate::billing::policy::{
+    is_internal_or_test_billing_account, INTERNAL_TEST_BILLING_BLOCK_MESSAGE,
+};
 use crate::config::BillingProvider;
 use crate::db::account_data;
 use crate::object_storage::ObjectStorage;
@@ -176,11 +179,11 @@ pub async fn update_billing_settings(
                 }),
             ));
         }
-        if super::billing::is_internal_or_test_billing_account(&account) {
+        if is_internal_or_test_billing_account(&account) {
             return Err((
                 StatusCode::FORBIDDEN,
                 Json(ApiError {
-                    error: super::billing::INTERNAL_TEST_BILLING_BLOCK_MESSAGE.to_string(),
+                    error: INTERNAL_TEST_BILLING_BLOCK_MESSAGE.to_string(),
                 }),
             ));
         }
@@ -283,12 +286,13 @@ pub(crate) fn account_me_payload(
 ) -> AccountMe {
     let (provider, available, reason, payment_label) = auto_topup_capability(state, &account);
     let square_public = square_public_config(state);
+    let internal_or_test_billing = is_internal_or_test_billing_account(&account);
     AccountMe {
         id: account.id,
         email: account.email,
         balance_cents: account.balance_cents,
         trial_seconds_remaining: account.trial_seconds_remaining,
-        auto_topup_enabled: account.auto_topup_enabled,
+        auto_topup_enabled: account.auto_topup_enabled && !internal_or_test_billing,
         auto_topup_threshold_cents: account.auto_topup_threshold_cents,
         auto_topup_amount_cents: account.auto_topup_amount_cents,
         is_admin: account.is_admin,
@@ -329,11 +333,11 @@ fn auto_topup_capability(
                 .stripe_payment_method_id
                 .as_ref()
                 .map(|_| "Saved Stripe card".to_string());
-            if super::billing::is_internal_or_test_billing_account(account) {
+            if is_internal_or_test_billing_account(account) {
                 return (
                     "stripe".to_string(),
                     false,
-                    Some(super::billing::INTERNAL_TEST_BILLING_BLOCK_MESSAGE.to_string()),
+                    Some(INTERNAL_TEST_BILLING_BLOCK_MESSAGE.to_string()),
                     label,
                 );
             }
@@ -364,11 +368,11 @@ fn auto_topup_capability(
                 _ if account.square_card_id.is_some() => Some("Saved Square card".to_string()),
                 _ => None,
             };
-            if super::billing::is_internal_or_test_billing_account(account) {
+            if is_internal_or_test_billing_account(account) {
                 return (
                     "square".to_string(),
                     false,
-                    Some(super::billing::INTERNAL_TEST_BILLING_BLOCK_MESSAGE.to_string()),
+                    Some(INTERNAL_TEST_BILLING_BLOCK_MESSAGE.to_string()),
                     label,
                 );
             }

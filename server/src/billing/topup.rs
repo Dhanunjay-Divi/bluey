@@ -107,6 +107,15 @@ pub fn maybe_spawn(
             );
             return;
         }
+        Ok(Some(account))
+            if crate::billing::policy::is_internal_or_test_billing_account(&account) =>
+        {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account_id),
+                "auto reload skipped: internal/test billing account"
+            );
+            return;
+        }
         Ok(Some(_)) => {}
         Ok(None) => {
             tracing::warn!(
@@ -461,6 +470,18 @@ mod tests {
         })
     }
 
+    fn test_config_with_stripe() -> std::sync::Arc<Config> {
+        let mut config = (*test_config()).clone();
+        config.stripe_secret_key = Some("sk_test".to_string());
+        std::sync::Arc::new(config)
+    }
+
+    async fn inflight_contains(account_id: &str) -> bool {
+        let mu = AUTO_TOPUP_INFLIGHT.get_or_init(Default::default);
+        let guard = mu.lock().await;
+        guard.contains_key(account_id)
+    }
+
     #[tokio::test]
     async fn skip_when_disabled() {
         let pool = temp_pool();
@@ -515,6 +536,48 @@ mod tests {
             None,
             None,
             1500,
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_internal_test_account_even_if_auto_topup_was_already_enabled() {
+        let pool = temp_pool();
+        let account = Account::create(
+            &pool,
+            "internal-admin-20260606023943@bluey.sh",
+            "password-hash",
+        )
+        .unwrap();
+        Account::mark_email_verified(&pool, &account.id).unwrap();
+        Account::save_stripe_checkout_refs(
+            &pool,
+            &account.id,
+            Some("cus_internal"),
+            Some("pm_internal"),
+        )
+        .unwrap();
+        let account = Account::update_auto_topup_settings(&pool, &account.id, true, 500, 1500)
+            .unwrap()
+            .unwrap();
+
+        maybe_spawn(
+            pool,
+            test_config_with_stripe(),
+            account.id.clone(),
+            0,
+            account.auto_topup_enabled,
+            account.auto_topup_threshold_cents,
+            account.stripe_customer_id.clone(),
+            account.stripe_payment_method_id.clone(),
+            account.square_customer_id.clone(),
+            account.square_card_id.clone(),
+            account.auto_topup_amount_cents,
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !inflight_contains(&account.id).await,
+            "internal/test account should skip before reserving an auto reload"
         );
     }
 

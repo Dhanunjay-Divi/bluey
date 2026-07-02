@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-02 03:57 EDT
+Latest checkpoint: 2026-07-02 04:18 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,29 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-300-BILLING-LESSON-GUARDS.md`; the next canonical Bluey round doc should start at `ROUND-301-...`.
+- Latest completed Bluey round doc is `ROUND-301-FRESH-REVIEW-BILLING-GUARD-CLOSURE.md`; the next canonical Bluey round doc should start at `ROUND-302-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 301 is complete for the fresh review of Codex-owned billing guard work:
+  - reviewed Round 300 against the Pinky billing lesson goal with fresh eyes
+  - found one remaining edge: an internal/test account with legacy Auto Reload enabled and a saved payment method could still reach the background Auto Reload worker
+  - moved the internal/admin/test billing-account policy into shared `server/src/billing/policy.rs`
+  - checkout, saved-card setup, account settings, account payload, and the Auto Reload worker now use the shared policy
+  - background Auto Reload now skips internal/admin/test accounts before reserving an in-flight top-up
+  - `/account/me` now reports Auto Reload effectively off for internal/admin/test accounts so UI state matches the safety goal
+  - added regression coverage for the legacy internal-account Auto Reload case
+  - verification passed:
+    - `cargo test --manifest-path server/Cargo.toml internal_and_test_accounts_cannot_enter_paid_billing_flows -- --nocapture`
+    - `cargo test --manifest-path server/Cargo.toml skip_internal_test_account_even_if_auto_topup_was_already_enabled -- --nocapture`
+    - `cargo test --manifest-path server/Cargo.toml billing -- --nocapture`
+    - `cargo check --manifest-path server/Cargo.toml --quiet`
+    - `git diff --check`
+  - Round doc:
+    `docs/rounds/ROUND-301-FRESH-REVIEW-BILLING-GUARD-CLOSURE.md`
+  - Deploy note: server code is tested locally but not marked deployed unless the next operator runs the production server deploy path.
 - Round 300 is complete for Pinky-style billing lesson guardrails:
   - audited Bluey's existing credit/reload billing posture against the Pinky billing lesson pack
   - confirmed Bluey already credits reloads only through verified Stripe/Square processor events and revokes/restricts on refund/dispute risk events

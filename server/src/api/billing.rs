@@ -24,6 +24,9 @@ use serde::{Deserialize, Serialize};
 
 use super::AppState;
 use crate::auth::AuthedAccount;
+use crate::billing::policy::{
+    is_internal_or_test_billing_account, INTERNAL_TEST_BILLING_BLOCK_MESSAGE,
+};
 use crate::config::BillingProvider;
 use crate::db::{accounts::Account, balance, webhook_events};
 
@@ -50,8 +53,6 @@ pub struct SaveSquareCardRequest {
 
 const MINIMUM_RELOAD_CENTS: i64 = 1500;
 const SQUARE_API_VERSION: &str = "2025-04-16";
-pub(crate) const INTERNAL_TEST_BILLING_BLOCK_MESSAGE: &str =
-    "Internal/test accounts cannot start paid checkout, save payment methods, or enable Auto Reload. Use an internal credit grant instead.";
 
 fn square_idempotency_key(
     prefix: &str,
@@ -62,24 +63,6 @@ fn square_idempotency_key(
         "{prefix}-{}-{suffix}",
         cue_core::account_id_hash_prefix(account_id)
     )
-}
-
-pub(crate) fn is_internal_or_test_billing_account(account: &Account) -> bool {
-    account.is_admin || is_internal_or_test_billing_email(&account.email)
-}
-
-fn is_internal_or_test_billing_email(email: &str) -> bool {
-    let email = email.trim().to_ascii_lowercase();
-    if email.is_empty() {
-        return false;
-    }
-
-    let bluey_internal = email.ends_with("@bluey.sh")
-        && (email.starts_with("internal-")
-            || email.starts_with("test-")
-            || email.starts_with("admin-test-")
-            || email.contains("+test@"));
-    bluey_internal || email.ends_with("@test.local") || email.contains("+test@")
 }
 
 fn ensure_payment_setup_allowed(
