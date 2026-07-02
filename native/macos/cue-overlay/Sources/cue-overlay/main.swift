@@ -4891,11 +4891,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         keyboardFocusRing.wantsLayer = true
         keyboardFocusRing.isHidden = true
         keyboardFocusRing.layer?.cornerRadius = 12
-        keyboardFocusRing.layer?.borderWidth = 1.8
-        keyboardFocusRing.layer?.shadowOpacity = 0.22
-        keyboardFocusRing.layer?.shadowRadius = 8
+        keyboardFocusRing.layer?.borderWidth = 3.0
+        keyboardFocusRing.layer?.shadowOpacity = 0.45
+        keyboardFocusRing.layer?.shadowRadius = 12
         keyboardFocusRing.layer?.shadowOffset = .zero
-        keyboardFocusRing.layer?.zPosition = 3_000
+        keyboardFocusRing.layer?.zPosition = 4_900
 
         configureHeader()
         configureSystemToast()
@@ -6028,6 +6028,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             .insetBy(dx: -5, dy: -5)
         keyboardFocusRing.frame = frame
         keyboardFocusRing.layer?.cornerRadius = min(14, max(8, frame.height / 2))
+        keyboardFocusRing.layer?.zPosition = 4_900
         keyboardFocusRing.isHidden = false
     }
 
@@ -6035,7 +6036,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let color = lightThemeEnabled
             ? BlueyLightTheme.accent
             : BlueyTheme.cyan
-        keyboardFocusRing.layer?.borderColor = color.withAlphaComponent(0.92).cgColor
+        keyboardFocusRing.layer?.backgroundColor = color.withAlphaComponent(lightThemeEnabled ? 0.16 : 0.12).cgColor
+        keyboardFocusRing.layer?.borderColor = color.withAlphaComponent(0.98).cgColor
         keyboardFocusRing.layer?.shadowColor = color.cgColor
     }
 
@@ -7165,6 +7167,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         updateSessionDrawerGeometry(layoutWidth: layoutWidth, layoutHeight: layoutHeight)
         answerStyleOverlay.layer?.zPosition = 4_200
         closeConfirmOverlay.layer?.zPosition = 4_300
+        keyboardFocusRing.layer?.zPosition = 4_900
         toastView.layer?.zPosition = 4_100
         transcriptStrip.layer?.zPosition = 3_000
         attachmentStrip.layer?.zPosition = 3_000

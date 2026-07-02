@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 18:43 EDT
+Latest checkpoint: 2026-07-01 20:15 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,36 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-286-SHORTCUT-PARITY-KEYBOARD-NAV.md`; the next canonical Bluey round doc should start at `ROUND-287-...`.
+- Latest completed Bluey round doc is `ROUND-287-TAB-FOCUS-RING-VISIBILITY.md`; the next canonical Bluey round doc should start at `ROUND-288-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 287 is complete for Tab focus ring visibility:
+  - fixed the reason Tab focus was hard to see on macOS
+  - root cause was the new focus ring sitting at z-position `3000` while header/composer chrome is reasserted around `4000+`
+  - raised the keyboard focus ring to z-position `4900`
+  - reasserted that z-position during layout
+  - increased ring border width, shadow, and added a subtle blue fill
+  - desktop workspace version bumped to `0.1.41`
+  - Windows parity note:
+    - no Windows code change needed because Windows draws focus directly inside each owner-drawn button from Round 286
+  - local verification passed:
+    - `cargo check -p cue-daemon --quiet`
+    - `swift build -c debug --package-path native/macos/cue-overlay`
+    - `git diff --check`
+  - macOS release verification passed:
+    - `https://bluey.sh/latest.json` reported `0.1.41`
+    - live `latest.json.sig` verified successfully against the release Ed25519 key
+    - live artifact SHA256:
+      `23ca4c32d7781407616be9f9301b1ae38ef30f252ee45c0c73e96d6b417c7370`
+    - `/install.sh` returned `application/x-shellscript`
+    - `/install.ps1` returned `application/x-powershell`
+  - live artifact:
+    `https://bluey.sh/releases/v0.1.41/bluey-0.1.41-darwin-arm64.tar.gz`
+  - Round doc:
+    `docs/rounds/ROUND-287-TAB-FOCUS-RING-VISIBILITY.md`
 - Round 286 is complete for shortcut parity and button keyboard navigation:
   - shortcut guide now shows a stable command list in click-through on and off
   - the guide now separates mode guidance from available commands instead of hiding commands by mode
