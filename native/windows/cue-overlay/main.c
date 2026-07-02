@@ -1237,8 +1237,8 @@ static void layout_controls(void) {
     int header_h = 30;
     MoveWindow(g_close_button, header_right - margin - 62, header_y + 4, 62, header_h, TRUE);
     MoveWindow(g_note_button, header_right - margin - 62 - small_w - 8, header_y + 4, small_w, header_h, TRUE);
-    MoveWindow(g_shortcuts_button, header_right - margin - 62 - (small_w + 8) * 2, header_y + 4, small_w, header_h, TRUE);
-    MoveWindow(g_theme_button, header_right - margin - 62 - (small_w + 8) * 3, header_y + 4, small_w, header_h, TRUE);
+    MoveWindow(g_theme_button, header_right - margin - 62 - (small_w + 8) * 2, header_y + 4, small_w, header_h, TRUE);
+    MoveWindow(g_shortcuts_button, header_right - margin - 62 - (small_w + 8) * 3, header_y + 4, small_w, header_h, TRUE);
     MoveWindow(g_attach_button, header_right - margin - 62 - (small_w + 8) * 4, header_y + 4, small_w, header_h, TRUE);
     MoveWindow(g_session_button, header_right - margin - 62 - (small_w + 8) * 5, header_y + 4, small_w, header_h, TRUE);
     MoveWindow(g_help_button, header_right - margin - 62 - (small_w + 8) * 6, header_y + 4, small_w, header_h, TRUE);
@@ -1274,8 +1274,8 @@ static bool point_hits_overlay_control(POINT point) {
         g_attach_button,
         g_recap_button,
         g_note_button,
-        g_theme_button,
         g_shortcuts_button,
+        g_theme_button,
         g_close_button,
     };
     for (size_t i = 0; i < sizeof(controls) / sizeof(controls[0]); i++) {
@@ -1656,8 +1656,8 @@ static int keyboard_focus_controls(HWND *controls, int max_controls) {
         g_attach_button,
         g_recap_button,
         g_note_button,
-        g_theme_button,
         g_shortcuts_button,
+        g_theme_button,
         g_close_button,
         g_transcript_clear_button,
         g_ask_edit,

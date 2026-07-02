@@ -6156,7 +6156,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 .filter(isKeyboardFocusable)
         }
 
-        var controls: [NSView] = [
+        let headerControls = controlsInVisualOrder([
             navButton,
             newSessionButton,
             moveHandleButton,
@@ -6167,7 +6167,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             interactionModeButton,
             hideButton,
             closeButton,
-        ]
+        ])
+
+        var controls: [NSView] = headerControls
 
         if !sessionDrawer.isHidden {
             controls.append(contentsOf: controlsInView(sessionDrawer))
@@ -6187,6 +6189,18 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         ])
 
         return dedupeControls(controls).filter(isKeyboardFocusable)
+    }
+
+    private func controlsInVisualOrder(_ controls: [NSView]) -> [NSView] {
+        controls.sorted { lhs, rhs in
+            let lhsFrame = lhs.convert(lhs.bounds, to: self)
+            let rhsFrame = rhs.convert(rhs.bounds, to: self)
+            let rowTolerance: CGFloat = 10
+            if abs(lhsFrame.midY - rhsFrame.midY) > rowTolerance {
+                return lhsFrame.midY > rhsFrame.midY
+            }
+            return lhsFrame.minX < rhsFrame.minX
+        }
     }
 
     private func controlsInView(_ view: NSView) -> [NSView] {

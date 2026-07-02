@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-02 01:27 EDT
+Latest checkpoint: 2026-07-02 02:08 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,40 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-295-CLICKTHROUGH-MOVE-HANDLE-RELIABILITY.md`; the next canonical Bluey round doc should start at `ROUND-296-...`.
+- Latest completed Bluey round doc is `ROUND-296-KEYBOARD-THEME-TAB-ORDER-FINAL-PASS.md`; the next canonical Bluey round doc should start at `ROUND-297-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 296 is complete and deployed for Keyboard-before-Theme focus order and final pass:
+  - inspected `IMG_3704.MOV` by extracting frames
+  - confirmed the focus ring reached Theme before the Keyboard Shortcuts icon despite the icon being visually left of Theme
+  - macOS header keyboard traversal now sorts header controls by rendered row/x position
+  - Windows header layout now places Keyboard Shortcuts before Theme
+  - Windows keyboard focus and hit order now match the visual order
+  - desktop workspace version bumped to `0.1.50`
+  - local verification passed:
+    - `swift build -c debug --package-path native/macos/cue-overlay`
+    - `cargo check -p cue-core --quiet`
+    - `cargo check -p cue-daemon --quiet`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c`
+    - `cargo test -p cue-core overlay --lib`
+    - `cargo test -p cue-daemon deepgram --lib`
+    - `git diff --check`
+  - macOS release verification passed:
+    - `https://bluey.sh/latest.json` reported `0.1.50`
+    - live `latest.json.sig` verified successfully against the release Ed25519 key
+    - live artifact SHA256:
+      `58d949c727ac73381a84a363549c5d1562ce658519bcee32ff961ed2b6ef447e`
+    - `/install.sh` returned `application/x-shellscript`
+    - `/install.ps1` returned `application/x-powershell`
+    - unpacked release reported `bluey 0.1.50` and `bluey-daemon 0.1.50`
+    - release artifact scan passed with no configured secrets/dev capture flags present
+  - live artifact:
+    `https://bluey.sh/releases/v0.1.50/bluey-0.1.50-darwin-arm64.tar.gz`
+  - Round doc:
+    `docs/rounds/ROUND-296-KEYBOARD-THEME-TAB-ORDER-FINAL-PASS.md`
 - Round 295 is complete and deployed for macOS click-through move-handle reliability:
   - enlarged the blue click-through move handle from `34px` to `42px`
   - enlarged the move-handle hit padding from `18px` to `26px`
