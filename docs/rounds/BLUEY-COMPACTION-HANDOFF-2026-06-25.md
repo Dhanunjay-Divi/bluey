@@ -4370,3 +4370,41 @@ cargo fmt -p cue-daemon
 cargo fmt --manifest-path server/Cargo.toml
 git diff --check
 ```
+
+## Latest Round 307: Stream And Context Robustness
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-307-STREAM-CONTEXT-ROBUSTNESS.md`
+
+Round 307 addressed the photo where a simple follow-up coding request failed with `Bluey's connection dropped before the answer finished`:
+
+- OpenAI-compatible provider streams now complete with estimated usage when text was delivered but `[DONE]` is missing.
+- Anthropic streams now complete with estimated usage when text was delivered but `message_stop` is missing.
+- Empty streams still fail.
+- The desktop daemon now preserves complete-looking streamed answers when only terminal metadata is missing.
+- Incomplete answer shapes such as unclosed code fences still fail and are not saved.
+- User-facing incomplete-stream copy no longer tells users to check server logs.
+- User-facing/status/prompt labels now say `conversation context` instead of `saved Bluey memory`, `saved context`, or `local RAG`.
+- The AnswerPlan eval suite now covers the screenshot-style Java palindrome code request.
+
+Verification:
+
+```bash
+cargo test --manifest-path server/Cargo.toml stream_without --lib
+cargo test --manifest-path server/Cargo.toml answer_plan --lib
+cargo test -p cue-daemon incomplete_stream --lib
+cargo test -p cue-daemon terminal_metadata --lib
+cargo test -p cue-core --lib
+cargo fmt -p cue-daemon -p cue-core -p cue-llm
+cargo fmt --manifest-path server/Cargo.toml
+git diff --check
+```

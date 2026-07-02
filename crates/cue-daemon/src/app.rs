@@ -6865,7 +6865,7 @@ fn user_facing_answer_error(error: &anyhow::Error) -> String {
     let raw = format!("{error:#}");
     let lower = raw.to_ascii_lowercase();
     if is_incomplete_stream_error(&lower) {
-        return "Bluey's connection dropped before the answer finished. It was not saved as a completed answer. Please retry; if this keeps happening, check Bluey status and server logs.".to_string();
+        return "Bluey's connection dropped before the answer finished. I did not save that partial answer. Please retry.".to_string();
     }
     if is_payload_too_large_error(&lower) {
         return "That answer had too much attached screen context for one request. Remove one screenshot or retry with a smaller capture; Bluey will still use any saved text previews it has.".to_string();
@@ -6900,7 +6900,8 @@ fn user_facing_answer_error(error: &anyhow::Error) -> String {
     {
         return "Bluey hit provider capacity for this lane. Try again shortly; the router will use the next healthy lane when available.".to_string();
     }
-    "Bluey could not complete that answer yet. Try again, or check the server logs for the detailed provider error.".to_string()
+    "Bluey could not complete that answer yet. Try again; if it keeps happening, open Bluey status."
+        .to_string()
 }
 
 fn is_incomplete_stream_error(lower_error: &str) -> bool {
@@ -6910,6 +6911,12 @@ fn is_incomplete_stream_error(lower_error: &str) -> bool {
         || lower_error.contains("stream returned no answer text")
         || lower_error.contains("stream interrupted")
         || lower_error.contains("upstream_stream_error")
+        || lower_error.contains("upstream_stream_incomplete")
+}
+
+fn is_missing_terminal_stream_metadata_error(lower_error: &str) -> bool {
+    lower_error.contains("stream ended before final billing metadata")
+        || lower_error.contains("stream ended before completion")
         || lower_error.contains("upstream_stream_incomplete")
 }
 
@@ -8180,7 +8187,7 @@ async fn call_bluey_managed_provider(
             if !llm_request.image_data_urls.is_empty() {
                 stream.push_status("Reading screen context").await?;
             } else {
-                stream.push_status("Checking saved Bluey memory").await?;
+                stream.push_status("Checking conversation context").await?;
             }
         }
         let mut chunks = managed
@@ -8195,7 +8202,26 @@ async fn call_bluey_managed_provider(
         let mut saw_finished = false;
         let mut blocked_internal_output = false;
         while let Some(chunk) = chunks.next().await {
-            let chunk = chunk.map_err(managed_llm_error)?;
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    let error = managed_llm_error(error);
+                    let lower = format!("{error:#}").to_ascii_lowercase();
+                    if !answer.trim().is_empty()
+                        && is_missing_terminal_stream_metadata_error(&lower)
+                        && incomplete_answer_reason(&answer).is_none()
+                    {
+                        warn!(
+                            provider = %provider.display_label(),
+                            request_id = %request.metadata.request_id,
+                            answer_chars = answer.chars().count(),
+                            "managed provider stream ended without terminal metadata after a complete-looking answer; preserving streamed answer"
+                        );
+                        break;
+                    }
+                    return Err(error);
+                }
+            };
             if let Some(status) = chunk.status.as_ref() {
                 if let Some(stream) = stream.as_mut() {
                     stream.push_status(&status.message).await?;
@@ -8257,12 +8283,10 @@ async fn call_bluey_managed_provider(
         if !saw_finished {
             warn!(
                 provider = %provider.display_label(),
+                request_id = %request.metadata.request_id,
                 answer_chars = answer.chars().count(),
-                "managed provider stream ended before final billing metadata"
+                "managed provider stream completed locally without final billing metadata; preserving complete-looking answer"
             );
-            return Err(anyhow!(
-                "managed provider stream ended before final billing metadata"
-            ));
         }
         if let Some(stream) = stream.as_mut() {
             stream
@@ -9929,7 +9953,7 @@ async fn retrieved_memory_contexts(
             debug!(
                 session_id = %current_session_id,
                 error = %error,
-                "local RAG memory query failed"
+                "conversation context query failed"
             );
         }
     }
@@ -9952,14 +9976,14 @@ fn rag_hit_to_answer_context(
 
     let same_session = hit.session_id == current_session_id;
     let title = if same_session {
-        "Relevant current-session memory"
+        "Relevant current-session context"
     } else {
-        "Relevant older Bluey memory"
+        "Relevant prior Bluey context"
     };
     let source = if same_session {
-        "local RAG · current session".to_string()
+        "conversation context · current session".to_string()
     } else {
-        format!("local RAG · session {}", hit.session_id)
+        format!("conversation context · session {}", hit.session_id)
     };
     let content = format!("Relevance: {:.2}\n{}", hit.score, hit.chunk_text.trim());
     Some(
@@ -15049,7 +15073,24 @@ mod tests {
 
         assert!(message.contains("connection dropped"));
         assert!(message.contains("retry"));
+        assert!(!message.contains("server logs"));
         assert!(!message.contains("billing/quota"));
+    }
+
+    #[test]
+    fn terminal_metadata_errors_are_the_only_preserved_stream_errors() {
+        assert!(is_missing_terminal_stream_metadata_error(
+            "managed provider stream ended before final billing metadata"
+        ));
+        assert!(is_missing_terminal_stream_metadata_error(
+            "upstream_stream_incomplete"
+        ));
+        assert!(!is_missing_terminal_stream_metadata_error(
+            "upstream_stream_error"
+        ));
+        assert!(!is_missing_terminal_stream_metadata_error(
+            "provider_key_cooling_down"
+        ));
     }
 
     #[test]

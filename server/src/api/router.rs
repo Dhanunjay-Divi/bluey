@@ -954,7 +954,7 @@ impl AnswerPlan {
             labels.push("live transcript");
         }
         if self.needs_memory {
-            labels.push("saved Bluey memory");
+            labels.push("prior conversation context");
         }
         if self.needs_web_search {
             labels.push("managed web search");
@@ -2887,6 +2887,26 @@ fn retrieval_status_events(
     rag_count: usize,
     web_search: &WebSearchOutcome,
 ) -> Vec<Event> {
+    retrieval_status_entries(plan, rag_count, web_search)
+        .into_iter()
+        .map(|(stage, message)| {
+            Event::default().event("status").data(
+                serde_json::json!({
+                    "type": "status",
+                    "stage": stage,
+                    "message": message,
+                })
+                .to_string(),
+            )
+        })
+        .collect()
+}
+
+fn retrieval_status_entries(
+    plan: &AnswerPlan,
+    rag_count: usize,
+    web_search: &WebSearchOutcome,
+) -> Vec<(String, String)> {
     let mut statuses: Vec<(String, String)> = Vec::new();
     if plan.needs_screen {
         statuses.push((
@@ -2903,7 +2923,7 @@ fn retrieval_status_events(
     if plan.needs_memory {
         statuses.push((
             "checking_memory".to_string(),
-            "Checking saved context...".to_string(),
+            "Checking conversation context...".to_string(),
         ));
     }
     if web_search.attempted {
@@ -2917,7 +2937,7 @@ fn retrieval_status_events(
     } else if rag_count > 0 {
         statuses.push((
             "found_saved_context".to_string(),
-            "Found relevant saved context.".to_string(),
+            "Found relevant conversation context.".to_string(),
         ));
     }
     if web_search.searches_used > 0 {
@@ -2933,18 +2953,6 @@ fn retrieval_status_events(
     }
 
     statuses
-        .into_iter()
-        .map(|(stage, message)| {
-            Event::default().event("status").data(
-                serde_json::json!({
-                    "type": "status",
-                    "stage": stage,
-                    "message": message,
-                })
-                .to_string(),
-            )
-        })
-        .collect()
 }
 
 fn web_search_usage_label(searches_used: i64, source_count: usize) -> String {
@@ -6710,6 +6718,14 @@ mod tests {
                 false,
             ),
             (
+                "palindrome_java_code",
+                "Question:\nCan you give me palindrome number code in Java?",
+                AnswerIntent::Coding,
+                AnswerOutput::CodeArtifact,
+                "deep",
+                false,
+            ),
+            (
                 "self_intro_behavioral",
                 "Question:\nTell me about yourself for a senior software engineer interview.",
                 AnswerIntent::Behavioral,
@@ -6973,6 +6989,40 @@ mod tests {
         assert!(system.contains("Managed web search did not return usable sources"));
         assert!(system.contains("Web search is not configured yet."));
         assert!(system.contains("Do not imply web search succeeded"));
+    }
+
+    #[test]
+    fn answer_plan_context_wording_does_not_expose_memory_jargon() {
+        let plan = AnswerPlan {
+            intent: AnswerIntent::General,
+            output: AnswerOutput::Compact,
+            recommended_lane: "balanced",
+            confidence: 0.80,
+            needs_screen: false,
+            needs_docs: false,
+            needs_transcript: false,
+            needs_memory: true,
+            needs_web_search: false,
+        };
+        let web_search = WebSearchOutcome::default();
+
+        let (system, _) = prompt_with_answer_plan(
+            "You are Bluey.",
+            "Question:\nCan you explain queues and stacks?",
+            &plan,
+            &web_search,
+        );
+        let statuses = retrieval_status_entries(&plan, 1, &web_search);
+        let status_text = statuses
+            .iter()
+            .map(|(_, message)| message.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(system.contains("prior conversation context"));
+        assert!(status_text.contains("Checking conversation context"));
+        assert!(!system.contains("saved Bluey memory"));
+        assert!(!status_text.contains("saved context"));
     }
 
     #[test]

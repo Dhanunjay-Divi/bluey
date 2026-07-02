@@ -1517,11 +1517,11 @@ mod tests {
         let status = AnswerStreamEvent::retrieval_status(
             request.metadata.request_id,
             "checking_memory",
-            "Checking saved Bluey memory",
+            "Checking conversation context",
         );
         let status_json = serde_json::to_string(&status).expect("serialize status event");
         assert!(status_json.contains(r#""type":"retrieval_status""#));
-        assert!(status_json.contains("Checking saved Bluey memory"));
+        assert!(status_json.contains("Checking conversation context"));
     }
 
     #[test]

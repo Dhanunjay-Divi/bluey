@@ -895,6 +895,68 @@ fn estimated_tokens_from_chars(chars: usize) -> i64 {
     ((chars as i64) + 2) / 3
 }
 
+fn openai_stream_usage_or_estimate(
+    provider: &str,
+    model: &str,
+    seen_done: bool,
+    final_usage: Option<OpenAiUsage>,
+    output_chars: usize,
+    fallback_input_tokens: Option<i64>,
+) -> Result<OpenAiUsage> {
+    if !seen_done && output_chars == 0 {
+        return Err(anyhow!("{provider} stream ended before [DONE]"));
+    }
+    if !seen_done {
+        tracing::warn!(
+            provider,
+            model,
+            output_chars,
+            "OpenAI-compatible stream ended without [DONE] after output; using token estimate"
+        );
+    }
+    Ok(final_usage.unwrap_or_else(|| {
+        tracing::warn!(
+            provider,
+            model,
+            "OpenAI-compatible stream ended without final usage; using token estimate"
+        );
+        OpenAiUsage {
+            prompt_tokens: fallback_input_tokens.unwrap_or(0),
+            completion_tokens: estimated_tokens_from_chars(output_chars),
+        }
+    }))
+}
+
+fn anthropic_stream_usage_or_estimate(
+    model: &str,
+    seen_stop: bool,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    output_chars: usize,
+    fallback_input: i64,
+) -> Result<(i64, i64)> {
+    if !seen_stop && output_chars == 0 {
+        return Err(anyhow!("anthropic stream ended before message_stop"));
+    }
+    if !seen_stop {
+        tracing::warn!(
+            provider = "anthropic",
+            model,
+            output_chars,
+            "Anthropic stream ended without message_stop after output; using token estimate"
+        );
+    }
+    let output_tokens = output_tokens.unwrap_or_else(|| {
+        tracing::warn!(
+            provider = "anthropic",
+            model,
+            "Anthropic stream ended without final usage; using token estimate"
+        );
+        estimated_tokens_from_chars(output_chars)
+    });
+    Ok((input_tokens.unwrap_or(fallback_input), output_tokens))
+}
+
 #[derive(Serialize)]
 struct OpenAiMessage<'a> {
     role: &'static str,
@@ -1206,20 +1268,14 @@ async fn openai_compatible_complete_stream(
                 yield CompletionStreamEvent::Delta(delta);
             }
         }
-        if !seen_done {
-            Err::<(), anyhow::Error>(anyhow!("{stream_provider} stream ended before [DONE]"))?;
-        }
-        let usage = final_usage.unwrap_or_else(|| {
-            tracing::warn!(
-                provider = %stream_provider,
-                model = %stream_model,
-                "OpenAI-compatible stream ended without final usage; using token estimate"
-            );
-            OpenAiUsage {
-                prompt_tokens: fallback_input_tokens.unwrap_or(0),
-                completion_tokens: estimated_tokens_from_chars(output_chars),
-            }
-        });
+        let usage = openai_stream_usage_or_estimate(
+            &stream_provider,
+            &stream_model,
+            seen_done,
+            final_usage,
+            output_chars,
+            fallback_input_tokens,
+        )?;
         let (input_tokens, output_tokens) = (usage.prompt_tokens, usage.completion_tokens);
         yield CompletionStreamEvent::Done {
             input_tokens,
@@ -1912,6 +1968,7 @@ async fn anthropic_complete_stream(
 
     let provider = "anthropic".to_string();
     let model_string = model.to_string();
+    let stream_model = model_string.clone();
     let fallback_input = fallback_input_tokens.unwrap_or(0);
     let mut bytes = resp.bytes_stream();
     let stream = async_stream::try_stream! {
@@ -1920,12 +1977,14 @@ async fn anthropic_complete_stream(
         let mut input_tokens: Option<i64> = None;
         let mut output_tokens: Option<i64> = None;
         let mut seen_stop = false;
+        let mut output_chars: usize = 0;
 
         while let Some(chunk) = bytes.next().await {
             let chunk = chunk.context("anthropic stream read")?;
             append_utf8_chunk(&chunk, &mut pending_utf8, &mut buffer)?;
             while let Some((event, data)) = take_sse_event(&mut buffer) {
                 if let Some(delta) = parse_anthropic_stream_event(&event, &data, &mut input_tokens, &mut output_tokens, &mut seen_stop)? {
+                    output_chars = output_chars.saturating_add(delta.chars().count());
                     yield CompletionStreamEvent::Delta(delta);
                 }
             }
@@ -1936,18 +1995,20 @@ async fn anthropic_complete_stream(
         }
         while let Some((event, data)) = take_sse_event(&mut buffer) {
             if let Some(delta) = parse_anthropic_stream_event(&event, &data, &mut input_tokens, &mut output_tokens, &mut seen_stop)? {
+                output_chars = output_chars.saturating_add(delta.chars().count());
                 yield CompletionStreamEvent::Delta(delta);
             }
         }
-        if !seen_stop {
-            Err::<(), anyhow::Error>(anyhow!(
-                "anthropic stream ended before message_stop"
-            ))?;
-        }
-        let output_tokens = output_tokens
-            .ok_or_else(|| anyhow!("anthropic stream ended before final usage"))?;
+        let (input_tokens, output_tokens) = anthropic_stream_usage_or_estimate(
+            &stream_model,
+            seen_stop,
+            input_tokens,
+            output_tokens,
+            output_chars,
+            fallback_input,
+        )?;
         yield CompletionStreamEvent::Done {
-            input_tokens: input_tokens.unwrap_or(fallback_input),
+            input_tokens,
             output_tokens,
         };
     };
@@ -2785,6 +2846,23 @@ mod tests {
     }
 
     #[test]
+    fn openai_stream_without_done_after_text_uses_estimated_usage() {
+        let usage =
+            openai_stream_usage_or_estimate("zai", "glm-5.2", false, None, 18, Some(12)).unwrap();
+
+        assert_eq!(usage.prompt_tokens, 12);
+        assert_eq!(usage.completion_tokens, 6);
+    }
+
+    #[test]
+    fn openai_stream_without_done_and_without_text_is_error() {
+        match openai_stream_usage_or_estimate("zai", "glm-5.2", false, None, 0, Some(12)) {
+            Ok(_) => panic!("expected missing DONE error"),
+            Err(err) => assert!(err.to_string().contains("before [DONE]")),
+        }
+    }
+
+    #[test]
     fn anthropic_stream_error_event_is_not_treated_as_empty_success() {
         let mut input_tokens = None;
         let mut output_tokens = None;
@@ -2805,6 +2883,25 @@ mod tests {
         assert!(input_tokens.is_none());
         assert!(output_tokens.is_none());
         assert!(!seen_stop);
+    }
+
+    #[test]
+    fn anthropic_stream_without_stop_after_text_uses_estimated_usage() {
+        let (input_tokens, output_tokens) =
+            anthropic_stream_usage_or_estimate("claude-sonnet-4-6", false, Some(9), None, 21, 7)
+                .unwrap();
+
+        assert_eq!(input_tokens, 9);
+        assert_eq!(output_tokens, 7);
+    }
+
+    #[test]
+    fn anthropic_stream_without_stop_and_without_text_is_error() {
+        let err =
+            anthropic_stream_usage_or_estimate("claude-sonnet-4-6", false, Some(9), None, 0, 7)
+                .unwrap_err();
+
+        assert!(err.to_string().contains("message_stop"));
     }
 
     #[test]
