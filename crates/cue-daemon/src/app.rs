@@ -8763,11 +8763,12 @@ fn provider_prompt_parts(payload: &ProviderRequestPayload) -> Result<ProviderPro
     if should_use_role_domain_interview_answer_style(payload) {
         system.push_str("\n\nRole/domain interview answer mode:\n");
         system.push_str("- Treat this as real-time interview coaching for the role/domain implied by the resume, JD, transcript, screen, and files. The role may be SDE, data engineer, BI engineer, data scientist, AI/ML engineer, DevOps, security, product, or another role shown by context.\n");
+        system.push_str("- If the input is a messy live transcript, infer the latest interviewer question and answer that question. Do not summarize the transcript or repeat generic live-caption wrapper text. If the transcript contains the user's rough draft, repair it into a clean answer the user can say while preserving supplied facts.\n");
         system.push_str("- Sound like a human candidate or engineer who actually built the system in production, not a textbook or polished memo. Use simple English, confident transitions, and practical production reasoning.\n");
         system.push_str("- Start with the answer the user can say aloud, then add only the context needed to defend it. Avoid too many bullets unless the answer is a checklist or comparison.\n");
         system.push_str("- For technical interview questions, explain the problem, the design or implementation choice, why that choice was made, tradeoffs, debugging, reliability, observability, security/auth, evaluation, scaling, and failure handling when relevant.\n");
-        system.push_str("- For AI/ML, RAG, MCP, or agent questions, cover ingestion, chunking, embeddings, retrieval, orchestration, grounding or hallucination controls, evals, auth, traces, latency, and cost only when they apply.\n");
-        system.push_str("- For SDE/system questions, cover ownership, APIs, data flow, concurrency, failure modes, tests, and rollout. For data/BI/DE questions, cover source systems, ETL, validation, freshness, metrics/KPI definitions, query performance, lineage, and stakeholder impact.\n");
+        system.push_str("- For AI/ML, autonomy, perception, robotics, RAG, MCP, or agent questions, cover data curation, labeling, object detection/segmentation/tracking, localization, sensor calibration, model selection, eval metrics, deployment latency, safety constraints, ingestion, chunking, embeddings, retrieval, orchestration, grounding or hallucination controls, traces, and cost only when they apply.\n");
+        system.push_str("- For SDE/system questions, cover ownership, APIs, data flow, concurrency, failure modes, tests, and rollout. For BIE/data analyst/data engineer questions, cover SQL, source systems, ETL/PySpark/dbt/Airflow, validation, freshness, reconciliation, metrics/KPI definitions, dashboard choices, query performance, lineage, stakeholder impact, and how the user would verify the answer in production.\n");
         system.push_str("- Avoid over-polished corporate language and filler like maybe, probably, I guess, or generic buzzwords. Do not invent companies, metrics, tools, or production claims beyond supplied context.\n");
         system.push_str("- If the user's draft is weak or the interviewer challenges it, repair it by reframing the story realistically instead of blindly defending it.");
     }
@@ -9149,10 +9150,12 @@ fn should_use_role_domain_interview_answer_style(payload: &ProviderRequestPayloa
         "star answer",
         "goldman",
         "amazon",
+        "caterpillar",
+        "may mobility",
     ]
     .iter()
     .any(|signal| question.contains(signal));
-    let role_or_domain_signal = [
+    let role_or_domain_signals = [
         "software engineer",
         "sde",
         "backend",
@@ -9176,6 +9179,15 @@ fn should_use_role_domain_interview_answer_style(payload: &ProviderRequestPayloa
         "ai/ml",
         "ai engineer",
         "ml engineer",
+        "autonomy",
+        "perception",
+        "robot",
+        "robotics",
+        "object detection",
+        "semantic segmentation",
+        "instance segmentation",
+        "localization",
+        "sensor calibration",
         "rag",
         "llm",
         "mcp",
@@ -9191,9 +9203,11 @@ fn should_use_role_domain_interview_answer_style(payload: &ProviderRequestPayloa
         "platform",
         "security",
         "product manager",
-    ]
-    .iter()
-    .any(|signal| question.contains(signal));
+    ];
+    let role_or_domain_signal = role_or_domain_signals
+        .iter()
+        .any(|signal| question.contains(signal));
+    let mut context_role_or_domain_signal = false;
     let has_interview_context = payload.context.iter().any(|item| {
         let mut text = String::new();
         if let Some(title) = item.title.as_deref() {
@@ -9206,6 +9220,12 @@ fn should_use_role_domain_interview_answer_style(payload: &ProviderRequestPayloa
         }
         text.push_str(&compact_snippet(&item.content, 2_000));
         let lower = text.to_ascii_lowercase();
+        if role_or_domain_signals
+            .iter()
+            .any(|signal| lower.contains(signal))
+        {
+            context_role_or_domain_signal = true;
+        }
         lower.contains("resume")
             || lower.contains("résumé")
             || lower.contains("job description")
@@ -9216,7 +9236,8 @@ fn should_use_role_domain_interview_answer_style(payload: &ProviderRequestPayloa
             || lower.contains("preferred qualifications")
     });
 
-    direct_interview_signal || (role_or_domain_signal && has_interview_context)
+    direct_interview_signal
+        || ((role_or_domain_signal || context_role_or_domain_signal) && has_interview_context)
 }
 
 fn provider_messages(payload: &ProviderRequestPayload) -> Result<Vec<ChatMessage>> {
@@ -15004,9 +15025,52 @@ mod tests {
         };
 
         assert!(system.contains("Role/domain interview answer mode"));
-        assert!(system.contains("AI/ML, RAG, MCP, or agent questions"));
+        assert!(system.contains("AI/ML, autonomy, perception, robotics"));
         assert!(system.contains("ingestion, chunking, embeddings, retrieval"));
-        assert!(system.contains("traces, latency, and cost"));
+        assert!(system.contains("traces"));
+        assert!(system.contains("cost"));
+        assert!(system.contains("infer the latest interviewer question"));
+        assert!(system.contains("rough draft"));
+        assert!(system.contains("object detection/segmentation/tracking"));
+        assert!(system.contains("ETL/PySpark/dbt/Airflow"));
+    }
+
+    #[test]
+    fn provider_messages_enable_autonomy_and_bie_transcript_interview_style() {
+        let route = ProviderRoute::direct(ProviderSelector::openai("gpt-4.1-mini"));
+        let request = AnswerRequest::new(
+            "Answer the latest live captions from the current session transcript. Treat the transcript as the user's current question or working context.",
+            route,
+        )
+        .with_context(
+            AnswerContext::new(
+                AnswerContextKind::Transcript,
+                "Interviewer: This is a machine learning question. Tell us a little bit about yourself and the perception work you have done.\nMic: I worked on object detection, semantic segmentation, localization, robot pose, sparse maps, and sensor calibration, but my answer is rambling.\nInterviewer: For the BIE side, explain how you handled a backend refresh lag in a Tableau dashboard and verified source-table numbers.",
+            )
+            .with_title("Interview transcript")
+            .with_source("otter-summary"),
+        );
+        let payload = ProviderRequestPayload::from_request(
+            &request,
+            ProviderSelector::openai("gpt-4.1-mini"),
+            Some("https://api.openai.com/v1/chat/completions".to_string()),
+            "fallback",
+            RouteBudget::realtime(),
+        );
+
+        assert!(should_use_role_domain_interview_answer_style(&payload));
+
+        let messages = provider_messages(&payload).expect("build provider messages");
+        let system = match &messages[0].content {
+            ChatMessageContent::Text(text) => text,
+            ChatMessageContent::Parts(_) => panic!("system message should be text"),
+        };
+
+        assert!(system.contains("infer the latest interviewer question"));
+        assert!(system.contains("repair it into a clean answer"));
+        assert!(system.contains("autonomy, perception, robotics"));
+        assert!(system.contains("BIE/data analyst/data engineer"));
+        assert!(system.contains("freshness, reconciliation"));
     }
 
     #[test]

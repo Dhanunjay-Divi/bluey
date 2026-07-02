@@ -1076,12 +1076,25 @@ fn answer_plan_for_request(
         );
     let context_coding = has_planning_context
         && (looks_like_coding_question(&normalized_context) || has_code_shape(&normalized_context));
-    let coding = looks_like_coding_question(&normalized) || (has_images && context_coding);
+    let context_system_design =
+        has_planning_context && looks_like_system_design_question(&normalized_context);
+    let coding = looks_like_coding_question(&normalized)
+        || (has_images && context_coding)
+        || (generic_live_transcript_prompt && context_coding);
     let coding_followup = looks_like_coding_followup(&normalized, follow_up)
         || (has_images && context_coding && follow_up);
     let simple_coding = coding && looks_like_simple_coding_question(&normalized, short_question);
-    let behavioral = looks_like_behavioral_question(&normalized);
-    let system_design = !behavioral && looks_like_system_design_question(&normalized);
+    let context_behavioral = generic_live_transcript_prompt
+        && has_planning_context
+        && !context_coding
+        && !context_system_design
+        && (looks_like_behavioral_question(&normalized_context)
+            || looks_like_interview_coaching_question(&normalized_context)
+            || looks_like_interview_answer_context(&normalized_context, ""));
+    let behavioral = looks_like_behavioral_question(&normalized) || context_behavioral;
+    let system_design = !behavioral
+        && (looks_like_system_design_question(&normalized)
+            || (generic_live_transcript_prompt && context_system_design));
     let screen = has_images
         || contains_any(
             &normalized,
@@ -1159,8 +1172,8 @@ fn answer_plan_for_request(
     let has_any_attached_evidence = has_images || has_planning_context || !rag_matches.is_empty();
     let missing_context = rag_matches.is_empty()
         && (((docs && !has_any_attached_evidence) || screen_without_image)
-            || generic_live_transcript_prompt
-            || transcript_placeholder
+            || (generic_live_transcript_prompt && !has_planning_context)
+            || (transcript_placeholder && !has_planning_context)
             || (!has_any_attached_evidence
                 && contains_any(
                     &normalized,
@@ -2009,6 +2022,8 @@ fn looks_like_interview_answer_context(normalized: &str, normalized_context: &st
                 " jd",
                 "goldman",
                 "amazon",
+                "caterpillar",
+                "may mobility",
                 "onsite",
                 "phone screen",
                 "hiring manager",
@@ -2057,6 +2072,8 @@ fn looks_like_interview_coaching_question(normalized: &str) -> bool {
                 "interview",
                 "interviewer",
                 "amazon",
+                "caterpillar",
+                "may mobility",
                 "leadership principle",
                 "dive deep",
                 "star answer",
@@ -2085,6 +2102,15 @@ fn looks_like_interview_coaching_question(normalized: &str) -> bool {
             "machine learning",
             "ai/ml",
             "ai engineer",
+            "autonomy",
+            "perception",
+            "robot",
+            "robotics",
+            "object detection",
+            "semantic segmentation",
+            "instance segmentation",
+            "localization",
+            "sensor calibration",
             "llm",
             "rag",
             "retrieval",
@@ -2182,6 +2208,11 @@ fn looks_like_interview_coaching_question(normalized: &str) -> bool {
             "tableau filters",
             "backend lag",
             "backend query",
+            "backend refresh",
+            "refresh lag",
+            "dashboard refresh",
+            "source table",
+            "source tables",
         ],
     );
     let direct_code_or_design =
@@ -2304,7 +2335,7 @@ fn prompt_with_answer_plan(
 
     if plan.interview_context {
         instructions.push_str(
-            "\nInterview answer mode: treat this as real-time interview coaching for the role/domain implied by the resume, JD, transcript, screen, and files. Sound like a human candidate or engineer who actually built the system, not a textbook. Use simple English, confident transitions, and production-specific reasoning. Start with the answer the user can say aloud, then add only the context needed to defend it. For technical interview questions, explain the problem, the design/implementation choice, why that choice was made, tradeoffs, debugging, reliability, observability, security/auth, evaluation, scaling, and failure handling when relevant. For AI/ML, RAG, MCP, or agent questions, cover ingestion, chunking, embeddings, retrieval, orchestration, grounding/hallucination controls, evals, auth, traces, latency, and cost only when they apply. For SDE/system questions, cover ownership, APIs, data flow, concurrency, failure modes, tests, and rollout. For data/BI/DE questions, cover source systems, ETL, validation, freshness, metrics/KPI definitions, query performance, lineage, and stakeholder impact. Avoid over-polished corporate language, too many bullets, and filler like maybe/probably/I guess. Do not invent companies, metrics, tools, or production claims beyond supplied context. If the user's draft is weak or challenged, repair it by reframing the story realistically instead of blindly defending it.",
+            "\nInterview answer mode: treat this as real-time interview coaching for the role/domain implied by the resume, JD, transcript, screen, and files. If the input is a messy live transcript, infer the latest interviewer question and answer that question; do not summarize the transcript or repeat the generic live-caption wrapper. If the transcript contains the user's rough draft, repair it into a clean answer the user can say while preserving supplied facts. Sound like a human candidate or engineer who actually built the system, not a textbook. Use simple English, confident transitions, and production-specific reasoning. Start with the answer the user can say aloud, then add only the context needed to defend it. For technical interview questions, explain the problem, the design/implementation choice, why that choice was made, tradeoffs, debugging, reliability, observability, security/auth, evaluation, scaling, and failure handling when relevant. For AI/ML, autonomy, perception, robotics, RAG, MCP, or agent questions, cover data curation, labeling, object detection/segmentation/tracking, localization, sensor calibration, model selection, eval metrics, deployment latency, safety constraints, ingestion, chunking, embeddings, retrieval, orchestration, grounding/hallucination controls, traces, and cost only when they apply. For SDE/system questions, cover ownership, APIs, data flow, concurrency, failure modes, tests, and rollout. For BIE/data analyst/data engineer questions, cover SQL, source systems, ETL/PySpark/dbt/Airflow, validation, freshness, reconciliation, metrics/KPI definitions, dashboard choices, query performance, lineage, stakeholder impact, and how the user would verify the answer in production. Avoid over-polished corporate language, too many bullets, and filler like maybe/probably/I guess. Do not invent companies, metrics, tools, or production claims beyond supplied context. If the user's draft is weak or challenged, repair it by reframing the story realistically instead of blindly defending it.",
         );
     }
 
@@ -6876,6 +6907,8 @@ mod tests {
             "Question:\nFor an SDE interview, how should I answer if they ask me about a production incident I debugged?",
             "Question:\nFor a data engineer interview, can you talk about a pipeline that you built and the tradeoffs you made?",
             "Question:\nFor a Goldman AI/ML interview, how did you evaluate the RAG and MCP agents?",
+            "Question:\nAnswer the latest live captions from the current session transcript. Treat the transcript as the user's current question or working context.\n\nSession context:\nInterviewer: This is a machine learning question. Tell us a little bit about yourself and the perception work you have done.\nMic: I worked on object detection, semantic segmentation, localization, robot pose, sparse maps, and sensor calibration, but my answer is rambling.",
+            "Question:\nFor an Amazon BIE interview, talk about a Tableau dashboard where the backend refresh lagged and you had to decide whether to query source tables directly.",
         ];
 
         for user in cases {
@@ -6908,6 +6941,11 @@ mod tests {
         assert!(system.contains("Role/domain interview questions") || system.contains("role/domain"));
         assert!(system.contains("RAG, MCP, or agent questions"));
         assert!(system.contains("retrieval, orchestration, grounding"));
+        assert!(system.contains("infer the latest interviewer question"));
+        assert!(system.contains("rough draft"));
+        assert!(system.contains("object detection/segmentation/tracking"));
+        assert!(system.contains("ETL/PySpark/dbt/Airflow"));
+        assert!(system.contains("verify the answer in production"));
     }
 
     #[test]

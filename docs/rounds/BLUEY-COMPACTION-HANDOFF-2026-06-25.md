@@ -4512,3 +4512,41 @@ cargo fmt --all
 cargo build -p cue-daemon --bin bluey-daemon
 cargo build --manifest-path server/Cargo.toml
 ```
+
+## Latest Round 311: Otter Interview Transcript Retry
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-311-OTTER-INTERVIEW-TRANSCRIPT-RETRY.md`
+
+Round 311 retried the Otter interview-recording review after earlier Chrome lazy-loading timeouts:
+
+- Confirmed the Otter folder can expose 76 recording links after scrolling/waiting, not only the first 12 visible rows.
+- Sampled shared Otter speech endpoints for representative BIE, AI/ML perception, and data-role recordings without copying private transcript text into tracked docs.
+- Used the observed role/domain patterns to harden Bluey's interview-answer behavior.
+
+What changed:
+
+- Generic live-caption prompts now inherit coding, behavioral/interview, or system-design intent from hidden transcript/planning context instead of being treated as missing context.
+- Interview answer mode now tells Bluey to infer the latest interviewer question from messy live transcript input, repair rough candidate drafts, and avoid summarizing the transcript wrapper.
+- Added deeper role/domain guidance for AI/ML/autonomy/perception/robotics, BIE/data analyst/data engineering, and SDE/system work.
+- Native/direct daemon prompt path now mirrors these rules and can detect role/domain signals inside transcript context, not only the visible question.
+- Added regression tests for Otter-style live transcript interview prompts, Amazon BIE/Tableau/backend-refresh/source-table prompts, and autonomy/BIE native prompt activation.
+
+Verification:
+
+```bash
+cargo fmt --all
+cargo test --manifest-path server/Cargo.toml answer_plan -- --nocapture
+cargo test -p cue-daemon provider_messages_enable -- --nocapture
+cargo build -p cue-daemon --bin bluey-daemon
+cargo build --manifest-path server/Cargo.toml
+```
