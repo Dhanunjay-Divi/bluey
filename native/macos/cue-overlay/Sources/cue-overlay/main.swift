@@ -1944,6 +1944,9 @@ private final class ModalBlockerView: NSView {
 }
 
 private final class HeaderMoveButton: NSButton {
+    var onBeginDrag: ((NSEvent) -> Void)?
+    var onDrag: ((NSEvent) -> Void)?
+    var onEndDrag: ((NSEvent) -> Void)?
     var onDragStateChanged: ((Bool) -> Void)?
     var onMoved: ((NSRect) -> Void)?
 
@@ -1955,6 +1958,30 @@ private final class HeaderMoveButton: NSButton {
     }
 
     override func mouseDown(with event: NSEvent) {
+        if let onBeginDrag {
+            onBeginDrag(event)
+            return
+        }
+        performWindowDrag(with: event)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        if let onDrag {
+            onDrag(event)
+            return
+        }
+        super.mouseDragged(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if let onEndDrag {
+            onEndDrag(event)
+            return
+        }
+        super.mouseUp(with: event)
+    }
+
+    private func performWindowDrag(with event: NSEvent) {
         onDragStateChanged?(true)
         window?.makeKey()
         defer {
@@ -4766,6 +4793,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var passThroughMode = false
     private var signedOutGateActive = false
     private var headerDragInProgress = false
+    private var manualWindowDragActive = false
+    private var manualWindowDragStartMouse = NSPoint.zero
+    private var manualWindowDragStartFrame = NSRect.zero
     private var closeConfirmPanelWidthConstraint: NSLayoutConstraint?
     private var closeConfirmCancelLeadingConstraint: NSLayoutConstraint?
     private var closeConfirmCancelCenterXConstraint: NSLayoutConstraint?
@@ -5391,6 +5421,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         headerBar.onWindowFrameChanged = { [weak self] frame in
             self?.onWindowFrameChanged?(frame)
         }
+        moveHandleButton.onBeginDrag = { [weak self] event in
+            self?.beginManualWindowDrag(with: event)
+        }
+        moveHandleButton.onDrag = { [weak self] event in
+            self?.updateManualWindowDrag(with: event)
+        }
+        moveHandleButton.onEndDrag = { [weak self] event in
+            self?.endManualWindowDrag(with: event)
+        }
         moveHandleButton.onDragStateChanged = { [weak self] active in
             self?.headerDragInProgress = active
         }
@@ -5785,7 +5824,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 return
             }
             if isHeaderMoveHandleHit(at: localPoint) {
-                beginHeaderDrag(with: event)
+                beginManualWindowDrag(with: event)
                 return
             }
             if hasInteractiveView(at: localPoint) {
@@ -6535,6 +6574,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if manualWindowDragActive {
+            updateManualWindowDrag(with: event)
+            return
+        }
         guard !activeResizeEdges.isEmpty, let window else {
             super.mouseDragged(with: event)
             return
@@ -6573,6 +6616,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if manualWindowDragActive {
+            endManualWindowDrag(with: event)
+            return
+        }
         if !activeResizeEdges.isEmpty {
             (window as? OverlayWindow)?.lockedFrameHeight = nil
             if let window {
@@ -6747,6 +6794,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             guard rect.contains(rootPoint) else { continue }
 
             if let button = subview as? NSButton, button.isEnabled {
+                if button === moveHandleButton {
+                    continue
+                }
                 return button
             }
             if let nested = manualButton(in: subview, atRootPoint: rootPoint) {
@@ -6877,6 +6927,44 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             headerDragInProgress = false
         }
         window?.performDrag(with: event)
+        if let window {
+            onWindowFrameChanged?(window.frame)
+        }
+    }
+
+    private func beginManualWindowDrag(with _: NSEvent) {
+        guard let window else { return }
+        manualWindowDragActive = true
+        manualWindowDragStartMouse = NSEvent.mouseLocation
+        manualWindowDragStartFrame = window.frame
+        headerDragInProgress = true
+        blurComposerIfFocused()
+        window.makeKey()
+    }
+
+    private func updateManualWindowDrag(with _: NSEvent) {
+        guard manualWindowDragActive, let window else { return }
+        let currentMouse = NSEvent.mouseLocation
+        var frame = manualWindowDragStartFrame
+        frame.origin.x += currentMouse.x - manualWindowDragStartMouse.x
+        frame.origin.y += currentMouse.y - manualWindowDragStartMouse.y
+        let visibleFrame = window.screen?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        frame = ExpandedPanelMetrics.fitExpandedFrameToVisibleScreen(
+            frame,
+            visibleFrame: visibleFrame)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0
+            context.allowsImplicitAnimation = false
+            window.setFrame(frame, display: true, animate: false)
+        }
+    }
+
+    private func endManualWindowDrag(with _: NSEvent) {
+        guard manualWindowDragActive else { return }
+        manualWindowDragActive = false
+        headerDragInProgress = false
         if let window {
             onWindowFrameChanged?(window.frame)
         }
