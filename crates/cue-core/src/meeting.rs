@@ -285,7 +285,70 @@ pub struct MeetingRecord {
     pub conversation: Vec<ConversationTurn>,
     #[serde(default)]
     pub answer_instructions: Option<String>,
+    #[serde(default)]
+    pub diagnostics: MeetingDiagnostics,
     pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MeetingDiagnostics {
+    #[serde(default)]
+    pub listen_runs: u64,
+    #[serde(default)]
+    pub stt_parse_errors: u64,
+    #[serde(default)]
+    pub stt_provider_errors: u64,
+    #[serde(default)]
+    pub audio_start_errors: u64,
+    #[serde(default)]
+    pub audio_source_errors: u64,
+    #[serde(default)]
+    pub last_audio_session_id: Option<String>,
+    #[serde(default)]
+    pub last_stt_provider: Option<String>,
+    #[serde(default)]
+    pub last_error_kind: Option<String>,
+    #[serde(default)]
+    pub last_error_message: Option<String>,
+    #[serde(default)]
+    pub last_error_at: Option<String>,
+}
+
+impl MeetingDiagnostics {
+    pub fn record_listen_start(
+        &mut self,
+        audio_session_id: impl Into<String>,
+        stt_provider: Option<impl Into<String>>,
+    ) {
+        self.listen_runs = self.listen_runs.saturating_add(1);
+        self.last_audio_session_id = Some(audio_session_id.into());
+        if let Some(provider) = stt_provider {
+            let provider = provider.into();
+            if !provider.trim().is_empty() {
+                self.last_stt_provider = Some(provider);
+            }
+        }
+    }
+
+    pub fn record_error(&mut self, kind: impl Into<String>, message: impl Into<String>) {
+        let kind = kind.into();
+        match kind.as_str() {
+            "stt_parse_error" => self.stt_parse_errors = self.stt_parse_errors.saturating_add(1),
+            "stt_provider_error" => {
+                self.stt_provider_errors = self.stt_provider_errors.saturating_add(1)
+            }
+            "audio_start_error" => {
+                self.audio_start_errors = self.audio_start_errors.saturating_add(1)
+            }
+            "audio_source_error" => {
+                self.audio_source_errors = self.audio_source_errors.saturating_add(1)
+            }
+            _ => {}
+        }
+        self.last_error_kind = Some(kind);
+        self.last_error_message = Some(message.into());
+        self.last_error_at = Some(clock::now_epoch_ms_string());
+    }
 }
 
 impl MeetingRecord {
@@ -303,8 +366,13 @@ impl MeetingRecord {
             context: Vec::new(),
             conversation: Vec::new(),
             answer_instructions: None,
+            diagnostics: MeetingDiagnostics::default(),
             summary: None,
         }
+    }
+
+    pub fn session_code(&self) -> String {
+        short_session_code(self.id)
     }
 
     pub fn last_transcript_text(&self, count: usize) -> String {
@@ -380,6 +448,15 @@ impl MeetingRecord {
             .collect::<Vec<_>>()
             .join("\n\n")
     }
+}
+
+pub fn short_session_code(id: Uuid) -> String {
+    id.as_simple()
+        .to_string()
+        .chars()
+        .take(8)
+        .collect::<String>()
+        .to_ascii_uppercase()
 }
 
 fn truncate_transcript_line_tail(speaker: Speaker, text: &str, max_chars: usize) -> String {

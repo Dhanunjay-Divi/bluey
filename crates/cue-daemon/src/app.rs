@@ -1606,6 +1606,7 @@ async fn handle_request_inner(
             };
 
             update_state_from_meeting(daemon, Some(&meeting)).await?;
+            refresh_overlay_sessions(daemon).await;
             let card = CueCard::new(
                 CardKind::System,
                 "Meeting started",
@@ -2912,6 +2913,102 @@ fn listen_auth_error_should_clear_tokens(error: &cue_cloud_client::Error) -> boo
     )
 }
 
+async fn ensure_active_meeting_for_session(
+    daemon: &Arc<Daemon>,
+    sync_reason: &'static str,
+) -> Result<MeetingRecord> {
+    let meeting_snapshot = {
+        let mut meeting_guard = daemon.meeting.lock().await;
+        if meeting_guard.is_none() {
+            *meeting_guard = Some(MeetingRecord::new(Some("New recording".to_string())));
+        }
+        let meeting = meeting_guard.as_ref().expect("meeting exists").clone();
+        daemon.store.save_active(&meeting)?;
+        meeting
+    };
+
+    info!(
+        meeting_id = %meeting_snapshot.id,
+        session_code = %meeting_snapshot.session_code(),
+        reason = sync_reason,
+        "active session ensured"
+    );
+    update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
+    refresh_overlay_sessions(daemon).await;
+    schedule_auto_cloud_sync(daemon, sync_reason, None).await;
+    Ok(meeting_snapshot)
+}
+
+async fn record_active_session_listen_start(
+    daemon: &Arc<Daemon>,
+    audio_session_id: &str,
+    stt_provider: Option<&str>,
+) -> Result<MeetingRecord> {
+    let meeting_snapshot = {
+        let mut meeting_guard = daemon.meeting.lock().await;
+        if meeting_guard.is_none() {
+            *meeting_guard = Some(MeetingRecord::new(Some("New recording".to_string())));
+        }
+        let meeting = meeting_guard.as_mut().expect("meeting exists");
+        meeting.diagnostics.record_listen_start(
+            audio_session_id.to_string(),
+            stt_provider.map(str::to_string),
+        );
+        daemon.store.save_active(meeting)?;
+        meeting.clone()
+    };
+    info!(
+        meeting_id = %meeting_snapshot.id,
+        session_code = %meeting_snapshot.session_code(),
+        audio_session_id,
+        stt_provider = stt_provider.unwrap_or("unknown"),
+        "active session listen run recorded"
+    );
+    update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
+    refresh_overlay_sessions(daemon).await;
+    schedule_auto_cloud_sync(daemon, "audio_listen_start", None).await;
+    Ok(meeting_snapshot)
+}
+
+async fn record_active_session_diagnostic(daemon: &Arc<Daemon>, kind: &'static str, message: &str) {
+    if let Err(error) = record_active_session_diagnostic_inner(daemon, kind, message).await {
+        warn!(
+            diagnostic_kind = kind,
+            error = %error,
+            "failed to record active session diagnostic"
+        );
+    }
+}
+
+async fn record_active_session_diagnostic_inner(
+    daemon: &Arc<Daemon>,
+    kind: &'static str,
+    message: &str,
+) -> Result<()> {
+    let clean = compact_snippet(message, 260);
+    let meeting_snapshot = {
+        let mut meeting_guard = daemon.meeting.lock().await;
+        if meeting_guard.is_none() {
+            *meeting_guard = Some(MeetingRecord::new(Some("New recording".to_string())));
+        }
+        let meeting = meeting_guard.as_mut().expect("meeting exists");
+        meeting.diagnostics.record_error(kind, clean.clone());
+        daemon.store.save_active(meeting)?;
+        meeting.clone()
+    };
+    info!(
+        meeting_id = %meeting_snapshot.id,
+        session_code = %meeting_snapshot.session_code(),
+        diagnostic_kind = kind,
+        message_chars = clean.chars().count(),
+        "active session diagnostic recorded"
+    );
+    update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
+    refresh_overlay_sessions(daemon).await;
+    schedule_auto_cloud_sync(daemon, "session_diagnostic", None).await;
+    Ok(())
+}
+
 async fn start_audio_capture(
     daemon: &Arc<Daemon>,
     config: AudioCaptureConfig,
@@ -2933,6 +3030,13 @@ async fn start_audio_capture(
     };
 
     let session_id = format!("audio-{}", clock::now_epoch_ms_string());
+    if let Err(error) = ensure_active_meeting_for_session(daemon, "audio_session_prepare").await {
+        let mut runtime = daemon.audio_runtime.lock().await;
+        if runtime.start_generation == start_generation {
+            runtime.starting = false;
+        }
+        return Err(error);
+    }
     let (stop_tx, stop_rx) = oneshot::channel();
 
     let runtime = match build_real_audio_runtime_config(&daemon.paths, &config).await {
@@ -2942,6 +3046,12 @@ async fn start_audio_capture(
             if runtime.start_generation == start_generation {
                 runtime.starting = false;
             }
+            record_active_session_diagnostic(
+                daemon,
+                "audio_start_error",
+                &format!("failed to build audio runtime: {error:#}"),
+            )
+            .await;
             return Err(error);
         }
     };
@@ -2988,6 +3098,7 @@ async fn start_audio_capture(
         if still_current {
             *daemon.audio.lock().await = status;
         }
+        record_active_session_diagnostic(daemon, "audio_start_error", &message).await;
         return Err(anyhow!(message));
     };
 
@@ -3005,6 +3116,8 @@ async fn start_audio_capture(
         runtime.starting = false;
     }
     *daemon.audio.lock().await = status.clone();
+    let _ = record_active_session_listen_start(daemon, &session_id, status.stt_provider.as_deref())
+        .await;
 
     let daemon_for_loop = daemon.clone();
     match runtime {
@@ -3856,6 +3969,7 @@ async fn real_audio_loop(
                 Ok(None) => {}
                 Err(error) => {
                     let message = compact_snippet(&format!("{error:#}"), 260);
+                    record_active_session_diagnostic(&daemon, "audio_source_error", &message).await;
                     let is_permission = crate::audio::capture::is_permission_denied_message(
                         &message,
                     )
@@ -4010,6 +4124,12 @@ async fn real_audio_relay_loop(
             .await
             {
                 let message = compact_snippet(&format!("{error:#}"), 260);
+                record_active_session_diagnostic(
+                    &daemon_for_source,
+                    "audio_source_error",
+                    &message,
+                )
+                .await;
                 let is_permission = crate::audio::capture::is_permission_denied_message(&message)
                     || crate::audio::system_capture::is_system_audio_permission_denied_message(
                         &message,
@@ -4505,8 +4625,30 @@ async fn emit_deepgram_relay_payload(
     last_transcript_at: Arc<Mutex<Instant>>,
 ) -> Result<()> {
     let pcm_source = pcm_source_for_audio_source(source);
-    let events = crate::stt::deepgram::parse_frame(payload, pcm_source)
-        .map_err(|error| anyhow!("Deepgram relay frame parse failed: {error}"))?;
+    let events = match crate::stt::deepgram::parse_frame(payload, pcm_source) {
+        Ok(events) => events,
+        Err(error) => {
+            let kind = if matches!(&error, cue_core::stt::SttError::Provider(_)) {
+                "stt_provider_error"
+            } else {
+                "stt_parse_error"
+            };
+            let frame_type = serde_json::from_str::<serde_json::Value>(payload)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("type")
+                        .and_then(|ty| ty.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            let message = format!(
+                "Deepgram relay frame parse failed for {source} sequence {sequence} type {frame_type}: {error}"
+            );
+            record_active_session_diagnostic(daemon, kind, &message).await;
+            return Err(anyhow!(message));
+        }
+    };
     if events.is_empty() {
         let frame_type = serde_json::from_str::<serde_json::Value>(payload)
             .ok()
@@ -4777,7 +4919,8 @@ async fn refresh_current_overlay_context_items(daemon: &Arc<Daemon>) {
 
 async fn refresh_overlay_sessions(daemon: &Arc<Daemon>) {
     let started = Instant::now();
-    let active_id = daemon.meeting.lock().await.as_ref().map(|m| m.id);
+    let active_meeting = daemon.meeting.lock().await.clone();
+    let active_id = active_meeting.as_ref().map(|m| m.id);
     match overlay_session_items(daemon, active_id) {
         Ok(sessions) => {
             let session_count = sessions.len();
@@ -4786,6 +4929,7 @@ async fn refresh_overlay_sessions(daemon: &Arc<Daemon>) {
             let image_count: usize = sessions.iter().map(|session| session.image_count).sum();
             match send_overlay(daemon, OverlayCommand::SetSessions { sessions }).await {
                 Ok(()) => {
+                    send_active_session_overlay(daemon, active_meeting.as_ref()).await;
                     info!(
                         active_session_id = active_id
                             .map(|id| id.to_string())
@@ -4819,6 +4963,24 @@ async fn refresh_overlay_sessions(daemon: &Arc<Daemon>) {
                 "overlay session list refresh failed: {error:#}"
             );
         }
+    }
+}
+
+async fn send_active_session_overlay(daemon: &Arc<Daemon>, meeting: Option<&MeetingRecord>) {
+    let command = match meeting {
+        Some(meeting) => OverlayCommand::SetActiveSession {
+            id: Some(meeting.id),
+            code: meeting.session_code(),
+            title: display_meeting_title(meeting),
+        },
+        None => OverlayCommand::SetActiveSession {
+            id: None,
+            code: String::new(),
+            title: String::new(),
+        },
+    };
+    if let Err(error) = send_overlay(daemon, command).await {
+        debug!("active session overlay update skipped: {error:#}");
     }
 }
 
@@ -4865,6 +5027,10 @@ fn overlay_session_items(
             ));
         }
         let title = display_meeting_title(&meeting);
+        let code = meeting.session_code();
+        if !bits.iter().any(|bit| bit.starts_with("ID ")) {
+            bits.insert(0, format!("ID {code}"));
+        }
         items.push(OverlaySessionItem {
             id: meeting.id,
             title,

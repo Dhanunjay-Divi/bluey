@@ -48,8 +48,9 @@ pub use logging::{
     init_local_json_logging, local_log_dir, log_file_prefix, retain_recent_log_files, LocalLogGuard,
 };
 pub use meeting::{
-    ActionItem, ContextArtifact, ContextKind, ContextProcessingStatus, ConversationTurn, Decision,
-    MeetingRecap, MeetingRecord, MemoryHit, Speaker, TranscriptSegment,
+    short_session_code, ActionItem, ContextArtifact, ContextKind, ContextProcessingStatus,
+    ConversationTurn, Decision, MeetingDiagnostics, MeetingRecap, MeetingRecord, MemoryHit,
+    Speaker, TranscriptSegment,
 };
 pub use observability::{
     account_id_hash_prefix, new_request_id, new_trace_id, platform, sanitize_observability_id,

@@ -15,8 +15,9 @@ use cue_cloud_client::{
     SyncSessionRecord, SyncTranscriptSegment,
 };
 use cue_core::{
-    CardArtifactType, ContextArtifact, ContextKind, ContextProcessingStatus, ConversationTurn,
-    CueCardArtifact, MeetingRecord, Speaker, TranscriptSegment,
+    short_session_code, CardArtifactType, ContextArtifact, ContextKind, ContextProcessingStatus,
+    ConversationTurn, CueCardArtifact, MeetingDiagnostics, MeetingRecord, Speaker,
+    TranscriptSegment,
 };
 use serde_json::json;
 use tracing::{debug, warn};
@@ -467,6 +468,7 @@ async fn meeting_from_cloud_bundle(
         context,
         conversation,
         answer_instructions: bundle.session.answer_style,
+        diagnostics: MeetingDiagnostics::default(),
         summary: bundle
             .session
             .metadata
@@ -833,9 +835,22 @@ fn session_record(meeting: &MeetingRecord) -> SyncSessionRecord {
         last_active_at_ms: Some(updated_at_ms(meeting)),
         answer_style: meeting.answer_instructions.clone(),
         metadata: json!({
+            "session_code": short_session_code(meeting.id),
             "summary": meeting.summary.as_deref(),
             "action_items": meeting.action_items.len(),
             "decisions": meeting.decisions.len(),
+            "diagnostics": {
+                "listen_runs": meeting.diagnostics.listen_runs,
+                "stt_parse_errors": meeting.diagnostics.stt_parse_errors,
+                "stt_provider_errors": meeting.diagnostics.stt_provider_errors,
+                "audio_start_errors": meeting.diagnostics.audio_start_errors,
+                "audio_source_errors": meeting.diagnostics.audio_source_errors,
+                "last_audio_session_id": meeting.diagnostics.last_audio_session_id.as_deref(),
+                "last_stt_provider": meeting.diagnostics.last_stt_provider.as_deref(),
+                "last_error_kind": meeting.diagnostics.last_error_kind.as_deref(),
+                "last_error_message": meeting.diagnostics.last_error_message.as_deref(),
+                "last_error_at": meeting.diagnostics.last_error_at.as_deref(),
+            },
         }),
         deleted_at_ms: None,
     }

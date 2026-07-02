@@ -74,6 +74,12 @@ pub enum OverlayCommand {
     SetSessions {
         sessions: Vec<OverlaySessionItem>,
     },
+    SetActiveSession {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<uuid::Uuid>,
+        code: String,
+        title: String,
+    },
     ListeningStateChanged {
         state: ListeningState,
     },
@@ -248,6 +254,22 @@ mod tests {
         assert_eq!(
             json,
             r#"{"type":"set_sessions","sessions":[{"id":"00000000-0000-0000-0000-000000000000","title":"System design prep","subtitle":"3 transcripts · 2 files","context_count":2,"image_count":1,"is_active":true}]}"#
+        );
+    }
+
+    #[test]
+    fn set_active_session_serializes_as_overlay_command() {
+        let id = uuid::Uuid::nil();
+        let json = serde_json::to_string(&OverlayCommand::SetActiveSession {
+            id: Some(id),
+            code: "00000000".to_string(),
+            title: "New recording".to_string(),
+        })
+        .expect("serialize active session command");
+
+        assert_eq!(
+            json,
+            r#"{"type":"set_active_session","id":"00000000-0000-0000-0000-000000000000","code":"00000000","title":"New recording"}"#
         );
     }
 

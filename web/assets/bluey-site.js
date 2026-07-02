@@ -1170,6 +1170,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       for (const session of sessions) {
         const row = document.createElement('article');
         row.className = 'session-row';
+        const sessionCode = shortSessionId(session.session_id).toUpperCase();
 
         const body = document.createElement('div');
         const title = document.createElement('strong');
@@ -1178,6 +1179,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const meta = document.createElement('span');
         meta.className = 'session-meta';
         meta.textContent = [
+          `ID ${sessionCode}`,
           session.status || 'saved',
           `${session.transcript_count || 0} transcript`,
           `${session.response_count || 0} answer(s)`,
@@ -1186,12 +1188,18 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         ].join(' - ');
         body.append(title, meta);
 
+        const copyId = document.createElement('button');
+        copyId.className = 'account-button ghost compact';
+        copyId.type = 'button';
+        copyId.dataset.copy = session.session_id || '';
+        copyId.textContent = 'Copy ID';
+
         const button = document.createElement('button');
         button.className = 'account-button ghost';
         button.type = 'button';
         button.dataset.sessionId = session.session_id || '';
         button.textContent = 'View';
-        row.append(body, button);
+        row.append(body, copyId, button);
         list.append(row);
       }
     }
@@ -1228,6 +1236,24 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       detail.append(pre);
     }
 
+    function diagnosticsText(metadata) {
+      const diagnostics = metadata?.diagnostics;
+      if (!diagnostics || typeof diagnostics !== 'object') return '';
+      const lines = [
+        `listen runs: ${diagnostics.listen_runs || 0}`,
+        `stt parse errors: ${diagnostics.stt_parse_errors || 0}`,
+        `stt provider errors: ${diagnostics.stt_provider_errors || 0}`,
+        `audio start errors: ${diagnostics.audio_start_errors || 0}`,
+        `audio source errors: ${diagnostics.audio_source_errors || 0}`,
+      ];
+      if (diagnostics.last_stt_provider) lines.push(`last provider: ${diagnostics.last_stt_provider}`);
+      if (diagnostics.last_audio_session_id) lines.push(`audio session: ${diagnostics.last_audio_session_id}`);
+      if (diagnostics.last_error_kind) lines.push(`last error: ${diagnostics.last_error_kind}`);
+      if (diagnostics.last_error_message) lines.push(String(diagnostics.last_error_message));
+      if (diagnostics.last_error_at) lines.push(`last error at: ${formatSessionTime(diagnostics.last_error_at)}`);
+      return lines.join('\n');
+    }
+
     async function loadCloudSessions() {
       const sessions = await apiJson('/sync/sessions?limit=8');
       renderCloudSessions(sessions);
@@ -1246,16 +1272,26 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       const title = document.createElement('strong');
       title.textContent = bundle.session?.title || `Session ${shortSessionId(sessionId)}`;
       const meta = document.createElement('span');
+      const sessionCode = shortSessionId(sessionId).toUpperCase();
       meta.textContent = [
+        `ID ${sessionCode}`,
         `${bundle.transcript_segments?.length || 0} transcript segment(s)`,
         `${bundle.cue_responses?.length || 0} answer(s)`,
         `${bundle.context_artifacts?.length || 0} context item(s)`,
       ].join(' - ');
       detail.append(title, meta);
 
+      const copyId = document.createElement('button');
+      copyId.className = 'account-button ghost compact';
+      copyId.type = 'button';
+      copyId.dataset.copy = sessionId;
+      copyId.textContent = 'Copy full session ID';
+      detail.append(copyId);
+
       if (bundle.session?.answer_style) {
         appendBundlePreview(detail, 'Answer style', bundle.session.answer_style);
       }
+      appendBundlePreview(detail, 'Diagnostics', diagnosticsText(bundle.session?.metadata));
       const transcript = latestRecord(bundle.transcript_segments);
       if (transcript?.text) {
         appendBundlePreview(detail, `Latest transcript (${transcript.speaker || 'speaker'})`, transcript.text);

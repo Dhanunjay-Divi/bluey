@@ -1305,6 +1305,12 @@ private struct OverlaySessionItem {
     let isActive: Bool
 }
 
+private func shortSessionCode(_ id: String) -> String {
+    let compact = id.filter { $0 != "-" }
+    let prefix = String(compact.prefix(8)).uppercased()
+    return prefix.isEmpty ? "SESSION" : prefix
+}
+
 // Matches the trusted remote-control event source marker used by the host
 // remote-input bridge. Bluey should not consume those injected clicks.
 private let blueyTrustedRemoteInputEventSourceUserData: Int64 = 0x70696e6b797231
@@ -1342,6 +1348,7 @@ private enum OverlayCommand {
     case setAccountState(signedIn: Bool)
     case setContextItems([OverlayContextItem])
     case setSessions([OverlaySessionItem])
+    case setActiveSession(id: String?, code: String, title: String)
     case listeningStateChanged(String)
     case transcriptPartial(source: String, text: String)
     case transcriptFinal(source: String, text: String)
@@ -1405,6 +1412,11 @@ private func parseCommand(_ line: String) -> OverlayCommand {
             )
         }.filter { !$0.id.isEmpty }
         return .setSessions(sessions)
+    case "set_active_session":
+        return .setActiveSession(
+            id: obj["id"] as? String,
+            code: obj["code"] as? String ?? "",
+            title: obj["title"] as? String ?? "")
     case "listening_state_changed":
         return .listeningStateChanged(obj["state"] as? String ?? "idle")
     case "transcript_partial":
@@ -4730,6 +4742,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private var transcriptStripShouldFollowTail = false
     private var sessionItems: [OverlaySessionItem] = []
     private var sessionsHaveLoaded = false
+    private var activeSessionId: String?
+    private var activeSessionCode: String?
+    private var activeSessionTitle: String?
     private var editingSessionId: String?
     private var pendingDeleteSessionId: String?
     private var renameField: NSTextField?
@@ -9106,6 +9121,31 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         layoutHeaderChromeControls()
     }
 
+    private func refreshSessionHeaderSubtitle() {
+        guard !signedOutGateActive else { return }
+        let code = (activeSessionCode ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !code.isEmpty else {
+            setHeaderSubtitle()
+            statusLabel.toolTip = nil
+            return
+        }
+        setHeaderSubtitle("ID \(code)")
+        if let id = activeSessionId, !id.isEmpty {
+            let title = activeSessionTitle.flatMap { $0.isEmpty ? nil : $0 } ?? "Session"
+            statusLabel.toolTip = "\(title) · \(id)"
+        } else {
+            statusLabel.toolTip = "Session \(code)"
+        }
+    }
+
+    func setActiveSession(id: String?, code: String, title: String) {
+        activeSessionId = id?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanCode = code.trimmingCharacters(in: .whitespacesAndNewlines)
+        activeSessionCode = cleanCode.isEmpty ? activeSessionId.map(shortSessionCode) : cleanCode
+        activeSessionTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        refreshSessionHeaderSubtitle()
+    }
+
     func showSignedOutLogin(url: URL?) {
         signedOutGateActive = true
         setHeaderSubtitle("Local ready")
@@ -9130,8 +9170,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     func showSignedInChromeReady() {
         signedOutGateActive = false
         applySignedOutGateControlState()
-        setHeaderSubtitle()
-        statusLabel.toolTip = nil
+        refreshSessionHeaderSubtitle()
         routeBadge.stringValue = "● Ready"
         routeBadge.textColor = BlueyTheme.green
         routeBadge.toolTip = "Ready"
@@ -9782,6 +9821,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                     routeBadge.stringValue = "● Ready"
                     routeBadge.textColor = BlueyTheme.green
                     routeBadge.toolTip = "Ready"
+                    refreshSessionHeaderSubtitle()
                 }
             } else {
                 routeBadge.stringValue = routeBadgeText(for: artifact)
@@ -9793,6 +9833,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             routeBadge.stringValue = "● Ready"
             routeBadge.textColor = BlueyTheme.green
             routeBadge.toolTip = "Ready"
+            refreshSessionHeaderSubtitle()
             if card.kind == "answer" {
                 let question = feed.nearestQuestionBody(beforeCardId: id)
                 if shouldCloseCanvasForPlainAnswer(question: question) {
@@ -11975,11 +12016,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         title.textColor = BlueyTheme.text
         title.lineBreakMode = .byTruncatingTail
 
-        let subtitle = NSTextField(labelWithString: session.subtitle)
+        let code = shortSessionCode(session.id)
+        let subtitleText = session.subtitle.contains("ID ")
+            ? session.subtitle
+            : "ID \(code) · \(session.subtitle)"
+        let subtitle = NSTextField(labelWithString: subtitleText)
         subtitle.translatesAutoresizingMaskIntoConstraints = false
         subtitle.font = NSFont.systemFont(ofSize: 9.5, weight: .medium)
         subtitle.textColor = BlueyTheme.textDim
         subtitle.lineBreakMode = .byTruncatingTail
+        row.toolTip = "Session \(session.id)"
 
         let contextBadge = makeSessionContextBadge(session)
 
@@ -13707,6 +13753,8 @@ private final class OverlayApp {
             expandedView?.setContextItems(items)
         case .setSessions(let sessions):
             expandedView?.setSessions(sessions)
+        case .setActiveSession(let id, let code, let title):
+            expandedView?.setActiveSession(id: id, code: code, title: title)
         case .listeningStateChanged(let state):
             let runState = PillRunState(listeningState: state)
             setRunState(runState)

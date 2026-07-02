@@ -219,17 +219,41 @@ pub struct DgWord {
 /// Parse a raw Deepgram JSON payload into an `SttProvider` event list.
 /// Deepgram can emit 0, 1, or 2 events per frame (transcript + diarization).
 pub fn parse_frame(payload: &str, source: AudioSource) -> Result<Vec<TranscriptEvent>, SttError> {
-    let frame: DgFrame = serde_json::from_str(payload)
+    let value: serde_json::Value = serde_json::from_str(payload)
         .map_err(|e| SttError::Protocol(format!("invalid Deepgram JSON: {e}")))?;
+    let frame_type = value.get("type").and_then(|ty| ty.as_str());
 
-    if matches!(frame.ty.as_deref(), Some("Error")) {
+    if matches!(frame_type, Some("Error")) {
         return Err(SttError::Provider(payload.to_string()));
     }
 
-    let channel = match frame.channel {
-        Some(c) => c,
-        None => return Ok(Vec::new()),
+    // Deepgram also emits lifecycle/VAD frames such as SpeechStarted and
+    // UtteranceEnd. Those frames may use `channel: 0` or `channel: [0, 1]`,
+    // so parsing the full response as a transcript frame would incorrectly
+    // kill live captions. Only Results frames can produce transcript events.
+    if !matches!(frame_type, None | Some("Results")) {
+        return Ok(Vec::new());
+    }
+
+    let Some(channel_value) = value.get("channel") else {
+        return Ok(Vec::new());
     };
+    if !channel_value.is_object() {
+        return Ok(Vec::new());
+    }
+    let channel: DgChannel = match serde_json::from_value(channel_value.clone()) {
+        Ok(channel) => channel,
+        Err(error) => {
+            return Err(SttError::Protocol(format!(
+                "invalid Deepgram channel JSON: {error}"
+            )));
+        }
+    };
+    let is_final = value
+        .get("is_final")
+        .and_then(|is_final| is_final.as_bool())
+        .unwrap_or(false);
+
     let alt = match channel.alternatives.into_iter().next() {
         Some(a) => a,
         None => return Ok(Vec::new()),
@@ -251,7 +275,7 @@ pub fn parse_frame(payload: &str, source: AudioSource) -> Result<Vec<TranscriptE
 
     let mut out = Vec::with_capacity(2);
 
-    if frame.is_final {
+    if is_final {
         out.push(TranscriptEvent::Final {
             text: alt.transcript,
             confidence: alt.confidence,
@@ -801,6 +825,27 @@ mod tests {
     #[test]
     fn parse_frame_empty_transcript_returns_no_events() {
         let payload = r#"{"type":"Results","is_final":false,"channel":{"alternatives":[{"transcript":"","words":[]}]}}"#;
+        let events = parse_frame(payload, AudioSource::Microphone).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn parse_frame_ignores_speech_started_control_frame() {
+        let payload = r#"{"type":"SpeechStarted","channel":0,"timestamp":1.24}"#;
+        let events = parse_frame(payload, AudioSource::Microphone).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn parse_frame_ignores_utterance_end_control_frame() {
+        let payload = r#"{"type":"UtteranceEnd","channel":[0,1],"last_word_end":2.5}"#;
+        let events = parse_frame(payload, AudioSource::System).unwrap();
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn parse_frame_ignores_non_object_results_channel() {
+        let payload = r#"{"type":"Results","is_final":false,"channel":0}"#;
         let events = parse_frame(payload, AudioSource::Microphone).unwrap();
         assert!(events.is_empty());
     }

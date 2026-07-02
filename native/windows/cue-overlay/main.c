@@ -116,6 +116,9 @@ static wchar_t g_transcript_final[1024] = L"";
 static wchar_t g_transcript_source[64] = L"";
 static wchar_t g_session_banner[256] = L"";
 static ULONGLONG g_session_banner_tick = 0;
+static wchar_t g_active_session_id[80] = L"";
+static wchar_t g_active_session_code[32] = L"";
+static wchar_t g_active_session_title[160] = L"";
 static WNDPROC g_ask_edit_proc = NULL;
 
 static void send_current_question(void);
@@ -1982,6 +1985,14 @@ static DWORD WINAPI stdin_thread(LPVOID unused) {
             update_transcript_clear_button();
             update_paste_answer_button();
             InvalidateRect(g_hwnd, NULL, TRUE);
+        } else if (strcmp(msg_type, "set_active_session") == 0) {
+            safe_extract_json_to_wide(line, line_len, "id", g_active_session_id, 80);
+            safe_extract_json_to_wide(line, line_len, "code", g_active_session_code, 32);
+            safe_extract_json_to_wide(line, line_len, "title", g_active_session_title, 160);
+            if (wcslen(g_active_session_code) == 0 && wcslen(g_active_session_id) >= 8) {
+                wcsncpy_s(g_active_session_code, 32, g_active_session_id, 8);
+            }
+            InvalidateRect(g_hwnd, NULL, TRUE);
         } else if (strcmp(msg_type, "ping") == 0) {
             emit_simple_event("pong");
             fflush(stdout);
@@ -2448,6 +2459,11 @@ static bool paint_with_d2d(HWND hwnd) {
         BLUEY_FILL_ELLIPSE(g_d2d_target, &record_dot, g_d2d_brush);
 
         d2d_text(L"bluey", g_fmt_brand, d2d_rectf((float)header_left + 50.0f, 10.0f, (float)header_left + 118.0f, 46.0f), g_light_theme ? 8 : 230, g_light_theme ? 22 : 240, g_light_theme ? 32 : 245, 1.0f);
+        if (wcslen(g_active_session_code) > 0) {
+            wchar_t session_label[48];
+            swprintf_s(session_label, 48, L"ID %s", g_active_session_code);
+            d2d_text(session_label, g_fmt_label, d2d_rectf((float)header_left + 126.0f, 18.0f, (float)header_left + 220.0f, 42.0f), g_light_theme ? 22 : 168, g_light_theme ? 74 : 210, g_light_theme ? 96 : 226, 1.0f);
+        }
 
         if (!g_interactive_mode) {
             RECT handle = clickthrough_move_handle_rect(rect);
