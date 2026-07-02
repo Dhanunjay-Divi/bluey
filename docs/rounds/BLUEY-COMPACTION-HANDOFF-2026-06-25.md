@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-01 22:01 EDT
+Latest checkpoint: 2026-07-01 22:14 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,38 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-289-TAB-ORDER-COMPOSER-TAB-FIX.md`; the next canonical Bluey round doc should start at `ROUND-290-...`.
+- Latest completed Bluey round doc is `ROUND-290-TONE-EDITOR-ENTER-READABILITY.md`; the next canonical Bluey round doc should start at `ROUND-291-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 290 is complete for Tone editor Enter/save and readability:
+  - macOS Tone field now saves on `Enter`
+  - handled both `insertNewline:` and `insertNewlineIgnoringFieldEditor:`
+  - Tone title copy is now `How should Bluey answer?`
+  - Tone title is bright/visible instead of dim grey
+  - Tone input text is left-aligned so it starts from the left
+  - desktop workspace version bumped to `0.1.44`
+  - Windows parity note:
+    - Windows does not have the same native Tone input modal in `native/windows/cue-overlay/main.c`
+    - Windows source was syntax-checked again
+  - local verification passed:
+    - `swift build -c debug --package-path native/macos/cue-overlay`
+    - `cargo check -p cue-daemon --quiet`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c`
+    - `git diff --check`
+  - macOS release verification passed:
+    - `https://bluey.sh/latest.json` reported `0.1.44`
+    - live `latest.json.sig` verified successfully against the release Ed25519 key
+    - live artifact SHA256:
+      `09fc42a591cd7279b11fc276c0c0058be6a100a528eac4f1b47e8b52e2217fc2`
+    - `/install.sh` returned `application/x-shellscript`
+    - `/install.ps1` returned `application/x-powershell`
+  - live artifact:
+    `https://bluey.sh/releases/v0.1.44/bluey-0.1.44-darwin-arm64.tar.gz`
+  - Round doc:
+    `docs/rounds/ROUND-290-TONE-EDITOR-ENTER-READABILITY.md`
 - Round 289 is complete for Tab order and composer Tab behavior:
   - fixed macOS header focus order so keyboard shortcuts is selected before theme, matching the visible header
   - added a composer-level `Tab` fallback so the Ask text box does not insert tab whitespace

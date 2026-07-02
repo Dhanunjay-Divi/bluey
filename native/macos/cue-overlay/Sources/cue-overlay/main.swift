@@ -5624,6 +5624,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         answerStylePanel.layer?.backgroundColor = BlueyTheme.panelDeep
             .withAlphaComponent(materialAlpha(0.97))
             .cgColor
+        answerStyleLabel.textColor = lightThemeEnabled ? BlueyLightTheme.text : NSColor.white.withAlphaComponent(0.96)
         composerBar.layer?.backgroundColor = themedComposerColor.cgColor
         composerBar.layer?.borderColor = (lightThemeEnabled
             ? BlueyLightTheme.accentBorder.withAlphaComponent(0.68)
@@ -6566,6 +6567,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
         guard control === answerStyleBox else { return false }
+        if commandSelector == #selector(NSResponder.insertNewline(_:))
+            || commandSelector == #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:)) {
+            saveAnswerStyleClicked()
+            return true
+        }
         if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
             dismissAnswerStyleEditor(animated: true)
             return true
@@ -7634,9 +7640,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         sessionScroll.scrollerStyle = .overlay
 
         answerStyleLabel.font = NSFont.systemFont(ofSize: 10.5, weight: .bold)
-        answerStyleLabel.textColor = BlueyTheme.textDim
+        answerStyleLabel.textColor = NSColor.white.withAlphaComponent(0.96)
         answerStyleLabel.alignment = .center
-        answerStyleLabel.stringValue = "How Bluey should answer"
+        answerStyleLabel.stringValue = "How should Bluey answer?"
         answerStyleBox.placeholderString = "Natural, concise, interview-ready..."
         answerStyleBox.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
         answerStyleBox.isBezeled = false
@@ -7644,7 +7650,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         answerStyleBox.focusRingType = .none
         answerStyleBox.backgroundColor = NSColor.white.withAlphaComponent(0.98)
         answerStyleBox.textColor = NSColor.black.withAlphaComponent(0.96)
-        answerStyleBox.alignment = .center
+        answerStyleBox.alignment = .left
         answerStyleBox.placeholderAttributedString = NSAttributedString(
             string: "Natural, concise, interview-ready...",
             attributes: [.foregroundColor: NSColor.black.withAlphaComponent(0.60)])
