@@ -4474,3 +4474,41 @@ cargo test --manifest-path server/Cargo.toml answer_plan -- --nocapture
 cargo test -p cue-daemon provider_messages_enable -- --nocapture
 cargo fmt --all
 ```
+
+## Latest Round 310: Production Interview Answer Mode
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-310-PRODUCTION-INTERVIEW-ANSWER-MODE.md`
+
+Round 310 reviewed another ChatGPT interview-prep share and Otter interview/work recordings:
+
+- `https://chatgpt.com/share/6a46a5d7-36d4-83ea-923f-d50d70422748`
+- `https://otter.ai/u/7bMMtxGmuG-ba_5W8vGS8LC-sIw`
+- `https://otter.ai/folder/1887796`
+
+What changed:
+
+- Managed `AnswerPlan` now carries `interview_context`.
+- Interview context can improve the voice of coding, system-design, behavioral, AI/ML, data, and general answers without stealing the correct route.
+- Added production interview answer guidance for AI/ML/RAG/MCP/agents, SDE/system design, and data/BI/DE questions.
+- Native/direct daemon prompt path now mirrors the same role/domain interview mode.
+- Added tests proving direct interview code stays code, direct interview system design stays system design, and AI/ML RAG/MCP prompts get production interview style.
+
+Verification:
+
+```bash
+cargo test --manifest-path server/Cargo.toml answer_plan -- --nocapture
+cargo test -p cue-daemon provider_messages_enable -- --nocapture
+cargo fmt --all
+cargo build -p cue-daemon --bin bluey-daemon
+cargo build --manifest-path server/Cargo.toml
+```

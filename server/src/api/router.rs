@@ -934,6 +934,7 @@ struct AnswerPlan {
     output: AnswerOutput,
     recommended_lane: &'static str,
     confidence: f32,
+    interview_context: bool,
     needs_screen: bool,
     needs_docs: bool,
     needs_transcript: bool,
@@ -1059,6 +1060,7 @@ fn answer_plan_for_request(
     let normalized = normalize_guardrail_text(&question);
     let planning_context = extract_planning_context(&req.user);
     let normalized_context = normalize_guardrail_text(&planning_context);
+    let interview_context = looks_like_interview_answer_context(&normalized, &normalized_context);
     let word_count = normalized.split_whitespace().count();
     let short_question = word_count <= 8;
     let topic_reset = looks_like_new_topic_request(&normalized);
@@ -1239,6 +1241,7 @@ fn answer_plan_for_request(
         output,
         recommended_lane,
         confidence,
+        interview_context,
         needs_screen: screen,
         needs_docs: docs,
         needs_transcript: meeting,
@@ -1654,6 +1657,7 @@ fn merge_ai_answer_plan(
         output,
         recommended_lane,
         confidence,
+        interview_context: rule_plan.interview_context,
         needs_screen: intent == AnswerIntent::Screen || rule_plan.needs_screen,
         needs_docs: rule_plan.needs_docs,
         needs_transcript: intent == AnswerIntent::Meeting || rule_plan.needs_transcript,
@@ -1989,6 +1993,45 @@ fn looks_like_behavioral_question(normalized: &str) -> bool {
     ) || looks_like_interview_coaching_question(normalized)
 }
 
+fn looks_like_interview_answer_context(normalized: &str, normalized_context: &str) -> bool {
+    looks_like_interview_coaching_question(normalized)
+        || contains_any(
+            normalized,
+            &[
+                "interview",
+                "interviewer",
+                "interviewing",
+                "candidate",
+                "tell me about yourself",
+                "resume",
+                "résumé",
+                "job description",
+                " jd",
+                "goldman",
+                "amazon",
+                "onsite",
+                "phone screen",
+                "hiring manager",
+                "behavioral",
+                "star answer",
+            ],
+        )
+        || contains_any(
+            normalized_context,
+            &[
+                "resume",
+                "résumé",
+                "job description",
+                " jd",
+                "interview",
+                "interviewer",
+                "candidate",
+                "role requirements",
+                "preferred qualifications",
+            ],
+        )
+}
+
 fn looks_like_interview_coaching_question(normalized: &str) -> bool {
     let coaching_frame = contains_any(
         normalized,
@@ -2040,6 +2083,23 @@ fn looks_like_interview_coaching_question(normalized: &str) -> bool {
             "data analyst",
             "data scientist",
             "machine learning",
+            "ai/ml",
+            "ai engineer",
+            "llm",
+            "rag",
+            "retrieval",
+            "embedding",
+            "vector db",
+            "vector database",
+            "agent",
+            "multi-agent",
+            "mcp",
+            "bedrock",
+            "langsmith",
+            "chunking",
+            "hallucination",
+            "grounding",
+            "evaluation framework",
             "ml engineer",
             "devops",
             "platform",
@@ -2105,6 +2165,17 @@ fn looks_like_interview_coaching_question(normalized: &str) -> bool {
             "favorite sql function",
             "favorite programming language",
             "favorite design pattern",
+            "how did you evaluate",
+            "how you evaluate",
+            "evaluation metric",
+            "handle authentication",
+            "handle authorization",
+            "chunking strategy",
+            "embedding model",
+            "rag pipeline",
+            "mcp server",
+            "multi-agent",
+            "agent orchestration",
             "solve a problem that required in-depth thought",
             "focusing on the right problem",
             "how did you know that you were focusing",
@@ -2230,6 +2301,12 @@ fn prompt_with_answer_plan(
         plan.recommended_lane,
         plan.confidence
     );
+
+    if plan.interview_context {
+        instructions.push_str(
+            "\nInterview answer mode: treat this as real-time interview coaching for the role/domain implied by the resume, JD, transcript, screen, and files. Sound like a human candidate or engineer who actually built the system, not a textbook. Use simple English, confident transitions, and production-specific reasoning. Start with the answer the user can say aloud, then add only the context needed to defend it. For technical interview questions, explain the problem, the design/implementation choice, why that choice was made, tradeoffs, debugging, reliability, observability, security/auth, evaluation, scaling, and failure handling when relevant. For AI/ML, RAG, MCP, or agent questions, cover ingestion, chunking, embeddings, retrieval, orchestration, grounding/hallucination controls, evals, auth, traces, latency, and cost only when they apply. For SDE/system questions, cover ownership, APIs, data flow, concurrency, failure modes, tests, and rollout. For data/BI/DE questions, cover source systems, ETL, validation, freshness, metrics/KPI definitions, query performance, lineage, and stakeholder impact. Avoid over-polished corporate language, too many bullets, and filler like maybe/probably/I guess. Do not invent companies, metrics, tools, or production claims beyond supplied context. If the user's draft is weak or challenged, repair it by reframing the story realistically instead of blindly defending it.",
+        );
+    }
 
     if !web_search.sources.is_empty() {
         instructions.push_str(
@@ -6798,6 +6875,7 @@ mod tests {
             "Question:\nIf the interviewer pushes back that the dashboard automation did not solve upstream data arrival, how should I answer?",
             "Question:\nFor an SDE interview, how should I answer if they ask me about a production incident I debugged?",
             "Question:\nFor a data engineer interview, can you talk about a pipeline that you built and the tradeoffs you made?",
+            "Question:\nFor a Goldman AI/ML interview, how did you evaluate the RAG and MCP agents?",
         ];
 
         for user in cases {
@@ -6807,6 +6885,7 @@ mod tests {
             assert_eq!(plan.intent, AnswerIntent::Behavioral, "{user}");
             assert_eq!(plan.output, AnswerOutput::Compact, "{user}");
             assert_eq!(plan.recommended_lane, "balanced", "{user}");
+            assert!(plan.interview_context, "{user}");
             assert!(!plan.needs_web_search, "{user}");
         }
 
@@ -6826,6 +6905,9 @@ mod tests {
         assert!(system.contains("SDE, data engineer, BI engineer"));
         assert!(system.contains("role/domain interview questions"));
         assert!(system.contains("company, project, tools, metrics, constraints"));
+        assert!(system.contains("Role/domain interview questions") || system.contains("role/domain"));
+        assert!(system.contains("RAG, MCP, or agent questions"));
+        assert!(system.contains("retrieval, orchestration, grounding"));
     }
 
     #[test]
@@ -6835,12 +6917,14 @@ mod tests {
 
         assert_eq!(code_plan.intent, AnswerIntent::Coding);
         assert_eq!(code_plan.output, AnswerOutput::CodeArtifact);
+        assert!(code_plan.interview_context);
 
         let design = complete_request("Question:\nDesign a scalable notification system for an SDE interview.");
         let design_plan = answer_plan_for_request(&design, "balanced", &[]);
 
         assert_eq!(design_plan.intent, AnswerIntent::SystemDesign);
         assert_eq!(design_plan.output, AnswerOutput::CanvasDetail);
+        assert!(design_plan.interview_context);
     }
 
     #[test]
@@ -7182,6 +7266,7 @@ mod tests {
             output: AnswerOutput::SourceAnswer,
             recommended_lane: "balanced",
             confidence: 0.90,
+            interview_context: false,
             needs_screen: false,
             needs_docs: false,
             needs_transcript: false,
@@ -7216,6 +7301,7 @@ mod tests {
             output: AnswerOutput::Compact,
             recommended_lane: "balanced",
             confidence: 0.80,
+            interview_context: false,
             needs_screen: false,
             needs_docs: false,
             needs_transcript: false,
