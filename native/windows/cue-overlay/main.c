@@ -1742,6 +1742,10 @@ static bool handle_overlay_shortcut_key(WPARAM key, bool local_key) {
     if (!g_hwnd) return false;
     bool expanded = !g_collapsed && g_visible;
 
+    if (local_key && key != VK_RETURN && key != VK_ESCAPE) {
+        return false;
+    }
+
     if (key == 'B') {
         if (expanded) {
             collapse_to_pill(g_hwnd, true);
@@ -2643,12 +2647,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
                 sizeof(shortcut_body) / sizeof(shortcut_body[0]),
                 L"%ls\n"
                 L"%ls\n\n"
-                L"Inside Bluey when click-through is off and Ask is not focused:\n\n"
-                L"T Text input        L Listen\n"
-                L"S Screen            I Click-through\n"
-                L"H History           F Files\n"
+                L"Inside Bluey when click-through is off:\n\n"
                 L"Enter Answer        Esc Close panel\n"
-                L"Tab Next control    Shift+Tab Previous control\n\n"
+                L"Tab Next control    Shift+Tab Previous control\n"
+                L"Letters always type normally when Ask is focused.\n\n"
                 L"Global shortcuts work in both modes:\n"
                 L"Ctrl+Alt+B         Minimize to pill / restore\n"
                 L"Ctrl+Alt+T         Text input\n"
@@ -2847,16 +2849,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
                 return 0;
             }
         }
-        if (g_interactive_mode && !edit_focused && !ctrl && !alt && !shift) {
+        if (g_interactive_mode && !edit_focused && !ctrl && !alt && !shift &&
+            (wparam == VK_RETURN || wparam == VK_ESCAPE)) {
             if (handle_overlay_shortcut_key(wparam, true)) {
                 return 0;
-            }
-        }
-        if (g_interactive_mode && !edit_focused && ctrl && !alt && !shift) {
-            if (wparam == VK_RETURN || wparam == 'L' || wparam == 'S' || wparam == 'I') {
-                if (handle_overlay_shortcut_key(wparam, true)) {
-                    return 0;
-                }
             }
         }
         if (wparam == VK_RETURN && GetFocus() == g_ask_edit) {

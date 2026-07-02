@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-02 02:49 EDT
+Latest checkpoint: 2026-07-02 03:20 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,41 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-297-RELEASE-DISCIPLINE-RUNBOOKS.md`; the next canonical Bluey round doc should start at `ROUND-298-...`.
+- Latest completed Bluey round doc is `ROUND-298-LOCAL-LETTER-SHORTCUT-REMOVAL.md`; the next canonical Bluey round doc should start at `ROUND-299-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 298 is complete and deployed for local letter shortcut removal:
+  - removed local unmodified alphabet shortcuts from the Mac overlay
+  - removed local unmodified alphabet shortcuts from the Windows overlay
+  - kept local `Enter`, `Esc`, `Tab`, and `Shift+Tab`
+  - kept global modified shortcuts:
+    - macOS: `Ctrl+Option+...`
+    - Windows: `Ctrl+Alt+...`
+  - updated Mac and Windows shortcut help so it no longer lists `T/L/S/I/H/F`
+  - help now states that letters type normally when Ask is focused
+  - desktop workspace version bumped to `0.1.51`
+  - local verification passed:
+    - `swift build -c debug --package-path native/macos/cue-overlay`
+    - `cargo check -p cue-core --quiet`
+    - `cargo check -p cue-daemon --quiet`
+    - `x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c`
+    - `cargo test -p cue-core overlay --lib`
+    - `git diff --check`
+  - macOS release verification passed:
+    - `https://bluey.sh/latest.json` reported `0.1.51`
+    - live `latest.json.sig` verified successfully against the release Ed25519 key
+    - live artifact SHA256:
+      `f54d50e3939ab58dacdc4e36da60bb65846ed06558aea8042d44f2038ff788c2`
+    - `/install.sh` returned `application/x-shellscript`
+    - `/install.ps1` returned `application/x-powershell`
+    - unpacked release reported `bluey 0.1.51` and `bluey-daemon 0.1.51`
+  - live artifact:
+    `https://bluey.sh/releases/v0.1.51/bluey-0.1.51-darwin-arm64.tar.gz`
+  - Round doc:
+    `docs/rounds/ROUND-298-LOCAL-LETTER-SHORTCUT-REMOVAL.md`
 - Round 297 is complete for release discipline and ops runbooks:
   - copied the Pinky deployment discipline into Bluey-owned docs and scripts
   - updated `docs/RELEASE-RUNBOOK.md` with:

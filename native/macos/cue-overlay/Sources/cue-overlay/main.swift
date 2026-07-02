@@ -6349,7 +6349,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
            flags.isDisjoint(with: [.control, .option, .command, .shift]),
            !passThroughMode,
            shouldRouteLocalShortcutThroughFocusedComposer(key: key, isReturn: isReturn) {
-            return performBlueyShortcut(key: key, isReturn: isReturn, source: source, allowFocusShortcut: false)
+            return performBlueyShortcut(key: key, isReturn: isReturn, source: source)
         }
 
         guard source == "local",
@@ -6360,11 +6360,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
 
         if event.keyCode == 53 {
-            return performBlueyShortcut(key: "escape", isReturn: false, source: source, allowFocusShortcut: false)
+            return performBlueyShortcut(key: "escape", isReturn: false, source: source)
         }
 
         guard !passThroughMode else { return false }
-        return performBlueyShortcut(key: key, isReturn: isReturn, source: source, allowFocusShortcut: false)
+        guard isReturn else { return false }
+        return performBlueyShortcut(key: key, isReturn: isReturn, source: source)
     }
 
     private func shouldRouteLocalShortcutThroughFocusedComposer(key: String, isReturn: Bool) -> Bool {
@@ -6377,7 +6378,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         if isReturn {
             return true
         }
-        return ["l", "s", "i", "h", "f", "t"].contains(key)
+        return false
     }
 
     @discardableResult
@@ -6447,8 +6448,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     private func performBlueyShortcut(
         key: String,
         isReturn: Bool,
-        source: String,
-        allowFocusShortcut: Bool
+        source: String
     ) -> Bool {
         if isReturn {
             askClicked()
@@ -8263,13 +8263,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             ? "Blank Bluey space clicks behind it. Drag the blue move handle to move."
             : "Blank Bluey space drags the window. Tab selects Bluey controls; Enter opens the selected control.")
         appendLine()
-        appendLine("Inside Bluey when click-through is off and Ask is not focused:", font: noteFont, color: titleColor)
+        appendLine("Inside Bluey when click-through is off:", font: noteFont, color: titleColor)
         appendLine()
-        appendPair("T", "Text input", "L", "Listen")
-        appendPair("S", "Screen", "I", "Click-through")
-        appendPair("H", "History", "F", "Files")
         appendPair("Enter", "Answer", "Esc", "Close panel")
         appendPair("Tab", "Next control", "Shift+Tab", "Previous control")
+        appendLine("Letters always type normally when Ask is focused.")
         appendLine("Opacity selected: arrow keys adjust it.")
         appendLine()
         appendLine("Global shortcuts work in both modes:")
