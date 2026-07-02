@@ -1990,16 +1990,80 @@ fn looks_like_behavioral_question(normalized: &str) -> bool {
 }
 
 fn looks_like_interview_coaching_question(normalized: &str) -> bool {
-    let data_domain = contains_any(
+    let coaching_frame = contains_any(
         normalized,
         &[
+            "what should i say",
+            "how should i answer",
+            "how do i answer",
+            "answer this like",
+            "if they ask",
+            "if interviewer",
+            "interviewer asks",
+            "interviewer asked",
+            "interviewer pushes",
+            "interviewer push",
+            "they ask me",
+            "asked in interview",
+        ],
+    );
+    let interview_frame = coaching_frame
+        || contains_any(
+            normalized,
+            &[
+                "interview",
+                "interviewer",
+                "amazon",
+                "leadership principle",
+                "dive deep",
+                "star answer",
+            ],
+        );
+    let role_domain = contains_any(
+        normalized,
+        &[
+            "software engineer",
+            "sde",
+            "developer",
+            "backend",
+            "frontend",
+            "full stack",
+            "full-stack",
+            "api",
+            "microservice",
+            "distributed system",
+            "system design",
+            "data engineer",
+            "data engineering",
             "business intelligence",
             "bie",
+            "data analyst",
+            "data scientist",
+            "machine learning",
+            "ml engineer",
+            "devops",
+            "platform",
+            "cloud",
+            "security",
+            "cybersecurity",
+            "product manager",
+            "program manager",
             "dashboard",
             "tableau",
             "power bi",
             "sql",
             "redshift",
+            "snowflake",
+            "spark",
+            "airflow",
+            "kafka",
+            "dbt",
+            "python",
+            "java",
+            "react",
+            "node",
+            "aws",
+            "azure",
             "etl",
             "pipeline",
             "metric",
@@ -2012,35 +2076,35 @@ fn looks_like_interview_coaching_question(normalized: &str) -> bool {
             "reporting",
         ],
     );
-    let interview_frame = contains_any(
+    let story_prompt = contains_any(
         normalized,
         &[
-            "interview",
-            "interviewer",
-            "amazon",
-            "leadership principle",
-            "dive deep",
-            "what should i say",
-            "how should i answer",
-            "how do i answer",
-            "answer this like",
-            "if they ask",
-            "if interviewer",
-            "interviewer asks",
-            "interviewer asked",
-        ],
-    );
-    let bi_story_prompt = contains_any(
-        normalized,
-        &[
+            "can you talk about a project",
+            "talk about a project",
+            "project that you built",
+            "technical project",
+            "most challenging project",
+            "complex project",
+            "production issue",
+            "debug a production",
+            "debugged a production",
+            "incident",
+            "outage",
+            "tradeoff",
+            "stakeholder",
+            "prioritize",
             "can you talk about a dashboard",
             "talk about a dashboard",
             "dashboard that you built",
+            "can you talk about a pipeline",
+            "pipeline that you built",
             "built from scratch",
             "what was the business problem",
             "what metrics",
             "what visual",
             "favorite sql function",
+            "favorite programming language",
+            "favorite design pattern",
             "solve a problem that required in-depth thought",
             "focusing on the right problem",
             "how did you know that you were focusing",
@@ -2049,8 +2113,12 @@ fn looks_like_interview_coaching_question(normalized: &str) -> bool {
             "backend query",
         ],
     );
+    let direct_code_or_design =
+        (looks_like_coding_question(normalized) || looks_like_system_design_question(normalized))
+            && !coaching_frame
+            && !story_prompt;
 
-    (interview_frame && data_domain) || bi_story_prompt || (interview_frame && bi_story_prompt)
+    !direct_code_or_design && ((interview_frame && role_domain) || story_prompt)
 }
 
 fn looks_like_system_design_question(normalized: &str) -> bool {
@@ -2127,7 +2195,7 @@ fn prompt_with_answer_plan(
             "Treat this as a follow-up to existing code when relevant. Preserve the existing artifact unless the user asks for a new one. Give the smallest useful delta, but include the actual updated code or snippet when the user asks for code. If you include code, add any line-by-line explanation as `Line notes:` outside the code fence so copied code stays clean."
         }
         AnswerIntent::Behavioral => {
-            "Answer like a polished interview coach and candidate voice: natural, first-person when appropriate, specific, and conversational. First infer what the interviewer is testing, such as Dive Deep, ownership, data quality, prioritization, SQL/Tableau depth, or stakeholder judgment, then make the response prove that signal. For self-introductions like \"tell me about yourself\", do not compress the resume into one facts paragraph. Use a speakable present-past-fit arc: current role and specialty, the most relevant past experience, the user's strongest proof points, and why that background fits the role. For self-introductions, aim for a 45-60 second answer. For BI/data interview questions, give a ready-to-say answer anchored in the supplied company, project, tools, metrics, and constraints; when useful, include a brief why-it-works or if-they-push-back recovery line. Do not defend weak story logic blindly: reframe it in a production-realistic way, such as upstream data, ETL validation, reporting impact, stakeholder communication, or KPI definition. For interview stories, aim for a 45-90 second answer in tight paragraphs, not generic bullets, unless the user asks for notes. Do not invent metrics, employers, tools, or motivation beyond the supplied resume/JD/context. Never route resume/self-intro or BI interview prompts into system design."
+            "Answer like a polished interview coach and candidate voice: natural, first-person when appropriate, specific, and conversational. Use the supplied resume, JD, documents, transcript, and screen context to infer the role and domain, such as SDE, data engineer, BI engineer, data scientist, DevOps, security, product, or another role. First infer what the interviewer is testing, such as Dive Deep, ownership, technical depth, data quality, system judgment, prioritization, stakeholder communication, or tradeoffs, then make the response prove that signal. For self-introductions like \"tell me about yourself\", do not compress the resume into one facts paragraph. Use a speakable present-past-fit arc: current role and specialty, the most relevant past experience, the user's strongest proof points, and why that background fits the role. For self-introductions, aim for a 45-60 second answer. For role/domain interview questions, give a ready-to-say answer anchored in the supplied company, project, tools, metrics, constraints, and role expectations; when useful, include a brief why-it-works or if-they-push-back recovery line. Do not defend weak story logic blindly: reframe it in a production-realistic way, such as code ownership, incident debugging, architecture tradeoffs, upstream data, ETL validation, reporting impact, stakeholder communication, or KPI definition. For interview stories, aim for a 45-90 second answer in tight paragraphs, not generic bullets, unless the user asks for notes. Do not invent metrics, employers, tools, or motivation beyond the supplied resume/JD/context. Never route resume/self-intro or interview-coaching prompts into system design just because they mention architecture or systems."
         }
         AnswerIntent::SystemDesign => {
             "Use clear sections for requirements, architecture, data flow, tradeoffs, scaling, and failure modes. Keep it practical and avoid overexplaining obvious basics."
@@ -6722,12 +6790,14 @@ mod tests {
     }
 
     #[test]
-    fn answer_plan_bi_interview_prompts_are_behavioral_and_humanized() {
+    fn answer_plan_role_interview_prompts_are_behavioral_and_humanized() {
         let cases = [
             "Question:\nCan you talk about a dashboard that you built from scratch, what was the business problem, what metrics did you use, and what visual did you choose?",
             "Question:\nWhat is your favorite SQL function?",
             "Question:\nCan you talk about a time when you had to solve a problem that required in-depth thought and analysis, and how did you know you were focusing on the right problem?",
             "Question:\nIf the interviewer pushes back that the dashboard automation did not solve upstream data arrival, how should I answer?",
+            "Question:\nFor an SDE interview, how should I answer if they ask me about a production incident I debugged?",
+            "Question:\nFor a data engineer interview, can you talk about a pipeline that you built and the tradeoffs you made?",
         ];
 
         for user in cases {
@@ -6753,7 +6823,24 @@ mod tests {
         assert!(system.contains("ready-to-say answer"));
         assert!(system.contains("if-they-push-back"));
         assert!(system.contains("production-realistic"));
-        assert!(system.contains("company, project, tools, metrics, and constraints"));
+        assert!(system.contains("SDE, data engineer, BI engineer"));
+        assert!(system.contains("role/domain interview questions"));
+        assert!(system.contains("company, project, tools, metrics, constraints"));
+    }
+
+    #[test]
+    fn answer_plan_interview_word_does_not_steal_direct_code_or_design() {
+        let code = complete_request("Question:\nWrite LRU cache code in Python for an SDE interview.");
+        let code_plan = answer_plan_for_request(&code, "balanced", &[]);
+
+        assert_eq!(code_plan.intent, AnswerIntent::Coding);
+        assert_eq!(code_plan.output, AnswerOutput::CodeArtifact);
+
+        let design = complete_request("Question:\nDesign a scalable notification system for an SDE interview.");
+        let design_plan = answer_plan_for_request(&design, "balanced", &[]);
+
+        assert_eq!(design_plan.intent, AnswerIntent::SystemDesign);
+        assert_eq!(design_plan.output, AnswerOutput::CanvasDetail);
     }
 
     #[test]
@@ -6833,8 +6920,24 @@ mod tests {
                 false,
             ),
             (
-                "bie_dashboard_interview",
+                "role_dashboard_interview",
                 "Question:\nCan you talk about a dashboard that you built from scratch and the metrics you used?",
+                AnswerIntent::Behavioral,
+                AnswerOutput::Compact,
+                "balanced",
+                false,
+            ),
+            (
+                "sde_incident_interview",
+                "Question:\nFor an SDE interview, how should I answer if they ask me about a production incident I debugged?",
+                AnswerIntent::Behavioral,
+                AnswerOutput::Compact,
+                "balanced",
+                false,
+            ),
+            (
+                "de_pipeline_interview",
+                "Question:\nFor a data engineer interview, can you talk about a pipeline that you built?",
                 AnswerIntent::Behavioral,
                 AnswerOutput::Compact,
                 "balanced",

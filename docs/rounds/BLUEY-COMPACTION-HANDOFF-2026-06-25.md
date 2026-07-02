@@ -4444,3 +4444,33 @@ cargo test --manifest-path server/Cargo.toml answer_plan -- --nocapture
 cargo test -p cue-daemon provider_messages_enable -- --nocapture
 cargo fmt --all
 ```
+
+## Latest Round 309: Role-Agnostic Interview Coaching
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-309-ROLE-AGNOSTIC-INTERVIEW-COACHING.md`
+
+Round 309 generalized the Round 308 BIE-specific coaching pass:
+
+- Managed AnswerPlan interview coaching detection now covers SDE, DE, BI, DS/ML, DevOps/platform/cloud, security, product, and other roles supplied through resume/JD/API context.
+- Managed behavioral prompt style now tells Bluey to infer role/domain from supplied context rather than assuming BIE.
+- Native/direct daemon prompt style now mirrors role/domain interview coaching instead of BI/data-only wording.
+- Added guards so direct code/system-design requests that mention interviews stay in code/system-design lanes unless the user is asking for interview answer coaching.
+- Added SDE and data-engineering regression tests.
+
+Verification:
+
+```bash
+cargo test --manifest-path server/Cargo.toml answer_plan -- --nocapture
+cargo test -p cue-daemon provider_messages_enable -- --nocapture
+cargo fmt --all
+```

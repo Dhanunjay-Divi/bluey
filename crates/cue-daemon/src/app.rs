@@ -8765,9 +8765,10 @@ fn provider_prompt_parts(payload: &ProviderRequestPayload) -> Result<ProviderPro
         system.push_str("- If the question asks for a self-introduction such as \"tell me about yourself\", give a complete first-person answer the user can say aloud, not a resume dump or notes. Use a present-past-fit arc: current role and specialty, the most relevant past experience, the user's strongest proof points, and why that background fits the role.\n");
         system.push_str("- For self-introductions, aim for a 45-60 second answer in 2-3 tight paragraphs. Do not use bullets unless the user asks for notes. Do not start with \"You can say\" or a meta explanation.\n");
         system.push_str("- If the question asks for an interview story such as \"tell me about a time\", \"describe a situation\", \"worked under pressure\", conflict, leadership, ownership, ambiguity, failure, or deadline pressure, give a complete first-person answer the user can say aloud, not notes.\n");
-        system.push_str("- For BI/data interview questions, infer what the interviewer is testing, such as Dive Deep, data quality, SQL/Tableau depth, ETL judgment, KPI logic, prioritization, or stakeholder communication. Make the answer prove that signal without sounding memorized.\n");
-        system.push_str("- Start with a ready-to-say answer anchored in the supplied company, project, tools, metrics, and constraints. If useful, add a short why-it-works or if-they-push-back recovery line.\n");
-        system.push_str("- If the interviewer challenges the story, do not blindly defend weak logic. Reframe it in a production-realistic way: upstream data arrival, ETL validation, reporting impact, KPI definitions, dashboard query behavior, or communication gaps.\n");
+        system.push_str("- Use the supplied resume, JD, prep docs, transcript, and screen context to infer the role and domain: SDE, data engineer, BI engineer, data scientist, DevOps, security, product, or whatever role the context shows.\n");
+        system.push_str("- For role/domain interview questions, infer what the interviewer is testing, such as Dive Deep, ownership, technical depth, data quality, system judgment, prioritization, stakeholder communication, or tradeoffs. Make the answer prove that signal without sounding memorized.\n");
+        system.push_str("- Start with a ready-to-say answer anchored in the supplied company, project, tools, metrics, constraints, and role expectations. If useful, add a short why-it-works or if-they-push-back recovery line.\n");
+        system.push_str("- If the interviewer challenges the story, do not blindly defend weak logic. Reframe it in a production-realistic way: code ownership, incident debugging, architecture tradeoffs, upstream data arrival, ETL validation, reporting impact, KPI definitions, dashboard query behavior, or communication gaps.\n");
         system.push_str("- Use attached resume, JD, prep docs, transcript, and screen context as source material. Prefer concrete names, tools, domains, constraints, and outcomes found in context.\n");
         system.push_str("- Shape the answer as STAR internally: situation, task, action, result. Do not label every sentence unless the user asks. Aim for a 45-90 second answer in 2-4 tight paragraphs, or 4-6 bullets only if structure helps.\n");
         system.push_str("- If context does not contain a confirmed metric, use a defensible qualitative result instead of inventing numbers.\n");
@@ -8908,14 +8909,40 @@ fn should_use_behavioral_interview_answer_mode(payload: &ProviderRequestPayload)
         "what should i say",
         "how should i answer",
         "how do i answer",
+        "answer this like",
+        "if they ask",
+        "if interviewer",
+        "interviewer asks",
+        "interviewer asked",
+        "interviewer pushes",
+        "interviewer push",
+        "they ask me",
+        "asked in interview",
+        "can you talk about a project",
+        "talk about a project",
+        "project that you built",
+        "technical project",
+        "most challenging project",
+        "complex project",
+        "production issue",
+        "debug a production",
+        "debugged a production",
+        "incident",
+        "outage",
+        "tradeoff",
+        "stakeholder",
         "can you talk about a dashboard",
         "talk about a dashboard",
         "dashboard that you built",
+        "can you talk about a pipeline",
+        "pipeline that you built",
         "built from scratch",
         "what was the business problem",
         "what metrics",
         "what visual",
         "favorite sql function",
+        "favorite programming language",
+        "favorite design pattern",
         "solve a problem that required in-depth thought",
         "focusing on the right problem",
         "how did you know that you were focusing",
@@ -8929,14 +8956,104 @@ fn should_use_behavioral_interview_answer_mode(payload: &ProviderRequestPayload)
         return false;
     }
 
-    let data_interview_signal = [
+    let coaching_story_signal = [
+        "what should i say",
+        "how should i answer",
+        "how do i answer",
+        "answer this like",
+        "if they ask",
+        "if interviewer",
+        "interviewer asks",
+        "interviewer asked",
+        "can you talk about a project",
+        "talk about a project",
+        "project that you built",
+        "technical project",
+        "most challenging project",
+        "complex project",
+        "production issue",
+        "debug a production",
+        "debugged a production",
+        "incident",
+        "outage",
+        "tradeoff",
+        "stakeholder",
+        "can you talk about a dashboard",
+        "talk about a dashboard",
+        "dashboard that you built",
+        "can you talk about a pipeline",
+        "pipeline that you built",
+        "built from scratch",
+        "favorite sql function",
+        "favorite programming language",
+        "favorite design pattern",
+        "solve a problem that required in-depth thought",
+        "focusing on the right problem",
+        "how did you know that you were focusing",
+    ]
+    .iter()
+    .any(|signal| question.contains(signal));
+    let direct_code_or_design_request = [
+        "write code",
+        "write a code",
+        "give me code",
+        "give me the code",
+        "build me",
+        "implement",
+        "leetcode",
+        "algorithm",
+        "design a system",
+        "system design",
+    ]
+    .iter()
+    .any(|signal| question.contains(signal));
+    if direct_code_or_design_request && !coaching_story_signal {
+        return false;
+    }
+
+    let role_domain_signal = [
+        "software engineer",
+        "sde",
+        "developer",
+        "backend",
+        "frontend",
+        "full stack",
+        "full-stack",
+        "api",
+        "microservice",
+        "distributed system",
+        "system design",
+        "data engineer",
+        "data engineering",
         "business intelligence",
         "bie",
+        "data analyst",
+        "data scientist",
+        "machine learning",
+        "ml engineer",
+        "devops",
+        "platform",
+        "cloud",
+        "security",
+        "cybersecurity",
+        "product manager",
+        "program manager",
         "dashboard",
         "tableau",
         "power bi",
         "sql",
         "redshift",
+        "snowflake",
+        "spark",
+        "airflow",
+        "kafka",
+        "dbt",
+        "python",
+        "java",
+        "react",
+        "node",
+        "aws",
+        "azure",
         "etl",
         "pipeline",
         "metric",
@@ -8973,14 +9090,27 @@ fn should_use_behavioral_interview_answer_mode(payload: &ProviderRequestPayload)
             || lower.contains("experience")
             || lower.contains("project")
             || lower.contains("business intelligence")
+            || lower.contains("software engineer")
+            || lower.contains("sde")
+            || lower.contains("data engineer")
+            || lower.contains("data scientist")
+            || lower.contains("machine learning")
+            || lower.contains("devops")
+            || lower.contains("security")
+            || lower.contains("product manager")
             || lower.contains("tableau")
             || lower.contains("sql")
             || lower.contains("etl")
             || lower.contains("dashboard")
+            || lower.contains("python")
+            || lower.contains("java")
+            || lower.contains("react")
+            || lower.contains("aws")
+            || lower.contains("azure")
     });
 
     has_candidate_context
-        || data_interview_signal
+        || role_domain_signal
         || question.contains("interview")
         || question.contains("interviewer")
         || question.contains("behavioral")
@@ -14602,7 +14732,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_messages_enable_bi_interview_coaching_mode() {
+    fn provider_messages_enable_role_interview_coaching_mode() {
         let route = ProviderRoute::direct(ProviderSelector::openai("gpt-4.1-mini"));
         let request = AnswerRequest::new(
             "Can you talk about a dashboard that you built from scratch, what was the business problem, metrics, and visual used?",
@@ -14635,7 +14765,9 @@ mod tests {
         };
 
         assert!(system.contains("Behavioral interview answer mode"));
-        assert!(system.contains("BI/data interview questions"));
+        assert!(system.contains("role and domain"));
+        assert!(system.contains("SDE, data engineer, BI engineer"));
+        assert!(system.contains("role/domain interview questions"));
         assert!(system.contains("interviewer is testing"));
         assert!(system.contains("ready-to-say answer"));
         assert!(system.contains("if-they-push-back"));
@@ -14643,6 +14775,87 @@ mod tests {
         assert!(user.contains("Sukruthi_Korukonda_BIE.docx"));
         assert!(user.contains("Humana"));
         assert!(user.contains("Vanguard"));
+    }
+
+    #[test]
+    fn provider_messages_enable_sde_and_de_interview_coaching_mode() {
+        let route = ProviderRoute::direct(ProviderSelector::openai("gpt-4.1-mini"));
+        let sde_request = AnswerRequest::new(
+            "For an SDE interview, how should I answer if they ask me about a production incident I debugged?",
+            route.clone(),
+        )
+        .with_context(
+            AnswerContext::new(
+                AnswerContextKind::Document,
+                "Resume: Senior Software Engineer with Python, Java, React, APIs, Azure, distributed systems, incident debugging, and architecture tradeoffs.",
+            )
+            .with_title("SDE_resume.pdf")
+            .with_source("/tmp/SDE_resume.pdf"),
+        );
+        let sde_payload = ProviderRequestPayload::from_request(
+            &sde_request,
+            ProviderSelector::openai("gpt-4.1-mini"),
+            Some("https://api.openai.com/v1/chat/completions".to_string()),
+            "fallback",
+            RouteBudget::realtime(),
+        );
+        let de_request = AnswerRequest::new(
+            "For a data engineer interview, can you talk about a pipeline that you built and the tradeoffs you made?",
+            route,
+        )
+        .with_context(
+            AnswerContext::new(
+                AnswerContextKind::Document,
+                "Resume: Data Engineer with Spark, Airflow, Kafka, Snowflake, dbt, Python, data quality checks, and batch pipelines.",
+            )
+            .with_title("DE_resume.pdf")
+            .with_source("/tmp/DE_resume.pdf"),
+        );
+        let de_payload = ProviderRequestPayload::from_request(
+            &de_request,
+            ProviderSelector::openai("gpt-4.1-mini"),
+            Some("https://api.openai.com/v1/chat/completions".to_string()),
+            "fallback",
+            RouteBudget::realtime(),
+        );
+
+        assert!(should_use_behavioral_interview_answer_mode(&sde_payload));
+        assert!(should_use_behavioral_interview_answer_mode(&de_payload));
+
+        let sde_messages = provider_messages(&sde_payload).expect("build provider messages");
+        let sde_system = match &sde_messages[0].content {
+            ChatMessageContent::Text(text) => text,
+            ChatMessageContent::Parts(_) => panic!("system message should be text"),
+        };
+        assert!(sde_system.contains("Behavioral interview answer mode"));
+        assert!(sde_system.contains("code ownership"));
+        assert!(sde_system.contains("incident debugging"));
+    }
+
+    #[test]
+    fn provider_messages_do_not_enable_behavioral_mode_for_direct_interview_code() {
+        let route = ProviderRoute::direct(ProviderSelector::openai("gpt-4.1-mini"));
+        let request = AnswerRequest::new(
+            "Write LRU cache code in Python for an SDE interview.",
+            route,
+        )
+        .with_context(
+            AnswerContext::new(
+                AnswerContextKind::Document,
+                "Resume: Software Engineer with Python, APIs, and distributed systems.",
+            )
+            .with_title("SDE_resume.pdf")
+            .with_source("/tmp/SDE_resume.pdf"),
+        );
+        let payload = ProviderRequestPayload::from_request(
+            &request,
+            ProviderSelector::openai("gpt-4.1-mini"),
+            Some("https://api.openai.com/v1/chat/completions".to_string()),
+            "fallback",
+            RouteBudget::realtime(),
+        );
+
+        assert!(!should_use_behavioral_interview_answer_mode(&payload));
     }
 
     #[test]
