@@ -4274,3 +4274,32 @@ swift build -c debug --package-path native/macos/cue-overlay
 x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c
 git diff --check
 ```
+
+## Latest Round 304: STT Realtime Latency Audit
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-304-STT-REALTIME-LATENCY-AUDIT.md`
+
+Round 304 investigated why live transcription can feel slower than Web Speech API:
+
+- Managed Deepgram already requests partials with `interim_results=true`.
+- Deepgram partials are parsed and forwarded to overlay as `TranscriptPartial`.
+- macOS and Windows overlays both have partial-caption display paths.
+- Live relay reads small chunks, about 128 ms of PCM per read in the relay path.
+- The main latency tradeoff is startup gating: Bluey waits for audible audio before creating the paid STT session and opening the websocket, which avoids silence billing but can make first captions feel late.
+
+Recommended next build:
+
+- Add a low-latency STT mode that opens the relay earlier while preserving zero-audio settlement/refund.
+- Add timing logs for first PCM, first audible audio, reservation, websocket open, first provider partial, first overlay partial, and first final transcript.
+
+No product code was changed in this round.
