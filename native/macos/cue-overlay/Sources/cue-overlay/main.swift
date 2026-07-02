@@ -6277,6 +6277,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             return false
         }
 
+        if source == "local",
+           flags.isDisjoint(with: [.control, .option, .command, .shift]),
+           !passThroughMode,
+           shouldRouteLocalShortcutThroughFocusedComposer(key: key, isReturn: isReturn) {
+            return performBlueyShortcut(key: key, isReturn: isReturn, source: source, allowFocusShortcut: false)
+        }
+
         guard source == "local",
               flags.isDisjoint(with: [.control, .option, .command, .shift]),
               !isTextEditingResponderActive
@@ -6290,6 +6297,19 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         guard !passThroughMode else { return false }
         return performBlueyShortcut(key: key, isReturn: isReturn, source: source, allowFocusShortcut: false)
+    }
+
+    private func shouldRouteLocalShortcutThroughFocusedComposer(key: String, isReturn: Bool) -> Bool {
+        guard window?.firstResponder === composer,
+              composer.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              composerInputArmedUntil <= CACurrentMediaTime()
+        else {
+            return false
+        }
+        if isReturn {
+            return true
+        }
+        return ["l", "s", "i", "h", "f", "t"].contains(key)
     }
 
     @discardableResult
@@ -8901,6 +8921,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             : "Ask anything..."
         window?.makeFirstResponder(composer)
         composer.armTypingCaret()
+        composerInputArmedUntil = CACurrentMediaTime() + 1.5
     }
 
     private func updateBackgroundControlsEnabledForModalState() {
