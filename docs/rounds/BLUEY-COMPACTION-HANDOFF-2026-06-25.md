@@ -4303,3 +4303,34 @@ Recommended next build:
 - Add timing logs for first PCM, first audible audio, reservation, websocket open, first provider partial, first overlay partial, and first final transcript.
 
 No product code was changed in this round.
+
+## Latest Round 305: Pending Attachment Strip
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-305-PENDING-ATTACHMENT-STRIP.md`
+
+Round 305 made the attachment flow explicit:
+
+- Newly attached documents/screens show below the workspace near the composer as pending context.
+- Pressing Enter or Answer sends those pending attachments with the question.
+- After send, the bottom pending attachment strip collapses.
+- Sent files/screens remain available from the top `Show files` control.
+- macOS now renders pending context items when `Show files` is closed.
+- Windows now has separate pending context chip state for attach, drag/drop, and screen capture.
+
+Verification:
+
+```bash
+swift build -c debug --package-path native/macos/cue-overlay
+x86_64-w64-mingw32-gcc -fsyntax-only native/windows/cue-overlay/main.c
+git diff --check
+```

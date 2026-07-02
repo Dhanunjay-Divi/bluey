@@ -9654,8 +9654,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             if mutationExpected {
                 pendingContextItemIds.formUnion(newlyAddedIds)
             }
-            // New files are prepared for the next answer immediately, but the
-            // visible chip strip stays collapsed unless the user opened it.
+            // New files are prepared for the next answer immediately. Show
+            // only those pending files near the composer until the answer is
+            // sent; the full saved list remains behind the header badge.
         }
         guard !items.isEmpty else {
             pendingContextItemIds.removeAll()
@@ -9712,7 +9713,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func itemsForVisibleAttachmentStrip() -> [OverlayContextItem] {
-        showingSavedContextItems ? contextItems : []
+        if showingSavedContextItems {
+            return contextItems
+        }
+        guard !pendingContextItemIds.isEmpty else {
+            return []
+        }
+        return contextItems.filter { pendingContextItemIds.contains($0.id) }
     }
 
     private func isScreenContextItem(_ item: OverlayContextItem) -> Bool {
@@ -9736,7 +9743,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         attachmentStrip.isHidden = false
         attachmentStrip.toolTip = showingSavedContextItems
             ? "All files in this conversation. Scroll horizontally to see more."
-            : "Files that will be sent with the next answer. Scroll horizontally to see more."
+            : "Attached for the next answer. Press Enter or Answer to send, then use Show files above to see them again."
         attachmentStripHeightConstraint?.constant = 34
         for item in items {
             attachmentStack.addArrangedSubview(makeAttachmentChip(item))

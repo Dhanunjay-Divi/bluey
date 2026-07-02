@@ -145,6 +145,8 @@ typedef struct OverlayContextChip {
 static OverlayContextChip g_context_chips[MAX_CONTEXT_CHIPS];
 static int g_context_chip_count = 0;
 static bool g_show_context_chips = false;
+static bool g_pending_context_chips = false;
+static ULONGLONG g_pending_context_expected_until_ms = 0;
 static OverlayContextChip g_sent_chips[MAX_CONTEXT_CHIPS];
 static int g_sent_chip_count = 0;
 static void consume_sent_context_chips(void);
@@ -577,6 +579,21 @@ static void show_supported_drop_loading(UINT count) {
     InvalidateRect(g_hwnd, NULL, TRUE);
 }
 
+static void expect_pending_context_chips(void) {
+    g_pending_context_expected_until_ms = GetTickCount64() + 45000ULL;
+}
+
+static bool pending_context_expected(void) {
+    if (g_pending_context_expected_until_ms == 0) return false;
+    if (GetTickCount64() <= g_pending_context_expected_until_ms) return true;
+    g_pending_context_expected_until_ms = 0;
+    return false;
+}
+
+static bool context_chips_visible(void) {
+    return (g_show_context_chips || g_pending_context_chips) && g_context_chip_count > 0;
+}
+
 static void emit_attach_files_event_from_drop(HDROP drop) {
     UINT count = DragQueryFileW(drop, 0xFFFFFFFFu, NULL, 0);
     if (count == 0) return;
@@ -596,6 +613,8 @@ static void emit_attach_files_event_from_drop(HDROP drop) {
     if (supported_count == 0) return;
     if (skipped_count == 0) show_supported_drop_loading(supported_count);
     g_show_context_chips = false;
+    g_pending_context_chips = false;
+    expect_pending_context_chips();
 
     fputs("{\"type\":\"attach_files_requested\",\"paths\":[", stdout);
     bool emitted = false;
@@ -1453,6 +1472,8 @@ static void create_controls(HWND hwnd) {
 
 static void consume_sent_context_chips(void) {
     g_show_context_chips = false;
+    g_pending_context_chips = false;
+    g_pending_context_expected_until_ms = 0;
     InvalidateRect(g_hwnd, NULL, TRUE);
 }
 
@@ -1937,6 +1958,14 @@ static void set_context_chips_from_json(const char *line, size_t line_len) {
     set_chips_from_json_key(line, line_len, "items", g_context_chips, &g_context_chip_count);
     if (g_context_chip_count <= 0) {
         g_show_context_chips = false;
+        g_pending_context_chips = false;
+        g_pending_context_expected_until_ms = 0;
+        return;
+    }
+    if (pending_context_expected()) {
+        g_pending_context_chips = true;
+        g_show_context_chips = false;
+        g_pending_context_expected_until_ms = 0;
     }
 }
 
@@ -2249,7 +2278,7 @@ static float context_chip_width(const wchar_t *label) {
 }
 
 static void draw_context_chips_d2d(RECT rect) {
-    if (!g_show_context_chips || g_context_chip_count <= 0) return;
+    if (!context_chips_visible()) return;
 
     int composer_w = clamp_int((rect.right * 72) / 100, 560, 760);
     int composer_left = (rect.right - composer_w) / 2;
@@ -2291,7 +2320,7 @@ static void draw_sent_chips_d2d(RECT rect, float context_reserved) {
 }
 
 static void draw_context_chips_gdi(HDC hdc, RECT rect) {
-    if (!g_show_context_chips || g_context_chip_count <= 0) return;
+    if (!context_chips_visible()) return;
 
     int composer_w = clamp_int((rect.right * 72) / 100, 560, 760);
     int composer_left = (rect.right - composer_w) / 2;
@@ -2584,7 +2613,7 @@ static bool paint_with_d2d(HWND hwnd) {
         if (show_title) {
             d2d_text(g_title, g_fmt_title, d2d_rectf(18.0f, 82.0f, (float)rect.right - 18.0f, 108.0f), g_light_theme ? 8 : 230, g_light_theme ? 22 : 240, g_light_theme ? 32 : 245, 1.0f);
         }
-        float context_reserved = (g_show_context_chips && g_context_chip_count > 0) ? 34.0f : 0.0f;
+        float context_reserved = context_chips_visible() ? 34.0f : 0.0f;
         float sent_reserved = (_wcsicmp(g_kind, L"question") == 0 && g_sent_chip_count > 0) ? 34.0f : 0.0f;
         d2d_text(g_body, g_fmt_body, d2d_rectf(18.0f, (float)body_top, (float)rect.right - 18.0f, (float)rect.bottom - 124.0f - context_reserved - sent_reserved), g_light_theme ? 22 : 230, g_light_theme ? 43 : 240, g_light_theme ? 56 : 245, 1.0f);
         draw_sent_chips_d2d(rect, context_reserved);
@@ -2782,10 +2811,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             );
             if (answer == IDYES) {
                 g_show_context_chips = false;
+                g_pending_context_chips = false;
+                expect_pending_context_chips();
                 emit_simple_event("attach_requested");
             }
             if (answer == IDNO) {
                 g_show_context_chips = true;
+                g_pending_context_chips = false;
+                g_pending_context_expected_until_ms = 0;
                 InvalidateRect(hwnd, NULL, TRUE);
                 emit_simple_event("context_list_requested");
             }
@@ -2797,7 +2830,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
                 L"Analyse screen context?",
                 MB_OKCANCEL | MB_ICONINFORMATION
             );
-            if (answer == IDOK) emit_simple_event("analyze_screen_requested");
+            if (answer == IDOK) {
+                g_show_context_chips = false;
+                g_pending_context_chips = false;
+                expect_pending_context_chips();
+                emit_simple_event("analyze_screen_requested");
+            }
             return 0;
         }
         if (id == ID_NOTE_BUTTON) {
@@ -3158,7 +3196,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lpar
             DrawTextW(hdc, g_title, -1, &title_rect, DT_LEFT | DT_TOP | DT_WORDBREAK);
         }
 
-        int context_reserved = (g_show_context_chips && g_context_chip_count > 0) ? 34 : 0;
+        int context_reserved = context_chips_visible() ? 34 : 0;
         int sent_reserved = (_wcsicmp(g_kind, L"question") == 0 && g_sent_chip_count > 0) ? 34 : 0;
         RECT body_rect = {18, body_top, rect.right - 18, rect.bottom - 124 - context_reserved - sent_reserved};
         SelectObject(hdc, body_font);
