@@ -6687,9 +6687,11 @@ async fn answer_with_provider_runtime(
         Ok(outcome) => outcome,
         Err(error) => {
             if is_answer_generation_current(daemon, generation_id) {
-                let _ = overlay_stream
-                    .finish(&user_facing_answer_error(&error))
-                    .await;
+                let error_message = answer_error_with_ref(
+                    &user_facing_answer_error(&error),
+                    request.metadata.request_id,
+                );
+                let _ = overlay_stream.finish(&error_message).await;
             }
             clear_active_answer_card(daemon, generation_id, answer_card_id).await;
             return Err(error);
@@ -6902,6 +6904,12 @@ fn user_facing_answer_error(error: &anyhow::Error) -> String {
     }
     "Bluey could not complete that answer yet. Try again; if it keeps happening, open Bluey status."
         .to_string()
+}
+
+fn answer_error_with_ref(message: &str, request_id: uuid::Uuid) -> String {
+    let id = request_id.simple().to_string();
+    let short = id.get(..8).unwrap_or(&id).to_ascii_uppercase();
+    format!("{message}\nRef: {short}")
 }
 
 fn is_incomplete_stream_error(lower_error: &str) -> bool {
@@ -8186,8 +8194,6 @@ async fn call_bluey_managed_provider(
         if let Some(stream) = stream.as_mut() {
             if !llm_request.image_data_urls.is_empty() {
                 stream.push_status("Reading screen context").await?;
-            } else {
-                stream.push_status("Checking conversation context").await?;
             }
         }
         let mut chunks = managed
@@ -9969,7 +9975,7 @@ async fn answer_context_for_question(
         question,
     ));
     let memory_timeout = answer_rag_lookup_timeout();
-    if !memory_timeout.is_zero() {
+    if should_lookup_answer_memory(question, visible_context_ids) && !memory_timeout.is_zero() {
         match timeout(
             memory_timeout,
             retrieved_memory_contexts(daemon, meeting, question),
@@ -9987,6 +9993,51 @@ async fn answer_context_for_question(
         }
     }
     context
+}
+
+fn should_lookup_answer_memory(question: &str, visible_context_ids: &[uuid::Uuid]) -> bool {
+    let q = question.trim().to_ascii_lowercase();
+    if q.chars().count() < 8 {
+        return false;
+    }
+    if !visible_context_ids.is_empty() {
+        return false;
+    }
+    if q.contains("answer the latest live captions from the current session transcript")
+        || q.contains("captions appear here")
+        || q.contains("live captions preview")
+    {
+        return false;
+    }
+    [
+        "saved memory",
+        "bluey memory",
+        "conversation context",
+        "session context",
+        "current session",
+        "previous session",
+        "use memory",
+        "use the memory",
+        "from memory",
+        "what did we",
+        "what was decided",
+        "action item",
+        "meeting notes",
+        "continue",
+        "the previous",
+        "previous answer",
+        "previous code",
+        "previous design",
+        "earlier answer",
+        "earlier code",
+        "same answer",
+        "same code",
+        "same design",
+        "above answer",
+        "above code",
+    ]
+    .iter()
+    .any(|signal| q.contains(signal))
 }
 
 fn recent_sent_attachment_context_for_follow_up(
@@ -14219,6 +14270,30 @@ mod tests {
     }
 
     #[test]
+    fn answer_memory_lookup_is_explicit_or_followup_only() {
+        assert!(!should_lookup_answer_memory(
+            "Write a Python LRU cache.",
+            &[]
+        ));
+        assert!(!should_lookup_answer_memory(
+            "Answer the latest live captions from the current session transcript. Treat the transcript as the user's current question or working context.",
+            &[]
+        ));
+        assert!(!should_lookup_answer_memory(
+            "Use saved memory and tell me what was decided.",
+            &[uuid::Uuid::new_v4()]
+        ));
+        assert!(should_lookup_answer_memory(
+            "Use saved memory and tell me what was decided.",
+            &[]
+        ));
+        assert!(should_lookup_answer_memory(
+            "Can you update the previous code?",
+            &[]
+        ));
+    }
+
+    #[test]
     fn relevant_current_attachment_context_matches_current_doc_without_pending_ids() {
         let handoff = ContextArtifact::new(
             ContextKind::Document,
@@ -15644,6 +15719,16 @@ mod tests {
         assert_eq!(
             user_facing_answer_error(&error),
             "Capacity busy. Bluey is waiting for provider capacity to recover before trying again. Retry in about 17s."
+        );
+    }
+
+    #[test]
+    fn answer_error_ref_is_short_and_shareable() {
+        let request_id = uuid::Uuid::parse_str("25594f6d-4cc7-4315-b99b-017b567851ae").unwrap();
+
+        assert_eq!(
+            answer_error_with_ref("Bluey could not complete that answer yet.", request_id),
+            "Bluey could not complete that answer yet.\nRef: 25594F6D"
         );
     }
 

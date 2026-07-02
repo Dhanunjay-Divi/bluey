@@ -1263,6 +1263,69 @@ fn answer_plan_for_request(
     }
 }
 
+fn should_lookup_completion_memory(req: &CompleteRequest, requested_lane: &str) -> bool {
+    let question = extract_search_question(&req.user);
+    let normalized = normalize_guardrail_text(&question);
+    if normalized.trim().chars().count() < 8 {
+        return false;
+    }
+    if !req.image_data_urls.is_empty() || requested_lane == "vision" {
+        return false;
+    }
+    let planning_context = extract_planning_context(&req.user);
+    if !planning_context.trim().is_empty()
+        && (is_generic_live_transcript_prompt(&normalized)
+            || looks_like_transcript_placeholder(&normalized))
+    {
+        return false;
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "saved memory",
+            "bluey memory",
+            "conversation context",
+            "session context",
+            "current session",
+            "previous session",
+            "use memory",
+            "use the memory",
+            "from memory",
+            "what did we",
+            "what was decided",
+            "action item",
+            "meeting notes",
+            "continue",
+            "the previous",
+            "previous answer",
+            "previous code",
+            "previous design",
+            "earlier answer",
+            "earlier code",
+            "same answer",
+            "same code",
+            "same design",
+            "above answer",
+            "above code",
+        ],
+    ) {
+        return true;
+    }
+
+    let word_count = normalized.split_whitespace().count();
+    let short_follow_up = word_count <= 8
+        && !looks_like_new_topic_request(&normalized)
+        && contains_any(
+            &normalized,
+            &["that", "this", "those", "same", "above", "previous", "next"],
+        );
+    if short_follow_up {
+        return true;
+    }
+
+    false
+}
+
 fn answer_plan_routing_enabled() -> bool {
     !env_flag_is_false("BLUEY_ANSWER_PLAN_ROUTING")
 }
@@ -3144,7 +3207,7 @@ fn retrieval_status_events(
 
 fn retrieval_status_entries(
     plan: &AnswerPlan,
-    rag_count: usize,
+    _rag_count: usize,
     web_search: &WebSearchOutcome,
 ) -> Vec<(String, String)> {
     let mut statuses: Vec<(String, String)> = Vec::new();
@@ -3162,8 +3225,8 @@ fn retrieval_status_entries(
     }
     if plan.needs_memory {
         statuses.push((
-            "checking_memory".to_string(),
-            "Checking conversation context...".to_string(),
+            "using_memory".to_string(),
+            "Using relevant conversation context...".to_string(),
         ));
     }
     if web_search.attempted {
@@ -3173,11 +3236,6 @@ fn retrieval_status_entries(
         statuses.push((
             "reading_web_sources".to_string(),
             format!("Reading {} sources...", web_search.sources.len()),
-        ));
-    } else if rag_count > 0 {
-        statuses.push((
-            "found_saved_context".to_string(),
-            "Found relevant conversation context.".to_string(),
         ));
     }
     if web_search.searches_used > 0 {
@@ -3485,17 +3543,23 @@ async fn complete_stream_inner(
         ));
     }
 
-    let rag_matches = completion_rag_matches_budgeted(
-        &state.pool,
-        &account.id,
-        req.session_id.as_deref(),
-        &req.user,
-    )
-    .await;
+    let should_lookup_memory = should_lookup_completion_memory(&req, &requested_effective_lane);
+    let rag_matches = if should_lookup_memory {
+        completion_rag_matches_budgeted(
+            &state.pool,
+            &account.id,
+            req.session_id.as_deref(),
+            &req.user,
+        )
+        .await
+    } else {
+        Vec::new()
+    };
     tracing::debug!(
         account_id_hash = %account_id_hash,
         request_id = %req.request_id,
         session_id = %session_id_log,
+        memory_lookup = should_lookup_memory,
         rag_match_count = rag_matches.len(),
         streaming = true,
         "managed chat memory context prepared"
@@ -4447,17 +4511,23 @@ async fn complete_inner(
         ));
     }
 
-    let rag_matches = completion_rag_matches_budgeted(
-        &state.pool,
-        &account.id,
-        req.session_id.as_deref(),
-        &req.user,
-    )
-    .await;
+    let should_lookup_memory = should_lookup_completion_memory(&req, &requested_effective_lane);
+    let rag_matches = if should_lookup_memory {
+        completion_rag_matches_budgeted(
+            &state.pool,
+            &account.id,
+            req.session_id.as_deref(),
+            &req.user,
+        )
+        .await
+    } else {
+        Vec::new()
+    };
     tracing::debug!(
         account_id_hash = %account_id_hash,
         request_id = %req.request_id,
         session_id = %session_id_log,
+        memory_lookup = should_lookup_memory,
         rag_match_count = rag_matches.len(),
         streaming = false,
         "managed chat memory context prepared"
@@ -7362,9 +7432,27 @@ mod tests {
             .join("\n");
 
         assert!(system.contains("prior conversation context"));
-        assert!(status_text.contains("Checking conversation context"));
+        assert!(status_text.contains("Using relevant conversation context"));
         assert!(!system.contains("saved Bluey memory"));
         assert!(!status_text.contains("saved context"));
+    }
+
+    #[test]
+    fn memory_lookup_is_explicit_or_followup_only() {
+        let direct_code = complete_request("Question:\nWrite a Python LRU cache.");
+        assert!(!should_lookup_completion_memory(&direct_code, "balanced"));
+
+        let live_caption = complete_request(
+            "Question:\nAnswer the latest live captions from the current session transcript. Treat the transcript as the user's current question or working context.\n\nSession context:\nInterviewer: Tell me about yourself.\nMic: I am a data engineer.",
+        );
+        assert!(!should_lookup_completion_memory(&live_caption, "balanced"));
+
+        let previous_code = complete_request("Question:\nCan you update the previous code?");
+        assert!(should_lookup_completion_memory(&previous_code, "balanced"));
+
+        let explicit_memory =
+            complete_request("Question:\nUse saved memory and tell me what was decided.");
+        assert!(should_lookup_completion_memory(&explicit_memory, "balanced"));
     }
 
     #[test]

@@ -4550,3 +4550,44 @@ cargo test -p cue-daemon provider_messages_enable -- --nocapture
 cargo build -p cue-daemon --bin bluey-daemon
 cargo build --manifest-path server/Cargo.toml
 ```
+
+## Latest Round 312: Memory Lookup Startup Latency
+
+Backup thread id remains: `019e133e-d92a-7830-8df0-3a050a4e22f6`
+
+Current branch for Codex-owned local work:
+
+```bash
+codex/bluey-overlay-spacing-20260626
+```
+
+Round doc:
+
+- `docs/rounds/ROUND-312-MEMORY-LOOKUP-STARTUP-LATENCY.md`
+
+Round 312 investigated user-reported Bluey id `25594F6D`:
+
+- Local status mapped it to active meeting `25594f6d-4cc7-4315-b99b-017b567851ae`.
+- The active meeting had no transcript segments and no context items.
+- The active session file contained two successful managed answers but no persisted failed turn, so the exact provider failure could not be reconstructed from the short session id alone.
+- Native overlay had been showing `Checking conversation context` for every non-screen managed stream before the server even selected a route, making provider failures look like memory failures.
+
+What changed:
+
+- Native overlay no longer shows a default conversation-context status for every non-screen managed answer.
+- Native local RAG lookup is now explicit/follow-up only.
+- Server RAG lookup before completion is now explicit/follow-up only, not every standalone direct ask.
+- Server memory status now says `Using relevant conversation context...` only when relevant context is actually attached.
+- Failed overlay answer cards now append a short request ref such as `Ref: 25594F6D` so future screenshots are traceable.
+
+Verification:
+
+```bash
+cargo fmt --all
+cargo test --manifest-path server/Cargo.toml memory_lookup -- --nocapture
+cargo test --manifest-path server/Cargo.toml answer_plan_context_wording -- --nocapture
+cargo test -p cue-daemon answer_memory_lookup -- --nocapture
+cargo test -p cue-daemon answer_error_ref -- --nocapture
+cargo build -p cue-daemon --bin bluey-daemon
+cargo build --manifest-path server/Cargo.toml
+```
