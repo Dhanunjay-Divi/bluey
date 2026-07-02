@@ -1,7 +1,7 @@
 # Bluey Compaction Handoff
 
 Generated: 2026-06-25 03:04 EDT
-Latest checkpoint: 2026-07-02 03:38 EDT
+Latest checkpoint: 2026-07-02 03:57 EDT
 Current Codex thread id: `019e133e-d92a-7830-8df0-3a050a4e22f6`
 Workspace: `/Users/uno/Downloads/cue`
 
@@ -30,12 +30,28 @@ Do not restart from scratch. Treat the repo as dirty and do not revert user or p
 - Write or update a `docs/rounds/` round doc for every work round.
 - Canonical new Bluey round docs should use Bluey's own numbered style: `ROUND-NNN-SLUG.md`, title `# Round NNN - Title`, and concise sections such as Trigger, Root Cause/Fix, Verification, Current State, and Remaining QA/Gates.
 - Keep non-round planning, phase, contract, review handoff, operational brief, and compaction handoff docs under their semantic names unless the owner explicitly asks to convert those too.
-- Latest completed Bluey round doc is `ROUND-299-LIVE-CAPTION-RAIL-ENTER-SEND.md`; the next canonical Bluey round doc should start at `ROUND-300-...`.
+- Latest completed Bluey round doc is `ROUND-300-BILLING-LESSON-GUARDS.md`; the next canonical Bluey round doc should start at `ROUND-301-...`.
 - Old date-only round doc paths may remain as compatibility pointers, but final responses should link the numbered canonical doc.
 
 ## Current State
 
 - Current Codex working branch for the latest saved work is `codex/bluey-overlay-spacing-20260626`.
+- Round 300 is complete for Pinky-style billing lesson guardrails:
+  - audited Bluey's existing credit/reload billing posture against the Pinky billing lesson pack
+  - confirmed Bluey already credits reloads only through verified Stripe/Square processor events and revokes/restricts on refund/dispute risk events
+  - added an internal/admin/test account guard for paid checkout/card-save/Auto Reload setup
+  - admin accounts, `internal-*`/`test-*`/`admin-test-*` `@bluey.sh` accounts, `+test` emails, and `@test.local` emails cannot enter real paid billing setup paths
+  - `/account/me` now reports Auto Reload unavailable for those accounts so the UI does not invite a real payment method setup
+  - added a regression test for the active internal account pattern:
+    `internal-admin-20260606023943@bluey.sh`
+  - verification passed:
+    - `cargo test --manifest-path server/Cargo.toml internal_and_test_accounts_cannot_enter_paid_billing_flows -- --nocapture`
+    - `cargo test --manifest-path server/Cargo.toml billing -- --nocapture`
+    - `cargo check --manifest-path server/Cargo.toml --quiet`
+    - `git diff --check`
+  - Round doc:
+    `docs/rounds/ROUND-300-BILLING-LESSON-GUARDS.md`
+  - Deploy note: server code is tested locally but not marked deployed unless the next operator runs the production server deploy path.
 - Round 299 is complete and deployed for live caption rail tail-follow and Enter send:
   - macOS caption rail now forces layout before scrolling to the newest caption tail
   - macOS repeats the tail-follow pass shortly after layout so partial caption updates stay visually live

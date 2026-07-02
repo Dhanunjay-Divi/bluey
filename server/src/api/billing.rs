@@ -50,6 +50,8 @@ pub struct SaveSquareCardRequest {
 
 const MINIMUM_RELOAD_CENTS: i64 = 1500;
 const SQUARE_API_VERSION: &str = "2025-04-16";
+pub(crate) const INTERNAL_TEST_BILLING_BLOCK_MESSAGE: &str =
+    "Internal/test accounts cannot start paid checkout, save payment methods, or enable Auto Reload. Use an internal credit grant instead.";
 
 fn square_idempotency_key(
     prefix: &str,
@@ -62,6 +64,24 @@ fn square_idempotency_key(
     )
 }
 
+pub(crate) fn is_internal_or_test_billing_account(account: &Account) -> bool {
+    account.is_admin || is_internal_or_test_billing_email(&account.email)
+}
+
+fn is_internal_or_test_billing_email(email: &str) -> bool {
+    let email = email.trim().to_ascii_lowercase();
+    if email.is_empty() {
+        return false;
+    }
+
+    let bluey_internal = email.ends_with("@bluey.sh")
+        && (email.starts_with("internal-")
+            || email.starts_with("test-")
+            || email.starts_with("admin-test-")
+            || email.contains("+test@"));
+    bluey_internal || email.ends_with("@test.local") || email.contains("+test@")
+}
+
 fn ensure_payment_setup_allowed(
     account: &crate::db::accounts::Account,
 ) -> Result<(), (StatusCode, Json<ApiError>)> {
@@ -70,6 +90,14 @@ fn ensure_payment_setup_allowed(
             StatusCode::FORBIDDEN,
             Json(ApiError {
                 error: "Billing is paused while this account is under review.".to_string(),
+            }),
+        ));
+    }
+    if is_internal_or_test_billing_account(account) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiError {
+                error: INTERNAL_TEST_BILLING_BLOCK_MESSAGE.to_string(),
             }),
         ));
     }
@@ -1519,6 +1547,30 @@ mod tests {
     }
 
     #[test]
+    fn internal_and_test_accounts_cannot_enter_paid_billing_flows() {
+        assert!(is_internal_or_test_billing_account(&billing_test_account(
+            "internal-admin-20260606023943@bluey.sh",
+            false
+        )));
+        assert!(is_internal_or_test_billing_account(&billing_test_account(
+            "owner@bluey.sh",
+            true
+        )));
+        assert!(is_internal_or_test_billing_account(&billing_test_account(
+            "person+test@gmail.com",
+            false
+        )));
+        assert!(is_internal_or_test_billing_account(&billing_test_account(
+            "dev@test.local",
+            false
+        )));
+        assert!(!is_internal_or_test_billing_account(&billing_test_account(
+            "customer@gmail.com",
+            false
+        )));
+    }
+
+    #[test]
     fn square_payment_link_body_carries_bluey_metadata() {
         let body = build_square_payment_link_body(
             "https://bluey.sh",
@@ -1621,6 +1673,29 @@ mod tests {
         assert_eq!(extracted.account_id, "acct-123");
         assert_eq!(extracted.amount_cents, 3000);
         assert_eq!(extracted.payment_id, "payment_1");
+    }
+
+    fn billing_test_account(email: &str, is_admin: bool) -> Account {
+        Account {
+            id: "acct-test".to_string(),
+            email: email.to_string(),
+            email_verified_at: Some("2026-06-26T00:00:00Z".to_string()),
+            balance_cents: 0,
+            trial_seconds_remaining: 0,
+            auto_topup_enabled: false,
+            auto_topup_threshold_cents: 1000,
+            auto_topup_amount_cents: 3000,
+            is_admin,
+            stripe_customer_id: None,
+            stripe_payment_method_id: None,
+            square_customer_id: None,
+            square_card_id: None,
+            square_card_brand: None,
+            square_card_last4: None,
+            billing_restricted: false,
+            billing_restriction_reason: None,
+            billing_restricted_at: None,
+        }
     }
 
     #[test]

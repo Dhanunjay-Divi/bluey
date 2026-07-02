@@ -176,6 +176,14 @@ pub async fn update_billing_settings(
                 }),
             ));
         }
+        if super::billing::is_internal_or_test_billing_account(&account) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ApiError {
+                    error: super::billing::INTERNAL_TEST_BILLING_BLOCK_MESSAGE.to_string(),
+                }),
+            ));
+        }
         let (_, available, reason, _) = auto_topup_capability(&state, &account);
         if !available {
             return Err((
@@ -321,6 +329,14 @@ fn auto_topup_capability(
                 .stripe_payment_method_id
                 .as_ref()
                 .map(|_| "Saved Stripe card".to_string());
+            if super::billing::is_internal_or_test_billing_account(account) {
+                return (
+                    "stripe".to_string(),
+                    false,
+                    Some(super::billing::INTERNAL_TEST_BILLING_BLOCK_MESSAGE.to_string()),
+                    label,
+                );
+            }
             if account.billing_restricted {
                 return (
                     "stripe".to_string(),
@@ -348,6 +364,14 @@ fn auto_topup_capability(
                 _ if account.square_card_id.is_some() => Some("Saved Square card".to_string()),
                 _ => None,
             };
+            if super::billing::is_internal_or_test_billing_account(account) {
+                return (
+                    "square".to_string(),
+                    false,
+                    Some(super::billing::INTERNAL_TEST_BILLING_BLOCK_MESSAGE.to_string()),
+                    label,
+                );
+            }
             if account.billing_restricted {
                 return (
                     "square".to_string(),
